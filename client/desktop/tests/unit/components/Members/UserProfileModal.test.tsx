@@ -16,6 +16,7 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 import UserProfileModal from '@/renderer/components/Members/UserProfileModal';
 import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
 import type { ServerMember } from '@/renderer/stores/chat/memberStore';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // Match SafeLink.test.tsx's pattern: tests/setup.ts installs a base
 // `window.electron` mock; this helper attaches an openExternal vi.fn so
@@ -309,6 +310,20 @@ describe('UserProfileModal', () => {
     );
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(
+      <UserProfileModal
+        isOpen={true}
+        onClose={mockOnClose}
+        member={mockMember}
+        presenceStatus="online"
+      />
+    );
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(mockOnClose).not.toHaveBeenCalled();
   });
 
   it('closes when clicking overlay background', () => {

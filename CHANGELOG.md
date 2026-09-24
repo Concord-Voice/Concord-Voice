@@ -47,6 +47,18 @@ that keeps sending far more than your plan allows.
 
 ### Fixed
 
+- **The "Verify Your Identity" prompt can no longer get stuck behind Settings** ([#3423](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3423)) — when Concord
+  asked you to confirm your identity while Settings or another dialog was open, the prompt opened
+  underneath it and could not be reached, and the action you were taking stayed on "Processing…"
+  until you reloaded. The prompt now opens on top and takes the keyboard, and Escape cancels it. It
+  stays on top if another dialog opens while it is showing, and a new prompt no longer starts out
+  locked, or showing an error, left over from an earlier one. It is also styled correctly when it
+  appears at sign-in, before Settings has ever been opened, and it now appears if Concord asks
+  while it is still starting up. Escape, Tab and the arrow keys reach it even with a sidebar,
+  menu, popup, picker, image viewer or another dialog open behind it, the mute and deafen
+  shortcuts still work while it is showing, it fits a zoomed or small window, and a check that
+  takes too long stops with a message instead of locking the prompt. A wrong code now says what
+  went wrong, including for single sign-on accounts, and puts the cursor back in the code box.
 - **Voice activity now clears before a privacy change reconnects the app** ([#3412](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3412)) — lowering Rich Presence visibility,
   leaving a voice session, or disconnecting can no longer briefly deliver an older activity
   update after its removal.
@@ -80,7 +92,6 @@ that keeps sending far more than your plan allows.
   started inside a picture-in-picture window could open a new Concord window. Picture-in-picture
   windows now follow the same rule as the main window: secure (`https`) links open in your browser,
   and anything else is blocked.
-
 - **Sharing an app with its sound now tells you when the sound could not be captured** ([#3405](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3405)) — when Concord could not
   capture an app's sound (for example a Finder window, which has never played audio), the share
   could still show app sound as on while none was being sent. It now says "We couldn't capture that

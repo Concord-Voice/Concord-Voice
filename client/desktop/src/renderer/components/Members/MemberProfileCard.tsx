@@ -11,6 +11,7 @@ import SendFriendRequestButton from './SendFriendRequestButton';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './MemberProfileCard.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 /** Flexible member shape that works for both ServerMembers and Friends */
 export interface ProfileCardMember {
@@ -62,6 +63,7 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
     };
 
     const handleEscape = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, cardRef.current)) return;
       if (e.key === 'Escape') {
         onClose();
       }

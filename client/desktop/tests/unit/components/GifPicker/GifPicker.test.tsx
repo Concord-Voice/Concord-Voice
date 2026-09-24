@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { openForeignModal } from '../../../helpers/foreignModal';
 import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
@@ -312,6 +313,15 @@ describe('GifPicker', () => {
     await waitFor(() => expect(trendingMock).toHaveBeenCalled());
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', async () => {
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('clicking outside the picker closes it', async () => {

@@ -6,6 +6,7 @@ import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { mockUser } from '../../../mocks/fixtures';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // Mock websocketService
 const mockSendSetStatus = vi.fn();
@@ -125,6 +126,13 @@ describe('UserPopover', () => {
     render(<UserPopover {...defaultProps} />);
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(<UserPopover {...defaultProps} />);
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(mockOnClose).not.toHaveBeenCalled();
   });
 
   it('renders avatar image when user has avatar_url', () => {

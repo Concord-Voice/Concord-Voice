@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, userEvent } from '../../../../test-utils';
+import { render, screen, userEvent, fireEvent } from '../../../../test-utils';
 import SubscriptionResetModal from '@/renderer/components/Settings/SubscriptionResetModal';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { resetAllStores } from '../../../../helpers/store-helpers';
+import { openForeignModal } from '../../../../helpers/foreignModal';
 
 beforeEach(() => {
   resetAllStores();
@@ -92,5 +93,15 @@ describe('SubscriptionResetModal', () => {
     await user.keyboard('{Escape}');
 
     expect(onAcknowledge).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    const onAcknowledge = vi.fn();
+    render(<SubscriptionResetModal open onAcknowledge={onAcknowledge} />);
+
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(onAcknowledge).not.toHaveBeenCalled();
   });
 });

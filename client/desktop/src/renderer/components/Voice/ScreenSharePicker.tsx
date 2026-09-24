@@ -23,6 +23,7 @@ import {
 } from '../../utils/policy/screenAudioCapability';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { groupDesktopSources, type GroupedSources } from '../../utils/ui/groupDesktopSources';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 import './ScreenSharePicker.css';
 
 interface DesktopSource {
@@ -332,7 +333,7 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   // on the belief that <dialog> handles Escape would silently break it.
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel();
+      if (e.key === 'Escape' && !keyTargetsForeignModal(e, dialogRef.current)) onCancel();
     },
     [onCancel]
   );
@@ -356,13 +357,15 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   //
   // No modal-stack / isTopmost gate, unlike Modal.tsx: that exists to stop nested
   // modals fighting over the trap, and the picker is opened from the voice bar
-  // rather than from inside another modal. If it ever gains a child modal, this
-  // needs the same gate.
+  // rather than from inside another modal. A top-layer dialog in front of it
+  // (the MFA challenge) owns its own Tab, which keyTargetsForeignModal leaves
+  // alone; a child ui/Modal would still need the stack gate.
   useEffect(() => {
     const handleTab = (e: KeyboardEvent) => {
       if (e.key !== 'Tab') return;
       const container = dialogRef.current;
       if (!container) return;
+      if (keyTargetsForeignModal(e, container)) return;
       const focusables = getFocusable(container);
       if (focusables.length === 0) {
         e.preventDefault();

@@ -6,6 +6,7 @@ import {
 } from '../../stores/ui/settingsOverlayStore';
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './SettingsOverlayHost.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 const SettingsPage = lazy(() => import('./SettingsPage'));
 const ServerSettingsPage = lazy(() => import('../Servers/ServerSettingsPage'));
@@ -72,6 +73,7 @@ const SettingsOverlayHost: React.FC = () => {
     if (!open) return;
     if (dialogCancelsOnEscape) return;
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, dialogRef.current)) return;
       if (
         e.key === 'Escape' &&
         !isSettingsOverlayDismissBlocked(useSettingsOverlayStore.getState().open)

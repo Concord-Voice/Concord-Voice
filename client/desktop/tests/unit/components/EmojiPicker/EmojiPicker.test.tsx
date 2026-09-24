@@ -1,8 +1,9 @@
 import React from 'react';
-import { act, waitFor } from '@testing-library/react';
+import { act, fireEvent, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { render, screen } from '../../../test-utils';
+import { openForeignModal } from '../../../helpers/foreignModal';
 import type { EmojiCategory, EmojiEntry } from '@/renderer/components/EmojiPicker/types';
 
 // ─── Module mocks ─────────────────────────────────────────────────────────────
@@ -205,6 +206,19 @@ describe('EmojiPicker — close handlers', () => {
 
     await screen.findByPlaceholderText('Search emoji...');
     await user.keyboard('{Escape}');
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', async () => {
+    const onClose = vi.fn();
+    render(<EmojiPicker onSelect={vi.fn()} onClose={onClose} mode="popover" />);
+
+    await waitFor(() =>
+      expect(document.body.querySelector('.emoji-picker--popover')).toBeInTheDocument()
+    );
+
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();
   });
 });

@@ -1,9 +1,10 @@
 import React from 'react';
-import { render, screen, act } from '../../../test-utils';
+import { render, screen, act, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { vi } from 'vitest';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // ── CSS mock ─────────────────────────────────────────────────────────────────
 vi.mock('@/renderer/components/Voice/VoiceStage.css', () => ({}));
@@ -171,6 +172,24 @@ describe('VoiceStage', () => {
     render(<VoiceStage />);
     expect(screen.getByTitle(/Previous screen share/)).toBeInTheDocument();
     expect(screen.getByTitle(/Next screen share/)).toBeInTheDocument();
+  });
+
+  it('leaves arrow keys to a modal dialog open in front of it', () => {
+    setStageState({
+      stageLayout: 'focus',
+      dominantScreenShareId: 'p1',
+      tunedInScreenShares: { p1: 'c1', p2: 'c2' },
+      participants: {
+        'user-1': mockParticipant(),
+        'user-2': mockParticipant({ userId: 'user-2', username: 'bob' }),
+      },
+    });
+    render(<VoiceStage />);
+    expect(screen.getByText('1 / 2')).toBeInTheDocument();
+
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'ArrowRight' });
+    expect(screen.getByText('1 / 2')).toBeInTheDocument();
   });
 
   it('does not show cycle buttons in focus mode with single share', () => {

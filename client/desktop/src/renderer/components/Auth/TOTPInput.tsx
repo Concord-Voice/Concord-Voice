@@ -94,7 +94,11 @@ const TOTPInput: React.FC<TOTPInputProps> = ({
           />
         ))}
       </div>
-      {error && <p className="totp-error">{error}</p>}
+      {error && (
+        <p className="totp-error" role="alert">
+          {error}
+        </p>
+      )}
       {onBackupCode && (
         <button
           type="button"

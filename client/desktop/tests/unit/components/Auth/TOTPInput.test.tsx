@@ -106,6 +106,8 @@ describe('TOTPInput', () => {
   it('shows error message', () => {
     render(<TOTPInput onSubmit={onSubmit} error="Invalid code" />);
     expect(screen.getByText('Invalid code')).toBeInTheDocument();
+    // Announced when it appears (WCAG 4.1.3).
+    expect(screen.getByRole('alert')).toHaveTextContent('Invalid code');
   });
 
   it('adds error class to digit inputs when error exists', () => {

@@ -6,6 +6,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { fetchEligibility, peekEligibility } from '@/renderer/services/system/friendEligibility';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // #1241: the affordance is now gated on server eligibility. Most of these tests
 // are about rendering and sending, not about the gate (which has its own suite
@@ -154,6 +155,13 @@ describe('MemberProfileCard', () => {
     render(<MemberProfileCard {...defaultProps} />);
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(<MemberProfileCard {...defaultProps} />);
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(mockOnClose).not.toHaveBeenCalled();
   });
 
   it('renders "Offline" for offline status with no lastSeen', () => {

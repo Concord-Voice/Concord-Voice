@@ -532,6 +532,26 @@
   z-index: 9999;
 }
 
+/* MFAChallengeModal's native <dialog> shell. showModal() puts it in the top
+   layer (so no z-index) and dims the page through ::backdrop; the card itself
+   is the .mfa-modal inside. `margin: auto` restores the UA centring that the
+   global `* { margin: 0 }` reset in styles/index.css removes. */
+.mfa-challenge-dialog {
+  width: 100%;
+  max-width: 380px;
+  margin: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  /* No overflow override: the UA default (auto) lets a dialog taller than a
+     zoomed or small window scroll to its buttons. */
+}
+
+.mfa-challenge-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.7);
+}
+
 .mfa-modal {
   background: var(--bg-primary, #1e1e1e);
   border: 1px solid var(--border-color, #444);

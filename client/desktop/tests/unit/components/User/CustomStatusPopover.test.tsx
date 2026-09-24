@@ -10,6 +10,7 @@ import {
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
 import type { PresenceSettings } from '@/renderer/stores/ui/richPresenceStore';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // Mock the EmojiPicker to avoid loading the full emoji dataset. The mock exposes
 // deterministic Select/Close buttons so the popover's onSelect/onClose wiring is
@@ -871,6 +872,14 @@ describe('CustomStatusPopover', () => {
 
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(<CustomStatusPopover onClose={onClose} />);
+
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('does NOT close on Escape while the emoji picker is open', () => {

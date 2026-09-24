@@ -2,6 +2,7 @@ import React, { use, useEffect, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { ModalPortalHostContext } from './ModalContext';
 import './ContextMenu.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 /* ------------------------------------------------------------------ */
 /*  Main ContextMenu wrapper                                          */
@@ -65,6 +66,7 @@ const ContextMenuRoot: React.FC<ContextMenuProps> = ({ position, onClose, childr
     };
 
     const handleEscape = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, menuRef.current)) return;
       if (e.key === 'Escape') {
         animateClose();
       }
@@ -236,6 +238,7 @@ const SubMenu: React.FC<SubMenuProps> = ({ children, closing }) => {
     // trigger, so one wider than the space there (a wide root menu pinned to the
     // right of an 800px layout) put its leading items at a negative `left`.
     if (rect.left + width > vw) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the flip needs the submenu's measured width, which exists only after mount; it sets state once, only when the submenu overflows
       setFlipped(true);
       const parentLeft = parentRect?.left ?? 0;
       const flippedLeft = parentLeft - SUBMENU_GAP - width;

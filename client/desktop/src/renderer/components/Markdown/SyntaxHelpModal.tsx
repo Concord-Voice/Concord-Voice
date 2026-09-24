@@ -3,6 +3,7 @@ import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useDialogSync } from '../../hooks/ui/useDialogSync';
 import { clampMessageCharsForTier } from '../../utils/policy/entitlementLimits';
 import './SyntaxHelpModal.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 // jsdom (the vitest test environment) implements <dialog> but does NOT fire
 // the native `cancel` / `close` events on Escape keypress when using
@@ -66,6 +67,7 @@ const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
     if (!open) return;
     if (dialogCancelsOnEscape) return;
     const handler = (e: KeyboardEvent): void => {
+      if (keyTargetsForeignModal(e, dialogRef.current)) return;
       if (e.key === 'Escape') onClose();
     };
     globalThis.addEventListener('keydown', handler);

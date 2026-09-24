@@ -3,6 +3,7 @@ import { vi } from 'vitest';
 import ImageLightbox from '@/renderer/components/Chat/ImageLightbox';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 describe('ImageLightbox', () => {
   const baseProps = { src: 'blob:fake-url', alt: 'pic', onClose: vi.fn() };
@@ -36,6 +37,14 @@ describe('ImageLightbox', () => {
     render(<ImageLightbox {...baseProps} onClose={onClose} />);
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    const onClose = vi.fn();
+    render(<ImageLightbox {...baseProps} onClose={onClose} />);
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('closes when the close button is clicked', () => {

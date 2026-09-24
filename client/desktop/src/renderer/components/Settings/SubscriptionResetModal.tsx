@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { openSubscriptionPage } from '../../utils/ui/openSubscriptionPage';
 import { useDialogSync } from '../../hooks/ui/useDialogSync';
 import './SubscriptionResetModal.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 // Mirror SyntaxHelpModal's environment probe: jsdom implements <dialog> but does
 // NOT fire native `cancel`/`close` on Escape via .showModal(); Electron/Chrome
@@ -36,6 +37,7 @@ const SubscriptionResetModal: React.FC<SubscriptionResetModalProps> = ({ open, o
     if (!open) return;
     if (dialogCancelsOnEscape) return;
     const handler = (e: KeyboardEvent): void => {
+      if (keyTargetsForeignModal(e, dialogRef.current)) return;
       if (e.key === 'Escape') onAcknowledge();
     };
     globalThis.addEventListener('keydown', handler);

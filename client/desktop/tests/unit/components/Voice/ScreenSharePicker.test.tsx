@@ -39,6 +39,7 @@ const mockSources = [
 ];
 
 import ScreenSharePicker from '@/renderer/components/Voice/ScreenSharePicker';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 /** Sources are behind tabs now; open one by its tab button. */
 const openTab = (name: 'Screens' | 'Windows') =>
@@ -1320,6 +1321,24 @@ describe('ScreenSharePicker', () => {
 
       fireEvent.keyDown(document, { key: 'Tab' });
       expect(dialog.contains(document.activeElement)).toBe(true);
+    });
+
+    it('leaves Tab and Escape to a modal dialog open in front of it', async () => {
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => {
+        expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
+      });
+      const { input } = openForeignModal();
+
+      const tabNotPrevented = fireEvent.keyDown(input, { key: 'Tab' });
+      expect(tabNotPrevented, 'Tab must move within the dialog in front').toBe(true);
+      expect(document.activeElement, 'focus must not be pulled back to the picker').toBe(input);
+
+      fireEvent.keyDown(input, { key: 'Escape' });
+      expect(
+        mockOnCancel,
+        'Escape in the dialog in front must not cancel the picker'
+      ).not.toHaveBeenCalled();
     });
 
     it('still closes on Escape', () => {

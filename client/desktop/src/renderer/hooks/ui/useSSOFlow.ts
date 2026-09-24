@@ -16,6 +16,7 @@
 import { useCallback } from 'react';
 import { useSSOStore, type SSOState } from '../../stores/auth/ssoStore';
 import {
+  abandonSSOReservation,
   startSSOFlow,
   type SSOProvider,
   type SSOResult,
@@ -159,9 +160,14 @@ async function handleSSOMfaResult(
   } else {
     if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
     // verified:false — the user cancelled (clearChallenge resolves
-    // { verified: false }). The verification-failed case never reaches here:
-    // MFAChallengeModal stays open on a failed proof and does NOT resolve; the
-    // user must cancel explicitly to leave that state.
+    // { verified: false }), or another challenge replaced this one. The
+    // verification-failed case never reaches here: MFAChallengeModal stays
+    // open on a failed proof and does NOT resolve; the user must cancel
+    // explicitly to leave that state. Release the reservation on every such
+    // ending. A modal Cancel has already released it and still reaches this
+    // line: the repeat is intended and harmless, because main's release finds
+    // no reservation, returns false and discards nothing.
+    void abandonSSOReservation();
     setState({ phase: 'idle' });
   }
 }

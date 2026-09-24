@@ -10,6 +10,7 @@ import { getWebSocketService } from '../../services/messaging/websocketService';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import './UserPopover.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 interface UserPopoverProps {
   user: UserProfile;
@@ -97,6 +98,7 @@ const UserPopover: React.FC<UserPopoverProps> = ({
     };
 
     const handleEscape = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, popoverRef.current)) return;
       if (e.key === 'Escape') {
         onClose();
       }

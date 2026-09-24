@@ -8,6 +8,7 @@ import EmojiCategoryBar from './EmojiCategoryBar';
 import EmojiGrid from './EmojiGrid';
 import { resolveAnchoredPlacement } from '../../utils/ui/pickerAnchor';
 import './EmojiPicker.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 /** Border width and corner radius baked into EmojiPicker.css's `.emoji-picker`
  *  rule — kept in sync with the stylesheet, not read from it (#2370). */
@@ -160,6 +161,7 @@ const EmojiPicker: React.FC<EmojiPickerProps> = ({
     };
 
     const handleEscape = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, pickerRef.current)) return;
       if (e.key === 'Escape') {
         onClose();
         restoreFocus();

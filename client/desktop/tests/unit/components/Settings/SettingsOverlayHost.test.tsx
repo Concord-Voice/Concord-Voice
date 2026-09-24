@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 vi.mock('@/renderer/components/Settings/SettingsPage', async () => {
   const ReactModule = await import('react');
@@ -54,7 +55,12 @@ beforeAll(() => {
   };
   proto.showModal = function () {
     showModalOrder.push((this as unknown as HTMLDialogElement).className);
-    (this as unknown as HTMLDialogElement).setAttribute('open', '');
+    // Delegate to the setup.ts patched original rather than reimplementing
+    // it: that version also registers this dialog in the `:modal` WeakSet
+    // setup.ts installs, which a foreign-modal test (#3423) needs to match
+    // `dialog.matches(':modal')` correctly. Reimplementing bare
+    // `setAttribute('open', '')` here silently breaks that match.
+    originalShowModal.call(this as unknown as HTMLDialogElement);
   };
   proto.close = function () {
     (this as unknown as HTMLDialogElement).removeAttribute('open');
@@ -144,6 +150,21 @@ describe('SettingsOverlayHost', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
 
     expect(useSettingsOverlayStore.getState().open).toBeNull();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', async () => {
+    render(<SettingsOverlayHost />);
+    act(() => {
+      useSettingsOverlayStore.getState().openSettings('app');
+    });
+    await screen.findByTestId('mock-settings-page');
+
+    // Appended to document.body, not inside the Settings dialog — the way an
+    // MFA challenge opens over it, not nested in it.
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(useSettingsOverlayStore.getState().open).toBe('app');
   });
 
   it('closes when the dialog backdrop is clicked', async () => {

@@ -1,4 +1,8 @@
 import { useKeyboardShortcutStore, type KeyCombo } from '../../stores/ui/keyboardShortcutStore';
+import { useMFAChallengeStore } from '../../stores/auth/mfaChallengeStore';
+
+/** Shortcuts that open no dialog and never use Escape, so a pending MFA challenge lets them run. */
+const RUNS_DURING_CHALLENGE: ReadonlySet<string> = new Set(['toggle-mute', 'toggle-deafen']);
 
 class KeyboardShortcutService {
   private readonly handlers = new Map<string, () => void>();
@@ -55,6 +59,10 @@ class KeyboardShortcutService {
   /** Core keydown handler */
   private handleKeyDown(event: KeyboardEvent): void {
     if (!this.enabled) return;
+    // A pending identity challenge owns the keyboard: a shortcut would open a
+    // dialog over it, or cancel the Escape keydown that closes it. Mute and
+    // deafen do neither, and a user in a call must still be able to use them.
+    const challengePending = !!useMFAChallengeStore.getState().challengeToken;
 
     const { shortcuts } = useKeyboardShortcutStore.getState();
     const inInput = this.isInTextInput(event);
@@ -62,6 +70,7 @@ class KeyboardShortcutService {
     for (const shortcut of shortcuts) {
       if (!this.matchesCombo(event, shortcut.combo)) continue;
       if (inInput && !shortcut.allowInInput) continue;
+      if (challengePending && !RUNS_DURING_CHALLENGE.has(shortcut.id)) continue;
 
       const handler = this.handlers.get(shortcut.id);
       if (handler) {

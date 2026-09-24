@@ -114,6 +114,14 @@ function resolveFetchUrl(input: Parameters<typeof fetch>[0]): string {
 
 const active = new Map<number, LoopbackHandle>();
 const SESSION_ID_HEADER = 'X-Concord-Session-ID';
+// Well above a healthy verify, which answers in well under the control plane's
+// 15 s WriteTimeout. It fires for a stuck connection or a stalled handler
+// alike, and either way fails closed. The challenge token's 5-minute TTL and
+// single-use claim remain the security bound; this one is liveness.
+const SSO_MFA_VERIFY_TIMEOUT_MS = 30_000;
+// The best-effort logout after a failed completion must not re-open the hang
+// the verify timeout closes; server-side session expiry is the backstop.
+const COOKIE_SESSION_REVOKE_TIMEOUT_MS = 10_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 interface PendingSSOCompletion {
@@ -321,6 +329,7 @@ async function revokeCookieBoundSession(apiBase: string, sessionId: string | nul
       method: 'POST',
       credentials: 'include',
       headers: { 'X-Session-ID': sessionId },
+      signal: AbortSignal.timeout(COOKIE_SESSION_REVOKE_TIMEOUT_MS),
     });
   } catch {
     // Best effort; the session ID + cookie hash match prevents successor revoke.
@@ -539,6 +548,12 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
         },
         credentials: 'include',
         body: JSON.stringify(requestBody),
+        // The renderer disables the challenge's Cancel while this proof is in
+        // flight, so it must settle. The bound lives HERE, where the
+        // credential is stored: a renderer-side timeout cannot stop main from
+        // storing a late credential that no session admits (#3423). It covers
+        // the body read too; a cut body parses to null and stores nothing.
+        signal: AbortSignal.timeout(SSO_MFA_VERIFY_TIMEOUT_MS),
       });
     } catch {
       return { kind: 'error', status: 0, code: 'sso_mfa_verify_failed' };

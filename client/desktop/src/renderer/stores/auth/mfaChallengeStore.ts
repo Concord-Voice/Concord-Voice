@@ -141,6 +141,15 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
   resolve: null,
 
   showChallenge: (token, methods, purpose, recoveryOnlyMethods, ssoContext) => {
+    // Every caller awaits this promise, so each one must settle. A challenge
+    // this one replaces is settled not-verified rather than dropped, and an
+    // empty token settles at once: the modal treats it as no challenge, so
+    // nothing could ever answer it, and clears the replaced challenge's state.
+    if (!token) {
+      get().clearChallenge();
+      return Promise.resolve({ verified: false });
+    }
+    get().resolve?.({ verified: false });
     return new Promise<MFAChallengeResult>((resolve) => {
       set({
         challengeToken: token,

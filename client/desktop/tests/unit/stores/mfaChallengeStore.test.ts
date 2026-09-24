@@ -132,9 +132,9 @@ describe('mfaChallengeStore', () => {
         provider: 'google',
         credentialOwner: 7,
       });
-    let aSettled = false;
-    void promiseA.then(() => {
-      aSettled = true;
+    let aResult: unknown;
+    void promiseA.then((result) => {
+      aResult = result;
     });
     // Challenge B supersedes A (overwrites the active challenge + resolver).
     const promiseB = useMFAChallengeStore
@@ -145,7 +145,8 @@ describe('mfaChallengeStore', () => {
       });
 
     // A late completion bound to challenge A must be IGNORED (token mismatch):
-    // it neither settles A nor clears the active challenge B.
+    // it cannot turn A verified, and it does not clear the active challenge B.
+    // A itself was already settled not-verified by the supersession.
     useMFAChallengeStore
       .getState()
       .completeChallenge(
@@ -153,7 +154,7 @@ describe('mfaChallengeStore', () => {
         'token-A'
       );
     await Promise.resolve();
-    expect(aSettled).toBe(false);
+    expect(aResult).toEqual({ verified: false });
     expect(useMFAChallengeStore.getState().challengeToken).toBe('token-B');
 
     // A completion bound to challenge B settles B.
@@ -167,6 +168,63 @@ describe('mfaChallengeStore', () => {
     await expect(promiseB).resolves.toEqual({
       verified: true,
       ssoCompletion: { accessToken: 'b', sessionId: 's2', credentialOwner: 9 },
+    });
+  });
+
+  it('settles a superseded challenge as not verified, so its caller is not left waiting forever', async () => {
+    const promiseA = useMFAChallengeStore
+      .getState()
+      .showChallenge('token-A', ['totp'], 'suspicious_refresh');
+    let aResult: unknown;
+    void promiseA.then((result) => {
+      aResult = result;
+    });
+
+    useMFAChallengeStore.getState().showChallenge('token-B', ['totp'], 'suspicious_refresh');
+    await Promise.resolve();
+
+    expect(aResult, 'the request gated on A must be released when B replaces it').toEqual({
+      verified: false,
+    });
+    expect(useMFAChallengeStore.getState().challengeToken).toBe('token-B');
+  });
+
+  it('settles a challenge with an empty token at once, since nothing can be shown to answer it', async () => {
+    const result = useMFAChallengeStore
+      .getState()
+      .showChallenge('', ['totp'], 'suspicious_refresh');
+    let settled: unknown;
+    void result.then((value) => {
+      settled = value;
+    });
+    await Promise.resolve();
+
+    expect(settled).toEqual({ verified: false });
+    expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
+  });
+
+  it('an empty token clears the challenge it replaces, not only its token', async () => {
+    const replaced = useMFAChallengeStore
+      .getState()
+      .showChallenge('tok-A', ['totp', 'webauthn'], 'sso_login', ['totp'], {
+        provider: 'apple',
+        credentialOwner: 12,
+      });
+
+    await expect(
+      useMFAChallengeStore.getState().showChallenge('', ['totp'], 'suspicious_refresh')
+    ).resolves.toEqual({
+      verified: false,
+    });
+    await expect(replaced).resolves.toEqual({ verified: false });
+    expect(useMFAChallengeStore.getState()).toMatchObject({
+      challengeToken: null,
+      methods: [],
+      recoveryOnlyMethods: [],
+      purpose: null,
+      webauthnOptions: null,
+      ssoContext: null,
+      resolve: null,
     });
   });
 });

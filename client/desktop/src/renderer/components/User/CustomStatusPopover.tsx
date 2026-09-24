@@ -11,6 +11,7 @@ import {
 } from '../../stores/ui/richPresenceStore';
 import EmojiPicker from '../EmojiPicker/EmojiPicker';
 import './CustomStatusPopover.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 const MAX_LEN = 140;
 // Native maxLength counts UTF-16 units; preserve one all-astral over-limit value.
@@ -77,6 +78,7 @@ const CustomStatusPopover: React.FC<CustomStatusPopoverProps> = ({ onClose }) =>
   const [error, setError] = useState<string | null>(null);
   const [emojiAnchor, setEmojiAnchor] = useState<{ x: number; y: number } | null>(null);
 
+  const rootRef = useRef<HTMLDialogElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
   const mountedRef = useRef(false);
   const textDirtyRef = useRef(false);
@@ -207,6 +209,7 @@ const CustomStatusPopover: React.FC<CustomStatusPopoverProps> = ({ onClose }) =>
   // Close on Escape (only when the emoji picker isn't capturing it).
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, rootRef.current)) return;
       if (e.key === 'Escape' && !showEmojiPicker) onClose();
     };
     document.addEventListener('keydown', handleEscape);
@@ -224,7 +227,7 @@ const CustomStatusPopover: React.FC<CustomStatusPopoverProps> = ({ onClose }) =>
     // popover via the `open` attribute — NOT showModal() (no ::backdrop, no focus
     // trap, no top-layer). Keeps the existing absolute positioning; S6819 prefers
     // the native element over a role attribute on a <div>.
-    <dialog className="custom-status-popover" open aria-label="Set custom status">
+    <dialog ref={rootRef} className="custom-status-popover" open aria-label="Set custom status">
       <div className="custom-status-popover-title">Set a custom status</div>
 
       <div className="custom-status-popover-row">

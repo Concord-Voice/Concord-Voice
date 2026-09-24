@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import './AppLayout.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 export interface AttributedPopoverProps {
   id: string;
@@ -78,6 +79,7 @@ export const AttributedPopover: React.FC<AttributedPopoverProps> = ({
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (keyTargetsForeignModal(event, surface)) return;
       event.preventDefault();
       event.stopPropagation();
       dismiss();

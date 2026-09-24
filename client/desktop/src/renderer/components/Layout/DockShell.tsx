@@ -22,6 +22,7 @@ import {
   useLayoutStore,
 } from '../../stores/ui/layoutStore';
 import './AppLayout.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 interface DockOverlayContextValue {
   activeOverlayId: string | null;
@@ -361,6 +362,7 @@ export const DockShell: React.FC<DockShellProps> = ({
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (keyTargetsForeignModal(event, shellRef.current)) return;
       event.preventDefault();
       event.stopPropagation();
       closeTransientOverlay(true);

@@ -639,7 +639,13 @@ function App() {
   if (isRestoring) {
     return (
       <ContextMenuProvider>
-        <div className="app">{!isPipWindow && <Titlebar />}</div>
+        <div className="app">
+          {!isPipWindow && <Titlebar />}
+          {/* Restore waits on post-login hydration, and a hydration request
+              can raise a challenge and wait on it, so it must render here too
+              (#3423). */}
+          <MFAChallengeModal />
+        </div>
       </ContextMenuProvider>
     );
   }

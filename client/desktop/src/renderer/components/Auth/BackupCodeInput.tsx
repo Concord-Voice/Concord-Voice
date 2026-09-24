@@ -35,7 +35,11 @@ const BackupCodeInput: React.FC<BackupCodeInputProps> = ({ onSubmit, disabled = 
           textAlign: 'center',
         }}
       />
-      {error && <p className="totp-error">{error}</p>}
+      {error && (
+        <p className="totp-error" role="alert">
+          {error}
+        </p>
+      )}
     </form>
   );
 };

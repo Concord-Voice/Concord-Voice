@@ -41,6 +41,8 @@ describe('BackupCodeInput', () => {
   it('shows error message', () => {
     render(<BackupCodeInput onSubmit={onSubmit} error="Invalid backup code" />);
     expect(screen.getByText('Invalid backup code')).toBeInTheDocument();
+    // Announced when it appears (WCAG 4.1.3).
+    expect(screen.getByRole('alert')).toHaveTextContent('Invalid backup code');
   });
 
   it('adds error class to input when error exists', () => {

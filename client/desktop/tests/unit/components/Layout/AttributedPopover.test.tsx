@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { AttributedPopover } from '@/renderer/components/Layout/AttributedPopover';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 const anchors: HTMLElement[] = [];
 
@@ -62,6 +63,52 @@ describe('AttributedPopover', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledOnce();
     expect(anchor).toHaveFocus();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    const anchor = makeAnchor();
+    const onClose = vi.fn();
+    render(
+      <AttributedPopover
+        id="friends-online"
+        anchor={anchor}
+        label="Online — 2"
+        open
+        onClose={onClose}
+      >
+        <button type="button">Alice</button>
+      </AttributedPopover>
+    );
+    const { input } = openForeignModal();
+
+    const notPrevented = fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(notPrevented, 'the dialog in front must still get its close request').toBe(true);
+    expect(onClose, 'the popover behind must stay open').not.toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog in front even when focus has dropped to the body', () => {
+    const anchor = makeAnchor();
+    const onClose = vi.fn();
+    render(
+      <AttributedPopover
+        id="friends-online"
+        anchor={anchor}
+        label="Online — 2"
+        open
+        onClose={onClose}
+      >
+        <button type="button">Alice</button>
+      </AttributedPopover>
+    );
+    const { input } = openForeignModal();
+    // A disabled control loses focus to <body> in Chromium.
+    input.blur();
+
+    const notPrevented = fireEvent.keyDown(document.body, { key: 'Escape' });
+
+    expect(notPrevented, 'the dialog in front must still get its close request').toBe(true);
+    expect(onClose, 'the popover behind must stay open').not.toHaveBeenCalled();
   });
 
   it('closes for an outside pointer but ignores pointers inside the portaled surface', () => {

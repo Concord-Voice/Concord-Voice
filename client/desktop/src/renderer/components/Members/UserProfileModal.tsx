@@ -7,6 +7,7 @@ import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './UserProfileModal.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 interface UserProfileModalProps {
   isOpen: boolean;
@@ -81,6 +82,7 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, overlayRef.current)) return;
       if (e.key === 'Escape') onClose();
     };
     document.addEventListener('keydown', handleKeyDown);

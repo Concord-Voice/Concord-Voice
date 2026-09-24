@@ -5,6 +5,7 @@ import { vi } from 'vitest';
 import type { ServerMember } from '@/renderer/stores/chat/memberStore';
 import type { Role } from '@/renderer/types/server';
 import { prefetchEligibility } from '@/renderer/services/system/friendEligibility';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // Mock heavy child dependencies so right-click surfaces a simple test double
 vi.mock('@/renderer/components/Members/MemberContextMenu', () => ({
@@ -231,6 +232,18 @@ describe('MemberListPanel', () => {
     expect(document.querySelector('.member-role-dropdown--portal')).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(document.querySelector('.member-role-dropdown--portal')).toBeNull();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(<MemberListPanel {...defaultProps} />);
+    const bobRow = screen.getByText('bob').closest('.member-row')!;
+    const addBtn = bobRow.querySelector('.member-role-add-btn') as HTMLElement;
+    fireEvent.click(addBtn);
+
+    expect(document.querySelector('.member-role-dropdown--portal')).toBeInTheDocument();
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(document.querySelector('.member-role-dropdown--portal')).toBeInTheDocument();
   });
 
   it('Add Role dropdown closes when clicking outside (#799)', () => {

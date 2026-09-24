@@ -5,6 +5,7 @@ import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { usePresenceOverrideStore } from '../../stores/ui/presenceOverrideStore';
 import { comparePresenceOverrideUserIds } from '../../utils/policy/presenceOverrides';
 import './PresenceExceptions.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 const EXPLANATION =
   'Category selections add current members. Later category changes do not update saved exceptions automatically.';
@@ -113,6 +114,7 @@ const PresenceExceptionModal: React.FC<PresenceExceptionModalProps> = ({
   useEffect(() => {
     if (dialogCancelsOnEscape) return;
     const handleEscape = (event: KeyboardEvent): void => {
+      if (keyTargetsForeignModal(event, dialogRef.current)) return;
       if (event.key !== 'Escape') return;
       event.preventDefault();
       event.stopPropagation();

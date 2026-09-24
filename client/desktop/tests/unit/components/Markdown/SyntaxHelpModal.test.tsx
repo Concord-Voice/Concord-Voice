@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
 import SyntaxHelpModal from '@/renderer/components/Markdown/SyntaxHelpModal';
 import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 describe('SyntaxHelpModal', () => {
   beforeEach(() => useSubscriptionStore.getState().reset()); // FREE_ENTITLEMENT (5120)
@@ -39,6 +40,14 @@ describe('SyntaxHelpModal', () => {
     render(<SyntaxHelpModal open onClose={onClose} />);
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    const onClose = vi.fn();
+    render(<SyntaxHelpModal open onClose={onClose} />);
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('calls onClose when the dialog backdrop is pressed', () => {

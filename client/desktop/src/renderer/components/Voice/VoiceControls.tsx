@@ -37,6 +37,7 @@ import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
 import ScreenSharePicker from './ScreenSharePicker';
 import MediaPolicyNotice, { mediaPolicyNoticeRowId } from './MediaPolicyNotice';
 import './VoiceControls.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 /**
  * JIT permission pre-check: verify an OS permission before starting a media action.
@@ -128,6 +129,7 @@ function attachDismissListeners(
     dismiss(false);
   };
   const handleKeyDown = (e: KeyboardEvent) => {
+    if (keyTargetsForeignModal(e, popupRef.current)) return;
     if (e.key === 'Escape') dismiss(true);
   };
   document.addEventListener('mousedown', handleClick);

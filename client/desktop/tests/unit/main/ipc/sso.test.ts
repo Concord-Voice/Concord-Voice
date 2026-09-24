@@ -541,6 +541,7 @@ describe('sso IPC handlers', () => {
         method: 'POST',
         credentials: 'include',
         headers: { 'X-Session-ID': SESSION_ID },
+        signal: expect.any(AbortSignal),
       });
       expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
       expect(tokenMocks.clearTokensIfOwner).toHaveBeenCalledWith(41);
@@ -760,6 +761,7 @@ describe('sso IPC handlers', () => {
         method: 'POST',
         credentials: 'include',
         headers: { 'X-Session-ID': SESSION_ID },
+        signal: expect.any(AbortSignal),
       });
       expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
       expect(tokenMocks.clearTokensIfOwner).toHaveBeenCalledWith(41);
@@ -913,6 +915,7 @@ describe('sso IPC handlers', () => {
           method: 'totp',
           code: '123456',
         }),
+        signal: expect.any(AbortSignal),
       });
     });
 
@@ -947,7 +950,98 @@ describe('sso IPC handlers', () => {
           method: 'webauthn',
           assertion: { id: 'cred-1', rawId: 'AAAA' },
         }),
+        signal: expect.any(AbortSignal),
       });
+    });
+
+    // A proof in flight disables the challenge's Cancel, so the verify must
+    // settle. The bound lives here, where the credential is stored: a
+    // renderer-side timeout could not stop main storing a late one (#3423).
+    it('bounds the verify request at 30 s and stores nothing when it times out', async () => {
+      await beginGoogleMFA();
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
+      vi.mocked(net.fetch).mockRejectedValueOnce(
+        new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+      );
+
+      const result = await completeMFAHandler(
+        { senderFrame: { url: TRUSTED } },
+        SAAS_API_BASE,
+        totpPayload
+      );
+
+      expect(timeout).toHaveBeenCalledWith(30_000);
+      expect(vi.mocked(net.fetch).mock.calls[0][1]?.signal).toBe(timeout.mock.results[0].value);
+      expect(result).toEqual({ kind: 'error', status: 0, code: 'sso_mfa_verify_failed' });
+      expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+      expect(tokenMocks.clearTokensIfOwner).not.toHaveBeenCalled();
+      timeout.mockRestore();
+
+      // The server may never have seen the proof, so a retry must still reach it.
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'mfa-access-retry',
+            refresh_token: 'mfa-refresh-retry',
+            session_id: SUCCESS_SESSION_ID,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+      await expect(
+        completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, totpPayload)
+      ).resolves.toMatchObject({ kind: 'tokens', credentialOwner: 41 });
+    });
+
+    it('stores nothing and revokes the session when the body stops mid-read', async () => {
+      await beginGoogleMFA();
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
+      // What an abort after the headers looks like: the stream errors mid-body.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"access_token":'));
+          controller.error(new DOMException('The operation was aborted.', 'AbortError'));
+        },
+      });
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'X-Concord-Session-ID': SESSION_ID },
+        })
+      );
+
+      const result = await completeMFAHandler(
+        { senderFrame: { url: TRUSTED } },
+        SAAS_API_BASE,
+        totpPayload
+      );
+
+      expect(result).toMatchObject({ kind: 'error', code: 'sso_session_rejected' });
+      expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+      expect(net.fetch).toHaveBeenLastCalledWith(`${SAAS_API_BASE}/api/v1/auth/logout`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'X-Session-ID': SESSION_ID },
+        signal: expect.any(AbortSignal),
+      });
+      expect(tokenMocks.clearTokensIfOwner).toHaveBeenCalledWith(41);
+      // The logout is bounded at 10 s, so it cannot re-open the hang the verify
+      // timeout closes. The verify's own 30 s call comes first; find by value.
+      const revokeCall = timeout.mock.calls.findIndex(([ms]) => ms === 10_000);
+      expect(revokeCall, 'the logout must get its own 10 s bound').toBeGreaterThanOrEqual(0);
+      expect(vi.mocked(net.fetch).mock.lastCall?.[1]?.signal).toBe(
+        timeout.mock.results[revokeCall].value
+      );
+      timeout.mockRestore();
+      // pendingMFA is gone: a replay is refused at the pendingMFA gate, before
+      // the owner check (which would also refuse it) and before any fetch.
+      const fetches = vi.mocked(net.fetch).mock.calls.length;
+      tokenMocks.credentialOwnerIsCurrent.mockClear();
+      await expect(
+        completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, totpPayload)
+      ).resolves.toMatchObject({ kind: 'error', status: 409 });
+      expect(tokenMocks.credentialOwnerIsCurrent).not.toHaveBeenCalled();
+      expect(vi.mocked(net.fetch).mock.calls.length).toBe(fetches);
     });
 
     it('rejects an untrusted sender frame before any network or credential access', async () => {
@@ -1262,6 +1356,7 @@ describe('sso IPC handlers', () => {
         method: 'POST',
         credentials: 'include',
         headers: { 'X-Session-ID': SESSION_ID },
+        signal: expect.any(AbortSignal),
       });
       expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
         `${SAAS_API_BASE}/api/v1/auth/logout`,

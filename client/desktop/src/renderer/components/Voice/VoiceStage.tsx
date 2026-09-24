@@ -5,6 +5,7 @@ import { useRenderStateReporter } from '../../hooks/voice/useRenderStateReporter
 import type { RemoteVideoRole } from '../../services/voice/remoteVideoLayerPolicy';
 import { ScreenShareAudioControls } from './ScreenShareAudioControls';
 import './VoiceStage.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 /**
  * Single screen share video cell (used in both equal and focus modes).
@@ -168,6 +169,7 @@ const VoiceStage: React.FC = () => {
   useEffect(() => {
     if (stageLayout !== 'focus' || !hasMultiple) return;
     const handler = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, null)) return;
       if (e.key === 'ArrowLeft') cycle(-1);
       if (e.key === 'ArrowRight') cycle(1);
     };

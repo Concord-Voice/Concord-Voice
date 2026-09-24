@@ -1,6 +1,7 @@
 import { render, screen, act, waitFor } from '../../test-utils';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useNotificationNavigationStore } from '@/renderer/stores/ui/notificationNavigationStore';
@@ -53,9 +54,15 @@ vi.mock('@/renderer/components/ui/ForceUpdateOverlay', () => ({
 vi.mock('@/renderer/components/ui/UpdateBanner', () => ({
   default: () => null,
 }));
-vi.mock('@/renderer/components/Auth/MFAChallengeModal', () => ({
-  default: () => null,
-}));
+vi.mock('@/renderer/components/Auth/MFAChallengeModal', async () => {
+  const { useMFAChallengeStore } = await import('@/renderer/stores/auth/mfaChallengeStore');
+  return {
+    default: () =>
+      useMFAChallengeStore((s) => s.challengeToken) ? (
+        <div data-testid="mfa-challenge-modal" />
+      ) : null,
+  };
+});
 vi.mock('@/renderer/components/Auth/SSOEagerUnlock', () => ({
   default: ({
     onUnlock,
@@ -369,6 +376,50 @@ describe('App', () => {
     // hydrated — not the old authenticated-but-empty half-restore.
     expect(mockInitializeFromStoredKeys).toHaveBeenCalledWith(e2eeKeys);
     await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledTimes(1));
+  });
+
+  // A hydration request whose refresh hits the pre-MFA lock raises a challenge
+  // and waits on it; restore waits on hydration (#3423 row 12b).
+  it('shows an MFA challenge raised while a restore is still hydrating', async () => {
+    let finishHydration!: () => void;
+    mockHydratePostLogin.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishHydration = resolve;
+        })
+    );
+    const restoreSession = vi.fn().mockResolvedValue({
+      status: 'restored',
+      accessToken: 'restored-token',
+      rememberMe: false,
+      credentialOwner: 41,
+      pendingE2EEUnlock: false,
+      e2eeKeys: {
+        wrappingKeyBase64: 'wk',
+        preferencesKeyBase64: 'pk',
+        wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
+      },
+    });
+    Object.assign(globalThis.electron ?? {}, { restoreSession });
+
+    render(<App />);
+    await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledTimes(1));
+    act(() => {
+      void useMFAChallengeStore
+        .getState()
+        .showChallenge('restore-challenge', ['totp'], 'suspicious_refresh');
+    });
+
+    expect(screen.getByTestId('mfa-challenge-modal')).toBeInTheDocument();
+
+    // Restore finishing must not drop the pending challenge on the way to the
+    // main layout.
+    await act(async () => {
+      finishHydration();
+      await Promise.resolve();
+    });
+    expect(useMFAChallengeStore.getState().challengeToken).toBe('restore-challenge');
+    expect(screen.getByTestId('mfa-challenge-modal')).toBeInTheDocument();
   });
 
   it('gates a restored credential with pending E2EE custody before hydration', async () => {

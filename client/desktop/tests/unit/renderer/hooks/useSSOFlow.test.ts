@@ -19,6 +19,7 @@ vi.mock('@/renderer/services/system/ssoService', async (importOriginal) => {
   return {
     ...actual,
     startSSOFlow: vi.fn(),
+    abandonSSOReservation: vi.fn().mockResolvedValue(true),
   };
 });
 
@@ -35,7 +36,11 @@ vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   hydratePostLogin: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { startSSOFlow, type SSOResult } from '@/renderer/services/system/ssoService';
+import {
+  abandonSSOReservation,
+  startSSOFlow,
+  type SSOResult,
+} from '@/renderer/services/system/ssoService';
 import { revokeAbortedSession } from '@/renderer/services/system/apiClient';
 import { hydratePostLogin } from '@/renderer/services/system/postLoginHydration';
 import { deferred } from '../../../helpers/deferred';
@@ -582,6 +587,78 @@ describe('useSSOFlow', () => {
     expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
     // needsSSOUnlock should NOT be flipped on cancellation
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+  });
+
+  // A replaced challenge settles not-verified without the modal's cancel,
+  // which is the only other path that releases the reservation (#3423).
+  it('mfa_required: a challenge replaced by another releases the SSO reservation', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'mfa_required',
+      mfaChallengeToken: 'mfa-chal-replaced',
+      methods: ['totp'],
+    });
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+    vi.mocked(abandonSSOReservation).mockClear();
+
+    await act(async () => {
+      void useMFAChallengeStore
+        .getState()
+        .showChallenge('other-challenge', ['totp'], 'suspicious_refresh');
+      await Promise.resolve();
+    });
+
+    expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
+    expect(vi.mocked(abandonSSOReservation)).toHaveBeenCalledTimes(1);
+  });
+
+  it('mfa_required: an empty challenge token ends the flow and releases the reservation once', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'mfa_required',
+      mfaChallengeToken: '',
+      methods: ['totp'],
+    });
+    vi.mocked(abandonSSOReservation).mockClear();
+    const { result } = renderHook(() => useSSOFlow());
+
+    await act(async () => {
+      await result.current.begin('google');
+      await Promise.resolve();
+    });
+
+    expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
+    expect(vi.mocked(abandonSSOReservation)).toHaveBeenCalledTimes(1);
+  });
+
+  it('mfa_required: a retried sign-in does not release the reservation it now holds', async () => {
+    mockedStartSSOFlow
+      .mockResolvedValueOnce({
+        kind: 'mfa_required',
+        mfaChallengeToken: 'mfa-chal-first',
+        methods: ['totp'],
+      })
+      .mockResolvedValueOnce({
+        kind: 'mfa_required',
+        mfaChallengeToken: 'mfa-chal-retry',
+        methods: ['totp'],
+      });
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+    vi.mocked(abandonSSOReservation).mockClear();
+
+    // The retry settles the first challenge not-verified after the generation
+    // moved, so the first flow's continuation must not release the retry's
+    // reservation.
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    expect(useMFAChallengeStore.getState().challengeToken).toBe('mfa-chal-retry');
+    expect(vi.mocked(abandonSSOReservation)).not.toHaveBeenCalled();
   });
 
   it('error: sets phase to error with message when service throws', async () => {

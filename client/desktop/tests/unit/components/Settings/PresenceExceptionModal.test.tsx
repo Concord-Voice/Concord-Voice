@@ -7,6 +7,7 @@ import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { deferred } from '../../../helpers/deferred';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
@@ -53,9 +54,14 @@ describe('PresenceExceptionModal', () => {
   let showModalCalls = 0;
 
   beforeAll(() => {
-    HTMLDialogElement.prototype.showModal = function showModal() {
+    HTMLDialogElement.prototype.showModal = function showModal(this: HTMLDialogElement) {
       showModalCalls += 1;
-      this.setAttribute('open', '');
+      // Delegate to the setup.ts patched original rather than reimplementing
+      // it: that version also registers this dialog in the `:modal` WeakSet
+      // setup.ts installs, which a foreign-modal test (#3423) needs to match
+      // `dialog.matches(':modal')` correctly. Reimplementing bare
+      // `setAttribute('open', '')` here silently breaks that match.
+      originalShowModal.call(this);
     };
     HTMLDialogElement.prototype.close = function close() {
       this.removeAttribute('open');
@@ -291,6 +297,14 @@ describe('PresenceExceptionModal', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Add exceptions' })).toHaveFocus();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(<ModalHarness />);
+    const dialog = screen.getByRole('dialog', { name: 'Custom Status exceptions' });
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(dialog).toBeInTheDocument();
   });
 
   it('prevents Escape, cancel, and backdrop dismissal while saving', () => {

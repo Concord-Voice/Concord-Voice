@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import ContextMenu from '@/renderer/components/ui/ContextMenu';
 import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 describe('ContextMenu', () => {
   const mockOnClose = vi.fn();
@@ -97,6 +98,20 @@ describe('ContextMenu', () => {
       vi.advanceTimersByTime(200);
     });
     expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    render(
+      <ContextMenu position={{ x: 0, y: 0 }} onClose={mockOnClose}>
+        <ContextMenu.Item label="Item" onClick={() => {}} />
+      </ContextMenu>
+    );
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    expect(mockOnClose).not.toHaveBeenCalled();
   });
 
   it('closes on click outside', () => {

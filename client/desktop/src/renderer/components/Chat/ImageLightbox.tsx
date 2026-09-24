@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Download, Pause, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react';
 import './ImageLightbox.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 export interface ImageLightboxProps {
   /**
@@ -75,6 +76,7 @@ const ImageLightbox: React.FC<ImageLightboxProps> = ({ src, alt, paused, onClose
   // also firing on the same keypress.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, overlayRef.current)) return;
       if (e.key === 'Escape') {
         e.stopImmediatePropagation();
         onClose();
@@ -87,6 +89,9 @@ const ImageLightbox: React.FC<ImageLightboxProps> = ({ src, alt, paused, onClose
   // Focus trap — keep Tab within the overlay. A document listener (rather than a
   // JSX handler on the non-interactive <dialog>) so the trap composes with the
   // native dialog semantics. The tabindex=-1 backdrop is excluded from the ring.
+  // ponytail: no keyTargetsForeignModal gate here. The trap acts only while
+  // focus is on its own first or last control, so a key in a dialog in front
+  // (or on <body>) never reaches a branch that moves focus.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Tab') return;

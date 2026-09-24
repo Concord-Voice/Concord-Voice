@@ -10,13 +10,26 @@
     globalThis as typeof globalThis & { HTMLDialogElement?: { prototype: HTMLDialogElement } }
   ).HTMLDialogElement?.prototype;
   if (proto) {
+    // jsdom parses `:modal` but never matches it, so remember which dialogs
+    // showModal() opened; a dialog opened by show() or the `open` attribute is
+    // not modal in a browser either. A suite that stubs showModal() must call
+    // through to this polyfill (keep the original and call it), or `:modal`
+    // never matches the dialogs it opens.
+    const modal = new WeakSet<Element>();
     if (typeof proto.showModal !== 'function') {
       proto.showModal = function showModal(this: HTMLDialogElement) {
+        modal.add(this);
         this.setAttribute('open', '');
+      };
+      const matches = Element.prototype.matches;
+      Element.prototype.matches = function (this: Element, selector: string) {
+        if (selector === ':modal') return modal.has(this) && this.hasAttribute('open');
+        return matches.call(this, selector);
       };
     }
     if (typeof proto.close !== 'function') {
       proto.close = function close(this: HTMLDialogElement) {
+        modal.delete(this);
         this.removeAttribute('open');
         this.dispatchEvent(new Event('close'));
       };

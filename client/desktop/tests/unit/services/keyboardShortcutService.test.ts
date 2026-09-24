@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { ShortcutDefinition } from '../../../src/renderer/stores/ui/keyboardShortcutStore';
+import { useMFAChallengeStore } from '../../../src/renderer/stores/auth/mfaChallengeStore';
 
 // Mock the store module before importing the service
 const mockGetState = vi.fn();
@@ -270,6 +271,59 @@ describe('KeyboardShortcutService', () => {
       keyboardShortcutService.unregisterHandler('toggle-mute');
       document.dispatchEvent(createKeyEvent('m', { ctrlKey: true }));
       expect(handler).toHaveBeenCalledOnce(); // Still just the one call
+    });
+  });
+
+  // ── MFA challenge gate ─────────────────────────────────────────────
+  // A pending identity challenge owns the keyboard. A shortcut run from inside
+  // it either opens a dialog on top of it (Ctrl/Cmd+, opens Settings) or
+  // cancels the Escape keydown, which stops the browser from sending the
+  // challenge dialog its close request.
+  describe('while an MFA challenge is pending', () => {
+    afterEach(() => {
+      useMFAChallengeStore.setState({ challengeToken: null });
+    });
+
+    it.each([
+      ['close-modal', 'Escape', {}],
+      ['open-settings', ',', { ctrlKey: true }],
+    ] as const)('runs no %s shortcut and leaves the keydown uncancelled', (id, key, modifiers) => {
+      const handler = vi.fn();
+      const combo = key === ',' ? { key, ctrl: true } : { key };
+      mockGetState.mockReturnValue({
+        shortcuts: [makeShortcut({ id, combo, allowInInput: true })],
+      });
+      keyboardShortcutService.init();
+      keyboardShortcutService.registerHandler(id, handler);
+
+      useMFAChallengeStore.setState({ challengeToken: 'challenge-token' });
+      const event = createKeyEvent(key, modifiers);
+      document.dispatchEvent(event);
+      expect(handler).not.toHaveBeenCalled();
+      expect(event.defaultPrevented).toBe(false);
+
+      // Control: the same shortcut runs once the challenge is settled.
+      useMFAChallengeStore.setState({ challengeToken: null });
+      document.dispatchEvent(createKeyEvent(key, modifiers));
+      expect(handler).toHaveBeenCalledOnce();
+    });
+
+    // A user in a call must still be able to mute mid-challenge.
+    it.each(['toggle-mute', 'toggle-deafen'])('still runs %s', (id) => {
+      const handler = vi.fn();
+      mockGetState.mockReturnValue({
+        shortcuts: [
+          makeShortcut({ id, combo: { key: 'm', ctrl: true, shift: true }, allowInInput: true }),
+        ],
+      });
+      keyboardShortcutService.init();
+      keyboardShortcutService.registerHandler(id, handler);
+
+      useMFAChallengeStore.setState({ challengeToken: 'challenge-token' });
+      const event = createKeyEvent('m', { ctrlKey: true, shiftKey: true });
+      document.dispatchEvent(event);
+      expect(handler).toHaveBeenCalledOnce();
+      expect(event.defaultPrevented).toBe(true);
     });
   });
 });

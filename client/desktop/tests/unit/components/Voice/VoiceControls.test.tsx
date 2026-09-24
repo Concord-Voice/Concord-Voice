@@ -78,6 +78,7 @@ vi.mock('@/renderer/components/Voice/VoiceControls.css', () => ({}));
 
 import VoiceControls from '@/renderer/components/Voice/VoiceControls';
 import { MEDIA_POLICY_NOTICE_COPY } from '@/renderer/components/Voice/MediaPolicyNotice';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const VOICE_CHANNEL_ID = 'voice-1';
@@ -354,6 +355,18 @@ describe('VoiceControls', () => {
 
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(trigger).toHaveFocus();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+    const trigger = screen.getByTitle('More controls');
+    fireEvent.click(trigger);
+    expect(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM })).toBeInTheDocument();
+
+    const { input } = openForeignModal();
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM })).toBeInTheDocument();
   });
 
   it('does not announce a menu popup it has not implemented', () => {

@@ -12,6 +12,7 @@ import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { resolveAnchoredPlacement } from '../../utils/ui/pickerAnchor';
 import { useWindowFocus } from '../../hooks/ui/useWindowFocus';
 import './GifPicker.css';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 interface GifPickerProps {
   onSelect: (slug: string) => void;
@@ -501,6 +502,7 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   // Escape to close
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, pickerRef.current)) return;
       if (e.key === 'Escape') {
         handleDismiss();
       }

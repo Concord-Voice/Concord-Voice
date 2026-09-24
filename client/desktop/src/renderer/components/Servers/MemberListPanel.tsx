@@ -10,6 +10,7 @@ import MemberContextMenu from '../Members/MemberContextMenu';
 import UserProfileModal from '../Members/UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { PurgeMessagesOptIn, moderateMember } from '../Members/purgeOnModeration';
+import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 interface MemberListPanelProps {
   members: ServerMember[];
@@ -74,6 +75,7 @@ function AddRoleDropdown({
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (keyTargetsForeignModal(e, popoverRef.current)) return;
       if (e.key === 'Escape') {
         handleClose();
       }

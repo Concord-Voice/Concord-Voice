@@ -10,6 +10,7 @@ import {
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import { AttributedPopover } from '@/renderer/components/Layout/AttributedPopover';
+import { openForeignModal } from '../../../helpers/foreignModal';
 
 const profiles = (width = 240, pinned = true): SidebarProfiles => ({
   dm: {
@@ -231,6 +232,20 @@ describe('DockShell', () => {
     expect(screen.getByRole('region', { name: 'Online — 1' })).toBeVisible();
     expect(surface).toHaveAttribute('data-state', 'open');
     vi.useRealTimers();
+  });
+
+  it('leaves Escape to a modal dialog open in front of it', () => {
+    useLayoutStore.setState({ sidebarProfiles: profiles(240, false) });
+    const { container } = renderDock({ header: <button type="button">Inside</button> });
+    fireEvent.click(screen.getByRole('button', { name: 'Open Friends sidebar' }));
+    const surface = container.querySelector('.dock-shell__surface') as HTMLElement;
+    expect(surface).toHaveAttribute('data-state', 'open');
+    const { input } = openForeignModal();
+
+    const notPrevented = fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(notPrevented, 'the dialog in front must still get its close request').toBe(true);
+    expect(surface, 'the dock overlay behind must stay open').toHaveAttribute('data-state', 'open');
   });
 
   it('keeps an activated lip held open until Escape and restores visible focus after close', () => {
