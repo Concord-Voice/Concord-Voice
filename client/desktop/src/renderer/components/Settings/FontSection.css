@@ -129,7 +129,7 @@
   pointer-events: none;
 }
 .font-mode-toggle .settings-mode-pill:has(.font-mode-radio:focus-visible) {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 .font-mode-toggle .settings-mode-pill:has(.font-mode-radio[aria-disabled='true']) {
@@ -179,7 +179,7 @@
   display: none;
 }
 .font-area-summary:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
   border-radius: 8px;
 }

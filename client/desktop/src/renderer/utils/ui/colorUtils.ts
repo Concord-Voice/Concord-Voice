@@ -31,6 +31,7 @@ export interface DerivedThemeVariables {
   '--accent-secondary': string;
   '--accent-hover': string;
   '--accent-color': string;
+  '--state-focused': string;
   '--gradient-brand': string;
   '--border-color': string;
   '--on-accent': string;
@@ -61,6 +62,7 @@ const THEME_VARIABLE_KEYS: (keyof DerivedThemeVariables)[] = [
   '--accent-secondary',
   '--accent-hover',
   '--accent-color',
+  '--state-focused',
   '--gradient-brand',
   '--border-color',
   '--on-accent',
@@ -324,6 +326,9 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
     '--accent-secondary': a2,
     '--accent-hover': lighten(a1, 15),
     '--accent-color': 'var(--accent-primary)',
+    // Every focus ring draws in this token (#798). Left underived it resolves to the
+    // user's raw secondary, which can equal the background and paint rings at 1:1.
+    '--state-focused': liftToContrast(a2, darkSurfaces, 3.2, true),
     '--gradient-brand': `linear-gradient(90deg, ${a1} 0%, ${a2} 100%)`,
     '--border-color': lighten(bg, 15),
     '--on-accent': contrastColor(a1),
@@ -381,6 +386,9 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
     '--accent-secondary': lightA2,
     '--accent-hover': lighten(lightA1, 10),
     '--accent-color': 'var(--accent-primary)',
+    // Derived for the same reason as dark mode, and also because underived it would take
+    // the [data-theme='light'] block's literal, which knows nothing of this palette.
+    '--state-focused': liftToContrast(lightA2, lightSurfaces, 3.2, false),
     '--gradient-brand': `linear-gradient(90deg, ${lightA1} 0%, ${lightA2} 100%)`,
     '--border-color': darken(bgLight, 15),
     '--on-accent': contrastColor(lightA1),

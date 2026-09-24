@@ -163,9 +163,24 @@ const CONTRAST_PAIRS: readonly ContrastPair[] = [
     threshold: WCAG_NON_TEXT_THRESHOLD,
     standard: 'WCAG 1.4.11 non-text',
   },
+  // Focus rings (#798) draw on every surface, not only the page background, so the
+  // ring token is held to 3:1 against all three. Every renderer focus ring uses it;
+  // focus-ring-token.test.ts keeps them there.
   {
     foreground: '--state-focused',
     background: '--bg-primary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
+    foreground: '--state-focused',
+    background: '--bg-secondary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
+    foreground: '--state-focused',
+    background: '--bg-tertiary',
     threshold: WCAG_NON_TEXT_THRESHOLD,
     standard: 'WCAG 1.4.11 non-text',
   },
@@ -313,20 +328,6 @@ const KNOWN_NONCOMPLIANT_BLOCKS: readonly KnownNoncompliantContrast[] = [
     background: '--bg-primary',
     issue: '#1183',
     blocks: ["[data-scheme='cottoncandy'][data-theme='light']", "[data-scheme='eclipse']"],
-  },
-  {
-    foreground: '--state-focused',
-    background: '--bg-primary',
-    issue: '#1183',
-    blocks: [
-      "[data-theme='light']",
-      "[data-scheme='concord'][data-theme='light']",
-      "[data-scheme='morky'][data-theme='light']",
-      "[data-scheme='foxden'][data-theme='light']",
-      "[data-scheme='spooky']",
-      "[data-scheme='cottoncandy'][data-theme='light']",
-      "[data-scheme='eclipse']",
-    ],
   },
   {
     foreground: '--border-color',
@@ -939,6 +940,24 @@ describe('WCAG contrast across all theme blocks', () => {
         }
       );
     }
+
+    it('--state-focused is not the selected colour (#798)', () => {
+      // Contrast alone cannot catch a block aliasing the ring back to the accent: the
+      // accent clears 3:1 on all three surfaces in most blocks. Check the declaration
+      // and the resolved colour both.
+      const declared = extractCascadedDeclaration(blockBody ?? '', rootBody, '--state-focused');
+      expect(declared ?? '').not.toMatch(
+        /var\(\s*--(accent-primary|accent-color|state-selected)\b/
+      );
+      const focused = resolveToHex(declared ?? '', blockBody ?? '', rootBody);
+      const selected = resolveToHex(
+        extractCascadedDeclaration(blockBody ?? '', rootBody, '--accent-primary') ?? '',
+        blockBody ?? '',
+        rootBody
+      );
+      expect(focused).not.toBeNull();
+      expect(focused?.toLowerCase()).not.toBe(selected?.toLowerCase());
+    });
   });
 });
 

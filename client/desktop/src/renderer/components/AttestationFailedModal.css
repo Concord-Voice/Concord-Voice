@@ -80,6 +80,6 @@
 }
 
 .attestation-modal__download-link:focus-visible {
-  outline: 2px solid var(--accent-color, #5865f2);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }

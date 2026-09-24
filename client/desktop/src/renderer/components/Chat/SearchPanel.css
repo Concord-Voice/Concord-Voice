@@ -82,7 +82,7 @@
 
 .search-panel-input:focus {
   outline: none;
-  border-color: var(--accent-color);
+  border-color: var(--state-focused);
 }
 
 .search-panel-input::placeholder {

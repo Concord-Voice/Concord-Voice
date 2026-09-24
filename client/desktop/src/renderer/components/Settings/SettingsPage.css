@@ -294,7 +294,7 @@
 }
 
 .settings-expand-collapse-all-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -491,7 +491,7 @@
 }
 
 .color-scheme-circle:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 4px;
 }
 
@@ -587,7 +587,7 @@
 
 .custom-theme-hex-input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* Theme selector */
@@ -693,7 +693,7 @@
 }
 
 .font-size-option:focus-within {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -1488,7 +1488,7 @@
 }
 
 .settings-select:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* ─── Basic / Advanced Mode Toggle ──────────────────────────────── */
@@ -1557,7 +1557,7 @@
 /* Focus lands on the hidden input, so the ring is drawn on the visible pill.
    `:focus-visible` rather than `:focus-within`, so a mouse click draws no ring. */
 .settings-mode-pill:has(.settings-mode-radio:focus-visible) {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -1699,7 +1699,7 @@
 }
 
 .settings-codec-profile-help:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -2296,7 +2296,7 @@
 
 .settings-time-input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* ─── Premium lock affordances (#1301 — L5/L6 video clamps) ───────────────── */
@@ -2331,7 +2331,7 @@
 }
 
 .settings-bitrate-ghost-zone:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

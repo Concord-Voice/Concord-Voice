@@ -73,7 +73,7 @@
 
 .custom-status-input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .custom-status-popover-meta {

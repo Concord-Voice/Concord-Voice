@@ -17,7 +17,7 @@
 }
 
 .shortcut-search:focus {
-  border-color: var(--accent-color);
+  border-color: var(--state-focused);
 }
 
 .shortcut-list {

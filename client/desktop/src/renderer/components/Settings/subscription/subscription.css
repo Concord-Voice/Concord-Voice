@@ -103,7 +103,7 @@
 }
 
 .subscription-redeem-input:focus {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 

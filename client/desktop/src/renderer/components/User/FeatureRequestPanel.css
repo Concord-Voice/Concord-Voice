@@ -63,7 +63,7 @@
 .feature-request-textarea:focus,
 .feature-request-select:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .feature-request-input:disabled,
@@ -113,7 +113,7 @@
 }
 
 .feature-request-submit:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

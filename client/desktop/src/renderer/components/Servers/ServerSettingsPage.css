@@ -151,7 +151,7 @@
 }
 
 .server-settings-submit-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -225,7 +225,7 @@
 
 .role-select-btn:focus-visible,
 .role-drag-handle:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: -2px;
 }
 
@@ -602,7 +602,7 @@
 }
 
 .role-badge__remove:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
   border-radius: 2px;
 }

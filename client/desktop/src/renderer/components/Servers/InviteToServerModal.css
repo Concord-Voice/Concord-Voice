@@ -108,7 +108,7 @@
 }
 
 .invite-option-select:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .invite-option-select:disabled {
@@ -141,7 +141,7 @@
 }
 
 .invite-code-value:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .invite-code-copy-btn {

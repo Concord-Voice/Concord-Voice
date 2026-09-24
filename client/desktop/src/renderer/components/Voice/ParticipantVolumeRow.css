@@ -60,8 +60,10 @@
   outline: none;
 }
 
+/* The thumb ring is the slider's only focus indicator (outline is off above), so it
+   is solid: a 35% tint of the accent fell well below 3:1. */
 .participant-volume-row-slider:focus-visible::-webkit-slider-thumb {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 35%, transparent);
+  box-shadow: 0 0 0 2px var(--state-focused);
 }
 
 .participant-volume-row-reset {

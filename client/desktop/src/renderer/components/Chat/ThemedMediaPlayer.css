@@ -10,7 +10,7 @@
 }
 
 .themed-media-player:focus-visible {
-  box-shadow: 0 0 0 2px var(--accent-color);
+  box-shadow: 0 0 0 2px var(--state-focused);
 }
 
 .themed-media-player[data-variant='video'] .attachment-video {
@@ -89,7 +89,7 @@
 }
 
 .media-controls-range:focus-visible::-webkit-slider-thumb {
-  box-shadow: 0 0 0 3px var(--accent-color);
+  box-shadow: 0 0 0 3px var(--state-focused);
 }
 
 .media-controls-range:disabled {

@@ -95,6 +95,10 @@ const REQUIRED_TOKENS = [
   '--success',
   '--danger',
   '--link-color',
+  // Every focus ring draws in this token (#798). Undeclared here, a scheme block's literal
+  // wins the cascade and leaks into HCM: Eclipse dark's #a54539 measured 2.91:1 on the HCM
+  // #1a1a1a surface.
+  '--state-focused',
 ] as const;
 
 /**
@@ -313,6 +317,22 @@ describe('High Contrast Mode cascade (#489)', () => {
         ratio,
         `dark HCM text '${text}' on bg '${bg}' = ${ratio.toFixed(2)}:1, below WCAG AAA 7:1`
       ).toBeGreaterThanOrEqual(7);
+    });
+
+    it.each([
+      ['dark', HCM_DARK_SELECTOR],
+      ['light', HCM_LIGHT_SELECTOR],
+    ])('%s HCM: --state-focused meets WCAG AAA (≥7:1) on every surface', (_mode, selector) => {
+      const body = extractBlockBody(css, selector) ?? '';
+      const ring = extractDeclaration(body, '--state-focused') ?? '';
+      for (const surface of ['--bg-primary', '--bg-secondary', '--bg-tertiary']) {
+        const bg = extractDeclaration(body, surface) ?? '';
+        const ratio = wcagContrast(ring, bg);
+        expect(
+          ratio,
+          `${selector} focus ring '${ring}' on ${surface} '${bg}' = ${ratio.toFixed(2)}:1, below WCAG AAA 7:1`
+        ).toBeGreaterThanOrEqual(7);
+      }
     });
 
     it('light HCM: --accent-primary on --bg-primary meets WCAG AAA (≥7:1)', () => {

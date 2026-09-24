@@ -51,7 +51,7 @@
 .bug-report-input:focus,
 .bug-report-textarea:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .bug-report-input:disabled,
@@ -127,7 +127,7 @@
 }
 
 .bug-report-preview-link:focus-visible {
-  outline: 2px solid var(--accent-primary, #2563eb);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -159,7 +159,7 @@
 }
 
 .bug-report-submit:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

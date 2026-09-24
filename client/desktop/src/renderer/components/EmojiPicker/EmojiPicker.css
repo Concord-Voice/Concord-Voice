@@ -123,7 +123,7 @@
 }
 
 .emoji-picker-search-input:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .emoji-picker-search-input::placeholder {
@@ -170,7 +170,7 @@
 /* 2.4.7 — no UA focus ring was set for this control; several of the 32
    themes render it near-invisibly. */
 .emoji-picker-category-tab:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 
@@ -303,7 +303,7 @@
 /* 2.4.7 — no UA focus ring was set for this control; several of the 32
    themes render it near-invisibly. */
 .emoji-picker-skin-toggle:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 

@@ -171,8 +171,8 @@
 }
 
 .purge-modal__typed input:focus-visible {
-  border-color: var(--accent-primary);
-  outline: 2px solid var(--accent-primary);
+  border-color: var(--state-focused);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 
@@ -196,7 +196,7 @@
 }
 
 .purge-modal__stage-heading:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 4px;
 }
 
@@ -241,8 +241,8 @@
 }
 
 .purge-modal__field input:focus-visible {
-  border-color: var(--accent-primary);
-  outline: 2px solid var(--accent-primary);
+  border-color: var(--state-focused);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 

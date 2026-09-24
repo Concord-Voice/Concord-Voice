@@ -80,7 +80,7 @@
 
 .server-url-input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
   background: var(--bg-tertiary);
 }
 
@@ -88,7 +88,7 @@
    This component now programmatically focuses this input on two outcomes, so restore a
    non-colour indicator for keyboard users (matches the button rule below). */
 .server-url-input:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -193,7 +193,7 @@
 
 .server-connect-btn:focus-visible,
 .server-back-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

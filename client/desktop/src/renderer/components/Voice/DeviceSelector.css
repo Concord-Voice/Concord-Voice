@@ -27,7 +27,7 @@
 }
 
 .device-selector__select:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .device-selector__select option {

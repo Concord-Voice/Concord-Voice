@@ -88,7 +88,7 @@
 }
 
 .connection-option:focus-within {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -210,9 +210,8 @@
 }
 
 .connection-continue:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 3px;
-  box-shadow: 0 0 0 5px rgba(250, 112, 154, 0.2);
 }
 
 .connection-continue:disabled {
@@ -242,7 +241,7 @@
 }
 
 .footer-link:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
   border-radius: 4px;
 }

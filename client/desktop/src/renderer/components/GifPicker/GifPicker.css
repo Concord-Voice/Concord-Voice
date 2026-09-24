@@ -99,7 +99,7 @@
    themes render it near-invisibly. */
 .gif-picker-tab:focus-visible,
 .gif-picker-close:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 
@@ -245,7 +245,7 @@
    native and render the UA default ring. */
 .gif-picker-search input:focus-visible,
 .gif-picker-retry:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 1px;
 }
 

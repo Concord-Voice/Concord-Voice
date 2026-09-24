@@ -35,7 +35,7 @@
 
 .channel-form-input:focus {
   outline: none;
-  border-color: var(--accent-color);
+  border-color: var(--state-focused);
 }
 
 .channel-form-input.error {

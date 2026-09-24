@@ -34,7 +34,7 @@
 }
 
 .icon-upload-area:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -101,7 +101,7 @@
 }
 
 .banner-upload-area:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -216,6 +216,6 @@
 }
 
 .create-server-submit-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }

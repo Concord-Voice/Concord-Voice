@@ -316,6 +316,52 @@ describe('settingsStore', () => {
       expect(useSettingsStore.getState().appearance.uiScale).toBe(UI_SCALE_MAX);
     });
 
+    it('drops stored custom colours that are not #rrggbb, falling back to the default scheme', async () => {
+      // They reach documentElement.style.setProperty through deriveThemeVariables; the
+      // colour picker validates with isValidHex, but storage is outside its reach.
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({
+          state: {
+            appearance: {
+              colorScheme: 'custom',
+              customColors: {
+                background: '#0d0821',
+                accentPrimary: 'red; --x: url(evil)',
+                accentSecondary: '#ffe13f',
+              },
+            },
+          },
+          version: 1,
+        })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance).toMatchObject({
+        customColors: null,
+        colorScheme: 'concord',
+      });
+    });
+
+    it('keeps stored custom colours that are all #rrggbb', async () => {
+      const colors = {
+        background: '#0d0821',
+        accentPrimary: '#fa709a',
+        accentSecondary: '#ffe13f',
+      };
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({
+          state: { appearance: { colorScheme: 'custom', customColors: colors } },
+          version: 1,
+        })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance).toMatchObject({
+        customColors: colors,
+        colorScheme: 'custom',
+      });
+    });
+
     it('replaces unknown font ids and modes on rehydration, keeping valid ones (#2366)', async () => {
       localStorage.setItem(
         'concord-settings',

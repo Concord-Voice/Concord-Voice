@@ -58,7 +58,7 @@
 
 .sso-eager-unlock__input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .sso-eager-unlock__input:disabled {

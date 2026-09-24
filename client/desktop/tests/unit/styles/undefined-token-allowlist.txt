@@ -38,7 +38,6 @@ src/renderer/components/Markdown/MarkdownContent.css --accent
 src/renderer/components/Markdown/MarkdownContent.css --border-subtle
 src/renderer/components/Markdown/MarkdownContent.css --code-font
 src/renderer/components/Markdown/MarkdownContent.css --surface-2
-src/renderer/components/Markdown/Spoiler.css --focus-ring
 src/renderer/components/Markdown/Spoiler.css --spoiler-bg
 src/renderer/components/Markdown/Spoiler.css --spoiler-bg-hover
 src/renderer/components/Markdown/Spoiler.css --spoiler-bg-revealed

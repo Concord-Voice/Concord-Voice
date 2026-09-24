@@ -51,7 +51,7 @@
 }
 
 .conversation-search input:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* Conversation items */
@@ -557,7 +557,7 @@
 }
 
 .friends-list-search-input:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* The popover supplies its own padding; drop the in-panel gutter and gap. */
@@ -628,7 +628,7 @@
 
 .friends-list--compact .friends-add-btn:focus-visible,
 .friends-compact-trigger:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: -2px;
 }
 
@@ -823,7 +823,7 @@
 }
 
 .conversation-list--compact .conversation-item--compact:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: -2px;
 }
 
@@ -899,7 +899,7 @@
 }
 
 .add-friend-input:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .add-friend-code-input-row {
@@ -1015,7 +1015,7 @@
 }
 
 .add-friend-option-group select:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* Toggle switch for auto-accept */
@@ -1416,7 +1416,7 @@
 }
 
 .create-group-name-input:focus {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 /* Selected user chips */
@@ -1466,7 +1466,7 @@
 }
 
 .create-group-search:focus-within {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .create-group-search-icon {

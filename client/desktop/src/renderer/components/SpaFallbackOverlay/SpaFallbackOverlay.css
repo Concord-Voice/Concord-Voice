@@ -8,7 +8,7 @@
  *                           the bottom border to signal "warning"
  *                           without introducing a fictional banner-bg
  *                           token
- *   --accent-primary      — focus-ring color (matches Modal.css convention)
+ *   --state-focused       — focus-ring color (matches Modal.css convention)
  *
  * Stacking choice — z-index 950: deliberately sits between SettingsOverlayHost
  * (900) and Modal (1000). Above all standard renderer-content layers
@@ -56,6 +56,6 @@
 }
 
 .spa-fallback-overlay__dismiss:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }

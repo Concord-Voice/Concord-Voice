@@ -74,9 +74,9 @@
 }
 
 .checkbox-label:focus-within {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .checkbox-label input[type='checkbox'] {
@@ -179,9 +179,8 @@
 }
 
 .register-submit-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 3px;
-  box-shadow: 0 0 0 5px rgba(250, 112, 154, 0.2);
 }
 
 .register-submit-btn:disabled {
@@ -210,7 +209,7 @@
 }
 
 .register-back-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 
@@ -246,7 +245,7 @@
 }
 
 .switch-to-login-btn:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
   border-radius: 4px;
 }

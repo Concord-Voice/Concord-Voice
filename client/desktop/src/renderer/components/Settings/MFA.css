@@ -271,7 +271,7 @@
 
 .mfa-backup-email-input:focus {
   outline: none;
-  border-color: var(--accent-color, #5865f2);
+  border-color: var(--state-focused);
 }
 
 .mfa-backup-email-error {
@@ -434,7 +434,7 @@
 
 .mfa-verify-field input:focus {
   outline: none;
-  border-color: var(--accent-color, #5865f2);
+  border-color: var(--state-focused);
 }
 
 .mfa-manual-entry {

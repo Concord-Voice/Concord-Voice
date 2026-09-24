@@ -41,7 +41,7 @@
 
 .change-email-form input[type='email']:focus {
   outline: none;
-  border-color: var(--accent-color);
+  border-color: var(--state-focused);
 }
 
 .change-email-form .error {

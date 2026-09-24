@@ -274,7 +274,7 @@
   --text-error-strong: #991b1b; /* Red-800, high-contrast on light backgrounds */
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #ae4e6b; /* the link colour; the yellow accent-secondary is 1.07:1 on these surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -386,7 +386,7 @@
   --text-error-strong: #991b1b;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #ae4e6b; /* the link colour; the yellow accent-secondary is 1.07:1 on these surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -498,7 +498,7 @@
   --text-error-strong: #991b1b;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #d7592b; /* accent-secondary darkened in OKLCH to clear 3:1 on all three surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -729,7 +729,7 @@
   --text-error-strong: #991b1b;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #d35e00; /* accent-secondary darkened in OKLCH to clear 3:1 on all three surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -901,7 +901,7 @@
   --text-error-strong: #f87171;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #9841b4; /* accent-secondary lightened in OKLCH to clear 3:1 on all three surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -1293,7 +1293,7 @@
   --text-error-strong: #991b1b;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #0082c4; /* accent-secondary darkened in OKLCH to clear 3:1 on all three surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -1461,7 +1461,7 @@
   --text-error-strong: #f87171;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #a54539; /* accent-secondary lightened in OKLCH to clear 3:1 on all three surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -1876,7 +1876,7 @@
   --text-error-strong: #991b1b;
   /* Design-token taxonomy extension (#1033) */
   --state-selected: var(--accent-primary);
-  --state-focused: var(--accent-secondary);
+  --state-focused: #1f83f2; /* accent-secondary darkened in OKLCH to clear 3:1 on all three surfaces (#798) */
   --state-hover: var(--bg-hover);
   --font-display-stack: 'Droidiga', system-ui, sans-serif;
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
@@ -2373,6 +2373,8 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
   --accent-primary: #ffff00;
   --accent-secondary: #00ffff;
   --accent-hover: #ffff80;
+  /* Declared here, not inherited: a scheme block's literal would otherwise win (#798). */
+  --state-focused: #00ffff;
   --accent-color: #ffff00;
   --gradient-brand: linear-gradient(90deg, #ffff00 0%, #00ffff 100%);
   --success: #00ff00;
@@ -2407,6 +2409,7 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
   --accent-primary: #0000cc;
   --accent-secondary: #800080;
   --accent-hover: #0000a0;
+  --state-focused: #800080;
   --accent-color: #0000cc;
   --gradient-brand: linear-gradient(90deg, #0000cc 0%, #800080 100%);
   --success: #006600;
@@ -2431,7 +2434,7 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
 }
 
 [data-high-contrast='true'] *:focus-visible {
-  outline: 3px solid var(--accent-primary);
+  outline: 3px solid var(--state-focused);
   outline-offset: 2px;
 }
 

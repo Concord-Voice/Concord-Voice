@@ -26,8 +26,8 @@
 }
 
 .totp-digit:focus {
-  border-color: var(--accent-color, #5865f2);
-  box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.25);
+  border-color: var(--state-focused);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--state-focused) 25%, transparent);
 }
 
 .totp-digit-error {

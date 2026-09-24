@@ -49,12 +49,19 @@
 }
 
 .presence-tier-option:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: -2px;
 }
 
+/* The ring is inset (the container clips with overflow: hidden), so on the active option
+   its inner edge would sit on the accent fill. A --bg-primary band deeper than the ring's
+   2px inset puts that edge on a measured surface instead. */
+.presence-tier-option.active:focus-visible {
+  box-shadow: inset 0 0 0 4px var(--bg-primary);
+}
+
 .presence-retry-button:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

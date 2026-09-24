@@ -393,5 +393,5 @@ function measure(): { checked: number; unresolvable: number; failures: Map<strin
   return { checked, unresolvable, failures };
 }
 
-export { FLOOR, ALLOWLIST, parseThemeBlocks, measure, toRgb };
+export { FLOOR, ALLOWLIST, parseThemeBlocks, measure, toRgb, stripComments, walk };
 export type { Failure, Rule, ThemeBlock };

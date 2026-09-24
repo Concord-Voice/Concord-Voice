@@ -198,10 +198,13 @@ describe('deriveThemeVariables', () => {
     accentSecondary: '#ffe13f',
   };
 
-  it('returns all 26 expected CSS property keys', () => {
+  it('returns all 27 expected CSS property keys', () => {
     const vars = deriveThemeVariables(defaultColors, true);
     const keys = Object.keys(vars);
-    expect(keys).toHaveLength(26);
+    expect(keys).toHaveLength(27);
+    // Every focus ring draws in --state-focused (#798). Not derived, it resolves to the
+    // user's raw --accent-secondary in dark mode and to a scheme block's literal in light.
+    expect(keys).toContain('--state-focused');
     expect(keys).toContain('--bg-primary');
     expect(keys).toContain('--text-primary');
     expect(keys).toContain('--accent-primary');
@@ -303,6 +306,49 @@ describe('deriveThemeVariables', () => {
       const darkAccentL = hexToHsl(darkVars['--accent-primary']).l;
       const lightAccentL = hexToHsl(vars['--accent-primary']).l;
       expect(lightAccentL).toBeLessThan(darkAccentL);
+    });
+  });
+
+  describe('--state-focused clears 3:1 on every surface', () => {
+    const surfaces = ['--bg-primary', '--bg-secondary', '--bg-tertiary'] as const;
+    // The last palette is the hostile one: a secondary accent equal to the background
+    // would paint every focus ring at 1:1 if it were used unmodified.
+    const palettes: CustomColors[] = [
+      defaultColors,
+      { background: '#f4f4f4', accentPrimary: '#0969da', accentSecondary: '#fff6a0' },
+      { ...defaultColors, accentSecondary: defaultColors.background },
+    ];
+    it.each(
+      palettes.flatMap((colors) => [
+        { colors, isDark: true },
+        { colors, isDark: false },
+      ])
+    )('$colors.accentSecondary on $colors.background, dark=$isDark', ({ colors, isDark }) => {
+      const vars = deriveThemeVariables(colors, isDark);
+      for (const surface of surfaces) {
+        expect(
+          contrastRatio(vars['--state-focused'], vars[surface]),
+          `${vars['--state-focused']} on ${surface} ${vars[surface]}`
+        ).toBeGreaterThanOrEqual(3);
+      }
+    });
+
+    it.each([true, false])(
+      'never derives the focus colour equal to the selected (accent) colour, dark=%s',
+      (isDark) => {
+        // #798: focus and selected are separate tokens so a ring never reads as part
+        // of a selected highlight. Every palette here has distinct accents.
+        for (const colors of palettes) {
+          const vars = deriveThemeVariables(colors, isDark);
+          expect(vars['--state-focused']).not.toBe(vars['--accent-primary']);
+        }
+      }
+    );
+
+    it('keeps the secondary accent unchanged when it already clears the floor', () => {
+      expect(deriveThemeVariables(defaultColors, true)['--state-focused']).toBe(
+        defaultColors.accentSecondary
+      );
     });
   });
 

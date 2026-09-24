@@ -68,7 +68,7 @@
 
 .sso-link-confirm__input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .sso-link-confirm__input:disabled {

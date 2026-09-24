@@ -22,7 +22,7 @@
 }
 
 .activity-history-consent__heading:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 4px;
   border-radius: var(--radius-base);
 }
@@ -145,7 +145,7 @@
 }
 
 .activity-history-card__heading:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 4px;
   border-radius: var(--radius-base);
 }
@@ -210,7 +210,7 @@
 }
 
 .activity-history-card__danger-button:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

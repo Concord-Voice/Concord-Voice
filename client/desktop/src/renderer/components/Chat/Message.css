@@ -247,7 +247,7 @@
 
 .message-edit-input:focus {
   outline: none;
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .message-edit-actions {

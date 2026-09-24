@@ -87,6 +87,6 @@
    sibling selector on the input would match nothing, because what follows it is
    a text node rather than an element. */
 .gif-playback-option:focus-within {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }

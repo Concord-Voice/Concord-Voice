@@ -15,7 +15,7 @@
 .presence-exception-remove:focus-visible,
 .presence-exception-option input:focus-visible,
 .presence-exception-search input:focus-visible {
-  outline: 2px solid var(--state-focused, var(--accent-primary));
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

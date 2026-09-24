@@ -111,7 +111,7 @@
 }
 
 .message-input-box:focus-within {
-  border-color: var(--accent-primary);
+  border-color: var(--state-focused);
 }
 
 .message-input-textarea {
@@ -353,7 +353,7 @@ kbd {
 }
 
 .input-hint .help-icon:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
 

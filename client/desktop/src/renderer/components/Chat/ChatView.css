@@ -109,7 +109,7 @@
 
 .chat-header-expiration-button:focus-visible,
 .chat-header-purge-button:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--state-focused);
   outline-offset: -2px;
 }
 

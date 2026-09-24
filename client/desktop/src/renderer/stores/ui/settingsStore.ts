@@ -6,6 +6,7 @@ import {
   deriveThemeVariables,
   applyCustomThemeVariables,
   clearCustomThemeVariables,
+  isValidHex,
 } from '../../utils/ui/colorUtils';
 import { DEFAULT_CLIENT_BEHAVIOR, type ClientBehavior } from '../../../shared/clientBehavior';
 import { deriveOverlayColors } from '../../utils/ui/overlayColors';
@@ -190,6 +191,30 @@ const defaultAppearance: AppearanceSettings = {
   fontNavigation: 'default',
   fontMessages: 'default',
 };
+
+/**
+ * Stored custom colours reach documentElement.style.setProperty through
+ * deriveThemeVariables. The colour picker validates them; storage is outside its reach,
+ * so a palette with any non-#rrggbb field is dropped and the default scheme restored.
+ */
+function sanitizeCustomColors(appearance: AppearanceSettings): AppearanceSettings {
+  const c: unknown = appearance.customColors;
+  if (c === null || c === undefined) return appearance;
+  const valid =
+    typeof c === 'object' &&
+    [
+      (c as Partial<CustomColors>).background,
+      (c as Partial<CustomColors>).accentPrimary,
+      (c as Partial<CustomColors>).accentSecondary,
+    ].every((v) => typeof v === 'string' && isValidHex(v));
+  if (valid) return appearance;
+  return {
+    ...appearance,
+    customColors: null,
+    colorScheme:
+      appearance.colorScheme === 'custom' ? defaultAppearance.colorScheme : appearance.colorScheme,
+  };
+}
 
 function resolveTheme(theme: AppearanceSettings['theme']): 'dark' | 'light' {
   if (theme === 'system') {
@@ -455,7 +480,7 @@ export const useSettingsStore = wrapStore(
             // font id used to count as an explicit pick and displace a theme-bundled
             // font, so font ids and the font mode are validated too (#2366).
             appearance: sanitizeFontSettings({
-              ...appearance,
+              ...sanitizeCustomColors(appearance),
               uiScale: clampUiScale(appearance.uiScale),
             }),
             clientBehavior: { ...DEFAULT_CLIENT_BEHAVIOR, ...p?.clientBehavior },
