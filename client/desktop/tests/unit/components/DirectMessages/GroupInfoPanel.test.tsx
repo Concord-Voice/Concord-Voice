@@ -40,6 +40,7 @@ import GroupInfoPanel from '@/renderer/components/DirectMessages/GroupInfoPanel'
 
 describe('GroupInfoPanel', () => {
   const mockOnClose = vi.fn();
+  const mockOnRequestRemoval = vi.fn();
 
   const mockConversation: DMConversation = {
     id: 'group-1',
@@ -71,62 +72,94 @@ describe('GroupInfoPanel', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
 
+  const renderPanel = (conversation: DMConversation = mockConversation) =>
+    render(
+      <GroupInfoPanel
+        conversation={conversation}
+        onClose={mockOnClose}
+        onRequestRemoval={mockOnRequestRemoval}
+      />
+    );
+
   it('renders group name and member count', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.getByText('Test Group')).toBeInTheDocument();
     expect(screen.getByText('3 members')).toBeInTheDocument();
   });
 
   it('renders all member items', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.getByTestId('member-user-1')).toBeInTheDocument();
     expect(screen.getByTestId('member-user-2')).toBeInTheDocument();
     expect(screen.getByTestId('member-user-3')).toBeInTheDocument();
   });
 
   it('shows Leave Group button for all members', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.getByText('Leave Group')).toBeInTheDocument();
   });
 
+  it('shows Hide, Clear, Purge, and a separate Leave action without using native confirm', () => {
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    renderPanel();
+
+    expect(screen.getByRole('button', { name: 'Hide thread' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clear history for me' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide thread' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history for me' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Leave Group' }));
+    expect(mockOnRequestRemoval).toHaveBeenNthCalledWith(1, {
+      conversation: mockConversation,
+      action: 'hide',
+    });
+    expect(mockOnRequestRemoval).toHaveBeenNthCalledWith(2, {
+      conversation: mockConversation,
+      action: 'clear',
+    });
+    expect(mockOnRequestRemoval).toHaveBeenNthCalledWith(3, {
+      conversation: mockConversation,
+      action: 'leave',
+    });
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
   it('shows Delete Group button for admin/creator', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.getByText('Delete Group')).toBeInTheDocument();
   });
 
   it('hides Delete Group button for non-admin non-creator', () => {
     useUserStore.setState({ user: { id: 'user-2', username: 'bob' } as any });
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.queryByText('Delete Group')).not.toBeInTheDocument();
   });
 
   it('calls onClose when close button clicked', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     const closeBtn = document.querySelector('.group-info-close-btn');
     fireEvent.click(closeBtn!);
     expect(mockOnClose).toHaveBeenCalled();
   });
 
   it('shows edit button for admin users', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.getByLabelText('Edit group name')).toBeInTheDocument();
   });
 
   it('hides edit button for non-admin users', () => {
     useUserStore.setState({ user: { id: 'user-2', username: 'bob' } as any });
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.queryByLabelText('Edit group name')).not.toBeInTheDocument();
   });
 
-  it('calls leaveGroup on Leave Group click', async () => {
-    const mockLeave = vi.fn().mockResolvedValue(undefined);
-    useDMStore.setState({ leaveGroup: mockLeave });
-
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
-    fireEvent.click(screen.getByText('Leave Group'));
-
-    await vi.waitFor(() => {
-      expect(mockLeave).toHaveBeenCalledWith('group-1');
+  it('requests Leave confirmation on Leave Group click', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Leave Group' }));
+    expect(mockOnRequestRemoval).toHaveBeenCalledWith({
+      conversation: mockConversation,
+      action: 'leave',
     });
   });
 
@@ -134,7 +167,7 @@ describe('GroupInfoPanel', () => {
     const mockDelete = vi.fn().mockResolvedValue(undefined);
     useDMStore.setState({ deleteGroup: mockDelete });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Delete Group'));
 
     await vi.waitFor(() => {
@@ -144,7 +177,7 @@ describe('GroupInfoPanel', () => {
 
   it('shows participant names as comma-separated fallback when no group name', () => {
     const noNameConv = { ...mockConversation, name: null };
-    render(<GroupInfoPanel conversation={noNameConv} onClose={mockOnClose} />);
+    renderPanel(noNameConv);
     expect(screen.getByText('alice, bob, charlie')).toBeInTheDocument();
   });
 
@@ -153,14 +186,14 @@ describe('GroupInfoPanel', () => {
       ...mockConversation,
       participants: [{ userId: 'user-1', username: 'alice', role: 'admin' as const }],
     };
-    render(<GroupInfoPanel conversation={singleConv} onClose={mockOnClose} />);
+    renderPanel(singleConv);
     expect(screen.getByText('1 member')).toBeInTheDocument();
   });
 
   // --- Edit modal ---
 
   it('opens EditGroupModal when edit button is clicked', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     expect(screen.queryByTestId('edit-group-modal')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText('Edit group name'));
@@ -168,48 +201,12 @@ describe('GroupInfoPanel', () => {
   });
 
   it('closes EditGroupModal when its onClose is called', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByLabelText('Edit group name'));
     expect(screen.getByTestId('edit-group-modal')).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('Close Edit'));
     expect(screen.queryByTestId('edit-group-modal')).not.toBeInTheDocument();
-  });
-
-  // --- Leave group confirmation flow ---
-
-  it('does not call leaveGroup when confirm is cancelled', () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false);
-    const mockLeave = vi.fn().mockResolvedValue(undefined);
-    useDMStore.setState({ leaveGroup: mockLeave });
-
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
-    fireEvent.click(screen.getByText('Leave Group'));
-    expect(mockLeave).not.toHaveBeenCalled();
-  });
-
-  it('shows error when leaveGroup fails', async () => {
-    const mockLeave = vi.fn().mockRejectedValue(new Error('Network error'));
-    useDMStore.setState({ leaveGroup: mockLeave });
-
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
-    fireEvent.click(screen.getByText('Leave Group'));
-
-    await vi.waitFor(() => {
-      expect(screen.getByText('Network error')).toBeInTheDocument();
-    });
-  });
-
-  it('shows fallback error for non-Error leaveGroup rejection', async () => {
-    const mockLeave = vi.fn().mockRejectedValue('string error');
-    useDMStore.setState({ leaveGroup: mockLeave });
-
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
-    fireEvent.click(screen.getByText('Leave Group'));
-
-    await vi.waitFor(() => {
-      expect(screen.getByText('Failed to leave group')).toBeInTheDocument();
-    });
   });
 
   // --- Delete group confirmation flow ---
@@ -219,7 +216,7 @@ describe('GroupInfoPanel', () => {
     const mockDelete = vi.fn().mockResolvedValue(undefined);
     useDMStore.setState({ deleteGroup: mockDelete });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Delete Group'));
     expect(mockDelete).not.toHaveBeenCalled();
   });
@@ -228,7 +225,7 @@ describe('GroupInfoPanel', () => {
     const mockDelete = vi.fn().mockRejectedValue(new Error('Permission denied'));
     useDMStore.setState({ deleteGroup: mockDelete });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Delete Group'));
 
     await vi.waitFor(() => {
@@ -240,7 +237,7 @@ describe('GroupInfoPanel', () => {
     const mockDelete = vi.fn().mockRejectedValue(42);
     useDMStore.setState({ deleteGroup: mockDelete });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Delete Group'));
 
     await vi.waitFor(() => {
@@ -254,7 +251,7 @@ describe('GroupInfoPanel', () => {
     const mockUpdateRole = vi.fn().mockRejectedValue(new Error('Role update failed'));
     useDMStore.setState({ updateMemberRole: mockUpdateRole });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Promote bob'));
 
     await vi.waitFor(() => {
@@ -266,7 +263,7 @@ describe('GroupInfoPanel', () => {
     const mockUpdateRole = vi.fn().mockResolvedValue(undefined);
     useDMStore.setState({ updateMemberRole: mockUpdateRole });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Promote bob'));
 
     await vi.waitFor(() => {
@@ -278,7 +275,7 @@ describe('GroupInfoPanel', () => {
     const mockRemove = vi.fn().mockRejectedValue(new Error('Remove failed'));
     useDMStore.setState({ removeGroupMember: mockRemove });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Remove bob'));
 
     await vi.waitFor(() => {
@@ -290,7 +287,7 @@ describe('GroupInfoPanel', () => {
     const mockRemove = vi.fn().mockRejectedValue('oops');
     useDMStore.setState({ removeGroupMember: mockRemove });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Remove bob'));
 
     await vi.waitFor(() => {
@@ -302,7 +299,7 @@ describe('GroupInfoPanel', () => {
     const mockUpdateRole = vi.fn().mockRejectedValue(null);
     useDMStore.setState({ updateMemberRole: mockUpdateRole });
 
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     fireEvent.click(screen.getByText('Promote bob'));
 
     await vi.waitFor(() => {
@@ -320,19 +317,19 @@ describe('GroupInfoPanel', () => {
         { userId: 'user-4', username: 'dave', role: 'admin' as const },
       ],
     };
-    render(<GroupInfoPanel conversation={convWithAdminDave} onClose={mockOnClose} />);
+    renderPanel(convWithAdminDave);
     expect(screen.getByText('Delete Group')).toBeInTheDocument();
   });
 
   it('renders group icon initial from group name', () => {
-    render(<GroupInfoPanel conversation={mockConversation} onClose={mockOnClose} />);
+    renderPanel();
     const icon = document.querySelector('.group-info-icon span');
     expect(icon?.textContent).toBe('T'); // "Test Group" -> "T"
   });
 
   it('renders group icon initial "G" when no name', () => {
     const noNameConv = { ...mockConversation, name: null };
-    render(<GroupInfoPanel conversation={noNameConv} onClose={mockOnClose} />);
+    renderPanel(noNameConv);
     const icon = document.querySelector('.group-info-icon span');
     expect(icon?.textContent).toBe('G');
   });
@@ -348,7 +345,7 @@ describe('GroupInfoPanel', () => {
         { userId: 'user-2', username: 'bob', role: 'admin' as const },
       ],
     };
-    render(<GroupInfoPanel conversation={creatorNotAdmin} onClose={mockOnClose} />);
+    renderPanel(creatorNotAdmin);
     expect(screen.getByText('Delete Group')).toBeInTheDocument();
   });
 });

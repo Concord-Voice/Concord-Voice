@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { MessageSquare, Users, Phone, Timer, Eraser } from 'lucide-react';
+import { Ellipsis, MessageSquare, Users, Phone, Timer, Eraser } from 'lucide-react';
 import MessageList, { type MessageListHandle } from '../Chat/MessageList';
 import DMPinnedMessagesPanel from './DMPinnedMessagesPanel';
 import { getPins } from '../../services/messaging/pinService';
@@ -28,10 +28,12 @@ import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
 import { expirationClause, expirationControlLabel } from '../Chat/MessageExpirationIndicator';
 import { useHoverIntent } from '../../hooks/ui/useHoverIntent';
 import type { ChatContext } from '../../types/chat';
+import type { DMThreadRemovalTarget } from './DMThreadRemovalDialog';
 import './DirectMessages.css';
 
 interface DMChatAreaProps {
   selectedThreadId: string | null;
+  onRequestRemoval: (target: DMThreadRemovalTarget) => void;
 }
 
 type VoiceJoinAvailability = 'available' | 'joining' | 'busy';
@@ -57,8 +59,9 @@ function voiceJoinButtonLabel(availability: VoiceJoinAvailability): string {
   return 'Join voice call';
 }
 
-const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
+const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemoval }) => {
   const [showGroupInfo, setShowGroupInfo] = useState(false);
+  const [showThreadActions, setShowThreadActions] = useState(false);
   const [showPinnedPanel, setShowPinnedPanel] = useState(false);
   const [pinnedCount, setPinnedCount] = useState(0);
   const [pinRefreshKey, setPinRefreshKey] = useState(0);
@@ -153,7 +156,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     activeConv && !activeConv.isPersonal ? { kind: 'dm' as const, id: activeConv.id } : null;
   const expiration = useExpirationPolicy(expirationScope);
   const currentParticipant = activeConv?.participants.find((p) => p.userId === currentUserId);
-  const canPurge = currentParticipant !== undefined;
+  const canPurge = currentParticipant !== undefined && activeConv?.isPersonal !== true;
   const purgeRole = currentParticipant?.role === 'admin' ? 'admin' : 'member';
 
   useEffect(() => {
@@ -162,6 +165,12 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- close local controls when their conversation or auth owner changes
     setPurgeTarget(null);
   }, [authGeneration, selectedThreadId]);
+
+  useEffect(() => {
+    // A chooser belongs to the selected thread and must not survive a switch.
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: close the thread-scoped chooser after selection changes
+    setShowThreadActions(false);
+  }, [selectedThreadId]);
 
   useEffect(() => {
     if (!purgeTarget) return;
@@ -485,6 +494,16 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
                 <Users size={18} />
               </button>
             )}
+            {activeConv && !activeConv.isGroup && !activeConv.isPersonal && (
+              <button
+                type="button"
+                className="dm-chat-header-thread-actions-btn"
+                onClick={() => setShowThreadActions(true)}
+                aria-label="Thread actions"
+              >
+                <Ellipsis size={18} aria-hidden="true" />
+              </button>
+            )}
             {canPurge && activeConv && (
               <button
                 type="button"
@@ -557,7 +576,60 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
       </div>
 
       {showGroupInfo && activeConv?.isGroup && (
-        <GroupInfoPanel conversation={activeConv} onClose={() => setShowGroupInfo(false)} />
+        <GroupInfoPanel
+          conversation={activeConv}
+          onClose={() => setShowGroupInfo(false)}
+          onRequestRemoval={onRequestRemoval}
+        />
+      )}
+
+      {activeConv && !activeConv.isGroup && !activeConv.isPersonal && (
+        <Modal
+          isOpen={showThreadActions}
+          onClose={() => setShowThreadActions(false)}
+          title="Thread actions"
+          width="small"
+        >
+          <div className="dm-thread-actions">
+            <button
+              type="button"
+              className="group-info-action-btn"
+              onClick={() => {
+                setShowThreadActions(false);
+                onRequestRemoval({ conversation: activeConv, action: 'hide' });
+              }}
+            >
+              Hide thread
+            </button>
+            <button
+              type="button"
+              className="group-info-action-btn"
+              onClick={() => {
+                setShowThreadActions(false);
+                onRequestRemoval({ conversation: activeConv, action: 'clear' });
+              }}
+            >
+              Clear history for me
+            </button>
+            {canPurge && (
+              <button
+                type="button"
+                className="group-info-action-btn group-info-delete-btn"
+                onClick={() => {
+                  setShowThreadActions(false);
+                  setPurgeTarget({
+                    id: activeConv.id,
+                    name: threadName,
+                    context: 'dm',
+                    role: purgeRole,
+                  });
+                }}
+              >
+                Purge Messages
+              </button>
+            )}
+          </div>
+        </Modal>
       )}
 
       <DMPinnedMessagesPanel

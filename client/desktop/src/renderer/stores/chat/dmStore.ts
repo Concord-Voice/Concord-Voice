@@ -23,6 +23,21 @@ import {
   isSameAuthLifecycle,
 } from '../../services/system/postLoginHydrationLifecycle';
 
+/**
+ * Remove a conversation from this client's view while retaining its membership.
+ *
+ * A hide (and a list row omitted because it may be hidden) must fence stale
+ * decrypts and purge plaintext, but it is not proof that the server revoked
+ * this member's key access. `invalidateChannelKey` provides that narrow fence
+ * without installing the terminal NOT_MEMBER revocation marker.
+ */
+function discardConversationViewState(conversationId: string): void {
+  e2eeService.invalidateChannelKey(conversationId);
+  useChatStore.getState().clearMessages(conversationId);
+  removeScope(conversationId);
+}
+
+/** Only confirmed leave, kick, or deletion may permanently revoke E2EE access. */
 function purgeConversationAccessState(conversationId: string): void {
   e2eeService.revokeChannelAccess(conversationId);
   useChatStore.getState().clearMessages(conversationId);
@@ -470,6 +485,8 @@ interface DMState {
   // Real-time updates (called from WebSocket handlers)
   addConversation: (conv: DMConversation) => void;
   updateConversation: (id: string, updates: Partial<DMConversation>) => void;
+  /** Hide a local view without claiming the member lost server-side access. */
+  discardConversationView: (id: string) => void;
   removeConversation: (id: string) => void;
   updateLastMessage: (convId: string, message: DMLastMessage) => void;
   /**
@@ -691,7 +708,10 @@ function reconcileConversationResponse(
       conversations.push(conversation);
       continue;
     }
-    purgeConversationAccessState(conversation.id);
+    // A list omission is ambiguous: it can mean Hide as well as a terminal
+    // membership loss. Terminal E2EE revocation is reserved for explicit WS
+    // removal/deletion signals and successful local leave/delete operations.
+    discardConversationViewState(conversation.id);
   }
 
   const hasPostFetchAddition = currentState.conversations.some(
@@ -917,6 +937,17 @@ export const useDMStore = wrapStore(
             }));
           },
 
+          discardConversationView: (id: string) => {
+            for (const journal of conversationFetchJournals) journal.removedIds.add(id);
+            discardConversationViewState(id);
+            set((state) => ({
+              conversations: state.conversations.filter((c) => c.id !== id),
+              activeConversationId:
+                state.activeConversationId === id ? null : state.activeConversationId,
+              isLoading: hasLiveConversationFetch(),
+            }));
+          },
+
           removeConversation: (id: string) => {
             for (const journal of conversationFetchJournals) journal.removedIds.add(id);
             // Fence pending decrypts first, then purge every plaintext-bearing
@@ -1043,7 +1074,9 @@ export const useDMStore = wrapStore(
           },
 
           leaveGroup: async (conversationId: string) => {
+            const lifecycle = captureAuthLifecycle();
             const userStore = await import('../auth/userStore');
+            if (!isSameAuthLifecycle(lifecycle)) return;
             const userId = userStore.useUserStore.getState().user?.id;
             if (!userId) throw new Error('Not authenticated');
 
@@ -1053,10 +1086,13 @@ export const useDMStore = wrapStore(
                 method: 'DELETE',
               }
             );
+            if (!isSameAuthLifecycle(lifecycle)) return;
             if (!response.ok) {
               const data = await response.json();
+              if (!isSameAuthLifecycle(lifecycle)) return;
               throw new Error(data.error || 'Failed to leave group');
             }
+            if (!isSameAuthLifecycle(lifecycle)) return;
             get().removeConversation(conversationId);
           },
 

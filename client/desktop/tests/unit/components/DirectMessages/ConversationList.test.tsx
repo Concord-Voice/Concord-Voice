@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, act, within } from '../../../test-utils';
 import {
   useDMStore,
   type DMConversation,
@@ -30,6 +30,14 @@ import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import ContextMenuProvider from '@/renderer/components/ui/ContextMenuProvider';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+
+vi.mock('@/renderer/services/messaging/dmVisibilityApi', () => ({
+  hideDMThread: vi.fn(),
+  clearDMHistory: vi.fn(),
+}));
+import { hideDMThread } from '@/renderer/services/messaging/dmVisibilityApi';
+
+const mockHideDMThread = vi.mocked(hideDMThread);
 
 /**
  * The preview renders the sender name in its own element, so the untrusted half
@@ -1240,6 +1248,57 @@ describe('ConversationList', () => {
     // there regardless of encryption state, while Rotate Encryption Key
     // depends on the conversation being encrypted.
     expect(screen.getByText('Mute Conversation')).toBeInTheDocument();
+  });
+
+  it('keeps the lifted removal dialog mounted after the row menu closes', async () => {
+    useDMStore.setState({
+      conversations: [makeConversation()],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+    fireEvent.contextMenu(screen.getByLabelText('Alice'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Hide thread' }));
+
+    expect(screen.queryByText('Mute Conversation')).not.toBeInTheDocument();
+    expect(await screen.findByRole('dialog', { name: 'Hide thread' })).toBeInTheDocument();
+  });
+
+  it('returns focus to the row when removal is cancelled from its context menu', async () => {
+    useDMStore.setState({
+      conversations: [makeConversation()],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+    const row = screen.getByLabelText('Alice');
+    fireEvent.contextMenu(row);
+    fireEvent.click(await screen.findByRole('button', { name: 'Hide thread' }));
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Hide thread' })).getByRole('button', {
+        name: 'Cancel',
+      })
+    );
+
+    await waitFor(() => expect(row).toHaveFocus());
+  });
+
+  it('moves focus to the surviving normal search input after Hide removes the row', async () => {
+    mockHideDMThread.mockResolvedValue(true);
+    useDMStore.setState({
+      conversations: [makeConversation()],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<ConversationList selectedThreadId="conv-1" onSelectThread={mockOnSelectThread} />);
+
+    fireEvent.contextMenu(screen.getByLabelText('Alice'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Hide thread' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Hide thread' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Hide thread' }));
+
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText('Search conversations...')).toHaveFocus()
+    );
   });
 
   it('renders multiple conversations', () => {

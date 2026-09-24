@@ -1,9 +1,18 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, within } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { vi } from 'vitest';
+import type { DMConversation } from '@/renderer/stores/chat/dmStore';
+
+vi.mock('@/renderer/services/messaging/dmVisibilityApi', () => ({
+  hideDMThread: vi.fn(),
+  clearDMHistory: vi.fn(),
+}));
+
+import { hideDMThread } from '@/renderer/services/messaging/dmVisibilityApi';
+const mockHideDMThread = vi.mocked(hideDMThread);
 
 const channelPanelState = vi.hoisted(() => ({ compact: false }));
 
@@ -77,15 +86,69 @@ vi.mock('@/renderer/components/DirectMessages/ConversationList', () => ({
       data-testid="conversation-list"
       data-compact={compact || undefined}
       data-selected={selectedThreadId}
+      className={compact ? 'conversation-list conversation-list--compact' : 'conversation-list'}
     >
+      <div className="conversation-search">
+        <input aria-label="Search conversations" />
+      </div>
       <button onClick={() => onSelectThread('conv-1')}>Select Thread</button>
     </div>
   ),
 }));
 
 vi.mock('@/renderer/components/DirectMessages/DMChatArea', () => ({
-  default: ({ selectedThreadId }: { selectedThreadId: string | null }) => (
-    <div data-testid="dm-chat-area" data-thread={selectedThreadId} />
+  default: ({
+    selectedThreadId,
+    onRequestRemoval,
+  }: {
+    selectedThreadId: string | null;
+    onRequestRemoval?: (target: {
+      conversation: DMConversation;
+      action: 'hide' | 'clear' | 'leave';
+    }) => void;
+  }) => (
+    <div data-testid="dm-chat-area" data-thread={selectedThreadId}>
+      <button
+        aria-label="Thread actions"
+        className="dm-chat-header-thread-actions-btn"
+        onClick={() =>
+          onRequestRemoval?.({
+            conversation: {
+              id: 'conv-1',
+              isGroup: false,
+              isPersonal: false,
+              name: 'Alice',
+              participants: [],
+              lastMessage: null,
+              unreadCount: 0,
+              createdAt: '2025-01-01T00:00:00Z',
+            },
+            action: 'hide',
+          })
+        }
+      >
+        Thread actions
+      </button>
+      <button
+        onClick={() =>
+          onRequestRemoval?.({
+            conversation: {
+              id: 'conv-1',
+              isGroup: false,
+              isPersonal: false,
+              name: 'Alice',
+              participants: [],
+              lastMessage: null,
+              unreadCount: 0,
+              createdAt: '2025-01-01T00:00:00Z',
+            },
+            action: 'hide',
+          })
+        }
+      >
+        Request Hide
+      </button>
+    </div>
   ),
 }));
 
@@ -174,6 +237,7 @@ describe('DirectMessagesView', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    mockHideDMThread.mockReset();
     channelPanelState.compact = false;
     useDMStore.setState({
       activeConversationId: null,
@@ -255,6 +319,96 @@ describe('DirectMessagesView', () => {
     useDMStore.setState({ activeConversationId: 'conv-42' });
     render(<DirectMessagesView />);
     expect(screen.getByTestId('conversation-list')).toHaveAttribute('data-selected', 'conv-42');
+  });
+
+  it('keeps the removal dialog mounted when optimistic Hide clears the active thread', () => {
+    let rejectHide!: (reason?: unknown) => void;
+    mockHideDMThread.mockReturnValue(
+      new Promise<boolean>((_, reject) => {
+        rejectHide = reject;
+      })
+    );
+    useDMStore.setState({
+      activeConversationId: 'conv-1',
+      conversations: [
+        {
+          id: 'conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: 'Alice',
+          participants: [],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: '2025-01-01T00:00:00Z',
+        },
+      ],
+    });
+    render(<DirectMessagesView />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request Hide' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Hide thread' }));
+
+    expect(useDMStore.getState().activeConversationId).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Hide thread' })).toBeInTheDocument();
+
+    rejectHide(new Error('request lost'));
+    return vi.waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/could not confirm the hide/i);
+      expect(screen.getByRole('dialog', { name: 'Hide thread' })).toBeInTheDocument();
+    });
+  });
+
+  it('focuses the surviving search target after Hide succeeds', async () => {
+    mockHideDMThread.mockResolvedValue(true);
+    useDMStore.setState({
+      activeConversationId: 'conv-1',
+      conversations: [
+        {
+          id: 'conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: 'Alice',
+          participants: [],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: '2025-01-01T00:00:00Z',
+        },
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<DirectMessagesView />);
+    const search = screen.getByRole('textbox', { name: 'Search conversations' });
+    fireEvent.click(screen.getByRole('button', { name: 'Request Hide' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Hide thread' }));
+    await vi.waitFor(() => expect(search).toHaveFocus());
+  });
+
+  it('returns focus to the in-thread removal trigger when cancelled', async () => {
+    useDMStore.setState({
+      activeConversationId: 'conv-1',
+      conversations: [
+        {
+          id: 'conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: 'Alice',
+          participants: [],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: '2025-01-01T00:00:00Z',
+        },
+      ],
+    });
+    render(<DirectMessagesView />);
+    const trigger = screen.getByRole('button', { name: 'Thread actions' });
+    fireEvent.click(trigger);
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Hide thread' })).getByRole('button', {
+        name: 'Cancel',
+      })
+    );
+
+    await vi.waitFor(() => expect(trigger).toHaveFocus());
   });
 
   it('passes the ChannelPanel compact state to ConversationList', () => {

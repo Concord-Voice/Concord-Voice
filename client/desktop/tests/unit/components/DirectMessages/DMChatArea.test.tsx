@@ -333,6 +333,37 @@ describe('DMChatArea', () => {
     expect(screen.getByText('Alice')).toBeInTheDocument();
   });
 
+  it('offers thread actions for a 1:1 while retaining the header Purge pill', () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Thread actions' }));
+    expect(screen.getByRole('dialog', { name: 'Thread actions' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide thread' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clear history for me' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Purge messages in this conversation' })).toHaveClass(
+      'chat-header-purge-button'
+    );
+  });
+
+  it('does not expose thread actions or Purge for personal notes', () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          isPersonal: true,
+          participants: [{ userId: 'user-1', username: 'me' }],
+        }),
+      ],
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+
+    expect(screen.queryByRole('button', { name: 'Thread actions' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Purge messages in this conversation' })
+    ).not.toBeInTheDocument();
+  });
+
   it('keeps a non-admin group policy review read-only', async () => {
     const group = makeConversation({
       id: 'group-1',

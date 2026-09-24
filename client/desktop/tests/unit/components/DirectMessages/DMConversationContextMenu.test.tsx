@@ -254,37 +254,114 @@ describe('DMConversationContextMenu', () => {
     });
   });
 
-  describe('Close Conversation (#984)', () => {
-    it('is visible for 1:1 DMs', () => {
-      renderMenu(makeConversation());
-      expect(screen.getByText('Close Conversation')).toBeInTheDocument();
+  describe('thread removal actions (#2822)', () => {
+    it('shows Hide and Clear for a non-personal 1:1, with Purge separated', () => {
+      render(
+        <DMConversationContextMenu
+          conversation={makeConversation()}
+          currentUserId={CURRENT_USER_ID}
+          position={{ x: 100, y: 100 }}
+          onClose={mockOnClose}
+          onPurgeMessages={vi.fn()}
+          onHideThread={vi.fn()}
+          onClearHistory={vi.fn()}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: 'Hide thread' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Clear history for me' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Close Conversation' })).toBeNull();
     });
 
-    it('is visible for group DMs (acts as local hide)', () => {
-      renderMenu(makeConversation({ isGroup: true, name: 'Test Group' }));
-      expect(screen.getByText('Close Conversation')).toBeInTheDocument();
+    it('keeps removal actions and Purge off personal notes', () => {
+      render(
+        <DMConversationContextMenu
+          conversation={makeConversation({ isPersonal: true })}
+          currentUserId={CURRENT_USER_ID}
+          position={{ x: 100, y: 100 }}
+          onClose={mockOnClose}
+          onPurgeMessages={vi.fn()}
+          onHideThread={vi.fn()}
+          onClearHistory={vi.fn()}
+          onLeaveGroup={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByRole('button', { name: 'Hide thread' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Clear history for me' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Purge Messages' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Leave group' })).toBeNull();
     });
 
-    it('is HIDDEN for personal DMs (you cannot close your own notes)', () => {
-      renderMenu(makeConversation({ isPersonal: true }));
-      expect(screen.queryByText('Close Conversation')).not.toBeInTheDocument();
+    it('adds a separate Leave group action only for groups', () => {
+      const onLeaveGroup = vi.fn();
+      render(
+        <DMConversationContextMenu
+          conversation={makeConversation({ isGroup: true, name: 'Test Group' })}
+          currentUserId={CURRENT_USER_ID}
+          position={{ x: 100, y: 100 }}
+          onClose={mockOnClose}
+          onPurgeMessages={vi.fn()}
+          onHideThread={vi.fn()}
+          onClearHistory={vi.fn()}
+          onLeaveGroup={onLeaveGroup}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: 'Hide thread' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Clear history for me' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Leave group' })).toBeInTheDocument();
     });
 
-    it('closes the menu on click', () => {
-      renderMenu(makeConversation());
-      fireEvent.click(screen.getByText('Close Conversation'));
+    it.each([
+      ['Hide thread', 'onHideThread'],
+      ['Clear history for me', 'onClearHistory'],
+      ['Purge Messages', 'onPurgeMessages'],
+    ] as const)('calls the parent callback for %s and closes the menu', (label, callbackName) => {
+      const callbacks = {
+        onHideThread: vi.fn(),
+        onClearHistory: vi.fn(),
+        onPurgeMessages: vi.fn(),
+      };
+      const conversation = makeConversation({ id: 'conv-removal' });
+      render(
+        <DMConversationContextMenu
+          conversation={conversation}
+          currentUserId={CURRENT_USER_ID}
+          position={{ x: 100, y: 100 }}
+          onClose={mockOnClose}
+          {...callbacks}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: label }));
+
+      expect(callbacks[callbackName]).toHaveBeenCalledWith(conversation);
       expect(mockOnClose).toHaveBeenCalled();
     });
 
-    it('invokes dmStore.removeConversation with the correct id (#984 coverage)', async () => {
+    it('calls the parent callback for Leave group and never mutates the store directly', async () => {
       const { useDMStore } = await import('@/renderer/stores/chat/dmStore');
       const removeSpy = vi.fn();
       useDMStore.setState({ removeConversation: removeSpy });
+      const onLeaveGroup = vi.fn();
+      const conversation = makeConversation({ id: 'group-to-leave', isGroup: true });
 
-      renderMenu(makeConversation({ id: 'conv-to-close' }));
-      fireEvent.click(screen.getByText('Close Conversation'));
+      render(
+        <DMConversationContextMenu
+          conversation={conversation}
+          currentUserId={CURRENT_USER_ID}
+          position={{ x: 100, y: 100 }}
+          onClose={mockOnClose}
+          onLeaveGroup={onLeaveGroup}
+        />
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Leave group' }));
 
-      expect(removeSpy).toHaveBeenCalledWith('conv-to-close');
+      expect(onLeaveGroup).toHaveBeenCalledWith(conversation);
+      expect(removeSpy).not.toHaveBeenCalled();
     });
   });
 

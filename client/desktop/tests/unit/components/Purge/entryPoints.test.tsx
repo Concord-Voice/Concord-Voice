@@ -184,7 +184,9 @@ describe('Group DM purge entry point', () => {
 
   it('opens the purge modal from the group danger zone with the admin role copy', async () => {
     const user = userEvent.setup();
-    render(<GroupInfoPanel conversation={groupConversation} onClose={noop} />);
+    render(
+      <GroupInfoPanel conversation={groupConversation} onClose={noop} onRequestRemoval={noop} />
+    );
 
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
     expect(screen.getAllByRole('radio')).toHaveLength(9);
@@ -205,6 +207,7 @@ describe('Group DM purge entry point', () => {
           ],
         }}
         onClose={noop}
+        onRequestRemoval={noop}
       />
     );
 

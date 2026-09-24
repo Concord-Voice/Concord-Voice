@@ -1,5 +1,5 @@
 import React, { useCallback } from 'react';
-import { Eraser, Timer } from 'lucide-react';
+import { Eraser, EyeOff, LogOut, Timer } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
 import { useRotateKey } from '../../hooks/voice/useRotateKey';
@@ -23,6 +23,9 @@ interface DMConversationContextMenuProps {
   onBlockUser?: (conversation: DMConversation) => void;
   onUnfriend?: (conversation: DMConversation) => void;
   onViewProfile?: (conversation: DMConversation) => void;
+  onHideThread?: (conversation: DMConversation) => void;
+  onClearHistory?: (conversation: DMConversation) => void;
+  onLeaveGroup?: (conversation: DMConversation) => void;
   onPurgeMessages?: (conversation: DMConversation) => void;
   onMessageExpiration?: (conversation: DMConversation) => void;
 }
@@ -35,6 +38,9 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
   onBlockUser,
   onUnfriend,
   onViewProfile,
+  onHideThread,
+  onClearHistory,
+  onLeaveGroup,
   onPurgeMessages,
   onMessageExpiration,
 }) => {
@@ -86,9 +92,6 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
     peer ? s.friends.some((f) => f.userId === peer.userId) : false
   );
 
-  // Store actions — extracted via useDMStore.getState() at click time so the
-  // handlers don't need to subscribe (these don't read state, only invoke).
-  const removeConversation = useDMStore((s) => s.removeConversation);
   const clearUnread = useDMStore((s) => s.clearUnread);
   const updateConversation = useDMStore((s) => s.updateConversation);
 
@@ -113,14 +116,6 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
         updateConversation(conversation.id, { unreadCount: previousUnread });
       }
     }
-  };
-
-  const handleCloseConversation = () => {
-    onClose();
-    // Client-side hide. The conversation reappears if the peer sends a new
-    // message — there is no server-side "close" for 1:1 DMs. For groups, this
-    // hides locally; the user can rejoin via invite link.
-    removeConversation(conversation.id);
   };
 
   const handleBlockUser = () => {
@@ -274,25 +269,25 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
         />
       )}
 
-      {/* Close Conversation — hides the conversation from the local list. For
-          1:1 DMs this is a "I don't want to see this in my list" toggle. For
-          groups, it's similar (leaving the group properly requires a separate
-          UI). For personal DMs (self-notes) this item is hidden — you can't
-          close your own notes. */}
-      {!conversation.isPersonal && (
+      {!conversation.isPersonal && onHideThread && (
         <ContextMenu.Item
-          icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path
-                d="M3 3l10 10M13 3L3 13"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-            </svg>
-          }
-          label="Close Conversation"
-          onClick={handleCloseConversation}
+          icon={<EyeOff size={16} />}
+          label="Hide thread"
+          onClick={() => {
+            onClose();
+            onHideThread(conversation);
+          }}
+        />
+      )}
+
+      {!conversation.isPersonal && onClearHistory && (
+        <ContextMenu.Item
+          icon={<Eraser size={16} />}
+          label="Clear history for me"
+          onClick={() => {
+            onClose();
+            onClearHistory(conversation);
+          }}
         />
       )}
 
@@ -330,9 +325,9 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
       )}
 
       {/* Purge Messages — always available in a DM: authorization is
-          participant-based, not RBAC. Divider-separated from Block / Close
-          Conversation so the destructive act stands on its own (spec §4.2). */}
-      {onPurgeMessages && (
+          participant-based, not RBAC. Divider-separated from the thread
+          actions so the destructive act stands on its own (spec §4.2). */}
+      {!conversation.isPersonal && onPurgeMessages && (
         <>
           <ContextMenu.Separator />
           <ContextMenu.Item
@@ -342,6 +337,21 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
             onClick={() => {
               onPurgeMessages(conversation);
               onClose();
+            }}
+          />
+        </>
+      )}
+
+      {!conversation.isPersonal && conversation.isGroup && onLeaveGroup && (
+        <>
+          <ContextMenu.Separator />
+          <ContextMenu.Item
+            icon={<LogOut size={16} />}
+            label="Leave group"
+            danger
+            onClick={() => {
+              onClose();
+              onLeaveGroup(conversation);
             }}
           />
         </>

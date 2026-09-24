@@ -1285,6 +1285,21 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       purgeScope(msg.data.conversation_id);
     });
 
+    const unsubDMHidden = wsService.on('dm_conversation_hidden', (msg) => {
+      if (msg.data.hidden_at !== null) {
+        // Hide only discards this local view. The member still belongs to the
+        // conversation, so a terminal E2EE access-revocation marker would make
+        // the next legitimate message fail as NOT_MEMBER.
+        useDMStore.getState().discardConversationView(msg.data.conversation_id);
+      }
+      void useDMStore.getState().fetchConversations();
+    });
+
+    const unsubDMCleared = wsService.on('dm_conversation_cleared', (msg) => {
+      purgeScope(msg.data.conversation_id);
+      void useDMStore.getState().fetchConversations();
+    });
+
     // Server-wide purge. `channel_purged` only reaches clients subscribed to that
     // one channel — i.e. the channel they have mounted — so on its own it would
     // leave every OTHER purged channel's decrypted plaintext in the local search
@@ -2528,6 +2543,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubDelete();
       unsubChannelPurged();
       unsubDmPurged();
+      unsubDMHidden();
+      unsubDMCleared();
       unsubServerPurged();
       globalThis.removeEventListener('messages-purged', handleMessagesPurged);
       unsubReactionAdded();

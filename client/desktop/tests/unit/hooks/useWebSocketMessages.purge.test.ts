@@ -109,25 +109,25 @@ function dmPurgedEvent(conversationId: string) {
 
 /** Seed one conversation carrying a decrypted preview, the second plaintext copy. */
 function seedConversation(conversationId: string, preview: string) {
-  useDMStore.setState({
-    conversations: [
-      {
-        id: conversationId,
-        isGroup: false,
-        isPersonal: false,
-        name: null,
-        participants: [],
-        lastMessage: {
-          content: preview,
-          userId: PURGED_BY,
-          username: 'peer',
-          createdAt: '2026-08-11T00:00:00.000Z',
-        },
-        unreadCount: 0,
-        createdAt: '2026-08-11T00:00:00.000Z',
-      },
-    ],
-  });
+  const conversation = {
+    id: conversationId,
+    isGroup: false,
+    isPersonal: false,
+    name: null,
+    participants: [],
+    lastMessage: {
+      content: preview,
+      userId: PURGED_BY,
+      username: 'peer',
+      createdAt: '2026-08-11T00:00:00.000Z',
+    },
+    unreadCount: 0,
+    createdAt: '2026-08-11T00:00:00.000Z',
+  };
+  const conversations = useDMStore
+    .getState()
+    .conversations.filter((existing) => existing.id !== conversationId);
+  useDMStore.setState({ conversations: [...conversations, conversation] });
 }
 
 function findConversation(conversationId: string) {
@@ -313,6 +313,160 @@ describe('dm_purged handler', () => {
     });
 
     expect(findConversation(conversationId)?.lastMessage).toBeNull();
+  });
+});
+
+describe('DM conversation visibility handlers', () => {
+  const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+
+  it('removes a hidden conversation immediately and refreshes the authoritative list', () => {
+    seedConversation(conversationId, 'preview should disappear');
+    const fetchSpy = vi
+      .spyOn(useDMStore.getState(), 'fetchConversations')
+      .mockResolvedValue(undefined);
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    fetchSpy.mockClear();
+
+    act(() => {
+      requireHandler(
+        ws,
+        'dm_conversation_hidden'
+      )({
+        type: 'dm_conversation_hidden',
+        data: { conversation_id: conversationId, hidden_at: '2026-09-23T20:00:00Z' },
+      });
+    });
+
+    expect(findConversation(conversationId)).toBeUndefined();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes on an unhide without locally removing the existing conversation', () => {
+    seedConversation(conversationId, 'preview remains until the list refresh');
+    const fetchSpy = vi
+      .spyOn(useDMStore.getState(), 'fetchConversations')
+      .mockResolvedValue(undefined);
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    fetchSpy.mockClear();
+
+    act(() => {
+      requireHandler(
+        ws,
+        'dm_conversation_hidden'
+      )({
+        type: 'dm_conversation_hidden',
+        data: { conversation_id: conversationId, hidden_at: null },
+      });
+    });
+
+    expect(findConversation(conversationId)?.lastMessage?.content).toBe(
+      'preview remains until the list refresh'
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the authoritative unhide refresh restore a row removed by a late hide event', () => {
+    seedConversation(conversationId, 'authoritative preview');
+    const fetchSpy = vi
+      .spyOn(useDMStore.getState(), 'fetchConversations')
+      .mockResolvedValue(undefined);
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    fetchSpy.mockClear();
+
+    act(() => {
+      requireHandler(
+        ws,
+        'dm_conversation_hidden'
+      )({
+        type: 'dm_conversation_hidden',
+        data: { conversation_id: conversationId, hidden_at: '2026-09-23T20:00:00Z' },
+      });
+    });
+    expect(findConversation(conversationId)).toBeUndefined();
+
+    fetchSpy.mockImplementationOnce(async () => {
+      seedConversation(conversationId, 'restored by authoritative refresh');
+    });
+    act(() => {
+      requireHandler(
+        ws,
+        'dm_conversation_hidden'
+      )({
+        type: 'dm_conversation_hidden',
+        data: { conversation_id: conversationId, hidden_at: null },
+      });
+    });
+
+    expect(findConversation(conversationId)?.lastMessage?.content).toBe(
+      'restored by authoritative refresh'
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears only the changed conversation scope and refreshes without a mounted message view', () => {
+    const otherConversationId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    useChatStore
+      .getState()
+      .setMessages(conversationId, [{ ...mockMessage, channel_id: conversationId }]);
+    useChatStore
+      .getState()
+      .setMessages(otherConversationId, [{ ...mockMessage, channel_id: otherConversationId }]);
+    seedConversation(conversationId, 'clear this preview');
+    seedConversation(otherConversationId, 'keep this preview');
+    const fetchSpy = vi
+      .spyOn(useDMStore.getState(), 'fetchConversations')
+      .mockResolvedValue(undefined);
+    const purgedSpy = vi.fn();
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    const handler = requireHandler(ws, 'dm_conversation_cleared');
+    globalThis.addEventListener('messages-purged', purgedSpy);
+    fetchSpy.mockClear();
+
+    act(() => {
+      handler({
+        type: 'dm_conversation_cleared',
+        data: { conversation_id: conversationId, cleared_at: '2026-09-23T20:00:00Z' },
+      });
+    });
+
+    expect(useChatStore.getState().messagesByChannel.get(conversationId)).toBeUndefined();
+    expect(useChatStore.getState().messagesByChannel.get(otherConversationId)).toHaveLength(1);
+    expect(findConversation(conversationId)?.lastMessage).toBeNull();
+    expect(findConversation(otherConversationId)?.lastMessage?.content).toBe('keep this preview');
+    expect(purgedSpy).toHaveBeenCalledTimes(1);
+    expect((purgedSpy.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      scopeId: conversationId,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    globalThis.removeEventListener('messages-purged', purgedSpy);
+  });
+
+  it('removes visibility listeners on unmount', () => {
+    const fetchSpy = vi
+      .spyOn(useDMStore.getState(), 'fetchConversations')
+      .mockResolvedValue(undefined);
+    const ws = createMockWsService();
+    const { unmount } = renderHook(() => useWebSocketMessages(ws as never));
+    unmount();
+
+    expect(ws.handlers.has('dm_conversation_hidden')).toBe(false);
+    expect(ws.handlers.has('dm_conversation_cleared')).toBe(false);
+
+    seedConversation(conversationId, 'must survive after unmount');
+    act(() => {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: conversationId } })
+      );
+    });
+    expect(findConversation(conversationId)?.lastMessage?.content).toBe(
+      'must survive after unmount'
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

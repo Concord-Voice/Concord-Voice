@@ -15,6 +15,7 @@ import { deferred } from '../../helpers/deferred';
 import { captureAuthLifecycle } from '@/renderer/services/system/postLoginHydrationLifecycle';
 
 const mockInvalidateChannelKey = vi.fn();
+const mockRevokeChannelAccess = vi.fn();
 
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
@@ -23,7 +24,7 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
     createChannelKeys: vi.fn(),
     clearKeys: vi.fn(),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
-    revokeChannelAccess: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    revokeChannelAccess: (...args: unknown[]) => mockRevokeChannelAccess(...args),
   },
 }));
 
@@ -210,8 +211,26 @@ describe('dmStore', () => {
       useDMStore.getState().removeConversation('conv-1');
 
       expect(useChatStore.getState().messagesByChannel.get('conv-1')).toBeUndefined();
-      expect(mockInvalidateChannelKey).toHaveBeenCalledOnce();
+      expect(mockRevokeChannelAccess).toHaveBeenCalledOnce();
+      expect(mockRevokeChannelAccess).toHaveBeenCalledWith('conv-1');
+    });
+
+    it('keeps membership usable when discarding a hidden conversation view', () => {
+      useDMStore.getState().addConversation(mockConversation);
+      useChatStore.getState().addMessage('conv-1', {
+        ...mockMessage,
+        id: 'hidden-dm-message',
+        channel_id: 'conv-1',
+      });
+      indexMessage('hidden-dm-message', 'hidden plaintext', 'conv-1');
+
+      useDMStore.getState().discardConversationView('conv-1');
+
+      expect(useDMStore.getState().conversations).toHaveLength(0);
+      expect(useChatStore.getState().messagesByChannel.has('conv-1')).toBe(false);
+      expect(isIndexed('hidden-dm-message')).toBe(false);
       expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-1');
+      expect(mockRevokeChannelAccess).not.toHaveBeenCalled();
     });
   });
 
@@ -760,6 +779,7 @@ describe('dmStore', () => {
 
       expect(mockInvalidateChannelKey).toHaveBeenCalledOnce();
       expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-1');
+      expect(mockRevokeChannelAccess).not.toHaveBeenCalled();
       expect(useChatStore.getState().messagesByChannel.has('conv-1')).toBe(false);
       expect(useChatStore.getState().messagesByChannel.has('conv-2')).toBe(true);
       expect(isIndexed('removed-dm-message')).toBe(false);
@@ -1316,9 +1336,9 @@ describe('dmStore', () => {
 
       useDMStore.getState().clearDMs();
 
-      expect(mockInvalidateChannelKey).toHaveBeenCalledTimes(2);
-      expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-1');
-      expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-2');
+      expect(mockRevokeChannelAccess).toHaveBeenCalledTimes(2);
+      expect(mockRevokeChannelAccess).toHaveBeenCalledWith('conv-1');
+      expect(mockRevokeChannelAccess).toHaveBeenCalledWith('conv-2');
       expect(useChatStore.getState().messagesByChannel.has('conv-1')).toBe(false);
       expect(isIndexed('conv-1-message')).toBe(false);
       expect(isIndexed('conv-2-message')).toBe(false);
@@ -1508,7 +1528,7 @@ describe('dmStore', () => {
         expect(useDMStore.getState().activeConversationId).toBeNull();
         expect(isIndexed('left-group-message')).toBe(false);
         expect(useChatStore.getState().messagesByChannel.get('group-1')).toBeUndefined();
-        expect(mockInvalidateChannelKey).toHaveBeenCalledWith('group-1');
+        expect(mockRevokeChannelAccess).toHaveBeenCalledWith('group-1');
       });
     });
 
@@ -1555,7 +1575,7 @@ describe('dmStore', () => {
 
         await useDMStore.getState().deleteGroup('group-1');
         expect(useDMStore.getState().conversations.find((c) => c.id === 'group-1')).toBeUndefined();
-        expect(mockInvalidateChannelKey).toHaveBeenCalledWith('group-1');
+        expect(mockRevokeChannelAccess).toHaveBeenCalledWith('group-1');
       });
 
       it('clears activeConversationId if deleted group was active', async () => {
@@ -1657,6 +1677,33 @@ describe('dmStore', () => {
     });
 
     describe('leaveGroup - edge cases', () => {
+      it('does not remove the successor account conversation after a deferred response', async () => {
+        const started = deferred();
+        const release = deferred();
+        useDMStore.getState().addConversation(mockGroupConv);
+        const { useUserStore } = await import('@/renderer/stores/auth/userStore');
+        useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
+        server.use(
+          http.delete(`${API_BASE}/api/v1/dm/conversations/group-1/members/user-1`, async () => {
+            started.resolve();
+            await release.promise;
+            return HttpResponse.json({ success: true });
+          })
+        );
+
+        const leavePromise = useDMStore.getState().leaveGroup('group-1');
+        await started.promise;
+        useAuthStore.getState().setAccessToken('successor-token');
+        useDMStore.setState({ conversations: [{ ...mockConversation, id: 'successor-dm' }] });
+        release.resolve();
+        await leavePromise;
+
+        expect(useDMStore.getState().conversations.map((conversation) => conversation.id)).toEqual([
+          'successor-dm',
+        ]);
+        expect(mockRevokeChannelAccess).not.toHaveBeenCalled();
+      });
+
       it('throws when user is not authenticated', async () => {
         const { useUserStore } = await import('@/renderer/stores/auth/userStore');
         useUserStore.setState({ user: null });

@@ -1679,6 +1679,28 @@
   color: var(--text-primary);
 }
 
+.dm-chat-header-thread-actions-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.dm-chat-header-thread-actions-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
 /* Join voice call header affordance (#1219 R5). Accent-styled pill so an
    active group call the user isn't in reads as an invitation, not a passive
    icon. Theme-aware via CSS custom properties. */
@@ -1998,6 +2020,8 @@
   padding: calc(8px * var(--sp, 1));
   border: none;
   border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 500;
   cursor: pointer;
@@ -2007,12 +2031,7 @@
   width: 100%;
 }
 
-.group-info-leave-btn {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
-.group-info-leave-btn:hover {
+.group-info-action-btn:hover {
   background: var(--bg-primary);
 }
 
@@ -2023,4 +2042,16 @@
 
 .group-info-delete-btn:hover {
   background: rgba(255, 70, 70, 0.1);
+}
+
+.group-info-actions-divider {
+  height: 1px;
+  margin: calc(6px * var(--sp, 1)) 0;
+  background: var(--border-color);
+}
+
+.dm-thread-actions {
+  display: flex;
+  flex-direction: column;
+  gap: calc(8px * var(--sp, 1));
 }

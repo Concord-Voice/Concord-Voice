@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import AppLayout from '../Layout/AppLayout';
 import ServerBar from '../Layout/ServerBar';
 import FolderBar from '../Layout/FolderBar';
@@ -16,7 +16,10 @@ import ServerContextMenu from '../Servers/ServerContextMenu';
 import { selectSidebarDock, useLayoutStore } from '../../stores/ui/layoutStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useDMStore } from '../../stores/chat/dmStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import { ServerWithRole } from '../../types/server';
+import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
+import DMThreadRemovalDialog, { type DMThreadRemovalTarget } from './DMThreadRemovalDialog';
 
 const DirectMessagesView: React.FC = () => {
   const activeConversationId = useDMStore((s) => s.activeConversationId);
@@ -40,6 +43,49 @@ const DirectMessagesView: React.FC = () => {
   const [isServerActionModalOpen, setIsServerActionModalOpen] = useState(false);
   const [isCreateServerModalOpen, setIsCreateServerModalOpen] = useState(false);
   const [isJoinServerModalOpen, setIsJoinServerModalOpen] = useState(false);
+  const [removalTarget, setRemovalTarget] = useState<DMThreadRemovalTarget | null>(null);
+  const removalTargetRef = useRef<DMThreadRemovalTarget | null>(null);
+  removalTargetRef.current = removalTarget;
+  const focusAfterRemovalRef = useRef<string | null>(null);
+  const authGeneration = useAuthStore((s) => s.authGeneration);
+
+  useEffect(() => {
+    const conversationId = focusAfterRemovalRef.current;
+    if (removalTarget || conversationId === null) return;
+    focusAfterRemovalRef.current = null;
+    const inThreadTrigger =
+      activeConversationId === conversationId
+        ? document.querySelector<HTMLButtonElement>('.dm-chat-header-thread-actions-btn')
+        : null;
+    const survivingInvoker = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(
+        `[data-context-area="${DIRECT_MESSAGES_CONTEXT_AREA}"] .conversation-item[data-conversation-id]`
+      )
+    ).find((element) => element.dataset.conversationId === conversationId);
+    const search =
+      document.querySelector<HTMLInputElement>(
+        '.conversation-list:not(.conversation-list--compact) .conversation-search input'
+      ) ??
+      document.querySelector<HTMLButtonElement>(
+        '.conversation-list--compact .conversation-search-trigger'
+      );
+    let focusTarget = search;
+    if (survivingInvoker?.isConnected) focusTarget = survivingInvoker;
+    if (inThreadTrigger?.isConnected) focusTarget = inThreadTrigger;
+    focusTarget?.focus();
+  }, [activeConversationId, removalTarget]);
+
+  useEffect(() => {
+    focusAfterRemovalRef.current = null;
+    if (!removalTargetRef.current) return;
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- a destructive target belongs only to its captured account
+    setRemovalTarget(null);
+  }, [authGeneration]);
+
+  const requestRemoval = (target: DMThreadRemovalTarget) => {
+    focusAfterRemovalRef.current = target.conversation.id;
+    setRemovalTarget(target);
+  };
 
   // Server context menu
   const [contextMenu, setContextMenu] = useState<{
@@ -103,7 +149,7 @@ const DirectMessagesView: React.FC = () => {
             className="main-content"
             data-has-persistent-bar={showPersistentVoiceBar || undefined}
           >
-            <DMChatArea selectedThreadId={activeConversationId} />
+            <DMChatArea selectedThreadId={activeConversationId} onRequestRemoval={requestRemoval} />
             {showPersistentVoiceBar && <PersistentVoiceBar />}
             {showFloatingAvatar && (
               <div className="floating-user-avatar">
@@ -114,6 +160,16 @@ const DirectMessagesView: React.FC = () => {
         }
         memberSpace={<FriendsFlexSpace onFriendClick={handleFriendClick} />}
       />
+
+      {removalTarget && (
+        <DMThreadRemovalDialog
+          target={removalTarget}
+          onClose={() => setRemovalTarget(null)}
+          onRemoved={() => {
+            setRemovalTarget(null);
+          }}
+        />
+      )}
 
       {/* Server management modals */}
       <ServerActionModal

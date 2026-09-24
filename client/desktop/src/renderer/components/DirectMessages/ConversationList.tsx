@@ -26,6 +26,7 @@ import CreateGroupModal from './CreateGroupModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
 import DMConversationContextMenu from './DMConversationContextMenu';
+import DMThreadRemovalDialog, { type DMThreadRemovalTarget } from './DMThreadRemovalDialog';
 import DMProfileModal from './DMProfileModal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import Modal from '../ui/Modal';
@@ -314,6 +315,7 @@ const CompactConversationItem: React.FC<ConversationItemViewProps> = ({
     <button
       type="button"
       className={`conversation-item conversation-item--compact${selected ? ' active' : ''}${showUnread ? ' unread' : ''}`}
+      data-conversation-id={conv.id}
       aria-label={ariaLabel}
       title={name}
       onClick={onSelect}
@@ -379,6 +381,7 @@ const StandardConversationItem: React.FC<StandardConversationItemProps> = ({
     <button
       type="button"
       className={`conversation-item${selected ? ' active' : ''}${showUnread ? ' unread' : ''}`}
+      data-conversation-id={conv.id}
       onClick={onSelect}
       onContextMenu={onContextMenu}
       onKeyDown={(event) => {
@@ -511,6 +514,8 @@ const ConversationList: React.FC<ConversationListProps> = ({
   onSelectThread,
 }) => {
   const [search, setSearch] = useState('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchTriggerRef = useRef<HTMLButtonElement>(null);
   const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
   const searchTriggerId = useId();
   const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false);
@@ -531,6 +536,10 @@ const ConversationList: React.FC<ConversationListProps> = ({
   // DM Profile modal target (#1208). Same lifted-state pattern as block/unfriend
   // so the modal continues rendering after the context menu unmounts.
   const [profileTarget, setProfileTarget] = useState<DMConversation | null>(null);
+  const [removalTarget, setRemovalTarget] = useState<DMThreadRemovalTarget | null>(null);
+  const removalTargetRef = useRef<DMThreadRemovalTarget | null>(null);
+  removalTargetRef.current = removalTarget;
+  const focusAfterRemovalRef = useRef<string | null>(null);
   const blockUser = useFriendStore((s) => s.blockUser);
   const removeFriend = useFriendStore((s) => s.removeFriend);
   const friends = useFriendStore((s) => s.friends);
@@ -545,6 +554,26 @@ const ConversationList: React.FC<ConversationListProps> = ({
   const currentExpirationTarget = expirationTarget
     ? (conversations.find((conversation) => conversation.id === expirationTarget.id) ?? null)
     : null;
+
+  useEffect(() => {
+    const conversationId = focusAfterRemovalRef.current;
+    if (removalTarget !== null || conversationId === null) return;
+    focusAfterRemovalRef.current = null;
+    const survivingInvoker = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('.conversation-item[data-conversation-id]')
+    ).find((element) => element.dataset.conversationId === conversationId);
+    const focusTarget =
+      (survivingInvoker?.isConnected ? survivingInvoker : null) ??
+      (compact ? searchTriggerRef.current : searchInputRef.current);
+    focusTarget?.focus();
+  }, [compact, removalTarget]);
+
+  useEffect(() => {
+    focusAfterRemovalRef.current = null;
+    if (!removalTargetRef.current) return;
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- an account-scoped destructive target must not survive its auth owner
+    setRemovalTarget(null);
+  }, [authGeneration]);
   const expiration = useExpirationPolicy(
     currentExpirationTarget &&
       !currentExpirationTarget.isGroup &&
@@ -784,6 +813,18 @@ const ConversationList: React.FC<ConversationListProps> = ({
       onBlockUser={(conv) => setBlockTarget(conv)}
       onUnfriend={(conv) => setUnfriendTarget(conv)}
       onViewProfile={(conv) => setProfileTarget(conv)}
+      onHideThread={(conv) => {
+        focusAfterRemovalRef.current = conv.id;
+        setRemovalTarget({ conversation: conv, action: 'hide' });
+      }}
+      onClearHistory={(conv) => {
+        focusAfterRemovalRef.current = conv.id;
+        setRemovalTarget({ conversation: conv, action: 'clear' });
+      }}
+      onLeaveGroup={(conv) => {
+        focusAfterRemovalRef.current = conv.id;
+        setRemovalTarget({ conversation: conv, action: 'leave' });
+      }}
       onPurgeMessages={(conv) => setPurgeTarget(conv)}
       onMessageExpiration={(conv) => setExpirationTarget(conv)}
     />
@@ -797,6 +838,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
       {compact && (
         <>
           <button
+            ref={searchTriggerRef}
             id={`${searchTriggerId}-thread-search`}
             type="button"
             className="conversation-item conversation-item--compact conversation-search-trigger"
@@ -822,6 +864,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
           >
             <div className="conversation-search conversation-search--popover">
               <input
+                ref={searchInputRef}
                 type="text"
                 placeholder="Search conversations..."
                 value={search}
@@ -845,6 +888,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
       {!compact && (
         <div className="conversation-search">
           <input
+            ref={searchInputRef}
             type="text"
             placeholder="Search conversations..."
             value={search}
@@ -914,6 +958,16 @@ const ConversationList: React.FC<ConversationListProps> = ({
           ))}
       <CreateGroupModal isOpen={isCreateGroupOpen} onClose={() => setIsCreateGroupOpen(false)} />
       {contextMenuElement}
+
+      {removalTarget && (
+        <DMThreadRemovalDialog
+          target={removalTarget}
+          onClose={() => setRemovalTarget(null)}
+          onRemoved={() => {
+            setRemovalTarget(null);
+          }}
+        />
+      )}
 
       {currentExpirationTarget && (
         <Modal isOpen={true} onClose={() => setExpirationTarget(null)} title="Message expiration">

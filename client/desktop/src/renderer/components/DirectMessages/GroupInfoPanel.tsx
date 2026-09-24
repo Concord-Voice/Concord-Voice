@@ -5,14 +5,20 @@ import { useUserStore } from '../../stores/auth/userStore';
 import GroupMemberItem from './GroupMemberItem';
 import EditGroupModal from './EditGroupModal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import type { DMThreadRemovalTarget } from './DMThreadRemovalDialog';
 import './DirectMessages.css';
 
 interface GroupInfoPanelProps {
   conversation: DMConversation;
   onClose: () => void;
+  onRequestRemoval: (target: DMThreadRemovalTarget) => void;
 }
 
-const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }) => {
+const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({
+  conversation,
+  onClose,
+  onRequestRemoval,
+}) => {
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -49,16 +55,6 @@ const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }
     },
     [conversation.id]
   );
-
-  const handleLeaveGroup = useCallback(async () => {
-    if (!confirm('Are you sure you want to leave this group?')) return;
-    setActionError(null);
-    try {
-      await useDMStore.getState().leaveGroup(conversation.id);
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to leave group');
-    }
-  }, [conversation.id]);
 
   const handleDeleteGroup = useCallback(async () => {
     if (!confirm('Are you sure you want to delete this group? This cannot be undone.')) return;
@@ -128,12 +124,20 @@ const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }
         <div className="group-info-actions">
           <button
             type="button"
-            className="group-info-action-btn group-info-leave-btn"
-            onClick={handleLeaveGroup}
+            className="group-info-action-btn"
+            onClick={() => onRequestRemoval({ conversation, action: 'hide' })}
           >
-            <LogOut size={14} />
-            Leave Group
+            Hide thread
           </button>
+          <button
+            type="button"
+            className="group-info-action-btn"
+            onClick={() => onRequestRemoval({ conversation, action: 'clear' })}
+          >
+            Clear history for me
+          </button>
+
+          <div className="group-info-actions-divider" aria-hidden="true" />
 
           {/* Purge Messages — always available: authorization is
               participant-based, not RBAC. Only the copy differs by role, and
@@ -145,6 +149,15 @@ const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }
           >
             <Eraser size={14} />
             Purge Messages
+          </button>
+
+          <button
+            type="button"
+            className="group-info-action-btn"
+            onClick={() => onRequestRemoval({ conversation, action: 'leave' })}
+          >
+            <LogOut size={14} />
+            Leave Group
           </button>
 
           {(isCreator || isCurrentUserAdmin) && (
