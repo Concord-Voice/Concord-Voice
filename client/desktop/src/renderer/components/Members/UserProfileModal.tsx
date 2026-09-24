@@ -1,9 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { use, useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/system/apiClient';
 import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
+import { ModalPortalHostContext } from '../ui/ModalContext';
 import './UserProfileModal.css';
 
 interface UserProfileModalProps {
@@ -68,6 +70,7 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
   const [profile, setProfile] = useState<PublicProfile | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(false);
   const overlayRef = useRef<HTMLDivElement>(null);
+  const portalHost = use(ModalPortalHostContext);
 
   const displayName = member.display_name || member.username;
   const roleLabel = member.role.charAt(0).toUpperCase() + member.role.slice(1);
@@ -138,7 +141,10 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
 
   const links = profile?.links?.filter((l: string) => l?.trim()) || [];
 
-  return (
+  // Portaled like ui/Modal: rendered in place it inherited the font of the
+  // area that opened it (Navigation or Messages, #2366) instead of Interface.
+  // The host context keeps it inside a top-layer settings dialog.
+  return createPortal(
     <div className="user-profile-overlay" ref={overlayRef} onClick={handleOverlayClick}>
       <div className="user-profile-container" {...scopeProps} style={scopeProps.style}>
         {/* Banner + Close Button */}
@@ -304,7 +310,8 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    portalHost ?? document.body
   );
 };
 

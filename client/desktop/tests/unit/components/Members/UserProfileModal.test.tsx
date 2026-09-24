@@ -14,6 +14,7 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 }));
 
 import UserProfileModal from '@/renderer/components/Members/UserProfileModal';
+import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
 import type { ServerMember } from '@/renderer/stores/chat/memberStore';
 
 // Match SafeLink.test.tsx's pattern: tests/setup.ts installs a base
@@ -68,6 +69,8 @@ describe('UserProfileModal', () => {
       />
     );
     expect(container.firstChild).toBeNull();
+    // The modal portals to document.body, so the container alone proves nothing.
+    expect(document.querySelector('.user-profile-overlay')).toBeNull();
   });
 
   it('renders modal content when isOpen is true', async () => {
@@ -309,7 +312,7 @@ describe('UserProfileModal', () => {
   });
 
   it('closes when clicking overlay background', () => {
-    const { container } = render(
+    render(
       <UserProfileModal
         isOpen={true}
         onClose={mockOnClose}
@@ -317,7 +320,7 @@ describe('UserProfileModal', () => {
         presenceStatus="online"
       />
     );
-    const overlay = container.querySelector('.user-profile-overlay');
+    const overlay = document.querySelector('.user-profile-overlay');
     fireEvent.click(overlay!);
     expect(mockOnClose).toHaveBeenCalled();
   });
@@ -645,6 +648,43 @@ describe('UserProfileModal', () => {
       const link = screen.getByText('github.com/test').closest('a');
       expect(link).toHaveAttribute('target', '_blank');
       expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    });
+  });
+
+  // #2366: rendered in place, the overlay inherited the font of the area that
+  // opened it (Navigation or Messages). It must portal out like ui/Modal.
+  describe('portal', () => {
+    it('renders outside the region that opened it', () => {
+      render(
+        <div className="message-list">
+          <UserProfileModal
+            isOpen={true}
+            onClose={mockOnClose}
+            member={mockMember}
+            presenceStatus="online"
+          />
+        </div>
+      );
+      const root = document.querySelector('.user-profile-overlay');
+      expect(root?.parentElement).toBe(document.body);
+      expect(root?.closest('.message-list')).toBeNull();
+    });
+
+    it('renders into a modal portal host when one is provided', () => {
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      render(
+        <ModalPortalHostContext.Provider value={host}>
+          <UserProfileModal
+            isOpen={true}
+            onClose={mockOnClose}
+            member={mockMember}
+            presenceStatus="online"
+          />
+        </ModalPortalHostContext.Provider>
+      );
+      expect(host.querySelector('.user-profile-overlay')).not.toBeNull();
+      host.remove();
     });
   });
 });

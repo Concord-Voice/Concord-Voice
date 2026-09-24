@@ -172,7 +172,7 @@
   border-radius: 6px;
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: var(--font-body-stack);
+  font-family: inherit;
   font-size: calc(14px * var(--font-scale, 1));
   transition:
     border-color 0.15s ease,

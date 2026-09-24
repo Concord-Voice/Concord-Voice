@@ -6,14 +6,20 @@
 // (the runtime import edge stays one-way settingsStore → effectiveFont).
 import type { AppearanceSettings } from '../../stores/ui/settingsStore';
 
-export type AppFontId =
-  | 'default' // Concord Voice Default (brand) — ALSO the "no explicit pick" sentinel
-  | 'system' // OS UI font stack
-  | 'opendyslexic'
-  | 'inter'
-  | 'lexend'
-  | 'lato' // already bundled (Agency body)
-  | 'atkinson'; // already bundled — CSS family 'Atkinson Hyperlegible Next'
+/** Every AppFontId. The type derives from this list, so storage/sync validation
+ *  (isAppFontId) can never lag a newly added face (#2366). */
+export const APP_FONT_IDS = [
+  'default', // Concord Voice Default (brand) — ALSO the "no explicit pick" sentinel
+  'sourcesans', // #2366: explicit Source Sans pick — distinct from the 'default' no-pick sentinel
+  'system', // OS UI font stack
+  'opendyslexic',
+  'inter',
+  'lexend',
+  'lato', // already bundled (Agency body)
+  'atkinson', // already bundled — CSS family 'Atkinson Hyperlegible Next'
+] as const;
+
+export type AppFontId = (typeof APP_FONT_IDS)[number];
 
 export const DYSLEXIA_FONT: AppFontId = 'opendyslexic';
 export const APP_DEFAULT_FONT: AppFontId = 'default';
@@ -82,8 +88,85 @@ const SCHEME_FONTS: Partial<Record<AppearanceSettings['colorScheme'], AppFontId>
 export function themeBundledFontFor(
   colorScheme: AppearanceSettings['colorScheme']
 ): AppFontId | null {
-  return SCHEME_FONTS[colorScheme] ?? null;
+  // Own-key lookup: a corrupted persisted or synced scheme such as
+  // 'constructor' must not resolve to an Object.prototype member.
+  return Object.hasOwn(SCHEME_FONTS, colorScheme) ? (SCHEME_FONTS[colorScheme] ?? null) : null;
 }
 
 /** The shipped C1 configuration: an explicit user pick wins over a theme font (Q1). */
 export const RESOLVER_CONFIG: FontResolverConfig = { themeVsUser: 'user-wins' };
+
+export function isAppFontId(value: unknown): value is AppFontId {
+  return typeof value === 'string' && (APP_FONT_IDS as readonly string[]).includes(value);
+}
+
+/** 'one' applies `appFont` everywhere; 'area' applies the per-area keys (#2366). */
+export type FontMode = 'one' | 'area';
+
+export function isFontMode(value: unknown): value is FontMode {
+  return value === 'one' || value === 'area';
+}
+
+/** The wordmark follows the theme's face unless Dyslexic Support is on. */
+export type BrandFontId = 'default' | 'opendyslexic';
+
+export interface FontLayersInput extends FontResolverInput {
+  fontMode: FontMode;
+  fontHeadings: AppFontId;
+  fontNavigation: AppFontId;
+  fontMessages: AppFontId;
+}
+
+export interface FontLayers {
+  interface: AppFontId;
+  headings: AppFontId;
+  navigation: AppFontId;
+  messages: AppFontId;
+  brand: BrandFontId;
+  pickerLocked: boolean;
+  lockReason: FontResolution['lockReason'];
+}
+
+/**
+ * One resolver call for every font layer (#2366). Interface precedence is exactly
+ * `resolveEffectiveFont`'s; the other layers are decided here and nowhere else.
+ * 'default' on a layer means "no override": Headings keep the theme's display face,
+ * Navigation and Messages match the rest of the app.
+ */
+export function resolveFontLayers(input: FontLayersInput, cfg: FontResolverConfig): FontLayers {
+  const base = resolveEffectiveFont(input, cfg);
+  if (base.lockReason === 'dyslexic') {
+    return {
+      interface: DYSLEXIA_FONT,
+      headings: DYSLEXIA_FONT,
+      navigation: DYSLEXIA_FONT,
+      messages: DYSLEXIA_FONT,
+      brand: 'opendyslexic',
+      pickerLocked: true,
+      lockReason: 'dyslexic',
+    };
+  }
+  const shared = {
+    interface: base.effective,
+    brand: 'default' as const,
+    pickerLocked: base.pickerLocked,
+    lockReason: base.lockReason,
+  };
+  if (input.fontMode === 'area') {
+    return {
+      ...shared,
+      headings: input.fontHeadings,
+      navigation: input.fontNavigation,
+      messages: input.fontMessages,
+    };
+  }
+  // One Font: an explicit pick also drives headings; the regions inherit, so they need
+  // no override. A theme-bundled font is a body font — it never reaches headings, and
+  // under theme-wins a pick the theme overrode must not reach them either.
+  return {
+    ...shared,
+    headings: base.lockReason === 'theme' ? APP_DEFAULT_FONT : input.appFont,
+    navigation: APP_DEFAULT_FONT,
+    messages: APP_DEFAULT_FONT,
+  };
+}

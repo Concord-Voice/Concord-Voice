@@ -1,4 +1,6 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { use, useEffect, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { ModalPortalHostContext } from './ModalContext';
 import './ContextMenu.css';
 
 /* ------------------------------------------------------------------ */
@@ -41,6 +43,7 @@ function fitToViewport(el: HTMLElement, height: number, viewportHeight: number):
 
 const ContextMenuRoot: React.FC<ContextMenuProps> = ({ position, onClose, children }) => {
   const menuRef = useRef<HTMLDivElement>(null);
+  const portalHost = use(ModalPortalHostContext);
   const [closing, setClosing] = useState(false);
   const closingRef = useRef(false);
 
@@ -103,7 +106,10 @@ const ContextMenuRoot: React.FC<ContextMenuProps> = ({ position, onClose, childr
     fitToViewport(el, height, viewportHeight);
   }, [position]);
 
-  return (
+  // Portaled like Modal: rendered in place, a menu opened from the member list or a
+  // message inherited that area's font (#2366) instead of Interface. The host
+  // context keeps it inside a top-layer settings dialog.
+  return createPortal(
     <div className={`ctx-menu-overlay ${closing ? 'ctx-menu-overlay-closing' : ''}`}>
       <div
         ref={menuRef}
@@ -112,7 +118,8 @@ const ContextMenuRoot: React.FC<ContextMenuProps> = ({ position, onClose, childr
       >
         {children}
       </div>
-    </div>
+    </div>,
+    portalHost ?? document.body
   );
 };
 

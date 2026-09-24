@@ -34,4 +34,23 @@ describe('draft font preview + revert', () => {
     expect(useSettingsStore.getState().appearance.appFont).toBe('lexend');
     expect(document.documentElement.dataset.appfont).toBe('lexend');
   });
+
+  it('write-through and Revert cover the four #2366 keys', () => {
+    useDraftSettingsStore.getState().initialize();
+    setDraftAppearanceSetting('fontMode', 'area');
+    setDraftAppearanceSetting('fontHeadings', 'lexend');
+    setDraftAppearanceSetting('fontNavigation', 'inter');
+    setDraftAppearanceSetting('fontMessages', 'lato');
+    const d = document.documentElement.dataset;
+    expect([d.fontHeadings, d.fontNav, d.fontMessages]).toEqual(['lexend', 'inter', 'lato']);
+
+    useDraftSettingsStore.getState().revert();
+    expect(useSettingsStore.getState().appearance).toMatchObject({
+      fontMode: 'one',
+      fontHeadings: 'default',
+      fontNavigation: 'default',
+      fontMessages: 'default',
+    });
+    expect(d.fontHeadings).toBe('default');
+  });
 });

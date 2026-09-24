@@ -113,6 +113,34 @@ describe('schemeColors', () => {
 
   // --- resolveUserThemeScope ---
 
+  describe('member-controlled values (#2366 review)', () => {
+    // Another member's colour_scheme JSON reaches inline style custom properties.
+    const custom = (a: string, b = '#112233') =>
+      JSON.stringify({ scheme: 'custom', accentPrimary: a, accentSecondary: b });
+
+    it('ignores custom accents that are not #rrggbb', () => {
+      for (const bad of [
+        'url(https://example.com/x.png)',
+        'red',
+        '#12345',
+        '#1234567',
+        'var(--x)',
+      ]) {
+        expect(resolveUserAccentColors(custom(bad))).toBeNull();
+        expect(resolveUserAccentColors(custom('#112233', bad))).toBeNull();
+        expect(resolveUserThemeScope(custom(bad)).customStyles).toBeUndefined();
+      }
+      expect(resolveUserAccentColors(custom('#AABBCC'))?.accentPrimary).toBe('#AABBCC');
+      expect(resolveUserThemeScope(custom('#aabbcc')).customStyles).toBeDefined();
+    });
+
+    it('does not treat an Object member name as a preset scheme', () => {
+      for (const scheme of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+        expect(resolveUserAccentColors(JSON.stringify({ scheme }))).toBeNull();
+      }
+    });
+  });
+
   describe('resolveUserThemeScope', () => {
     it('returns concord/dark fallback for null input', () => {
       const result = resolveUserThemeScope(null);

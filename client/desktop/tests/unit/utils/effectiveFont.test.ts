@@ -3,6 +3,12 @@ import {
   resolveEffectiveFont,
   themeBundledFontFor,
   RESOLVER_CONFIG,
+  resolveFontLayers,
+  APP_FONT_IDS,
+  isAppFontId,
+  isFontMode,
+  type AppFontId,
+  type FontMode,
 } from '@/renderer/utils/ui/effectiveFont';
 
 const userWins = { themeVsUser: 'user-wins' as const };
@@ -112,5 +118,164 @@ describe('resolveEffectiveFont', () => {
         RESOLVER_CONFIG
       )
     ).toEqual({ effective: 'opendyslexic', pickerLocked: true, lockReason: 'dyslexic' });
+  });
+});
+
+describe('resolveFontLayers (#2366)', () => {
+  const base = {
+    dyslexicSupport: false,
+    appFont: 'default' as AppFontId,
+    themeBundledFont: null as AppFontId | null,
+    fontMode: 'one' as FontMode,
+    fontHeadings: 'default' as AppFontId,
+    fontNavigation: 'default' as AppFontId,
+    fontMessages: 'default' as AppFontId,
+  };
+
+  it('One Font with no pick is today: every layer at its default', () => {
+    expect(resolveFontLayers(base, RESOLVER_CONFIG)).toEqual({
+      interface: 'default',
+      headings: 'default',
+      navigation: 'default',
+      messages: 'default',
+      brand: 'default',
+      pickerLocked: false,
+      lockReason: null,
+    });
+  });
+
+  it('One Font with an explicit pick moves interface AND headings; regions and brand stay default', () => {
+    expect(resolveFontLayers({ ...base, appFont: 'inter' }, RESOLVER_CONFIG)).toMatchObject({
+      interface: 'inter',
+      headings: 'inter',
+      navigation: 'default',
+      messages: 'default',
+      brand: 'default',
+    });
+  });
+
+  it('One Font keeps per-area picks stored but does not apply them', () => {
+    const r = resolveFontLayers(
+      { ...base, fontHeadings: 'lexend', fontNavigation: 'lato', fontMessages: 'inter' },
+      RESOLVER_CONFIG
+    );
+    expect(r).toMatchObject({ headings: 'default', navigation: 'default', messages: 'default' });
+  });
+
+  it('Font by Area applies each area independently; interface still comes from appFont', () => {
+    const r = resolveFontLayers(
+      {
+        ...base,
+        fontMode: 'area',
+        appFont: 'atkinson',
+        fontHeadings: 'lexend',
+        fontNavigation: 'inter',
+        fontMessages: 'sourcesans',
+      },
+      RESOLVER_CONFIG
+    );
+    expect(r).toMatchObject({
+      interface: 'atkinson',
+      headings: 'lexend',
+      navigation: 'inter',
+      messages: 'sourcesans',
+      brand: 'default',
+    });
+  });
+
+  it('a theme-bundled font drives interface only; headings keep the theme face (Agency, no pick)', () => {
+    expect(
+      resolveFontLayers({ ...base, themeBundledFont: 'atkinson' }, RESOLVER_CONFIG)
+    ).toMatchObject({
+      interface: 'atkinson',
+      headings: 'default',
+      pickerLocked: true,
+      lockReason: 'theme',
+    });
+  });
+
+  it('Dyslexic Support makes every layer, brand included, OpenDyslexic in either mode', () => {
+    for (const fontMode of ['one', 'area'] as const) {
+      expect(
+        resolveFontLayers(
+          { ...base, fontMode, dyslexicSupport: true, appFont: 'inter', fontHeadings: 'lexend' },
+          RESOLVER_CONFIG
+        )
+      ).toEqual({
+        interface: 'opendyslexic',
+        headings: 'opendyslexic',
+        navigation: 'opendyslexic',
+        messages: 'opendyslexic',
+        brand: 'opendyslexic',
+        pickerLocked: true,
+        lockReason: 'dyslexic',
+      });
+    }
+  });
+
+  it('Font by Area keeps a theme-bundled body font on Interface', () => {
+    const agency = {
+      ...base,
+      fontMode: 'area' as FontMode,
+      themeBundledFont: 'atkinson' as AppFontId,
+    };
+    expect(resolveFontLayers(agency, RESOLVER_CONFIG)).toMatchObject({
+      interface: 'atkinson',
+      headings: 'default',
+      lockReason: 'theme',
+    });
+    expect(resolveFontLayers({ ...agency, appFont: 'inter' }, RESOLVER_CONFIG)).toMatchObject({
+      interface: 'inter',
+      lockReason: null,
+    });
+  });
+
+  it('theme-wins: a pick the theme overrode does not reach headings either', () => {
+    const input = {
+      ...base,
+      appFont: 'inter' as AppFontId,
+      themeBundledFont: 'atkinson' as AppFontId,
+    };
+    expect(resolveFontLayers(input, themeWins)).toMatchObject({
+      interface: 'atkinson',
+      headings: 'default',
+      lockReason: 'theme',
+    });
+    // user-wins is unchanged: the pick drives both.
+    expect(resolveFontLayers(input, userWins)).toMatchObject({
+      interface: 'inter',
+      headings: 'inter',
+    });
+  });
+
+  it('an ordinary OpenDyslexic PICK goes everywhere except the wordmark', () => {
+    expect(resolveFontLayers({ ...base, appFont: 'opendyslexic' }, RESOLVER_CONFIG)).toMatchObject({
+      interface: 'opendyslexic',
+      headings: 'opendyslexic',
+      brand: 'default',
+    });
+  });
+});
+
+describe('font id and mode guards (#2366)', () => {
+  it('accepts every declared id and rejects anything else', () => {
+    expect(APP_FONT_IDS).toContain('sourcesans');
+    for (const id of APP_FONT_IDS) expect(isAppFontId(id)).toBe(true);
+    for (const bad of ['', 'comic-sans', 'Default', 42, null, undefined]) {
+      expect(isAppFontId(bad)).toBe(false);
+    }
+  });
+
+  it('a scheme named after an Object member has no bundled font', () => {
+    for (const key of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect(themeBundledFontFor(key as Parameters<typeof themeBundledFontFor>[0])).toBeNull();
+    }
+    expect(themeBundledFontFor('agency')).toBe('atkinson');
+  });
+
+  it("accepts 'one' and 'area' only", () => {
+    expect(isFontMode('one')).toBe(true);
+    expect(isFontMode('area')).toBe(true);
+    for (const bad of ['basic', 'advanced', '', null, 1]) expect(isFontMode(bad)).toBe(false);
   });
 });

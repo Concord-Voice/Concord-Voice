@@ -9,6 +9,10 @@ let mockAppFont = 'default';
 let mockColorScheme = 'concord';
 let mockDyslexicSupport = false;
 let mockFontSize = 'default';
+let mockFontMode = 'one';
+let mockFontHeadings = 'default';
+let mockFontNavigation = 'default';
+let mockFontMessages = 'default';
 
 vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAppearance: vi.fn(() => ({
@@ -22,6 +26,11 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
     customColors: null,
     appFont: mockAppFont,
     dyslexicSupport: mockDyslexicSupport,
+    gifPlayback: 'auto',
+    fontMode: mockFontMode,
+    fontHeadings: mockFontHeadings,
+    fontNavigation: mockFontNavigation,
+    fontMessages: mockFontMessages,
   })),
   setDraftAppearanceSetting: (...args: unknown[]) => mockSetDraftAppearanceSetting(...args),
 }));
@@ -33,6 +42,10 @@ beforeEach(() => {
   mockColorScheme = 'concord';
   mockDyslexicSupport = false;
   mockFontSize = 'default';
+  mockFontMode = 'one';
+  mockFontHeadings = 'default';
+  mockFontNavigation = 'default';
+  mockFontMessages = 'default';
   mockSetDraftAppearanceSetting.mockClear();
   useSettingsNavStore.getState().clearFocusRequest();
 });
@@ -165,5 +178,123 @@ describe('FontSection — Font Size (moved from Accessibility, #2367)', () => {
     expect(small).not.toHaveAttribute('aria-disabled');
     fireEvent.click(small);
     expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('fontSize', 'small');
+  });
+});
+
+describe('FontSection — One Font / Font by Area (#2366)', () => {
+  const rows = (container: HTMLElement) => [
+    ...container.querySelectorAll<HTMLDetailsElement>('details.font-area-row'),
+  ];
+  const row = (container: HTMLElement, name: string) => {
+    const r = rows(container).find((d) => d.querySelector('.font-area-name')?.textContent === name);
+    if (!r) throw new Error(`no ${name} row`);
+    return r;
+  };
+
+  it('renders the mode as a radio pair with One Font checked, and no area rows', () => {
+    const { container } = render(<FontSection />);
+    expect(screen.getByRole('radio', { name: 'One Font' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Font by Area' })).not.toBeChecked();
+    expect(rows(container)).toHaveLength(0);
+    expect(screen.getByRole('button', { name: /Concord Voice Default/i })).toBeInTheDocument();
+  });
+
+  it('choosing Font by Area writes fontMode', () => {
+    render(<FontSection />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Font by Area' }));
+    expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('fontMode', 'area');
+  });
+
+  it('Font by Area renders four rows in one exclusive group, each showing its current font', () => {
+    mockFontMode = 'area';
+    mockFontHeadings = 'lexend';
+    const { container } = render(<FontSection />);
+    expect(rows(container).map((d) => d.querySelector('.font-area-name')?.textContent)).toEqual([
+      'Messages',
+      'Headings',
+      'Navigation',
+      'Interface',
+    ]);
+    expect(rows(container).every((d) => d.getAttribute('name') === 'font-areas')).toBe(true);
+    expect(
+      within(row(container, 'Headings')).getByText('Lexend', { selector: '.font-area-current' })
+    ).toBeInTheDocument();
+    expect(
+      within(row(container, 'Messages')).getByText('Match the app', {
+        selector: '.font-area-current',
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('picking a font inside an area row writes that area key', () => {
+    mockFontMode = 'area';
+    const { container } = render(<FontSection />);
+    fireEvent.click(within(row(container, 'Navigation')).getByRole('button', { name: /^Inter/ }));
+    expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('fontNavigation', 'inter');
+  });
+
+  it('the Interface row writes appFont and area lists offer Source Sans, One Font does not', () => {
+    mockFontMode = 'area';
+    const { container } = render(<FontSection />);
+    fireEvent.click(within(row(container, 'Interface')).getByRole('button', { name: /^Inter/ }));
+    expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('appFont', 'inter');
+    expect(
+      within(row(container, 'Headings')).getByRole('button', { name: /^Source Sans/ })
+    ).toBeInTheDocument();
+    expect(
+      within(row(container, 'Interface')).queryByRole('button', { name: /^Source Sans/ })
+    ).toBeNull();
+  });
+
+  it('shows the theme badge on Headings "Theme default" under Agency, never on Messages or Navigation', () => {
+    mockFontMode = 'area';
+    mockColorScheme = 'agency';
+    const { container } = render(<FontSection />);
+    const badge = (name: string) =>
+      within(row(container, name)).queryAllByText('Provided by the active theme');
+    expect(badge('Headings')).toHaveLength(1);
+    expect(badge('Messages')).toHaveLength(0);
+    expect(badge('Navigation')).toHaveLength(0);
+    expect(badge('Interface')).toHaveLength(1);
+  });
+
+  it('under Agency the Interface row reads the theme font; a stored Source Sans keeps its name', () => {
+    mockFontMode = 'area';
+    mockColorScheme = 'agency';
+    const { container, rerender } = render(<FontSection />);
+    const current = () => row(container, 'Interface').querySelector('.font-area-current');
+    expect(current()).toHaveTextContent('Atkinson Hyperlegible Next');
+    mockColorScheme = 'concord';
+    mockAppFont = 'sourcesans';
+    rerender(<FontSection />);
+    expect(current()).toHaveTextContent('Source Sans');
+  });
+
+  it('the saved-choices notice appears only in One Font with a non-default area pick', () => {
+    const { rerender } = render(<FontSection />);
+    // A native <output>: its implicit role is status, so it is a polite live region.
+    const status = screen.getByRole('status');
+    expect(status.tagName).toBe('OUTPUT');
+    expect(status).toBeEmptyDOMElement();
+    mockFontMessages = 'lato';
+    rerender(<FontSection />);
+    expect(status).toHaveTextContent('Your per-area choices are saved');
+    mockFontMode = 'area';
+    rerender(<FontSection />);
+    expect(status).toBeEmptyDOMElement();
+  });
+
+  it('Dyslexic Support locks the mode radios and every area option without writing', () => {
+    mockDyslexicSupport = true;
+    mockFontMode = 'area';
+    const { container } = render(<FontSection />);
+    const oneFont = screen.getByRole('radio', { name: 'One Font' });
+    expect(oneFont).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.click(oneFont);
+    fireEvent.click(within(row(container, 'Headings')).getByRole('button', { name: /^Inter/ }));
+    expect(mockSetDraftAppearanceSetting).not.toHaveBeenCalled();
+    for (const d of rows(container)) {
+      expect(d.querySelector('.font-area-current')).toHaveTextContent('OpenDyslexic · Locked');
+    }
   });
 });

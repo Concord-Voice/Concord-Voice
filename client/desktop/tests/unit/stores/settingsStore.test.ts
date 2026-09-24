@@ -316,6 +316,84 @@ describe('settingsStore', () => {
       expect(useSettingsStore.getState().appearance.uiScale).toBe(UI_SCALE_MAX);
     });
 
+    it('replaces unknown font ids and modes on rehydration, keeping valid ones (#2366)', async () => {
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({
+          state: {
+            appearance: {
+              appFont: 'comic-sans',
+              fontMode: 'advanced',
+              fontHeadings: 'lexend',
+              fontNavigation: 42,
+              fontMessages: 'sourcesans',
+            },
+          },
+          version: 1,
+        })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance).toMatchObject({
+        appFont: 'default',
+        fontMode: 'one',
+        fontHeadings: 'lexend',
+        fontNavigation: 'default',
+        fontMessages: 'sourcesans',
+      });
+    });
+
+    it.each(['appFont', 'fontHeadings', 'fontNavigation', 'fontMessages'] as const)(
+      'replaces a corrupt %s alone, leaving the other font keys (#2366)',
+      async (key) => {
+        const valid = {
+          appFont: 'lato',
+          fontHeadings: 'lato',
+          fontNavigation: 'lato',
+          fontMessages: 'lato',
+        };
+        localStorage.setItem(
+          'concord-settings',
+          JSON.stringify({
+            state: { appearance: { ...valid, [key]: 'comic-sans' } },
+            version: 1,
+          })
+        );
+        await useSettingsStore.persist.rehydrate();
+        expect(useSettingsStore.getState().appearance).toMatchObject({
+          ...valid,
+          [key]: 'default',
+        });
+      }
+    );
+
+    it('a corrupt pick on a font-bundling theme resolves to the theme font (#2366)', async () => {
+      useSettingsStore.getState().setAppFont('inter');
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({
+          state: { appearance: { colorScheme: 'agency', appFont: 'comic-sans' } },
+          version: 1,
+        })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(document.documentElement.dataset.appfont).toBe('atkinson');
+    });
+
+    it('a pre-#2366 snapshot gets the new font keys from the defaults', async () => {
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({ state: { appearance: { appFont: 'inter' } }, version: 1 })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance).toMatchObject({
+        appFont: 'inter',
+        fontMode: 'one',
+        fontHeadings: 'default',
+        fontNavigation: 'default',
+        fontMessages: 'default',
+      });
+    });
+
     it('never lets storage replace an action or the live zoom factor', async () => {
       // `partialize` keeps both out of what is written; a hand-edited snapshot
       // must not put them back into what is read.

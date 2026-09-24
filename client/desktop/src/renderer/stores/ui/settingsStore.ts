@@ -17,7 +17,12 @@ import { useMemberStore } from '../chat/memberStore';
 import { isSyncSuppressed } from './colorSyncSuppression';
 import {
   type AppFontId,
-  resolveEffectiveFont,
+  type FontLayers,
+  type FontMode,
+  APP_DEFAULT_FONT,
+  isAppFontId,
+  isFontMode,
+  resolveFontLayers,
   themeBundledFontFor,
   RESOLVER_CONFIG,
 } from '../../utils/ui/effectiveFont';
@@ -83,6 +88,12 @@ export interface AppearanceSettings {
    * setting that silently never syncs.
    */
   gifPlayback: GifPlaybackMode;
+  /** #2366: 'one' applies `appFont` everywhere; 'area' applies the three keys below. */
+  fontMode: FontMode;
+  /** #2366 per-area picks, applied only in 'area' mode. 'default' = the area's default. */
+  fontHeadings: AppFontId;
+  fontNavigation: AppFontId;
+  fontMessages: AppFontId;
 }
 
 /** Lower + upper bound for the STORED uiScale — the zoom-bridge slider range.
@@ -153,6 +164,10 @@ interface SettingsState {
   setAppFont: (id: AppFontId) => void;
   setDyslexicSupport: (on: boolean) => void;
   setGifPlayback: (mode: GifPlaybackMode) => void;
+  setFontMode: (mode: FontMode) => void;
+  setFontHeadings: (id: AppFontId) => void;
+  setFontNavigation: (id: AppFontId) => void;
+  setFontMessages: (id: AppFontId) => void;
   setClientBehavior: (value: ClientBehavior) => void;
   setSubscriptionResetAcknowledged: (acknowledged: boolean) => void;
   setAllowNsfwContent: (allowed: boolean) => void;
@@ -170,6 +185,10 @@ const defaultAppearance: AppearanceSettings = {
   appFont: 'default',
   dyslexicSupport: false,
   gifPlayback: 'auto',
+  fontMode: 'one',
+  fontHeadings: 'default',
+  fontNavigation: 'default',
+  fontMessages: 'default',
 };
 
 function resolveTheme(theme: AppearanceSettings['theme']): 'dark' | 'light' {
@@ -272,19 +291,37 @@ function runtimeOnlySettings(state: SettingsState): Partial<SettingsState> {
   for (const [key, value] of Object.entries(state)) {
     if (typeof value === 'function') kept[key] = value;
   }
-  return kept as Partial<SettingsState>;
+  return kept;
 }
 
 function applyHighContrast(enabled: boolean) {
   document.documentElement.dataset.highContrast = enabled ? 'true' : 'false';
 }
 
-// Single DOM sink for the resolved application font (see utils/ui/effectiveFont.ts).
-// The resolver decides which font wins; this just writes the one attribute CSS
-// keys on (`[data-appfont='…']`). Do NOT add a second sink for dyslexic/theme —
-// they feed the resolver, not the DOM.
-function applyEffectiveFont(id: AppFontId) {
-  document.documentElement.dataset.appfont = id;
+// Single DOM sink for the resolved application fonts: one attribute per layer (#2366).
+// The resolver (utils/ui/effectiveFont.ts) decides; this writes. `data-appfont` keeps its
+// name because it IS the Interface layer and existing rules and tests key on it. Do not
+// add another font write anywhere — dyslexic/theme/mode feed the resolver, not the DOM.
+function applyFontLayers(layers: FontLayers) {
+  const d = document.documentElement.dataset;
+  d.appfont = layers.interface;
+  d.fontHeadings = layers.headings;
+  d.fontNav = layers.navigation;
+  d.fontMessages = layers.messages;
+  d.fontBrand = layers.brand;
+}
+
+/** Storage and sync are outside the setters' reach: an unknown id or mode falls back. */
+function sanitizeFontSettings(a: AppearanceSettings): AppearanceSettings {
+  const font = (v: unknown): AppFontId => (isAppFontId(v) ? v : APP_DEFAULT_FONT);
+  return {
+    ...a,
+    appFont: font(a.appFont),
+    fontHeadings: font(a.fontHeadings),
+    fontNavigation: font(a.fontNavigation),
+    fontMessages: font(a.fontMessages),
+    fontMode: isFontMode(a.fontMode) ? a.fontMode : 'one',
+  };
 }
 
 // v0 → v1 (#1099): the #1383 interim default {toTray:'none', toToolbar:'minimize'}
@@ -369,6 +406,16 @@ export const useSettingsStore = wrapStore(
         setGifPlayback: (gifPlayback) =>
           set((state) => ({ appearance: { ...state.appearance, gifPlayback } })),
 
+        // #2366 — names are load-bearing (draftSettingsStore derives set<Key>).
+        setFontMode: (fontMode) =>
+          set((state) => ({ appearance: { ...state.appearance, fontMode } })),
+        setFontHeadings: (fontHeadings) =>
+          set((state) => ({ appearance: { ...state.appearance, fontHeadings } })),
+        setFontNavigation: (fontNavigation) =>
+          set((state) => ({ appearance: { ...state.appearance, fontNavigation } })),
+        setFontMessages: (fontMessages) =>
+          set((state) => ({ appearance: { ...state.appearance, fontMessages } })),
+
         setSubscriptionResetAcknowledged: (subscriptionResetAcknowledged) =>
           set({ subscriptionResetAcknowledged }),
 
@@ -404,8 +451,13 @@ export const useSettingsStore = wrapStore(
             ...current,
             ...p,
             // Re-clamp on the way in: storage is outside the setter's reach, so
-            // a hand-edited or corrupt value must not reach the apply path.
-            appearance: { ...appearance, uiScale: clampUiScale(appearance.uiScale) },
+            // a hand-edited or corrupt value must not reach the apply path. A corrupt
+            // font id used to count as an explicit pick and displace a theme-bundled
+            // font, so font ids and the font mode are validated too (#2366).
+            appearance: sanitizeFontSettings({
+              ...appearance,
+              uiScale: clampUiScale(appearance.uiScale),
+            }),
             clientBehavior: { ...DEFAULT_CLIENT_BEHAVIOR, ...p?.clientBehavior },
             // Default false when a pre-#1301 snapshot has no ack flag (the
             // `...p` spread already carries it forward when present).
@@ -515,29 +567,40 @@ useSettingsStore.subscribe(
   { fireImmediately: true }
 );
 
-// Subscribe to the effective-font inputs (appFont, dyslexicSupport, colorScheme)
-// and apply the resolved font as the single `data-appfont` attribute. This is the
-// ONLY DOM write for fonts — the resolver (utils/ui/effectiveFont.ts) owns precedence
-// (Dyslexic > user pick > theme-bundled > default). In C1 `themeBundledFontFor`
-// returns null; #1643 fills it. `lockReason`/`pickerLocked` are read by the picker.
+// Subscribe to every font input and apply the resolved layers through the single sink
+// (#2366). The resolver owns precedence (Dyslexic > pick > theme-bundled > default, and
+// the One Font / Font by Area split); `lockReason`/`pickerLocked` are read by the picker.
+const FONT_INPUT_KEYS = [
+  'appFont',
+  'dyslexicSupport',
+  'colorScheme',
+  'fontMode',
+  'fontHeadings',
+  'fontNavigation',
+  'fontMessages',
+] as const;
 useSettingsStore.subscribe(
-  (state) => ({
-    appFont: state.appearance.appFont,
-    dyslexicSupport: state.appearance.dyslexicSupport,
-    colorScheme: state.appearance.colorScheme,
-  }),
-  ({ appFont, dyslexicSupport, colorScheme }) => {
-    const { effective } = resolveEffectiveFont(
-      { dyslexicSupport, appFont, themeBundledFont: themeBundledFontFor(colorScheme) },
-      RESOLVER_CONFIG
-    );
-    applyEffectiveFont(effective);
+  (state) => {
+    const a = state.appearance;
+    return {
+      appFont: a.appFont,
+      dyslexicSupport: a.dyslexicSupport,
+      colorScheme: a.colorScheme,
+      fontMode: a.fontMode,
+      fontHeadings: a.fontHeadings,
+      fontNavigation: a.fontNavigation,
+      fontMessages: a.fontMessages,
+    };
   },
+  (inputs) =>
+    applyFontLayers(
+      resolveFontLayers(
+        { ...inputs, themeBundledFont: themeBundledFontFor(inputs.colorScheme) },
+        RESOLVER_CONFIG
+      )
+    ),
   {
-    equalityFn: (a, b) =>
-      a.appFont === b.appFont &&
-      a.dyslexicSupport === b.dyslexicSupport &&
-      a.colorScheme === b.colorScheme,
+    equalityFn: (a, b) => FONT_INPUT_KEYS.every((k) => a[k] === b[k]),
     fireImmediately: true,
   }
 );

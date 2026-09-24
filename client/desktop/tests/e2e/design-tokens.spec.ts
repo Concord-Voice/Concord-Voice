@@ -221,28 +221,15 @@ test(
 );
 
 // ---------------------------------------------------------------------------
-// Dyslexic Support reaches the display stack — cascade verification (#2366)
+// Application font layers — cascade verification (#2366)
 // ---------------------------------------------------------------------------
 
 /**
- * The assertion Vitest structurally cannot make.
- *
- * `tests/unit/styles/design-tokens.test.ts` proves the sink's rules are PRESENT in
- * source; jsdom returns '' for every custom property regardless of what is declared, so
- * it can never prove one WINS. That distinction is the whole risk in this one rule.
- *
- * #2366 leaves the five other font ids on their original `[data-appfont='<id>'] body`
- * rules, which are attribute+type selectors that outrank the bare `body` rule outright
- * — no tie, nothing to verify at runtime. OpenDyslexic additionally redefines
- * `--font-display-stack`, and that is the one rule that MUST live at :root, because the
- * display font is a token each surface opts into by name rather than something
- * inherited. At :root it is (0,2,0), which merely TIES with
- * `[data-scheme='…'][data-theme='light']` and wins on source order alone.
- *
- * `agency-light` is the deliberate worst case on both axes: a two-attribute block, and
- * the ONLY scheme whose `--font-display-stack` diverges from the other 30 (Atkinson
- * Hyperlegible Next rather than Droidiga), so a sink that failed to win resolves to a
- * real, plausible, wrong font rather than to an empty string.
+ * The assertions Vitest structurally cannot make (#2366): jsdom returns '' for every
+ * custom property, so only a browser can prove which declaration WINS. Every font rule
+ * is declared on body or a region root; these read computed values on those elements.
+ * `agency-light` is the worst case: a two-attribute theme block, and the one scheme whose
+ * display face (Atkinson) differs from the other 30 (Droidiga).
  */
 const FONT_CASCADE_CASES = [
   { scheme: 'agency', theme: 'light', label: 'agency-light' },
@@ -251,84 +238,192 @@ const FONT_CASCADE_CASES = [
   { scheme: 'concord', theme: null as string | null, label: 'concord-dark' },
 ] as const;
 
+type FontAttrs = Partial<
+  Record<'appfont' | 'fontHeadings' | 'fontNav' | 'fontMessages' | 'fontBrand', string>
+>;
+
 async function applyFontContext(
   page: import('@playwright/test').Page,
   scheme: string,
   theme: string | null,
-  appfont: string | null
+  attrs: FontAttrs
 ): Promise<void> {
   await page.evaluate(
-    ({ s, t, f }) => {
+    ({ s, t, a }) => {
       const root = document.documentElement;
       root.setAttribute('data-scheme', s);
       if (t === null) root.removeAttribute('data-theme');
       else root.setAttribute('data-theme', t);
-      if (f === null) delete root.dataset.appfont;
-      else root.dataset.appfont = f;
+      for (const key of ['appfont', 'fontHeadings', 'fontNav', 'fontMessages', 'fontBrand']) {
+        const v = (a as Record<string, string | undefined>)[key];
+        if (v === undefined) delete root.dataset[key];
+        else root.dataset[key] = v;
+      }
+      // Probe elements for the regions; the login page renders none of them.
+      // message-list-empty is the empty/loading state, a sibling of message-list.
+      for (const cls of ['layout-channel-panel', 'message-list', 'message-list-empty']) {
+        if (document.querySelector(`[data-probe='${cls}']`)) continue;
+        const region = document.createElement('div');
+        region.className = cls;
+        region.dataset.probe = cls;
+        const text = document.createElement('span');
+        text.className = 'probe-text';
+        text.textContent = 'x';
+        const display = document.createElement('span');
+        display.className = 'probe-display';
+        display.style.fontFamily = 'var(--font-display-stack)';
+        display.textContent = 'x';
+        region.append(text, display);
+        document.body.appendChild(region);
+      }
+      // A bare form control, which takes the system font unless something says inherit.
+      if (!document.querySelector("[data-probe='control']")) {
+        const control = document.createElement('button');
+        control.dataset.probe = 'control';
+        control.textContent = 'x';
+        document.body.appendChild(control);
+      }
+      // A themed scope root, as useUserThemeScope renders another user's profile:
+      // its data-scheme re-matches a theme block that re-declares the display stack.
+      const scopes: [string, Element][] = [
+        ['scope-body', document.body],
+        ['scope-nav', document.querySelector("[data-probe='layout-channel-panel']")!],
+        ['scope-msg', document.querySelector("[data-probe='message-list']")!],
+      ];
+      for (const [name, parent] of scopes) {
+        if (document.querySelector(`[data-probe='${name}']`)) continue;
+        const scope = document.createElement('div');
+        scope.dataset.probe = name;
+        scope.dataset.scheme = 'concord';
+        scope.dataset.theme = 'light';
+        const display = document.createElement('span');
+        display.className = 'probe-display';
+        display.style.fontFamily = 'var(--font-display-stack)';
+        display.textContent = 'x';
+        scope.append(display);
+        parent.appendChild(scope);
+      }
     },
-    { s: scheme, t: theme, f: appfont }
+    { s: scheme, t: theme, a: attrs }
   );
 }
 
-const readDisplayStack = (page: import('@playwright/test').Page) =>
-  page.evaluate(() =>
-    getComputedStyle(document.documentElement).getPropertyValue('--font-display-stack').trim()
-  );
+const probe = (page: import('@playwright/test').Page) =>
+  page.evaluate(() => {
+    const family = (sel: string) => {
+      const el = document.querySelector(sel);
+      return el ? getComputedStyle(el).fontFamily : '';
+    };
+    const bodyStyle = getComputedStyle(document.body);
+    return {
+      body: bodyStyle.fontFamily,
+      display: bodyStyle.getPropertyValue('--font-display-stack').trim(),
+      brand: bodyStyle.getPropertyValue('--font-brand-stack').trim(),
+      navText: family("[data-probe='layout-channel-panel'] .probe-text"),
+      navDisplay: family("[data-probe='layout-channel-panel'] .probe-display"),
+      msgText: family("[data-probe='message-list'] .probe-text"),
+      msgDisplay: family("[data-probe='message-list'] .probe-display"),
+      emptyText: family("[data-probe='message-list-empty'] .probe-text"),
+      emptyDisplay: family("[data-probe='message-list-empty'] .probe-display"),
+      control: family("[data-probe='control']"),
+      scopeBody: family("[data-probe='scope-body'] .probe-display"),
+      scopeNav: family("[data-probe='scope-nav'] .probe-display"),
+      scopeMsg: family("[data-probe='scope-msg'] .probe-display"),
+    };
+  });
 
-/** The rendered body font — the inherited half, asserted as an OUTCOME not a token. */
-const readBodyFont = (page: import('@playwright/test').Page) =>
-  page.evaluate(() => getComputedStyle(document.body).fontFamily);
+const ALL_DYSLEXIC: FontAttrs = {
+  appfont: 'opendyslexic',
+  fontHeadings: 'opendyslexic',
+  fontNav: 'opendyslexic',
+  fontMessages: 'opendyslexic',
+  fontBrand: 'opendyslexic',
+};
 
 for (const combo of FONT_CASCADE_CASES) {
   test(
-    `Dyslexic Support reaches the display stack in ${combo.label} (#2366)`,
+    `Dyslexic Support reaches every layer and the wordmark in ${combo.label} (#2366)`,
     { tag: '@renderer-only' },
     async ({ page }) => {
       await page.goto('/');
-      await applyFontContext(page, combo.scheme, combo.theme, 'opendyslexic');
-
-      // The half that was already working: `[data-appfont] body` sets the body font,
-      // and everything that inherits follows it.
-      expect(await readBodyFont(page), `body font in ${combo.label}`).toContain('OpenDyslexic');
-
-      // The half #2366 adds: headings, the server/channel nav and the titlebar read the
-      // DISPLAY stack, so an accommodation that stopped at body left them in the brand
-      // face. This is the assertion that fails if the :root rule loses its cascade tie.
-      expect(await readDisplayStack(page), `display stack in ${combo.label}`).toContain(
-        'OpenDyslexic'
-      );
+      await applyFontContext(page, combo.scheme, combo.theme, ALL_DYSLEXIC);
+      const p = await probe(page);
+      for (const [layer, value] of Object.entries(p)) {
+        expect(value, `${layer} in ${combo.label}`).toContain('OpenDyslexic');
+      }
     }
   );
 }
 
 test(
-  'an ordinary font pick moves BODY only, leaving the display face alone (#2366)',
+  'One Font: a pick moves body, headings and both regions; the wordmark stays brand (#2366)',
   { tag: '@renderer-only' },
   async ({ page }) => {
-    // The distinguishing control. Without it the tests above pass just as well on a
-    // sink that overrode the display stack for EVERY font id — a different feature
-    // (#2366's layered-assignment half). This is what makes "Dyslexic Support is the
-    // one id that goes global" tellable apart from "all fonts go global".
     await page.goto('/');
-    await applyFontContext(page, 'concord', 'light', 'inter');
-
-    expect(await readBodyFont(page)).toContain('Inter');
-
-    const display = await readDisplayStack(page);
-    expect(display).toContain('Droidiga');
-    expect(display).not.toContain('Inter');
+    await applyFontContext(page, 'concord', 'light', {
+      appfont: 'inter',
+      fontHeadings: 'inter',
+      fontNav: 'default',
+      fontMessages: 'default',
+      fontBrand: 'default',
+    });
+    const p = await probe(page);
+    expect(p.body).toContain('Inter');
+    expect(p.control).toContain('Inter');
+    expect(p.display).toContain('Inter');
+    expect(p.navText).toContain('Inter');
+    expect(p.navDisplay).toContain('Inter');
+    expect(p.msgText).toContain('Inter');
+    // Another user's themed profile surface still shows the viewer's headings font.
+    expect(p.scopeBody).toContain('Inter');
+    expect(p.scopeNav).toContain('Inter');
+    expect(p.scopeMsg).toContain('Inter');
+    expect(p.brand).toContain('Droidiga');
+    expect(p.brand).not.toContain('Inter');
   }
 );
 
 test(
-  "'default' leaves the theme's own display face standing (#2366)",
+  'Font by Area: each region keeps its own font for text AND headers (#2366)',
   { tag: '@renderer-only' },
   async ({ page }) => {
-    // 'default' is the "no explicit pick" sentinel and deliberately has no rule, so
-    // Agency keeps its bundled display face rather than falling back to Droidiga.
     await page.goto('/');
-    await applyFontContext(page, 'agency', 'light', null);
+    await applyFontContext(page, 'agency', 'light', {
+      appfont: 'atkinson',
+      fontHeadings: 'lexend',
+      fontNav: 'inter',
+      fontMessages: 'lato',
+      fontBrand: 'default',
+    });
+    const p = await probe(page);
+    expect(p.display).toContain('Lexend');
+    expect(p.navText).toContain('Inter');
+    expect(p.navDisplay).toContain('Inter');
+    expect(p.msgText).toContain('Lato');
+    expect(p.msgDisplay).toContain('Lato');
+    // An empty or loading channel shows the Messages font too.
+    expect(p.emptyText).toContain('Lato');
+    expect(p.emptyDisplay).toContain('Lato');
+    // A themed scope root follows Headings outside the regions and the area inside them.
+    expect(p.scopeBody).toContain('Lexend');
+    expect(p.scopeNav).toContain('Inter');
+    expect(p.scopeMsg).toContain('Lato');
+    // Agency's own display face, unaffected by the Headings pick declared on body.
+    expect(p.brand).toContain('Atkinson');
+  }
+);
 
-    expect(await readDisplayStack(page)).toContain('Atkinson');
+test(
+  "'default' everywhere leaves the theme's faces standing (#2366)",
+  { tag: '@renderer-only' },
+  async ({ page }) => {
+    await page.goto('/');
+    await applyFontContext(page, 'agency', 'light', {});
+    const p = await probe(page);
+    expect(p.display).toContain('Atkinson');
+    expect(p.brand).toContain('Atkinson');
+    expect(p.navDisplay).toContain('Atkinson');
+    // With no pick, the viewed user's theme keeps its own display face.
+    expect(p.scopeBody).toContain('Droidiga');
   }
 );

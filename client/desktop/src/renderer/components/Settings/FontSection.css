@@ -109,3 +109,117 @@
 .font-option-lock-link:hover {
   color: var(--link-color-hover, var(--accent-hover));
 }
+
+/* #2366 — mode radios reuse the settings-mode pill look (SettingsPage.css). A fieldset
+   brings UA border/padding/min-inline-size that the original div never had. */
+.font-mode-toggle {
+  min-inline-size: 0;
+  margin-inline: 0;
+}
+.font-mode-toggle .settings-mode-pill {
+  position: relative;
+  white-space: nowrap;
+}
+.font-mode-radio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.font-mode-toggle .settings-mode-pill:has(.font-mode-radio:focus-visible) {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+.font-mode-toggle .settings-mode-pill:has(.font-mode-radio[aria-disabled='true']) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Always-mounted live region (<output>, implicit role="status"). It is
+   inline by default, so make it a block for the notice box. Zero-height
+   while empty. */
+.font-mode-notice {
+  display: block;
+}
+
+.font-mode-notice:empty {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.font-area-intro,
+.font-area-hint {
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+.font-area-hint {
+  margin: 8px 0 0;
+}
+.font-area-row {
+  margin-bottom: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+}
+.font-area-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+.font-area-summary::-webkit-details-marker {
+  display: none;
+}
+.font-area-summary:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+.font-area-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.font-area-name::before {
+  /* Empty alt text: <summary> already announces expanded/collapsed. */
+  content: '▸' / '';
+  display: inline-block;
+  width: 1em;
+}
+.font-area-row[open] .font-area-name::before {
+  content: '▾' / '';
+}
+.font-area-helper {
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+/* Never truncate the current font — wrap it (narrow windows, 200% UI Scale). */
+.font-area-current {
+  margin-left: auto;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+.font-area-body {
+  padding: 0 12px 12px;
+}
+
+/* Below 520px of settings width (a narrow window or 200% UI Scale) the helper drops
+   under the area name, leaving the name and the current font on the first line.
+   A container query, because the pane is narrower than the viewport. */
+.font-area-list {
+  container-type: inline-size;
+}
+@container (max-width: 520px) {
+  .font-area-helper {
+    order: 1;
+    flex-basis: 100%;
+  }
+}

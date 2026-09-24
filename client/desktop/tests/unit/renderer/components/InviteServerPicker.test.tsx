@@ -161,12 +161,10 @@ describe('InviteServerPicker', () => {
   });
 
   it('renders through the shared context-menu layer at the requested viewport position', () => {
-    const { container } = render(
-      <InviteServerPicker position={{ x: 16, y: 32 }} onPick={vi.fn()} onClose={vi.fn()} />
-    );
+    render(<InviteServerPicker position={{ x: 16, y: 32 }} onPick={vi.fn()} onClose={vi.fn()} />);
 
-    expect(container.querySelector('.ctx-menu-overlay')).toBeInTheDocument();
-    expect(container.querySelector('.ctx-menu')).toHaveStyle({ left: '16px', top: '32px' });
+    expect(document.querySelector('.ctx-menu-overlay')).toBeInTheDocument();
+    expect(document.querySelector('.ctx-menu')).toHaveStyle({ left: '16px', top: '32px' });
   });
 
   it('calls onPick with the chosen server id', () => {

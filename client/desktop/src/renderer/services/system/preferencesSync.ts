@@ -440,6 +440,11 @@ class PreferencesSyncService {
           // WHOLESALE, so bumping it would silently disable all theme and layout
           // sync for every not-yet-updated device in the fleet.
           gifPlayback: settings.gifPlayback,
+          // #2366. Same terms as appFont above: synced, NOT applied on pull, `v` stays 1.
+          fontMode: settings.fontMode,
+          fontHeadings: settings.fontHeadings,
+          fontNavigation: settings.fontNavigation,
+          fontMessages: settings.fontMessages,
         },
         layout: {
           sidebarProfiles,

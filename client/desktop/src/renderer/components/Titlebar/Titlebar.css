@@ -43,7 +43,8 @@
 }
 
 .titlebar-title {
-  font-family: var(--font-display-stack);
+  /* #2366: the wordmark keeps the brand face; only Dyslexic Support changes it. */
+  font-family: var(--font-brand-stack);
   font-size: 13px;
   letter-spacing: 0.08em;
   overflow: hidden;

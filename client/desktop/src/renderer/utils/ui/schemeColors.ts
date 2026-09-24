@@ -7,7 +7,7 @@
  */
 
 import type { CSSProperties } from 'react';
-import { deriveThemeVariables, type DerivedThemeVariables } from './colorUtils';
+import { deriveThemeVariables, isValidHex, type DerivedThemeVariables } from './colorUtils';
 
 export interface SchemeAccentColors {
   accentPrimary: string;
@@ -70,17 +70,20 @@ export function resolveUserAccentColors(
 
     if (!parsed.scheme) return null;
 
-    // Custom theme — user provided accent colors
-    if (parsed.scheme === 'custom' && parsed.accentPrimary && parsed.accentSecondary) {
+    // Custom theme — user provided accent colors. Another member controls this JSON,
+    // and the values land in inline styles, so only #rrggbb is accepted.
+    const primary = parsed.accentPrimary ?? '';
+    const secondary = parsed.accentSecondary ?? '';
+    if (parsed.scheme === 'custom' && isValidHex(primary) && isValidHex(secondary)) {
       return {
-        accentPrimary: parsed.accentPrimary,
-        accentSecondary: parsed.accentSecondary,
-        gradient: buildGradient(parsed.accentPrimary, parsed.accentSecondary),
+        accentPrimary: primary,
+        accentSecondary: secondary,
+        gradient: buildGradient(primary, secondary),
       };
     }
 
-    // Preset scheme — look up from static map
-    return PRESET_COLORS[parsed.scheme] ?? null;
+    // Preset scheme — own-key lookup, so a scheme named 'constructor' is not a colour set
+    return Object.hasOwn(PRESET_COLORS, parsed.scheme) ? PRESET_COLORS[parsed.scheme] : null;
   } catch {
     return null;
   }
@@ -130,14 +133,16 @@ export function resolveUserThemeScope(colorSchemeJson: string | null | undefined
 
     const themeMode = parsed.themeMode === 'light' ? 'light' : 'dark';
 
-    // Custom scheme — generate inline CSS variables
-    if (parsed.scheme === 'custom' && parsed.accentPrimary && parsed.accentSecondary) {
+    // Custom scheme — generate inline CSS variables (from #rrggbb accents only; see above)
+    const primary = parsed.accentPrimary ?? '';
+    const secondary = parsed.accentSecondary ?? '';
+    if (parsed.scheme === 'custom' && isValidHex(primary) && isValidHex(secondary)) {
       const isDark = themeMode === 'dark';
       const vars = deriveThemeVariables(
         {
           background: isDark ? '#0d0821' : '#f5f5f7',
-          accentPrimary: parsed.accentPrimary,
-          accentSecondary: parsed.accentSecondary,
+          accentPrimary: primary,
+          accentSecondary: secondary,
         },
         isDark
       );

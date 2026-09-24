@@ -215,6 +215,38 @@ describe('preferencesSyncService', () => {
       expect((encryptedBlob as { v: number }).v).toBe(1);
     });
 
+    it('A9: the pushed blob carries the #2366 font layers, still pinned to v === 1', async () => {
+      let encryptedBlob: unknown;
+      vi.mocked(e2eeService.encryptPreferences).mockImplementationOnce(async (blob) => {
+        encryptedBlob = blob;
+        return 'encrypted-blob';
+      });
+      useSettingsStore.setState((s) => ({
+        appearance: {
+          ...s.appearance,
+          fontMode: 'area',
+          fontHeadings: 'lexend',
+          fontNavigation: 'inter',
+          fontMessages: 'lato',
+        },
+      }));
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/preferences`, () => HttpResponse.json({ version: 1 }))
+      );
+
+      await preferencesSyncService.pushPreferences();
+
+      expect(encryptedBlob).toMatchObject({
+        settings: {
+          fontMode: 'area',
+          fontHeadings: 'lexend',
+          fontNavigation: 'inter',
+          fontMessages: 'lato',
+        },
+      });
+      expect((encryptedBlob as { v: number }).v).toBe(1);
+    });
+
     it('round-trips all four retained docks and the decoupling preference', async () => {
       const profiles: SidebarProfiles = {
         dm: {
@@ -458,6 +490,45 @@ describe('preferencesSyncService', () => {
         },
       });
       expect(useLayoutStore.getState().serverOrder).toEqual(['server-1']);
+    });
+
+    it('does not apply synced font settings on pull, valid or not (#2366)', async () => {
+      const before = { ...useSettingsStore.getState().appearance };
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: {
+          theme: before.theme,
+          colorScheme: before.colorScheme,
+          fontSize: before.fontSize,
+          compactMode: before.compactMode,
+          appFont: 'comic-sans',
+          fontMode: 'area',
+          fontHeadings: 'lexend',
+          fontNavigation: 'inter',
+          fontMessages: 'lato',
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      // Only sanitizeFontSettings (storage) validates these keys, so pull must not apply them.
+      const after = useSettingsStore.getState().appearance;
+      for (const key of [
+        'appFont',
+        'fontMode',
+        'fontHeadings',
+        'fontNavigation',
+        'fontMessages',
+      ] as const) {
+        expect(after[key]).toBe(before[key]);
+      }
     });
 
     it('provisions a missing Server profile from the normalized DM profile', async () => {

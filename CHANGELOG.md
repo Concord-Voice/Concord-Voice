@@ -32,6 +32,15 @@ that keeps sending far more than your plan allows.
   width so the layout never gets too cramped to use, and the slider tells you when that happens and
   how far it would go in a wider window. Picture-in-picture windows keep their normal size. A
   desktop app that has not updated yet keeps the previous 85–130% range.
+- **Your font choice now reaches headings, navigation and messages** ([#2366](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2366), [#3429](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3429)) —
+  Appearance ▸ Application Font has two modes. **One Font** applies your pick across the app,
+  including headings, the server and channel lists and the member list, which used to keep the
+  brand face. **Font by Area** sets separate fonts for Messages, Headings, Navigation and
+  Interface. The Concord Voice wordmark keeps its brand face unless Dyslexic Support is on. Menus,
+  profile cards and other people's profiles now follow your font too, and so do buttons and text
+  boxes that used to show the system font, even with Dyslexic Support on (for example "Forgot
+  password?" on the sign-in screen). Those controls are the one change you will see if you never
+  picked a font.
 
 - **DM-block and credential-epoch cleanup now survives delivery failures** ([#3140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3140)) — guarded reconciliation records retryable voice-ejection obligations and fences stale callbacks by generation.
 

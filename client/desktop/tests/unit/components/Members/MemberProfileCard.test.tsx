@@ -1,5 +1,6 @@
 import { act, render, screen, fireEvent } from '../../../test-utils';
 import MemberProfileCard from '@/renderer/components/Members/MemberProfileCard';
+import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
 import { mockMember } from '../../../mocks/fixtures';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
@@ -296,10 +297,8 @@ describe('MemberProfileCard', () => {
         return this.classList.contains('member-profile-card') ? 300 : 0;
       });
     try {
-      const { container } = render(
-        <MemberProfileCard {...defaultProps} position={{ x: 300, y: 600 }} />
-      );
-      const card = container.querySelector('.member-profile-card') as HTMLElement;
+      render(<MemberProfileCard {...defaultProps} position={{ x: 300, y: 600 }} />);
+      const card = document.querySelector('.member-profile-card') as HTMLElement;
       const initialTop = Number.parseFloat(card.style.top);
 
       act(() => {
@@ -348,11 +347,14 @@ describe('MemberProfileCard', () => {
       updated_at: 1,
     });
 
-    const { container } = render(<MemberProfileCard {...defaultProps} />);
+    render(<MemberProfileCard {...defaultProps} />);
+    // The card portals to document.body, so assert on the card itself, never the container.
+    const card = document.querySelector('.member-profile-card');
+    expect(card).not.toBeNull();
 
     expect(screen.getByText('Details hidden')).toBeInTheDocument();
-    expect(container.textContent).not.toContain('Hidden Lobby');
-    expect(container.textContent).not.toContain('Hidden Server');
+    expect(card?.textContent).not.toContain('Hidden Lobby');
+    expect(card?.textContent).not.toContain('Hidden Server');
     expect(screen.queryByText('11111111-1111-4111-8111-111111111111')).not.toBeInTheDocument();
     expect(screen.queryByText('22222222-2222-4222-8222-222222222222')).not.toBeInTheDocument();
     for (const element of document.querySelectorAll('*')) {
@@ -378,13 +380,16 @@ describe('MemberProfileCard', () => {
       updated_at: 1,
     });
 
-    const { container } = render(<MemberProfileCard {...defaultProps} />);
+    render(<MemberProfileCard {...defaultProps} />);
+    const card = document.querySelector('.member-profile-card');
+    expect(card).not.toBeNull();
+    expect(card?.textContent).toContain('In a group call');
 
-    expect(container.textContent).not.toContain('Alice Example');
-    expect(container.textContent).not.toContain('Bob Example');
-    expect(container.textContent).not.toContain('alice-id');
-    expect(container.textContent).not.toContain('With 7 people');
-    for (const element of container.querySelectorAll('*')) {
+    expect(card?.textContent).not.toContain('Alice Example');
+    expect(card?.textContent).not.toContain('Bob Example');
+    expect(card?.textContent).not.toContain('alice-id');
+    expect(card?.textContent).not.toContain('With 7 people');
+    for (const element of document.querySelectorAll('*')) {
       for (const attribute of Array.from(element.attributes)) {
         expect(attribute.value).not.toContain('Alice Example');
         expect(attribute.value).not.toContain('Bob Example');
@@ -457,10 +462,10 @@ describe('MemberProfileCard', () => {
     const literal = '<img src=x onerror=alert(1)>';
     useRichPresenceStore.getState().setCustomText(mockMember.user_id, { text: literal });
 
-    const { container } = render(<MemberProfileCard {...defaultProps} />);
+    render(<MemberProfileCard {...defaultProps} />);
 
     expect(screen.getByText(literal)).toBeInTheDocument();
-    expect(container.querySelector('img[src="x"]')).not.toBeInTheDocument();
+    expect(document.querySelector('img[src="x"]')).not.toBeInTheDocument();
   });
 
   it('does not render a Custom Status row when the store has no entry', () => {
@@ -547,5 +552,32 @@ describe('MemberProfileCard', () => {
     // The row survives for the other affordance — only the gated button goes.
     expect(document.querySelector('.member-profile-actions')).toBeInTheDocument();
     expect(screen.getByText('View Full Profile')).toBeInTheDocument();
+  });
+
+  // #2366: rendered in place, the overlay inherited the font of the area that
+  // opened it (Navigation or Messages). It must portal out like ui/Modal.
+  describe('portal', () => {
+    it('renders outside the region that opened it', () => {
+      render(
+        <div className="message-list">
+          <MemberProfileCard {...defaultProps} />
+        </div>
+      );
+      const root = document.querySelector('.member-profile-card');
+      expect(root?.parentElement).toBe(document.body);
+      expect(root?.closest('.message-list')).toBeNull();
+    });
+
+    it('renders into a modal portal host when one is provided', () => {
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      render(
+        <ModalPortalHostContext.Provider value={host}>
+          <MemberProfileCard {...defaultProps} />
+        </ModalPortalHostContext.Provider>
+      );
+      expect(host.querySelector('.member-profile-card')).not.toBeNull();
+      host.remove();
+    });
   });
 });

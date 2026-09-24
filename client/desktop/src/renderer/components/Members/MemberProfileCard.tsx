@@ -1,4 +1,5 @@
-import React, { useEffect, useId, useRef, useState, useLayoutEffect } from 'react';
+import React, { use, useEffect, useId, useRef, useState, useLayoutEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
@@ -8,6 +9,7 @@ import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/ui/useUse
 import { presentRemoteActivities } from '../../utils/ui/richPresencePresentation';
 import SendFriendRequestButton from './SendFriendRequestButton';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
+import { ModalPortalHostContext } from '../ui/ModalContext';
 import './MemberProfileCard.css';
 
 /** Flexible member shape that works for both ServerMembers and Friends */
@@ -41,6 +43,7 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
   onViewFullProfile,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
+  const portalHost = use(ModalPortalHostContext);
   const presenceEntries = useRichPresenceStore((state) => state.otherByUser[member.user_id]);
   const activities = presentRemoteActivities(presenceEntries);
   const nowHeadingId = useId();
@@ -155,7 +158,9 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
   const scopedTheme = useUserThemeScope(member.color_scheme);
   const scopeProps = isSelf ? EMPTY_USER_THEME_SCOPE : scopedTheme.scopeProps;
 
-  return (
+  // Portaled like ui/Modal: rendered in place it inherited the font of the
+  // area that opened it (Navigation or Messages, #2366) instead of Interface.
+  return createPortal(
     <div
       ref={cardRef}
       className="member-profile-card"
@@ -311,7 +316,8 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
           </>
         )}
       </div>
-    </div>
+    </div>,
+    portalHost ?? document.body
   );
 };
 

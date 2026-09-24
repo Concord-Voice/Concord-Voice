@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { APP_FONT_IDS } from '@/renderer/utils/ui/effectiveFont';
 
 const ALL_23_TOKENS = [
   // State (3)
@@ -147,11 +148,10 @@ describe('design-token schema symmetry', () => {
     // declared) while leaving the new block unchecked. This assertion makes
     // that drift loud.
     //
-    // `:root` must be followed by `{` here, so this counts the BASE theme block and not
-    // #2366's `:root[data-appfont='opendyslexic']` rule, which is a single-property
-    // token override rather than a theme block. Counting it reported 33 blocks against
-    // a taxonomy that is 32 by construction — failing this guard while nothing had
-    // actually drifted. The sink's own coverage is asserted in the describe below.
+    // `:root` must be followed by `{` here, so this counts the BASE theme block only. No
+    // font rule may add a `:root {` block (the #2366 font stacks live INSIDE the base
+    // block), and the font-layer rules start with `[data-appfont=` / `[data-font-`,
+    // which this pattern does not match. The sink's own coverage is asserted below.
     //
     // Literal regex (not constructed from variables) — Semgrep CWE-1333
     // ReDoS taint applies only to dynamic RegExp construction.
@@ -193,17 +193,18 @@ describe('design-token schema symmetry', () => {
  * direction fails — a font added to the picker with no rule, and a rule left behind for
  * a font the picker dropped.
  *
- * Note the two shapes, which are not an inconsistency. The body font is INHERITED, so
+ * Two shapes, which are not an inconsistency. The body font is INHERITED, so
  * `[data-appfont='<id>'] body` reaches every surface that inherits, and the controls
  * that cannot inherit (`<input>`, `<select>`, `<textarea>`, `<button>`) say
- * `font-family: inherit` — no token needed. The display font is NOT inherited; it is a
- * token each surface opts into by name, so redirecting it means redefining the token at
- * :root. Only OpenDyslexic does that.
+ * `font-family: inherit`. The display font is NOT inherited; it is a token each surface
+ * opts into by name, so the Headings layer redefines the token — on `body`, never on
+ * :root (#2366). A region layer sets both. Every rule sits on `body` or deeper, so it
+ * wins over the theme tokens on <html> by inheritance rather than by specificity.
  *
  * This is a source-parse check, not a rendering one. jsdom cannot resolve custom
- * properties at all, so whether the :root override WINS its cascade is unanswerable
- * here and is asserted in real Chromium by tests/e2e/design-tokens.spec.ts. Green here
- * means the rules are present, never that they apply.
+ * properties at all, so whether a rule WINS its cascade is unanswerable here and is
+ * asserted in real Chromium by tests/e2e/design-tokens.spec.ts. Green here means the
+ * rules are present, never that they apply.
  */
 describe('application-font sink (#2366)', () => {
   const cssPath = resolve(__dirname, '../../../src/renderer/styles/index.css');
@@ -241,22 +242,132 @@ describe('application-font sink (#2366)', () => {
     expect(missing).toEqual([]);
   });
 
-  it("'default' deliberately has NO rule — the base body stack stands", () => {
-    expect(css).not.toContain("[data-appfont='default']");
+  it("'default' deliberately has NO rule on any layer — the theme's faces stand", () => {
+    expect(css).not.toMatch(/data-(?:appfont|font-[a-z]+)='default'/);
   });
 
-  it('Dyslexic Support is the one id that also claims the display stack', () => {
-    // The accommodation reaches headings, nav and brand surfaces; a mere preference
-    // does not. Asserting the NEGATIVE for the sibling ids is what makes this
-    // meaningful — without it the test passes on a sink that overrode the display
-    // stack for everything, which is a different feature (#2366's layered-font half).
-    //
-    // Reads each block's BODY rather than pattern-matching the declaration onto the
-    // opening brace, so declaration order cannot answer for declaration presence.
-    const displayOverrides = pickerIds.filter((id) => {
-      const body = extractBlockBody(css, `:root[data-appfont='${id}']`);
-      return body !== null && body.includes('--font-display-stack:');
-    });
-    expect(displayOverrides).toEqual(['opendyslexic']);
+  const explicitIds = APP_FONT_IDS.filter((id) => id !== 'default');
+  // Prettier breaks long selector lists across lines; match on collapsed whitespace.
+  const flat = css.replace(/\s+/g, ' ');
+
+  it('every explicit font id has a rule on every layer (#2366)', () => {
+    const missing = explicitIds
+      .flatMap((id) => [
+        `[data-appfont='${id}'] body`,
+        `[data-font-headings='${id}'] body`,
+        `[data-font-nav='${id}'] :is(`,
+        // The empty/loading state renders .message-list-empty with no
+        // .message-list ancestor, so it is named explicitly.
+        `[data-font-messages='${id}'] :is(.message-list, .message-list-empty)`,
+      ])
+      .filter((selector) => !flat.includes(selector));
+    expect(explicitIds.length).toBeGreaterThan(5);
+    expect(missing).toEqual([]);
+  });
+
+  it('every explicit font id has one stack variable in the base :root block', () => {
+    const root = extractBlockBody(css, ':root') ?? '';
+    expect(explicitIds.filter((id) => !root.includes(`--font-stack-${id}:`))).toEqual([]);
+    expect(root).toContain('--font-brand-stack: var(--font-display-stack);');
+  });
+
+  it('no font rule sits on :root — every override is on body or deeper (#2366)', () => {
+    // Retires the (0,2,0) `:root[data-appfont='opendyslexic']` rule, which only TIED
+    // `[data-scheme][data-theme]` and had to stay last in the file.
+    expect(css).not.toMatch(/:root\[data-(?:appfont|font-)/);
+  });
+
+  it('only the Dyslexic Support brand value redefines the wordmark stack', () => {
+    const brandValues = [...css.matchAll(/\[data-font-brand='([a-z]+)'\]/g)].map((m) => m[1]);
+    expect(brandValues).toEqual(['opendyslexic']);
+    expect(extractBlockBody(css, "[data-font-brand='opendyslexic'] body")).toContain(
+      '--font-brand-stack:'
+    );
+  });
+
+  // A renamed region class, or a state rendered outside the region (the empty/loading
+  // .message-list-empty was), silently drops that area's font. Pin both ends.
+  it('area rules name one region list per layer, and each class still exists', () => {
+    const regions = (layer: 'nav' | 'messages') => {
+      const lists = [
+        ...flat.matchAll(new RegExp(`\\[data-font-${layer}='[a-z]+'\\] :is\\(([^)]*)\\)`, 'g')),
+      ].map((m) =>
+        m[1]
+          .split(',')
+          .map((c) => c.trim().replace(/^\./, ''))
+          .sort()
+          .join(' ')
+      );
+      expect(lists.length).toBe(explicitIds.length * 2); // plain + [data-scheme] variant
+      expect(new Set(lists).size).toBe(1);
+      return lists[0].split(' ');
+    };
+    const nav = regions('nav');
+    const messages = regions('messages');
+    expect(nav).toEqual([
+      'layout-channel-panel',
+      'layout-folder-bar',
+      'layout-member-space',
+      'layout-server-bar',
+    ]);
+    expect(messages).toEqual(['message-list', 'message-list-empty']);
+    const tsx = ['components/Layout/AppLayout.tsx', 'components/Chat/MessageList.tsx']
+      .map((f) => readFileSync(resolve(__dirname, '../../../src/renderer', f), 'utf-8'))
+      .join('\n');
+    for (const cls of [...nav, ...messages]) expect(tsx).toContain(`className="${cls}"`);
+  });
+
+  it('headings and area rules also reach a themed scope root (#2366)', () => {
+    // useUserThemeScope puts data-scheme on another user's profile surface, which
+    // re-matches a theme block there; only a [data-scheme] rule outranks it.
+    const missing = explicitIds
+      .flatMap((id) => [
+        `[data-font-headings='${id}'] body [data-scheme]`,
+        `[data-font-messages='${id}'] :is(.message-list, .message-list-empty) [data-scheme]`,
+      ])
+      .filter((selector) => !flat.includes(selector));
+    expect(missing).toEqual([]);
+    expect(flat.match(/\[data-font-nav='[a-z]+'\] :is\([^)]*\) \[data-scheme\]/g)).toHaveLength(
+      explicitIds.length
+    );
+  });
+
+  // A control that names a body family itself ignores every font setting, Dyslexic
+  // Support included (CategoryManagerPanel's input used --font-body-stack).
+  it('renderer CSS never hard-codes a body font outside the two deliberate places', () => {
+    const renderer = resolve(__dirname, '../../../src/renderer');
+    const allowed = /^(inherit|var\(--font-(display|brand)-stack\)|var\(--font-stack-[a-z]+\))$/;
+    const deliberate = new Set([
+      'components/Auth/SSOButton.css', // Google's sign-in branding mandates Roboto
+      'styles/index.css', // the base body rule every layer starts from
+    ]);
+    const offenders: string[] = [];
+    for (const entry of readdirSync(renderer, { recursive: true }) as string[]) {
+      const rel = entry.replaceAll('\\', '/'); // Windows returns backslash-separated paths
+      if (!rel.endsWith('.css') || deliberate.has(rel)) continue;
+      const text = readFileSync(resolve(renderer, rel), 'utf-8')
+        .replace(/@font-face\s*\{[^}]*\}/g, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '');
+      for (const [, value] of text.matchAll(/font-family:\s*([^;]+);/g)) {
+        const v = value.trim();
+        if (!allowed.test(v) && !v.includes('monospace')) offenders.push(`${rel}: ${v}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('form controls inherit the body font through a zero-specificity reset', () => {
+    // Chromium gives controls the system font; without this a bare <button> ignores
+    // every font setting, Dyslexic Support included.
+    expect(flat).toContain(':where(button, input, select, textarea) { font-family: inherit; }');
+  });
+
+  it('the titlebar wordmark reads the brand stack, not the display stack', () => {
+    const titlebar = readFileSync(
+      resolve(__dirname, '../../../src/renderer/components/Titlebar/Titlebar.css'),
+      'utf-8'
+    );
+    expect(titlebar).toContain('var(--font-brand-stack)');
+    expect(titlebar).not.toContain('var(--font-display-stack)');
   });
 });

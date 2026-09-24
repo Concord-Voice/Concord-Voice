@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import ContextMenu from '@/renderer/components/ui/ContextMenu';
+import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
 
 describe('ContextMenu', () => {
   const mockOnClose = vi.fn();
@@ -32,12 +33,12 @@ describe('ContextMenu', () => {
   });
 
   it('renders Separator', () => {
-    const { container } = render(
+    render(
       <ContextMenu position={{ x: 0, y: 0 }} onClose={mockOnClose}>
         <ContextMenu.Separator />
       </ContextMenu>
     );
-    expect(container.querySelector('.ctx-menu-separator')).toBeInTheDocument();
+    expect(document.querySelector('.ctx-menu-separator')).toBeInTheDocument();
   });
 
   it('renders Item with icon', () => {
@@ -114,15 +115,15 @@ describe('ContextMenu', () => {
   // --- z-index stacks above all in-app chrome (#571 item #3) ---
 
   it('overlay and menu z-index exceed every other renderer stacking layer', () => {
-    const { container } = render(
+    render(
       <ContextMenu position={{ x: 100, y: 200 }} onClose={mockOnClose}>
         <ContextMenu.Item label="Pin" onClick={() => {}} />
         <ContextMenu.Item label="Edit" onClick={() => {}} />
         <ContextMenu.Item label="Delete" onClick={() => {}} danger />
       </ContextMenu>
     );
-    const overlay = container.querySelector('.ctx-menu-overlay') as HTMLElement;
-    const menu = container.querySelector('.ctx-menu') as HTMLElement;
+    const overlay = document.querySelector('.ctx-menu-overlay') as HTMLElement;
+    const menu = document.querySelector('.ctx-menu') as HTMLElement;
     // CSSOM doesn't resolve stylesheet values in jsdom, so we assert the
     // known-high constants from ContextMenu.css. Any regression that lowers
     // these below 10000 (the ForceUpdateOverlay) would cause the same
@@ -140,7 +141,7 @@ describe('ContextMenu', () => {
     // sibling must still render its children fully (no clipping from DOM
     // ordering — ContextMenuProvider always appends the menu AFTER the app
     // subtree in the root fragment).
-    const { container } = render(
+    render(
       <>
         <div data-testid="composer" style={{ position: 'fixed', zIndex: 50, bottom: 0 }}>
           Composer
@@ -157,7 +158,7 @@ describe('ContextMenu', () => {
     for (const label of ['Pin', 'Reply', 'Copy', 'Edit', 'Delete']) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
-    const menu = container.querySelector('.ctx-menu');
+    const menu = document.querySelector('.ctx-menu');
     expect(menu).not.toBeNull();
   });
 
@@ -252,12 +253,12 @@ describe('ContextMenu', () => {
       // 383px above it. Flipping alone put the top at 383 − 500 = −117.
       setViewport(1024, 600);
       boxes = { 'ctx-menu': { width: 200, height: 500 } };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 100, y: 383 }} onClose={mockOnClose}>
           <ContextMenu.Item label="Pin" onClick={() => {}} />
         </ContextMenu>
       );
-      const menu = container.querySelector('.ctx-menu') as HTMLElement;
+      const menu = document.querySelector('.ctx-menu') as HTMLElement;
       const top = Number.parseFloat(menu.style.top);
       expect(top).toBeGreaterThanOrEqual(8);
       expect(top + 500).toBeLessThanOrEqual(600 - 8);
@@ -269,36 +270,36 @@ describe('ContextMenu', () => {
       // sits inside the clamp band, so this isolates the flip from the clamp.
       setViewport(1024, 600);
       boxes = { 'ctx-menu': { width: 200, height: 200 } };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 100, y: 500 }} onClose={mockOnClose}>
           <ContextMenu.Item label="Pin" onClick={() => {}} />
         </ContextMenu>
       );
-      const menu = container.querySelector('.ctx-menu') as HTMLElement;
+      const menu = document.querySelector('.ctx-menu') as HTMLElement;
       expect(menu.style.top).toBe('300px');
     });
 
     it('keeps a wide menu flipped left of a click inside the left margin', () => {
       setViewport(400, 768);
       boxes = { 'ctx-menu': { width: 300, height: 100 } };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 150, y: 100 }} onClose={mockOnClose}>
           <ContextMenu.Item label="Pin" onClick={() => {}} />
         </ContextMenu>
       );
-      const menu = container.querySelector('.ctx-menu') as HTMLElement;
+      const menu = document.querySelector('.ctx-menu') as HTMLElement;
       expect(Number.parseFloat(menu.style.left)).toBeGreaterThanOrEqual(8);
     });
 
     it('caps a menu taller than the viewport and lets it scroll', () => {
       setViewport(1024, 600);
       boxes = { 'ctx-menu': { width: 200, height: 700 } };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 100, y: 300 }} onClose={mockOnClose}>
           <ContextMenu.Item label="Pin" onClick={() => {}} />
         </ContextMenu>
       );
-      const menu = container.querySelector('.ctx-menu') as HTMLElement;
+      const menu = document.querySelector('.ctx-menu') as HTMLElement;
       expect(menu.style.top).toBe('8px');
       expect(menu.style.maxHeight).toBe('584px');
       expect(menu.style.overflowY).toBe('auto');
@@ -307,12 +308,12 @@ describe('ContextMenu', () => {
     it('leaves a menu that fits unscrollable, so its submenu flyouts are not clipped', () => {
       setViewport(1024, 600);
       boxes = { 'ctx-menu': { width: 200, height: 300 } };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 100, y: 100 }} onClose={mockOnClose}>
           <ContextMenu.Item label="Pin" onClick={() => {}} />
         </ContextMenu>
       );
-      const menu = container.querySelector('.ctx-menu') as HTMLElement;
+      const menu = document.querySelector('.ctx-menu') as HTMLElement;
       expect(menu.style.overflowY).toBe('');
       expect(menu.style.maxHeight).toBe('');
       // And one that fits where it was clicked is not moved at all.
@@ -325,7 +326,7 @@ describe('ContextMenu', () => {
         'ctx-menu-item-wrapper': { width: 200, height: 30, top: 304, left: 150 },
         'ctx-submenu': { width: 150, height: 700, top: 300, left: 300 },
       };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 100, y: 100 }} onClose={mockOnClose}>
           <div className="ctx-menu-item-wrapper">
             <ContextMenu.Item label="Move to" onClick={() => {}} hasSubMenu />
@@ -335,7 +336,7 @@ describe('ContextMenu', () => {
           </div>
         </ContextMenu>
       );
-      const sub = container.querySelector('.ctx-submenu') as HTMLElement;
+      const sub = document.querySelector('.ctx-submenu') as HTMLElement;
       // Viewport top = the wrapper's top + the submenu's (nudged) offset in it.
       const viewportTop = 304 + Number.parseFloat(sub.style.top);
       expect(viewportTop).toBeGreaterThanOrEqual(8);
@@ -351,7 +352,7 @@ describe('ContextMenu', () => {
         'ctx-menu-item-wrapper': { width: 200, height: 30, top: 104, left: 150 },
         'ctx-submenu': { width: 150, height: 600, rectHeight: 576, top: 100, left: 300 },
       };
-      const { container } = render(
+      render(
         <ContextMenu position={{ x: 100, y: 100 }} onClose={mockOnClose}>
           <div className="ctx-menu-item-wrapper">
             <ContextMenu.Item label="Move to" onClick={() => {}} hasSubMenu />
@@ -361,7 +362,7 @@ describe('ContextMenu', () => {
           </div>
         </ContextMenu>
       );
-      const sub = container.querySelector('.ctx-submenu') as HTMLElement;
+      const sub = document.querySelector('.ctx-submenu') as HTMLElement;
       expect(sub.style.maxHeight).toBe('584px');
       expect(sub.style.overflowY).toBe('auto');
       expect(104 + Number.parseFloat(sub.style.top)).toBeGreaterThanOrEqual(8);
@@ -379,7 +380,7 @@ describe('ContextMenu', () => {
         ) {
           return this.classList.contains('ctx-submenu') ? wrapper.width + 6 : 0;
         });
-        const { container } = render(
+        render(
           <ContextMenu position={{ x: 100, y: 100 }} onClose={mockOnClose}>
             <div className="ctx-menu-item-wrapper">
               <ContextMenu.Item label="Roles" onClick={() => {}} hasSubMenu />
@@ -389,7 +390,7 @@ describe('ContextMenu', () => {
             </div>
           </ContextMenu>
         );
-        return container.querySelector('.ctx-submenu') as HTMLElement;
+        return document.querySelector('.ctx-submenu') as HTMLElement;
       };
 
       it('flips a submenu that overflows right, leaving it beside its trigger when it fits', () => {
@@ -410,6 +411,37 @@ describe('ContextMenu', () => {
         expect(sub.style.right).toBe('auto');
         expect(sub.style.width).toBe('300px');
       });
+    });
+  });
+
+  // #2366: rendered in place, the overlay inherited the font of the area that
+  // opened it (Navigation or Messages). It must portal out like ui/Modal.
+  describe('portal', () => {
+    it('renders outside the region that opened it', () => {
+      render(
+        <div className="message-list">
+          <ContextMenu position={{ x: 10, y: 10 }} onClose={mockOnClose}>
+            <ContextMenu.Item label="Pin" onClick={() => {}} />
+          </ContextMenu>
+        </div>
+      );
+      const root = document.querySelector('.ctx-menu-overlay');
+      expect(root?.parentElement).toBe(document.body);
+      expect(root?.closest('.message-list')).toBeNull();
+    });
+
+    it('renders into a modal portal host when one is provided', () => {
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      render(
+        <ModalPortalHostContext.Provider value={host}>
+          <ContextMenu position={{ x: 10, y: 10 }} onClose={mockOnClose}>
+            <ContextMenu.Item label="Pin" onClick={() => {}} />
+          </ContextMenu>
+        </ModalPortalHostContext.Provider>
+      );
+      expect(host.querySelector('.ctx-menu-overlay')).not.toBeNull();
+      host.remove();
     });
   });
 });

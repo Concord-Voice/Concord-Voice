@@ -303,14 +303,14 @@ describe('ContextMenuProvider', () => {
   });
 
   it('shows no menu for generic targets', () => {
-    const { container } = render(
+    render(
       <ContextMenuProvider>
         <div data-testid="generic">Nothing here</div>
       </ContextMenuProvider>
     );
 
     fireEvent.contextMenu(screen.getByTestId('generic'));
-    expect(container.querySelector('.ctx-menu')).not.toBeInTheDocument();
+    expect(document.querySelector('.ctx-menu')).not.toBeInTheDocument();
   });
 
   it('closes menu when Escape is pressed', () => {
@@ -671,7 +671,7 @@ describe('ContextMenuProvider', () => {
   });
 
   it('shows empty fallback for unknown area', () => {
-    const { container } = render(
+    render(
       <ContextMenuProvider>
         <div data-context-area="unknown">
           <span data-testid="unknown-area">Unknown</span>
@@ -681,6 +681,6 @@ describe('ContextMenuProvider', () => {
 
     fireEvent.contextMenu(screen.getByTestId('unknown-area'));
     // Menu still renders (area case), but default areaItems returns null
-    expect(container.querySelector('.ctx-menu')).toBeInTheDocument();
+    expect(document.querySelector('.ctx-menu')).toBeInTheDocument();
   });
 });
