@@ -38,14 +38,17 @@ describe('PremiumChip', () => {
     expect(onActivate).toHaveBeenCalledTimes(1);
   });
 
-  it('fires onActivate on Enter and Space (keyboard)', async () => {
+  // Exactly once: a native <button> already turns Enter/Space into a click, so a key
+  // handler on top double-fires unless the host happens to call preventDefault().
+  it.each([
+    ['Enter', '{Enter}'],
+    ['Space', ' '],
+  ])('fires onActivate exactly once on %s (keyboard)', async (_key, keys) => {
     const onActivate = vi.fn();
     render(<PremiumChip onActivate={onActivate} />);
-    const button = screen.getByRole('button');
-    button.focus();
-    await userEvent.keyboard('{Enter}');
-    await userEvent.keyboard(' ');
-    expect(onActivate).toHaveBeenCalled();
+    screen.getByRole('button').focus();
+    await userEvent.keyboard(keys);
+    expect(onActivate).toHaveBeenCalledTimes(1);
   });
 
   it('omits the glyph when locked={false}', () => {

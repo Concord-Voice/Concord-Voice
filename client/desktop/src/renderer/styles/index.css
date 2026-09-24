@@ -148,6 +148,10 @@
 
   /* Utility colors */
   --on-accent: #ffffff;
+  /* Text on --accent-secondary (Premium chip, admin role badge). Black or white by
+     the fill's luminance, the same rule colorUtils.contrastColor applies to custom
+     themes; >= 4.5:1 in every block. Redeclare it wherever --accent-secondary moves. */
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #d43b3b;
@@ -264,6 +268,7 @@
   --bg-hover: #dddde2;
   --bg-active: #d2d2d8;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #c83232;
@@ -320,6 +325,7 @@
   --bg-hover: #1a1230;
   --bg-active: #241e38;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #d43b3b;
@@ -376,6 +382,7 @@
   --bg-hover: #dddde2;
   --bg-active: #d2d2d8;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #c83232;
@@ -432,6 +439,7 @@
   --bg-hover: #262626;
   --bg-active: #2e2e2e;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #d43030;
@@ -488,6 +496,7 @@
   --bg-hover: #e2e2e2;
   --bg-active: #d8d8d8;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #a82020;
@@ -544,6 +553,7 @@
   --bg-hover: #2e2042;
   --bg-active: #36264c;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #c43a60;
@@ -600,6 +610,7 @@
   --bg-hover: #e6dcf0;
   --bg-active: #ddd0ea;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #a82a50;
@@ -656,6 +667,7 @@
   --bg-hover: #6a3c08;
   --bg-active: #7a4810;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #d43838;
@@ -719,6 +731,7 @@
   --bg-hover: #ffe0b0;
   --bg-active: #ffd898;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #a82020;
@@ -779,6 +792,7 @@
   --bg-hover: #181818;
   --bg-active: #202020;
   --on-accent: #000000;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #cc1818;
@@ -835,6 +849,7 @@
   --bg-hover: #c2e8c2;
   --bg-active: #b0d8b0;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #a80e0e;
@@ -891,6 +906,7 @@
   --bg-hover: #221818;
   --bg-active: #2a1e1e;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #aa1a1a;
@@ -947,6 +963,7 @@
   --bg-hover: #e0d4c4;
   --bg-active: #d6c8b6;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #981414;
@@ -1003,6 +1020,7 @@
   --bg-hover: #0e2438;
   --bg-active: #142e44;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #d6354f;
@@ -1059,6 +1077,7 @@
   --bg-hover: #cce4f2;
   --bg-active: #c0dae8;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #be123c;
@@ -1115,6 +1134,7 @@
   --bg-hover: #222a1a;
   --bg-active: #2a3222;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #9a4a2c;
@@ -1171,6 +1191,7 @@
   --bg-hover: #dae0cc;
   --bg-active: #d0d6c0;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #884020;
@@ -1227,6 +1248,7 @@
   --bg-hover: #1e1a28;
   --bg-active: #262230;
   --on-accent: #000000;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #e03868;
@@ -1283,6 +1305,7 @@
   --bg-hover: #c4d8f4;
   --bg-active: #b4ccea;
   --on-accent: #000000;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #d80050;
@@ -1339,6 +1362,7 @@
   --bg-hover: #2a221a;
   --bg-active: #322a20;
   --on-accent: #12100a;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #a84830;
@@ -1395,6 +1419,7 @@
   --bg-hover: #e0d4c4;
   --bg-active: #d6c8b6;
   --on-accent: #000000;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #8c361e;
@@ -1451,6 +1476,7 @@
   --bg-hover: #1a0808;
   --bg-active: #221010;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #000000;
   --on-success: #ffffff;
   --danger-hover: #dd0000;
@@ -1507,6 +1533,7 @@
   --bg-hover: #dcc4c4;
   --bg-active: #d0b8b8;
   --on-accent: #f4e8e8;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #990000;
@@ -1563,6 +1590,7 @@
   --bg-hover: #1a2444;
   --bg-active: #222e52;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #e05068;
@@ -1619,6 +1647,7 @@
   --bg-hover: #d0d6ea;
   --bg-active: #c4cae0;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #be123c;
@@ -1677,6 +1706,7 @@
   --bg-hover: #122545;
   --bg-active: #1a3666;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #ff3060;
@@ -1744,6 +1774,7 @@
   --bg-hover: #e0e8f0;
   --bg-active: #cdd9e6;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #a30030;
@@ -1810,6 +1841,7 @@
   --bg-hover: #2a2a30;
   --bg-active: #34343b;
   --on-accent: #0d1117;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #da3633;
@@ -1866,6 +1898,7 @@
   --bg-hover: #f3f4f6;
   --bg-active: #eaeef2;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #a40e26;
@@ -1930,6 +1963,7 @@
   --bg-hover: #2b2336;
   --bg-active: #342a42;
   --on-accent: #ffffff;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #e04848;
@@ -1994,6 +2028,7 @@
   --bg-hover: #f3e7ef;
   --bg-active: #ebdce7;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #000000;
   --danger-hover: #b32f2f;
@@ -2385,6 +2420,7 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
   --bg-hover: #333333;
   --bg-active: #4d4d4d;
   --on-accent: #000000;
+  --on-accent-secondary: #000000;
   --on-danger: #000000;
   --on-success: #000000;
   --danger-hover: #ff8080;
@@ -2420,6 +2456,7 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
   --bg-hover: #e0e0e0;
   --bg-active: #c0c0c0;
   --on-accent: #ffffff;
+  --on-accent-secondary: #ffffff;
   --on-danger: #ffffff;
   --on-success: #ffffff;
   --danger-hover: #990000;

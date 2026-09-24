@@ -70,6 +70,12 @@ that keeps sending far more than your plan allows.
   1080p instead, and show Source Native as a Premium option you cannot select. Upgrading brings
   Source Native back without changing any setting.
 
+- **Premium labels and Admin badges are readable in every color scheme** ([#3439](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3439)) — the Premium lock
+  label, the Premium badge in Settings and the Admin badge on member profiles drew white text on
+  yellow in light themes, and black text on the dark accent some color schemes use. Their text now
+  switches between black and white to stay readable in every color scheme, including High Contrast
+  and custom themes.
+
 - **Links opened from a picture-in-picture window now open in your browser** ([#3416](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3416)) — a link or pop-up
   started inside a picture-in-picture window could open a new Concord window. Picture-in-picture
   windows now follow the same rule as the main window: secure (`https`) links open in your browser,

@@ -202,7 +202,7 @@
 
 .user-profile-modal-role-badge.role-admin {
   background: var(--accent-secondary);
-  color: #000000;
+  color: var(--on-accent-secondary);
 }
 
 .user-profile-modal-role-badge.role-member {

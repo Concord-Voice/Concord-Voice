@@ -90,6 +90,9 @@ const REQUIRED_TOKENS = [
   '--accent-primary',
   '--accent-secondary',
   '--on-accent',
+  // Text on --accent-secondary (Premium chip, admin role badge). HCM swaps that
+  // fill, so it must swap the foreground with it or a scheme's value leaks through.
+  '--on-accent-secondary',
   '--border-color',
   '--gradient-brand',
   '--success',
@@ -372,6 +375,20 @@ describe('High Contrast Mode cascade (#489)', () => {
       expect(
         ratio,
         `light HCM on-accent '${onAccent}' on accent '${accent}' = ${ratio.toFixed(2)}:1, below WCAG AAA 7:1`
+      ).toBeGreaterThanOrEqual(7);
+    });
+
+    // Premium chips, the premium badge and Admin role badges draw this pair.
+    it.each([
+      ['dark', () => darkBody],
+      ['light', () => lightBody],
+    ])('%s HCM: --on-accent-secondary on --accent-secondary meets WCAG AAA', (mode, body) => {
+      const onAccent2 = extractDeclaration(body(), '--on-accent-secondary') ?? '';
+      const accent2 = extractDeclaration(body(), '--accent-secondary') ?? '';
+      const ratio = wcagContrast(onAccent2, accent2);
+      expect(
+        ratio,
+        `${mode} HCM on-accent-secondary '${onAccent2}' on accent-secondary '${accent2}' = ${ratio.toFixed(2)}:1, below WCAG AAA 7:1`
       ).toBeGreaterThanOrEqual(7);
     });
   });

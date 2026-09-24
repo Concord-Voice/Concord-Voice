@@ -1,6 +1,6 @@
 /* ─── PremiumChip — the universal lock affordance (#1301) ─────────────────
    Extends the existing `.settings-quality-premium-badge` (SettingsPage.css):
-   yellow pill (--accent-secondary bg, --bg-primary text), 🔒 glyph slot, the
+   yellow pill (--accent-secondary bg, --on-accent-secondary text), 🔒 glyph slot, the
    literal word "Premium". The brand gradient is RESERVED for active-Premium
    surfaces (dossier I.1 "the gradient is the reward") — the locked chip stays
    in the flat yellow badge palette. */
@@ -13,7 +13,7 @@
   padding: 1px 6px;
   border-radius: 4px;
   background: var(--accent-secondary, var(--accent-primary));
-  color: var(--bg-primary);
+  color: var(--on-accent-secondary);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -38,7 +38,9 @@
   font-weight: 600;
   text-transform: none;
   letter-spacing: normal;
-  opacity: 0.85; /* non-text chrome only — the "Premium" word stays full opacity */
+  /* No opacity: this is TEXT, and dimming it toward the fill cost up to 0.8:1 --
+     below 4.5:1 in four schemes (worst Agency dark, 3.76:1). Weight and case
+     already set it apart from the "Premium" word. */
 }
 
 /* Interactive chip = native <button>, reset to look like the pill, keyboard +
@@ -49,21 +51,15 @@
   font-family: inherit;
 }
 
+/* Hover draws a ring in the text colour instead of re-tinting the pill: a
+   brightness filter lightened the fill under white text already near 4.5:1
+   (Agency dark fell to 4.02:1), and the contrast ratchet cannot see filters.
+   currentColor contrasts with the fill by construction. */
 .premium-chip--interactive:hover {
-  filter: brightness(1.08);
+  box-shadow: inset 0 0 0 1px currentColor;
 }
 
 .premium-chip--interactive:focus-visible {
   outline: 2px solid var(--state-focused);
   outline-offset: 2px;
-}
-
-/* Reduced motion: the brightness/transition affordances become instant. */
-@media (prefers-reduced-motion: reduce) {
-  .premium-chip--interactive {
-    transition: none;
-  }
-  .premium-chip--interactive:hover {
-    filter: none;
-  }
 }

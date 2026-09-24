@@ -17,7 +17,9 @@ export interface PremiumChipProps {
   locked?: boolean;
   /**
    * When provided, the chip is an interactive native `<button>` that calls this
-   * on click + keyboard (the host wires Enter/Space). When omitted, the chip is
+   * on click. The button turns Enter/Space into that click itself, so the chip
+   * adds no key handler: one would fire twice per key unless the host called
+   * preventDefault(). When omitted, the chip is
    * a non-interactive `<span>` (decorative/inline label only). Never a
    * role+tabindex span (Sonar S6819 / a11y).
    */
@@ -69,9 +71,6 @@ const PremiumChip: React.FC<PremiumChipProps> = ({
         id={id}
         className={`${rootClass} premium-chip--interactive`}
         onClick={(e) => onActivate(e)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') onActivate(e);
-        }}
       >
         <ChipBody locked={locked} label={label} />
       </button>

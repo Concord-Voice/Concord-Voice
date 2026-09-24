@@ -198,13 +198,15 @@ describe('deriveThemeVariables', () => {
     accentSecondary: '#ffe13f',
   };
 
-  it('returns all 27 expected CSS property keys', () => {
+  it('returns all 28 expected CSS property keys', () => {
     const vars = deriveThemeVariables(defaultColors, true);
     const keys = Object.keys(vars);
-    expect(keys).toHaveLength(27);
+    expect(keys).toHaveLength(28);
     // Every focus ring draws in --state-focused (#798). Not derived, it resolves to the
     // user's raw --accent-secondary in dark mode and to a scheme block's literal in light.
     expect(keys).toContain('--state-focused');
+    // Text on the --accent-secondary fill (#3439), derived per mode by contrastColor.
+    expect(keys).toContain('--on-accent-secondary');
     expect(keys).toContain('--bg-primary');
     expect(keys).toContain('--text-primary');
     expect(keys).toContain('--accent-primary');
@@ -215,6 +217,33 @@ describe('deriveThemeVariables', () => {
     // foreground against a fill :root never saw. Both halves ship together.
     expect(keys).toContain('--on-danger');
     expect(keys).toContain('--on-success');
+  });
+
+  // The Premium chip and the admin role badge draw text on --accent-secondary. A
+  // custom theme that derives that fill without its foreground inherits the
+  // scheme's on-colour against a fill the scheme never saw -- the white-on-yellow
+  // 1.20:1 chip, reproduced for any user-picked accent.
+  it.each([
+    ['dark', true],
+    ['light', false],
+  ])('derives --on-accent-secondary for its own %s --accent-secondary fill', (_mode, isDark) => {
+    // '#7f7f7f' straddles the 0.179 luminance threshold: black on its own, but light
+    // mode darkens it to '#6b6b6b', which needs white -- so contrasting against the
+    // input instead of the derived fill fails here.
+    for (const accentSecondary of [
+      '#ffe13f',
+      '#880000',
+      '#017fa4',
+      '#7c5cc8',
+      '#00ee38',
+      '#7f7f7f',
+    ]) {
+      const vars = deriveThemeVariables({ ...defaultColors, accentSecondary }, isDark);
+      expect(vars['--on-accent-secondary']).toBe(contrastColor(vars['--accent-secondary']));
+      expect(
+        contrastRatio(vars['--on-accent-secondary'], vars['--accent-secondary'])
+      ).toBeGreaterThanOrEqual(4.5);
+    }
   });
 
   it('clears every key it applies', () => {

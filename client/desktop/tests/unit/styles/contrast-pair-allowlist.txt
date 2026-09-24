@@ -45,7 +45,6 @@ src/renderer/components/Chat/SearchPanel.css	.search-result-jump:hover	1.98
 src/renderer/components/Chat/ThemedMediaPlayer.css	.media-controls-btn:focus-visible	2.19
 src/renderer/components/Chat/ThemedMediaPlayer.css	.media-controls-btn:hover	2.19
 src/renderer/components/common/audioQualitySlider.css	.settings-tier-kbps-label	2.19
-src/renderer/components/common/PremiumChip.css	.premium-chip	1.20
 src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-delete-confirm-btn	3.83
 src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-delete-confirm-btn:hover	4.04
 src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .create-role-btn:hover	1.98
@@ -72,13 +71,11 @@ src/renderer/components/Layout/ServerBar.css	.server-bar-pm-icon	2.22
 src/renderer/components/Layout/ServerBar.css	.server-bar-scroll-arrow	2.00
 src/renderer/components/Members/MemberList.css	.member-compact-trigger-count	2.46
 src/renderer/components/Members/MemberList.css	.member-list-error .retry-btn:hover	2.19
-src/renderer/components/Members/MemberProfileCard.css	.member-profile-role-badge.role-admin	1.69
 src/renderer/components/Members/MemberProfileCard.css	.member-profile-role-badge.role-owner	2.68
 src/renderer/components/Members/MemberProfileCard.css	.member-profile-view-full-btn:hover	2.68
 src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn	2.68
 src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn--error	2.96
 src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn:hover:not(:disabled)	2.14
-src/renderer/components/Members/UserProfileModal.css	.user-profile-modal-role-badge.role-admin	1.69
 src/renderer/components/Members/UserProfileModal.css	.user-profile-modal-role-badge.role-owner	2.68
 src/renderer/components/Permissions/OverridePanel.css	.override-delete-btn:hover	3.45
 src/renderer/components/Permissions/PermissionGrid.css	.permission-tristate-btn.deny-active	3.83
@@ -116,7 +113,6 @@ src/renderer/components/Settings/SettingsPage.css	.settings-codec-info-badge	2.1
 src/renderer/components/Settings/SettingsPage.css	.settings-estimated-bitrate	2.19
 src/renderer/components/Settings/SettingsPage.css	.settings-notification-permission-btn	2.68
 src/renderer/components/Settings/SettingsPage.css	.settings-pending-blob-apply	2.68
-src/renderer/components/Settings/SettingsPage.css	.settings-quality-premium-badge	1.20
 src/renderer/components/Settings/SettingsPage.css	.settings-rotate-id-btn:hover:not(:disabled)	2.46
 src/renderer/components/Settings/subscription/subscription.css	.subscription-redeem-submit	2.68
 src/renderer/components/Settings/subscription/subscription.css	.subscription-redeem-submit:hover:not(:disabled)	2.14

@@ -35,6 +35,7 @@ export interface DerivedThemeVariables {
   '--gradient-brand': string;
   '--border-color': string;
   '--on-accent': string;
+  '--on-accent-secondary': string;
   '--on-danger': string;
   '--on-success': string;
   '--success': string;
@@ -66,6 +67,7 @@ const THEME_VARIABLE_KEYS: (keyof DerivedThemeVariables)[] = [
   '--gradient-brand',
   '--border-color',
   '--on-accent',
+  '--on-accent-secondary',
   '--on-danger',
   '--on-success',
   '--success',
@@ -332,6 +334,7 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
     '--gradient-brand': `linear-gradient(90deg, ${a1} 0%, ${a2} 100%)`,
     '--border-color': lighten(bg, 15),
     '--on-accent': contrastColor(a1),
+    '--on-accent-secondary': contrastColor(a2),
     '--success': '#43b581',
     '--danger': '#f04747',
     // Lighter than the fill, not darker. Every other hover this function derives
@@ -392,6 +395,7 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
     '--gradient-brand': `linear-gradient(90deg, ${lightA1} 0%, ${lightA2} 100%)`,
     '--border-color': darken(bgLight, 15),
     '--on-accent': contrastColor(lightA1),
+    '--on-accent-secondary': contrastColor(lightA2),
     '--success': '#2d9f6f',
     '--danger': '#e03e3e',
     '--danger-hover': '#c83232',

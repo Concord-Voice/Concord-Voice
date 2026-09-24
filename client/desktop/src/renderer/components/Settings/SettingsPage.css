@@ -1182,7 +1182,7 @@
   padding: 1px 6px;
   border-radius: 4px;
   background: var(--accent-secondary, var(--accent-primary));
-  color: var(--bg-primary);
+  color: var(--on-accent-secondary);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.5px;

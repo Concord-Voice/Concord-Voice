@@ -290,7 +290,7 @@
 
 .member-profile-role-badge.role-admin {
   background: var(--accent-secondary);
-  color: #000000;
+  color: var(--on-accent-secondary);
 }
 
 .member-profile-role-badge.role-member {
