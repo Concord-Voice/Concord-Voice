@@ -233,6 +233,23 @@ describe('AudioConfigSection', () => {
     expect(slider).toHaveAttribute('max', '6');
   });
 
+  // G1: the slider had no accessible name and no value text, so a screen
+  // reader announced only the raw index ("3"). It needs an accessible name
+  // plus aria-valuetext naming the current tier, matching the sibling
+  // sliders (DMPrivacyControls / FriendRequestPrivacyControls).
+  it('quality slider has an accessible name and announces the current tier as its value', () => {
+    render(<AudioConfigSection />);
+    const slider = screen.getByRole('slider', { name: /audio quality/i });
+    expect(slider).toHaveAttribute('aria-valuetext', 'Standard');
+  });
+
+  it('quality slider aria-valuetext follows a non-default tier', async () => {
+    await overrideTier('low');
+    render(<AudioConfigSection />);
+    const slider = screen.getByRole('slider', { name: /audio quality/i });
+    expect(slider).toHaveAttribute('aria-valuetext', 'Low');
+  });
+
   it('does not render AudioOpusSection in basic mode', () => {
     render(<AudioConfigSection />);
     expect(screen.queryByTestId('audio-opus-section')).not.toBeInTheDocument();
@@ -341,15 +358,42 @@ describe('AudioConfigSection', () => {
     expect(mockStashAndSwap).not.toHaveBeenCalled();
   });
 
-  // ===== 5. Tier label onClick =====
+  // ===== 5. Tier label activation parity (click / Enter / Space) =====
 
-  it('sets quality tier when clicking a tier label in basic mode', async () => {
-    const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
-    render(<AudioConfigSection />);
-    fireEvent.click(screen.getByText('High'));
-    expect(mockSetQualityTier).toHaveBeenCalledWith('high');
-    expect(batchSetAudioDrafts).toHaveBeenCalled();
-  });
+  // Click, Enter and Space must all resolve to exactly one selection and one
+  // basic-mode draft batch — a native <button> gets Enter/Space activation
+  // for free, so this also guards against a stray onKeyDown handler that
+  // would double-fire alongside it.
+  it.each([
+    ['click', (btn: HTMLElement) => fireEvent.click(btn)],
+    [
+      'Enter',
+      async (btn: HTMLElement) => {
+        const user = userEvent.setup();
+        btn.focus();
+        await user.keyboard('{Enter}');
+      },
+    ],
+    [
+      'Space',
+      async (btn: HTMLElement) => {
+        const user = userEvent.setup();
+        btn.focus();
+        await user.keyboard(' ');
+      },
+    ],
+  ])(
+    'activates a free tier via %s: selects it once and batches drafts in basic mode',
+    async (_label, activate) => {
+      const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
+      render(<AudioConfigSection />);
+      const btn = screen.getByRole('button', { name: 'High' });
+      await activate(btn);
+      expect(mockSetQualityTier).toHaveBeenCalledTimes(1);
+      expect(mockSetQualityTier).toHaveBeenCalledWith('high');
+      expect(batchSetAudioDrafts).toHaveBeenCalled();
+    }
+  );
 
   it('sets quality tier without batching drafts in advanced mode', async () => {
     await enableAdvancedMode();
@@ -360,26 +404,42 @@ describe('AudioConfigSection', () => {
     expect(batchSetAudioDrafts).not.toHaveBeenCalled();
   });
 
-  // ===== 6. Tier label onKeyDown =====
+  // ===== 6. Tier labels are native buttons =====
 
-  it('triggers tier click on Enter key', async () => {
+  // The labels are shortcuts onto the slider: native buttons whose pressed
+  // state marks the current tier. A tab would promise a tabpanel that does
+  // not exist.
+  it('renders each tier label as a native button pressed only for the current tier', () => {
     render(<AudioConfigSection />);
-    const label = screen.getByText('Minimum');
-    fireEvent.keyDown(label, { key: 'Enter' });
-    expect(mockSetQualityTier).toHaveBeenCalledWith('minimum');
+    expect(screen.getByRole('button', { name: 'Standard' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    expect(screen.getByRole('button', { name: 'Low' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByRole('tab', { name: 'Standard' })).not.toBeInTheDocument();
   });
 
-  it('triggers tier click on Space key', async () => {
-    render(<AudioConfigSection />);
-    const label = screen.getByText('Low');
-    fireEvent.keyDown(label, { key: ' ' });
-    expect(mockSetQualityTier).toHaveBeenCalledWith('low');
+  // G3: the tests above only ever exercise the DEFAULT tier ('standard'), so a
+  // mutant that hardcodes the pressed comparison against that default (rather
+  // than the live `qualityTier`) would still pass every one of them.
+  it('pressed state follows a non-default tier, and exactly one label is pressed', async () => {
+    await overrideTier('low');
+    const { container } = render(<AudioConfigSection />);
+    expect(screen.getByRole('button', { name: 'Low' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Standard' })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+    const labels = within(container.querySelector('.settings-tier-labels') as HTMLElement);
+    expect(labels.getAllByRole('button', { pressed: true })).toHaveLength(1);
+    expect(labels.getAllByRole('button', { pressed: true })[0]).toHaveTextContent('Low');
   });
 
-  it('does not trigger tier click on other keys', () => {
+  it('does not select a tier on other keys', async () => {
+    const user = userEvent.setup();
     render(<AudioConfigSection />);
-    const label = screen.getByText('Minimum');
-    fireEvent.keyDown(label, { key: 'Tab' });
+    screen.getByRole('button', { name: 'Minimum' }).focus();
+    await user.keyboard('a');
     expect(mockSetQualityTier).not.toHaveBeenCalled();
   });
 

@@ -154,6 +154,12 @@ that keeps sending far more than your plan allows.
   meant the "already a member" check was answering about the wrong server. It now ignores an
   answer to a code you have already replaced, so the card always describes the code in front of
   you.
+- **The audio quality labels above the Audio Configuration slider now work as buttons for keyboard and
+  screen-reader users** ([#3430](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3430)) —
+  Minimum through Studio are announced as buttons, with the current tier marked as pressed, instead
+  of as tabs. Enter and Space select a tier, and the premium tiers still explain that they need a
+  subscription. The slider below them is now announced as "Audio quality" with the tier's name,
+  instead of a bare number. They look the same as before.
 
 ### Security
 

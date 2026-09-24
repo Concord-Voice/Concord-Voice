@@ -224,23 +224,17 @@ const AudioConfigSection: React.FC = () => {
           {TIER_ORDER.map((tier, i) => {
             const config = AUDIO_QUALITY_TIERS[tier];
             const locked = isTierLocked(tier);
+            // Native buttons with aria-pressed: a shortcut onto the slider.
             return (
-              <span
+              <button
+                type="button"
                 key={tier}
                 className={`settings-tier-label ${tierIndex === i ? 'active' : ''} ${locked ? 'settings-tier-label-locked' : ''}`}
-                role="tab"
-                tabIndex={0}
-                aria-selected={tierIndex === i}
+                aria-pressed={tierIndex === i}
                 // O1: locked tiers stay focusable + aria-disabled (never
                 // `disabled`/`pointer-events:none`); selecting one snaps back.
                 {...(locked ? { 'aria-disabled': 'true' } : {})}
                 onClick={() => selectTierGated(tier)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    e.currentTarget.click();
-                  }
-                }}
               >
                 {config.label}
                 {locked && (
@@ -252,7 +246,7 @@ const AudioConfigSection: React.FC = () => {
                     {'\u{1F512}'}
                   </span>
                 )}
-              </span>
+              </button>
             );
           })}
         </div>
@@ -272,6 +266,8 @@ const AudioConfigSection: React.FC = () => {
             max={TIER_ORDER.length - 1}
             step={1}
             value={tierIndex}
+            aria-label="Audio quality"
+            aria-valuetext={AUDIO_QUALITY_TIERS[TIER_ORDER[tierIndex]].label}
             onChange={handleTierSlider}
           />
         </div>

@@ -71,7 +71,7 @@ vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import AudioConfigSection from '@/renderer/components/Settings/AudioConfigSection';
@@ -83,6 +83,12 @@ function setEntitlement(overrides: Record<string, unknown>) {
 
 function tierLabel(name: string): HTMLElement {
   return screen.getByText(name).closest('.settings-tier-label') as HTMLElement;
+}
+
+/** The snap-back popover's Premium chip. Scoped to the popover because the locked tier
+ *  buttons also carry "Premium" in their accessible names. */
+function premiumChip(): HTMLElement {
+  return within(screen.getByRole('status')).getByRole('button', { name: /Premium/ });
 }
 
 function tierSlider(): HTMLInputElement {
@@ -115,13 +121,45 @@ describe('AudioConfigSection — L1 audio tier clamp', () => {
     }
   });
 
-  it('locked (free): premium tier labels stay focusable + aria-disabled, never disabled (O1)', () => {
+  // G3: the CSS-class check above cannot see the ARIA attribute a screen
+  // reader actually announces — a free tier must carry no aria-disabled at
+  // all, not merely lack the locked visual class.
+  it('locked (free): free tier labels carry no aria-disabled', () => {
     render(<AudioConfigSection />);
-    const high = tierLabel('High');
-    expect(high).toHaveAttribute('aria-disabled', 'true');
-    expect(high).toHaveAttribute('tabindex', '0');
-    expect(high).not.toHaveAttribute('disabled');
+    for (const t of ['Minimum', 'Low', 'Moderate', 'Standard']) {
+      expect(screen.getByRole('button', { name: t })).not.toHaveAttribute('aria-disabled');
+    }
   });
+
+  it('locked (free): premium tier labels stay focusable + aria-disabled, never disabled (O1)', async () => {
+    const user = userEvent.setup();
+    render(<AudioConfigSection />);
+    const high = screen.getByRole('button', { name: /^High/ });
+    expect(high).toHaveAttribute('aria-disabled', 'true');
+    expect(high).not.toHaveAttribute('disabled');
+    // Real Tab order, not a direct `.focus()` call: `.focus()` can land on an
+    // element jsdom would still let a native `disabled` button accept, so it
+    // cannot distinguish aria-disabled (must stay in the Tab sequence) from a
+    // regression to native `disabled` (removed from it). Tabbing from the
+    // preceding free tier is the assertion that actually proves O1.
+    screen.getByRole('button', { name: 'Standard' }).focus();
+    await user.tab();
+    expect(high).toHaveFocus();
+  });
+
+  it.each(['{Enter}', ' '])(
+    'locked (free): %s on a premium label snaps back and shows the chip, like a click',
+    async (key) => {
+      const user = userEvent.setup();
+      render(<AudioConfigSection />);
+      screen.getByRole('button', { name: /^Studio/ }).focus();
+      await user.keyboard(key);
+      expect(mockSetQualityTier).toHaveBeenCalledTimes(1);
+      expect(mockSetQualityTier).toHaveBeenCalledWith('standard');
+      expect(mockSetQualityTier).not.toHaveBeenCalledWith('studio');
+      expect(premiumChip()).toBeInTheDocument();
+    }
+  );
 
   it('locked (free): clicking a premium label snaps back to Standard + shows the chip', () => {
     render(<AudioConfigSection />);
@@ -130,7 +168,18 @@ describe('AudioConfigSection — L1 audio tier clamp', () => {
     expect(mockSetQualityTier).toHaveBeenCalledWith('standard');
     expect(mockSetQualityTier).not.toHaveBeenCalledWith('hifi');
     expect(screen.getByText(/High-fidelity tiers need a subscription/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Premium/ })).toBeInTheDocument();
+    expect(premiumChip()).toBeInTheDocument();
+  });
+
+  // G3: the popover is a snapshot of the last snap-back, not a standing
+  // warning — picking a free tier afterward must clear it, not just leave it
+  // stale beside the new (unlocked) selection.
+  it('locked (free): picking a free tier after a snap-back hides the popover', () => {
+    render(<AudioConfigSection />);
+    fireEvent.click(tierLabel('Studio'));
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    fireEvent.click(tierLabel('Low'));
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('locked (free): dragging the slider onto a premium index snaps back to Standard', () => {
@@ -150,7 +199,7 @@ describe('AudioConfigSection — L1 audio tier clamp', () => {
   it('locked (free): clicking a premium label routes to the Subscription page via the chip', () => {
     render(<AudioConfigSection />);
     fireEvent.click(tierLabel('Studio'));
-    fireEvent.click(screen.getByRole('button', { name: /Premium/ }));
+    fireEvent.click(premiumChip());
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
       section: 'subscriptions',
       controlId: 'section-current-plan',
@@ -167,5 +216,15 @@ describe('AudioConfigSection — L1 entitled (premium) passthrough', () => {
     expect(screen.queryByLabelText('Premium feature')).not.toBeInTheDocument();
     fireEvent.click(tierLabel('Studio'));
     expect(mockSetQualityTier).toHaveBeenCalledWith('studio');
+  });
+
+  it('entitled: High / Hi-Fi / Studio carry no aria-disabled', () => {
+    setEntitlement({
+      allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+    });
+    render(<AudioConfigSection />);
+    for (const t of ['High', 'Hi-Fi', 'Studio']) {
+      expect(screen.getByRole('button', { name: t })).not.toHaveAttribute('aria-disabled');
+    }
   });
 });

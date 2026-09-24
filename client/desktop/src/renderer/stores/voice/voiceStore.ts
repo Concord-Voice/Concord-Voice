@@ -6,7 +6,7 @@ import type { CallState } from '../../services/voice/voiceService/callStateMachi
 // re-declaring them here would let the two lists drift silently.
 import type { ScreenAudioDegradeReason } from '../../../main/audiocapHost';
 import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
-import type { AudioQualityTier } from './audioQualityTiers';
+import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from './audioQualityTiers';
 import type { MediaPolicySource } from '../../services/voice/mediaPolicyEvents';
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,15 @@ function loadPersistedSettings(): Partial<PersistedVoiceSettings> {
     const parsed = JSON.parse(raw) as Partial<PersistedVoiceSettings>;
     // Migrate old tier name → new tier name
     if ((parsed.qualityTier as string) === 'voice') parsed.qualityTier = 'low';
+    // Every AUDIO_QUALITY_TIERS[qualityTier] lookup in Settings throws on a tier it does
+    // not know, so an unrecognised stored value is dropped and the default applies.
+    if (
+      parsed.qualityTier !== undefined &&
+      (typeof parsed.qualityTier !== 'string' ||
+        !Object.hasOwn(AUDIO_QUALITY_TIERS, parsed.qualityTier))
+    ) {
+      delete parsed.qualityTier;
+    }
     return parsed;
   } catch {
     return {};
