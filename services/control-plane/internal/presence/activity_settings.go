@@ -150,6 +150,17 @@ func (s *ActivityService) clearAndDisconnectActivitySettingsRecipients(
 	if len(audience) == 0 {
 		return cleanupErrors
 	}
+	plans := activitySettingsClearPlans(userID, before, after, recipients)
+	return append(cleanupErrors, s.deliverActivitySettingsClears(workCtx, plans, audience)...)
+}
+
+// activitySettingsClearPlans builds one clear per changed category that still
+// has recipients.
+func activitySettingsClearPlans(
+	userID uuid.UUID,
+	before, after ActivityPolicySettings,
+	recipients activitySettingsRecipients,
+) []DeliveryPlan {
 	plans := make([]DeliveryPlan, 0, 2)
 	for _, category := range changedActivitySettingsCategories(before, after) {
 		if categoryRecipients := recipients[category]; len(categoryRecipients) > 0 {
@@ -158,6 +169,16 @@ func (s *ActivityService) clearAndDisconnectActivitySettingsRecipients(
 			})
 		}
 	}
+	return plans
+}
+
+// deliverActivitySettingsClears sends the clears, then disconnects the audience.
+func (s *ActivityService) deliverActivitySettingsClears(
+	workCtx context.Context,
+	plans []DeliveryPlan,
+	audience map[uuid.UUID]bool,
+) []error {
+	var cleanupErrors []error
 	if delivery, supported := s.delivery.(clearThenDisconnectDeliverer); supported {
 		if deliveryErr := delivery.DeliverRichPresenceClearsThenDisconnect(workCtx, plans, audience); deliveryErr != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf(
@@ -378,7 +399,12 @@ func currentServerSettingsRecipients(
 		return nil, false, err
 	}
 	if !found {
-		return settingsRecipientsWithoutState(CategoryServerVoice, priorEligible, allowAbsentCategory)
+		return settingsRecipientsWithoutState(
+			ctx, dependencies.db, userID, CategoryServerVoice, priorEligible, allowAbsentCategory,
+			func() (map[uuid.UUID]bool, error) {
+				return serverSettingsRecipientsFromRow(ctx, dependencies, userID, tier)
+			},
+		)
 	}
 	built, err := loadCurrentServerSettingsActivity(
 		ctx, dependencies.builder, dependencies.store, userID, state,
@@ -563,7 +589,12 @@ func currentPrivateSettingsRecipients(
 		return nil, false, err
 	}
 	if !found {
-		return settingsRecipientsWithoutState(CategoryPrivateCall, priorEligible, allowAbsentCategory)
+		return settingsRecipientsWithoutState(
+			ctx, dependencies.db, userID, CategoryPrivateCall, priorEligible, allowAbsentCategory,
+			func() (map[uuid.UUID]bool, error) {
+				return privateSettingsRecipientsFromRow(ctx, dependencies.db, userID, tier)
+			},
+		)
 	}
 	active, err := dependencies.store.IsActiveGeneration(
 		ctx, userID, CategoryPrivateCall, state.SourceToken, state.SourceVersion,
@@ -592,7 +623,32 @@ func currentPrivateSettingsRecipients(
 		built.Input.PrivateCall.Context.ConversationID != conversationID {
 		return nil, false, errors.New("rich-presence private settings generation changed")
 	}
-	recipients, err := queryBoundedSettingsRecipients(ctx, dependencies.db, `
+	recipients, err := privateSettingsRecipients(ctx, dependencies.db, userID, conversationID, tier)
+	if err != nil {
+		return nil, false, err
+	}
+	stillActive, err := dependencies.store.IsActiveGeneration(
+		ctx, userID, CategoryPrivateCall, state.SourceToken, state.SourceVersion,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	if !stillActive {
+		return nil, false, errors.New("rich-presence private settings generation changed")
+	}
+	return recipients, true, nil
+}
+
+// privateSettingsRecipients lists everyone a Private Call badge in
+// conversationID can reach at tier: the call's participants, plus friends and
+// friends of friends from Friends up, plus server peers at Servers.
+func privateSettingsRecipients(
+	ctx context.Context,
+	db DBTX,
+	userID, conversationID uuid.UUID,
+	tier Tier,
+) (map[uuid.UUID]bool, error) {
+	return queryBoundedSettingsRecipients(ctx, db, `
 		WITH candidates AS (
 			SELECT participant.user_id
 			FROM dm_voice_participants participant
@@ -640,40 +696,147 @@ func currentPrivateSettingsRecipients(
 		ORDER BY user_id
 		LIMIT $4
 	`, userID, conversationID, tier, activitySettingsRecipientLimit+1)
+}
+
+// settingsRecipientsWithoutState answers a category with no stored generation.
+// Nothing stored normally means nothing is published: the sender is not in
+// Server Voice or a Private Call, so no viewer can hold that badge and there is
+// no audience to clear. That is the steady state for most settings changes.
+//
+// Absence is trusted when the database holds no evidence of a live or
+// uncleared badge: no participant row, no pending active-category clear plan,
+// and for Server Voice no undelivered terminal-outbox obligation. A pending plan
+// or outbox row fails closed, because a clear is still owed. A sender with only
+// a participant row may have had a badge delivered whose generation was since
+// lost, or may publish nothing by design (invisible, or no audience); the two
+// cannot be told apart, so that sender is treated like a stored badge:
+// priorRecipients names the prior audience from the participant row and the
+// caller clears and reconnects exactly those viewers. A failed lookup or an
+// ambiguous scope still fails closed. This narrows #2408, which failed closed
+// on every prior-eligible absence and so turned each idle sender's second
+// sharing change into a replica-wide disconnect and a marker that never cleared.
+func settingsRecipientsWithoutState(
+	ctx context.Context,
+	db DBTX,
+	userID uuid.UUID,
+	category Category,
+	priorEligible bool,
+	allowAbsentCategory bool,
+	priorRecipients func() (map[uuid.UUID]bool, error),
+) (map[uuid.UUID]bool, bool, error) {
+	evidenceQuery, err := settingsEvidenceQuery(category)
 	if err != nil {
 		return nil, false, err
 	}
-	stillActive, err := dependencies.store.IsActiveGeneration(
-		ctx, userID, CategoryPrivateCall, state.SourceToken, state.SourceVersion,
+	if !priorEligible || allowAbsentCategory {
+		return nil, false, nil
+	}
+	unavailable := fmt.Errorf(
+		"rich-presence %s settings evidence unavailable for prior-eligible policy", category,
 	)
-	if err != nil {
-		return nil, false, err
+	if db == nil {
+		return nil, false, unavailable
 	}
-	if !stillActive {
-		return nil, false, errors.New("rich-presence private settings generation changed")
+	var participating, clearOwed bool
+	if err := db.QueryRowContext(ctx, evidenceQuery, userID).Scan(&participating, &clearOwed); err != nil {
+		return nil, false, errors.Join(unavailable, err)
+	}
+	if clearOwed {
+		return nil, false, unavailable
+	}
+	if !participating {
+		return nil, false, nil
+	}
+	if priorRecipients == nil {
+		return nil, false, unavailable
+	}
+	recipients, err := priorRecipients()
+	if err != nil {
+		return nil, false, errors.Join(unavailable, err)
 	}
 	return recipients, true, nil
 }
 
-func settingsRecipientsWithoutState(
-	category Category,
-	priorEligible bool,
-	allowAbsentCategory bool,
-) (map[uuid.UUID]bool, bool, error) {
+// settingsEvidenceQuery selects (participating, clearOwed) for one category.
+func settingsEvidenceQuery(category Category) (string, error) {
 	switch category {
-	case CategoryServerVoice, CategoryPrivateCall:
+	case CategoryServerVoice:
+		return `SELECT EXISTS (SELECT 1 FROM voice_participants WHERE user_id = $1),
+			EXISTS (SELECT 1 FROM server_voice_terminal_outbox WHERE user_id = $1)
+			OR EXISTS (SELECT 1 FROM presence_active_pending_plans
+			           WHERE user_id = $1 AND category = 'server_voice')`, nil
+	case CategoryPrivateCall:
+		return `SELECT EXISTS (SELECT 1 FROM dm_voice_participants WHERE user_id = $1),
+			EXISTS (SELECT 1 FROM presence_active_pending_plans
+			        WHERE user_id = $1 AND category = 'private_call')`, nil
 	default:
-		return nil, false, ErrInvalidActivityState
+		return "", ErrInvalidActivityState
 	}
-	if !priorEligible {
-		return nil, false, nil
+}
+
+// serverSettingsRecipientsFromRow names the audience a Server Voice badge could
+// have reached, from the sender's participant row instead of a stored
+// generation. A sender in two channels is ambiguous, the builder refuses a
+// stale row, and the audience is the one currentServerSettingsRecipients
+// computes for a stored badge.
+func serverSettingsRecipientsFromRow(
+	ctx context.Context,
+	dependencies activitySettingsRecipientDependencies,
+	userID uuid.UUID,
+	tier Tier,
+) (map[uuid.UUID]bool, error) {
+	var channelID uuid.UUID
+	var lifecycleAt time.Time
+	var channels int
+	if err := dependencies.db.QueryRowContext(ctx, `
+		SELECT channel_id, lifecycle_event_at, count(*) OVER ()
+		FROM voice_participants WHERE user_id = $1
+		ORDER BY channel_id LIMIT 1
+	`, userID).Scan(&channelID, &lifecycleAt, &channels); err != nil {
+		return nil, fmt.Errorf("read server voice settings scope: %w", err)
 	}
-	if allowAbsentCategory {
-		return nil, false, nil
+	// Declared here rather than left to the builder's own LIMIT 2 check, so a
+	// future change there cannot silently pick one of two channels.
+	if channels != 1 {
+		return nil, errors.New("rich-presence server settings scope is not unique")
 	}
-	return nil, false, fmt.Errorf(
-		"rich-presence %s settings evidence unavailable for prior-eligible policy", category,
+	built, err := dependencies.builder.Build(ctx, userID, Scope{
+		Category: CategoryServerVoice, RoomID: channelID,
+		LifecycleID: channelID, EventAt: lifecycleAt,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if built.Input.ServerVoice == nil {
+		return nil, errors.New("rich-presence server settings scope unavailable")
+	}
+	voice := built.Input.ServerVoice.Context
+	return visibleServerSettingsRecipients(
+		ctx, dependencies.db, dependencies.visibility, userID, voice.ServerID, voice.ChannelID, tier,
 	)
+}
+
+// privateSettingsRecipientsFromRow does the same for a Private Call, from the
+// sender's single DM call row. A sender with rows in two calls is ambiguous.
+func privateSettingsRecipientsFromRow(
+	ctx context.Context,
+	db DBTX,
+	userID uuid.UUID,
+	tier Tier,
+) (map[uuid.UUID]bool, error) {
+	var conversationID uuid.UUID
+	var calls int
+	if err := db.QueryRowContext(ctx, `
+		SELECT conversation_id, count(*) OVER ()
+		FROM dm_voice_participants WHERE user_id = $1
+		ORDER BY conversation_id LIMIT 1
+	`, userID).Scan(&conversationID, &calls); err != nil {
+		return nil, fmt.Errorf("read private call settings scope: %w", err)
+	}
+	if calls != 1 {
+		return nil, errors.New("rich-presence private settings scope is not unique")
+	}
+	return privateSettingsRecipients(ctx, db, userID, conversationID, tier)
 }
 
 func exactCurrentPrivateCallScope(

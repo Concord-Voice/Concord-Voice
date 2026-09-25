@@ -374,17 +374,34 @@ func TestActivityService_SettingsCleanupMissingStateUsesPriorEligibility(t *test
 }
 
 func TestSettingsRecipientsWithoutState_HiddenSenderAllowsOnlyConfirmedAbsentSibling(t *testing.T) {
-	_, active, err := settingsRecipientsWithoutState(CategoryPrivateCall, true, false)
-	require.Error(t, err, "ordinary settings tier-down must fail closed on missing prior-eligible evidence")
+	ctx := context.Background()
+	_, active, err := settingsRecipientsWithoutState(ctx, nil, uuid.New(), CategoryPrivateCall, true, false, nil)
+	require.Error(t, err, "ordinary settings cleanup must fail closed without a database")
 	assert.False(t, active)
 
-	recipients, active, err := settingsRecipientsWithoutState(CategoryPrivateCall, true, true)
+	recipients, active, err := settingsRecipientsWithoutState(ctx, nil, uuid.New(), CategoryPrivateCall, true, true, nil)
 	require.NoError(t, err, "hidden-sender cleanup may skip a confirmed absent sibling category")
 	assert.False(t, active)
 	assert.Nil(t, recipients)
 
-	_, _, err = settingsRecipientsWithoutState(Category("invalid"), true, true)
+	_, _, err = settingsRecipientsWithoutState(ctx, nil, uuid.New(), Category("invalid"), true, true, nil)
 	require.ErrorIs(t, err, ErrInvalidActivityState)
+}
+
+// A failed participation lookup must never read as "not participating".
+func TestSettingsRecipientsWithoutState_FailedParticipationLookupFailsClosed(t *testing.T) {
+	closedDB, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, closedDB.Close())
+
+	for _, category := range []Category{CategoryServerVoice, CategoryPrivateCall} {
+		recipients, active, err := settingsRecipientsWithoutState(
+			context.Background(), closedDB, uuid.New(), category, true, false, nil,
+		)
+		require.Error(t, err, category)
+		assert.False(t, active)
+		assert.Nil(t, recipients)
+	}
 }
 
 func TestActivityService_ApplySettingsSuppressionAlreadyGatedAttemptsAllCleanup(t *testing.T) {

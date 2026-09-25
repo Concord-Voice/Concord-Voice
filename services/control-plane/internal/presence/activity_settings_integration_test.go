@@ -351,13 +351,42 @@ func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testi
 		missingState   bool
 		authoritative  bool
 		wantDisconnect bool
+		// priorServerTier is the Server Voice tier in effect before the change.
+		priorServerTier presence.Tier
+		// Evidence that a badge may still be held although nothing is stored.
+		pendingPlan, terminalOutbox bool
+		// otherUserActive puts a different user in voice and in a call.
+		otherUserActive bool
+		// audience gives an authoritative sender someone the prior policy
+		// reaches: a fellow server member, or a second call participant.
+		audience bool
+		// secondScope puts an authoritative sender in a second room as well.
+		secondScope bool
+		// wantTargeted expects the audience member to be cleared and
+		// reconnected, as for a stored badge, instead of a replica-wide disconnect.
+		wantTargeted bool
 	}{
+		{name: "server prior eligible missing with pending clear plan", category: presence.CategoryServerVoice, missingState: true, pendingPlan: true, priorServerTier: presence.TierFriends, wantDisconnect: true},
+		{name: "private prior eligible missing with pending clear plan", category: presence.CategoryPrivateCall, missingState: true, pendingPlan: true, wantDisconnect: true},
+		{name: "server prior eligible missing with terminal outbox", category: presence.CategoryServerVoice, missingState: true, terminalOutbox: true, priorServerTier: presence.TierFriends, wantDisconnect: true},
+		{name: "server prior eligible missing while another user is in voice", category: presence.CategoryServerVoice, missingState: true, otherUserActive: true, priorServerTier: presence.TierFriends},
+		{name: "private prior eligible missing while another user is in a call", category: presence.CategoryPrivateCall, missingState: true, otherUserActive: true},
+		// In voice with nothing stored is treated like a stored badge: the prior
+		// audience is cleared and reconnected, never the whole replica.
+		{name: "server prior eligible state missing while active", category: presence.CategoryServerVoice, missingState: true, authoritative: true, audience: true, priorServerTier: presence.TierServers, wantTargeted: true},
+		{name: "server state missing while active with an empty prior audience", category: presence.CategoryServerVoice, missingState: true, authoritative: true, priorServerTier: presence.TierServers},
+		{name: "server state missing while active in two channels", category: presence.CategoryServerVoice, missingState: true, authoritative: true, secondScope: true, priorServerTier: presence.TierServers, wantDisconnect: true},
+		{name: "server prior eligible state missing while inactive", category: presence.CategoryServerVoice, missingState: true, priorServerTier: presence.TierFriends},
 		{name: "server state missing after prior suppression while active", category: presence.CategoryServerVoice, missingState: true, authoritative: true},
 		{name: "server lifecycle expired while active", category: presence.CategoryServerVoice, authoritative: true, wantDisconnect: true},
-		{name: "private state missing while active", category: presence.CategoryPrivateCall, missingState: true, authoritative: true, wantDisconnect: true},
+		{name: "private state missing while active", category: presence.CategoryPrivateCall, missingState: true, authoritative: true, audience: true, wantTargeted: true},
+		{name: "private state missing while alone in the call", category: presence.CategoryPrivateCall, missingState: true, authoritative: true},
+		{name: "private state missing while in two calls", category: presence.CategoryPrivateCall, missingState: true, authoritative: true, secondScope: true, wantDisconnect: true},
 		{name: "private lifecycle expired while active", category: presence.CategoryPrivateCall, authoritative: true, wantDisconnect: true},
 		{name: "server state missing after prior suppression while inactive", category: presence.CategoryServerVoice, missingState: true},
-		{name: "private prior eligible state missing while inactive", category: presence.CategoryPrivateCall, missingState: true, wantDisconnect: true},
+		// Overrides #2408: nothing stored and not in a call means nothing was
+		// published, so there is no audience to clear and nothing to disconnect.
+		{name: "private prior eligible state missing while inactive", category: presence.CategoryPrivateCall, missingState: true},
 		{name: "server lifecycle expired after stored delivery", category: presence.CategoryServerVoice, wantDisconnect: true},
 		{name: "private lifecycle expired after stored delivery", category: presence.CategoryPrivateCall, wantDisconnect: true},
 	}
@@ -372,25 +401,71 @@ func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testi
 			senderID := testhelpers.CreateUser(t, db)
 			sourceToken := uuid.New()
 			lifecycleAt := time.Date(2026, 7, 15, 3, 10, 0, 0, time.UTC)
+			audienceID := testhelpers.CreateUser(t, db)
 			if test.authoritative {
 				switch test.category {
 				case presence.CategoryServerVoice:
-					_, _, channelID := createServerVoiceBuilderFixtureForUser(
+					_, serverID, channelID := createServerVoiceBuilderFixtureForUser(
 						t, db, senderID, "Settings", "Current",
 					)
+					if test.audience {
+						testhelpers.AddServerMember(t, db, serverID, audienceID)
+					}
 					sourceToken = channelID
-					_, err := db.Exec(`
-						INSERT INTO voice_participants (
-							channel_id, user_id, joined_at, lifecycle_event_at
-						) VALUES ($1, $2, $3, $3)
-					`, channelID, senderID, lifecycleAt)
-					require.NoError(t, err)
+					channels := []uuid.UUID{channelID}
+					if test.secondScope {
+						_, _, secondChannelID := createServerVoiceBuilderFixtureForUser(
+							t, db, senderID, "Second", "Second",
+						)
+						channels = append(channels, secondChannelID)
+					}
+					for _, voiceChannelID := range channels {
+						_, err := db.Exec(`
+							INSERT INTO voice_participants (
+								channel_id, user_id, joined_at, lifecycle_event_at
+							) VALUES ($1, $2, $3, $3)
+						`, voiceChannelID, senderID, lifecycleAt)
+						require.NoError(t, err)
+					}
 				case presence.CategoryPrivateCall:
-					conversationID := uuid.New()
-					createPrivateCallBuilderFixture(t, db, conversationID, false, map[uuid.UUID]time.Time{
-						senderID: lifecycleAt,
-					})
+					participants := map[uuid.UUID]time.Time{senderID: lifecycleAt}
+					if test.audience {
+						participants[audienceID] = lifecycleAt
+					}
+					createPrivateCallBuilderFixture(t, db, uuid.New(), false, participants)
+					if test.secondScope {
+						createPrivateCallBuilderFixture(t, db, uuid.New(), false, map[uuid.UUID]time.Time{
+							senderID: lifecycleAt,
+						})
+					}
 				}
+			}
+
+			if test.pendingPlan {
+				_, err := db.Exec(`
+					INSERT INTO presence_active_pending_plans (
+						user_id, category, operation_id, resolution, scope_event_at
+					) VALUES ($1, $2, $3, 'conservative', $4)
+				`, senderID, string(test.category), uuid.New(), lifecycleAt)
+				require.NoError(t, err)
+			}
+			if test.terminalOutbox {
+				_, serverID, channelID := createServerVoiceBuilderFixtureForUser(t, db, senderID, "Outbox", "Outbox")
+				_, err := db.Exec(`
+					INSERT INTO server_voice_terminal_outbox (channel_id, user_id, server_id, operation_id)
+					VALUES ($1, $2, $3, $4)
+				`, channelID, senderID, serverID, uuid.New())
+				require.NoError(t, err)
+			}
+			if test.otherUserActive {
+				otherID := testhelpers.CreateUser(t, db)
+				_, _, channelID := createServerVoiceBuilderFixtureForUser(t, db, otherID, "Other", "Other")
+				_, err := db.Exec(`
+					INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+					VALUES ($1, $2, $3, $3)
+				`, channelID, otherID, lifecycleAt)
+				require.NoError(t, err)
+				createPrivateCallBuilderFixture(t, db, uuid.New(), false, map[uuid.UUID]time.Time{otherID: lifecycleAt})
 			}
 
 			store := presence.NewActivityStore(redisClient)
@@ -416,7 +491,7 @@ func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testi
 				permitAllPresence{},
 			)
 			before := presence.ActivityPolicySettings{
-				MasterEnabled: true, ServerVoiceTier: presence.TierOff,
+				MasterEnabled: true, ServerVoiceTier: test.priorServerTier,
 				ServerVoiceShowDetails: true, PrivateCallTier: presence.TierOff,
 				PrivateCallShowDetails: true,
 			}
@@ -436,7 +511,13 @@ func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testi
 				require.NoError(t, err)
 				assert.Zero(t, delivery.all)
 			}
-			assert.Empty(t, delivery.targeted)
+			if test.wantTargeted {
+				require.Len(t, delivery.targeted, 1)
+				assert.True(t, delivery.targeted[0][audienceID], "the prior audience is reconnected")
+				assert.NotContains(t, delivery.targeted[0], senderID)
+			} else {
+				assert.Empty(t, delivery.targeted)
+			}
 		})
 	}
 }

@@ -746,7 +746,7 @@ func (h *Handler) respondPresenceWriterFailure(c *gin.Context, message string, e
 	if errors.As(err, &overrideErr) {
 		errorClass = overrideErr.Operation
 	}
-	h.log.Error(message, "error_class", errorClass)
+	h.log.Error(message, "error_class", errorClass, "error", err)
 	c.JSON(status, gin.H{"error": message})
 }
 

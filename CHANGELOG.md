@@ -57,6 +57,13 @@ that keeps sending far more than your plan allows.
 
 ### Fixed
 
+- **Rich Presence sharing settings save every time** ([#3444](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3444)) — changing who can see your Server Voice or
+  Private Call activity worked once and then failed on every later try, snapping back to the old
+  choice. Each failed try also briefly disconnected everyone whose app was connected to the same
+  Concord backend.
+  Changes now save every time. While you are in voice or a call, only the people who could see
+  that activity briefly reconnect; otherwise nobody else is disconnected. If a setting of yours is
+  stuck, the next change fixes it.
 - **Purging a direct message can no longer hang** ([#3442](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3442)) — Purge Messages in a
   direct message or group chat now stops after 10 seconds, the same limit channel and server purges
   already have. If it runs out of time you see that some messages may already have been purged, and
