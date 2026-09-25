@@ -69,6 +69,11 @@ const (
 	errMsgFailedDisableEmailSms      = "Failed to disable Email/SMS MFA methods"
 	errMsgFailedDisableMFA           = "Failed to disable MFA"
 	errMsgFailedDeleteCredential     = "Failed to delete credential"
+	errMsgFailedVerify               = "Failed to verify"
+	errMsgFailedSendCode             = "Failed to send code"
+	errMsgFailedStartVerification    = "Failed to start verification"
+	errMsgFailedRemoveDevice         = "Failed to remove trusted device"
+	errMsgFailedDeleteCircle         = "Failed to delete recovery circle"
 
 	// errMsgInlineFactorRequired is the D1 refusal: removing the last inline
 	// factor while email or SMS is on would leave an account whose login
@@ -382,14 +387,69 @@ func (h *Handler) BeginWebAuthnLogin(ctx context.Context, userID string, jti str
 		return nil, fmt.Errorf("begin login: %w", err)
 	}
 
-	sessionJSON, _ := json.Marshal(session)
+	sessionJSON, err := json.Marshal(session)
+	if err != nil {
+		return nil, fmt.Errorf("marshal webauthn login session: %w", err)
+	}
+	// The verify step reads this session back; options handed out without it
+	// describe a ceremony the server can never complete.
 	sessionKey := fmt.Sprintf("mfa_webauthn_session:%s", jti)
-	h.redis.Set(ctx, sessionKey, sessionJSON, challengeTTL)
+	if err := h.redis.Set(ctx, sessionKey, sessionJSON, challengeTTL).Err(); err != nil {
+		return nil, fmt.Errorf("store webauthn login session: %w", err)
+	}
 
 	return assertion, nil
 }
 
 // ── Helper ───────────────────────────────────────────────────────────────────
+
+// delBestEffort removes Redis state whose purpose is already served — a
+// consumed code or session, an attempt counter after success or lockout. A
+// failure here must not undo the completed operation before it, so it is
+// logged rather than returned. Keys can embed challenge identifiers and
+// codes, so only user_id is logged beside the fixed message.
+func (h *Handler) delBestEffort(ctx context.Context, msg, userID string, keys ...string) {
+	if err := h.redis.Del(ctx, keys...).Err(); err != nil {
+		h.log.Warn(msg, "user_id", userID)
+	}
+}
+
+// Code-guessing policy shared by login MFA verification and TOTP setup
+// verification: five wrong codes inside a sliding five-minute window lock that
+// flow for fifteen minutes.
+const (
+	codeAttemptLimit  = 5
+	codeAttemptWindow = 5 * time.Minute
+	codeLockoutPeriod = 15 * time.Minute
+)
+
+// emailCodeTTL is how long a login email code, and the one-send-per-challenge
+// marker that guards it, stay valid.
+const emailCodeTTL = 10 * time.Minute
+
+// recordCodeFailure counts one wrong code against attemptsKey and arms
+// lockoutKey at the threshold. These writes are what bound code guessing, so
+// every error is returned: a failed INCR leaves the attempt uncounted, a
+// failed EXPIRE leaves a window that never slides, and a failed SET leaves
+// the threshold reached with no lockout in force. The caller fails closed on
+// any of them rather than answering an ordinary wrong code.
+func (h *Handler) recordCodeFailure(ctx context.Context, userID, attemptsKey, lockoutKey string) error {
+	attempts, err := h.redis.Incr(ctx, attemptsKey).Result()
+	if err != nil {
+		return fmt.Errorf("count failed attempt: %w", err)
+	}
+	if err := h.redis.Expire(ctx, attemptsKey, codeAttemptWindow).Err(); err != nil {
+		return fmt.Errorf("set attempt window: %w", err)
+	}
+	if attempts < codeAttemptLimit {
+		return nil
+	}
+	if err := h.redis.Set(ctx, lockoutKey, "1", codeLockoutPeriod).Err(); err != nil {
+		return fmt.Errorf("arm lockout: %w", err)
+	}
+	h.delBestEffort(ctx, "Failed to reset MFA attempt counter after lockout", userID, attemptsKey)
+	return nil
+}
 
 func (h *Handler) verifyUserPassword(ctx context.Context, userID, password string) (bool, error) {
 	var passwordHash string
@@ -840,10 +900,19 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 		return
 	}
 
-	// Check if already has confirmed TOTP
+	// Check if already has confirmed TOTP. The upsert below resets enabled and
+	// confirmed to FALSE, so an unreadable guard must stop here: proceeding
+	// would silently disable a working factor.
 	var existingConfirmed bool
 	checkErr := h.db.QueryRowContext(ctx, `SELECT confirmed FROM user_mfa_totp WHERE user_id = $1`, userID).Scan(&existingConfirmed)
-	if checkErr == nil && existingConfirmed {
+	switch {
+	case errors.Is(checkErr, sql.ErrNoRows):
+		// No TOTP row yet: a first enrolment proceeds.
+	case checkErr != nil:
+		h.log.Error("Failed to read existing TOTP state", "error", checkErr, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start TOTP setup"})
+		return
+	case existingConfirmed:
 		c.JSON(http.StatusConflict, gin.H{"error": "TOTP is already enabled. Disable it first to re-enroll."})
 		return
 	}
@@ -929,13 +998,13 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 		return
 	}
 
-	// Rate limit: check for MFA setup lockout. An unreadable lockout stops the
-	// request; checking codes without it would lift the attempt limit.
+	// Rate limit: check for MFA setup lockout. An unreadable lockout fails
+	// closed — reading it as "not locked" lets codes be guessed during an outage.
 	lockoutKey := fmt.Sprintf("mfa_setup_lockout:%s", userID)
 	locked, err := h.redis.Exists(ctx, lockoutKey).Result()
 	if err != nil {
-		h.log.Error("Failed to read the MFA setup lockout", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify code"})
+		h.log.Error("Failed to read MFA setup lockout", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
 		return
 	}
 	if locked > 0 {
@@ -971,7 +1040,14 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	}
 
 	if !ValidateCode(string(secret), req.Code) {
-		h.recordFailedSetupAttempt(ctx, userID, lockoutKey)
+		// Track failed attempts. An attempt that could not be counted fails
+		// closed rather than answering "invalid code" uncounted.
+		attemptsKey := fmt.Sprintf("mfa_setup_attempts:%s", userID)
+		if err := h.recordCodeFailure(ctx, userID, attemptsKey, lockoutKey); err != nil {
+			h.log.Error("Failed to record MFA setup attempt", "error", err, "user_id", userID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+			return
+		}
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid code"})
 		return
 	}
@@ -999,9 +1075,7 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	}
 
 	// Clear attempt tracking
-	if err := h.redis.Del(ctx, fmt.Sprintf("mfa_setup_attempts:%s", userID)).Err(); err != nil {
-		h.log.Error("Failed to reset the MFA setup attempt count", "error", err)
-	}
+	h.delBestEffort(ctx, "Failed to clear MFA setup attempt counter", userID, fmt.Sprintf("mfa_setup_attempts:%s", userID))
 
 	// confirm-setup takes no code, so it may exempt a session from the pre-MFA
 	// challenge only if that session is the one that proved the code here.
@@ -1104,35 +1178,6 @@ func (h *Handler) grantTOTPEnrollmentUpgrade(c *gin.Context, userID string, firs
 type totpDisableRequest struct {
 	Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
 	Code     string `json:"code" binding:"required"`
-}
-
-// recordFailedSetupAttempt counts a wrong verify-setup code and locks setup
-// after five. Its Redis errors are logged rather than answered. The lockout
-// read at the top of verify-setup fails closed, so an outage that fails reads
-// stops setup entirely. An outage that fails only writes (out of memory, a
-// read-only replica) leaves no attempt limit here; the caller is guessing a
-// code for a secret it was just shown.
-func (h *Handler) recordFailedSetupAttempt(ctx context.Context, userID, lockoutKey string) {
-	attemptsKey := fmt.Sprintf("mfa_setup_attempts:%s", userID)
-	attempts, err := h.redis.Incr(ctx, attemptsKey).Result()
-	if err != nil {
-		h.log.Error("Failed to count an MFA setup attempt", "error", err)
-		return
-	}
-	if err := h.redis.Expire(ctx, attemptsKey, 5*time.Minute).Err(); err != nil {
-		h.log.Error("Failed to expire the MFA setup attempt count", "error", err)
-	}
-	if attempts < 5 {
-		return
-	}
-	if err := h.redis.Set(ctx, lockoutKey, "1", 15*time.Minute).Err(); err != nil {
-		// Keep the count, so the next wrong code tries the lockout again.
-		h.log.Error("Failed to lock MFA setup", "error", err)
-		return
-	}
-	if err := h.redis.Del(ctx, attemptsKey).Err(); err != nil {
-		h.log.Error("Failed to reset the MFA setup attempt count", "error", err)
-	}
 }
 
 // TOTPDisable disables TOTP MFA. Requires password + a valid MFA code.
@@ -1375,23 +1420,42 @@ func (h *Handler) WebAuthnRegisterBegin(c *gin.Context) {
 		return
 	}
 
-	// Store session data in Redis (keyed by user ID, 5-min TTL)
-	sessionJSON, _ := json.Marshal(session)
 	credName := req.CredentialName
 	if credName == "" {
 		credName = "Security Key"
 	}
-	// Store session + metadata together
+	// Options handed out without their stored session describe a ceremony
+	// the finish step can never complete, so a failed store fails the request.
+	if err := h.storeRegistrationSession(ctx, userID, session, credName, credType); err != nil {
+		h.log.Error("Failed to store WebAuthn registration session", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartReg})
+		return
+	}
+
+	h.clearStepUpAfterSuccess(c, userID)
+	c.JSON(http.StatusOK, creation)
+}
+
+// storeRegistrationSession stores the registration ceremony's session data
+// together with the requested credential metadata (keyed by user ID, 5-min TTL).
+func (h *Handler) storeRegistrationSession(ctx context.Context, userID string, session *webauthn.SessionData, credName, credType string) error {
+	sessionJSON, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("marshal registration session: %w", err)
+	}
 	meta := map[string]interface{}{
 		"session":         string(sessionJSON),
 		"credential_name": credName,
 		"credential_type": credType,
 	}
-	metaJSON, _ := json.Marshal(meta)
-	h.redis.Set(ctx, fmt.Sprintf(redisKeyWebAuthnReg, userID), metaJSON, 5*time.Minute)
-
-	h.clearStepUpAfterSuccess(c, userID)
-	c.JSON(http.StatusOK, creation)
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal registration metadata: %w", err)
+	}
+	if err := h.redis.Set(ctx, fmt.Sprintf(redisKeyWebAuthnReg, userID), metaJSON, 5*time.Minute).Err(); err != nil {
+		return fmt.Errorf("store registration session: %w", err)
+	}
+	return nil
 }
 
 // WebAuthnRegisterFinish completes WebAuthn credential registration.
@@ -1663,20 +1727,10 @@ func (h *Handler) Verify(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Check single-use: ensure this JTI hasn't been consumed
-	usedKey := fmt.Sprintf("mfa_challenge_used:%s", claims.ID)
-	if h.redis.Exists(ctx, usedKey).Val() > 0 {
-		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify})
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA challenge already used"})
-		return
-	}
-
-	// Rate limit per user
+	// Single-use check, then the per-user rate limit
 	attemptsKey := fmt.Sprintf("mfa_verify_attempts:%s", claims.UserID)
 	lockoutKey := fmt.Sprintf("mfa_verify_lockout:%s", claims.UserID)
-	if h.redis.Exists(ctx, lockoutKey).Val() > 0 {
-		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeLocked, RouteTemplate: securityevent.RouteAuthMFAVerify})
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many failed attempts. Try again later."})
+	if !h.admitVerifyChallenge(ctx, c, claims, lockoutKey) {
 		return
 	}
 
@@ -1686,15 +1740,69 @@ func (h *Handler) Verify(c *gin.Context) {
 	}
 
 	if !verified {
-		h.recordVerifyFailure(ctx, attemptsKey, lockoutKey)
-		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
-		h.emitHTTPEvent(c, mfaChallengeInvalidEvent(req.Method))
-		middleware.MarkAuthFailureOutcome(c, outcome)
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code"})
+		h.refuseVerifyCode(ctx, c, req.Method, claims.UserID, attemptsKey, lockoutKey)
 		return
 	}
 
 	h.completeVerifiedChallenge(ctx, c, claims, purpose, matchedMethod)
+}
+
+// failVerifyUnavailable is the one answer every login-MFA verification branch
+// gives when the Redis state it enforces cannot be read or written. A fault on
+// the single-use, lockout, or attempt-counter keys must never degrade to "not
+// used", "not locked", or "not counted".
+func (h *Handler) failVerifyUnavailable(c *gin.Context) {
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+}
+
+// admitVerifyChallenge runs the single-use and lockout gates before any code is
+// evaluated. Either read failing closes the request: its zero value reads as
+// "not consumed" / "not locked", which would let a code be tried against a
+// spent challenge or past the lockout. Returns false once it has answered.
+func (h *Handler) admitVerifyChallenge(ctx context.Context, c *gin.Context, claims *ChallengeClaims, lockoutKey string) bool {
+	used, err := h.redis.Exists(ctx, fmt.Sprintf("mfa_challenge_used:%s", claims.ID)).Result()
+	if err != nil {
+		h.log.Error("Failed to read MFA challenge single-use marker", "error", err, "user_id", claims.UserID)
+		h.failVerifyUnavailable(c)
+		return false
+	}
+	if used > 0 {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA challenge already used"})
+		return false
+	}
+
+	locked, err := h.redis.Exists(ctx, lockoutKey).Result()
+	if err != nil {
+		h.log.Error("Failed to read MFA verification lockout", "error", err, "user_id", claims.UserID)
+		h.failVerifyUnavailable(c)
+		return false
+	}
+	if locked > 0 {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeLocked, RouteTemplate: securityevent.RouteAuthMFAVerify})
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many failed attempts. Try again later."})
+		return false
+	}
+	return true
+}
+
+// refuseVerifyCode answers a wrong code. The per-user counter is what bounds
+// code guessing, so a wrong code whose attempt could not be counted fails
+// closed as a dependency fault instead of answering "invalid code" — otherwise
+// the caller could keep guessing for as long as the counter's writes fail. The
+// per-IP failure counter is independent state and is recorded either way.
+func (h *Handler) refuseVerifyCode(ctx context.Context, c *gin.Context, method, userID, attemptsKey, lockoutKey string) {
+	recordErr := h.recordCodeFailure(ctx, userID, attemptsKey, lockoutKey)
+	outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+	middleware.MarkAuthFailureOutcome(c, outcome)
+	if recordErr != nil {
+		h.log.Error("Failed to record MFA verification attempt", "error", recordErr, "user_id", userID)
+		h.failVerifyUnavailable(c)
+		return
+	}
+	h.emitHTTPEvent(c, mfaChallengeInvalidEvent(method))
+	c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code"})
 }
 
 // completeVerifiedChallenge records only the outcome of a completed challenge
@@ -1709,8 +1817,7 @@ func (h *Handler) completeVerifiedChallenge(ctx context.Context, c *gin.Context,
 	attemptsKey := fmt.Sprintf("mfa_verify_attempts:%s", claims.UserID)
 	claimed, err := h.redis.SetNX(ctx, usedKey, "1", challengeTTL).Result()
 	if err != nil {
-		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+		h.failVerifyUnavailable(c)
 		return
 	}
 	if !claimed {
@@ -1718,7 +1825,7 @@ func (h *Handler) completeVerifiedChallenge(ctx context.Context, c *gin.Context,
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA challenge already used"})
 		return
 	}
-	h.redis.Del(ctx, attemptsKey)
+	h.delBestEffort(ctx, "Failed to clear MFA verification attempt counter", claims.UserID, attemptsKey)
 	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
 	if h.completeVerifyPurpose(ctx, c, claims, purpose) {
 		h.emitHTTPEvent(c, mfaChallengeVerifiedEvent(method))
@@ -1811,10 +1918,18 @@ func (h *Handler) verifyWebAuthnChallenge(ctx context.Context, c *gin.Context, a
 		return false, true
 	}
 
+	// Read and delete the session in one step, so a failed delete cannot leave
+	// a single-use ceremony reusable. Only a missing key is the client's
+	// problem; any other failure is ours.
 	sessionKey := fmt.Sprintf("mfa_webauthn_session:%s", claims.ID)
-	sessionJSON, err := h.redis.Get(ctx, sessionKey).Bytes()
-	if err != nil {
+	sessionJSON, err := h.redis.GetDel(ctx, sessionKey).Bytes()
+	if errors.Is(err, redis.Nil) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No WebAuthn session found. Request a new challenge."})
+		return false, true
+	}
+	if err != nil {
+		h.log.Error("Failed to consume WebAuthn login session", "error", err, "user_id", claims.UserID)
+		h.failVerifyUnavailable(c)
 		return false, true
 	}
 
@@ -1826,22 +1941,24 @@ func (h *Handler) verifyWebAuthnChallenge(ctx context.Context, c *gin.Context, a
 
 	user, err := h.buildWebAuthnUser(ctx, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerify})
 		return false, true
 	}
 
 	credential, err := h.webauthn.FinishLoginWithBytes(user, session, assertion)
 	if err != nil {
 		h.log.Warn("WebAuthn login verification failed", "error", err, "user_id", claims.UserID)
-		h.redis.Del(ctx, sessionKey)
 		return false, false
 	}
+	// Cloned-authenticator detection compares the next assertion against this
+	// value, so the login does not verify unless it landed.
 	if _, err := h.db.ExecContext(ctx, `
 		UPDATE user_mfa_webauthn SET sign_count = $1, last_used_at = NOW() WHERE credential_id = $2 AND user_id = $3
 	`, credential.Authenticator.SignCount, credential.ID, claims.UserID); err != nil {
 		h.log.Error("Failed to update WebAuthn sign count", "error", err, "user_id", claims.UserID)
+		h.failVerifyUnavailable(c)
+		return false, true
 	}
-	h.redis.Del(ctx, sessionKey)
 	return true, false
 }
 
@@ -1866,8 +1983,7 @@ func (h *Handler) verifyEmailCode(ctx context.Context, c *gin.Context, rawCode s
 	if subtle.ConstantTimeCompare([]byte(code), []byte(stored)) != 1 {
 		return false, false
 	}
-	h.redis.Del(ctx, codeKey)
-	h.redis.Del(ctx, fmt.Sprintf("mfa_email_sent:%s", claims.ID))
+	h.delBestEffort(ctx, "Failed to clear MFA email code", claims.UserID, codeKey, fmt.Sprintf("mfa_email_sent:%s", claims.ID))
 	return true, false
 }
 
@@ -1884,16 +2000,6 @@ func isValidEmailCode(code string) bool {
 	return true
 }
 
-// recordVerifyFailure increments the failure counter and applies lockout if threshold reached.
-func (h *Handler) recordVerifyFailure(ctx context.Context, attemptsKey, lockoutKey string) {
-	attempts := h.redis.Incr(ctx, attemptsKey).Val()
-	h.redis.Expire(ctx, attemptsKey, 5*time.Minute)
-	if attempts >= 5 {
-		h.redis.Set(ctx, lockoutKey, "1", 15*time.Minute)
-		h.redis.Del(ctx, attemptsKey)
-	}
-}
-
 // completeVerifyPurpose performs the action associated with the MFA challenge purpose.
 func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, claims *ChallengeClaims, purpose ChallengePurpose) bool {
 	switch purpose {
@@ -1905,13 +2011,12 @@ func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, cla
 		rememberKey := fmt.Sprintf(redisKeyMFAChallengeRememberMe, claims.ID)
 		rememberValue, err := h.redis.Get(ctx, rememberKey).Result()
 		if err != nil && !errors.Is(err, redis.Nil) {
-			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+			h.failVerifyUnavailable(c)
 			return false
 		}
 		rememberMe := rememberValue == "1"
 		if err == nil {
-			h.redis.Del(ctx, rememberKey)
+			h.delBestEffort(ctx, "Failed to clear MFA challenge remember-me state", claims.UserID, rememberKey)
 		}
 		primaryAuthMethod, err := normalizePrimaryAuthMethod(claims.PrimaryAuthMethod)
 		if err != nil {
@@ -1923,8 +2028,7 @@ func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, cla
 	case PurposeMFAUpgrade:
 		bypassKey := auth.MFAUpgradeBypassKey(claims.UserID, claims.RefreshSessionID)
 		if err := h.redis.Set(ctx, bypassKey, "1", mfaUpgradeBypassTTL).Err(); err != nil {
-			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+			h.failVerifyUnavailable(c)
 			return false
 		}
 		c.JSON(http.StatusOK, gin.H{"verified": true, "purpose": string(purpose), "user_id": claims.UserID})
@@ -1980,30 +2084,28 @@ func (h *Handler) SendEmailMFACode(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Rate limit: 1 email per challenge JTI
 	sentKey := fmt.Sprintf("mfa_email_sent:%s", claims.ID)
-	if h.redis.Exists(ctx, sentKey).Val() > 0 {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Email code already sent. Check your inbox or wait for it to expire."})
+	if !h.admitEmailCodeSend(ctx, c, claims.UserID, sentKey) {
 		return
 	}
 
-	// Verify user has email MFA enabled
-	enabledKey := fmt.Sprintf(redisKeyEmailSmsEnabledEmail, claims.UserID)
-	if h.redis.Exists(ctx, enabledKey).Val() == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Email MFA is not enabled for this account"})
-		return
+	// Every failure below releases the reservation, so the user can ask again.
+	release := func() {
+		h.delBestEffort(ctx, "Failed to release MFA email send reservation", claims.UserID, sentKey)
 	}
 
 	// Look up user's email
 	var userEmail string
 	if err := h.db.QueryRowContext(ctx, `SELECT email FROM users WHERE id = $1`, claims.UserID).Scan(&userEmail); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send code"})
+		release()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendCode})
 		return
 	}
 
 	// Generate code
 	code, err := generateNumericCode(6)
 	if err != nil {
+		release()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate code"})
 		return
 	}
@@ -2012,6 +2114,7 @@ func (h *Handler) SendEmailMFACode(c *gin.Context) {
 	if h.emailSvc != nil {
 		if err := h.emailSvc.SendVerificationCode(userEmail, code); err != nil {
 			h.log.Error("Failed to send MFA email code", "error", err, "user_id", claims.UserID)
+			release()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 			return
 		}
@@ -2020,22 +2123,52 @@ func (h *Handler) SendEmailMFACode(c *gin.Context) {
 		h.log.Info("DEV MODE — MFA email code", "user_id", claims.UserID, "code", code)
 	}
 
-	// Store code + sent flag in Redis only after successful send
+	// Store the code only after a successful send
 	codeKey := fmt.Sprintf("mfa_email_login:%s", claims.ID)
-	if err := h.redis.Set(ctx, codeKey, code, 10*time.Minute).Err(); err != nil {
+	if err := h.redis.Set(ctx, codeKey, code, emailCodeTTL).Err(); err != nil {
 		h.log.Error("Failed to store MFA email code in Redis", "error", err)
+		release()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Code sent but failed to store — request a new one"})
 		return
-	}
-	if err := h.redis.Set(ctx, sentKey, "1", 10*time.Minute).Err(); err != nil {
-		h.log.Error("Failed to store MFA email sent flag in Redis", "error", err)
-		// Code is stored, sent flag failed — non-fatal, user can still verify
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":    "Verification code sent to your email",
-		"expires_in": 600,
+		"expires_in": int(emailCodeTTL.Seconds()),
 	})
+}
+
+// admitEmailCodeSend enforces one email per challenge and that email MFA is
+// enabled. Both reads fail closed: an unreadable sent-marker read as "not
+// sent" would send again, and an unreadable enabled flag is a server fault,
+// not "not enabled". Returns false once it has answered.
+func (h *Handler) admitEmailCodeSend(ctx context.Context, c *gin.Context, userID, sentKey string) bool {
+	enabled, err := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabledEmail, userID)).Result()
+	if err != nil {
+		h.log.Error("Failed to read email MFA enabled flag", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendCode})
+		return false
+	}
+	if enabled == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email MFA is not enabled for this account"})
+		return false
+	}
+
+	// Reserve the one email this challenge may send. SET NX reads and writes
+	// the marker in one step, so two concurrent requests cannot both send, and
+	// a marker that cannot be written stops this send rather than letting the
+	// next request send again. The caller releases it if the send fails.
+	reserved, err := h.redis.SetNX(ctx, sentKey, "1", emailCodeTTL).Result()
+	if err != nil {
+		h.log.Error("Failed to reserve MFA email send", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendCode})
+		return false
+	}
+	if !reserved {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Email code already sent. Check your inbox or wait for it to expire."})
+		return false
+	}
+	return true
 }
 
 // ── Inline WebAuthn Verify (for protected operations) ────────────────────────
@@ -2050,7 +2183,7 @@ func (h *Handler) WebAuthnVerifyInlineBegin(c *gin.Context) {
 	user, err := h.buildWebAuthnUser(ctx, userID)
 	if err != nil {
 		h.log.Error("Failed to build WebAuthn user", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start verification"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartVerification})
 		return
 	}
 	if len(user.WebAuthnCredentials()) == 0 {
@@ -2061,13 +2194,24 @@ func (h *Handler) WebAuthnVerifyInlineBegin(c *gin.Context) {
 	assertion, session, err := h.webauthn.BeginLogin(user)
 	if err != nil {
 		h.log.Error("WebAuthn BeginLogin failed for inline verify", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start verification"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartVerification})
 		return
 	}
 
-	sessionJSON, _ := json.Marshal(session)
+	sessionJSON, err := json.Marshal(session)
+	if err != nil {
+		h.log.Error("Failed to encode inline WebAuthn session", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartVerification})
+		return
+	}
+	// Options handed out without their stored session describe a ceremony
+	// the finish step can never complete.
 	sessionKey := fmt.Sprintf("mfa_inline_session:%s", userID)
-	h.redis.Set(ctx, sessionKey, sessionJSON, 2*time.Minute)
+	if err := h.redis.Set(ctx, sessionKey, sessionJSON, 2*time.Minute).Err(); err != nil {
+		h.log.Error("Failed to store inline WebAuthn session", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartVerification})
+		return
+	}
 
 	c.JSON(http.StatusOK, assertion)
 }
@@ -2079,15 +2223,20 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
 
-	// Read raw body for WebAuthn assertion parsing
+	// Consume the session atomically (single-use). A GET followed by a DEL
+	// whose failure went unchecked left a completed ceremony reusable; GETDEL
+	// cannot, and a failure to consume it fails closed.
 	sessionKey := fmt.Sprintf("mfa_inline_session:%s", userID)
-	sessionJSON, err := h.redis.Get(ctx, sessionKey).Bytes()
-	if err != nil {
+	sessionJSON, err := h.redis.GetDel(ctx, sessionKey).Bytes()
+	if errors.Is(err, redis.Nil) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No verification session found. Start a new verification."})
 		return
 	}
-	// Delete session immediately (single-use)
-	h.redis.Del(ctx, sessionKey)
+	if err != nil {
+		h.log.Error("Failed to consume inline WebAuthn session", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerify})
+		return
+	}
 
 	var session webauthn.SessionData
 	if err := json.Unmarshal(sessionJSON, &session); err != nil {
@@ -2097,7 +2246,7 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 
 	user, err := h.buildWebAuthnUser(ctx, userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerify})
 		return
 	}
 
@@ -2108,11 +2257,16 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 		return
 	}
 
-	// Update sign count
-	_, _ = h.db.ExecContext(ctx,
+	// Update sign count. Cloned-authenticator detection compares the next
+	// assertion against this value, so a token is not issued unless it landed.
+	if _, err := h.db.ExecContext(ctx,
 		`UPDATE user_mfa_webauthn SET sign_count = $1, last_used_at = NOW() WHERE credential_id = $2 AND user_id = $3`,
 		credential.Authenticator.SignCount, credential.ID, userID,
-	)
+	); err != nil {
+		h.log.Error("Failed to update WebAuthn sign count", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerify})
+		return
+	}
 
 	// Generate a short-lived verification token (60s, single-use)
 	tokenBytes := make([]byte, 24)
@@ -2122,7 +2276,14 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
 	tokenKey := fmt.Sprintf("mfa_inline_token:%s:%s", userID, token)
-	h.redis.Set(ctx, tokenKey, "1", 60*time.Second)
+	// A token the server never stored is one it will never accept. The key
+	// embeds the token, so the error — which a client hook may annotate with
+	// the key — is deliberately not logged.
+	if err := h.redis.Set(ctx, tokenKey, "1", 60*time.Second).Err(); err != nil {
+		h.log.Error("Failed to store inline WebAuthn token", "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"mfa_token": token})
 }
@@ -2257,26 +2418,24 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 		enabled[m] = true
 	}
 	validRecoveryOnly := filterValidRecoveryOnly(req.Methods, enabled)
-
-	if hasEmailOrSms(validRecoveryOnly) {
-		_, err = h.db.ExecContext(ctx,
-			`UPDATE users SET recovery_only_methods = $1, recovery_hardened = TRUE WHERE id = $2`,
-			pq.Array(validRecoveryOnly), userID,
-		)
-	} else {
-		_, err = h.db.ExecContext(ctx,
-			`UPDATE users SET recovery_only_methods = $1 WHERE id = $2`,
-			pq.Array(validRecoveryOnly), userID,
-		)
+	// Clearing sends `methods: []`, which filters to a nil slice; pq.Array(nil)
+	// binds SQL NULL and the NOT NULL column refuses it. Clearing stores '{}'.
+	if validRecoveryOnly == nil {
+		validRecoveryOnly = []string{}
 	}
-	if err != nil {
-		h.log.Error("Failed to update recovery_only_methods", "error", err)
+
+	// recovery_hardened comes back from the write itself, so the response can
+	// never report a value the row does not hold.
+	query := `UPDATE users SET recovery_only_methods = $1 WHERE id = $2 RETURNING recovery_hardened`
+	if hasEmailOrSms(validRecoveryOnly) {
+		query = `UPDATE users SET recovery_only_methods = $1, recovery_hardened = TRUE WHERE id = $2 RETURNING recovery_hardened`
+	}
+	var recoveryHardened bool
+	if err := h.db.QueryRowContext(ctx, query, pq.Array(validRecoveryOnly), userID).Scan(&recoveryHardened); err != nil {
+		h.log.Error("Failed to update recovery_only_methods", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update settings"})
 		return
 	}
-
-	var recoveryHardened bool
-	_ = h.db.QueryRowContext(ctx, `SELECT recovery_hardened FROM users WHERE id = $1`, userID).Scan(&recoveryHardened)
 
 	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{
@@ -2358,8 +2517,11 @@ func (h *Handler) generateAndStoreEmailSmsCodes(ctx context.Context, userID stri
 		if err != nil {
 			return nil, err
 		}
+		// A code that was never stored can never verify, so it must not be sent.
 		key := fmt.Sprintf(redisKeyEmailSmsSetup, userID, method)
-		h.redis.Set(ctx, key, code, 10*time.Minute)
+		if err := h.redis.Set(ctx, key, code, 10*time.Minute).Err(); err != nil {
+			return nil, fmt.Errorf("store %s setup code: %w", method, err)
+		}
 		codes[method] = code
 	}
 	return codes, nil
@@ -2383,7 +2545,7 @@ func (h *Handler) sendEmailSmsSetupEmail(c *gin.Context, userID string, userEmai
 			if c.Request != nil {
 				ctx = c.Request.Context()
 			}
-			h.redis.Del(ctx, fmt.Sprintf(redisKeyEmailSmsSetup, userID, "email"))
+			h.delBestEffort(ctx, "Failed to clear unsent email MFA setup code", userID, fmt.Sprintf(redisKeyEmailSmsSetup, userID, "email"))
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 		return false
@@ -3296,12 +3458,17 @@ func (h *Handler) RemoveTrustedDevice(c *gin.Context) {
 		`DELETE FROM trusted_recovery_devices WHERE id = $1 AND user_id = $2`, deviceID, userID,
 	)
 	if err != nil {
-		h.log.Error("Failed to remove trusted device", "error", err, "user_id", userID, "device_id", deviceID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove trusted device"})
+		h.log.Error(errMsgFailedRemoveDevice, "error", err, "user_id", userID, "device_id", deviceID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveDevice})
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read trusted device removal count", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveDevice})
+		return
+	}
 	if rowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Trusted device not found"})
 		return
@@ -3758,12 +3925,17 @@ func (h *Handler) DeleteRecoveryCircle(c *gin.Context) {
 		`DELETE FROM recovery_circles WHERE user_id = $1`, userID,
 	)
 	if err != nil {
-		h.log.Error("Failed to delete recovery circle", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete recovery circle"})
+		h.log.Error(errMsgFailedDeleteCircle, "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCircle})
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read recovery circle deletion count", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCircle})
+		return
+	}
 	if rowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No recovery circle found"})
 		return
@@ -3939,7 +4111,11 @@ func (h *Handler) executeSocialRecoveryResponse(ctx context.Context, requestID, 
 		h.log.Error("Failed to insert social recovery response", "error", err)
 		return 0, errMsgFailedSubmitResponse, http.StatusInternalServerError
 	}
-	rowsAffected, _ := res.RowsAffected()
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read social recovery response insert count", "error", err)
+		return 0, errMsgFailedSubmitResponse, http.StatusInternalServerError
+	}
 	if rowsAffected == 0 {
 		return 0, "You have already responded to this request", http.StatusConflict
 	}

@@ -2375,10 +2375,9 @@ func TestSetRecoveryOnlyClear(t *testing.T) {
 		"methods":  []string{},
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	// Handler exercises: password+MFA verify, method validation, login-eligible check,
-	// nil-safe filtering, and DB update. May return 500 if pq.Array receives nil
-	// for a NOT NULL column — that's a known code path to cover.
-	assert.Contains(t, []int{http.StatusOK, http.StatusInternalServerError}, w.Code)
+	// Clearing the list stores '{}'. It used to bind SQL NULL into the NOT NULL
+	// column and 500, which this test once accepted as "a known code path".
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
 
 // --- SetRecoveryHardened: Wrong password ---

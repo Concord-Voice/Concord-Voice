@@ -274,6 +274,14 @@ account can't provide, never your password twice.
   ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — a brief outage in the service that checks your password or two-factor code during a
   security action used to look identical to having tried too many times. It now says verification
   is temporarily unavailable and to try again in a few minutes.
+- **Account-security actions now report a failure instead of claiming success**
+  ([#3461](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3461)) — signing in with a
+  security key now asks you to try again when the server cannot record the key's use, instead of
+  signing you in without the check that detects a copied key. Removing a trusted device, deleting a
+  recovery circle and answering a recovery request now show an error when the server cannot confirm
+  the change, instead of saying it was not found or already answered. An email sign-in code is sent
+  at most once per sign-in attempt, even when two requests arrive together. Turning recovery-only
+  mode off works again.
 
 ### Security
 
