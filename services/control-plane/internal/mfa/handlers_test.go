@@ -137,7 +137,19 @@ func TestTOTPSetupNoPassword(t *testing.T) {
 
 	w := ts.DoRequest("POST", urlTOTPSetup, map[string]interface{}{}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// The route speaks the step-up seam: a missing password is the
+	// actionable 403, no longer a bind-shape 400.
+	assertPasswordRequired(t, w, "Enter your password to set up an authenticator app.")
+}
+
+// assertPasswordRequired pins the seam's missing-password refusal, including
+// the route's own CredentialRequired copy (I6) — the client renders it.
+func assertPasswordRequired(t *testing.T, w *httptest.ResponseRecorder, wantCopy string) {
+	t.Helper()
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, map[string]interface{}{"error": wantCopy, "password_required": true}, body)
 }
 
 func TestTOTPSetupWrongPassword(t *testing.T) {
@@ -158,13 +170,19 @@ func TestTOTPSetupAlreadyEnabled(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "totpdup")
 
-	// Insert a confirmed TOTP row directly
-	_, err := ts.DB.Exec(`INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, enabled, confirmed) VALUES ($1, $2, $3, true, true)`,
-		user.ID, []byte("enc"), []byte("nonce"))
-	assert.NoError(t, err)
+	// Enroll a real, confirmed TOTP factor so P1's inlineMFAMethods sees it:
+	// a directly-inserted row (bypassing enrollment) makes requirePasswordAndMFA
+	// correctly demand a code, which this test must supply to reach the
+	// "already enabled" 409 it exists to pin.
+	secret, _ := enrollTOTP(t, ts, user)
+	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{
+		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
+	require.NoError(t, err)
 
 	w := ts.DoRequest("POST", urlTOTPSetup, map[string]interface{}{
 		"password": testPassword,
+		"mfa_code": code,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusConflict, w.Code)
@@ -307,7 +325,7 @@ func TestWebAuthnRegisterBeginNoPassword(t *testing.T) {
 		"credential_name": testCredName,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertPasswordRequired(t, w, "Enter your password to add a security key.")
 }
 
 func TestWebAuthnRegisterFinishNoSession(t *testing.T) {
@@ -369,7 +387,7 @@ func TestEmailSmsSetupNoPassword(t *testing.T) {
 		"methods": []string{"email"},
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertPasswordRequired(t, w, "Enter your password to turn on email or text-message codes.")
 }
 
 func TestEmailSmsSetupInvalidMethod(t *testing.T) {
@@ -414,8 +432,17 @@ func TestEmailSmsDisable(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "emailsmsdis")
 
+	// Body-less request: no credentials, so the step-up gate refuses.
 	w := ts.DoRequest("POST", urlEmailSmsDisable, nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, true, body["password_required"])
 
+	// Credentialed variant on a password-only account succeeds.
+	w = ts.DoRequest("POST", urlEmailSmsDisable, map[string]interface{}{
+		"password": testPassword,
+	}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
@@ -514,7 +541,12 @@ func TestDeleteRecoveryKeyNoPassword(t *testing.T) {
 
 	w := ts.DoRequest("DELETE", urlRecoveryKey, map[string]interface{}{}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// A credential-less request is now the step-up gate's actionable 403,
+	// not a bind-shape 400.
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, true, body["password_required"])
 }
 
 // --- Trusted Devices ---
@@ -540,7 +572,7 @@ func TestDesignateTrustedDeviceNoPassword(t *testing.T) {
 		"device_name": "My Laptop",
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertPasswordRequired(t, w, "Enter your password to trust this device for account recovery.")
 }
 
 func TestDesignateTrustedDeviceSuccess(t *testing.T) {
@@ -785,7 +817,7 @@ func TestSetRecoveryOnlyNoPassword(t *testing.T) {
 		"methods": []string{"email"},
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertPasswordRequired(t, w, "Enter your password to change which methods are for recovery only.")
 }
 
 func TestSetRecoveryOnlyWrongPassword(t *testing.T) {
@@ -810,7 +842,7 @@ func TestSetRecoveryHardenedNoPassword(t *testing.T) {
 		"enabled": true,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertPasswordRequired(t, w, "Enter your password to change hardened recovery.")
 }
 
 func TestSetRecoveryHardenedSuccess(t *testing.T) {
@@ -1776,6 +1808,31 @@ func TestTOTPDisableInvalidMFACode(t *testing.T) {
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
+	// The literal is the wire contract: the desktop's classifyStepUpRefusal
+	// matches this exact body to put the refusal on the code field. A longer
+	// wording fell through to a generic banner.
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Invalid MFA code", body["error"])
+}
+
+// --- TOTP Disable: wrong password with TOTP enrolled ---
+
+func TestTOTPDisableWrongPasswordEnrolled(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "disablebadpw")
+	enrollTOTP(t, ts, user)
+
+	w := ts.DoRequest("POST", urlTOTPDisable, map[string]interface{}{
+		"password": testBadPassword,
+		"code":     "000000",
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	// Same body as the step-up seam, so the desktop routes it to the password field.
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Invalid password", body["error"])
 }
 
 // --- Regenerate Backup Codes: TOTP not enabled ---
@@ -2067,6 +2124,10 @@ func TestWebAuthnDeleteCredentialWrongPassword(t *testing.T) {
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
+	// Same body as the step-up seam, so the desktop routes it to the password field.
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Invalid password", body["error"])
 }
 
 // --- WebAuthn Delete Credential: No Password ---
@@ -2371,9 +2432,11 @@ func TestSetBackupEmailClear(t *testing.T) {
 		"password": testPassword,
 	}, auth)
 
-	// Clear it
+	// Clear it — the gate applies to the requested action, clear included,
+	// so this also needs credentials.
 	w := ts.DoRequest("PUT", urlBackupEmail, map[string]interface{}{
-		"email": "",
+		"email":    "",
+		"password": testPassword,
 	}, auth)
 
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -2534,6 +2597,9 @@ func TestDeleteRecoveryKeyWrongPassword(t *testing.T) {
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, map[string]interface{}{"error": "Invalid password"}, body)
 }
 
 // --- RemoveTrustedDevice: Wrong password ---
@@ -2558,7 +2624,7 @@ func TestRemoveTrustedDeviceNoPassword(t *testing.T) {
 	w := ts.DoRequest("DELETE", urlTrustedDevices+"/some-id", map[string]interface{}{},
 		testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertPasswordRequired(t, w, "Enter your password to remove a trusted recovery device.")
 }
 
 // --- DesignateTrustedDevice: No machine ID header ---
@@ -2751,7 +2817,7 @@ func TestVerifyEmailCodeNoPending(t *testing.T) {
 func TestEmailSmsDisableAfterEnable(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "emailsmsdisok")
-	enrollTOTP(t, ts, user)
+	secret, _ := enrollTOTP(t, ts, user)
 
 	// Enable email MFA via Redis
 	ctx := context.Background()
@@ -2763,8 +2829,16 @@ func TestEmailSmsDisableAfterEnable(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &statusBefore)
 	assert.Equal(t, true, statusBefore["email_enabled"])
 
-	// Disable
-	w = ts.DoRequest("POST", urlEmailSmsDisable, nil, testhelpers.AuthHeaders(user.AccessToken))
+	// Disable — TOTP is enrolled and confirmed, so P1 requires the inline
+	// code alongside the password.
+	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{
+		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
+	require.NoError(t, err)
+	w = ts.DoRequest("POST", urlEmailSmsDisable, map[string]interface{}{
+		"password": testPassword,
+		"mfa_code": code,
+	}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	// Verify email is disabled
@@ -3836,7 +3910,8 @@ func TestSetBackupEmailValid(t *testing.T) {
 	user := ts.CreateTestUser(t, "bkemailok")
 
 	w := ts.DoRequest("PUT", urlBackupEmail, map[string]interface{}{
-		"email": testBackupEmail,
+		"email":    testBackupEmail,
+		"password": testPassword,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -3854,7 +3929,9 @@ func TestEmailSmsDisableSuccess(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "emsmsdis")
 
-	w := ts.DoRequest("POST", urlEmailSmsDisable, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w := ts.DoRequest("POST", urlEmailSmsDisable, map[string]interface{}{
+		"password": testPassword,
+	}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
@@ -4303,8 +4380,8 @@ func TestEmailSmsVerifyKeepsPendingCodesWhenActivationWriteFails(t *testing.T) {
 		"the pending sms code must survive a failed activation so the caller can retry (#2654)")
 }
 
-// TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails covers the
-// updateUserMFAFlags error arm, and locks the same two-phase ordering from the
+// TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails covers the flag-write
+// transaction's error arm, and locks the same two-phase ordering from the
 // other side: the durable flag write is the LAST thing that can fail, and when
 // it does the pending code must still be there.
 func TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails(t *testing.T) {
@@ -4318,30 +4395,42 @@ func TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails(t *testing.T) {
 	emailKey := fmt.Sprintf(redisEmailSmsSetup, user.ID)
 	require.NoError(t, ts.Redis.Set(ctx, emailKey, "123456", 10*time.Minute).Err())
 
-	// A second pool against the same test database, pinned to a single
-	// connection and switched into a read-only session. Every SELECT the handler
-	// makes still succeeds (recovery_hardened, and updateUserMFAFlags' own
-	// reads); only its UPDATE fails. default_transaction_read_only is
-	// session-scoped on a connection this test owns, so unlike a role or a
-	// trigger it mutates no shared state in the test database.
-	roDB, err := sql.Open("postgres", dbtest.DatabaseURL())
+	// The flag write runs in its own transaction that locks the users row
+	// first. A read-only session cannot fail it: lib/pq opens every
+	// non-read-only transaction with an explicit READ WRITE, which overrides
+	// default_transaction_read_only. So the fault is the lock instead: this
+	// test holds the row, and a second pool pinned to one connection carries a
+	// session-scoped lock_timeout. Plain SELECTs (recovery_hardened) are not
+	// blocked by a row lock; the flag transaction's opening lock is. Nothing
+	// here mutates shared state in the test database.
+	holder, err := ts.DB.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, roDB.Close()) })
-	roDB.SetMaxOpenConns(1)
-	roDB.SetMaxIdleConns(1)
-	_, err = roDB.ExecContext(ctx, `SET default_transaction_read_only = on`)
+	t.Cleanup(func() { _ = holder.Rollback() })
+	var held string
+	require.NoError(t, holder.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, user.ID).Scan(&held))
+
+	faultDB, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, faultDB.Close()) })
+	faultDB.SetMaxOpenConns(1)
+	faultDB.SetMaxIdleConns(1)
+	_, err = faultDB.ExecContext(ctx, `SET lock_timeout = '100ms'`)
 	require.NoError(t, err)
 
-	// Prove the session pin actually took, so a future pooling change cannot
-	// make this test pass for the wrong reason (e.g. by failing earlier).
+	// Prove the session pin took, so a future pooling change cannot make this
+	// test pass for the wrong reason (e.g. by failing earlier).
 	var probe bool
-	require.NoError(t, roDB.QueryRowContext(ctx,
+	require.NoError(t, faultDB.QueryRowContext(ctx,
 		`SELECT recovery_hardened FROM users WHERE id = $1`, user.ID).Scan(&probe),
-		"reads must still work on the read-only session")
-	_, err = roDB.ExecContext(ctx, `UPDATE users SET mfa_enabled = TRUE WHERE id = $1`, user.ID)
-	require.Error(t, err, "the read-only session pin did not take effect")
+		"reads must still work while the row is held")
+	probeTx, err := faultDB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	require.NoError(t, err)
+	var probeID string
+	require.Error(t, probeTx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, user.ID).Scan(&probeID),
+		"the lock_timeout pin did not take effect")
+	require.NoError(t, probeTx.Rollback())
 
-	h := mfa.NewHandler(roDB, ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	h := mfa.NewHandler(faultDB, ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
 	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456"}}`)
 
 	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())

@@ -3,7 +3,7 @@ import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import PurgeRangePicker from './PurgeRangePicker';
 import PurgeResult from './PurgeResult';
-import StepUpFields, { type StepUpFieldErrors } from './StepUpFields';
+import StepUpFields, { stepUpFieldErrors, stepUpRefusedField } from './StepUpFields';
 import { PURGE_RANGE_PHRASES, type PurgeRange } from '../../constants/purgeRanges';
 import {
   isStepUpPurgeResult,
@@ -59,22 +59,6 @@ const TRANSPORT_FAILURE: TerminalPurgeResult = { kind: 'networkError' };
 
 /** configure → result, or configure → stepup → result for DM/group. */
 type Stage = 'configure' | 'stepup' | 'result';
-
-/**
- * Per-field step-up error copy (deck §5). Held in a switch rather than a lookup
- * object because the pre-commit secret scanner flags a credential-shaped key
- * placed beside a quoted literal — see StepUpFields' `credentialError`.
- */
-function stepUpFieldErrors(stepUp: StepUpPurgeResult | null): StepUpFieldErrors {
-  switch (stepUp?.kind) {
-    case 'invalidPassword':
-      return { credentialError: 'That password is not correct.' };
-    case 'invalidMfaCode':
-      return { codeError: 'That code is not correct, or it has expired. Try the next one.' };
-    default:
-      return {};
-  }
-}
 
 /**
  * The scope echo, split around the bolded scope name. Qualitative by
@@ -167,10 +151,14 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   const needsTypedConfirm = range === 'all' || context === 'server';
   const canConfirm = range !== null && (!needsTypedConfirm || typed === 'PURGE') && !busy;
 
-  // An SSO account has no password to offer, so an explicit MFA challenge drops
-  // the field rather than demanding something that cannot exist.
-  const showPassword = stepUp?.kind !== 'mfaRequired';
-  const canSubmitStepUp = !busy && ((showPassword && password !== '') || code !== '');
+  // The password field stays up through an `mfa_required` refusal. The seam
+  // verifies the password FIRST, so that refusal is exactly what a correct
+  // password with no code receives — hiding the field on it made the next
+  // submit send no password, drew `password_required`, and burned a second
+  // attempt from the budget the purge itself spends. Same fix, same reason, as
+  // PurgeFenceStepUpDialog (#2792); the server's arms drive the copy.
+  const showPassword = true;
+  const canSubmitStepUp = !busy && (password !== '' || code !== '');
 
   // A stage change moves focus to the stage heading. The dialog title stays put:
   // ui/Modal binds it to aria-labelledby, so renaming it mid-interaction renames
@@ -205,8 +193,9 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   // A rejected factor returns focus to the field that owns it. Keyed on the
   // result object, so a second wrong attempt of the same kind re-focuses too.
   useLayoutEffect(() => {
-    if (stepUp?.kind === 'invalidPassword') passwordRef.current?.focus();
-    else if (stepUp?.kind === 'invalidMfaCode') codeRef.current?.focus();
+    const field = stepUpRefusedField(stepUp);
+    if (field === 'password') passwordRef.current?.focus();
+    else if (field === 'code') codeRef.current?.focus();
   }, [stepUp]);
 
   const applyOutcome = (outcome: PurgeOutcome) => {
@@ -216,7 +205,14 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       // a fresh code they already typed.
       if (outcome.kind === 'invalidPassword') setPassword('');
       if (outcome.kind === 'invalidMfaCode') setCode('');
-      setStepUp(outcome);
+      // A refusal of the configure-stage submit carried no credentials, so it
+      // is the challenge that opens the stage, not a mistake: it names no field
+      // and focus stays on the stage heading. `stage` is the one the refused
+      // request was sent from — this closure belongs to that render.
+      const opensStage =
+        stage === 'configure' &&
+        (outcome.kind === 'passwordRequired' || outcome.kind === 'mfaRequired');
+      setStepUp(opensStage ? null : outcome);
       setStage('stepup');
       return;
     }
@@ -292,7 +288,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
           context,
           scopeId,
           range,
-          currentPassword: showPassword && password ? password : undefined,
+          currentPassword: password || undefined,
           mfaCode: code || undefined,
         })
       );

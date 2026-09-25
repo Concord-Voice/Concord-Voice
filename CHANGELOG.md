@@ -8,8 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Concord Voice now keeps screen sharing steady when a capture changes, cleans up
 cancelled audio work before it can surface later, records security outcomes
-without losing the observation that triggered them, and pauses a voice stream
-that keeps sending far more than your plan allows.
+without losing the observation that triggered them, pauses a voice stream
+that keeps sending far more than your plan allows, and asks for the right
+proof of identity in the right places — never a code an email/text-only
+account can't provide, never your password twice.
 
 ### Changed
 
@@ -53,9 +55,25 @@ that keeps sending far more than your plan allows.
   Audio and Video Basic / Advanced switches now also has an outline, so it stands out in every
   theme.
 
+- **Setting up an authenticator app now tells you what happened to your recovery key** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — after
+  you finish adding an authenticator app, Concord shows whether it created a new recovery key, kept
+  the one you already had, or could not create one, instead of moving on without saying. If
+  creating one fails you can try again or continue without it. Replacing a key you already have
+  asks for your password and an authenticator code.
+
 - **DM-block and credential-epoch cleanup now survives delivery failures** ([#3140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3140)) — guarded reconciliation records retryable voice-ejection obligations and fences stale callbacks by generation.
 
 ### Fixed
+
+- **Try again on the recovery-key screen now shows each attempt** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — when creating a recovery
+  key failed again after Try again, the screen looked exactly the same, so the button seemed to do
+  nothing. The message now counts the attempts.
+
+- **Reset TOTP now accepts a typed backup code** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — a backup code typed into Reset TOTP was only
+  picked up if you pressed Enter, so clicking Confirm sent no code and failed with "Password and MFA
+  code are required". The code is now used as soon as all eight characters are typed, and Confirm
+  waits until a code is entered. When signing in, a backup code is now submitted as soon as its
+  eighth character is typed, the same way an authenticator code is.
 
 - **Rich Presence sharing settings save every time** ([#3444](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3444)) — changing who can see your Server Voice or
   Private Call activity worked once and then failed on every later try, snapping back to the old
@@ -64,6 +82,7 @@ that keeps sending far more than your plan allows.
   Changes now save every time. While you are in voice or a call, only the people who could see
   that activity briefly reconnect; otherwise nobody else is disconnected. If a setting of yours is
   stuck, the next change fixes it.
+
 - **Purging a direct message can no longer hang** ([#3442](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3442)) — Purge Messages in a
   direct message or group chat now stops after 10 seconds, the same limit channel and server purges
   already have. If it runs out of time you see that some messages may already have been purged, and
@@ -227,8 +246,45 @@ that keeps sending far more than your plan allows.
   subscription. The slider below them is now announced as "Audio quality" with the tier's name,
   instead of a bare number. They look the same as before.
 
+- **Accounts with only email or text-message codes are no longer asked for a code they have no
+  way to check** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — setting up an authenticator app, adding a security key, changing recovery
+  settings, and the other account-security actions that ask for your password now also skip the
+  code prompt for an account whose only two-factor methods are email and text-message codes,
+  matching how those accounts already sign in. Transferring ownership of a server works the same
+  way.
+- **Removing your last authenticator app or security key while email or text-message codes are on
+  is refused, with a reason** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — removing your last authenticator app or security key while email or
+  text-message codes are still on used to leave your account able to sign in with a code its own
+  settings pages could no longer check. That is now refused, and the screen tells you to turn off
+  email/text-message codes first.
+- **Purging messages no longer asks for your password twice** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — confirming a purge with your
+  password and a two-factor code, correctly entered, no longer re-asks for the password on the
+  next screen.
+- **A wrong password or code now points at the field that was wrong, and screen readers read it
+  out** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — resetting your authenticator app or removing a security key with a wrong
+  password or code now marks that field, clears it and puts the cursor back in it, like the other
+  account-security actions, instead of showing a general error. A wrong two-factor or backup code,
+  including at sign-in, is now announced by screen readers instead of appearing silently. In the
+  purge dialogs, sending only your password or only a code now says which one is missing, instead
+  of doing nothing.
+- **Retrying a lost recovery-key save now resends the same key** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — if the confirmation that a new
+  recovery key was saved never arrived, Try Again now resends that same key instead of generating
+  a different one that might not match what was actually saved.
+- **A temporarily unavailable verification check now says so, instead of "too many attempts"**
+  ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — a brief outage in the service that checks your password or two-factor code during a
+  security action used to look identical to having tried too many times. It now says verification
+  is temporarily unavailable and to try again in a few minutes.
+
 ### Security
 
+- **Weakening your account's recovery now asks you to prove it's you** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — turning off email or
+  SMS sign-in codes, replacing your recovery key, and adding or removing a backup email now ask for
+  your password, plus a code from your authenticator app or security key when you have one set up.
+  Before, anyone with access to an open session could make these changes. Creating your first
+  recovery key still does not ask again. After five wrong attempts in 15 minutes, further attempts
+  are refused until the window passes. Separately, turning off link previews on a message now
+  checks that you are allowed to manage messages before it answers, so it no longer reveals whether
+  that message's previews were already hidden.
 - **A dropped voice connection no longer leaves your activity visible to people you later hide it from** ([#3446](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3446)) — when
   your connection to a voice channel or a direct call dropped without a clean exit, Concord removed
   you from the call but never told other people's apps. They kept showing you "in voice", and if you

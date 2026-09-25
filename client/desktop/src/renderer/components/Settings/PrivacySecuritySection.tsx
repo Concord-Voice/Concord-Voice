@@ -14,6 +14,8 @@ import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
 import MFATierSelector, { WebAuthnCredential } from './MFATierSelector';
 import MFASetup from './MFASetup';
+import { submitMfaStepUp, type MfaStepUpResult } from './mfaStepUp';
+import ErrorBanner from './ErrorBanner';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import BackupCodeDisplay from './BackupCodeDisplay';
 import EmailSmsSetup from './EmailSmsSetup';
@@ -253,6 +255,7 @@ const AuthVerifyField: React.FC<{
           onMfaVerify(code);
           onClearError();
         }}
+        onCodeChange={onMfaVerify}
         disabled={disabled}
         error={error || undefined}
         excludeBackupCodes={excludeBackupCodes}
@@ -717,6 +720,10 @@ const PrivacySecuritySection: React.FC = () => {
   const [mfaBackupRemaining, setMfaBackupRemaining] = useState<number | undefined>();
   const [mfaWebauthnCredentials, setMfaWebauthnCredentials] = useState<WebAuthnCredential[]>([]);
   const [mfaBackupEmail, setMfaBackupEmail] = useState('');
+  // Whether the MFA state above is the server's (F8). Until it is, the tier
+  // controls stay hidden: the empty defaults would read as "MFA is off",
+  // undoing the server's fail-closed 500 on a status read it could not do.
+  const [mfaStatusLoad, setMfaStatusLoad] = useState<'loading' | 'ready' | 'error'>('loading');
   const [mfaSetupMethod, setMfaSetupMethod] = useState<'totp' | 'webauthn' | 'email-sms' | null>(
     null
   );
@@ -933,7 +940,14 @@ const PrivacySecuritySection: React.FC = () => {
   const fetchMFAStatus = useCallback(async () => {
     if (!accessToken) return;
     const data = await fetchMFAStatusData();
-    if (!data) return; // helper returned null on transient failure; keep prior state
+    // A failed read keeps the prior values (never clobbered with defaults) but
+    // is reported, and the controls built on them are hidden until a read
+    // succeeds — after a change, the prior values are known to be stale.
+    if (!data) {
+      setMfaStatusLoad('error');
+      return;
+    }
+    setMfaStatusLoad('ready');
     setMfaMethods(data.methods);
     setMfaRecoveryOnly(data.recoveryOnly);
     setMfaRecoveryHardened(data.recoveryHardened);
@@ -1246,117 +1260,126 @@ const PrivacySecuritySection: React.FC = () => {
 
   // ─── MFA action handlers (extracted from JSX props so their branching does
   // not inflate this component's cognitive complexity) ─────────────────────
-  const handleResetTOTP = async (password: string, code: string): Promise<boolean> => {
-    const res = await apiFetch('/api/v1/mfa/totp/disable', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password, code }),
-    });
-    if (res.ok) {
-      fetchMFAStatus();
-      return true;
-    }
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || 'Failed to disable TOTP');
+  // Every MFA settings action resolves an MfaStepUpResult and never throws:
+  // the modal routes all six through one path (mfaStepUp.ts). The status is
+  // refetched only after an accepted change — a refusal changed nothing.
+  const handleResetTOTP = async (password: string, code: string): Promise<MfaStepUpResult> => {
+    // TOTPDisable predates the seam and binds the code as `code`.
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/totp/disable',
+      'POST',
+      {},
+      { password, mfaCode: code },
+      { codeField: 'code' }
+    );
+    if (result.kind === 'accepted') fetchMFAStatus();
+    return result;
   };
 
   const handleRevokeWebAuthnKey = async (
     credentialId: string,
     password: string
-  ): Promise<boolean> => {
-    const res = await apiFetch(`/api/v1/mfa/webauthn/credentials/${credentialId}`, {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
-    });
-    if (res.ok) {
-      const data = await res.json();
+  ): Promise<MfaStepUpResult> => {
+    // The route verifies the password alone; no code is sent.
+    const result = await submitMfaStepUp(
+      `/api/v1/mfa/webauthn/credentials/${credentialId}`,
+      'DELETE',
+      {},
+      { password, mfaCode: '' }
+    );
+    if (result.kind === 'accepted') {
       // Signal the authenticator to clean up the deleted credential (best-effort).
+      const data = (result.data ?? {}) as { remaining_credential_ids?: string[]; user_id?: string };
       await signalRemovedWebAuthnCredential(data);
       fetchMFAStatus();
-      return true;
     }
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.error || 'Failed to revoke credential');
+    return result;
   };
 
-  const handleDisableEmailSms = async (): Promise<boolean> => {
-    const res = await apiFetch('/api/v1/mfa/email-sms/disable', { method: 'POST' });
-    if (res.ok) {
-      fetchMFAStatus();
-      return true;
-    }
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.error || 'Failed to disable Email/SMS');
+  const handleDisableEmailSms = async (
+    password: string,
+    mfaCode: string
+  ): Promise<MfaStepUpResult> => {
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/email-sms/disable',
+      'POST',
+      {},
+      { password, mfaCode }
+    );
+    if (result.kind === 'accepted') fetchMFAStatus();
+    return result;
   };
 
-  const handleSetBackupEmail = async (email: string): Promise<boolean> => {
-    const res = await apiFetch('/api/v1/mfa/backup-email', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setMfaBackupEmail(data.backup_email || '');
-      return true;
+  const handleSetBackupEmail = async (
+    email: string,
+    password: string,
+    mfaCode: string
+  ): Promise<MfaStepUpResult> => {
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/backup-email',
+      'PUT',
+      { email },
+      { password, mfaCode }
+    );
+    if (result.kind === 'accepted') {
+      const data = result.data as { backup_email?: string } | null;
+      setMfaBackupEmail(data?.backup_email ?? '');
     }
-    return false;
+    return result;
   };
 
   const handleToggleRecoveryHardened = async (
     enabled: boolean,
     password: string,
-    mfaCode?: string
-  ): Promise<boolean> => {
-    try {
-      const res = await apiFetch('/api/v1/mfa/recovery-hardened', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled, password, mfa_code: mfaCode || undefined }),
-      });
-      if (res.ok) {
-        const data = await res.json();
+    mfaCode = ''
+  ): Promise<MfaStepUpResult> => {
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/recovery-hardened',
+      'PUT',
+      { enabled },
+      { password, mfaCode }
+    );
+    if (result.kind === 'accepted') {
+      const data = result.data as { recovery_hardened?: unknown } | null;
+      if (typeof data?.recovery_hardened === 'boolean') {
         setMfaRecoveryHardened(data.recovery_hardened);
-        return true;
+      } else {
+        fetchMFAStatus();
       }
-      return false;
-    } catch {
-      return false;
     }
+    return result;
   };
 
   const handleToggleRecoveryOnly = async (
     method: string,
     recoveryOnly: boolean,
     password: string,
-    mfaCode?: string
-  ): Promise<boolean> => {
+    mfaCode = ''
+  ): Promise<MfaStepUpResult> => {
     const newList = recoveryOnly
       ? [...mfaRecoveryOnly, method]
       : mfaRecoveryOnly.filter((m) => m !== method);
-    try {
-      const res = await apiFetch('/api/v1/mfa/recovery-only', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          methods: newList,
-          password,
-          mfa_code: mfaCode || undefined,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setMfaRecoveryOnly(data.recovery_only_methods || []);
-        if (data.recovery_hardened !== undefined) {
-          setMfaRecoveryHardened(data.recovery_hardened);
-        }
-        return true;
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/recovery-only',
+      'PUT',
+      { methods: newList },
+      { password, mfaCode }
+    );
+    if (result.kind === 'accepted') {
+      const data = result.data as {
+        recovery_only_methods?: unknown;
+        recovery_hardened?: unknown;
+      } | null;
+      const methods = data?.recovery_only_methods;
+      if (!Array.isArray(methods)) {
+        fetchMFAStatus();
+        return result;
       }
-      return false;
-    } catch {
-      return false;
+      setMfaRecoveryOnly(methods.filter((m): m is string => typeof m === 'string'));
+      const hardened = data?.recovery_hardened;
+      if (typeof hardened === 'boolean') setMfaRecoveryHardened(hardened);
     }
+    return result;
   };
 
   // MFA setup area — three-way branch extracted from the render tree so its
@@ -1387,7 +1410,25 @@ const PrivacySecuritySection: React.FC = () => {
           onCancel={() => setMfaSetupMethod(null)}
         />
       )}
-      {!mfaSetupMethod && (
+      {!mfaSetupMethod && mfaStatusLoad === 'loading' && (
+        <p className="settings-section-description">Loading your MFA settings…</p>
+      )}
+      {!mfaSetupMethod && mfaStatusLoad === 'error' && (
+        <div className="mfa-status-error">
+          <ErrorBanner error="We couldn't load your MFA settings, so they're hidden until they load. Nothing has changed." />
+          <button
+            type="button"
+            className="btn btn-sm btn-secondary"
+            onClick={() => {
+              setMfaStatusLoad('loading');
+              void fetchMFAStatus();
+            }}
+          >
+            Reload MFA settings
+          </button>
+        </div>
+      )}
+      {!mfaSetupMethod && mfaStatusLoad === 'ready' && (
         <MFATierSelector
           activeMethods={mfaMethods}
           recoveryOnlyMethods={mfaRecoveryOnly}
@@ -1449,7 +1490,8 @@ const PrivacySecuritySection: React.FC = () => {
               <MFAVerifyPrompt
                 methods={mfaMethods}
                 recoveryOnlyMethods={mfaRecoveryOnly}
-                onVerify={(code) => setBackupResetMfaCode(code)}
+                onVerify={setBackupResetMfaCode}
+                onCodeChange={setBackupResetMfaCode}
                 disabled={backupResetLoading}
                 error={backupResetError || undefined}
               />

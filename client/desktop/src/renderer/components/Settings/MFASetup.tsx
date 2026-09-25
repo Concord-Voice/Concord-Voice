@@ -7,57 +7,192 @@ import TOTPInput from '../Auth/TOTPInput';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import BackupCodeDisplay from './BackupCodeDisplay';
 import RecoveryKeyDisplay from './RecoveryKeyDisplay';
+import ErrorBanner, { FieldError } from './ErrorBanner';
 import {
   generateRecoveryKey,
   wrapWithRecoveryKey,
   wrapPrefsKeyWithRecoveryKey,
 } from '../../utils/crypto/crypto';
 import { e2eeService } from '../../services/e2ee/e2eeService';
+import { classifyStepUpRefusal } from '../../services/system/stepUpRefusal';
+import {
+  inlineMfaMethods,
+  isStepUpLocked,
+  stepUpBanner,
+  stepUpMfaError,
+  stepUpPasswordError,
+  stepUpPromptMethods,
+  submitMfaStepUp,
+  type MfaStepUpResult,
+} from './mfaStepUp';
 
 // ── Extracted helpers (reduce cognitive complexity) ───────────────────
 
-/** Generate a recovery key, wrap E2EE keys with it, and upload to server. */
-async function generateAndStoreRecoveryKey(): Promise<string | null> {
+export type RecoveryKeyOutcome =
+  | { kind: 'created'; key: string }
+  | { kind: 'kept' }
+  | { kind: 'failed' }
+  | { kind: 'unavailable' };
+
+/**
+ * The E2EE material a prepared upload wraps. Compared by identity, never by
+ * value: the wrapping key is a CryptoKey object and the wrapped private key is
+ * the server-stored ciphertext, so no key bytes are copied into this record.
+ */
+interface RecoverySource {
+  wrappingKey: CryptoKey;
+  wrappedPrivateKey: string;
+  hasPrefsKey: boolean;
+}
+
+/** One recovery key and the upload body that wraps it, bound to its source. */
+interface PreparedRecovery {
+  key: string;
+  body: Record<string, string>;
+  source: RecoverySource;
+}
+
+type Preparation =
+  | { kind: 'ready'; prepared: PreparedRecovery }
+  /** This device has no unlocked E2EE keys to wrap. */
+  | { kind: 'unavailable' }
+  | { kind: 'failed' }
+  /** The holder was cleared (Back, Done, unmount) while this was in flight. */
+  | { kind: 'abandoned' };
+
+/** Where a component keeps a preparation. A ref, never state or a store. */
+interface PreparationSlot {
+  current: Promise<Preparation> | null;
+}
+
+/** This device's recovery-wrappable material, read once. Null when locked. */
+function readRecoveryMaterial(): { source: RecoverySource; prefsKeyBase64: string | null } | null {
   const wrappingKey = e2eeService.getWrappingKey();
   const wrappedPrivateKey = e2eeService.getWrappedPrivateKey();
-
-  if (!wrappingKey || !wrappedPrivateKey) {
-    return null; // No wrapping key available, skip recovery
-  }
-
-  const newRecoveryKey = generateRecoveryKey();
-  const { wrappedKey: recoveryWrappedKey, salt: recoverySalt } = await wrapWithRecoveryKey(
-    wrappedPrivateKey,
-    wrappingKey,
-    newRecoveryKey
-  );
-
-  const uploadBody: Record<string, string> = {
-    recovery_wrapped_private_key: recoveryWrappedKey,
-    recovery_key_salt: recoverySalt,
-  };
-
+  if (!wrappingKey || !wrappedPrivateKey) return null;
   const prefsKeyBase64 = e2eeService.getPreferencesKeyBase64();
-  if (prefsKeyBase64) {
-    const { wrappedKey: recoveryWrappedPrefs, salt: prefsSalt } = await wrapPrefsKeyWithRecoveryKey(
-      prefsKeyBase64,
-      newRecoveryKey
+  return {
+    source: { wrappingKey, wrappedPrivateKey, hasPrefsKey: prefsKeyBase64 !== null },
+    prefsKeyBase64,
+  };
+}
+
+/** True while `prepared` still wraps what this device holds now. */
+function wrapsCurrentKeys(prepared: PreparedRecovery): boolean {
+  const now = readRecoveryMaterial()?.source ?? null;
+  return (
+    now !== null &&
+    now.wrappingKey === prepared.source.wrappingKey &&
+    now.wrappedPrivateKey === prepared.source.wrappedPrivateKey &&
+    now.hasPrefsKey === prepared.source.hasPrefsKey
+  );
+}
+
+/**
+ * Wraps the E2EE keys with a fresh recovery key — two Argon2id (64 MiB)
+ * derivations, so it runs once per holder and not once per attempt. Never
+ * rejects: a failure is logged by message only (never the key) and resolves
+ * to `failed`, where it used to be swallowed by `.catch(() => null)`.
+ */
+async function prepareForCurrentKeys(): Promise<Preparation> {
+  const material = readRecoveryMaterial();
+  if (!material) return { kind: 'unavailable' };
+  const { source, prefsKeyBase64 } = material;
+  try {
+    const key = generateRecoveryKey();
+    const { wrappedKey, salt } = await wrapWithRecoveryKey(
+      source.wrappedPrivateKey,
+      source.wrappingKey,
+      key
     );
-    uploadBody.recovery_wrapped_prefs_key = recoveryWrappedPrefs;
-    uploadBody.recovery_prefs_key_salt = prefsSalt;
+    const body: Record<string, string> = {
+      recovery_wrapped_private_key: wrappedKey,
+      recovery_key_salt: salt,
+    };
+    if (prefsKeyBase64) {
+      const prefs = await wrapPrefsKeyWithRecoveryKey(prefsKeyBase64, key);
+      body.recovery_wrapped_prefs_key = prefs.wrappedKey;
+      body.recovery_prefs_key_salt = prefs.salt;
+    }
+    return { kind: 'ready', prepared: { key, body, source } };
+  } catch (err) {
+    console.warn('Recovery key preparation failed:', errorMessage(err));
+    return { kind: 'failed' };
   }
+}
 
-  const storeRes = await apiFetch('/api/v1/mfa/recovery-key', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(uploadBody),
-  });
-
-  if (!storeRes.ok) {
-    return null; // Server rejected, caller decides fallback
+/**
+ * The preparation held in `slot`, reused while it still wraps this device's
+ * current keys, otherwise a fresh one (F1/F2). Reuse is the point: after an
+ * ambiguous outcome — the response lost after the server committed — a retry
+ * must resend the SAME bytes, so the key the user is finally shown is the key
+ * the server holds. A new key per attempt shows one key while storing another.
+ */
+async function resolvePreparation(slot: PreparationSlot): Promise<Preparation> {
+  const held = slot.current;
+  if (held) {
+    const settled = await held;
+    if (slot.current !== held) return { kind: 'abandoned' };
+    if (settled.kind === 'ready' && wrapsCurrentKeys(settled.prepared)) return settled;
   }
+  const next = prepareForCurrentKeys();
+  slot.current = next;
+  const settled = await next;
+  return slot.current === next ? settled : { kind: 'abandoned' };
+}
 
-  return newRecoveryKey;
+/**
+ * First-time store after TOTP confirm-setup. Needs no credentials: the server
+ * inserts only when no key exists, and answers 200 to a resend of the bytes it
+ * already holds. A 403 carrying either step-up flag means a DIFFERENT key
+ * already existed and was KEPT — never a silent 'done'.
+ */
+async function storeRecoveryKey(prepared: PreparedRecovery): Promise<RecoveryKeyOutcome> {
+  try {
+    const res = await apiFetch('/api/v1/mfa/recovery-key', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(prepared.body),
+    });
+    if (res.ok) return { kind: 'created', key: prepared.key };
+    const refusal = classifyStepUpRefusal(res.status, await res.json().catch(() => ({})));
+    if (refusal.kind === 'passwordRequired' || refusal.kind === 'mfaRequired') {
+      return { kind: 'kept' };
+    }
+    return { kind: 'failed' };
+  } catch (err) {
+    console.warn('Recovery key upload failed:', errorMessage(err));
+    return { kind: 'failed' };
+  }
+}
+
+/** Replace-step refusal shown when this device cannot make a key at all. */
+const REPLACE_KEYS_LOCKED_MESSAGE =
+  "Your encryption keys aren't unlocked on this device, so a new recovery key can't be made here.";
+
+/** An outcome after which the server may or may not have stored the new key. */
+function isAmbiguousOutcome(result: MfaStepUpResult): boolean {
+  return (
+    result.kind === 'networkError' || result.kind === 'failed' || result.kind === 'unavailable'
+  );
+}
+
+/** What the done screen says about the recovery key (F16). */
+type RecoveryNote = 'none' | 'uncertain' | null;
+
+/** Copy for the `'recovery-failed'` step (handoff §1.3). `attempts` puts
+ * the count in the text so a retry that fails again visibly changes the
+ * screen and re-announces the `role="alert"` region — identical text is
+ * neither seen nor re-read, and Try again then looks inert. */
+function recoveryFailedCopy(outcome: 'failed' | 'unavailable' | null, attempts: number): string {
+  if (outcome === 'unavailable') {
+    return "We couldn't create your recovery key because your encryption keys aren't unlocked on this device. Without one, you'll lose access to your encrypted message history if you forget your password.";
+  }
+  const lead =
+    attempts > 1
+      ? `We still couldn't create your recovery key after ${attempts} attempts.`
+      : "We couldn't create your recovery key.";
+  return `${lead} Without one, you'll lose access to your encrypted message history if you forget your password.`;
 }
 
 /** Classify a WebAuthn error into a user-friendly message. */
@@ -101,7 +236,16 @@ function shouldResetToPasswordStep(err: unknown, msg: string, currentStep: WebAu
 }
 
 type SetupMethod = 'totp' | 'webauthn';
-type TOTPStep = 'password' | 'qr' | 'verify' | 'backup' | 'recovery' | 'done';
+type TOTPStep =
+  | 'password'
+  | 'qr'
+  | 'verify'
+  | 'backup'
+  | 'recovery'
+  | 'recovery-kept'
+  | 'recovery-failed'
+  | 'recovery-replace'
+  | 'done';
 type WebAuthnStep = 'password' | 'registering' | 'done';
 
 interface MFASetupProps {
@@ -137,6 +281,49 @@ const MFASetup: React.FC<MFASetupProps> = ({
   const [backupCodes, setBackupCodes] = useState<string[]>([]);
   const [recoveryKey, setRecoveryKey] = useState('');
   const [recoveryLoading, setRecoveryLoading] = useState(false);
+  // Which copy the 'recovery-failed' step shows (handoff §1.3).
+  const [recoveryOutcome, setRecoveryOutcome] = useState<'failed' | 'unavailable' | null>(null);
+  const [recoveryFailures, setRecoveryFailures] = useState(0);
+  const [recoveryNote, setRecoveryNote] = useState<RecoveryNote>(null);
+  // Methods from an mfa_required answer on the password step. The server's
+  // present list wins over `activeMethods`, which can be stale (F3's twin).
+  const [setupPromptMethods, setSetupPromptMethods] = useState<string[] | null>(null);
+
+  // Prepared recovery-key uploads (F1/F2). Key material lives in these refs
+  // and nowhere else — never state, never a store, never persisted, never
+  // logged — and each is dropped on accept, Back, Continue, Done and unmount.
+  const firstStorePrepRef = useRef<Promise<Preparation> | null>(null);
+  const replacePrepRef = useRef<Promise<Preparation> | null>(null);
+  useEffect(
+    () => () => {
+      firstStorePrepRef.current = null;
+      replacePrepRef.current = null;
+    },
+    []
+  );
+
+  // Recovery-key replace state (spec §4.6.4, R-9). A fresh password entry —
+  // the wizard's own `password` state is deliberately NOT reused here, since
+  // replacing destroys the old key and requires present proof. The banner,
+  // the field errors and the lock are all derived from `replaceRefusal`.
+  const [replacePassword, setReplacePassword] = useState('');
+  const [replaceMfaCode, setReplaceMfaCode] = useState('');
+  const [replaceLoading, setReplaceLoading] = useState(false);
+  const [replaceRefusal, setReplaceRefusal] = useState<MfaStepUpResult | null>(null);
+  const [replaceMfaPromptKey, setReplaceMfaPromptKey] = useState(0);
+  // True once a replace attempt ended without a definite answer: the old key
+  // may already be gone, so nothing may say it was "left in place".
+  const [replaceUncertain, setReplaceUncertain] = useState(false);
+  const replacePasswordRef = useRef<HTMLInputElement>(null);
+
+  // Focus the password once a password refusal has rendered and the field is
+  // enabled again — focusing while it is still disabled does nothing (F4).
+  useEffect(() => {
+    if (replaceLoading) return;
+    if (replaceRefusal?.kind === 'passwordRequired' || replaceRefusal?.kind === 'invalidPassword') {
+      replacePasswordRef.current?.focus();
+    }
+  }, [replaceLoading, replaceRefusal]);
 
   // WebAuthn state
   const [webauthnStep, setWebauthnStep] = useState<WebAuthnStep>('password');
@@ -147,6 +334,30 @@ const MFASetup: React.FC<MFASetupProps> = ({
   const setFieldError = (message: string) => {
     setError(message);
     setErrorField(classifyErrorField(message));
+  };
+
+  /**
+   * Applies a begin-step step-up refusal (TOTP setup / WebAuthn register
+   * begin) to the shared error state, using the same field routing and copy
+   * as every other step-up surface (`mfaStepUp.ts`) instead of the server's
+   * raw text. An mfa_required answer also names the methods to prompt for,
+   * even when the status this wizard opened with said MFA was off.
+   */
+  const noteSetupRefusal = (status: number, body: unknown) => {
+    const refusal = classifyStepUpRefusal(status, body);
+    if (refusal.kind === 'mfaRequired') setSetupPromptMethods(refusal.methods);
+    const passwordError = stepUpPasswordError(refusal);
+    const mfaError = stepUpMfaError(refusal);
+    if (passwordError !== undefined) {
+      setError(passwordError);
+      setErrorField('password');
+    } else if (mfaError === undefined) {
+      setError(stepUpBanner(refusal) ?? 'Something went wrong. Try again.');
+      setErrorField('general');
+    } else {
+      setError(mfaError);
+      setErrorField('mfa');
+    }
   };
 
   const handleTOTPSetup = async () => {
@@ -160,7 +371,10 @@ const MFASetup: React.FC<MFASetupProps> = ({
         body: JSON.stringify({ password, ...(mfaCode ? { mfa_code: mfaCode } : {}) }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Setup failed');
+      if (!res.ok) {
+        noteSetupRefusal(res.status, data);
+        return;
+      }
 
       setOtpauthUrl(data.otpauth_url);
       setTotpSecret(data.secret);
@@ -204,6 +418,38 @@ const MFASetup: React.FC<MFASetupProps> = ({
     }
   };
 
+  /** Dispatches a RecoveryKeyOutcome to its step — shared by the automatic
+   * post-confirm upload and by a retry, so both route identically. Never
+   * falls silently to `'done'`: every outcome has its own step. */
+  const applyRecoveryOutcome = (outcome: RecoveryKeyOutcome) => {
+    switch (outcome.kind) {
+      case 'created':
+        setRecoveryKey(outcome.key);
+        setTotpStep('recovery');
+        break;
+      case 'kept':
+        setTotpStep('recovery-kept');
+        break;
+      case 'failed':
+      case 'unavailable':
+        setRecoveryOutcome(outcome.kind);
+        setRecoveryFailures((n) => n + 1);
+        setTotpStep('recovery-failed');
+        break;
+    }
+  };
+
+  /** Prepares once and stores. A failed store keeps the prepared bytes so Try
+   * again resends them; every settled outcome drops them. */
+  const runFirstStore = async (): Promise<RecoveryKeyOutcome> => {
+    const prep = await resolvePreparation(firstStorePrepRef);
+    if (prep.kind === 'unavailable') return { kind: 'unavailable' };
+    if (prep.kind !== 'ready') return { kind: 'failed' };
+    const outcome = await storeRecoveryKey(prep.prepared);
+    if (outcome.kind !== 'failed') firstStorePrepRef.current = null;
+    return outcome;
+  };
+
   const handleTOTPConfirm = async () => {
     setLoading(true);
     setError('');
@@ -222,22 +468,91 @@ const MFASetup: React.FC<MFASetupProps> = ({
     // that session is challenged once at its next refresh, as before this fix.
     void refreshAccessToken().catch(() => console.warn('[mfa] Refresh after enrollment failed'));
 
-    // Generate and store recovery key
+    // runFirstStore never throws — every failure is already a
+    // RecoveryKeyOutcome — so no surrounding try/catch is needed here.
     setRecoveryLoading(true);
+    const outcome = await runFirstStore();
+    setRecoveryLoading(false);
+    setLoading(false);
+    applyRecoveryOutcome(outcome);
+  };
+
+  /** Retry after `'recovery-failed'`. Calls only the key upload — confirm-
+   * setup has already committed and must never be called again. */
+  const handleRecoveryRetry = async () => {
+    setRecoveryLoading(true);
+    const outcome = await runFirstStore();
+    setRecoveryLoading(false);
+    applyRecoveryOutcome(outcome);
+  };
+
+  /** Leaves the recovery steps for 'done', dropping every copy of key material. */
+  const finishRecovery = (note: RecoveryNote) => {
+    firstStorePrepRef.current = null;
+    replacePrepRef.current = null;
+    setRecoveryKey('');
+    setRecoveryNote(note);
+    setTotpStep('done');
+  };
+
+  /** Opens the replace step and starts preparing the new key while the user
+   * types their credentials (F1). A lock — a spent budget or a dead session —
+   * survives Back and reopen; only a new wizard clears it (F10). */
+  const handleOpenReplace = () => {
+    setReplacePassword('');
+    setReplaceMfaCode('');
+    setReplaceRefusal((prev) => (isStepUpLocked(prev) ? prev : null));
+    replacePrepRef.current = prepareForCurrentKeys();
+    setTotpStep('recovery-replace');
+  };
+
+  const handleReplaceBack = () => {
+    replacePrepRef.current = null;
+    setTotpStep('recovery-kept');
+  };
+
+  /** Records a replace refusal and clears only the factor it rejected,
+   * mirroring the action modal (handoff §1.1). Display is derived at render. */
+  const applyReplaceRefusal = (result: MfaStepUpResult) => {
+    setReplaceRefusal(result);
+    if (result.kind === 'passwordRequired' || result.kind === 'invalidPassword') {
+      setReplacePassword('');
+    } else if (result.kind === 'invalidMfaCode') {
+      setReplaceMfaPromptKey((k) => k + 1);
+      setReplaceMfaCode('');
+    }
+  };
+
+  const handleReplaceRecoveryKey = async () => {
+    setReplaceLoading(true);
     try {
-      const newRecoveryKey = await generateAndStoreRecoveryKey();
-      if (newRecoveryKey) {
-        setRecoveryKey(newRecoveryKey);
-        setTotpStep('recovery');
-      } else {
-        setTotpStep('done');
+      const prep = await resolvePreparation(replacePrepRef);
+      if (prep.kind === 'abandoned') return;
+      if (prep.kind !== 'ready') {
+        // Nothing was sent, so this is a refusal, not an ambiguous outcome.
+        applyReplaceRefusal(
+          prep.kind === 'unavailable'
+            ? { kind: 'failed', message: REPLACE_KEYS_LOCKED_MESSAGE }
+            : { kind: 'failed' }
+        );
+        return;
       }
-    } catch (recoveryErr) {
-      console.warn('Recovery key generation failed, skipping:', errorMessage(recoveryErr));
-      setTotpStep('done');
+      const result = await submitMfaStepUp('/api/v1/mfa/recovery-key', 'PUT', prep.prepared.body, {
+        password: replacePassword,
+        mfaCode: replaceMfaCode,
+      });
+      if (result.kind === 'accepted') {
+        replacePrepRef.current = null;
+        setReplaceUncertain(false);
+        setReplaceRefusal(null);
+        setRecoveryKey(prep.prepared.key);
+        setTotpStep('recovery');
+        return;
+      }
+      if (isAmbiguousOutcome(result)) setReplaceUncertain(true);
+      applyReplaceRefusal(result);
     } finally {
-      setRecoveryLoading(false);
-      setLoading(false);
+      setReplaceLoading(false);
     }
   };
 
@@ -260,7 +575,10 @@ const MFASetup: React.FC<MFASetupProps> = ({
         }),
       });
       const beginData = await beginRes.json();
-      if (!beginRes.ok) throw new Error(beginData.error || 'Registration failed');
+      if (!beginRes.ok) {
+        noteSetupRefusal(beginRes.status, beginData);
+        return;
+      }
 
       // Convert base64url fields for WebAuthn API
       const options = beginData.publicKey;
@@ -326,6 +644,11 @@ const MFASetup: React.FC<MFASetupProps> = ({
 
   // ── Render helpers (reduce cognitive complexity) ────────────────────
 
+  // The password step asks for a code when the account is known to hold MFA,
+  // or when the server has just said it does.
+  const showSetupPrompt = mfaActive === true || setupPromptMethods !== null;
+  const replacePasswordError = stepUpPasswordError(replaceRefusal);
+
   // Shared password + MFA-verify step used by both the TOTP and WebAuthn
   // flows — they differ only in copy, an optional extra field, and the
   // submit action.
@@ -338,7 +661,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
     extraFields?: React.ReactNode;
   }) => (
     <div className="mfa-setup-step">
-      <p>{mfaActive ? opts.activeIntro : opts.intro}</p>
+      <p>{showSetupPrompt ? opts.activeIntro : opts.intro}</p>
       <input
         type="password"
         className={`form-input ${errorField === 'password' ? 'error' : ''}`}
@@ -348,11 +671,12 @@ const MFASetup: React.FC<MFASetupProps> = ({
         disabled={loading}
         autoFocus
       />
-      {mfaActive && (
+      {showSetupPrompt && (
         <MFAVerifyPrompt
-          methods={activeMethods}
+          methods={inlineMfaMethods(setupPromptMethods ?? activeMethods)}
           recoveryOnlyMethods={recoveryOnlyMethods}
-          onVerify={(code) => setMfaCode(code)}
+          onVerify={setMfaCode}
+          onCodeChange={setMfaCode}
           disabled={loading}
           error={errorField === 'mfa' ? error : undefined}
           excludeBackupCodes
@@ -364,7 +688,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
         <button
           className="btn btn-primary"
           onClick={opts.onSubmit}
-          disabled={loading || !password || (mfaActive && !mfaCode)}
+          disabled={loading || !password || (showSetupPrompt && !mfaCode)}
         >
           {loading ? opts.busyLabel : opts.submitLabel}
         </button>
@@ -415,7 +739,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
   const renderWebAuthnRegisteringStep = () => (
     <div className="mfa-setup-step" style={{ alignItems: 'center' }}>
       <div style={{ textAlign: 'center', padding: '20px 0' }}>
-        {error ? <ErrorBanner error={error} errorField="" size={20} /> : <WebAuthnWaitingPrompt />}
+        {error ? <ErrorBanner error={error} size={20} /> : <WebAuthnWaitingPrompt />}
       </div>
       <div className="mfa-setup-actions" style={{ justifyContent: 'center' }}>
         {error ? (
@@ -468,7 +792,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
               onConfirm={handleTOTPConfirm}
               disabled={loading}
             />
-            {error && <p className="mfa-setup-error">{error}</p>}
+            <ErrorBanner error={error} />
           </div>
         )}
 
@@ -480,11 +804,105 @@ const MFASetup: React.FC<MFASetupProps> = ({
             </p>
             <RecoveryKeyDisplay
               recoveryKey={recoveryKey}
-              onConfirm={() => setTotpStep('done')}
-              onSkip={() => setTotpStep('done')}
+              onConfirm={() => finishRecovery(null)}
+              onSkip={() => finishRecovery(null)}
               disabled={recoveryLoading}
             />
-            {error && <p className="mfa-setup-error">{error}</p>}
+            <ErrorBanner error={error} />
+          </div>
+        )}
+
+        {totpStep === 'recovery-kept' && (
+          <RecoveryKeptStep
+            replaceUncertain={replaceUncertain}
+            onOpenReplace={handleOpenReplace}
+            onFinish={finishRecovery}
+          />
+        )}
+
+        {totpStep === 'recovery-failed' && (
+          <div className="mfa-setup-step">
+            <ErrorBanner error={recoveryFailedCopy(recoveryOutcome, recoveryFailures)} />
+            <div className="mfa-setup-actions">
+              {recoveryOutcome === 'failed' && (
+                <button
+                  className="btn btn-primary"
+                  autoFocus
+                  disabled={recoveryLoading}
+                  onClick={() => void handleRecoveryRetry()}
+                >
+                  {recoveryLoading ? 'Trying again...' : 'Try again'}
+                </button>
+              )}
+              <button
+                className={
+                  recoveryOutcome === 'unavailable' ? 'btn btn-primary' : 'btn btn-secondary'
+                }
+                autoFocus={recoveryOutcome === 'unavailable'}
+                onClick={() => finishRecovery('none')}
+              >
+                {recoveryOutcome === 'failed' ? 'Continue without a recovery key' : 'Continue'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {totpStep === 'recovery-replace' && (
+          <div className="mfa-setup-step">
+            <p>
+              Make a new recovery key. Confirm it&apos;s you with your password and a code from your
+              authenticator app.
+            </p>
+            <p className="mfa-modal-desc">Your old recovery key will stop working.</p>
+            <div className="mfa-verify-field">
+              <label htmlFor="mfa-replace-password">Password</label>
+              <input
+                id="mfa-replace-password"
+                ref={replacePasswordRef}
+                type="password"
+                autoComplete="current-password"
+                value={replacePassword}
+                onChange={(e) => setReplacePassword(e.target.value)}
+                placeholder="Your password"
+                disabled={replaceLoading}
+                aria-invalid={replacePasswordError !== undefined}
+                aria-describedby={replacePasswordError ? 'mfa-replace-password-error' : undefined}
+                autoFocus
+              />
+              {replacePasswordError && (
+                <FieldError id="mfa-replace-password-error">{replacePasswordError}</FieldError>
+              )}
+            </div>
+            <MFAVerifyPrompt
+              key={replaceMfaPromptKey}
+              methods={stepUpPromptMethods(replaceRefusal, ['totp'])}
+              onVerify={setReplaceMfaCode}
+              onCodeChange={setReplaceMfaCode}
+              disabled={replaceLoading}
+              error={stepUpMfaError(replaceRefusal)}
+            />
+            <ErrorBanner error={stepUpBanner(replaceRefusal) ?? ''} />
+            <div className="mfa-setup-actions">
+              <button
+                className="btn btn-danger"
+                onClick={() => void handleReplaceRecoveryKey()}
+                disabled={
+                  replaceLoading ||
+                  isStepUpLocked(replaceRefusal) ||
+                  !replacePassword ||
+                  !replaceMfaCode
+                }
+              >
+                {replaceLoading ? 'Replacing...' : 'Replace recovery key'}
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={handleReplaceBack}
+                disabled={replaceLoading}
+              >
+                Back
+              </button>
+            </div>
           </div>
         )}
 
@@ -492,6 +910,18 @@ const MFASetup: React.FC<MFASetupProps> = ({
           <div className="mfa-setup-step mfa-setup-success">
             <h4>MFA Activated!</h4>
             <p>Your authenticator app is now protecting your account.</p>
+            {recoveryNote === 'none' && (
+              <p>
+                This account has no recovery key you can use. Without one, you&apos;ll lose access
+                to your encrypted message history if you forget your password.
+              </p>
+            )}
+            {recoveryNote === 'uncertain' && (
+              <p>
+                We couldn&apos;t confirm your recovery key was replaced, so the one you have may no
+                longer work.
+              </p>
+            )}
             <button className="btn btn-primary" onClick={onComplete}>
               Done
             </button>
@@ -527,32 +957,77 @@ const MFASetup: React.FC<MFASetupProps> = ({
 
 // ── Extracted sub-components (reduce cognitive complexity) ──────────
 
-/** Inline error banner shown when a non-MFA error is present. */
-const ErrorBanner: React.FC<{
-  error: string;
-  errorField: string;
-  size?: number;
-}> = ({ error, errorField, size = 16 }) => {
-  if (!error || errorField === 'mfa') return null;
-  return (
-    <div className="mfa-setup-error-banner">
+interface RecoveryKeptStepProps {
+  /** True once a replace attempt ended without a definite answer — the old
+   * key may already be gone, so nothing here may say it was left in place. */
+  replaceUncertain: boolean;
+  onOpenReplace: () => void;
+  onFinish: (note: RecoveryNote) => void;
+}
+
+/**
+ * The 'recovery-kept' TOTP step: an existing recovery key was left in place,
+ * or a prior replace attempt ended ambiguously. Extracted from {@link MFASetup}
+ * to keep its cognitive complexity down (SonarCloud typescript:S3776).
+ */
+const RecoveryKeptStep: React.FC<RecoveryKeptStepProps> = ({
+  replaceUncertain,
+  onOpenReplace,
+  onFinish,
+}) => (
+  <div className="mfa-setup-step">
+    <output className="mfa-setup-info">
       <svg
-        width={size}
-        height={size}
+        width={16}
+        height={16}
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
         strokeWidth="2"
+        aria-hidden="true"
+        focusable="false"
         style={{ flexShrink: 0 }}
       >
         <circle cx="12" cy="12" r="10" />
-        <line x1="12" y1="8" x2="12" y2="12" />
-        <line x1="12" y1="16" x2="12.01" y2="16" />
+        <line x1="12" y1="16" x2="12" y2="12" />
+        <line x1="12" y1="8" x2="12.01" y2="8" />
       </svg>
-      <span>{error}</span>
+      {replaceUncertain ? (
+        <span>
+          We couldn&apos;t confirm whether your recovery key was replaced, so the one you have may
+          no longer work. Finish replacing it to get a key you know works.
+        </span>
+      ) : (
+        <span>
+          A recovery key is already saved for your account, so we left it in place. It&apos;s the
+          only way back into your encrypted messages if you forget your password. If you don&apos;t
+          have that key, replace it now.
+        </span>
+      )}
+    </output>
+    <div className="mfa-setup-actions">
+      {replaceUncertain ? (
+        <>
+          <button className="btn btn-primary" autoFocus onClick={onOpenReplace}>
+            Finish replacing
+          </button>
+          <button className="btn btn-secondary" onClick={() => onFinish('uncertain')}>
+            Continue
+          </button>
+        </>
+      ) : (
+        <>
+          <button className="btn btn-primary" autoFocus onClick={() => onFinish(null)}>
+            Continue
+          </button>
+          <button className="btn btn-secondary" onClick={onOpenReplace}>
+            Replace recovery key
+          </button>
+        </>
+      )}
     </div>
-  );
-};
+  </div>
+);
 
 /** Waiting prompt shown during WebAuthn key registration. */
 const WebAuthnWaitingPrompt: React.FC = () => (

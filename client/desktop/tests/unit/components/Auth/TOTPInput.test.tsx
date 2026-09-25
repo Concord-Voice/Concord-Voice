@@ -139,4 +139,28 @@ describe('TOTPInput', () => {
     expect(digit1).toHaveValue('');
     expect(onSubmit).not.toHaveBeenCalled();
   });
+
+  // Q3: deleting a digit of a complete code must clear the parent's copy.
+  it('reports every edit to onCodeChange: the code once complete, empty while not', () => {
+    const onCodeChange = vi.fn();
+    render(<TOTPInput onSubmit={onSubmit} onCodeChange={onCodeChange} />);
+    for (let i = 1; i <= 6; i++) {
+      fireEvent.change(screen.getByLabelText(`Digit ${i}`), { target: { value: String(i) } });
+    }
+    expect(onCodeChange).toHaveBeenLastCalledWith('123456');
+    expect(onSubmit).toHaveBeenCalledWith('123456');
+
+    fireEvent.change(screen.getByLabelText('Digit 6'), { target: { value: '' } });
+    expect(onCodeChange).toHaveBeenLastCalledWith('');
+  });
+
+  it('reports a complete paste to onCodeChange, and a partial paste as empty', () => {
+    const onCodeChange = vi.fn();
+    render(<TOTPInput onSubmit={onSubmit} onCodeChange={onCodeChange} />);
+    const container = screen.getByLabelText('Digit 1').parentElement as HTMLElement;
+    fireEvent.paste(container, { clipboardData: { getData: () => '123' } });
+    expect(onCodeChange).toHaveBeenLastCalledWith('');
+    fireEvent.paste(container, { clipboardData: { getData: () => '654321' } });
+    expect(onCodeChange).toHaveBeenLastCalledWith('654321');
+  });
 });

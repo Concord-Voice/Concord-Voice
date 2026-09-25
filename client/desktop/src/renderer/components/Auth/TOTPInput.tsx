@@ -2,6 +2,13 @@ import React, { useState, useRef, useCallback } from 'react';
 
 interface TOTPInputProps {
   onSubmit: (code: string) => void;
+  /**
+   * Fires on every edit: the six-digit code once complete, `''` while any
+   * digit is missing. A parent that stores the code for a later Confirm reads
+   * this, so deleting a digit clears the stored value instead of leaving
+   * Confirm enabled with a code the field no longer shows.
+   */
+  onCodeChange?: (code: string) => void;
   onBackupCode?: () => void;
   disabled?: boolean;
   error?: string;
@@ -12,6 +19,7 @@ const DIGIT_KEYS = ['d1', 'd2', 'd3', 'd4', 'd5', 'd6'] as const;
 
 const TOTPInput: React.FC<TOTPInputProps> = ({
   onSubmit,
+  onCodeChange,
   onBackupCode,
   disabled = false,
   error,
@@ -35,11 +43,13 @@ const TOTPInput: React.FC<TOTPInputProps> = ({
 
       // Auto-submit when all 6 digits are filled
       const code = newDigits.join('');
-      if (code.length === 6 && newDigits.every((d) => d !== '')) {
+      const complete = code.length === 6 && newDigits.every((d) => d !== '');
+      onCodeChange?.(complete ? code : '');
+      if (complete) {
         onSubmit(code);
       }
     },
-    [digits, disabled, onSubmit]
+    [digits, disabled, onSubmit, onCodeChange]
   );
 
   const handleKeyDown = useCallback(
@@ -63,13 +73,14 @@ const TOTPInput: React.FC<TOTPInputProps> = ({
       }
       setDigits(newDigits);
 
+      onCodeChange?.(pasted.length === 6 ? pasted : '');
       if (pasted.length === 6) {
         onSubmit(pasted);
       } else {
         inputsRef.current[pasted.length]?.focus();
       }
     },
-    [onSubmit]
+    [onSubmit, onCodeChange]
   );
 
   return (

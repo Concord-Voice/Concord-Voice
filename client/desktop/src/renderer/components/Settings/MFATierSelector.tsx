@@ -1,9 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useRef, useState, useEffect } from 'react';
 import ToggleSwitch from './ToggleSwitch';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import RecoveryApprovalModal from '../Auth/RecoveryApprovalModal';
 import RecoveryCircle from './RecoveryCircle';
+import Modal from '../ui/Modal';
+import ErrorBanner, { FieldError } from './ErrorBanner';
 import { apiFetch } from '../../services/system/apiClient';
+import {
+  isStepUpLocked,
+  stepUpBanner,
+  stepUpMfaError,
+  stepUpPasswordError,
+  stepUpPromptMethods,
+  type MfaStepUpResult,
+} from './mfaStepUp';
 
 export interface WebAuthnCredential {
   id: string;
@@ -74,6 +84,7 @@ type ActionType =
   | 'reset-totp'
   | 'revoke-webauthn'
   | 'disable-emailsms'
+  | 'set-backup-email'
   | 'toggle-recovery-only'
   | 'toggle-hardened';
 
@@ -83,9 +94,15 @@ interface ActionModalState {
   credentialName?: string;
   toggleMethod?: string;
   toggleValue?: boolean;
+  /** `set-backup-email` only. Empty string means "remove the backup email". */
+  pendingBackupEmail?: string;
 }
 
-/** Derive the modal title from the current action state */
+/**
+ * Derive the modal title from the current action state. Fixed the instant the
+ * modal opens and never mutated afterward (WCAG 4.1.2 / 3.2.2 — Modal binds
+ * this to aria-labelledby).
+ */
 function getActionTitle(modal: ActionModalState | null): string {
   if (!modal) return '';
   switch (modal.type) {
@@ -98,11 +115,19 @@ function getActionTitle(modal: ActionModalState | null): string {
     case 'toggle-hardened':
       return modal.toggleValue ? 'Enable Hardened Mode' : 'Disable Hardened Mode';
     case 'disable-emailsms':
-      return 'Disable Email/SMS';
+      return 'Disable Email/SMS verification';
+    case 'set-backup-email':
+      return modal.pendingBackupEmail ? 'Save backup email' : 'Remove backup email';
   }
 }
 
-/** Derive the modal description from the current action state */
+/**
+ * Derive the modal description from the current action state, for the four
+ * sibling action types plus `disable-emailsms`. `set-backup-email` needs the
+ * live `backupEmail` prop and its own line breaks, so it is rendered by
+ * {@link renderActionBody} instead — this case exists only to keep the switch
+ * exhaustive over `ActionType`.
+ */
 function getActionDesc(modal: ActionModalState | null): string {
   if (!modal) return '';
   switch (modal.type) {
@@ -119,7 +144,143 @@ function getActionDesc(modal: ActionModalState | null): string {
         ? 'Recovery will require BOTH email and SMS codes simultaneously.'
         : 'Recovery will accept either an email code or an SMS code individually.';
     case 'disable-emailsms':
-      return 'This will disable email and SMS verification methods.';
+      return "You'll no longer be able to use email or text codes to sign in.";
+    case 'set-backup-email':
+      return '';
+  }
+}
+
+/** Derive the Confirm button's label. Only the two step-up-gated types get a
+ * specific label (spec §4.6.2, T13) — the four siblings keep "Confirm". */
+function getActionConfirmLabel(modal: ActionModalState | null): string {
+  if (!modal) return 'Confirm';
+  switch (modal.type) {
+    case 'disable-emailsms':
+      return 'Disable Email/SMS';
+    case 'set-backup-email':
+      return modal.pendingBackupEmail ? 'Save backup email' : 'Remove backup email';
+    default:
+      return 'Confirm';
+  }
+}
+
+/** Derive the Confirm button's class. `set-backup-email` is primary when it
+ * would save a value and danger when it would clear one. */
+function getActionConfirmClass(modal: ActionModalState | null): string {
+  if (!modal) return 'btn btn-sm btn-danger';
+  switch (modal.type) {
+    case 'toggle-recovery-only':
+    case 'toggle-hardened':
+      return 'btn btn-sm btn-primary';
+    case 'set-backup-email':
+      return modal.pendingBackupEmail ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-danger';
+    default:
+      return 'btn btn-sm btn-danger';
+  }
+}
+
+/**
+ * Render the modal body for the current action. `set-backup-email` needs the
+ * live `backupEmail` prop (to name the address being removed) and a two-line
+ * body when saving a new one; every other type renders {@link getActionDesc}
+ * as a single paragraph.
+ */
+function renderActionBody(
+  modal: ActionModalState | null,
+  backupEmail: string | undefined
+): React.ReactNode {
+  if (!modal) return null;
+  if (modal.type === 'set-backup-email') {
+    if (modal.pendingBackupEmail) {
+      return (
+        <>
+          <p className="mfa-modal-desc">{modal.pendingBackupEmail}</p>
+          <p className="mfa-modal-desc">This address becomes a way to recover your account.</p>
+        </>
+      );
+    }
+    return (
+      <p className="mfa-modal-desc">
+        {backupEmail || 'This address'} will no longer be able to recover your account.
+      </p>
+    );
+  }
+  return <p className="mfa-modal-desc">{getActionDesc(modal)}</p>;
+}
+
+/**
+ * Whether Confirm waits for an MFA code. The four actions on the step-up seam
+ * need one whenever the account holds an inline factor, up front, so a
+ * password-only submit does not spend one of the five shared attempts on a
+ * request that must fail with mfa_required (spec R-4). Reset TOTP always
+ * does: its server binds `code` as required and the account necessarily holds
+ * TOTP. Revoke takes the password alone. An mfa_required refusal overrides all
+ * of it — the server has just said a code is needed, whatever the last status
+ * fetch believed (F3).
+ */
+function actionNeedsCode(
+  type: ActionType,
+  hasRealMFA: boolean,
+  refusal: MfaStepUpResult | null
+): boolean {
+  if (refusal?.kind === 'mfaRequired') return true;
+  switch (type) {
+    case 'reset-totp':
+      return true;
+    case 'revoke-webauthn':
+      return false;
+    default:
+      return hasRealMFA;
+  }
+}
+
+/** Runs `toggle-recovery-only`, or reports it unavailable when no handler is
+ * wired or the modal is missing its method/value. Extracted from
+ * {@link MFATierSelector}'s `executeAction` to reduce its cognitive
+ * complexity (SonarCloud typescript:S3776). */
+function runToggleRecoveryOnly(
+  modal: ActionModalState,
+  handler: MFATierSelectorProps['onToggleRecoveryOnly'],
+  password: string,
+  mfaCode: string
+): MfaStepUpResult | Promise<MfaStepUpResult> {
+  return handler && modal.toggleMethod !== undefined && modal.toggleValue !== undefined
+    ? handler(modal.toggleMethod, modal.toggleValue, password, mfaCode)
+    : { kind: 'failed' };
+}
+
+/** Runs `toggle-hardened`, or reports it unavailable when no handler is wired
+ * or the modal is missing its value. Sibling to {@link runToggleRecoveryOnly}. */
+function runToggleHardened(
+  modal: ActionModalState,
+  handler: MFATierSelectorProps['onToggleRecoveryHardened'],
+  password: string,
+  mfaCode: string
+): MfaStepUpResult | Promise<MfaStepUpResult> {
+  return handler && modal.toggleValue !== undefined
+    ? handler(modal.toggleValue, password, mfaCode)
+    : { kind: 'failed' };
+}
+
+interface RecoveryCircleConfig {
+  has_circle: boolean;
+  threshold_k?: number;
+  total_shares_n?: number;
+  contacts?: Array<{ username: string }>;
+}
+
+/**
+ * GETs `path` and returns its JSON only for a 2xx. A refusal, a non-JSON body
+ * and a request that never completed all read as null, so a caller keeps its
+ * current state instead of rendering an error body as the resource (F13).
+ */
+async function readOkJson<T>(path: string): Promise<T | null> {
+  try {
+    const res = await apiFetch(path);
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
   }
 }
 
@@ -181,16 +342,16 @@ interface MFATierSelectorProps {
     recoveryOnly: boolean,
     password: string,
     mfaCode: string
-  ) => Promise<boolean>;
+  ) => Promise<MfaStepUpResult>;
   onToggleRecoveryHardened?: (
     enabled: boolean,
     password: string,
     mfaCode: string
-  ) => Promise<boolean>;
-  onResetTOTP?: (password: string, code: string) => Promise<boolean>;
-  onRevokeWebAuthnKey?: (credentialId: string, password: string) => Promise<boolean>;
-  onDisableEmailSms?: (password: string) => Promise<boolean>;
-  onSetBackupEmail?: (email: string) => Promise<boolean>;
+  ) => Promise<MfaStepUpResult>;
+  onResetTOTP?: (password: string, code: string) => Promise<MfaStepUpResult>;
+  onRevokeWebAuthnKey?: (credentialId: string, password: string) => Promise<MfaStepUpResult>;
+  onDisableEmailSms?: (password: string, mfaCode: string) => Promise<MfaStepUpResult>;
+  onSetBackupEmail?: (email: string, password: string, mfaCode: string) => Promise<MfaStepUpResult>;
 }
 
 const MFATierSelector: React.FC<MFATierSelectorProps> = ({
@@ -226,21 +387,29 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
   const [actionModal, setActionModal] = useState<ActionModalState | null>(null);
   const [actionPassword, setActionPassword] = useState('');
   const [actionMfaCode, setActionMfaCode] = useState('');
-  const [actionError, setActionError] = useState('');
+  // The last refusal. The field errors, the banner and the lock are all
+  // derived from it (mfaStepUp.ts), so they cannot disagree with each other.
+  // The lock clears only when the modal is reopened (handoff §1.1 / §5).
+  const [actionRefusal, setActionRefusal] = useState<MfaStepUpResult | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  // Bumped on an invalid-code refusal so MFAVerifyPrompt remounts empty
+  // (handoff §1.1) rather than showing a stale rejected code.
+  const [mfaPromptKey, setMfaPromptKey] = useState(0);
+  const passwordRef = useRef<HTMLInputElement>(null);
 
   // Recovery key state
   const [hasRecoveryKey, setHasRecoveryKey] = useState(false);
   const [recoveryKeyCreatedAt, setRecoveryKeyCreatedAt] = useState<string | null>(null);
 
   // Recovery circle state
-  const [circleConfig, setCircleConfig] = useState<{
-    has_circle: boolean;
-    threshold_k?: number;
-    total_shares_n?: number;
-    contacts?: Array<{ username: string }>;
-  } | null>(null);
+  const [circleConfig, setCircleConfig] = useState<RecoveryCircleConfig | null>(null);
   const [showCircleSetup, setShowCircleSetup] = useState(false);
+  const closeCircleSetup = useCallback(() => setShowCircleSetup(false), []);
+  const refreshCircleConfig = useCallback(() => {
+    readOkJson<RecoveryCircleConfig>('/api/v1/mfa/recovery-circle').then((data) => {
+      if (data) setCircleConfig(data);
+    });
+  }, []);
 
   // Trusted devices state
   const [trustedDevices, setTrustedDevices] = useState<
@@ -256,112 +425,150 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
   } | null>(null);
 
   useEffect(() => {
-    apiFetch('/api/v1/mfa/recovery-key')
-      .then((res) => res.json())
-      .then((data) => {
-        setHasRecoveryKey(data.has_recovery_key || false);
-        setRecoveryKeyCreatedAt(data.created_at || null);
-      })
-      .catch(() => {});
+    // A non-2xx body is an error object, not the resource: reading it as one
+    // would report "no recovery key" / "no circle" for a read that failed.
+    // Each section keeps its initial state instead.
+    readOkJson<{ has_recovery_key?: unknown; created_at?: unknown }>(
+      '/api/v1/mfa/recovery-key'
+    ).then((data) => {
+      if (!data) return;
+      setHasRecoveryKey(data.has_recovery_key === true);
+      setRecoveryKeyCreatedAt(typeof data.created_at === 'string' ? data.created_at : null);
+    });
 
-    apiFetch('/api/v1/mfa/trusted-devices')
-      .then((res) => res.json())
-      .then((data) => setTrustedDevices(Array.isArray(data.devices) ? data.devices : []))
-      .catch(() => {});
+    readOkJson<{ devices?: unknown }>('/api/v1/mfa/trusted-devices').then((data) => {
+      if (data) setTrustedDevices(Array.isArray(data.devices) ? data.devices : []);
+    });
 
-    apiFetch('/api/v1/mfa/recovery-circle')
-      .then((res) => res.json())
-      .then((data) => setCircleConfig(data))
-      .catch(() => {});
+    refreshCircleConfig();
 
-    apiFetch('/api/v1/mfa/recovery-requests')
-      .then((res) => res.json())
-      .then((data) => setPendingRecoveryRequests(Array.isArray(data.requests) ? data.requests : []))
-      .catch(() => {});
-  }, []);
+    readOkJson<{ requests?: unknown }>('/api/v1/mfa/recovery-requests').then((data) => {
+      if (data) setPendingRecoveryRequests(Array.isArray(data.requests) ? data.requests : []);
+    });
+  }, [refreshCircleConfig]);
 
   // Backup email state
   const [editingBackupEmail, setEditingBackupEmail] = useState(false);
   const [backupEmailDraft, setBackupEmailDraft] = useState(backupEmail || '');
   const [backupEmailError, setBackupEmailError] = useState('');
 
-  const clearActionModal = () => {
+  // Stable identity: Modal re-registers its Escape listener whenever onClose
+  // changes, which an inline arrow would do on every render.
+  const clearActionModal = useCallback(() => {
     setActionModal(null);
     setActionPassword('');
     setActionMfaCode('');
-    setActionError('');
-  };
+    setActionRefusal(null);
+  }, []);
 
   const openActionModal = (state: ActionModalState) => {
     setActionModal(state);
     setActionPassword('');
     setActionMfaCode('');
-    setActionError('');
+    setActionRefusal(null);
   };
 
-  const executeAction = async (modal: ActionModalState): Promise<boolean> => {
+  // Focus the password field once a password refusal has rendered AND the
+  // field is enabled again. Focusing inside the submit handler ran while the
+  // input was still `disabled` for loading, so the call was a no-op (F4).
+  useEffect(() => {
+    if (actionLoading) return;
+    if (actionRefusal?.kind === 'passwordRequired' || actionRefusal?.kind === 'invalidPassword') {
+      passwordRef.current?.focus();
+    }
+  }, [actionLoading, actionRefusal]);
+
+  /** Runs the action behind the modal. Every one of the six answers with the
+   * step-up result shape, so there is one routing path and no action can
+   * surface a refusal the others would route differently. */
+  const executeAction = async (modal: ActionModalState): Promise<MfaStepUpResult> => {
+    const unavailable: MfaStepUpResult = { kind: 'failed' };
     switch (modal.type) {
       case 'reset-totp':
-        return onResetTOTP ? onResetTOTP(actionPassword, actionMfaCode) : false;
+        return onResetTOTP ? onResetTOTP(actionPassword, actionMfaCode) : unavailable;
       case 'revoke-webauthn':
         return onRevokeWebAuthnKey && modal.credentialId
           ? onRevokeWebAuthnKey(modal.credentialId, actionPassword)
-          : false;
-      case 'disable-emailsms':
-        return onDisableEmailSms ? onDisableEmailSms(actionPassword) : false;
+          : unavailable;
       case 'toggle-recovery-only':
-        return onToggleRecoveryOnly &&
-          modal.toggleMethod !== undefined &&
-          modal.toggleValue !== undefined
-          ? onToggleRecoveryOnly(
-              modal.toggleMethod,
-              modal.toggleValue,
-              actionPassword,
-              actionMfaCode
-            )
-          : false;
+        return runToggleRecoveryOnly(modal, onToggleRecoveryOnly, actionPassword, actionMfaCode);
       case 'toggle-hardened':
-        return onToggleRecoveryHardened && modal.toggleValue !== undefined
-          ? onToggleRecoveryHardened(modal.toggleValue, actionPassword, actionMfaCode)
-          : false;
+        return runToggleHardened(modal, onToggleRecoveryHardened, actionPassword, actionMfaCode);
+      case 'disable-emailsms':
+        return onDisableEmailSms ? onDisableEmailSms(actionPassword, actionMfaCode) : unavailable;
+      case 'set-backup-email':
+        return onSetBackupEmail
+          ? onSetBackupEmail(modal.pendingBackupEmail ?? '', actionPassword, actionMfaCode)
+          : unavailable;
+    }
+  };
+
+  /** Records a refusal and clears only the factor it rejected, per the handoff
+   * §1.1 routing table. Where the refusal is SHOWN is derived at render. */
+  const applyRefusal = (result: MfaStepUpResult) => {
+    setActionRefusal(result);
+    if (result.kind === 'passwordRequired' || result.kind === 'invalidPassword') {
+      setActionPassword('');
+    } else if (result.kind === 'invalidMfaCode') {
+      setMfaPromptKey((k) => k + 1);
+      setActionMfaCode('');
     }
   };
 
   const handleAction = async () => {
     if (!actionModal) return;
-    setActionError('');
     setActionLoading(true);
 
     try {
-      const success = await executeAction(actionModal);
-      if (success) {
+      const result = await executeAction(actionModal);
+      if (result.kind === 'accepted') {
+        // The draft-email reset is scoped to a saved/removed backup email —
+        // cancelling or failing the modal leaves the draft untouched
+        // (handoff §1.2).
+        if (actionModal.type === 'set-backup-email') setEditingBackupEmail(false);
         clearActionModal();
-      } else {
-        setActionError('Verification failed. Check your password and try again.');
+        return;
       }
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'An error occurred. Please try again.');
+      applyRefusal(result);
     } finally {
       setActionLoading(false);
     }
   };
 
-  const handleSaveBackupEmail = async () => {
+  /**
+   * Trim and validate locally (no credentials needed for a format error),
+   * then hand off to the shared step-up modal. Save no longer writes
+   * directly — the request happens on Confirm (handoff §1.2).
+   */
+  const handleSaveBackupEmail = () => {
     const trimmed = backupEmailDraft.trim();
     if (trimmed && !/^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(trimmed)) {
       setBackupEmailError('Please enter a valid email address.');
       return;
     }
     setBackupEmailError('');
-    if (onSetBackupEmail) {
-      const ok = await onSetBackupEmail(trimmed);
-      if (ok) setEditingBackupEmail(false);
-      else setBackupEmailError('Failed to save. Please try again.');
+    if (trimmed === (backupEmail || '')) {
+      setEditingBackupEmail(false);
+      return;
     }
+    openActionModal({ type: 'set-backup-email', pendingBackupEmail: trimmed });
   };
 
   const actionTitle = getActionTitle(actionModal);
-  const actionDesc = getActionDesc(actionModal);
+  const needsCode = actionModal
+    ? actionNeedsCode(actionModal.type, hasRealMFA, actionRefusal)
+    : false;
+  const confirmEnabled = actionModal
+    ? !actionLoading &&
+      actionPassword !== '' &&
+      (!needsCode || actionMfaCode !== '') &&
+      !isStepUpLocked(actionRefusal)
+    : false;
+  // The prompt renders whenever a code could be asked for: the account's
+  // known factors, or the server's own list on an mfa_required refusal (F3).
+  const showActionPrompt = hasRealMFA || actionRefusal?.kind === 'mfaRequired';
+  const actionPromptMethods = stepUpPromptMethods(actionRefusal, activeMethods);
+  const actionPasswordError = stepUpPasswordError(actionRefusal);
 
   return (
     <div className="mfa-tier-selector">
@@ -579,9 +786,18 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                         setBackupEmailError('');
                       }}
                       placeholder="backup@example.com"
+                      aria-invalid={backupEmailError !== ''}
+                      aria-describedby={
+                        backupEmailError
+                          ? 'mfa-backup-email-error'
+                          : 'mfa-backup-email-confirm-hint'
+                      }
                     />
+                    <span id="mfa-backup-email-confirm-hint" className="mfa-backup-email-hint">
+                      You&apos;ll confirm with your password before this is saved.
+                    </span>
                     {backupEmailError && (
-                      <span className="mfa-backup-email-error">{backupEmailError}</span>
+                      <FieldError id="mfa-backup-email-error">{backupEmailError}</FieldError>
                     )}
                     <div className="mfa-backup-email-actions">
                       <button
@@ -816,23 +1032,23 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
         </div>
       )}
 
-      {showCircleSetup && (
-        <div className="mfa-modal-overlay">
-          <div className="mfa-modal" style={{ maxWidth: 500, maxHeight: '80vh', overflow: 'auto' }}>
-            <RecoveryCircle
-              onComplete={() => {
-                setShowCircleSetup(false);
-                // Refresh circle status
-                apiFetch('/api/v1/mfa/recovery-circle')
-                  .then((res) => res.json())
-                  .then((data) => setCircleConfig(data))
-                  .catch(() => {});
-              }}
-              onCancel={() => setShowCircleSetup(false)}
-            />
-          </div>
-        </div>
-      )}
+      {/* No-rot (handoff §3, X6): this overlay had the same missing-dialog
+          defect (no role, no trap, no Escape) as the action modal below. */}
+      <Modal
+        isOpen={showCircleSetup}
+        onClose={closeCircleSetup}
+        title="Recovery Circle"
+        width="medium"
+        dismissable
+      >
+        <RecoveryCircle
+          onComplete={() => {
+            setShowCircleSetup(false);
+            refreshCircleConfig();
+          }}
+          onCancel={closeCircleSetup}
+        />
+      </Modal>
 
       {/* Recovery Approval Modal */}
       {activeRecoveryRequest && (
@@ -850,50 +1066,63 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
         />
       )}
 
-      {/* Action confirmation modal */}
-      {actionModal && (
-        <div className="mfa-modal-overlay">
-          <div className="mfa-modal">
-            <h3>{actionTitle}</h3>
-            <p className="mfa-modal-desc">{actionDesc}</p>
+      {/* Action confirmation modal — reused by all eight action types (handoff
+          §1.1). Moved onto ui/Modal for dialog semantics (role, Tab trap,
+          Escape, focus return); the title is fixed at open and never mutated. */}
+      <Modal
+        isOpen={actionModal !== null}
+        onClose={clearActionModal}
+        title={actionTitle}
+        width="small"
+        dismissable={!actionLoading}
+        initialFocusRef={passwordRef}
+      >
+        {actionModal && (
+          <div className="mfa-action-body">
+            {renderActionBody(actionModal, backupEmail)}
 
             <div className="mfa-verify-field">
               <label htmlFor="mfa-action-password">Password</label>
               <input
                 id="mfa-action-password"
+                ref={passwordRef}
                 type="password"
+                autoComplete="current-password"
                 value={actionPassword}
                 onChange={(e) => setActionPassword(e.target.value)}
                 placeholder="Enter your password"
                 disabled={actionLoading}
+                aria-invalid={actionPasswordError !== undefined}
+                aria-describedby={actionPasswordError ? 'mfa-action-password-error' : undefined}
               />
+              {actionPasswordError && (
+                <FieldError id="mfa-action-password-error">{actionPasswordError}</FieldError>
+              )}
             </div>
 
-            {hasRealMFA && (
+            {showActionPrompt && (
               <MFAVerifyPrompt
-                methods={activeMethods}
+                key={mfaPromptKey}
+                methods={actionPromptMethods}
                 recoveryOnlyMethods={recoveryOnlyMethods}
-                onVerify={(code) => setActionMfaCode(code)}
+                onVerify={setActionMfaCode}
+                onCodeChange={setActionMfaCode}
                 disabled={actionLoading}
-                error={actionError || undefined}
+                error={stepUpMfaError(actionRefusal)}
+                excludeBackupCodes={!actionPromptMethods.includes('totp')}
               />
             )}
 
-            {actionError && !hasRealMFA && <p className="mfa-setup-error">{actionError}</p>}
+            <ErrorBanner error={stepUpBanner(actionRefusal) ?? ''} />
 
             <div className="mfa-setup-actions">
               <button
                 type="button"
-                className={
-                  actionModal.type === 'toggle-recovery-only' ||
-                  actionModal.type === 'toggle-hardened'
-                    ? 'btn btn-sm btn-primary'
-                    : 'btn btn-sm btn-danger'
-                }
-                onClick={handleAction}
-                disabled={actionLoading || !actionPassword}
+                className={getActionConfirmClass(actionModal)}
+                onClick={() => void handleAction()}
+                disabled={!confirmEnabled}
               >
-                {actionLoading ? 'Processing...' : 'Confirm'}
+                {actionLoading ? 'Processing...' : getActionConfirmLabel(actionModal)}
               </button>
               <button
                 type="button"
@@ -905,8 +1134,8 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
               </button>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </Modal>
     </div>
   );
 };

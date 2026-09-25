@@ -471,20 +471,38 @@ func (h *Handler) validateReplyToID(c *gin.Context, replyToID *string, channelID
 	return replyToID, true
 }
 
-// checkSendAccess validates membership, PermSendMessages, and fetches the embed policy.
-// Returns (serverID, membershipIncarnation, allowEmbeds, ok). On failure, writes the JSON error to c.
+// channelViewPermission maps a channel type to the view bit that gates it,
+// mirroring the WebSocket send path (channelContext.viewPermission in
+// internal/websocket/hub.go) so REST and WebSocket send refuse the same members.
+// An unknown type returns ok=false, which callers treat as not viewable.
+// ponytail: this mapping now lives in hub.go, channels, media and here; the shared
+// home is internal/rbac, and consolidating the four is its own change.
+func channelViewPermission(channelType string) (rbac.Permission, bool) {
+	switch channelType {
+	case "text", "bulletin":
+		return rbac.PermViewTextChannels, true
+	case "voice":
+		return rbac.PermViewVoiceChannels, true
+	default:
+		return 0, false
+	}
+}
+
+// checkSendAccess validates membership, the channel's view bit, PermSendMessages, and fetches
+// the embed policy. Returns (serverID, membershipIncarnation, allowEmbeds, ok). On failure,
+// writes the JSON error to c.
 func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (string, time.Time, bool, bool) {
-	var serverID string
+	var serverID, channelType string
 	var membershipIncarnation time.Time
 	var serverAllowEmbeds bool
 	var timedOutUntil sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT c.server_id, sm.joined_at, s.allow_embedded_content, sm.timed_out_until
+		SELECT c.server_id, c.type, sm.joined_at, s.allow_embedded_content, sm.timed_out_until
 		FROM channels c
 		INNER JOIN server_members sm ON c.server_id = sm.server_id
 		INNER JOIN servers s ON c.server_id = s.id
 		WHERE c.id = $1 AND sm.user_id = $2
-	`, channelID, userID).Scan(&serverID, &membershipIncarnation, &serverAllowEmbeds, &timedOutUntil)
+	`, channelID, userID).Scan(&serverID, &channelType, &membershipIncarnation, &serverAllowEmbeds, &timedOutUntil)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 		return "", time.Time{}, false, false
@@ -505,7 +523,10 @@ func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (str
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
 		return "", time.Time{}, false, false
 	}
-	if !effectivePerms.Has(rbac.PermSendMessages) {
+	// Send alone is not enough: a channel is made private by denying its view bit while
+	// Send stays granted by the base role, so both are required, as on the WebSocket path.
+	viewPerm, viewable := channelViewPermission(channelType)
+	if !viewable || !effectivePerms.Has(viewPerm) || !effectivePerms.Has(rbac.PermSendMessages) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 		return "", time.Time{}, false, false
 	}
@@ -1057,18 +1078,19 @@ func (h *Handler) SuppressEmbeds(c *gin.Context) {
 		return
 	}
 
-	// Get message info for permission check
+	ctx := c.Request.Context()
+
+	// Resolve the message's scope ONLY. embeds_suppressed is deliberately not
+	// read here: branching on it before the permission check told any caller
+	// holding a message ID whether that message was suppressed.
 	var channelID, serverID string
-	var alreadySuppressed bool
-	checkQuery := `
-		SELECT m.channel_id, c.server_id, m.embeds_suppressed
+	err := h.db.QueryRowContext(ctx, `
+		SELECT m.channel_id, c.server_id
 		FROM messages m
 		INNER JOIN channels c ON m.channel_id = c.id
 		WHERE m.id = $1
-	`
-
-	err := h.db.QueryRow(checkQuery, messageID).Scan(&channelID, &serverID, &alreadySuppressed)
-	if err == sql.ErrNoRows {
+	`, messageID).Scan(&channelID, &serverID)
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return
 	} else if err != nil {
@@ -1077,14 +1099,9 @@ func (h *Handler) SuppressEmbeds(c *gin.Context) {
 		return
 	}
 
-	// Already suppressed — no-op, return success
-	if alreadySuppressed {
-		c.JSON(http.StatusOK, gin.H{"message": "Embeds already suppressed"})
-		return
-	}
-
-	// Check PermManageAllMessages
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermManageAllMessages)
+	// Authorization precedes any state-dependent branch. A non-member resolves
+	// to (false, nil) and lands here with a 403 like any unprivileged member.
+	hasPerm, permErr := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermManageAllMessages)
 	if permErr != nil {
 		h.log.Error(errMsgFailedCheckPerms, "error", permErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSuppressEmbeds})
@@ -1095,14 +1112,27 @@ func (h *Handler) SuppressEmbeds(c *gin.Context) {
 		return
 	}
 
-	// One-way ratchet: suppress only (false → true). Never un-suppress.
-	_, err = h.db.Exec(
+	// One-way ratchet: suppress only (false → true). The row count, not a
+	// prior read, decides whether this request changed anything.
+	res, err := h.db.ExecContext(ctx,
 		`UPDATE messages SET embeds_suppressed = TRUE, updated_at = NOW() WHERE id = $1 AND embeds_suppressed = FALSE`,
 		messageID,
 	)
 	if err != nil {
 		h.log.Error("Failed to suppress embeds", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSuppressEmbeds})
+		return
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read suppress-embeds row count", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSuppressEmbeds})
+		return
+	}
+	if n == 0 {
+		// Already suppressed by an authorized caller: success, and no second
+		// broadcast for a change that did not happen.
+		c.JSON(http.StatusOK, gin.H{"message": "Embeds already suppressed"})
 		return
 	}
 

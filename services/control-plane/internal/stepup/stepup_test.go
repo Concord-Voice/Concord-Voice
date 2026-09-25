@@ -133,22 +133,27 @@ func TestVerifyPasswordFactor_MalformedHashIs500(t *testing.T) {
 	require.Equal(t, ErrMsgVerificationFailed, err.Body["error"])
 }
 
+// The pool form offers the caller's P1 set, not the verifier's lookup: the
+// fake's GetEnabledMethods answers "email" (what a stale users.mfa_methods can
+// hold), so an implementation that ignored the preload would offer a factor
+// the account cannot enter inline.
 func TestVerifyMFAFactor_MissingCodeIs403WithMethods(t *testing.T) {
-	v := &fakeMFAVerifier{enabled: true, methods: []string{"totp"}}
+	v := &fakeMFAVerifier{enabled: true, methods: []string{"email"}}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "")
+	err := VerifyMFAFactor(context.Background(), v, "user-1", "", []string{"totp"})
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusForbidden, err.Status)
 	require.Equal(t, "MFA verification required", err.Body["error"])
 	require.Equal(t, true, err.Body["mfa_required"])
 	require.Equal(t, []string{"totp"}, err.Body["methods"])
+	require.Equal(t, 0, v.methodsCalls, "a preloaded set must not be re-read from the verifier")
 }
 
 func TestVerifyMFAFactor_InvalidCodeIs403(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, valid: false}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "000000")
+	err := VerifyMFAFactor(context.Background(), v, "user-1", "000000", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusForbidden, err.Status)
@@ -158,7 +163,7 @@ func TestVerifyMFAFactor_InvalidCodeIs403(t *testing.T) {
 func TestVerifyMFAFactor_VerifyErrorIs500(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, verifyErr: errors.New("totp backend down")}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "123456")
+	err := VerifyMFAFactor(context.Background(), v, "user-1", "123456", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusInternalServerError, err.Status)
@@ -169,7 +174,7 @@ func TestVerifyMFAFactor_VerifyErrorIs500(t *testing.T) {
 func TestVerifyMFAFactor_ValidCodePasses(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, valid: true}
 
-	require.Nil(t, VerifyMFAFactor(context.Background(), v, "user-1", "123456"))
+	require.Nil(t, VerifyMFAFactor(context.Background(), v, "user-1", "123456", nil))
 	require.True(t, v.usedPool, "the non-tx form must reach VerifyCode")
 }
 
@@ -195,7 +200,7 @@ func TestVerifyMFAFactorTx_ReachesTxVerifier(t *testing.T) {
 func TestError_MFABackendFailurePropagatesCause(t *testing.T) {
 	backendDown := errors.New("totp store unreachable")
 	err := VerifyMFAFactor(context.Background(),
-		&fakeMFAVerifier{enabled: true, verifyErr: backendDown}, "u1", "123456")
+		&fakeMFAVerifier{enabled: true, verifyErr: backendDown}, "u1", "123456", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusInternalServerError, err.Status)
@@ -233,9 +238,9 @@ func TestError_RejectionsCarryNoCause(t *testing.T) {
 		"password omitted": VerifyPasswordFactor(
 			Subject{PasswordHash: stubEncoding}, "", testCopy),
 		"mfa code omitted": VerifyMFAFactor(context.Background(),
-			&fakeMFAVerifier{enabled: true}, "u1", ""),
+			&fakeMFAVerifier{enabled: true}, "u1", "", []string{"totp"}),
 		"mfa code invalid": VerifyMFAFactor(context.Background(),
-			&fakeMFAVerifier{enabled: true, valid: false}, "u1", "000000"),
+			&fakeMFAVerifier{enabled: true, valid: false}, "u1", "000000", nil),
 	}
 	for name, err := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -273,7 +278,7 @@ func TestVerifyMFAFactorTx_PreloadedMethodsSkipTheLookup(t *testing.T) {
 func TestVerifyMFAFactor_NilPreloadFallsBackToLookup(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, methods: []string{"webauthn"}}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "")
+	err := VerifyMFAFactor(context.Background(), v, "user-1", "", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, []string{"webauthn"}, err.Body["methods"])

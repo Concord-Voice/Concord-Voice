@@ -244,7 +244,9 @@ var purgeStepUpCopy = stepup.Copy{
 // Policy lives in internal/stepup (#2765); this is the DM binding of it. There
 // is no enclosing transaction here, so the non-tx MFA form is correct.
 func (h *Handler) verifyPurgeStepUp(ctx context.Context, c *gin.Context, userID, currentPassword, mfaCode string) bool {
-	subj, sErr := stepup.LoadSubject(ctx, h.db, userID, h.mfaVerifier)
+	// LoadSubject derives MFA from the factor tables (policy P1) and fails
+	// closed on a read error; it no longer consults IsEnabled.
+	subj, sErr := stepup.LoadSubject(ctx, h.db, userID)
 	if sErr != nil {
 		h.logPurgeStepUpFailure(sErr)
 		sErr.Write(c)
@@ -256,7 +258,7 @@ func (h *Handler) verifyPurgeStepUp(ctx context.Context, c *gin.Context, userID,
 		return false
 	}
 	if subj.MFAEnabled {
-		if mErr := stepup.VerifyMFAFactor(ctx, h.mfaVerifier, userID, mfaCode); mErr != nil {
+		if mErr := stepup.VerifyMFAFactor(ctx, h.mfaVerifier, userID, mfaCode, subj.MFAMethods); mErr != nil {
 			h.logPurgeStepUpFailure(mErr)
 			mErr.Write(c)
 			return false

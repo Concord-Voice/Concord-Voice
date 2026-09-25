@@ -83,6 +83,15 @@ interface MFAVerifyPromptProps {
   recoveryOnlyMethods?: string[];
   /** Called with the MFA code (TOTP, backup code, or WebAuthn inline-verify token) */
   onVerify: (code: string) => void;
+  /**
+   * Fires on every edit of a typed code — the complete code, or `''` while it
+   * is incomplete — and with `''` on a switch to another method. A parent
+   * that STORES the code for a later Confirm needs this: `onVerify` reports
+   * only completion, so editing a complete code, or switching away from it,
+   * would otherwise leave the old code stored behind an enabled Confirm. A
+   * WebAuthn token still arrives only through `onVerify`.
+   */
+  onCodeChange?: (code: string) => void;
   disabled?: boolean;
   error?: string;
   /** If true, backup codes are hidden (use during setup, not revoke/remove) */
@@ -97,6 +106,7 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
   methods,
   recoveryOnlyMethods = [],
   onVerify,
+  onCodeChange,
   disabled = false,
   error,
   excludeBackupCodes = false,
@@ -147,9 +157,12 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
       } else {
         abortRef.current?.abort();
       }
+      // The field being left held the reported code; the one being shown is
+      // empty, so the parent's copy must be too.
+      onCodeChange?.('');
       setMode(def.mode);
     },
-    [setMode, setWebauthnStatus, setWebauthnError]
+    [setMode, setWebauthnStatus, setWebauthnError, onCodeChange]
   );
 
   const renderMethodLinks = useCallback(
@@ -216,14 +229,25 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
 
       {mode === 'totp' && (
         <>
-          <TOTPInput onSubmit={onVerify} disabled={disabled} error={error} autoFocus />
+          <TOTPInput
+            onSubmit={onVerify}
+            onCodeChange={onCodeChange}
+            disabled={disabled}
+            error={error}
+            autoFocus
+          />
           {renderMethodLinks()}
         </>
       )}
 
       {mode === 'backup' && !excludeBackupCodes && (
         <>
-          <BackupCodeInput onSubmit={onVerify} disabled={disabled} error={error} />
+          <BackupCodeInput
+            onSubmit={onVerify}
+            onCodeChange={onCodeChange}
+            disabled={disabled}
+            error={error}
+          />
           {renderMethodLinks()}
         </>
       )}
@@ -285,7 +309,13 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
 
       {mode === 'email-sms' && (
         <>
-          <TOTPInput onSubmit={onVerify} disabled={disabled} error={error} autoFocus />
+          <TOTPInput
+            onSubmit={onVerify}
+            onCodeChange={onCodeChange}
+            disabled={disabled}
+            error={error}
+            autoFocus
+          />
           {renderMethodLinks()}
         </>
       )}

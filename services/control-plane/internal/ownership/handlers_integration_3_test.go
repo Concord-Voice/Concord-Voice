@@ -16,12 +16,18 @@ import (
 // MFA coverage — verifyMFA paths (InitiateTransfer + ReverseTransfer)
 // =============================================================================
 
-// enableMFAForUser sets the user's mfa_enabled flag so IsEnabled returns true.
-// Does NOT insert a TOTP secret row — VerifyCode will gracefully return false
-// for invalid codes without hitting decryption errors.
+// enableMFAForUser gives the user a WebAuthn credential, which is what makes
+// IsEnabled true: step-up reads the factor tables, never the users.mfa_*
+// flags, so a flags-only fixture is an account with no MFA. A key rather than
+// a TOTP row keeps VerifyCode off the decryption path — a wrong code is simply
+// false — and the inline token seedMFAInlineToken stores is what a key's
+// successful assertion leaves behind.
 func enableMFAForUser(t *testing.T, ts *testhelpers.TestServer, userID string) {
 	t.Helper()
-	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = true, mfa_methods = '{totp}' WHERE id = $1`, userID)
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = true, mfa_methods = '{webauthn}' WHERE id = $1`, userID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`INSERT INTO user_mfa_webauthn (id, user_id, credential_id, credential_name, credential_type, public_key, sign_count, created_at)
+		VALUES (gen_random_uuid(), $1, $2, 'Key', 'hardware', '\x00', 0, NOW())`, userID, []byte("cred-"+userID))
 	require.NoError(t, err)
 }
 
@@ -53,6 +59,49 @@ func TestInitiateTransferMFARequired(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, true, body["mfa_required"])
 	assert.NotNil(t, body["methods"])
+}
+
+// The prompt's methods come from the factor tables (P1), not users.mfa_methods.
+// The fixture makes the two disagree, so a flags-based read fails here.
+func TestInitiateTransferMFAMethodsFromFactorTables(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "mfap1own")
+	member := ts.CreateTestUser(t, "mfap1mem")
+	serverID := ts.CreateTestServer(t, owner.ID, "MFA P1 Server")
+	ts.AddMemberToServer(t, serverID, member.ID, keyMember)
+
+	enableMFAForUser(t, ts, owner.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_methods = '{totp,email}' WHERE id = $1`, owner.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
+		keyTargetUserID: member.ID,
+		keyPassword:     testhelpers.TestAuthPlaintext,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, []interface{}{"webauthn"}, body["methods"])
+}
+
+// An email-only account has no inline-verifiable factor, so the MFA leg does
+// not apply: demanding a code it cannot supply would lock it out of transfer.
+func TestInitiateTransferEmailOnlyMFASkipsCodeLeg(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "mfaemlown")
+	member := ts.CreateTestUser(t, "mfaemlmem")
+	serverID := ts.CreateTestServer(t, owner.ID, "MFA Email Server")
+	ts.AddMemberToServer(t, serverID, member.ID, keyMember)
+
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = true, mfa_methods = '{email}' WHERE id = $1`, owner.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
+		keyTargetUserID: member.ID,
+		keyPassword:     testhelpers.TestAuthPlaintext,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 }
 
 func TestInitiateTransferMFAInvalidCode(t *testing.T) {

@@ -251,6 +251,51 @@ describe('PurgeFenceStepUpDialog — accounts that hold only some factors (#2765
     expect(bodies[1].mfa_code).toBe(FIXTURE_OTP);
   });
 
+  // Both fields are on screen from the start, so a refusal that names a MISSING
+  // factor changes nothing visible unless the field says so.
+  it('asks for the code when a correct password was sent alone, and focuses it', async () => {
+    serveSection(true);
+    server.use(
+      http.patch(PRIVACY_ENDPOINT, () =>
+        HttpResponse.json(
+          { error: 'MFA required', mfa_required: true, methods: ['totp'] },
+          { status: 403 }
+        )
+      )
+    );
+
+    await flipFence();
+    await screen.findByRole('heading', { name: DIALOG_TITLE });
+    await userEvent.type(passwordField(), FIXTURE_PW);
+    await userEvent.click(screen.getByRole('button', { name: SUBMIT_LABEL }));
+
+    expect(
+      await screen.findByText('Enter the code from your authenticator app to continue.')
+    ).toBeInTheDocument();
+    await waitFor(() => expect(codeField()).toHaveAttribute('aria-invalid', 'true'));
+    await waitFor(() => expect(codeField()).toHaveFocus());
+    expect(passwordField()).toHaveValue(FIXTURE_PW);
+  });
+
+  it('asks for the password when a code was sent alone, and focuses it', async () => {
+    serveSection(true);
+    server.use(
+      http.patch(PRIVACY_ENDPOINT, () =>
+        HttpResponse.json({ error: 'Password required', password_required: true }, { status: 403 })
+      )
+    );
+
+    await flipFence();
+    await screen.findByRole('heading', { name: DIALOG_TITLE });
+    await userEvent.type(codeField(), FIXTURE_OTP);
+    await userEvent.click(screen.getByRole('button', { name: SUBMIT_LABEL }));
+
+    expect(await screen.findByText('Enter your password to continue.')).toBeInTheDocument();
+    await waitFor(() => expect(passwordField()).toHaveAttribute('aria-invalid', 'true'));
+    await waitFor(() => expect(passwordField()).toHaveFocus());
+    expect(codeField()).toHaveValue(FIXTURE_OTP);
+  });
+
   it('accepts an MFA-only submission, which is how an account with no password proceeds', async () => {
     const bodies: Array<Record<string, unknown>> = [];
     serveSection(true);

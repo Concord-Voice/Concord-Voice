@@ -18,6 +18,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/protocol"
@@ -60,6 +61,19 @@ const (
 	errMsgFailedListSocialReqs       = "Failed to list social recovery requests"
 	errMsgFailedSubmitResponse       = "Failed to submit response"
 	errMsgMFAVerificationUnavailable = "MFA verification unavailable"
+	errMsgInvalidRequest             = "Invalid request"
+	errMsgFailedLoadMFAStatus        = "Failed to load MFA status"
+	errMsgFailedUpdateBackupEmail    = "Failed to update backup email"
+	errMsgFailedStoreRecoveryKey     = "Failed to store recovery key"
+	msgRecoveryKeyStored             = "Recovery key stored"
+	errMsgFailedDisableEmailSms      = "Failed to disable Email/SMS MFA methods"
+	errMsgFailedDisableMFA           = "Failed to disable MFA"
+	errMsgFailedDeleteCredential     = "Failed to delete credential"
+
+	// errMsgInlineFactorRequired is the D1 refusal: removing the last inline
+	// factor while email or SMS is on would leave an account whose login
+	// demands an email/SMS code but whose step-up (policy P1) has no MFA leg.
+	errMsgInlineFactorRequired = "Turn off email and text-message codes before removing your last authenticator app or security key."
 )
 
 // LoginCompleter completes the login flow after MFA verification.
@@ -141,11 +155,23 @@ type codeVerificationStore interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 }
 
-// IsEnabled returns true if the user has any active MFA method.
+// IsEnabled reports whether a step-up must demand an MFA code from this user:
+// true iff the account holds an inline-verifiable factor (policy P1 —
+// confirmed TOTP or any WebAuthn credential), read from the factor tables
+// rather than users.mfa_enabled, which also counts email/SMS and can be stale.
+//
+// It fails CLOSED. The signature has no error, and every caller reads false
+// as "skip the MFA leg", so a failed read answers true: the caller then asks
+// for a code, which a user without a factor cannot supply until the database
+// answers again. Reading the failure as false is exactly the fail-open this
+// replaced (it read `err == nil && enabled`).
 func (h *Handler) IsEnabled(ctx context.Context, userID string) bool {
-	var enabled bool
-	err := h.db.QueryRowContext(ctx, `SELECT mfa_enabled FROM users WHERE id = $1`, userID).Scan(&enabled)
-	return err == nil && enabled
+	methods, err := stepup.InlineMFAMethods(ctx, h.db, userID)
+	if err != nil {
+		h.log.Error("MFA status unreadable; requiring the MFA leg", "error", err)
+		return true
+	}
+	return len(methods) > 0
 }
 
 // VerifyCode checks a TOTP code or backup code against the user's stored MFA secrets.
@@ -382,9 +408,58 @@ func containsStr(ss []string, target string) bool {
 	return false
 }
 
+// ── MFA flag sync (B1) ───────────────────────────────────────────────────────
+//
+// users.mfa_methods / mfa_enabled / mfa_enabled_at are a denormalized mirror of
+// four sources: user_mfa_totp and user_mfa_webauthn in Postgres, and the
+// email/SMS enabled keys in Redis. Login and refresh read the mirror, so a
+// mirror that disagrees with a factor is a live defect in either direction: an
+// enrolled factor missing from it is never challenged, and a removed factor
+// still in it is demanded at login with nothing to satisfy it.
+//
+// The invariant: every factor write and its flag write commit in ONE
+// transaction, and that transaction locks the users row FIRST, so every writer
+// (and every step-up gate) takes users → factor-table locks in one order.
+// Redis is read BEFORE the transaction opens, never inside it. When that read
+// fails, the flags are still written — the TOTP/WebAuthn half is exact because
+// it comes from the tables inside the transaction, and the email/SMS half keeps
+// whatever the row already lists (mfaFlagsDegradedSQL). A failed Redis read may
+// therefore leave email/SMS listed that is no longer on, which is fail-closed;
+// it can never drop one that is on, and it can never skip the write.
+
+// errSubjectGone reports that the authenticated account's users row no longer
+// exists (a deleted account holding a still-valid JWT).
+var errSubjectGone = errors.New("user no longer exists")
+
+// mfaFlagsExactSQL writes the flags when the email/SMS state is known. It is
+// also the first-activation rule: mfa_enabled_at is set only on a NULL → on
+// transition (pre-existing sessions are challenged on their next refresh) and
+// cleared when MFA goes fully off, so re-enabling later stamps a fresh one.
+const mfaFlagsExactSQL = `
+	UPDATE users
+	SET mfa_methods    = $1::text[],
+	    mfa_enabled    = cardinality($1::text[]) > 0,
+	    mfa_enabled_at = CASE WHEN cardinality($1::text[]) > 0 THEN COALESCE(mfa_enabled_at, NOW()) END
+	WHERE id = $2`
+
+// mfaFlagsDegradedSQL writes the flags when the email/SMS state could not be
+// read: $1 holds the exact inline factors plus any email/SMS known to be on,
+// and the row's own email/SMS entries are carried forward. Every SET
+// expression reads the OLD row, so the statement is atomic.
+const mfaFlagsDegradedSQL = `
+	UPDATE users
+	SET mfa_methods    = $1::text[] || ARRAY(
+	        SELECT m FROM unnest(mfa_methods) AS m
+	        WHERE m IN ('email', 'sms') AND m <> ALL ($1::text[])),
+	    mfa_enabled    = cardinality($1::text[]) > 0 OR mfa_methods && ARRAY['email', 'sms'],
+	    mfa_enabled_at = CASE WHEN cardinality($1::text[]) > 0 OR mfa_methods && ARRAY['email', 'sms']
+	                          THEN COALESCE(mfa_enabled_at, NOW()) END
+	WHERE id = $2`
+
 // mfaNeverEnabled reports whether MFA has never been active on the account.
-// Read it before an enable writes users.mfa_enabled_at. A read error answers
-// false, which keeps the pre-MFA challenge.
+// Read it before the enable's flag-sync transaction writes
+// users.mfa_enabled_at. A read error answers false, which keeps the pre-MFA
+// challenge.
 func (h *Handler) mfaNeverEnabled(ctx context.Context, userID string) bool {
 	var never bool
 	if err := h.db.QueryRowContext(ctx, `SELECT mfa_enabled_at IS NULL FROM users WHERE id = $1`, userID).Scan(&never); err != nil {
@@ -409,114 +484,181 @@ func (h *Handler) grantEnrollmentUpgrade(ctx context.Context, userID, sessionID 
 	}
 }
 
-// updateUserMFAFlags recalculates and updates the denormalized mfa_enabled and mfa_methods on users.
-// Every read must succeed before it writes: a method it failed to read would be
-// counted as absent, and with none left it takes the disable branch, clearing
-// mfa_enabled and mfa_enabled_at on an account that has MFA.
-func (h *Handler) updateUserMFAFlags(ctx context.Context, userID string) error {
-	methods := make([]string, 0) // must be non-nil for pq.Array to produce '{}' not NULL
-
-	// Check TOTP (no row means no TOTP)
-	var totpActive bool
-	err := h.db.QueryRowContext(ctx,
-		`SELECT enabled AND confirmed FROM user_mfa_totp WHERE user_id = $1`, userID,
-	).Scan(&totpActive)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read TOTP state: %w", err)
-	}
-	if totpActive {
-		methods = append(methods, "totp")
-	}
-
-	// Check WebAuthn
-	var webauthnCount int
-	if err := h.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM user_mfa_webauthn WHERE user_id = $1`, userID,
-	).Scan(&webauthnCount); err != nil {
-		return fmt.Errorf("count WebAuthn credentials: %w", err)
-	}
-	if webauthnCount > 0 {
-		methods = append(methods, "webauthn")
-	}
-
-	// Check Email/SMS (dev stub — tracked via Redis flag)
-	for _, m := range []string{"email", "sms"} {
-		n, err := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, m)).Result()
-		if err != nil {
-			return fmt.Errorf("read %s MFA flag: %w", m, err)
-		}
-		if n > 0 {
-			methods = append(methods, m)
-		}
-	}
-
-	enabled := len(methods) > 0
-
-	if enabled {
-		// Set mfa_enabled_at only on the first activation (NULL → NOW).
-		// Pre-existing sessions created before this timestamp will be
-		// challenged for MFA on their next refresh.
-		_, err = h.db.ExecContext(ctx, `
-			UPDATE users
-			SET mfa_enabled = TRUE,
-			    mfa_methods = $1,
-			    mfa_enabled_at = COALESCE(mfa_enabled_at, NOW())
-			WHERE id = $2
-		`, pq.Array(methods), userID)
-	} else {
-		// MFA fully disabled — clear the timestamp so re-enabling later
-		// sets a fresh one.
-		_, err = h.db.ExecContext(ctx, `
-			UPDATE users
-			SET mfa_enabled = FALSE,
-			    mfa_methods = $1,
-			    mfa_enabled_at = NULL
-			WHERE id = $2
-		`, pq.Array(methods), userID)
-	}
-	return err
+// emailSmsState is the Redis half of the flags, read before a transaction.
+type emailSmsState struct {
+	// known is false when the state store could not be read.
+	known bool
+	// email and sms are the exact state when known; when !known they name the
+	// methods known to be ON regardless (e.g. just activated), and the row's
+	// own entries are carried forward for the rest.
+	email, sms bool
 }
 
-// requirePasswordAndMFA verifies the user's password and, if MFA is already active,
-// also verifies an MFA code. Returns true if verification passed, false if a
-// response was already written to c.
-func (h *Handler) requirePasswordAndMFA(c *gin.Context, userID, password, mfaCode string) bool {
-	ctx := c.Request.Context()
+// withKnownOn marks methods as on without claiming anything about the others.
+func (s emailSmsState) withKnownOn(methods []string) emailSmsState {
+	s.email = s.email || containsStr(methods, "email")
+	s.sms = s.sms || containsStr(methods, "sms")
+	return s
+}
 
-	match, err := h.verifyUserPassword(ctx, userID, password)
+// readEmailSmsForSync reads the email/SMS state for a flag sync. It never
+// fails: an unreadable store yields known=false, which the sync handles by
+// carrying the row's entries forward.
+func (h *Handler) readEmailSmsForSync(ctx context.Context, userID string) emailSmsState {
+	email, sms, err := h.readEmailSmsEnabled(ctx, userID)
 	if err != nil {
-		h.log.Error("Password verification failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify password"})
+		h.log.Warn("Email/SMS MFA state unreadable; MFA flags keep the listed email/SMS factors", "error", err)
+		return emailSmsState{}
+	}
+	return emailSmsState{known: true, email: email, sms: sms}
+}
+
+// lockUserForMFAWriteTx is the first statement of a factor write that takes no
+// credential (it has no step-up of its own): it only orders the write against
+// every other users-row holder.
+func lockUserForMFAWriteTx(ctx context.Context, tx *sql.Tx, userID string) error {
+	var id string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errSubjectGone
+	}
+	if err != nil {
+		return fmt.Errorf("lock user for MFA write: %w", err)
+	}
+	return nil
+}
+
+// writeMFAFlagsTx writes the flags from an already-read inline set. Use it
+// only when inline was read on this transaction after the users-row lock.
+func writeMFAFlagsTx(ctx context.Context, tx *sql.Tx, userID string, inline []string, es emailSmsState) error {
+	methods := make([]string, 0, len(inline)+2) // non-nil: pq.Array must send '{}', never NULL
+	methods = append(methods, inline...)
+	if es.email {
+		methods = append(methods, "email")
+	}
+	if es.sms {
+		methods = append(methods, "sms")
+	}
+	query := mfaFlagsExactSQL
+	if !es.known {
+		query = mfaFlagsDegradedSQL
+	}
+	res, err := tx.ExecContext(ctx, query, pq.Array(methods), userID)
+	if err != nil {
+		return fmt.Errorf("write MFA flags: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read MFA flags write count: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("write MFA flags: %d rows affected", n)
+	}
+	return nil
+}
+
+// syncMFAFlagsTx derives the inline factors on tx and writes the flags.
+func syncMFAFlagsTx(ctx context.Context, tx *sql.Tx, userID string, es emailSmsState) error {
+	inline, err := stepup.InlineMFAMethods(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	return writeMFAFlagsTx(ctx, tx, userID, inline, es)
+}
+
+// withMFAFactorWriteTx runs write (nil for a flags-only resync) and the flag
+// sync in ONE transaction that locks the users row first. Any error rolls the
+// whole thing back: a factor whose flags could not be written is not written
+// either. errSubjectGone is returned unwrapped-matchable.
+func (h *Handler) withMFAFactorWriteTx(ctx context.Context, userID string, es emailSmsState, write func(*sql.Tx) error) error {
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin MFA factor write: %w", err)
+	}
+	defer h.rollbackQuietly(tx)
+	if err := lockUserForMFAWriteTx(ctx, tx, userID); err != nil {
+		return err
+	}
+	if write != nil {
+		if err := write(tx); err != nil {
+			return err
+		}
+	}
+	if err := syncMFAFlagsTx(ctx, tx, userID, es); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit MFA factor write: %w", err)
+	}
+	return nil
+}
+
+// failMFAFactorWrite answers a failed withMFAFactorWriteTx: a vanished account
+// is the client's 401, anything else is logged and a 500 with the route's body.
+func (h *Handler) failMFAFactorWrite(c *gin.Context, logMsg, body string, err error) {
+	if errors.Is(err, errSubjectGone) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": stepup.ErrMsgSessionNoLongerValid})
+		return
+	}
+	h.log.Error(logMsg, "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": body})
+}
+
+// emailOrSmsOnTx answers D1's "is email or SMS on?" for a transaction that
+// already holds the users-row lock. A known state answers directly; an unknown
+// one falls back to the row's own listing — the same evidence the degraded
+// flag write carries forward, so the invariant and the flags agree.
+func emailOrSmsOnTx(ctx context.Context, tx *sql.Tx, userID string, es emailSmsState) (bool, error) {
+	if es.email || es.sms {
+		return true, nil
+	}
+	if es.known {
+		return false, nil
+	}
+	var listed bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT mfa_methods && ARRAY['email', 'sms']::text[] FROM users WHERE id = $1`, userID,
+	).Scan(&listed); err != nil {
+		return false, fmt.Errorf("read listed email/SMS factors: %w", err)
+	}
+	return listed, nil
+}
+
+// refuseLastInlineFactorTx enforces D1 after a factor delete, on the same
+// transaction: if no inline factor remains while email or SMS is on, it writes
+// the 409 and returns true (the caller returns; the deferred rollback undoes
+// the delete). An account reaching that state would be asked for an email/SMS
+// code at login while its step-up (policy P1) had no MFA leg at all. A read
+// failure is a 500 with failBody, and also returns true.
+func (h *Handler) refuseLastInlineFactorTx(c *gin.Context, tx *sql.Tx, userID string, es emailSmsState, failBody string) bool {
+	ctx := c.Request.Context()
+	remaining, err := stepup.InlineMFAMethods(ctx, tx, userID)
+	if err != nil {
+		h.log.Error("Failed to read remaining inline MFA factors", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failBody})
+		return true
+	}
+	if len(remaining) > 0 {
 		return false
 	}
-	if !match {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
+	on, err := emailOrSmsOnTx(ctx, tx, userID, es)
+	if err != nil {
+		h.log.Error("Failed to read email/SMS MFA state for the last-factor check", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failBody})
+		return true
+	}
+	if !on {
 		return false
 	}
-
-	// If MFA is already active, require an MFA code too
-	if h.IsEnabled(ctx, userID) {
-		if mfaCode == "" {
-			c.JSON(http.StatusForbidden, gin.H{"error": "MFA code is required", "mfa_required": true})
-			return false
-		}
-		ok, verifyErr := h.VerifyCode(ctx, userID, mfaCode)
-		if verifyErr != nil {
-			// Same 403 as a wrong code, but a server-side failure must be visible.
-			h.log.Error("MFA code verification error during step-up", "user_id", userID, "error", verifyErr)
-		}
-		if verifyErr != nil || !ok {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code"})
-			return false
-		}
-	}
-
+	c.JSON(http.StatusConflict, gin.H{"error": errMsgInlineFactorRequired, "inline_factor_required": true})
 	return true
 }
 
 // ── TOTP Endpoints ───────────────────────────────────────────────────────────
 
-// GetStatus returns the user's MFA status across all methods.
+// GetStatus returns the user's MFA status across all methods. Every read fails
+// closed to a 500: a failed read served as "no factor" would tell the client
+// MFA is off when the server does not know that.
 func (h *Handler) GetStatus(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
@@ -531,69 +673,154 @@ func (h *Handler) GetStatus(c *gin.Context) {
 	}
 
 	// TOTP status
+	totpActive, err := h.addTOTPStatus(ctx, userID, result)
+	if err != nil {
+		h.failMFAStatus(c, "totp", err)
+		return
+	}
+
+	// WebAuthn credential count
+	var webauthnCount int
+	if err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_mfa_webauthn WHERE user_id = $1`, userID).Scan(&webauthnCount); err != nil {
+		h.failMFAStatus(c, "webauthn", err)
+		return
+	}
+	result["webauthn_credentials"] = webauthnCount
+
+	// Overall — read denormalized flags, then self-heal if stale
+	flags, err := h.readMFAUserFlags(ctx, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// A deleted account holding a still-valid JWT (the EmailSmsVerify
+		// precedent): client-side, so 401, not 5xx.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": stepup.ErrMsgSessionNoLongerValid})
+		return
+	}
+	if err != nil {
+		h.failMFAStatus(c, "flags", err)
+		return
+	}
+
+	// Email/SMS MFA status (stored in Redis). Read before the resync so the
+	// resync compares — and writes — all four sources, not two.
+	emailEnabled, smsEnabled, err := h.readEmailSmsEnabled(ctx, userID)
+	if err != nil {
+		h.failMFAStatus(c, "email_sms", err)
+		return
+	}
+	actual := mfaFactorState{totp: totpActive, webauthn: webauthnCount > 0, email: emailEnabled, sms: smsEnabled}
+	if err := h.resyncStaleMFAFlags(ctx, userID, &flags, actual); err != nil {
+		h.failMFAStatus(c, "flags_resync", err)
+		return
+	}
+
+	result["mfa_enabled"] = flags.enabled
+	result["methods"] = flags.methods
+	result["recovery_only_methods"] = flags.recoveryOnly
+	result["recovery_hardened"] = flags.recoveryHardened
+	if flags.backupEmail.Valid {
+		result["backup_email"] = flags.backupEmail.String
+	} else {
+		result["backup_email"] = ""
+	}
+	result["email_mfa_enabled"] = emailEnabled
+	result["sms_mfa_enabled"] = smsEnabled
+
+	c.JSON(http.StatusOK, result)
+}
+
+// failMFAStatus answers an MFA status read failure. stage is a fixed
+// identifier naming the read that broke; the cause is logged and never
+// serialized.
+func (h *Handler) failMFAStatus(c *gin.Context, stage string, err error) {
+	h.log.Error(errMsgFailedLoadMFAStatus, "stage", stage, "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedLoadMFAStatus})
+}
+
+// mfaFactorState is what the four factor sources say right now.
+type mfaFactorState struct {
+	totp, webauthn, email, sms bool
+}
+
+// agrees reports whether the denormalized methods list every factor that is
+// on and none that is off.
+func (s mfaFactorState) agrees(methods []string) bool {
+	return s.totp == containsStr(methods, "totp") &&
+		s.webauthn == containsStr(methods, "webauthn") &&
+		s.email == containsStr(methods, "email") &&
+		s.sms == containsStr(methods, "sms")
+}
+
+// addTOTPStatus fills GetStatus's TOTP fields and reports whether TOTP is
+// active (enabled AND confirmed). No row is the ordinary not-enrolled state;
+// any other read error is returned rather than served as "not enrolled".
+func (h *Handler) addTOTPStatus(ctx context.Context, userID string, result gin.H) (bool, error) {
 	var totpEnabled, totpConfirmed bool
 	var backupUsed []bool
 	var backupHashes []string
 	err := h.db.QueryRowContext(ctx, `SELECT enabled, confirmed, backup_codes_hash, backup_codes_used FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
 	).Scan(&totpEnabled, &totpConfirmed, pq.Array(&backupHashes), pq.Array(&backupUsed))
-	if err == nil {
-		result["totp_enabled"] = totpEnabled
-		result["totp_confirmed"] = totpConfirmed
-		remaining := 0
-		for i, used := range backupUsed {
-			if !used && i < len(backupHashes) {
-				remaining++
-			}
-		}
-		result["backup_codes_remaining"] = remaining
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
-
-	// WebAuthn credential count
-	var webauthnCount int
-	_ = h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_mfa_webauthn WHERE user_id = $1`, userID).Scan(&webauthnCount)
-	result["webauthn_credentials"] = webauthnCount
-
-	// Overall — read denormalized flags, then self-heal if stale
-	var methods, recoveryOnly []string
-	var mfaEnabled, recoveryHardened bool
-	var backupEmail sql.NullString
-	_ = h.db.QueryRowContext(ctx, `SELECT mfa_enabled, mfa_methods, recovery_only_methods, recovery_hardened, backup_email FROM users WHERE id = $1`, userID).Scan(&mfaEnabled, pq.Array(&methods), pq.Array(&recoveryOnly), &recoveryHardened, &backupEmail)
-
-	// Self-heal: if denormalized flags disagree with actual table data, resync
-	actualTOTP := totpEnabled && totpConfirmed
-	actualWebAuthn := webauthnCount > 0
-	denormTOTP := containsStr(methods, "totp")
-	denormWebAuthn := containsStr(methods, "webauthn")
-	if actualTOTP != denormTOTP || actualWebAuthn != denormWebAuthn {
-		h.log.Warn("MFA flags out of sync, resyncing", "user_id", userID,
-			"actual_totp", actualTOTP, "denorm_totp", denormTOTP,
-			"actual_webauthn", actualWebAuthn, "denorm_webauthn", denormWebAuthn)
-		if syncErr := h.updateUserMFAFlags(ctx, userID); syncErr != nil {
-			h.log.Error("Failed to resync MFA flags", "user_id", userID, "error", syncErr)
-		} else {
-			// Re-read after sync
-			_ = h.db.QueryRowContext(ctx, `SELECT mfa_enabled, mfa_methods FROM users WHERE id = $1`, userID).Scan(&mfaEnabled, pq.Array(&methods))
+	if err != nil {
+		return false, fmt.Errorf("read TOTP status: %w", err)
+	}
+	result["totp_enabled"] = totpEnabled
+	result["totp_confirmed"] = totpConfirmed
+	remaining := 0
+	for i, used := range backupUsed {
+		if !used && i < len(backupHashes) {
+			remaining++
 		}
 	}
+	result["backup_codes_remaining"] = remaining
+	return totpEnabled && totpConfirmed, nil
+}
 
-	result["mfa_enabled"] = mfaEnabled
-	result["methods"] = methods
-	result["recovery_only_methods"] = recoveryOnly
-	result["recovery_hardened"] = recoveryHardened
-	if backupEmail.Valid {
-		result["backup_email"] = backupEmail.String
-	} else {
-		result["backup_email"] = ""
+// mfaUserFlags is the users-row half of GetStatus.
+type mfaUserFlags struct {
+	enabled          bool
+	methods          []string
+	recoveryOnly     []string
+	recoveryHardened bool
+	backupEmail      sql.NullString
+}
+
+// readMFAUserFlags reads the denormalized MFA flags. sql.ErrNoRows stays
+// matchable through the wrap.
+func (h *Handler) readMFAUserFlags(ctx context.Context, userID string) (mfaUserFlags, error) {
+	var f mfaUserFlags
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT mfa_enabled, mfa_methods, recovery_only_methods, recovery_hardened, backup_email FROM users WHERE id = $1`, userID,
+	).Scan(&f.enabled, pq.Array(&f.methods), pq.Array(&f.recoveryOnly), &f.recoveryHardened, &f.backupEmail); err != nil {
+		return mfaUserFlags{}, fmt.Errorf("read MFA flags: %w", err)
 	}
+	return f, nil
+}
 
-	// Email/SMS MFA status (stored in Redis)
-	emailEnabled := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabledEmail, userID)).Val() > 0
-	smsEnabled := h.redis.Exists(ctx, fmt.Sprintf("mfa_emailsms_enabled:%s:sms", userID)).Val() > 0
-	result["email_mfa_enabled"] = emailEnabled
-	result["sms_mfa_enabled"] = smsEnabled
-
-	c.JSON(http.StatusOK, result)
+// resyncStaleMFAFlags self-heals the denormalized flags when they disagree
+// with any of the four factor sources — including email/SMS, which a commit
+// failing after EmailSmsDisable's Redis delete can leave listed — then
+// re-reads them into f. A failed resync is returned, never served as if the
+// flags were right: the caller answers 500 rather than showing a status the
+// server knows to be stale.
+func (h *Handler) resyncStaleMFAFlags(ctx context.Context, userID string, f *mfaUserFlags, actual mfaFactorState) error {
+	if actual.agrees(f.methods) {
+		return nil
+	}
+	h.log.Warn("MFA flags out of sync, resyncing", "user_id", userID,
+		"actual_totp", actual.totp, "actual_webauthn", actual.webauthn,
+		"actual_email", actual.email, "actual_sms", actual.sms)
+	es := emailSmsState{known: true, email: actual.email, sms: actual.sms}
+	if err := h.withMFAFactorWriteTx(ctx, userID, es, nil); err != nil {
+		return fmt.Errorf("resync MFA flags: %w", err)
+	}
+	if err := h.db.QueryRowContext(ctx, `SELECT mfa_enabled, mfa_methods FROM users WHERE id = $1`, userID).
+		Scan(&f.enabled, pq.Array(&f.methods)); err != nil {
+		return fmt.Errorf("re-read MFA flags after resync: %w", err)
+	}
+	return nil
 }
 
 // TOTPSetup initiates TOTP enrollment. Requires password confirmation (and MFA if already active).
@@ -602,15 +829,14 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var req struct {
-		Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode  string `json:"mfa_code"`
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgPasswordRequired})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, totpSetupStepUpCopy); !ok {
 		return
 	}
 
@@ -645,34 +871,34 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 		return
 	}
 
-	// Upsert (replace pending setup or insert new)
-
-	_, err = h.db.ExecContext(ctx, `
-		INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed)
-		VALUES ($1, $2, $3, $4, FALSE, FALSE)
-		ON CONFLICT (user_id) DO UPDATE SET
-			totp_secret_enc = EXCLUDED.totp_secret_enc,
-			totp_secret_nonce = EXCLUDED.totp_secret_nonce,
-			key_version = EXCLUDED.key_version,
-			enabled = FALSE,
-			confirmed = FALSE,
-			verified_at = NULL,
-			confirmed_at = NULL,
-			backup_codes_hash = '{}',
-			backup_codes_used = '{}',
-			updated_at = NOW()
-	`, userID, ciphertext, nonce, keyVer)
-	if err != nil {
-		h.log.Error("Failed to store TOTP secret", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store MFA secret"})
+	// Upsert (replace pending setup or insert new) and sync the flags in one
+	// transaction: re-enrolling resets enabled/confirmed to FALSE, so the old
+	// "totp" entry must leave the flags in the same commit, never after it.
+	es := h.readEmailSmsForSync(ctx, userID)
+	if err := h.withMFAFactorWriteTx(ctx, userID, es, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed)
+			VALUES ($1, $2, $3, $4, FALSE, FALSE)
+			ON CONFLICT (user_id) DO UPDATE SET
+				totp_secret_enc = EXCLUDED.totp_secret_enc,
+				totp_secret_nonce = EXCLUDED.totp_secret_nonce,
+				key_version = EXCLUDED.key_version,
+				enabled = FALSE,
+				confirmed = FALSE,
+				verified_at = NULL,
+				confirmed_at = NULL,
+				backup_codes_hash = '{}',
+				backup_codes_used = '{}',
+				updated_at = NOW()
+		`, userID, ciphertext, nonce, keyVer); err != nil {
+			return fmt.Errorf("store TOTP secret: %w", err)
+		}
+		return nil
+	}); err != nil {
+		h.failMFAFactorWrite(c, "Failed to store TOTP secret", "Failed to store MFA secret", err)
 		return
 	}
-
-	// Sync user flags — if re-enrolling, the upsert reset enabled/confirmed
-	// to FALSE so mfa_enabled must be cleared until the new setup completes.
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		h.log.Error("Failed to sync MFA flags after TOTP re-enrollment", "error", err)
-	}
+	h.clearStepUpAfterSuccess(c, userID)
 
 	// The secret was replaced, so a session that verified the previous one must
 	// not match at confirm-setup for this one. Stop if the record survives: the
@@ -791,65 +1017,93 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	})
 }
 
+// TOTP confirm-setup refusals, carried out of the write transaction so it
+// rolls back before the handler answers.
+var (
+	errTOTPSetupNotStarted  = errors.New("no TOTP setup in progress")
+	errTOTPSetupNotVerified = errors.New("TOTP code not yet verified")
+)
+
 // TOTPConfirmSetup activates MFA after the user confirms they saved their backup codes.
 func (h *Handler) TOTPConfirmSetup(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
 
-	// Verify TOTP is enabled (code verified) but not yet confirmed
-	var enabled, confirmed bool
-
-	err := h.db.QueryRowContext(ctx,
-		`SELECT enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`, userID,
-	).Scan(&enabled, &confirmed)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No TOTP setup in progress"})
-		return
-	}
-	if !enabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "TOTP code not yet verified. Complete verify-setup first."})
-		return
-	}
-	if confirmed && h.totpAlreadyActive(c, userID) {
-		return
-	}
-
+	// The confirmation and the flag write commit together (B1). On the
+	// already-confirmed path nothing is confirmed, but the flags are still
+	// recomputed and committed: a confirm whose flag write was lost before B1
+	// left a live TOTP factor that login never challenged, and this retry is
+	// how that account heals. Only a row whose flags already list TOTP is a
+	// completed activation (409); the healing retry answers 200 and grants as
+	// a first confirm would.
+	es := h.readEmailSmsForSync(ctx, userID)
 	firstActivation := h.mfaNeverEnabled(ctx, userID)
-
-	// Activate MFA. A retry that is finishing an earlier activation finds the
-	// row already confirmed and goes straight to the flags write.
-	if !confirmed {
-		_, err = h.db.ExecContext(ctx, `
-			UPDATE user_mfa_totp SET confirmed = TRUE, confirmed_at = NOW(), updated_at = NOW() WHERE user_id = $1
-		`, userID)
-		if err != nil {
-			h.log.Error("Failed to confirm TOTP setup", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
-			return
+	alreadyActive := false
+	err := h.withMFAFactorWriteTx(ctx, userID, es, func(tx *sql.Tx) error {
+		var enabled, confirmed bool
+		err := tx.QueryRowContext(ctx,
+			`SELECT enabled, confirmed FROM user_mfa_totp WHERE user_id = $1 FOR UPDATE`, userID,
+		).Scan(&enabled, &confirmed)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return errTOTPSetupNotStarted
+		case err != nil:
+			return fmt.Errorf("read TOTP setup state: %w", err)
+		case !enabled:
+			return errTOTPSetupNotVerified
+		case confirmed:
+			// The users row is locked, so these are the flags this commit replaces.
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COALESCE('totp' = ANY(mfa_methods), FALSE) FROM users WHERE id = $1`, userID,
+			).Scan(&alreadyActive); err != nil {
+				return fmt.Errorf("read TOTP activation state: %w", err)
+			}
+			return nil
 		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE user_mfa_totp SET confirmed = TRUE, confirmed_at = NOW(), updated_at = NOW() WHERE user_id = $1
+		`, userID); err != nil {
+			return fmt.Errorf("confirm TOTP setup: %w", err)
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errTOTPSetupNotStarted):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No TOTP setup in progress"})
+	case errors.Is(err, errTOTPSetupNotVerified):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "TOTP code not yet verified. Complete verify-setup first."})
+	case err != nil:
+		h.failMFAFactorWrite(c, "Failed to confirm TOTP setup", errMsgFailedActivateMFA, err)
+	case alreadyActive:
+		c.JSON(http.StatusConflict, gin.H{"error": "TOTP MFA is already active"})
+	default:
+		h.grantTOTPEnrollmentUpgrade(c, userID, firstActivation)
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled, AuthMethod: securityevent.AuthTOTP})
+		c.JSON(http.StatusOK, gin.H{"message": "MFA is now active"})
 	}
+}
 
-	// Fatal on this enable path, as in activateEmailSmsMethods: login and the
-	// pre-MFA session lock read these flags, so telling the user MFA is on
-	// while they are unset leaves both unenforced. GetStatus re-syncs them.
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		h.log.Error("Failed to update user MFA flags", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
-		return
-	}
-
-	// A missing or unreadable record matches no session, so it keeps the challenge.
-	provedBy, getErr := h.redis.GetDel(ctx, fmt.Sprintf(redisKeyTOTPSetupSession, userID)).Result()
-	if getErr != nil && !errors.Is(getErr, redis.Nil) {
-		h.log.Error("Failed to read the TOTP setup session", "error", getErr)
+// grantTOTPEnrollmentUpgrade exempts the session that verified the new secret,
+// and only on a first activation. confirm-setup takes no code, so verify-setup
+// recorded which session proved it; a missing or unreadable record matches no
+// session, so it keeps the challenge. The record is consumed either way.
+func (h *Handler) grantTOTPEnrollmentUpgrade(c *gin.Context, userID string, firstActivation bool) {
+	ctx := c.Request.Context()
+	provedBy, err := h.redis.GetDel(ctx, fmt.Sprintf(redisKeyTOTPSetupSession, userID)).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		h.log.Error("Failed to read the TOTP setup session", "error", err)
 	}
 	sid := middleware.TokenSessionID(c)
 	if firstActivation && sid != "" && subtle.ConstantTimeCompare([]byte(sid), []byte(provedBy)) == 1 {
 		h.grantEnrollmentUpgrade(ctx, userID, sid)
 	}
+}
 
-	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled, AuthMethod: securityevent.AuthTOTP})
-	c.JSON(http.StatusOK, gin.H{"message": "MFA is now active"})
+// totpDisableRequest is TOTPDisable's body. Its bodies predate the step-up
+// seam and are unchanged; only the transaction around them is new.
+type totpDisableRequest struct {
+	Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
+	Code     string `json:"code" binding:"required"`
 }
 
 // recordFailedSetupAttempt counts a wrong verify-setup code and locks setup
@@ -881,92 +1135,105 @@ func (h *Handler) recordFailedSetupAttempt(ctx context.Context, userID, lockoutK
 	}
 }
 
-// totpAlreadyActive answers confirm-setup for a row that is already confirmed,
-// and reports whether it did. confirm-setup commits confirmed = TRUE before it
-// writes the account flags, so a retry after that write failed finds the row
-// confirmed while mfa_methods lacks TOTP. That retry must finish the
-// activation; only a completed one is a 409.
-func (h *Handler) totpAlreadyActive(c *gin.Context, userID string) bool {
-	var active bool
-	err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT COALESCE('totp' = ANY(mfa_methods), FALSE) FROM users WHERE id = $1`, userID,
-	).Scan(&active)
-	switch {
-	case err != nil:
-		h.log.Error("Failed to read the TOTP activation state", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
-		return true
-	case active:
-		c.JSON(http.StatusConflict, gin.H{"error": "TOTP MFA is already active"})
-		return true
-	}
-	return false
-}
-
 // TOTPDisable disables TOTP MFA. Requires password + a valid MFA code.
+//
+// Everything runs in ONE transaction that takes the users row FOR NO KEY
+// UPDATE first (it writes the flags): the password and code are checked under
+// that lock, the code on the transaction so a rollback cannot burn a backup
+// code, the delete and the flags commit together (B1), and D1 is checked
+// before the commit.
 func (h *Handler) TOTPDisable(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
 
-	var req struct {
-		Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		Code     string `json:"code" binding:"required"`
-	}
+	var req totpDisableRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password and MFA code are required"})
 		return
 	}
 
-	// Check if TOTP is actually enrolled before proceeding
-	var totpExists bool
-	err := h.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM user_mfa_totp WHERE user_id = $1)`, userID).Scan(&totpExists)
-	if err != nil || !totpExists {
-		// Row is gone but mfa_methods may still list 'totp' — clean up the denormalized flags
-		if syncErr := h.updateUserMFAFlags(ctx, userID); syncErr != nil {
-			h.log.Error("Failed to sync MFA flags after missing TOTP row", "error", syncErr)
-		}
-		c.JSON(http.StatusOK, gin.H{"message": "TOTP MFA has been disabled"})
+	es := h.readEmailSmsForSync(ctx, userID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin TOTP disable transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
+		return
+	}
+	defer h.rollbackQuietly(tx)
+	subj, e := stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForNoKeyUpdate, middleware.TokenCredentialEpoch(c))
+	if e != nil {
+		h.refuseMFASettingsStepUp(c, e, subjectStage(e))
 		return
 	}
 
-	// Verify password
-	match, err := h.verifyUserPassword(ctx, userID, req.Password)
-	if err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
+	// Check if TOTP is actually enrolled before proceeding. A read error is a
+	// 500, never "not enrolled" (which answered 200 on a fault).
+	var totpExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM user_mfa_totp WHERE user_id = $1)`, userID).Scan(&totpExists); err != nil {
+		h.log.Error("Failed to read TOTP enrollment", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
 		return
+	}
+	// Row gone but mfa_methods may still list 'totp': the sync below cleans
+	// the denormalized flags either way.
+	if totpExists && !h.verifyAndDeleteTOTPTx(c, tx, userID, subj, req, es) {
+		return
+	}
+	if err := syncMFAFlagsTx(ctx, tx, userID, es); err != nil {
+		h.log.Error("Failed to sync MFA flags after TOTP disable", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit TOTP disable", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
+		return
+	}
+
+	if totpExists {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled, AuthMethod: securityevent.AuthTOTP})
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "TOTP MFA has been disabled"})
+}
+
+// verifyAndDeleteTOTPTx is TOTPDisable's verified delete, on the caller's
+// locked transaction. On refusal or failure it has written the response and
+// returns false; the caller's deferred rollback undoes the delete.
+func (h *Handler) verifyAndDeleteTOTPTx(c *gin.Context, tx *sql.Tx, userID string, subj stepup.Subject, req totpDisableRequest, es emailSmsState) bool {
+	ctx := c.Request.Context()
+
+	match, err := auth.VerifyPassword(req.Password, subj.PasswordHash)
+	if err != nil {
+		// Never log err: an argon2 decode failure can embed the hash
+		// ([internal]rules/observability.md Core principle #1).
+		h.log.Error("Password verification failed during TOTP disable", "error", stepup.ErrPasswordVerification)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": stepup.ErrMsgVerificationFailed})
+		return false
 	}
 	if !match {
 		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword})
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
-		return
+		c.JSON(http.StatusForbidden, gin.H{"error": stepup.ErrMsgInvalidPassword})
+		return false
 	}
 
-	// Verify MFA code
-	valid, err := h.VerifyCode(ctx, userID, req.Code)
+	valid, err := h.VerifyCodeTx(ctx, tx, userID, req.Code)
 	if err != nil {
 		h.log.Error("MFA code verification error during TOTP disable", "user_id", userID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "MFA verification failed because of a server error. Contact support if this continues."})
-		return
+		return false
 	}
 	if !valid {
 		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid})
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code. Make sure the code hasn't expired."})
-		return
+		c.JSON(http.StatusForbidden, gin.H{"error": stepup.ErrMsgInvalidMFACode})
+		return false
 	}
 
-	// Delete TOTP enrollment
-	if _, err := h.db.ExecContext(ctx, `DELETE FROM user_mfa_totp WHERE user_id = $1`, userID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_mfa_totp WHERE user_id = $1`, userID); err != nil {
 		h.log.Error("Failed to disable TOTP MFA", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disable MFA"})
-		return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
+		return false
 	}
-
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		h.log.Error("Failed to update user MFA flags after TOTP disable", "error", err)
-	}
-
-	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled, AuthMethod: securityevent.AuthTOTP})
-	c.JSON(http.StatusOK, gin.H{"message": "TOTP MFA has been disabled"})
+	return !h.refuseLastInlineFactorTx(c, tx, userID, es, errMsgFailedDisableMFA)
 }
 
 // RegenerateBackupCodes generates new backup codes. Requires password + TOTP code.
@@ -1045,17 +1312,16 @@ func (h *Handler) WebAuthnRegisterBegin(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var req struct {
-		Password       string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode        string `json:"mfa_code"`
+		mfaStepUpCredentials
 		CredentialName string `json:"credential_name"`
 		CredentialType string `json:"credential_type"` // "hardware" or "platform"
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgPasswordRequired})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, webAuthnRegisterStepUpCopy); !ok {
 		return
 	}
 
@@ -1124,6 +1390,7 @@ func (h *Handler) WebAuthnRegisterBegin(c *gin.Context) {
 	metaJSON, _ := json.Marshal(meta)
 	h.redis.Set(ctx, fmt.Sprintf(redisKeyWebAuthnReg, userID), metaJSON, 5*time.Minute)
 
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, creation)
 }
 
@@ -1177,28 +1444,20 @@ func (h *Handler) WebAuthnRegisterFinish(c *gin.Context) {
 		transports = append(transports, string(t))
 	}
 
-	_, err = h.db.ExecContext(ctx, `
-		INSERT INTO user_mfa_webauthn (user_id, credential_id, public_key, aaguid, sign_count, credential_name, credential_type, transports)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, userID, credential.ID, credential.PublicKey, credential.Authenticator.AAGUID,
-		credential.Authenticator.SignCount, meta.CredentialName, meta.CredentialType, pq.Array(transports))
-	if err != nil {
-		h.log.Error("Failed to store WebAuthn credential", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store credential"})
-		return
-	}
-
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		// Fatal for the same reason as TOTPConfirmSetup's flag write. Take the
-		// credential back out, so a retry registers the key again rather than
-		// adding a second one beside a key login does not know MFA is on for.
-		h.log.Error("Failed to update user MFA flags after WebAuthn register", "error", err)
-		if _, delErr := h.db.ExecContext(ctx,
-			`DELETE FROM user_mfa_webauthn WHERE user_id = $1 AND credential_id = $2`, userID, credential.ID,
-		); delErr != nil {
-			h.log.Error("Failed to remove the unactivated WebAuthn credential", "user_id", userID, "error", delErr)
+	// The credential and the flags commit together (B1): a key that is stored
+	// but not listed is never challenged at login.
+	es := h.readEmailSmsForSync(ctx, userID)
+	if err := h.withMFAFactorWriteTx(ctx, userID, es, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO user_mfa_webauthn (user_id, credential_id, public_key, aaguid, sign_count, credential_name, credential_type, transports)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, userID, credential.ID, credential.PublicKey, credential.Authenticator.AAGUID,
+			credential.Authenticator.SignCount, meta.CredentialName, meta.CredentialType, pq.Array(transports)); err != nil {
+			return fmt.Errorf("store WebAuthn credential: %w", err)
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
+		return nil
+	}); err != nil {
+		h.failMFAFactorWrite(c, "Failed to store WebAuthn credential", "Failed to store credential", err)
 		return
 	}
 	// The proof is the attestation this request just verified, so the session
@@ -1274,31 +1533,33 @@ func (h *Handler) WebAuthnDeleteCredential(c *gin.Context) {
 		return
 	}
 
-	match, err := h.verifyUserPassword(ctx, userID, req.Password)
+	// One transaction, users row locked FOR NO KEY UPDATE first (it writes the
+	// flags): password under the lock, delete, D1, flags, commit (B1).
+	es := h.readEmailSmsForSync(ctx, userID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
+		h.log.Error("Failed to begin WebAuthn delete transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
 		return
 	}
-	if !match {
-		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword})
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
+	defer h.rollbackQuietly(tx)
+	subj, e := stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForNoKeyUpdate, middleware.TokenCredentialEpoch(c))
+	if e != nil {
+		h.refuseMFASettingsStepUp(c, e, subjectStage(e))
 		return
 	}
-
-	result, err := h.db.ExecContext(ctx,
-		`DELETE FROM user_mfa_webauthn WHERE id = $1 AND user_id = $2`, credentialID, userID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete credential"})
+	if !h.verifyAndDeleteWebAuthnTx(c, tx, userID, credentialID, subj, req.Password, es) {
 		return
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
+	if err := syncMFAFlagsTx(ctx, tx, userID, es); err != nil {
+		h.log.Error("Failed to sync MFA flags after WebAuthn delete", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
 		return
 	}
-
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		h.log.Error("Failed to update user MFA flags after WebAuthn delete", "error", err)
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit WebAuthn delete", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
+		return
 	}
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled, AuthMethod: securityevent.AuthWebAuthn})
 
@@ -1329,6 +1590,47 @@ func (h *Handler) WebAuthnDeleteCredential(c *gin.Context) {
 	})
 }
 
+// verifyAndDeleteWebAuthnTx is WebAuthnDeleteCredential's verified delete, on
+// the caller's locked transaction. On refusal or failure it has written the
+// response and returns false; the caller's deferred rollback undoes the delete.
+func (h *Handler) verifyAndDeleteWebAuthnTx(
+	c *gin.Context, tx *sql.Tx, userID, credentialID string, subj stepup.Subject, password string, es emailSmsState,
+) bool {
+	ctx := c.Request.Context()
+
+	match, err := auth.VerifyPassword(password, subj.PasswordHash)
+	if err != nil {
+		// Never log err: an argon2 decode failure can embed the hash.
+		h.log.Error("Password verification failed during WebAuthn delete", "error", stepup.ErrPasswordVerification)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": stepup.ErrMsgVerificationFailed})
+		return false
+	}
+	if !match {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword})
+		c.JSON(http.StatusForbidden, gin.H{"error": stepup.ErrMsgInvalidPassword})
+		return false
+	}
+
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM user_mfa_webauthn WHERE id = $1 AND user_id = $2`, credentialID, userID)
+	if err != nil {
+		h.log.Error("Failed to delete WebAuthn credential", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
+		return false
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read WebAuthn delete count", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
+		return false
+	}
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
+		return false
+	}
+	return !h.refuseLastInlineFactorTx(c, tx, userID, es, errMsgFailedDeleteCredential)
+}
+
 // ── Shared MFA Verify (Unauthenticated — uses challenge token) ──────────────
 
 // verifyRequest holds the parsed MFA verify request body.
@@ -1344,7 +1646,7 @@ type verifyRequest struct {
 func (h *Handler) Verify(c *gin.Context) {
 	var req verifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
@@ -1923,16 +2225,15 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var req struct {
-		Methods  []string `json:"methods"`                     // e.g. ["email", "sms"] or [] to clear
-		Password string   `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode  string   `json:"mfa_code"`
+		Methods []string `json:"methods"` // e.g. ["email", "sms"] or [] to clear
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgPasswordRequired})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, recoveryOnlyStepUpCopy); !ok {
 		return
 	}
 
@@ -1977,6 +2278,7 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 	var recoveryHardened bool
 	_ = h.db.QueryRowContext(ctx, `SELECT recovery_hardened FROM users WHERE id = $1`, userID).Scan(&recoveryHardened)
 
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{
 		"recovery_only_methods": validRecoveryOnly,
 		"recovery_hardened":     recoveryHardened,
@@ -1991,16 +2293,15 @@ func (h *Handler) SetRecoveryHardened(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var req struct {
-		Enabled  bool   `json:"enabled"`
-		Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode  string `json:"mfa_code"`
+		Enabled bool `json:"enabled"`
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgPasswordRequired})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, recoveryHardenedStepUpCopy); !ok {
 		return
 	}
 
@@ -2014,6 +2315,7 @@ func (h *Handler) SetRecoveryHardened(c *gin.Context) {
 		return
 	}
 
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{
 		"recovery_hardened": req.Enabled,
 	})
@@ -2098,12 +2400,11 @@ func (h *Handler) EmailSmsSetup(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var req struct {
-		Password string   `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode  string   `json:"mfa_code"`
-		Methods  []string `json:"methods" binding:"required"` // ["email"], ["sms"], or ["email", "sms"]
+		mfaStepUpCredentials
+		Methods []string `json:"methods" binding:"required"` // ["email"], ["sms"], or ["email", "sms"]
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "password and methods are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "methods are required"})
 		return
 	}
 
@@ -2112,11 +2413,14 @@ func (h *Handler) EmailSmsSetup(c *gin.Context) {
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	subj, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, emailSmsSetupStepUpCopy)
+	if !ok {
 		return
 	}
 
-	if !h.IsEnabled(ctx, userID) {
+	// The step-up's own P1 read answers "is there a Standard factor?" — the
+	// same predicate, already read, with no second lookup to fail open.
+	if !subj.MFAEnabled {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Enable a Standard or higher MFA method first"})
 		return
 	}
@@ -2144,6 +2448,7 @@ func (h *Handler) EmailSmsSetup(c *gin.Context) {
 		return
 	}
 
+	h.clearStepUpAfterSuccess(c, userID)
 	resp := gin.H{
 		"message":    "Verification codes sent",
 		"methods":    req.Methods,
@@ -2229,7 +2534,7 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 		// holding a still-valid JWT — AuthRequired's live check is Redis-only),
 		// so it is a 401, not a 5xx. Still fail closed: the request is refused.
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Session no longer valid"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": stepup.ErrMsgSessionNoLongerValid})
 			return
 		}
 		h.log.Error("Failed to read recovery_hardened for MFA verify", "error", err)
@@ -2269,8 +2574,8 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 //
 // go-redis returns *StatusCmd/*IntCmd rather than an error, so errcheck is
 // structurally blind here: a dropped Set would leave the method inactive while
-// the handler still answered 200, and updateUserMFAFlags — which reads this
-// exact key back to derive mfa_methods — could then write mfa_enabled = FALSE.
+// the handler still answered 200, and the flag sync — which reads this exact
+// key back to derive mfa_methods — could then write mfa_enabled = FALSE.
 //
 // Two-phase: activate every method and commit the durable flags BEFORE deleting
 // any pending setup code. A Del is irreversible, so deleting mid-loop makes a
@@ -2280,11 +2585,12 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 // removed, answering "No pending email code". Found by CodeRabbit + Codex on
 // PR #2654.
 //
-// The flag write is fatal on this ENABLE path only: mfa_enabled_at is
-// load-bearing (pre-existing sessions are challenged based on it), so a failed
-// write would leave those sessions silently never challenged while the user is
-// told MFA is on. EmailSmsDisable deliberately keeps log-and-continue — a failed
-// write there leaves MFA ON, which is already fail-closed.
+// The flag write is fatal: mfa_enabled_at is load-bearing (pre-existing
+// sessions are challenged based on it), so a failed write would leave those
+// sessions silently never challenged while the user is told MFA is on. The
+// state is re-read after the Sets; if that read fails, the just-activated
+// methods are still known to be on and are written, and the row's other
+// email/SMS entries are carried forward.
 //
 // This request checked the code, so the session activating the method is the
 // one that proved it, and a first activation exempts that session as TOTP and
@@ -2298,7 +2604,8 @@ func (h *Handler) activateEmailSmsMethods(ctx context.Context, userID, sessionID
 		}
 	}
 
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
+	es := h.readEmailSmsForSync(ctx, userID).withKnownOn(verified)
+	if err := h.withMFAFactorWriteTx(ctx, userID, es, nil); err != nil {
 		h.log.Error("Failed to update MFA flags after email/sms enable", "error", err)
 		return err
 	}
@@ -2319,46 +2626,150 @@ func (h *Handler) activateEmailSmsMethods(ctx context.Context, userID, sessionID
 	return nil
 }
 
-// EmailSmsDisable removes email and/or SMS MFA methods.
+// settingsStepUpCopy builds a route's refusal copy. NoFactors is reachable
+// only if a password hash is ever empty (see internal/stepup); prompt is what
+// a request that sent no password is told, and must be honest to a renderer
+// that shows it verbatim.
+func settingsStepUpCopy(action, prompt string) stepup.Copy {
+	return stepup.Copy{
+		NoFactors:          action + " requires proving your identity, but this account has no password and no MFA method.",
+		CredentialRequired: prompt,
+	}
+}
+
+// Per-route refusal copy for the MFA-settings step-up gate (settings_stepup.go).
+// A renderer that predates the in-transaction gate never asks for a password,
+// so the two of its routes it still drives carry an update hint. The nine
+// pool-side routes always required a password, so an old renderer already
+// sends one and their copy needs no hint.
+var (
+	emailSmsDisableStepUpCopy = settingsStepUpCopy("Turning off email verification",
+		"Enter your password to turn off email verification. If you aren't asked for it, update Concord Voice.")
+	backupEmailStepUpCopy = settingsStepUpCopy("Changing your backup email",
+		"Enter your password to change your backup email. If you aren't asked for it, update Concord Voice.")
+	recoveryKeyReplaceStepUpCopy = settingsStepUpCopy("Replacing your recovery key",
+		"Enter your password to replace your recovery key.")
+	recoveryKeyRemoveStepUpCopy = settingsStepUpCopy("Removing your recovery key",
+		"Enter your password to remove your recovery key.")
+
+	totpSetupStepUpCopy = settingsStepUpCopy("Setting up an authenticator app",
+		"Enter your password to set up an authenticator app.")
+	webAuthnRegisterStepUpCopy = settingsStepUpCopy("Adding a security key",
+		"Enter your password to add a security key.")
+	recoveryOnlyStepUpCopy = settingsStepUpCopy("Changing your recovery-only methods",
+		"Enter your password to change which methods are for recovery only.")
+	recoveryHardenedStepUpCopy = settingsStepUpCopy("Changing hardened recovery",
+		"Enter your password to change hardened recovery.")
+	emailSmsSetupStepUpCopy = settingsStepUpCopy("Turning on email or text-message codes",
+		"Enter your password to turn on email or text-message codes.")
+	designateTrustedDeviceStepUpCopy = settingsStepUpCopy("Trusting this device for recovery",
+		"Enter your password to trust this device for account recovery.")
+	removeTrustedDeviceStepUpCopy = settingsStepUpCopy("Removing a trusted device",
+		"Enter your password to remove a trusted recovery device.")
+	upsertRecoveryCircleStepUpCopy = settingsStepUpCopy("Setting up your recovery circle",
+		"Enter your password to set up your recovery circle.")
+	deleteRecoveryCircleStepUpCopy = settingsStepUpCopy("Deleting your recovery circle",
+		"Enter your password to delete your recovery circle.")
+)
+
+// EmailSmsDisable removes email and/or SMS MFA methods. Turning off a factor is
+// gated by the in-transaction step-up (settings_stepup.go); the users row is
+// locked FOR NO KEY UPDATE because this transaction writes it.
 func (h *Handler) EmailSmsDisable(c *gin.Context) {
-
 	userID := c.GetString("user_id")
+	var creds mfaStepUpCredentials
+	if err := bindOptionalJSON(c, &creds); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
+		return
+	}
+	tx, subj, ok := h.openMFASettingsTx(c, userID, creds, lockForNoKeyUpdate)
+	if !ok {
+		return
+	}
+	defer h.rollbackQuietly(tx)
 	ctx := c.Request.Context()
-
-	// Remove every email/SMS state key in one Redis command so a transport
-	// failure cannot leave a partial disable reported as successful.
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, emailSmsDisableStepUpCopy); e != nil {
+		h.refuseMFASettingsStepUp(c, e, stage)
+		return
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET recovery_only_methods = array_remove(array_remove(recovery_only_methods, 'email'), 'sms') WHERE id = $1`,
+		userID,
+	); err != nil {
+		h.log.Error("Failed to clear email/SMS from recovery-only methods", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableEmailSms})
+		return
+	}
+	// The new state is known exactly — both off — and subj.MFAMethods is the
+	// inline set LockSubjectTx read under this transaction's lock, so the
+	// flags are written here, in the same transaction, with no Redis read.
+	if err := writeMFAFlagsTx(ctx, tx, userID, subj.MFAMethods, emailSmsState{known: true}); err != nil {
+		h.log.Error("Failed to write MFA flags for email/SMS disable", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableEmailSms})
+		return
+	}
+	// Redis last, while the lock is still held: on failure the deferred
+	// rollback undoes both users writes and nothing has changed. All four keys
+	// go in one command so a transport failure cannot leave a partial disable.
+	//
+	// This is NOT atomic across the two stores: a commit that fails AFTER the
+	// Del leaves email/SMS off in Redis while the row still lists them. That
+	// is the fail-closed direction (the flags over-report MFA, never
+	// under-report it), and GetStatus's resync compares email/SMS and repairs
+	// the row on the next status load.
+	if h.redis == nil {
+		h.log.Error("MFA state store is not configured")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MFA service temporarily unavailable"})
+		return
+	}
 	if err := h.redis.Del(ctx,
 		fmt.Sprintf(redisKeyEmailSmsEnabled, userID, "email"),
 		fmt.Sprintf(redisKeyEmailSmsEnabled, userID, "sms"),
 		fmt.Sprintf(redisKeyEmailSmsSetup, userID, "email"),
 		fmt.Sprintf(redisKeyEmailSmsSetup, userID, "sms"),
 	).Err(); err != nil {
-		h.log.Error("Failed to disable email/SMS MFA methods in Redis")
+		h.log.Error("Failed to disable email/SMS MFA methods in Redis", "error", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MFA service temporarily unavailable"})
 		return
 	}
-
-	// Also clear from recovery-only if present
-	_, _ = h.db.ExecContext(ctx,
-		`UPDATE users SET recovery_only_methods = array_remove(array_remove(recovery_only_methods, 'email'), 'sms') WHERE id = $1`,
-		userID,
-	)
-
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		h.log.Error("Failed to update MFA flags after email/sms disable", "error", err)
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit email/SMS disable", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableEmailSms})
+		return
 	}
+	h.clearStepUpAfterSuccess(c, userID)
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled})
-
 	c.JSON(http.StatusOK, gin.H{"message": "Email/SMS MFA methods disabled"})
+}
+
+// readEmailSmsEnabled reports the email and SMS MFA flags from Redis. A
+// transport error is returned rather than read as "disabled": reporting a
+// factor as off when the store could not be read tells the client something
+// the server does not know.
+func (h *Handler) readEmailSmsEnabled(ctx context.Context, userID string) (emailEnabled, smsEnabled bool, err error) {
+	if h.redis == nil {
+		return false, false, errors.New("MFA state store is not configured")
+	}
+	emailCount, err := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabledEmail, userID)).Result()
+	if err != nil {
+		return false, false, fmt.Errorf("read email MFA state: %w", err)
+	}
+	smsCount, err := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, "sms")).Result()
+	if err != nil {
+		return false, false, fmt.Errorf("read SMS MFA state: %w", err)
+	}
+	return emailCount > 0, smsCount > 0, nil
 }
 
 // EmailSmsStatus returns whether email/sms methods are enabled.
 func (h *Handler) EmailSmsStatus(c *gin.Context) {
 	userID := c.GetString("user_id")
-	ctx := c.Request.Context()
 
-	emailEnabled := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabledEmail, userID)).Val() > 0
-	smsEnabled := h.redis.Exists(ctx, fmt.Sprintf("mfa_emailsms_enabled:%s:sms", userID)).Val() > 0
+	emailEnabled, smsEnabled, err := h.readEmailSmsEnabled(c.Request.Context(), userID)
+	if err != nil {
+		h.failMFAStatus(c, "email_sms", err)
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"email_enabled": emailEnabled,
@@ -2372,9 +2783,19 @@ func (h *Handler) EmailSmsStatus(c *gin.Context) {
 func (h *Handler) GetBackupEmail(c *gin.Context) {
 	userID := c.GetString("user_id")
 	var backupEmail sql.NullString
-	_ = h.db.QueryRowContext(c.Request.Context(),
+	if err := h.db.QueryRowContext(c.Request.Context(),
 		`SELECT backup_email FROM users WHERE id = $1`, userID,
-	).Scan(&backupEmail)
+	).Scan(&backupEmail); err != nil {
+		// A missing users row is a deleted account holding a still-valid JWT
+		// (the EmailSmsVerify precedent): client-side, so 401, not 5xx.
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": stepup.ErrMsgSessionNoLongerValid})
+			return
+		}
+		h.log.Error("Failed to load backup email", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load backup email"})
+		return
+	}
 	email := ""
 	if backupEmail.Valid {
 		email = backupEmail.String
@@ -2382,37 +2803,56 @@ func (h *Handler) GetBackupEmail(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"backup_email": email})
 }
 
-// SetBackupEmail sets or clears the user's backup email for recovery.
+// SetBackupEmail sets or clears the user's backup email for recovery. Both are
+// gated by the in-transaction step-up (settings_stepup.go) on the requested
+// action; the users row is locked FOR NO KEY UPDATE because this transaction
+// writes it.
 func (h *Handler) SetBackupEmail(c *gin.Context) {
 	userID := c.GetString("user_id")
 	var req struct {
 		Email string `json:"email"`
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
-	// Basic email validation (or allow empty to clear)
+	// Basic email validation (or allow empty to clear). Shape errors are
+	// answered before the budget and the transaction, so they consume nothing.
 	if req.Email != "" && !isValidEmail(req.Email) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid email address"})
 		return
 	}
 
-	var val interface{}
-	if req.Email == "" {
-		val = nil
-	} else {
-		val = req.Email
-	}
-
-	_, err := h.db.ExecContext(c.Request.Context(),
-		`UPDATE users SET backup_email = $1 WHERE id = $2`, val, userID,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update backup email"})
+	tx, subj, ok := h.openMFASettingsTx(c, userID, req.mfaStepUpCredentials, lockForNoKeyUpdate)
+	if !ok {
 		return
 	}
+	defer h.rollbackQuietly(tx)
+	ctx := c.Request.Context()
+	// Gated on the requested action, set or clear alike; the prior value is
+	// never read.
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, req.mfaStepUpCredentials, backupEmailStepUpCopy); e != nil {
+		h.refuseMFASettingsStepUp(c, e, stage)
+		return
+	}
+
+	var val any
+	if req.Email != "" {
+		val = req.Email
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET backup_email = $1 WHERE id = $2`, val, userID); err != nil {
+		h.log.Error(errMsgFailedUpdateBackupEmail, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateBackupEmail})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit backup email change", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateBackupEmail})
+		return
+	}
+	h.clearStepUpAfterSuccess(c, userID)
 
 	c.JSON(http.StatusOK, gin.H{"backup_email": req.Email})
 }
@@ -2451,7 +2891,9 @@ func (h *Handler) ValidateRecoveryToken(tokenString string) (*auth.RecoveryClaim
 
 // ── Recovery Key Endpoints ──────────────────────────────────────────────────
 
-// StoreRecoveryKey stores or updates the user's recovery-wrapped private key.
+// StoreRecoveryKey stores the user's recovery-wrapped private key. A first store
+// is token-only; replacing an existing key requires the step-up (B1, see
+// storeRecoveryKey).
 func (h *Handler) StoreRecoveryKey(c *gin.Context) {
 	userID := c.GetString("user_id")
 
@@ -2460,6 +2902,7 @@ func (h *Handler) StoreRecoveryKey(c *gin.Context) {
 		RecoveryKeySalt           string `json:"recovery_key_salt" binding:"required"`
 		RecoveryWrappedPrefsKey   string `json:"recovery_wrapped_prefs_key"`
 		RecoveryPrefsKeySalt      string `json:"recovery_prefs_key_salt"`
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "recovery_wrapped_private_key and recovery_key_salt are required"})
@@ -2502,8 +2945,159 @@ func (h *Handler) StoreRecoveryKey(c *gin.Context) {
 		}
 	}
 
-	// UPSERT into user_recovery_keys
-	_, err = h.db.ExecContext(c.Request.Context(), `
+	h.storeRecoveryKey(c, userID, req.mfaStepUpCredentials, recoveryKeyMaterial{
+		wrappedKey:      wrappedKey,
+		keySalt:         keySalt,
+		wrappedPrefsKey: wrappedPrefsKey,
+		prefsKeySalt:    prefsKeySalt,
+	})
+}
+
+// recoveryKeyMaterial is the decoded body of PUT /mfa/recovery-key.
+type recoveryKeyMaterial struct {
+	wrappedKey, keySalt, wrappedPrefsKey, prefsKeySalt []byte
+}
+
+// storeRecoveryKey is StoreRecoveryKey's write half (B1). The users row is
+// locked FOR SHARE — this transaction never writes users — and the unique
+// index alone decides whether a key already exists, so there is no read of
+// absence to lose a race against. A first store (TOTP enrollment's automatic
+// upload) needs no credentials; an overwrite, which can do everything
+// DeleteRecoveryKey can, needs the same step-up. It always writes the response.
+func (h *Handler) storeRecoveryKey(c *gin.Context, userID string, creds mfaStepUpCredentials, m recoveryKeyMaterial) {
+	tx, subj, ok := h.openMFASettingsTx(c, userID, creds, lockForShare)
+	if !ok {
+		return
+	}
+	defer h.rollbackQuietly(tx)
+	ctx := c.Request.Context()
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO user_recovery_keys (user_id, recovery_wrapped_private_key, recovery_key_salt, recovery_wrapped_prefs_key, recovery_prefs_key_salt)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (user_id) DO NOTHING
+	`, userID, m.wrappedKey, m.keySalt, m.wrappedPrefsKey, m.prefsKeySalt)
+	if err != nil {
+		h.log.Error(errMsgFailedStoreRecoveryKey, "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreRecoveryKey})
+		return
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read recovery key insert count", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreRecoveryKey})
+		return
+	}
+	// Exactly one inserted row is the only token-only outcome; anything else
+	// takes the step-up, so an unexpected count fails toward more checking.
+	replacing := inserted != 1
+	if replacing && !creds.sent() && h.answerRepeatedFirstStoreTx(c, tx, userID, m) {
+		return
+	}
+	if replacing && !h.replaceRecoveryKeyTx(c, tx, userID, subj, creds, m) {
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit recovery key", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreRecoveryKey})
+		return
+	}
+	if replacing {
+		// Only a VERIFIED commit clears the budget. A first-time insert
+		// verified nothing, even when credentials were sent and charged.
+		h.clearStepUpAfterSuccess(c, userID)
+	}
+
+	h.log.Info(msgRecoveryKeyStored, "user_id", userID)
+	c.JSON(http.StatusOK, gin.H{"message": msgRecoveryKeyStored})
+}
+
+// answerRepeatedFirstStoreTx makes the token-only first store idempotent (F2).
+// A client whose first-store response was lost after the commit retries with
+// the SAME bytes and no credentials; without this, the retry met the existing
+// row, fell to the step-up, and was refused — and the client read that refusal
+// as "the key you are holding was kept", while it had in fact been stored.
+//
+// It reads the stored row FOR SHARE (lock order users → user_recovery_keys,
+// e2ee.md) and answers 200 — the existing success body, nothing written, the
+// budget untouched because nothing was verified — only when EVERY column is
+// byte-identical to the submission. Any difference, and a row that has
+// vanished since the insert conflicted, returns false so the caller takes the
+// ordinary step-up path. A read failure is a 500 and also returns true.
+//
+// What this grants a bearer without credentials: confirmation that bytes they
+// already hold equal the stored ciphertext, and nothing else. The stored row
+// is never returned, nothing is written, and matching requires the whole
+// wrapped key.
+func (h *Handler) answerRepeatedFirstStoreTx(c *gin.Context, tx *sql.Tx, userID string, m recoveryKeyMaterial) bool {
+	same, err := recoveryKeyMatchesTx(c.Request.Context(), tx, userID, m)
+	if err != nil {
+		h.log.Error("Failed to read the stored recovery key for comparison", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreRecoveryKey})
+		return true
+	}
+	if !same {
+		return false
+	}
+	h.log.Info("Recovery key store repeated an identical key", "user_id", userID)
+	c.JSON(http.StatusOK, gin.H{"message": msgRecoveryKeyStored})
+	return true
+}
+
+// recoveryKeyMatchesTx reports whether the stored recovery key is
+// byte-identical, column by column, to m. No row is (false, nil).
+func recoveryKeyMatchesTx(ctx context.Context, tx *sql.Tx, userID string, m recoveryKeyMaterial) (bool, error) {
+	var stored recoveryKeyMaterial
+	err := tx.QueryRowContext(ctx, `
+		SELECT recovery_wrapped_private_key, recovery_key_salt, recovery_wrapped_prefs_key, recovery_prefs_key_salt
+		FROM user_recovery_keys WHERE user_id = $1 FOR SHARE
+	`, userID).Scan(&stored.wrappedKey, &stored.keySalt, &stored.wrappedPrefsKey, &stored.prefsKeySalt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read stored recovery key: %w", err)
+	}
+	return stored.sameAs(m), nil
+}
+
+// sameAs compares every column in constant time for equal lengths, and
+// evaluates all four before answering so the result does not reveal which
+// column differed.
+func (m recoveryKeyMaterial) sameAs(o recoveryKeyMaterial) bool {
+	same := sameRecoveryColumn(m.wrappedKey, o.wrappedKey) &
+		sameRecoveryColumn(m.keySalt, o.keySalt) &
+		sameRecoveryColumn(m.wrappedPrefsKey, o.wrappedPrefsKey) &
+		sameRecoveryColumn(m.prefsKeySalt, o.prefsKeySalt)
+	return same == 1
+}
+
+// sameRecoveryColumn returns 1 when a and b are equal, else 0. NULL (a nil
+// slice, which is how both the driver scans a NULL bytea and the handler
+// represents an absent optional field) matches only NULL; an empty non-NULL
+// value never matches an absent one. A length difference is 0 before any byte
+// is compared.
+func sameRecoveryColumn(a, b []byte) int {
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return 0
+	}
+	return subtle.ConstantTimeCompare(a, b)
+}
+
+// replaceRecoveryKeyTx is B1's overwrite arm: a key already exists, so the
+// step-up must pass before anything is written. It is INSERT … DO UPDATE, not
+// a plain UPDATE, so a delete that commits between the insert above and this
+// statement still leaves the caller's key stored. On refusal or failure it has
+// written the response and returns false.
+func (h *Handler) replaceRecoveryKeyTx(
+	c *gin.Context, tx *sql.Tx, userID string, subj stepup.Subject, creds mfaStepUpCredentials, m recoveryKeyMaterial,
+) bool {
+	ctx := c.Request.Context()
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, recoveryKeyReplaceStepUpCopy); e != nil {
+		h.refuseMFASettingsStepUp(c, e, stage)
+		return false
+	}
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO user_recovery_keys (user_id, recovery_wrapped_private_key, recovery_key_salt, recovery_wrapped_prefs_key, recovery_prefs_key_salt)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (user_id) DO UPDATE SET
@@ -2512,15 +3106,12 @@ func (h *Handler) StoreRecoveryKey(c *gin.Context) {
 			recovery_wrapped_prefs_key = EXCLUDED.recovery_wrapped_prefs_key,
 			recovery_prefs_key_salt = EXCLUDED.recovery_prefs_key_salt,
 			updated_at = NOW()
-	`, userID, wrappedKey, keySalt, wrappedPrefsKey, prefsKeySalt)
-	if err != nil {
-		h.log.Error("Failed to store recovery key", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store recovery key"})
-		return
+	`, userID, m.wrappedKey, m.keySalt, m.wrappedPrefsKey, m.prefsKeySalt); err != nil {
+		h.log.Error("Failed to replace recovery key", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreRecoveryKey})
+		return false
 	}
-
-	h.log.Info("Recovery key stored", "user_id", userID)
-	c.JSON(http.StatusOK, gin.H{"message": "Recovery key stored"})
+	return true
 }
 
 // GetRecoveryKeyStatus returns whether the user has a recovery key and when it was created.
@@ -2549,31 +3140,37 @@ func (h *Handler) GetRecoveryKeyStatus(c *gin.Context) {
 	})
 }
 
-// DeleteRecoveryKey removes the user's recovery key after verifying password and MFA.
+// DeleteRecoveryKey removes the user's recovery key. It is gated by the
+// in-transaction step-up (settings_stepup.go); the users row is locked FOR
+// SHARE because this transaction never writes users.
 func (h *Handler) DeleteRecoveryKey(c *gin.Context) {
 	userID := c.GetString("user_id")
-
-	var req struct {
-		Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode  string `json:"mfa_code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgPasswordRequired})
+	var creds mfaStepUpCredentials
+	if err := bindOptionalJSON(c, &creds); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
-
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	tx, subj, ok := h.openMFASettingsTx(c, userID, creds, lockForShare)
+	if !ok {
 		return
 	}
-
-	_, err := h.db.ExecContext(c.Request.Context(),
-		`DELETE FROM user_recovery_keys WHERE user_id = $1`, userID,
-	)
-	if err != nil {
+	defer h.rollbackQuietly(tx)
+	ctx := c.Request.Context()
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, recoveryKeyRemoveStepUpCopy); e != nil {
+		h.refuseMFASettingsStepUp(c, e, stage)
+		return
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_recovery_keys WHERE user_id = $1`, userID); err != nil {
 		h.log.Error("Failed to delete recovery key", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove recovery key"})
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit recovery key removal", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove recovery key"})
+		return
+	}
+	h.clearStepUpAfterSuccess(c, userID)
 
 	h.log.Info("Recovery key removed", "user_id", userID)
 	c.JSON(http.StatusOK, gin.H{"message": "Recovery key removed"})
@@ -2634,16 +3231,15 @@ func (h *Handler) DesignateTrustedDevice(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	var req struct {
-		Password   string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode    string `json:"mfa_code"`
+		mfaStepUpCredentials
 		DeviceName string `json:"device_name" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "password and device_name are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "device_name is required"})
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, designateTrustedDeviceStepUpCopy); !ok {
 		return
 	}
 
@@ -2670,6 +3266,7 @@ func (h *Handler) DesignateTrustedDevice(c *gin.Context) {
 	}
 
 	h.log.Info("Trusted device designated", "user_id", userID, "device_id", deviceID, "machine_id", machineID)
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{
 		"id":            deviceID,
 		"device_name":   req.DeviceName,
@@ -2684,15 +3281,14 @@ func (h *Handler) RemoveTrustedDevice(c *gin.Context) {
 	deviceID := c.Param("id")
 
 	var req struct {
-		Password string `json:"password" binding:"required"` //nolint:gosec // request field, not a secret
-		MFACode  string `json:"mfa_code"`
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgPasswordRequired})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, removeTrustedDeviceStepUpCopy); !ok {
 		return
 	}
 
@@ -2712,6 +3308,7 @@ func (h *Handler) RemoveTrustedDevice(c *gin.Context) {
 	}
 
 	h.log.Info("Trusted device removed", "user_id", userID, "device_id", deviceID)
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{"message": "Trusted device removed"})
 }
 
@@ -3090,8 +3687,7 @@ func (h *Handler) UpsertRecoveryCircle(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	var req struct {
-		Password     string             `json:"password" binding:"required"` //nolint:gosec // G117: request binding struct, not a credential
-		MFACode      string             `json:"mfa_code"`
+		mfaStepUpCredentials
 		ThresholdK   int                `json:"threshold_k" binding:"required"`
 		TotalSharesN int                `json:"total_shares_n" binding:"required"`
 		Shares       []CircleShareEntry `json:"shares" binding:"required"`
@@ -3102,7 +3698,7 @@ func (h *Handler) UpsertRecoveryCircle(c *gin.Context) {
 		return
 	}
 
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, upsertRecoveryCircleStepUpCopy); !ok {
 		return
 	}
 
@@ -3136,6 +3732,7 @@ func (h *Handler) UpsertRecoveryCircle(c *gin.Context) {
 	}
 
 	h.log.Info("Recovery circle configured", "user_id", userID, "threshold_k", req.ThresholdK, "total_shares_n", req.TotalSharesN, "share_version", shareVersion)
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{"message": "Recovery circle configured", "share_version": shareVersion})
 }
 
@@ -3144,16 +3741,15 @@ func (h *Handler) DeleteRecoveryCircle(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	var req struct {
-		Password string `json:"password" binding:"required"` //nolint:gosec // G117: request binding struct, not a credential
-		MFACode  string `json:"mfa_code"`
+		mfaStepUpCredentials
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequest})
 		return
 	}
 
 	// Require password + MFA verification
-	if !h.requirePasswordAndMFA(c, userID, req.Password, req.MFACode) {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, deleteRecoveryCircleStepUpCopy); !ok {
 		return
 	}
 
@@ -3174,6 +3770,7 @@ func (h *Handler) DeleteRecoveryCircle(c *gin.Context) {
 	}
 
 	h.log.Info("Recovery circle deleted", "user_id", userID)
+	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{"message": "Recovery circle deleted"})
 }
 

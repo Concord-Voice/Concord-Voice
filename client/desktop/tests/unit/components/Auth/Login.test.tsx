@@ -1997,6 +1997,40 @@ describe('Login', () => {
     expect(screen.getByText('Select a verification method')).toBeInTheDocument();
   });
 
+  // I9: a backup code auto-submits at the 8th character. The field is then
+  // disabled for the request, so the code reaches /mfa/verify exactly once —
+  // Enter or a further keystroke cannot send it a second time.
+  it('submits a typed backup code to /mfa/verify exactly once (I9)', async () => {
+    let releaseVerify: (r: unknown) => void = () => {};
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, json: async () => makeMFAResponse(['totp']) })
+      .mockReturnValueOnce(new Promise((r) => (releaseVerify = r)));
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+    await screen.findByText('Choose another form of verification');
+    await user.click(screen.getByText('Choose another form of verification'));
+    await user.click(screen.getByText('Backup Code'));
+
+    const input = screen.getByPlaceholderText('XXXXXXXX');
+    await user.type(input, 'exci3g5f');
+    await user.keyboard('{Enter}');
+    await user.type(input, 'x');
+
+    const verifyCalls = () =>
+      mockFetch.mock.calls.filter((c) => String(c[0]).endsWith('/api/v1/auth/mfa/verify'));
+    await vi.waitFor(() => expect(verifyCalls()).toHaveLength(1));
+    expect(JSON.parse((verifyCalls()[0][1] as { body: string }).body)).toMatchObject({
+      code: 'EXCI3G5F',
+    });
+    releaseVerify({ ok: false, status: 401, json: async () => ({ error: 'Invalid code' }) });
+    await vi.waitFor(() => expect(input).not.toBeDisabled());
+    expect(verifyCalls()).toHaveLength(1);
+  });
+
   it('shows WebAuthn fallback message when no webauthn options', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,

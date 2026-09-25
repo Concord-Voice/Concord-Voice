@@ -17,12 +17,20 @@
 // no-password-factor handling here is deliberate defence-in-depth for a state
 // the schema forbids today; see VerifyPasswordFactor.
 //
-// Its only internal import is internal/auth; it otherwise depends on stdlib
-// plus gin, which it needs because Error carries a gin.H body and Write emits
-// it onto a gin.Context. An earlier comment claimed "internal/auth and stdlib"
-// and omitted gin — corrected after review (#2792). The MFA dependency is
-// declared here, at the consumer, following the rbac.PresenceRecheck
-// precedent, so no new INTERNAL import edge is created.
+// Its internal imports are internal/auth (password verification),
+// internal/credepoch (the epoch fence LockSubjectTx applies) and
+// internal/middleware (the fail-closed attempt budget); it otherwise depends on
+// stdlib, gin (Error carries a gin.H body and Write emits it onto a
+// gin.Context) and go-redis (Budget). None of the three imports this package,
+// so no cycle is possible. The MFA dependency is declared here, at the
+// consumer, following the rbac.PresenceRecheck precedent, so internal/mfa is
+// not imported.
+//
+// Policy P1 lives here too: the MFA leg is required only for a factor the
+// server can verify inline — TOTP (enabled AND confirmed) or WebAuthn (any
+// credential) — and that set is read from the factor tables by
+// InlineMFAMethods, never from users.mfa_enabled / users.mfa_methods, which
+// also list email and SMS and can be stale in either direction.
 package stepup
 
 import (
@@ -41,13 +49,27 @@ import (
 // purge original so no caller's copy diverges.
 const ErrMsgVerificationFailed = "Verification failed"
 
+// ErrMsgInvalidPassword and ErrMsgInvalidMFACode are the 403 refusal bodies.
+// The desktop's classifyStepUpRefusal matches them byte-for-byte to place the
+// refusal on the right field, so a route off this seam that refuses a password
+// or code must send these exact strings too.
+const (
+	ErrMsgInvalidPassword = "Invalid password" // pragma: allowlist secret
+	ErrMsgInvalidMFACode  = "Invalid MFA code"
+)
+
 // ErrPasswordVerification marks a 500 that came from the password factor. It is
 // a fixed sentinel rather than the underlying error because that error can
 // embed the malformed hash — see the Cause field on Error.
 var ErrPasswordVerification = errors.New("password verification failed")
 
 // MFAStatusChecker reports whether an account has any MFA factor available.
-// LoadSubject needs only this.
+//
+// No function in this package consults it any more: LoadSubject and
+// LockSubjectTx derive MFA from the factor tables (policy P1), because a bool
+// has no way to report a failed read and every caller of the old path read
+// that failure as "no MFA". It stays in the MFAVerifier union because the
+// consumers' own interfaces (internal/dm, internal/users) still name it.
 type MFAStatusChecker interface {
 	IsEnabled(ctx context.Context, userID string) bool
 }
@@ -81,8 +103,8 @@ type MFAVerifier interface {
 	MFATxCodeVerifier
 }
 
-// RowQuerier is the single-row read surface LoadSubject needs, satisfied by
-// *sql.DB, *sql.Tx, and *sql.Conn alike.
+// RowQuerier is the single-row read surface LoadSubject and InlineMFAMethods
+// need, satisfied by *sql.DB, *sql.Tx, and *sql.Conn alike.
 type RowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
@@ -109,7 +131,24 @@ type Error struct {
 	// ErrPasswordVerification instead: a fixed sentinel that says which stage
 	// broke without carrying anything derived from the credential.
 	Cause error
+
+	// reason tags a refusal a caller must tell apart for telemetry without
+	// reading the body text. Never serialized.
+	reason refusalReason
 }
+
+// refusalReason is the closed set of refusals a caller may need to classify.
+type refusalReason int
+
+const (
+	reasonNone refusalReason = iota
+	reasonEpochMismatch
+)
+
+// EpochMismatch reports whether this is LockSubjectTx's credential-epoch
+// refusal, so a caller can emit its credential-epoch event without comparing
+// body strings. Nil-safe.
+func (e *Error) EpochMismatch() bool { return e != nil && e.reason == reasonEpochMismatch }
 
 // Error renders the status only. The body may carry call-site copy, and no
 // credential value ever reaches either — see [internal]rules/observability.md.
@@ -123,7 +162,9 @@ func (e *Error) Unwrap() error { return e.Cause }
 // Write emits the error onto a gin context.
 func (e *Error) Write(c *gin.Context) { c.JSON(e.Status, e.Body) }
 
-// Subject is the account state a step-up decision is made against.
+// Subject is the account state a step-up decision is made against. Build it
+// with LoadSubject (no transaction) or LockSubjectTx (inside the write
+// transaction); both derive MFAEnabled and MFAMethods under policy P1.
 //
 // PasswordHash is COALESCE'd to the empty string, so callers never see a Go
 // nil/NULL distinction. Empty means "no usable password factor". That state is
@@ -133,10 +174,10 @@ func (e *Error) Write(c *gin.Context) { c.JSON(e.Status, e.Body) }
 // DO carry a real hash.
 type Subject struct {
 	PasswordHash string
-	MFAEnabled   bool
-	// MFAMethods is the enabled method names, when the caller read them from
-	// the same row it locked. Nil is fine; it only means the missing-code
-	// branch must look them up itself.
+	// MFAEnabled is true iff MFAMethods is non-empty.
+	MFAEnabled bool
+	// MFAMethods is the inline-verifiable subset ("totp", "webauthn") read from
+	// the factor tables. It is what a missing-code refusal offers the client.
 	MFAMethods []string
 }
 
@@ -154,32 +195,6 @@ type Copy struct {
 	// same reason StepUpFields.tsx calls its prop `credentialError`. Renaming
 	// this to PasswordRequired blocks every commit that touches the file.
 	CredentialRequired string
-}
-
-// LoadSubject reads the step-up inputs.
-//
-// The COALESCE is defensive, not load-bearing today: users.password_hash is
-// TEXT NOT NULL (migration 000001, never relaxed), so Scan into a string
-// cannot fail on NULL. It is kept because it makes this query correct for free
-// if that constraint is ever relaxed, and because the alternative — a bare
-// Scan into a string — turns such a migration into a 500 at every call site at
-// once. Do not read it as evidence that a NULL occurs.
-func LoadSubject(ctx context.Context, q RowQuerier, userID string, v MFAStatusChecker) (Subject, *Error) {
-	var s Subject
-	if err := q.QueryRowContext(ctx,
-		`SELECT COALESCE(password_hash, '') FROM users WHERE id = $1`, userID,
-	).Scan(&s.PasswordHash); err != nil {
-		// Safe to surface: a database read failure, not anything derived from
-		// a credential. COALESCE means a NULL hash is no longer an error path,
-		// so reaching here is a genuine fault worth diagnosing.
-		return Subject{}, &Error{
-			Status: http.StatusInternalServerError,
-			Body:   gin.H{"error": ErrMsgVerificationFailed},
-			Cause:  fmt.Errorf("load step-up subject: %w", err),
-		}
-	}
-	s.MFAEnabled = v != nil && v.IsEnabled(ctx, userID)
-	return s, nil
 }
 
 // VerifyPasswordFactor checks the password half.
@@ -229,15 +244,17 @@ func VerifyPasswordFactor(subj Subject, currentPassword string, wording Copy) *E
 		}
 	}
 	if !match {
-		return &Error{Status: http.StatusForbidden, Body: gin.H{"error": "Invalid password"}}
+		return &Error{Status: http.StatusForbidden, Body: gin.H{"error": ErrMsgInvalidPassword}}
 	}
 	return nil
 }
 
 // VerifyMFAFactor checks the MFA half outside a transaction. Only call when the
-// actor has MFA enabled.
-func VerifyMFAFactor(ctx context.Context, v MFACodeVerifier, userID, mfaCode string) *Error {
-	return verifyMFA(ctx, v, userID, mfaCode, nil, func() (bool, error) {
+// actor has MFA enabled. preloadedMethods has the same meaning as on
+// VerifyMFAFactorTx: pass the Subject's MFAMethods so a missing-code refusal
+// offers the P1 set rather than users.mfa_methods.
+func VerifyMFAFactor(ctx context.Context, v MFACodeVerifier, userID, mfaCode string, preloadedMethods []string) *Error {
+	return verifyMFA(ctx, v, userID, mfaCode, preloadedMethods, func() (bool, error) {
 		return v.VerifyCode(ctx, userID, mfaCode)
 	})
 }
@@ -248,9 +265,11 @@ func VerifyMFAFactor(ctx context.Context, v MFACodeVerifier, userID, mfaCode str
 // WRITE — backup-code redemption marks the code used — so verifying on the
 // pool while a transaction is open lets a rollback burn a single-use factor
 // while changing nothing else.
-// preloadedMethods carries the enabled MFA method names a caller already read
-// from its own locked row, so the missing-code branch does not have to look
-// them up. A nil slice means "not preloaded — look them up".
+// preloadedMethods carries the inline MFA method names the caller's Subject
+// already holds, so the missing-code branch does not have to look them up. A
+// nil slice means "not preloaded — look them up"; that fallback reads
+// users.mfa_methods and so is P1-blind, which is why every production caller
+// passes Subject.MFAMethods (never nil from LoadSubject or LockSubjectTx).
 func VerifyMFAFactorTx(
 	ctx context.Context, tx *sql.Tx, v MFATxCodeVerifier, userID, mfaCode string, preloadedMethods []string,
 ) *Error {
@@ -292,7 +311,7 @@ func verifyMFA(
 		}
 	}
 	if !valid {
-		return &Error{Status: http.StatusForbidden, Body: gin.H{"error": "Invalid MFA code"}}
+		return &Error{Status: http.StatusForbidden, Body: gin.H{"error": ErrMsgInvalidMFACode}}
 	}
 	return nil
 }

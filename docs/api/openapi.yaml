@@ -8680,7 +8680,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Not a member of the channel's server
+          description: 'Not a member of the channel''s server; missing the channel''s view
+            permission (PermViewTextChannels for a text or bulletin channel, PermViewVoiceChannels
+            for a voice channel) or PermSendMessages, which the WebSocket send path also requires;
+            or the member is timed out (code member_timed_out).'
           content:
             application/json:
               schema:
@@ -9055,7 +9058,13 @@ paths:
       summary: Suppress embeds on a message
       description: 'Hide link embeds on a message (one-way: embeds cannot be re-enabled). Requires the
 
-        Manage All Messages permission. Idempotent — already-suppressed messages return 200.
+        Manage All Messages permission, checked BEFORE any read of the message''s current
+
+        suppression state — a non-member or unprivileged member gets 403 rather than learning
+
+        whether embeds are already suppressed. Idempotent — an authorized repeat returns 200
+
+        with no further broadcast.
 
         Rate limit: 10 requests per minute.
 
@@ -9073,7 +9082,8 @@ paths:
         description: Message UUID
       responses:
         '200':
-          description: Embeds suppressed (or already suppressed)
+          description: Embeds suppressed, or already suppressed by an authorized caller (no second
+            broadcast)
           content:
             application/json:
               schema:
@@ -9081,7 +9091,9 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Insufficient permissions (Manage All Messages required)
+          description: Insufficient permissions (Manage All Messages required). Returned for every
+            unprivileged caller, including a non-member, regardless of the message's current
+            suppression state.
           content:
             application/json:
               schema:
@@ -9167,11 +9179,28 @@ paths:
                 properties:
                   backup_email:
                     type: string
+        '401':
+          description: 'Session no longer valid: the user row no longer exists'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: 'Failed to load backup email: the read failed (fail-closed, never reported as unset)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     put:
       tags:
       - MFA
       summary: Set or clear backup email
-      description: 'Sets the recovery backup email. Send an empty string to clear it.
+      description: 'Sets the recovery backup email. Send an empty string to clear it. Step-up
+        auth: requires `password` (plus `mfa_code` for an account with an inline-verifiable
+        factor — TOTP or WebAuthn) verified inside the write transaction, for both setting
+        and clearing. Verification runs in the write transaction after a first-statement
+        `FOR NO KEY UPDATE` lock on the user row, and consumes a fail-closed attempt budget
+        separate from the route rate limit (charged only when credentials are sent).
 
         Rate limit: 5 requests per minute (user-based).
 
@@ -9188,7 +9217,15 @@ paths:
               properties:
                 email:
                   type: string
-                  description: Email address, or empty string to clear
+                  description: Email address, or empty string (or omitted) to clear
+                password:
+                  type: string
+                  description: Required to authorize the change (see the 403 responses below)
+                  example: <password>
+                mfa_code:
+                  type: string
+                  description: Required only when the account has an inline-verifiable MFA
+                    factor (TOTP or WebAuthn); see the 403 mfa_required response
       responses:
         '200':
           description: Backup email updated
@@ -9200,11 +9237,33 @@ paths:
                   backup_email:
                     type: string
         '400':
-          description: Invalid email address
+          description: Invalid email address, or missing/malformed request body
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: The session's credential epoch was superseded (a password change or
+            account recovery committed first). Re-authenticate; nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead. The stored value is unchanged in every case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/email-sms/disable:
     post:
       tags:
@@ -9212,7 +9271,12 @@ paths:
       summary: Disable email/SMS MFA methods
       description: 'Removes both email and SMS MFA methods and clears them from
 
-        recovery-only settings. Idempotent.
+        recovery-only settings. Idempotent. Step-up auth: requires `password` (plus
+        `mfa_code` for an account with an inline-verifiable factor — TOTP or WebAuthn),
+        verified inside the write transaction under a first-statement `FOR NO KEY UPDATE`
+        lock on the user row. A missing or empty body is treated as no credentials sent,
+        not a malformed request. Consumes a fail-closed attempt budget separate from the
+        route rate limit (charged only when credentials are sent).
 
         Rate limit: 3 requests per minute (user-based).
 
@@ -9220,6 +9284,21 @@ paths:
       operationId: mfaEmailSmsDisable
       security:
       - BearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  description: Required to authorize the change (see the 403 responses below)
+                  example: <password>
+                mfa_code:
+                  type: string
+                  description: Required only when the account has an inline-verifiable MFA
+                    factor (TOTP or WebAuthn); see the 403 mfa_required response
       responses:
         '200':
           description: Methods disabled
@@ -9227,6 +9306,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '401':
+          description: The session's credential epoch was superseded (a password change or
+            account recovery committed first). Re-authenticate; nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead. The stored value is unchanged in every case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          description: >-
+            Two distinct causes share this status. (1) The step-up attempt
+            budget could not be evaluated — nothing was checked or changed;
+            the body reads "Verification is temporarily unavailable. Try
+            again in a few minutes." (2) The MFA cache/session state (Redis)
+            could not be cleared while the user row was still locked — rolled
+            back, nothing was changed; the body reads "MFA service
+            temporarily unavailable" (example below).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: MFA service temporarily unavailable
   /mfa/email-sms/setup:
     post:
       tags:
@@ -9300,11 +9414,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: SMS MFA unavailable in production, or incorrect password / MFA code
+          description: >-
+            SMS MFA unavailable in production, OR step-up required/rejected. The
+            step-up shape sets `password_required` when a password is still
+            needed, or `mfa_required` together with `methods` when a code is
+            still needed; a supplied-but-wrong factor returns "Invalid password"
+            or "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/email-sms/status:
     get:
       tags:
@@ -9326,6 +9451,12 @@ paths:
                     type: boolean
                   sms_enabled:
                     type: boolean
+        '500':
+          description: 'Failed to load MFA status: a Redis read failed (fail-closed, never reported as disabled)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /mfa/email-sms/verify:
     post:
       tags:
@@ -9524,11 +9655,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
     delete:
       tags:
       - MFA
@@ -9561,11 +9701,20 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
         '404':
           description: No recovery circle found
           content:
@@ -9640,11 +9789,20 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/recovery-key:
     put:
       tags:
@@ -9661,6 +9819,19 @@ paths:
         neither). All values are base64-encoded; the server stores them opaque
 
         and never sees plaintext key material.
+
+
+        Step-up auth applies to an OVERWRITE only. The very first key ever stored for an
+        account is token-only — no `password`/`mfa_code` needed — because it rides TOTP
+        enrollment''s automatic upload and nothing exists yet to overwrite. Once a key is
+        stored, replacing it requires `password` (plus `mfa_code` for an account with an
+        inline-verifiable factor — TOTP or WebAuthn), verified inside the write transaction
+        under a first-statement `FOR SHARE` lock on the user row. For a credential-less
+        caller on an account that already has a key, the 403 `password_required` response
+        means the existing key was left in place, unchanged — not that the request failed
+        outright. Consumes a fail-closed attempt budget separate from the route rate limit
+        (charged only when credentials are sent; a first-time, credential-less store does
+        not clear or count against it).
 
         Rate limit: 3 requests per minute (user-based).
 
@@ -9691,9 +9862,23 @@ paths:
                 recovery_prefs_key_salt:
                   type: string
                   description: Base64 — salt for the prefs wrapping key (requires recovery_wrapped_prefs_key)
+                password:
+                  type: string
+                  description: Required to authorize overwriting an existing key. Not required,
+                    and ignored if sent, for the first-ever store on an account with no key yet.
+                  example: <password>
+                mfa_code:
+                  type: string
+                  description: Required to overwrite an existing key only when the account has an
+                    inline-verifiable MFA factor (TOTP or WebAuthn); see the 403 mfa_required response
       responses:
         '200':
-          description: Recovery key stored
+          description: >-
+            Recovery key stored (first-time creation, an authorized overwrite,
+            or a credential-less retry of a first-time store whose earlier
+            response was lost — the resubmitted bytes matched the stored row
+            byte-for-byte, in constant time, so nothing was written and the
+            attempt budget was not charged).
           content:
             application/json:
               schema:
@@ -9705,6 +9890,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: The session's credential epoch was superseded (a password change or
+            account recovery committed first). Re-authenticate; nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Step-up required or rejected while overwriting an existing recovery
+            key. The body sets `password_required` when a password is still needed — meaning
+            a key already exists and was kept unchanged — or `mfa_required` together with
+            `methods` when a code is still needed; a supplied-but-wrong factor returns
+            "Invalid password" or "Invalid MFA code" instead. Never returned for a first-time
+            store on an account with no existing key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
     get:
       tags:
       - MFA
@@ -9737,11 +9946,19 @@ paths:
       tags:
       - MFA
       summary: Remove the recovery key
-      description: 'Deletes the user''s stored recovery key material after verifying the
+      description: 'Deletes the user''s stored recovery key material. Step-up auth: requires
 
-        password (and an MFA code if MFA is active). Idempotent — returns 200
+        `password` (plus `mfa_code` for an account with an inline-verifiable factor —
 
-        even when no recovery key exists.
+        TOTP or WebAuthn), verified inside the write transaction under a first-statement
+
+        `FOR SHARE` lock on the user row. A missing or empty body is treated as no
+
+        credentials sent, not a malformed request. Idempotent — returns 200
+
+        even when no recovery key exists. Consumes a fail-closed attempt budget
+
+        separate from the route rate limit (charged only when credentials are sent).
 
         Rate limit: 3 requests per minute (user-based).
 
@@ -9750,26 +9967,49 @@ paths:
       security:
       - BearerAuth: []
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/MfaPasswordConfirmRequest'
+              type: object
+              properties:
+                password:
+                  type: string
+                  description: Required to authorize the removal (see the 403 responses below)
+                  example: <password>
+                mfa_code:
+                  type: string
+                  description: Required only when the account has an inline-verifiable MFA
+                    factor (TOTP or WebAuthn); see the 403 mfa_required response
       responses:
         '200':
-          description: Recovery key removed
+          description: Recovery key removed (or already absent)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '403':
-          description: Incorrect password, or MFA code required/invalid
+        '401':
+          description: The session's credential epoch was superseded (a password change or
+            account recovery committed first). Re-authenticate; nothing was written.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead. The stored key, if any, is unchanged in every case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/recovery-only:
     put:
       tags:
@@ -9827,11 +10067,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/recovery-requests:
     get:
       tags:
@@ -10048,6 +10297,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MfaStatus'
+        '401':
+          description: 'Session no longer valid: the user row no longer exists'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: 'Failed to load MFA status: a factor or flag read failed (fail-closed, never reported as not enrolled)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /mfa/totp/confirm-setup:
     post:
       tags:
@@ -10120,11 +10381,28 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password or invalid MFA code
+          description: >-
+            Wrong password or wrong MFA code. The body is the step-up seam's
+            exact refusal, `Invalid password` or `Invalid MFA code`, which clients
+            match to mark the right field.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            Refused — this account has email or SMS MFA enabled and this is the
+            only remaining inline-verifiable factor (TOTP or WebAuthn). Email and
+            SMS have no inline verifier, so disabling this factor first would
+            leave the account's step-up unable to check anything. Turn off
+            email/SMS first, or leave this factor in place.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+              example:
+                error: Turn off email and text-message codes before removing your last authenticator app or security key.
+                inline_factor_required: true
   /mfa/totp/setup:
     post:
       tags:
@@ -10163,11 +10441,20 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
         '409':
           description: TOTP is already enabled — disable it first to re-enroll
           content:
@@ -10326,11 +10613,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/trusted-devices/{id}:
     delete:
       tags:
@@ -10368,11 +10664,20 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
         '404':
           description: Trusted device not found
           content:
@@ -10455,7 +10760,9 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password
+          description: >-
+            Wrong password. The body is the step-up seam's exact refusal,
+            `Invalid password`, which clients match to mark the password field.
           content:
             application/json:
               schema:
@@ -10466,6 +10773,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            Refused — deleting this credential would leave zero WebAuthn
+            credentials while email or SMS MFA is enabled, and email/SMS have
+            no inline verifier for step-up. Turn off email/SMS first, or keep
+            this credential.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+              example:
+                error: Turn off email and text-message codes before removing your last authenticator app or security key.
+                inline_factor_required: true
   /mfa/webauthn/register/begin:
     post:
       tags:
@@ -10521,11 +10841,20 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Incorrect password, or MFA code required/invalid
+          description: Step-up required or rejected. The body sets `password_required` when
+            a password is still needed, or `mfa_required` together with `methods` when a
+            code is still needed; a supplied-but-wrong factor returns "Invalid password" or
+            "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
         '409':
           description: Maximum of 10 WebAuthn credentials reached
           content:
@@ -13945,13 +14274,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/StepUpError'
         '429':
-          description: >-
-            Too many step-up verification attempts for this user. Fail-closed: this
-            bound also denies when its backing store is unreachable.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          $ref: '#/components/responses/StepUpVerificationFailed'
+        '503':
+          $ref: '#/components/responses/StepUpBudgetUnavailable'
   /users/me/presence-settings:
     get:
       tags:
@@ -15513,6 +15840,39 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    StepUpAttemptsExhausted:
+      description: >-
+        Too many step-up verification attempts for this user (5 per 15 minutes,
+        shared across every step-up-gated route for that account). Cleared only
+        after a verified, committed success.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    StepUpBudgetUnavailable:
+      description: >-
+        The step-up attempt budget could not be evaluated (its Redis-backed store
+        is unreachable). Nothing was checked, verified, or changed — this is
+        deliberately NOT the 429 above, since reporting a server fault as "too
+        many attempts" would misattribute it to the caller and lock the form for
+        a window that never started. Retry shortly.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Verification is temporarily unavailable. Try again in a few minutes.
+    StepUpVerificationFailed:
+      description: >-
+        The step-up factor could not be verified due to a server-side failure —
+        a database read or an MFA backend error — not a rejected credential.
+        Nothing was written.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Verification failed
   schemas:
     VoiceEnforcementHealthBootstrap:
       type: object
@@ -17746,10 +18106,15 @@ components:
     StepUpError:
       type: object
       description: >-
-        A step-up refusal on `PATCH /users/me/privacy` (#2765). The three
-        discriminators are load-bearing: a client uses them to decide which
-        factor to prompt for, so they are modelled here rather than left to the
-        generic `Error` shape, which declares only `error`.
+        The body every step-up-gated route answers with (`internal/stepup`):
+        the MFA-settings routes, `PATCH /users/me/privacy` (#2765), DM
+        Clear/purge, and ownership transfer. The discriminators are
+        load-bearing: a client uses them to decide which factor to prompt for,
+        so they are modelled here rather than left to the generic `Error`
+        shape, which declares only `error`. "Has MFA" for every one of these
+        routes means TOTP (enabled AND confirmed) or WebAuthn (any credential),
+        read from the factor tables — never email or SMS, which have no inline
+        verifier.
       properties:
         error:
           type: string
@@ -17762,16 +18127,26 @@ components:
         mfa_required:
           type: boolean
           description: >-
-            Present and true when the account has MFA enabled and no code was
-            supplied. NOTE: its presence WITHOUT `password_required` does not
-            imply the account lacks a password — the server verifies the
-            password factor first, so a correct password plus a missing code
-            produces exactly this shape.
+            Present and true when the account has an inline-verifiable MFA
+            factor (TOTP or WebAuthn) and no code was supplied. NOTE: its
+            presence WITHOUT `password_required` does not imply the account
+            lacks a password — the server verifies the password factor first,
+            so a correct password plus a missing code produces exactly this
+            shape.
         methods:
           type: array
-          description: Enabled MFA method names, so the client can name the prompt.
+          description: Enabled inline MFA method names ("totp", "webauthn"), so the
+            client can name the prompt.
           items:
             type: string
+        inline_factor_required:
+          type: boolean
+          description: >-
+            Present and true only on the 409 returned by disabling TOTP or
+            deleting a WebAuthn credential when it would leave email/SMS as
+            the account's only second factor. Email and SMS have no inline
+            verifier, so this refusal keeps at least one factor the server can
+            check without a round trip through email or a text message.
       required:
       - error
     PrivacySettingsUpdateRequest:

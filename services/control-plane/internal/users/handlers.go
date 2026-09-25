@@ -136,8 +136,8 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier 
 // SetRedis wires the client backing the fail-closed step-up attempt budget
 // (#2765).
 //
-// A nil client DENIES rather than skipping the bound — see
-// allowPurgeFenceStepUpAttempt. That is the safe direction, but it is also
+// A nil client DENIES (503) rather than skipping the bound — see
+// stepup.Budget. That is the safe direction, but it is also
 // silent: an unwired handler refuses every purge-fence step-up instead of
 // obviously breaking. HasRedis exists so the router's boot guard can catch
 // that at startup rather than in production.
@@ -2305,48 +2305,34 @@ var purgeFenceStepUpCopy = stepup.Copy{
 	CredentialRequired: "Current password required to turn off purge verification",
 }
 
-const (
-	// Bounds are const, never configuration — a configurable security bound is
-	// a fifth place it can be wrong ([internal]rules/backend.md), and the purge
-	// rate limits set the precedent.
-	purgeFenceStepUpLimit  = 5
-	purgeFenceStepUpWindow = 15 * time.Minute
-)
-
-// allowPurgeFenceStepUpAttempt bounds credential guessing against the purge
-// fence. Fail-CLOSED: the route's own limiter is fail-open by design (it
-// protects twelve innocuous fields), so a Redis outage would otherwise remove
-// every bound from a path that verifies passwords.
+// purgeFenceStepUpPrefix keys the purge fence's attempt budget. The bound,
+// the fail-closed posture (a nil or erroring Redis DENIES with a 503, never a
+// 429 that blames the user) and the clear-after-verified-commit rule are
+// internal/stepup's Budget, shared with the MFA-settings routes so the two
+// cannot drift apart again.
 //
-// A nil client denies rather than skipping the bound — a rate limiter that
-// silently no-ops when unwired is the failure mode this exists to prevent.
-func (h *Handler) allowPurgeFenceStepUpAttempt(ctx context.Context, userID string) (bool, error) {
-	if h.redis == nil {
-		return false, errors.New("step-up rate limiter unavailable")
-	}
-	return middleware.AllowUserAction(ctx, h.redis,
-		purgeFenceStepUpKey(userID), purgeFenceStepUpLimit, purgeFenceStepUpWindow)
+// The route's own limiter stays fail-OPEN by design — it protects twelve
+// innocuous fields — so without this budget a Redis outage would remove every
+// bound from a path that verifies passwords.
+const purgeFenceStepUpPrefix = "stepup:privacy_purge_fence:"
+
+func (h *Handler) purgeFenceStepUpBudget() stepup.Budget {
+	return stepup.NewBudget(h.redis, purgeFenceStepUpPrefix)
 }
 
 // allowPurgeFenceStepUp consumes the fail-closed attempt budget before the
-// transaction begins. It writes the existing 429 response and returns false
-// when the budget cannot admit the request.
+// transaction begins. It writes the budget's 429 (exhausted) or 503 (cannot
+// be evaluated) and returns false when the budget does not admit the request.
 func (h *Handler) allowPurgeFenceStepUp(ctx context.Context, c *gin.Context, userID string) bool {
-	allowed, err := h.allowPurgeFenceStepUpAttempt(ctx, userID)
-	if err != nil {
-		h.log.Error("Purge-fence step-up budget unavailable", "error", err)
+	e := h.purgeFenceStepUpBudget().Consume(ctx, userID)
+	if e == nil {
+		return true
 	}
-	if err != nil || !allowed {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many verification attempts"})
-		return false
+	if e.Cause != nil {
+		h.log.Error("Purge-fence step-up budget unavailable", "error", e.Cause)
 	}
-	return true
-}
-
-// purgeFenceStepUpKey is the one place the budget's Redis key is spelled, so
-// the consume and the clear below cannot drift apart.
-func purgeFenceStepUpKey(userID string) string {
-	return "stepup:privacy_purge_fence:" + userID
+	e.Write(c)
+	return false
 }
 
 // clearPurgeFenceStepUpAttempts resets the budget after a step-up that actually
@@ -2356,20 +2342,13 @@ func purgeFenceStepUpKey(userID string) string {
 // and never decrements — so without this a legitimate user toggling the fence
 // off and on, or retrying past a transient 401/500, burns the same budget meant
 // to bound password guessing and is eventually locked out WITH correct
-// credentials (Gitar review, #2792). Counting the attempt and clearing it on
-// success is the standard failed-attempts shape; the alternative Gitar offered,
-// raising the bound, only moves the wall further out.
+// credentials (Gitar review, #2792).
 //
-// Deliberately NOT security-critical, so deliberately best-effort: a failure
-// leaves the counter high, which fails toward MORE limiting, never less. It
-// runs post-commit because only a committed disable is a success — a verified
-// credential whose transaction then rolled back has changed nothing and should
-// still cost an attempt.
+// Deliberately best-effort: a failure leaves the counter high, which fails
+// toward MORE limiting, never less. It runs post-commit because only a
+// committed disable is a success.
 func (h *Handler) clearPurgeFenceStepUpAttempts(ctx context.Context, userID string) {
-	if h.redis == nil {
-		return
-	}
-	if err := h.redis.Del(ctx, purgeFenceStepUpKey(userID)).Err(); err != nil {
+	if err := h.purgeFenceStepUpBudget().Clear(ctx, userID); err != nil {
 		h.log.Warn("Could not reset the purge-fence step-up budget after a successful disable",
 			"error", err)
 	}
@@ -2377,14 +2356,15 @@ func (h *Handler) clearPurgeFenceStepUpAttempts(ctx context.Context, userID stri
 
 // gatePurgeFenceDisable verifies the actor may disable the purge fence (#2765).
 //
-// ONE statement takes the users row FOR SHARE and reads every input. FOR SHARE
-// (not FOR NO KEY UPDATE — this handler never writes users) conflicts with the
-// FOR NO KEY UPDATE every destructive reset holds, so a request authorized by
-// credentials that were superseded while it waited blocks, re-reads, and fails.
-// That serialization is why the check lives inside the transaction rather than
-// in front of it.
+// The users row is locked FOR SHARE as the first statement (stepup.LockSubjectTx).
+// FOR SHARE (not FOR NO KEY UPDATE — this handler never writes users) conflicts
+// with the FOR NO KEY UPDATE every destructive reset holds, so a request
+// authorized by credentials that were superseded while it waited blocks,
+// re-reads, and fails. That serialization is why the check lives inside the
+// transaction rather than in front of it. A deleted account is a 401, not the
+// 500 a failed lock read is.
 //
-// The returned error is a *stepup.Error wrapped for transport; the outer
+// The returned error is a *stepup.Error (never a typed nil); the outer
 // handler unwraps it with errors.As so the closure's blanket 500 does not
 // swallow the real status.
 func (h *Handler) gatePurgeFenceDisable(
@@ -2395,34 +2375,18 @@ func (h *Handler) gatePurgeFenceDisable(
 	// connection for the length of a network call, and the check needs no
 	// transactional consistency with the row lock (Gitar review, #2792).
 
-	// credential_epoch is sql.NullString (NULL = never rotated), matching the
-	// existing precedent in upsertE2EEBlobGuarded. mfa_enabled comes from the
-	// same row rather than mfaVerifier.IsEnabled, which would take a second
-	// pooled connection while this transaction holds one.
-	var subj stepup.Subject
-	var epoch sql.NullString
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COALESCE(password_hash, ''), credential_epoch, mfa_enabled,
-		       COALESCE(mfa_methods, '{}')
-		FROM users WHERE id = $1 FOR SHARE
-	`, userID).Scan(&subj.PasswordHash, &epoch, &subj.MFAEnabled, pq.Array(&subj.MFAMethods)); err != nil {
-		return &stepup.Error{
-			Status: http.StatusInternalServerError,
-			Body:   gin.H{"error": stepup.ErrMsgVerificationFailed},
-			Cause:  fmt.Errorf("lock user for purge-fence step-up: %w", err),
-		}
-	}
-
-	// The step-up proves knowledge of a password; the fence proves this session
-	// was not revoked. Different facts — see the design's §8. MatchEpoch, not
-	// GuardTx: GuardTx would issue its own SELECT ... FOR SHARE on a row already
-	// locked. Body string matches upsertE2EEBlobGuarded so the client's existing
-	// 401 handling applies unchanged.
-	if credepoch.MatchEpoch(epoch, middleware.TokenCredentialEpoch(c)) != nil {
-		return &stepup.Error{
-			Status: http.StatusUnauthorized,
-			Body:   gin.H{"error": "Authentication required"},
-		}
+	// stepup.LockSubjectTx is the first statement: the users row FOR SHARE (this
+	// handler never writes users), then the credential-epoch fence on that
+	// same read, then the P1 factor set read from the factor tables AFTER the
+	// lock. MFA comes from user_mfa_totp / user_mfa_webauthn, never
+	// users.mfa_enabled, which also counts email/SMS (no inline verifier, so
+	// demanding one locked those accounts out) and can be stale in the other
+	// direction too (a confirmed TOTP factor the flags missed let a password
+	// alone lower the fence). The step-up proves knowledge of a password; the
+	// fence proves this session was not revoked — different facts.
+	subj, e := stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForShare, middleware.TokenCredentialEpoch(c))
+	if e != nil {
+		return e
 	}
 
 	if pErr := stepup.VerifyPasswordFactor(subj, creds.CurrentPassword, purgeFenceStepUpCopy); pErr != nil {

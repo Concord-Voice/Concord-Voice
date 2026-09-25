@@ -16,7 +16,6 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 )
 
 const (
@@ -120,21 +119,8 @@ func (h *Handler) ClearConversation(c *gin.Context) {
 		return
 	}
 	userID, convID := actorID.String(), conversationID.String()
-	var req clearConversationRequest
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxClearRequestBytes)
-	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "Request body too large"})
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
-		return
-	}
-	body, ok := c.Get(gin.BodyBytesKey)
-	bodyBytes, bodyIsBytes := body.([]byte)
-	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) || !bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("{")) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+	req, ok := bindClearRequest(c)
+	if !ok {
 		return
 	}
 	unlockPublication := lockDMVisibilityPublication(actorID, conversationID)
@@ -151,12 +137,8 @@ func (h *Handler) ClearConversation(c *gin.Context) {
 	defer rollbackVisibilityTx(h, tx)
 	subject, subjectErr := h.loadClearStepUpSubject(ctx, tx, userID, middleware.TokenCredentialEpoch(c))
 	if subjectErr != nil {
-		if errors.Is(subjectErr, credepoch.ErrEpochMismatch) || errors.Is(subjectErr, credepoch.ErrBlocked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
-			return
-		}
-		h.log.Error("Failed to load DM clear step-up subject", "error", subjectErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": stepup.ErrMsgVerificationFailed})
+		h.logClearStepUpFailure(subjectErr)
+		subjectErr.Write(c)
 		return
 	}
 	requireAuth, settingsErr := requireClearAuth(ctx, tx, userID)
@@ -171,12 +153,8 @@ func (h *Handler) ClearConversation(c *gin.Context) {
 	if !h.lockVisibilityParticipant(ctx, c, tx, userID, convID) {
 		return
 	}
-	if requireAuth {
-		if stepUpErr := h.verifyClearStepUp(ctx, tx, userID, subject, req); stepUpErr != nil {
-			h.logClearStepUpFailure(stepUpErr)
-			stepUpErr.Write(c)
-			return
-		}
+	if !h.enforceClearStepUp(ctx, c, tx, userID, subject, req, requireAuth) {
+		return
 	}
 	var cutoff time.Time
 	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&cutoff); err != nil {
@@ -201,6 +179,30 @@ func (h *Handler) ClearConversation(c *gin.Context) {
 	}
 	h.emitDMVisibility(userID, "dm_conversation_cleared", convID, "cleared_at", &cutoff)
 	c.JSON(http.StatusOK, gin.H{"conversation_id": convID, "cleared_at": cutoff})
+}
+
+// bindClearRequest applies the bounded strict-JSON body rule (backend.md § Gin
+// Conventions): an oversized body is a 413 first, and anything but exactly one
+// JSON object is a 400. On refusal it has written the response.
+func bindClearRequest(c *gin.Context) (clearConversationRequest, bool) {
+	var req clearConversationRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxClearRequestBytes)
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "Request body too large"})
+			return req, false
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return req, false
+	}
+	body, ok := c.Get(gin.BodyBytesKey)
+	bodyBytes, bodyIsBytes := body.([]byte)
+	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) || !bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("{")) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return req, false
+	}
+	return req, true
 }
 
 func (h *Handler) commitClear(tx *sql.Tx) error {
@@ -324,22 +326,15 @@ func requireClearAuth(ctx context.Context, tx *sql.Tx, userID string) (bool, err
 	return required, err
 }
 
-// loadClearStepUpSubject takes the users lock once. Clear needs an exclusive
-// subject lock for transactional MFA redemption, so GuardTx's FOR SHARE lock
-// would create an unsafe same-row upgrade under concurrent Clears.
-func (h *Handler) loadClearStepUpSubject(ctx context.Context, tx *sql.Tx, userID, tokenEpoch string) (stepup.Subject, error) {
-	var subject stepup.Subject
-	var epoch sql.NullString
-	if err := tx.QueryRowContext(ctx,
-		`SELECT credential_epoch, COALESCE(password_hash, ''), mfa_enabled, mfa_methods
-		 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
-	).Scan(&epoch, &subject.PasswordHash, &subject.MFAEnabled, pq.Array(&subject.MFAMethods)); err != nil {
-		return stepup.Subject{}, err
-	}
-	if err := credepoch.MatchEpoch(epoch, tokenEpoch); err != nil {
-		return stepup.Subject{}, err
-	}
-	return subject, nil
+// loadClearStepUpSubject takes the users lock once, as the transaction's first
+// statement, through the shared stepup.LockSubjectTx: FOR NO KEY UPDATE (Clear
+// needs an exclusive subject lock for transactional MFA redemption, so
+// GuardTx's FOR SHARE would be an unsafe same-row upgrade under concurrent
+// Clears), the credential-epoch fence, then the P1 factor set read from the
+// factor tables after the lock. A stale epoch is a 401, a deleted account a
+// 401, any read failure a 500 with Cause for the caller to log.
+func (h *Handler) loadClearStepUpSubject(ctx context.Context, tx *sql.Tx, userID, tokenEpoch string) (stepup.Subject, *stepup.Error) {
+	return stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForNoKeyUpdate, tokenEpoch)
 }
 
 var clearStepUpCopy = stepup.Copy{
@@ -355,6 +350,21 @@ func (h *Handler) verifyClearStepUp(ctx context.Context, tx *sql.Tx, userID stri
 		return stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, req.MFACode, subject.MFAMethods)
 	}
 	return stepup.VerifyPasswordFactor(subject, req.CurrentPassword, clearStepUpCopy)
+}
+
+// enforceClearStepUp verifies the step-up only when the actor's
+// require_auth_before_purge setting asks for it. On refusal it has logged and
+// written the response and returns false.
+func (h *Handler) enforceClearStepUp(ctx context.Context, c *gin.Context, tx *sql.Tx, userID string, subject stepup.Subject, req clearConversationRequest, requireAuth bool) bool {
+	if !requireAuth {
+		return true
+	}
+	if stepUpErr := h.verifyClearStepUp(ctx, tx, userID, subject, req); stepUpErr != nil {
+		h.logClearStepUpFailure(stepUpErr)
+		stepUpErr.Write(c)
+		return false
+	}
+	return true
 }
 
 func (h *Handler) logClearStepUpFailure(e *stepup.Error) {

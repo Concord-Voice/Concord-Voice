@@ -154,4 +154,38 @@ describe('privacyStore — require authentication before purging (#1354)', () =>
     ).rejects.toThrow('Failed to update privacy settings');
     expect(usePrivacyStore.getState().error).toBe('Failed to update privacy settings');
   });
+
+  // Q4 twin: the purge-fence budget answers 503 when it cannot be evaluated.
+  // The fence toggle routes it through the shared classifier to a refusal
+  // carrying the server's own copy — nothing was checked, nothing changed.
+  it('maps a budget-outage 503 on the fence toggle to a refusal with the server copy', async () => {
+    const outage = 'Verification is temporarily unavailable. Try again in a few minutes.';
+    server.use(
+      http.patch('*/api/v1/users/me/privacy', () =>
+        HttpResponse.json({ error: outage }, { status: 503 })
+      )
+    );
+    const result = await usePrivacyStore
+      .getState()
+      .disablePurgeFence({ currentPassword: 'pw', mfaCode: '123456' }); // pragma: allowlist secret
+    expect(result).toEqual({ kind: 'refused', message: outage });
+  });
+
+  it('routes a 403 step-up refusal through the shared classifier', async () => {
+    server.use(
+      http.patch('*/api/v1/users/me/privacy', () =>
+        HttpResponse.json(
+          { error: 'MFA verification required', mfa_required: true, methods: ['totp', 9] },
+          { status: 403 }
+        )
+      )
+    );
+    // pragma: allowlist nextline secret
+    const result = await usePrivacyStore.getState().disablePurgeFence({ currentPassword: 'pw' });
+    expect(result).toEqual({
+      kind: 'mfaRequired',
+      methods: ['totp'],
+      message: 'MFA verification required',
+    });
+  });
 });

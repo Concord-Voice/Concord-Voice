@@ -6,6 +6,7 @@
  */
 
 import { apiFetch } from '../system/apiClient';
+import { classifyStepUpRefusal, isStepUpFactorRefusal } from '../system/stepUpRefusal';
 import type { PurgeRange } from '../../constants/purgeRanges';
 
 export type PurgeContext = 'channel' | 'server' | 'dm' | 'group';
@@ -78,37 +79,20 @@ function purgePath(context: PurgeContext, scopeId: string): string {
   }
 }
 
-interface PurgeErrorBody {
-  error?: string;
-  password_required?: boolean;
-  mfa_required?: boolean;
-  methods?: string[];
-}
-
 /**
- * The two boolean flags are the intended contract and are matched first. The two
- * string comparisons below are NOT: they match human-readable prose emitted by
- * `verifyPurgePasswordFactor` / `verifyPurgeMFAFactor`
- * (`services/control-plane/internal/dm/purge.go`), because those two refusals
- * carry no machine-readable discriminator.
+ * A 403 from the purge route is either a step-up refusal — read by the shared
+ * classifier (`services/system/stepUpRefusal.ts`), which owns the flag-first,
+ * exact-string-second contract and its documented brittleness — or a plain
+ * authorization refusal.
  *
- * Known brittleness, deliberately left in place: rewording either server string
- * silently degrades a per-field error into the generic `forbidden` copy — no
- * test on either side fails, because each asserts its own fixture. The durable
- * fix is a `code` field on those 403s, which changes the response contract and
- * is out of this issue's scope; it is raised on PR #2743 for a decision.
- *
- * The degradation is at least safe rather than wrong — the user sees "this purge
- * couldn't be completed" instead of "that password is not correct", so nothing
- * is misreported and nothing is purged. Match on the flags whenever a future
- * server change makes that possible, and delete the string arms.
+ * The degradation stays safe rather than wrong: a reworded seam string lands on
+ * `forbidden` ("this purge couldn't be completed") instead of a per-field
+ * error, so nothing is misreported and nothing is purged. The durable fix is a
+ * `code` field on those 403s, raised on PR #2743 for a decision.
  */
-function mapForbidden(payload: PurgeErrorBody): PurgeResult {
-  if (payload.password_required) return { kind: 'passwordRequired' };
-  if (payload.mfa_required) return { kind: 'mfaRequired', methods: payload.methods ?? [] };
-  if (payload.error === 'Invalid password') return { kind: 'invalidPassword' };
-  if (payload.error === 'Invalid MFA code') return { kind: 'invalidMfaCode' };
-  return { kind: 'forbidden' };
+function mapForbidden(payload: unknown): PurgeResult {
+  const refusal = classifyStepUpRefusal(403, payload);
+  return isStepUpFactorRefusal(refusal) ? refusal : { kind: 'forbidden' };
 }
 
 export async function purgeMessages(args: PurgeArgs): Promise<PurgeResult> {
@@ -163,7 +147,7 @@ export async function purgeMessages(args: PurgeArgs): Promise<PurgeResult> {
   // handler runs, so nothing was deleted. `partial` would claim otherwise.
   if (res.status === 401) return { kind: 'sessionExpired' };
 
-  const payload = (await res.json().catch(() => ({}))) as PurgeErrorBody;
+  const payload: unknown = await res.json().catch(() => ({}));
 
   if (res.status === 403) return mapForbidden(payload);
 

@@ -816,6 +816,16 @@ describe('PrivacySecuritySection', () => {
   // Coverage for the #2017 render-helper extraction (renderMfaSetupArea /
   // renderBackupResetModal). These MFA states were previously untested.
 
+  // Completing a wizard refetches the MFA status. Since F8 a failed refetch
+  // is reported and hides the tier controls, so these cases answer it.
+  const queueStatusRefetch = () =>
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ methods: ['totp'], recovery_only_methods: [] }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+
   it('renders EmailSmsSetup when the email-sms setup method is selected', async () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByTestId('mfa-tier-selector')).toBeInTheDocument());
@@ -823,6 +833,7 @@ describe('PrivacySecuritySection', () => {
     expect(screen.getByTestId('email-sms-setup')).toBeInTheDocument();
     expect(screen.queryByTestId('mfa-tier-selector')).not.toBeInTheDocument();
     // completing returns to the tier selector (covers the onComplete callback)
+    queueStatusRefetch();
     fireEvent.click(screen.getByTestId('email-sms-complete'));
     expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
   });
@@ -844,6 +855,7 @@ describe('PrivacySecuritySection', () => {
     fireEvent.click(screen.getByTestId('stub-setup-webauthn'));
     expect(screen.getByTestId('mfa-setup')).toBeInTheDocument();
     // completing returns to the tier selector (covers the onComplete callback)
+    queueStatusRefetch();
     fireEvent.click(screen.getByTestId('mfa-setup-complete'));
     expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
   });

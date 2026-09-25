@@ -35,27 +35,79 @@ import (
 
 const enrollUser = "user-fixture"
 
-// enrollConn answers the two reads the shared fake does not: whether MFA was
-// ever on for the account, and verify-setup's four-column TOTP row. It also
-// models the enable write stamping mfa_enabled_at, so a handler that reads the
-// flag after that write, rather than before, sees MFA as already on.
+// enrollConn answers the reads the shared fake does not: whether MFA was ever
+// on for the account, verify-setup's four-column TOTP row, and the inline
+// factors the B1 flag sync reads inside its transaction. It models the flag
+// write stamping or clearing mfa_enabled_at, so a handler that reads the flag
+// after that write, rather than before, sees MFA as already on. It also models
+// rollback: B1 commits a factor and its flags together, so a write the
+// transaction undoes must not be counted.
 type enrollConn struct {
 	mfaEventConn
 	neverEnabled bool
 	enabledAtSet *bool
-	totpActive   *bool
 	secretEnc    []byte
 	secretNonce  []byte
 	keyVersion   int
 	// failQuery, when set, fails any read whose SQL contains it. disabledAt
-	// records a write that clears mfa_enabled_at. confirmed, when set, models
-	// user_mfa_totp.confirmed across requests.
+	// records a flag write that clears mfa_enabled_at. confirmed, when set,
+	// models user_mfa_totp.confirmed across requests.
 	failQuery  *string
 	disabledAt *bool
 	confirmed  *bool
-	// credentialRemoved records a delete of a WebAuthn credential.
-	credentialRemoved *bool
+	// degradedWrite records a flag write that carried the row's email/SMS
+	// entries forward because their state could not be read.
+	degradedWrite *bool
+	// credentialStored records a WebAuthn credential INSERT that was not
+	// rolled back.
+	credentialStored *bool
+	// tx makes a write inside a transaction undoable on rollback.
+	tx *enrollTxLog
 }
+
+// enrollTxLog is one transaction's undo log. A write applies at once, so later
+// statements in the same transaction see it, and is undone on rollback.
+type enrollTxLog struct {
+	open bool
+	undo []func()
+}
+
+type enrollTx struct{ log *enrollTxLog }
+
+func (t enrollTx) Commit() error {
+	t.log.open, t.log.undo = false, nil
+	return nil
+}
+
+func (t enrollTx) Rollback() error {
+	for i := len(t.log.undo) - 1; i >= 0; i-- {
+		t.log.undo[i]()
+	}
+	t.log.open, t.log.undo = false, nil
+	return nil
+}
+
+func (c enrollConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.tx == nil {
+		return c.mfaEventConn.BeginTx(ctx, opts)
+	}
+	c.tx.open, c.tx.undo = true, nil
+	return enrollTx{log: c.tx}, nil
+}
+
+// set records a successful write's effect, undoably while a transaction is open.
+func (c enrollConn) set(p *bool) {
+	if p == nil {
+		return
+	}
+	prev := *p
+	*p = true
+	if c.tx != nil && c.tx.open {
+		c.tx.undo = append(c.tx.undo, func() { *p = prev })
+	}
+}
+
+func isSet(p *bool) bool { return p != nil && *p }
 
 // ExecContext records a write only when it succeeded.
 func (c enrollConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -64,14 +116,21 @@ func (c enrollConn) ExecContext(ctx context.Context, query string, args []driver
 		return nil, err
 	}
 	switch {
-	case strings.Contains(query, "mfa_enabled_at = COALESCE"):
-		*c.enabledAtSet = true
-	case c.disabledAt != nil && strings.Contains(query, "mfa_enabled_at = NULL"):
-		*c.disabledAt = true
-	case c.confirmed != nil && strings.Contains(query, "SET confirmed = TRUE"):
-		*c.confirmed = true
-	case c.credentialRemoved != nil && strings.Contains(query, "DELETE FROM user_mfa_webauthn"):
-		*c.credentialRemoved = true
+	// The B1 flag write (mfaFlagsExactSQL / mfaFlagsDegradedSQL): a non-empty
+	// method list stamps mfa_enabled_at, an empty one clears it.
+	case strings.Contains(query, "COALESCE(mfa_enabled_at, NOW())"):
+		if strings.Contains(query, "m IN ('email', 'sms')") {
+			c.set(c.degradedWrite)
+		}
+		if len(args) > 0 && fmt.Sprint(args[0].Value) != "{}" {
+			c.set(c.enabledAtSet)
+		} else {
+			c.set(c.disabledAt)
+		}
+	case strings.Contains(query, "SET confirmed = TRUE"):
+		c.set(c.confirmed)
+	case strings.Contains(query, "INSERT INTO user_mfa_webauthn"):
+		c.set(c.credentialStored)
 	}
 	return result, nil
 }
@@ -87,8 +146,12 @@ func (c enrollConn) QueryContext(ctx context.Context, query string, args []drive
 		return &mfaEventRows{values: []driver.Value{*c.enabledAtSet}}, nil
 	case strings.Contains(query, "mfa_enabled_at IS NULL"):
 		return &mfaEventRows{values: []driver.Value{c.neverEnabled && !*c.enabledAtSet}}, nil
-	case c.totpActive != nil && strings.Contains(query, "enabled AND confirmed"):
-		return &mfaEventRows{values: []driver.Value{*c.totpActive}}, nil
+	// stepup.InlineMFAMethods, read by the B1 flag sync inside its transaction:
+	// TOTP counts once confirm-setup has confirmed it, WebAuthn once its
+	// credential is stored. stepup.LoadSubject's read carries the same TOTP
+	// predicate and is left to the shared fake.
+	case strings.Contains(query, "AND enabled AND confirmed") && !strings.Contains(query, "FROM users u"):
+		return &mfaEventRows{values: []driver.Value{isSet(c.confirmed), isSet(c.credentialStored)}}, nil
 	case strings.Contains(query, "key_version, enabled FROM user_mfa_totp"):
 		return &mfaEventRows{values: []driver.Value{c.secretEnc, c.secretNonce, int64(c.keyVersion), false}}, nil
 	}
@@ -142,7 +205,7 @@ func runTOTPEnrollment(t *testing.T, state *mfaEventDB, neverEnabled bool, verif
 	return e.mini, e.confirm(confirmer)
 }
 
-// confirmFaults fail updateUserMFAFlags' reads during confirm-setup only, after
+// confirmFaults fail the flag sync's reads during confirm-setup only, after
 // verify-setup has succeeded.
 type confirmFaults struct {
 	failQuery  string // fail the DB read whose SQL contains this
@@ -171,12 +234,14 @@ func (f failCommandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 // totpEnrollment is one account's TOTP enrollment against the fake, so a test
 // can call confirm-setup more than once.
 type totpEnrollment struct {
-	h          *Handler
-	mini       *miniredis.Miniredis
-	redis      *redis.Client
-	code       string
-	failQuery  *string
-	disabledAt *bool
+	h             *Handler
+	mini          *miniredis.Miniredis
+	redis         *redis.Client
+	code          string
+	failQuery     *string
+	disabledAt    *bool
+	degradedWrite *bool
+	confirmed     *bool
 }
 
 func newTOTPEnrollment(t *testing.T, state *mfaEventDB, neverEnabled bool) *totpEnrollment {
@@ -190,17 +255,19 @@ func newTOTPEnrollment(t *testing.T, state *mfaEventDB, neverEnabled bool) *totp
 	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
 	require.NoError(t, err)
 
-	e := &totpEnrollment{mini: mini, redis: redisClient, code: code, failQuery: new(string), disabledAt: new(bool)}
+	e := &totpEnrollment{mini: mini, redis: redisClient, code: code, failQuery: new(string), disabledAt: new(bool), degradedWrite: new(bool), confirmed: new(bool)}
 	db := sql.OpenDB(enrollConnector{conn: enrollConn{
-		mfaEventConn: mfaEventConn{state: state},
-		neverEnabled: neverEnabled,
-		enabledAtSet: new(bool),
-		secretEnc:    secretEnc,
-		secretNonce:  secretNonce,
-		keyVersion:   keyVersion,
-		failQuery:    e.failQuery,
-		disabledAt:   e.disabledAt,
-		confirmed:    new(bool),
+		mfaEventConn:  mfaEventConn{state: state},
+		neverEnabled:  neverEnabled,
+		enabledAtSet:  new(bool),
+		secretEnc:     secretEnc,
+		secretNonce:   secretNonce,
+		keyVersion:    keyVersion,
+		failQuery:     e.failQuery,
+		disabledAt:    e.disabledAt,
+		confirmed:     e.confirmed,
+		degradedWrite: e.degradedWrite,
+		tx:            new(enrollTxLog),
 	}})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	e.h = NewHandler(db, redisClient, logger.New("test"), keyring, "test", nil, "test")
@@ -285,10 +352,10 @@ func registerWebAuthnAs(t *testing.T, neverEnabled bool, sessionID string) *mini
 }
 
 // webauthnFaults arms Redis hooks after the ceremony data is seeded, and can
-// record whether finish deleted the credential it inserted.
+// observe whether the credential finish inserted survived its transaction.
 type webauthnFaults struct {
-	hooks             []redis.Hook
-	credentialRemoved *bool
+	hooks            []redis.Hook
+	credentialStored *bool
 }
 
 func runWebAuthnRegistration(t *testing.T, state *mfaEventDB, neverEnabled bool, sessionID string, faults ...webauthnFaults) (*miniredis.Miniredis, *httptest.ResponseRecorder) {
@@ -303,19 +370,24 @@ func runWebAuthnRegistration(t *testing.T, state *mfaEventDB, neverEnabled bool,
 	require.NoError(t, err)
 	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf(redisKeyWebAuthnReg, enrollUser),
 		`{"session":`+strconv.Quote(string(sessionJSON))+`,"credential_name":"credential-fixture","credential_type":"device-fixture"}`, time.Minute).Err())
-	var credentialRemoved *bool
+	// Always tracked: the flag sync's inline read lists WebAuthn only once the
+	// credential is stored.
+	credentialStored := new(bool)
 	for _, f := range faults {
 		for _, hook := range f.hooks {
 			redisClient.AddHook(hook)
 		}
-		credentialRemoved = f.credentialRemoved
+		if f.credentialStored != nil {
+			credentialStored = f.credentialStored
+		}
 	}
 
 	db := sql.OpenDB(enrollConnector{conn: enrollConn{
-		mfaEventConn:      mfaEventConn{state: state},
-		neverEnabled:      neverEnabled,
-		enabledAtSet:      new(bool),
-		credentialRemoved: credentialRemoved,
+		mfaEventConn:     mfaEventConn{state: state},
+		neverEnabled:     neverEnabled,
+		enabledAtSet:     new(bool),
+		credentialStored: credentialStored,
+		tx:               new(enrollTxLog),
 	}})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	h := NewHandler(db, redisClient, logger.New("test"), nil, "test", webAuthnService, "test")
@@ -358,15 +430,27 @@ func TestTOTPEnrollmentFailsWhenTheMFAFlagsCannotBeWritten(t *testing.T) {
 }
 
 func TestWebAuthnEnrollmentFailsWhenTheMFAFlagsCannotBeWritten(t *testing.T) {
-	removed := new(bool)
-	mini, finish := runWebAuthnRegistration(t, &mfaEventDB{failExecAt: 2}, true, "session-enrolling", webauthnFaults{credentialRemoved: removed})
+	stored := new(bool)
+	mini, finish := runWebAuthnRegistration(t, &mfaEventDB{failExecAt: 2}, true, "session-enrolling", webauthnFaults{credentialStored: stored})
 
 	require.Equal(t, http.StatusInternalServerError, finish.Code, finish.Body.String())
 	noUpgradeGranted(t, mini)
-	// The key is taken back out, so a retry registers it again instead of
+	// The credential and the flags commit together (B1), so the failed flag
+	// write rolls the key back out and a retry registers it again, instead of
 	// adding a second credential beside one login does not know MFA is on for
 	// (silent-failure review, PR #3437).
-	require.True(t, *removed, "a failed activation must not leave the credential registered")
+	require.False(t, *stored, "a failed activation must not leave the credential registered")
+}
+
+// Control for the case above: the same flow with a working flag write keeps
+// the credential, so the case above is observing the rollback, not a fixture
+// that never stores anything.
+func TestWebAuthnEnrollmentKeepsTheCredentialWhenTheFlagsAreWritten(t *testing.T) {
+	stored := new(bool)
+	_, finish := runWebAuthnRegistration(t, &mfaEventDB{}, true, "session-enrolling", webauthnFaults{credentialStored: stored})
+
+	require.Equal(t, http.StatusOK, finish.Code, finish.Body.String())
+	require.True(t, *stored)
 }
 
 // finish reads and deletes the ceremony data in one step, so a failed delete
@@ -378,35 +462,43 @@ func TestWebAuthnRegisterFinishConsumesTheCeremonyWhenADeleteFails(t *testing.T)
 	require.False(t, mini.Exists(fmt.Sprintf(redisKeyWebAuthnReg, enrollUser)), "the ceremony data must not survive a finish")
 }
 
-// updateUserMFAFlags reads every method before it writes the flags. A read that
-// fails must fail the activation. Counting that method as absent can take the
-// disable branch, which clears mfa_enabled_at on an account that already had
-// MFA on (security review, PR #3437).
-func TestTOTPEnrollmentFailsWhenAnMFAMethodCannotBeRead(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		faults confirmFaults
-	}{
-		{"TOTP row", confirmFaults{failQuery: "enabled AND confirmed"}},
-		{"WebAuthn count", confirmFaults{failQuery: "COUNT(*) FROM user_mfa_webauthn"}},
-		{"Email/SMS flag", confirmFaults{failExists: true}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newTOTPEnrollment(t, &mfaEventDB{}, false)
-			e.verify(t, "session-enrolling")
-			e.arm(tc.faults)
+// A factor read that fails must fail the activation: counting a factor it could
+// not read as absent can take the disable branch, which clears mfa_enabled_at
+// on an account that already had MFA on (security review, PR #3437). The B1
+// flag sync reads both inline factors in ONE statement inside the transaction
+// that confirms TOTP, so the failure rolls the confirm back with it.
+func TestTOTPEnrollmentFailsWhenTheInlineFactorsCannotBeRead(t *testing.T) {
+	e := newTOTPEnrollment(t, &mfaEventDB{}, false)
+	e.verify(t, "session-enrolling")
+	e.arm(confirmFaults{failQuery: "AND enabled AND confirmed"})
 
-			confirm := e.confirm("session-enrolling")
+	confirm := e.confirm("session-enrolling")
 
-			require.Equal(t, http.StatusInternalServerError, confirm.Code, confirm.Body.String())
-			require.False(t, *e.disabledAt, "a failed read must not clear mfa_enabled_at")
-			noUpgradeGranted(t, e.mini)
-		})
-	}
+	require.Equal(t, http.StatusInternalServerError, confirm.Code, confirm.Body.String())
+	require.False(t, *e.disabledAt, "a failed read must not clear mfa_enabled_at")
+	noUpgradeGranted(t, e.mini)
 }
 
-// confirm-setup commits confirmed = TRUE before it writes the account flags. A
-// retry after that write failed must finish the activation, including the
+// An unreadable email/SMS state does NOT fail the activation. PR #3437 failed
+// it; the B1 flag sync instead writes the TOTP half exactly and carries the
+// row's own email/SMS entries forward (mfaFlagsDegradedSQL). That never drops
+// a factor that is on and never clears mfa_enabled_at, which is the harm #3437
+// guarded against, and it does not turn a Redis blip into a failed enable.
+func TestTOTPEnrollmentCarriesEmailSmsForwardWhenTheirStateCannotBeRead(t *testing.T) {
+	e := newTOTPEnrollment(t, &mfaEventDB{}, true)
+	e.verify(t, "session-enrolling")
+	e.arm(confirmFaults{failExists: true})
+
+	confirm := e.confirm("session-enrolling")
+
+	require.Equal(t, http.StatusOK, confirm.Code, confirm.Body.String())
+	require.True(t, *e.degradedWrite, "an unreadable email/SMS state must take the carry-forward write")
+	require.False(t, *e.disabledAt, "a failed read must not clear mfa_enabled_at")
+	require.True(t, upgradeGranted(e.mini, "session-enrolling"))
+}
+
+// A confirm whose flag write fails is rolled back with it (B1), so the retry is
+// an ordinary first confirm. It must finish the activation, including the
 // grant, instead of answering 409 (code review, PR #3437).
 func TestTOTPConfirmRetryFinishesAnActivationWhoseFlagsWriteFailed(t *testing.T) {
 	e := newTOTPEnrollment(t, &mfaEventDB{failExecAt: 3}, true)
@@ -417,6 +509,22 @@ func TestTOTPConfirmRetryFinishesAnActivationWhoseFlagsWriteFailed(t *testing.T)
 	retry := e.confirm("session-enrolling")
 
 	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	require.True(t, upgradeGranted(e.mini, "session-enrolling"))
+	require.Equal(t, http.StatusConflict, e.confirm("session-enrolling").Code, "a completed activation still answers 409")
+}
+
+// Before B1 a confirm could commit confirmed = TRUE and then lose its flag
+// write, leaving a row confirmed while the flags lack TOTP. confirm-setup heals
+// it: the flags are written, it answers 200 and grants as a first confirm
+// would, and only a completed activation answers 409.
+func TestTOTPConfirmHealsARowConfirmedWithoutItsFlags(t *testing.T) {
+	e := newTOTPEnrollment(t, &mfaEventDB{}, true)
+	e.verify(t, "session-enrolling")
+	*e.confirmed = true // the pre-B1 confirm whose flag write was lost
+
+	heal := e.confirm("session-enrolling")
+
+	require.Equal(t, http.StatusOK, heal.Code, heal.Body.String())
 	require.True(t, upgradeGranted(e.mini, "session-enrolling"))
 	require.Equal(t, http.StatusConflict, e.confirm("session-enrolling").Code, "a completed activation still answers 409")
 }
@@ -458,7 +566,7 @@ func newTOTPReSetup(t *testing.T) (*Handler, *miniredis.Miniredis, *redis.Client
 	db := sql.OpenDB(enrollConnector{conn: enrollConn{
 		mfaEventConn: mfaEventConn{state: &mfaEventDB{passwordHash: passwordHash}},
 		enabledAtSet: new(bool),
-		totpActive:   new(bool),
+		tx:           new(enrollTxLog),
 	}})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	return NewHandler(db, redisClient, logger.New("test"), keyring, "test", nil, "test"), mini, redisClient
@@ -494,6 +602,7 @@ func runEmailVerification(t *testing.T, state *mfaEventDB, neverEnabled bool, se
 		mfaEventConn: mfaEventConn{state: state},
 		neverEnabled: neverEnabled,
 		enabledAtSet: new(bool),
+		tx:           new(enrollTxLog),
 	}})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	h := NewHandler(db, redisClient, logger.New("test"), nil, "test", nil, "test")

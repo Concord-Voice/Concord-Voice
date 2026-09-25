@@ -140,6 +140,19 @@ describe('MFAVerifyPrompt', () => {
     expect(screen.getByText('Invalid code')).toBeInTheDocument();
   });
 
+  // A refused code clears the field and moves focus to its first box, which is
+  // announced as "Digit 1". Without an alert the refusal itself is never read out.
+  it('announces a code error as an alert', () => {
+    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} error="Invalid code" />);
+    expect(screen.getByRole('alert')).toHaveTextContent('Invalid code');
+  });
+
+  it('announces a code error as an alert in backup-code mode', () => {
+    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} error="Invalid code" />);
+    fireEvent.click(screen.getByText('Use a backup code instead'));
+    expect(screen.getByRole('alert')).toHaveTextContent('Invalid code');
+  });
+
   it('disables inputs when disabled prop is true', () => {
     render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} disabled />);
     const inputs = screen.getAllByRole('textbox');
@@ -590,5 +603,33 @@ describe('MFAVerifyPrompt', () => {
     expect(abortSpy).toHaveBeenCalled();
 
     abortSpy.mockRestore();
+  });
+
+  // Q3: onCodeChange is threaded to the typed inputs, and a method switch
+  // clears the parent's stored code — the field now shown is empty.
+  describe('onCodeChange', () => {
+    it('forwards every TOTP edit, and clears on a switch to backup codes', () => {
+      const onVerify = vi.fn();
+      const onCodeChange = vi.fn();
+      render(
+        <MFAVerifyPrompt methods={['totp']} onVerify={onVerify} onCodeChange={onCodeChange} />
+      );
+      for (let i = 1; i <= 6; i++) {
+        fireEvent.change(screen.getByLabelText(`Digit ${i}`), { target: { value: String(i) } });
+      }
+      expect(onCodeChange).toHaveBeenLastCalledWith('123456');
+      fireEvent.click(screen.getByText('Use a backup code instead'));
+      expect(onCodeChange).toHaveBeenLastCalledWith('');
+      fireEvent.change(screen.getByPlaceholderText('XXXXXXXX'), {
+        target: { value: 'ABCD1234' },
+      });
+      expect(onCodeChange).toHaveBeenLastCalledWith('ABCD1234');
+    });
+
+    it('is optional: a prompt without it still switches methods', () => {
+      render(<MFAVerifyPrompt methods={['totp']} onVerify={vi.fn()} />);
+      fireEvent.click(screen.getByText('Use a backup code instead'));
+      expect(screen.getByPlaceholderText('XXXXXXXX')).toBeInTheDocument();
+    });
   });
 });

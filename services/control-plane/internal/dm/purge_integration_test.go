@@ -423,3 +423,22 @@ func TestPurgeConversation_NonParticipant403(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	assert.Equal(t, 1, countDMMessages(t, ts, convID))
 }
+
+// TestPurgeConversation_P1EmailOnlyAccountPasswordAlone locks policy P1 on the
+// DM purge: stepup.LoadSubject derives MFA from the factor tables, so an
+// email/SMS-only account is not asked for an inline code it cannot supply.
+func TestPurgeConversation_P1EmailOnlyAccountPasswordAlone(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "p1_alice")
+	bob := ts.CreateTestUser(t, "p1_bob")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+	insertDMMsg(t, ts, convID, alice.ID, "mine")
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = TRUE, mfa_methods = '{email}' WHERE id = $1`, alice.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(http.MethodDelete, purgeConvPath(convID),
+		map[string]any{"range": "all", "current_password": testhelpers.TestAuthPlaintext},
+		testhelpers.AuthHeaders(alice.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 0, countDMMessages(t, ts, convID))
+}

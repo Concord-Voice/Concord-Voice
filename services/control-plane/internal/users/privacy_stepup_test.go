@@ -16,6 +16,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -181,7 +182,13 @@ func TestPurgeFenceStepUp_RedisOutageDenies(t *testing.T) {
 
 	h.UpdatePrivacySettings(c)
 
-	require.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
+	// 503, not 429: an unevaluable budget is a server fault, and telling the
+	// user "too many attempts" misreports it as theirs (the MFA-settings twin
+	// had the same defect; both now share stepup.Budget).
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	require.Equal(t, map[string]interface{}{"error": stepup.ErrMsgBudgetUnavailable}, body)
 	require.True(t, storedPurgeFence(t, ts, user.ID),
 		"a denied attempt must not lower the fence")
 }
@@ -560,4 +567,49 @@ func TestUpdatePrivacy_SuccessfulDisableClearsTheAttemptBudget(t *testing.T) {
 	require.ErrorIs(t, err, redis.Nil,
 		"a committed disable must clear the attempt budget; otherwise correct "+
 			"credentials eventually lock the actor out of their own setting")
+}
+
+// TestUpdatePrivacy_P1EmailOnlyAccountPasswordAlone locks policy P1 on the
+// purge fence: the MFA leg is required only for a factor the server can verify
+// inline (TOTP, WebAuthn), read from the factor tables. An email/SMS-only
+// account has nowhere to enter an inline code, so demanding one — which the
+// raw users.mfa_enabled flag used to do — locked it out of its own setting.
+func TestUpdatePrivacy_P1EmailOnlyAccountPasswordAlone(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "purgefencep1email")
+	materializePrivacyRow(t, ts, user)
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = TRUE, mfa_methods = '{email}' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := patchPrivacy(t, ts, user.AccessToken, map[string]interface{}{
+		keyRequireAuthBeforePurge: false,
+		keyCurrentPassword:        testhelpers.TestAuthPlaintext,
+	})
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.False(t, storedPurgeFence(t, ts, user.ID))
+}
+
+// TestUpdatePrivacy_P1StaleFlagsStillRequireCode is P1's other half: a
+// confirmed TOTP factor demands a code even when the denormalized flags say MFA
+// is off. Reading users.mfa_enabled let a password alone lower the fence here.
+func TestUpdatePrivacy_P1StaleFlagsStillRequireCode(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "purgefencep1stale")
+	materializePrivacyRow(t, ts, user)
+	enableTOTP(t, ts, user)
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = FALSE, mfa_methods = '{}' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := patchPrivacy(t, ts, user.AccessToken, map[string]interface{}{
+		keyRequireAuthBeforePurge: false,
+		keyCurrentPassword:        testhelpers.TestAuthPlaintext,
+	})
+
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	require.Equal(t, true, body["mfa_required"])
+	require.Equal(t, []interface{}{"totp"}, body["methods"])
+	require.True(t, storedPurgeFence(t, ts, user.ID), "a password alone must not lower the fence of a TOTP account")
 }

@@ -217,15 +217,16 @@ describe('PurgeMessagesModal — single-shot submission', () => {
     ).toBeInTheDocument();
   });
 
-  it('sends the code alone when the server asked for MFA only', async () => {
+  it('keeps the accepted password through an MFA challenge, so the retry carries both', async () => {
     const bodies: unknown[] = [];
-    setRequireAuthBeforePurge(false);
     server.use(
       http.delete(DM_ROUTE, async ({ request }) => {
         bodies.push(await request.json());
         if (bodies.length === 1) {
+          // The seam checks the password first: this is what a CORRECT
+          // password with no code receives.
           return HttpResponse.json(
-            { error: 'MFA required', mfa_required: true, methods: ['totp'] },
+            { error: 'MFA verification required', mfa_required: true, methods: ['totp'] },
             { status: 403 }
           );
         }
@@ -237,16 +238,20 @@ describe('PurgeMessagesModal — single-shot submission', () => {
     renderDm();
     await reachStepUp(user);
 
-    // An SSO account with MFA has no password to offer, so the stage must not
-    // demand one (copy deck §5).
-    expect(await screen.findByLabelText('Authentication code')).toBeInTheDocument();
-    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    await user.type(passwordField(), FIXTURE_PW);
+    await user.click(screen.getByRole('button', { name: 'Confirm and Purge' }));
+    await waitFor(() => expect(bodies).toHaveLength(1));
+
+    // Hiding the field here made the retry send no password, drew
+    // `password_required`, and spent a second attempt from the purge budget —
+    // the loop PurgeFenceStepUpDialog closed in #2792.
+    expect(passwordField()).toBeInTheDocument();
 
     await user.type(codeField(), FIXTURE_OTP);
     await user.click(screen.getByRole('button', { name: 'Confirm and Purge' }));
 
     await waitFor(() => expect(bodies).toHaveLength(2));
-    expect(bodies[1]).toEqual({ range: '7d', mfa_code: FIXTURE_OTP });
+    expect(bodies[1]).toEqual({ range: '7d', current_password: FIXTURE_PW, mfa_code: FIXTURE_OTP });
   });
 
   it('reveals the fields when a credential-less purge is refused', async () => {
@@ -263,6 +268,9 @@ describe('PurgeMessagesModal — single-shot submission', () => {
 
     expect(await screen.findByRole('heading', { name: 'Confirm it is you' })).toBeInTheDocument();
     expect(passwordField()).toBeInTheDocument();
+    // This refusal is the challenge itself: nothing was typed, so no field is wrong.
+    expect(screen.queryByText('Enter your password to continue.')).not.toBeInTheDocument();
+    expect(passwordField()).not.toHaveAttribute('aria-invalid');
   });
 });
 
@@ -329,6 +337,54 @@ describe('PurgeMessagesModal — secret containment', () => {
 });
 
 describe('PurgeMessagesModal — per-field errors', () => {
+  // Both fields are on screen from the start of the stage, so a refusal that
+  // names a MISSING factor changes nothing visible unless the field says so:
+  // the dialog looked like it had ignored the click.
+  it('asks for the code when a correct password was sent alone, and focuses it', async () => {
+    server.use(
+      http.delete(DM_ROUTE, () =>
+        HttpResponse.json(
+          { error: 'MFA verification required', mfa_required: true, methods: ['totp'] },
+          { status: 403 }
+        )
+      )
+    );
+
+    const user = userEvent.setup();
+    renderDm();
+    await reachStepUp(user);
+    await user.type(passwordField(), FIXTURE_PW);
+    await user.click(screen.getByRole('button', { name: 'Confirm and Purge' }));
+
+    expect(
+      await screen.findByText('Enter the code from your authenticator app to continue.')
+    ).toBeInTheDocument();
+    await waitFor(() => expect(codeField()).toHaveAttribute('aria-invalid', 'true'));
+    expect(passwordField()).not.toHaveAttribute('aria-invalid');
+    await waitFor(() => expect(codeField()).toHaveFocus());
+    expect(passwordField()).toHaveValue(FIXTURE_PW);
+  });
+
+  it('asks for the password when a code was sent alone, and focuses it', async () => {
+    server.use(
+      http.delete(DM_ROUTE, () =>
+        HttpResponse.json({ error: 'password_required', password_required: true }, { status: 403 })
+      )
+    );
+
+    const user = userEvent.setup();
+    renderDm();
+    await reachStepUp(user);
+    await user.type(codeField(), FIXTURE_OTP);
+    await user.click(screen.getByRole('button', { name: 'Confirm and Purge' }));
+
+    expect(await screen.findByText('Enter your password to continue.')).toBeInTheDocument();
+    await waitFor(() => expect(passwordField()).toHaveAttribute('aria-invalid', 'true'));
+    expect(codeField()).not.toHaveAttribute('aria-invalid');
+    await waitFor(() => expect(passwordField()).toHaveFocus());
+    expect(codeField()).toHaveValue(FIXTURE_OTP);
+  });
+
   it('marks only the password field invalid on a wrong password', async () => {
     server.use(
       http.delete(DM_ROUTE, () => HttpResponse.json({ error: 'Invalid password' }, { status: 403 }))

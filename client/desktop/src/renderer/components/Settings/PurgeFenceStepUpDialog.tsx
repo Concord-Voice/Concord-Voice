@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import StepUpFields, { type StepUpFieldErrors } from '../Purge/StepUpFields';
+import StepUpFields, { stepUpFieldErrors, stepUpRefusedField } from '../Purge/StepUpFields';
 import { usePrivacyStore, type PurgeFenceDisableResult } from '../../stores/ui/privacyStore';
 // StepUpFields renders the shipped #1354 markup, so it needs the shipped #1354
 // stylesheet — the Settings pane never loads PurgeMessagesModal.
@@ -29,23 +29,6 @@ const TITLE = 'Confirm it is you';
 const DISABLE_WARNING =
   'Without this, anyone with access to your unlocked account can permanently purge your ' +
   'message history.';
-
-/**
- * Per-field step-up error copy (#1354 deck §5, byte-identical to
- * PurgeMessagesModal). Held in a switch rather than a lookup object because the
- * pre-commit secret scanner flags a credential-shaped key placed beside a
- * quoted literal — see StepUpFields' `credentialError`.
- */
-function stepUpFieldErrors(refusal: PurgeFenceDisableResult | null): StepUpFieldErrors {
-  switch (refusal?.kind) {
-    case 'invalidPassword':
-      return { credentialError: 'That password is not correct.' };
-    case 'invalidMfaCode':
-      return { codeError: 'That code is not correct, or it has expired. Try the next one.' };
-    default:
-      return {};
-  }
-}
 
 /**
  * Whether a refusal belongs above the fields rather than on one of them. The
@@ -118,8 +101,9 @@ const PurgeFenceStepUpDialog: React.FC<PurgeFenceStepUpDialogProps> = ({ open, o
   // A rejected factor returns focus to the field that owns it. Keyed on the
   // refusal object, so a second wrong attempt of the same kind re-focuses too.
   useLayoutEffect(() => {
-    if (refusal?.kind === 'invalidPassword') passwordRef.current?.focus();
-    else if (refusal?.kind === 'invalidMfaCode') codeRef.current?.focus();
+    const field = stepUpRefusedField(refusal);
+    if (field === 'password') passwordRef.current?.focus();
+    else if (field === 'code') codeRef.current?.focus();
   }, [refusal]);
 
   const handleSubmit = async () => {

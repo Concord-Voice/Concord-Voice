@@ -274,11 +274,6 @@
   border-color: var(--state-focused);
 }
 
-.mfa-backup-email-error {
-  font-size: 12px;
-  color: var(--error-color, #ed4245);
-}
-
 .mfa-backup-email-actions {
   display: flex;
   gap: 6px;
@@ -339,11 +334,28 @@
   border: 1px solid var(--error-color, #ed4245);
   border-radius: 6px;
   padding: 12px 16px;
-  color: var(--error-color, #ed4245);
+  /* Text is --text-primary, not --error-color/--danger: the latter measures
+     an AA failure as label text in 9 of 30 scheme×theme pairs. --error-color
+     is reserved for the glyph and the border, which only need the 3:1
+     UI-component floor (SC 1.4.11). */
+  color: var(--text-primary, #fff);
   font-size: 14px;
   font-weight: 500;
   text-align: left;
   margin: 8px 0;
+}
+
+.mfa-setup-error-banner svg {
+  color: var(--error-color, #ed4245);
+  flex-shrink: 0;
+}
+
+/* The MFA status could not be read: the banner, then a retry under it. */
+.mfa-status-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
 }
 
 .mfa-setup-actions {
@@ -435,6 +447,43 @@
 .mfa-verify-field input:focus {
   outline: none;
   border-color: var(--state-focused);
+}
+
+/* Non-text use of --danger (border only) needs the 3:1 UI-component floor
+   (SC 1.4.11), not the AA text floor .mfa-field-error is held to below. */
+.mfa-verify-field input[aria-invalid='true'] {
+  border-color: var(--danger, #ed4245);
+}
+
+.mfa-field-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-primary, #fff);
+  margin: 0;
+}
+
+.mfa-field-error svg {
+  flex-shrink: 0;
+  color: var(--error-color, #ed4245);
+}
+
+.mfa-setup-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 6px;
+  padding: 12px 16px;
+  color: var(--text-primary, #fff);
+  font-size: 14px;
+  margin: 8px 0;
+}
+
+.mfa-setup-info svg {
+  flex-shrink: 0;
+  color: var(--accent-color, #5865f2);
 }
 
 .mfa-manual-entry {
@@ -569,6 +618,14 @@
   color: var(--text-primary, #fff);
 }
 
+/* The action modal's body inside ui/Modal. It carries the column gap that
+   .mfa-modal gave these same children before the move to ui/Modal. */
+.mfa-action-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 .mfa-modal-desc {
   color: var(--text-secondary, #bbb);
   font-size: 14px;
@@ -598,6 +655,14 @@
   color: var(--text-secondary, #bbb);
   font-size: 13px;
   margin: 0;
+}
+
+/* Advance notice that the 8th character submits (WCAG 3.2.2) — the input's
+   aria-describedby, so it is announced with the field, not only seen. */
+.backup-code-hint {
+  color: var(--text-secondary, #bbb);
+  font-size: 12px;
+  margin: -6px 0 0;
 }
 
 .backup-code-field {

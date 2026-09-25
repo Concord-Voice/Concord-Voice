@@ -443,54 +443,102 @@ func TestTOTPConfirmSetupEmitsFactorEnabledOnlyAfterWrites(t *testing.T) {
 	}}, successRecorder.events)
 }
 
-func TestEmailSmsDisableEmitsAfterAuthoritativeDeleteEvenIfFlagSyncFails(t *testing.T) {
+// TestEmailSmsDisableEmitsOnlyAfterFlagsAndDeleteCommit: since B1 the flag
+// write is the second statement of EmailSmsDisable's own transaction (after
+// the recovery-only update), not a post-commit best-effort sync — so a failed
+// flag write is a 500 that rolls everything back and emits nothing. Before B1
+// this case (then "...EvenIfFlagSyncFails") pinned a 200 over stale flags.
+func TestEmailSmsDisableEmitsOnlyAfterFlagsAndDeleteCommit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mini := miniredis.RunT(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+
+	// The step-up gate now requires credentials on every call this test
+	// makes, so every fixture needs a real password hash and every request
+	// carries the matching password. pragma: allowlist secret -- test credential
+	passwordHash, err := auth.HashPasswordWithParams("EmailSmsDisableEventTest1!", &auth.Argon2Params{Memory: 8, Iterations: 1, Parallelism: 1, SaltLength: 8, KeyLength: 16})
+	require.NoError(t, err)
 	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
 		response := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(response)
-		c.Request = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa/email-sms", nil)
+		// pragma: allowlist secret -- test credential, matches passwordHash above
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/email-sms",
+			strings.NewReader(`{"password":"EmailSmsDisableEventTest1!"}`))
+		c.Request.Header.Set("Content-Type", "application/json")
 		c.Set("user_id", "user")
 		return c, response
 	}
 
-	failureDB := sql.OpenDB(mfaEventConnector{state: &mfaEventDB{failExecAt: 2}})
+	// Exec 2 is the in-transaction flag write.
+	failureDB := sql.OpenDB(mfaEventConnector{state: &mfaEventDB{failExecAt: 2, passwordHash: passwordHash}})
 	t.Cleanup(func() { require.NoError(t, failureDB.Close()) })
 	failureHandler := NewHandler(failureDB, redisClient, logger.New("test"), nil, "test", nil, "test")
 	failureRecorder := &securityEventRecorder{}
 	failureHandler.SetSecurityEvents(failureRecorder)
 	failureContext, failureResponse := newContext()
 	failureHandler.EmailSmsDisable(failureContext)
-	require.Equal(t, http.StatusOK, failureResponse.Code)
-	require.Equal(t, []securityevent.Event{{
-		EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess,
-		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled,
-	}}, failureRecorder.events)
+	require.Equal(t, http.StatusInternalServerError, failureResponse.Code, "body: %s", failureResponse.Body.String())
+	require.Empty(t, failureRecorder.events, "a failed flag write must not emit factor_disabled")
 
-	successDB := sql.OpenDB(mfaEventConnector{state: &mfaEventDB{}})
+	successDB := sql.OpenDB(mfaEventConnector{state: &mfaEventDB{passwordHash: passwordHash}})
 	t.Cleanup(func() { require.NoError(t, successDB.Close()) })
 	successHandler := NewHandler(successDB, redisClient, logger.New("test"), nil, "test", nil, "test")
 	successRecorder := &securityEventRecorder{}
 	successHandler.SetSecurityEvents(successRecorder)
 	successContext, successResponse := newContext()
 	successHandler.EmailSmsDisable(successContext)
-	require.Equal(t, http.StatusOK, successResponse.Code)
+	require.Equal(t, http.StatusOK, successResponse.Code, "body: %s", successResponse.Body.String())
 	require.Equal(t, []securityevent.Event{{
 		EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess,
 		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled,
 	}}, successRecorder.events)
 
-	downRedis := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
-	t.Cleanup(func() { require.NoError(t, downRedis.Close()) })
-	downHandler := NewHandler(nil, downRedis, logger.New("test"), nil, "test", nil, "test")
+	// The authoritative delete is the Redis Del of the four email/SMS flag
+	// keys, issued from INSIDE the write transaction while the users-row
+	// lock is held — not the step-up budget's Redis INCR, which runs before
+	// BeginTx and must stay healthy for this request to ever reach the
+	// delete at all. A fully-unreachable Redis client can no longer isolate
+	// that specific failure: it would fail the budget check first, with its
+	// own distinct 429 ReasonRateLimitBackendUnavailable event (covered in
+	// settings_stepup_internal_test.go). A DEL-only ProcessHook against a
+	// live miniredis is what lets every other call on this request succeed
+	// while only the authoritative delete fails.
+	delFailRedis := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { require.NoError(t, delFailRedis.Close()) })
+	delFailRedis.AddHook(mfaEventDelFaultHook{})
+	downDB := sql.OpenDB(mfaEventConnector{state: &mfaEventDB{passwordHash: passwordHash}})
+	t.Cleanup(func() { require.NoError(t, downDB.Close()) })
+	downHandler := NewHandler(downDB, delFailRedis, logger.New("test"), nil, "test", nil, "test")
 	downRecorder := &securityEventRecorder{}
 	downHandler.SetSecurityEvents(downRecorder)
 	downContext, downResponse := newContext()
 	downHandler.EmailSmsDisable(downContext)
-	require.Equal(t, http.StatusServiceUnavailable, downResponse.Code)
+	require.Equal(t, http.StatusServiceUnavailable, downResponse.Code, "body: %s", downResponse.Body.String())
 	require.Empty(t, downRecorder.events, "a failed authoritative Redis delete must not emit factor_disabled")
+}
+
+// mfaEventDelFaultHook fails every Redis DEL command and passes everything
+// else through untouched — in particular the step-up budget's INCR/TTL/
+// EXPIRE calls, which must stay healthy so the request reaches the
+// authoritative delete this hook exists to fail.
+type mfaEventDelFaultHook struct{}
+
+func (mfaEventDelFaultHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (mfaEventDelFaultHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "del" {
+			return next(ctx, cmd)
+		}
+		err := errors.New("simulated redis DEL failure")
+		cmd.SetErr(err)
+		return err
+	}
+}
+
+func (mfaEventDelFaultHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
 }
 
 func TestEmailSmsVerifyEmitsFactorEnabledOnlyAfterFlagWrite(t *testing.T) {
@@ -652,6 +700,62 @@ func TestVerifyTOTPOrBackupEmitsDependencyEventOnVerificationFailure(t *testing.
 	require.True(t, middleware.NightwatchHandled(c))
 }
 
+// TestStepUpGateFailsClosedOnSubjectReadFailure is C2. The request carries the
+// CORRECT password and no MFA code, so a gate that read a failed subject or
+// factor lookup as "no MFA" would admit it on the password alone. Every arm
+// must answer 500 "Verification failed", write nothing, and emit nothing (a
+// fault is not a denied credential). The control arm proves the fixture
+// reaches the success path when nothing fails, so each fault arm fails for
+// its own reason.
+func TestStepUpGateFailsClosedOnSubjectReadFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const credential = "GateFailClosedFixture1!" // pragma: allowlist secret -- test credential
+	passwordHash, err := auth.HashPasswordWithParams(credential, &auth.Argon2Params{Memory: 8, Iterations: 1, Parallelism: 1, SaltLength: 8, KeyLength: 16})
+	require.NoError(t, err)
+	mini := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+
+	emailSmsDisable := func(h *Handler, c *gin.Context) { h.EmailSmsDisable(c) }
+	totpSetup := func(h *Handler, c *gin.Context) { h.TOTPSetup(c) }
+	for _, tc := range []struct {
+		name       string
+		state      mfaEventDB
+		call       func(*Handler, *gin.Context)
+		wantStatus int
+	}{
+		{name: "control: nothing fails", call: emailSmsDisable, wantStatus: http.StatusOK},
+		{name: "in-transaction gate: users-row lock read fails", state: mfaEventDB{failLock: true}, call: emailSmsDisable, wantStatus: http.StatusInternalServerError},
+		{name: "in-transaction gate: P1 factor read fails", state: mfaEventDB{failInline: true}, call: emailSmsDisable, wantStatus: http.StatusInternalServerError},
+		{name: "pool gate: subject read fails", state: mfaEventDB{failInline: true}, call: totpSetup, wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := tc.state
+			state.passwordHash = passwordHash // pragma: allowlist secret -- test-only password hash
+			db := sql.OpenDB(mfaEventConnector{state: &state})
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			h := NewHandler(db, redisClient, logger.New("test"), nil, "test", nil, "test")
+			recorder := &securityEventRecorder{}
+			h.SetSecurityEvents(recorder)
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/mfa/step-up", strings.NewReader(`{"password":"`+credential+`"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("user_id", "user-fixture-"+strconv.Itoa(len(tc.name)))
+
+			tc.call(h, c)
+
+			require.Equal(t, tc.wantStatus, response.Code, "body: %s", response.Body.String())
+			if tc.wantStatus == http.StatusOK {
+				return
+			}
+			require.JSONEq(t, `{"error":"Verification failed"}`, response.Body.String())
+			require.Zero(t, state.execCalls, "a failed subject read must write nothing")
+			require.Empty(t, recorder.events, "a server fault is not a denied credential and emits no event")
+		})
+	}
+}
+
 const webAuthnCredentialID = "6Jry73M_WVWDoXLsGxRsBVVHpPWDpNy1ETGXUEvJLdTAn5Ew6nDGU6W8iO3ZkcLEqr-CBwvx0p2WAxzt8RiwQQ" // #nosec G101 -- public WebAuthn test fixture // pragma: allowlist secret
 
 const webAuthnAttestation = "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YVjEdKbqkhPJnC90siSSsyDPQCYqlMGpUKA5fyklC2CEHvBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAQOia8u9zP1lVg6Fy7BsUbAVVR6T1g6TctRExl1BLyS3UwJ-RMOpwxlOlvIjt2ZHCxKq_ggcL8dKdlgMc7fEYsEGlAQIDJiABIVgg--n_QvZithDycYmnifk6vMHiwBP6kugn2PlsnvkrcSgiWCBAlBYm2B-rMtQlp5MxGTLoGDHoktxb0p364Hy2BH9U2Q" // pragma: allowlist secret -- public WebAuthn test fixture
@@ -713,8 +817,12 @@ func TestWebAuthnRegisterFinishEmitsFactorEnabledOnlyAfterCredentialInsert(t *te
 }
 
 type mfaEventDB struct {
-	failFirstExec   bool
-	failExecAt      int
+	failFirstExec bool
+	failExecAt    int
+	// failLock fails the step-up's first-statement users-row lock read;
+	// failInline fails the P1 factor read (and LoadSubject's combined read).
+	failLock        bool
+	failInline      bool
 	execCalls       int
 	passwordHash    string
 	totpSecretEnc   []byte
@@ -740,7 +848,28 @@ type mfaEventConn struct{ state *mfaEventDB }
 
 func (mfaEventConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
 func (mfaEventConn) Close() error                        { return nil }
-func (mfaEventConn) Begin() (driver.Tx, error)           { return nil, driver.ErrSkip }
+func (mfaEventConn) Begin() (driver.Tx, error)           { return mfaEventTx{}, nil }
+
+// BeginTx makes this fake driver satisfy driver.ConnBeginTx. Without it,
+// database/sql's ctxDriverBegin refuses any non-default isolation level
+// outright ("driver does not support non-default isolation level") before
+// ever falling back to Begin() — and the MFA-settings step-up gate always
+// requests sql.LevelReadCommitted. The isolation/read-only options are
+// otherwise unused by this fake; it always begins a no-op transaction.
+func (mfaEventConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return mfaEventTx{}, nil
+}
+
+// mfaEventTx is a no-op driver.Tx: Commit/Rollback do nothing beyond letting
+// database/sql mark the *sql.Tx done. Statements issued on the *sql.Tx route
+// back through the same mfaEventConn (ExecContext/QueryContext), so the
+// shared *mfaEventDB state is still exercised identically whether a call
+// happens inside or outside a transaction.
+type mfaEventTx struct{}
+
+func (mfaEventTx) Commit() error   { return nil }
+func (mfaEventTx) Rollback() error { return nil }
+
 func (c mfaEventConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
 	c.state.execCalls++
 	if (c.state.failFirstExec && c.state.execCalls == 1) || c.state.failExecAt == c.state.execCalls {
@@ -750,6 +879,34 @@ func (c mfaEventConn) ExecContext(context.Context, string, []driver.NamedValue) 
 }
 func (c mfaEventConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
+	// The MFA-settings step-up gate's first-statement users-row lock
+	// (settings_stepup.go stepUpLockForShareSQL / stepUpLockForNoKeyUpdateSQL)
+	// selects credential_epoch and password_hash together. Matched ahead of
+	// the single-column "password_hash" case below because that query text
+	// also contains "password_hash". A nil epoch scans into an invalid
+	// sql.NullString, which credepoch.MatchEpoch treats as "never rotated" —
+	// the same meaning a NULL column carries in production.
+	case strings.Contains(query, "credential_epoch"):
+		if c.state.failLock {
+			return nil, errors.New("raw-error-fixture: forced users-row lock failure")
+		}
+		return &mfaEventRows{values: []driver.Value{nil, c.state.passwordHash}}, nil
+	// stepup.LoadSubject's combined read (hash + both P1 EXISTS) — matched
+	// ahead of the two cases below, whose substrings it also contains.
+	case strings.Contains(query, "FROM users u WHERE u.id"):
+		if c.state.failInline {
+			return nil, errors.New("raw-error-fixture: forced subject read failure")
+		}
+		return &mfaEventRows{values: []driver.Value{c.state.passwordHash, false, false}}, nil
+	// stepup.InlineMFAMethods' two-column EXISTS query also contains
+	// "SELECT EXISTS", so it must be matched ahead of the single-column case
+	// below (TOTPDisable's existence probe). None of this file's fixtures need
+	// an inline-verifiable factor, so both columns are false.
+	case strings.Contains(query, "AND enabled AND confirmed"):
+		if c.state.failInline {
+			return nil, errors.New("raw-error-fixture: forced inline factor read failure")
+		}
+		return &mfaEventRows{values: []driver.Value{false, false}}, nil
 	case strings.Contains(query, "SELECT EXISTS"):
 		return &mfaEventRows{values: []driver.Value{c.state.totpExists}}, nil
 	case strings.Contains(query, "password_hash"):

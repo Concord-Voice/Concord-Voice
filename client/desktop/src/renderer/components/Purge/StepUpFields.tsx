@@ -11,6 +11,44 @@ export interface StepUpFieldErrors {
   codeError?: string;
 }
 
+/** The refusal shape both step-up dialogs route here: only its kind is read. */
+interface StepUpRefusalLike {
+  kind: string;
+}
+
+/**
+ * Per-field copy for a step-up refusal, shared by the purge dialog and the
+ * purge-fence dialog so the two cannot drift (they held a copy each, kept
+ * "byte-identical" by a comment). Both keep both fields on screen, so a refusal
+ * that names a MISSING factor has no other visible effect: without copy here, a
+ * correct password sent with no code changed nothing and the dialog looked like
+ * it had ignored the click. Held in a switch rather than a lookup object because
+ * the pre-commit secret scanner flags a credential-shaped key placed beside a
+ * quoted literal — see `credentialError` above.
+ */
+export function stepUpFieldErrors(refusal: StepUpRefusalLike | null): StepUpFieldErrors {
+  switch (refusal?.kind) {
+    case 'passwordRequired':
+      return { credentialError: 'Enter your password to continue.' };
+    case 'invalidPassword':
+      return { credentialError: 'That password is not correct.' };
+    case 'mfaRequired':
+      return { codeError: 'Enter the code from your authenticator app to continue.' };
+    case 'invalidMfaCode':
+      return { codeError: 'That code is not correct, or it has expired. Try the next one.' };
+    default:
+      return {};
+  }
+}
+
+/** The field a refusal belongs to, for returning focus; null when it names neither. */
+export function stepUpRefusedField(refusal: StepUpRefusalLike | null): 'password' | 'code' | null {
+  const errors = stepUpFieldErrors(refusal);
+  if (errors.credentialError !== undefined) return 'password';
+  if (errors.codeError !== undefined) return 'code';
+  return null;
+}
+
 interface StepUpFieldsProps {
   /** False when the server asked for MFA alone — an SSO account has no password. */
   showPassword: boolean;

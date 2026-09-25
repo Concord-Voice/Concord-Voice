@@ -20,6 +20,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -34,6 +35,7 @@ const (
 	errMsgFailedQueryOwner       = "Failed to query server owner"
 	errMsgFailedVerifyOwnership  = "Failed to verify ownership"
 	errMsgFailedVerifyPassword   = "Failed to verify password"
+	errMsgFailedVerifyMFACode    = "Failed to verify MFA code"
 	errMsgFailedReverseTransfer  = "Failed to reverse transfer"
 	errMsgFailedInitiateTransfer = "Failed to initiate transfer"
 	errMsgFailedCancelTransfer   = "Failed to cancel transfer"
@@ -1317,16 +1319,24 @@ func (h *Handler) verifyPassword(c *gin.Context, userID, password string) error 
 	return nil
 }
 
-// verifyMFA checks MFA if enabled for the user.
+// verifyMFA checks MFA if the user holds an inline-verifiable factor (policy
+// P1: TOTP or WebAuthn, read from the factor tables, never users.mfa_methods).
+// One read decides both whether the leg applies and which methods the prompt
+// offers, so the two cannot disagree. A read error fails closed.
 // On failure, sends an error response to the gin context and returns an error.
 func (h *Handler) verifyMFA(c *gin.Context, userID, mfaCode string) error {
 	ctx := c.Request.Context()
-	if !h.mfaVerifier.IsEnabled(ctx, userID) {
+	methods, err := stepup.InlineMFAMethods(ctx, h.db, userID)
+	if err != nil {
+		h.log.Error("Failed to read MFA factors", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyMFACode})
+		return err
+	}
+	if len(methods) == 0 {
 		return nil
 	}
 
 	if mfaCode == "" {
-		methods, _ := h.mfaVerifier.GetEnabledMethods(ctx, userID)
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":        "MFA verification required",
 			"mfa_required": true,
@@ -1337,8 +1347,8 @@ func (h *Handler) verifyMFA(c *gin.Context, userID, mfaCode string) error {
 
 	valid, err := h.mfaVerifier.VerifyCode(ctx, userID, mfaCode)
 	if err != nil {
-		h.log.Error("Failed to verify MFA code", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify MFA code"})
+		h.log.Error(errMsgFailedVerifyMFACode, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyMFACode})
 		return err
 	}
 	if !valid {

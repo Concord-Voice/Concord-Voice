@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
+import { classifyStepUpRefusal, isStepUpFactorRefusal } from '../../services/system/stepUpRefusal';
 
 // DM Privacy Levels:
 // 0 = Off (no DMs at all)
@@ -160,12 +161,12 @@ export type PurgeFenceDisableResult = { kind: 'accepted' } | PrivacyUpdateRefusa
 /**
  * Maps a non-2xx privacy PATCH onto {@link PrivacyUpdateRefusal}.
  *
- * The two boolean flags are the intended contract and are matched first. The
- * two string comparisons below are NOT: they match human-readable prose from
- * `internal/stepup`, which carries no machine-readable discriminator — the same
- * known brittleness `services/messaging/purgeApi.ts` documents, kept byte-identical on
- * purpose so both clients degrade the same way. Rewording either server string
- * downgrades a per-field error to the generic banner; nothing is misreported.
+ * A 403 is read by the shared step-up classifier
+ * (`services/system/stepUpRefusal.ts`), the same one `purgeApi.ts` and the MFA
+ * settings actions use, so the clients of the `internal/stepup` seam cannot
+ * drift and degrade identically if a seam string is ever reworded. Every other
+ * status — including the purge fence's 429 and its budget-outage 503 — stays a
+ * `refused` carrying the server's own text, which is the copy written for it.
  */
 export function classifyPrivacyRefusal(
   status: number,
@@ -184,14 +185,11 @@ export function classifyPrivacyRefusal(
   }
 
   if (status === 403) {
-    if (body.password_required) return { kind: 'passwordRequired', message };
-    // An account with MFA but no password is answered with `mfa_required` and
-    // no `password_required` — that absence is the signal to drop the password
-    // field, because a passwordless SSO account has nothing to type there.
-    if (body.mfa_required) return { kind: 'mfaRequired', methods: body.methods ?? [], message };
-    if (body.error === 'Invalid password') return { kind: 'invalidPassword', message };
-    if (body.error === 'Invalid MFA code') return { kind: 'invalidMfaCode', message };
-    return { kind: 'refused', message };
+    // `mfa_required` arrives AFTER a correct password (the seam checks the
+    // password first), so it is never a signal to drop the password field —
+    // PurgeFenceStepUpDialog keeps it up for exactly that reason (#2792).
+    const refusal = classifyStepUpRefusal(status, body);
+    return isStepUpFactorRefusal(refusal) ? { ...refusal, message } : { kind: 'refused', message };
   }
 
   // A 400 on the gated transition means the account carries neither a password
