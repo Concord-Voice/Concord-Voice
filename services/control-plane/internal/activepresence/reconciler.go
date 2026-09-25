@@ -344,13 +344,12 @@ func (r *Reconciler) resolveOneAlreadyGated(
 		return false, nil
 	}
 
-	decision := Resolve(txCtx, r.reader, plan, time.Now())
+	decision := Resolve(txCtx, r.reader, plan)
 
 	switch decision.Outcome {
-	case OutcomeStateAbsent, OutcomeSuperseded:
-		// No delivery is owed. B1's viewers have already expired their copy;
-		// B4's generation belongs to a LIVE successor, so touching Redis here
-		// would kill a live call's presence.
+	case OutcomeSuperseded:
+		// No delivery is owed. B4's generation belongs to a LIVE successor, so
+		// touching Redis here would kill a live call's presence.
 		if err := DeletePlanTx(txCtx, tx, plan); err != nil {
 			return false, err
 		}

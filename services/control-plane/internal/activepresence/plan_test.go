@@ -110,7 +110,7 @@ func TestClosedVocabulariesPinEveryMember(t *testing.T) {
 	}
 
 	outcomes := map[Outcome]string{
-		OutcomeStateAbsent:  "state_absent",
+		outcomeUnset:        "retained",
 		OutcomeSuperseded:   "superseded",
 		OutcomeCleared:      "cleared",
 		OutcomeDisconnected: "disconnected",

@@ -3,7 +3,6 @@ package activepresence
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -28,25 +27,25 @@ type Decision struct {
 // HasGeneration reports whether the decision authorizes an exact generation
 // delete. Only the clear arm ever does: the superseded arm deliberately carries
 // no generation (the one in Redis belongs to a LIVE successor), and the
-// absent-but-young arm has none to carry.
+// absent arm has none to carry.
 //
 // Callers gate ActivityStore.CompareAndDelete on this. Passing a zero generation
 // to it is not a harmless no-op -- activityGenerationKey rejects it, so every
-// young-absent plan would report a spurious generation_delete failure.
+// absent-state plan would report a spurious generation_delete failure.
 func (d Decision) HasGeneration() bool {
 	return d.Outcome == OutcomeCleared &&
 		d.State.SourceToken != uuid.Nil &&
 		d.State.SourceVersion > 0
 }
 
-// Resolve runs the six-branch decision procedure. It performs no SQL and no
+// Resolve runs the five-branch decision procedure. It performs no SQL and no
 // delivery; it decides.
 //
 // Every uncertain branch fails CLOSED toward a terminal. Resolution may degrade
 // exact -> conservative and never the reverse: Resolve takes p BY VALUE and
 // never writes to it, and the one branch that requires exactness -- supersession
 // -- is unreachable without lifecycle evidence.
-func Resolve(ctx context.Context, reader StateReader, p Plan, now time.Time) Decision {
+func Resolve(ctx context.Context, reader StateReader, p Plan) Decision {
 	// Validate BEFORE the read. An inconsistent plan must not reach Redis at
 	// all: its category is what names the key, and a plan claiming exactness it
 	// cannot prove must never get far enough to act on what it finds.
@@ -72,11 +71,13 @@ func Resolve(ctx context.Context, reader StateReader, p Plan, now time.Time) Dec
 	}
 
 	if !found {
-		// B1. Absent AND past the level arm: every viewer's copy has expired.
-		if now.Sub(p.EventAt) >= presence.ActivityStateTTL {
-			return Decision{Outcome: OutcomeStateAbsent}
-		}
-		// B5. Absent but younger than the arm proves nothing about viewers.
+		// B5. Absent proves nothing about viewers, however old the plan is. The
+		// desktop client keeps a badge until a rich_presence_clear or a
+		// reconnect snapshot replaces it; richPresenceStore has no expiry. A
+		// former B1 arm acknowledged a plan older than ActivityStateTTL with no
+		// delivery, on the premise that every viewer's copy had expired by
+		// then. #3446's red-team proved that premise false with a plan that
+		// failed five times and was retried from quarantine ten minutes later.
 		return Decision{Outcome: OutcomeCleared}
 	}
 

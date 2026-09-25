@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
@@ -76,6 +77,9 @@ type TestServer struct {
 	Redis                    *redis.Client
 	PresenceHistory          *presencehistory.Service
 	CompleteExpiredTransfers func(context.Context)
+	// ActivePlanReconciler drains durable Rich Presence clear obligations.
+	// Production ticks it; tests call ReconcilePass to run one pass.
+	ActivePlanReconciler *activepresence.Reconciler
 
 	// logBuf captures all structured-log output emitted by handlers during the
 	// test. It is written alongside os.Stdout via an io.MultiWriter so human
@@ -133,7 +137,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, completeExpiredTransfers, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, activePlanReconciler, completeExpiredTransfers, err := api.NewRouter(
 		t.Context(),
 		db,
 		redisClient,
@@ -171,6 +175,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		Redis:                    redisClient,
 		PresenceHistory:          presenceHistoryService,
 		CompleteExpiredTransfers: completeExpiredTransfers,
+		ActivePlanReconciler:     activePlanReconciler,
 		logBuf:                   logBuf,
 	}
 }

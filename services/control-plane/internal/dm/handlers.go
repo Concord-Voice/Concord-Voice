@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
@@ -3305,11 +3306,7 @@ func (h *Handler) ensureDMVoiceRingAvailable(c *gin.Context, convUUID uuid.UUID,
 	// events advance lifecycle_event_at while joined_at remains the stable call
 	// start; rows whose lifecycle watermark ages past the lease window are stale
 	// after a dropped terminal event and must not block future calls forever.
-	if _, err := h.db.Exec(`
-		DELETE FROM dm_voice_participants
-		WHERE conversation_id = $1
-		  AND lifecycle_event_at < NOW() - ($2 * INTERVAL '1 second')
-	`, convUUID, int(DMVoiceCallLeaseTTL.Seconds())); err != nil {
+	if err := h.expireStaleDMVoiceParticipants(c.Request.Context(), convUUID); err != nil {
 		h.log.Error("Failed to expire stale DM voice presence", "error", err,
 			"conversation_id", sanitizeLogValue(convID))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
@@ -3375,6 +3372,88 @@ func (h *Handler) ensureDMVoiceRingAvailable(c *gin.Context, convUUID uuid.UUID,
 		return false
 	}
 	return true
+}
+
+// expireStaleDMVoiceParticipants deletes this conversation's participant rows
+// whose lifecycle watermark aged past the lease window, and records a
+// conservative Rich Presence clear for each removed user in the same
+// transaction. Without that plan the delete retracts nothing: a viewer keeps
+// the badge, and with the row gone no durable evidence says one is still
+// outstanding (#3444). The activepresence reconciler drains the plan.
+//
+// Each user row is locked FOR KEY SHARE before that user's participant row is
+// touched. The plan insert takes the same lock through its foreign key, and
+// account erasure takes users FOR UPDATE before cascading into
+// dm_voice_participants, so taking it last would invert erasure's order and
+// let the two deadlock. Users are processed in sorted order so two rings that
+// expire the same users queue on the plan rows instead of deadlocking.
+//
+// The plan is recorded even when the user holds a row in another
+// conversation: a viewer who could see only this call must still lose the
+// badge, and the cost -- a live badge cleared until the next heartbeat
+// republishes it -- is the privacy-safe direction. EventAt is the expiry time,
+// so a call whose lifecycle event is stamped after it resolves as a successor.
+func (h *Handler) expireStaleDMVoiceParticipants(ctx context.Context, convUUID uuid.UUID) (returnErr error) {
+	candidates, err := readVoiceCandidates(ctx, h.db, convUUID.String())
+	if err != nil || len(candidates) == 0 {
+		return err
+	}
+	slices.SortFunc(candidates, func(a, b uuid.UUID) int { return strings.Compare(a.String(), b.String()) })
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin stale DM voice expiry: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("rollback stale DM voice expiry: %w", rollbackErr))
+		}
+	}()
+	for _, userID := range candidates {
+		if err := expireStaleDMVoiceParticipantTx(ctx, tx, convUUID, userID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit stale DM voice expiry: %w", err)
+	}
+	return nil
+}
+
+func expireStaleDMVoiceParticipantTx(ctx context.Context, tx *sql.Tx, convUUID, userID uuid.UUID) error {
+	var lockedUserID uuid.UUID
+	err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, userID).Scan(&lockedUserID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // erased: the cascade already removed the participant row
+	}
+	if err != nil {
+		return fmt.Errorf("lock stale DM voice participant user: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM dm_voice_participants
+		WHERE conversation_id = $1 AND user_id = $2
+		  AND lifecycle_event_at < NOW() - ($3 * INTERVAL '1 second')
+	`, convUUID, userID, int(DMVoiceCallLeaseTTL.Seconds()))
+	if err != nil {
+		return fmt.Errorf("delete stale DM voice participant: %w", err)
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read stale DM voice delete result: %w", err)
+	}
+	if removed == 0 {
+		return nil
+	}
+	if err := activepresence.InsertPlanTx(ctx, tx, activepresence.Plan{
+		SubjectID:   userID,
+		Category:    activepresence.CategoryPrivateCall,
+		OperationID: uuid.New(),
+		Resolution:  activepresence.ResolutionConservative,
+		EventAt:     time.Now(),
+	}); err != nil {
+		return fmt.Errorf("capture expired DM voice presence clear: %w", err)
+	}
+	return nil
 }
 
 type voiceRingRecipients struct {

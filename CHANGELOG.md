@@ -222,6 +222,12 @@ that keeps sending far more than your plan allows.
 
 ### Security
 
+- **A dropped voice connection no longer leaves your activity visible to people you later hide it from** ([#3446](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3446)) — when
+  your connection to a voice channel or a direct call dropped without a clean exit, Concord removed
+  you from the call but never told other people's apps. They kept showing you "in voice", and if you
+  then narrowed who can see that activity, the people you excluded could keep seeing the old badge.
+  Their apps now clear it as soon as Concord removes you. A clear that Concord had to retry, for
+  example after a restart, is also no longer dropped when the retry comes more than 90 seconds later.
 - **Identity-anomaly audit records no longer hide the request's final authorization result** ([#3369](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3369)) — Concord
   now records the unusual identifier spelling as an observation, then still records whether the
   request was allowed or denied.

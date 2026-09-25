@@ -55,7 +55,7 @@ func TestConservativePlanDoesNotRetractALiveSuccessor(t *testing.T) {
 	}
 
 	reader := &fakeStateReader{state: successor, found: true}
-	decision := Resolve(context.Background(), reader, plan, cutAt.Add(time.Minute))
+	decision := Resolve(context.Background(), reader, plan)
 
 	require.Equal(t, OutcomeSuperseded, decision.Outcome,
 		"a live generation published after the plan was cut must be left alone")
@@ -87,7 +87,7 @@ func TestConservativePlanStillClearsTheGenerationItWasCutAgainst(t *testing.T) {
 	}
 
 	reader := &fakeStateReader{state: stale, found: true}
-	decision := Resolve(context.Background(), reader, plan, cutAt.Add(time.Minute))
+	decision := Resolve(context.Background(), reader, plan)
 
 	require.Equal(t, OutcomeCleared, decision.Outcome,
 		"the stale generation the plan was cut against must still be retracted")

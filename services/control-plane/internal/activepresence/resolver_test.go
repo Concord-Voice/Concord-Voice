@@ -49,11 +49,13 @@ func TestResolveSixBranches(t *testing.T) {
 		wantReads int
 	}{
 		{
-			name:   "B1 absent and past the level arm",
+			// Former B1: an old plan with no state used to be acked silently.
+			// Clients never expire a badge, so age proves nothing (#3446).
+			name:   "absent long after the event still clears",
 			reader: fakeStateReader{},
 			plan: Plan{Resolution: ResolutionConservative,
 				EventAt: now.Add(-2 * presence.ActivityStateTTL)},
-			outcome:   OutcomeStateAbsent,
+			outcome:   OutcomeCleared,
 			failure:   FailureNone,
 			wantReads: 1,
 		},
@@ -193,7 +195,7 @@ func TestResolveSixBranches(t *testing.T) {
 			}
 			reader := tc.reader
 
-			decision := Resolve(context.Background(), &reader, plan, now)
+			decision := Resolve(context.Background(), &reader, plan)
 
 			require.Equal(t, tc.outcome, decision.Outcome)
 			require.Equal(t, tc.failure, decision.Failure)
@@ -214,7 +216,7 @@ func TestResolveWithoutReaderRetains(t *testing.T) {
 		Resolution: ResolutionConservative, EventAt: time.Now(),
 	}
 
-	decision := Resolve(context.Background(), nil, plan, time.Now())
+	decision := Resolve(context.Background(), nil, plan)
 
 	require.Equal(t, OutcomeRetained, decision.Outcome)
 	require.Equal(t, FailureStateRead, decision.Failure)
@@ -240,7 +242,7 @@ func TestResolveNeverUpgradesConservativeToExact(t *testing.T) {
 		found: true,
 	}
 
-	decision := Resolve(context.Background(), reader, plan, time.Now())
+	decision := Resolve(context.Background(), reader, plan)
 
 	require.Equal(t, OutcomeCleared, decision.Outcome,
 		"a conservative plan cannot prove supersession, so it must take the clear arm")
@@ -271,7 +273,7 @@ func TestResolveSupersededHandsTheTerminalNothing(t *testing.T) {
 		EventAt:     eventAt,
 	}
 
-	decision := Resolve(context.Background(), reader, plan, time.Now())
+	decision := Resolve(context.Background(), reader, plan)
 
 	require.Equal(t, OutcomeSuperseded, decision.Outcome)
 	require.Equal(t, presence.ActivityState{}, decision.State)

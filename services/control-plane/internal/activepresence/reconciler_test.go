@@ -222,7 +222,7 @@ func TestReconcilePassContinuesAfterServerVoiceCleanupFailure(t *testing.T) {
 	require.Zero(t, countPlans(t, db))
 }
 
-// B5, absent-but-young: the clear frame still ships, but there is NO generation
+// B5, absent: the clear frame still ships, but there is NO generation
 // to delete. Step (a) must be skipped -- activityGenerationKey rejects
 // uuid.Nil, so an ungated call reports a spurious generation_delete failure on
 // every young-absent plan.
@@ -359,9 +359,10 @@ func TestReconcilePassAcksSupersededWithoutDelivery(t *testing.T) {
 	require.Zero(t, countPlans(t, db))
 }
 
-// B1: absent AND past the 90-second level arm. Every viewer's copy has already
-// expired, so the obligation is discharged by deletion alone.
-func TestReconcilePassAcksAnExpiredAbsentPlanWithoutDelivery(t *testing.T) {
+// An absent generation still owes a clear however old the plan is: the desktop
+// client never expires a badge on its own. A former B1 arm acked this case with
+// no delivery, which #3446's red-team proved leaves a viewer holding a badge.
+func TestReconcilePassClearsAnAbsentPlanPastTheStateTTL(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	subject := dbtest.CreateUser(t, db)
 	plan := livePlan(subject)
@@ -374,10 +375,10 @@ func TestReconcilePassAcksAnExpiredAbsentPlanWithoutDelivery(t *testing.T) {
 
 	stats, err := r.ReconcilePass(context.Background(), maxPlanBatch)
 	require.NoError(t, err)
-	require.Equal(t, 1, stats.Acked)
-	require.Empty(t, deliverer.clears)
+	require.Equal(t, 1, stats.Cleared)
+	require.Len(t, deliverer.clears, 1)
 	require.Zero(t, deliverer.disconnects)
-	require.Zero(t, deleter.callCount())
+	require.Zero(t, deleter.callCount(), "no generation to delete")
 	require.Zero(t, countPlans(t, db))
 }
 

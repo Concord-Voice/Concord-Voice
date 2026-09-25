@@ -27,16 +27,17 @@ import (
 )
 
 var (
-	errStaleDiscovery = errors.New("stale discovery failed")
-	errStaleIteration = errors.New("stale iteration failed")
-	errStaleBegin     = errors.New("stale begin failed")
-	errStaleLock      = errors.New("stale lock failed")
-	errStaleReread    = errors.New("stale reread failed")
-	errStaleDelete    = errors.New("stale delete failed")
-	errStaleCapture   = errors.New("stale capture failed")
-	errStaleAffected  = errors.New("stale rows affected failed")
-	errStaleCommit    = errors.New("stale commit failed")
-	errStaleBusy      = errors.New("stale lifecycle lock busy")
+	errStaleDiscovery   = errors.New("stale discovery failed")
+	errStaleIteration   = errors.New("stale iteration failed")
+	errStaleBegin       = errors.New("stale begin failed")
+	errStaleLock        = errors.New("stale lock failed")
+	errStaleReread      = errors.New("stale reread failed")
+	errStaleDelete      = errors.New("stale delete failed")
+	errStaleCapture     = errors.New("stale capture failed")
+	errStalePlanCapture = errors.New("stale presence clear plan capture failed")
+	errStaleAffected    = errors.New("stale rows affected failed")
+	errStaleCommit      = errors.New("stale commit failed")
+	errStaleBusy        = errors.New("stale lifecycle lock busy")
 )
 
 const staleVoiceCandidateChannel = "11111111-1111-1111-1111-111111111111"
@@ -258,6 +259,12 @@ func (c *staleVoiceConn) ExecContext(
 		}
 		return staleVoiceResult{rows: 1}, nil
 	}
+	if strings.Contains(query, "presence_active_pending_plans") {
+		if c.scenario == "plan_capture_error" {
+			return nil, errStalePlanCapture
+		}
+		return staleVoiceResult{rows: 1}, nil
+	}
 	if strings.Contains(query, "pg_advisory_xact_lock") {
 		if c.scenario == "lock_error" {
 			return nil, errStaleLock
@@ -296,7 +303,7 @@ func (c *staleVoiceConn) ExecContext(
 				c.state.deleted = true
 			}
 			return staleVoiceResult{rows: 1}, nil
-		case "capture_error":
+		case "capture_error", "plan_capture_error":
 			return staleVoiceResult{rows: 1}, nil
 		case "busy_two", "reread_error_two":
 			return staleVoiceResult{rows: 1}, nil
@@ -411,6 +418,7 @@ func TestReconcileStaleServerVoiceParticipants_GuardsAndFailurePaths(t *testing.
 		{name: "fresh row is a no-op", scenario: "fresh", limit: 1},
 		{name: "delete error", scenario: "delete_error", limit: 1, wantError: errStaleDelete},
 		{name: "capture error propagates", scenario: "capture_error", limit: 1, wantError: errStaleCapture},
+		{name: "presence clear plan error propagates", scenario: "plan_capture_error", limit: 1, wantError: errStalePlanCapture},
 		{name: "rows affected error", scenario: "affected_error", limit: 1, wantError: errStaleAffected},
 		{name: "invalid rows affected", scenario: "affected_many", limit: 1, contains: "affected 2 rows"},
 		{name: "commit error", scenario: "commit_error", limit: 1, wantError: errStaleCommit},

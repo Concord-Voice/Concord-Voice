@@ -70,7 +70,9 @@ type Outcome uint8
 
 // Supported plan outcomes.
 const (
-	OutcomeStateAbsent Outcome = iota
+	// outcomeUnset is the zero value and is never produced. It keeps a zero
+	// Decision off every terminal arm: the reconciler routes it to retention.
+	outcomeUnset Outcome = iota
 	OutcomeSuperseded
 	OutcomeCleared
 	OutcomeDisconnected
@@ -82,8 +84,6 @@ const (
 // corrupted value can never report a terminal outcome it did not reach.
 func (o Outcome) String() string {
 	switch o {
-	case OutcomeStateAbsent:
-		return "state_absent"
 	case OutcomeSuperseded:
 		return "superseded"
 	case OutcomeCleared:

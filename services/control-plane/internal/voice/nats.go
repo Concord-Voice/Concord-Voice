@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -3677,25 +3678,9 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 	}
 	var operationID uuid.UUID
 	if rowsAffected == 1 {
-		operationID = uuid.New()
-		if _, err := tx.ExecContext(ctx, `
-			WITH captured AS MATERIALIZED (
-				SELECT clock_timestamp() AS captured_at
-			)
-			INSERT INTO server_voice_terminal_outbox (
-				channel_id, user_id, server_id, operation_id, created_at, reconcile_after
-			)
-			SELECT $1, $2, $3, $4, captured_at, captured_at
-			FROM captured
-			ON CONFLICT (channel_id, user_id) DO UPDATE
-			SET server_id = EXCLUDED.server_id,
-				operation_id = EXCLUDED.operation_id,
-				created_at = EXCLUDED.created_at,
-				reconcile_after = EXCLUDED.reconcile_after,
-				delivery_claim_id = NULL,
-				delivery_claim_until = NULL
-		`, candidate.channelID, candidate.userID, candidate.serverID, operationID); err != nil {
-			return false, false, fmt.Errorf("capture stale server voice terminal obligation: %w", err)
+		operationID, err = captureStaleServerVoiceObligationsTx(ctx, tx, candidate)
+		if err != nil {
+			return false, false, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -3711,6 +3696,58 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		operationID: operationID,
 	}, outcomes)
 	return true, admitted, returnErr
+}
+
+// captureStaleServerVoiceObligationsTx records both obligations a reap owes,
+// inside the reap's transaction: the terminal voice-state frame (outbox) and a
+// Rich Presence clear (plan). Without the plan the reap retracts nothing: a
+// viewer keeps the badge, and once the outbox row drains no durable evidence
+// says one is still outstanding, so a later settings change that excludes that
+// viewer has nothing to act on (#3444). The activepresence reconciler runs this
+// reaper at the start of its pass and drains the plan in the same pass.
+//
+// The plan is conservative because the lifecycle is gone. It is recorded even
+// when the user still holds another voice_participants row: a viewer who could
+// see only the reaped channel must still lose the badge, and the cost -- a live
+// badge cleared until the next heartbeat republishes it -- is the privacy-safe
+// direction. EventAt is the reap time, so a generation whose lifecycle event
+// is stamped after the reap resolves as a successor. A join stamped before the
+// reap but committed after it is cleared the same way and republished.
+func captureStaleServerVoiceObligationsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	candidate staleServerVoiceParticipant,
+) (uuid.UUID, error) {
+	operationID := uuid.New()
+	if _, err := tx.ExecContext(ctx, `
+			WITH captured AS MATERIALIZED (
+				SELECT clock_timestamp() AS captured_at
+			)
+			INSERT INTO server_voice_terminal_outbox (
+				channel_id, user_id, server_id, operation_id, created_at, reconcile_after
+			)
+			SELECT $1, $2, $3, $4, captured_at, captured_at
+			FROM captured
+			ON CONFLICT (channel_id, user_id) DO UPDATE
+			SET server_id = EXCLUDED.server_id,
+				operation_id = EXCLUDED.operation_id,
+				created_at = EXCLUDED.created_at,
+				reconcile_after = EXCLUDED.reconcile_after,
+				delivery_claim_id = NULL,
+				delivery_claim_until = NULL
+	`, candidate.channelID, candidate.userID, candidate.serverID, operationID); err != nil {
+		return uuid.Nil, fmt.Errorf("capture stale server voice terminal obligation: %w", err)
+	}
+	if err := activepresence.InsertPlanTx(ctx, tx, activepresence.Plan{
+		SubjectID:   candidate.userID,
+		Category:    activepresence.CategoryServerVoice,
+		OperationID: uuid.New(),
+		Resolution:  activepresence.ResolutionConservative,
+		EventAt:     time.Now(),
+	}); err != nil {
+		return uuid.Nil, fmt.Errorf("capture reaped server voice presence clear: %w", err)
+	}
+	return operationID, nil
 }
 
 func lockExistingServerVoiceUserTx(ctx context.Context, tx *sql.Tx, userID uuid.UUID) (bool, error) {
