@@ -241,24 +241,17 @@ func (h *Handler) IssueMFAChallenge(ctx context.Context, userID string) (
 	if err != nil {
 		return "", nil, nil, nil, false, fmt.Errorf("generate login challenge: %w", err)
 	}
+
+	// Same posture as the password login: WebAuthn is offered only with the
+	// options to answer it, and a challenge nothing can answer is an error.
+	offered, webauthnOptions, err := h.webAuthnLoginOffer(ctx, userID, jti, loginMethods)
+	if err != nil {
+		h.discardLoginChallenge(ctx, userID, jti)
+		return "", nil, nil, nil, false, fmt.Errorf("offer SSO MFA methods: %w", err)
+	}
 	h.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: securityevent.AuthSSO})
 
-	// WebAuthn options when applicable — same posture as addWebAuthnOptions in
-	// handlers.go. We log and continue on BeginWebAuthnLogin errors; the
-	// renderer falls back to a non-WebAuthn method.
-	for _, m := range loginMethods {
-		if m == "webauthn" {
-			opts, beginErr := h.mfaChecker.BeginWebAuthnLogin(ctx, userID, jti)
-			if beginErr != nil {
-				h.log.Error("Failed to begin WebAuthn login on SSO MFA challenge", "error", beginErr)
-			} else if opts != nil {
-				webauthnOptions = opts
-			}
-			break
-		}
-	}
-
-	return token, loginMethods, recoveryOnlyMethods, webauthnOptions, true, nil
+	return token, offered, recoveryOnlyMethods, webauthnOptions, true, nil
 }
 
 // VerifyPassword is the production binding for oauth.AuthAdapter.VerifyPassword.

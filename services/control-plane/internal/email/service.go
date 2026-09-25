@@ -4,6 +4,7 @@ package email
 import (
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
@@ -31,8 +32,14 @@ const (
 	contentTypeHTML    = "Content-Type: text/html; charset=UTF-8\r\n"
 )
 
+// ErrDeliveryNotConfigured is returned for a send when SMTP is unset outside
+// development and test.
+var ErrDeliveryNotConfigured = errors.New("email delivery is not configured")
+
 // Service sends emails via SMTP. When SMTPHost is empty (dev mode), codes are
-// logged to stdout instead of sent.
+// logged to stdout instead of sent, but only when the environment is exactly
+// development or test. Anywhere else a send fails instead: a logged code or
+// reversal token is a credential in the logs, and staging runs without SMTP.
 type Service struct {
 	host      string
 	port      int
@@ -41,11 +48,13 @@ type Service struct {
 	from      string
 	log       *logger.Logger
 	devMode   bool
+	logCodes  bool        // devMode in development or test
 	tlsConfig *tls.Config // nil = default (verify against system CAs); set in tests only
 }
 
 // NewService creates an email service from the application config.
 func NewService(cfg *config.Config, log *logger.Logger) *Service {
+	devMode := cfg.SMTPHost == ""
 	return &Service{
 		host:     cfg.SMTPHost,
 		port:     cfg.SMTPPort,
@@ -53,7 +62,8 @@ func NewService(cfg *config.Config, log *logger.Logger) *Service {
 		password: cfg.SMTPPassword, // #nosec G101 -- loaded from env, not hardcoded
 		from:     cfg.SMTPFrom,
 		log:      log,
-		devMode:  cfg.SMTPHost == "",
+		devMode:  devMode,
+		logCodes: devMode && (cfg.Environment == "development" || cfg.Environment == "test"),
 	}
 }
 
@@ -90,6 +100,9 @@ func (s *Service) sendTemplatedEmail(to, subject string, tmpl *template.Template
 // SendVerificationCode sends a 6-digit verification code to the given email address.
 func (s *Service) SendVerificationCode(to, code string) error {
 	if s.devMode {
+		if !s.logCodes {
+			return ErrDeliveryNotConfigured
+		}
 		s.log.Info("DEV MODE — email verification code", "to", to, "code", code)
 		return nil
 	}
@@ -99,6 +112,9 @@ func (s *Service) SendVerificationCode(to, code string) error {
 // SendRecoveryCode sends a 6-digit account recovery code to the given email address.
 func (s *Service) SendRecoveryCode(to, code string) error {
 	if s.devMode {
+		if !s.logCodes {
+			return ErrDeliveryNotConfigured
+		}
 		s.log.Info("DEV MODE — account recovery code", "to", to, "code", code)
 		return nil
 	}
@@ -164,6 +180,9 @@ func (s *Service) sendMail(from, to, msg string) error {
 // SendOwnershipTransferNotification sends an ownership transfer notification to the server owner.
 func (s *Service) SendOwnershipTransferNotification(to, serverName, newOwnerUsername, reversalToken string) error {
 	if s.devMode {
+		if !s.logCodes {
+			return ErrDeliveryNotConfigured
+		}
 		s.log.Info("DEV MODE — ownership transfer notification",
 			"to", to, "server", serverName, "new_owner", newOwnerUsername, "reversal_token", reversalToken)
 		return nil

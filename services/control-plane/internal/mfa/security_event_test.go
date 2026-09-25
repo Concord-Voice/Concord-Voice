@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,9 +30,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type securityEventRecorder struct{ events []securityevent.Event }
+// securityEventRecorder may receive events from concurrent requests; tests read
+// events only after every request has returned.
+type securityEventRecorder struct {
+	mu     sync.Mutex
+	events []securityevent.Event
+}
 
 func (r *securityEventRecorder) Emit(_ context.Context, event securityevent.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.events = append(r.events, event)
 }
 
@@ -119,7 +127,7 @@ func TestCompleteVerifyPurposePreservesSignedPrimaryAuthMethod(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", nil)
 			claims := &ChallengeClaims{UserID: "test-user", Purpose: PurposeLogin, PrimaryAuthMethod: test.method, RegisteredClaims: jwt.RegisteredClaims{ID: "test-challenge-" + test.name}}
 
-			ok := h.completeVerifyPurpose(c.Request.Context(), c, claims, PurposeLogin)
+			ok := h.completeVerifyPurpose(c.Request.Context(), c, claims, PurposeLogin, false)
 			require.Equal(t, test.wantOK, ok)
 			require.Equal(t, test.wantOK, completer.called)
 			if test.wantOK {
@@ -130,32 +138,6 @@ func TestCompleteVerifyPurposePreservesSignedPrimaryAuthMethod(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestCompleteVerifyPurposeFailsClosedWhenRememberStateReadFails(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	downRedis := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
-	t.Cleanup(func() { require.NoError(t, downRedis.Close()) })
-
-	h := NewHandler(nil, downRedis, logger.New("test"), nil, "test", nil, "test")
-	completer := &recordingLoginCompleter{}
-	recorder := &securityEventRecorder{}
-	h.SetLoginCompleter(completer)
-	h.SetSecurityEvents(recorder)
-	response := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(response)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", nil)
-
-	ok := h.completeVerifyPurpose(c.Request.Context(), c, &ChallengeClaims{UserID: "test-user", Purpose: PurposeLogin, RegisteredClaims: jwt.RegisteredClaims{ID: "test-challenge-redis-down"}}, PurposeLogin)
-	require.False(t, ok)
-	require.False(t, completer.called)
-	require.Equal(t, http.StatusInternalServerError, response.Code)
-	require.Equal(t, []securityevent.Event{{
-		EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded,
-		Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable,
-		RouteTemplate: securityevent.RouteAuthMFAVerify,
-	}}, recorder.events)
-	require.True(t, middleware.NightwatchHandled(c))
 }
 
 func TestCompleteVerifiedLoginEmitsOnlyAfterAuthoritativeCompleterSuccess(t *testing.T) {
@@ -177,13 +159,13 @@ func TestCompleteVerifiedLoginEmitsOnlyAfterAuthoritativeCompleterSuccess(t *tes
 	h.SetSecurityEvents(recorder)
 	h.SetLoginCompleter(rejectedLoginCompleter{})
 	context, _ := newContext()
-	h.completeVerifiedChallenge(context.Request.Context(), context, claims, PurposeLogin, "totp")
+	h.completeVerifiedChallenge(context.Request.Context(), context, claims, PurposeLogin, "totp", false)
 	require.Empty(t, recorder.events, "a failed session-mint completion must not produce challenge_verified")
 
 	h.SetLoginCompleter(committedLoginCompleter{})
 	context, _ = newContext()
 	claims = &ChallengeClaims{UserID: "test-user", Purpose: PurposeLogin, RegisteredClaims: jwt.RegisteredClaims{ID: "test-challenge-success"}}
-	h.completeVerifiedChallenge(context.Request.Context(), context, claims, PurposeLogin, "totp")
+	h.completeVerifiedChallenge(context.Request.Context(), context, claims, PurposeLogin, "totp", false)
 	require.Equal(t, []securityevent.Event{{
 		EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess,
 		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeVerified,
@@ -220,7 +202,7 @@ func TestCredentialDisableDenialsEmitAuthenticationEvents(t *testing.T) {
 			c.Request.Header.Set("Content-Type", "application/json")
 			c.Set("user_id", "user-fixture")
 			if test.name == "webauthn" {
-				c.Params = gin.Params{{Key: "id", Value: "credential"}}
+				c.Params = gin.Params{{Key: "id", Value: "11111111-2222-3333-4444-555555555555"}}
 			}
 			test.call(h, c)
 			require.Equal(t, http.StatusForbidden, response.Code)
@@ -239,7 +221,7 @@ func TestVerifySuccessEmitsServerMatchedFactorRatherThanRequestedMethod(t *testi
 	mini := miniredis.RunT(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
-	h := NewHandler(nil, redisClient, logger.New("test"), nil, "test", nil, "test")
+	h := NewHandler(fakeMFADB(t, nil), redisClient, logger.New("test"), nil, "test", nil, "test")
 	h.SetLoginCompleter(committedLoginCompleter{})
 	recorder := &securityEventRecorder{}
 	h.SetSecurityEvents(recorder)
@@ -278,7 +260,7 @@ func TestCompleteVerifiedChallengeClaimsOnceBeforeLoginMint(t *testing.T) {
 		response := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(response)
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", nil)
-		h.completeVerifiedChallenge(c.Request.Context(), c, claims, PurposeLogin, "totp")
+		h.completeVerifiedChallenge(c.Request.Context(), c, claims, PurposeLogin, "totp", false)
 		if i == 1 {
 			require.Equal(t, http.StatusUnauthorized, response.Code,
 				"a claimed challenge must not invoke the login completer a second time")
@@ -305,7 +287,7 @@ func TestCompleteVerifiedChallengeFailsClosedWhenClaimStoreIsUnavailable(t *test
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", nil)
 	claims := &ChallengeClaims{UserID: "test-user", Purpose: PurposeLogin, RegisteredClaims: jwt.RegisteredClaims{ID: "test-challenge-store-failure"}}
 
-	h.completeVerifiedChallenge(c.Request.Context(), c, claims, PurposeLogin, "totp")
+	h.completeVerifiedChallenge(c.Request.Context(), c, claims, PurposeLogin, "totp", false)
 
 	require.Equal(t, http.StatusInternalServerError, response.Code)
 	require.False(t, completer.called, "a challenge that could not be claimed must never mint a session")
@@ -584,7 +566,7 @@ func TestWebAuthnDeleteEmitsFactorDisabledOnlyAfterDelete(t *testing.T) {
 	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
 		response := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(response)
-		c.Params = gin.Params{{Key: "id", Value: "credential"}}
+		c.Params = gin.Params{{Key: "id", Value: "11111111-2222-3333-4444-555555555555"}}
 		c.Request = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa/webauthn/credential", strings.NewReader(`{"password":"correct"}`))
 		c.Request.Header.Set("Content-Type", "application/json")
 		c.Set("user_id", "user")
@@ -720,19 +702,22 @@ func TestStepUpGateFailsClosedOnSubjectReadFailure(t *testing.T) {
 	totpSetup := func(h *Handler, c *gin.Context) { h.TOTPSetup(c) }
 	for _, tc := range []struct {
 		name       string
-		state      mfaEventDB
+		state      *mfaEventDB // nil: nothing fails
 		call       func(*Handler, *gin.Context)
 		wantStatus int
 	}{
 		{name: "control: nothing fails", call: emailSmsDisable, wantStatus: http.StatusOK},
-		{name: "in-transaction gate: users-row lock read fails", state: mfaEventDB{failLock: true}, call: emailSmsDisable, wantStatus: http.StatusInternalServerError},
-		{name: "in-transaction gate: P1 factor read fails", state: mfaEventDB{failInline: true}, call: emailSmsDisable, wantStatus: http.StatusInternalServerError},
-		{name: "pool gate: subject read fails", state: mfaEventDB{failInline: true}, call: totpSetup, wantStatus: http.StatusInternalServerError},
+		{name: "in-transaction gate: users-row lock read fails", state: &mfaEventDB{failLock: true}, call: emailSmsDisable, wantStatus: http.StatusInternalServerError},
+		{name: "in-transaction gate: P1 factor read fails", state: &mfaEventDB{failInline: true}, call: emailSmsDisable, wantStatus: http.StatusInternalServerError},
+		{name: "pool gate: subject read fails", state: &mfaEventDB{failInline: true}, call: totpSetup, wantStatus: http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := tc.state
+			if state == nil {
+				state = &mfaEventDB{}
+			}
 			state.passwordHash = passwordHash // pragma: allowlist secret -- test-only password hash
-			db := sql.OpenDB(mfaEventConnector{state: &state})
+			db := sql.OpenDB(mfaEventConnector{state: state})
 			t.Cleanup(func() { require.NoError(t, db.Close()) })
 			h := NewHandler(db, redisClient, logger.New("test"), nil, "test", nil, "test")
 			recorder := &securityEventRecorder{}
@@ -831,12 +816,58 @@ type mfaEventDB struct {
 	totpExists      bool
 	totpEnabled     bool
 	totpConfirmed   bool
+	// recoveryOnly is the user's recovery_only_methods, as a Postgres array
+	// literal; empty means none.
+	recoveryOnly string
+	// mfaMethods is the user's mfa_methods, as a Postgres array literal; empty
+	// means several factors, so a restriction on one of them still applies.
+	mfaMethods string
+	// deleteMatchesNothing makes every DELETE report zero rows.
+	deleteMatchesNothing bool
+	// statements logs every statement as "<conn> <sql>", plus "<conn> BEGIN"
+	// and "<conn> COMMIT", so a test can see which connection ran what.
+	statements  []string
+	connsOpened int
+	mu          sync.Mutex
+}
+
+func (s *mfaEventDB) record(conn int, statement string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statements = append(s.statements, fmt.Sprintf("%d %s", conn, statement))
+}
+
+// fakeMFADB is a database for a handler test that reaches the user's MFA reads
+// but needs no real rows. A nil state answers as an account with no factors.
+func fakeMFADB(t *testing.T, state *mfaEventDB) *sql.DB {
+	t.Helper()
+	if state == nil {
+		state = &mfaEventDB{}
+	}
+	db := sql.OpenDB(mfaEventConnector{state: state})
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return db
+}
+
+func (s *mfaEventDB) mfaMethodsArray() string {
+	if s.mfaMethods == "" {
+		return "{totp,webauthn,email}"
+	}
+	return s.mfaMethods
+}
+
+func (s *mfaEventDB) recoveryOnlyArray() string {
+	if s.recoveryOnly == "" {
+		return "{}"
+	}
+	return s.recoveryOnly
 }
 
 type mfaEventConnector struct{ state *mfaEventDB }
 
 func (c mfaEventConnector) Connect(context.Context) (driver.Conn, error) {
-	return mfaEventConn(c), nil
+	c.state.connsOpened++
+	return mfaEventConn{state: c.state, id: c.state.connsOpened}, nil
 }
 func (mfaEventConnector) Driver() driver.Driver { return mfaEventDriver{} }
 
@@ -844,7 +875,10 @@ type mfaEventDriver struct{}
 
 func (mfaEventDriver) Open(string) (driver.Conn, error) { return nil, errors.New("connector required") }
 
-type mfaEventConn struct{ state *mfaEventDB }
+type mfaEventConn struct {
+	state *mfaEventDB
+	id    int
+}
 
 func (mfaEventConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
 func (mfaEventConn) Close() error                        { return nil }
@@ -870,14 +904,19 @@ type mfaEventTx struct{}
 func (mfaEventTx) Commit() error   { return nil }
 func (mfaEventTx) Rollback() error { return nil }
 
-func (c mfaEventConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+func (c mfaEventConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.state.record(c.id, query)
 	c.state.execCalls++
 	if (c.state.failFirstExec && c.state.execCalls == 1) || c.state.failExecAt == c.state.execCalls {
 		return nil, errors.New("activation write failed")
 	}
+	if c.state.deleteMatchesNothing && strings.HasPrefix(strings.TrimSpace(query), "DELETE") {
+		return driver.RowsAffected(0), nil
+	}
 	return driver.RowsAffected(1), nil
 }
 func (c mfaEventConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.state.record(c.id, query)
 	switch {
 	// The MFA-settings step-up gate's first-statement users-row lock
 	// (settings_stepup.go stepUpLockForShareSQL / stepUpLockForNoKeyUpdateSQL)
@@ -923,6 +962,8 @@ func (c mfaEventConn) QueryContext(_ context.Context, query string, _ []driver.N
 		return &mfaEventRows{values: []driver.Value{true, false}}, nil
 	case strings.Contains(query, "enabled AND confirmed"):
 		return &mfaEventRows{values: []driver.Value{true}}, nil
+	case strings.Contains(query, "recovery_only_methods FROM users"):
+		return &mfaEventRows{values: []driver.Value{[]byte(c.state.mfaMethodsArray()), []byte(c.state.recoveryOnlyArray())}}, nil
 	default:
 		return &mfaEventRows{values: []driver.Value{int64(0)}}, nil
 	}

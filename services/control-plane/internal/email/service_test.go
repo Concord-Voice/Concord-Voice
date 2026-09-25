@@ -2,6 +2,7 @@ package email
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -35,7 +36,8 @@ const (
 
 func newDevService() *Service {
 	cfg := &config.Config{
-		SMTPHost: "", // empty = dev mode
+		SMTPHost:    "", // empty = dev mode
+		Environment: "development",
 	}
 	return NewService(cfg, logger.New("test"))
 }
@@ -243,6 +245,40 @@ func TestSendOwnershipTransferNotificationDevMode(t *testing.T) {
 		"token-abc-123",
 	)
 	assert.NoError(t, err)
+}
+
+// Without SMTP, only development and test may log what they would have sent.
+// Anywhere else every send fails and the secret never reaches the log: a
+// recovery code resets the account, and staging runs without SMTP (security
+// review, PR #3460).
+func TestDevModeLogsCodesOnlyInDevelopmentAndTest(t *testing.T) {
+	sends := map[string]func(*Service) error{
+		"verification": func(s *Service) error { return s.SendVerificationCode(testUserEmail, "123456") },
+		"recovery":     func(s *Service) error { return s.SendRecoveryCode(testUserEmail, "123456") },
+		"ownership": func(s *Service) error {
+			return s.SendOwnershipTransferNotification(testOwnerEmail, "Srv", "new", "123456")
+		},
+	}
+	for _, env := range []string{"development", "test", "staging", "production", "", "Development"} {
+		allowed := env == "development" || env == "test"
+		for name, send := range sends {
+			t.Run(fmt.Sprintf("%q/%s", env, name), func(t *testing.T) {
+				var logs bytes.Buffer
+				svc := NewService(&config.Config{Environment: env}, logger.NewWithWriter(&logs))
+				require.True(t, svc.IsDevMode(), "no SMTP is still dev mode, whatever the environment")
+
+				err := send(svc)
+
+				if allowed {
+					require.NoError(t, err)
+					require.Contains(t, logs.String(), "123456")
+					return
+				}
+				require.ErrorIs(t, err, ErrDeliveryNotConfigured)
+				require.NotContains(t, logs.String(), "123456", "the secret must not be logged")
+			})
+		}
+	}
 }
 
 func TestSendTemplatedEmailInvalidFrom(t *testing.T) {

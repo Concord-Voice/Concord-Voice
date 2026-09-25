@@ -248,7 +248,7 @@ type Config struct {
 	ReleasesDir string // Path to directory containing release assets; empty disables update endpoint
 
 	// SMTP (email verification)
-	SMTPHost     string // SMTP server hostname (e.g. "smtp.protonmail.ch"); empty = dev mode (log codes to stdout)
+	SMTPHost     string // SMTP server hostname (e.g. "smtp.protonmail.ch"); empty = no delivery: codes are logged in development/test, sends fail elsewhere
 	SMTPPort     int    // SMTP server port (default 587 for STARTTLS submission)
 	SMTPUsername string // SMTP authentication username
 	SMTPPassword string // SMTP authentication password // #nosec G101 -- config field, loaded from env

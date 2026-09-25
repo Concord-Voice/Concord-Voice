@@ -435,6 +435,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Two-factor verification is required but no method can answer it right now — a security key is the only login method and its ceremony could not begin. Retry. A challenge offers `webauthn` only together with `webauthn_options`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/logout:
     post:
       tags:
@@ -528,6 +534,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           description: Email code already sent for this challenge, or IP rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Email MFA state, the send limit, or the code could not be read or stored, or email delivery is not configured. No code was sent.
           content:
             application/json:
               schema:
@@ -634,6 +646,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           description: Too many failed attempts (per-user lockout) or IP rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: A dependency failed. Before the code is judged (reuse marker, lockout, remember-me state, recovery-only methods, attempt count) nothing is spent and a right code answers like a wrong one, so retry while the challenge is valid. After an accepted code (the challenge claim, session issuance, the MFA-upgrade bypass) the challenge and the code are spent; start again.
           content:
             application/json:
               schema:
@@ -9350,9 +9368,9 @@ paths:
 
         10 minutes). Requires an already-active standard MFA method. Email codes
 
-        are delivered via the email service; SMS is dev-only (403 in production).
+        are delivered via the email service; SMS is dev-only (403 outside a development or test environment).
 
-        In non-production, SMS codes are returned in the response (`dev_codes`).
+        In a development or test environment, SMS codes are returned in the response (`dev_codes`).
 
         Rate limit: 5 requests per minute (user-based).
 
@@ -9415,7 +9433,8 @@ paths:
                 $ref: '#/components/schemas/Error'
         '403':
           description: >-
-            SMS MFA unavailable in production, OR step-up required/rejected. The
+            SMS MFA unavailable outside a development or test
+            environment, OR step-up required/rejected. The
             step-up shape sets `password_required` when a password is still
             needed, or `mfa_required` together with `methods` when a code is
             still needed; a supplied-but-wrong factor returns "Invalid password"
@@ -9427,7 +9446,11 @@ paths:
         '429':
           $ref: '#/components/responses/StepUpAttemptsExhausted'
         '500':
-          $ref: '#/components/responses/StepUpVerificationFailed'
+          description: The step-up factor could not be verified because of a server-side failure, email delivery is not configured, the account email could not be read, a setup code could not be stored, or the email could not be sent. Nothing is enabled until the codes are confirmed; request them again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/StepUpBudgetUnavailable'
   /mfa/email-sms/status:
@@ -9509,6 +9532,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '403':
           description: Invalid code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: MFA settings or a pending code could not be read, or activation could not be completed. No method is left partly on and the pending codes are kept, so retry with the same codes.
           content:
             application/json:
               schema:
@@ -10403,6 +10432,12 @@ paths:
               example:
                 error: Turn off email and text-message codes before removing your last authenticator app or security key.
                 inline_factor_required: true
+        '500':
+          description: TOTP could not be removed, or the account MFA flags could not be updated. The removal and the flags write are one transaction, so nothing changed; it is safe to retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /mfa/totp/setup:
     post:
       tags:
@@ -10753,7 +10788,7 @@ paths:
                     type: array
                     items:
                       type: string
-                    description: Base64url-encoded WebAuthn credential IDs still registered
+                    description: Base64url-encoded WebAuthn credential IDs still registered. Omitted when they could not be listed; an absent field is not an empty list.
                   user_id:
                     type: string
                     format: uuid
@@ -10786,6 +10821,12 @@ paths:
               example:
                 error: Turn off email and text-message codes before removing your last authenticator app or security key.
                 inline_factor_required: true
+        '500':
+          description: The credential could not be deleted, or the account MFA flags could not be updated. The delete and the flags write are one transaction, so nothing changed; it is safe to retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /mfa/webauthn/register/begin:
     post:
       tags:

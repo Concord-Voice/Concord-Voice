@@ -1686,7 +1686,8 @@ func NewRouter(
 					mfaHandler.SetRecoveryHardened,
 				)
 
-				// Email MFA setup, with SMS blocked in production until provider integration
+				// Email MFA setup; SMS is refused outside a development or test
+				// environment until provider integration
 				mfaRoutes.POST("/email-sms/setup",
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
 					mfaHandler.EmailSmsSetup,

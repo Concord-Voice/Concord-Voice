@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -600,6 +601,23 @@ func TestRemoveTrustedDeviceNotFound(t *testing.T) {
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// An id that is not a UUID matches no device. It is a 404 like any other miss,
+// not the 500 the database's parse error would otherwise produce.
+func TestRemoveTrustedDeviceMalformedIDIsNotFound(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "trustdevbadid")
+
+	w := ts.DoRequest("DELETE", urlTrustedDevices+"/not-a-uuid", map[string]interface{}{
+		"password": testPassword,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	require.Equal(t, http.StatusNotFound, w.Code, "Response body: %s", w.Body.String())
+	// The handler's own miss, not gin's no-route 404, which has no JSON body.
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Trusted device not found", body["error"])
 }
 
 // --- Recovery Requests ---
@@ -2870,6 +2888,68 @@ func TestGetStatusSelfHeal(t *testing.T) {
 	assert.Contains(t, methods, "totp")
 }
 
+// A flags write that has to wait for a concurrent factor change must read that
+// change once it runs. Before the row lock it read the factors first, waited
+// only at its own UPDATE, and then wrote the answer it had read before the
+// change landed: here, the disable branch over a TOTP confirmed while it
+// waited, leaving the account's password alone enough to sign in (security
+// review, PR #3437).
+func TestMFAFlagsWriteReadsTheFactorsAfterWaitingForTheRowLock(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "flagsrowlock")
+	enrollTOTP(t, ts, user)
+	ctx := context.Background()
+
+	// TOTP verified but not yet confirmed, and flags that list a WebAuthn key
+	// the account does not have, so GetStatus re-syncs them.
+	_, err := ts.DB.ExecContext(ctx, `UPDATE user_mfa_totp SET confirmed = FALSE WHERE user_id = $1`, user.ID)
+	require.NoError(t, err)
+	_, err = ts.DB.ExecContext(ctx, `UPDATE users SET mfa_enabled = TRUE, mfa_methods = '{webauthn}' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	// A concurrent confirm holds the row and commits while the re-sync waits.
+	holder, err := ts.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = holder.Rollback() })
+	_, err = holder.ExecContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, user.ID)
+	require.NoError(t, err)
+	_, err = holder.ExecContext(ctx, `UPDATE user_mfa_totp SET confirmed = TRUE WHERE user_id = $1`, user.ID)
+	require.NoError(t, err)
+
+	done := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest("GET", urlMFAStatus, nil, testhelpers.AuthHeaders(user.AccessToken))
+		done <- w.Code
+	}()
+
+	// Wait until the re-sync is blocked on the users row, whichever statement
+	// it is blocked at.
+	require.Eventually(t, func() bool {
+		var waiting int
+		err := ts.DB.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND datname = current_database()
+			  AND pid <> pg_backend_pid() AND query ILIKE '%users%'`).Scan(&waiting)
+		return err == nil && waiting > 0
+	}, 10*time.Second, 20*time.Millisecond, "the flags write never waited on the users row")
+
+	require.NoError(t, holder.Commit())
+	select {
+	case code := <-done:
+		require.Equal(t, http.StatusOK, code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("GetStatus did not finish after the row was released")
+	}
+
+	var enabled bool
+	var methods []string
+	require.NoError(t, ts.DB.QueryRowContext(ctx,
+		`SELECT mfa_enabled, mfa_methods FROM users WHERE id = $1`, user.ID,
+	).Scan(&enabled, pq.Array(&methods)))
+	assert.True(t, enabled, "TOTP was confirmed while the flags write waited, so MFA is on")
+	assert.Contains(t, methods, "totp")
+}
+
 // --- TOTP Setup: Requires MFA code when MFA is already active ---
 
 func TestTOTPSetupRequiresMFAWhenActive(t *testing.T) {
@@ -4377,6 +4457,53 @@ func TestEmailSmsVerifyKeepsPendingCodesWhenActivationWriteFails(t *testing.T) {
 		"the pending email code must survive a failed activation so the caller can retry (#2654)")
 	assert.NoError(t, ts.Redis.Get(ctx, smsKey).Err(),
 		"the pending sms code must survive a failed activation so the caller can retry (#2654)")
+
+	// The method activated before the failure is taken back. Left on, status
+	// reports it and login sends codes for it while mfa_methods does not list it.
+	assertEmailSmsMethodOff(t, ts, user.ID, "email")
+	assertEmailSmsMethodOff(t, ts, user.ID, "sms")
+}
+
+func assertEmailSmsMethodOff(t *testing.T, ts *testhelpers.TestServer, userID, method string) {
+	t.Helper()
+	n, err := ts.Redis.Exists(context.Background(), fmt.Sprintf("mfa_emailsms_enabled:%s:%s", userID, method)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n, "%s must not stay enabled after a failed activation", method)
+}
+
+// dbThatCannotLockUser returns a single-connection pool against the test
+// database that times out on any lock of userID's users row, which this helper
+// holds until the test ends. Every plain SELECT still succeeds, because a row
+// lock blocks no reader; only the flags write, which locks the users row before
+// it reads, fails. lock_timeout is session-scoped on a connection the test owns,
+// so it changes no shared state. (A read-only session does not work: lib/pq
+// opens every transaction READ WRITE.)
+func dbThatCannotLockUser(t *testing.T, ts *testhelpers.TestServer, userID string) *sql.DB {
+	t.Helper()
+	ctx := context.Background()
+	lockedDB, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, lockedDB.Close()) })
+	lockedDB.SetMaxOpenConns(1)
+	lockedDB.SetMaxIdleConns(1)
+	_, err = lockedDB.ExecContext(ctx, `SET lock_timeout = '100ms'`)
+	require.NoError(t, err)
+
+	holder, err := ts.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = holder.Rollback() })
+	_, err = holder.ExecContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID)
+	require.NoError(t, err)
+
+	// Prove the setup took, so a future pooling change cannot make a caller
+	// pass for the wrong reason (e.g. by failing earlier).
+	var probe bool
+	require.NoError(t, lockedDB.QueryRowContext(ctx,
+		`SELECT recovery_hardened FROM users WHERE id = $1`, userID).Scan(&probe),
+		"reads must still work while the row is held")
+	_, err = lockedDB.ExecContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID)
+	require.Error(t, err, "the lock_timeout pin did not take effect")
+	return lockedDB
 }
 
 // TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails covers the flag-write
@@ -4394,42 +4521,9 @@ func TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails(t *testing.T) {
 	emailKey := fmt.Sprintf(redisEmailSmsSetup, user.ID)
 	require.NoError(t, ts.Redis.Set(ctx, emailKey, "123456", 10*time.Minute).Err())
 
-	// The flag write runs in its own transaction that locks the users row
-	// first. A read-only session cannot fail it: lib/pq opens every
-	// non-read-only transaction with an explicit READ WRITE, which overrides
-	// default_transaction_read_only. So the fault is the lock instead: this
-	// test holds the row, and a second pool pinned to one connection carries a
-	// session-scoped lock_timeout. Plain SELECTs (recovery_hardened) are not
-	// blocked by a row lock; the flag transaction's opening lock is. Nothing
-	// here mutates shared state in the test database.
-	holder, err := ts.DB.BeginTx(ctx, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = holder.Rollback() })
-	var held string
-	require.NoError(t, holder.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, user.ID).Scan(&held))
-
-	faultDB, err := sql.Open("postgres", dbtest.DatabaseURL())
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, faultDB.Close()) })
-	faultDB.SetMaxOpenConns(1)
-	faultDB.SetMaxIdleConns(1)
-	_, err = faultDB.ExecContext(ctx, `SET lock_timeout = '100ms'`)
-	require.NoError(t, err)
-
-	// Prove the session pin took, so a future pooling change cannot make this
-	// test pass for the wrong reason (e.g. by failing earlier).
-	var probe bool
-	require.NoError(t, faultDB.QueryRowContext(ctx,
-		`SELECT recovery_hardened FROM users WHERE id = $1`, user.ID).Scan(&probe),
-		"reads must still work while the row is held")
-	probeTx, err := faultDB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	require.NoError(t, err)
-	var probeID string
-	require.Error(t, probeTx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, user.ID).Scan(&probeID),
-		"the lock_timeout pin did not take effect")
-	require.NoError(t, probeTx.Rollback())
-
-	h := mfa.NewHandler(faultDB, ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	// dbThatCannotLockUser holds the users row: the flag write's opening lock
+	// times out while plain SELECTs still succeed.
+	h := mfa.NewHandler(dbThatCannotLockUser(t, ts, user.ID), ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
 	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456"}}`)
 
 	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
@@ -4439,4 +4533,108 @@ func TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails(t *testing.T) {
 
 	assert.NoError(t, ts.Redis.Get(ctx, emailKey).Err(),
 		"the pending email code must survive a failed flag update so the caller can retry (#2654)")
+	assertEmailSmsMethodOff(t, ts, user.ID, "email")
+}
+
+// TestEmailSmsVerifyWithdrawsOnlyTheMethodsItTurnedOn fails the flags write
+// after both enable writes succeed. The method this call turned on is taken
+// back; the one that was on before the call is left alone, since turning it off
+// would disable a factor the user already had.
+func TestEmailSmsVerifyWithdrawsOnlyTheMethodsItTurnedOn(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmswithdraw")
+
+	ctx := context.Background()
+	emailEnabled := fmt.Sprintf("mfa_emailsms_enabled:%s:email", user.ID)
+	require.NoError(t, ts.Redis.Set(ctx, emailEnabled, "1", 0).Err())
+	require.NoError(t, ts.Redis.Set(ctx, fmt.Sprintf(redisEmailSmsSetup, user.ID), "123456", 10*time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(ctx, fmt.Sprintf("mfa_emailsms_setup:%s:sms", user.ID), "654321", 10*time.Minute).Err())
+
+	h := mfa.NewHandler(dbThatCannotLockUser(t, ts, user.ID), ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456","sms":"654321"}}`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
+	require.NoError(t, ts.Redis.Get(ctx, emailEnabled).Err(), "the email method was on before the call and must stay on")
+	assertEmailSmsMethodOff(t, ts, user.ID, "sms")
+}
+
+// TestEmailSmsVerifyUndoLeavesAMethodARetryTurnedOn is the interleaving the
+// security review of PR #3460 found. Request A turns email on and its flags
+// write fails. Before A's undo runs, a retry with the same code turns email on
+// again and reports success. A's undo must not switch off what the retry
+// reported on.
+func TestEmailSmsVerifyUndoLeavesAMethodARetryTurnedOn(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmsretry")
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+	ctx := context.Background()
+	emailEnabled := fmt.Sprintf(redisEmailSMSEnabled, user.ID)
+	require.NoError(t, ts.Redis.Set(ctx, fmt.Sprintf(redisEmailSmsSetup, user.ID), "123456", 10*time.Minute).Err())
+
+	opts := *ts.Redis.Options()
+	requestA := redis.NewClient(&opts)
+	t.Cleanup(func() { require.NoError(t, requestA.Close()) })
+	requestA.AddHook(&beforeScriptHook{fn: func() {
+		// The retry's SET ... GET, which replaces A's value with its own.
+		require.NoError(t, ts.Redis.Set(ctx, emailEnabled, "request-b", 0).Err())
+	}})
+
+	h := mfa.NewHandler(dbThatCannotLockUser(t, ts, user.ID), requestA, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456"}}`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
+	on, err := ts.Redis.Get(ctx, emailEnabled).Result()
+	require.NoError(t, err, "a failed attempt's undo must not switch off a method a retry turned on")
+	assert.Equal(t, "request-b", on)
+}
+
+// TestEmailSmsVerifyLeavesANewerSetupCode: a setup started while this
+// verification runs stores and sends a new code. Clearing the code this
+// request used must not remove that one.
+func TestEmailSmsVerifyLeavesANewerSetupCode(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmsnewer")
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+	ctx := context.Background()
+	setupKey := fmt.Sprintf(redisEmailSmsSetup, user.ID)
+	require.NoError(t, ts.Redis.Set(ctx, setupKey, "123456", 10*time.Minute).Err())
+
+	opts := *ts.Redis.Options()
+	client := redis.NewClient(&opts)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	client.AddHook(&beforeScriptHook{fn: func() {
+		require.NoError(t, ts.Redis.Set(ctx, setupKey, "777777", 10*time.Minute).Err())
+	}})
+
+	h := mfa.NewHandler(ts.DB, client, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456"}}`)
+
+	require.Equal(t, http.StatusOK, w.Code, "Response body: %s", w.Body.String())
+	stored, err := ts.Redis.Get(ctx, setupKey).Result()
+	require.NoError(t, err, "the newer setup's code must survive")
+	assert.Equal(t, "777777", stored)
+}
+
+// beforeScriptHook runs fn once, just before the first Lua script call, which
+// is where a concurrent request's write is interleaved.
+type beforeScriptHook struct {
+	once sync.Once
+	fn   func()
+}
+
+func (*beforeScriptHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *beforeScriptHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if name := cmd.Name(); name == "evalsha" || name == "eval" {
+			h.once.Do(h.fn)
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*beforeScriptHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
 }

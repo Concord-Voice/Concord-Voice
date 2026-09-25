@@ -325,6 +325,18 @@ account can't provide, never your password twice.
   spelling before any check runs, and the voice server turns away a spelling it does not
   recognise instead of guessing. No identifier Concord issues is affected, so signing in,
   messaging and calling are unchanged.
+- **Two-factor sign-in keeps its limits, and your code, through a server fault** ([#3460](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3460)) — many sign-in
+  code guesses sent at once can no longer get past the five-attempt limit, and a slow trickle of
+  failed attempts can no longer keep two-factor sign-in locked indefinitely. A brief server fault
+  no longer uses up the backup code or security-key prompt you were using, so you can try again
+  once it clears. A method you set aside for account recovery can no longer be used to sign in;
+  if every method you have is set aside for recovery, sign-in still asks for one of them instead
+  of taking your password alone. If your security key cannot be offered at sign-in you are asked
+  to try again instead of being left waiting. Retrying a slow email-code setup no longer switches
+  the method back off after reporting it on. Text-message codes, which Concord cannot send yet,
+  can no longer be turned on outside development builds. A server set up without email delivery
+  no longer writes sign-up, account-recovery or ownership-transfer codes into its logs outside
+  development; those emails fail instead.
 
 ## [0.2.47] — 2026-09-18
 

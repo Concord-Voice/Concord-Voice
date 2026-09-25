@@ -85,6 +85,7 @@ const (
 	errMsgFailedRollbackTx       = "Failed to rollback transaction"
 	errMsgFailedCreateAccount    = "Failed to create account"
 	errMsgLoginFailed            = "Login failed"
+	errMsgMFAUnavailable         = "Two-factor verification is unavailable right now. Try again."
 	errMsgInvalidCredentials     = "Invalid credentials"   //nolint:gosec // G101 false positive: error message text, not a credential
 	errMsgInvalidRefreshToken    = "Invalid refresh token" //nolint:gosec // G101 false positive: error message text, not a credential
 
@@ -1145,35 +1146,77 @@ func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
 		return true
 	}
-	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: primaryAuthMethod, RouteTemplate: securityevent.RouteAuthLogin})
 
 	recoveryOnly := computeRecoveryOnlyMethods(allMethods, loginMethods)
 
-	h.log.Info("MFA required for login", "user_id", userID, "methods", loginMethods)
+	offered, webauthnOptions, err := h.webAuthnLoginOffer(ctx, userID, jti, loginMethods)
+	if err != nil {
+		h.discardLoginChallenge(ctx, userID, jti)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgMFAUnavailable})
+		return true
+	}
+	// Recorded only once the challenge can be answered and is being sent.
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: primaryAuthMethod, RouteTemplate: securityevent.RouteAuthLogin})
+
+	h.log.Info("MFA required for login", "user_id", userID, "methods", offered)
 	resp := gin.H{
 		"mfa_required":        true,
 		"mfa_challenge_token": challengeToken,
-		"methods":             loginMethods,
+		"methods":             offered,
 	}
 	if len(recoveryOnly) > 0 {
 		resp["recovery_only_methods"] = recoveryOnly
 	}
-	addWebAuthnOptions(ctx, h, resp, loginMethods, userID, jti)
+	if webauthnOptions != nil {
+		resp["webauthn_options"] = webauthnOptions
+	}
 	c.JSON(http.StatusOK, resp)
 	return true
 }
 
-func addWebAuthnOptions(ctx context.Context, h *Handler, resp gin.H, loginMethods []string, userID, jti string) {
-	for _, m := range loginMethods {
-		if m == "webauthn" {
-			if opts, err := h.mfaChecker.BeginWebAuthnLogin(ctx, userID, jti); err != nil {
-				h.log.Error("Failed to begin WebAuthn login", "error", err)
-			} else if opts != nil {
-				resp["webauthn_options"] = opts
-			}
-			return
+// errNoAnswerableMFAMethod reports an MFA challenge that none of its methods
+// can answer: WebAuthn was the only one and its ceremony could not begin.
+var errNoAnswerableMFAMethod = errors.New("no MFA method can answer this challenge")
+
+// webAuthnLoginOffer begins the WebAuthn ceremony when webauthn is a login
+// method, and returns the methods the challenge can actually be answered with
+// and the WebAuthn options. A key offered without options strands the user:
+// the client picks it and nothing happens, which for an account whose only
+// factor is a key means no way in. So when the ceremony cannot begin, webauthn
+// is dropped from the offer, and when nothing is left the caller gets
+// errNoAnswerableMFAMethod and answers with a retryable error instead.
+func (h *Handler) webAuthnLoginOffer(ctx context.Context, userID, jti string, methods []string) ([]string, interface{}, error) {
+	if !containsMethod(methods, "webauthn") {
+		return methods, nil, nil
+	}
+	opts, err := h.mfaChecker.BeginWebAuthnLogin(ctx, userID, jti)
+	if err == nil && opts != nil {
+		return methods, opts, nil
+	}
+	if err != nil {
+		h.log.Error("Failed to begin WebAuthn login", "user_id", userID, "error", err)
+	} else {
+		h.log.Warn("WebAuthn is a login method but no key is registered", "user_id", userID)
+	}
+	offered := make([]string, 0, len(methods))
+	for _, m := range methods {
+		if m != "webauthn" {
+			offered = append(offered, m)
 		}
 	}
+	if len(offered) == 0 {
+		return nil, nil, errNoAnswerableMFAMethod
+	}
+	return offered, nil, nil
+}
+
+func containsMethod(methods []string, method string) bool {
+	for _, m := range methods {
+		if m == method {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveRememberMe(req *LoginRequest) bool {
@@ -1895,6 +1938,23 @@ func MFAUpgradeBypassKey(userID, refreshSessionID string) string {
 	return fmt.Sprintf("mfa_upgrade_bypass:%s:%s", userID, refreshSessionID)
 }
 
+// MFAChallengeRememberMeKey holds a login challenge's remember-me choice, keyed
+// by the challenge's JTI. The MFA package writes and reads it; this package
+// discards it when a challenge it generated is never sent.
+func MFAChallengeRememberMeKey(jti string) string {
+	return fmt.Sprintf("mfa_challenge:%s:remember_me", jti)
+}
+
+// discardLoginChallenge removes the state GenerateLoginChallenge stored for a
+// challenge that will not be sent. It is best-effort: the key expires with the
+// challenge, so a failed delete only leaves it until then. The key embeds the
+// JTI, so only user_id is logged.
+func (h *Handler) discardLoginChallenge(ctx context.Context, userID, jti string) {
+	if err := h.redis.Del(ctx, MFAChallengeRememberMeKey(jti)).Err(); err != nil {
+		h.log.Warn("Failed to discard an unsent MFA login challenge", "user_id", userID)
+	}
+}
+
 func (h *Handler) failPreMFASessionLock(c *gin.Context, message string, err error, userID string) bool {
 	h.log.Error(message, "error", err, "user_id", userID)
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
@@ -1933,28 +1993,24 @@ func (h *Handler) buildMFAChallengeResponse(ctx context.Context, errorCode, mess
 		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
 	}
 
+	offered, webauthnOptions, err := h.webAuthnLoginOffer(ctx, userID, jti, loginMethods)
+	if err != nil {
+		return nil, err
+	}
+
 	resp := gin.H{
 		"error":               errorCode,
 		"message":             message,
 		"mfa_challenge_token": challengeToken,
-		"methods":             loginMethods,
+		"methods":             offered,
 	}
 
 	recoveryOnly := computeRecoveryOnlyMethods(allMethods, loginMethods)
 	if len(recoveryOnly) > 0 {
 		resp["recovery_only_methods"] = recoveryOnly
 	}
-
-	loginSet := make(map[string]bool, len(loginMethods))
-	for _, m := range loginMethods {
-		loginSet[m] = true
-	}
-	if loginSet["webauthn"] {
-		if opts, werr := h.mfaChecker.BeginWebAuthnLogin(ctx, userID, jti); werr != nil {
-			h.log.Error("Failed to begin WebAuthn login", "error", werr)
-		} else if opts != nil {
-			resp["webauthn_options"] = opts
-		}
+	if webauthnOptions != nil {
+		resp["webauthn_options"] = webauthnOptions
 	}
 
 	return resp, nil
