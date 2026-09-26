@@ -1,6 +1,7 @@
 import React, { useCallback, useRef, useState, useEffect } from 'react';
 import ToggleSwitch from './ToggleSwitch';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import RecoveryApprovalModal from '../Auth/RecoveryApprovalModal';
 import RecoveryCircle from './RecoveryCircle';
 import Modal from '../ui/Modal';
@@ -232,6 +233,28 @@ function actionNeedsCode(
       return false;
     default:
       return hasRealMFA;
+  }
+}
+
+/**
+ * The step-up purpose of the request an action's code is sent with, which is
+ * the one route a WebAuthn inline token minted in its prompt can be spent on.
+ * Revoking a key sends the password alone, so it has none.
+ */
+function actionPurpose(type: ActionType): StepUpPurpose | null {
+  switch (type) {
+    case 'reset-totp':
+      return 'mfa_settings.totp_disable';
+    case 'revoke-webauthn':
+      return null;
+    case 'disable-emailsms':
+      return 'mfa_settings.email_sms_disable';
+    case 'set-backup-email':
+      return 'mfa_settings.backup_email_set';
+    case 'toggle-recovery-only':
+      return 'mfa_settings.recovery_only_set';
+    case 'toggle-hardened':
+      return 'mfa_settings.recovery_hardened_set';
   }
 }
 
@@ -1110,6 +1133,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                 methods={actionPromptMethods}
                 recoveryOnlyMethods={recoveryOnlyMethods}
                 onVerify={setActionMfaCode}
+                purpose={actionPurpose(actionModal.type)}
                 onCodeChange={setActionMfaCode}
                 disabled={actionLoading}
                 error={stepUpMfaError(actionRefusal)}

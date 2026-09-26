@@ -306,6 +306,13 @@ account can't provide, never your password twice.
   one. The app now clears a code once you submit it instead of offering it again. And if you restart
   authenticator-app setup while an earlier attempt is still finishing, you are asked to scan the
   newest QR code, so your account never ends up expecting a code your app cannot produce.
+- **A security-key confirmation now counts only for the action you confirmed** ([#3467](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3467), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — when you
+  touch your security key to confirm a sensitive change, such as removing a backup email or signing
+  out your other sessions, that confirmation can no longer be used for any other change, or to finish
+  signing in. Where a screen never accepted a security key (regenerating backup codes), it no longer
+  offers one, nor a backup code, which that screen never accepted either. Once your key confirms,
+  the prompt now says so instead of still asking you to touch it. If the change is then refused, the
+  prompt shows why and asks for your key again, where before it showed no reason at all.
 - **Weakening your account's recovery now asks you to prove it's you** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — turning off email or
   SMS sign-in codes, replacing your recovery key, and adding or removing a backup email now ask for
   your password, plus a code from your authenticator app or security key when you have one set up.

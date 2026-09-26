@@ -192,8 +192,15 @@ func LockGateTx(
 // An actor with no inline factor gets stepup.EnrollmentRequired. A nil
 // verifier is a 500. Otherwise the code is checked on tx through
 // stepup.VerifyMFAFactorTx, so a backup code is spent only if tx commits.
+//
+// purpose is the calling route's own stepup.Purpose: a WebAuthn inline token
+// is accepted only if it was minted for exactly that purpose. #3454 passes one
+// purpose per dangerous action through RequireConfirmationTx, and each must be
+// a distinct constant; a purpose shared by two actions makes a token minted for
+// one spendable on the other.
 func ConfirmTx(
-	ctx context.Context, tx *sql.Tx, subj stepup.Subject, v stepup.MFATxCodeVerifier, actorID, code string,
+	ctx context.Context, tx *sql.Tx, subj stepup.Subject, v stepup.MFATxCodeVerifier, actorID string,
+	purpose stepup.Purpose, code string,
 ) *stepup.Error {
 	// Never `return nil` here. That is the shape of the purge-fence gate,
 	// which skips the MFA leg for an unenrolled user because a password
@@ -213,20 +220,22 @@ func ConfirmTx(
 			Cause:  errors.New("mfaenforce: MFA verifier is not configured"),
 		}
 	}
-	return stepup.VerifyMFAFactorTx(ctx, tx, v, actorID, code, subj.MFAMethods)
+	return stepup.VerifyMFAFactorTx(ctx, tx, v, actorID, purpose, code, subj.MFAMethods)
 }
 
 // RequireConfirmationTx is the gate for a dangerous action: nil when the
 // server does not enforce, without consulting the verifier, and ConfirmTx when
 // it does. It must run after the caller's own permission check (see the
-// package comment).
+// package comment). purpose is the dangerous action's own stepup.Purpose (see
+// ConfirmTx).
 func RequireConfirmationTx(
-	ctx context.Context, tx *sql.Tx, g Gate, v stepup.MFATxCodeVerifier, actorID, code string,
+	ctx context.Context, tx *sql.Tx, g Gate, v stepup.MFATxCodeVerifier, actorID string,
+	purpose stepup.Purpose, code string,
 ) *stepup.Error {
 	if !g.Enforcing {
 		return nil
 	}
-	return ConfirmTx(ctx, tx, g.Subject, v, actorID, code)
+	return ConfirmTx(ctx, tx, g.Subject, v, actorID, purpose, code)
 }
 
 // IsLockConflict reports whether err carries PostgreSQL deadlock_detected

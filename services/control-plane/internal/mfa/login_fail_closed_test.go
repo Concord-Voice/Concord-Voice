@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -228,18 +227,16 @@ func TestVerifyFailsClosedWhenItCannotReadTheReuseOrLockoutGuard(t *testing.T) {
 		{name: "lockout", prefix: "mfa_verify_lockout:"},
 	} {
 		t.Run(guard.name, func(t *testing.T) {
-			_, redisClient := newEnrollmentRedis(t)
-			h := NewHandler(nil, redisClient, logger.New("test"), nil, "test", nil, "test")
+			// The account holds a TOTP factor and the code is right, so the
+			// guard is the only thing between this request and a session.
+			fixture := newRealTOTPFixture(t)
+			h, redisClient := scriptedHandlerFull(t, fixture.state(), "test", fixture.keyring, nil, nil)
 			completer := &recordingLoginCompleter{}
 			h.SetLoginCompleter(completer)
 			token, _ := loginChallenge(t, h)
-			// A stored inline WebAuthn token verifies without the database, so
-			// the guard is the only thing between this request and a session.
-			const inline = "webauthn-inline-token-123456"
-			require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf("mfa_inline_token:%s:%s", enrollUser, inline), "1", time.Minute).Err())
 			redisClient.AddHook(failKeyHook{name: "exists", prefix: guard.prefix})
 
-			response := verifyWith(h, `{"mfa_challenge_token":"`+token+`","method":"totp","code":"`+inline+`"}`)
+			response := verifyWith(h, `{"mfa_challenge_token":"`+token+`","method":"totp","code":"`+fixture.code+`"}`)
 
 			require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
 			require.False(t, completer.called, "an unreadable guard must never let a login through")
@@ -248,13 +245,46 @@ func TestVerifyFailsClosedWhenItCannotReadTheReuseOrLockoutGuard(t *testing.T) {
 }
 
 const (
+	// inlineFactor is a WebAuthn inline token a step-up test stores for one
+	// purpose (storeInlineFactor). It verifies without the database.
 	inlineFactor = "webauthn-inline-token-123456"
-	wrongFactor  = "webauthn-inline-token-999999"
+	// wrongFactor is wrong for an account with no TOTP secret, which is every
+	// fixture that uses it.
+	wrongFactor = "000000"
 )
 
-// verifyFixture is a login challenge whose only valid factor is a stored
-// inline WebAuthn token. The token verifies without the database and is spent
-// (GETDEL) when a code is judged, so its survival shows no code was judged.
+// storeInlineFactor stores inlineFactor as a token minted for purpose.
+func storeInlineFactor(t *testing.T, redisClient *redis.Client, purpose stepup.Purpose) {
+	t.Helper()
+	require.NoError(t, redisClient.Set(context.Background(), inlineTokenKey(enrollUser, purpose, inlineFactor), "1", time.Minute).Err())
+}
+
+// state is an account whose only factor is this fixture's confirmed TOTP.
+func (f realTOTPFixture) state() *mfaEventDB {
+	return &mfaEventDB{totpSecretEnc: f.secretEnc, totpSecretNonce: f.secretNonce, totpKeyVersion: f.keyVersion, totpEnabled: true, totpConfirmed: true}
+}
+
+// wrongCode is a six-digit code outside the window ValidateCode accepts
+// around now, so it is wrong for this fixture however the clock falls.
+func (f realTOTPFixture) wrongCode(t *testing.T) string {
+	t.Helper()
+	accepted := map[string]bool{}
+	for _, offset := range []time.Duration{-60 * time.Second, -30 * time.Second, 0, 30 * time.Second, 60 * time.Second} {
+		code, err := totp.GenerateCodeCustom("JBSWY3DPEHPK3PXP", time.Now().Add(offset), totp.ValidateOpts{Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
+		require.NoError(t, err)
+		accepted[code] = true
+	}
+	for i := 0; ; i++ {
+		if code := fmt.Sprintf("%06d", i); !accepted[code] {
+			return code
+		}
+	}
+}
+
+// verifyFixture is a login challenge whose only factor is a confirmed TOTP.
+// Judging a code reads the TOTP secret, so a request that recorded no such read
+// judged no code. Login never accepts a WebAuthn inline token (#3453 RS11), so
+// this fixture no longer uses one.
 type verifyFixture struct {
 	h         *Handler
 	redis     *redis.Client
@@ -263,18 +293,21 @@ type verifyFixture struct {
 	events    *securityEventRecorder
 	token     string
 	jti       string
+	right     string
+	wrong     string
 }
 
 func newVerifyFixture(t *testing.T) *verifyFixture {
 	t.Helper()
-	_, redisClient := newEnrollmentRedis(t)
-	state := &mfaEventDB{} // no TOTP and no backup codes: only the inline token is valid
-	h := NewHandler(fakeMFADB(t, state), redisClient, logger.New("test"), nil, "test", nil, "test")
-	f := &verifyFixture{h: h, redis: redisClient, state: state, completer: &recordingLoginCompleter{}, events: &securityEventRecorder{}}
+	fixture := newRealTOTPFixture(t)
+	state := fixture.state()
+	// The scripted connector hands out one connection and counts nothing, so
+	// concurrent requests do not race on the fake's connection counter.
+	h, redisClient := scriptedHandlerFull(t, state, "test", fixture.keyring, nil, nil)
+	f := &verifyFixture{h: h, redis: redisClient, state: state, completer: &recordingLoginCompleter{}, events: &securityEventRecorder{}, right: fixture.code, wrong: fixture.wrongCode(t)}
 	h.SetLoginCompleter(f.completer)
 	h.SetSecurityEvents(f.events)
 	f.token, f.jti = loginChallenge(t, h)
-	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf("mfa_inline_token:%s:%s", enrollUser, inlineFactor), "1", time.Minute).Err())
 	return f
 }
 
@@ -289,8 +322,22 @@ func (f *verifyFixture) exists(t *testing.T, key string) bool {
 	return n == 1
 }
 
-func (f *verifyFixture) inlineFactorStored(t *testing.T) bool {
-	return f.exists(t, fmt.Sprintf("mfa_inline_token:%s:%s", enrollUser, inlineFactor))
+// judged counts the requests that reached the code check.
+func (f *verifyFixture) judged() int {
+	return judgedIn(f.state)
+}
+
+// judgedIn counts the TOTP secret reads state recorded.
+func judgedIn(state *mfaEventDB) int {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	n := 0
+	for _, statement := range state.statements {
+		if strings.Contains(statement, "totp_secret_enc") {
+			n++
+		}
+	}
+	return n
 }
 
 // An attempt that cannot be counted is refused before any code is judged. A
@@ -299,17 +346,21 @@ func (f *verifyFixture) inlineFactorStored(t *testing.T) bool {
 func TestVerifyJudgesNoCodeItCannotCount(t *testing.T) {
 	// The count is INCR followed by EXPIRE NX; either failing leaves it unset.
 	for _, command := range []string{"incr", "expire"} {
-		for _, code := range []string{inlineFactor, wrongFactor} {
-			t.Run(command+"/"+code, func(t *testing.T) {
+		for _, which := range []string{"right", "wrong"} {
+			t.Run(command+"/"+which, func(t *testing.T) {
 				f := newVerifyFixture(t)
 				f.redis.AddHook(failCommandHook{name: command})
+				code := f.right
+				if which == "wrong" {
+					code = f.wrong
+				}
 
 				response := f.verify(code)
 
 				require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
 				require.Contains(t, response.Body.String(), errMsgMFAVerificationUnavailable)
 				require.False(t, f.completer.called)
-				require.True(t, f.inlineFactorStored(t), "an unjudged request must not spend the factor")
+				require.Zero(t, f.judged(), "an uncounted request must not have its code judged")
 				require.False(t, f.exists(t, "auth_failures:ip:192.0.2.1"), "a code that was never judged is not a failed attempt")
 			})
 		}
@@ -355,7 +406,7 @@ func TestVerifyGivesACountWithoutAnExpiryOne(t *testing.T) {
 func TestVerifyCountsAWrongCode(t *testing.T) {
 	f := newVerifyFixture(t)
 
-	response := f.verify(wrongFactor)
+	response := f.verify(f.wrong)
 
 	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
 	attempts, err := f.redis.Get(context.Background(), "mfa_verify_attempts:"+enrollUser).Int()
@@ -372,36 +423,18 @@ func TestVerifyRefusesPastTheLimitWhenTheLockoutWriteFails(t *testing.T) {
 	require.NoError(t, f.redis.Set(context.Background(), "mfa_verify_attempts:"+enrollUser, failedAttemptLimit-1, time.Minute).Err())
 	f.redis.AddHook(failKeyHook{name: "set", prefix: "mfa_verify_lockout:"})
 
-	last := f.verify(wrongFactor)
+	last := f.verify(f.wrong)
 	require.Equal(t, http.StatusInternalServerError, last.Code, last.Body.String())
 	require.Contains(t, last.Body.String(), errMsgMFAVerificationUnavailable)
 	require.False(t, f.exists(t, "mfa_verify_lockout:"+enrollUser))
 	require.True(t, f.exists(t, "auth_failures:ip:192.0.2.1"), "the wrong code still counts against the IP")
 
-	next := f.verify(inlineFactor)
+	judgedBefore := f.judged()
+	next := f.verify(f.right)
 
 	require.Equal(t, http.StatusTooManyRequests, next.Code, next.Body.String())
 	require.False(t, f.completer.called, "a right code must not sign in past the limit")
-	require.True(t, f.inlineFactorStored(t))
-}
-
-// judgeCounter counts the codes that are judged, and holds each one briefly
-// so that concurrent requests are all in flight at once. A code longer than 20
-// characters is judged by first trying to spend it as an inline WebAuthn token.
-type judgeCounter struct{ judged *atomic.Int32 }
-
-func (judgeCounter) DialHook(next redis.DialHook) redis.DialHook { return next }
-func (judgeCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return next
-}
-func (j judgeCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
-	return func(ctx context.Context, cmd redis.Cmder) error {
-		if cmd.Name() == "getdel" && strings.HasPrefix(fmt.Sprint(cmd.Args()[1]), "mfa_inline_token:") {
-			j.judged.Add(1)
-			time.Sleep(20 * time.Millisecond)
-		}
-		return next(ctx, cmd)
-	}
+	require.Equal(t, judgedBefore, f.judged(), "a refused attempt must not have its code judged")
 }
 
 // Guesses sent at once must not each get a code checked. Before the count was
@@ -409,8 +442,9 @@ func (j judgeCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 // had its code judged.
 func TestVerifyJudgesAtMostTheLimitOfConcurrentGuesses(t *testing.T) {
 	f := newVerifyFixture(t)
-	var judged atomic.Int32
-	f.redis.AddHook(judgeCounter{judged: &judged})
+	// Each judged code holds its TOTP read briefly, so every concurrent request
+	// is in flight at once; the fake records one read per judged code.
+	f.state.totpReadDelay = 20 * time.Millisecond
 
 	const guesses = 4 * failedAttemptLimit
 	codes := make([]int, guesses)
@@ -421,13 +455,13 @@ func TestVerifyJudgesAtMostTheLimitOfConcurrentGuesses(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			codes[i] = f.verify(wrongFactor).Code
+			codes[i] = f.verify(f.wrong).Code
 		}()
 	}
 	close(start)
 	wg.Wait()
 
-	require.Equal(t, int32(failedAttemptLimit), judged.Load(), "only the first %d attempts may have a code judged", failedAttemptLimit)
+	require.Equal(t, failedAttemptLimit, f.judged(), "only the first %d attempts may have a code judged", failedAttemptLimit)
 	statuses := map[int]int{}
 	for _, code := range codes {
 		statuses[code]++
@@ -470,19 +504,19 @@ func TestVerifyRefusesARecoveryOnlyMethodAtSignIn(t *testing.T) {
 		recoveryOnly string
 		want         int
 	}{
-		{name: "restricted", recoveryOnly: "{webauthn}", want: http.StatusForbidden},
+		{name: "restricted", recoveryOnly: "{totp}", want: http.StatusForbidden},
 		{name: "another method restricted", recoveryOnly: "{email}", want: http.StatusOK},
 		// With no other method left the restriction lapses: refusing here
 		// would leave a challenge nothing can answer (see
 		// TestGetLoginMethodsNeverLeavesAnMFAAccountWithNoMethod).
-		{name: "restriction would leave nothing", methods: "{webauthn}", recoveryOnly: "{webauthn}", want: http.StatusOK},
+		{name: "restriction would leave nothing", methods: "{totp}", recoveryOnly: "{totp}", want: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newVerifyFixture(t)
 			f.state.mfaMethods = tc.methods
 			f.state.recoveryOnly = tc.recoveryOnly
 
-			response := f.verify(inlineFactor)
+			response := f.verify(f.right)
 
 			require.Equal(t, tc.want, response.Code, response.Body.String())
 			if tc.want == http.StatusForbidden {
@@ -494,19 +528,17 @@ func TestVerifyRefusesARecoveryOnlyMethodAtSignIn(t *testing.T) {
 }
 
 func TestVerifyFailsClosedWhenItCannotReadTheRecoveryOnlyMethods(t *testing.T) {
-	h, redisClient := scriptedHandler(t, &mfaEventDB{}, "test",
-		scriptedAnswer{match: "recovery_only_methods FROM users", err: errReadFailed})
+	fixture := newRealTOTPFixture(t)
+	state := fixture.state()
+	h, _ := scriptedHandlerFull(t, state, "test", fixture.keyring,
+		[]scriptedAnswer{{match: "recovery_only_methods FROM users", err: errReadFailed}}, nil)
 	token, _ := loginChallenge(t, h)
-	inlineKey := fmt.Sprintf("mfa_inline_token:%s:%s", enrollUser, inlineFactor)
-	require.NoError(t, redisClient.Set(context.Background(), inlineKey, "1", time.Minute).Err())
 
-	response := verifyWith(h, `{"mfa_challenge_token":"`+token+`","method":"totp","code":"`+inlineFactor+`"}`)
+	response := verifyWith(h, `{"mfa_challenge_token":"`+token+`","method":"totp","code":"`+fixture.code+`"}`)
 
 	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
 	require.Contains(t, response.Body.String(), errMsgMFAVerificationUnavailable)
-	n, err := redisClient.Exists(context.Background(), inlineKey).Result()
-	require.NoError(t, err)
-	require.Equal(t, int64(1), n, "the factor must not be judged, and so not spent, before the setting is known")
+	require.Zero(t, judgedIn(state), "the code must not be judged, and so not spent, before the setting is known")
 }
 
 // Judging a code can spend it, so the remember-me state is read first: a read
@@ -515,12 +547,12 @@ func TestVerifyReadsRememberStateBeforeJudgingTheCode(t *testing.T) {
 	f := newVerifyFixture(t)
 	f.redis.AddHook(failKeyHook{name: "get", prefix: "mfa_challenge:"})
 
-	response := f.verify(inlineFactor)
+	response := f.verify(f.right)
 
 	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
 	require.Contains(t, response.Body.String(), errMsgMFAVerificationUnavailable)
 	require.False(t, f.completer.called)
-	require.True(t, f.inlineFactorStored(t), "the factor must survive a read that failed before judging")
+	require.Zero(t, f.judged(), "the code must not be judged by a read that failed before judging")
 	require.False(t, f.exists(t, "mfa_challenge_used:"+f.jti), "the challenge must stay usable")
 	require.False(t, f.exists(t, "mfa_verify_attempts:"+enrollUser), "nothing was attempted")
 	require.Equal(t, []securityevent.Event{{
@@ -537,11 +569,11 @@ func TestVerifyRefusesACountAtTheLimitWhoseLockoutWasNeverWritten(t *testing.T) 
 	f := newVerifyFixture(t)
 	require.NoError(t, f.redis.Set(context.Background(), "mfa_verify_attempts:"+enrollUser, failedAttemptLimit, time.Minute).Err())
 
-	response := f.verify(inlineFactor)
+	response := f.verify(f.right)
 
 	require.Equal(t, http.StatusTooManyRequests, response.Code, response.Body.String())
 	require.False(t, f.completer.called, "a right code must not sign in past the limit")
-	require.True(t, f.inlineFactorStored(t), "a refused attempt must not spend the factor")
+	require.Zero(t, f.judged(), "a refused attempt must not have its code judged")
 }
 
 func TestWebAuthnLoginReportsAnUnreadableCeremonyAsAnOutage(t *testing.T) {
@@ -788,8 +820,9 @@ func TestEmailSmsSetupRefusesAnEmailServiceThatOnlyLogs(t *testing.T) {
 				scriptedAnswer{match: "FROM users u WHERE u.id", values: []driver.Value{hash, true, false}},
 				scriptedAnswer{match: "SELECT email FROM users", values: []driver.Value{"email-fixture@example.test"}})
 			h.SetEmailService(loggingEmailService(tc.environment))
-			// The step-up factor: an inline WebAuthn token verifies without the database.
-			require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf("mfa_inline_token:%s:%s", enrollUser, inlineFactor), "1", time.Minute).Err())
+			// The step-up factor: an inline WebAuthn token minted for this
+			// route verifies without the database.
+			storeInlineFactor(t, redisClient, stepup.PurposeEmailSmsSetup)
 			c, response := enrollRequest("/api/v1/mfa/email-sms/setup",
 				`{"password":"correct","mfa_code":"`+inlineFactor+`","methods":["email"]}`, "session-a")
 
@@ -1090,7 +1123,7 @@ func TestWebAuthnCeremoniesReportAnUnreadableSessionAsAnOutage(t *testing.T) {
 		body   string
 	}{
 		{name: "register finish", prefix: "webauthn_reg:", call: func(h *Handler, c *gin.Context) { h.WebAuthnRegisterFinish(c) }, body: "Failed to complete registration"},
-		{name: "inline verify finish", prefix: "mfa_inline_session:", call: func(h *Handler, c *gin.Context) { h.WebAuthnVerifyInlineFinish(c) }, body: errMsgFailedVerify},
+		{name: "inline verify finish", prefix: "mfa_inline_purpose_session:", call: func(h *Handler, c *gin.Context) { h.WebAuthnVerifyInlineFinish(c) }, body: errMsgFailedVerify},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, redisClient := scriptedHandler(t, &mfaEventDB{}, "test")
@@ -1410,9 +1443,16 @@ func TestRemainingCredentialIDsFailsWhenIterationFails(t *testing.T) {
 
 // ── WebAuthn inline verify (protected-operation step-up) ───────────────────
 
+// inlineBeginBody names a purpose, which begin requires before any other work.
+const inlineBeginBody = `{"purpose":"mfa_settings.totp_setup"}`
+
+// inlineStoredSession is an empty ceremony that carries a purpose: finish
+// refuses a session with none before reaching the step under test.
+const inlineStoredSession = `{"purpose":"mfa_settings.totp_setup"}`
+
 func TestWebAuthnVerifyInlineBeginFailsWhenItCannotBuildTheUser(t *testing.T) {
 	h, _ := scriptedHandler(t, &mfaEventDB{}, "test", scriptedAnswer{match: "COALESCE(display_name", err: errReadFailed})
-	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/begin", "", "session-a")
+	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/begin", inlineBeginBody, "session-a")
 
 	h.WebAuthnVerifyInlineBegin(c)
 
@@ -1428,8 +1468,8 @@ func TestWebAuthnVerifyInlineBeginFailsWhenItCannotStoreTheSession(t *testing.T)
 			[]byte("cred-id"), []byte("pub-key"), []byte("aaguid"), int64(0), []byte("{usb}"),
 		}})
 	h.webauthn, _ = NewWebAuthnService("webauthn.io", "test", []string{"https://webauthn.io"})
-	redisClient.AddHook(failKeyHook{name: "set", prefix: "mfa_inline_session:"})
-	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/begin", "", "session-a")
+	redisClient.AddHook(failKeyHook{name: "set", prefix: "mfa_inline_purpose_session:"})
+	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/begin", inlineBeginBody, "session-a")
 
 	h.WebAuthnVerifyInlineBegin(c)
 
@@ -1439,7 +1479,7 @@ func TestWebAuthnVerifyInlineBeginFailsWhenItCannotStoreTheSession(t *testing.T)
 
 func TestWebAuthnVerifyInlineFinishFailsOnUndecodableSession(t *testing.T) {
 	h, redisClient := scriptedHandler(t, &mfaEventDB{}, "test")
-	require.NoError(t, redisClient.Set(context.Background(), "mfa_inline_session:"+enrollUser, "not json", time.Minute).Err())
+	require.NoError(t, redisClient.Set(context.Background(), inlineSessionKey(enrollUser), "not json", time.Minute).Err())
 	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/finish", "{}", "session-a")
 
 	h.WebAuthnVerifyInlineFinish(c)
@@ -1450,7 +1490,7 @@ func TestWebAuthnVerifyInlineFinishFailsOnUndecodableSession(t *testing.T) {
 
 func TestWebAuthnVerifyInlineFinishFailsWhenItCannotBuildTheUser(t *testing.T) {
 	h, redisClient := scriptedHandler(t, &mfaEventDB{}, "test", scriptedAnswer{match: "COALESCE(display_name", err: errReadFailed})
-	require.NoError(t, redisClient.Set(context.Background(), "mfa_inline_session:"+enrollUser, "{}", time.Minute).Err())
+	require.NoError(t, redisClient.Set(context.Background(), inlineSessionKey(enrollUser), inlineStoredSession, time.Minute).Err())
 	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/finish", "{}", "session-a")
 
 	h.WebAuthnVerifyInlineFinish(c)
@@ -1463,7 +1503,7 @@ func TestWebAuthnVerifyInlineFinishFailsWhenItCannotBuildTheUser(t *testing.T) {
 func TestWebAuthnVerifyInlineFinishRefusesAMalformedAssertion(t *testing.T) {
 	h, redisClient := scriptedHandler(t, &mfaEventDB{}, "test")
 	h.webauthn, _ = NewWebAuthnService("webauthn.io", "test", []string{"https://webauthn.io"})
-	require.NoError(t, redisClient.Set(context.Background(), "mfa_inline_session:"+enrollUser, "{}", time.Minute).Err())
+	require.NoError(t, redisClient.Set(context.Background(), inlineSessionKey(enrollUser), inlineStoredSession, time.Minute).Err())
 	c, response := enrollRequest("/api/v1/auth/mfa/webauthn/verify/finish", "{}", "session-a")
 
 	h.WebAuthnVerifyInlineFinish(c)
@@ -1497,7 +1537,7 @@ func TestBeginWebAuthnLoginFailsWhenItCannotStoreTheSession(t *testing.T) {
 func TestTOTPSetupFailsWhenItCannotCheckExistingEnrollment(t *testing.T) {
 	h, redisClient := scriptedHandler(t, &mfaEventDB{passwordHash: correctPasswordHash(t)}, "test",
 		scriptedAnswer{match: "SELECT confirmed FROM user_mfa_totp", err: errReadFailed})
-	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf("mfa_inline_token:%s:%s", enrollUser, inlineFactor), "1", time.Minute).Err())
+	storeInlineFactor(t, redisClient, stepup.PurposeTOTPSetup)
 	c, response := enrollRequest("/api/v1/auth/mfa/totp/setup", `{"password":"correct","mfa_code":"`+inlineFactor+`"}`, "session-a")
 
 	h.TOTPSetup(c)
@@ -1750,7 +1790,7 @@ func TestCompleteVerifiedChallengeLogsWhenTheAttemptCountCannotBeReset(t *testin
 	f.h.log = logger.NewWithWriter(&buf)
 	f.redis.AddHook(failKeyHook{name: "del", prefix: "mfa_verify_attempts:"})
 
-	response := f.verify(inlineFactor)
+	response := f.verify(f.right)
 
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.True(t, f.completer.called, "the login must still complete despite the best-effort failure")

@@ -8,6 +8,7 @@ import {
   getDefaultMethod,
   type MFAMethodCategory,
 } from './MFAMethodPicker';
+import type { StepUpPurpose } from './stepUpPurpose';
 
 // ── WebAuthn helpers (module-level, outside component) ─────────────────
 
@@ -59,6 +60,13 @@ function classifyWebAuthnError(err: unknown): string | null {
   return err instanceof Error ? err.message : 'Verification failed';
 }
 
+/** Error copy in the security-key branch, for the ceremony's and the parent's. */
+const REFUSAL_STYLE: React.CSSProperties = {
+  margin: '0 0 8px',
+  fontSize: '13px',
+  color: 'var(--error-color, #ed4245)',
+};
+
 // ── Method-link descriptors ────────────────────────────────────────────
 
 interface MethodLinkDescriptor {
@@ -84,6 +92,15 @@ interface MFAVerifyPromptProps {
   /** Called with the MFA code (TOTP, backup code, or WebAuthn inline-verify token) */
   onVerify: (code: string) => void;
   /**
+   * The step-up purpose of the one request this prompt's code is sent with.
+   * A WebAuthn inline-verify token is minted for exactly this purpose and the
+   * server accepts it on no other route, so it must name that request, not a
+   * neighbour. `null` when the route accepts no inline token at all: the
+   * security-key option is then not offered, since a token minted for it
+   * could never be spent. Required, so a new mount cannot forget it.
+   */
+  purpose: StepUpPurpose | null;
+  /**
    * Fires on every edit of a typed code — the complete code, or `''` while it
    * is incomplete — and with `''` on a switch to another method. A parent
    * that STORES the code for a later Confirm needs this: `onVerify` reports
@@ -106,12 +123,18 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
   methods,
   recoveryOnlyMethods = [],
   onVerify,
+  purpose,
   onCodeChange,
   disabled = false,
   error,
   excludeBackupCodes = false,
 }) => {
-  const excludedMethods = useMemo(() => [...recoveryOnlyMethods], [recoveryOnlyMethods]);
+  // A route that accepts no inline token (purpose null) is offered no
+  // security-key option: excluding the method keeps it out of every list below.
+  const excludedMethods = useMemo(
+    () => (purpose === null ? [...recoveryOnlyMethods, 'webauthn'] : [...recoveryOnlyMethods]),
+    [recoveryOnlyMethods, purpose]
+  );
 
   const available = useMemo(() => {
     const cats = getAvailableCategories(methods, excludedMethods);
@@ -127,9 +150,22 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
   }, [methods, excludedMethods, excludeBackupCodes, available]);
 
   const [mode, setMode] = useState<MFAMethodCategory>(defaultMethod);
-  const [webauthnStatus, setWebauthnStatus] = useState<'idle' | 'waiting' | 'error'>('idle');
+  const [webauthnStatus, setWebauthnStatus] = useState<'idle' | 'waiting' | 'verified' | 'error'>(
+    'idle'
+  );
   const [webauthnError, setWebauthnError] = useState('');
   const abortRef = useRef<AbortController | null>(null);
+
+  // A refusal that arrives after the key answered means the request it
+  // confirmed was turned down, and the server may already have spent the
+  // token. "Security key verified" no longer holds, so the key is offered
+  // again. Only a CHANGE counts: the parents keep a refusal's text until the
+  // next submission, so a key re-run under an earlier refusal stays verified.
+  const [refusalSeen, setRefusalSeen] = useState(error);
+  if (error !== refusalSeen) {
+    setRefusalSeen(error);
+    if (error && webauthnStatus === 'verified') setWebauthnStatus('idle');
+  }
   const showBackupSwitch = !excludeBackupCodes && available.includes('backup');
 
   // Abort any pending WebAuthn ceremony on unmount
@@ -190,9 +226,12 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
     setWebauthnStatus('waiting');
     setWebauthnError('');
     try {
-      // Step 1: Get assertion options from server
+      // Step 1: Get assertion options from server, for this prompt's purpose
+      // only (the token minted at finish is spendable on no other route).
       const beginRes = await apiFetch('/api/v1/mfa/webauthn/verify-inline/begin', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose }),
       });
       const beginData = await beginRes.json();
       if (!beginRes.ok) throw new Error(beginData.error || 'Failed to start verification');
@@ -212,6 +251,8 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
       // Step 3: Send assertion to server and get MFA token
       const mfaToken = await finishWebAuthnVerification(credential, beginData.challengeToken);
       onVerify(mfaToken);
+      // Leave the waiting state: the key has answered and Confirm is live.
+      setWebauthnStatus('verified');
     } catch (err) {
       const message = classifyWebAuthnError(err);
       if (message === null) {
@@ -221,7 +262,7 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
       setWebauthnError(message);
       setWebauthnStatus('error');
     }
-  }, [onVerify]);
+  }, [onVerify, purpose]);
 
   return (
     <div className="mfa-verify-prompt">
@@ -255,14 +296,23 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
       {mode === 'webauthn' && (
         <div className="mfa-webauthn-inline">
           {webauthnStatus === 'idle' && (
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={handleWebAuthnVerify}
-              disabled={disabled}
-            >
-              Verify with security key
-            </button>
+            <>
+              {/* Every parent routes a code refusal only to this prompt, so
+                  security-key mode must show it as the code inputs do. */}
+              {error && (
+                <p role="alert" style={REFUSAL_STYLE}>
+                  {error}
+                </p>
+              )}
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleWebAuthnVerify}
+                disabled={disabled}
+              >
+                Verify with security key
+              </button>
+            </>
           )}
           {webauthnStatus === 'waiting' && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
@@ -282,17 +332,24 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
               </p>
             </div>
           )}
+          {webauthnStatus === 'verified' && (
+            // <output> carries the implicit "status" role, so the confirmation
+            // is announced without an ARIA role on a paragraph.
+            <output
+              style={{
+                display: 'block',
+                margin: '0 0 8px',
+                textAlign: 'center',
+                fontSize: '13px',
+                color: 'var(--text-primary)',
+              }}
+            >
+              Security key verified
+            </output>
+          )}
           {webauthnStatus === 'error' && (
             <>
-              <p
-                style={{
-                  margin: '0 0 8px',
-                  fontSize: '13px',
-                  color: 'var(--error-color, #ed4245)',
-                }}
-              >
-                {webauthnError}
-              </p>
+              <p style={REFUSAL_STYLE}>{webauthnError}</p>
               <button
                 type="button"
                 className="btn btn-primary"

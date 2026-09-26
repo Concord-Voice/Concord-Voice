@@ -347,7 +347,7 @@ func (h *Handler) verifyClearStepUp(ctx context.Context, tx *sql.Tx, userID stri
 		if h.mfaVerifier == nil {
 			return &stepup.Error{Status: http.StatusInternalServerError, Body: gin.H{"error": stepup.ErrMsgVerificationFailed}}
 		}
-		return stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, req.MFACode, subject.MFAMethods)
+		return stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, stepup.PurposeDMClear, req.MFACode, subject.MFAMethods)
 	}
 	return stepup.VerifyPasswordFactor(subject, req.CurrentPassword, clearStepUpCopy)
 }

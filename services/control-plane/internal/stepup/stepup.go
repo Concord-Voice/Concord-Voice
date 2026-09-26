@@ -88,15 +88,21 @@ type MFAMethodLister interface {
 // MFACodeVerifier is the pool-scoped MFA surface VerifyMFAFactor needs. It is
 // deliberately narrower than MFAVerifier: internal/dm holds an mfa.Verifier,
 // which has no VerifyCodeTx, and must still be able to call the non-tx form.
+//
+// purpose is the calling route's own Purpose. It scopes the WebAuthn inline
+// token a code may be: only a token minted for that purpose is accepted, and a
+// token minted for any other is refused like an invalid code without being
+// consumed.
 type MFACodeVerifier interface {
 	MFAMethodLister
-	VerifyCode(ctx context.Context, userID, code string) (bool, error)
+	VerifyCode(ctx context.Context, userID string, purpose Purpose, code string) (bool, error)
 }
 
 // MFATxCodeVerifier is the transaction-scoped surface VerifyMFAFactorTx needs.
+// purpose has the same meaning as on MFACodeVerifier.
 type MFATxCodeVerifier interface {
 	MFAMethodLister
-	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID, code string) (bool, error)
+	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, purpose Purpose, code string) (bool, error)
 }
 
 // MFAVerifier is the full MFA surface step-up policy can consume. *mfa.Handler
@@ -257,10 +263,13 @@ func VerifyPasswordFactor(subj Subject, currentPassword string, wording Copy) *E
 // VerifyMFAFactor checks the MFA half outside a transaction. Only call when the
 // actor has MFA enabled. preloadedMethods has the same meaning as on
 // VerifyMFAFactorTx: pass the Subject's MFAMethods so a missing-code refusal
-// offers the P1 set rather than users.mfa_methods.
-func VerifyMFAFactor(ctx context.Context, v MFACodeVerifier, userID, mfaCode string, preloadedMethods []string) *Error {
+// offers the P1 set rather than users.mfa_methods. purpose is the calling
+// route's own Purpose (see MFACodeVerifier).
+func VerifyMFAFactor(
+	ctx context.Context, v MFACodeVerifier, userID string, purpose Purpose, mfaCode string, preloadedMethods []string,
+) *Error {
 	return verifyMFA(ctx, v, userID, mfaCode, preloadedMethods, func() (bool, error) {
-		return v.VerifyCode(ctx, userID, mfaCode)
+		return v.VerifyCode(ctx, userID, purpose, mfaCode)
 	})
 }
 
@@ -275,11 +284,13 @@ func VerifyMFAFactor(ctx context.Context, v MFACodeVerifier, userID, mfaCode str
 // nil slice means "not preloaded — look them up"; that fallback reads
 // users.mfa_methods and so is P1-blind, which is why every production caller
 // passes Subject.MFAMethods (never nil from LoadSubject or LockSubjectTx).
+// purpose is the calling route's own Purpose (see MFACodeVerifier).
 func VerifyMFAFactorTx(
-	ctx context.Context, tx *sql.Tx, v MFATxCodeVerifier, userID, mfaCode string, preloadedMethods []string,
+	ctx context.Context, tx *sql.Tx, v MFATxCodeVerifier, userID string, purpose Purpose, mfaCode string,
+	preloadedMethods []string,
 ) *Error {
 	return verifyMFA(ctx, v, userID, mfaCode, preloadedMethods, func() (bool, error) {
-		return v.VerifyCodeTx(ctx, tx, userID, mfaCode)
+		return v.VerifyCodeTx(ctx, tx, userID, purpose, mfaCode)
 	})
 }
 

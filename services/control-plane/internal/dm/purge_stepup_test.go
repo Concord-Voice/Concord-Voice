@@ -37,10 +37,10 @@ type fakeMFAVerifier struct {
 }
 
 func (f *fakeMFAVerifier) IsEnabled(context.Context, string) bool { return f.enabled }
-func (f *fakeMFAVerifier) VerifyCode(context.Context, string, string) (bool, error) {
+func (f *fakeMFAVerifier) VerifyCode(context.Context, string, stepup.Purpose, string) (bool, error) {
 	return f.valid, f.verifyErr
 }
-func (f *fakeMFAVerifier) VerifyCodeTx(context.Context, *sql.Tx, string, string) (bool, error) {
+func (f *fakeMFAVerifier) VerifyCodeTx(context.Context, *sql.Tx, string, stepup.Purpose, string) (bool, error) {
 	return f.valid, f.verifyErr
 }
 func (f *fakeMFAVerifier) GetEnabledMethods(context.Context, string) ([]string, error) {

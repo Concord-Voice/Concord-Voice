@@ -20,24 +20,40 @@ describe('MFAVerifyPrompt', () => {
   // ── Rendering ──────────────────────────────────────────────────────────
 
   it('renders MFA Verification label', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={onVerify} />
+    );
     expect(screen.getByText('MFA Verification')).toBeInTheDocument();
   });
 
   it('shows TOTP input when totp is the default method', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={onVerify} />
+    );
     // Should show 6 digit inputs for TOTP
     const inputs = screen.getAllByRole('textbox');
     expect(inputs.length).toBe(6);
   });
 
   it('shows WebAuthn button when webauthn is the default method', () => {
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     expect(screen.getByText('Verify with security key')).toBeInTheDocument();
   });
 
   it('shows switch links for other available methods', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'webauthn']}
+        onVerify={onVerify}
+      />
+    );
     // Default should be webauthn (highest priority), so we should see "Use authenticator app"
     expect(screen.getByText('Use authenticator app instead')).toBeInTheDocument();
   });
@@ -45,7 +61,13 @@ describe('MFAVerifyPrompt', () => {
   // ── Mode Switching ─────────────────────────────────────────────────────
 
   it('switches from webauthn to totp mode', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Use authenticator app instead'));
     // Now should show TOTP digit inputs
     const inputs = screen.getAllByRole('textbox');
@@ -53,13 +75,17 @@ describe('MFAVerifyPrompt', () => {
   });
 
   it('switches from totp to backup code mode', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={onVerify} />
+    );
     fireEvent.click(screen.getByText('Use a backup code instead'));
     expect(screen.getByPlaceholderText('XXXXXXXX')).toBeInTheDocument();
   });
 
   it('switches from backup back to totp mode', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={onVerify} />
+    );
     fireEvent.click(screen.getByText('Use a backup code instead'));
     expect(screen.getByPlaceholderText('XXXXXXXX')).toBeInTheDocument();
     fireEvent.click(screen.getByText('Use authenticator app instead'));
@@ -68,7 +94,13 @@ describe('MFAVerifyPrompt', () => {
   });
 
   it('shows webauthn switch from totp mode', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'webauthn']}
+        onVerify={onVerify}
+      />
+    );
     // Default is webauthn; switch to totp first
     fireEvent.click(screen.getByText('Use authenticator app instead'));
     // Now should see option to switch back to webauthn
@@ -76,7 +108,13 @@ describe('MFAVerifyPrompt', () => {
   });
 
   it('switches from backup to webauthn when available', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'webauthn']}
+        onVerify={onVerify}
+      />
+    );
     // Start on webauthn, go to totp, then backup
     fireEvent.click(screen.getByText('Use authenticator app instead'));
     fireEvent.click(screen.getByText('Use a backup code instead'));
@@ -87,13 +125,21 @@ describe('MFAVerifyPrompt', () => {
   // ── Exclude Options ────────────────────────────────────────────────────
 
   it('hides backup code option when excludeBackupCodes is true', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} excludeBackupCodes />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        onVerify={onVerify}
+        excludeBackupCodes
+      />
+    );
     expect(screen.queryByText('Use a backup code instead')).not.toBeInTheDocument();
   });
 
   it('excludes recovery-only methods', () => {
     render(
       <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
         methods={['totp', 'email']}
         recoveryOnlyMethods={['email']}
         onVerify={onVerify}
@@ -105,7 +151,12 @@ describe('MFAVerifyPrompt', () => {
 
   it('does not show backup switch when excludeBackupCodes and in webauthn mode', () => {
     render(
-      <MFAVerifyPrompt methods={['webauthn', 'totp']} onVerify={onVerify} excludeBackupCodes />
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn', 'totp']}
+        onVerify={onVerify}
+        excludeBackupCodes
+      />
     );
     expect(screen.queryByText('Use a backup code instead')).not.toBeInTheDocument();
   });
@@ -113,7 +164,9 @@ describe('MFAVerifyPrompt', () => {
   // ── Code Submission ────────────────────────────────────────────────────
 
   it('calls onVerify when TOTP code is entered', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={onVerify} />
+    );
     for (let i = 1; i <= 6; i++) {
       fireEvent.change(screen.getByLabelText(`Digit ${i}`), {
         target: { value: String(i) },
@@ -123,7 +176,9 @@ describe('MFAVerifyPrompt', () => {
   });
 
   it('calls onVerify when backup code is submitted', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={onVerify} />
+    );
     fireEvent.click(screen.getByText('Use a backup code instead'));
     const input = screen.getByPlaceholderText('XXXXXXXX');
     fireEvent.change(input, {
@@ -136,25 +191,53 @@ describe('MFAVerifyPrompt', () => {
   // ── Error & Disabled States ────────────────────────────────────────────
 
   it('shows error message when provided', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} error="Invalid code" />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        onVerify={onVerify}
+        error="Invalid code"
+      />
+    );
     expect(screen.getByText('Invalid code')).toBeInTheDocument();
   });
 
   // A refused code clears the field and moves focus to its first box, which is
   // announced as "Digit 1". Without an alert the refusal itself is never read out.
   it('announces a code error as an alert', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} error="Invalid code" />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        onVerify={onVerify}
+        error="Invalid code"
+      />
+    );
     expect(screen.getByRole('alert')).toHaveTextContent('Invalid code');
   });
 
   it('announces a code error as an alert in backup-code mode', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} error="Invalid code" />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        onVerify={onVerify}
+        error="Invalid code"
+      />
+    );
     fireEvent.click(screen.getByText('Use a backup code instead'));
     expect(screen.getByRole('alert')).toHaveTextContent('Invalid code');
   });
 
   it('disables inputs when disabled prop is true', () => {
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} disabled />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        onVerify={onVerify}
+        disabled
+      />
+    );
     const inputs = screen.getAllByRole('textbox');
     for (const input of inputs) {
       expect(input).toBeDisabled();
@@ -162,19 +245,39 @@ describe('MFAVerifyPrompt', () => {
   });
 
   it('disables webauthn button when disabled', () => {
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} disabled />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+        disabled
+      />
+    );
     expect(screen.getByText('Verify with security key')).toBeDisabled();
   });
 
   it('disables switch links when disabled', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'webauthn']} onVerify={onVerify} disabled />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'webauthn']}
+        onVerify={onVerify}
+        disabled
+      />
+    );
     expect(screen.getByText('Use authenticator app instead')).toBeDisabled();
   });
 
   // ── WebAuthn Inline Flow ───────────────────────────────────────────────
 
   it('shows "Verify with security key" button in idle state', () => {
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     expect(screen.getByText('Verify with security key')).toBeInTheDocument();
   });
 
@@ -201,7 +304,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     // Should transition to waiting state
@@ -216,7 +325,13 @@ describe('MFAVerifyPrompt', () => {
       json: async () => ({ error: 'No credentials registered' }),
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -266,12 +381,64 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
       expect(onVerify).toHaveBeenCalledWith('webauthn-mfa-token-123');
     });
+  });
+
+  // Seen in the running app: after a successful ceremony the prompt still
+  // asked the user to touch their key while Confirm was already enabled.
+  it('says the key was verified once the ceremony succeeds', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          publicKey: { challenge: 'dGVzdC1jaGFsbGVuZ2U', rpId: 'localhost', allowCredentials: [] },
+          challengeToken: 'test-challenge-token',
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ mfa_token: 'verified-token' }) });
+    Object.defineProperty(navigator, 'credentials', {
+      value: {
+        get: vi.fn().mockResolvedValue({
+          id: 'credential-id',
+          rawId: new Uint8Array([1, 2, 3]).buffer,
+          type: 'public-key',
+          response: {
+            authenticatorData: new Uint8Array([10, 20]).buffer,
+            clientDataJSON: new Uint8Array([30, 40]).buffer,
+            signature: new Uint8Array([50, 60]).buffer,
+            userHandle: new Uint8Array([70, 80]).buffer,
+          },
+        }),
+        create: vi.fn(),
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
+    fireEvent.click(screen.getByText('Verify with security key'));
+
+    await vi.waitFor(() => expect(onVerify).toHaveBeenCalledWith('verified-token'));
+    expect(await screen.findByText('Security key verified')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('Security key verified');
+    expect(screen.queryByText(/Touch your security key/)).not.toBeInTheDocument();
   });
 
   it('shows error when navigator.credentials.get returns null', async () => {
@@ -292,7 +459,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -320,7 +493,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -347,7 +526,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -391,7 +576,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -433,7 +624,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -459,7 +656,13 @@ describe('MFAVerifyPrompt', () => {
       configurable: true,
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -474,7 +677,13 @@ describe('MFAVerifyPrompt', () => {
       json: async () => ({ error: 'Server error' }),
     });
 
-    render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -521,21 +730,35 @@ describe('MFAVerifyPrompt', () => {
   // ── Email/SMS Mode ─────────────────────────────────────────────────────
 
   it('shows TOTP-style input for email-sms mode', () => {
-    render(<MFAVerifyPrompt methods={['email']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['email']} onVerify={onVerify} />
+    );
     // email maps to email-sms category, which shows TOTP input
     const inputs = screen.getAllByRole('textbox');
     expect(inputs.length).toBe(6);
   });
 
   it('shows email-sms switch link from totp mode when email is available', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'email']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'email']}
+        onVerify={onVerify}
+      />
+    );
     // Default is totp (higher priority than email-sms)
     // Should see email/sms switch link
     expect(screen.getByText('Use email/SMS code instead')).toBeInTheDocument();
   });
 
   it('switches from totp to email-sms mode', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'email']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'email']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Use email/SMS code instead'));
     // email-sms mode also shows TOTP-style 6-digit input
     const inputs = screen.getAllByRole('textbox');
@@ -547,7 +770,7 @@ describe('MFAVerifyPrompt', () => {
   // ── Edge Cases ─────────────────────────────────────────────────────────
 
   it('handles empty methods array gracefully', () => {
-    render(<MFAVerifyPrompt methods={[]} onVerify={onVerify} />);
+    render(<MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={[]} onVerify={onVerify} />);
     // Default method falls back to 'totp', should render TOTP inputs
     const inputs = screen.getAllByRole('textbox');
     expect(inputs.length).toBe(6);
@@ -556,14 +779,27 @@ describe('MFAVerifyPrompt', () => {
   it('defaults to first available when excludeBackupCodes removes the default', () => {
     // If only backup would be available (which shouldn't normally happen),
     // the component handles it by falling through
-    render(<MFAVerifyPrompt methods={['totp']} onVerify={onVerify} excludeBackupCodes />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        onVerify={onVerify}
+        excludeBackupCodes
+      />
+    );
     // Should still show TOTP
     const inputs = screen.getAllByRole('textbox');
     expect(inputs.length).toBe(6);
   });
 
   it('shows all three method links when all methods available', () => {
-    render(<MFAVerifyPrompt methods={['totp', 'webauthn', 'email']} onVerify={onVerify} />);
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp', 'webauthn', 'email']}
+        onVerify={onVerify}
+      />
+    );
     // Default is webauthn (highest priority)
     expect(screen.getByText('Use authenticator app instead')).toBeInTheDocument();
     expect(screen.getByText('Use a backup code instead')).toBeInTheDocument();
@@ -592,7 +828,13 @@ describe('MFAVerifyPrompt', () => {
     // Spy on AbortController.prototype.abort
     const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
 
-    const { unmount } = render(<MFAVerifyPrompt methods={['webauthn']} onVerify={onVerify} />);
+    const { unmount } = render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
     fireEvent.click(screen.getByText('Verify with security key'));
 
     await vi.waitFor(() => {
@@ -605,6 +847,23 @@ describe('MFAVerifyPrompt', () => {
     abortSpy.mockRestore();
   });
 
+  // A route that accepts no inline token passes purpose={null}: a token minted
+  // there could never be spent, so the security-key option is not offered.
+  describe('purpose null', () => {
+    it('offers no security-key switch when other methods remain', () => {
+      render(<MFAVerifyPrompt purpose={null} methods={['totp', 'webauthn']} onVerify={vi.fn()} />);
+      expect(screen.getByLabelText('Digit 1')).toBeInTheDocument();
+      expect(screen.queryByText('Use a security key instead')).not.toBeInTheDocument();
+      expect(screen.queryByText('Verify with security key')).not.toBeInTheDocument();
+    });
+
+    it('never starts a ceremony even when WebAuthn is the only method', () => {
+      render(<MFAVerifyPrompt purpose={null} methods={['webauthn']} onVerify={vi.fn()} />);
+      expect(screen.queryByText('Verify with security key')).not.toBeInTheDocument();
+      expect(mockApiFetch).not.toHaveBeenCalled();
+    });
+  });
+
   // Q3: onCodeChange is threaded to the typed inputs, and a method switch
   // clears the parent's stored code — the field now shown is empty.
   describe('onCodeChange', () => {
@@ -612,7 +871,12 @@ describe('MFAVerifyPrompt', () => {
       const onVerify = vi.fn();
       const onCodeChange = vi.fn();
       render(
-        <MFAVerifyPrompt methods={['totp']} onVerify={onVerify} onCodeChange={onCodeChange} />
+        <MFAVerifyPrompt
+          purpose="mfa_settings.totp_setup"
+          methods={['totp']}
+          onVerify={onVerify}
+          onCodeChange={onCodeChange}
+        />
       );
       for (let i = 1; i <= 6; i++) {
         fireEvent.change(screen.getByLabelText(`Digit ${i}`), { target: { value: String(i) } });
@@ -627,7 +891,9 @@ describe('MFAVerifyPrompt', () => {
     });
 
     it('is optional: a prompt without it still switches methods', () => {
-      render(<MFAVerifyPrompt methods={['totp']} onVerify={vi.fn()} />);
+      render(
+        <MFAVerifyPrompt purpose="mfa_settings.totp_setup" methods={['totp']} onVerify={vi.fn()} />
+      );
       fireEvent.click(screen.getByText('Use a backup code instead'));
       expect(screen.getByPlaceholderText('XXXXXXXX')).toBeInTheDocument();
     });

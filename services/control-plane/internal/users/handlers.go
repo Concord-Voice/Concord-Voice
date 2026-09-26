@@ -48,9 +48,9 @@ const (
 //
 // *mfa.Handler satisfies this; router.go already passes it.
 type MFAVerifier interface {
-	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, code string) (bool, error)
+	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, purpose stepup.Purpose, code string) (bool, error)
 	IsEnabled(ctx context.Context, userID string) bool
-	VerifyCode(ctx context.Context, userID, code string) (bool, error)
+	VerifyCode(ctx context.Context, userID string, purpose stepup.Purpose, code string) (bool, error)
 	GetEnabledMethods(ctx context.Context, userID string) ([]string, error)
 }
 
@@ -407,7 +407,7 @@ func (h *Handler) replaceMyKeysCoordinated(
 	defer h.rollbackKeyReplacement(tx)
 
 	if err := h.verifyStepUpWithLockedUser(
-		c.Request.Context(), tx, senderID, req.CurrentPassword, req.MFACode,
+		c.Request.Context(), tx, senderID, stepup.PurposeE2EEKeyReset, req.CurrentPassword, req.MFACode,
 	); err != nil {
 		fenceOp.Rollback(c.Request.Context())
 		h.respondKeyReplacementReauthenticationFailure(c, err)
@@ -1220,13 +1220,25 @@ func (h *Handler) verifyCurrentPassword(userID interface{}, currentPassword stri
 	return passwordHash, 0, ""
 }
 
-// verifyMFAForPasswordChange checks the locked user's MFA state and verifies a
-// code on the same transaction connection. Returns an HTTP status + body on
-// failure.
-func (h *Handler) verifyMFAForPasswordChange(
+// mfaRequiredMessage is the human-readable half of the mfa_required refusal for
+// the one route verifyStepUpWithLockedUser is guarding. Clients branch on the
+// `error` field, never on this text.
+func mfaRequiredMessage(purpose stepup.Purpose) string {
+	if purpose == stepup.PurposeE2EEKeyReset {
+		return "MFA verification required to replace encryption keys"
+	}
+	return "MFA verification required to change password"
+}
+
+// verifyMFAWithLockedUser checks the locked user's MFA state and verifies a
+// code on the same transaction connection, for the one route named by purpose.
+// Returns an HTTP status + body on failure.
+func (h *Handler) verifyMFAWithLockedUser(
 	ctx context.Context,
 	tx *sql.Tx,
-	uid, mfaCode string,
+	uid string,
+	purpose stepup.Purpose,
+	mfaCode string,
 ) (int, gin.H) {
 	var enabled bool
 	var methods []string
@@ -1234,7 +1246,7 @@ func (h *Handler) verifyMFAForPasswordChange(
 		`SELECT mfa_enabled, mfa_methods FROM users WHERE id = $1`,
 		uid,
 	).Scan(&enabled, pq.Array(&methods)); err != nil {
-		h.log.Error("MFA state query failed during password change", "error", err)
+		h.log.Error("MFA state query failed during reauthentication", "error", err)
 		return http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed}
 	}
 	if !enabled {
@@ -1243,7 +1255,7 @@ func (h *Handler) verifyMFAForPasswordChange(
 	if mfaCode == "" {
 		return http.StatusForbidden, gin.H{
 			"error":   "mfa_required",
-			"message": "MFA verification required to change password",
+			"message": mfaRequiredMessage(purpose),
 			"methods": methods,
 		}
 	}
@@ -1251,9 +1263,9 @@ func (h *Handler) verifyMFAForPasswordChange(
 		h.log.Error("MFA verifier is not configured for MFA-enabled user")
 		return http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed}
 	}
-	valid, mfaErr := h.mfaVerifier.VerifyCodeTx(ctx, tx, uid, mfaCode)
+	valid, mfaErr := h.mfaVerifier.VerifyCodeTx(ctx, tx, uid, purpose, mfaCode)
 	if mfaErr != nil {
-		h.log.Error("MFA verification error during password change", "error", mfaErr)
+		h.log.Error("MFA verification error during reauthentication", "error", mfaErr)
 		return http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed}
 	}
 	if !valid {
@@ -1275,10 +1287,16 @@ func (e *stepUpReauthenticationError) Error() string {
 // for password-derived key rotations. Locking the user row before reading the
 // password and MFA state prevents a request verified with superseded
 // credentials from overwriting a concurrently recovered account.
+//
+// purpose is the calling route's own step-up purpose. Two routes share this
+// helper, the password change and the E2EE key reset, and each passes its own:
+// a WebAuthn inline token is bound to one route, so a shared purpose here
+// would let a token minted to change the password reset the E2EE identity.
 func (h *Handler) verifyStepUpWithLockedUser(
 	ctx context.Context,
 	tx *sql.Tx,
 	userID uuid.UUID,
+	purpose stepup.Purpose,
 	currentPassword, mfaCode string,
 ) error {
 	var passwordHash string
@@ -1307,7 +1325,7 @@ func (h *Handler) verifyStepUpWithLockedUser(
 		}
 	}
 
-	if status, body := h.verifyMFAForPasswordChange(ctx, tx, userID.String(), mfaCode); status != 0 {
+	if status, body := h.verifyMFAWithLockedUser(ctx, tx, userID.String(), purpose, mfaCode); status != 0 {
 		return &stepUpReauthenticationError{status: status, body: body}
 	}
 	return nil
@@ -1506,7 +1524,7 @@ func (h *Handler) executePasswordChange(ctx context.Context, change passwordChan
 	}()
 
 	if err := h.verifyStepUpWithLockedUser(
-		ctx, tx, change.userID, change.currentPassword, change.mfaCode,
+		ctx, tx, change.userID, stepup.PurposePasswordChange, change.currentPassword, change.mfaCode,
 	); err != nil {
 		return outcome, err
 	}
@@ -2407,7 +2425,7 @@ func (h *Handler) gatePurgeFenceDisable(
 	}
 	// Tx form: backup-code redemption is a write, and a rollback must not burn a
 	// single-use factor.
-	if mErr := stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, creds.MFACode, subj.MFAMethods); mErr != nil {
+	if mErr := stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, stepup.PurposePurgeFenceDisable, creds.MFACode, subj.MFAMethods); mErr != nil {
 		return mErr
 	}
 	return nil

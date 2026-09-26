@@ -3,6 +3,7 @@ package ownership_test
 import (
 	"context"
 	"fmt"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"net/http"
 	"testing"
 	"time"
@@ -31,11 +32,11 @@ func enableMFAForUser(t *testing.T, ts *testhelpers.TestServer, userID string) {
 	require.NoError(t, err)
 }
 
-// seedMFAInlineToken stores a WebAuthn inline verification token in Redis so
-// VerifyCode accepts it as a valid MFA code.
-func seedMFAInlineToken(t *testing.T, ts *testhelpers.TestServer, userID, token string) {
+// seedMFAInlineToken stores a WebAuthn inline verification token minted for
+// purpose, so VerifyCode accepts it as a valid MFA code for that purpose only.
+func seedMFAInlineToken(t *testing.T, ts *testhelpers.TestServer, userID string, purpose stepup.Purpose, token string) {
 	t.Helper()
-	key := fmt.Sprintf("mfa_inline_token:%s:%s", userID, token)
+	key := fmt.Sprintf("mfa_inline_purpose_token:%s:%s:%s", userID, purpose, token)
 	require.NoError(t, ts.Redis.Set(context.Background(), key, "1", 5*time.Minute).Err())
 }
 
@@ -137,7 +138,7 @@ func TestInitiateTransferMFAValidCode(t *testing.T) {
 
 	// Seed a valid inline MFA token
 	mfaToken := "valid-inline-mfa-token-for-testing-1234" //nolint:gosec // test token, not real credential
-	seedMFAInlineToken(t, ts, owner.ID, mfaToken)
+	seedMFAInlineToken(t, ts, owner.ID, stepup.PurposeOwnershipTransfer, mfaToken)
 
 	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
 		keyTargetUserID: member.ID,
@@ -208,7 +209,7 @@ func TestReverseTransferMFAValidCode(t *testing.T) {
 
 	// Seed a valid inline MFA token
 	mfaToken := "valid-inline-mfa-token-for-reversal-1234" //nolint:gosec // test token, not real credential
-	seedMFAInlineToken(t, ts, owner.ID, mfaToken)
+	seedMFAInlineToken(t, ts, owner.ID, stepup.PurposeOwnershipReverse, mfaToken)
 
 	w = ts.DoRequest("POST", pathOwnershipReverse+reversalToken, map[string]interface{}{
 		keyPassword: testhelpers.TestAuthPlaintext,

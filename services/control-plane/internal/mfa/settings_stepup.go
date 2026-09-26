@@ -163,13 +163,13 @@ func subjectStage(e *stepup.Error) gateStage {
 // so nothing here touches the pool.
 func (h *Handler) verifyMFASettingsStepUpTx(
 	ctx context.Context, tx *sql.Tx, userID string, subj stepup.Subject,
-	creds mfaStepUpCredentials, wording stepup.Copy,
+	creds mfaStepUpCredentials, gate settingsStepUp,
 ) (*stepup.Error, gateStage) {
-	return verifyStepUpFactors(subj, creds, wording, func() *stepup.Error {
+	return verifyStepUpFactors(subj, creds, gate.wording, func() *stepup.Error {
 		// Tx form: backup-code redemption is a write that a rollback must be
 		// able to undo. The preloaded set keeps GetEnabledMethods (a pool
 		// read) from ever running under the lock.
-		return stepup.VerifyMFAFactorTx(ctx, tx, h, userID, creds.MFACode, subj.MFAMethods)
+		return stepup.VerifyMFAFactorTx(ctx, tx, h, userID, gate.purpose, creds.MFACode, subj.MFAMethods)
 	})
 }
 
@@ -213,7 +213,7 @@ func verifyStepUpFactors(
 // It charges the same fail-closed budget as the in-transaction gate. The
 // route must call clearStepUpAfterSuccess once its own write has succeeded.
 func (h *Handler) requirePasswordAndMFA(
-	c *gin.Context, userID string, creds mfaStepUpCredentials, wording stepup.Copy,
+	c *gin.Context, userID string, creds mfaStepUpCredentials, gate settingsStepUp,
 ) (stepup.Subject, bool) {
 	if creds.sent() && !h.allowMFASettingsStepUp(c, userID) {
 		return stepup.Subject{}, false
@@ -224,8 +224,8 @@ func (h *Handler) requirePasswordAndMFA(
 		h.refuseMFASettingsStepUp(c, e, subjectStage(e))
 		return stepup.Subject{}, false
 	}
-	e, stage := verifyStepUpFactors(subj, creds, wording, func() *stepup.Error {
-		return stepup.VerifyMFAFactor(ctx, h, userID, creds.MFACode, subj.MFAMethods)
+	e, stage := verifyStepUpFactors(subj, creds, gate.wording, func() *stepup.Error {
+		return stepup.VerifyMFAFactor(ctx, h, userID, gate.purpose, creds.MFACode, subj.MFAMethods)
 	})
 	if e != nil {
 		h.refuseMFASettingsStepUp(c, e, stage)

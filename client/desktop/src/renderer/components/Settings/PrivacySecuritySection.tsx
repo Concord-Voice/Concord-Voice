@@ -17,6 +17,7 @@ import MFASetup from './MFASetup';
 import { submitMfaStepUp, type MfaStepUpResult } from './mfaStepUp';
 import ErrorBanner from './ErrorBanner';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import BackupCodeDisplay from './BackupCodeDisplay';
 import EmailSmsSetup from './EmailSmsSetup';
 import CollapsibleSection from './CollapsibleSection';
@@ -226,6 +227,8 @@ const AuthVerifyField: React.FC<{
   password: string;
   onPasswordChange: (v: string) => void;
   onMfaVerify: (code: string) => void;
+  /** The sessions route the code is sent with (see MFAVerifyPrompt). */
+  purpose: StepUpPurpose;
   error: string;
   onClearError: () => void;
   disabled: boolean;
@@ -241,6 +244,7 @@ const AuthVerifyField: React.FC<{
   password,
   onPasswordChange,
   onMfaVerify,
+  purpose,
   error,
   onClearError,
   disabled,
@@ -259,6 +263,7 @@ const AuthVerifyField: React.FC<{
           onMfaVerify(code);
           onClearError();
         }}
+        purpose={purpose}
         onCodeChange={onMfaVerify}
         disabled={disabled}
         error={error || undefined}
@@ -1511,6 +1516,11 @@ const PrivacySecuritySection: React.FC = () => {
                 methods={mfaMethods}
                 recoveryOnlyMethods={mfaRecoveryOnly}
                 onVerify={setBackupResetMfaCode}
+                // Backup-code regeneration checks an authenticator-app code
+                // and nothing else: no inline token (so no security-key
+                // option) and no backup code.
+                purpose={null}
+                excludeBackupCodes
                 onCodeChange={setBackupResetMfaCode}
                 disabled={backupResetLoading}
                 error={backupResetError || undefined}
@@ -1855,6 +1865,7 @@ const PrivacySecuritySection: React.FC = () => {
               onPasswordChange={setRevokePassword}
               onMfaVerify={setRevokeMfaCode}
               promptKey={codePromptKey}
+              purpose="sessions.revoke_all"
               error={revokePasswordError}
               onClearError={() => setRevokePasswordError('')}
               disabled={isRevokingAll}
@@ -1898,6 +1909,7 @@ const PrivacySecuritySection: React.FC = () => {
               onPasswordChange={setSessionPassword}
               onMfaVerify={setSessionMfaCode}
               promptKey={codePromptKey}
+              purpose="sessions.revoke"
               error={sessionPasswordError}
               onClearError={() => setSessionPasswordError('')}
               disabled={revokingId === sessionPasswordTarget}
@@ -1954,6 +1966,7 @@ const PrivacySecuritySection: React.FC = () => {
               onPasswordChange={setModeChangePassword}
               onMfaVerify={setModeChangeMfaCode}
               promptKey={codePromptKey}
+              purpose="sessions.revocation_mode_set"
               error={modeChangeError}
               onClearError={() => setModeChangeError('')}
               disabled={isChangingMode}

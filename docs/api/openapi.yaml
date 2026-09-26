@@ -10950,9 +10950,17 @@ paths:
       tags:
       - MFA
       summary: Begin inline WebAuthn verification
-      description: 'Starts a WebAuthn assertion for verifying MFA on protected operations
+      description: 'Starts a WebAuthn assertion for verifying MFA on ONE protected
 
-        (without a login challenge token). The session expires after 2 minutes.
+        operation, named by `purpose` (without a login challenge token). The
+
+        purpose is stored with the ceremony session, which expires after 2
+
+        minutes; the token the finish step mints is accepted only by that
+
+        purpose''s route, and any other route refuses it exactly like an invalid
+
+        code without consuming it. The login MFA challenge never accepts one.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -10960,6 +10968,45 @@ paths:
       operationId: mfaWebauthnVerifyInlineBegin
       security:
       - BearerAuth: []
+      requestBody:
+        required: true
+        description: Exactly one JSON object, at most 1 KiB, with no trailing content.
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - purpose
+              properties:
+                purpose:
+                  type: string
+                  description: The step-up consumer route the token will be spent on (server enum `stepup.Purpose`, one value per route).
+                  enum:
+                  - mfa_settings.totp_setup
+                  - mfa_settings.totp_disable
+                  - mfa_settings.webauthn_register
+                  - mfa_settings.recovery_only_set
+                  - mfa_settings.recovery_hardened_set
+                  - mfa_settings.email_sms_setup
+                  - mfa_settings.email_sms_disable
+                  - mfa_settings.backup_email_set
+                  - mfa_settings.recovery_key_replace
+                  - mfa_settings.recovery_key_remove
+                  - mfa_settings.trusted_device_designate
+                  - mfa_settings.trusted_device_remove
+                  - mfa_settings.recovery_circle_upsert
+                  - mfa_settings.recovery_circle_delete
+                  - account.password_change
+                  - account.e2ee_key_reset
+                  - privacy.purge_fence_disable
+                  - sessions.revoke
+                  - sessions.revoke_all
+                  - sessions.revocation_mode_set
+                  - ownership.transfer_initiate
+                  - ownership.transfer_reverse
+                  - dm.purge
+                  - dm.clear
+                  - servers.mfa_enforcement_disable
       responses:
         '200':
           description: WebAuthn assertion options (CredentialAssertion)
@@ -10973,7 +11020,15 @@ paths:
                     type: object
                     additionalProperties: true
         '400':
-          description: No WebAuthn credentials registered
+          description: 'A body that is not one JSON object naming a known `purpose` (fixed body
+
+            "A valid verification purpose is required"), or no WebAuthn credentials registered'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body larger than 1 KiB
           content:
             application/json:
               schema:
@@ -10985,9 +11040,13 @@ paths:
       summary: Finish inline WebAuthn verification
       description: 'Validates the WebAuthn assertion. On success returns a short-lived
 
-        (60-second, single-use) verification token usable as `mfa_code` on
+        (60-second, single-use) verification token usable as `mfa_code` only on
 
-        protected endpoints. Consumes the single-use verification session.
+        the route whose `purpose` the begin request named. The purpose comes from
+
+        the stored session; a `purpose` field in this body is ignored. Consumes
+
+        the single-use verification session.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -11013,9 +11072,9 @@ paths:
                 properties:
                   mfa_token:
                     type: string
-                    description: Single-use verification token (60-second TTL)
+                    description: Single-use verification token (60-second TTL), bound to the begin request's purpose
         '400':
-          description: No verification session found — start a new verification
+          description: No verification session found (or one stored without a purpose) — start a new verification
           content:
             application/json:
               schema:
@@ -16811,7 +16870,7 @@ components:
           default: argon2id
         mfa_code:
           type: string
-          description: Required when MFA is enabled
+          description: Required when MFA is enabled. A TOTP code, a backup code, or a WebAuthn inline token minted with purpose `account.password_change`; a token minted for any other purpose is refused as an invalid code.
         presence_override:
           description: 'Required when a Custom Status exception preference exists.
             Omitting this property asserts that no preference row exists; if one does,
@@ -16991,7 +17050,7 @@ components:
           description: Current account password required for destructive step-up authentication
         mfa_code:
           type: string
-          description: Required when MFA is enabled
+          description: Required when MFA is enabled. A TOTP code, a backup code, or a WebAuthn inline token minted with purpose `account.e2ee_key_reset`; a token minted for any other purpose is refused as an invalid code.
         acknowledge_data_loss:
           type: boolean
           enum:

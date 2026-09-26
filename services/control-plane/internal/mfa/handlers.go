@@ -1,6 +1,7 @@
 package mfa
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -256,24 +257,45 @@ func (h *Handler) IsEnabled(ctx context.Context, userID string) bool {
 	return len(methods) > 0
 }
 
-// VerifyCode checks a TOTP code or backup code against the user's stored MFA secrets.
-func (h *Handler) VerifyCode(ctx context.Context, userID string, code string) (bool, error) {
-	return h.verifyCode(ctx, h.db, userID, code)
+// errInvalidStepUpPurpose refuses a step-up verification whose caller named
+// no known consumer purpose. It is a wiring fault, so it is a 5xx, never a
+// silent downgrade to "TOTP and backup codes only".
+var errInvalidStepUpPurpose = errors.New("MFA verification requires a known step-up purpose")
+
+// noInlinePurpose is the purpose the login MFA challenge verifies with. It is
+// deliberately not a valid stepup.Purpose, so no inline token is ever minted
+// for it and consumeWebAuthnInlineToken never reads one: the login modal
+// answers WebAuthn with an assertion, and an inline token reaching login can
+// only be a proof minted for some other action.
+const noInlinePurpose stepup.Purpose = ""
+
+// VerifyCode checks a TOTP code, a backup code, or a WebAuthn inline token
+// minted for purpose against the user's stored MFA state. purpose is the
+// calling route's own stepup.Purpose; a token minted for any other purpose is
+// refused like an invalid code and left unconsumed.
+func (h *Handler) VerifyCode(ctx context.Context, userID string, purpose stepup.Purpose, code string) (bool, error) {
+	if !purpose.Valid() {
+		return false, errInvalidStepUpPurpose
+	}
+	return h.verifyCode(ctx, h.db, userID, purpose, code)
 }
 
 // VerifyCodeTx performs the same verification on the caller's transaction
 // connection. Sensitive rotations use this after locking the users row so they
 // neither re-authorize against superseded MFA state nor acquire a second pooled
 // database connection while holding the first.
-func (h *Handler) VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, code string) (bool, error) {
+func (h *Handler) VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, purpose stepup.Purpose, code string) (bool, error) {
 	if tx == nil {
 		return false, fmt.Errorf("MFA verification transaction is required")
 	}
-	return h.verifyCode(ctx, tx, userID, code)
+	if !purpose.Valid() {
+		return false, errInvalidStepUpPurpose
+	}
+	return h.verifyCode(ctx, tx, userID, purpose, code)
 }
 
-func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, error) {
-	verified, _, err := h.verifyCodeMatchedMethod(ctx, store, userID, code)
+func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, userID string, purpose stepup.Purpose, code string) (bool, error) {
+	verified, _, err := h.verifyCodeMatchedMethod(ctx, store, userID, purpose, code)
 	return verified, err
 }
 
@@ -281,9 +303,10 @@ func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, u
 // retaining the server-observed factor for success telemetry. A submitted
 // method is only an attempted method: a backup-code submission can validate a
 // TOTP value (and vice versa), so it must not choose the success event label.
-func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, string, error) {
-	// Check for WebAuthn inline verification token first (from WebAuthnVerifyInlineFinish)
-	inlineVerified, err := h.consumeWebAuthnInlineToken(ctx, userID, code)
+func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerificationStore, userID string, purpose stepup.Purpose, code string) (bool, string, error) {
+	// A WebAuthn inline token (from WebAuthnVerifyInlineFinish) counts only for
+	// the purpose it was minted for; noInlinePurpose reads none.
+	inlineVerified, err := h.consumeWebAuthnInlineToken(ctx, userID, purpose, code)
 	if err != nil {
 		return false, "", err
 	}
@@ -324,16 +347,50 @@ func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerific
 	return false, "", nil
 }
 
-func (h *Handler) consumeWebAuthnInlineToken(ctx context.Context, userID, code string) (bool, error) {
-	if len(code) <= 20 {
+// inlineTokenKey is where WebAuthnVerifyInlineFinish stores a token minted for
+// purpose, and the only key a consumer of that purpose claims.
+//
+// Both inline keys use the mfa_inline_purpose_ prefix, which a binary from
+// before purpose binding never builds. That binary claims
+// mfa_inline_token:<uid>:<code> and finishes mfa_inline_session:<uid>. If the
+// new keys shared those prefixes, then during a rolling deploy an old replica
+// would spend a purpose-bound token sent as mfa_code "<purpose>:<token>" on
+// any route, and would finish a new ceremony into an unbound token. Disjoint
+// prefixes leave each binary able to reach only its own keys.
+func inlineTokenKey(userID string, purpose stepup.Purpose, token string) string {
+	return fmt.Sprintf("mfa_inline_purpose_token:%s:%s:%s", userID, purpose, token)
+}
+
+// inlineSessionKey holds the one pending inline ceremony for userID: the
+// WebAuthn session data and the purpose begin was given. A second begin
+// replaces it, challenge and purpose together.
+func inlineSessionKey(userID string) string {
+	return fmt.Sprintf("mfa_inline_purpose_session:%s", userID)
+}
+
+// errInlineTokenStoreUnavailable replaces a Redis error from the inline-token
+// consume. The raw error is deliberately not wrapped: the key embeds the live
+// token, and a client hook may annotate a go-redis error with the command's
+// arguments, so wrapping it would put a spendable token into the log line of
+// every caller that logs a verification dependency failure. The finish path
+// withholds its SET error for the same reason. The consume still fails closed.
+var errInlineTokenStoreUnavailable = errors.New("consume WebAuthn inline verification token: token store unavailable")
+
+// consumeWebAuthnInlineToken claims a token minted for purpose. It GETDELs only
+// that purpose's key, so a token minted for another purpose is an absent key:
+// refused exactly like an invalid code, and not consumed. Nothing here logs or
+// counts which of the two a refusal was (observability.md principle 7). An
+// invalid purpose (noInlinePurpose) reads nothing.
+func (h *Handler) consumeWebAuthnInlineToken(ctx context.Context, userID string, purpose stepup.Purpose, code string) (bool, error) {
+	if !purpose.Valid() || len(code) <= 20 {
 		return false, nil
 	}
-	token, err := h.redis.GetDel(ctx, fmt.Sprintf("mfa_inline_token:%s:%s", userID, code)).Result()
+	token, err := h.redis.GetDel(ctx, inlineTokenKey(userID, purpose, code)).Result()
 	if errors.Is(err, redis.Nil) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("consume WebAuthn inline verification token: %w", err)
+		return false, errInlineTokenStoreUnavailable
 	}
 	return token != "", nil
 }
@@ -966,7 +1023,7 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, totpSetupStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, totpSetupStepUp); !ok {
 		return
 	}
 
@@ -1392,7 +1449,7 @@ func (h *Handler) verifyAndDeleteTOTPTx(c *gin.Context, tx *sql.Tx, userID strin
 		return false
 	}
 
-	valid, err := h.VerifyCodeTx(ctx, tx, userID, req.Code)
+	valid, err := h.VerifyCodeTx(ctx, tx, userID, stepup.PurposeTOTPDisable, req.Code)
 	if err != nil {
 		h.log.Error("MFA code verification error during TOTP disable", "user_id", userID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "MFA verification failed because of a server error. Contact support if this continues."})
@@ -1525,7 +1582,7 @@ func (h *Handler) WebAuthnRegisterBegin(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, webAuthnRegisterStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, webAuthnRegisterStepUp); !ok {
 		return
 	}
 
@@ -2271,7 +2328,8 @@ func (h *Handler) verifyTOTPOrBackup(ctx context.Context, c *gin.Context, code, 
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCodeRequired})
 		return false, "", true
 	}
-	valid, matchedMethod, err := h.verifyCodeMatchedMethod(ctx, h.db, userID, code)
+	// Login never accepts a WebAuthn inline token (see noInlinePurpose).
+	valid, matchedMethod, err := h.verifyCodeMatchedMethod(ctx, h.db, userID, noInlinePurpose, code)
 	if err != nil {
 		h.verifyDependencyFailed(c, userID, err)
 		return false, "", true
@@ -2578,12 +2636,66 @@ func (h *Handler) canSendSetupEmail() bool {
 
 // ── Inline WebAuthn Verify (for protected operations) ────────────────────────
 
+// errMsgNoInlineSession is finish's 400 when there is no usable ceremony.
+const errMsgNoInlineSession = "No verification session found. Start a new verification."
+
+// maxInlineBeginRequestBytes bounds the begin body, which carries one purpose.
+const maxInlineBeginRequestBytes = 1 << 10
+
+// errMsgInvalidInlinePurpose is the fixed 400 for a begin body that is not one
+// JSON object naming a known purpose. It never echoes what was sent.
+const errMsgInvalidInlinePurpose = "A valid verification purpose is required"
+
+// inlineVerifySession is the stored inline ceremony: the WebAuthn session and
+// the purpose begin was asked for. SessionData is embedded so its fields stay
+// at the top level of the stored JSON; finish takes the purpose from here and
+// never from its own request body.
+type inlineVerifySession struct {
+	webauthn.SessionData
+	Purpose stepup.Purpose `json:"purpose"`
+}
+
+// bindInlineVerifyBegin applies the bounded strict-JSON body rule (backend.md
+// § Gin Conventions) to {"purpose": "<stepup.Purpose>"}: an oversized body is a
+// 413 first, and anything but exactly one JSON object naming a known purpose
+// is the fixed 400. On refusal it has written the response. Nothing is logged:
+// a refused purpose may not reach a log line (observability.md principle 7).
+func bindInlineVerifyBegin(c *gin.Context) (stepup.Purpose, bool) {
+	var req struct {
+		Purpose stepup.Purpose `json:"purpose"`
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxInlineBeginRequestBytes)
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "Request body too large"})
+			return "", false
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidInlinePurpose})
+		return "", false
+	}
+	body, ok := c.Get(gin.BodyBytesKey)
+	bodyBytes, bodyIsBytes := body.([]byte)
+	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) ||
+		!bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("{")) || !req.Purpose.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidInlinePurpose})
+		return "", false
+	}
+	return req.Purpose, true
+}
+
 // WebAuthnVerifyInlineBegin starts a WebAuthn assertion for MFA verification on
-// protected endpoints (setup, revoke, etc.). Returns assertion options for
-// navigator.credentials.get(). The session is stored in Redis keyed by user ID.
+// one protected action, named by the body's purpose. Returns assertion options
+// for navigator.credentials.get(). The session and its purpose are stored in
+// Redis keyed by user ID, so a second begin replaces the first.
 func (h *Handler) WebAuthnVerifyInlineBegin(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
+
+	purpose, ok := bindInlineVerifyBegin(c)
+	if !ok {
+		return
+	}
 
 	user, err := h.buildWebAuthnUser(ctx, userID)
 	if err != nil {
@@ -2603,7 +2715,7 @@ func (h *Handler) WebAuthnVerifyInlineBegin(c *gin.Context) {
 		return
 	}
 
-	sessionJSON, err := json.Marshal(session)
+	sessionJSON, err := json.Marshal(inlineVerifySession{SessionData: *session, Purpose: purpose})
 	if err != nil {
 		h.log.Error("Failed to encode inline WebAuthn session", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartVerification})
@@ -2611,8 +2723,7 @@ func (h *Handler) WebAuthnVerifyInlineBegin(c *gin.Context) {
 	}
 	// Options handed out without their stored session describe a ceremony
 	// the finish step can never complete.
-	sessionKey := fmt.Sprintf("mfa_inline_session:%s", userID)
-	if err := h.redis.Set(ctx, sessionKey, sessionJSON, 2*time.Minute).Err(); err != nil {
+	if err := h.redis.Set(ctx, inlineSessionKey(userID), sessionJSON, 2*time.Minute).Err(); err != nil {
 		h.log.Error("Failed to store inline WebAuthn session", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStartVerification})
 		return
@@ -2622,8 +2733,8 @@ func (h *Handler) WebAuthnVerifyInlineBegin(c *gin.Context) {
 }
 
 // WebAuthnVerifyInlineFinish validates a WebAuthn assertion for protected
-// operations. On success, returns a short-lived verification token that can be
-// used as mfa_code on any protected endpoint.
+// operations. On success, returns a short-lived verification token usable as
+// mfa_code only on the action whose purpose begin stored with the session.
 func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
@@ -2631,10 +2742,9 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 	// Consume the session atomically (single-use). A GET followed by a DEL
 	// whose failure went unchecked left a completed ceremony reusable; GETDEL
 	// cannot, and a failure to consume it fails closed.
-	sessionKey := fmt.Sprintf("mfa_inline_session:%s", userID)
-	sessionJSON, err := h.redis.GetDel(ctx, sessionKey).Bytes()
+	sessionJSON, err := h.redis.GetDel(ctx, inlineSessionKey(userID)).Bytes()
 	if errors.Is(err, redis.Nil) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No verification session found. Start a new verification."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgNoInlineSession})
 		return
 	}
 	if err != nil {
@@ -2643,10 +2753,16 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 		return
 	}
 
-	var session webauthn.SessionData
+	var session inlineVerifySession
 	if err := json.Unmarshal(sessionJSON, &session); err != nil {
 		h.log.Error("Failed to decode inline WebAuthn session", "user_id", userID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInvalidSessionData})
+		return
+	}
+	// A session with no known purpose (one stored before purposes existed)
+	// could mint only a token no consumer accepts, so it is treated as absent.
+	if !session.Purpose.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgNoInlineSession})
 		return
 	}
 
@@ -2657,7 +2773,7 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 		return
 	}
 
-	credential, err := h.webauthn.FinishLogin(user, session, c.Request)
+	credential, err := h.webauthn.FinishLogin(user, session.SessionData, c.Request)
 	if err != nil {
 		h.log.Warn("WebAuthn inline verify assertion failed", "error", err, "user_id", userID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Verification failed. Try again."})
@@ -2683,11 +2799,10 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 		return
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	tokenKey := fmt.Sprintf("mfa_inline_token:%s:%s", userID, token)
 	// A token the server never stored is one it will never accept. The key
 	// embeds the token, so the error — which a client hook may annotate with
 	// the key — is deliberately not logged.
-	if err := h.redis.Set(ctx, tokenKey, "1", 60*time.Second).Err(); err != nil {
+	if err := h.redis.Set(ctx, inlineTokenKey(userID, session.Purpose, token), "1", 60*time.Second).Err(); err != nil {
 		h.log.Error("Failed to store inline WebAuthn token", "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
@@ -2808,7 +2923,7 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, recoveryOnlyStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, recoveryOnlyStepUp); !ok {
 		return
 	}
 
@@ -2875,7 +2990,7 @@ func (h *Handler) SetRecoveryHardened(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, recoveryHardenedStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, recoveryHardenedStepUp); !ok {
 		return
 	}
 
@@ -2999,7 +3114,7 @@ func (h *Handler) EmailSmsSetup(c *gin.Context) {
 		return
 	}
 
-	subj, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, emailSmsSetupStepUpCopy)
+	subj, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, emailSmsSetupStepUp)
 	if !ok {
 		return
 	}
@@ -3264,49 +3379,61 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
 
-// settingsStepUpCopy builds a route's refusal copy. NoFactors is reachable
-// only if a password hash is ever empty (see internal/stepup); prompt is what
-// a request that sent no password is told, and must be honest to a renderer
-// that shows it verbatim.
-func settingsStepUpCopy(action, prompt string) stepup.Copy {
-	return stepup.Copy{
-		NoFactors:          action + " requires proving your identity, but this account has no password and no MFA method.",
-		CredentialRequired: prompt,
+// settingsStepUp is one MFA-settings route's step-up: the purpose a WebAuthn
+// inline token must have been minted for, and the route's refusal copy. They
+// are declared together so a route cannot take one without the other, and
+// each route has its own purpose (see stepup.Purpose).
+type settingsStepUp struct {
+	purpose stepup.Purpose
+	wording stepup.Copy
+}
+
+// newSettingsStepUp builds a route's step-up. NoFactors is reachable only if a
+// password hash is ever empty (see internal/stepup); prompt is what a request
+// that sent no password is told, and must be honest to a renderer that shows
+// it verbatim.
+func newSettingsStepUp(purpose stepup.Purpose, action, prompt string) settingsStepUp {
+	return settingsStepUp{
+		purpose: purpose,
+		wording: stepup.Copy{
+			NoFactors:          action + " requires proving your identity, but this account has no password and no MFA method.",
+			CredentialRequired: prompt,
+		},
 	}
 }
 
-// Per-route refusal copy for the MFA-settings step-up gate (settings_stepup.go).
-// A renderer that predates the in-transaction gate never asks for a password,
+// Per-route step-ups for the MFA-settings gate (settings_stepup.go). A
+// renderer that predates the in-transaction gate never asks for a password,
 // so the two of its routes it still drives carry an update hint. The nine
 // pool-side routes always required a password, so an old renderer already
 // sends one and their copy needs no hint.
 var (
-	emailSmsDisableStepUpCopy = settingsStepUpCopy("Turning off email verification",
+	emailSmsDisableStepUp = newSettingsStepUp(stepup.PurposeEmailSmsDisable, "Turning off email verification",
 		"Enter your password to turn off email verification. If you aren't asked for it, update Concord Voice.")
-	backupEmailStepUpCopy = settingsStepUpCopy("Changing your backup email",
+	backupEmailStepUp = newSettingsStepUp(stepup.PurposeBackupEmailSet, "Changing your backup email",
 		"Enter your password to change your backup email. If you aren't asked for it, update Concord Voice.")
-	recoveryKeyReplaceStepUpCopy = settingsStepUpCopy("Replacing your recovery key",
+	recoveryKeyReplaceStepUp = newSettingsStepUp(stepup.PurposeRecoveryKeyReplace, "Replacing your recovery key",
 		"Enter your password to replace your recovery key.")
-	recoveryKeyRemoveStepUpCopy = settingsStepUpCopy("Removing your recovery key",
+	recoveryKeyRemoveStepUp = newSettingsStepUp(stepup.PurposeRecoveryKeyRemove, "Removing your recovery key",
 		"Enter your password to remove your recovery key.")
 
-	totpSetupStepUpCopy = settingsStepUpCopy("Setting up an authenticator app",
+	totpSetupStepUp = newSettingsStepUp(stepup.PurposeTOTPSetup, "Setting up an authenticator app",
 		"Enter your password to set up an authenticator app.")
-	webAuthnRegisterStepUpCopy = settingsStepUpCopy("Adding a security key",
+	webAuthnRegisterStepUp = newSettingsStepUp(stepup.PurposeWebAuthnRegister, "Adding a security key",
 		"Enter your password to add a security key.")
-	recoveryOnlyStepUpCopy = settingsStepUpCopy("Changing your recovery-only methods",
+	recoveryOnlyStepUp = newSettingsStepUp(stepup.PurposeRecoveryOnlySet, "Changing your recovery-only methods",
 		"Enter your password to change which methods are for recovery only.")
-	recoveryHardenedStepUpCopy = settingsStepUpCopy("Changing hardened recovery",
+	recoveryHardenedStepUp = newSettingsStepUp(stepup.PurposeRecoveryHardenedSet, "Changing hardened recovery",
 		"Enter your password to change hardened recovery.")
-	emailSmsSetupStepUpCopy = settingsStepUpCopy("Turning on email or text-message codes",
+	emailSmsSetupStepUp = newSettingsStepUp(stepup.PurposeEmailSmsSetup, "Turning on email or text-message codes",
 		"Enter your password to turn on email or text-message codes.")
-	designateTrustedDeviceStepUpCopy = settingsStepUpCopy("Trusting this device for recovery",
+	designateTrustedDeviceStepUp = newSettingsStepUp(stepup.PurposeTrustedDeviceDesignate, "Trusting this device for recovery",
 		"Enter your password to trust this device for account recovery.")
-	removeTrustedDeviceStepUpCopy = settingsStepUpCopy("Removing a trusted device",
+	removeTrustedDeviceStepUp = newSettingsStepUp(stepup.PurposeTrustedDeviceRemove, "Removing a trusted device",
 		"Enter your password to remove a trusted recovery device.")
-	upsertRecoveryCircleStepUpCopy = settingsStepUpCopy("Setting up your recovery circle",
+	upsertRecoveryCircleStepUp = newSettingsStepUp(stepup.PurposeRecoveryCircleUpsert, "Setting up your recovery circle",
 		"Enter your password to set up your recovery circle.")
-	deleteRecoveryCircleStepUpCopy = settingsStepUpCopy("Deleting your recovery circle",
+	deleteRecoveryCircleStepUp = newSettingsStepUp(stepup.PurposeRecoveryCircleDelete, "Deleting your recovery circle",
 		"Enter your password to delete your recovery circle.")
 )
 
@@ -3326,7 +3453,7 @@ func (h *Handler) EmailSmsDisable(c *gin.Context) {
 	}
 	defer h.rollbackQuietly(tx)
 	ctx := c.Request.Context()
-	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, emailSmsDisableStepUpCopy); e != nil {
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, emailSmsDisableStepUp); e != nil {
 		h.refuseMFASettingsStepUp(c, e, stage)
 		return
 	}
@@ -3471,7 +3598,7 @@ func (h *Handler) SetBackupEmail(c *gin.Context) {
 	ctx := c.Request.Context()
 	// Gated on the requested action, set or clear alike; the prior value is
 	// never read.
-	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, req.mfaStepUpCredentials, backupEmailStepUpCopy); e != nil {
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, req.mfaStepUpCredentials, backupEmailStepUp); e != nil {
 		h.refuseMFASettingsStepUp(c, e, stage)
 		return
 	}
@@ -3731,7 +3858,7 @@ func (h *Handler) replaceRecoveryKeyTx(
 	c *gin.Context, tx *sql.Tx, userID string, subj stepup.Subject, creds mfaStepUpCredentials, m recoveryKeyMaterial,
 ) bool {
 	ctx := c.Request.Context()
-	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, recoveryKeyReplaceStepUpCopy); e != nil {
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, recoveryKeyReplaceStepUp); e != nil {
 		h.refuseMFASettingsStepUp(c, e, stage)
 		return false
 	}
@@ -3794,7 +3921,7 @@ func (h *Handler) DeleteRecoveryKey(c *gin.Context) {
 	}
 	defer h.rollbackQuietly(tx)
 	ctx := c.Request.Context()
-	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, recoveryKeyRemoveStepUpCopy); e != nil {
+	if e, stage := h.verifyMFASettingsStepUpTx(ctx, tx, userID, subj, creds, recoveryKeyRemoveStepUp); e != nil {
 		h.refuseMFASettingsStepUp(c, e, stage)
 		return
 	}
@@ -3877,7 +4004,7 @@ func (h *Handler) DesignateTrustedDevice(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, designateTrustedDeviceStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, designateTrustedDeviceStepUp); !ok {
 		return
 	}
 
@@ -3926,7 +4053,7 @@ func (h *Handler) RemoveTrustedDevice(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, removeTrustedDeviceStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, removeTrustedDeviceStepUp); !ok {
 		return
 	}
 
@@ -4380,7 +4507,7 @@ func (h *Handler) UpsertRecoveryCircle(c *gin.Context) {
 		return
 	}
 
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, upsertRecoveryCircleStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, upsertRecoveryCircleStepUp); !ok {
 		return
 	}
 
@@ -4431,7 +4558,7 @@ func (h *Handler) DeleteRecoveryCircle(c *gin.Context) {
 	}
 
 	// Require password + MFA verification
-	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, deleteRecoveryCircleStepUpCopy); !ok {
+	if _, ok := h.requirePasswordAndMFA(c, userID, req.mfaStepUpCredentials, deleteRecoveryCircleStepUp); !ok {
 		return
 	}
 

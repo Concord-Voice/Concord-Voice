@@ -5,6 +5,7 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
 import TOTPInput from '../Auth/TOTPInput';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import BackupCodeDisplay from './BackupCodeDisplay';
 import RecoveryKeyDisplay from './RecoveryKeyDisplay';
 import ErrorBanner, { FieldError } from './ErrorBanner';
@@ -678,6 +679,8 @@ const MFASetup: React.FC<MFASetupProps> = ({
     submitLabel: string;
     busyLabel: string;
     onSubmit: () => void;
+    /** The route the code is sent with: TOTP setup or WebAuthn register begin. */
+    purpose: StepUpPurpose;
     extraFields?: React.ReactNode;
   }) => (
     <div className="mfa-setup-step">
@@ -697,6 +700,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
           methods={inlineMfaMethods(setupPromptMethods ?? activeMethods)}
           recoveryOnlyMethods={recoveryOnlyMethods}
           onVerify={setMfaCode}
+          purpose={opts.purpose}
           onCodeChange={setMfaCode}
           disabled={loading}
           error={errorField === 'mfa' ? error : undefined}
@@ -727,6 +731,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
       submitLabel: 'Continue',
       busyLabel: 'Setting up...',
       onSubmit: handleTOTPSetup,
+      purpose: 'mfa_settings.totp_setup',
     });
 
   const renderWebAuthnPasswordStep = () =>
@@ -736,6 +741,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
       submitLabel: 'Register Key',
       busyLabel: 'Registering...',
       onSubmit: handleWebAuthnRegister,
+      purpose: 'mfa_settings.webauthn_register',
       extraFields: (
         <input
           type="text"
@@ -898,6 +904,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
               key={replaceMfaPromptKey}
               methods={stepUpPromptMethods(replaceRefusal, ['totp'])}
               onVerify={setReplaceMfaCode}
+              purpose="mfa_settings.recovery_key_replace"
               onCodeChange={setReplaceMfaCode}
               disabled={replaceLoading}
               error={stepUpMfaError(replaceRefusal)}

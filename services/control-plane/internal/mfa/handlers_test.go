@@ -18,6 +18,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -2036,11 +2037,11 @@ func TestVerifyCodeBackupCodeIsSingleUse(t *testing.T) {
 	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
 	code := backupCodes[0].(string)
 
-	verified, err := handler.VerifyCode(context.Background(), user.ID, code)
+	verified, err := handler.VerifyCode(context.Background(), user.ID, stepup.PurposeTOTPSetup, code)
 	require.NoError(t, err)
 	require.True(t, verified)
 
-	verified, err = handler.VerifyCode(context.Background(), user.ID, code)
+	verified, err = handler.VerifyCode(context.Background(), user.ID, stepup.PurposeTOTPSetup, code)
 	require.NoError(t, err)
 	require.False(t, verified, "a consumed backup code must not pass a second VerifyCode call")
 }
@@ -2176,11 +2177,15 @@ func TestWebAuthnDeleteCredentialNoPassword(t *testing.T) {
 
 // --- WebAuthn Inline Verify Begin: No credentials ---
 
+// inlineBeginPurposeBody is a valid begin body: begin refuses one that names no
+// known step-up purpose before it looks at the account's credentials.
+var inlineBeginPurposeBody = map[string]interface{}{"purpose": string(stepup.PurposeTOTPSetup)}
+
 func TestWebAuthnInlineVerifyBeginNoCreds(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "wahninlineno")
 
-	w := ts.DoRequest("POST", urlWebAuthnInlineBegin, nil,
+	w := ts.DoRequest("POST", urlWebAuthnInlineBegin, inlineBeginPurposeBody,
 		testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -3067,7 +3072,7 @@ func TestVerifyCodeDecryptFailureLeavesBackupCodeUnused(t *testing.T) {
 	require.NoError(t, err)
 	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
 
-	verified, err := handler.VerifyCode(context.Background(), user.ID, backupCodes[0].(string))
+	verified, err := handler.VerifyCode(context.Background(), user.ID, stepup.PurposeTOTPSetup, backupCodes[0].(string))
 	require.ErrorContains(t, err, "invalid nonce length")
 	assert.False(t, verified)
 
@@ -3862,7 +3867,7 @@ func TestWebAuthnVerifyInlineBeginNoCreds(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "wahnilbnocr")
 
-	w := ts.DoRequest("POST", urlWebAuthnInlineBegin, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w := ts.DoRequest("POST", urlWebAuthnInlineBegin, inlineBeginPurposeBody, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
@@ -4089,7 +4094,7 @@ func TestVerifyCode_SeedSealedV1_DecryptsAfterRotationToV2(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ok, err := handler.VerifyCode(context.Background(), user.ID, code)
+	ok, err := handler.VerifyCode(context.Background(), user.ID, stepup.PurposeTOTPSetup, code)
 	require.NoError(t, err)
 	assert.True(t, ok, "v1-sealed seed must authenticate under a v2-active ring with v1 retained")
 }
@@ -4152,7 +4157,7 @@ func TestVerifyCode_SealingVersionAbsentFromRing_FailsClosed(t *testing.T) {
 	require.NoError(t, err)
 	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), v2OnlyRing, testhelpers.TestJWTSecret, nil, "test")
 
-	ok, err := handler.VerifyCode(context.Background(), user.ID, "000000")
+	ok, err := handler.VerifyCode(context.Background(), user.ID, stepup.PurposeTOTPSetup, "000000")
 	assert.False(t, ok)
 	require.Error(t, err, "missing sealing key must surface as an error, not a silent auth failure")
 }

@@ -40,7 +40,7 @@ func TestTOTPStepReplay_PoolRacingACommittingTxAcceptsOnce(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		okPool, poolErr = h.VerifyCode(context.Background(), user.ID, code)
+		okPool, poolErr = h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	}()
 	go func() {
 		defer wg.Done()
@@ -50,7 +50,7 @@ func TestTOTPStepReplay_PoolRacingACommittingTxAcceptsOnce(t *testing.T) {
 			txErr = err
 			return
 		}
-		okTx, txErr = h.VerifyCodeTx(context.Background(), tx, user.ID, code)
+		okTx, txErr = h.VerifyCodeTx(context.Background(), tx, user.ID, stepReplayPurpose, code)
 		if txErr != nil {
 			_ = tx.Rollback()
 			return
@@ -80,7 +80,7 @@ func TestTOTPStepReplay_PoolRacingACommittingTxAcceptsOnce(t *testing.T) {
 	}
 	assert.Equal(t, 1, accepted, "exactly one of the pool and the committed tx accepts the code (pool=%v tx=%v)", okPool, okTx)
 
-	replay, err := h.VerifyCode(context.Background(), user.ID, code)
+	replay, err := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	require.NoError(t, err)
 	assert.False(t, replay, "the step is burned for both stores")
 }
@@ -108,7 +108,7 @@ func TestTOTPStepReplay_VerifySetupCodeRefusedAsAConfirmedFactor(t *testing.T) {
 	w = ts.DoRequest(http.MethodPost, urlTOTPConfirmSetup, nil, auth)
 	require.Equal(t, http.StatusOK, w.Code, "confirm-setup: %s", w.Body.String())
 
-	ok, err := newDirectHandler(t, ts).VerifyCode(context.Background(), user.ID, code)
+	ok, err := newDirectHandler(t, ts).VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	require.NoError(t, err)
 	assert.False(t, ok, "the code that completed verify-setup must not verify again within its window")
 }
@@ -123,12 +123,12 @@ func TestTOTPStepReplay_CommittedTxBurnRefusesAPoolReplay(t *testing.T) {
 
 	tx, err := ts.DB.Begin()
 	require.NoError(t, err)
-	ok, err := h.VerifyCodeTx(context.Background(), tx, user.ID, code)
+	ok, err := h.VerifyCodeTx(context.Background(), tx, user.ID, stepReplayPurpose, code)
 	require.NoError(t, err)
 	require.True(t, ok, "the transaction accepts the fresh code")
 	require.NoError(t, tx.Commit())
 
-	ok, err = h.VerifyCode(context.Background(), user.ID, code)
+	ok, err = h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	require.NoError(t, err)
 	assert.False(t, ok, "a step burned by a committed transaction is refused on the pool")
 
@@ -136,7 +136,7 @@ func TestTOTPStepReplay_CommittedTxBurnRefusesAPoolReplay(t *testing.T) {
 	// the +1 skew window) still verifies unless it happens to equal this one.
 	next := stepReplayCode(t, secret, now.Add(30*time.Second))
 	if next != code {
-		ok, err = h.VerifyCode(context.Background(), user.ID, next)
+		ok, err = h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, next)
 		require.NoError(t, err)
 		assert.True(t, ok, "the following step's code still verifies")
 	}

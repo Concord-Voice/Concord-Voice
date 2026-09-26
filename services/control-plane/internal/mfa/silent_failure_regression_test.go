@@ -509,14 +509,14 @@ func TestSilentFailureBeginWebAuthnLogin_SessionWriteFault_ReturnsError(t *testi
 }
 
 func TestSilentFailureWebAuthnVerifyInlineBegin_SessionWriteFault_FailsClosed(t *testing.T) {
-	hook, hits := sfFault("set", "mfa_inline_session:")
+	hook, hits := sfFault("set", "mfa_inline_purpose_session:")
 	db := iuNewTestDB(t)
 	kr := iuKeyring(t)
 	userID := iuCreateUser(t, db, iuPassword)
 	iuAddWebAuthnCredential(t, db, userID)
 	h := sfWebAuthnHandler(t, db, sfHooked(t, hook), kr)
 
-	c, w := iuGinContext(http.MethodPost, "/api/v1/mfa/webauthn/verify-inline/begin", `{}`, userID, "")
+	c, w := iuGinContext(http.MethodPost, "/api/v1/mfa/webauthn/verify-inline/begin", sfInlinePurposeBody, userID, "")
 	h.WebAuthnVerifyInlineBegin(c)
 	sfRequireFired(t, hits)
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "an inline challenge whose session could not be stored must fail closed, not return options")
@@ -654,12 +654,16 @@ func (a *sfAuthenticator) assertion(t *testing.T, challenge string) string {
 
 // sfInlineVerify runs a real inline ceremony: begin, read the stored session's
 // challenge through the unhooked client, sign it, finish.
+// sfInlinePurposeBody is the begin body sfInlineVerify sends: begin refuses a
+// body that names no known purpose before any ceremony starts.
+const sfInlinePurposeBody = `{"purpose":"mfa_settings.backup_email_set"}`
+
 func sfInlineVerify(t *testing.T, h *Handler, clean *redis.Client, auth *sfAuthenticator, userID string) (int, map[string]interface{}) {
 	t.Helper()
-	c1, w1 := iuGinContext(http.MethodPost, "/api/v1/mfa/webauthn/verify-inline/begin", `{}`, userID, "")
+	c1, w1 := iuGinContext(http.MethodPost, "/api/v1/mfa/webauthn/verify-inline/begin", sfInlinePurposeBody, userID, "")
 	h.WebAuthnVerifyInlineBegin(c1)
 	require.Equal(t, http.StatusOK, w1.Code, "inline begin must succeed: %s", w1.Body.String())
-	raw, err := clean.Get(context.Background(), "mfa_inline_session:"+userID).Bytes()
+	raw, err := clean.Get(context.Background(), inlineSessionKey(userID)).Bytes()
 	require.NoError(t, err)
 	var session webauthn.SessionData
 	require.NoError(t, json.Unmarshal(raw, &session))
@@ -705,7 +709,7 @@ func TestSilentFailureInlineFinish_SignCountWriteFault_IssuesNoToken(t *testing.
 }
 
 func TestSilentFailureInlineFinish_SessionConsumeFault_IssuesNoToken(t *testing.T) {
-	hook, hits := sfFault("del|getdel", "mfa_inline_session:")
+	hook, hits := sfFault("del|getdel", "mfa_inline_purpose_session:")
 	db := iuNewTestDB(t)
 	h, clean, auth, userID := sfInlineFixture(t, db, hook)
 	status, body := sfInlineVerify(t, h, clean, auth, userID)
@@ -715,7 +719,7 @@ func TestSilentFailureInlineFinish_SessionConsumeFault_IssuesNoToken(t *testing.
 }
 
 func TestSilentFailureInlineFinish_TokenWriteFault_FailsClosed(t *testing.T) {
-	hook, hits := sfFault("set", "mfa_inline_token:")
+	hook, hits := sfFault("set", "mfa_inline_purpose_token:")
 	db := iuNewTestDB(t)
 	h, clean, auth, userID := sfInlineFixture(t, db, hook)
 	status, body := sfInlineVerify(t, h, clean, auth, userID)

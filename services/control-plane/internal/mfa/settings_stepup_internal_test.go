@@ -567,9 +567,12 @@ func TestOpenAndVerifyMFASettingsStepUpTx_PoolSafety(t *testing.T) {
 					return
 				}
 				defer func() { _ = tx.Rollback() }()
-				stepErr, stage = h.verifyMFASettingsStepUpTx(c.Request.Context(), tx, s.userID, subj, s.creds(), stepup.Copy{ //nolint:gosec // G101 false positive: user-facing refusal copy, not credentials
-					NoFactors:          "no factors",
-					CredentialRequired: "credential required",
+				stepErr, stage = h.verifyMFASettingsStepUpTx(c.Request.Context(), tx, s.userID, subj, s.creds(), settingsStepUp{
+					purpose: stepup.PurposeBackupEmailSet,
+					wording: stepup.Copy{ //nolint:gosec // G101 false positive: user-facing refusal copy, not credentials
+						NoFactors:          "no factors",
+						CredentialRequired: "credential required",
+					},
 				})
 				if stepErr == nil {
 					_ = tx.Commit()

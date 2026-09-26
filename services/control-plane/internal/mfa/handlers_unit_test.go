@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"strings"
 	"testing"
 
@@ -176,7 +177,7 @@ func TestVerifyCodeFailsClosedWhenWebAuthnTokenStoreIsUnavailable(t *testing.T) 
 	h := &Handler{redis: redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})}
 	t.Cleanup(func() { require.NoError(t, h.redis.Close()) })
 
-	verified, err := h.VerifyCode(context.Background(), "user-fixture", "webauthn-inline-token-123456")
+	verified, err := h.VerifyCode(context.Background(), "user-fixture", stepup.PurposeTOTPSetup, "webauthn-inline-token-123456")
 
 	require.False(t, verified)
 	require.ErrorContains(t, err, "consume WebAuthn inline verification token")
@@ -218,7 +219,7 @@ func TestVerifyCodeRejectsBackupCodeCASConflict(t *testing.T) {
 
 	handler := NewHandler(db, nil, logger.New("test"), keyring, "test", nil, "test")
 	verified, err := handler.verifyCode(
-		context.Background(), &conflictingBackupCodeStore{DB: db, userID: userID.String()}, userID.String(), backupCode)
+		context.Background(), &conflictingBackupCodeStore{DB: db, userID: userID.String()}, userID.String(), stepup.PurposeTOTPSetup, backupCode)
 
 	require.NoError(t, err)
 	require.False(t, verified, "the stale consumer must not redeem a backup code consumed by its competitor")

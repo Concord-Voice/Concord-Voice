@@ -221,17 +221,20 @@ func TestVerifySuccessEmitsServerMatchedFactorRatherThanRequestedMethod(t *testi
 	mini := miniredis.RunT(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
-	h := NewHandler(fakeMFADB(t, nil), redisClient, logger.New("test"), nil, "test", nil, "test")
+	// The request names backup_code but carries a TOTP code, so the event must
+	// report the factor the server matched (totp), not the one requested. A
+	// WebAuthn inline token cannot stand in here any more: login never accepts
+	// one (#3453 RS11).
+	fixture := newRealTOTPFixture(t)
+	h := NewHandler(fakeMFADB(t, fixture.state()), redisClient, logger.New("test"), fixture.keyring, "test", nil, "test")
 	h.SetLoginCompleter(committedLoginCompleter{})
 	recorder := &securityEventRecorder{}
 	h.SetSecurityEvents(recorder)
 	challenge, _, err := h.GenerateLoginChallenge(context.Background(), "test-user", false, "", securityevent.AuthPassword)
 	require.NoError(t, err)
-	const inlineCode = "webauthn-inline-token-123456"
-	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf("mfa_inline_token:%s:%s", "test-user", inlineCode), "1", time.Minute).Err())
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", strings.NewReader(`{"mfa_challenge_token":"`+challenge+`","method":"totp","code":"`+inlineCode+`"}`))
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", strings.NewReader(`{"mfa_challenge_token":"`+challenge+`","method":"backup_code","code":"`+fixture.code+`"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.Verify(c)
@@ -240,7 +243,7 @@ func TestVerifySuccessEmitsServerMatchedFactorRatherThanRequestedMethod(t *testi
 	require.Equal(t, []securityevent.Event{{
 		EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess,
 		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeVerified,
-		AuthMethod: securityevent.AuthWebAuthn, RouteTemplate: securityevent.RouteAuthMFAVerify,
+		AuthMethod: securityevent.AuthTOTP, RouteTemplate: securityevent.RouteAuthMFAVerify,
 	}}, recorder.events)
 	require.True(t, middleware.NightwatchHandled(c))
 }
@@ -816,6 +819,9 @@ type mfaEventDB struct {
 	totpExists      bool
 	totpEnabled     bool
 	totpConfirmed   bool
+	// totpReadDelay holds each read of the TOTP secret, so concurrent
+	// requests that reach the code check are all in flight at once.
+	totpReadDelay time.Duration
 	// recoveryOnly is the user's recovery_only_methods, as a Postgres array
 	// literal; empty means none.
 	recoveryOnly string
@@ -951,6 +957,7 @@ func (c mfaEventConn) QueryContext(_ context.Context, query string, _ []driver.N
 	case strings.Contains(query, "password_hash"):
 		return &mfaEventRows{values: []driver.Value{c.state.passwordHash}}, nil
 	case strings.Contains(query, "totp_secret_enc"):
+		time.Sleep(c.state.totpReadDelay)
 		return &mfaEventRows{values: []driver.Value{c.state.totpSecretEnc, c.state.totpSecretNonce, int64(c.state.totpKeyVersion), c.state.totpEnabled, c.state.totpConfirmed}}, nil
 	case strings.Contains(query, "backup_codes_hash"):
 		return &mfaEventRows{values: []driver.Value{[]byte("{}"), []byte("{}")}}, nil

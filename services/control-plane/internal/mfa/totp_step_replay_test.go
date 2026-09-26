@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
@@ -32,6 +33,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// stepReplayPurpose is the step-up purpose these tests verify under. TOTP and
+// backup codes ignore the purpose; the WebAuthn inline token guard below is
+// minted for it.
+const stepReplayPurpose = stepup.PurposeBackupEmailSet
 
 // totpStepReplayEncKey mirrors testhelpers.SetupTestServer's fixed all-zero
 // MFA_ENCRYPTION_KEY (internal/testhelpers/testserver.go) so a Handler built
@@ -78,7 +84,7 @@ func verifyCodeConcurrently(t *testing.T, h *mfa.Handler, userID, code string, n
 		go func() {
 			defer wg.Done()
 			<-start
-			ok, err := h.VerifyCode(context.Background(), userID, code)
+			ok, err := h.VerifyCode(context.Background(), userID, stepReplayPurpose, code)
 			results[i] = ok
 			errs[i] = err
 		}()
@@ -111,11 +117,11 @@ func TestTOTPStepReplay_SamePathRejectsImmediateReplay(t *testing.T) {
 
 	code := stepReplayCode(t, secret, time.Now())
 
-	ok1, err1 := h.VerifyCode(context.Background(), user.ID, code)
+	ok1, err1 := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	require.NoError(t, err1)
 	require.True(t, ok1, "the first submission of a valid code must be accepted")
 
-	ok2, err2 := h.VerifyCode(context.Background(), user.ID, code)
+	ok2, err2 := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	require.NoError(t, err2)
 	assert.False(t, ok2,
 		"TOTPStepReplay: a TOTP code already accepted once must be refused when submitted again through the same path (Handler.VerifyCode), but it was accepted a second time")
@@ -206,11 +212,11 @@ func TestTOTPStepReplay_EarlierStepRefusedAfterLaterStepAccepted(t *testing.T) {
 	codeNow := stepReplayCode(t, secret, now)
 	codePrev := stepReplayCode(t, secret, now.Add(-30*time.Second))
 
-	okNow, err := h.VerifyCode(context.Background(), user.ID, codeNow)
+	okNow, err := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, codeNow)
 	require.NoError(t, err)
 	require.True(t, okNow, "the current-step code must be accepted")
 
-	okPrev, err := h.VerifyCode(context.Background(), user.ID, codePrev)
+	okPrev, err := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, codePrev)
 	require.NoError(t, err)
 	assert.False(t, okPrev,
 		"TOTPStepReplay: a code from a step earlier than the last accepted step must be refused, even though it independently validates under the skew window")
@@ -341,11 +347,11 @@ func TestTOTPStepReplay_GuardNextStepAcceptedAfterPreviousStep(t *testing.T) {
 	codeNow := stepReplayCode(t, secret, now)
 	codeNext := stepReplayCode(t, secret, now.Add(30*time.Second))
 
-	okNow, err := h.VerifyCode(context.Background(), user.ID, codeNow)
+	okNow, err := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, codeNow)
 	require.NoError(t, err)
 	require.True(t, okNow, "guard: the current-step code must be accepted")
 
-	okNext, err := h.VerifyCode(context.Background(), user.ID, codeNext)
+	okNext, err := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, codeNext)
 	require.NoError(t, err)
 	assert.True(t, okNext,
 		"guard: a code from the step after the last accepted one must be accepted")
@@ -369,12 +375,12 @@ func TestTOTPStepReplay_GuardRolledBackVerificationLeavesCodeUsable(t *testing.T
 	// user_mfa_totp row lock: the package cleanup's TRUNCATE would then block
 	// forever instead of the test failing. Rollback after Rollback is a no-op.
 	defer func() { _ = tx.Rollback() }()
-	okTx, err := h.VerifyCodeTx(context.Background(), tx, user.ID, code)
+	okTx, err := h.VerifyCodeTx(context.Background(), tx, user.ID, stepReplayPurpose, code)
 	require.NoError(t, err)
 	require.True(t, okTx, "guard: verification inside the transaction must succeed")
 	require.NoError(t, tx.Rollback())
 
-	okAfter, err := h.VerifyCode(context.Background(), user.ID, code)
+	okAfter, err := h.VerifyCode(context.Background(), user.ID, stepReplayPurpose, code)
 	require.NoError(t, err)
 	assert.True(t, okAfter,
 		"guard: a code verified inside a transaction that was rolled back must remain usable in a later verification")
@@ -395,30 +401,30 @@ func TestTOTPStepReplay_GuardBackupCodeAndWebAuthnTokenIndependentOfTOTP(t *test
 	// Backup code: single-use already, by its own mechanism.
 	backupCode, isString := backupCodes[0].(string)
 	require.True(t, isString, "enrollTOTP must return string backup codes")
-	ok1, err := h.VerifyCode(ctx, user.ID, backupCode)
+	ok1, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, backupCode)
 	require.NoError(t, err)
 	require.True(t, ok1, "guard: the first use of a backup code must succeed")
 
-	ok2, err := h.VerifyCode(ctx, user.ID, backupCode)
+	ok2, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, backupCode)
 	require.NoError(t, err)
 	assert.False(t, ok2, "guard: a backup code must not be usable twice")
 
 	// Consuming the backup code must not block a current-step TOTP code.
 	codeAfterBackup := stepReplayCode(t, secret, time.Now())
-	okTOTP1, err := h.VerifyCode(ctx, user.ID, codeAfterBackup)
+	okTOTP1, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, codeAfterBackup)
 	require.NoError(t, err)
 	assert.True(t, okTOTP1, "guard: consuming a backup code must not affect TOTP verification")
 
 	// WebAuthn inline token: single-use already, by its own mechanism
 	// (consumeWebAuthnInlineToken, internal/mfa/handlers.go:326).
 	token := uuid.New().String() // > 20 chars, required by consumeWebAuthnInlineToken
-	require.NoError(t, ts.Redis.Set(ctx, "mfa_inline_token:"+user.ID+":"+token, "1", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(ctx, "mfa_inline_purpose_token:"+user.ID+":"+string(stepReplayPurpose)+":"+token, "1", time.Minute).Err())
 
-	ok3, err := h.VerifyCode(ctx, user.ID, token)
+	ok3, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, token)
 	require.NoError(t, err)
 	require.True(t, ok3, "guard: the first use of a WebAuthn inline token must succeed")
 
-	ok4, err := h.VerifyCode(ctx, user.ID, token)
+	ok4, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, token)
 	require.NoError(t, err)
 	assert.False(t, ok4, "guard: a WebAuthn inline token must not be usable twice")
 
@@ -426,7 +432,7 @@ func TestTOTPStepReplay_GuardBackupCodeAndWebAuthnTokenIndependentOfTOTP(t *test
 	// either. Advance one step from codeAfterBackup so this assertion cannot
 	// be confused with a leftover step-replay refusal of that earlier code.
 	codeAfterToken := stepReplayCode(t, secret, time.Now().Add(30*time.Second))
-	okTOTP2, err := h.VerifyCode(ctx, user.ID, codeAfterToken)
+	okTOTP2, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, codeAfterToken)
 	require.NoError(t, err)
 	assert.True(t, okTOTP2, "guard: consuming a WebAuthn inline token must not affect TOTP verification")
 }

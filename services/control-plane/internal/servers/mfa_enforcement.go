@@ -88,7 +88,7 @@ var errMFAEnforcementRowsAffected = errors.New("servers: MFA enforcement update 
 // *mfa.Handler satisfies it structurally.
 type MFAVerifier interface {
 	GetEnabledMethods(ctx context.Context, userID string) ([]string, error)
-	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID, code string) (bool, error)
+	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, purpose stepup.Purpose, code string) (bool, error)
 }
 
 // SetMFAVerifier wires the verifier that checks the OFF confirmation. An
@@ -356,7 +356,7 @@ func (h *Handler) confirmMFAEnforcementRequest(
 	}
 	// A nil h.mfaVerifier converts to a nil interface, which ConfirmTx answers
 	// with a 500: an unwired verifier fails closed.
-	return mfaenforce.ConfirmTx(ctx, tx, subj, h.mfaVerifier, userID, code)
+	return mfaenforce.ConfirmTx(ctx, tx, subj, h.mfaVerifier, userID, stepup.PurposeServerMFAEnforcementOff, code)
 }
 
 // respondMFAEnforcementError maps a PUT error, in the order mfaenforce's

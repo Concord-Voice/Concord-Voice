@@ -258,7 +258,7 @@ func (h *Handler) verifyPurgeStepUp(ctx context.Context, c *gin.Context, userID,
 		return false
 	}
 	if subj.MFAEnabled {
-		if mErr := stepup.VerifyMFAFactor(ctx, h.mfaVerifier, userID, mfaCode, subj.MFAMethods); mErr != nil {
+		if mErr := stepup.VerifyMFAFactor(ctx, h.mfaVerifier, userID, stepup.PurposeDMPurge, mfaCode, subj.MFAMethods); mErr != nil {
 			h.logPurgeStepUpFailure(mErr)
 			mErr.Write(c)
 			return false

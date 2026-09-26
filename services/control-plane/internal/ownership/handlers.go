@@ -183,7 +183,7 @@ func (h *Handler) InitiateTransfer(c *gin.Context) {
 		return
 	}
 
-	if err := h.verifyMFA(c, userID, req.MFACode); err != nil {
+	if err := h.verifyMFA(c, userID, stepup.PurposeOwnershipTransfer, req.MFACode); err != nil {
 		return
 	}
 
@@ -502,7 +502,7 @@ func (h *Handler) ReverseTransfer(c *gin.Context) {
 		return
 	}
 
-	if err := h.verifyMFA(c, userID, req.MFACode); err != nil {
+	if err := h.verifyMFA(c, userID, stepup.PurposeOwnershipReverse, req.MFACode); err != nil {
 		return
 	}
 
@@ -1322,9 +1322,11 @@ func (h *Handler) verifyPassword(c *gin.Context, userID, password string) error 
 // verifyMFA checks MFA if the user holds an inline-verifiable factor (policy
 // P1: TOTP or WebAuthn, read from the factor tables, never users.mfa_methods).
 // One read decides both whether the leg applies and which methods the prompt
-// offers, so the two cannot disagree. A read error fails closed.
+// offers, so the two cannot disagree. A read error fails closed. purpose is
+// the calling route's own stepup.Purpose, which a WebAuthn inline token must
+// have been minted for.
 // On failure, sends an error response to the gin context and returns an error.
-func (h *Handler) verifyMFA(c *gin.Context, userID, mfaCode string) error {
+func (h *Handler) verifyMFA(c *gin.Context, userID string, purpose stepup.Purpose, mfaCode string) error {
 	ctx := c.Request.Context()
 	methods, err := stepup.InlineMFAMethods(ctx, h.db, userID)
 	if err != nil {
@@ -1345,7 +1347,7 @@ func (h *Handler) verifyMFA(c *gin.Context, userID, mfaCode string) error {
 		return fmt.Errorf("MFA required")
 	}
 
-	valid, err := h.mfaVerifier.VerifyCode(ctx, userID, mfaCode)
+	valid, err := h.mfaVerifier.VerifyCode(ctx, userID, purpose, mfaCode)
 	if err != nil {
 		h.log.Error(errMsgFailedVerifyMFACode, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyMFACode})

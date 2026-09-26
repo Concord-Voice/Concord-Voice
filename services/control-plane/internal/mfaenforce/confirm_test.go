@@ -16,8 +16,9 @@ import (
 
 // spyVerifier records every call. valid is its verdict for a code.
 type spyVerifier struct {
-	valid bool
-	calls int
+	valid   bool
+	calls   int
+	purpose stepup.Purpose
 }
 
 func (s *spyVerifier) GetEnabledMethods(context.Context, string) ([]string, error) {
@@ -25,12 +26,16 @@ func (s *spyVerifier) GetEnabledMethods(context.Context, string) ([]string, erro
 	return nil, nil
 }
 
-func (s *spyVerifier) VerifyCodeTx(context.Context, *sql.Tx, string, string) (bool, error) {
+func (s *spyVerifier) VerifyCodeTx(_ context.Context, _ *sql.Tx, _ string, purpose stepup.Purpose, _ string) (bool, error) {
 	s.calls++
+	s.purpose = purpose
 	return s.valid, nil
 }
 
 var _ stepup.MFATxCodeVerifier = (*spyVerifier)(nil)
+
+// testPurpose is the purpose these tests confirm for: the toggle-OFF route's.
+const testPurpose = stepup.PurposeServerMFAEnforcementOff
 
 var enrolledTOTP = stepup.Subject{MFAEnabled: true, MFAMethods: []string{"totp"}}
 
@@ -56,7 +61,7 @@ func TestConfirmTx_RefusesAnActorWithNoInlineFactor(t *testing.T) {
 	t.Run("a subject from LockGateTx", func(t *testing.T) {
 		spy := &spyVerifier{valid: true}
 
-		requireEnrollmentRequired(t, mfaenforce.ConfirmTx(context.Background(), tx, g.Subject, spy, owner, "123456"))
+		requireEnrollmentRequired(t, mfaenforce.ConfirmTx(context.Background(), tx, g.Subject, spy, owner, testPurpose, "123456"))
 		require.Zero(t, spy.calls, "the verifier must not be asked")
 	})
 
@@ -67,13 +72,13 @@ func TestConfirmTx_RefusesAnActorWithNoInlineFactor(t *testing.T) {
 		spy := &spyVerifier{valid: true}
 
 		requireEnrollmentRequired(t, mfaenforce.ConfirmTx(context.Background(), tx,
-			stepup.Subject{MFAEnabled: true}, spy, owner, ""))
+			stepup.Subject{MFAEnabled: true}, spy, owner, testPurpose, ""))
 		require.Zero(t, spy.calls)
 	})
 }
 
 func TestConfirmTx_NilVerifierIs500(t *testing.T) {
-	e := mfaenforce.ConfirmTx(context.Background(), nil, enrolledTOTP, nil, "user-1", "123456")
+	e := mfaenforce.ConfirmTx(context.Background(), nil, enrolledTOTP, nil, "user-1", testPurpose, "123456")
 
 	require.NotNil(t, e)
 	require.Equal(t, http.StatusInternalServerError, e.Status)
@@ -92,7 +97,7 @@ func TestConfirmTx_VerifiesTheCodeOnTheTransaction(t *testing.T) {
 	t.Run("no code asks for one and offers the P1 methods", func(t *testing.T) {
 		g, tx := lockGate(t, db, serverID, owner)
 
-		e := mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, "")
+		e := mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testPurpose, "")
 
 		require.NotNil(t, e)
 		require.Equal(t, http.StatusForbidden, e.Status)
@@ -103,7 +108,7 @@ func TestConfirmTx_VerifiesTheCodeOnTheTransaction(t *testing.T) {
 	t.Run("a wrong code is refused", func(t *testing.T) {
 		g, tx := lockGate(t, db, serverID, owner)
 
-		e := mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, "not-a-code")
+		e := mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testPurpose, "not-a-code")
 
 		require.NotNil(t, e)
 		require.Equal(t, http.StatusForbidden, e.Status)
@@ -115,7 +120,7 @@ func TestConfirmTx_VerifiesTheCodeOnTheTransaction(t *testing.T) {
 		code, err := totp.GenerateCode(secret, time.Now())
 		require.NoError(t, err)
 
-		require.Nil(t, mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, code))
+		require.Nil(t, mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testPurpose, code))
 	})
 }
 
@@ -132,18 +137,18 @@ func TestConfirmTx_BackupCodeIsSpentOnlyWhenTheTransactionCommits(t *testing.T) 
 	ctx := context.Background()
 
 	g, tx := lockGate(t, db, serverID, owner)
-	require.Nil(t, mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testBackupCode))
+	require.Nil(t, mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testPurpose, testBackupCode))
 	require.NoError(t, tx.Rollback())
 	require.False(t, backupCodeUsed(t, db, owner), "a rolled-back gate must not spend the backup code")
 
 	g, tx = lockGate(t, db, serverID, owner)
-	require.Nil(t, mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testBackupCode),
+	require.Nil(t, mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testPurpose, testBackupCode),
 		"the code must still be usable after the rollback")
 	require.NoError(t, tx.Commit())
 	require.True(t, backupCodeUsed(t, db, owner), "a committed gate spends the backup code")
 
 	g, tx = lockGate(t, db, serverID, owner)
-	e := mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testBackupCode)
+	e := mfaenforce.ConfirmTx(ctx, tx, g.Subject, verifier, owner, testPurpose, testBackupCode)
 	require.NotNil(t, e, "a backup code is single use")
 	require.Equal(t, stepup.ErrMsgInvalidMFACode, e.Body["error"])
 }
@@ -154,7 +159,7 @@ func TestRequireConfirmationTx(t *testing.T) {
 	t.Run("a server that does not enforce asks nothing of an unenrolled actor", func(t *testing.T) {
 		spy := &spyVerifier{}
 
-		require.Nil(t, mfaenforce.RequireConfirmationTx(ctx, nil, mfaenforce.Gate{}, spy, "user-1", ""))
+		require.Nil(t, mfaenforce.RequireConfirmationTx(ctx, nil, mfaenforce.Gate{}, spy, "user-1", testPurpose, ""))
 		require.Zero(t, spy.calls)
 	})
 
@@ -162,7 +167,7 @@ func TestRequireConfirmationTx(t *testing.T) {
 		spy := &spyVerifier{valid: false}
 
 		require.Nil(t, mfaenforce.RequireConfirmationTx(ctx, nil,
-			mfaenforce.Gate{Subject: enrolledTOTP}, spy, "user-1", "123456"))
+			mfaenforce.Gate{Subject: enrolledTOTP}, spy, "user-1", testPurpose, "123456"))
 		require.Zero(t, spy.calls, "a code sent to a non-enforcing server must not be checked, or spent")
 	})
 
@@ -170,12 +175,12 @@ func TestRequireConfirmationTx(t *testing.T) {
 		spy := &spyVerifier{valid: true}
 
 		requireEnrollmentRequired(t, mfaenforce.RequireConfirmationTx(ctx, nil,
-			mfaenforce.Gate{Enforcing: true}, spy, "user-1", "123456"))
+			mfaenforce.Gate{Enforcing: true}, spy, "user-1", testPurpose, "123456"))
 	})
 
 	t.Run("an enforcing server asks an enrolled actor for a code", func(t *testing.T) {
 		e := mfaenforce.RequireConfirmationTx(ctx, nil,
-			mfaenforce.Gate{Enforcing: true, Subject: enrolledTOTP}, &spyVerifier{}, "user-1", "")
+			mfaenforce.Gate{Enforcing: true, Subject: enrolledTOTP}, &spyVerifier{}, "user-1", testPurpose, "")
 
 		require.NotNil(t, e)
 		require.Equal(t, true, e.Body["mfa_required"])
@@ -185,7 +190,8 @@ func TestRequireConfirmationTx(t *testing.T) {
 		spy := &spyVerifier{valid: true}
 
 		require.Nil(t, mfaenforce.RequireConfirmationTx(ctx, nil,
-			mfaenforce.Gate{Enforcing: true, Subject: enrolledTOTP}, spy, "user-1", "123456"))
+			mfaenforce.Gate{Enforcing: true, Subject: enrolledTOTP}, spy, "user-1", testPurpose, "123456"))
 		require.Equal(t, 1, spy.calls)
+		require.Equal(t, testPurpose, spy.purpose, "the gate must hand the verifier the caller's purpose")
 	})
 }

@@ -38,11 +38,13 @@ vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
     methods,
     excludeBackupCodes,
     onVerify,
+    purpose,
     disabled,
     error,
   }: {
     methods: string[];
     excludeBackupCodes?: boolean;
+    purpose: string | null;
     onVerify: (code: string) => void;
     disabled?: boolean;
     error?: string;
@@ -51,6 +53,7 @@ vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
       data-testid="mfa-verify-prompt"
       data-methods={methods.join(',')}
       data-exclude-backup-codes={String(!!excludeBackupCodes)}
+      data-purpose={String(purpose)}
     >
       <input
         data-testid="mfa-verify-input"
@@ -609,6 +612,26 @@ describe('MFATierSelector', () => {
   });
 
   // ── Action modal — MFA methods filter + excludeBackupCodes (spec R-13/T14) ─
+
+  // A WebAuthn inline token is bound to the purpose the prompt names, so each
+  // action must name the route its code is actually sent with (#3453 RS11).
+  describe('action modal — MFAVerifyPrompt purpose', () => {
+    it('names the email/SMS disable route for Disable', () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn', 'email']} />);
+      fireEvent.click(screen.getByText('Disable'));
+      expect(screen.getByTestId('mfa-verify-prompt').dataset.purpose).toBe(
+        'mfa_settings.email_sms_disable'
+      );
+    });
+
+    it('names the TOTP disable route for Reset', () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      expect(screen.getByTestId('mfa-verify-prompt').dataset.purpose).toBe(
+        'mfa_settings.totp_disable'
+      );
+    });
+  });
 
   describe('action modal — MFAVerifyPrompt methods filter', () => {
     it('passes only the totp/webauthn subset, excluding email/sms', () => {

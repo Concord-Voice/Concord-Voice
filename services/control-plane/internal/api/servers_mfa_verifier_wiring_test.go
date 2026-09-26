@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"os"
 	"os/exec"
 	"strings"
@@ -26,7 +27,7 @@ func (stubServersMFAVerifier) GetEnabledMethods(context.Context, string) ([]stri
 	return nil, nil
 }
 
-func (stubServersMFAVerifier) VerifyCodeTx(context.Context, *sql.Tx, string, string) (bool, error) {
+func (stubServersMFAVerifier) VerifyCodeTx(context.Context, *sql.Tx, string, stepup.Purpose, string) (bool, error) {
 	return false, nil
 }
 

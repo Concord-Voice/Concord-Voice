@@ -45,17 +45,21 @@ type fakeMFAVerifier struct {
 	methods      []string
 	usedTx       bool
 	usedPool     bool
+	// purpose is the step-up purpose the last verify call received.
+	purpose Purpose
 }
 
 func (f *fakeMFAVerifier) IsEnabled(context.Context, string) bool { return f.enabled }
 
-func (f *fakeMFAVerifier) VerifyCode(context.Context, string, string) (bool, error) {
+func (f *fakeMFAVerifier) VerifyCode(_ context.Context, _ string, purpose Purpose, _ string) (bool, error) {
 	f.usedPool = true
+	f.purpose = purpose
 	return f.valid, f.verifyErr
 }
 
-func (f *fakeMFAVerifier) VerifyCodeTx(context.Context, *sql.Tx, string, string) (bool, error) {
+func (f *fakeMFAVerifier) VerifyCodeTx(_ context.Context, _ *sql.Tx, _ string, purpose Purpose, _ string) (bool, error) {
 	f.usedTx = true
+	f.purpose = purpose
 	return f.valid, f.verifyErr
 }
 
@@ -63,6 +67,9 @@ func (f *fakeMFAVerifier) GetEnabledMethods(context.Context, string) ([]string, 
 	f.methodsCalls++
 	return f.methods, f.methodsErr
 }
+
+// testPurpose is the step-up purpose these tests verify for.
+const testPurpose = PurposeTOTPSetup
 
 // fakeMFAVerifier must satisfy the union contract Task 3 consumes.
 var _ MFAVerifier = (*fakeMFAVerifier)(nil)
@@ -142,7 +149,7 @@ func TestVerifyPasswordFactor_MalformedHashIs500(t *testing.T) {
 func TestVerifyMFAFactor_MissingCodeIs403WithMethods(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, methods: []string{"email"}}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "", []string{"totp"})
+	err := VerifyMFAFactor(context.Background(), v, "user-1", testPurpose, "", []string{"totp"})
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusForbidden, err.Status)
@@ -155,7 +162,7 @@ func TestVerifyMFAFactor_MissingCodeIs403WithMethods(t *testing.T) {
 func TestVerifyMFAFactor_InvalidCodeIs403(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, valid: false}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "000000", nil)
+	err := VerifyMFAFactor(context.Background(), v, "user-1", testPurpose, "000000", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusForbidden, err.Status)
@@ -165,7 +172,7 @@ func TestVerifyMFAFactor_InvalidCodeIs403(t *testing.T) {
 func TestVerifyMFAFactor_VerifyErrorIs500(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, verifyErr: errors.New("totp backend down")}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "123456", nil)
+	err := VerifyMFAFactor(context.Background(), v, "user-1", testPurpose, "123456", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusInternalServerError, err.Status)
@@ -176,7 +183,8 @@ func TestVerifyMFAFactor_VerifyErrorIs500(t *testing.T) {
 func TestVerifyMFAFactor_ValidCodePasses(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, valid: true}
 
-	require.Nil(t, VerifyMFAFactor(context.Background(), v, "user-1", "123456", nil))
+	require.Nil(t, VerifyMFAFactor(context.Background(), v, "user-1", testPurpose, "123456", nil))
+	require.Equal(t, testPurpose, v.purpose, "the pool form must hand the verifier the caller's purpose")
 	require.True(t, v.usedPool, "the non-tx form must reach VerifyCode")
 }
 
@@ -187,8 +195,9 @@ func TestVerifyMFAFactor_ValidCodePasses(t *testing.T) {
 func TestVerifyMFAFactorTx_ReachesTxVerifier(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, valid: true}
 
-	require.Nil(t, VerifyMFAFactorTx(context.Background(), nil, v, "user-1", "123456", nil))
+	require.Nil(t, VerifyMFAFactorTx(context.Background(), nil, v, "user-1", testPurpose, "123456", nil))
 	require.True(t, v.usedTx, "the tx form must reach VerifyCodeTx")
+	require.Equal(t, testPurpose, v.purpose, "the tx form must hand the verifier the caller's purpose")
 	require.False(t, v.usedPool, "the tx form must not fall back to the pool verifier")
 }
 
@@ -202,7 +211,7 @@ func TestVerifyMFAFactorTx_ReachesTxVerifier(t *testing.T) {
 func TestError_MFABackendFailurePropagatesCause(t *testing.T) {
 	backendDown := errors.New("totp store unreachable")
 	err := VerifyMFAFactor(context.Background(),
-		&fakeMFAVerifier{enabled: true, verifyErr: backendDown}, "u1", "123456", nil)
+		&fakeMFAVerifier{enabled: true, verifyErr: backendDown}, "u1", testPurpose, "123456", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusInternalServerError, err.Status)
@@ -240,9 +249,9 @@ func TestError_RejectionsCarryNoCause(t *testing.T) {
 		"password omitted": VerifyPasswordFactor(
 			Subject{PasswordHash: stubEncoding}, "", testCopy),
 		"mfa code omitted": VerifyMFAFactor(context.Background(),
-			&fakeMFAVerifier{enabled: true}, "u1", "", []string{"totp"}),
+			&fakeMFAVerifier{enabled: true}, "u1", testPurpose, "", []string{"totp"}),
 		"mfa code invalid": VerifyMFAFactor(context.Background(),
-			&fakeMFAVerifier{enabled: true, valid: false}, "u1", "000000", nil),
+			&fakeMFAVerifier{enabled: true, valid: false}, "u1", testPurpose, "000000", nil),
 	}
 	for name, err := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -266,7 +275,7 @@ func TestVerifyMFAFactorTx_PreloadedMethodsSkipTheLookup(t *testing.T) {
 	// slice were ignored, methods would come back empty instead of preloaded.
 	v := &fakeMFAVerifier{enabled: true, methodsErr: errors.New("pool lookup must not happen")}
 
-	err := VerifyMFAFactorTx(context.Background(), nil, v, "user-1", "", []string{"totp"})
+	err := VerifyMFAFactorTx(context.Background(), nil, v, "user-1", testPurpose, "", []string{"totp"})
 
 	require.NotNil(t, err)
 	require.Equal(t, http.StatusForbidden, err.Status)
@@ -280,7 +289,7 @@ func TestVerifyMFAFactorTx_PreloadedMethodsSkipTheLookup(t *testing.T) {
 func TestVerifyMFAFactor_NilPreloadFallsBackToLookup(t *testing.T) {
 	v := &fakeMFAVerifier{enabled: true, methods: []string{"webauthn"}}
 
-	err := VerifyMFAFactor(context.Background(), v, "user-1", "", nil)
+	err := VerifyMFAFactor(context.Background(), v, "user-1", testPurpose, "", nil)
 
 	require.NotNil(t, err)
 	require.Equal(t, []string{"webauthn"}, err.Body["methods"])

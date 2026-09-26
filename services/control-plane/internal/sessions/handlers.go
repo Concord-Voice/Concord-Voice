@@ -16,6 +16,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -43,11 +44,28 @@ type SessionDisconnector interface {
 }
 
 // MFAVerifier checks MFA status and verifies codes for sensitive operations.
+// purpose scopes the WebAuthn inline token a code may be (see stepup.Purpose).
 type MFAVerifier interface {
 	IsEnabled(ctx context.Context, userID string) bool
-	VerifyCode(ctx context.Context, userID string, code string) (bool, error)
+	VerifyCode(ctx context.Context, userID string, purpose stepup.Purpose, code string) (bool, error)
 	GetEnabledMethods(ctx context.Context, userID string) ([]string, error)
 }
+
+// revokeAction is one route's authenticateForRevoke parameters: the copy its
+// refusal names, the route its security events carry, and the step-up purpose
+// a WebAuthn inline token must have been minted for. Each route has its own
+// purpose, so a token minted to revoke one session cannot revoke them all.
+type revokeAction struct {
+	desc    string
+	route   securityevent.RouteTemplate
+	purpose stepup.Purpose
+}
+
+var (
+	revokeSessionAction     = revokeAction{desc: "revoke this session", route: securityevent.RouteSessionDelete, purpose: stepup.PurposeSessionRevoke}
+	revokeAllSessionsAction = revokeAction{desc: "revoke all sessions", route: securityevent.RouteSessionsRevokeAll, purpose: stepup.PurposeSessionsRevokeAll}
+	revocationModeSetAction = revokeAction{desc: "change revocation mode", route: securityevent.RouteSessionsRevocationMode, purpose: stepup.PurposeRevocationModeSet}
+)
 
 // Revocation rate-limiting constants.
 const (
@@ -386,7 +404,7 @@ func (h *Handler) RevokeSession(c *gin.Context) {
 	}
 
 	if needsPassword {
-		if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "revoke this session", securityevent.RouteSessionDelete) {
+		if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, revokeSessionAction) {
 			return
 		}
 		if mode == "simple" {
@@ -441,11 +459,12 @@ func (h *Handler) determineAuthRequired(ctx context.Context, uid string) (needsP
 
 // authenticateForRevoke verifies the user's identity via MFA or password for session revocation.
 // Returns true if the request was blocked (response written), false if authentication passed.
-func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid, password, mfaCode, actionDesc string, route securityevent.RouteTemplate) bool {
+func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid, password, mfaCode string, action revokeAction) bool {
+	route := action.route
 	hasMFA := h.mfaVerifier != nil && h.mfaVerifier.IsEnabled(ctx, uid)
 
 	if hasMFA && mfaCode != "" {
-		valid, mfaErr := h.mfaVerifier.VerifyCode(ctx, uid, mfaCode)
+		valid, mfaErr := h.mfaVerifier.VerifyCode(ctx, uid, action.purpose, mfaCode)
 		if mfaErr != nil {
 			h.log.Error("MFA verification error during session revoke", "error", mfaErr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed})
@@ -479,13 +498,13 @@ func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid
 		methods, _ := h.mfaVerifier.GetEnabledMethods(ctx, uid)
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":   "auth_required",
-			"message": "Authentication required to " + actionDesc,
+			"message": "Authentication required to " + action.desc,
 			"methods": methods,
 		})
 	} else {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":   "password_required",
-			"message": "Password verification required to " + actionDesc,
+			"message": "Password verification required to " + action.desc,
 		})
 	}
 	return true
@@ -545,7 +564,7 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 	uid := userID.(string)
 	ctx := c.Request.Context()
 
-	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "revoke all sessions", securityevent.RouteSessionsRevokeAll) {
+	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, revokeAllSessionsAction) {
 		return
 	}
 
@@ -637,7 +656,7 @@ func (h *Handler) UpdateRevocationMode(c *gin.Context) {
 	uid := userID.(string)
 	ctx := c.Request.Context()
 
-	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "change revocation mode", securityevent.RouteSessionsRevocationMode) {
+	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, revocationModeSetAction) {
 		return
 	}
 

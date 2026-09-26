@@ -15,6 +15,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -167,7 +168,7 @@ func TestRevokeAllSessionsEmitsOnlyAfterCommittedBulkRevoke(t *testing.T) {
 type revokeMFAVerifier struct{ enabled bool }
 
 func (v revokeMFAVerifier) IsEnabled(context.Context, string) bool { return v.enabled }
-func (revokeMFAVerifier) VerifyCode(context.Context, string, string) (bool, error) {
+func (revokeMFAVerifier) VerifyCode(context.Context, string, stepup.Purpose, string) (bool, error) {
 	return false, nil
 }
 func (revokeMFAVerifier) GetEnabledMethods(context.Context, string) ([]string, error) {
@@ -180,12 +181,12 @@ func TestAuthenticateForRevokeEmitsCredentialSpecificRefusalEvents(t *testing.T)
 	require.NoError(t, err)
 
 	for _, test := range []struct {
-		name  string
-		route securityevent.RouteTemplate
+		name   string
+		action revokeAction
 	}{
-		{name: "delete", route: securityevent.RouteSessionDelete},
-		{name: "revoke all", route: securityevent.RouteSessionsRevokeAll},
-		{name: "revocation mode", route: securityevent.RouteSessionsRevocationMode},
+		{name: "delete", action: revokeSessionAction},
+		{name: "revoke all", action: revokeAllSessionsAction},
+		{name: "revocation mode", action: revocationModeSetAction},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
@@ -201,12 +202,12 @@ func TestAuthenticateForRevokeEmitsCredentialSpecificRefusalEvents(t *testing.T)
 			passwordRecorder := &securityEventRecorder{}
 			passwordHandler.SetSecurityEvents(passwordRecorder)
 			passwordContext, passwordResponse := newContext()
-			require.True(t, passwordHandler.authenticateForRevoke(context.Background(), passwordContext, privacyUserID, "wrong", "", "revoke", test.route))
+			require.True(t, passwordHandler.authenticateForRevoke(context.Background(), passwordContext, privacyUserID, "wrong", "", test.action))
 			require.Equal(t, http.StatusForbidden, passwordResponse.Code)
 			require.Equal(t, []securityevent.Event{{
 				EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied,
 				Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials,
-				AuthMethod: securityevent.AuthPassword, RouteTemplate: test.route,
+				AuthMethod: securityevent.AuthPassword, RouteTemplate: test.action.route,
 			}}, passwordRecorder.events)
 			require.True(t, middleware.NightwatchHandled(passwordContext))
 
@@ -214,17 +215,17 @@ func TestAuthenticateForRevokeEmitsCredentialSpecificRefusalEvents(t *testing.T)
 			mfaRecorder := &securityEventRecorder{}
 			mfaHandler.SetSecurityEvents(mfaRecorder)
 			mfaContext, mfaResponse := newContext()
-			require.True(t, mfaHandler.authenticateForRevoke(context.Background(), mfaContext, privacyUserID, "", "bad-code", "revoke", test.route))
+			require.True(t, mfaHandler.authenticateForRevoke(context.Background(), mfaContext, privacyUserID, "", "bad-code", test.action))
 			require.Equal(t, http.StatusForbidden, mfaResponse.Code)
 			require.Equal(t, []securityevent.Event{{
 				EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied,
 				Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid,
-				RouteTemplate: test.route,
+				RouteTemplate: test.action.route,
 			}}, mfaRecorder.events)
 			require.True(t, middleware.NightwatchHandled(mfaContext))
 
 			noCredentialContext, noCredentialResponse := newContext()
-			require.True(t, mfaHandler.authenticateForRevoke(context.Background(), noCredentialContext, privacyUserID, "", "", "revoke", test.route))
+			require.True(t, mfaHandler.authenticateForRevoke(context.Background(), noCredentialContext, privacyUserID, "", "", test.action))
 			require.Equal(t, http.StatusForbidden, noCredentialResponse.Code)
 			require.False(t, middleware.NightwatchHandled(noCredentialContext))
 		})

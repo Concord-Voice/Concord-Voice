@@ -192,6 +192,7 @@ vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
   default: ({
     onVerify,
     disabled,
+    excludeBackupCodes,
   }: {
     onVerify: (code: string) => void;
     disabled?: boolean;
@@ -200,7 +201,10 @@ vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
     error?: string;
     excludeBackupCodes?: boolean;
   }) => (
-    <div data-testid="mfa-verify-prompt">
+    <div
+      data-testid="mfa-verify-prompt"
+      data-exclude-backup-codes={excludeBackupCodes ? 'true' : 'false'}
+    >
       <button data-testid="mfa-verify-btn" onClick={() => onVerify('123456')} disabled={disabled}>
         Verify
       </button>
@@ -2780,6 +2784,38 @@ describe('PrivacySecuritySection', () => {
     await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
     expect(screen.getByText(/This will invalidate all existing backup codes/)).toBeInTheDocument();
     expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument();
+  });
+
+  // RegenerateBackupCodes checks an authenticator-app code and nothing else,
+  // so its prompt must not offer a backup code (nor a security key, pinned
+  // with the purpose tests).
+  it('offers only an authenticator code when resetting backup codes', async () => {
+    mockApiFetch
+      .mockReset()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          methods: ['totp'],
+          recovery_only_methods: [],
+          recovery_hardened: false,
+          backup_codes_remaining: 5,
+          backup_email: '',
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
+    fireEvent.click(screen.getByText(/Reset/));
+    await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
+
+    expect(screen.getByTestId('mfa-verify-prompt')).toHaveAttribute(
+      'data-exclude-backup-codes',
+      'true'
+    );
   });
 
   // ── Backup code reset submission ────────────────────────────────────────
