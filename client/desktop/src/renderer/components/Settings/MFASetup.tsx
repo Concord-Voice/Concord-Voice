@@ -19,6 +19,7 @@ import {
   inlineMfaMethods,
   isStepUpLocked,
   stepUpBanner,
+  stepUpCodeMayBeSpent,
   stepUpMfaError,
   stepUpPasswordError,
   stepUpPromptMethods,
@@ -270,6 +271,8 @@ const MFASetup: React.FC<MFASetupProps> = ({
   // Shared state
   const [password, setPassword] = useState('');
   const [mfaCode, setMfaCode] = useState('');
+  // Bumped to remount the password step's code prompt empty (see dropSetupCode).
+  const [setupPromptKey, setSetupPromptKey] = useState(0);
   const [error, setError] = useState('');
   const [errorField, setErrorField] = useState<'password' | 'mfa' | 'general' | ''>('');
   const [loading, setLoading] = useState(false);
@@ -337,6 +340,18 @@ const MFASetup: React.FC<MFASetupProps> = ({
   };
 
   /**
+   * Drops the password step's code once a submission has settled. The server
+   * accepts each code once and can accept it yet still fail the request, so a
+   * code that was sent is never offered again: the stored copy is cleared and
+   * the prompt remounts empty, which keeps the submit disabled until a fresh
+   * code is typed.
+   */
+  const dropSetupCode = () => {
+    setMfaCode('');
+    setSetupPromptKey((k) => k + 1);
+  };
+
+  /**
    * Applies a begin-step step-up refusal (TOTP setup / WebAuthn register
    * begin) to the shared error state, using the same field routing and copy
    * as every other step-up surface (`mfaStepUp.ts`) instead of the server's
@@ -382,6 +397,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
     } catch (err) {
       setFieldError(err instanceof Error ? err.message : 'Setup failed');
     } finally {
+      dropSetupCode();
       setLoading(false);
     }
   };
@@ -511,13 +527,15 @@ const MFASetup: React.FC<MFASetupProps> = ({
     setTotpStep('recovery-kept');
   };
 
-  /** Records a replace refusal and clears only the factor it rejected,
-   * mirroring the action modal (handoff §1.1). Display is derived at render. */
+  /** Records a refusal to a SENT replace request, mirroring the action modal:
+   * the password is cleared only when it was refused (handoff §1.1), the code
+   * whenever the server may have used it up. Display is derived at render. */
   const applyReplaceRefusal = (result: MfaStepUpResult) => {
     setReplaceRefusal(result);
     if (result.kind === 'passwordRequired' || result.kind === 'invalidPassword') {
       setReplacePassword('');
-    } else if (result.kind === 'invalidMfaCode') {
+    }
+    if (stepUpCodeMayBeSpent(result)) {
       setReplaceMfaPromptKey((k) => k + 1);
       setReplaceMfaCode('');
     }
@@ -529,8 +547,9 @@ const MFASetup: React.FC<MFASetupProps> = ({
       const prep = await resolvePreparation(replacePrepRef);
       if (prep.kind === 'abandoned') return;
       if (prep.kind !== 'ready') {
-        // Nothing was sent, so this is a refusal, not an ambiguous outcome.
-        applyReplaceRefusal(
+        // Nothing was sent, so this is a refusal, not an ambiguous outcome,
+        // and the typed code is still unused — it stays.
+        setReplaceRefusal(
           prep.kind === 'unavailable'
             ? { kind: 'failed', message: REPLACE_KEYS_LOCKED_MESSAGE }
             : { kind: 'failed' }
@@ -638,6 +657,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
       }
       // Otherwise stay on 'registering' step so the error banner is clearly visible
     } finally {
+      dropSetupCode();
       setLoading(false);
     }
   };
@@ -673,6 +693,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
       />
       {showSetupPrompt && (
         <MFAVerifyPrompt
+          key={setupPromptKey}
           methods={inlineMfaMethods(setupPromptMethods ?? activeMethods)}
           recoveryOnlyMethods={recoveryOnlyMethods}
           onVerify={setMfaCode}

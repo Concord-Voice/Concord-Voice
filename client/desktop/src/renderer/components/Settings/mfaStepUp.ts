@@ -106,6 +106,21 @@ export function stepUpBanner(result: MfaStepUpResult | null): string | null {
 }
 
 /**
+ * True when the server may have used up the code that was sent, so the surface
+ * must drop it and wait for a fresh one. The server accepts each code once and
+ * can accept it yet still fail the request, so only two answers leave the code
+ * known-unused: a password refusal (the seam checks the password before it
+ * reads the code) and `aborted`, which `apiFetch` raises only before dispatch.
+ */
+export function stepUpCodeMayBeSpent(result: MfaStepUpResult): boolean {
+  return (
+    result.kind !== 'passwordRequired' &&
+    result.kind !== 'invalidPassword' &&
+    result.kind !== 'aborted'
+  );
+}
+
+/**
  * True when Confirm must stay disabled until the surface is reopened: the
  * budget is spent, or the session is gone. A speed bump — the server budget
  * is the enforcement.

@@ -66,6 +66,14 @@ account can't provide, never your password twice.
 
 ### Fixed
 
+- **Signing in with two-factor authentication no longer hangs when your encryption keys can't be unlocked** ([#3466](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3466), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) —
+  the offer to reset your encryption keys appeared only on the password page, so an account with
+  two-factor authentication waited on it forever after entering its code. It now appears on the
+  two-factor page too, with its code field and buttons styled to match the app. A code the server
+  refuses at sign-in is also cleared from the boxes, since it cannot work a second time.
+- **Regenerating backup codes from Settings works again** ([#3466](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3466), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — the app sent the code
+  from your authenticator app in a field the server does not read, so every regeneration was
+  refused. It now sends the code where the server expects it.
 - **Server owners can mention @all and @here again** ([#3464](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3464), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — the
   permission set the server gives a server's owner did not include the right to mention everyone, so
   an owner's @all or @here was silently removed from the message unless one of their roles also
@@ -291,6 +299,13 @@ account can't provide, never your password twice.
 
 ### Security
 
+- **An authenticator-app code now works only once** ([#3466](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3466), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — each code from your
+  authenticator app is accepted once. Using it again, for a second change or on another screen, is
+  refused just like a wrong code, so a code someone sees over your shoulder or in a screen share
+  cannot be used after you. If you are asked for a code straight after signing in, wait for the next
+  one. The app now clears a code once you submit it instead of offering it again. And if you restart
+  authenticator-app setup while an earlier attempt is still finishing, you are asked to scan the
+  newest QR code, so your account never ends up expecting a code your app cannot produce.
 - **Weakening your account's recovery now asks you to prove it's you** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — turning off email or
   SMS sign-in codes, replacing your recovery key, and adding or removing a backup email now ask for
   your password, plus a code from your authenticator app or security key when you have one set up.

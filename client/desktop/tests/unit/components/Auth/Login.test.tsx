@@ -1434,6 +1434,120 @@ describe('Login', () => {
     });
   });
 
+  // The server accepts each TOTP code once, and the reset prompt follows the
+  // sign-in within seconds — so the code the user just signed in with is
+  // refused here exactly like a wrong one. The copy says so without claiming
+  // which case it was.
+  describe('key reset refusal copy', () => {
+    const runResetWithCode = async (retryReply: { status: number; body: unknown }) => {
+      mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+      const { apiFetch } = await import('@/renderer/services/system/apiClient');
+      (apiFetch as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 403,
+          json: async () => ({ error: 'mfa_required' }),
+        })
+        .mockResolvedValueOnce({
+          ok: false,
+          status: retryReply.status,
+          json: async () => retryReply.body,
+        });
+
+      Object.defineProperty(globalThis, 'electron', {
+        value: {
+          ...globalThis.electron,
+          storeRefreshToken: vi.fn().mockResolvedValue(41),
+          storeE2EEKeys: vi.fn().mockResolvedValue(undefined),
+          checkPermission: vi.fn().mockResolvedValue('granted'),
+        },
+        writable: true,
+      });
+
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => makeLoginResponse() });
+
+      const user = userEvent.setup();
+      render(<Login {...defaultProps} />);
+      await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+      await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+      await user.click(screen.getByText('Sign In'));
+
+      await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+      let dialog = screen.getByRole('dialog');
+      await user.click(within(dialog).getByRole('checkbox'));
+      await user.click(within(dialog).getByRole('button', { name: /reset and continue/i }));
+
+      await vi.waitFor(() =>
+        expect(screen.getByRole('button', { name: /verify and reset/i })).toBeInTheDocument()
+      );
+      dialog = screen.getByRole('dialog');
+      await user.type(within(dialog).getByRole('textbox'), '654321');
+      await user.click(within(dialog).getByRole('button', { name: /verify and reset/i }));
+    };
+
+    it('a refused code gets copy that allows for a code already used to sign in', async () => {
+      await runResetWithCode({ status: 403, body: { error: 'Invalid MFA code' } });
+
+      expect(
+        await screen.findByText(
+          "That code didn't work. Each code can be used once — if you just used it to sign in, wait for the next code."
+        )
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Failed to reset encryption keys/)).not.toBeInTheDocument();
+    });
+
+    it('a refused code on the first request is read once, not re-read', async () => {
+      mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+      const { apiFetch } = await import('@/renderer/services/system/apiClient');
+      // A real body reads once: a second json() rejects, as fetch's does.
+      let read = false;
+      (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => {
+          if (read) throw new TypeError('Body has already been consumed.');
+          read = true;
+          return { error: 'Invalid MFA code' };
+        },
+      });
+      Object.defineProperty(globalThis, 'electron', {
+        value: {
+          ...globalThis.electron,
+          storeRefreshToken: vi.fn().mockResolvedValue(41),
+          storeE2EEKeys: vi.fn().mockResolvedValue(undefined),
+          checkPermission: vi.fn().mockResolvedValue('granted'),
+        },
+        writable: true,
+      });
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => makeLoginResponse() });
+
+      const user = userEvent.setup();
+      render(<Login {...defaultProps} />);
+      await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+      await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+      await user.click(screen.getByText('Sign In'));
+      await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+      const dialog = screen.getByRole('dialog');
+      await user.click(within(dialog).getByRole('checkbox'));
+      await user.click(within(dialog).getByRole('button', { name: /reset and continue/i }));
+
+      expect(
+        await screen.findByText(
+          "That code didn't work. Each code can be used once — if you just used it to sign in, wait for the next code."
+        )
+      ).toBeInTheDocument();
+    });
+
+    it('any other failure keeps the generic copy', async () => {
+      await runResetWithCode({ status: 500, body: { error: 'Invalid MFA code' } });
+
+      expect(
+        await screen.findByText('Failed to reset encryption keys. Please try again.')
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Each code can be used once/)).not.toBeInTheDocument();
+    });
+  });
+
   it('does not reset keys when the user cancels recovery', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
     const { apiFetch } = await import('@/renderer/services/system/apiClient');
@@ -1857,6 +1971,79 @@ describe('Login', () => {
     expect(defaultProps.onSuccess).not.toHaveBeenCalled();
   });
 
+  // Each code is accepted once, so a refused sign-in code is either wrong or
+  // already spent: the digits clear rather than offering it again.
+  it('clears the sign-in code after the server refuses it', async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeMFAResponse(['totp']),
+      })
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: 'Invalid MFA code' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+    await screen.findByText('Two-Factor Authentication');
+
+    for (let digit = 1; digit <= 6; digit += 1) {
+      await user.type(screen.getByLabelText(`Digit ${digit}`), String(digit));
+    }
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+
+    for (let digit = 1; digit <= 6; digit += 1) {
+      expect(screen.getByLabelText(`Digit ${digit}`)).toHaveValue('');
+    }
+  });
+
+  // The MFA step renders its own page, and the key-recovery prompt used to
+  // mount only on the password page, so an MFA account whose keys would not
+  // unwrap waited on a prompt that never appeared.
+  it('offers the key reset when an MFA sign-in cannot unwrap the keys', async () => {
+    mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken: vi.fn().mockResolvedValue(41),
+        storeE2EEKeys: vi.fn().mockResolvedValue(undefined),
+        checkPermission: vi.fn().mockResolvedValue('granted'),
+      },
+      writable: true,
+    });
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, json: async () => makeMFAResponse(['totp']) })
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(makeLoginResponse()), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+    await screen.findByText('Two-Factor Authentication');
+    for (let digit = 1; digit <= 6; digit += 1) {
+      await user.type(screen.getByLabelText(`Digit ${digit}`), String(digit));
+    }
+
+    // Positive control: the sign-in reached the key unwrap.
+    await vi.waitFor(() => expect(mockUnwrapLoginKeys).toHaveBeenCalled());
+    expect(
+      await screen.findByRole('button', { name: /reset and continue/i }, { timeout: 3000 })
+    ).toBeInTheDocument();
+  });
+
   it('revokes the header-identified MFA session when a successful completion body is undecodable', async () => {
     const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     mockFetch
@@ -2027,7 +2214,10 @@ describe('Login', () => {
       code: 'EXCI3G5F',
     });
     releaseVerify({ ok: false, status: 401, json: async () => ({ error: 'Invalid code' }) });
-    await vi.waitFor(() => expect(input).not.toBeDisabled());
+    // The refusal remounts the field empty (a refused code is wrong or spent),
+    // so re-query it rather than holding the detached node.
+    await vi.waitFor(() => expect(screen.getByPlaceholderText('XXXXXXXX')).not.toBeDisabled());
+    expect(screen.getByPlaceholderText('XXXXXXXX')).toHaveValue('');
     expect(verifyCalls()).toHaveLength(1);
   });
 

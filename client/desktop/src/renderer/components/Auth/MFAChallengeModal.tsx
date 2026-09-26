@@ -76,6 +76,9 @@ const MFAChallengeModal: React.FC = () => {
   const [mode, setMode] = useState<MFAMethodCategory | 'method-select'>(defaultMethod);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  // Bumped when a code is refused, remounting the code input empty: each code
+  // is accepted once, so a refused code is either wrong or spent.
+  const [inputKey, setInputKey] = useState(0);
   // WebAuthn options now flow through the store so callers (or tests) can
   // populate them via setState. The modal subscribes selectively and remounts
   // WebAuthnPrompt when options arrive.
@@ -149,10 +152,14 @@ const MFAChallengeModal: React.FC = () => {
           completeChallenge({ verified: true, payload: data }, challengeToken);
         } else if (isCurrent()) {
           setError(data.error || 'Verification failed');
+          setInputKey((k) => k + 1);
         }
       } catch (err) {
         const message = resolveMfaProofError(err, timeout.aborted);
-        if (isCurrent()) setError(message);
+        if (isCurrent()) {
+          setError(message);
+          setInputKey((k) => k + 1);
+        }
       } finally {
         if (isCurrent()) setLoading(false);
       }
@@ -350,6 +357,7 @@ const MFAChallengeModal: React.FC = () => {
 
         {mode === 'totp' && (
           <TOTPInput
+            key={inputKey}
             onSubmit={(code) => handleVerify(code, 'totp')}
             disabled={loading}
             error={error}
@@ -358,6 +366,7 @@ const MFAChallengeModal: React.FC = () => {
 
         {mode === 'backup' && (
           <BackupCodeInput
+            key={inputKey}
             onSubmit={(code) => handleVerify(code, 'backup_code')}
             disabled={loading}
             error={error}
@@ -389,6 +398,7 @@ const MFAChallengeModal: React.FC = () => {
 
         {mode === 'email-sms' && (
           <TOTPInput
+            key={inputKey}
             onSubmit={(code) => handleVerify(code, methods.includes('email') ? 'email' : 'sms')}
             disabled={loading}
             error={error}

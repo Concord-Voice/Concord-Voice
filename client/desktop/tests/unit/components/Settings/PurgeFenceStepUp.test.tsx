@@ -186,6 +186,26 @@ describe('PurgeFenceStepUpDialog — per-field errors (#2765)', () => {
     expect(codeField()).toHaveValue('');
     expect(passwordField()).toHaveValue(FIXTURE_PW);
   });
+
+  // The server accepts each code once and can accept one yet still refuse the
+  // change, so a code that reached it past the password check is never re-sent.
+  it('drops the code after a refusal that may have spent it (a 500)', async () => {
+    serveSection(true);
+    server.use(
+      http.patch(PRIVACY_ENDPOINT, () =>
+        HttpResponse.json({ error: 'Failed to update privacy settings' }, { status: 500 })
+      )
+    );
+
+    await flipFence();
+    await userEvent.type(await screen.findByLabelText('Password'), FIXTURE_PW);
+    await userEvent.type(codeField(), FIXTURE_OTP);
+    await userEvent.click(screen.getByRole('button', { name: SUBMIT_LABEL }));
+
+    expect(await screen.findByText('Failed to update privacy settings')).toBeInTheDocument();
+    expect(codeField()).toHaveValue('');
+    expect(passwordField()).toHaveValue(FIXTURE_PW);
+  });
 });
 
 describe('PurgeFenceStepUpDialog — tightening is never gated (#2765)', () => {

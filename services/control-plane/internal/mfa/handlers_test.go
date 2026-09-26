@@ -894,15 +894,16 @@ func enrollTOTP(t *testing.T, ts *testhelpers.TestServer, user testhelpers.TestU
 	testhelpers.ParseJSON(t, w, &setupBody)
 	secret = setupBody["secret"].(string)
 
-	// Step 2: Verify setup — generate valid code and submit
-	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{
-		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
-	})
-	require.NoError(t, err)
-
-	w = ts.DoRequest("POST", urlTOTPVerifySetup, map[string]interface{}{
-		"code": code,
-	}, auth)
+	// Step 2: Verify setup with the PREVIOUS step's code. Verify-setup records
+	// the step it accepts (last_used_step, RFC 6238 §5.2), so enrolling with the
+	// current step's code would make every caller's own time.Now() code a
+	// replay. The previous step stays inside the skew window unless a step
+	// boundary passes between generating the code and the server checking it;
+	// that is the only way this 403s, and one retry with a fresh code clears it.
+	w = verifySetupWithPreviousStep(t, ts, auth, secret)
+	if w.Code == http.StatusForbidden {
+		w = verifySetupWithPreviousStep(t, ts, auth, secret)
+	}
 	require.Equal(t, http.StatusOK, w.Code)
 	var verifyBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &verifyBody)
@@ -913,6 +914,19 @@ func enrollTOTP(t *testing.T, ts *testhelpers.TestServer, user testhelpers.TestU
 	require.Equal(t, http.StatusOK, w.Code)
 
 	return secret, backupCodes
+}
+
+// verifySetupWithPreviousStep submits the code for the step before now to
+// TOTP verify-setup; see enrollTOTP.
+func verifySetupWithPreviousStep(t *testing.T, ts *testhelpers.TestServer, auth http.Header, secret string) *httptest.ResponseRecorder {
+	t.Helper()
+	code, err := totp.GenerateCodeCustom(secret, time.Now().Add(-30*time.Second), totp.ValidateOpts{
+		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
+	require.NoError(t, err)
+	return ts.DoRequest("POST", urlTOTPVerifySetup, map[string]interface{}{
+		"code": code,
+	}, auth)
 }
 
 // --- Full TOTP Enrollment Flow ---

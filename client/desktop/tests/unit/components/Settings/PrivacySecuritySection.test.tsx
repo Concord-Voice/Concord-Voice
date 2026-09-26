@@ -3742,3 +3742,199 @@ describe('PrivacySecuritySection — screen-capture protection (#2468)', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// ── A sent MFA code is never offered again ──────────────────────────────────
+//
+// The server accepts a TOTP code at most once, and on some routes spends it
+// even when the action then fails. A prompt that kept its code behind an
+// enabled Confirm would re-send a spent code and draw a confusing refusal.
+
+describe('PrivacySecuritySection — a sent MFA code is never offered again', () => {
+  type Reply = { ok: boolean; status: number; json: () => Promise<unknown> };
+  const reply = (status: number, body: unknown): Reply => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  });
+
+  /** Mount GETs for an account with TOTP and another live session; writes go to `onWrite`. */
+  const serve = (onWrite: (path: string, init: RequestInit) => Reply) => {
+    mockApiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method && init.method !== 'GET') return onWrite(path, init);
+      if (path === '/api/v1/sessions') {
+        return reply(200, {
+          sessions: [
+            {
+              id: 's2',
+              device_name: 'Phone',
+              ip_address: '5.6.7.8',
+              user_agent: 'Mozilla/5.0 Chrome/100',
+              expires_at: '2026-12-01T00:00:00Z',
+              created_at: '2026-02-01T00:00:00Z',
+              last_used: new Date().toISOString(),
+              is_current: false,
+            },
+          ],
+          past_sessions: [],
+          revocation_mode: 'secure',
+        });
+      }
+      if (path === '/api/v1/mfa/status') {
+        return reply(200, {
+          methods: ['totp'],
+          recovery_only_methods: [],
+          recovery_hardened: false,
+          backup_codes_remaining: 5,
+          backup_email: '',
+        });
+      }
+      if (path === '/api/v1/mfa/webauthn/credentials') return reply(200, { credentials: [] });
+      return reply(404, {});
+    });
+  };
+
+  /** Enters a code through the (mocked) prompt of the one open dialog. */
+  const enterCode = () => {
+    fireEvent.click(within(screen.getByRole('dialog')).getByTestId('mfa-verify-btn'));
+  };
+
+  /** Resolves once a submitted request has settled and `label` is back. */
+  const settled = (label: string) =>
+    vi.waitFor(() => expect(screen.getByRole('button', { name: label })).toBeInTheDocument());
+
+  beforeEach(() => {
+    drainOnceQueues();
+    vi.clearAllMocks();
+  });
+
+  const openBackupReset = async () => {
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
+    fireEvent.click(screen.getByText(/Reset/));
+    await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
+      target: { value: 'my-password' },
+    });
+    // The backup reset is an inline panel, not a dialog; its prompt renders last.
+    fireEvent.click(screen.getAllByTestId('mfa-verify-btn').at(-1) as HTMLElement);
+  };
+
+  it('backup-code regeneration sends the code as `code`, the field the route binds', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    serve((path, init) => {
+      bodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      return reply(200, { backup_codes: ['CODE1'] });
+    });
+    await openBackupReset();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Regenerate Codes' }));
+    });
+
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toEqual({ password: 'my-password', code: '123456' }); // pragma: allowlist secret
+    expect(bodies[0]).not.toHaveProperty('mfa_code');
+  });
+
+  it('backup-code regeneration: a 500 clears the code and disables Regenerate', async () => {
+    serve(() => reply(500, { error: 'Failed to regenerate backup codes' }));
+    await openBackupReset();
+    expect(screen.getByRole('button', { name: 'Regenerate Codes' })).not.toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Regenerate Codes' }));
+    });
+
+    await vi.waitFor(() =>
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/mfa/backup-codes/regenerate',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    await settled('Regenerate Codes');
+    expect(screen.getByRole('button', { name: 'Regenerate Codes' })).toBeDisabled();
+  });
+
+  it.each([
+    { name: 'a 500', status: 500, body: { error: 'Failed to change revocation mode' } },
+    { name: 'a refused code', status: 403, body: { error: 'Invalid MFA code' } },
+  ])('revocation-mode change: $name clears the code and disables Confirm', async (c) => {
+    serve(() => reply(c.status, c.body));
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
+    // The status read must land first, or the modal asks for a password.
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
+    fireEvent.click(screen.getByText('Simple'));
+    await vi.waitFor(() => expect(screen.getByText('Change Revocation Mode')).toBeInTheDocument());
+    enterCode();
+    expect(screen.getByRole('button', { name: 'Confirm' })).not.toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    });
+
+    await vi.waitFor(() =>
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/sessions/revocation-mode',
+        expect.objectContaining({ body: JSON.stringify({ mode: 'simple', mfa_code: '123456' }) })
+      )
+    );
+    await settled('Confirm');
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+  });
+
+  it.each([
+    { name: 'a 500', status: 500, body: { error: 'Failed to revoke session' } },
+    { name: 'a refused code', status: 403, body: { error: 'Invalid MFA code' } },
+  ])('single-session revoke: $name clears the code and disables Confirm', async (c) => {
+    const deletes: RequestInit[] = [];
+    serve((path, init) => {
+      deletes.push(init);
+      // The first, credential-less attempt asks for verification.
+      return deletes.length === 1
+        ? reply(403, { error: 'auth_required' })
+        : reply(c.status, c.body);
+    });
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
+    await act(async () => {
+      fireEvent.click(screen.getByText('Revoke'));
+    });
+    await vi.waitFor(() => expect(screen.getByText('Verify Your Identity')).toBeInTheDocument());
+    enterCode();
+    expect(screen.getByRole('button', { name: 'Confirm & Revoke' })).not.toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm & Revoke' }));
+    });
+
+    await vi.waitFor(() => expect(deletes).toHaveLength(2));
+    expect(JSON.parse(deletes[1].body as string)).toEqual({ mfa_code: '123456' });
+    await settled('Confirm & Revoke');
+    expect(screen.getByRole('button', { name: 'Confirm & Revoke' })).toBeDisabled();
+  });
+
+  it('revoke all: a refused code clears the code and disables Confirm', async () => {
+    serve(() => reply(403, { error: 'Invalid MFA code' }));
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
+    fireEvent.click(screen.getByText('Revoke All Sessions'));
+    await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    enterCode();
+    const confirm = () => screen.getByRole('button', { name: 'Yes, Revoke All Sessions' });
+    expect(confirm()).not.toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(confirm());
+    });
+
+    await vi.waitFor(() =>
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/sessions/revoke-all',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    await settled('Yes, Revoke All Sessions');
+    expect(confirm()).toBeDisabled();
+  });
+});

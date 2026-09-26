@@ -9,6 +9,7 @@ import { apiFetch } from '../../services/system/apiClient';
 import {
   isStepUpLocked,
   stepUpBanner,
+  stepUpCodeMayBeSpent,
   stepUpMfaError,
   stepUpPasswordError,
   stepUpPromptMethods,
@@ -503,13 +504,16 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
     }
   };
 
-  /** Records a refusal and clears only the factor it rejected, per the handoff
-   * §1.1 routing table. Where the refusal is SHOWN is derived at render. */
+  /** Records a refusal, clears the password only when it was refused (handoff
+   * §1.1), and clears the code whenever the server may have used it up — the
+   * prompt remounts empty so Confirm waits for a fresh one. Where the refusal
+   * is SHOWN is derived at render. */
   const applyRefusal = (result: MfaStepUpResult) => {
     setActionRefusal(result);
     if (result.kind === 'passwordRequired' || result.kind === 'invalidPassword') {
       setActionPassword('');
-    } else if (result.kind === 'invalidMfaCode') {
+    }
+    if (stepUpCodeMayBeSpent(result)) {
       setMfaPromptKey((k) => k + 1);
       setActionMfaCode('');
     }

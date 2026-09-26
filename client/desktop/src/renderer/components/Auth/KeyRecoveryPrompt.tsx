@@ -56,11 +56,12 @@ export default function KeyRecoveryPrompt({
             <p>
               Enter your multi-factor authentication code to confirm resetting your encryption keys.
             </p>
-            <label className="key-recovery-prompt__ack" htmlFor="key-recovery-mfa-code">
+            <label className="key-recovery-prompt__field-label" htmlFor="key-recovery-mfa-code">
               MFA code
             </label>
             <input
               id="key-recovery-mfa-code"
+              className="key-recovery-prompt__code"
               type="text"
               inputMode="numeric"
               autoComplete="one-time-code"
@@ -68,7 +69,12 @@ export default function KeyRecoveryPrompt({
               onChange={(e) => setMfaCode(e.target.value)}
             />
             <div className="key-recovery-prompt__actions">
-              <button type="button" autoFocus onClick={onCancel}>
+              <button
+                type="button"
+                className="key-recovery-prompt__cancel"
+                autoFocus
+                onClick={onCancel}
+              >
                 Cancel
               </button>
               <button
@@ -98,7 +104,13 @@ export default function KeyRecoveryPrompt({
               I understand my encrypted message history will be permanently deleted.
             </label>
             <div className="key-recovery-prompt__actions">
-              <button type="button" autoFocus onClick={onCancel} disabled={submitting}>
+              <button
+                type="button"
+                className="key-recovery-prompt__cancel"
+                autoFocus
+                onClick={onCancel}
+                disabled={submitting}
+              >
                 Cancel
               </button>
               <button

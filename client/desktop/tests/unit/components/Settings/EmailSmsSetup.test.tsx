@@ -208,4 +208,44 @@ describe('EmailSmsSetup', () => {
     await waitFor(() => expect(warn).toHaveBeenCalledWith('[mfa] Refresh after enrollment failed'));
     warn.mockRestore();
   });
+
+  // The server accepts each code once and can accept one yet still fail the
+  // request, so a code that was sent is never offered again.
+  describe('a sent MFA code is never offered again', () => {
+    const fillAndSend = () => {
+      render(<EmailSmsSetup mfaActive onComplete={onComplete} onCancel={onCancel} />);
+      fireEvent.change(screen.getByPlaceholderText('Your password'), {
+        target: { value: 'mypassword' },
+      });
+      fireEvent.change(screen.getByPlaceholderText('MFA code from your authenticator'), {
+        target: { value: '654321' },
+      });
+      expect(screen.getByText('Send Code')).not.toBeDisabled();
+      fireEvent.click(screen.getByText('Send Code'));
+    };
+
+    it('a 500 clears the code and disables Send Code', async () => {
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'Internal server error' }),
+      });
+      fillAndSend();
+
+      expect(await screen.findByText('Internal server error')).toBeInTheDocument();
+      expect(screen.getByPlaceholderText('MFA code from your authenticator')).toHaveValue('');
+      expect(screen.getByText('Send Code')).toBeDisabled();
+    });
+
+    it('Back from the verify step asks for a fresh code', async () => {
+      mockSetupSuccess();
+      fillAndSend();
+      await waitFor(() => expect(screen.getByLabelText('Email code')).toBeInTheDocument());
+
+      fireEvent.click(screen.getByText('Back'));
+
+      expect(screen.getByPlaceholderText('MFA code from your authenticator')).toHaveValue('');
+      expect(screen.getByText('Send Code')).toBeDisabled();
+    });
+  });
 });

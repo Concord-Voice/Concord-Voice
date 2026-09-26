@@ -122,10 +122,13 @@ const PurgeFenceStepUpDialog: React.FC<PurgeFenceStepUpDialogProps> = ({ open, o
         onClose();
         return;
       }
-      // Drop only the factor the server rejected, so a wrong password does not
-      // cost the user a fresh code they already typed.
+      // Drop the password only when it was rejected. Drop the code whenever the
+      // server may have used it up: it accepts each code once and can accept
+      // it yet still refuse the change. A password refusal is the one answer
+      // that leaves the code unread (the password is checked first), so a
+      // wrong password does not cost the user a fresh code they already typed.
       if (result.kind === 'invalidPassword') setPassword('');
-      if (result.kind === 'invalidMfaCode') setCode('');
+      if (result.kind !== 'invalidPassword' && result.kind !== 'passwordRequired') setCode('');
       setRefusal(result);
     } finally {
       // Without this the dialog is unclosable: `busy` disables the fieldset that

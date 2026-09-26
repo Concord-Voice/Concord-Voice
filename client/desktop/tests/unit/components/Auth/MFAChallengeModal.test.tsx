@@ -30,24 +30,32 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 }));
 
 // Mock child components to isolate MFAChallengeModal behavior
-vi.mock('@/renderer/components/Auth/TOTPInput', () => ({
-  default: ({
-    onSubmit,
-    disabled,
-    error,
-  }: {
-    onSubmit: (code: string) => void;
-    disabled?: boolean;
-    error?: string;
-  }) => (
-    <div data-testid="totp-input">
-      <button data-testid="totp-submit" disabled={disabled} onClick={() => onSubmit('123456')}>
-        Submit TOTP
-      </button>
-      {error && <span data-testid="totp-error">{error}</span>}
-    </div>
-  ),
-}));
+// Counts mounts, so a test can see the modal remount the input to clear it.
+const totpMounts = vi.hoisted(() => ({ count: 0 }));
+vi.mock('@/renderer/components/Auth/TOTPInput', async () => {
+  const React = await import('react');
+  return {
+    default: function MockTOTPInput({
+      onSubmit,
+      disabled,
+      error,
+    }: {
+      onSubmit: (code: string) => void;
+      disabled?: boolean;
+      error?: string;
+    }) {
+      const [mount] = React.useState(() => ++totpMounts.count);
+      return (
+        <div data-testid="totp-input" data-mount={mount}>
+          <button data-testid="totp-submit" disabled={disabled} onClick={() => onSubmit('123456')}>
+            Submit TOTP
+          </button>
+          {error && <span data-testid="totp-error">{error}</span>}
+        </div>
+      );
+    },
+  };
+});
 
 vi.mock('@/renderer/components/Auth/BackupCodeInput', () => ({
   default: ({
@@ -446,6 +454,35 @@ describe('MFAChallengeModal', () => {
     });
     expect(mockResolve).not.toHaveBeenCalled();
     expect(useMFAChallengeStore.getState().challengeToken).toBe('test-token');
+  });
+
+  // Each code is accepted once, so a refused code is either wrong or already
+  // spent: the input remounts empty rather than offering it again.
+  it.each([
+    [
+      'a refusal',
+      () =>
+        mockFetch.mockResolvedValueOnce({
+          ok: false,
+          json: async () => ({ error: 'Invalid MFA code' }),
+        }),
+    ],
+    ['a network error', () => mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'))],
+  ])('remounts the code input after %s', async (_label, arrange) => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'test-token',
+      methods: ['totp'],
+      recoveryOnlyMethods: [],
+      resolve: vi.fn(),
+    });
+    arrange();
+
+    render(<MFAChallengeModal />);
+    const before = screen.getByTestId('totp-input').dataset.mount;
+    fireEvent.click(screen.getByTestId('totp-submit'));
+
+    await waitFor(() => expect(screen.getByTestId('totp-error')).toBeInTheDocument());
+    expect(screen.getByTestId('totp-input').dataset.mount).not.toBe(before);
   });
 
   it('treats res.json() parse failure on a 2xx response as a verification failure (modal stays open)', async () => {

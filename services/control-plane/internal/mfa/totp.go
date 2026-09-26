@@ -43,15 +43,40 @@ func GenerateSecret(email string) (*otp.Key, error) {
 	})
 }
 
-// ValidateCode checks a TOTP code against a secret with a 1-step skew window.
-func ValidateCode(secret, code string) bool {
-	valid, _ := totp.ValidateCustom(code, secret, time.Now(), totp.ValidateOpts{
-		Period:    totpPeriod,
-		Digits:    totpDigits,
-		Algorithm: totpAlgo,
-		Skew:      totpSkew,
-	})
-	return valid
+// MatchCodeStep checks a TOTP code against a secret with a 1-step skew window
+// and reports which 30-second time step (Unix time / totpPeriod) it matched.
+// A match is not an acceptance: the caller must record the step through a
+// guarded write that admits only a step later than the last one accepted
+// (user_mfa_totp.last_used_step), which is what makes a code single-use
+// (RFC 6238 §5.2).
+func MatchCodeStep(secret, code string) (step int64, ok bool) {
+	return matchCodeStepAt(secret, code, time.Now())
+}
+
+// matchCodeStepAt is MatchCodeStep at a given instant. pquerna/otp's
+// totp.ValidateCustom returns only a bool, so the window is enumerated here.
+// Every candidate is generated and compared in constant time whether or not an
+// earlier one matched, and a code that matches two candidates (a six-digit
+// collision inside the window) reports the later one, so the recorded step can
+// only burn more of the window, never less. Each candidate is
+// generated at the start of its own step, so the counter the library derives
+// is exactly the step reported.
+func matchCodeStepAt(secret, code string, now time.Time) (step int64, ok bool) {
+	// hotp.ValidateCustom, which the previous matcher went through, trimmed
+	// surrounding whitespace; keep accepting what it accepted.
+	submitted := []byte(strings.TrimSpace(code))
+	opts := totp.ValidateOpts{Period: totpPeriod, Digits: totpDigits, Algorithm: totpAlgo}
+	current := now.Unix() / totpPeriod
+	for candidate := current - totpSkew; candidate <= current+totpSkew; candidate++ {
+		want, err := totp.GenerateCodeCustom(secret, time.Unix(candidate*totpPeriod, 0), opts)
+		if err != nil {
+			return 0, false
+		}
+		if subtle.ConstantTimeCompare([]byte(want), submitted) == 1 {
+			step, ok = candidate, true
+		}
+	}
+	return step, ok
 }
 
 // EncryptSecret encrypts a TOTP secret using AES-256-GCM.

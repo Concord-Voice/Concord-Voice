@@ -147,7 +147,21 @@ func iuEnrollTOTP(t *testing.T, db *sql.DB, kr *Keyring, userID string) string {
 
 func iuTOTPCode(t *testing.T, secret string) string {
 	t.Helper()
-	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{
+	return iuTOTPCodeAt(t, secret, time.Now())
+}
+
+// iuTOTPNextCode mints the code for the step after now. A TOTP code is
+// accepted once per step (last_used_step, migration 000158), so a second
+// verification for the same user needs a later step; the next one is still
+// inside the skew window.
+func iuTOTPNextCode(t *testing.T, secret string) string {
+	t.Helper()
+	return iuTOTPCodeAt(t, secret, time.Now().Add(30*time.Second))
+}
+
+func iuTOTPCodeAt(t *testing.T, secret string, at time.Time) string {
+	t.Helper()
+	code, err := totp.GenerateCodeCustom(secret, at, totp.ValidateOpts{
 		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
 	})
 	require.NoError(t, err)
@@ -524,9 +538,10 @@ func TestOpenAndVerifyMFASettingsStepUpTx_PoolSafety(t *testing.T) {
 			creds: func() mfaStepUpCredentials {
 				return mfaStepUpCredentials{Password: iuPassword, MFACode: iuTOTPCode(t, totpSecret)}
 			}},
+		// The step above committed its code's step, so this one uses the next.
 		{name: "FOR SHARE, TOTP leg", userID: totpUser, lock: lockForShare,
 			creds: func() mfaStepUpCredentials {
-				return mfaStepUpCredentials{Password: iuPassword, MFACode: iuTOTPCode(t, totpSecret)}
+				return mfaStepUpCredentials{Password: iuPassword, MFACode: iuTOTPNextCode(t, totpSecret)}
 			}},
 		{name: "FOR NO KEY UPDATE, TOTP enrolled, code missing", userID: totpUser, lock: lockForNoKeyUpdate,
 			creds:           func() mfaStepUpCredentials { return mfaStepUpCredentials{Password: iuPassword} },
@@ -670,12 +685,14 @@ func TestHandlers_PoolSafety_GreenButProspective(t *testing.T) {
 			handler: h.SetBackupEmail,
 		},
 		{
+			// EmailSmsDisable above spent totpUser's current step, so this
+			// verification uses the next one.
 			name: "StoreRecoveryKey overwrite (seeded K1), password + valid TOTP code", userID: totpUser,
 			method: http.MethodPut, path: "/recovery-key",
 			body: fmt.Sprintf(`{"recovery_wrapped_private_key":%q,"recovery_key_salt":%q,"password":%q,"mfa_code":%q}`,
 				base64.StdEncoding.EncodeToString([]byte("iu-overwrite-recovery-key-32-by")),
 				base64.StdEncoding.EncodeToString([]byte("iu-overwrite-salt-16b")),
-				iuPassword, iuTOTPCode(t, totpSecret)),
+				iuPassword, iuTOTPNextCode(t, totpSecret)),
 			handler: h.StoreRecoveryKey,
 		},
 		{

@@ -232,6 +232,8 @@ const AuthVerifyField: React.FC<{
   inputId: string;
   onEnterKey?: () => void;
   excludeBackupCodes?: boolean;
+  /** Remounts the code prompt empty when it changes (see `dropCode`). */
+  promptKey: number;
 }> = ({
   hasMFA,
   mfaMethods,
@@ -245,10 +247,12 @@ const AuthVerifyField: React.FC<{
   inputId,
   onEnterKey,
   excludeBackupCodes,
+  promptKey,
 }) => {
   if (hasMFA) {
     return (
       <MFAVerifyPrompt
+        key={promptKey}
         methods={mfaMethods}
         recoveryOnlyMethods={mfaRecoveryOnly}
         onVerify={(code) => {
@@ -741,6 +745,16 @@ const PrivacySecuritySection: React.FC = () => {
   const [backupResetLoading, setBackupResetLoading] = useState(false);
   const [backupResetCodes, setBackupResetCodes] = useState<string[] | null>(null);
 
+  // The server accepts each MFA code once and can accept one yet still fail
+  // the request, so every code prompt here drops its code once a submission
+  // settles: the stored copy, and — by remounting the prompt — the digits on
+  // screen, so Confirm stays disabled until a fresh code is typed.
+  const [codePromptKey, setCodePromptKey] = useState(0);
+  const dropCode = (setCode: (code: string) => void) => {
+    setCode('');
+    setCodePromptKey((k) => k + 1);
+  };
+
   useEffect(() => {
     let mounted = true;
     void globalThis.electron
@@ -982,7 +996,8 @@ const PrivacySecuritySection: React.FC = () => {
       const res = await apiFetch('/api/v1/mfa/backup-codes/regenerate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: backupResetPassword, mfa_code: backupResetMfaCode }),
+        // The route binds the code as `code`, not the step-up seam's `mfa_code`.
+        body: JSON.stringify({ password: backupResetPassword, code: backupResetMfaCode }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to regenerate backup codes');
@@ -991,6 +1006,7 @@ const PrivacySecuritySection: React.FC = () => {
     } catch (err) {
       setBackupResetError(err instanceof Error ? err.message : 'Failed to regenerate codes');
     } finally {
+      dropCode(setBackupResetMfaCode);
       setBackupResetLoading(false);
     }
   };
@@ -1051,6 +1067,7 @@ const PrivacySecuritySection: React.FC = () => {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to revoke session');
     } finally {
+      dropCode(setSessionMfaCode);
       setRevokingId(null);
     }
   };
@@ -1147,6 +1164,7 @@ const PrivacySecuritySection: React.FC = () => {
     } catch (err) {
       setModeChangeError(err instanceof Error ? err.message : 'Failed to change revocation mode');
     } finally {
+      dropCode(setModeChangeMfaCode);
       setIsChangingMode(false);
     }
   };
@@ -1203,6 +1221,7 @@ const PrivacySecuritySection: React.FC = () => {
       setError(err instanceof Error ? err.message : 'Failed to revoke sessions');
       setShowRevokeAllModal(false);
     } finally {
+      dropCode(setRevokeMfaCode);
       setIsRevokingAll(false);
     }
   };
@@ -1488,6 +1507,7 @@ const PrivacySecuritySection: React.FC = () => {
               </div>
 
               <MFAVerifyPrompt
+                key={codePromptKey}
                 methods={mfaMethods}
                 recoveryOnlyMethods={mfaRecoveryOnly}
                 onVerify={setBackupResetMfaCode}
@@ -1834,6 +1854,7 @@ const PrivacySecuritySection: React.FC = () => {
               password={revokePassword}
               onPasswordChange={setRevokePassword}
               onMfaVerify={setRevokeMfaCode}
+              promptKey={codePromptKey}
               error={revokePasswordError}
               onClearError={() => setRevokePasswordError('')}
               disabled={isRevokingAll}
@@ -1876,6 +1897,7 @@ const PrivacySecuritySection: React.FC = () => {
               password={sessionPassword}
               onPasswordChange={setSessionPassword}
               onMfaVerify={setSessionMfaCode}
+              promptKey={codePromptKey}
               error={sessionPasswordError}
               onClearError={() => setSessionPasswordError('')}
               disabled={revokingId === sessionPasswordTarget}
@@ -1931,6 +1953,7 @@ const PrivacySecuritySection: React.FC = () => {
               password={modeChangePassword}
               onPasswordChange={setModeChangePassword}
               onMfaVerify={setModeChangeMfaCode}
+              promptKey={codePromptKey}
               error={modeChangeError}
               onClearError={() => setModeChangeError('')}
               disabled={isChangingMode}

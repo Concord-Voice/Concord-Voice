@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"testing"
 	"time"
 
@@ -29,28 +30,127 @@ func TestGenerateSecret(t *testing.T) {
 	}
 }
 
-func TestValidateCode(t *testing.T) {
-	key, err := GenerateSecret("test@example.com")
-	if err != nil {
-		t.Fatalf("GenerateSecret failed: %v", err)
-	}
+// stepFixtureSecret is a fixed seed, so the matcher tests never depend on a
+// random secret or on when they run.
+const stepFixtureSecret = "JBSWY3DPEHPK3PXP" //nolint:gosec // test-only TOTP seed // pragma: allowlist secret
 
-	// Generate a valid code
-	code, err := totp.GenerateCodeCustom(key.Secret(), time.Now(), totp.ValidateOpts{
+// stepCode generates the TOTP code for one time step with the parameters
+// MatchCodeStep checks against.
+func stepCode(t *testing.T, secret string, step int64) string {
+	t.Helper()
+	code, err := totp.GenerateCodeCustom(secret, time.Unix(step*totpPeriod, 0), totp.ValidateOpts{
 		Period:    totpPeriod,
 		Digits:    totpDigits,
 		Algorithm: totpAlgo,
 	})
 	if err != nil {
-		t.Fatalf("GenerateCode failed: %v", err)
+		t.Fatalf("GenerateCodeCustom failed: %v", err)
+	}
+	return code
+}
+
+// TestMatchCodeStep pins the step matcher: each of the three candidate steps in
+// the skew window reports its own step, and a code outside the window, a wrong
+// code, or a bad secret reports no match.
+func TestMatchCodeStep(t *testing.T) {
+	// A fixed secret and a fixed instant 7 s into its step, so no candidate
+	// sits on a boundary and the result never depends on when the test runs.
+	const secret = stepFixtureSecret // pragma: allowlist secret -- test-only TOTP seed
+	const current = int64(59_000_000)
+	now := time.Unix(current*totpPeriod+7, 0)
+
+	// Codes for steps current-2 .. current+2. They must be distinct, or a
+	// single-match case below would really be a double match.
+	codes := map[int64]string{}
+	seen := map[string]bool{}
+	for offset := int64(-2); offset <= 2; offset++ {
+		code := stepCode(t, secret, current+offset)
+		if seen[code] {
+			t.Fatalf("fixture broken: step %d repeats an earlier code", current+offset)
+		}
+		seen[code] = true
+		codes[offset] = code
 	}
 
-	if !ValidateCode(key.Secret(), code) {
-		t.Error("valid code rejected")
+	for _, offset := range []int64{-1, 0, 1} {
+		want := current + offset
+		if got, ok := matchCodeStepAt(secret, codes[offset], now); !ok || got != want {
+			t.Errorf("offset %d: matchCodeStepAt = (%d, %v), want (%d, true)", offset, got, ok, want)
+		}
+		// Surrounding whitespace is trimmed, as the previous matcher did.
+		if got, ok := matchCodeStepAt(secret, " "+codes[offset]+"\n", now); !ok || got != want {
+			t.Errorf("offset %d: padded code = (%d, %v), want (%d, true)", offset, got, ok, want)
+		}
 	}
 
-	if ValidateCode(key.Secret(), "000000") {
-		t.Error("invalid code accepted")
+	for _, offset := range []int64{-2, 2} {
+		if got, ok := matchCodeStepAt(secret, codes[offset], now); ok {
+			t.Errorf("offset %d is outside the skew window but matched step %d", offset, got)
+		}
+	}
+
+	// A wrong code, chosen deterministically so it is none of the window's.
+	wrong := 0
+	for seen[fmt.Sprintf("%06d", wrong)] {
+		wrong++
+	}
+	for _, code := range []string{fmt.Sprintf("%06d", wrong), "", "12345", "1234567", "abcdef"} {
+		if got, ok := matchCodeStepAt(secret, code, now); ok {
+			t.Errorf("code %q matched step %d, want no match", code, got)
+		}
+	}
+
+	if _, ok := matchCodeStepAt("not base32!", codes[0], now); ok {
+		t.Error("an undecodable secret must never match")
+	}
+}
+
+// TestMatchCodeStepDoubleMatchReportsHighest pins that a code matching two
+// candidates reports the later step, so recording it burns the whole
+// collision. The fixture was found by search: for this secret, steps
+// 59607044 and 59607045 share one code.
+func TestMatchCodeStepDoubleMatchReportsHighest(t *testing.T) {
+	const secret = stepFixtureSecret // pragma: allowlist secret -- test-only TOTP seed
+	const lo, hi = int64(59607044), int64(59607045)
+	code := stepCode(t, secret, lo)
+	if stepCode(t, secret, hi) != code {
+		t.Fatalf("fixture broken: steps %d and %d no longer share a code", lo, hi)
+	}
+
+	cases := []struct {
+		name    string
+		current int64
+		want    int64
+	}{
+		{"both in window, current is the lower", lo, hi},
+		{"both in window, current is the higher", hi, hi},
+		{"lower out of window", hi + 1, hi},
+		{"higher out of window", lo - 1, lo},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := matchCodeStepAt(secret, code, time.Unix(tc.current*totpPeriod+7, 0))
+			if !ok || got != tc.want {
+				t.Errorf("matchCodeStepAt = (%d, %v), want (%d, true)", got, ok, tc.want)
+			}
+		})
+	}
+}
+
+// TestMatchCodeStepReadsTheClock pins that the exported matcher reads the real
+// clock: a code generated for now matches the step now falls in.
+func TestMatchCodeStepReadsTheClock(t *testing.T) {
+	key, err := GenerateSecret("test@example.com")
+	if err != nil {
+		t.Fatalf("GenerateSecret failed: %v", err)
+	}
+	before := time.Now().Unix() / totpPeriod
+	code := stepCode(t, key.Secret(), before)
+	got, ok := MatchCodeStep(key.Secret(), code)
+	// A step boundary may pass between the two reads; the code then matches as
+	// the previous step, which still names before.
+	if !ok || got < before {
+		t.Errorf("MatchCodeStep = (%d, %v), want (>= %d, true)", got, ok, before)
 	}
 }
 

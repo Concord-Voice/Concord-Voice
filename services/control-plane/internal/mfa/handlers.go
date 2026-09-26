@@ -69,6 +69,7 @@ const (
 	errMsgPasswordRequired           = "Password is required"
 	errMsgIncorrectPassword          = "Incorrect password"
 	errMsgCodeRequired               = "Code is required"
+	errMsgInvalidTOTPCode            = "Invalid TOTP code" // wrong, replayed and undecryptable codes all answer this
 	errMsgFailedBackupCodes          = "Failed to generate backup codes"
 	errMsgFailedStartReg             = "Failed to start registration"
 	errMsgFailedActivateMFA          = "Failed to activate MFA"
@@ -309,8 +310,8 @@ func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerific
 				"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
 			return false, "", fmt.Errorf("TOTP secret decryption failed: %w", decErr)
 		}
-		if ValidateCode(string(secret), code) {
-			return true, "totp", nil
+		if step, matched := MatchCodeStep(string(secret), code); matched {
+			return acceptTOTPStep(ctx, store, userID, step)
 		}
 
 		backupVerified, backupErr := consumeBackupCode(ctx, store, userID, code)
@@ -335,6 +336,37 @@ func (h *Handler) consumeWebAuthnInlineToken(ctx context.Context, userID, code s
 		return false, fmt.Errorf("consume WebAuthn inline verification token: %w", err)
 	}
 	return token != "", nil
+}
+
+// acceptTOTPStep finishes verifyCodeMatchedMethod for a TOTP code that matched
+// step: it records step as userID's last accepted step, and accepts the code
+// only if that write happened. The guard admits only a step strictly later
+// than the last one accepted, so a replayed code updates no row, and so does
+// the loser of two concurrent submissions of one code: under READ COMMITTED it
+// waits on the winner's row lock and re-evaluates the guard against the
+// committed step. A refused advance answers exactly as a wrong code, and the
+// code is not then tried as a backup code.
+//
+// It runs on the store the caller verified on, so inside a transaction a
+// rollback un-burns the step with everything else, as it does a backup code.
+// On the pool the advance commits at once, so an action that fails after
+// verification has still spent the step.
+func acceptTOTPStep(ctx context.Context, store codeVerificationStore, userID string, step int64) (bool, string, error) {
+	result, err := store.ExecContext(ctx,
+		`UPDATE user_mfa_totp SET last_used_step = $2, updated_at = NOW() WHERE user_id = $1 AND (last_used_step IS NULL OR last_used_step < $2)`,
+		userID, step,
+	)
+	if err != nil {
+		return false, "", fmt.Errorf("record TOTP step: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, "", fmt.Errorf("read TOTP step result: %w", err)
+	}
+	if rows != 1 {
+		return false, "", nil
+	}
+	return true, "totp", nil
 }
 
 func consumeBackupCode(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, error) {
@@ -997,6 +1029,7 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 				confirmed_at = NULL,
 				backup_codes_hash = '{}',
 				backup_codes_used = '{}',
+				last_used_step = NULL,
 				updated_at = NOW()
 		`, userID, ciphertext, nonce, keyVer); err != nil {
 			return fmt.Errorf("store TOTP secret: %w", err)
@@ -1083,7 +1116,8 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 		return
 	}
 
-	if !ValidateCode(string(secret), req.Code) {
+	step, matched := MatchCodeStep(string(secret), req.Code)
+	if !matched {
 		// Track failed attempts. An attempt that could not be counted fails
 		// closed rather than answering "invalid code" uncounted.
 		attemptsKey := fmt.Sprintf("mfa_setup_attempts:%s", userID)
@@ -1104,17 +1138,16 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 		return
 	}
 
-	// Mark as enabled (code verified) but NOT confirmed (backup codes not yet acknowledged)
-	usedFlags := make([]bool, len(hashes))
-
-	_, err = h.db.ExecContext(ctx, `
-		UPDATE user_mfa_totp
-		SET enabled = TRUE, verified_at = NOW(), backup_codes_hash = $1, backup_codes_used = $2, updated_at = NOW()
-		WHERE user_id = $3
-	`, pq.Array(hashes), pq.Array(usedFlags), userID)
-	if err != nil {
-		h.log.Error("Failed to update TOTP status", "user_id", userID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete verification"})
+	// Mark as enabled (code verified) but NOT confirmed (backup codes not yet
+	// acknowledged), recording the code's step. The guard is the compare-and-set
+	// for two races. `enabled = FALSE`: of two submissions that both passed the
+	// read above, the second waits on the first's row lock, re-reads enabled as
+	// TRUE and updates nothing, so only one response carries backup codes, and
+	// they are the stored ones. `totp_secret_nonce`: a TOTPSetup re-enrolment
+	// that lands between the read and this write stores a new secret whose row
+	// is also not enabled; the nonce, fresh on every seal, is what tells the
+	// secret this code was checked against from the one now stored.
+	if !h.enableVerifiedTOTP(ctx, c, userID, hashes, step, secretNonce) {
 		return
 	}
 	// The UPDATE autocommitted, so this is after its commit.
@@ -1135,6 +1168,55 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 		"backup_codes": codes,
 		"message":      "TOTP verified. Save your backup codes, then call /mfa/totp/confirm-setup to activate MFA.",
 	})
+}
+
+// enableVerifiedTOTP runs TOTPVerifySetup's guarded UPDATE: it marks the
+// factor enabled, stores the backup-code hashes and records the code's step,
+// but only while the row is still not enabled and still holds the secret the
+// code was checked against. It answers the request itself and returns false
+// when the UPDATE failed or changed no row.
+func (h *Handler) enableVerifiedTOTP(ctx context.Context, c *gin.Context, userID string, hashes []string, step int64, secretNonce []byte) bool {
+	usedFlags := make([]bool, len(hashes))
+	result, err := h.db.ExecContext(ctx, `
+		UPDATE user_mfa_totp
+		SET enabled = TRUE, verified_at = NOW(), backup_codes_hash = $1, backup_codes_used = $2, last_used_step = $3, updated_at = NOW()
+		WHERE user_id = $4 AND enabled = FALSE AND totp_secret_nonce = $5
+	`, pq.Array(hashes), pq.Array(usedFlags), step, userID, secretNonce)
+	if err != nil {
+		h.log.Error("Failed to update TOTP status", "user_id", userID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete verification"})
+		return false
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read the TOTP status update result", "user_id", userID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete verification"})
+		return false
+	}
+	if rows != 1 {
+		h.refuseUnappliedVerifySetup(ctx, c, userID)
+		return false
+	}
+	return true
+}
+
+// errMsgTOTPSetupRestarted is the 409 for a verify-setup whose secret was
+// replaced by a newer TOTPSetup after its code was checked.
+const errMsgTOTPSetupRestarted = "TOTP setup was restarted. Enter a code from the newest QR code."
+
+// refuseUnappliedVerifySetup answers a verify-setup whose guarded UPDATE
+// changed no row. It re-reads only to choose honest copy: a concurrent
+// submission already enabled the factor, or a re-enrolment replaced the
+// secret the code was checked against. Either way nothing was enabled and no
+// backup codes are returned, so a failed re-read still answers 409.
+func (h *Handler) refuseUnappliedVerifySetup(ctx context.Context, c *gin.Context, userID string) {
+	var enabled bool
+	err := h.db.QueryRowContext(ctx, `SELECT enabled FROM user_mfa_totp WHERE user_id = $1`, userID).Scan(&enabled)
+	if err == nil && enabled {
+		c.JSON(http.StatusConflict, gin.H{"error": "TOTP is already verified"})
+		return
+	}
+	c.JSON(http.StatusConflict, gin.H{"error": errMsgTOTPSetupRestarted})
 }
 
 // TOTP confirm-setup refusals, carried out of the write transaction so it
@@ -1382,11 +1464,12 @@ func (h *Handler) RegenerateBackupCodes(c *gin.Context) {
 		// sites. The client still sees the same 403 (no oracle).
 		h.log.Error("Failed to decrypt TOTP secret",
 			"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid TOTP code"})
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInvalidTOTPCode})
 		return
 	}
-	if !ValidateCode(string(secret), req.Code) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid TOTP code"})
+	step, matched := MatchCodeStep(string(secret), req.Code)
+	if !matched {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInvalidTOTPCode})
 		return
 	}
 
@@ -1398,13 +1481,27 @@ func (h *Handler) RegenerateBackupCodes(c *gin.Context) {
 		return
 	}
 
+	// The code's step is recorded in the same statement, under the guard
+	// acceptTOTPStep uses: a replayed code, or the loser of two concurrent
+	// submissions of one code, updates no row and answers as a wrong code.
 	usedFlags := make([]bool, len(hashes))
-	_, err = h.db.ExecContext(ctx, `
-		UPDATE user_mfa_totp SET backup_codes_hash = $1, backup_codes_used = $2, updated_at = NOW() WHERE user_id = $3
-	`, pq.Array(hashes), pq.Array(usedFlags), userID)
+	result, err := h.db.ExecContext(ctx, `
+		UPDATE user_mfa_totp SET backup_codes_hash = $1, backup_codes_used = $2, last_used_step = $3, updated_at = NOW()
+		WHERE user_id = $4 AND (last_used_step IS NULL OR last_used_step < $3)
+	`, pq.Array(hashes), pq.Array(usedFlags), step, userID)
 	if err != nil {
 		h.log.Error("Failed to store regenerated backup codes", "user_id", userID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store backup codes"})
+		return
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read the backup-code store result", "user_id", userID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store backup codes"})
+		return
+	}
+	if rows != 1 {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInvalidTOTPCode})
 		return
 	}
 

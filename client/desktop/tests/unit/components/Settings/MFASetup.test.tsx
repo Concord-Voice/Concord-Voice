@@ -1,4 +1,4 @@
-import { render, screen, userEvent } from '../../../test-utils';
+import { act, render, screen, userEvent } from '../../../test-utils';
 import { vi } from 'vitest';
 
 // ── Mocks ──────────────────────────────────────────────────────────────
@@ -1128,6 +1128,57 @@ describe('MFASetup', () => {
       });
       expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
     });
+
+    // The server accepts each code once and can accept it yet still fail the
+    // request, so a code that reached it is never offered again.
+    it('a 500 after the code was sent clears the code and disables Replace', async () => {
+      const user = userEvent.setup();
+      await setupToKept(user);
+
+      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+      await vi.waitFor(() =>
+        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
+      );
+      await user.type(screen.getByPlaceholderText('Your password'), 'freshpw');
+      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
+
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'Internal server error' }),
+      });
+      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+
+      await vi.waitFor(() => {
+        expect(screen.getByText('Internal server error')).toBeInTheDocument();
+      });
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(screen.getByRole('button', { name: 'Replace recovery key' })).toBeDisabled();
+    });
+
+    it('a wrong password keeps the code, which the server never read', async () => {
+      const user = userEvent.setup();
+      await setupToKept(user);
+
+      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+      await vi.waitFor(() =>
+        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
+      );
+      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpw');
+      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
+
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: 'Invalid password' }),
+      });
+      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+
+      await vi.waitFor(() => {
+        expect(screen.getByText('That password is not correct.')).toBeInTheDocument();
+      });
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('654321');
+    });
   });
 
   // ── I1: the replace step routes every refusal kind ────────────────────────
@@ -1232,8 +1283,16 @@ describe('MFASetup', () => {
       expect((screen.getByLabelText('Password') as HTMLInputElement).value).toBe(
         clearsPassword ? '' : 'freshpw'
       );
+      // Only a password refusal leaves the code unread; every other answer may
+      // have spent it, so the prompt comes back empty.
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe(
+        clearsPassword ? '654321' : ''
+      );
+      // Re-entering what was cleared re-enables Replace unless the refusal locked it.
+      if (clearsPassword) await user.type(screen.getByLabelText('Password'), 'freshpw');
+      else await user.type(screen.getByTestId('mfa-verify-input'), '765432');
       if (locks) expect(replaceButton()).toBeDisabled();
-      else if (!clearsPassword) expect(replaceButton()).toBeEnabled();
+      else expect(replaceButton()).toBeEnabled();
       expect(screen.queryByTestId('recovery-key-display')).not.toBeInTheDocument();
     });
 
@@ -1499,6 +1558,9 @@ describe('MFASetup', () => {
         ).toBeInTheDocument()
       );
 
+      // The first code may have been spent by the lost request, so the retry
+      // needs a fresh one; the key material must still be byte-identical.
+      await user.type(screen.getByTestId('mfa-verify-input'), '765432');
       mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) }); // replace #2
       await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
       await vi.waitFor(() =>
@@ -2004,6 +2066,151 @@ describe('MFASetup', () => {
       await vi.waitFor(() => {
         expect(screen.getByText('Security Key Registered!')).toBeInTheDocument();
       });
+    });
+  });
+
+  // ── A sent code is never offered again ────────────────────────────────
+  //
+  // The server accepts a TOTP code at most once, and can accept it yet still
+  // fail the request. The password step keeps its password across a failure,
+  // so a code left behind it would re-send a spent code behind an enabled
+  // submit button.
+
+  describe('password step drops a code once it was sent', () => {
+    const beginOk = () =>
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          publicKey: {
+            challenge: 'dGVzdC1jaGFsbGVuZ2U',
+            rp: { name: 'Concord', id: 'localhost' },
+            user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
+            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+          },
+        }),
+      });
+
+    const stubCreate = (create: () => Promise<unknown>) =>
+      Object.defineProperty(navigator, 'credentials', {
+        value: { create: vi.fn(create) },
+        writable: true,
+        configurable: true,
+      });
+
+    const renderWebAuthn = () =>
+      render(
+        <MFASetup
+          method="webauthn"
+          mfaActive
+          activeMethods={['totp']}
+          onComplete={onComplete}
+          onCancel={onCancel}
+        />
+      );
+
+    const fillAndRegister = async (user: ReturnType<typeof userEvent.setup>) => {
+      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
+      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
+      expect(screen.getByRole('button', { name: 'Register Key' })).toBeEnabled();
+      await user.click(screen.getByRole('button', { name: 'Register Key' }));
+    };
+
+    it('security key: a cancelled key dialog returns to a step that needs a new code', async () => {
+      beginOk();
+      stubCreate(() => Promise.reject(new DOMException('User cancelled', 'NotAllowedError')));
+
+      const user = userEvent.setup();
+      renderWebAuthn();
+      await fillAndRegister(user);
+
+      await vi.waitFor(() => {
+        expect(
+          screen.getByText('Registration cancelled or timed out. Try again.')
+        ).toBeInTheDocument();
+      });
+      // Back on the password step with the password kept but the spent code gone.
+      expect((screen.getByPlaceholderText('Your password') as HTMLInputElement).value).toBe(
+        'mypassword'
+      );
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(screen.getByRole('button', { name: 'Register Key' })).toBeDisabled();
+    });
+
+    it('security key: Cancel while the key dialog is open, then its timeout, needs a new code', async () => {
+      beginOk();
+      // The OS dialog stays open until the test closes it.
+      let closeDialog: (err: unknown) => void = () => {};
+      stubCreate(
+        () =>
+          new Promise((_, reject) => {
+            closeDialog = reject;
+          })
+      );
+
+      const user = userEvent.setup();
+      renderWebAuthn();
+      await fillAndRegister(user);
+
+      await vi.waitFor(() => {
+        expect(screen.queryByPlaceholderText('Your password')).not.toBeInTheDocument();
+      });
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      await act(async () => {
+        closeDialog(new DOMException('Timed out', 'NotAllowedError'));
+      });
+
+      await vi.waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Register Key' })).toBeDisabled();
+      });
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      // Only the begin request was sent; nothing re-sent the spent code.
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('security key: a failed begin clears the code and disables Register Key', async () => {
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'Internal server error' }),
+      });
+
+      const user = userEvent.setup();
+      renderWebAuthn();
+      await fillAndRegister(user);
+
+      await vi.waitFor(() => {
+        expect(screen.getByText('Internal server error')).toBeInTheDocument();
+      });
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(screen.getByRole('button', { name: 'Register Key' })).toBeDisabled();
+    });
+
+    it('authenticator app: a failed setup request clears the code and disables Continue', async () => {
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'Internal server error' }),
+      });
+
+      const user = userEvent.setup();
+      render(
+        <MFASetup
+          method="totp"
+          mfaActive
+          activeMethods={['totp']}
+          onComplete={onComplete}
+          onCancel={onCancel}
+        />
+      );
+      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
+      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
+      await user.click(screen.getByRole('button', { name: 'Continue' }));
+
+      await vi.waitFor(() => {
+        expect(screen.getByText('Internal server error')).toBeInTheDocument();
+      });
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
     });
   });
 });

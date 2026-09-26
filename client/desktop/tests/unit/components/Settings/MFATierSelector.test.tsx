@@ -742,7 +742,7 @@ describe('MFATierSelector', () => {
       expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
     });
 
-    it('networkError: shows the banner, keeps the fields, and re-enables Confirm', async () => {
+    it('networkError: shows the banner, keeps the password, and asks for a fresh code', async () => {
       const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'networkError' });
       renderDisableModal(onDisableEmailSms);
       fillCredentials();
@@ -753,6 +753,10 @@ describe('MFATierSelector', () => {
       expect((screen.getByPlaceholderText('Enter your password') as HTMLInputElement).value).toBe(
         'mypassword'
       );
+      // The request may have reached the server, which accepts each code once.
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+      fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '654321' } });
       expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toBeDisabled();
     });
 
@@ -762,6 +766,27 @@ describe('MFATierSelector', () => {
       fillCredentials();
       await submit();
       expect(await screen.findByText('Something went wrong. Try again.')).toBeInTheDocument();
+    });
+
+    // The server accepts each code once and can accept one yet still fail the
+    // request (a 500 after the code verified), so the code is never re-offered.
+    it('failed (a 500 after the code was sent): clears the code and disables Confirm', async () => {
+      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'failed' });
+      renderDisableModal(onDisableEmailSms);
+      fillCredentials();
+      await submit();
+      await screen.findByText('Something went wrong. Try again.');
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+    });
+
+    it('invalidPassword: keeps the code, which the server never read', async () => {
+      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'invalidPassword' });
+      renderDisableModal(onDisableEmailSms);
+      fillCredentials();
+      await submit();
+      await screen.findByText('That password is not correct.');
+      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('123456');
     });
   });
 
@@ -931,6 +956,9 @@ describe('MFATierSelector', () => {
       await confirm('Confirm');
       expect(await screen.findByText(message)).toBeInTheDocument();
       expect(screen.getByRole('dialog')).toBeInTheDocument();
+      // Not a lock: a fresh code (the sent one may be spent) re-enables Confirm.
+      expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+      fillCode();
       expect(screen.getByRole('button', { name: 'Confirm' })).not.toBeDisabled();
     });
 
@@ -952,6 +980,9 @@ describe('MFATierSelector', () => {
           'Verification is temporarily unavailable. Try again in a few minutes.'
         )
       ).toBeInTheDocument();
+      // Not a lock: a fresh code (the sent one may be spent) re-enables Confirm.
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+      fillCode();
       expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toBeDisabled();
     });
 

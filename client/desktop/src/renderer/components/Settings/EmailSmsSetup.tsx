@@ -37,6 +37,10 @@ const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ mfaActive, onComplete, on
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Setup failed');
     } finally {
+      // A code that was sent is never offered again, whatever the answer: the
+      // server accepts each code once and can accept it yet still fail the
+      // request. Also covers Back from the verify step.
+      setMfaCode('');
       setLoading(false);
     }
   };

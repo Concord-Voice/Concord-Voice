@@ -273,6 +273,29 @@ const TEARDOWN_ABORT_NOTICE =
 const KEY_RESET_REAUTH_NOTICE =
   'Your encryption keys were reset, but we could not keep you signed in. Sign in again to continue — your new keys are already active.';
 
+const KEY_RESET_FAILED_NOTICE = 'Failed to reset encryption keys. Please try again.';
+
+/**
+ * User-facing copy for a key reset whose MFA code the server refused. It names
+ * no single cause, because the wire does not: a mistyped code, an expired one,
+ * and the code this sign-in already used (each code is accepted once, and the
+ * reset prompt follows sign-in within seconds) all arrive as the same 403.
+ */
+const KEY_RESET_CODE_REFUSED_NOTICE =
+  "That code didn't work. Each code can be used once — if you just used it to sign in, wait for the next code.";
+
+/**
+ * Copy for a failed key-reset PUT: the refused-code notice or the generic one.
+ * `readBody` is the response's body when the caller already read it.
+ */
+async function keyResetFailureMessage(res: Response, readBody?: unknown): Promise<string> {
+  if (res.status !== 403) return KEY_RESET_FAILED_NOTICE;
+  const body: unknown = readBody ?? (await res.json().catch(() => null));
+  return isRecord(body) && body.error === 'Invalid MFA code'
+    ? KEY_RESET_CODE_REFUSED_NOTICE
+    : KEY_RESET_FAILED_NOTICE;
+}
+
 class LoginOriginChangedError extends E2EEInitTeardownError {
   constructor() {
     super();
@@ -425,6 +448,9 @@ const Login: React.FC<LoginProps> = ({
   const [mfaMode, setMfaMode] = useState<MFAMethodCategory | 'method-select'>('totp');
   const [mfaRecoveryOnly, setMfaRecoveryOnly] = useState<string[]>([]);
   const [mfaError, setMfaError] = useState('');
+  // Bumped when a sign-in code is refused, remounting the code input empty:
+  // each code is accepted once, so a refused code is either wrong or spent.
+  const [mfaInputKey, setMfaInputKey] = useState(0);
   const [mfaServerSelection, setMfaServerSelection] = useState<RuntimeServerSelection | null>(null);
   const [webauthnOptions, setWebauthnOptions] = useState<PublicKeyCredentialRequestOptions | null>(
     null
@@ -772,8 +798,11 @@ const Login: React.FC<LoginProps> = ({
 
       // Step-up MFA: if the server requires an MFA code, re-open the prompt in
       // MFA-entry mode and retry once with the supplied code.
+      // A 403 body read here is handed on, since a response body reads once.
+      let refusalBody: unknown;
       if (replaceRes.status === 403) {
         const body = await replaceRes.json().catch(() => ({}));
+        refusalBody = body;
         if (body?.error === 'mfa_required') {
           setKeyRecoveryMfaRequired(true);
           const mfaDecision = await promptKeyRecovery();
@@ -789,10 +818,11 @@ const Login: React.FC<LoginProps> = ({
           }
           await requireFlowOwnership();
           replaceRes = await sendReset(mfaDecision.mfaCode);
+          refusalBody = undefined;
         }
       }
 
-      if (!replaceRes.ok) throw new Error('Failed to reset encryption keys. Please try again.');
+      if (!replaceRes.ok) throw new Error(await keyResetFailureMessage(replaceRes, refusalBody));
 
       // #2415: the continuation pair lives in THIS body. The reset revoked every
       // refresh token for this user — including the one the login that led here
@@ -1333,6 +1363,7 @@ const Login: React.FC<LoginProps> = ({
       );
     } catch (err) {
       setMfaError(describeLoginError(err, 'Verification failed'));
+      setMfaInputKey((k) => k + 1);
     } finally {
       setIsSubmitting(false);
     }
@@ -1431,10 +1462,21 @@ const Login: React.FC<LoginProps> = ({
   else if (mfaMode === 'email-sms') mfaSubtitle = 'Enter the verification code sent to you';
   else mfaSubtitle = 'Select a verification method';
 
+  // Rendered on both pages: a key unwrap that fails after an MFA challenge
+  // prompts from the two-factor page, which would otherwise never show it.
+  const keyRecoveryPrompt = keyRecoveryResolver && (
+    <KeyRecoveryPrompt
+      mfaRequired={keyRecoveryMfaRequired}
+      onReset={(mfaCode) => keyRecoveryResolver({ action: 'reset', mfaCode })}
+      onCancel={() => keyRecoveryResolver({ action: 'cancel' })}
+    />
+  );
+
   // MFA Step UI
   if (mfaRequired) {
     return (
       <div className="login-container">
+        {keyRecoveryPrompt}
         <div className="login-content">
           <div className="login-header">
             <ConcordWordmark className="login-logo" />
@@ -1461,6 +1503,7 @@ const Login: React.FC<LoginProps> = ({
 
             {mfaMode === 'totp' && (
               <TOTPInput
+                key={mfaInputKey}
                 onSubmit={(code) => handleMFAVerify(code, 'totp')}
                 disabled={isSubmitting}
                 error={mfaError}
@@ -1469,6 +1512,7 @@ const Login: React.FC<LoginProps> = ({
 
             {mfaMode === 'backup' && (
               <BackupCodeInput
+                key={mfaInputKey}
                 onSubmit={(code) => handleMFAVerify(code, 'backup_code')}
                 disabled={isSubmitting}
                 error={mfaError}
@@ -1500,6 +1544,7 @@ const Login: React.FC<LoginProps> = ({
 
             {mfaMode === 'email-sms' && (
               <TOTPInput
+                key={mfaInputKey}
                 onSubmit={(code) =>
                   handleMFAVerify(code, mfaMethods.includes('email') ? 'email' : 'sms')
                 }
@@ -1594,13 +1639,7 @@ const Login: React.FC<LoginProps> = ({
 
   return (
     <div className="login-container">
-      {keyRecoveryResolver && (
-        <KeyRecoveryPrompt
-          mfaRequired={keyRecoveryMfaRequired}
-          onReset={(mfaCode) => keyRecoveryResolver({ action: 'reset', mfaCode })}
-          onCancel={() => keyRecoveryResolver({ action: 'cancel' })}
-        />
-      )}
+      {keyRecoveryPrompt}
       <div className="login-content">
         <div className="login-header">
           <ConcordWordmark className="login-logo" />

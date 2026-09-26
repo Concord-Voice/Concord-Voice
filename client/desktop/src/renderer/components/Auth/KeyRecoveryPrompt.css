@@ -17,6 +17,15 @@
   color: var(--text-primary);
   padding: 24px;
   border-radius: 12px;
+  border: 1px solid var(--border-color);
+}
+.key-recovery-prompt__card h2 {
+  font-size: calc(18px * var(--font-scale, 1));
+  margin-bottom: 8px;
+}
+.key-recovery-prompt__card p {
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
 }
 .key-recovery-prompt__ack {
   display: flex;
@@ -24,16 +33,69 @@
   align-items: flex-start;
   margin: 16px 0;
 }
+/* The MFA step's label sits above its field rather than beside a checkbox. */
+.key-recovery-prompt__field-label {
+  display: block;
+  margin: 16px 0 6px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+}
+.key-recovery-prompt__code {
+  display: block;
+  width: 100%;
+  margin-bottom: 20px;
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: calc(16px * var(--font-scale, 1));
+  letter-spacing: 0.2em;
+}
+.key-recovery-prompt__code:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 1px;
+}
 .key-recovery-prompt__actions {
   display: flex;
   justify-content: flex-end;
   gap: 12px;
 }
-.key-recovery-prompt__danger:not(:disabled) {
-  background: #dc2626;
-  color: #fff;
+/* Mirrors the settings confirmation modals (revoke-all-modal-*-btn). */
+.key-recovery-prompt__actions button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: calc(13px * var(--font-scale, 1));
+  cursor: pointer;
+  transition: all 0.15s ease;
 }
-.key-recovery-prompt__danger:disabled {
+.key-recovery-prompt__cancel {
+  background: none;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+.key-recovery-prompt__cancel:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+/* A theme-invariant pair (4.83:1): the themed --danger/--on-danger pair measures
+   3.83:1 in the Hacker scheme and would add a contrast-allowlist entry. */
+.key-recovery-prompt__danger {
+  background: #dc2626;
+  border: 1px solid #dc2626;
+  color: #fff;
+  font-weight: 600;
+}
+.key-recovery-prompt__danger:hover:not(:disabled) {
+  opacity: 0.9;
+}
+.key-recovery-prompt__actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+.key-recovery-prompt__actions button:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
 }
