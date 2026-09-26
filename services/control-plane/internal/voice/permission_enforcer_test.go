@@ -402,7 +402,8 @@ func TestPermissionEnforcer_RecheckParticipants_ClearedTimeoutPublishesFreshPerm
 
 	lockTx := lockEnforcerTable(t, r.ts.DB, "servers")
 	r.enforcer.RecheckParticipant(blockerChannel, blocker.ID)
-	waitForEnforcerQuery(t, monitor, "active", "Lock", "SELECT owner_id FROM servers")
+	// The resolver's owner query; since #3453 it also reads the MFA flag.
+	waitForEnforcerQuery(t, monitor, "active", "Lock", "SELECT owner_id, enforce_mfa_dangerous_actions FROM servers")
 
 	r.enforcer.RecheckParticipants(
 		serverID, targetChannel, []uuid.UUID{uuid.MustParse(target.ID)},

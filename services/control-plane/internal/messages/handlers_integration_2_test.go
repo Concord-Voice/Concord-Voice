@@ -1,7 +1,6 @@
 package messages_test
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -782,8 +781,7 @@ func TestSendMessage_RejoinedMemberCannotUseStalePermissionCache(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 
-	cache := rbac.NewPermissionCache(ts.Redis)
-	require.NoError(t, cache.Set(context.Background(), serverID, member.ID, channelID, rbac.PermSendMessages))
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, channelID, rbac.PermSendMessages)
 	_, err := ts.DB.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, member.ID)
 	require.NoError(t, err)
 	ts.AddMemberToServer(t, serverID, member.ID, "member")

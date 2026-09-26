@@ -20,6 +20,14 @@ const (
 	BudgetWindow = 15 * time.Minute
 )
 
+// MFASettingsBudgetPrefix keys the one budget shared by every MFA-settings
+// route and the MFA-enforcement toggle's OFF confirmation. It is one budget
+// because each of those surfaces verifies the same factor: a budget per route
+// hands a stolen session five more guesses for every route added (PR #3464
+// review finding 8, CWE-307). The spelling predates the toggle and is kept, so
+// a deploy does not reset counters in flight.
+const MFASettingsBudgetPrefix = "stepup:mfa_settings:"
+
 // ErrMsgTooManyAttempts is the 429 body when the budget is exhausted.
 const ErrMsgTooManyAttempts = "Too many verification attempts"
 

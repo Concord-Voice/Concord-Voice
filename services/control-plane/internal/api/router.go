@@ -611,6 +611,42 @@ func requireStepUpBudgetWired(log *logger.Logger, u *users.Handler) {
 	}
 }
 
+// requirePermissionInvalidatorWired fatal-exits when the MFA handler has no
+// permission invalidator (#3453).
+//
+// The handler treats a nil invalidator as a no-op, so an unwired one fails
+// OPEN, and silently: a member who removes their last inline factor keeps
+// their cached dangerous permissions on every enforcing server until the cache
+// TTL expires. Boot is where that should surface. It interrogates the HANDLER,
+// never the resolver value, for the reason requirePresenceRecheckWired gives:
+// rbac.NewResolver never returns nil, so checking that value could not see a
+// deleted SetPermissionInvalidator call. Extracted from NewRouter, which sits
+// at the go:S3776 limit.
+func requirePermissionInvalidatorWired(log *logger.Logger, h *mfa.Handler) {
+	if h == nil || !h.HasPermissionInvalidator() {
+		log.Fatal("MFA handler has no permission invalidator: MFA factor changes would leave cached permissions stale")
+	}
+}
+
+// requireServersMFAVerifierWired fatal-exits when the servers handler lacks a
+// dependency of the MFA-enforcement toggle's OFF confirmation (#3453).
+//
+// Both fail CLOSED, which is the safe direction but a silent one: with no
+// verifier every OFF is a 500, and with no Redis client the step-up attempt
+// budget answers every OFF that carries a code with a 503, so an owner could
+// turn enforcement on and never off again. Boot is where that should surface.
+// It interrogates the HANDLER, never the values the router holds, for the
+// reason requirePermissionInvalidatorWired gives. Extracted from NewRouter,
+// which sits at the go:S3776 limit.
+func requireServersMFAVerifierWired(log *logger.Logger, h *servers.Handler) {
+	if h == nil || !h.HasMFAVerifier() {
+		log.Fatal("servers handler has no MFA verifier: turning MFA enforcement off would fail for every server")
+	}
+	if !h.HasRedis() {
+		log.Fatal("servers handler has no Redis client: the MFA enforcement step-up budget would deny every request")
+	}
+}
+
 // wireMediaHandler injects the media handler's optional dependencies.
 //
 // Extracted from NewRouter rather than inlined, and the reason is mechanical:
@@ -888,6 +924,10 @@ func NewRouter(
 	authHandler.SetMFAChecker(mfaHandler)
 	mfaHandler.SetLoginCompleter(authHandler)
 	mfaHandler.SetEmailService(emailSvc)
+	// A committed factor change bumps the user's permission generation (#3453):
+	// the MFA mask reads P1, so a cached value would otherwise outlive it.
+	mfaHandler.SetPermissionInvalidator(rbacResolver)
+	requirePermissionInvalidatorWired(log, mfaHandler)
 	entCache := entitlements.NewCacheForInstance(redis, db, cfg.InstanceType)
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
@@ -900,6 +940,10 @@ func NewRouter(
 	usersHandler.SetActivitySettingsSuppressor(activityService)
 	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
+	serversHandler.SetMFAVerifier(mfaHandler)
+	serversHandler.SetRedis(redis)
+	serversHandler.SetSecurityEvents(securityEvents)
+	requireServersMFAVerifierWired(log, serversHandler)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
 	voiceEnforcementSessionHandler := newVoiceEnforcementSessionHandler(db, cfg.JWTSecret, natsClient)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
@@ -2013,6 +2057,22 @@ func NewRouter(
 					serversHandler.UpdateServer,
 				)
 
+				// "Enforce MFA On Dangerous Actions" (#3453). Readable and
+				// writable only by the owner or a raw-bit Administrator; the
+				// handler answers everyone else with RequirePermission's 403.
+				// Both limiters are fail-open like UpdateServer's: the OFF
+				// confirmation carries its own fail-closed stepup.Budget.
+				serverRoutes.GET("/:id/mfa-enforcement",
+					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+					rbac.RequireMembership(rbacResolver),
+					serversHandler.GetMFAEnforcement,
+				)
+				serverRoutes.PUT("/:id/mfa-enforcement",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					rbac.RequireMembership(rbacResolver),
+					serversHandler.PutMFAEnforcement,
+				)
+
 				// Delete server (5 requests per minute - destructive action)
 				serverRoutes.DELETE("/:id",
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
@@ -3004,6 +3064,7 @@ var nightwatchFallbackEvents = map[securityevent.RouteTemplate]securityevent.Eve
 	securityevent.RouteServerMemberRoleDelete:    {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMemberRoleDelete},
 	securityevent.RouteServerTransferOwnership:   {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerTransferOwnership},
 	securityevent.RouteServerTransferOwnershipOK: {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerTransferOwnershipOK},
+	securityevent.RouteServerMFAEnforcement:      {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMFAEnforcement},
 }
 
 var nightwatchRoutes = map[string]securityevent.RouteTemplate{
@@ -3018,6 +3079,7 @@ var nightwatchRoutes = map[string]securityevent.RouteTemplate{
 	"DELETE /api/v1/servers/:id/roles/:role_id": securityevent.RouteServerRoleDelete, "POST /api/v1/servers/:id/members/:user_id/roles": securityevent.RouteServerMemberRoleCreate,
 	"DELETE /api/v1/servers/:id/members/:user_id/roles/:role_id": securityevent.RouteServerMemberRoleDelete, "POST /api/v1/servers/:id/transfer-ownership": securityevent.RouteServerTransferOwnership,
 	"POST /api/v1/servers/:id/transfer-ownership/confirm": securityevent.RouteServerTransferOwnershipOK,
+	"PUT /api/v1/servers/:id/mfa-enforcement":             securityevent.RouteServerMFAEnforcement,
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

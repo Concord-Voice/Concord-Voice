@@ -20,12 +20,14 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -53,6 +55,13 @@ type Handler struct {
 	// graphPresence is the #2447 membership presence capture. nil means unwired.
 	graphPresence presencecapture.GraphPresenceCapture
 	activePlans   ActivePlanRail
+
+	// The MFA enforcement toggle's dependencies (#3453, mfa_enforcement.go).
+	// The verifier and the Redis client are boot-guarded by the router, and a
+	// nil one fails closed. securityEvents defaults to Discard.
+	mfaVerifier    MFAVerifier
+	redis          *redis.Client
+	securityEvents securityevent.Emitter
 }
 
 // ActivePlanRail is the narrow durable active-category seam used by server
@@ -66,12 +75,13 @@ type ActivePlanRail interface {
 // NewHandler creates a new server handler
 func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, serverTiers entitlements.ServerTierResolver) *Handler {
 	return &Handler{
-		db:          db,
-		log:         log,
-		hub:         hub,
-		resolver:    resolver,
-		tiers:       tiers,
-		serverTiers: serverTiers,
+		db:             db,
+		log:            log,
+		hub:            hub,
+		resolver:       resolver,
+		tiers:          tiers,
+		serverTiers:    serverTiers,
+		securityEvents: securityevent.Discard,
 	}
 }
 
@@ -96,6 +106,19 @@ type UpdateServerRequest struct {
 	BannerURL            json.RawMessage `json:"banner_url"`
 	AllowEmbeddedContent *bool           `json:"allow_embedded_content,omitempty"` // Server-level embed policy
 }
+
+// readListServersMFAMask resolves the caller's MFA mask for ListServers'
+// enforcing rows (#3453). It is a variable only so a test can make the P1 read
+// fail and prove ListServers' fail-closed branch; production never reassigns
+// it, and export_test.go is the only writer.
+var readListServersMFAMask = func(ctx context.Context, db *sql.DB, userID string) (rbac.MFAMask, error) {
+	return rbac.MaskFor(ctx, db, userID, true)
+}
+
+// scanListServersRow scans one ListServers row. It is a variable only so a
+// test can make a row fail to scan and observe ListServers' scan-error branch;
+// production never reassigns it, and export_test.go is the only writer.
+var scanListServersRow = func(rows *sql.Rows, dest ...any) error { return rows.Scan(dest...) }
 
 // ListServers returns all servers the user is a member of
 func (h *Handler) ListServers(c *gin.Context) {
@@ -128,6 +151,20 @@ func (h *Handler) ListServers(c *gin.Context) {
 	//
 	// Channel-scope SBAC overrides are absent by construction — that layer only
 	// exists per channel, and this is the server bitfield.
+	//
+	// #3453 adds a term this copy carries in Go, never in SQL: the MFA mask.
+	// s.enforce_mfa_dangerous_actions rides the SELECT below and is scanned into
+	// a local per-row bool only — it must never reach models.ServerWithRole or
+	// any response struct (spec L1; a leaked key would let a member read a
+	// setting D4 restricts to the owner and Administrators). After the row loop,
+	// if and only if some row enforces, ONE rbac.MaskFor call resolves the
+	// caller's own enrollment, and mask.Apply runs over each enforcing row's raw
+	// permissions in Go — including an owner row, exactly as
+	// resolveServerPermissions's owner branch masks OwnerPermissions at its own
+	// exit. A non-enforcing account therefore pays zero extra statements. Never
+	// mirror Apply's EXPAND arithmetic here in SQL: a second copy is a second
+	// place for it to drift, which is the same warning RawRolePermissions'
+	// mirror comment (resolver.go) makes about this query's BIT_OR term.
 	query := `
 		SELECT s.id, s.name, s.icon_url, s.banner_url, s.owner_id, s.allow_embedded_content, s.created_at, s.updated_at, sm.role,
 			(SELECT COUNT(*) FROM server_members WHERE server_id = s.id) AS member_count,
@@ -139,14 +176,15 @@ func (h *Handler) ListServers(c *gin.Context) {
 					INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 					WHERE mr.server_id = s.id AND mr.user_id = $1
 				), 0)
-			END AS permissions
+			END AS permissions,
+			s.enforce_mfa_dangerous_actions
 		FROM servers s
 		INNER JOIN server_members sm ON s.id = sm.server_id
 		WHERE sm.user_id = $1
 		ORDER BY s.created_at DESC
 	`
 
-	rows, err := h.db.Query(query, userID, pq.Array(connectedIDs), int64(rbac.OwnerPermissions))
+	rows, err := h.db.QueryContext(c.Request.Context(), query, userID, pq.Array(connectedIDs), int64(rbac.OwnerPermissions))
 	if err != nil {
 		h.log.Error("Failed to query servers", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
@@ -155,17 +193,25 @@ func (h *Handler) ListServers(c *gin.Context) {
 	defer func() { _ = rows.Close() }()
 
 	servers := []models.ServerWithRole{}
+	// rawPerms is parallel to servers (never models.ServerWithRole itself, per
+	// L1) so the post-loop mask pass can re-apply Apply to the exact pre-mask
+	// bitfield without re-parsing the formatted string it already wrote.
+	var rawPerms []int64
+	// enforcingIdx collects indices into servers/rawPerms whose row enforces
+	// MFA on dangerous actions (#3453), so the mask pass below touches exactly
+	// those rows and nothing else.
+	var enforcingIdx []int
 	for rows.Next() {
 		var server models.ServerWithRole
 		// sql.NullInt64 rather than int64, because the COST of being wrong here is
-		// not a wrong bitfield. BIT_OR over zero rows returns NULL; scanning NULL
-		// into int64 errors; the loop below then `continue`s — and fetchServers
-		// commits a whole-array replace, so purgeMissingServerState tears down that
-		// server's channel state. A derived display column would silently remove a
-		// server from the sidebar behind an HTTP 200. COALESCE makes NULL
-		// unreachable today; this keeps the failure proportionate if it ever is not.
+		// not a wrong bitfield. BIT_OR over zero rows returns NULL, and scanning NULL
+		// into int64 errors. A scan error fails the whole list (below), so a derived
+		// display column would take the user's entire server list down with it.
+		// COALESCE makes NULL unreachable today; this keeps the failure
+		// proportionate if it ever is not.
 		var permissions sql.NullInt64
-		err := rows.Scan(
+		var enforcing bool
+		err := scanListServersRow(rows,
 			&server.ID,
 			&server.Name,
 			&server.IconURL,
@@ -178,20 +224,50 @@ func (h *Handler) ListServers(c *gin.Context) {
 			&server.MemberCount,
 			&server.OnlineCount,
 			&permissions,
+			&enforcing,
 		)
 		if err != nil {
+			// Refuse the whole list rather than drop this one server. fetchServers
+			// commits the list as a whole-array replace, so a server missing from a
+			// 200 has its channel state torn down by purgeMissingServerState, while
+			// a non-OK response leaves the client's last-known list in place.
 			h.log.Error("Failed to scan server", "error", err)
-			continue
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
+			return
 		}
 		// Fail closed on the permission, never on the server's visibility.
 		server.Permissions = strconv.FormatInt(permissions.Int64, 10)
 		server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), server.ID)
+		if enforcing {
+			enforcingIdx = append(enforcingIdx, len(servers))
+		}
+		rawPerms = append(rawPerms, permissions.Int64)
 		servers = append(servers, server)
 	}
 	if err := rows.Err(); err != nil {
 		h.log.Error("Error iterating servers", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
 		return
+	}
+
+	// A non-enforcing account pays zero extra statements (#3453 I2/C-1): this
+	// block, and the single MaskFor call inside it, run only when some row
+	// enforced above.
+	if len(enforcingIdx) > 0 {
+		mask, err := readListServersMFAMask(c.Request.Context(), h.db, userID)
+		if err != nil {
+			// Fail closed: mask every enforcing row as if the caller were
+			// unenrolled, so a P1 read fault narrows the advertised permissions
+			// rather than widening them. Never log the caller's enrollment state
+			// or which rows were masked (I7) — only the fixed failure_class.
+			mask = rbac.MFAMask{Enforcing: true, Enrolled: false}
+			h.log.Error("Failed to resolve MFA enrollment for ListServers",
+				"failure_class", "list_servers_mfa_state_unavailable", "error", err)
+		}
+		for _, idx := range enforcingIdx {
+			masked := mask.Apply(rbac.Permission(rawPerms[idx]))
+			servers[idx].Permissions = strconv.FormatInt(int64(masked), 10)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"servers": servers})

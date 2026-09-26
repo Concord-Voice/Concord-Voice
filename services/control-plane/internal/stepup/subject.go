@@ -109,8 +109,8 @@ func LoadSubject(ctx context.Context, q RowQuerier, userID string) (Subject, *Er
 	return s, nil
 }
 
-// LockSubjectTx is the common prefix of every in-transaction step-up gate. It
-// MUST be the transaction's first statement. In order:
+// LockSubjectTx is the common prefix of every in-transaction step-up gate. In
+// order:
 //
 //  1. Lock the users row (lock) and read credential_epoch + password_hash.
 //  2. Fence the session: credepoch.MatchEpoch against tokenEpoch. The step-up
@@ -126,6 +126,34 @@ func LoadSubject(ctx context.Context, q RowQuerier, userID string) (Subject, *Er
 // factor tables as they were BEFORE that write committed, while the row itself
 // is re-read at its newest version. A statement issued after the lock is
 // granted sees the committed write.
+//
+// Placement contract (#3453). Each rule names what it protects, because each
+// is easy to relax for a reason that sounds harmless:
+//
+//   - The transaction MUST be READ COMMITTED. Step 3 sees a factor write that
+//     committed while step 1 waited only because READ COMMITTED takes a new
+//     snapshot per statement. Under REPEATABLE READ the snapshot is fixed at
+//     the first statement, so a factor removed while the gate waited still
+//     counts. This function does not check the level; internal/mfaenforce does.
+//   - It MUST precede every statement whose correctness depends on its
+//     verdict. A read the step-up authorizes is only as fresh as this lock.
+//   - It MUST precede every domain-parent row lock (servers, channels,
+//     dm_conversations). The global order is advisory, then users, then
+//     parents, then children; a parent locked first adds the reverse edge that
+//     DeleteServer (users FOR NO KEY UPDATE, then servers FOR UPDATE) can close
+//     into a deadlock. The one exception is a family that already holds the
+//     actor's users row at the requested strength or stronger, where taking
+//     it again adds no edge: rbac's withAuthorityCapture locks every principal
+//     FOR NO KEY UPDATE before its servers lock.
+//   - Advisory locks and SET LOCAL (lock_timeout) MAY precede it. Under READ
+//     COMMITTED neither leaves a snapshot that a later statement reads
+//     through, and neither takes a row lock.
+//
+// Hazard recorded for #3454: a family that holds the actor's users row at FOR
+// KEY SHARE (an FK check takes it implicitly) and gates only after its servers
+// lock upgrades KEY SHARE to SHARE on users while holding servers. That closes
+// a cycle with DeleteServer, whose FOR NO KEY UPDATE on users is compatible
+// with KEY SHARE and is granted first. Gate before the servers lock.
 //
 // Refusals: a missing users row is 401 ErrMsgSessionNoLongerValid; a
 // mismatched epoch is 401 ErrMsgAuthenticationRequired (EpochMismatch true);

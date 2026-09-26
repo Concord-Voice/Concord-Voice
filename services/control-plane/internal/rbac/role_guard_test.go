@@ -235,8 +235,12 @@ func TestAuthorizeRoleMutationTx_NullOwnerID_FailsClosed(t *testing.T) {
 	tx, err := f.db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
+	// enforce_mfa_dangerous_actions must be present so roleGuardSelect's
+	// (#3453) subselect resolves against the shadow rather than erroring. The
+	// shadow is empty, so that subselect yields NULL exactly as owner_id's does,
+	// and the flag must fail closed to enforcing (asserted below).
 	shadowWithEmptyTemp(t, tx,
-		`CREATE TEMP TABLE servers (id UUID PRIMARY KEY, owner_id UUID) ON COMMIT DROP`)
+		`CREATE TEMP TABLE servers (id UUID PRIMARY KEY, owner_id UUID, enforce_mfa_dangerous_actions BOOLEAN NOT NULL DEFAULT FALSE) ON COMMIT DROP`)
 
 	res, err := f.h.authorizeRoleMutationTx(
 		ctx, tx, f.serverID, f.ownerID, roleID, confersNothing, 0)
@@ -244,6 +248,9 @@ func TestAuthorizeRoleMutationTx_NullOwnerID_FailsClosed(t *testing.T) {
 	require.ErrorIs(t, err, errHierarchyDenied,
 		"a NULL owner_id must fail closed: not the owner, so the hierarchy check still applies")
 	assert.False(t, res.IsOwner)
+	assert.True(t, res.EnforceMFADangerousActions,
+		"an unreadable enforcement flag must fail closed to enforcing (#3453): an invisible "+
+			"servers row must never silently widen what a non-owner may confer")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

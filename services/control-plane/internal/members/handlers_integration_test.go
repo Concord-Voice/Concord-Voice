@@ -420,14 +420,14 @@ func TestMemberRemovalInvalidatesPermissionCache(t *testing.T) {
 
 			cache := rbac.NewPermissionCache(ts.Redis)
 			ctx := context.Background()
-			require.NoError(t, cache.Set(ctx, serverID, member.ID, "", rbac.PermManageAllMessages))
-			require.NoError(t, cache.Set(ctx, serverID, member.ID, channelID, rbac.PermManageAllMessages))
+			testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", rbac.PermManageAllMessages)
+			testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, channelID, rbac.PermManageAllMessages)
 
 			w := ts.DoRequest(tt.method, tt.path(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
 			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-			_, serverCached := cache.Get(ctx, serverID, member.ID, "")
-			_, channelCached := cache.Get(ctx, serverID, member.ID, channelID)
+			_, serverCached, _ := cache.Get(ctx, serverID, member.ID, "")
+			_, channelCached, _ := cache.Get(ctx, serverID, member.ID, channelID)
 			assert.False(t, serverCached, "member removal must evict the server permission cache entry")
 			assert.False(t, channelCached, "member removal must evict the channel permission cache entry")
 		})

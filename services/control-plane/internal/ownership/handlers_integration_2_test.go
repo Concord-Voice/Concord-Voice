@@ -271,8 +271,8 @@ func TestConfirmTransferInvalidatesPermissionCache(t *testing.T) {
 	// Seed permission cache
 	ownerCacheKey := "perm:" + serverID + ":" + owner.ID
 	memberCacheKey := "perm:" + serverID + ":" + member.ID
-	require.NoError(t, ts.Redis.Set(ctx, ownerCacheKey, "99999", 5*time.Minute).Err())
-	require.NoError(t, ts.Redis.Set(ctx, memberCacheKey, "99999", 5*time.Minute).Err())
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, owner.ID, "", 99999)
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", 99999)
 
 	// Initiate + confirm
 	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
@@ -546,8 +546,8 @@ func TestReverseTransferCacheInvalidated(t *testing.T) {
 	// Seed cache again (after confirm invalidated it)
 	ownerCacheKey := "perm:" + serverID + ":" + owner.ID
 	memberCacheKey := "perm:" + serverID + ":" + member.ID
-	require.NoError(t, ts.Redis.Set(ctx, ownerCacheKey, "88888", 5*time.Minute).Err())
-	require.NoError(t, ts.Redis.Set(ctx, memberCacheKey, "88888", 5*time.Minute).Err())
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, owner.ID, "", 88888)
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", 88888)
 
 	// Reverse
 	var reversalToken string

@@ -345,3 +345,110 @@ func TestDeleteRole_ReEnforcesIsManagedInsideTheGuardTransaction(t *testing.T) {
 		`SELECT EXISTS(SELECT 1 FROM roles WHERE id = $1)`, victim).Scan(&exists))
 	assert.True(t, exists, "R4 REGRESSION: the now-managed role was deleted anyway")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O-1 — the F3 voice-occupancy oracle for the #3453 MFA mask.
+//
+// preCheckRoleMutation's escalation half now masks ActorBasePermissions before
+// the subset comparison (role_guard.go). Without that mask, an unenrolled
+// non-owner's request that the MASKED in-transaction guard would deny — because
+// their effective permissions lack a dangerous bit their raw role carries — is
+// let through the cheap pre-check, and PrepareCapture is what refuses it
+// instead. That reproduces exactly the #2721 F3 shape one layer up: 403 below
+// presenceCaptureMaxChannels, 500 above it, disclosing aggregate voice
+// occupancy to an actor authorized for nothing the masked resolver grants.
+//
+// If this fails the class is back.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestRoleMutationDenial_MFAMaskAppliesInPreCheck(t *testing.T) {
+	quiet := newDenialFixture(t)
+	enforceMFA(t, quiet.ts, quiet.serverID)
+	// The actor's role already carries ManageRoles|ManageRolesAssign at the
+	// fixture's ceiling; grant PermBan at the SAME position so the ceiling is
+	// unchanged and only the escalation check, never hierarchy, can produce the
+	// denial below.
+	grantPermToUser(t, quiet.ts, quiet.serverID, quiet.actor.ID, denialActorCeiling, int64(rbac.PermBan))
+	quietBanRole := quiet.ts.CreateTestRole(t, quiet.serverID, "o1ban"+uuid.New().String()[:8],
+		denialTargetBelow, int64(rbac.PermBan))
+	quiet.seedOccupiedVoiceChannels(t, 1)
+
+	busy := newDenialServerOn(t, quiet.ts, quiet.probe)
+	enforceMFA(t, busy.ts, busy.serverID)
+	grantPermToUser(t, busy.ts, busy.serverID, busy.actor.ID, denialActorCeiling, int64(rbac.PermBan))
+	busyBanRole := busy.ts.CreateTestRole(t, busy.serverID, "o1ban"+uuid.New().String()[:8],
+		denialTargetBelow, int64(rbac.PermBan))
+	busy.seedOccupiedVoiceChannels(t, presenceCaptureFanOutBound+1)
+
+	quietTarget := quiet.ts.CreateTestUser(t, "o1qt"+uuid.New().String()[:6])
+	quiet.ts.AddMemberToServer(t, quiet.serverID, quietTarget.ID, "member")
+	busyTarget := busy.ts.CreateTestUser(t, "o1bt"+uuid.New().String()[:6])
+	busy.ts.AddMemberToServer(t, busy.serverID, busyTarget.ID, "member")
+
+	// SELF-VALIDATION, exactly as R3: an AUTHORIZED mutation still sees the
+	// bound, which is what makes the denial's identical status load-bearing
+	// below rather than a coincidence of two requests that never reached
+	// PrepareCapture at all.
+	logs := quiet.ts.CaptureLogs(t)
+	quietOwnerTarget := quiet.ts.CreateTestUser(t, "o1qo"+uuid.New().String()[:6])
+	quiet.ts.AddMemberToServer(t, quiet.serverID, quietOwnerTarget.ID, "member")
+	quietOwnerRole := quiet.ts.CreateTestRole(t, quiet.serverID, "o1qorole"+uuid.New().String()[:8],
+		denialTargetBelow, 0)
+	quietOwnerRec := quiet.ts.DoRequest("POST", assignRolePath(quiet.serverID, quietOwnerTarget.ID),
+		map[string]interface{}{"role_id": quietOwnerRole}, testhelpers.AuthHeaders(quiet.owner.AccessToken))
+	require.Equal(t, http.StatusOK, quietOwnerRec.Code, "body: %s", quietOwnerRec.Body.String())
+
+	busyOwnerTarget := busy.ts.CreateTestUser(t, "o1bo"+uuid.New().String()[:6])
+	busy.ts.AddMemberToServer(t, busy.serverID, busyOwnerTarget.ID, "member")
+	busyOwnerRole := busy.ts.CreateTestRole(t, busy.serverID, "o1borole"+uuid.New().String()[:8],
+		denialTargetBelow, 0)
+	busyOwnerRec := busy.ts.DoRequest("POST", assignRolePath(busy.serverID, busyOwnerTarget.ID),
+		map[string]interface{}{"role_id": busyOwnerRole}, testhelpers.AuthHeaders(busy.owner.AccessToken))
+	require.Equal(t, http.StatusInternalServerError, busyOwnerRec.Code,
+		"the fan-out bound must actually be crossed for this test to mean anything; body: %s",
+		busyOwnerRec.Body.String())
+	require.Contains(t, logs.String(), "capture_channel_limit",
+		"and it must be the capture bound that refused it, not some other failure")
+
+	// Reset the capture: only the two UNENROLLED actor requests below may
+	// appear in it. If PrepareCapture ran for either, this line proves it.
+	logs = quiet.ts.CaptureLogs(t)
+
+	quietRec := quiet.actorRequest("POST", assignRolePath(quiet.serverID, quietTarget.ID),
+		map[string]interface{}{"role_id": quietBanRole})
+	busyRec := busy.actorRequest("POST", assignRolePath(busy.serverID, busyTarget.ID),
+		map[string]interface{}{"role_id": busyBanRole})
+
+	require.Equal(t, http.StatusForbidden, quietRec.Code,
+		"control: below the bound the masked escalation denial is a clean 403; body: %s", quietRec.Body.String())
+	require.Equal(t, http.StatusForbidden, busyRec.Code,
+		"O-1 REGRESSION — the class is back: an unenrolled non-owner's masked-escalation denial "+
+			"changed status once the server crossed %d occupied voice channels, disclosing aggregate "+
+			"voice occupancy to an actor authorized for none of it; body: %s",
+		presenceCaptureFanOutBound, busyRec.Body.String())
+	assert.Equal(t, quietRec.Body.String(), busyRec.Body.String(),
+		"and the bodies must be byte-identical, not merely the same status")
+	assert.NotContains(t, logs.String(), "capture_channel_limit",
+		"O-1 REGRESSION: PrepareCapture ran for a request the MFA-masked pre-check should have "+
+			"refused first")
+
+	var assigned bool
+	require.NoError(t, quiet.ts.DB.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3)`,
+		quiet.serverID, quietTarget.ID, quietBanRole).Scan(&assigned))
+	assert.False(t, assigned, "a denied pre-check must not leave a partial assignment")
+
+	// Positive control: the SAME actor, enrolled, is allowed past the pre-check.
+	// Without this, a mask permanently stuck at Enforcing:true would also pass
+	// the test above for the wrong reason.
+	enrollWebAuthn(t, quiet.ts, quiet.actor.ID)
+	controlTarget := quiet.ts.CreateTestUser(t, "o1ct"+uuid.New().String()[:6])
+	quiet.ts.AddMemberToServer(t, quiet.serverID, controlTarget.ID, "member")
+	controlRole := quiet.ts.CreateTestRole(t, quiet.serverID, "o1ctrole"+uuid.New().String()[:8],
+		denialTargetBelow, int64(rbac.PermBan))
+	controlRec := quiet.actorRequest("POST", assignRolePath(quiet.serverID, controlTarget.ID),
+		map[string]interface{}{"role_id": controlRole})
+	require.Equal(t, http.StatusOK, controlRec.Code,
+		"positive control: an enrolled actor's identical assignment must pass; body: %s",
+		controlRec.Body.String())
+}

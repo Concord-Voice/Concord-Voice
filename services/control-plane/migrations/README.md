@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000156)
+## Existing Migrations (000001–000157)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -266,6 +266,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000154 | add_voice_enforcement_sessions | Add the durable exact-session voice-enforcement registry and rollout activation singleton |
 | 000155 | message_purge_clear_reason | Broaden `message_purges_reason_check` to admit `clear` and leave it `NOT VALID` (#3462) |
 | 000156 | validate_message_purge_clear_reason | Validate `message_purges_reason_check`; down restores the broader `NOT VALID` check (#3462) |
+| 000157 | add_server_mfa_enforcement | Per-server `servers.enforce_mfa_dangerous_actions` toggle, default FALSE (#3453). The down is guarded: it refuses while any server enforces |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -306,6 +307,14 @@ Migrations 000155–000156 repeat the 000130–000131 shape for `clear`, the
 reason the cleared-DM reap writes. Apply both before starting the reap. A
 downgrade through 000155 is refused while `clear` audit evidence exists; it
 does not delete or rewrite that evidence.
+
+Migration 000157 adds the per-server "Enforce MFA On Dangerous Actions" flag as a
+metadata-only `BOOLEAN NOT NULL DEFAULT FALSE`. Its down migration refuses while any
+server enforces, because dropping the column would silently turn enforcement off.
+A refused down leaves golang-migrate recording **156** as dirty (it writes the
+target version before running the file) while the column still exists: confirm
+the column, then force **157**. Never force 156, because a following down would
+run 000156's down.
 
 ## Troubleshooting
 

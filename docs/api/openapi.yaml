@@ -12486,6 +12486,209 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /servers/{id}/mfa-enforcement:
+    get:
+      tags:
+      - Servers
+      summary: Get the "Enforce MFA On Dangerous Actions" setting
+      description: >-
+        Read `servers.enforce_mfa_dangerous_actions` (#3453). Only the owner or a
+        raw-bit Administrator may read this — never the masked resolver, since an
+        unenrolled Administrator must still be able to see the setting that masks
+        them. Every other member gets the generic 403 `RequirePermission` body,
+        indistinguishable from any other permission refusal; the setting is never
+        exposed on `GetServer`, `ListServers`, `CreateServer`, `UpdateServer`, or
+        the `server_updated` WebSocket frame, by design (only this resource ever
+        carries it on the wire).
+
+
+        Rate limit: 30 requests per minute (user-based).
+
+        '
+      operationId: getServerMFAEnforcement
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ServerId'
+      responses:
+        '200':
+          description: Current setting
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - enforce_mfa_dangerous_actions
+                properties:
+                  enforce_mfa_dangerous_actions:
+                    type: boolean
+                    description: >-
+                      When true, a member with no inline MFA factor (TOTP enabled
+                      AND confirmed, or WebAuthn) loses the dangerous permissions
+                      (manage server/roles/channels/crypto-rotation, kick, ban,
+                      manage all messages, manage dev resources) at every
+                      resolver exit, in `ListServers`, and at the role-assignment
+                      pre-check, until they enroll.
+        '403':
+          description: >-
+            Not a member (the membership refusal), or a member who is neither
+            the owner nor a raw-bit Administrator. The latter is byte-identical
+            to `RequirePermission`'s body, so this route cannot be told apart
+            from an ordinary permission refusal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Server not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      tags:
+      - Servers
+      summary: Turn the "Enforce MFA On Dangerous Actions" setting on or off
+      description: >-
+        Owner or raw-bit Administrator only. Turning it ON requires the actor to
+        already have an inline MFA factor enrolled; turning it OFF always
+        requires an inline MFA confirmation, even if the setting is already off
+        (a same-value request is a no-op only after that confirmation passes).
+        `updated_at` on the server row is left untouched, because every member
+        can read it through `ListServers` and a change would otherwise reveal
+        that the flip happened. The cached permission generation for every
+        server member is bumped after a value change commits, so the next
+        permission read on any member reflects it.
+
+
+        Rate limit: 10 requests per minute (fail-open, matching `UpdateServer`).
+        An OFF request that carries a code is also charged against the
+        fail-closed step-up attempt budget the MFA-settings routes use, 5 per 15
+        minutes per account and shared with them, which a verified OFF clears.
+
+        '
+      operationId: putServerMFAEnforcement
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ServerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - enabled
+              properties:
+                enabled:
+                  type: boolean
+                  description: The requested value. A request that already matches
+                    the current value still requires confirmation.
+                mfa_code:
+                  type: string
+                  maxLength: 256
+                  description: >-
+                    An inline MFA confirmation (a TOTP code, a WebAuthn inline
+                    assertion token, or a backup code), required to turn the
+                    setting OFF. It is verified inside the write transaction, so
+                    a backup code is spent only if the change commits. Ignored
+                    when `enabled` is true: turning a security control ON never
+                    costs more than using it.
+      responses:
+        '200':
+          description: Setting updated (or already at the requested value, after
+            confirmation)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - enforce_mfa_dangerous_actions
+                properties:
+                  enforce_mfa_dangerous_actions:
+                    type: boolean
+        '400':
+          description: A malformed body, content after the JSON document, or
+            a missing `enabled` field
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: >-
+            Session no longer valid: the caller's credentials were rotated or
+            the account was removed while the request waited for its locks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: >-
+            Either the caller may not manage this setting (neither owner nor a
+            raw-bit Administrator — byte-identical to `RequirePermission`'s
+            body), or the requested change was refused for an MFA reason. An ON
+            request from an actor with no inline factor gets
+            `mfa_enrollment_required: true`; an OFF request with no code, or a
+            wrong one, gets `mfa_required` together with `methods`, or the
+            invalid-credential message. The stored value is unchanged in every
+            case, and every refusal on this route is reported to Nightwatch as
+            the same single `privileged_route_denied` reason — no refusal here
+            is distinguishable from another.
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/StepUpError'
+                - type: object
+                  properties:
+                    mfa_enrollment_required:
+                      type: boolean
+                      description: >-
+                        Present and true when `enabled: true` was requested and
+                        the actor has no inline MFA factor (TOTP or WebAuthn)
+                        enrolled. Distinct from `mfa_required`, which is the OFF
+                        path's "supply a code" refusal.
+        '404':
+          description: Server not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body exceeds 1 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/StepUpAttemptsExhausted'
+        '500':
+          description: >-
+            A server-side failure, never a rejected credential: either the MFA
+            confirmation could not be verified (`Verification failed`) or the
+            update failed (`Failed to update MFA enforcement`). Nothing was
+            written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: >-
+            Either the step-up attempt budget could not be evaluated (Redis
+            unreachable), or the request hit a row-lock conflict (PostgreSQL
+            40P01 or 55P03) while locking the caller's user row or the server
+            row. Nothing was written; retry after the given delay.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/mute-states:
     get:
       tags:
@@ -15883,9 +16086,11 @@ components:
             $ref: '#/components/schemas/Error'
     StepUpAttemptsExhausted:
       description: >-
-        Too many step-up verification attempts for this user (5 per 15 minutes,
-        shared across every step-up-gated route for that account). Cleared only
-        after a verified, committed success.
+        Too many step-up verification attempts for this user (5 per 15
+        minutes). Every `/mfa/*` route that returns this response shares one
+        budget per account with `PUT /servers/{id}/mfa-enforcement`; `PATCH
+        /users/me/privacy` has its own. Cleared only after a verified,
+        committed success on a route that charges it.
       content:
         application/json:
           schema:

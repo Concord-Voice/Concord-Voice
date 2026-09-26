@@ -11,6 +11,13 @@
 // - Cache result in Redis for 5 minutes
 package rbac
 
+import (
+	"context"
+	"fmt"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
+)
+
 // Permission represents a single permission bit in the bitfield
 type Permission int64
 
@@ -83,7 +90,78 @@ var AdminPermissions = ModeratorPermissions | PermManageChannels | PermManageRol
 
 // OwnerPermissions grants all non-administrator permissions plus server management
 // Owner does NOT get PermAdministrator by default (explicit security decision)
-var OwnerPermissions = AdminPermissions | PermManageServer | PermManageCryptoRotation
+var OwnerPermissions = AdminPermissions | PermManageServer | PermManageCryptoRotation | PermMentionEveryone
+
+// DangerousPermissions is the set an enforcing server withholds from a member
+// with no inline MFA factor (#3453). Bits 0, 1, 3, 4, 7, 8, 14 and 25.
+// ManageRolesAssign is deliberately absent (D6), as are the reversible voice
+// moderation bits, Invite, ViewAuditLog and MentionEveryone (spec §4, Q6).
+const DangerousPermissions = PermManageServer | PermManageRoles | PermManageChannels |
+	PermManageCryptoRotation | PermKick | PermBan | PermManageAllMessages | PermManageDevResources
+
+// ConcretePermissions is every NAMED permission except PermAdministrator: what
+// bit 62 means once it is expanded into real bits. It is a const rather than a
+// value derived from PermissionNames because that map is a mutable var, and a
+// new Perm* forgotten here must fail a pin test, not shift silently at runtime.
+const ConcretePermissions = PermManageServer | PermManageRoles | PermManageRolesAssign |
+	PermManageChannels | PermManageCryptoRotation | PermViewAuditLog | PermInvite | PermKick |
+	PermBan | PermViewVoiceChannels | PermViewTextChannels | PermSendMessages |
+	PermReadMessageHistory | PermManageOwnMessages | PermManageAllMessages | PermPinMessages |
+	PermJoinVoice | PermSpeak | PermMuteMembers | PermDeafenMembers | PermMoveMembers |
+	PermScreenShare | PermAttachFiles | PermUseExternalEmoji | PermMentionEveryone |
+	PermManageDevResources | PermMentionRoles | PermMentionUsers | PermVideo | PermTimeoutMembers
+
+// MFAMask is the MFA-enforcement state of one member on one server (#3453).
+// The zero value masks nothing.
+//
+// The mask applies to a RESULT, never to an input. Every resolver bypass — the
+// owner short-circuit and the Administrator override bypass — is decided on the
+// raw value, and Apply runs once, at each public entry point's single exit. An
+// unenrolled Administrator therefore still ignores channel overrides (raw bit
+// 62 decides that) and only THEN loses the dangerous bits. Masking before a
+// bypass decision is the defect this ordering exists to prevent: with bit 62
+// gone the member would fall into channel-override evaluation, where a DENY
+// that bit 62 is supposed to ignore would start to apply.
+type MFAMask struct {
+	Enforcing bool
+	Enrolled  bool
+}
+
+// Apply returns p as an enforcing server exposes it (spec §4, invariant I1).
+// When the mask does not bind (not enforcing, or enrolled) p is returned
+// unchanged. Otherwise bit 62 is EXPANDED into ConcretePermissions — an
+// Administrator keeps every non-dangerous concrete bit, because Permission.Has
+// stops short-circuiting once bit 62 is cleared — and the dangerous bits are
+// removed. Undefined bits 30–61 pass through untouched; bit 63 is never set.
+// Apply is idempotent.
+func (m MFAMask) Apply(p Permission) Permission {
+	if !m.Enforcing || m.Enrolled {
+		return p
+	}
+	if p&PermAdministrator != 0 {
+		p = (p &^ PermAdministrator) | ConcretePermissions
+	}
+	return p &^ DangerousPermissions
+}
+
+// MaskFor reads userID's MFA enrollment when, and only when, the server
+// enforces. A non-enforcing server issues no statement, which is what keeps the
+// resolver's statement count unchanged when enforcement is off (spec I2, C-1).
+//
+// Enrollment is policy P1, read through stepup.InlineMFAMethods so P1 has one
+// definition. A read error is returned wrapped AND with the restrictive mask
+// (enforcing, not enrolled) beside it, so a caller that logs the error and
+// carries on still fails closed on the permission.
+func MaskFor(ctx context.Context, q rowQuerier, userID string, enforcing bool) (MFAMask, error) {
+	if !enforcing {
+		return MFAMask{}, nil
+	}
+	methods, err := stepup.InlineMFAMethods(ctx, q, userID)
+	if err != nil {
+		return MFAMask{Enforcing: true}, fmt.Errorf("resolve MFA enrollment: %w", err)
+	}
+	return MFAMask{Enforcing: true, Enrolled: len(methods) > 0}, nil
+}
 
 // Has checks if a permission bitfield contains a specific permission
 func (p Permission) Has(perm Permission) bool {

@@ -13,3 +13,10 @@ func SetAuthorityCommitForTest(h *Handler, commit func(*sql.Tx) error) {
 func SetSyncedCategoryPreflightForTest(h *Handler, observe func()) {
 	h.syncedCategoryPreflight = observe
 }
+
+// SetAfterComputeForTest installs a hook that runs immediately after a
+// cache-publishing compute returns (HasPermission, GetEffectivePermissions,
+// ResolveEffectivePermissionsFresh), before its cache.Set (#3453 I-3).
+func SetAfterComputeForTest(r *Resolver, fn func()) {
+	r.afterCompute = fn
+}

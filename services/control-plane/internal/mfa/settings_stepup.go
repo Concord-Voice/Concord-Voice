@@ -82,8 +82,9 @@ const (
 	// this package's tests.
 	mfaSettingsStepUpLimit = stepup.BudgetLimit
 	// mfaSettingsStepUpPrefix keys the one budget every MFA-settings route
-	// charges.
-	mfaSettingsStepUpPrefix = "stepup:mfa_settings:"
+	// charges. The MFA-enforcement toggle charges it too (see
+	// stepup.MFASettingsBudgetPrefix).
+	mfaSettingsStepUpPrefix = stepup.MFASettingsBudgetPrefix
 	// postCommitTimeout bounds work that must outlive a cancelled request.
 	postCommitTimeout = 5 * time.Second
 )

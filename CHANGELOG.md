@@ -23,6 +23,7 @@ account can't provide, never your password twice.
   its own: screen sharing with sound now sends at your plan's audio quality (96 kbps on the free plan)
   instead of an uncapped rate.
 - **The control plane now supports private DM hide and history-clear operations** ([#3306](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3306)) — authenticated API clients can hide a direct message or group chat from one participant's list, or clear that participant's history before a server-stamped cutoff. Hide preserves history, read state, and the original hide timestamp on retries. Clear uses MFA when enabled or the current password otherwise when Privacy & Security requires authentication; the existing permanent purge action keeps its current password-and-MFA behavior.
+- **Server owners can require MFA for dangerous actions, through the API** ([#3464](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3464), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — a server's owner or an Administrator can turn on `PUT /api/v1/servers/{id}/mfa-enforcement`. While it is on, a member without an authenticator app or security key cannot use the dangerous permissions: managing the server, its roles or its channels, kicking, banning, deleting other members' messages, rotating channel keys, and managing developer resources. Email and text-message codes do not count. That member keeps every other permission and still sees every channel they could see before. Turning it on requires your own authenticator app or security key; turning it off requires a code from one. The app has no setting for it yet ([#3456](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3456)), so for now only API clients can change it.
 - **Direct messages now offer separate Hide, Clear history for me, and Leave group controls** ([#3434](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3434)) — Hide removes a thread from your list until a new message arrives; Clear removes its earlier messages only from your view and asks for account verification when required. Leaving a group ends your membership and access to its messages. Purge Messages remains a separate action.
 - **Font Size is back under Appearance** ([#3401](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3401), [#2367](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2367)) — the
   Small / Default / Large text size now sits in Appearance ▸ Application Font, next to the font it
@@ -64,6 +65,11 @@ account can't provide, never your password twice.
 - **DM-block and credential-epoch cleanup now survives delivery failures** ([#3140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3140)) — guarded reconciliation records retryable voice-ejection obligations and fences stale callbacks by generation.
 
 ### Fixed
+
+- **Server owners can mention @all and @here again** ([#3464](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3464), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — the
+  permission set the server gives a server's owner did not include the right to mention everyone, so
+  an owner's @all or @here was silently removed from the message unless one of their roles also
+  granted it. Owners now always have it.
 
 - **Try again on the recovery-key screen now shows each attempt** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — when creating a recovery
   key failed again after Try again, the screen looked exactly the same, so the button seemed to do

@@ -17,8 +17,10 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
@@ -283,4 +285,35 @@ func TestVerifyMFAFactor_NilPreloadFallsBackToLookup(t *testing.T) {
 	require.NotNil(t, err)
 	require.Equal(t, []string{"webauthn"}, err.Body["methods"])
 	require.Equal(t, 1, v.methodsCalls, "the pool lookup is the fallback when nothing is preloaded")
+}
+
+// EnrollmentRequired's body is a wire contract: the desktop shows the string
+// and (from #3456) keys on the flag, so the serialized bytes are pinned rather
+// than the fields. The literal is written out instead of built from the
+// constant so that changing the constant fails here.
+func TestEnrollmentRequired_IsA403WithTheExactBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	e := EnrollmentRequired()
+
+	require.Equal(t, http.StatusForbidden, e.Status)
+	require.Nil(t, e.Cause, "a 4xx is an outcome, not a fault")
+	require.False(t, e.EpochMismatch())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	e.Write(c)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t,
+		`{"error":"Set up an authenticator app or security key to do this.","mfa_enrollment_required":true}`,
+		w.Body.String())
+}
+
+// Body is a map, so a shared value would let one caller's edit leak into every
+// later refusal.
+func TestEnrollmentRequired_ReturnsAFreshValue(t *testing.T) {
+	first := EnrollmentRequired()
+	first.Body["error"] = "mutated by a caller"
+
+	require.Equal(t, ErrMsgMFAEnrollmentRequired, EnrollmentRequired().Body["error"])
 }

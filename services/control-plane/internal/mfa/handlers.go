@@ -120,6 +120,16 @@ type LoginCompleter interface {
 	CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string, primaryAuthMethod securityevent.AuthMethod) bool
 }
 
+// PermissionInvalidator makes a user's cached permissions miss on their next
+// read. Whether a user holds an inline factor (policy P1) decides what the
+// #3453 mask removes from their permissions on every enforcing server, so each
+// committed factor write must call it. Declared here, at the consumer (the
+// rbac.PresenceRecheck / VoiceEnforcer precedent), so mfa does not import rbac;
+// *rbac.Resolver satisfies it.
+type PermissionInvalidator interface {
+	BumpUserPermissionGeneration(ctx context.Context, userID string) error
+}
+
 // Handler implements MFA API endpoints and the Verifier interface.
 type Handler struct {
 	db             *sql.DB
@@ -132,6 +142,7 @@ type Handler struct {
 	emailSvc       *email.Service
 	environment    string // "development", "staging", "production"
 	securityEvents securityevent.Emitter
+	permissions    PermissionInvalidator
 }
 
 // Ensure Handler implements Verifier at compile time.
@@ -179,6 +190,43 @@ func (h *Handler) SetLoginCompleter(lc LoginCompleter) {
 // SetEmailService sets the email service for email-based MFA delivery.
 func (h *Handler) SetEmailService(svc *email.Service) {
 	h.emailSvc = svc
+}
+
+// SetPermissionInvalidator injects the permission-cache invalidator the factor
+// writes call after they commit. The router wires it at construction, and
+// requirePermissionInvalidatorWired refuses to boot without it: unwired, a
+// factor change would leave cached permissions stale until the cache TTL.
+func (h *Handler) SetPermissionInvalidator(p PermissionInvalidator) {
+	h.permissions = p
+}
+
+// HasPermissionInvalidator reports whether SetPermissionInvalidator ran with a
+// non-nil value. It is what the boot guard asks, because a nil check on the
+// resolver the router holds could not see a deleted setter call.
+func (h *Handler) HasPermissionInvalidator() bool {
+	return h.permissions != nil
+}
+
+// invalidatePermissionState bumps userID's permission generation after a
+// committed change to their inline factors (spec §6). Call it only after the
+// commit: called earlier, a concurrent read could recompute from the factor
+// state the commit is about to replace and cache it under the new generation.
+//
+// It runs detached from the request's cancellation (context.WithoutCancel keeps
+// the values), since a client that hangs up after the commit must not leave the
+// cache serving what the commit replaced. A failure is logged and dropped: the
+// change has committed, and the resolver has already retried and fallen back to
+// a scan-invalidate before reporting one. The line is identical for a gained
+// and a lost factor and names no method (I7, observability principle 7), which
+// the signature guarantees by carrying neither.
+func (h *Handler) invalidatePermissionState(ctx context.Context, userID string) {
+	if h.permissions == nil {
+		return
+	}
+	if err := h.permissions.BumpUserPermissionGeneration(context.WithoutCancel(ctx), userID); err != nil {
+		h.log.Error("Failed to invalidate cached permissions after an MFA factor change",
+			"failure_class", "perm_generation_bump", "error", err)
+	}
 }
 
 // ── Verifier Interface Implementation ────────────────────────────────────────
@@ -610,7 +658,9 @@ func syncMFAFlagsTx(ctx context.Context, tx *sql.Tx, userID string, es emailSmsS
 // withMFAFactorWriteTx runs write (nil for a flags-only resync) and the flag
 // sync in ONE transaction that locks the users row first. Any error rolls the
 // whole thing back: a factor whose flags could not be written is not written
-// either. errSubjectGone is returned unwrapped-matchable.
+// either. errSubjectGone is returned unwrapped-matchable. Every error before
+// Commit skips the permission invalidation; Commit itself is always followed by
+// one, whatever it returns, because a Commit error does not prove a rollback.
 func (h *Handler) withMFAFactorWriteTx(ctx context.Context, userID string, es emailSmsState, write func(*sql.Tx) error) error {
 	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -628,8 +678,15 @@ func (h *Handler) withMFAFactorWriteTx(ctx context.Context, userID string, es em
 	if err := syncMFAFlagsTx(ctx, tx, userID, es); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit MFA factor write: %w", err)
+	commitErr := tx.Commit()
+	// Invalidate whatever Commit returned. A Commit error does not prove a
+	// rollback: the server may have committed and the acknowledgement been
+	// lost. An extra bump costs one cache miss; a skipped one after a commit
+	// that did apply would leave a removed factor's dangerous bits cached until
+	// the TTL (#3453).
+	h.invalidatePermissionState(ctx, userID)
+	if commitErr != nil {
+		return fmt.Errorf("commit MFA factor write: %w", commitErr)
 	}
 	return nil
 }
@@ -1060,6 +1117,8 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete verification"})
 		return
 	}
+	// The UPDATE autocommitted, so this is after its commit.
+	h.invalidatePermissionState(ctx, userID)
 
 	// Clear attempt tracking
 	h.delBestEffort(ctx, "Failed to clear MFA setup attempt counter", userID, fmt.Sprintf("mfa_setup_attempts:%s", userID))
@@ -1216,8 +1275,11 @@ func (h *Handler) TOTPDisable(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
 		return
 	}
-	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit TOTP disable", "error", err)
+	commitErr := tx.Commit()
+	// Whatever Commit returned; see withMFAFactorWriteTx.
+	h.invalidatePermissionState(ctx, userID)
+	if commitErr != nil {
+		h.log.Error("Failed to commit TOTP disable", "error", commitErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisableMFA})
 		return
 	}
@@ -1616,8 +1678,11 @@ func (h *Handler) WebAuthnDeleteCredential(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
 		return
 	}
-	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit WebAuthn delete", "error", err)
+	commitErr := tx.Commit()
+	// Whatever Commit returned; see withMFAFactorWriteTx.
+	h.invalidatePermissionState(ctx, userID)
+	if commitErr != nil {
+		h.log.Error("Failed to commit WebAuthn delete", "error", commitErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteCredential})
 		return
 	}

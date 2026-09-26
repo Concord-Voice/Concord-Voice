@@ -178,7 +178,7 @@ func TestNightwatchServerMutationFallbacksArePrivilegedActionDenials(t *testing.
 		securityevent.RouteServerRoleCreate, securityevent.RouteServerRolePatch,
 		securityevent.RouteServerRoleDelete, securityevent.RouteServerMemberRoleCreate,
 		securityevent.RouteServerMemberRoleDelete, securityevent.RouteServerTransferOwnership,
-		securityevent.RouteServerTransferOwnershipOK,
+		securityevent.RouteServerTransferOwnershipOK, securityevent.RouteServerMFAEnforcement,
 	} {
 		event := nightwatchFallbackEvent(route)
 		require.Equal(t, securityevent.EventPrivilegedAction, event.EventType, route)

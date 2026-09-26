@@ -179,7 +179,7 @@ and [`services/media-plane/src/lib/securityEvent.ts`](../services/media-plane/sr
 owns the host write boundary. Nightwatch deployment, hardening, normalization,
 verification, and commissioning live in the dedicated
 [Nightwatch repository](https://github.com/Concord-Voice/nightwatch) and its
-[production runbook](https://github.com/Concord-Voice/nightwatch/blob/32c0845831c23734169c745b0fa090f6a0cdda69/[internal]nightwatch.md).
+[production runbook](https://github.com/Concord-Voice/nightwatch/blob/ae6288885a6cd1da778dbc6885b966bbd9f07ac1/[internal]nightwatch.md).
 
 ## Development Workflow
 

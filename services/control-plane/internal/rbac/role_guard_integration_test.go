@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -422,10 +421,9 @@ func permCacheKey(serverID, userID string) string {
 // the guard, and this test pins the difference.
 func TestCreateRole_IgnoresAPoisonedPermissionCacheEntry(t *testing.T) {
 	ts, _, member, serverID := setupOwnerAndMember(t)
-	ctx := context.Background()
 
-	poisoned := int64(rbac.PermManageRoles | rbac.PermManageChannels)
-	require.NoError(t, ts.Redis.Set(ctx, permCacheKey(serverID, member.ID), poisoned, 5*time.Minute).Err())
+	poisoned := rbac.PermManageRoles | rbac.PermManageChannels
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", poisoned)
 
 	roleName := "poisoned" + uuid.New().String()[:8]
 	rec := ts.DoRequest("POST", rolesPath(serverID), map[string]interface{}{
@@ -458,6 +456,9 @@ func TestResolveServerPermissionsTx_PublishesNoCacheEntry(t *testing.T) {
 
 	cache := rbac.NewPermissionCache(ts.Redis)
 	require.NoError(t, ts.Redis.Del(ctx, permCacheKey(serverID, member.ID)).Err())
+	// Both generations exist, so a publish would be served and the miss
+	// asserted below cannot come from an absent tag (#3453 seed-and-skip).
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
 
 	tx, err := ts.DB.BeginTx(ctx, nil)
 	require.NoError(t, err)
@@ -466,7 +467,7 @@ func TestResolveServerPermissionsTx_PublishesNoCacheEntry(t *testing.T) {
 	require.Equal(t, rbac.BasePermissions, perms)
 	require.NoError(t, tx.Rollback())
 
-	_, found := cache.Get(ctx, serverID, member.ID, "")
+	_, found, _ := cache.Get(ctx, serverID, member.ID, "")
 	assert.False(t, found,
 		"an in-transaction resolve must publish nothing; a rolled-back transaction would poison Redis")
 }

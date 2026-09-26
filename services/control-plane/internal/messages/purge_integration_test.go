@@ -437,8 +437,7 @@ func TestPurgeServer_EmptyScopeRejectsRemovedMemberWithWarmCache(t *testing.T) {
 	owner := ts.CreateTestUser(t, "empty_cached_owner")
 	serverID := ts.CreateTestServer(t, owner.ID, "empty-cached-server") // deliberately no channels
 
-	cache := rbac.NewPermissionCache(ts.Redis)
-	require.NoError(t, cache.Set(context.Background(), serverID, owner.ID, "", rbac.OwnerPermissions))
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, owner.ID, "", rbac.OwnerPermissions)
 	_, err := ts.DB.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, owner.ID)
 	require.NoError(t, err)
 

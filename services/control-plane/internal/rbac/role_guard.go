@@ -95,6 +95,11 @@ type roleGuardResult struct {
 	Position    int
 	Permissions int64
 	IsOwner     bool
+	// EnforceMFADangerousActions mirrors servers.enforce_mfa_dangerous_actions,
+	// read UNLOCKED in the same statement and for the same reason owner_id is
+	// (#3453): it costs nothing beyond the existing round trip and must never
+	// gain a locking clause.
+	EnforceMFADangerousActions bool
 	// ActorBasePermissions is COALESCE(BIT_OR(...), 0) over the actor's roles,
 	// read in the SAME statement as everything else. For a NON-OWNER it is
 	// exactly what resolveServerPermissions returns (that function's non-owner
@@ -166,6 +171,12 @@ type roleGuardResult struct {
 // 000144's composite FK now makes such a row unrepresentable; keep these predicates
 // anyway — they are what holds for a row arriving by a route the FK does not cover,
 // and they cost nothing, since mr.server_id is already pinned by the WHERE clause.
+//
+// enforce_mfa_dangerous_actions rides this same statement, in the same
+// UNLOCKED shape as owner_id and for the same reason: both are servers-table
+// facts a guard reads to make its decision, not rows a guard mutation ever
+// writes, so locking either would only manufacture a roles<->servers edge that
+// does not need to exist (#3453).
 const roleGuardSelect = `
 	SELECT r.is_managed, r.is_default, r.position, r.permissions,
 	       (SELECT COALESCE(MAX(r2.position), 0)
@@ -173,6 +184,7 @@ const roleGuardSelect = `
 	          INNER JOIN roles r2 ON mr.role_id = r2.id AND r2.server_id = mr.server_id
 	         WHERE mr.server_id = $2 AND mr.user_id = $3) AS actor_max_position,
 	       (SELECT s.owner_id FROM servers s WHERE s.id = r.server_id) AS owner_id,
+	       (SELECT s.enforce_mfa_dangerous_actions FROM servers s WHERE s.id = r.server_id) AS enforce_mfa_dangerous_actions,
 	       (SELECT COALESCE(BIT_OR(r3.permissions), 0)
 	          FROM member_roles mr3
 	          INNER JOIN roles r3 ON mr3.role_id = r3.id AND r3.server_id = mr3.server_id
@@ -243,11 +255,26 @@ func (h *Handler) authorizeRoleMutationTx(
 // can only ever save work, never grant it. Do not "harden" this into a denial on
 // error: a transient pool blip would then 403 a legitimate mutation.
 //
-// It deliberately does NOT resolve actor permissions. That is three more pooled
-// queries on every happy-path mutation, and the escalation denial it would catch
-// requires an actor who already holds ManageRoles — a far weaker abuse position
-// than the hierarchy denial, which any member can trigger against any role above
-// their ceiling and which this one statement already answers.
+// It does NOT call the resolver, which would cost three more pooled queries on
+// every happy-path mutation. It still denies on both halves, hierarchy and
+// escalation, at no extra round trip: the guard statement returns
+// ActorBasePermissions, the actor's raw BIT_OR, in the same row as the hierarchy
+// operands. That value equals what the resolver returns for a NON-owner only, so
+// every consumer short-circuits on IsOwner first.
+//
+// The pre-check verdict must equal the in-transaction verdict for the MFA mask
+// too, not only for hierarchy and escalation (#3453). The authoritative guard's
+// escalation check is already masked, because it resolves actorPerms through
+// ResolveServerPermissionsTx, which applies MFAMask.Apply at its exit. A
+// pre-check that compared unmasked ActorBasePermissions against an enforcing
+// server's dangerous conferral would pass exactly the escalation the masked
+// in-tx guard denies, reopening F3 for that one case: the mismatched pre-check
+// waves the request into withAuthorityCapture, which fails the SAME
+// unauthorized request 403-below-bound / 500-above-bound depending on how many
+// channels the target holds, disclosing aggregate voice occupancy. Masking
+// ActorBasePermissions here before the subset comparison closes it with no
+// additional round trip on a non-enforcing server, because MaskFor issues no
+// query when its enforcing argument is false.
 func (h *Handler) preCheckRoleMutation(
 	ctx context.Context, serverID, actorID, roleID string,
 	mode conferredMode, requested int64,
@@ -284,11 +311,27 @@ func (h *Handler) preCheckRoleMutation(
 	if res.IsOwner || mode == confersNothing {
 		return nil
 	}
+
+	// MFA mask (#3453). MaskFor issues no query when EnforceMFADangerousActions
+	// is false, so a non-enforcing server's pre-check pays no extra round trip.
+	// A read error here follows the SAME fail-open rule as the guard read above:
+	// it can only ever save work, never grant it, because the authoritative
+	// in-tx guard re-decides through an already-masked ResolveServerPermissionsTx.
+	mask, err := MaskFor(ctx, h.db, actorID, res.EnforceMFADangerousActions)
+	if err != nil {
+		//nolint:nilerr // deliberate and load-bearing, matching the guard-read
+		// fail-open above: this pre-check is NOT authoritative, so a P1 read
+		// fault must fall through to the transaction rather than deny a
+		// legitimate mutation on a transient error.
+		return nil
+	}
+	actorPerms := mask.Apply(Permission(res.ActorBasePermissions))
+
 	conferred := requested
 	if mode == confersTargetRole {
 		conferred = res.Permissions
 	}
-	if Permission(conferred)&^Permission(res.ActorBasePermissions) != 0 {
+	if Permission(conferred)&^actorPerms != 0 {
 		return errEscalationDenied
 	}
 	return nil
@@ -329,10 +372,11 @@ func (h *Handler) evaluateRoleGuard(
 	var res roleGuardResult
 	var actorMaxPosition int
 	var ownerID sql.NullString
+	var enforceMFA sql.NullBool
 
 	err := q.QueryRowContext(ctx, query, roleID, serverID, actorID).Scan(
 		&res.IsManaged, &res.IsDefault, &res.Position, &res.Permissions,
-		&actorMaxPosition, &ownerID, &res.ActorBasePermissions,
+		&actorMaxPosition, &ownerID, &enforceMFA, &res.ActorBasePermissions,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -346,6 +390,13 @@ func (h *Handler) evaluateRoleGuard(
 	// A servers row that vanished between request and guard leaves owner_id NULL.
 	// Fail CLOSED: treat it as "not the owner" so the hierarchy check still runs.
 	res.IsOwner = ownerID.Valid && ownerID.String == actorID
+
+	// Same vanished-row case for the enforcement flag (#3453). Fail CLOSED in the
+	// opposite-looking but consistent direction: treat an unreadable flag as
+	// enforcing, mirroring MaskFor's own fail-closed default (Enforcing: true).
+	// An invisible servers row must never silently widen what a non-owner may
+	// confer.
+	res.EnforceMFADangerousActions = !enforceMFA.Valid || enforceMFA.Bool
 
 	if !res.IsOwner && res.Position >= actorMaxPosition {
 		return res, errHierarchyDenied

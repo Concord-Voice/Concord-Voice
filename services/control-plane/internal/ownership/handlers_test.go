@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
@@ -679,8 +678,8 @@ func TestTransferInvalidatesPermissionCache(t *testing.T) {
 	// Seed permission cache for both users
 	ownerCacheKey := "perm:" + serverID + ":" + owner.ID
 	memberCacheKey := "perm:" + serverID + ":" + member.ID
-	require.NoError(t, ts.Redis.Set(ctx, ownerCacheKey, "12345", 5*time.Minute).Err())
-	require.NoError(t, ts.Redis.Set(ctx, memberCacheKey, "12345", 5*time.Minute).Err())
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, owner.ID, "", 12345)
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", 12345)
 
 	// Initiate + confirm
 	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{

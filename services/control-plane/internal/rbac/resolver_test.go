@@ -41,7 +41,7 @@ func TestResolveChannelPermissionsTx(t *testing.T) {
 		ts.CreateChannelOverride(t, channelID, "user", member.ID, int64(rbac.PermSendMessages), 0)
 
 		cache := rbac.NewPermissionCache(ts.Redis)
-		require.NoError(t, cache.Set(ctx, serverID, member.ID, channelID, 0))
+		testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, channelID, 0)
 		tx, err := ts.DB.BeginTx(ctx, nil)
 		require.NoError(t, err)
 		defer func() {
@@ -57,7 +57,7 @@ func TestResolveChannelPermissionsTx(t *testing.T) {
 		var one int
 		require.NoError(t, tx.QueryRowContext(ctx, `SELECT 1`).Scan(&one))
 		assert.Equal(t, 1, one)
-		cached, ok := cache.Get(ctx, serverID, member.ID, channelID)
+		cached, ok, _ := cache.Get(ctx, serverID, member.ID, channelID)
 		require.True(t, ok)
 		assert.Equal(t, rbac.Permission(0), cached)
 	})
@@ -72,7 +72,7 @@ func TestResolveChannelPermissionsTx(t *testing.T) {
 		ts.CreateChannelOverride(t, channelID, "user", member.ID, 0, int64(rbac.PermSendMessages))
 
 		cache := rbac.NewPermissionCache(ts.Redis)
-		require.NoError(t, cache.Set(ctx, serverID, member.ID, channelID, rbac.PermSendMessages))
+		testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, channelID, rbac.PermSendMessages)
 		tx, err := ts.DB.BeginTx(ctx, nil)
 		require.NoError(t, err)
 		defer func() {
@@ -88,7 +88,7 @@ func TestResolveChannelPermissionsTx(t *testing.T) {
 		var one int
 		require.NoError(t, tx.QueryRowContext(ctx, `SELECT 1`).Scan(&one))
 		assert.Equal(t, 1, one)
-		cached, ok := cache.Get(ctx, serverID, member.ID, channelID)
+		cached, ok, _ := cache.Get(ctx, serverID, member.ID, channelID)
 		require.True(t, ok)
 		assert.Equal(t, rbac.PermSendMessages, cached)
 	})
@@ -494,9 +494,11 @@ func TestResolveEffectivePermissionsForChannelsFreshDoesNotRefillCache(t *testin
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 
+	// Both generations exist, so a publish would be served (#3453 seed-and-skip).
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
 	_, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, member.ID, []string{channelID})
 	require.NoError(t, err)
-	_, cached := cache.Get(ctx, serverID, member.ID, channelID)
+	_, cached, _ := cache.Get(ctx, serverID, member.ID, channelID)
 	assert.False(t, cached, "fresh batch resolution must not restore a permission invalidation")
 }
 
@@ -512,9 +514,11 @@ func TestResolveEffectivePermissionsUncachedDoesNotRefillCache(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 
+	// Both generations exist, so a publish would be served (#3453 seed-and-skip).
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
 	_, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, member.ID, channelID)
 	require.NoError(t, err)
-	_, cached := cache.Get(ctx, serverID, member.ID, channelID)
+	_, cached, _ := cache.Get(ctx, serverID, member.ID, channelID)
 	assert.False(t, cached, "uncached resolution must not restore a permission invalidation")
 }
 
@@ -528,13 +532,13 @@ func TestResolveEffectivePermissionsUncachedServerScopeDoesNotRefillCache(t *tes
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 
 	cache := rbac.NewPermissionCache(ts.Redis)
-	require.NoError(t, cache.Set(ctx, serverID, member.ID, "", rbac.PermBan))
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", rbac.PermBan)
 
 	perms, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, member.ID, "")
 	require.NoError(t, err)
 	assert.True(t, perms.Has(rbac.PermViewTextChannels))
 
-	cachedPerms, cached := cache.Get(ctx, serverID, member.ID, "")
+	cachedPerms, cached, _ := cache.Get(ctx, serverID, member.ID, "")
 	assert.True(t, cached)
 	assert.Equal(t, rbac.PermBan, cachedPerms, "uncached server resolution must not read or overwrite the cache")
 }
@@ -616,18 +620,20 @@ func TestCacheFreeResolversRejectNonMembersWithoutCacheWrite(t *testing.T) {
 	outsider := ts.CreateTestUser(t, "cachefreeoutsider")
 	serverID := ts.CreateTestServer(t, owner.ID, "Cache-Free Non-Member Server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
+	// Both generations exist, so a publish would be served (#3453 seed-and-skip).
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, outsider.ID)
 
 	t.Run("batched", func(t *testing.T) {
 		_, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, outsider.ID, []string{channelID})
 		require.ErrorIs(t, err, rbac.ErrNotMember)
-		_, cached := cache.Get(ctx, serverID, outsider.ID, channelID)
+		_, cached, _ := cache.Get(ctx, serverID, outsider.ID, channelID)
 		assert.False(t, cached, "batched resolution must not cache a non-member result")
 	})
 
 	t.Run("single channel", func(t *testing.T) {
 		_, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, outsider.ID, channelID)
 		require.ErrorIs(t, err, rbac.ErrNotMember)
-		_, cached := cache.Get(ctx, serverID, outsider.ID, channelID)
+		_, cached, _ := cache.Get(ctx, serverID, outsider.ID, channelID)
 		assert.False(t, cached, "uncached resolution must not cache a non-member result")
 	})
 }
@@ -795,7 +801,10 @@ func TestResolver_InvalidateChannel_DelegatesToCache(t *testing.T) {
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 	channelID := ts.CreateTestChannel(t, serverID, "voice-room")
 
-	// Populate the channel-scoped cache entry for this user.
+	// Populate the channel-scoped cache entry for this user. A read publishes
+	// only once both permission generations exist (#3453 seed-and-skip), so
+	// seed them first; the single read below is then the one that publishes.
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
 	_, err := resolver.GetEffectivePermissions(ctx, serverID, member.ID, channelID)
 	require.NoError(t, err)
 
@@ -887,7 +896,13 @@ func TestChannelScopedResolveRefusesChannelOfAnotherServer(t *testing.T) {
 	})
 
 	t.Run("a refused pair is never cached", func(t *testing.T) {
-		_, cached := rbac.NewPermissionCache(ts.Redis).Get(ctx, serverA, ownerA.ID, channelB)
+		cache := rbac.NewPermissionCache(ts.Redis)
+		// The control subtest's reads seeded both generations, so a publish
+		// here would be served; the miss below is the refusal, not an absent tag.
+		tags := cache.Generations(ctx, serverA, ownerA.ID)
+		require.NotEmpty(t, tags.User)
+		require.NotEmpty(t, tags.Server)
+		_, cached, _ := cache.Get(ctx, serverA, ownerA.ID, channelB)
 		assert.False(t, cached)
 	})
 }

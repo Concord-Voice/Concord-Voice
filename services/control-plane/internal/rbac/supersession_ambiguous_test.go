@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -128,7 +127,7 @@ func TestRoleMutation_AmbiguousCommitInvalidatesPermissionCache(t *testing.T) {
 			requestCtx, cancelRequest := context.WithCancel(ctx)
 			t.Cleanup(cancelRequest)
 			cacheKey := "perm:" + serverID + ":" + member.ID
-			require.NoError(t, ts.Redis.Set(ctx, cacheKey, int64(rbac.PermManageRoles), time.Minute).Err())
+			testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", rbac.PermManageRoles)
 
 			tc.invoke(t, ts, requestCtx, newAcknowledgementLostRoleHandler(t, ts, cancelRequest), owner.ID, member.ID, serverID)
 
@@ -157,9 +156,16 @@ func TestUpsertChannelOverride_AmbiguousRetainedViewRechecksAuthority(t *testing
 
 	cache := rbac.NewPermissionCache(ts.Redis)
 	resolver := rbac.NewResolver(ts.DB, cache, logger.New("test"))
+	// A read publishes only once both generations exist (#3453 seed-and-skip);
+	// without them nothing would be cached and the invalidation asserted below
+	// would pass whether or not it ran.
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
 	before, err := resolver.GetEffectivePermissions(context.Background(), serverID, member.ID, channelID)
 	require.NoError(t, err)
 	require.True(t, before.Has(rbac.PermJoinVoice), "the pre-commit cache must contain the temporary grant")
+	cachedBefore, cached, _ := cache.Get(context.Background(), serverID, member.ID, channelID)
+	require.True(t, cached, "the pre-commit cache must contain the temporary grant")
+	require.True(t, cachedBefore.Has(rbac.PermJoinVoice))
 
 	enforcer := &supersessionVoiceEnforcer{}
 	h := rbac.NewHandler(ts.DB, logger.New("test"), ts.Redis, websocket.NewHub(ts.DB, ts.Redis), resolver, cache, nil)

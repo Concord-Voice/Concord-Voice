@@ -58,6 +58,11 @@ const (
 	ErrMsgInvalidMFACode  = "Invalid MFA code"
 )
 
+// ErrMsgMFAEnrollmentRequired is the 403 body EnrollmentRequired sends. It is
+// byte-stable: the desktop shows it verbatim, and #3456 teaches the desktop's
+// step-up refusal classifier the mfa_enrollment_required flag beside it.
+const ErrMsgMFAEnrollmentRequired = "Set up an authenticator app or security key to do this."
+
 // ErrPasswordVerification marks a 500 that came from the password factor. It is
 // a fixed sentinel rather than the underlying error because that error can
 // embed the malformed hash — see the Cause field on Error.
@@ -314,4 +319,16 @@ func verifyMFA(
 		return &Error{Status: http.StatusForbidden, Body: gin.H{"error": ErrMsgInvalidMFACode}}
 	}
 	return nil
+}
+
+// EnrollmentRequired refuses an action that demands an inline MFA confirmation
+// from an actor with no inline factor to confirm with (policy P1: no confirmed
+// TOTP and no WebAuthn credential). It is distinct from the missing-code
+// refusal: there is no code this actor could send, so offering "methods"
+// would prompt for a factor that does not exist. A 4xx outcome, so Cause is
+// nil. Each call returns a fresh value because Body is a mutable map.
+func EnrollmentRequired() *Error {
+	return &Error{Status: http.StatusForbidden, Body: gin.H{
+		"error": ErrMsgMFAEnrollmentRequired, "mfa_enrollment_required": true,
+	}}
 }

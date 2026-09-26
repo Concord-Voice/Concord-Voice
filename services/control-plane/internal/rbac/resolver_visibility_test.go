@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -989,14 +990,16 @@ func TestHasPermissionCacheHit(t *testing.T) {
 	serverID := ts.CreateTestServer(t, owner.ID, "HP Server")
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 
-	// First call populates cache
+	// First call populates cache (once both permission generations exist,
+	// which a publishing read requires under #3453's seed-and-skip)
+	testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
 	hasPerm, err := resolver.HasPermission(ctx, serverID, member.ID, "", rbac.PermViewTextChannels)
 	require.NoError(t, err)
 	assert.True(t, hasPerm)
 
 	// Verify cache was populated
 	cache := rbac.NewPermissionCache(ts.Redis)
-	cached, ok := cache.Get(ctx, serverID, member.ID, "")
+	cached, ok, _ := cache.Get(ctx, serverID, member.ID, "")
 	assert.True(t, ok, "cache should be populated after HasPermission call")
 	assert.True(t, cached.Has(rbac.PermViewTextChannels))
 }

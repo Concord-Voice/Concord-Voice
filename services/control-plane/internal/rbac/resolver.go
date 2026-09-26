@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/lib/pq"
 
@@ -60,6 +61,12 @@ type Resolver struct {
 	db    *sql.DB
 	cache *PermissionCache
 	log   *logger.Logger
+
+	// afterCompute, when set, runs immediately after a cache-publishing
+	// compute returns, before anything else reads Redis or calls cache.Set. It
+	// is a test seam for the in-flight race (#3453 I-3), set only through
+	// export_test.go, and nil in production.
+	afterCompute func()
 }
 
 type rowQuerier interface {
@@ -75,10 +82,11 @@ func NewResolver(db *sql.DB, cache *PermissionCache, log *logger.Logger) *Resolv
 	}
 }
 
-// cacheSet publishes a computed value. A failed write costs only a recompute on
-// the next read, so it is logged rather than returned.
-func (r *Resolver) cacheSet(ctx context.Context, serverID, userID, channelID string, perm Permission) {
-	if err := r.cache.Set(ctx, serverID, userID, channelID, perm); err != nil && r.log != nil {
+// cacheSet publishes a computed value tagged with the generations read BEFORE
+// that compute began (see PermissionCache). A failed write costs only a
+// recompute on the next read, so it is logged rather than returned.
+func (r *Resolver) cacheSet(ctx context.Context, serverID, userID, channelID string, perm Permission, tags GenTags) {
+	if err := r.cache.Set(ctx, serverID, userID, channelID, perm, tags); err != nil && r.log != nil {
 		r.log.Warn("Failed to cache permissions", "error", err)
 	}
 }
@@ -93,41 +101,34 @@ func (r *Resolver) cacheSet(ctx context.Context, serverID, userID, channelID str
 // Returns (false, nil) if user lacks permission
 // Returns (false, err) on database/system errors
 func (r *Resolver) HasPermission(ctx context.Context, serverID, userID, channelID string, perm Permission) (bool, error) {
-	// Check cache first
-	if cached, ok := r.cache.Get(ctx, serverID, userID, channelID); ok {
-		return cached.Has(perm), nil
-	}
-
-	// Compute effective permissions
-	effectivePerm, err := r.computeEffectivePermissions(ctx, serverID, userID, channelID)
+	effectivePerm, err := r.GetEffectivePermissions(ctx, serverID, userID, channelID)
 	if err != nil {
 		if errors.Is(err, ErrNotMember) {
 			return false, nil // Not a member = no permissions (not an error condition)
 		}
 		return false, err
 	}
-
-	// Cache result
-	r.cacheSet(ctx, serverID, userID, channelID, effectivePerm)
-
 	return effectivePerm.Has(perm), nil
 }
 
 // GetEffectivePermissions returns the computed permission bitfield for a user
 // Useful for frontend to determine which UI elements to show
+//
+// It is cache-first. On a miss it computes and publishes with the generations
+// Get read, which were current before the compute began.
 func (r *Resolver) GetEffectivePermissions(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
-	// Check cache first
-	if cached, ok := r.cache.Get(ctx, serverID, userID, channelID); ok {
+	cached, ok, tags := r.cache.Get(ctx, serverID, userID, channelID)
+	if ok {
 		return cached, nil
 	}
 
-	// Compute and cache
 	effectivePerm, err := r.computeEffectivePermissions(ctx, serverID, userID, channelID)
 	if err != nil {
 		return 0, err
 	}
+	r.runAfterCompute()
 
-	r.cacheSet(ctx, serverID, userID, channelID, effectivePerm)
+	r.cacheSet(ctx, serverID, userID, channelID, effectivePerm, tags)
 	return effectivePerm, nil
 }
 
@@ -137,20 +138,39 @@ func (r *Resolver) GetEffectivePermissions(ctx context.Context, serverID, userID
 // an enforcement push must reflect committed DB state, never a cache entry
 // that a concurrently in-flight pre-mutation compute may have repopulated
 // after the mutation's invalidation.
+//
+// It reads no cached VALUE, but it must still read the generations BEFORE the
+// compute: publishing with generations read afterwards would tag a value
+// computed before a concurrent change with the generation that change bumped
+// to, and the next cached read would serve it.
 func (r *Resolver) ResolveEffectivePermissionsFresh(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
+	var tags GenTags
+	if r.cache != nil {
+		tags = r.cache.Generations(ctx, serverID, userID)
+	}
 	perms, err := r.computeEffectivePermissions(ctx, serverID, userID, channelID)
 	if err != nil {
 		return 0, err
 	}
+	r.runAfterCompute()
 	if r.cache != nil {
-		r.cacheSet(ctx, serverID, userID, channelID, perms)
+		r.cacheSet(ctx, serverID, userID, channelID, perms, tags)
 	}
 	return perms, nil
+}
+
+func (r *Resolver) runAfterCompute() {
+	if r.afterCompute != nil {
+		r.afterCompute()
+	}
 }
 
 // ResolveEffectivePermissionsUncached recomputes permissions from the database
 // without reading or publishing a cache entry. Destructive preflight paths use
 // it so an in-flight result cannot restore permissions after invalidation.
+//
+// The channel arm returns ResolveEffectivePermissionsForChannelsFresh's value,
+// which that entry point has already masked; only the server arm masks here.
 func (r *Resolver) ResolveEffectivePermissionsUncached(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
 	if channelID != "" {
 		permsByChannel, err := r.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, userID, []string{channelID})
@@ -170,14 +190,14 @@ func (r *Resolver) ResolveEffectivePermissionsUncached(ctx context.Context, serv
 		}
 	}()
 
-	perms, _, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
+	raw, _, mask, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
 	if err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit permission snapshot: %w", err)
 	}
-	return perms, nil
+	return mask.Apply(raw), nil
 }
 
 // ResolveServerPermissionsTx resolves a member's SERVER-scope effective
@@ -197,8 +217,11 @@ func (r *Resolver) ResolveEffectivePermissionsUncached(ctx context.Context, serv
 func (r *Resolver) ResolveServerPermissionsTx(
 	ctx context.Context, q rowQuerier, serverID, userID string,
 ) (Permission, error) {
-	perms, _, err := r.resolveServerPermissions(ctx, q, serverID, userID)
-	return perms, err
+	raw, _, mask, err := r.resolveServerPermissions(ctx, q, serverID, userID)
+	if err != nil {
+		return 0, err
+	}
+	return mask.Apply(raw), nil
 }
 
 // ResolveChannelPermissionsTx resolves one channel's effective permissions in
@@ -207,21 +230,24 @@ func (r *Resolver) ResolveServerPermissionsTx(
 func (r *Resolver) ResolveChannelPermissionsTx(
 	ctx context.Context, tx *sql.Tx, serverID, userID, channelID string,
 ) (Permission, error) {
-	basePerms, isOwner, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
+	basePerms, isOwner, mask, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
 	if err != nil {
 		return 0, err
 	}
 	if err := requireChannelsInServer(ctx, tx, serverID, []string{channelID}); err != nil {
 		return 0, err
 	}
-	if isOwner || basePerms.Has(PermAdministrator) {
-		return basePerms, nil
+	// The bypass reads the RAW base: an unenrolled Administrator still ignores
+	// channel overrides, and is masked only at the exit below.
+	raw := basePerms
+	if !isOwner && !basePerms.Has(PermAdministrator) {
+		permsByChannel := map[string]Permission{channelID: basePerms}
+		if err := r.applyBatchedChannelOverrides(ctx, tx, []string{channelID}, serverID, userID, basePerms, permsByChannel); err != nil {
+			return 0, err
+		}
+		raw = permsByChannel[channelID]
 	}
-	permsByChannel := map[string]Permission{channelID: basePerms}
-	if err := r.applyBatchedChannelOverrides(ctx, tx, []string{channelID}, serverID, userID, basePerms, permsByChannel); err != nil {
-		return 0, err
-	}
-	return permsByChannel[channelID], nil
+	return mask.Apply(raw), nil
 }
 
 // ResolveEffectivePermissionsForChannelsFresh resolves a member's effective
@@ -245,7 +271,7 @@ func (r *Resolver) ResolveEffectivePermissionsForChannelsFresh(ctx context.Conte
 		}
 	}()
 
-	basePerms, isOwner, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
+	basePerms, isOwner, mask, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -255,6 +281,7 @@ func (r *Resolver) ResolveEffectivePermissionsForChannelsFresh(ctx context.Conte
 	for _, channelID := range channelIDs {
 		permsByChannel[channelID] = basePerms
 	}
+	// The bypass reads the RAW base; each channel is masked once, at the exit.
 	if !isOwner && !basePerms.Has(PermAdministrator) {
 		if err := r.applyBatchedChannelOverrides(ctx, tx, channelIDs, serverID, userID, basePerms, permsByChannel); err != nil {
 			return nil, err
@@ -262,6 +289,9 @@ func (r *Resolver) ResolveEffectivePermissionsForChannelsFresh(ctx context.Conte
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit permission snapshot: %w", err)
+	}
+	for channelID, raw := range permsByChannel {
+		permsByChannel[channelID] = mask.Apply(raw)
 	}
 	return permsByChannel, nil
 }
@@ -284,7 +314,7 @@ func (r *Resolver) applyBatchedChannelOverrides(
 		var channelID string
 		var roleAllow, roleDeny, userAllow, userDeny int64
 		if err := rows.Scan(&channelID, &roleAllow, &roleDeny, &userAllow, &userDeny); err != nil {
-			return err
+			return fmt.Errorf("scan channel override row: %w", err)
 		}
 		perms := basePerms
 		perms |= Permission(roleAllow)
@@ -294,7 +324,7 @@ func (r *Resolver) applyBatchedChannelOverrides(
 		permsByChannel[channelID] = perms
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return fmt.Errorf("iterate channel override rows: %w", err)
 	}
 	return nil
 }
@@ -302,72 +332,92 @@ func (r *Resolver) applyBatchedChannelOverrides(
 // computeEffectivePermissions implements the two-layer permission resolution model:
 // 1. RBAC: OR together permissions from all user's roles
 // 2. SBAC: Apply channel-specific overrides (deny > allow)
+//
+// and then the MFA mask, once, at its single exit (#3453). Every branch above
+// the exit — the owner short-circuit and applyChannelOverrides' Administrator
+// bypass — reads the raw value.
 func (r *Resolver) computeEffectivePermissions(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
-	basePerms, isOwner, err := r.resolveServerPermissionsFresh(ctx, serverID, userID)
+	basePerms, isOwner, mask, err := r.resolveServerPermissionsFresh(ctx, serverID, userID)
 	if err != nil {
 		return 0, err
 	}
 
-	// If no channel specified, return base permissions.
-	if channelID == "" {
-		return basePerms, nil
+	raw := basePerms
+	if channelID != "" {
+		// Before the owner short-circuit, which would otherwise return the
+		// owner's full set for a channel of any server.
+		if err := requireChannelsInServer(ctx, r.db, serverID, []string{channelID}); err != nil {
+			return 0, err
+		}
+		// The owner bypasses the SBAC layer; everyone else gets overrides.
+		if !isOwner {
+			raw, err = r.applyChannelOverrides(ctx, channelID, userID, basePerms)
+			if err != nil {
+				return 0, fmt.Errorf("failed to apply channel overrides: %w", err)
+			}
+		}
 	}
-	// Before the owner short-circuit, which would otherwise return the owner's
-	// full set for a channel of any server.
-	if err := requireChannelsInServer(ctx, r.db, serverID, []string{channelID}); err != nil {
-		return 0, err
-	}
-	if isOwner {
-		return basePerms, nil
-	}
-
-	// Apply channel-specific overrides (SBAC layer).
-	finalPerms, err := r.applyChannelOverrides(ctx, channelID, userID, basePerms)
-	if err != nil {
-		return 0, fmt.Errorf("failed to apply channel overrides: %w", err)
-	}
-
-	return finalPerms, nil
+	return mask.Apply(raw), nil
 }
 
 // resolveServerPermissionsFresh checks current membership and resolves the
 // server-level RBAC bitfield without consulting the cache.
-func (r *Resolver) resolveServerPermissionsFresh(ctx context.Context, serverID, userID string) (Permission, bool, error) {
+func (r *Resolver) resolveServerPermissionsFresh(ctx context.Context, serverID, userID string) (Permission, bool, MFAMask, error) {
 	return r.resolveServerPermissions(ctx, r.db, serverID, userID)
 }
 
-func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, bool, error) {
+// resolveServerPermissions returns the member's RAW server-scope permissions,
+// whether they own the server, and the MFA mask their entry point applies at
+// its exit. It never masks: the caller's bypass decisions read the raw value.
+//
+// The enforcement flag rides the owner query, so a server that does not
+// enforce costs exactly the statements it did before #3453; MaskFor then runs
+// on the SAME querier, which is the caller's transaction or snapshot.
+func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, bool, MFAMask, error) {
 	// Verify server membership.
 	var isMember bool
 	memberQuery := `SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`
 	if err := db.QueryRowContext(ctx, memberQuery, serverID, userID).Scan(&isMember); err != nil {
-		return 0, false, fmt.Errorf("failed to check membership: %w", err)
+		return 0, false, MFAMask{}, fmt.Errorf("failed to check membership: %w", err)
 	}
 	if !isMember {
-		return 0, false, ErrNotMember
+		return 0, false, MFAMask{}, ErrNotMember
 	}
 
 	// Server owner bypasses RBAC and SBAC.
 	var ownerID string
-	ownerQuery := `SELECT owner_id FROM servers WHERE id = $1`
-	if err := db.QueryRowContext(ctx, ownerQuery, serverID).Scan(&ownerID); err != nil {
-		return 0, false, fmt.Errorf("failed to fetch server owner: %w", err)
+	var enforcing bool
+	ownerQuery := `SELECT owner_id, enforce_mfa_dangerous_actions FROM servers WHERE id = $1`
+	if err := db.QueryRowContext(ctx, ownerQuery, serverID).Scan(&ownerID, &enforcing); err != nil {
+		return 0, false, MFAMask{}, fmt.Errorf("failed to fetch server owner: %w", err)
+	}
+	mask, err := MaskFor(ctx, db, userID, enforcing)
+	if err != nil {
+		return 0, false, MFAMask{}, err
 	}
 	if ownerID == userID {
 		// Owner gets all permissions — immune to channel overrides
 		// Owner bypasses SBAC layer entirely (cannot be restricted per-channel)
-		return OwnerPermissions, true, nil
+		return OwnerPermissions, true, mask, nil
 	}
 
 	// Compute base permissions from roles (OR all role permissions together).
-	basePerms, err := r.computeRolePermissions(ctx, db, serverID, userID)
+	basePerms, err := RawRolePermissions(ctx, db, serverID, userID)
 	if err != nil {
-		return 0, false, fmt.Errorf("failed to compute role permissions: %w", err)
+		return 0, false, MFAMask{}, fmt.Errorf("failed to compute role permissions: %w", err)
 	}
-	return basePerms, false, nil
+	return basePerms, false, mask, nil
 }
 
-// computeRolePermissions computes base permissions by OR'ing all user's role permissions.
+// computeRolePermissions is RawRolePermissions; see that function's comment.
+func (r *Resolver) computeRolePermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, error) {
+	return RawRolePermissions(ctx, db, serverID, userID)
+}
+
+// RawRolePermissions is the server-qualified BIT_OR of userID's role
+// permissions in serverID: RAW, with no owner short-circuit and no MFA mask.
+// It is the one copy of that aggregate for callers outside this package that
+// need raw bit 62 — Administrator identity is raw, never masked (#3453 I5).
 //
 // NOTE: this server-scope derivation is MIRRORED in raw SQL by
 // servers.ListServers (internal/servers/handlers.go), which inlines the same
@@ -380,6 +430,14 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 // #2869 is the first change to test that warning, and it held: the server
 // predicate below was added to BOTH copies in the same commit. Do not treat the
 // mirror as documentation — it is a second enforcement surface.
+//
+// #3453 adds a term the mirror must also carry, and it does not live in this
+// function: the MFA mask, which every resolver entry point applies to its
+// result (MFAMask.Apply). ListServers must select
+// servers.enforce_mfa_dangerous_actions and, when any row enforces, apply
+// MaskFor's mask to each row in Go, failing closed to the unenrolled mask when
+// enrollment cannot be read. Never mirror the mask's arithmetic in SQL: a
+// second copy of EXPAND is a second place for it to drift.
 //
 // Every member_roles read in this file that turns a role_id into authority joins
 // roles with `AND r.server_id = mr.server_id` (#2869) -- including the user_roles
@@ -394,7 +452,7 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 // every entry point. This aggregate feeds authorizeRoleMutationTx's actorPerms, so
 // a foreign role's bits landing here open the escalation guard rather than merely
 // widening a read.
-func (r *Resolver) computeRolePermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, error) {
+func RawRolePermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, error) {
 	query := `
 		SELECT COALESCE(BIT_OR(r.permissions), 0) AS total_permissions
 		FROM member_roles mr
@@ -413,6 +471,7 @@ func (r *Resolver) computeRolePermissions(ctx context.Context, db rowQuerier, se
 }
 
 // applyChannelOverrides applies channel-specific permission overrides (SBAC layer)
+// to the RAW base; its Administrator bypass is therefore driven by raw bit 62.
 // Applied in order (each step modifies the result of the previous):
 // 1. Base permissions (from roles)
 // 2. Role-specific allow (grant additional permissions)
@@ -491,6 +550,57 @@ func (r *Resolver) InvalidateChannel(ctx context.Context, serverID, channelID st
 // InvalidateUser clears cached server and channel permissions for one user.
 func (r *Resolver) InvalidateUser(ctx context.Context, serverID, userID string) error {
 	return r.cache.Invalidate(ctx, serverID, userID)
+}
+
+// BumpUserPermissionGeneration makes every cached permission of userID, on
+// every server, miss on its next read. Call it AFTER the commit that changed
+// one of the user's permission inputs (an MFA factor, #3453): bumping before
+// the commit lets a compute that reads the pre-commit state publish under the
+// new generation.
+//
+// It retries the bump once, then falls back to deleting the user's entries.
+// It returns an error only when all three fail; the caller logs it. The
+// fallback leaves a residual the bump does not (spec RS2): a compute already
+// in flight can still publish under the unchanged generation.
+func (r *Resolver) BumpUserPermissionGeneration(ctx context.Context, userID string) error {
+	if r.cache == nil {
+		return nil // nothing is cached, so nothing can be stale
+	}
+	return bumpWithFallback(ctx, userID, r.cache.BumpUser, r.cache.InvalidateUser)
+}
+
+// BumpServerPermissionGeneration makes every cached permission on serverID
+// miss on its next read. Call it AFTER the commit that changed a server-wide
+// input (the MFA enforcement flag, #3453). Same retry, fallback and error
+// contract as BumpUserPermissionGeneration.
+func (r *Resolver) BumpServerPermissionGeneration(ctx context.Context, serverID string) error {
+	if r.cache == nil {
+		return nil // nothing is cached, so nothing can be stale
+	}
+	return bumpWithFallback(ctx, serverID, r.cache.BumpServer, r.cache.InvalidateServer)
+}
+
+// permissionBumpTimeout bounds one bump with its retry and fallback.
+const permissionBumpTimeout = 10 * time.Second
+
+// bumpWithFallback runs detached from the caller's cancellation: the bump is a
+// post-commit obligation, and a client that hangs up must not leave the cache
+// serving the state that commit replaced. Detached is not unbounded — it gets
+// its own deadline (the CompleteChannelAuthorityMutationWithRotations shape).
+func bumpWithFallback(ctx context.Context, id string, bump, fallback func(context.Context, string) error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), permissionBumpTimeout)
+	defer cancel()
+	err := bump(ctx, id)
+	if err == nil {
+		return nil
+	}
+	if err = bump(ctx, id); err == nil {
+		return nil
+	}
+	if fallbackErr := fallback(ctx, id); fallbackErr != nil {
+		return fmt.Errorf("bump permission generation: %w", errors.Join(err, fallbackErr))
+	}
+	return nil
 }
 
 // sbacChannelOverrideColumns is the SELECT column list, shared verbatim by the
