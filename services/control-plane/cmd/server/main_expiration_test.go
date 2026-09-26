@@ -47,14 +47,19 @@ func TestRunExpirationPreflight_ReturnsRunErrorWithoutSignal(t *testing.T) {
 	assert.ErrorIs(t, runExpirationPreflight(context.Background(), quit, func(context.Context) error { return want }), want)
 }
 
-func TestMainExpirationPreflightComposesRetirementAfterExpiry(t *testing.T) {
+// TestMainExpirationPreflightComposesExpiryClearReapRetirement pins the
+// argument order main.go passes. runDMCleanupPreflight's typed parameters stop
+// reordering inside it, but all three sweepers satisfy preflightRunner, so
+// swapped arguments here would still compile (#3462 D12).
+func TestMainExpirationPreflightComposesExpiryClearReapRetirement(t *testing.T) {
 	body, err := os.ReadFile("main.go")
 	require.NoError(t, err)
 	source := string(body)
-	expiry := strings.Index(source, "expirySweeper.RunPreflight(ctx)")
-	retirement := strings.Index(source, "retirementSweeper.RunPreflight(ctx)")
-	require.GreaterOrEqual(t, expiry, 0)
-	require.Greater(t, retirement, expiry)
+	require.Equal(t, 1, strings.Count(source,
+		"runDMCleanupPreflight(ctx, expirySweeper, clearReapSweeper, retirementSweeper)"),
+		"preflight must run expiry, then the clear reap, then retirement")
+	require.Zero(t, strings.Count(source, ".RunPreflight(ctx)"),
+		"every preflight step must go through runDMCleanupPreflight")
 }
 
 func TestMainExpirationPreflightErrorIsCheckedBeforeListenAndServe(t *testing.T) {

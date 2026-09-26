@@ -337,6 +337,12 @@ account can't provide, never your password twice.
   can no longer be turned on outside development builds. A server set up without email delivery
   no longer writes sign-up, account-recovery or ownership-transfer codes into its logs outside
   development; those emails fail instead.
+- **Clearing a direct message or group chat's history now deletes it once everyone has** ([#3462](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3462)) — clearing
+  your history in a conversation has always removed it from your own view, but until now the messages
+  and their attachments stayed on the server even after every member had cleared them. Once every
+  current member has cleared the same history, Concord now deletes those messages and their
+  attachments for good, and a group whose last member has left is cleaned up the same way. This
+  happens in the background, usually within minutes; a very large conversation can take longer.
 
 ## [0.2.47] — 2026-09-18
 

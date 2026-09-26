@@ -586,31 +586,19 @@ func runControlPlane() (runErr error) {
 		return fmt.Errorf("initialize expiration sweeper: %w", err)
 	}
 	retirementSweeper := dm.NewRetirementSweeper(db, redisClient, activePlanRail, log)
+	clearReapSweeper := dm.NewClearReapSweeper(db, purgeEngine, log)
 	if err := runExpirationPreflight(context.Background(), quit, func(ctx context.Context) error {
-		if err := expirySweeper.RunPreflight(ctx); err != nil {
-			return err
-		}
-		return retirementSweeper.RunPreflight(ctx)
+		return runDMCleanupPreflight(ctx, expirySweeper, clearReapSweeper, retirementSweeper)
 	}); err != nil {
 		return fmt.Errorf("run expiration preflight: %w", err)
 	}
-	expirationWorkers.Add(4)
-	go func() {
-		defer expirationWorkers.Done()
-		purgeReaper.StartWorker(cleanupCtx)
-	}()
-	go func() {
-		defer expirationWorkers.Done()
-		purgeReaper.SweepStragglers(cleanupCtx)
-	}()
-	go func() {
-		defer expirationWorkers.Done()
-		expirySweeper.RunWorker(cleanupCtx, expiration.DefaultExpirySweepInterval)
-	}()
-	go func() {
-		defer expirationWorkers.Done()
-		retirementSweeper.RunWorker(cleanupCtx, expiration.DefaultExpirySweepInterval)
-	}()
+	startCleanupWorkers(cleanupCtx, &expirationWorkers,
+		purgeReaper.StartWorker,
+		purgeReaper.SweepStragglers,
+		func(ctx context.Context) { expirySweeper.RunWorker(ctx, expiration.DefaultExpirySweepInterval) },
+		func(ctx context.Context) { retirementSweeper.RunWorker(ctx, expiration.DefaultExpirySweepInterval) },
+		func(ctx context.Context) { clearReapSweeper.RunWorker(ctx, expiration.DefaultExpirySweepInterval) },
+	)
 
 	log.Info("Starting Control Plane server", "port", cfg.Port, "env", cfg.Environment)
 	if err := runControlPlaneServer(func() error { return srv.ListenAndServe() }, quit, cleanupRuntime, readiness.MarkDraining); err != nil {

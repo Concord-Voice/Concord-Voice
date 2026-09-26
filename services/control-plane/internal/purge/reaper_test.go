@@ -7,10 +7,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/lib/pq" // register the "postgres" driver for the fast-failing test handle
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -173,6 +176,46 @@ func TestReaper_EnqueueIsNonBlockingWhenQueueFull(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("EnqueueBlobDeletes blocked when the queue was full")
 	}
+}
+
+// A full queue must cost ONE aggregate warning per call, never one per ref, and
+// that warning must carry no storage key: `attachments/<fileID>` embeds a file
+// ID, and a large preflight reap would otherwise turn the overflow into a
+// high-volume ID emitter (#3462 I6, spec §9).
+func TestReaper_EnqueueDropLogIsOneAggregateLineWithoutKeys(t *testing.T) {
+	var logs bytes.Buffer
+	r := &Reaper{log: logger.NewWithWriter(&logs), jobs: make(chan media.BlobRef, 1)}
+	refs := make([]media.BlobRef, 0, 3)
+	for range 3 {
+		refs = append(refs, media.BlobRef{Key: "attachments/" + uuid.NewString()})
+	}
+
+	r.EnqueueBlobDeletes(refs)
+
+	require.Len(t, r.jobs, 1, "the first ref still fits the queue")
+	var dropLines []string
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.Contains(line, "queue full") {
+			dropLines = append(dropLines, line)
+		}
+	}
+	require.Len(t, dropLines, 1, "one aggregate line per call; got log:\n%s", logs.String())
+	assert.Contains(t, dropLines[0], "dropped=2")
+	assert.NotRegexp(t, regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-`), logs.String(),
+		"the drop log must carry no key (keys embed file IDs)")
+	assert.NotContains(t, logs.String(), "attachments/")
+}
+
+// Nothing dropped means nothing logged: the aggregate line is an overflow
+// signal, not a per-call trace.
+func TestReaper_EnqueueDropLogSilentWhenNothingDropped(t *testing.T) {
+	var logs bytes.Buffer
+	r := &Reaper{log: logger.NewWithWriter(&logs), jobs: make(chan media.BlobRef, 2)}
+
+	r.EnqueueBlobDeletes([]media.BlobRef{{Key: "attachments/a"}, {}, {Key: "attachments/b"}})
+
+	assert.Len(t, r.jobs, 2)
+	assert.Empty(t, logs.String())
 }
 
 func TestReaper_EnqueueSkipsEmptyKeys(t *testing.T) {

@@ -1,0 +1,1 @@
+ALTER TABLE message_purges VALIDATE CONSTRAINT message_purges_reason_check;

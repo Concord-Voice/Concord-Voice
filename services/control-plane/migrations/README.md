@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000154)
+## Existing Migrations (000001–000156)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -264,6 +264,8 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000152 | extend_voice_lifecycle_rollout_grace | Extend the Server Voice lifecycle rollout grace; irreversible timestamp repair, with documented no-op down migration |
 | 000153 | guard_blocked_friendship_reconciliation | Abort compatibility retrofit when final blocked friendships remain |
 | 000154 | add_voice_enforcement_sessions | Add the durable exact-session voice-enforcement registry and rollout activation singleton |
+| 000155 | message_purge_clear_reason | Broaden `message_purges_reason_check` to admit `clear` and leave it `NOT VALID` (#3462) |
+| 000156 | validate_message_purge_clear_reason | Validate `message_purges_reason_check`; down restores the broader `NOT VALID` check (#3462) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -299,6 +301,11 @@ retired aggregate series under an `ACCESS EXCLUSIVE` lock, then restores the exa
 Migration 000143 adds nullable delivery-claim metadata. Apply it before code that
 claims terminal delivery; its down migration removes only that ephemeral metadata
 and leaves terminal obligations intact.
+
+Migrations 000155–000156 repeat the 000130–000131 shape for `clear`, the
+reason the cleared-DM reap writes. Apply both before starting the reap. A
+downgrade through 000155 is refused while `clear` audit evidence exists; it
+does not delete or rewrite that evidence.
 
 ## Troubleshooting
 

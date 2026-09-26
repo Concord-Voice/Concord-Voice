@@ -71,8 +71,8 @@ func NewReaper(db *sql.DB, log *logger.Logger, backends media.DeleterResolver) *
 }
 
 // EnqueueBlobDeletes hands blob references to the background worker. Non-blocking:
-// if the bounded buffer is full, the ref is dropped (and logged) rather than
-// stalling the caller. SweepStragglers recovers it while its soft-deleted row
+// if the bounded buffer is full, the ref is dropped rather than stalling the
+// caller, and the call logs ONE aggregate count of its drops. SweepStragglers recovers it while its soft-deleted row
 // remains; media.OrphanReaper recovers it after a caller hard-deletes that row.
 //
 // A ref carries the BACKEND as well as the key. Enqueueing a bare key would leave
@@ -85,6 +85,7 @@ func NewReaper(db *sql.DB, log *logger.Logger, backends media.DeleterResolver) *
 // DETERMINISTIC tier-1 key (`avatars/<userID>`, media.tier1StorageKey) would delete
 // an object a live row may still point at. Route any such key through the sweep.
 func (r *Reaper) EnqueueBlobDeletes(refs []media.BlobRef) {
+	dropped := 0
 	for _, ref := range refs {
 		if ref.Key == "" {
 			continue
@@ -92,9 +93,14 @@ func (r *Reaper) EnqueueBlobDeletes(refs []media.BlobRef) {
 		select {
 		case r.jobs <- ref:
 		default:
-			r.log.Warn("purge reaper: blob-delete queue full; dropping key for sweeper recovery",
-				"key", ref.Key, "storage_backend", ref.BackendLabel())
+			dropped++
 		}
+	}
+	if dropped > 0 {
+		// One line, no keys: storage keys embed file IDs (#3462 I6), and a large
+		// preflight reap runs before StartWorker drains, so a per-ref line would
+		// be a high-volume ID emitter. SweepStragglers recovers every dropped ref.
+		r.log.Warn("purge reaper: blob-delete queue full; dropped refs left for sweeper recovery", "dropped", dropped)
 	}
 }
 
@@ -142,7 +148,7 @@ func (r *Reaper) reapBlob(ctx context.Context, ref media.BlobRef) {
 		// "there is nothing to delete" is no longer something we can assert.
 		if ref.Backend != nil {
 			r.log.Error("purge reaper: row names a storage backend but no resolver is wired; leaving unmarked for sweep retry",
-				"key", ref.Key, "storage_backend", ref.BackendLabel())
+				"storage_backend", ref.BackendLabel())
 			r.recordReapFailure(ctx, ref)
 			return
 		}
@@ -153,7 +159,7 @@ func (r *Reaper) reapBlob(ctx context.Context, ref media.BlobRef) {
 	store, err := r.backends.ResolveDeleter(ref.Backend)
 	if err != nil {
 		r.log.Error("purge reaper: could not resolve the storage backend for a blob; leaving unmarked for sweep retry",
-			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+			"error", err, "storage_backend", ref.BackendLabel())
 		r.recordReapFailure(ctx, ref)
 		return
 	}
@@ -161,8 +167,9 @@ func (r *Reaper) reapBlob(ctx context.Context, ref media.BlobRef) {
 	deleteErr := store.DeleteObject(deleteCtx, ref.Key)
 	cancel()
 	if deleteErr != nil {
+		// error_class, not the error: storage errors wrap the object key (I6).
 		r.log.Warn("purge reaper: blob delete failed; leaving unmarked for sweep retry",
-			"error", deleteErr, "key", ref.Key, "storage_backend", ref.BackendLabel())
+			"error_class", ErrorClass(deleteErr), "storage_backend", ref.BackendLabel())
 		r.recordReapFailure(ctx, ref)
 		return
 	}
@@ -201,7 +208,7 @@ func (r *Reaper) reapSweptBlob(ctx context.Context, ref media.BlobRef) {
 		// Fail closed: neither delete nor mark, so the next tick retries. Never delete
 		// an object whose live-reference status could not be established.
 		r.log.Warn("purge reaper: live-key check failed; skipping reap for retry",
-			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+			"error", err, "storage_backend", ref.BackendLabel())
 		r.recordReapFailure(ctx, ref)
 		return
 	}
@@ -220,7 +227,7 @@ func (r *Reaper) reapSweptBlob(ctx context.Context, ref media.BlobRef) {
 func (r *Reaper) markReaped(ctx context.Context, ref media.BlobRef) {
 	if _, err := r.db.ExecContext(ctx, markBlobReapedQuery, ref.Key, ref.Backend); err != nil {
 		r.log.Warn("purge reaper: failed to mark blob reaped",
-			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+			"error", err, "storage_backend", ref.BackendLabel())
 	}
 }
 
@@ -443,7 +450,7 @@ const incrementReapAttemptsQuery = `UPDATE media_files SET reap_attempts = reap_
 func (r *Reaper) recordReapFailure(ctx context.Context, ref media.BlobRef) {
 	if _, err := r.db.ExecContext(ctx, incrementReapAttemptsQuery, ref.Key, ref.Backend); err != nil {
 		r.log.Warn("purge reaper: failed to record blob reap failure",
-			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+			"error", err, "storage_backend", ref.BackendLabel())
 	}
 }
 

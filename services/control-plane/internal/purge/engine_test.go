@@ -2,6 +2,7 @@ package purge
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 func TestRunExpiryBatch_RejectsInvalidPlansBeforeDatabaseAccess(t *testing.T) {
@@ -44,6 +46,31 @@ func TestRunExpiryBatch_RejectsInvalidPlansBeforeDatabaseAccess(t *testing.T) {
 			_, err := (&Engine{}).RunExpiryBatch(context.Background(), tc.plan)
 			require.Error(t, err)
 		})
+	}
+}
+
+// Run is the handler-facing terminal, so it may only write handler-shaped
+// evidence. The system-owned reasons belong to their own restricted terminals
+// (RunExpiryBatch, RunClearReapBatch). The nil *sql.DB proves the refusal lands
+// before any database contact, including the audit insert.
+func TestEngineRunRejectsReasonsOutsideTheManualSet(t *testing.T) {
+	e := NewEngine(nil, logger.NewWithWriter(io.Discard), nil, 0)
+	for _, reason := range []string{ExpiryReason, ClearReason, "", "MANUAL", "manual "} {
+		_, err := e.Run(context.Background(), Plan{Reason: reason})
+		require.ErrorIs(t, err, errRunReason, "reason %q", reason)
+	}
+}
+
+// Positive control for the allow-list: every handler reason gets past it. An
+// illegal identifier then stops Run before the database, so a nil *sql.DB is
+// still never touched.
+func TestEngineRunAdmitsManualBanAndKickReasons(t *testing.T) {
+	e := NewEngine(nil, logger.NewWithWriter(io.Discard), nil, 0)
+	for _, reason := range []string{"manual", "ban", "kick"} {
+		_, err := e.Run(context.Background(), Plan{Reason: reason, Deletes: []DeleteSpec{{MessagesTable: "unknown"}}})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, errRunReason, "reason %q", reason)
+		require.ErrorContains(t, err, "illegal delete-spec identifiers")
 	}
 }
 

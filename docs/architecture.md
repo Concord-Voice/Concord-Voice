@@ -639,6 +639,7 @@ erDiagram
 > - migration 000134 repairs far-future DM voice lifecycle stamps; migrations 000135–000136 add the camera-layering and presence-liveness operations metrics, migration 000137 adds durable expiration-policy system-message rows, and migrations 000138–000139 add per-participant DM list hides, Clear-history provenance, and the concurrent partial index supporting hidden-participant lookups
 > - migrations 000140–000143 add the guarded Server Voice terminal outbox, its account-erasure index, six aggregate operations counters, a recoverable delivery claim, and retry delivery through local Hub admission; account erasure or channel deletion cancels a retained user-owned obligation
 > - migration 000144 binds member roles to their server; migrations 000145–000153 serialize DM revocation, add durable block and media-ejection reconciliation, fence delivery generations, add credential-epoch ejections and rollout grace, and validate blocked-friendship compatibility
+> - migrations 000155–000156 widen and validate the `message_purges` reason check to admit `clear`, the reason the DM clear-reap purge-engine terminal writes when it deletes messages every current participant has cleared
 
 DM participant visibility is private to the requesting account. `dm_participants.hidden_at`
 removes one participant's conversation from list reads without changing read state;
@@ -648,6 +649,20 @@ owned by `internal/dmvisibility` and consumed by purge and WebSocket delivery. R
 replaces and drains the singleton control-plane reader before Clear traffic is admitted;
 the guarded 000138 downgrade refuses live visibility data rather than deleting it. See
 the [participant visibility design](superpowers/specs/2026-09-13-2820-dm-participant-visibility-design.md).
+
+A restricted purge-engine terminal, `RunClearReapBatch`, garbage-collects rows
+that Clear has already made unreadable to every current participant (#3462).
+It shares one SQL fragment with a discovery sweeper (`internal/dmvisibility`)
+that derives the watermark W — the earliest cutoff every current participant
+has cleared through — inside the conversation lock, on every batch; no caller
+ever supplies a cutoff. A conversation with zero current participants reaps
+unbounded. Both the periodic sweeper (five-minute cadence, alongside expiry
+and retirement) and the pre-bind preflight run it in the fixed order **expiry
+→ clear reap → retirement**, so a conversation the reap empties can retire in
+the same preflight pass. The reap deletes messages, reactions and attachment
+links, and writes a `message_purges` audit row per non-empty batch — it never
+deletes E2EE key material itself; retirement remains the only event that
+destroys keys, including for a conversation the reap has just emptied. It emits no WebSocket event and adds no metric key.
 
 The DM expiration writer locks conversation participants before inserting its
 server-authored `expiration_event` row, returns the persisted `created_at`, and

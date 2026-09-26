@@ -206,6 +206,11 @@ type Engine struct {
 	log      *logger.Logger
 	reaper   *Reaper
 	maxBatch int
+
+	// Test-only ordering seams for the clear reap (#3462). Nil in production:
+	// NewEngine never sets them and no production caller can.
+	beforeClearLockHook     func()
+	afterClearWatermarkHook func(*sql.Tx)
 }
 
 // NewEngine constructs a purge engine. maxBatch is the batched-delete stride.
@@ -219,10 +224,21 @@ func NewEngine(db *sql.DB, log *logger.Logger, reaper *Reaper, maxBatch int) *En
 	return &Engine{db: db, log: log, reaper: reaper, maxBatch: maxBatch}
 }
 
+// errRunReason refuses a Plan whose reason Run may not write.
+var errRunReason = errors.New("purge: Run accepts only manual, ban and kick reasons")
+
+// runReasons is the evidence Run may write. The system-owned reasons (expiry,
+// clear) belong to their own restricted terminals, so a handler-built Plan can
+// never forge that evidence (#3462 §5.4).
+var runReasons = map[string]bool{"manual": true, "ban": true, "kick": true}
+
 // Run writes the in_progress audit row, executes each DeleteSpec's batched loop
 // (reaping attachments per batch), flips the audit row to completed with the final
 // count, and returns the Result. Synchronous.
 func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
+	if !runReasons[p.Reason] {
+		return Result{}, errRunReason
+	}
 	// Validate ALL specs up front so a malformed identifier aborts before any write
 	// (including the audit row) exists.
 	for _, ds := range p.Deletes {
