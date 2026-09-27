@@ -2,7 +2,7 @@
 
 > **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover still deferred
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-08-28 (status corrected; body last revised 2026-07-13)
+> **Last updated:** 2026-09-26 (approved dependency-only source exception documented)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
 
@@ -21,8 +21,10 @@
 
 ## Purpose
 
-This runbook governs Concord's unmodified upstream-source MinIO build,
-publication, and the safety gate for a later production cutover.
+This runbook governs Concord's MinIO source build, publication, and the safety
+gate for a later production cutover. General refreshes use the exact upstream
+source without a Concord patch, subject only to the release-specific exception
+recorded below.
 
 Phase 1 publishes a reproducible runtime and its corresponding source. It does
 not replace a live container or touch a data volume. Phase 2 starts only after
@@ -38,15 +40,21 @@ The container is disposable. The data is not.
 
 This procedure never authorizes:
 
-- a patch to the upstream MinIO tree
+- an unreviewed patch to the upstream MinIO tree; the sole approved dependency
+  exception is limited to #3441 and #3469 as described below
 - publication or use of `latest`
 - a fallback to Docker Hub or an unrelated third-party image
 - a change to the current static SigV4, internal-only, no-STS authentication
   model as part of an image refresh
 - deletion, recreation, formatting, or overwrite of a production data volume
 
-Any source patch or authentication-model change needs its own design, security,
-and legal review.
+The general policy remains: any source patch or authentication-model change
+needs its own design, security, and legal review. The approved design exception
+for #3441 and #3469 is limited to a dependency-only derivative of this upstream
+commit. It changes only `go.mod` and `go.sum`, uses AMQP 1.13.0, gRPC 1.83.2,
+and the pinned Go 1.26.8 builder. Required security review and recorded legal
+approval remain gates before publication dispatch. No application edits,
+authentication changes, or live cutover are authorized by the exception.
 
 ## Release Contract
 
@@ -75,8 +83,8 @@ hard stop.
 1. Review the upstream release and security reason.
 2. Resolve the release tag to its full commit.
 3. Confirm the source tree is clean and unchanged.
-4. Pin the Go builder, runtime base, BuildKit, Buildx asset checksum, smoke
-   client, and third-party Actions.
+4. Pin the Go builder, runtime base, BuildKit, Buildx asset checksum, available
+   runner tooling, and third-party Actions.
 5. Update together:
    - `infrastructure/docker/minio/Dockerfile`
    - `infrastructure/docker/minio/SOURCE-BUILD.md`
@@ -95,8 +103,13 @@ test -z "$SOURCE_STATUS"
 git -C minio-source show -s --format='%H %cI' HEAD
 ```
 
-The Dockerfile consumes that clean checkout as its build context. It must not
-download a MinIO binary or modify the source.
+For the published upstream-only recipe, the Dockerfile consumes that clean
+checkout as its build context. It must not download a MinIO binary. For the
+approved derivative, the publisher verifies the clean upstream checkout,
+applies and validates only the approved dependency patch, stages those two
+manifest files, creates the deterministic derivative commit, archives it, and
+extracts the archive into a fresh build context. The derivative runtime is
+built from that extracted context, not from the checkout.
 
 Run the repository contract:
 
@@ -119,6 +132,30 @@ The publisher must verify, on native amd64 and arm64:
 - authenticated S3 create, PUT, stat, GET, checksum, delete, and bucket removal
 - the production capability and `no-new-privileges` tuple
 - a clean SIGTERM exit
+
+For the proposed derivative, the native amd64 smoke uses the runner's `curl`
+with AWS SigV4 signing instead of pulling a separate MinIO client image. With
+temporary protected credentials in a mode-0600 temporary curl config and the
+isolated smoke server, require exact HTTP statuses for bucket creation (200),
+object PUT (200), HEAD (200), GET
+(200), object deletion (204), and bucket deletion (204), then compare the
+SHA-256 of the uploaded and downloaded bytes. This exercises standard S3
+operations only; it does not validate admin APIs. See the official
+[`CURLOPT_AWS_SIGV4` documentation](https://curl.se/libcurl/c/CURLOPT_AWS_SIGV4.html).
+Native arm64 validation remains startup, readiness, and clean shutdown; it is
+not full S3 coverage in the publisher workflow. Local isolated validation did
+pass the full S3 lifecycle, HEAD, and object-hash checks on native arm64. Its
+server-info response reported version `2025-10-15T17:29:55Z`, commit ID
+`823f9aa2bd624e7fa0bcc2217c4174d9ed6e1c8a`, and state `online`. Local amd64
+execution was emulated, so native amd64 publisher verification remains pending.
+
+The proposed derivative source inputs are recorded in
+[`SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md), including
+the patch, manifest, derivative commit/tree, and archive hashes. Its proposed
+tag is `RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62`; it has no published
+runtime or source digest yet. Keep the current fixed-release table below at the
+last successfully published digests until a publisher summary and anonymous
+digest proofs establish a new release.
 
 ## 2. Merge and Publish Private Artifacts
 
