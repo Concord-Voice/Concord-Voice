@@ -64,10 +64,11 @@ For a registry manifest, use `--platform linux/amd64,linux/arm64`,
 `--build-arg SOURCE_DATE_EPOCH=1760549395`, and an image exporter with
 `push=true,rewrite-timestamp=true`. The rewrite option normalizes file and
 directory timestamps inside generated layers. `SOURCE_DATE_EPOCH` alone only
-normalizes image metadata. The repository publisher uses the pinned Buildx and
-BuildKit versions above, writes run-scoped staging artifacts, tests both native
-architectures by digest, and only then promotes the stable runtime/source tag
-pair. Recovery accepts a matching pair or a matching source-only partial. A
+normalizes image metadata. The repository publisher uses the pinned Buildx
+listed above and the derivative BuildKit pin below, writes run-scoped staging
+artifacts, tests both native architectures by digest, and only then promotes
+the stable runtime/source tag pair. Recovery accepts a matching pair or a
+matching source-only partial. A
 runtime-only stable tag stops publication even when its digest matches. GHCR
 does not document registry-enforced immutable tags, so the captured digests—not
 the discovery tags—are
@@ -96,6 +97,7 @@ their separate gates in the refresh runbook.
 | Upstream commit | `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` |
 | Dependencies | `github.com/rabbitmq/amqp091-go v1.13.0`; `google.golang.org/grpc v1.83.2` |
 | Go builder | `golang:1.26.8-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d` |
+| BuildKit | `moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3` |
 | Derivative tree | `7445ef60bbf408e35d98bbeb1833c93f71a44708` |
 | Derivative commit | `823f9aa2bd624e7fa0bcc2217c4174d9ed6e1c8a` |
 | Derivative tag | `RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62` |
@@ -114,8 +116,9 @@ The commit uses parent `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`, subject
 committer `Concord Voice <build@concordvoice.com>` at
 `2026-09-26T00:00:00Z`. The upstream release time and
 `SOURCE_DATE_EPOCH=1760549395` remain compatibility timestamps; they do not
-identify the derivative source. Runtime base, Buildx, BuildKit, ports,
-credentials, volume, licenses, and compile flags remain at their existing pins.
+identify the derivative source. Runtime base, Buildx, ports, credentials,
+volume, licenses, and compile flags remain at their existing pins; the
+derivative uses the BuildKit pin listed above.
 
 From the repository root, prepare the source in a disposable directory. Keep
 the checked-in `infrastructure/docker/minio/dependencies.patch` and the
@@ -191,7 +194,8 @@ cp infrastructure/docker/minio/SOURCE-BUILD.md SOURCE-BUILD.md
 ```
 
 Build both architectures from the extracted archive context with the repository
-Dockerfile. The existing BuildKit and runtime-base pins remain in force.
+Dockerfile. The derivative BuildKit pin listed above and the existing
+runtime-base pin remain in force.
 
 ```bash
 for PLATFORM in linux/amd64 linux/arm64; do
