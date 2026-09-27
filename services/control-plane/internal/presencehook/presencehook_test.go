@@ -34,6 +34,7 @@ import (
 type stubDriver struct {
 	rollbackErr error
 	beginErr    error
+	commitErr   error
 }
 
 func (d *stubDriver) Open(string) (driver.Conn, error) { return &stubConn{d: d}, nil }
@@ -53,7 +54,7 @@ func (c *stubConn) Begin() (driver.Tx, error) {
 
 type stubTx struct{ d *stubDriver }
 
-func (t *stubTx) Commit() error   { return nil }
+func (t *stubTx) Commit() error   { return t.d.commitErr }
 func (t *stubTx) Rollback() error { return t.d.rollbackErr }
 
 var driverSeq atomic.Int64
@@ -306,6 +307,30 @@ func TestCompleteSurfacesUnwiredCommitFailure(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	assert.ErrorIs(t, presencehook.Complete(context.Background(), nil, tx, nil), sql.ErrTxDone)
+}
+
+func TestCompleteUnwiredCommitClassifiesOnlyDriverErrorsAsUnresolved(t *testing.T) {
+	t.Run("driver acknowledgement loss is unresolved", func(t *testing.T) {
+		commitErr := errors.New("connection lost after commit")
+		db := openStubDBWith(t, &stubDriver{commitErr: commitErr})
+		tx, err := db.Begin()
+		require.NoError(t, err)
+
+		err = presencehook.Complete(context.Background(), nil, tx, nil)
+		require.ErrorIs(t, err, commitErr)
+		assert.ErrorIs(t, err, presencecapture.ErrCommitUnresolved)
+	})
+
+	t.Run("already resolved transaction is not ambiguous", func(t *testing.T) {
+		db := openStubDB(t, nil)
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		err = presencehook.Complete(context.Background(), nil, tx, nil)
+		require.ErrorIs(t, err, sql.ErrTxDone)
+		assert.NotErrorIs(t, err, presencecapture.ErrCommitUnresolved)
+	})
 }
 
 // The wired terminal owns the commit; the plumbing must delegate rather than

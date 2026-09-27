@@ -16,7 +16,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 func openMembersLockProbe(t *testing.T) *sql.DB {
@@ -163,6 +163,190 @@ func TestConcurrentAddAndDeleteProduceNoDeadlock(t *testing.T) {
 		"a deadlock means the canonical lock order was violated on one of these paths")
 	require.NotContains(t, logs.String(), "deadlock detected",
 		"a deadlock means the canonical lock order was violated on one of these paths")
+}
+
+// Message persistence takes users before its channel parent. A moderation
+// capture must wait on that users lock before it takes the server/channel
+// authority locks, otherwise these two transactions form a cycle.
+func TestModerationCapturePrecedesMessageChannelLock(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   func(string, string) string
+	}{
+		{name: "remove", method: http.MethodDelete, path: memberPath},
+		{name: "ban", method: http.MethodPost, path: banPath},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupTS(t)
+			owner := ts.CreateTestUser(t, "capturelockowner"+tc.name)
+			target := ts.CreateTestUser(t, "capturelocktarget"+tc.name)
+			serverID := ts.CreateTestServer(t, owner.ID, "CaptureMessageLock"+tc.name)
+			channelID := ts.CreateTestChannel(t, serverID, "capture-message-lock")
+			ts.AddMemberToServer(t, serverID, target.ID, "member")
+
+			probe := openMembersLockProbe(t)
+			messageTx, err := probe.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = messageTx.Rollback() })
+			var lockedUserID string
+			require.NoError(t, messageTx.QueryRowContext(context.Background(),
+				`SELECT id FROM users WHERE id = $1 FOR SHARE`, target.ID,
+			).Scan(&lockedUserID))
+
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				result <- ts.DoRequest(tc.method, tc.path(serverID, target.ID), nil,
+					testhelpers.AuthHeaders(owner.AccessToken))
+			}()
+
+			require.Eventually(t, func() bool {
+				var waiting bool
+				err := probe.QueryRow(`SELECT EXISTS (
+					SELECT 1 FROM pg_stat_activity
+					WHERE datname = current_database()
+					  AND wait_event_type = 'Lock'
+					  AND query LIKE '%FROM users%'
+					  AND query LIKE '%id IN ($1, $2)%'
+					  AND query LIKE '%FOR NO KEY UPDATE%'
+				)`).Scan(&waiting)
+				return err == nil && waiting
+			}, 3*time.Second, 10*time.Millisecond,
+				"moderation must block on the message user's lock before its channel lock")
+
+			_, err = messageTx.ExecContext(context.Background(), `SET LOCAL lock_timeout = '250ms'`)
+			require.NoError(t, err)
+			var lockedChannelID string
+			require.NoError(t, messageTx.QueryRowContext(context.Background(),
+				`SELECT id FROM channels WHERE id = $1 FOR SHARE`, channelID,
+			).Scan(&lockedChannelID),
+				"a message writer must acquire the channel while moderation waits on users")
+
+			require.NoError(t, messageTx.Rollback())
+			select {
+			case response := <-result:
+				require.Equal(t, http.StatusOK, response.Code)
+			case <-time.After(5 * time.Second):
+				t.Fatal("moderation did not complete after the message transaction released its locks")
+			}
+		})
+	}
+}
+
+// Ban shares DeleteServer's users-before-server order once the visibility
+// serializer is held. While a live-voice delete holds the server row, Ban must
+// already hold its actor and target rows rather than invert that lock pair.
+func TestBanLocksModerationUsersBeforeServer(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ban-lock-order-owner")
+	target := ts.CreateTestUser(t, "ban-lock-order-target")
+	serverID := ts.CreateTestServer(t, owner.ID, "BanLockOrderServer")
+	ts.AddMemberToServer(t, serverID, target.ID, "member")
+
+	probe := openMembersLockProbe(t)
+	serverTx, err := probe.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = serverTx.Rollback() })
+	var lockedServer string
+	require.NoError(t, serverTx.QueryRowContext(context.Background(),
+		`SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID,
+	).Scan(&lockedServer))
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest(http.MethodPost, banPath(serverID, target.ID), nil,
+			testhelpers.AuthHeaders(owner.AccessToken))
+	}()
+
+	require.Eventually(t, func() bool {
+		userTx, beginErr := probe.BeginTx(context.Background(), nil)
+		if beginErr != nil {
+			return false
+		}
+		defer func() { _ = userTx.Rollback() }()
+		var lockedUser string
+		err := userTx.QueryRowContext(context.Background(),
+			`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE NOWAIT`, target.ID,
+		).Scan(&lockedUser)
+		var pqErr *pq.Error
+		return errors.As(err, &pqErr) && pqErr.Code == "55P03"
+	}, 3*time.Second, 10*time.Millisecond,
+		"ban must lock moderation users before waiting for the server row")
+
+	require.NoError(t, serverTx.Rollback())
+	select {
+	case response := <-result:
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("ban did not complete after the competing server transaction released its lock")
+	}
+}
+
+// Remove and ban must take the visibility serializer before either users row.
+// Otherwise a concurrent authority mutation can hold visibility while waiting
+// for a moderator or target user row, forming a cycle. The held serializer
+// makes the ordering observable: while moderation waits for it, both rows must
+// remain lockable with NOWAIT.
+func TestMemberModerationLocksVisibilityBeforeUsers(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		path       func(string, string) string
+		permission rbac.Permission
+	}{
+		{name: "remove", method: http.MethodDelete, path: memberPath, permission: rbac.PermKick},
+		{name: "ban", method: http.MethodPost, path: banPath, permission: rbac.PermBan},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupTS(t)
+			owner := ts.CreateTestUser(t, "visibility-order-owner"+tc.name)
+			moderator := ts.CreateTestUser(t, "visibility-order-moderator"+tc.name)
+			target := ts.CreateTestUser(t, "visibility-order-target"+tc.name)
+			serverID := ts.CreateTestServer(t, owner.ID, "Visibility User Order "+tc.name)
+			ts.AddMemberToServer(t, serverID, moderator.ID, "member")
+			ts.AddMemberToServer(t, serverID, target.ID, "member")
+			roleID := ts.CreateTestRole(t, serverID, "visibility-order-mod"+tc.name, 5, int64(tc.permission))
+			ts.AssignRoleToUser(t, serverID, moderator.ID, roleID)
+
+			key, err := rbac.ServerVisibilityCaptureAdvisoryKey(serverID)
+			require.NoError(t, err)
+			probe := openMembersLockProbe(t)
+			_, release := holdMembersAdvisoryBarrier(t, probe, key)
+
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				result <- ts.DoRequest(tc.method, tc.path(serverID, target.ID), nil,
+					testhelpers.AuthHeaders(moderator.AccessToken))
+			}()
+			dbtest.WaitForAdvisoryLockWaiter(t, probe, key)
+
+			userTx, err := probe.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = userTx.Rollback() })
+			rows, err := userTx.QueryContext(context.Background(), `
+				SELECT id FROM users WHERE id IN ($1, $2) ORDER BY id FOR NO KEY UPDATE NOWAIT
+			`, moderator.ID, target.ID)
+			require.NoError(t, err, "moderation must not lock users before visibility")
+			var locked int
+			for rows.Next() {
+				var userID string
+				require.NoError(t, rows.Scan(&userID))
+				locked++
+			}
+			require.NoError(t, rows.Err())
+			require.NoError(t, rows.Close())
+			require.Equal(t, 2, locked)
+			require.NoError(t, userTx.Rollback())
+			release()
+
+			select {
+			case response := <-result:
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			case <-time.After(5 * time.Second):
+				t.Fatal("member moderation did not complete after the visibility lock released")
+			}
+		})
+	}
 }
 
 // The owner check in each handler is intentionally a preflight optimization;

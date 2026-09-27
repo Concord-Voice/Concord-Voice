@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -423,13 +424,32 @@ func TestMemberRemovalInvalidatesPermissionCache(t *testing.T) {
 			testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", rbac.PermManageAllMessages)
 			testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, channelID, rbac.PermManageAllMessages)
 
-			w := ts.DoRequest(tt.method, tt.path(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+			w := ts.DoRequest(tt.method, tt.path(strings.ToUpper(serverID), member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
 			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 			_, serverCached, _ := cache.Get(ctx, serverID, member.ID, "")
 			_, channelCached, _ := cache.Get(ctx, serverID, member.ID, channelID)
 			assert.False(t, serverCached, "member removal must evict the server permission cache entry")
 			assert.False(t, channelCached, "member removal must evict the channel permission cache entry")
+		})
+
+		t.Run(tt.name+" middleware alias cache", func(t *testing.T) {
+			ts := setupTS(t)
+			owner := ts.CreateTestUser(t, "cache_middleware_"+tt.name+"_owner")
+			member := ts.CreateTestUser(t, "cache_middleware_"+tt.name+"_member")
+			serverID := ts.CreateTestServer(t, owner.ID, "Cache middleware "+tt.name+" Server")
+			ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+			upperServerID := strings.ToUpper(serverID)
+			permissionsPath := fmt.Sprintf("/api/v1/servers/%s/permissions", upperServerID)
+			w := ts.DoRequest(http.MethodGet, permissionsPath, nil, testhelpers.AuthHeaders(member.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			w = ts.DoRequest(tt.method, tt.path(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			w = ts.DoRequest(http.MethodGet, permissionsPath, nil, testhelpers.AuthHeaders(member.AccessToken))
+			assert.Equal(t, http.StatusForbidden, w.Code, "removed member must not reuse an alias-keyed middleware permission cache entry")
 		})
 	}
 }
@@ -512,6 +532,7 @@ func TestRemoveMemberCleansUpChannelKeys(t *testing.T) {
 	).Scan(&keyCount)
 	require.NoError(t, err)
 	assert.Equal(t, 0, keyCount)
+
 }
 
 func TestRemoveMemberUnauthorized(t *testing.T) {
@@ -1020,6 +1041,14 @@ func TestBanMemberTriggersKeyRevocation(t *testing.T) {
 	).Scan(&keyCount)
 	require.NoError(t, err)
 	assert.Equal(t, 0, keyCount)
+
+	var revocationCount int
+	err = ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`,
+		channelID,
+	).Scan(&revocationCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, revocationCount, "the ban must fence the old channel epoch exactly once")
 }
 
 // ── Kick triggers key revocation for E2EE channels ───────────────────────────

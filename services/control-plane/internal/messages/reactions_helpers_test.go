@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -122,7 +121,7 @@ func TestToggleDMReactionRowRequiresCurrentParticipant(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	action, _, err := h.toggleDMReactionInConversation(context.Background(), msgID, userID, thumbsUp, convID)
+	action, err := h.toggleDMReactionInConversation(context.Background(), msgID, userID, "", thumbsUp, convID)
 
 	assert.Empty(t, action)
 	require.Error(t, err)
@@ -158,17 +157,15 @@ func TestToggleDMReactionLocksActorBeforeConversation(t *testing.T) {
 	reactionCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result := make(chan struct {
-		action  string
-		summary *models.ReactionSummary
-		err     error
+		action string
+		err    error
 	}, 1)
 	go func() {
-		action, summary, toggleErr := h.toggleDMReactionInConversation(reactionCtx, messageID, actorID, "👍", conversationID)
+		action, toggleErr := h.toggleDMReactionInConversation(reactionCtx, messageID, actorID, "", "👍", conversationID)
 		result <- struct {
-			action  string
-			summary *models.ReactionSummary
-			err     error
-		}{action: action, summary: summary, err: toggleErr}
+			action string
+			err    error
+		}{action: action, err: toggleErr}
 	}()
 
 	testdb.WaitForRowLockWaiter(t, probe, barrierTxID)
@@ -182,8 +179,6 @@ func TestToggleDMReactionLocksActorBeforeConversation(t *testing.T) {
 	case outcome := <-result:
 		require.NoError(t, outcome.err)
 		assert.Equal(t, "added", outcome.action)
-		require.NotNil(t, outcome.summary)
-		assert.Equal(t, 1, outcome.summary.Count)
 	case <-reactionCtx.Done():
 		require.FailNow(t, "reaction did not finish after releasing the actor lock: %v", reactionCtx.Err())
 	}
@@ -191,6 +186,83 @@ func TestToggleDMReactionLocksActorBeforeConversation(t *testing.T) {
 	var reactionCount int
 	require.NoError(t, h.db.QueryRow(`SELECT count(*) FROM dm_message_reactions WHERE message_id = $1 AND user_id = $2`, messageID, actorID).Scan(&reactionCount))
 	assert.Equal(t, 1, reactionCount)
+}
+
+func TestToggleDMReactionSerializesConcurrentToggles(t *testing.T) {
+	h := newReactionHelperHandler(t)
+	messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
+	_, err := h.db.Exec(`
+		INSERT INTO dm_message_reactions (id, message_id, user_id, emoji)
+		VALUES ($1, $2, $3, '👍')`, uuid.NewString(), messageID, actorID)
+	require.NoError(t, err)
+
+	barrier, err := h.db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if rollbackErr := barrier.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("failed to roll back reaction conversation barrier: %v", rollbackErr)
+		}
+	})
+	var barrierTxID int64
+	require.NoError(t, barrier.QueryRow(`SELECT txid_current()`).Scan(&barrierTxID))
+	var lockedConversationID string
+	require.NoError(t, barrier.QueryRow(
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, conversationID).Scan(&lockedConversationID))
+
+	toggleCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	results := make(chan struct {
+		action string
+		err    error
+	}, 2)
+	started := make(chan struct{}, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		go func() {
+			started <- struct{}{}
+			<-start
+			action, toggleErr := h.toggleDMReactionInConversation(toggleCtx, messageID, actorID, "", "👍", conversationID)
+			results <- struct {
+				action string
+				err    error
+			}{action: action, err: toggleErr}
+		}()
+	}
+	<-started
+	<-started
+	close(start)
+
+	require.Eventually(t, func() bool {
+		var waiting int
+		if err := h.db.QueryRow(`
+			SELECT count(*) FROM pg_locks
+			WHERE locktype = 'transactionid' AND NOT granted
+			  AND transactionid::text::bigint = $1`,
+			testdb.TransactionIDForLockProbe(barrierTxID)).Scan(&waiting); err != nil {
+			return false
+		}
+		return waiting >= 1
+	}, 2*time.Second, 10*time.Millisecond, "toggle did not reach the conversation lock")
+	require.NoError(t, barrier.Commit())
+
+	actions := make(map[string]int)
+	for i := 0; i < 2; i++ {
+		select {
+		case result := <-results:
+			require.NoError(t, result.err)
+			actions[result.action]++
+		case <-toggleCtx.Done():
+			require.FailNow(t, "reaction toggles did not finish: %v", toggleCtx.Err())
+		}
+	}
+	assert.Equal(t, 1, actions["removed"])
+	assert.Equal(t, 1, actions["added"])
+
+	var reactionCount int
+	require.NoError(t, h.db.QueryRow(
+		`SELECT count(*) FROM dm_message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = '👍'`,
+		messageID, actorID).Scan(&reactionCount))
+	assert.Equal(t, 1, reactionCount, "two serialized toggles must leave the original reaction present")
 }
 
 func TestToggleDMReactionRequiresVisibleMessageForCurrentParticipant(t *testing.T) {
@@ -205,9 +277,8 @@ func TestToggleDMReactionRequiresVisibleMessageForCurrentParticipant(t *testing.
 		VALUES ($1, $2, '-infinity', NOW() + INTERVAL '1 minute', false)`, actorID, conversationID)
 	require.NoError(t, err)
 
-	action, summary, err := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "👍", conversationID)
+	action, err := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "", "👍", conversationID)
 	assert.Empty(t, action)
-	assert.Nil(t, summary)
 	require.Error(t, err)
 	assertNoDMReaction(t, h, messageID, actorID)
 }
@@ -261,43 +332,6 @@ func assertNoDMReaction(t *testing.T, h *Handler, messageID, userID string) {
 	assert.Zero(t, count)
 }
 
-func TestToggleDMReactionAggregateQueryFailureRollsBackMutation(t *testing.T) {
-	h := newReactionHelperHandler(t)
-	messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
-
-	original := dmMessageReactionBroadcastSummarySQL
-	dmMessageReactionBroadcastSummarySQL = `
-		SELECT user_id FROM missing_dm_reaction_summary
-		WHERE message_id = $1 AND emoji = $2
-	`
-	t.Cleanup(func() { dmMessageReactionBroadcastSummarySQL = original })
-
-	action, summary, err := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "👍", conversationID)
-	require.Error(t, err)
-	assert.Empty(t, action)
-	assert.Nil(t, summary)
-	assertNoDMReaction(t, h, messageID, actorID)
-}
-
-func TestToggleDMReactionAggregateScanFailureRollsBackMutation(t *testing.T) {
-	h := newReactionHelperHandler(t)
-	messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
-
-	original := dmMessageReactionBroadcastSummarySQL
-	dmMessageReactionBroadcastSummarySQL = `
-		SELECT mr.user_id
-		FROM dm_message_reactions mr
-		WHERE mr.message_id = $1 AND mr.emoji = $2
-	`
-	t.Cleanup(func() { dmMessageReactionBroadcastSummarySQL = original })
-
-	action, summary, err := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "👍", conversationID)
-	require.Error(t, err)
-	assert.Empty(t, action)
-	assert.Nil(t, summary)
-	assertNoDMReaction(t, h, messageID, actorID)
-}
-
 func TestToggleDMReactionPostCommitSummaryFailureReturnsCommittedAction(t *testing.T) {
 	base := newReactionHelperHandler(t)
 	h := NewHandler(base.db, logger.New("test"), websocket.NewHub(nil, nil), nil, nil, nil)
@@ -329,7 +363,7 @@ func TestToggleDMReactionPostCommitSummaryFailureReturnsCommittedAction(t *testi
 	assert.Equal(t, 1, count)
 }
 
-func TestToggleDMReactionCapturesAggregateBeforeClear(t *testing.T) {
+func TestToggleDMReactionSerializesWithClear(t *testing.T) {
 	h := newReactionHelperHandler(t)
 	messageID, actorID, peerID, conversationID := seedDMReactionForAggregateTest(t, h)
 
@@ -373,20 +407,15 @@ func TestToggleDMReactionCapturesAggregateBeforeClear(t *testing.T) {
 	barrierHeld = true
 
 	toggleResult := make(chan struct {
-		action       string
-		summaryCount int
-		err          error
+		action string
+		err    error
 	}, 1)
 	go func() {
-		action, summary, toggleErr := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "👍", conversationID)
+		action, toggleErr := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "", "👍", conversationID)
 		result := struct {
-			action       string
-			summaryCount int
-			err          error
+			action string
+			err    error
 		}{action: action, err: toggleErr}
-		if summary != nil {
-			result.summaryCount = summary.Count
-		}
 		toggleResult <- result
 	}()
 
@@ -465,7 +494,7 @@ func TestToggleDMReactionCapturesAggregateBeforeClear(t *testing.T) {
 			return err == nil && waiting
 		}, 2*time.Second, 10*time.Millisecond, "Clear must wait for the reaction's conversation lock")
 	case clearErr := <-clearDone:
-		t.Fatalf("Clear completed before waiting for the reaction aggregate: %v", clearErr)
+		t.Fatalf("Clear completed before waiting for the reaction mutation: %v", clearErr)
 	}
 
 	var released bool
@@ -477,7 +506,6 @@ func TestToggleDMReactionCapturesAggregateBeforeClear(t *testing.T) {
 	case result := <-toggleResult:
 		require.NoError(t, result.err)
 		assert.Equal(t, "added", result.action)
-		assert.Equal(t, 1, result.summaryCount, "broadcast aggregate must be captured before Clear commits")
 	case <-time.After(2 * time.Second):
 		t.Fatal("reaction toggle did not finish after the barrier released")
 	}

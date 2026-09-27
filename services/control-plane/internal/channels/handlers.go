@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,8 +35,8 @@ const (
 	maxChannelWrappedKeysRequestBytes = 512 * 1_024
 	maxDMWrappedKeys                  = 10
 	maxDMWrappedKeysRequestBytes      = 16 * 1_024
-	// A changed participant snapshot must restart the complete lock prefix;
-	// further churn fails closed rather than admitting stale topology.
+	// A changed participant snapshot restarts the complete lock prefix; further
+	// churn fails closed rather than admitting stale topology.
 	dmDistributionTopologyAttempts = 2
 	// Per-conversation ceiling on DM key distribution (#1218). Sized by
 	// legitimate peer-fulfillment fan-out, not by attacker modelling:
@@ -103,15 +104,20 @@ const (
 )
 
 var (
-	errInitialKeyDistributionCreator  = errors.New("initial channel key distribution requires creator")
-	errInitialKeyDistributionBusy     = errors.New("initial channel key distribution is incomplete")
-	errInitialCreatorKeyMissing       = errors.New("creator initial key missing")
-	errUnissuedChannelKeyVersion      = errors.New("channel key version was not issued for rotation")
-	errRotationDistributor            = errors.New("channel key rotation already has a distributor")
-	errChannelKeyDistributorAccess    = errors.New("channel key distributor no longer has access")
-	errNoChannelKeyRecipients         = errors.New("channel key distribution has no eligible recipients")
-	errManualRotationRateLimited      = errors.New("manual channel rotation rate limited")
-	errDMKeyDistributorNotParticipant = errors.New("dm key distributor is no longer a participant")
+	errInitialKeyDistributionCreator         = errors.New("initial channel key distribution requires creator")
+	errInitialKeyDistributionBusy            = errors.New("initial channel key distribution is incomplete")
+	errInitialCreatorKeyMissing              = errors.New("creator initial key missing")
+	errUnissuedChannelKeyVersion             = errors.New("channel key version was not issued for rotation")
+	errRotationDistributor                   = errors.New("channel key rotation already has a distributor")
+	errChannelKeyDistributorAccess           = errors.New("channel key distributor no longer has access")
+	errNoChannelKeyRecipients                = errors.New("channel key distribution has no eligible recipients")
+	errManualRotationRateLimited             = errors.New("manual channel rotation rate limited")
+	errDMKeyDistributorNotParticipant        = errors.New("dm key distributor is no longer a participant")
+	errDMKeyFetchNotParticipant              = errors.New("dm key fetch caller is no longer a participant")
+	errManageChannelsDenied                  = errors.New("current actor lacks manage channels")
+	errChannelAuthorityUnavailable           = errors.New("channel authority coordinator unavailable")
+	errChannelAuthoritySetChanged            = errors.New("channel authority set changed")
+	errChannelDeletedDuringAuthorityRotation = errors.New("channel deleted during authority rotation")
 )
 
 // Handler handles channel-related requests
@@ -122,6 +128,15 @@ type Handler struct {
 	resolver    *rbac.Resolver
 	redis       *redis.Client
 	serverTiers entitlements.ServerTierResolver
+	authority   *rbac.Handler
+}
+
+// SetAuthorityHandler wires the RBAC authority coordinator used only for
+// synchronized category topology changes. It is set during router assembly;
+// refusing a synced move without it is safer than changing durable authority
+// without the required capture and post-commit revalidation.
+func (h *Handler) SetAuthorityHandler(authority *rbac.Handler) {
+	h.authority = authority
 }
 
 // NewHandler creates a new channel handler
@@ -161,6 +176,8 @@ type CreateChannelRequest struct {
 	// distribution path.
 	WrappedKeyVersions map[string]int `json:"wrapped_key_versions,omitempty"`
 }
+
+const maxChannelsPerServer = 500
 
 // UpdateChannelRequest represents a request to update a channel
 type UpdateChannelRequest struct {
@@ -455,10 +472,60 @@ func (h *Handler) startCreatedChannelKeyDistributions(c *gin.Context, tx *sql.Tx
 	return initialPending, linkedPending, true
 }
 
-func (h *Handler) createChannelTx(c *gin.Context, tx *sql.Tx, req CreateChannelRequest, userID string) (createChannelResult, bool) {
+func (h *Handler) createChannelTx(c *gin.Context, tx *sql.Tx, req CreateChannelRequest, userID string, preflightMembers []string) (createChannelResult, bool) {
 	var result createChannelResult
+	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, req.ServerID); err != nil {
+		h.log.Error("Failed to lock channel creation visibility", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return result, false
+	}
+	if err := rbac.LockAuthorityPrincipalsTx(c.Request.Context(), tx, preflightMembers); err != nil {
+		h.log.Error("Lock channel creation principals", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return result, false
+	}
 	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondCreateChannelGuardError(c, guardErr)
+		return result, false
+	}
+	var lockedServerID string
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, req.ServerID).Scan(&lockedServerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Server not found"})
+		} else {
+			h.log.Error("Failed to lock channel creation server", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		}
+		return result, false
+	}
+	currentMembers, err := channelCreationMemberIDsTx(c.Request.Context(), tx, req.ServerID, userID)
+	if err != nil || !sameChannelIDSet(preflightMembers, currentMembers) {
+		if err != nil {
+			h.log.Error("Re-read channel creation members", "error", err)
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": "Server membership changed; retry channel creation"})
+		return result, false
+	}
+	if !h.authorizeCreateChannelTx(c, tx, req, userID) {
+		return result, false
+	}
+	// The visibility advisory lock serializes creators with server-wide authority
+	// rewrites and with each other. Count under it so a voice channel's linked
+	// text companion consumes its second slot atomically.
+	var channelCount int
+	if err := tx.QueryRowContext(c.Request.Context(),
+		`SELECT COUNT(*) FROM channels WHERE server_id = $1`, req.ServerID,
+	).Scan(&channelCount); err != nil {
+		h.log.Error("Failed to count server channels", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return result, false
+	}
+	needed := 1
+	if req.Type == "voice" {
+		needed = 2
+	}
+	if channelCount+needed > maxChannelsPerServer {
+		c.JSON(http.StatusConflict, gin.H{"error": "Server channel limit reached"})
 		return result, false
 	}
 
@@ -491,6 +558,85 @@ func (h *Handler) createChannelTx(c *gin.Context, tx *sql.Tx, req CreateChannelR
 	result.initialDistributionPending = initialPending
 	result.linkedDistributionPending = linkedPending
 	return result, true
+}
+
+func channelCreationMemberIDsTx(ctx context.Context, tx *sql.Tx, serverID, creatorID string) (ids []string, returnErr error) {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1 ORDER BY user_id LIMIT 501`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			ids = nil
+			returnErr = errors.Join(returnErr, fmt.Errorf("close channel creation members: %w", closeErr))
+		}
+	}()
+	ids = make([]string, 0, maxChannelWrappedKeys)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) > maxChannelWrappedKeys {
+		return nil, rbac.ErrChannelAuthorityChannelLimit
+	}
+	if !containsChannelUser(ids, creatorID) {
+		ids = append(ids, creatorID)
+		sort.Strings(ids)
+	}
+	return ids, nil
+}
+
+// authorizeCreateChannelTx repeats every preflight authority predicate after
+// the parent fence and credential guard. The request-time checks only avoid
+// needless work; this is the write authority.
+func (h *Handler) authorizeCreateChannelTx(c *gin.Context, tx *sql.Tx, req CreateChannelRequest, userID string) bool {
+	var lockedMember string
+	if err := tx.QueryRowContext(c.Request.Context(),
+		`SELECT user_id FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, req.ServerID, userID,
+	).Scan(&lockedMember); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		} else {
+			h.log.Error("Failed to lock channel creator membership", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		}
+		return false
+	}
+	perms, err := h.resolver.ResolveServerPermissionsTx(c.Request.Context(), tx, req.ServerID, userID)
+	if err != nil {
+		if errors.Is(err, rbac.ErrNotMember) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		} else {
+			h.log.Error("Failed to resolve channel creator permissions", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		}
+		return false
+	}
+	if !perms.Has(rbac.PermManageChannels) || !perms.Has(viewPermForType(req.Type)) || (req.Type == "voice" && !perms.Has(rbac.PermViewTextChannels)) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return false
+	}
+	if groupID := resolveGroupIDParam(req.GroupID); groupID != nil {
+		var lockedGroup string
+		if err := tx.QueryRowContext(c.Request.Context(),
+			`SELECT id FROM channel_groups WHERE id = $1 AND server_id = $2 FOR KEY SHARE`, groupID, req.ServerID,
+		).Scan(&lockedGroup); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
+			} else {
+				h.log.Error("Failed to lock channel group", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) finishCreateChannel(c *gin.Context, serverID, userID string, result createChannelResult) {
@@ -527,6 +673,16 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 	if !h.admitCreateChannelRequest(c, req, userID) {
 		return
 	}
+	memberIDs, err := h.channelCreationMemberIDs(c.Request.Context(), req.ServerID, userID)
+	if err != nil {
+		if errors.Is(err, rbac.ErrChannelAuthorityChannelLimit) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Server channel key recipients exceed 500"})
+		} else {
+			h.log.Error("Preflight channel creation members", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		}
+		return
+	}
 
 	// Start transaction for channel + keys
 	tx, err := h.db.Begin()
@@ -543,7 +699,7 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 
 	// #2201: every key-material-coupled write stays inside this transaction,
 	// behind the creator's credential-epoch guard.
-	result, ok := h.createChannelTx(c, tx, req, userID)
+	result, ok := h.createChannelTx(c, tx, req, userID, memberIDs)
 	if !ok {
 		return
 	}
@@ -555,6 +711,47 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 	}
 
 	h.finishCreateChannel(c, req.ServerID, userID, result)
+}
+
+func (h *Handler) channelCreationMemberIDs(ctx context.Context, serverID, creatorID string) (ids []string, returnErr error) {
+	rows, err := h.db.QueryContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1 ORDER BY user_id LIMIT 501`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("list channel creation members: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			ids = nil
+			returnErr = errors.Join(returnErr, fmt.Errorf("close channel creation members: %w", closeErr))
+		}
+	}()
+	ids = make([]string, 0, maxChannelWrappedKeys)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan channel creation member: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate channel creation members: %w", err)
+	}
+	if len(ids) > maxChannelWrappedKeys {
+		return nil, rbac.ErrChannelAuthorityChannelLimit
+	}
+	if !containsChannelUser(ids, creatorID) {
+		ids = append(ids, creatorID)
+		sort.Strings(ids)
+	}
+	return ids, nil
+}
+
+func containsChannelUser(ids []string, wanted string) bool {
+	for _, id := range ids {
+		if id == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // computeNextPosition returns the next position for a channel within a group (or uncategorized).
@@ -979,63 +1176,52 @@ func (h *Handler) UpdateChannel(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
 
-	if _, err := uuid.Parse(channelID); err != nil {
+	parsedChannelID, err := uuid.Parse(channelID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelID})
 		return
 	}
+	channelID = parsedChannelID.String()
 
 	var req UpdateChannelRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
 		return
 	}
+	normalizeUpdateChannelGroupID(&req)
 
-	serverID, err := h.lookupChannelServerID(channelID)
-	if err == sql.ErrNoRows {
+	serverID, ok := h.admitUpdateChannel(c, userID, channelID, req)
+	if !ok {
+		return
+	}
+
+	if !h.validateUpdateChannelAudioTier(c, req, serverID) {
+		return
+	}
+
+	channel, err := h.executeChannelUpdate(c.Request.Context(), serverID, userID, middleware.TokenCredentialEpoch(c), channelID, req)
+	if errors.Is(err, errChannelDeletedDuringAuthorityRotation) {
+		c.JSON(http.StatusGone, gin.H{"error": "Channel was deleted during authority reconciliation"})
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		return
 	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateChannel})
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
 		return
 	}
-
-	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermManageChannels)
-	if err != nil {
-		h.log.Error(logMsgFailedCheckPermissions, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateChannel})
-		return
-	}
-	if !hasPerm {
+	if errors.Is(err, errManageChannelsDenied) || errors.Is(err, rbac.ErrNotMember) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 		return
 	}
-
-	// CV-CAN-011: reject moving this channel under a category owned by another
-	// server before permission sync treats it as the source of overrides.
-	if !h.validateUpdateChannelGroupOwnership(c, req, serverID) {
+	if errors.Is(err, rbac.ErrTemporaryChannelOverrideManaged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Temporary move access is system-managed"})
 		return
 	}
-
-	if req.AudioQualityTier != nil && *req.AudioQualityTier != "" {
-		if !validAudioQualityTiers[*req.AudioQualityTier] {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid audio quality tier"})
-			return
-		}
-		// Bound the channel standard to the server's audio ceiling (#179):
-		// Groundspeed → Standard, any Mach → Studio. The server-tier resolver is
-		// the #1521 seam (Groundspeed today). Authoritative server-side guard —
-		// the client slider lock is UX only.
-		if !entitlements.AudioTierAllowedForServer(*req.AudioQualityTier,
-			h.serverTier(c.Request.Context(), serverID)) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Audio quality tier exceeds this server's tier"})
-			return
-		}
-	}
-
-	channel, err := h.executeChannelUpdate(channelID, req)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
+	if errors.Is(err, errChannelAuthoritySetChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Channel authority changed; retry"})
 		return
 	}
 	if err != nil {
@@ -1046,6 +1232,63 @@ func (h *Handler) UpdateChannel(c *gin.Context) {
 	h.log.Info("Channel updated", "channel_id", channelID, "user_id", userID)
 	h.broadcastChannelUpdated(channel)
 	c.JSON(http.StatusOK, gin.H{"channel": channel})
+}
+
+// normalizeUpdateChannelGroupID makes all UUID spellings accepted by the
+// request validator use one value before they reach authority-set comparisons.
+// A malformed value remains unchanged so validateUpdateChannelGroupOwnership
+// preserves its established 400 response.
+func normalizeUpdateChannelGroupID(req *UpdateChannelRequest) {
+	if req.GroupID == nil || *req.GroupID == "" {
+		return
+	}
+	groupID, err := uuid.Parse(*req.GroupID)
+	if err != nil {
+		return
+	}
+	canonicalGroupID := groupID.String()
+	req.GroupID = &canonicalGroupID
+}
+
+func (h *Handler) admitUpdateChannel(c *gin.Context, userID, channelID string, req UpdateChannelRequest) (string, bool) {
+	serverID, err := h.lookupChannelServerID(channelID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
+		return "", false
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateChannel})
+		return "", false
+	}
+	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermManageChannels)
+	if err != nil {
+		h.log.Error(logMsgFailedCheckPermissions, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateChannel})
+		return "", false
+	}
+	if !hasPerm {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return "", false
+	}
+	if !h.validateUpdateChannelGroupOwnership(c, req, serverID) {
+		return "", false
+	}
+	return serverID, true
+}
+
+func (h *Handler) validateUpdateChannelAudioTier(c *gin.Context, req UpdateChannelRequest, serverID string) bool {
+	if req.AudioQualityTier == nil || *req.AudioQualityTier == "" {
+		return true
+	}
+	if !validAudioQualityTiers[*req.AudioQualityTier] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid audio quality tier"})
+		return false
+	}
+	if !entitlements.AudioTierAllowedForServer(*req.AudioQualityTier, h.serverTier(c.Request.Context(), serverID)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Audio quality tier exceeds this server's tier"})
+		return false
+	}
+	return true
 }
 
 func (h *Handler) lookupChannelServerID(channelID string) (string, error) {
@@ -1102,46 +1345,336 @@ func resolveGroupIDParam(groupID *string) interface{} {
 	return *groupID
 }
 
-func (h *Handler) executeChannelUpdate(channelID string, req UpdateChannelRequest) (models.Channel, error) {
+type channelAuthorityState struct {
+	GroupID         *string
+	SyncPermissions bool
+	IsVoice         bool
+}
+
+func sameOptionalGroupID(left, right *string) bool {
+	return resolveGroupIDParam(left) == resolveGroupIDParam(right)
+}
+
+func (h *Handler) channelAuthorityState(ctx context.Context, channelID string) (channelAuthorityState, error) {
+	var state channelAuthorityState
+	err := h.db.QueryRowContext(ctx, `
+		SELECT group_id, sync_permissions, type = 'voice'
+		FROM channels WHERE id = $1`, channelID,
+	).Scan(&state.GroupID, &state.SyncPermissions, &state.IsVoice)
+	if err != nil {
+		return state, fmt.Errorf("read channel authority state: %w", err)
+	}
+	return state, nil
+}
+
+func (h *Handler) executeChannelUpdate(ctx context.Context, serverID, userID, tokenEpoch, channelID string, req UpdateChannelRequest) (models.Channel, error) {
+	state, err := h.channelAuthorityState(ctx, channelID)
+	if err != nil {
+		return models.Channel{}, err
+	}
+	if req.GroupID != nil || state.IsVoice != (req.Type == "voice") {
+		return h.moveSyncedChannel(ctx, serverID, userID, tokenEpoch, channelID, req, state)
+	}
+
+	channel, err := h.executeOrdinaryChannelUpdate(ctx, serverID, userID, tokenEpoch, channelID, req)
+	if !errors.Is(err, errChannelAuthoritySetChanged) {
+		return channel, err
+	}
+
+	// The type changed after the preflight, so the ordinary transaction rolled
+	// back before writing. Re-enter through the authority path, which captures
+	// and reconciles the live voice-to-text (or text-to-voice) transition.
+	state, err = h.channelAuthorityState(ctx, channelID)
+	if err != nil {
+		return models.Channel{}, err
+	}
+	return h.moveSyncedChannel(ctx, serverID, userID, tokenEpoch, channelID, req, state)
+}
+
+func (h *Handler) executeOrdinaryChannelUpdate(ctx context.Context, serverID, userID, tokenEpoch, channelID string, req UpdateChannelRequest) (models.Channel, error) {
 	var channel models.Channel
 	channel.ID = channelID
 	channel.Name = req.Name
 	channel.Type = req.Type
 
-	var err error
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return channel, fmt.Errorf("begin channel update transaction: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to rollback channel update transaction", "error", rollbackErr)
+		}
+	}()
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return channel, err
+	}
+	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+		return channel, err
+	}
+	actorPerms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
+	if err != nil {
+		return channel, fmt.Errorf("resolve current channel update actor permissions: %w", err)
+	}
+	if !actorPerms.Has(rbac.PermManageChannels) {
+		return channel, errManageChannelsDenied
+	}
+	var lockedVoice bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT type = 'voice' FROM channels WHERE id = $1 AND server_id = $2 FOR UPDATE`, channelID, serverID,
+	).Scan(&lockedVoice); err != nil {
+		return channel, fmt.Errorf("lock channel update authority state: %w", err)
+	}
+	if lockedVoice != (req.Type == "voice") {
+		return channel, errChannelAuthoritySetChanged
+	}
+
+	err = tx.QueryRowContext(ctx,
+		`UPDATE channels
+		SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, updated_at = NOW()
+		WHERE id = $5 AND server_id = $6
+		RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
+		          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
+		req.Name, req.Type, req.Emoji, req.AudioQualityTier, channelID, serverID,
+	).Scan(
+		&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier,
+		&channel.GroupID, &channel.LinkedVoiceChannelID, &channel.SyncPermissions,
+		&channel.Position, &channel.ExpirationWindowSeconds, &channel.ExpirationUpdatedAt,
+		&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt,
+	)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			h.log.Error("Failed to update channel", "error", err)
+		}
+		return channel, err
+	}
+	if err := tx.Commit(); err != nil {
+		return channel, fmt.Errorf("commit channel update transaction: %w", err)
+	}
+	return channel, nil
+}
+
+// moveSyncedChannel changes a materialized category authority source. A synced
+// child may never retain copied rows from its old parent: it either receives an
+// exact copy from the destination category or becomes unsynced with no rows.
+func (h *Handler) moveSyncedChannel(
+	ctx context.Context,
+	serverID, userID, tokenEpoch, channelID string,
+	req UpdateChannelRequest,
+	preflight channelAuthorityState,
+) (models.Channel, error) {
+	if h.authority == nil {
+		return models.Channel{}, errChannelAuthorityUnavailable
+	}
+	move := syncedChannelMoveRequest{
+		serverID: serverID, userID: userID, tokenEpoch: tokenEpoch, channelID: channelID,
+		update: req, preflight: preflight,
+	}
+	move.target = newSyncedChannelMoveTarget(move.preflight, move.channelID, move.update)
+	for attempt := 0; attempt < 2; attempt++ {
+		channel, rotations, err := h.runSyncedChannelMoveAttempt(ctx, move)
+		if errors.Is(err, errChannelAuthoritySetChanged) {
+			state, stateErr := h.channelAuthorityState(ctx, channelID)
+			if stateErr != nil {
+				return models.Channel{}, stateErr
+			}
+			move.preflight = state
+			move.target = newSyncedChannelMoveTarget(move.preflight, move.channelID, move.update)
+			continue
+		}
+		if err != nil {
+			if rbac.IsAmbiguousAuthorityCommit(err) {
+				h.authority.FailClosedChannelAuthorityMutation(ctx, serverID, move.target.affectedIDs)
+			}
+			return models.Channel{}, err
+		}
+		if _, wasDeleted := authorityRotationDeletedChannelIDs(rotations)[channelID]; wasDeleted {
+			return models.Channel{}, errChannelDeletedDuringAuthorityRotation
+		}
+		return channel, nil
+	}
+	return models.Channel{}, errChannelAuthoritySetChanged
+}
+
+// syncedChannelMoveTarget is derived from the authoritative preflight and is
+// rebuilt after a stale-capture retry. The same exact channel IDs must drive
+// both ambiguous-commit recovery and confirmed post-commit revalidation.
+type syncedChannelMoveTarget struct {
+	groupID     *string
+	affectedIDs []string
+	voiceIDs    []string
+}
+
+type syncedChannelMoveRequest struct {
+	serverID, userID, tokenEpoch, channelID string
+	update                                  UpdateChannelRequest
+	preflight                               channelAuthorityState
+	target                                  syncedChannelMoveTarget
+}
+
+func newSyncedChannelMoveTarget(preflight channelAuthorityState, channelID string, req UpdateChannelRequest) syncedChannelMoveTarget {
+	target := syncedChannelMoveTarget{groupID: preflight.GroupID}
 	if req.GroupID != nil {
-		err = h.db.QueryRow(
-			`UPDATE channels
-			SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, group_id = $5, updated_at = NOW()
-			WHERE id = $6
+		target.groupID = req.GroupID
+	}
+	changed := (preflight.SyncPermissions && !sameOptionalGroupID(preflight.GroupID, target.groupID)) || preflight.IsVoice != (req.Type == "voice")
+	if !changed {
+		return target
+	}
+	target.affectedIDs = []string{channelID}
+	if preflight.IsVoice {
+		target.voiceIDs = []string{channelID}
+	}
+	return target
+}
+
+func (h *Handler) runSyncedChannelMoveAttempt(ctx context.Context, request syncedChannelMoveRequest) (models.Channel, []keyrotation.Rotation, error) {
+	channel := models.Channel{ID: request.channelID, Name: request.update.Name, Type: request.update.Type}
+	var rotations []keyrotation.Rotation
+	var deniedByChannel map[string][]string
+	plan, err := h.authority.RunChannelAuthorityMutation(ctx, request.serverID, request.target.voiceIDs,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return h.moveSyncedChannelTx(ctx, tx, request, &channel, &rotations, &deniedByChannel)
+		}, request.userID,
+	)
+	if err != nil {
+		return models.Channel{}, nil, err
+	}
+	h.authority.CompleteChannelAuthorityMutationWithRotations(ctx, request.serverID, request.target.affectedIDs, plan, rotations, deniedByChannel)
+	return channel, rotations, nil
+}
+
+type syncedChannelMoveState struct {
+	syncMove    bool
+	typeChanged bool
+	candidates  rbac.ChannelKeyCandidates
+}
+
+func (h *Handler) moveSyncedChannelTx(ctx context.Context, tx *sql.Tx, request syncedChannelMoveRequest, channel *models.Channel, rotations *[]keyrotation.Rotation, deniedByChannel *map[string][]string) error {
+	state, err := h.prepareSyncedChannelMoveTx(ctx, tx, request)
+	if err != nil {
+		return err
+	}
+	if err := updateSyncedChannelTx(ctx, tx, request, state.syncMove, channel); err != nil {
+		return err
+	}
+	if !state.syncMove && !state.typeChanged {
+		return nil
+	}
+	if state.syncMove && channel.GroupID != nil {
+		if err := rbac.ReplaceCategoryOverridesForChannelsTx(ctx, tx, *channel.GroupID, []string{request.channelID}); err != nil {
+			return err
+		}
+	}
+	*rotations, *deniedByChannel, err = h.authority.RevokeDeniedChannelKeyCandidatesTx(
+		ctx, tx, request.serverID, request.userID, []string{request.channelID}, state.candidates,
+	)
+	return err
+}
+
+func (h *Handler) prepareSyncedChannelMoveTx(ctx context.Context, tx *sql.Tx, request syncedChannelMoveRequest) (syncedChannelMoveState, error) {
+	if err := credepoch.GuardTx(ctx, tx, request.userID, request.tokenEpoch); err != nil {
+		return syncedChannelMoveState{}, err
+	}
+	if err := lockChannelGroupsTx(ctx, tx, request.serverID, moveChannelGroupIDs(request.preflight.GroupID, request.target.groupID)); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return syncedChannelMoveState{}, errChannelAuthoritySetChanged
+		}
+		return syncedChannelMoveState{}, err
+	}
+	locked, err := lockChannelAuthorityStateTx(ctx, tx, request.serverID, request.channelID)
+	if err != nil {
+		return syncedChannelMoveState{}, err
+	}
+	if locked.SyncPermissions != request.preflight.SyncPermissions || locked.IsVoice != request.preflight.IsVoice || !sameOptionalGroupID(locked.GroupID, request.preflight.GroupID) {
+		return syncedChannelMoveState{}, errChannelAuthoritySetChanged
+	}
+	if err := h.requireManageChannelsTx(ctx, tx, request.serverID, request.userID, "resolve current channel move actor permissions"); err != nil {
+		return syncedChannelMoveState{}, err
+	}
+	state := syncedChannelMoveState{
+		syncMove:    locked.SyncPermissions && !sameOptionalGroupID(locked.GroupID, request.target.groupID),
+		typeChanged: locked.IsVoice != (request.update.Type == "voice"),
+	}
+	if !state.syncMove && !state.typeChanged {
+		return state, nil
+	}
+	protected, err := rbac.HasTemporaryMoveGrantForChannelsTx(ctx, tx, []string{request.channelID})
+	if err != nil {
+		return syncedChannelMoveState{}, err
+	}
+	if protected {
+		return syncedChannelMoveState{}, rbac.ErrTemporaryChannelOverrideManaged
+	}
+	state.candidates, err = rbac.CaptureChannelKeyCandidatesTx(ctx, tx, []string{request.channelID}, maxChannelWrappedKeys)
+	if err != nil {
+		return syncedChannelMoveState{}, err
+	}
+	if state.syncMove {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM channel_permission_overrides WHERE channel_id = $1`, request.channelID); err != nil {
+			return syncedChannelMoveState{}, fmt.Errorf("clear old synchronized channel overrides: %w", err)
+		}
+	}
+	return state, nil
+}
+
+func moveChannelGroupIDs(current, target *string) []string {
+	ids := make([]string, 0, 2)
+	if currentID := resolveGroupIDParam(current); currentID != nil {
+		ids = append(ids, currentID.(string))
+	}
+	if targetID := resolveGroupIDParam(target); targetID != nil && (len(ids) == 0 || ids[0] != targetID.(string)) {
+		ids = append(ids, targetID.(string))
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func lockChannelAuthorityStateTx(ctx context.Context, tx *sql.Tx, serverID, channelID string) (channelAuthorityState, error) {
+	var state channelAuthorityState
+	err := tx.QueryRowContext(ctx, `
+		SELECT group_id, sync_permissions, type = 'voice'
+		FROM channels WHERE id = $1 AND server_id = $2 FOR UPDATE`, channelID, serverID,
+	).Scan(&state.GroupID, &state.SyncPermissions, &state.IsVoice)
+	if err != nil {
+		return state, fmt.Errorf("lock channel authority state: %w", err)
+	}
+	return state, nil
+}
+
+func (h *Handler) requireManageChannelsTx(ctx context.Context, tx *sql.Tx, serverID, userID, operation string) error {
+	perms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
+	if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	if !perms.Has(rbac.PermManageChannels) {
+		return errManageChannelsDenied
+	}
+	return nil
+}
+
+func updateSyncedChannelTx(ctx context.Context, tx *sql.Tx, request syncedChannelMoveRequest, syncMove bool, channel *models.Channel) error {
+	if request.update.GroupID != nil && resolveGroupIDParam(request.target.groupID) == nil && syncMove {
+		return tx.QueryRowContext(ctx, `
+			UPDATE channels SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, group_id = NULL,
+				sync_permissions = FALSE, updated_at = NOW()
+			WHERE id = $5 AND server_id = $6
 			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
 			          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
-			req.Name, req.Type, req.Emoji, req.AudioQualityTier, resolveGroupIDParam(req.GroupID), channelID,
-		).Scan(
-			&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier,
-			&channel.GroupID, &channel.LinkedVoiceChannelID, &channel.SyncPermissions,
-			&channel.Position, &channel.ExpirationWindowSeconds, &channel.ExpirationUpdatedAt,
-			&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt,
-		)
-	} else {
-		err = h.db.QueryRow(
-			`UPDATE channels
-			SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, updated_at = NOW()
-			WHERE id = $5
-			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
-			          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
-			req.Name, req.Type, req.Emoji, req.AudioQualityTier, channelID,
-		).Scan(
-			&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier,
-			&channel.GroupID, &channel.LinkedVoiceChannelID, &channel.SyncPermissions,
-			&channel.Position, &channel.ExpirationWindowSeconds, &channel.ExpirationUpdatedAt,
-			&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt,
-		)
+			request.update.Name, request.update.Type, request.update.Emoji, request.update.AudioQualityTier, request.channelID, request.serverID,
+		).Scan(&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier, &channel.GroupID,
+			&channel.LinkedVoiceChannelID, &channel.SyncPermissions, &channel.Position, &channel.ExpirationWindowSeconds,
+			&channel.ExpirationUpdatedAt, &channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt)
 	}
-	if err != nil && err != sql.ErrNoRows {
-		h.log.Error("Failed to update channel", "error", err)
-	}
-	return channel, err
+	return tx.QueryRowContext(ctx, `
+		UPDATE channels SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, group_id = $5, updated_at = NOW()
+		WHERE id = $6 AND server_id = $7
+		RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
+		          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
+		request.update.Name, request.update.Type, request.update.Emoji, request.update.AudioQualityTier, resolveGroupIDParam(request.target.groupID), request.channelID, request.serverID,
+	).Scan(&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier, &channel.GroupID,
+		&channel.LinkedVoiceChannelID, &channel.SyncPermissions, &channel.Position, &channel.ExpirationWindowSeconds,
+		&channel.ExpirationUpdatedAt, &channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt)
 }
 
 func (h *Handler) broadcastChannelUpdated(channel models.Channel) {
@@ -1201,32 +1734,103 @@ func (h *Handler) DeleteChannel(c *gin.Context) {
 		return
 	}
 
-	// Delete channel
-	deleteQuery := `DELETE FROM channels WHERE id = $1`
-
-	_, err = h.db.Exec(deleteQuery, channelID)
+	if h.authority == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteChannel})
+		return
+	}
+	var preflightVoice bool
+	if err := h.db.QueryRowContext(c.Request.Context(), `SELECT type = 'voice' FROM channels WHERE id = $1`, channelID).Scan(&preflightVoice); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteChannel})
+		}
+		return
+	}
+	voiceIDs := []string{}
+	if preflightVoice {
+		voiceIDs = []string{channelID}
+	}
+	plan, err := h.authority.RunChannelAuthorityMutation(c.Request.Context(), serverID, voiceIDs,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return h.deleteChannelTx(ctx, tx, serverID, userID, middleware.TokenCredentialEpoch(c), channelID, preflightVoice)
+		}, userID,
+	)
+	if errors.Is(err, errChannelAuthoritySetChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": errChannelAuthorityRetry})
+		return
+	}
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+		return
+	}
+	if errors.Is(err, rbac.ErrNotMember) || errors.Is(err, errManageChannelsDenied) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return
+	}
+	if rbac.IsAmbiguousAuthorityCommit(err) {
+		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, []string{channelID})
+	}
 	if err != nil {
 		h.log.Error("Failed to delete channel", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteChannel})
 		return
 	}
+	h.authority.CompleteChannelAuthorityMutation(c.Request.Context(), serverID, []string{channelID}, plan)
 
 	h.log.Info("Channel deleted", "channel_id", channelID, "user_id", userID)
 
-	// Broadcast deletion to server subscribers so frontends can clean up
-	if h.hub != nil {
-		if serverUUID, err := uuid.Parse(serverID); err == nil {
-			h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
-				Type: "channel_deleted",
-				Data: map[string]interface{}{
-					"channel_id": channelID,
-					"server_id":  serverID,
-				},
-			})
-		}
-	}
+	h.broadcastChannelDeleted(serverID, channelID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Channel deleted successfully"})
+}
+
+func (h *Handler) broadcastChannelDeleted(serverID, channelID string) {
+	if h.hub == nil {
+		return
+	}
+	serverUUID, err := uuid.Parse(serverID)
+	if err != nil {
+		return
+	}
+	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+		Type: "channel_deleted",
+		Data: map[string]interface{}{"channel_id": channelID, "server_id": serverID},
+	})
+}
+
+func (h *Handler) deleteChannelTx(ctx context.Context, tx *sql.Tx, serverID, userID, tokenEpoch, channelID string, preflightVoice bool) error {
+	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+		return err
+	}
+	var lockedServerID string
+	var lockedVoice bool
+	if err := tx.QueryRowContext(ctx, `SELECT server_id, type = 'voice' FROM channels WHERE id = $1 FOR UPDATE`, channelID).Scan(&lockedServerID, &lockedVoice); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errChannelAuthoritySetChanged
+		}
+		return err
+	}
+	if lockedServerID != serverID || lockedVoice != preflightVoice {
+		return errChannelAuthoritySetChanged
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, serverID, userID).Scan(new(string)); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return rbac.ErrNotMember
+		}
+		return err
+	}
+	perms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
+	if err != nil {
+		return err
+	}
+	if !perms.Has(rbac.PermManageChannels) {
+		return errManageChannelsDenied
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = $1 AND server_id = $2`, channelID, serverID); err != nil {
+		return fmt.Errorf("delete channel: %w", err)
+	}
+	return nil
 }
 
 // GetUnreadCounts returns per-channel unread message counts for the channels the
@@ -1256,12 +1860,8 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 		return
 	}
 
-	// CV-CAN-002: restrict unread counts to channels the caller can READ — server
-	// membership alone must not enumerate hidden channel IDs or their activity, and
-	// an unread count is message-content disclosure, so it needs
-	// PermReadMessageHistory on top of the view bit (the same permission every
-	// message-fetch path enforces). Channels the caller can see but not read stay in
-	// the channel list and simply carry no count.
+	// CV-CAN-002: unread counts disclose message activity, so require history
+	// access as well as visibility.
 	readableIDs, visErr := h.resolver.GetReadableChannelIDs(c.Request.Context(), serverID, userID)
 	if visErr != nil {
 		h.log.Error(errMsgFailedResolveVisible, "error", visErr)
@@ -1279,15 +1879,13 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 		return
 	}
 
-	// For each READABLE channel in the server, count messages newer than
+	// For each readable channel in the server, count messages newer than
 	// last_read_at. If no read state exists, fall back to the user's join date so
 	// pre-existing messages are not counted as unread for first-time members.
 	// Uses JOINs instead of correlated subqueries for better query planning.
 	//
-	// CV-CAN-002: the ANY($3) predicate scopes aggregation to readable channels in
-	// SQL, so a view- or history-denied member cannot force the aggregate over
-	// those channels' message history (the rows are never scanned, not just
-	// dropped).
+	// CV-CAN-002: scope aggregation to readable channels in SQL, so a member
+	// cannot query message activity from history-denied channels.
 	query := `
 		SELECT ch.id,
 			COUNT(m.id)::int AS unread_count
@@ -1331,27 +1929,18 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"unreads": unreads})
 }
 
-// channelUnread is one row of GetServerUnreadStatus's additive `channels` field.
 type channelUnread struct {
 	ChannelID   string `json:"channel_id"`
 	ServerID    string `json:"server_id"`
 	UnreadCount int    `json:"unread_count"`
 }
 
-// GetServerUnreadStatus returns per-channel unread counts across every server the
-// user belongs to, plus the list of server IDs that have any unread. `server_ids`
-// is DERIVED from the same rows as `channels`, so the two cannot disagree.
-// Used to show unread dots on server icons, and (since #2403) to seed the desktop
-// badge, without fetching per-channel counts for every server separately.
+// GetServerUnreadStatus returns unread channel counts and their derived server IDs.
 func (h *Handler) GetServerUnreadStatus(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	// CV-CAN-002: only count unread in channels the caller can READ — view alone is
-	// not enough, because a count is a live measure of message volume and timing in
-	// a channel the caller may be forbidden to read (see GetReadableChannelIDs). A
-	// channel excluded here neither reports a count nor raises its server's unread
-	// flag. Resolved in a single query across all of the user's servers to avoid a
-	// per-server N+1.
+	// An unread count is message-activity disclosure, so visibility alone is not
+	// enough: the caller also needs history access.
 	readableIDs, visErr := h.resolver.GetAllReadableChannelIDs(c.Request.Context(), userID)
 	if visErr != nil {
 		h.log.Error(errMsgFailedResolveVisible, "error", visErr)
@@ -1359,19 +1948,12 @@ func (h *Handler) GetServerUnreadStatus(c *gin.Context) {
 		return
 	}
 	if len(readableIDs) == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"server_ids": []string{},
-			"channels":   []channelUnread{},
-		})
+		c.JSON(http.StatusOK, gin.H{"server_ids": []string{}, "channels": []channelUnread{}})
 		return
 	}
 
-	// Grouped per channel so the client can apply its own mute resolution:
-	// mute is a client-side concern (no query in this package filters it), and
-	// per-server totals would put muted servers on the desktop badge (#2403).
-	//
-	// Uses a LEFT JOIN to channel_read_states instead of a correlated subquery
-	// so the planner can use a hash/merge join instead of nested-loop per row.
+	// Group per channel so clients can apply their own mute resolution while the
+	// server_ids projection stays derived from exactly the same rows.
 	query := `
 		SELECT ch.id, ch.server_id, COUNT(*) AS unread_count
 		FROM channels ch
@@ -1512,15 +2094,6 @@ func (h *Handler) MarkServerRead(c *gin.Context) {
 
 	// CV-CAN-002: only write read state for channels the caller can view — do not
 	// upsert read state for hidden channels the member is denied visibility on.
-	//
-	// Deliberately still VISIBILITY, not readability, while GetUnreadCounts and
-	// GetServerUnreadStatus moved to GetReadableChannelIDs. Those two DISCLOSE a
-	// measure of message volume, which is what the history bit governs; this one
-	// writes the caller's own channel_read_states row and answers with a constant
-	// string however many rows it touched, so it is neither an oracle nor a
-	// disclosure. Stamping last_read_at on a history-denied channel is also the
-	// better behaviour: a later re-grant then surfaces no backlog, and a backlog's
-	// SIZE is exactly the activity measure the denial was meant to withhold.
 	visibleIDs, visErr := h.resolver.GetVisibleChannelIDs(c.Request.Context(), serverID, userID)
 	if visErr != nil {
 		h.log.Error(errMsgFailedResolveVisible, "error", visErr)
@@ -1593,11 +2166,11 @@ func (h *Handler) channelKeyAccess(ctx context.Context, channelID, userID string
 	if channelType == "voice" {
 		viewPerm = rbac.PermViewVoiceChannels
 	}
-	allowed, permErr := h.resolver.HasPermission(ctx, serverID, userID, channelID, viewPerm)
+	perms, permErr := h.resolver.ResolveEffectivePermissionsUncached(ctx, serverID, userID, channelID)
 	if permErr != nil {
 		return true, false, permErr
 	}
-	return true, allowed, nil
+	return true, perms.Has(viewPerm), nil
 }
 
 // GetChannelKeys returns the caller's own wrapped channel key (optionally a
@@ -2111,28 +2684,22 @@ func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, con
 }
 
 // keyDistributionErrorResponse maps a distribution or rotation error to its
-// status and body. known=false means the caller logs and answers 500 with its
-// own message — the unified route and RotateDMKey differ only there.
+// status and body. known=false leaves the caller to log and return its own 500.
 func keyDistributionErrorResponse(distErr error) (int, interface{}, bool) {
-	if errors.Is(distErr, errDMKeyDistributorNotParticipant) {
+	switch {
+	case errors.Is(distErr, errDMKeyDistributorNotParticipant):
 		return http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied}, true
-	}
-	if errors.Is(distErr, errChannelKeyDistributorAccess) {
+	case errors.Is(distErr, errChannelKeyDistributorAccess):
 		return http.StatusForbidden, gin.H{"error": "You must have the channel key to distribute keys"}, true
-	}
-	if errors.Is(distErr, errNoChannelKeyRecipients) {
+	case errors.Is(distErr, errNoChannelKeyRecipients):
 		return http.StatusBadRequest, gin.H{"error": "No eligible recipients supplied for channel-key distribution"}, true
-	}
-	if errors.Is(distErr, errInitialKeyDistributionCreator) {
+	case errors.Is(distErr, errInitialKeyDistributionCreator):
 		return http.StatusForbidden, gin.H{"error": errMsgInitialKeyDistributionOnly}, true
-	}
-	if errors.Is(distErr, errInitialKeyDistributionBusy) {
+	case errors.Is(distErr, errInitialKeyDistributionBusy):
 		return http.StatusConflict, gin.H{"error": errMsgInitialKeyDistributionBusy}, true
-	}
-	if errors.Is(distErr, errUnissuedChannelKeyVersion) {
+	case errors.Is(distErr, errUnissuedChannelKeyVersion):
 		return http.StatusConflict, gin.H{"error": "Key rotation has not been initiated"}, true
-	}
-	if errors.Is(distErr, errRotationDistributor) {
+	case errors.Is(distErr, errRotationDistributor):
 		return http.StatusConflict, gin.H{"error": "Key rotation requires its established key fingerprint"}, true
 	}
 	var stale *dmEpochClaimStaleError
@@ -2141,6 +2708,9 @@ func keyDistributionErrorResponse(distErr error) (int, interface{}, bool) {
 	}
 	if errors.Is(distErr, errDMEpochClaimNotHolder) {
 		return http.StatusForbidden, gin.H{"error": errMsgRotationNotHolder}, true
+	}
+	if errors.Is(distErr, errDuplicateWrappedRecipient) {
+		return http.StatusBadRequest, gin.H{"error": "Duplicate wrapped-key recipient"}, true
 	}
 	var incomplete *dmEpochClaimIncompleteError
 	if errors.As(distErr, &incomplete) {
@@ -2304,6 +2874,12 @@ func (h *Handler) notifyChannelKeyDistribution(req channelKeyDistributionRequest
 // their existing skip semantics.
 func (h *Handler) distributeChannelKeysToMembers(ctx context.Context, req channelKeyDistributionRequest) (channelDistributionTally, error) {
 	var tally channelDistributionTally
+	normalizedWrappedKeys, normalizedVersions, err := canonicalizeWrappedKeyMaps(req.wrappedKeys, req.wrappedKeyVersions)
+	if err != nil {
+		return tally, err
+	}
+	req.wrappedKeys = normalizedWrappedKeys
+	req.wrappedKeyVersions = normalizedVersions
 	// #2201 review: run on the request context so a client disconnect cancels a
 	// GuardTx FOR SHARE lock-wait (which blocks against a destructive reset's
 	// FOR NO KEY UPDATE) instead of pinning a pooled connection with no deadline.
@@ -2586,7 +3162,12 @@ func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 	}
 
 	requests := h.filterVisiblePendingRequests(c.Request.Context(), userID, candidates)
-	requests = h.appendDMPendingRequests(userID, requests)
+	requests, err = h.appendDMPendingRequests(c.Request.Context(), userID, requests)
+	if err != nil {
+		h.log.Error("Failed to fetch pending DM key requests", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchPendingKeys})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"pending_requests": requests})
 }
@@ -2623,12 +3204,10 @@ func (h *Handler) filterVisiblePendingRequests(ctx context.Context, callerID str
 // appendDMPendingRequests appends the caller's DM pending key requests to
 // requests. DM membership is scoped by the dm_channel_keys join, so no extra
 // VIEW gate applies here.
-func (h *Handler) appendDMPendingRequests(userID string, requests []pendingKeyRequest) []pendingKeyRequest {
-	// Only a holder of the conversation's CURRENT epoch may fulfil. The
-	// fulfiller wraps the key it has and the server stamps the row at the
-	// current version, so a holder of an older epoch would deliver the wrong
-	// key under the right version — undetectable until the recipient decrypts
-	// garbage. Mirrors the channel query's active-epoch join above.
+func (h *Handler) appendDMPendingRequests(ctx context.Context, userID string, requests []pendingKeyRequest) ([]pendingKeyRequest, error) {
+	// A fulfiller distributes the key it holds but the server stamps the row at
+	// the conversation's current epoch. Never offer a stale holder a pending
+	// request: it could wrap an old CSK and label it as the current epoch.
 	dmQuery := `
 		SELECT dpkr.id, dpkr.conversation_id, dpkr.user_id, dpkr.created_at
 		FROM dm_pending_key_requests dpkr
@@ -2639,19 +3218,87 @@ func (h *Handler) appendDMPendingRequests(userID string, requests []pendingKeyRe
 		  )
 		ORDER BY dpkr.created_at ASC
 	`
-	dmRows, dmErr := h.db.Query(dmQuery, userID)
+	dmRows, dmErr := h.db.QueryContext(ctx, dmQuery, userID)
 	if dmErr != nil {
-		return requests
+		return nil, fmt.Errorf("query pending DM key requests: %w", dmErr)
 	}
-	defer func() { _ = dmRows.Close() }()
+	candidates := make([]pendingKeyRequest, 0)
 	for dmRows.Next() {
 		var req pendingKeyRequest
 		if err := dmRows.Scan(&req.ID, &req.ChannelID, &req.UserID, &req.CreatedAt); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("scan pending DM key request: %w", err),
+				closePendingDMRequestRows(dmRows),
+			)
+		}
+		candidates = append(candidates, req)
+	}
+	if err := dmRows.Err(); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("iterate pending DM key requests: %w", err),
+			closePendingDMRequestRows(dmRows),
+		)
+	}
+	if err := closePendingDMRequestRows(dmRows); err != nil {
+		return nil, err
+	}
+	for _, req := range candidates {
+		available, guardErr := h.dmPendingConversationAvailable(ctx, req.ChannelID, userID)
+		if guardErr != nil {
+			return nil, fmt.Errorf("check pending DM conversation availability: %w", guardErr)
+		}
+		if !available {
 			continue
 		}
 		requests = append(requests, req)
 	}
-	return requests
+	return requests, nil
+}
+
+func closePendingDMRequestRows(rows *sql.Rows) error {
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close pending DM key request rows: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) dmPendingConversationAvailable(ctx context.Context, conversationID, userID string) (bool, error) {
+	caller, parseErr := uuid.Parse(userID)
+	if parseErr != nil {
+		return false, errDMKeyFetchNotParticipant
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return false, err
+		}
+		available := false
+		err = func() error {
+			if _, err := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{caller}, dmblock.LockShare, dmblock.LockShare); err != nil {
+				return err
+			}
+			var participant string
+			if err := tx.QueryRowContext(ctx, `SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID).Scan(&participant); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil
+				}
+				return err
+			}
+			available = true
+			return tx.Commit()
+		}()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("Failed to rollback DM pending-read transaction", "error", rbErr)
+		}
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		if errors.Is(err, dmblock.ErrUnavailable) {
+			return false, nil
+		}
+		return available, err
+	}
+	return false, dmblock.ErrMembershipChanged
 }
 
 // GetUnifiedKeys resolves a context_id to either a server channel or DM conversation
@@ -2735,6 +3382,53 @@ func (h *Handler) enrollPending(kind, contextID, userID string) (inserted bool, 
 	}
 	rows, _ := result.RowsAffected()
 	return rows > 0, nil
+}
+
+func (h *Handler) enrollDMPendingGuarded(ctx context.Context, conversationID, userID string) (bool, error) {
+	participantID, parseErr := uuid.Parse(userID)
+	if parseErr != nil {
+		return false, errDMKeyFetchNotParticipant
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return false, fmt.Errorf("begin guarded dm enrollment: %w", err)
+		}
+		inserted := false
+		err = func() error {
+			if _, err := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{participantID}, dmblock.LockShare, dmblock.LockShare); err != nil {
+				return err
+			}
+			var participant string
+			if err := tx.QueryRowContext(ctx, `SELECT user_id FROM dm_participants WHERE conversation_id=$1 AND user_id=$2 FOR SHARE`, conversationID, userID).Scan(&participant); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return errDMKeyFetchNotParticipant
+				}
+				return fmt.Errorf("recheck guarded dm enrollment participant: %w", err)
+			}
+			result, err := tx.ExecContext(ctx, `INSERT INTO dm_pending_key_requests (conversation_id,user_id) VALUES ($1,$2) ON CONFLICT (conversation_id,user_id) DO NOTHING`, conversationID, userID)
+			if err != nil {
+				return fmt.Errorf("insert guarded dm enrollment: %w", err)
+			}
+			rows, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			inserted = rows > 0
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit guarded dm enrollment: %w", err)
+			}
+			return nil
+		}()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("Failed to rollback DM pending-enrollment transaction", "error", rbErr)
+		}
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return inserted, err
+	}
+	return false, dmblock.ErrMembershipChanged
 }
 
 // RequestRewrap enrolls the caller into the peer-fulfillment queue for a
@@ -2849,7 +3543,7 @@ func (h *Handler) enrollDMRewrap(c *gin.Context, contextID, userID string) {
 		return
 	}
 
-	inserted, enrollErr := h.enrollPending("dm", contextID, userID)
+	inserted, enrollErr := h.enrollDMPendingGuarded(c.Request.Context(), contextID, userID)
 	if enrollErr != nil {
 		h.log.Error("re_wrap_request: dm enrollment insert failed",
 			"kind", "re_wrap_insert_db_error",
@@ -3021,84 +3715,150 @@ type dmKey struct {
 	CreatedAt      string `json:"created_at"`
 }
 
-// fetchDMKey is the DM twin of fetchChannelKey, and exists because the DM
-// branch used to IGNORE ?version= entirely -- it always answered
-// ORDER BY key_version DESC LIMIT 1, i.e. HTTP 200 with the current key for
-// any epoch a caller named.
-//
-// Two things followed. Historical DM content stayed undecryptable after a
-// rotation, because a request for the epoch it was sealed under silently got
-// the current key instead. And a 200 for an epoch that does not exist let a
-// fabricated key_version -- attested by an uploader, reflected back by the
-// attachment download -- be cached and recorded as a real epoch on the client,
-// poisoning a monotonic rotation watermark that then suppressed every genuine
-// rotation for the session.
-//
-// Exact match, then, and sql.ErrNoRows for anything else: the caller's 404
-// path already handles a missing wrap correctly.
-func (h *Handler) fetchDMKey(conversationID, userID, versionStr string) (dmKey, error) {
-	var key dmKey
-	if versionStr != "" {
-		var version int
-		if _, scanErr := fmt.Sscanf(versionStr, "%d", &version); scanErr != nil || version <= 0 {
-			return key, errInvalidVersion
-		}
-		err := h.db.QueryRow(
-			`SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
-			 FROM dm_channel_keys
-			 WHERE conversation_id = $1 AND user_id = $2 AND key_version = $3`,
-			conversationID, userID, version,
-		).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
-		return key, err
+// fetchDMKeyLocked performs membership, key selection and the epoch decision
+// under one parent/participant lock. A Block can therefore never remove a
+// recipient between the former preflight and its wrapped-key read.
+func (h *Handler) fetchDMKeyLocked(ctx context.Context, conversationID, userID, versionStr string) (dmKey, bool, int, error) {
+	version, err := parseDMKeyVersion(versionStr)
+	if err != nil {
+		return dmKey{}, false, 0, err
 	}
-	err := h.db.QueryRow(
-		`SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
-		 FROM dm_channel_keys
-		 WHERE conversation_id = $1 AND user_id = $2
-		 ORDER BY key_version DESC LIMIT 1`,
-		conversationID, userID,
-	).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
+	participantID, parseErr := uuid.Parse(userID)
+	if parseErr != nil {
+		return dmKey{}, false, 0, errDMKeyFetchNotParticipant
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		key, revoked, successorEpoch, fetchErr := h.fetchDMKeyLockedAttempt(ctx, conversationID, userID, participantID, versionStr, version)
+		if errors.Is(fetchErr, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return key, revoked, successorEpoch, fetchErr
+	}
+	return dmKey{}, false, 0, dmblock.ErrMembershipChanged
+}
+
+func parseDMKeyVersion(versionStr string) (int, error) {
+	if versionStr == "" {
+		return 0, nil
+	}
+	var version int
+	scanned, err := fmt.Sscanf(versionStr, "%d", &version)
+	if err != nil || scanned != 1 || version <= 0 {
+		return 0, errInvalidVersion
+	}
+	return version, nil
+}
+
+func (h *Handler) fetchDMKeyLockedAttempt(ctx context.Context, conversationID, userID string, participantID uuid.UUID, versionStr string, version int) (dmKey, bool, int, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return dmKey{}, false, 0, fmt.Errorf("begin locked dm key fetch: %w", err)
+	}
+	key, revoked, successorEpoch, fetchErr := fetchDMKeyLockedTx(ctx, tx, conversationID, userID, participantID, versionStr, version)
+	if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+		h.log.Error("Failed to rollback DM key-fetch transaction", "error", rbErr)
+	}
+	return key, revoked, successorEpoch, fetchErr
+}
+
+func fetchDMKeyLockedTx(ctx context.Context, tx *sql.Tx, conversationID, userID string, participantID uuid.UUID, versionStr string, version int) (dmKey, bool, int, error) {
+	if err := confirmDMKeyConversationTx(ctx, tx, conversationID); err != nil {
+		return dmKey{}, false, 0, err
+	}
+	if _, err := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{participantID}, dmblock.LockShare, dmblock.LockShare); err != nil {
+		return dmKey{}, false, 0, err
+	}
+	if err := lockDMKeyParticipantTx(ctx, tx, conversationID, userID); err != nil {
+		return dmKey{}, false, 0, err
+	}
+	key, err := readLockedDMKeyTx(ctx, tx, conversationID, userID, versionStr, version)
+	if errors.Is(err, sql.ErrNoRows) {
+		if commitErr := tx.Commit(); commitErr != nil {
+			return dmKey{}, false, 0, fmt.Errorf("commit missing dm key: %w", commitErr)
+		}
+		return dmKey{}, false, 0, sql.ErrNoRows
+	}
+	if err != nil {
+		return dmKey{}, false, 0, err
+	}
+	// A versioned fetch is a history read. Only the current-key request is
+	// refused for a revoked epoch; the successor is read under the same locks.
+	revoked := false
+	successorEpoch := 0
+	if versionStr == "" {
+		revoked, successorEpoch, err = dmKeyRevokedTx(ctx, tx, conversationID, key.KeyVersion)
+		if err != nil {
+			return dmKey{}, false, 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return dmKey{}, false, 0, fmt.Errorf("commit locked dm key fetch: %w", err)
+	}
+	return key, revoked, successorEpoch, nil
+}
+
+func confirmDMKeyConversationTx(ctx context.Context, tx *sql.Tx, conversationID string) error {
+	// This is classification-only: authorization still comes from the locked
+	// participant recheck below. PrepareConversationTx deliberately collapses an
+	// empty participant snapshot into ErrUnavailable, so probe the parent first.
+	var conversationExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dm_conversations WHERE id = $1)`, conversationID).Scan(&conversationExists); err != nil {
+		return fmt.Errorf("check dm key conversation: %w", err)
+	}
+	if !conversationExists {
+		return errDMKeyFetchNotParticipant
+	}
+	return nil
+}
+
+func lockDMKeyParticipantTx(ctx context.Context, tx *sql.Tx, conversationID, userID string) error {
+	var locked string
+	err := tx.QueryRowContext(ctx, `SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID).Scan(&locked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errDMKeyFetchNotParticipant
+	}
+	if err != nil {
+		return fmt.Errorf("lock dm key participant: %w", err)
+	}
+	return nil
+}
+
+func readLockedDMKeyTx(ctx context.Context, tx *sql.Tx, conversationID, userID, versionStr string, version int) (dmKey, error) {
+	var key dmKey
+	var err error
+	if versionStr != "" {
+		err = tx.QueryRowContext(ctx, `SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at FROM dm_channel_keys WHERE conversation_id=$1 AND user_id=$2 AND key_version=$3`, conversationID, userID, version).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at FROM dm_channel_keys WHERE conversation_id=$1 AND user_id=$2 ORDER BY key_version DESC LIMIT 1`, conversationID, userID).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return dmKey{}, fmt.Errorf("read locked dm key: %w", err)
+	}
 	return key, err
 }
 
-func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
-	// Under E2EE-everywhere (#201) all DMs are encrypted; check membership/existence only.
-	var exists bool
-	err := h.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM dm_conversations dc
-			INNER JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
-			WHERE dc.id = $1
-		)
-	`, contextID, userID).Scan(&exists)
-
+func dmKeyRevokedTx(ctx context.Context, tx *sql.Tx, conversationID string, keyVersion int) (bool, int, error) {
+	var successorEpoch int
+	err := tx.QueryRowContext(ctx, `
+		SELECT successor_epoch FROM dm_key_revocations
+		WHERE conversation_id = $1 AND revoked_epoch = $2
+	`, conversationID, keyVersion).Scan(&successorEpoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0, nil
+	}
 	if err != nil {
-		h.log.Error("e2ee key fetch: DM check failed",
-			"kind", "dm_check_db_error",
-			"context_id", contextID,
-			"user_id", userID,
-			"error", err)
-		c.JSON(http.StatusInternalServerError, e2eekeys.ErrorResponse{
-			Error: errMsgFailedFetchKeys,
-			Code:  e2eekeys.CodeInternalError,
-			Kind:  e2eekeys.KindUnknown,
-		})
-		return
+		return false, 0, fmt.Errorf("read locked dm key revocation: %w", err)
 	}
-	if !exists {
-		h.log.Info("e2ee key fetch: context not found or user not authorized",
-			"kind", "context_not_found_or_forbidden",
-			"context_id", contextID,
-			"user_id", userID)
-		c.JSON(http.StatusNotFound, e2eekeys.ErrorResponse{
-			Error: errMsgContextNotFoundOrDenied,
-			Code:  e2eekeys.CodeNotMember,
-			Kind:  e2eekeys.KindUnknown,
-		})
-		return
-	}
+	return true, successorEpoch, nil
+}
 
-	key, err := h.fetchDMKey(contextID, userID, c.Query("version"))
+func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
+
+	key, revokedLocked, successorEpoch, err := h.fetchDMKeyLocked(c.Request.Context(), contextID, userID, c.Query("version"))
+	if errors.Is(err, errDMKeyFetchNotParticipant) || errors.Is(err, dmblock.ErrUnavailable) {
+		c.JSON(http.StatusNotFound, e2eekeys.ErrorResponse{Error: errMsgContextNotFoundOrDenied, Code: e2eekeys.CodeNotMember, Kind: e2eekeys.KindUnknown})
+		return
+	}
 	if err == errInvalidVersion {
 		c.JSON(http.StatusBadRequest, e2eekeys.ErrorResponse{
 			Error: errMsgInvalidVersion,
@@ -3111,7 +3871,7 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 	if err == sql.ErrNoRows {
 		// Auto-enroll caller into dm_pending_key_requests (#1023).
 		// Mirror of getChannelKeyResponse auto-enroll path.
-		inserted, enrollErr := h.enrollPending("dm", contextID, userID)
+		inserted, enrollErr := h.enrollDMPendingGuarded(c.Request.Context(), contextID, userID)
 		if enrollErr != nil {
 			h.log.Error("auto-enroll pending dm insert failed",
 				"kind", "auto_enroll_insert_db_error",
@@ -3123,12 +3883,8 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 				"kind", "enroll_pending_dm",
 				"context_id", contextID,
 				"user_id", userID)
-			// The row is served only when a holder runs its pending queue, and
-			// a DM peer online the whole time had nothing to run it: key_needed
-			// was pushed for server channels only, so the requester waited on
-			// the holder's next reconnect. Pushed on the first enrollment only —
-			// the insert is ON CONFLICT DO NOTHING, so a re-fetch cannot re-page
-			// every holder.
+			// The guarded transaction has committed. Page holders only for the
+			// first enrollment; ON CONFLICT retries must not re-trigger the queue.
 			h.notifyDMKeyNeeded(contextID, userID)
 		}
 
@@ -3158,47 +3914,7 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 		return
 	}
 
-	// Epoch revocation check — if the caller's CURRENT key_version appears in
-	// dm_key_revocations as revoked_epoch, return REVOKED_EPOCH so the client
-	// triggers a rekey flow instead of trying to use stale wrap bytes. Per
-	// [internal]rules/e2ee.md: epoch numbers do NOT appear in the response.
-	//
-	// The current-key fetch only. A fetch that names a version is a history
-	// read: the row is the caller's own wrap, and reading old ciphertext under
-	// a superseded epoch is exactly what the ledger exists to permit once the
-	// successor is established. The channel path never applied the check to a
-	// versioned fetch; this one did, so a rotated DM lost its history on every
-	// device that had to refetch.
-	revokedExists := false
-	successorEpoch := 0
-	if c.Query("version") == "" {
-		revErr := h.db.QueryRow(`
-			SELECT successor_epoch FROM dm_key_revocations
-			WHERE conversation_id = $1 AND revoked_epoch = $2
-		`, contextID, key.KeyVersion).Scan(&successorEpoch)
-		switch {
-		case revErr == nil:
-			revokedExists = true
-		case errors.Is(revErr, sql.ErrNoRows):
-			// Not revoked.
-		default:
-			err = revErr
-		}
-	}
-	if err != nil {
-		h.log.Error("e2ee key fetch: dm revocation check failed",
-			"kind", "dm_revocation_check_db_error",
-			"context_id", contextID,
-			"user_id", userID,
-			"error", err)
-		c.JSON(http.StatusInternalServerError, e2eekeys.ErrorResponse{
-			Error: errMsgFailedFetchKeys,
-			Code:  e2eekeys.CodeInternalError,
-			Kind:  e2eekeys.KindUnknown,
-		})
-		return
-	}
-	if revokedExists {
+	if revokedLocked {
 		h.log.Info("e2ee key fetch: dm epoch revoked",
 			"kind", "dm_epoch_revoked",
 			"context_id", contextID,
@@ -3445,11 +4161,9 @@ func enqueueDMKeyRequest(ctx context.Context, tx *sql.Tx, conversationID, userID
 // distributeOneDMKey processes one DM distribution target inside the caller's
 // epoch-guarded transaction: the current-participant and #2420 recipient-
 // freshness guards (fail-open when the distributor supplied no version), then
-// the idempotent insert. A removed recipient is skipped; a stale recipient is
-// skipped and gets a self-heal enqueue — the caller decides whether a stale
-// skip is acceptable (a rewrap) or fails the batch (a successor claim). Any
-// statement error fails the batch (25P02). Its sole caller holds the
-// participant-set lock.
+// the idempotent insert. A stale or removed recipient is skipped (inserted=false);
+// a stale recipient additionally gets a self-heal enqueue. Any statement error
+// fails the batch (25P02). Its sole caller holds the participant-set lock.
 func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberUserID, wrappedKey string, wrappedKeyVersions map[string]int, keyVersion int) (dmRecipientOutcome, error) {
 	var current bool
 	if err := tx.QueryRowContext(ctx, `
@@ -3485,10 +4199,10 @@ func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberU
 	return dmRecipientInserted, nil
 }
 
-// lockDMKeyDistributionUsers takes the users-only portion of the shared
-// dmblock prefix, then proves the claimant's credential epoch. The caller
-// takes the participant-set advisory lock before completing the parent and
-// blocked-pair preparation.
+// lockDMKeyDistributionUsers takes every user-row lock this request can need
+// before touching the DM scope. The UUID ordering is load-bearing: account
+// erasure locks its affected users before its conversation scopes, so lazy
+// recipient locks here could form a cycle with that path.
 func lockDMKeyDistributionUsers(ctx context.Context, tx *sql.Tx, conversationID, actorID, tokenEpoch string) ([]uuid.UUID, error) {
 	actorUUID, err := uuid.Parse(actorID)
 	if err != nil {
@@ -3602,6 +4316,12 @@ const (
 // lock strength is also what makes the successor fences below sound — the
 // "previous" epoch they reason about cannot move underneath them.
 func distributeDMKeysTx(ctx context.Context, tx *sql.Tx, batch dmDistributionBatch) (dmDistributionOutcome, error) {
+	normalizedWrappedKeys, normalizedVersions, err := canonicalizeWrappedKeyMaps(batch.wrappedKeys, batch.wrappedKeyVersions)
+	if err != nil {
+		return dmDistributionOutcome{}, err
+	}
+	batch.wrappedKeys = normalizedWrappedKeys
+	batch.wrappedKeyVersions = normalizedVersions
 	actorID, tokenEpoch, conversationID := batch.actorID, batch.tokenEpoch, batch.conversationID
 	wrappedKeys, explicitVersion := batch.wrappedKeys, batch.explicitVersion
 	conversationUUID, err := uuid.Parse(conversationID)
@@ -3806,7 +4526,7 @@ func admitDMSuccessorClaimTx(ctx context.Context, tx *sql.Tx, conversationID, ac
 		if err := rows.Scan(&participantID); err != nil {
 			return fmt.Errorf("scan dm epoch claim participant: %w", err)
 		}
-		if _, wrapped := wrappedKeys[participantID]; !wrapped {
+		if !wrappedKeysContainUser(wrappedKeys, participantID) {
 			missing++
 		}
 	}
@@ -3833,7 +4553,7 @@ func admitDMSuccessorClaimTx(ctx context.Context, tx *sql.Tx, conversationID, ac
 // limit that lets any holder rotate garbage since the server never sees
 // plaintext. This closes the trivial self-only primitive, not that tail.
 func admitInitialDMEpochCompleteTx(ctx context.Context, tx *sql.Tx, conversationID, actorID string, wrappedKeys map[string]string) error {
-	if _, actorWrapped := wrappedKeys[actorID]; !actorWrapped {
+	if !wrappedKeysContainUser(wrappedKeys, actorID) {
 		return nil
 	}
 	rows, err := tx.QueryContext(ctx, `
@@ -3853,7 +4573,7 @@ func admitInitialDMEpochCompleteTx(ctx context.Context, tx *sql.Tx, conversation
 		if err := rows.Scan(&participantID); err != nil {
 			return fmt.Errorf("scan dm initial epoch participant: %w", err)
 		}
-		if _, wrapped := wrappedKeys[participantID]; !wrapped {
+		if !wrappedKeysContainUser(wrappedKeys, participantID) {
 			missing++
 		}
 	}
@@ -3864,6 +4584,57 @@ func admitInitialDMEpochCompleteTx(ctx context.Context, tx *sql.Tx, conversation
 		return &dmEpochClaimIncompleteError{missing: missing}
 	}
 	return nil
+}
+
+// wrappedKeysContainUser compares wrapped-key map entries as UUIDs. PostgreSQL
+// canonicalizes UUID spellings, while a Go map does not. DM batches are capped
+// at ten recipients, so the scan stays bounded at the trust boundary.
+func wrappedKeysContainUser(wrappedKeys map[string]string, userID string) bool {
+	target, err := uuid.Parse(userID)
+	if err != nil {
+		return false
+	}
+	for wrappedUserID := range wrappedKeys {
+		wrappedID, parseErr := uuid.Parse(wrappedUserID)
+		if parseErr == nil && wrappedID == target {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalizeWrappedKeyMaps gives every parseable recipient one UUID key
+// before completeness and public-key freshness checks. Invalid entries retain
+// the legacy skip behavior; aliases with conflicting values are refused rather
+// than choosing arbitrary key material for one recipient.
+func canonicalizeWrappedKeyMaps(wrappedKeys map[string]string, wrappedKeyVersions map[string]int) (map[string]string, map[string]int, error) {
+	keys := make(map[string]string, len(wrappedKeys))
+	for recipientID, wrappedKey := range wrappedKeys {
+		parsedID, err := uuid.Parse(recipientID)
+		if err != nil {
+			keys[recipientID] = wrappedKey
+			continue
+		}
+		canonicalID := parsedID.String()
+		if existing, ok := keys[canonicalID]; ok && existing != wrappedKey {
+			return nil, nil, errDuplicateWrappedRecipient
+		}
+		keys[canonicalID] = wrappedKey
+	}
+	versions := make(map[string]int, len(wrappedKeyVersions))
+	for recipientID, version := range wrappedKeyVersions {
+		parsedID, err := uuid.Parse(recipientID)
+		if err != nil {
+			versions[recipientID] = version
+			continue
+		}
+		canonicalID := parsedID.String()
+		if existing, ok := versions[canonicalID]; ok && existing != version {
+			return nil, nil, errDuplicateWrappedRecipient
+		}
+		versions[canonicalID] = version
+	}
+	return keys, versions, nil
 }
 
 // notifyDMKeyDistribution is the DM counterpart to notifyChannelKeyDistribution:

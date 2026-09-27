@@ -9,6 +9,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -26,65 +28,19 @@ const (
 
 var errDMReactionNotParticipant = errors.New("dm reaction user is not a current participant")
 
-var (
+const (
 	messageReactionInsertSQL = `
 		INSERT INTO message_reactions (id, message_id, user_id, emoji)
 		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
-	`
-	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
-	dmMessageReactionInsertSQL = `
-		INSERT INTO dm_message_reactions (id, message_id, user_id, emoji)
-		SELECT $1, $2, $3, $4
-		WHERE EXISTS (
-			SELECT 1
-			FROM dm_messages dm
-			INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $3
-			WHERE dm.id = $2
-		` + purge.HiddenRangeFilter("dm", 3) + `)
 		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
 	`
 	messageReactionDeleteSQL = `
 		DELETE FROM message_reactions
 		WHERE message_id = $1 AND user_id = $2 AND emoji = $3
 	`
-	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
-	dmMessageReactionDeleteSQL = `
-		DELETE FROM dm_message_reactions mr
-		USING dm_messages dm, dm_participants dp
-		WHERE mr.message_id = $1 AND mr.user_id = $2 AND mr.emoji = $3
-			AND dm.id = mr.message_id
-			AND dp.conversation_id = dm.conversation_id
-			AND dp.user_id = $2
-			` + purge.HiddenRangeFilter("dm", 2) + `
-	`
 	messageReactionSummarySQL = `
 		SELECT mr.user_id, u.username, u.display_name
 		FROM message_reactions mr
-		INNER JOIN users u ON mr.user_id = u.id
-		WHERE mr.message_id = $1 AND mr.emoji = $2
-		ORDER BY mr.created_at ASC
-	`
-	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
-	dmMessageReactionSummarySQL = `
-		SELECT mr.user_id, u.username, u.display_name
-		FROM dm_message_reactions mr
-		INNER JOIN users u ON mr.user_id = u.id
-		INNER JOIN dm_messages dm ON dm.id = mr.message_id
-		WHERE mr.message_id = $1 AND mr.emoji = $2
-		` + purge.HiddenRangeFilter("dm", 3) + `
-		ORDER BY mr.created_at ASC
-	`
-	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
-	dmMessageReactionVisibleSQL = `
-		SELECT dm.id
-		FROM dm_messages dm
-		WHERE dm.id = $1 AND dm.conversation_id = $2
-		` + purge.HiddenRangeFilter("dm", 3) + `
-	`
-	dmMessageReactionBroadcastSummarySQL = `
-		SELECT mr.user_id, u.username, u.display_name
-		FROM dm_message_reactions mr
 		INNER JOIN users u ON mr.user_id = u.id
 		WHERE mr.message_id = $1 AND mr.emoji = $2
 		ORDER BY mr.created_at ASC
@@ -96,7 +52,59 @@ var (
 		WHERE mr.message_id = $1
 		ORDER BY mr.emoji, mr.created_at ASC
 	`
-	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	messageReactionsForMessagesSQL = `
+		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
+		FROM message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = ANY($1::uuid[])
+		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
+	`
+)
+
+var (
+	//nolint:gosec // HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	dmMessageReactionInsertSQL = `
+		INSERT INTO dm_message_reactions (id, message_id, user_id, emoji)
+		SELECT $1, $2, $3, $4
+		WHERE EXISTS (
+			SELECT 1
+			FROM dm_messages dm
+			INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $3
+			WHERE dm.id = $2
+			` + purge.HiddenRangeFilter("dm", 3) + `)
+		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
+	`
+	//nolint:gosec // HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	dmMessageReactionDeleteSQL = `
+		DELETE FROM dm_message_reactions mr
+		USING dm_messages dm, dm_participants dp
+		WHERE mr.message_id = $1 AND mr.user_id = $2 AND mr.emoji = $3
+			AND dm.id = mr.message_id
+			AND dp.conversation_id = dm.conversation_id
+			AND dp.user_id = $2
+			` + purge.HiddenRangeFilter("dm", 2) + `
+	`
+	// dmMessageReactionSummarySQL is mutable only to let the post-commit
+	// failure test verify that a summary-read failure cannot roll back a
+	// committed reaction.
+	//nolint:gosec // HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	dmMessageReactionSummarySQL = `
+		SELECT mr.user_id, u.username, u.display_name
+		FROM dm_message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		INNER JOIN dm_messages dm ON dm.id = mr.message_id
+		WHERE mr.message_id = $1 AND mr.emoji = $2
+		` + purge.HiddenRangeFilter("dm", 3) + `
+		ORDER BY mr.created_at ASC
+	`
+	//nolint:gosec // HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	dmMessageReactionVisibleSQL = `
+		SELECT dm.id
+		FROM dm_messages dm
+		WHERE dm.id = $1 AND dm.conversation_id = $2
+		` + purge.HiddenRangeFilter("dm", 3) + `
+	`
+	//nolint:gosec // HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionsByMessageSQL = `
 		SELECT mr.emoji, mr.user_id, u.username, u.display_name
 		FROM dm_message_reactions mr
@@ -106,14 +114,7 @@ var (
 		` + purge.HiddenRangeFilter("dm", 2) + `
 		ORDER BY mr.emoji, mr.created_at ASC
 	`
-	messageReactionsForMessagesSQL = `
-		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
-		FROM message_reactions mr
-		INNER JOIN users u ON mr.user_id = u.id
-		WHERE mr.message_id = ANY($1::uuid[])
-		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
-	`
-	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	//nolint:gosec // HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionsForMessagesSQL = `
 		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
 		FROM dm_message_reactions mr
@@ -124,6 +125,14 @@ var (
 		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
 	`
 )
+
+const dmMessageReactionBroadcastAggregateSQL = `
+	SELECT mr.user_id, u.username, u.display_name
+	FROM dm_message_reactions mr
+	INNER JOIN users u ON mr.user_id = u.id
+	WHERE mr.message_id = $1 AND mr.emoji = $2
+	ORDER BY mr.created_at ASC
+`
 
 // ToggleReactionRequest is the request body for toggling a reaction.
 type ToggleReactionRequest struct {
@@ -200,9 +209,9 @@ func (h *Handler) lookupMessageContext(c *gin.Context, messageID, userID string)
 		return messageContext{}, false
 	}
 
-	// Fall back to a DM message visible to this participant. This check is
-	// repeated by each DM mutation query so a Clear that commits between the
-	// context lookup and the write cannot expose the message.
+	// Fall back to a DM message visible to this participant. This request-time
+	// check shapes the response; the mutation repeats it after its transaction
+	// locks so a concurrent Clear cannot resurrect hidden history.
 	dmErr := h.db.QueryRow(`
 		SELECT dm.conversation_id
 		FROM dm_messages dm
@@ -289,9 +298,29 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 		return
 	}
 
-	action, err := h.toggleReactionRow(messageReactionInsertSQL, messageReactionDeleteSQL, messageID, userID, req.Emoji)
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("Failed to rollback reaction transaction", "error", rbErr)
+		}
+	}()
+	lockedChannelID, _, _, allowed := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermSendMessages, errMsgReactionFailed)
+	if !allowed {
+		return
+	}
+	channelID = lockedChannelID
+	action, err := toggleReactionRowTx(c.Request.Context(), tx, messageReactionInsertSQL, messageReactionDeleteSQL, messageID, userID, req.Emoji)
 	if err != nil {
 		h.log.Error("Failed to toggle reaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit reaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
 		return
 	}
@@ -302,11 +331,37 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 
 }
 
+func toggleReactionRowTx(ctx context.Context, tx *sql.Tx, insertSQL, deleteSQL, messageID, userID, emoji string) (string, error) {
+	reactionID := uuid.New().String()
+	result, err := tx.ExecContext(ctx, insertSQL, reactionID, messageID, userID, emoji)
+	if err != nil {
+		return "", err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if rowsAffected > 0 {
+		return "added", nil
+	}
+	if _, err := tx.ExecContext(ctx, deleteSQL, messageID, userID, emoji); err != nil {
+		return "", err
+	}
+	return "removed", nil
+}
+
 func (h *Handler) toggleDMReaction(c *gin.Context, messageID, userID, emoji, conversationID string) {
-	action, broadcastSummary, err := h.toggleDMReactionInConversation(c.Request.Context(), messageID, userID, emoji, conversationID)
+	action, err := h.toggleDMReactionInConversation(c.Request.Context(), messageID, userID, middleware.TokenCredentialEpoch(c), emoji, conversationID)
 	if err != nil {
 		if errors.Is(err, errDMReactionNotParticipant) {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+			return
+		}
+		if respondDMMessageMutationGuardError(c, err) {
+			return
+		}
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
 			return
 		}
 		h.log.Error("Failed to toggle DM reaction", "error", err)
@@ -314,91 +369,30 @@ func (h *Handler) toggleDMReaction(c *gin.Context, messageID, userID, emoji, con
 		return
 	}
 
+	responseSummary := h.buildDMReactionSummary(messageID, emoji, userID)
+	broadcastSummary := h.buildReactionSummaryWithQuery(dmMessageReactionBroadcastAggregateSQL, messageID, emoji, "")
 	h.broadcastDMReaction(conversationID, messageID, emoji, userID, action, broadcastSummary)
-	writeToggleReactionResponse(c, action, h.buildDMReactionSummary(messageID, emoji, userID))
+	writeToggleReactionResponse(c, action, responseSummary)
 }
 
-func (h *Handler) toggleDMReactionInConversation(ctx context.Context, messageID, userID, emoji, conversationID string) (string, *models.ReactionSummary, error) {
-	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return "", nil, err
-	}
-	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			h.log.Error("Failed to roll back DM reaction transaction", "error", rollbackErr)
+func (h *Handler) toggleDMReactionInConversation(ctx context.Context, messageID, userID, credentialEpoch, emoji, conversationID string) (string, error) {
+	var action string
+	err := h.withDMMessageMutation(ctx, conversationID, userID, credentialEpoch, func(tx *sql.Tx) error {
+		var visibleMessageID string
+		if err := tx.QueryRowContext(ctx, dmMessageReactionVisibleSQL, messageID, conversationID, userID).Scan(&visibleMessageID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return errDMReactionNotParticipant
+			}
+			return err
 		}
-	}()
-
-	if err := lockVisibleDMReaction(ctx, tx, messageID, userID, conversationID); err != nil {
-		return "", nil, err
+		var mutationErr error
+		action, mutationErr = toggleReactionRowTx(ctx, tx, dmMessageReactionInsertSQL, dmMessageReactionDeleteSQL, messageID, userID, emoji)
+		return mutationErr
+	})
+	if errors.Is(err, errDMMessageMutationNotParticipant) || errors.Is(err, errDMReactionNotParticipant) {
+		return "", errDMReactionNotParticipant
 	}
-
-	reactionID := uuid.New().String()
-	result, err := tx.ExecContext(ctx, dmMessageReactionInsertSQL, reactionID, messageID, userID, emoji)
-	if err != nil {
-		return "", nil, err
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return "", nil, err
-	}
-	action := "added"
-	if rowsAffected == 0 {
-		if _, err := tx.ExecContext(ctx, dmMessageReactionDeleteSQL, messageID, userID, emoji); err != nil {
-			return "", nil, err
-		}
-		action = "removed"
-	}
-
-	rows, err := tx.QueryContext(ctx, dmMessageReactionBroadcastSummarySQL, messageID, emoji)
-	if err != nil {
-		return "", nil, err
-	}
-	summary, err := scanSingleReactionSummary(rows, emoji, "")
-	if err != nil {
-		return "", nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", nil, err
-	}
-	return action, summary, nil
-}
-
-func lockVisibleDMReaction(ctx context.Context, tx *sql.Tx, messageID, userID, conversationID string) error {
-	var id string
-	// The reaction's user FK requires the actor parent lock before the
-	// conversation lock; account erasure acquires those parents in that order.
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, userID,
-	).Scan(&id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errDMReactionNotParticipant
-		}
-		return err
-	}
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, conversationID,
-	).Scan(&id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errDMReactionNotParticipant
-		}
-		return err
-	}
-	if err := tx.QueryRowContext(ctx,
-		`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
-	).Scan(&id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errDMReactionNotParticipant
-		}
-		return err
-	}
-	if err := tx.QueryRowContext(ctx, dmMessageReactionVisibleSQL, messageID, conversationID, userID).Scan(&id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errDMReactionNotParticipant
-		}
-		return err
-	}
-	return nil
+	return action, err
 }
 
 func (h *Handler) toggleReactionRow(insertSQL, deleteSQL, messageID, userID, emoji string) (string, error) {
@@ -625,19 +619,9 @@ func (h *Handler) getDMReactions(c *gin.Context, messageID, userID string) {
 	)
 }
 
-func (h *Handler) writeReactionsResponse(
-	c *gin.Context,
-	query, messageID, userID string,
-) {
+func (h *Handler) writeReactionsResponse(c *gin.Context, query, messageID, userID string) {
 	rows, err := h.db.Query(query, messageID)
-	h.writeReactionRowsResponse(
-		c,
-		rows,
-		err,
-		userID,
-		"Failed to query reactions",
-		"Error iterating reaction rows",
-	)
+	h.writeReactionRowsResponse(c, rows, err, userID, "Failed to query reactions", "Error iterating reaction rows")
 }
 
 func (h *Handler) writeReactionRowsResponse(

@@ -17,8 +17,11 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -31,6 +34,7 @@ const (
 	ownershipAuditTimeout   = 5 * time.Second
 
 	errMsgInvalidServerID        = "Invalid server ID"
+	errMsgInvalidRequestBody     = "Invalid request body"
 	errMsgServerNotFound         = "Server not found"
 	errMsgFailedQueryOwner       = "Failed to query server owner"
 	errMsgFailedVerifyOwnership  = "Failed to verify ownership"
@@ -40,6 +44,7 @@ const (
 	errMsgFailedInitiateTransfer = "Failed to initiate transfer"
 	errMsgFailedCancelTransfer   = "Failed to cancel transfer"
 	errMsgTransferAlreadyPending = "A transfer is already pending for this server"
+	errMsgAuthenticationRequired = "Authentication required"
 
 	keyServerID   = "server_id"
 	keyUserID     = "user_id"
@@ -70,7 +75,18 @@ type Handler struct {
 	// refreshes it after an ownership change commits. It is wired at router
 	// construction; a nil value preserves the isolated-handler test default.
 	presenceRecheck ownershipPresenceRecheck
+	authority       ownershipAuthorityCoordinator
 }
+
+type ownershipAuthorityCoordinator interface {
+	LockServerAuthorityChannelsTx(context.Context, *sql.Tx, string) ([]string, error)
+	FencePostStateLossTx(context.Context, *sql.Tx, string, string, []string, func() error) ([]keyrotation.Rotation, map[string][]string, error)
+	CompleteChannelAuthorityMutationWithRotations(context.Context, string, []string, rbac.PresenceRecheckPlan, []keyrotation.Rotation, map[string][]string)
+	FailClosedChannelAuthorityMutation(context.Context, string, []string)
+}
+
+// SetAuthorityHandler injects router's shared RBAC authority coordinator.
+func (h *Handler) SetAuthorityHandler(authority *rbac.Handler) { h.authority = authority }
 
 type ownershipPresenceRecheck interface {
 	rbac.PresenceRecheck
@@ -166,9 +182,18 @@ func (h *Handler) InitiateTransfer(c *gin.Context) {
 
 	var req initiateTransferRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
 		return
 	}
+	// PostgreSQL treats UUID spellings as equal while the transfer guard keys
+	// its locks by strings. Normalize before the self-transfer check so aliases
+	// cannot turn one user into two logical lock targets.
+	targetUserID, err := uuid.Parse(req.TargetUserID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
+	req.TargetUserID = targetUserID.String()
 
 	if req.TargetUserID == userID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot transfer ownership to yourself"})
@@ -212,7 +237,7 @@ func (h *Handler) InitiateTransfer(c *gin.Context) {
 		expiresAt:     time.Now().Add(transferPendingDuration),
 	}
 
-	if err := h.insertTransferRecord(ctx, c, rec); err != nil {
+	if err := h.insertTransferRecord(ctx, c, rec, middleware.TokenCredentialEpoch(c)); err != nil {
 		return
 	}
 
@@ -333,6 +358,14 @@ func (h *Handler) CancelTransfer(c *gin.Context) {
 			h.log.Error("Failed to roll back transfer cancellation", "error", rollbackErr)
 		}
 	}()
+	if err := lockOwnershipUsersTx(ctx, tx, userID); err != nil {
+		h.internalError(c, "Failed to lock transfer cancellation user", errMsgFailedCancelTransfer, err)
+		return
+	}
+	if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+		h.respondCredentialEpochGuardError(c, err, errMsgFailedCancelTransfer)
+		return
+	}
 
 	var ownerID string
 	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
@@ -427,8 +460,10 @@ func (h *Handler) ConfirmTransfer(c *gin.Context) {
 	}
 
 	// Execute the transfer
-	if err := h.executeTransfer(ctx, serverID, transferID, fromUserID, toUserID); err != nil {
+	if err := h.executeTransfer(ctx, serverID, transferID, fromUserID, toUserID, middleware.TokenCredentialEpoch(c)); err != nil {
 		switch {
+		case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthenticationRequired})
 		case errors.Is(err, errTransferAlreadyCompleted):
 			c.JSON(http.StatusConflict, gin.H{"error": "Transfer has already been completed or cancelled"})
 		case errors.Is(err, errTransferOwnershipChanged):
@@ -437,6 +472,8 @@ func (h *Handler) ConfirmTransfer(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Target user is no longer a member of this server"})
 		case errors.Is(err, errFromUserNotMember):
 			c.JSON(http.StatusConflict, gin.H{"error": "Current owner membership record is missing"})
+		case errors.Is(err, rbac.ErrChannelAuthorityChannelLimit):
+			c.JSON(http.StatusConflict, gin.H{"error": "Channel key cleanup exceeds 500 recipients; resolve access changes in batches of 500 or fewer"})
 		default:
 			h.log.Error("Failed to execute transfer", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete transfer"})
@@ -494,7 +531,7 @@ func (h *Handler) ReverseTransfer(c *gin.Context) {
 
 	var req reverseTransferRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
 		return
 	}
 
@@ -506,21 +543,23 @@ func (h *Handler) ReverseTransfer(c *gin.Context) {
 		return
 	}
 
-	plan, err := h.executeReversal(ctx, rec)
+	_, err = h.executeReversal(ctx, rec, middleware.TokenCredentialEpoch(c))
 	if err != nil {
 		switch {
+		case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthenticationRequired})
 		case errors.Is(err, errReversalOwnershipChanged):
 			c.JSON(http.StatusConflict, gin.H{"error": "Ownership has changed since this transfer — reversal is no longer possible"})
 		case errors.Is(err, errReversalOriginalOwnerNotMember):
 			c.JSON(http.StatusConflict, gin.H{"error": "Original owner is no longer a member of this server"})
+		case errors.Is(err, rbac.ErrChannelAuthorityChannelLimit):
+			c.JSON(http.StatusConflict, gin.H{"error": "Channel key cleanup exceeds 500 recipients; resolve access changes in batches of 500 or fewer"})
 		default:
 			h.log.Error("Failed to reverse ownership transfer", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReverseTransfer})
 		}
 		return
 	}
-
-	h.reconcileOwnershipPostCommit(rec.serverID, rec.fromUserID, rec.toUserID, plan)
 
 	if serverUUID, err := uuid.Parse(rec.serverID); err == nil {
 		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
@@ -615,7 +654,11 @@ type transferRecord struct {
 	expiresAt     time.Time
 }
 
-func (h *Handler) insertTransferRecord(ctx context.Context, c *gin.Context, rec *transferRecord) error {
+func (h *Handler) insertTransferRecord(ctx context.Context, c *gin.Context, rec *transferRecord, tokenEpoch ...string) error {
+	claimEpoch := ""
+	if len(tokenEpoch) > 0 {
+		claimEpoch = tokenEpoch[0]
+	}
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		h.internalError(c, "Failed to begin transfer creation", errMsgFailedInitiateTransfer, err)
@@ -626,6 +669,14 @@ func (h *Handler) insertTransferRecord(ctx context.Context, c *gin.Context, rec 
 			h.log.Error("Failed to roll back transfer creation", "error", rollbackErr)
 		}
 	}()
+	if err := lockOwnershipUsersTx(ctx, tx, rec.fromUserID, rec.toUserID); err != nil {
+		h.internalError(c, "Failed to lock transfer users", errMsgFailedInitiateTransfer, err)
+		return fmt.Errorf("lock transfer users: %w", err)
+	}
+	if err := credepoch.GuardTx(ctx, tx, rec.fromUserID, claimEpoch); err != nil {
+		h.respondCredentialEpochGuardError(c, err, errMsgFailedInitiateTransfer)
+		return fmt.Errorf("guard transfer credential epoch: %w", err)
+	}
 
 	var ownerID string
 	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, rec.serverID).Scan(&ownerID); err != nil {
@@ -637,6 +688,18 @@ func (h *Handler) insertTransferRecord(ctx context.Context, c *gin.Context, rec 
 	}
 	if ownerID != rec.fromUserID {
 		return h.transferOwnershipChanged(c)
+	}
+	var targetIsMember bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
+		rec.serverID, rec.toUserID,
+	).Scan(&targetIsMember); err != nil {
+		h.internalError(c, "Failed to revalidate transfer target membership", errMsgFailedInitiateTransfer, err)
+		return fmt.Errorf("revalidate transfer target membership: %w", err)
+	}
+	if !targetIsMember {
+		c.JSON(http.StatusConflict, gin.H{"error": "Target user is no longer a member of this server"})
+		return errToUserNotMember
 	}
 
 	var pending bool
@@ -699,8 +762,50 @@ func (h *Handler) internalError(c *gin.Context, msg, userMsg string, err error) 
 	c.JSON(http.StatusInternalServerError, gin.H{"error": userMsg})
 }
 
-func (h *Handler) executeReversal(ctx context.Context, rec *reversalRecord) (rbac.PresenceRecheckPlan, error) {
-	var reversalStillPossible bool
+func (h *Handler) respondCredentialEpochGuardError(c *gin.Context, err error, fallback string) {
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthenticationRequired})
+		return
+	}
+	h.internalError(c, "ownership credential-epoch guard failed", fallback, err)
+}
+
+func (h *Handler) executeReversal(ctx context.Context, rec *reversalRecord, tokenEpoch ...string) (rbac.PresenceRecheckPlan, error) {
+	claimEpoch := ""
+	if len(tokenEpoch) > 0 {
+		claimEpoch = tokenEpoch[0]
+	}
+	if err := h.preflightReversalOwnership(ctx, rec); err != nil {
+		return nil, err
+	}
+	var mutation ownershipAuthorityMutation
+	plan, outcome, err := h.withOwnershipCaptureGuardedOutcome(ctx, rec.serverID, []string{rec.fromUserID, rec.toUserID}, rec.fromUserID, claimEpoch, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+		var writeErr error
+		mutation, writeErr = h.executeReversalWriteTx(ctx, tx, rec)
+		if writeErr != nil {
+			return ownershipWriteUnchanged, writeErr
+		}
+		return ownershipWriteChanged, nil
+	})
+	if err != nil {
+		return nil, h.resolveReversalExecutionError(ctx, rec, mutation.channelIDs, err)
+	}
+	if outcome != ownershipWriteChanged {
+		return nil, errReversalOwnershipChanged
+	}
+	h.reconcileOwnershipPostCommit(rec.serverID, rec.fromUserID, rec.toUserID, plan)
+	h.authority.CompleteChannelAuthorityMutationWithRotations(ctx, rec.serverID, mutation.channelIDs, nil, mutation.rotations, mutation.deniedByChannel)
+	return plan, nil
+}
+
+type ownershipAuthorityMutation struct {
+	channelIDs      []string
+	rotations       []keyrotation.Rotation
+	deniedByChannel map[string][]string
+}
+
+func (h *Handler) preflightReversalOwnership(ctx context.Context, rec *reversalRecord) error {
+	var possible bool
 	if err := h.db.QueryRowContext(ctx, `
 		SELECT EXISTS(
 			SELECT 1
@@ -711,85 +816,121 @@ func (h *Handler) executeReversal(ctx context.Context, rec *reversalRecord) (rba
 				AND ownership_transfers.server_id = $2
 				AND servers.owner_id = $3
 		)
-	`, rec.transferID, rec.serverID, rec.toUserID).Scan(&reversalStillPossible); err != nil {
-		return nil, fmt.Errorf("preflight reversal ownership: %w", err)
+	`, rec.transferID, rec.serverID, rec.toUserID).Scan(&possible); err != nil {
+		return fmt.Errorf("preflight reversal ownership: %w", err)
 	}
-	if !reversalStillPossible {
-		return nil, errReversalOwnershipChanged
+	if !possible {
+		return errReversalOwnershipChanged
 	}
+	return nil
+}
 
-	plan, changed, err := h.withOwnershipCapture(ctx, rec.serverID, func(ctx context.Context, tx *sql.Tx) (bool, error) {
-		var transferID string
-		if err := tx.QueryRowContext(ctx, `
-			SELECT id FROM ownership_transfers WHERE id = $1 AND status = 'completed' FOR UPDATE
-		`, rec.transferID).Scan(&transferID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return false, errReversalOwnershipChanged
-			}
-			return false, fmt.Errorf("lock completed transfer: %w", err)
-		}
-
-		var currentOwnerID string
-		if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, rec.serverID).Scan(&currentOwnerID); err != nil {
-			return false, fmt.Errorf("query current owner for reversal: %w", err)
-		}
-		if currentOwnerID != rec.toUserID {
-			return false, errReversalOwnershipChanged
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE ownership_transfers
-			SET status = 'cancelled', cancelled_at = NOW()
-			WHERE server_id = $1 AND status = 'pending'
-		`, rec.serverID); err != nil {
-			return false, fmt.Errorf("cancel pending transfers for reversal: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2`, rec.fromUserID, rec.serverID); err != nil {
-			return false, fmt.Errorf("update server owner for reversal: %w", err)
-		}
-
-		resFrom, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.fromUserID)
-		if err != nil {
-			return false, fmt.Errorf("update from_user role for reversal: %w", err)
-		}
-		n, err := resFrom.RowsAffected()
-		if err != nil {
-			return false, fmt.Errorf("read from_user role result for reversal: %w", err)
-		}
-		if n == 0 {
-			return false, errReversalOriginalOwnerNotMember
-		}
-
-		resTo, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.toUserID)
-		if err != nil {
-			return false, fmt.Errorf("update to_user role for reversal: %w", err)
-		}
-		if _, err := resTo.RowsAffected(); err != nil {
-			return false, fmt.Errorf("read to_user role result for reversal: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE ownership_transfers SET status = 'reversed', reversed_at = NOW() WHERE id = $1`, transferID); err != nil {
-			return false, fmt.Errorf("mark transfer reversed: %w", err)
-		}
-		return true, nil
+func (h *Handler) executeReversalWriteTx(
+	ctx context.Context, tx *sql.Tx, rec *reversalRecord,
+) (ownershipAuthorityMutation, error) {
+	if h.authority == nil {
+		return ownershipAuthorityMutation{}, errors.New("ownership authority coordinator unavailable")
+	}
+	channelIDs, err := h.authority.LockServerAuthorityChannelsTx(ctx, tx, rec.serverID)
+	if err != nil {
+		return ownershipAuthorityMutation{}, fmt.Errorf("lock reversal authority channels: %w", err)
+	}
+	transferID, err := lockCompletedReversalTx(ctx, tx, rec)
+	if err != nil {
+		return ownershipAuthorityMutation{channelIDs: channelIDs}, err
+	}
+	rotations, deniedByChannel, err := h.authority.FencePostStateLossTx(ctx, tx, rec.serverID, rec.fromUserID, channelIDs, func() error {
+		return applyReversalTx(ctx, tx, rec, transferID)
 	})
 	if err != nil {
-		if errors.Is(err, rbac.ErrPresenceCaptureLimited) {
-			if recheckErr := h.classifyReversalCaptureLimit(ctx, rec); recheckErr != nil {
-				if !errors.Is(recheckErr, errReversalOwnershipChanged) && !errors.Is(recheckErr, errReversalOriginalOwnerNotMember) {
-					h.log.Error("ownership reversal capture-limit classification failed",
-						"failure_class", "ownership_reversal_capture_limit_classification",
-						"error", recheckErr,
-					)
-					return nil, errors.Join(errReversalOwnershipChanged, recheckErr)
-				}
-				return nil, recheckErr
-			}
+		return ownershipAuthorityMutation{channelIDs: channelIDs}, fmt.Errorf("fence reversal channel authority: %w", err)
+	}
+	return ownershipAuthorityMutation{channelIDs: channelIDs, rotations: rotations, deniedByChannel: deniedByChannel}, nil
+}
+
+func lockCompletedReversalTx(ctx context.Context, tx *sql.Tx, rec *reversalRecord) (string, error) {
+	var transferID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id FROM ownership_transfers WHERE id = $1 AND status = 'completed' FOR UPDATE
+	`, rec.transferID).Scan(&transferID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errReversalOwnershipChanged
 		}
-		return nil, err
+		return "", fmt.Errorf("lock completed transfer: %w", err)
 	}
-	if !changed {
-		return nil, errReversalOwnershipChanged
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, rec.serverID).Scan(&ownerID); err != nil {
+		return "", fmt.Errorf("query current owner for reversal: %w", err)
 	}
-	return plan, nil
+	if ownerID != rec.toUserID {
+		return "", errReversalOwnershipChanged
+	}
+	return transferID, nil
+}
+
+func applyReversalTx(ctx context.Context, tx *sql.Tx, rec *reversalRecord, transferID string) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE ownership_transfers SET status = 'cancelled', cancelled_at = NOW()
+		WHERE server_id = $1 AND status = 'pending'
+	`, rec.serverID); err != nil {
+		return fmt.Errorf("cancel pending transfers for reversal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2`, rec.fromUserID, rec.serverID); err != nil {
+		return fmt.Errorf("update server owner for reversal: %w", err)
+	}
+	if err := setReversalMemberRolesTx(ctx, tx, rec); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ownership_transfers SET status = 'reversed', reversed_at = NOW() WHERE id = $1`, transferID); err != nil {
+		return fmt.Errorf("mark transfer reversed: %w", err)
+	}
+	return nil
+}
+
+func setReversalMemberRolesTx(ctx context.Context, tx *sql.Tx, rec *reversalRecord) error {
+	res, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.fromUserID)
+	if err != nil {
+		return fmt.Errorf("update from_user role for reversal: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read from_user role result for reversal: %w", err)
+	}
+	if rows == 0 {
+		return errReversalOriginalOwnerNotMember
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.toUserID)
+	if err != nil {
+		return fmt.Errorf("update to_user role for reversal: %w", err)
+	}
+	if _, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("read to_user role result for reversal: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) resolveReversalExecutionError(
+	ctx context.Context, rec *reversalRecord, channelIDs []string, err error,
+) error {
+	if errors.Is(err, errOwnershipAmbiguousCommit) {
+		h.reconcileOwnershipCacheAndVoice(rec.serverID, rec.fromUserID, rec.toUserID)
+	}
+	if errors.Is(err, errOwnershipAmbiguousCommit) && h.authority != nil && len(channelIDs) > 0 {
+		h.authority.FailClosedChannelAuthorityMutation(ctx, rec.serverID, channelIDs)
+	}
+	if !errors.Is(err, rbac.ErrPresenceCaptureLimited) {
+		return err
+	}
+	recheckErr := h.classifyReversalCaptureLimit(ctx, rec)
+	if recheckErr == nil {
+		return err
+	}
+	if errors.Is(recheckErr, errReversalOwnershipChanged) || errors.Is(recheckErr, errReversalOriginalOwnerNotMember) {
+		return recheckErr
+	}
+	h.log.Error("ownership reversal capture-limit classification failed",
+		"failure_class", "ownership_reversal_capture_limit_classification", "error", recheckErr)
+	return errors.Join(errReversalOwnershipChanged, recheckErr)
 }
 
 // classifyReversalCaptureLimit distinguishes an ownership change that raced
@@ -859,6 +1000,7 @@ func (h *Handler) classifyReversalCaptureLimit(ctx context.Context, rec *reversa
 
 // Sentinel errors for executeTransfer so callers can map to appropriate HTTP status codes.
 var (
+	errOwnershipAmbiguousCommit       = errors.New("ambiguous ownership commit")
 	errTransferAlreadyCompleted       = errors.New("transfer already completed or cancelled")
 	errTransferAlreadyPending         = errors.New("transfer already pending")
 	errTransferOwnershipChanged       = errors.New("transfer ownership changed")
@@ -897,15 +1039,15 @@ const (
 )
 
 // withOwnershipCapture runs an ownership write atomically with its pre-write
-// Server Voice visibility capture. The transaction locks advisory capture,
-// then the server relation, ownership_transfers, and server_members in that
-// order. A server deleted before its relation lock is a no-op.
+// Server Voice visibility capture. The transaction takes the visibility gate,
+// sorted subject users, server parent, then settings/presence capture before
+// transfer, member, and channel authority writes. A deleted server is a no-op.
 func (h *Handler) withOwnershipCapture(
 	ctx context.Context,
 	serverID string,
 	write func(context.Context, *sql.Tx) (bool, error),
 ) (plan rbac.PresenceRecheckPlan, changed bool, retErr error) {
-	plan, outcome, retErr := h.withOwnershipCaptureOutcome(ctx, serverID, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+	plan, outcome, retErr := h.withOwnershipCaptureOutcome(ctx, serverID, nil, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
 		changed, err := write(ctx, tx)
 		if !changed {
 			return ownershipWriteUnchanged, err
@@ -918,6 +1060,17 @@ func (h *Handler) withOwnershipCapture(
 func (h *Handler) withOwnershipCaptureOutcome(
 	ctx context.Context,
 	serverID string,
+	userIDs []string,
+	write func(context.Context, *sql.Tx) (ownershipWriteOutcome, error),
+) (plan rbac.PresenceRecheckPlan, outcome ownershipWriteOutcome, retErr error) {
+	return h.withOwnershipCaptureGuardedOutcome(ctx, serverID, userIDs, "", "", write)
+}
+
+func (h *Handler) withOwnershipCaptureGuardedOutcome(
+	ctx context.Context,
+	serverID string,
+	userIDs []string,
+	actorUserID, tokenEpoch string,
 	write func(context.Context, *sql.Tx) (ownershipWriteOutcome, error),
 ) (plan rbac.PresenceRecheckPlan, outcome ownershipWriteOutcome, retErr error) {
 	if h.presenceRecheck != nil {
@@ -957,9 +1110,12 @@ func (h *Handler) withOwnershipCaptureOutcome(
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return nil, ownershipWriteUnchanged, fmt.Errorf("lock ownership visibility capture: %w", err)
 	}
-	if h.presenceRecheck != nil && plan != nil {
-		if err := h.presenceRecheck.CaptureVisibility(ctx, tx, plan); err != nil {
-			return nil, ownershipWriteUnchanged, fmt.Errorf("capture ownership visibility: %w", err)
+	if err := lockOwnershipUsersTx(ctx, tx, userIDs...); err != nil {
+		return nil, ownershipWriteUnchanged, fmt.Errorf("lock ownership users: %w", err)
+	}
+	if actorUserID != "" {
+		if err := credepoch.GuardTx(ctx, tx, actorUserID, tokenEpoch); err != nil {
+			return nil, ownershipWriteUnchanged, fmt.Errorf("guard ownership credential epoch: %w", err)
 		}
 	}
 	var lockedServerID string
@@ -968,6 +1124,11 @@ func (h *Handler) withOwnershipCaptureOutcome(
 			return nil, ownershipWriteUnchanged, nil
 		}
 		return nil, ownershipWriteUnchanged, fmt.Errorf("lock ownership server: %w", err)
+	}
+	if h.presenceRecheck != nil && plan != nil {
+		if err := h.presenceRecheck.CaptureVisibility(ctx, tx, plan); err != nil {
+			return nil, ownershipWriteUnchanged, fmt.Errorf("capture ownership visibility: %w", err)
+		}
 	}
 	outcome, err = write(ctx, tx)
 	if err != nil {
@@ -978,7 +1139,7 @@ func (h *Handler) withOwnershipCaptureOutcome(
 	}
 	if err := tx.Commit(); err != nil {
 		h.presenceAbandon(plan, "ambiguous_commit")
-		return nil, ownershipWriteUnchanged, fmt.Errorf("commit ownership transaction: %w", err)
+		return nil, ownershipWriteUnchanged, fmt.Errorf("%w: %w", errOwnershipAmbiguousCommit, err)
 	}
 	return plan, outcome, nil
 }
@@ -1010,6 +1171,9 @@ func (h *Handler) classifyOwnershipPrepareFailure(
 
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return ownershipPrepareCurrent, fmt.Errorf("lock ownership visibility for prepare-failure classification: %w", err)
+	}
+	if err := lockOwnershipUsersTx(ctx, tx, fromUserID, toUserID); err != nil {
+		return ownershipPrepareCurrent, fmt.Errorf("lock ownership users for prepare-failure classification: %w", err)
 	}
 	var ownerID string
 	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
@@ -1078,11 +1242,59 @@ func swapOwnershipMemberRoles(ctx context.Context, tx *sql.Tx, serverID, fromUse
 	return nil
 }
 
+// lockOwnershipUsersTx acquires both transfer subjects in database order before
+// the server parent. This prevents ownership_transfers/server_members foreign
+// key locks from reversing migration 000087's users -> domain-parent order.
+func lockOwnershipUsersTx(ctx context.Context, tx *sql.Tx, userIDs ...string) (retErr error) {
+	expected := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID != "" {
+			expected[userID] = struct{}{}
+		}
+	}
+	if len(expected) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(expected))
+	for userID := range expected {
+		ids = append(ids, userID)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id::text FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE`, pq.Array(ids))
+	if err != nil {
+		return fmt.Errorf("lock ownership users: %w", err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close locked ownership users: %w", err))
+		}
+	}()
+	locked := 0
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			return fmt.Errorf("scan locked ownership user: %w", err)
+		}
+		locked++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate locked ownership users: %w", err)
+	}
+	if locked != len(expected) {
+		return errors.New("ownership transfer user no longer exists")
+	}
+	return nil
+}
+
 func (h *Handler) reconcileOwnershipPostCommit(
 	serverID, fromUserID, toUserID string,
 	plan rbac.PresenceRecheckPlan,
 ) {
 	h.presenceExecute(plan)
+	h.reconcileOwnershipCacheAndVoice(serverID, fromUserID, toUserID)
+}
+
+func (h *Handler) reconcileOwnershipCacheAndVoice(serverID, fromUserID, toUserID string) {
 	if h.cache != nil {
 		for _, userID := range []string{fromUserID, toUserID} {
 			if err := h.cache.Invalidate(context.Background(), serverID, userID); err != nil {
@@ -1097,7 +1309,7 @@ func (h *Handler) cancelStaleTransfer(ctx context.Context, tx *sql.Tx, transferI
 	res, err := tx.ExecContext(ctx, `
 		UPDATE ownership_transfers
 		SET status = 'cancelled', cancelled_at = NOW(), completed_at = NULL
-		WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'completed'
+		WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status IN ('pending', 'completed')
 	`, transferID, serverID, fromUserID)
 	if err != nil {
 		return ownershipWriteUnchanged, fmt.Errorf("cancel stale ownership transfer: %w", err)
@@ -1114,6 +1326,95 @@ func (h *Handler) cancelStaleTransfer(ctx context.Context, tx *sql.Tx, transferI
 
 type expiredTransfer struct {
 	id, serverID, fromUserID, toUserID string
+}
+
+func (h *Handler) executePendingOwnershipTransferTx(
+	ctx context.Context, tx *sql.Tx, transfer expiredTransfer,
+) (ownershipAuthorityMutation, ownershipWriteOutcome, error) {
+	pendingTransferID, outcome, err := h.preparePendingOwnershipTransferTx(ctx, tx, transfer)
+	if err != nil || outcome != ownershipWriteChanged {
+		return ownershipAuthorityMutation{}, outcome, err
+	}
+	if h.authority == nil {
+		return ownershipAuthorityMutation{}, ownershipWriteUnchanged, errors.New("ownership authority coordinator unavailable")
+	}
+	channelIDs, err := h.authority.LockServerAuthorityChannelsTx(ctx, tx, transfer.serverID)
+	if err != nil {
+		return ownershipAuthorityMutation{}, ownershipWriteUnchanged, fmt.Errorf("lock transfer authority channels: %w", err)
+	}
+	changed := false
+	rotations, deniedByChannel, err := h.authority.FencePostStateLossTx(ctx, tx, transfer.serverID, transfer.fromUserID, channelIDs, func() error {
+		var writeErr error
+		changed, writeErr = completePendingOwnershipTransferTx(ctx, tx, transfer, pendingTransferID)
+		return writeErr
+	})
+	mutation := ownershipAuthorityMutation{channelIDs: channelIDs, rotations: rotations, deniedByChannel: deniedByChannel}
+	if err != nil {
+		return mutation, ownershipWriteUnchanged, fmt.Errorf("fence transfer channel authority: %w", err)
+	}
+	if !changed {
+		return mutation, ownershipWriteUnchanged, nil
+	}
+	return mutation, ownershipWriteChanged, nil
+}
+
+func (h *Handler) preparePendingOwnershipTransferTx(
+	ctx context.Context, tx *sql.Tx, transfer expiredTransfer,
+) (string, ownershipWriteOutcome, error) {
+	var pendingTransferID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id FROM ownership_transfers
+		WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'pending'
+		FOR UPDATE
+	`, transfer.id, transfer.serverID, transfer.fromUserID).Scan(&pendingTransferID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ownershipWriteUnchanged, nil
+		}
+		return "", ownershipWriteUnchanged, fmt.Errorf("lock transfer: %w", err)
+	}
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, transfer.serverID).Scan(&ownerID); err != nil {
+		return "", ownershipWriteUnchanged, fmt.Errorf("query transfer owner: %w", err)
+	}
+	if ownerID != transfer.fromUserID {
+		outcome, err := h.cancelStaleTransfer(ctx, tx, pendingTransferID, transfer.serverID, transfer.fromUserID)
+		return "", outcome, err
+	}
+	return pendingTransferID, ownershipWriteChanged, nil
+}
+
+func completePendingOwnershipTransferTx(
+	ctx context.Context, tx *sql.Tx, transfer expiredTransfer, pendingTransferID string,
+) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
+		WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'pending'
+	`, pendingTransferID, transfer.serverID, transfer.fromUserID)
+	if err != nil {
+		return false, fmt.Errorf("mark transfer completed: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read transfer completion result: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id = $3`, transfer.toUserID, transfer.serverID, transfer.fromUserID)
+	if err != nil {
+		return false, fmt.Errorf("update server owner: %w", err)
+	}
+	rows, err = res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read transfer owner update result: %w", err)
+	}
+	if rows == 0 {
+		return false, errTransferOwnershipChanged
+	}
+	if err := swapOwnershipMemberRoles(ctx, tx, transfer.serverID, transfer.fromUserID, transfer.toUserID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // CompleteExpiredTransfers completes pending transfers whose confirmation
@@ -1150,38 +1451,20 @@ func (h *Handler) CompleteExpiredTransfers(ctx context.Context) {
 }
 
 func (h *Handler) completeExpiredTransfer(ctx context.Context, transfer expiredTransfer) (bool, error) {
-	plan, outcome, err := h.withOwnershipCaptureOutcome(ctx, transfer.serverID, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
-		res, err := tx.ExecContext(ctx, `
-			UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
-			WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'pending'
-		`, transfer.id, transfer.serverID, transfer.fromUserID)
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("mark expired transfer completed: %w", err)
-		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("read expired transfer completion result: %w", err)
-		}
-		if rows == 0 {
-			return ownershipWriteUnchanged, nil
-		}
-		res, err = tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id = $3`, transfer.toUserID, transfer.serverID, transfer.fromUserID)
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("update server owner for expired transfer: %w", err)
-		}
-		rows, err = res.RowsAffected()
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("read expired transfer owner update result: %w", err)
-		}
-		if rows == 0 {
-			return h.cancelStaleTransfer(ctx, tx, transfer.id, transfer.serverID, transfer.fromUserID)
-		}
-		if err := swapOwnershipMemberRoles(ctx, tx, transfer.serverID, transfer.fromUserID, transfer.toUserID); err != nil {
-			return ownershipWriteUnchanged, err
-		}
-		return ownershipWriteChanged, nil
+	var mutation ownershipAuthorityMutation
+	var outcome ownershipWriteOutcome
+	plan, outcome, err := h.withOwnershipCaptureOutcome(ctx, transfer.serverID, []string{transfer.fromUserID, transfer.toUserID}, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+		var writeErr error
+		mutation, outcome, writeErr = h.executePendingOwnershipTransferTx(ctx, tx, transfer)
+		return outcome, writeErr
 	})
 	if err != nil {
+		if errors.Is(err, errOwnershipAmbiguousCommit) {
+			h.reconcileOwnershipCacheAndVoice(transfer.serverID, transfer.fromUserID, transfer.toUserID)
+		}
+		if errors.Is(err, errOwnershipAmbiguousCommit) && h.authority != nil && len(mutation.channelIDs) > 0 {
+			h.authority.FailClosedChannelAuthorityMutation(ctx, transfer.serverID, mutation.channelIDs)
+		}
 		if isOwnershipPrepareFailure(err) {
 			classification, classifyErr := h.classifyOwnershipPrepareFailure(
 				ctx, transfer.serverID, transfer.id, transfer.fromUserID, transfer.toUserID)
@@ -1199,6 +1482,7 @@ func (h *Handler) completeExpiredTransfer(ctx context.Context, transfer expiredT
 	}
 
 	h.reconcileOwnershipPostCommit(transfer.serverID, transfer.fromUserID, transfer.toUserID, plan)
+	h.authority.CompleteChannelAuthorityMutationWithRotations(ctx, transfer.serverID, mutation.channelIDs, nil, mutation.rotations, mutation.deniedByChannel)
 	if serverUUID, err := uuid.Parse(transfer.serverID); err == nil {
 		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
 			Type: "ownership_transferred",
@@ -1213,53 +1497,22 @@ func (h *Handler) completeExpiredTransfer(ctx context.Context, transfer expiredT
 }
 
 // executeTransfer atomically transfers ownership from one user to another.
-// Lock order: servers → ownership_transfers → server_members.
-func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fromUserID, toUserID string) error {
-	plan, outcome, err := h.withOwnershipCaptureOutcome(ctx, serverID, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
-		res, err := tx.ExecContext(ctx, `
-			UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
-			WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'pending'
-		`, transferID, serverID, fromUserID)
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("mark transfer completed: %w", err)
-		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("read transfer completion result: %w", err)
-		}
-		if rows == 0 {
-			return ownershipWriteUnchanged, nil
-		}
-		res, err = tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id = $3`, toUserID, serverID, fromUserID)
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("update server owner: %w", err)
-		}
-		rows, err = res.RowsAffected()
-		if err != nil {
-			return ownershipWriteUnchanged, fmt.Errorf("read transfer owner update result: %w", err)
-		}
-		if rows == 0 {
-			return h.cancelStaleTransfer(ctx, tx, transferID, serverID, fromUserID)
-		}
-		if err := swapOwnershipMemberRoles(ctx, tx, serverID, fromUserID, toUserID); err != nil {
-			return ownershipWriteUnchanged, err
-		}
-		return ownershipWriteChanged, nil
+// Lock order: visibility capture → users → servers → ownership_transfers → server_members.
+func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fromUserID, toUserID string, tokenEpoch ...string) error {
+	claimEpoch := ""
+	if len(tokenEpoch) > 0 {
+		claimEpoch = tokenEpoch[0]
+	}
+	transfer := expiredTransfer{id: transferID, serverID: serverID, fromUserID: fromUserID, toUserID: toUserID}
+	var mutation ownershipAuthorityMutation
+	var outcome ownershipWriteOutcome
+	plan, outcome, err := h.withOwnershipCaptureGuardedOutcome(ctx, serverID, []string{fromUserID, toUserID}, fromUserID, claimEpoch, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+		var writeErr error
+		mutation, outcome, writeErr = h.executePendingOwnershipTransferTx(ctx, tx, transfer)
+		return outcome, writeErr
 	})
 	if err != nil {
-		if isOwnershipPrepareFailure(err) {
-			classification, classifyErr := h.classifyOwnershipPrepareFailure(ctx, serverID, transferID, fromUserID, toUserID)
-			if classifyErr != nil {
-				return errors.Join(err, classifyErr)
-			}
-			switch classification {
-			case ownershipPrepareStaleCancelled:
-				return errTransferOwnershipChanged
-			case ownershipPrepareNoOp:
-				return errTransferAlreadyCompleted
-			}
-		}
-		return err
+		return h.resolveTransferExecutionError(ctx, serverID, transferID, fromUserID, toUserID, mutation.channelIDs, err)
 	}
 	if outcome == ownershipWriteStaleCancelled {
 		return errTransferOwnershipChanged
@@ -1269,6 +1522,7 @@ func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fro
 	}
 
 	h.reconcileOwnershipPostCommit(serverID, fromUserID, toUserID, plan)
+	h.authority.CompleteChannelAuthorityMutationWithRotations(ctx, serverID, mutation.channelIDs, nil, mutation.rotations, mutation.deniedByChannel)
 
 	// Broadcast
 	if serverUUID, err := uuid.Parse(serverID); err == nil {
@@ -1294,6 +1548,32 @@ func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fro
 	}
 
 	return nil
+}
+
+func (h *Handler) resolveTransferExecutionError(
+	ctx context.Context, serverID, transferID, fromUserID, toUserID string, channelIDs []string, err error,
+) error {
+	if errors.Is(err, errOwnershipAmbiguousCommit) {
+		h.reconcileOwnershipCacheAndVoice(serverID, fromUserID, toUserID)
+	}
+	if errors.Is(err, errOwnershipAmbiguousCommit) && h.authority != nil && len(channelIDs) > 0 {
+		h.authority.FailClosedChannelAuthorityMutation(ctx, serverID, channelIDs)
+	}
+	if !isOwnershipPrepareFailure(err) {
+		return err
+	}
+	classification, classifyErr := h.classifyOwnershipPrepareFailure(ctx, serverID, transferID, fromUserID, toUserID)
+	if classifyErr != nil {
+		return errors.Join(err, classifyErr)
+	}
+	switch classification {
+	case ownershipPrepareStaleCancelled:
+		return errTransferOwnershipChanged
+	case ownershipPrepareNoOp:
+		return errTransferAlreadyCompleted
+	default:
+		return err
+	}
 }
 
 // verifyPassword checks the user's password against the stored hash.

@@ -1254,6 +1254,12 @@ the participant cascade. Only after all privacy cleanup succeeds does it start
 the account-erasure transaction and run `DELETE FROM users WHERE id = $1`. The
 cleanup-marker FK is `ON DELETE RESTRICT`, so a raced or failed obligation
 blocks deletion instead of being discarded.
+
+If the presence commit outcome is unresolved, the operation returns
+`presencecapture.ErrCommitUnresolved` even though the account cascade may have
+committed. Post-commit privacy clears still run fail-closed and idempotently;
+the destructive media handoff runs only after a durable query proves that the
+user row is absent, and is skipped when that absence cannot be proven.
 Other user-owned tables FK `users(id) ON DELETE CASCADE`, so refresh tokens,
 keys, memberships, messages, and DM data are removed atomically — strictly
 stronger than the soft-revoke in `ChangePassword` (no token residue). A

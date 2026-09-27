@@ -31,5 +31,5 @@ func SetKeyResetSessionDisconnectorForTest(h *Handler, disconnector KeyResetSess
 func ReclaimErasedMediaForTest(
 	ctx context.Context, s *AccountService, tier1, tier2 []media.BlobRef,
 ) {
-	s.reclaimErasedMedia(ctx, erasedMedia{tier1: tier1, tier2: tier2})
+	s.reclaimErasedMedia(ctx, "", false, erasedMedia{tier1: tier1, tier2: tier2})
 }

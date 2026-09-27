@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -36,6 +37,27 @@ type captureFailureRecheck struct {
 type captureFailurePlan struct{}
 
 func (captureFailurePlan) HasWork() bool { return true }
+
+type noOpOwnershipAuthority struct{}
+
+func (noOpOwnershipAuthority) LockServerAuthorityChannelsTx(context.Context, *sql.Tx, string) ([]string, error) {
+	return nil, nil
+}
+func (noOpOwnershipAuthority) FencePostStateLossTx(_ context.Context, _ *sql.Tx, _ string, _ string, _ []string, write func() error) ([]keyrotation.Rotation, map[string][]string, error) {
+	return nil, nil, write()
+}
+func (noOpOwnershipAuthority) CompleteChannelAuthorityMutationWithRotations(context.Context, string, []string, rbac.PresenceRecheckPlan, []keyrotation.Rotation, map[string][]string) {
+}
+func (noOpOwnershipAuthority) FailClosedChannelAuthorityMutation(context.Context, string, []string) {}
+
+type recordingOwnershipAuthority struct {
+	noOpOwnershipAuthority
+	failClosedCalls int
+}
+
+func (a *recordingOwnershipAuthority) FailClosedChannelAuthorityMutation(context.Context, string, []string) {
+	a.failClosedCalls++
+}
 
 func (r *captureFailureRecheck) PrepareCapture(context.Context, string, []string, *string) (rbac.PresenceRecheckPlan, error) {
 	r.prepared++
@@ -194,18 +216,19 @@ var (
 )
 
 type ambiguousConnector struct {
-	trace       *[]string
-	queryErr    error
-	ownerID     string
-	queryID     string
-	rollbackErr error
-	onCommit    func()
-	commitErr   error
-	commitOK    bool
-	execRows    int64
-	auditCalled *bool
-	auditErr    *error
-	auditUntil  *time.Time
+	trace           *[]string
+	queryErr        error
+	ownerID         string
+	queryID         string
+	credentialEpoch string
+	rollbackErr     error
+	onCommit        func()
+	commitErr       error
+	commitOK        bool
+	execRows        int64
+	auditCalled     *bool
+	auditErr        *error
+	auditUntil      *time.Time
 }
 
 func (c ambiguousConnector) Connect(context.Context) (driver.Conn, error) {
@@ -215,18 +238,19 @@ func (c ambiguousConnector) Driver() driver.Driver            { return c }
 func (c ambiguousConnector) Open(string) (driver.Conn, error) { return c.Connect(context.Background()) }
 
 type ambiguousConn struct {
-	trace       *[]string
-	queryErr    error
-	ownerID     string
-	queryID     string
-	rollbackErr error
-	onCommit    func()
-	commitErr   error
-	commitOK    bool
-	execRows    int64
-	auditCalled *bool
-	auditErr    *error
-	auditUntil  *time.Time
+	trace           *[]string
+	queryErr        error
+	ownerID         string
+	queryID         string
+	credentialEpoch string
+	rollbackErr     error
+	onCommit        func()
+	commitErr       error
+	commitOK        bool
+	execRows        int64
+	auditCalled     *bool
+	auditErr        *error
+	auditUntil      *time.Time
 }
 
 func (c ambiguousConn) Prepare(string) (driver.Stmt, error) {
@@ -252,36 +276,74 @@ func (c ambiguousConn) ExecContext(ctx context.Context, query string, _ []driver
 	*c.trace = append(*c.trace, step)
 	return driver.RowsAffected(c.execRows), nil
 }
-func (c ambiguousConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c ambiguousConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if c.queryErr != nil {
 		return nil, c.queryErr
 	}
 	*c.trace = append(*c.trace, "server-row")
 	value := uuid.NewString()
 	lowerQuery := strings.ToLower(query)
+	if strings.Contains(lowerQuery, "credential_epoch") {
+		value = c.credentialEpoch
+	}
+	if strings.Contains(lowerQuery, "from users where id = any") {
+		values, err := ambiguousUserLockValues(args)
+		if err != nil {
+			return nil, err
+		}
+		return &ambiguousRows{values: values}, nil
+	}
 	if strings.Contains(lowerQuery, "select owner_id") && c.ownerID != "" {
 		value = c.ownerID
 	}
 	if strings.Contains(lowerQuery, "select id") && c.queryID != "" {
 		value = c.queryID
 	}
-	return &ambiguousRows{value: value}, nil
+	return &ambiguousRows{values: []string{value}}, nil
 }
 
 type ambiguousRows struct {
-	read  bool
-	value string
+	index  int
+	values []string
 }
 
 func (*ambiguousRows) Columns() []string { return []string{"id"} }
 func (*ambiguousRows) Close() error      { return nil }
 func (r *ambiguousRows) Next(dest []driver.Value) error {
-	if r.read {
+	if r.index == len(r.values) {
 		return io.EOF
 	}
-	r.read = true
-	dest[0] = r.value
+	dest[0] = r.values[r.index]
+	r.index++
 	return nil
+}
+
+func ambiguousUserLockValues(args []driver.NamedValue) ([]string, error) {
+	if len(args) != 1 {
+		return nil, errors.New("expected one ownership user-lock argument")
+	}
+	var raw string
+	switch value := args[0].Value.(type) {
+	case string:
+		raw = value
+	case driver.Valuer:
+		resolved, err := value.Value()
+		if err != nil {
+			return nil, err
+		}
+		var ok bool
+		raw, ok = resolved.(string)
+		if !ok {
+			return nil, errors.New("ownership user-lock array is not text")
+		}
+	default:
+		return nil, errors.New("ownership user-lock argument is not text")
+	}
+	values := strings.Split(strings.Trim(raw, "{}"), ",")
+	for index := range values {
+		values[index] = strings.Trim(values[index], `"`)
+	}
+	return values, nil
 }
 
 type ambiguousTx struct {
@@ -311,30 +373,39 @@ func TestExecuteTransfer_AuditsAfterCommitWhenRequestContextIsCanceled(t *testin
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	trace := []string{}
+	serverID := uuid.NewString()
+	transferID := uuid.NewString()
+	fromUserID := uuid.NewString()
+	toUserID := uuid.NewString()
+	const credentialEpoch = "ownership-test-epoch"
 	auditCalled := false
 	var auditCtxErr error
 	var auditDeadline time.Time
 	db := sql.OpenDB(ambiguousConnector{
-		trace:       &trace,
-		execRows:    1,
-		commitOK:    true,
-		commitErr:   nil,
-		onCommit:    cancel,
-		auditCalled: &auditCalled,
-		auditErr:    &auditCtxErr,
-		auditUntil:  &auditDeadline,
+		trace:           &trace,
+		ownerID:         fromUserID,
+		queryID:         transferID,
+		credentialEpoch: credentialEpoch,
+		execRows:        1,
+		commitOK:        true,
+		commitErr:       nil,
+		onCommit:        cancel,
+		auditCalled:     &auditCalled,
+		auditErr:        &auditCtxErr,
+		auditUntil:      &auditDeadline,
 	})
 	t.Cleanup(func() {
 		require.NoError(t, db.Close())
 	})
 	h := &Handler{
-		db:    db,
-		hub:   websocket.NewHub(nil, nil),
-		audit: rbac.NewAuditWriter(db, logger.New("ownership-test")),
-		log:   logger.New("ownership-test"),
+		db:        db,
+		hub:       websocket.NewHub(nil, nil),
+		audit:     rbac.NewAuditWriter(db, logger.New("ownership-test")),
+		log:       logger.New("ownership-test"),
+		authority: noOpOwnershipAuthority{},
 	}
 
-	require.NoError(t, h.executeTransfer(ctx, uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()))
+	require.NoError(t, h.executeTransfer(ctx, serverID, transferID, fromUserID, toUserID, credentialEpoch))
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.True(t, auditCalled, "post-commit ownership audit must use a live context")
 	require.NoError(t, auditCtxErr, "post-commit ownership audit must not inherit the canceled request context")
@@ -385,6 +456,19 @@ func TestReconcileOwnershipPostCommit_ContinuesAfterCacheFailure(t *testing.T) {
 	require.Equal(t, 1, presence.executes)
 }
 
+func TestAmbiguousOwnershipWithoutAuthorityChannelsRechecksBothParties(t *testing.T) {
+	voice := &cacheFailureEnforcer{}
+	authority := &recordingOwnershipAuthority{}
+	h := &Handler{voiceEnforcer: voice, authority: authority}
+
+	reversal := &reversalRecord{serverID: "server", fromUserID: "from", toUserID: "to"}
+	require.ErrorIs(t, h.resolveReversalExecutionError(context.Background(), reversal, nil, errOwnershipAmbiguousCommit), errOwnershipAmbiguousCommit)
+	require.ErrorIs(t, h.resolveTransferExecutionError(context.Background(), "server", "transfer", "from", "to", nil, errOwnershipAmbiguousCommit), errOwnershipAmbiguousCommit)
+
+	require.Equal(t, []string{"from", "to", "from", "to"}, voice.users)
+	require.Zero(t, authority.failClosedCalls, "no channel authority exists to fence")
+}
+
 func TestWithOwnershipCapture_AmbiguousCommitAbandonsInOrder(t *testing.T) {
 	trace := []string{}
 	db := sql.OpenDB(ambiguousConnector{trace: &trace})
@@ -400,7 +484,7 @@ func TestWithOwnershipCapture_AmbiguousCommitAbandonsInOrder(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errAmbiguousCommit)
 	require.False(t, changed)
-	require.Equal(t, []string{"lock", "capture", "server-row", "write", "commit"}, trace)
+	require.Equal(t, []string{"lock", "server-row", "capture", "write", "commit"}, trace)
 	require.Equal(t, []string{"ambiguous_commit"}, presence.abandons)
 	require.Zero(t, presence.commits)
 }
@@ -468,7 +552,8 @@ func TestWithOwnershipCapture_RollbackFailureIsReturned(t *testing.T) {
 
 func TestExecuteTransfer_StaleClaimReturnsAlreadyCompleted(t *testing.T) {
 	trace := []string{}
-	db := sql.OpenDB(ambiguousConnector{trace: &trace})
+	const credentialEpoch = "ownership-test-epoch"
+	db := sql.OpenDB(ambiguousConnector{trace: &trace, credentialEpoch: credentialEpoch})
 	t.Cleanup(func() {
 		require.NoError(t, db.Close())
 	})
@@ -480,10 +565,11 @@ func TestExecuteTransfer_StaleClaimReturnsAlreadyCompleted(t *testing.T) {
 		uuid.NewString(),
 		uuid.NewString(),
 		uuid.NewString(),
+		credentialEpoch,
 	)
 
 	require.ErrorIs(t, err, errTransferAlreadyCompleted)
-	require.Equal(t, []string{"lock", "server-row", "write"}, trace)
+	require.Equal(t, []string{"lock", "server-row", "server-row", "server-row", "server-row", "server-row", "write"}, trace)
 }
 
 func TestCompleteExpiredTransfers_QueryFailureIsLogged(t *testing.T) {

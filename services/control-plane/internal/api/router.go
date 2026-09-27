@@ -144,6 +144,28 @@ func (a *permissionCheckerAdapter) HasChannelPermissionsUncached(ctx context.Con
 	return true, nil
 }
 
+func (a *permissionCheckerAdapter) HasChannelPermissionsUncachedTx(ctx context.Context, tx *sql.Tx, serverID, userID, channelID string, permBits ...int64) (bool, error) {
+	permissions, err := a.resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, userID, channelID)
+	if err != nil {
+		return false, err
+	}
+	for _, permission := range permBits {
+		if !permissions.Has(rbac.Permission(permission)) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (a *permissionCheckerAdapter) FilterVisibleUserIDsForChannelFresh(
+	ctx context.Context,
+	serverID string,
+	channelID string,
+	candidateUserIDs []string,
+) ([]string, error) {
+	return a.resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, channelID, candidateUserIDs)
+}
+
 // configureTrustedProxies applies the CIDR allowlist (validated + defaulted at
 // config Load time, production-guarded) and emits a startup audit log. When a
 // request arrives from a trusted peer, Gin iterates RemoteIPHeaders
@@ -945,8 +967,10 @@ func NewRouter(
 	serversHandler.SetSecurityEvents(securityEvents)
 	requireServersMFAVerifierWired(log, serversHandler)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
+	channelsHandler.SetAuthorityHandler(rbacHandler)
 	voiceEnforcementSessionHandler := newVoiceEnforcementSessionHandler(db, cfg.JWTSecret, natsClient)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
+	membersHandler.SetAuthorityHandler(rbacHandler)
 	// A kick/leave/ban deletes membership but leaves any voice participant on its
 	// join-time snapshot — recheck evicts them from the room (CV-CAN-007 P1).
 	membersHandler.SetVoiceEnforcer(voicePermEnforcer)
@@ -1080,6 +1104,7 @@ func NewRouter(
 	// Ownership changes are the largest single permission delta (owner
 	// short-circuit) — they must push voice rechecks too (CV-CAN-007 P1).
 	ownershipHandler.SetVoiceEnforcer(voicePermEnforcer)
+	ownershipHandler.SetAuthorityHandler(rbacHandler)
 	ownershipHandler.SetPresenceRecheck(presenceRecheckExecutor)
 	requirePresenceRecheckWired(log, activityService, rbacHandler, ownershipHandler)
 	var mediaHandler *media.Handler

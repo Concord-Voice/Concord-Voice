@@ -133,7 +133,7 @@ func TestInsertTransferRecordRejectsPreflightAfterProductionReversal(t *testing.
 		transferID, serverID, ownerB, ownerA, uuid.NewString())
 	require.NoError(t, err)
 
-	h := &Handler{db: db, log: logger.New("ownership-race")}
+	h := &Handler{db: db, log: logger.New("ownership-race"), authority: noOpOwnershipAuthority{}}
 	testContext, ctx, recorder := ownershipRaceContext()
 	// The initiation checks pass while A still owns the server.
 	require.NoError(t, h.requireServerOwner(ctx, nil, serverID.String(), ownerA.String(), "transfer ownership"))
@@ -377,12 +377,14 @@ func TestInsertTransferRecordRejectsMissingServer(t *testing.T) {
 	db, cleanup := dbtest.SetupTestDB(t)
 	defer cleanup()
 	serverID := uuid.New()
+	fromUserID := dbtest.CreateUser(t, db)
+	toUserID := dbtest.CreateUser(t, db)
 
 	h := &Handler{db: db, log: logger.New("ownership-race")}
 	testContext, ctx, recorder := ownershipRaceContext()
 	record := &transferRecord{
-		id: uuid.NewString(), serverID: serverID.String(), fromUserID: uuid.NewString(),
-		toUserID: uuid.NewString(), reversalToken: uuid.NewString(),
+		id: uuid.NewString(), serverID: serverID.String(), fromUserID: fromUserID.String(),
+		toUserID: toUserID.String(), reversalToken: uuid.NewString(),
 		requestedAt: time.Now(), expiresAt: time.Now().Add(time.Hour),
 	}
 	err := h.insertTransferRecord(ctx, testContext, record)
@@ -595,7 +597,7 @@ func TestExpiredPendingTransferCannotReviveAcrossOwnershipEpochs(t *testing.T) {
 		pendingAC, serverID, ownerA, targetC, uuid.NewString())
 	require.NoError(t, err)
 
-	h := &Handler{db: db, hub: websocket.NewHub(nil, nil), log: logger.New("ownership-race"), presenceRecheck: &captureLimitRecheck{}}
+	h := &Handler{db: db, hub: websocket.NewHub(nil, nil), log: logger.New("ownership-race"), presenceRecheck: &captureLimitRecheck{}, authority: noOpOwnershipAuthority{}}
 	changed, err := h.completeExpiredTransfer(context.Background(), expiredTransfer{
 		id: pendingAC.String(), serverID: serverID.String(), fromUserID: ownerA.String(), toUserID: targetC.String(),
 	})

@@ -48,6 +48,10 @@ var (
 	// be unusable; skipped it would strand them at the revoked epoch with no
 	// way to claim out. The batch is refused so the caller refetches.
 	errDMEpochClaimStaleRecipient = errors.New("dm epoch claim wrapped for a recipient whose key changed")
+	// errDuplicateWrappedRecipient rejects two textual UUID aliases carrying
+	// conflicting material for one recipient. Choosing either entry would make
+	// a key-distribution request nondeterministic.
+	errDuplicateWrappedRecipient = errors.New("wrapped-key request has conflicting recipient aliases")
 )
 
 // dmEpochClaimStaleError carries the epoch the conversation is actually at so

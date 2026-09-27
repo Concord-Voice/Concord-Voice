@@ -3,8 +3,10 @@ package ownership_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -109,6 +111,19 @@ func TestInitiateTransferTargetIsSelf(t *testing.T) {
 
 	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
 		keyTargetUserID: owner.ID,
+		keyPassword:     testhelpers.TestAuthPlaintext,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestInitiateTransferCanonicalizesSelfTarget(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "xferownerselfcanonical")
+	serverID := ts.CreateTestServer(t, owner.ID, "Transfer Self Canonical Server")
+
+	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
+		keyTargetUserID: strings.ToUpper(owner.ID),
 		keyPassword:     testhelpers.TestAuthPlaintext,
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 
@@ -322,6 +337,32 @@ func TestConfirmTransferSuccess(t *testing.T) {
 	err = ts.DB.QueryRow(`SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, member.ID).Scan(&newOwnerRole)
 	require.NoError(t, err)
 	assert.Equal(t, keyOwner, newOwnerRole)
+}
+
+func TestConfirmTransfer_RotatesOnceAndPurgesOutgoingOwnerWhenViewIsLost(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "confirmrotateowner")
+	member := ts.CreateTestUser(t, "confirmrotatemember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Confirm Rotation Server")
+	ts.AddMemberToServer(t, serverID, member.ID, keyMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "owner-lost-view")
+	_, err := ts.DB.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'owner-key', 1)`, channelID, owner.ID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, channelID, "user", owner.ID, 0, int64(rbac.PermViewVoiceChannels))
+
+	w := ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
+		keyTargetUserID: member.ID,
+		keyPassword:     testhelpers.TestAuthPlaintext,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	w = ts.DoRequest("POST", pathServersPrefix+serverID+pathTransferOwnershipConfirm, nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var revocations, ownerKeys int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID).Scan(&revocations))
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, owner.ID).Scan(&ownerKeys))
+	assert.Equal(t, 1, revocations, "one ownership transition must advance the channel epoch once")
+	assert.Zero(t, ownerKeys, "the demoted owner must lose durable channel keys when VIEW is lost")
 }
 
 func TestConfirmTransferNotOwner(t *testing.T) {

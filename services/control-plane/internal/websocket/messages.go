@@ -112,6 +112,12 @@ type ServerBroadcastMessage struct {
 	// the eviction ordered relative to other server broadcasts on this channel
 	// (e.g. a subsequent key_revocation). CV-CAN-027/028.
 	PruneUserAfter *uuid.UUID
+
+	// PruneOnly suppresses Data delivery while retaining the serialized
+	// PruneUserAfter eviction. It is used when a membership write's commit outcome
+	// is unresolved: the target must stop receiving server fanout, but the server
+	// must not be told that an unproven removal definitely happened.
+	PruneOnly bool
 }
 
 // PresenceUpdate represents a user presence change

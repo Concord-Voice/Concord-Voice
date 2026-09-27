@@ -435,7 +435,7 @@ func classifyTopologyCompletion(completion presencehistory.TopologyCompletion) e
 	case completion.Committed:
 		return fmt.Errorf("%w: %w", presencecapture.ErrPostCommitDelivery, completion.Err)
 	case completion.Err != nil:
-		return fmt.Errorf("complete topology audience batch: %w", completion.Err)
+		return fmt.Errorf("%w: complete topology audience batch: %w", presencecapture.ErrCommitUnresolved, completion.Err)
 	default:
 		// Unreachable through *presencehistory.Service: its validation terminal
 		// joins a non-nil error, and commitTopologyBatch reports Committed
@@ -444,7 +444,7 @@ func classifyTopologyCompletion(completion presencehistory.TopologyCompletion) e
 		// the one shape that would report SUCCESS for a commit nobody proved,
 		// and TopologyCompletion's own contract tells the caller to treat
 		// Committed == false as not proven.
-		return errors.New("complete topology audience batch: commit unproven")
+		return fmt.Errorf("%w: complete topology audience batch: commit unproven", presencecapture.ErrCommitUnresolved)
 	}
 }
 

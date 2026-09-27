@@ -12,7 +12,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -58,6 +60,10 @@ type Handler struct {
 	resolver *rbac.Resolver
 	audit    *rbac.AuditWriter
 	rotator  *keyrotation.Rotator
+	// authority is the shared RBAC channel-fence coordinator. It is injected
+	// from router construction so membership removal uses the same epoch rail
+	// and lock domain as category and role authority mutations.
+	authority memberAuthorityCoordinator
 	// voiceEnforcer pushes recomputed permissions to voice-connected members
 	// after a membership change (CV-CAN-007 review P1). A kick/leave/ban deletes
 	// server_members but leaves the media-plane participant holding its join-time
@@ -80,6 +86,17 @@ type Handler struct {
 	// presencecapture contract. nil means no hydrate.
 	snapshots *presence.ActivitySnapshotService
 }
+
+type memberAuthorityCoordinator interface {
+	LockServerAuthorityChannelsTx(context.Context, *sql.Tx, string) ([]string, error)
+	FenceKnownLossTx(context.Context, *sql.Tx, string, string, string, []string) ([]keyrotation.Rotation, map[string][]string, error)
+	CompleteChannelAuthorityMutationWithRotations(context.Context, string, []string, rbac.PresenceRecheckPlan, []keyrotation.Rotation, map[string][]string)
+	FailClosedChannelAuthorityMutation(context.Context, string, []string)
+}
+
+// SetAuthorityHandler injects the one RBAC authority coordinator constructed
+// by the router; it does not create another key delivery or rotation rail.
+func (h *Handler) SetAuthorityHandler(authority *rbac.Handler) { h.authority = authority }
 
 // SetVoiceEnforcer wires the mid-session voice permission push. Called once at
 // router construction, before the handler serves traffic.
@@ -369,8 +386,6 @@ func (h *Handler) populateLastSeen(members []MemberWithUser) {
 	ctx := context.Background()
 	vals, err := h.redis.MGet(ctx, keys...).Result()
 	if err != nil {
-		// last_seen is optional; an absent value honestly means "unknown".
-		h.log.Warn("Failed to fetch member last_seen", "error", err)
 		return
 	}
 	for i, val := range vals {
@@ -440,15 +455,10 @@ func (h *Handler) ensureRolesNotNil(members []MemberWithUser) {
 
 // maskOwnerRole masks the owner's role for non-owner viewers (#244: Hidden Owner Role).
 // Non-owners see the owner's highest RBAC role name instead of "owner".
-//
-// The owner is found by server_members.role, which ownership transfer swaps in
-// the same transaction as servers.owner_id. An earlier version looked owner_id up
-// separately and, when that lookup failed, returned WITHOUT masking -- disclosing
-// the owner to every viewer. There is no lookup left to fail.
 func (h *Handler) maskOwnerRole(viewerUserID string, members []MemberWithUser) {
 	for i := range members {
 		if members[i].Role != "owner" || members[i].UserID == viewerUserID {
-			continue // the owner sees their own "owner" role
+			continue
 		}
 		if len(members[i].Roles) > 0 {
 			members[i].Role = members[i].Roles[0].RoleName // highest position (sorted DESC)
@@ -570,6 +580,9 @@ func (h *Handler) AddMember(c *gin.Context) {
 		// the target, that let an actor repeatedly re-add an existing member and
 		// hold a stranger's presence locks, surfacing to them as 503s on their own
 		// presence writes (security review, PR #2840).
+		if err := rbac.LockAuthorityPrincipalsTx(ctx, tx, []string{req.UserID}); err != nil {
+			return fmt.Errorf("lock added member: %w", err)
+		}
 		var isBanned bool
 		if err := tx.QueryRowContext(ctx,
 			`SELECT EXISTS(SELECT 1 FROM server_bans WHERE server_id = $1 AND user_id = $2)`,
@@ -686,6 +699,8 @@ func (h *Handler) classifyModerationTxError(
 	switch {
 	case errors.Is(err, errRemoveCurrentOwner), errors.Is(err, errBanCurrentOwner):
 		c.JSON(http.StatusForbidden, gin.H{"error": ownerMessage})
+	case errors.Is(err, errModerationTargetGone):
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
 	case errors.Is(err, errModerationPermissionDenied):
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 	case errors.Is(err, errModerationHierarchyDenied):
@@ -729,6 +744,7 @@ var errMemberBanned = errors.New("members: user is banned from this server")
 var (
 	errRemoveCurrentOwner         = errors.New("members: cannot remove the current server owner")
 	errBanCurrentOwner            = errors.New("members: cannot ban the current server owner")
+	errModerationTargetGone       = errors.New("members: moderation target is no longer a member")
 	errModerationPermissionDenied = errors.New("members: moderator no longer has permission")
 	errModerationHierarchyDenied  = errors.New("members: moderator no longer outranks target")
 )
@@ -753,6 +769,45 @@ func (h *Handler) authorizeModerationTx(
 			return errModerationHierarchyDenied
 		}
 		return fmt.Errorf("check current moderation hierarchy: %w", err)
+	}
+	return nil
+}
+
+// lockModerationUsersTx acquires every users row a moderation write can reach
+// through its direct FKs after the server visibility serializer. ORDER BY keeps
+// the pair deterministic when two moderators cross-target each other.
+func lockModerationUsersTx(ctx context.Context, tx *sql.Tx, actorID, targetUserID string) (returnErr error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM users
+		WHERE id IN ($1, $2)
+		ORDER BY id
+		FOR NO KEY UPDATE
+	`, actorID, targetUserID)
+	if err != nil {
+		return fmt.Errorf("lock moderation users: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close moderation users: %w", closeErr))
+		}
+	}()
+	locked := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan locked moderation user: %w", err)
+		}
+		locked++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate locked moderation users: %w", err)
+	}
+	expected := 2
+	if actorID == targetUserID {
+		expected = 1
+	}
+	if locked != expected {
+		return fmt.Errorf("moderation user no longer exists: %w", errModerationTargetGone)
 	}
 	return nil
 }
@@ -852,8 +907,10 @@ func (h *Handler) UpdateMember(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMember})
 		return
 	}
-	if err := h.audit.Log(c.Request.Context(), serverID, &userID, "member_updated", "member", &targetUserID, nil); err != nil {
-		h.log.Warn("Member update audit write failed", "error", err)
+	if h.audit != nil {
+		if err := h.audit.Log(c.Request.Context(), serverID, &userID, "member_updated", "member", &targetUserID, nil); err != nil {
+			h.log.Warn("Member update audit write failed", "error", err)
+		}
 	}
 
 	h.log.Info("Member role updated", "server_id", serverID, "target_user", targetUserID, "new_role", req.Role, "updated_by", userID)
@@ -1102,59 +1159,110 @@ func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserI
 // that destroys the audience being captured. Everything after this function —
 // including BroadcastToServerAndPrune's deliver-then-prune ordering — is
 // untouched: the presence work has already completed by then.
-func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID, actorID string) error {
-	if h.graphPresence == nil {
-		defer h.hub.BeginAudienceRevocation()()
-	}
+type memberAuthorityFence struct {
+	channelIDs      []string
+	rotations       []keyrotation.Rotation
+	deniedByChannel map[string][]string
+}
 
+func (h *Handler) execRemovalFenceTx(ctx context.Context, serverID, targetUserID, actorID, credentialEpoch string) (memberAuthorityFence, error) {
+	var fence memberAuthorityFence
 	spec := presencehook.Spec{
 		Family:      presencecapture.FamilyMemberRemove,
 		Posture:     presencecapture.FailClosedBlockWrite,
 		PrincipalID: targetUserID,
 	}
 
-	return presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
-		// The ownership transfer path takes this same lock before changing
-		// servers.owner_id. It must be this transaction's first SQL statement,
-		// then the current owner must be read before capture or any destructive
-		// write, so a target that became owner cannot be removed.
-		if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
-			return fmt.Errorf("lock member removal server: %w", err)
+	err := presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		if err := h.prepareRemovalFenceTx(ctx, tx, serverID, targetUserID, actorID, credentialEpoch, &fence); err != nil {
+			return err
 		}
-		var ownerID string
-		if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
-			return fmt.Errorf("query current server owner for member removal: %w", err)
-		}
-		if ownerID == targetUserID {
-			return errRemoveCurrentOwner
-		}
-		if actorID != targetUserID && actorID != ownerID {
-			if err := h.authorizeModerationTx(ctx, tx, serverID, actorID, targetUserID, rbac.PermKick); err != nil {
-				return err
-			}
-		}
-
 		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
 		if captureErr != nil {
 			return fmt.Errorf("capture member removal presence: %w", captureErr)
+		}
+		abandon := func(err error, msg string) error {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("%s: %w", msg, err)
 		}
 
 		queries := []string{
 			// FIRST, and deliberately: this is the audience-destroying write.
 			`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`,
-			`DELETE FROM channel_keys WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
-			`DELETE FROM pending_key_requests WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
 			`DELETE FROM channel_read_states WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
 		}
 		for _, query := range queries {
 			if _, execErr := tx.ExecContext(ctx, query, serverID, targetUserID); execErr != nil {
-				presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
-				return fmt.Errorf("remove member rows: %w", execErr)
+				return abandon(execErr, "remove member rows")
 			}
+		}
+		var fenceErr error
+		fence.rotations, fence.deniedByChannel, fenceErr = h.authority.FenceKnownLossTx(ctx, tx, serverID, actorID, targetUserID, fence.channelIDs)
+		if fenceErr != nil {
+			return abandon(fenceErr, "fence removed member channel authority")
 		}
 
 		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
 	})
+	return fence, err
+}
+
+// prepareRemovalFenceTx takes the server visibility serializer before users.
+// Reversing that order lets concurrent authority mutations form a cycle while
+// one waits for visibility and the other waits for a moderation user row.
+func (h *Handler) prepareRemovalFenceTx(
+	ctx context.Context, tx *sql.Tx, serverID, targetUserID, actorID, credentialEpoch string, fence *memberAuthorityFence,
+) error {
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return fmt.Errorf("lock member removal server: %w", err)
+	}
+	if err := lockModerationUsersTx(ctx, tx, actorID, targetUserID); err != nil {
+		return err
+	}
+	// Take the sorted stronger pair before GuardTx's actor FOR SHARE read so
+	// concurrent cross-target removals cannot form a lock-upgrade cycle.
+	if err := credepoch.GuardTx(ctx, tx, actorID, credentialEpoch); err != nil {
+		return err
+	}
+
+	// Revalidate mutable server facts after all authoritative locks are held.
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+		return fmt.Errorf("query current server owner for member removal: %w", err)
+	}
+	if ownerID == targetUserID {
+		return errRemoveCurrentOwner
+	}
+	if actorID != targetUserID && actorID != ownerID {
+		if err := h.authorizeModerationTx(ctx, tx, serverID, actorID, targetUserID, rbac.PermKick); err != nil {
+			return err
+		}
+	}
+	if h.authority == nil {
+		return errors.New("member authority coordinator unavailable")
+	}
+	channelIDs, err := h.authority.LockServerAuthorityChannelsTx(ctx, tx, serverID)
+	if err != nil {
+		return fmt.Errorf("lock member removal authority channels: %w", err)
+	}
+	fence.channelIDs = channelIDs
+	var targetStillMember bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`, serverID, targetUserID,
+	).Scan(&targetStillMember); err != nil {
+		return fmt.Errorf("revalidate removed member: %w", err)
+	}
+	if !targetStillMember {
+		return errModerationTargetGone
+	}
+	return nil
+}
+
+// execRemovalTx preserves the package-private test seam while the HTTP path
+// consumes the confirmed fence result for post-commit delivery.
+func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID, actorID string) error {
+	_, err := h.execRemovalFenceTx(ctx, serverID, targetUserID, actorID, "")
+	return err
 }
 
 func (h *Handler) invalidateMemberPermissions(serverID, userID, action string) {
@@ -1176,43 +1284,84 @@ type RemoveMemberRequest struct {
 // Discarding the bind error would let a truncated body like `{"purge_messages":true,` set the
 // flag before ShouldBindJSON errors and trigger an irreversible purge from an invalid request.
 // Returns true to proceed; on false the caller must return (the 400 is already written).
-// moderationTarget reads the `:id` / `:user_id` path pair every member-moderation
-// handler takes, rejects a non-UUID in either with that handler's usual 400, and
-// returns the target id in its CANONICAL spelling.
-//
-// The canonical form is the point, not a side effect (#3362). `targetUserID` is
-// compared BYTE-WISE against DB-sourced ids further down — owner immunity and the
-// self-action guards — while PostgreSQL resolves braced, UPPERCASE and dash-less
-// spellings to the SAME row. `uuid.Parse` is a parser, not a canonicality check, so
-// parsing and then carrying the raw param validated nothing: an admin could defeat
-// the owner guard by uppercasing the owner's id and still have the ban SQL resolve
-// to the owner's row.
-//
-// It is ONE function rather than six copies for the same reason #3362 canonicalizes
-// at a single choke point instead of at each Redis key builder: a boundary expressed
-// six times is six places to forget it. The first draft did write it six times, and
-// SonarCloud failed the PR on 10.2% duplication of new code — the rule catching the
-// exact shape the change exists to argue against.
-func moderationTarget(c *gin.Context) (serverID, targetUserID string, ok bool) {
-	serverID = c.Param("id")
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return "", "", false
-	}
-	parsed, err := uuid.Parse(c.Param("user_id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
-		return "", "", false
-	}
-	return serverID, parsed.String(), true
-}
-
 func bindOptionalBody(c *gin.Context, req any) bool {
 	if err := c.ShouldBindJSON(req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 		return false
 	}
 	return true
+}
+
+func credentialFenceRejected(c *gin.Context, err error) bool {
+	if !errors.Is(err, credepoch.ErrEpochMismatch) && !errors.Is(err, credepoch.ErrBlocked) {
+		return false
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+	return true
+}
+
+func (h *Handler) classifyRemovalFenceError(
+	c *gin.Context, err error, fence memberAuthorityFence, serverID string, selfRemoval bool,
+) (*presencehook.Failure, bool) {
+	if credentialFenceRejected(c, err) {
+		return nil, true
+	}
+	if errors.Is(err, rbac.ErrChannelAuthorityChannelLimit) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Channel key cleanup exceeds 500 recipients; resolve access changes in batches of 500 or fewer"})
+		return nil, true
+	}
+	if !errors.Is(err, presencecapture.ErrPostCommitDelivery) && !isAmbiguousMemberCommit(err) && len(fence.channelIDs) > 0 {
+		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, fence.channelIDs)
+	}
+	return h.classifyModerationTxError(
+		c, err, removalCurrentOwnerMessage(selfRemoval),
+		"Cannot remove a member with equal or higher role position", "Failed to remove member", errMsgFailedRemoveMember,
+	)
+}
+
+func isAmbiguousMemberCommit(err error) bool {
+	return rbac.IsAmbiguousAuthorityCommit(err) || errors.Is(err, presencecapture.ErrCommitUnresolved)
+}
+
+// reconcileAmbiguousMemberDeauthorization closes the externally visible
+// authority after an acknowledgement-lost removal or ban. A concurrent re-add
+// cannot prove the original deletion rolled back, so recovery always
+// deauthorizes. Rotations are deliberately not published without a proven
+// commit.
+func (h *Handler) reconcileAmbiguousMemberDeauthorization(serverID, targetUserID string, fence memberAuthorityFence, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), permissionCacheInvalidationTimeout)
+	defer cancel()
+	if h.authority != nil && len(fence.channelIDs) > 0 {
+		h.authority.FailClosedChannelAuthorityMutation(ctx, serverID, fence.channelIDs)
+	}
+	if h.hub != nil {
+		serverUUID, serverErr := uuid.Parse(serverID)
+		targetUUID, targetErr := uuid.Parse(targetUserID)
+		if serverErr == nil && targetErr == nil {
+			h.hub.PruneServerSubscriber(serverUUID, targetUUID)
+		}
+	}
+	h.recheckVoiceUser(serverID, targetUserID)
+	if h.resolver != nil {
+		h.invalidateMemberPermissions(serverID, targetUserID, "ambiguous_"+reason)
+	}
+}
+
+// moderationTarget validates the member-moderation path ids and returns both
+// in canonical form. PostgreSQL treats alternate UUID spellings as the same
+// row, while guards and Redis permission-cache keys compare strings (#3362).
+func moderationTarget(c *gin.Context) (serverID, targetUserID string, ok bool) {
+	parsedServerID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
+		return "", "", false
+	}
+	parsedTargetUserID, err := uuid.Parse(c.Param("user_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+		return "", "", false
+	}
+	return parsedServerID.String(), parsedTargetUserID.String(), true
 }
 
 // RemoveMember removes a member from a server (kick or leave)
@@ -1222,9 +1371,12 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	if !idsOK {
 		return
 	}
-
 	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
 	defer purgeCancel()
+
+	// moderationTarget parsed and canonicalized both IDs above.
+	serverUUID := uuid.MustParse(serverID)
+	targetUUID := uuid.MustParse(targetUserID)
 
 	var req RemoveMemberRequest
 	if !bindOptionalBody(c, &req) { // #1353 optional body; empty OK, malformed rejected
@@ -1259,7 +1411,12 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// delivery failed. The de-authorization sequence still runs; the 503 is
 	// written after it.
 	var deliveryFailure *presencehook.Failure
-	if err := h.execRemovalTx(c.Request.Context(), serverID, targetUserID, userID); err != nil {
+	fence, removalErr := h.execRemovalFenceTx(c.Request.Context(), serverID, targetUserID, userID, middleware.TokenCredentialEpoch(c))
+	if removalErr != nil {
+		// presencehook wraps commit acknowledgement failures, so they do not
+		// retain rbac's ambiguity sentinel. Any non-delivery error after this
+		// exact set was locked receives idempotent fail-closed recovery; only a
+		// classified post-commit delivery failure may publish rotations below.
 		// Classify distinguishes a PRE-commit failure (500, nothing written) from
 		// a POST-commit delivery failure (503, the member IS removed and a retry
 		// is safe). The old blanket 500 told a client nothing had happened when
@@ -1271,26 +1428,27 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		// RBAC cache entry, an intact WS subscription, un-revoked channel keys and
 		// a media-plane session. That is stale authorization on a user who has
 		// actually been removed.
+		if isAmbiguousMemberCommit(removalErr) {
+			h.reconcileAmbiguousMemberDeauthorization(serverID, targetUserID, fence, "removed")
+		}
 		var handled bool
-		deliveryFailure, handled = h.classifyModerationTxError(
-			c, err, removalCurrentOwnerMessage(auth.isSelfRemoval),
-			"Cannot remove a member with equal or higher role position", "Failed to remove member", errMsgFailedRemoveMember)
+		deliveryFailure, handled = h.classifyRemovalFenceError(c, removalErr, fence, serverID, auth.isSelfRemoval)
 		if handled {
 			return
 		}
 	}
-
 	action := "removed"
 	auditAction := "member_removed"
 	if auth.isSelfRemoval {
 		action = "left"
 		auditAction = "member_left"
 	}
-	if err := h.audit.Log(c.Request.Context(), serverID, &userID, auditAction, "member", &targetUserID, nil); err != nil {
-		h.log.Warn("Member removal audit write failed", "error", err)
+	if h.audit != nil {
+		if err := h.audit.Log(c.Request.Context(), serverID, &userID, auditAction, "member", &targetUserID, nil); err != nil {
+			h.log.Warn("Member removal audit write failed", "error", err)
+		}
 	}
 
-	serverUUID, _ := uuid.Parse(serverID)
 	memberRemoved := websocket.OutgoingMessage{
 		Type: "member_removed",
 		Data: map[string]interface{}{
@@ -1305,14 +1463,10 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// their own removal event) and BEFORE the key-revocation fanout below (a later
 	// broadcast on the same channel), so they no longer receive key_revocation or any
 	// later server broadcast. Membership is already deleted at this point.
-	if targetUUID, parseErr := uuid.Parse(targetUserID); parseErr == nil {
-		h.hub.BroadcastToServerAndPrune(serverUUID, memberRemoved, targetUUID)
-	} else {
-		h.hub.BroadcastToServer(serverUUID, memberRemoved)
+	h.hub.BroadcastToServerAndPrune(serverUUID, memberRemoved, targetUUID)
+	if len(fence.rotations) > 0 {
+		h.authority.CompleteChannelAuthorityMutationWithRotations(c.Request.Context(), serverID, fence.channelIDs, nil, fence.rotations, fence.deniedByChannel)
 	}
-
-	// Rotate before the cache scan so a slow invalidation cannot extend the old-key window.
-	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
 
 	// CV-CAN-007 (review P1): membership is now deleted — recheck the removed
 	// member's voice presence so the media plane evicts them (the fresh resolve
@@ -1342,6 +1496,26 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+func (h *Handler) classifyBanFenceError(
+	c *gin.Context, err error, fence memberAuthorityFence, serverID, targetUserID string,
+) (*presencehook.Failure, bool) {
+	if credentialFenceRejected(c, err) {
+		return nil, true
+	}
+	if errors.Is(err, rbac.ErrChannelAuthorityChannelLimit) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Channel key cleanup exceeds 500 recipients; resolve access changes in batches of 500 or fewer"})
+		return nil, true
+	}
+	if !errors.Is(err, presencecapture.ErrPostCommitDelivery) && !isAmbiguousMemberCommit(err) && len(fence.channelIDs) > 0 {
+		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, fence.channelIDs)
+	}
+	return h.classifyModerationTxError(
+		c, err, "Cannot ban the server owner",
+		"Cannot ban a member with equal or higher role position", "Failed to ban member", errMsgFailedBanMember,
+		"server_id", serverID, "user_id", targetUserID,
+	)
+}
+
 // BanRequest represents a request to ban a member
 type BanRequest struct {
 	Reason        string `json:"reason"`
@@ -1359,6 +1533,15 @@ type BannedMember struct {
 	BannedByName *string `json:"banned_by_name,omitempty"`
 	Reason       *string `json:"reason,omitempty"`
 	CreatedAt    string  `json:"created_at"`
+}
+
+type banFenceRequest struct {
+	serverID        string
+	targetUserID    string
+	actorID         string
+	credentialEpoch string
+	reason          *string
+	probedMember    bool
 }
 
 // execBanTx bans the member inside a HOOKED transaction, on the same contract as
@@ -1385,143 +1568,212 @@ type BannedMember struct {
 // FOR UPDATE row locks with no stripe held: the lock-order invariant violated
 // in the one direction it forbids, and invisible to every behavioural test
 // because the response and the durable state come out byte-identical.
-func (h *Handler) execBanTx(
-	ctx context.Context, serverID, targetUserID, actorID string, reason *string, probedMember bool,
-) error {
-	// `gated` and `skipGateForProbe` are SEPARATE on purpose, and conflating them
-	// was a real defect (CodeRabbit, PR #2883). A nil capture means TWO different
-	// things: "this replica has no capture wired at all" — the documented unwired
-	// fallback, which requireGraphPresenceCaptureWired does NOT rule out because
-	// it early-returns when activityService is nil — and "the probe said this ban
-	// reconciles nothing, so skip the gate".
+func (h *Handler) execBanFenceTx(
+	ctx context.Context, serverID, targetUserID, actorID, credentialEpoch string, reason *string, probedMember bool,
+) (memberAuthorityFence, error) {
+	req := banFenceRequest{
+		serverID:        serverID,
+		targetUserID:    targetUserID,
+		actorID:         actorID,
+		credentialEpoch: credentialEpoch,
+		reason:          reason,
+		probedMember:    probedMember,
+	}
+	var fence memberAuthorityFence
+	// Capture and gate decisions are separate: an unwired replica still skips
+	// capture for a known non-member, while only a wired skipped gate can prove a
+	// later member result was a stale probe.
 	//
 	// Only the second may raise ErrProbeStale. Testing `gated == nil` for
 	// staleness made every ban of a real member 503 on an unwired replica, which
 	// is a fail-closed refusal of a moderation action that should simply proceed.
-	gated := h.graphPresence
-	skipGateForProbe := false
-	if gated != nil && !probedMember {
-		gated = nil
-		skipGateForProbe = true
-	}
-	if gated == nil && !skipGateForProbe {
-		defer h.hub.BeginAudienceRevocation()()
-	}
+	gated, skipCaptureForProbe, skipGateForProbe := h.banPresenceGate(req.probedMember)
 
 	spec := presencehook.Spec{
 		Family:      presencecapture.FamilyMemberBan,
 		Posture:     presencecapture.FailClosedBlockWrite,
-		PrincipalID: targetUserID,
+		PrincipalID: req.targetUserID,
 	}
 
-	return presencehook.WithGatedTx(ctx, gated, h.db, h.log, spec, func(tx *sql.Tx) error {
-		// Match ownership transfer's per-server serialization before reading the
-		// authoritative owner. This is intentionally before membership/capture:
-		// a target made owner by a concurrent transfer must not be banned or have
-		// any associated state removed.
-		if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
-			return fmt.Errorf("lock member ban server: %w", err)
+	err := presencehook.WithGatedTx(ctx, gated, h.db, h.log, spec, func(tx *sql.Tx) error {
+		isMember, err := h.prepareBanFenceTx(ctx, tx, req, skipGateForProbe, &fence)
+		if err != nil {
+			return err
 		}
-		var ownerID string
-		if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
-			return fmt.Errorf("query current server owner for member ban: %w", err)
+		plan, err := h.captureBanPresenceTx(ctx, tx, gated, spec, skipCaptureForProbe || !isMember)
+		if err != nil {
+			return err
 		}
-		if ownerID == targetUserID {
-			return errBanCurrentOwner
+		if err := h.writeBanTx(ctx, tx, gated, plan, req, isMember, &fence); err != nil {
+			return err
 		}
-		if actorID != ownerID {
-			if err := h.authorizeModerationTx(ctx, tx, serverID, actorID, targetUserID, rbac.PermBan); err != nil {
-				return err
-			}
-		}
-
-		// Capture ONLY when the target is actually a member.
-		//
-		// This read stays INSIDE the transaction and remains THE AUTHORITY
-		// (#2854 stage C). A pooled probe now precedes it and decides only
-		// whether a gate is taken; its verdict is never substituted for this
-		// read. When the two disagree the request fails CLOSED below rather
-		// than writing a revocation with no capture.
-		//
-		// Banning a non-member is permitted (a pre-emptive ban) and changes no
-		// shared-server audience, so there is nothing to reconcile. The capture
-		// would not know that: FamilyMemberBan is a revoking family and this
-		// family carries no counterpart, so graphpresence's accepted-edge gate
-		// (`policy.CanRevokeVisibility && subject.Counterpart != uuid.Nil`) is
-		// structurally unreachable here and the capture seeds plan.viewers with
-		// the named principal unconditionally. On the SUCCESS path that is a full
-		// websocket teardown of every device belonging to whoever was named.
-		//
-		// Any user can create a server and thereby hold PermBan on it, so leaving
-		// that ungated lets an attacker force-disconnect an arbitrary stranger
-		// with no relationship to the server — the exact abuse the accepted-edge
-		// gate's own comment describes, re-opened through a family that has no
-		// counterpart to gate on (security review, PR #2840).
-		//
-		// A nil plan is well-defined: Complete's foreign-plan guard is
-		// `!ok && plan != nil`, so nil falls through to the bare commit.
-		var isMember bool
-		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
-			serverID, targetUserID,
-		).Scan(&isMember); err != nil {
-			return fmt.Errorf("check ban target membership: %w", err)
-		}
-
-		// C4 fail-closed. The probe said this target had no audience, so no gate
-		// was taken and no capture exists -- but the authoritative read
-		// disagrees. Proceeding would DELETE this member's rows with NO
-		// reconciliation, leaving every viewer holding their Custom Status,
-		// which carries no TTL (CWE-284). The deferred rollback discards the
-		// transaction; the ban is idempotent, so a retry bans correctly and
-		// WITH a capture.
-		if isMember && skipGateForProbe {
-			return presencehook.ErrProbeStale
-		}
-
-		var plan presencecapture.Plan
-		if isMember {
-			var captureErr error
-			plan, captureErr = presencehook.Capture(ctx, gated, tx, spec)
-			if captureErr != nil {
-				return fmt.Errorf("capture member ban presence: %w", captureErr)
-			}
-		}
-
-		abandon := func(err error, msg string) error {
-			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
-			return fmt.Errorf("%s: %w", msg, err)
-		}
-
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO server_bans (server_id, user_id, banned_by, reason)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (server_id, user_id) DO UPDATE SET
-				banned_by = EXCLUDED.banned_by,
-				reason = EXCLUDED.reason,
-				created_at = NOW()
-		`, serverID, targetUserID, actorID, reason); err != nil {
-			return abandon(err, "record server ban")
-		}
-
-		if _, err := tx.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
-			return abandon(err, "delete server member")
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
-			return abandon(err, "delete member roles")
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM channel_keys WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
-			return abandon(err, "delete channel keys")
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_key_requests WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
-			return abandon(err, "delete pending key requests")
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM channel_read_states WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
-			return abandon(err, "delete channel read states")
-		}
-
 		return presencehook.Complete(ctx, gated, tx, plan)
 	})
+	return fence, err
+}
+
+func (h *Handler) banPresenceGate(probedMember bool) (presencecapture.GraphPresenceCapture, bool, bool) {
+	skipCaptureForProbe := !probedMember
+	gated := h.graphPresence
+	if gated != nil && skipCaptureForProbe {
+		return nil, true, true
+	}
+	return gated, skipCaptureForProbe, false
+}
+
+func (h *Handler) prepareBanFenceTx(
+	ctx context.Context, tx *sql.Tx, req banFenceRequest, skipGateForProbe bool, fence *memberAuthorityFence,
+) (bool, error) {
+	ownerID, err := lockBanActorAndServerTx(ctx, tx, req)
+	if err != nil {
+		return false, err
+	}
+	isMember, err := banTargetMembershipTx(ctx, tx, req.serverID, req.targetUserID, "check")
+	if err != nil {
+		return false, err
+	}
+	if err := validateBanProbe(isMember, skipGateForProbe); err != nil {
+		return false, err
+	}
+	if req.actorID != ownerID {
+		if err := h.authorizeModerationTx(ctx, tx, req.serverID, req.actorID, req.targetUserID, rbac.PermBan); err != nil {
+			return false, err
+		}
+	}
+	return h.lockBanAuthorityTx(ctx, tx, req, isMember, fence)
+}
+
+func lockBanActorAndServerTx(ctx context.Context, tx *sql.Tx, req banFenceRequest) (string, error) {
+	// The visibility serializer is the first shared lock for every moderation
+	// write. Once it is held, match DeleteServer's users-before-server order so
+	// a live-voice server delete cannot form a users <-> servers lock cycle.
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, req.serverID); err != nil {
+		return "", fmt.Errorf("lock member ban server: %w", err)
+	}
+	if err := lockModerationUsersTx(ctx, tx, req.actorID, req.targetUserID); err != nil {
+		return "", err
+	}
+	// The stronger, sorted user-pair lock prevents GuardTx's actor FOR SHARE
+	// read from creating a lock-upgrade cycle before the target is locked.
+	if err := credepoch.GuardTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
+		return "", err
+	}
+	return lockBanServerOwnerTx(ctx, tx, req.serverID, req.targetUserID)
+}
+
+func validateBanProbe(isMember, skipGateForProbe bool) error {
+	// A non-member ban is a supported pre-emptive ban and has no audience to
+	// reconcile. The pooled probe only selects that no-capture path; the locked
+	// membership read remains authoritative. A target that left after a member
+	// probe is still safe to ban pre-emptively: capture is skipped because there
+	// is no audience to revoke, while refusing the durable ban lets them rejoin.
+	if isMember && skipGateForProbe {
+		return presencehook.ErrProbeStale
+	}
+	return nil
+}
+
+func (h *Handler) lockBanAuthorityTx(
+	ctx context.Context, tx *sql.Tx, req banFenceRequest, isMember bool, fence *memberAuthorityFence,
+) (bool, error) {
+	if !isMember {
+		return false, nil
+	}
+	if h.authority == nil {
+		return false, errors.New("member authority coordinator unavailable")
+	}
+	channelIDs, err := h.authority.LockServerAuthorityChannelsTx(ctx, tx, req.serverID)
+	if err != nil {
+		return false, fmt.Errorf("lock member ban authority channels: %w", err)
+	}
+	fence.channelIDs = channelIDs
+	isMember, err = banTargetMembershipTx(ctx, tx, req.serverID, req.targetUserID, "revalidate")
+	if err != nil {
+		return false, err
+	}
+	if !isMember {
+		return false, errModerationTargetGone
+	}
+	return true, nil
+}
+
+func lockBanServerOwnerTx(ctx context.Context, tx *sql.Tx, serverID, targetUserID string) (string, error) {
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+		return "", fmt.Errorf("query current server owner for member ban: %w", err)
+	}
+	if ownerID == targetUserID {
+		return "", errBanCurrentOwner
+	}
+	return ownerID, nil
+}
+
+func banTargetMembershipTx(ctx context.Context, tx *sql.Tx, serverID, targetUserID, operation string) (bool, error) {
+	var isMember bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`, serverID, targetUserID,
+	).Scan(&isMember); err != nil {
+		return false, fmt.Errorf("%s ban target membership: %w", operation, err)
+	}
+	return isMember, nil
+}
+
+func (h *Handler) captureBanPresenceTx(
+	ctx context.Context, tx *sql.Tx, gated presencecapture.GraphPresenceCapture, spec presencehook.Spec, skipCapture bool,
+) (presencecapture.Plan, error) {
+	if skipCapture {
+		return nil, nil
+	}
+	plan, err := presencehook.Capture(ctx, gated, tx, spec)
+	if err != nil {
+		return nil, fmt.Errorf("capture member ban presence: %w", err)
+	}
+	return plan, nil
+}
+
+func (h *Handler) writeBanTx(
+	ctx context.Context, tx *sql.Tx, gated presencecapture.GraphPresenceCapture, plan presencecapture.Plan,
+	req banFenceRequest, isMember bool, fence *memberAuthorityFence,
+) error {
+	abandon := func(err error, message string) error {
+		presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
+		return fmt.Errorf("%s: %w", message, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO server_bans (server_id, user_id, banned_by, reason)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (server_id, user_id) DO UPDATE SET
+			banned_by = EXCLUDED.banned_by,
+			reason = EXCLUDED.reason,
+			created_at = NOW()
+	`, req.serverID, req.targetUserID, req.actorID, req.reason); err != nil {
+		return abandon(err, "record server ban")
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, req.serverID, req.targetUserID); err != nil {
+		return abandon(err, "delete server member")
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channel_read_states WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, req.targetUserID, req.serverID); err != nil {
+		return abandon(err, "delete channel read states")
+	}
+	if !isMember {
+		return nil
+	}
+	rotations, deniedByChannel, err := h.authority.FenceKnownLossTx(ctx, tx, req.serverID, req.actorID, req.targetUserID, fence.channelIDs)
+	if err != nil {
+		return abandon(err, "fence banned member channel authority")
+	}
+	fence.rotations = rotations
+	fence.deniedByChannel = deniedByChannel
+	return nil
+}
+
+// execBanTx preserves the package-private test seam while the HTTP path uses
+// the confirmed fence result for post-commit key delivery.
+func (h *Handler) execBanTx(
+	ctx context.Context, serverID, targetUserID, actorID string, reason *string, probedMember bool,
+) error {
+	_, err := h.execBanFenceTx(ctx, serverID, targetUserID, actorID, "", reason, probedMember)
+	return err
 }
 
 // BanMember bans a member from a server (removes + prevents rejoin)
@@ -1531,7 +1783,6 @@ func (h *Handler) BanMember(c *gin.Context) {
 	if !idsOK {
 		return
 	}
-
 	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
 	defer purgeCancel()
 
@@ -1586,18 +1837,19 @@ func (h *Handler) BanMember(c *gin.Context) {
 		probedMember = true
 	}
 
-	if err := h.execBanTx(c.Request.Context(), serverID, targetUserID, userID, reason, probedMember); err != nil {
+	fence, banErr := h.execBanFenceTx(c.Request.Context(), serverID, targetUserID, userID, middleware.TokenCredentialEpoch(c), reason, probedMember)
+	if banErr != nil {
 		// Same split as RemoveMember: a post-commit delivery failure means the
 		// member IS banned, so it must not be reported as a 500 that implies
 		// nothing happened — and must not skip the de-authorization below. A
 		// banned user left holding a live RBAC cache entry, an intact WS
 		// subscription and un-revoked channel keys is the moderation bypass this
 		// whole slice exists to close.
+		if isAmbiguousMemberCommit(banErr) {
+			h.reconcileAmbiguousMemberDeauthorization(serverID, targetUserID, fence, "banned")
+		}
 		var handled bool
-		banDeliveryFailure, handled = h.classifyModerationTxError(
-			c, err, "Cannot ban the server owner",
-			"Cannot ban a member with equal or higher role position", "Failed to ban member", errMsgFailedBanMember,
-			"server_id", serverID, "user_id", targetUserID)
+		banDeliveryFailure, handled = h.classifyBanFenceError(c, banErr, fence, serverID, targetUserID)
 		if handled {
 			return
 		}
@@ -1628,8 +1880,9 @@ func (h *Handler) BanMember(c *gin.Context) {
 		h.hub.BroadcastToServer(serverUUID, memberRemoved)
 	}
 
-	// Rotate before the cache scan so a slow invalidation cannot extend the old-key window.
-	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
+	if len(fence.rotations) > 0 {
+		h.authority.CompleteChannelAuthorityMutationWithRotations(c.Request.Context(), serverID, fence.channelIDs, nil, fence.rotations, fence.deniedByChannel)
+	}
 
 	// CV-CAN-007 (review P1): membership is now deleted — recheck the banned
 	// member's voice presence so the media plane evicts them (the fresh resolve
@@ -1683,8 +1936,10 @@ func (h *Handler) UnbanMember(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User is not banned"})
 		return
 	}
-	if err := h.audit.Log(c.Request.Context(), serverID, &userID, "member_unbanned", "member", &targetUserID, nil); err != nil {
-		h.log.Warn("Member unban audit write failed", "error", err)
+	if h.audit != nil {
+		if err := h.audit.Log(c.Request.Context(), serverID, &userID, "member_unbanned", "member", &targetUserID, nil); err != nil {
+			h.log.Warn("Member unban audit write failed", "error", err)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Member unbanned"})
@@ -1732,43 +1987,6 @@ func (h *Handler) ListBans(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, bans)
-}
-
-// triggerKeyRevocationsForServer creates key_revocations records and broadcasts
-// key_revocation events for all E2EE channels in a server. Called after a member
-// is removed so remaining clients rotate to a new epoch the removed user can't decrypt.
-//
-// It iterates the server's channels and delegates each channel's rotation to the
-// shared keyrotation.Rotator core (RevokeChannelKeyEpoch), passing removedUserID so
-// the broadcast payload preserves the member-removal shape. The same Rotator backs
-// single-channel rotations in the voice package (temporary-SBAC access revocation,
-// #487 P2) — the rotation SQL + broadcast lives in ONE place (internal/keyrotation).
-func (h *Handler) triggerKeyRevocationsForServer(serverID, removedUserID, actorID string) {
-	rows, err := h.db.Query(
-		`SELECT c.id
-		 FROM channels c
-		 WHERE c.server_id = $1`,
-		serverID,
-	)
-	if err != nil {
-		h.log.Error("Failed to query E2EE channels for key revocation", "error", err, "server_id", serverID)
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		var channelID string
-		if err := rows.Scan(&channelID); err != nil {
-			h.log.Error("Failed to scan channel for key revocation", "error", err)
-			continue
-		}
-
-		// Per-channel rotation with the member-removal payload shape.
-		h.rotator.RevokeChannelKeyEpoch(channelID, "member_removal", actorID, removedUserID)
-	}
-
-	h.log.Info("Key revocations triggered for member removal",
-		"server_id", serverID, "removed_user", removedUserID, "actor", actorID)
 }
 
 // triggerKeyRevocationForChannel rotates the CSK epoch for ONE channel and broadcasts

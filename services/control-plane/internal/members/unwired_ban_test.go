@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -63,7 +64,10 @@ func TestExecBanTxOnAnUnwiredReplicaIsNotAStaleProbe(t *testing.T) {
 	require.NoError(t, err)
 
 	// UNWIRED: no SetGraphPresenceCapture. h.graphPresence stays nil.
-	h := &Handler{db: db, log: logger.New("test")}
+	log := logger.New("test")
+	resolver := rbac.NewResolver(db, nil, log)
+	h := &Handler{db: db, log: log, resolver: resolver}
+	h.SetAuthorityHandler(rbac.NewHandler(db, log, nil, nil, resolver, nil, nil))
 	require.False(t, h.HasGraphPresenceCapture(), "precondition: the capture must be unwired")
 
 	// probedMember=false is what the probe reports for a target it could not
@@ -79,4 +83,27 @@ func TestExecBanTxOnAnUnwiredReplicaIsNotAStaleProbe(t *testing.T) {
 		`SELECT COUNT(*) FROM server_bans WHERE server_id = $1 AND user_id = $2`,
 		serverID, target).Scan(&bans))
 	require.Equal(t, 1, bans, "the ban MUST land on an unwired replica")
+}
+
+func TestExecBanTxOnAnUnwiredReplicaAllowsPreemptiveBan(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	defer cleanup()
+
+	owner := banTestUser(t, db)
+	stranger := banTestUser(t, db)
+	serverID := banTestServer(t, db, owner)
+	log := logger.New("test")
+	resolver := rbac.NewResolver(db, nil, log)
+	h := &Handler{db: db, log: log, resolver: resolver}
+	h.SetAuthorityHandler(rbac.NewHandler(db, log, nil, nil, resolver, nil, nil))
+
+	err := h.execBanTx(context.Background(), serverID.String(), stranger.String(), owner.String(), nil, false)
+	require.NoError(t, err, "an unwired preemptive ban must not be treated as a stale member probe")
+
+	var bans int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM server_bans WHERE server_id = $1 AND user_id = $2`,
+		serverID, stranger,
+	).Scan(&bans))
+	require.Equal(t, 1, bans)
 }

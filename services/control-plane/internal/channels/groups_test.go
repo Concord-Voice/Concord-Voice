@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -49,7 +50,7 @@ func createGroup(t *testing.T, ts *testhelpers.TestServer, serverID, name, token
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	group := body["channel_group"].(map[string]interface{})
+	group := testhelpers.JSONField[map[string]interface{}](t, body, "channel_group")
 	return group["id"].(string)
 }
 
@@ -82,8 +83,8 @@ func TestListChannelGroupsSuccess(t *testing.T) {
 	assert.Len(t, groups, 2)
 
 	// Should be ordered by position
-	first := groups[0].(map[string]interface{})
-	second := groups[1].(map[string]interface{})
+	first := testhelpers.JSONElem[map[string]interface{}](t, groups, 0)
+	second := testhelpers.JSONElem[map[string]interface{}](t, groups, 1)
 	assert.Equal(t, "Voice Channels", first["name"])
 	assert.Equal(t, "Text Channels", second["name"])
 }
@@ -116,7 +117,7 @@ func TestCreateChannelGroupSuccess(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	group := body["channel_group"].(map[string]interface{})
+	group := testhelpers.JSONField[map[string]interface{}](t, body, "channel_group")
 	assert.Equal(t, "New Category", group["name"])
 	assert.NotEmpty(t, group["id"])
 	assert.Equal(t, float64(0), group["position"])
@@ -135,7 +136,7 @@ func TestCreateChannelGroupAutoPosition(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	group := body["channel_group"].(map[string]interface{})
+	group := testhelpers.JSONField[map[string]interface{}](t, body, "channel_group")
 	assert.Equal(t, float64(1), group["position"])
 }
 
@@ -183,7 +184,7 @@ func TestUpdateChannelGroupName(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	group := body["channel_group"].(map[string]interface{})
+	group := testhelpers.JSONField[map[string]interface{}](t, body, "channel_group")
 	assert.Equal(t, newName, group["name"])
 }
 
@@ -199,7 +200,7 @@ func TestUpdateChannelGroupPosition(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	group := body["channel_group"].(map[string]interface{})
+	group := testhelpers.JSONField[map[string]interface{}](t, body, "channel_group")
 	assert.Equal(t, float64(5), group["position"])
 }
 
@@ -255,6 +256,19 @@ func TestDeleteChannelGroupSuccess(t *testing.T) {
 	assert.Empty(t, groups)
 }
 
+func TestDeleteChannelGroupRejectsStaleCredentialEpoch(t *testing.T) {
+	ts, user, serverID := setupWithServer(t)
+	groupID := createGroup(t, ts, serverID, "Stale epoch group", user.AccessToken)
+	staleToken := ts.SimulateStaleEpochWindow(t, user.ID)
+
+	w := ts.DoRequest("DELETE", groupPath(serverID, groupID), nil, testhelpers.AuthHeaders(staleToken))
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channel_groups WHERE id = $1`, groupID).Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
 func TestDeleteChannelGroupNotAdmin(t *testing.T) {
 	ts, user, serverID := setupWithServer(t)
 	groupID := createGroup(t, ts, serverID, "Protected", user.AccessToken)
@@ -300,6 +314,19 @@ func TestReorderChannelsSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestReorderChannelsUnknownChannelRejected(t *testing.T) {
+	ts, user, serverID := setupWithServer(t)
+
+	w := ts.DoRequest("PUT", reorderPath(serverID), map[string]interface{}{
+		"channels": []map[string]interface{}{{
+			"channel_id": uuid.NewString(),
+			"position":   0,
+		}},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 // TestReorderChannelsForeignGroupRejected covers CV-CAN-012: a bulk reorder must
 // not assign a channel to a category owned by another server.
 func TestReorderChannelsForeignGroupRejected(t *testing.T) {
@@ -320,9 +347,10 @@ func TestReorderChannelsNotAdmin(t *testing.T) {
 	ts, _, serverID := setupWithServer(t)
 	member := ts.CreateTestUser(t, "reordermember")
 	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateTestChannel(t, serverID, "reorder-not-admin")
 
 	w := ts.DoRequest("PUT", reorderPath(serverID), map[string]interface{}{
-		"channels": []map[string]interface{}{},
+		"channels": []map[string]interface{}{{"channel_id": channelID, "position": 0}},
 	}, testhelpers.AuthHeaders(member.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -335,11 +363,48 @@ func TestReorderChannelsInvalidBody(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestReorderChannelsMalformedGroupIDReturnsInvalidBody(t *testing.T) {
+	ts, user, serverID := setupWithServer(t)
+	channelID := ts.CreateTestChannel(t, serverID, "reorder-malformed-group")
+
+	w := ts.DoRequest("PUT", reorderPath(serverID), map[string]interface{}{
+		"channels": []map[string]interface{}{{
+			"channel_id": channelID,
+			"group_id":   invalidUUID,
+			"position":   0,
+		}},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.JSONEq(t, `{"error":"Invalid request body"}`, w.Body.String())
+}
+
 func TestReorderChannelsInvalidServerID(t *testing.T) {
 	ts, user, _ := setupWithServer(t)
 
 	w := ts.DoRequest("PUT", reorderPath(invalidUUID), map[string]interface{}{
 		"channels": []map[string]interface{}{},
 	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestReorderChannelsOversizedBodyRejectedBeforeMutation(t *testing.T) {
+	ts, user, serverID := setupWithServer(t)
+	channels := make([]map[string]interface{}, 501)
+	for i := range channels {
+		channels[i] = map[string]interface{}{"channel_id": uuid.NewString(), "position": i}
+	}
+
+	w := ts.DoRequest("PUT", reorderPath(serverID), map[string]interface{}{"channels": channels}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestReorderChannelsDuplicateIDsRejectedBeforeMutation(t *testing.T) {
+	ts, user, serverID := setupWithServer(t)
+	channelID := ts.CreateTestChannel(t, serverID, "duplicate-reorder")
+
+	w := ts.DoRequest("PUT", reorderPath(serverID), map[string]interface{}{"channels": []map[string]interface{}{
+		{"channel_id": channelID, "position": 0},
+		{"channel_id": channelID, "position": 1},
+	}}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }

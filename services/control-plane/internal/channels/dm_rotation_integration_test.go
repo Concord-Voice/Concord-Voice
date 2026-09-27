@@ -585,7 +585,10 @@ func TestRotateDMKey_RefusesWhenARecipientWrapIsStale(t *testing.T) {
 	ts.SeedDMKey(t, convID, user1.ID, 1)
 	ts.SeedDMKey(t, convID, user2.ID, 1)
 
-	body := dmRotationBody(2, user1.ID, user2.ID)
+	// The wrapped-key map and version map spell the same recipient differently.
+	// Without canonicalization, the stale version is missed and a revocation can
+	// commit ahead of a key the recipient can decrypt.
+	body := dmRotationBody(2, user1.ID, "{"+strings.ToUpper(user2.ID)+"}")
 	body["wrapped_key_versions"] = map[string]int{user2.ID: 0}
 	w := ts.DoRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathRotateKey, body,
 		testhelpers.AuthHeaders(user1.AccessToken))
@@ -601,6 +604,25 @@ func TestRotateDMKey_RefusesWhenARecipientWrapIsStale(t *testing.T) {
 	w = ts.DoRequest(http.MethodPost, pathE2EEKeys+convID, body, testhelpers.AuthHeaders(user1.AccessToken))
 	assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
 	assert.Equal(t, 0, dmRevocationCount(t, ts, convID))
+}
+
+func TestRotateDMKey_CanonicalizesRecipientVersionKeys(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmcanonical-1")
+	user2 := ts.CreateTestUser(t, "dmcanonical-2")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	ts.SeedDMKey(t, convID, user1.ID, 1)
+	ts.SeedDMKey(t, convID, user2.ID, 1)
+	setRecipientPublicKeyVersion(t, ts, user2.ID, 3)
+
+	body := dmRotationBody(2, user1.ID, "{"+strings.ToUpper(user2.ID)+"}")
+	body["wrapped_key_versions"] = map[string]int{user2.ID: 3}
+	w := ts.DoRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathRotateKey, body,
+		testhelpers.AuthHeaders(user1.AccessToken))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, []int{1, 2}, dmKeyVersions(t, ts, convID, user2.ID))
+	assert.Equal(t, 1, dmRevocationCount(t, ts, convID))
 }
 
 // The revoked-epoch refusal names the successor the ledger recorded, so a
@@ -761,6 +783,27 @@ func TestUnifiedDistributeDM_InitialSelfOnlyClaimIsRefused(t *testing.T) {
 		testhelpers.AuthHeaders(user1.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Equal(t, []int{1}, dmKeyVersions(t, ts, convID, user2.ID))
+}
+
+// PostgreSQL treats braced and canonical UUID spellings as the same recipient;
+// the initial-epoch fence must do likewise before deciding whether the actor
+// included its own wrap.
+func TestUnifiedDistributeDM_InitialSelfOnlyClaimRejectsRespeltActorID(t *testing.T) {
+	ts := setupTS(t)
+	peer := ts.CreateTestUser(t, "dminit-respelt-peer")
+	actor := ts.CreateTestUser(t, "dminit-respelt-actor")
+	convID := ts.CreateDMConversation(t, peer.ID, actor.ID)
+
+	w := ts.DoRequest(http.MethodPost, pathE2EEKeys+convID,
+		map[string]interface{}{"wrapped_keys": map[string]string{
+			"{" + actor.ID + "}": testhelpers.ValidCiphertext(),
+		}},
+		testhelpers.AuthHeaders(actor.AccessToken))
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "every participant")
+	assert.Empty(t, dmKeyVersions(t, ts, convID, actor.ID), "self-only claim must not establish epoch 1")
+	assert.Empty(t, dmKeyVersions(t, ts, convID, peer.ID), "omitted peer must not be stranded")
 }
 
 // TestRotateDMKey_PeerParticipantMayRotateOneToOne pins the 1:1 authority

@@ -23,3 +23,16 @@ func TestPopulateRBAcRolesReportsQueryFailure(t *testing.T) {
 	require.ErrorContains(t, err, "query member roles")
 	require.Nil(t, members[0].Roles)
 }
+
+func TestMaskOwnerRoleMasksEveryOwnerRow(t *testing.T) {
+	members := []MemberWithUser{
+		{UserID: "first-owner", Role: "owner", Roles: []MemberRoleInfo{{RoleName: "admin"}}},
+		{UserID: "second-owner", Role: "owner"},
+		{UserID: "viewer", Role: "member"},
+	}
+
+	(&Handler{}).maskOwnerRole("viewer", members)
+	require.Equal(t, "admin", members[0].Role)
+	require.Equal(t, "member", members[1].Role)
+	require.Equal(t, "member", members[2].Role)
+}

@@ -42,8 +42,11 @@ const (
 	errMsgFailedCheckMembership  = "Failed to check membership"
 	errMsgInvalidCiphertext      = "Invalid ciphertext format for E2EE channel"
 	errMsgInvalidKeyVersion      = "key_version is required and must be a positive integer"
+	errMsgMemberTimedOut         = "Member is timed out"
 	messageWriteTimeout          = 3 * time.Second
 )
+
+var errMessageDeleteGuardRejected = errors.New("message delete guard rejected")
 
 // respondGuardTxError maps a credepoch.GuardTx failure onto the wire (#2201
 // review), mirroring channels.respondKeyDistributionError: an epoch-fence
@@ -92,6 +95,14 @@ type OpsCounter interface {
 
 type epochQueryRower interface {
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+type messageChannelAuthorization struct {
+	serverID   string
+	channelID  string
+	userID     string
+	required   rbac.Permission
+	genericMsg string
 }
 
 // NewHandler creates a new message handler. purgeEngine backs the bulk-purge
@@ -367,8 +378,8 @@ func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.M
 func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cutoff *time.Time) ([]models.MessageWithUser, error) {
 	query := `
 		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
-			   m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
-			   m.type, m.expiration_event_payload,
+		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
+		       m.type, m.expiration_event_payload,
 		       u.username, u.display_name, u.avatar_url
 		FROM messages m
 		INNER JOIN users u ON m.user_id = u.id
@@ -403,8 +414,8 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 	messages := []models.MessageWithUser{}
 	for rows.Next() {
 		var msg models.MessageWithUser
-		// Scanned via []byte, not json.RawMessage, so a SQL NULL (every ordinary
-		// message) lands as nil rather than erroring on the conversion.
+		// Scan through []byte so a NULL payload from ordinary messages remains
+		// nil rather than failing conversion to json.RawMessage.
 		var expirationEventRaw []byte
 		scanErr := rows.Scan(
 			&msg.ID,
@@ -532,7 +543,7 @@ func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (str
 	}
 	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
 		c.JSON(http.StatusForbidden, gin.H{
-			"error":           "Member is timed out",
+			"error":           errMsgMemberTimedOut,
 			"code":            "member_timed_out",
 			"timed_out_until": timedOutUntil.Time,
 		})
@@ -636,10 +647,81 @@ func (h *Handler) lockMessageMembership(ctx context.Context, c *gin.Context, tx 
 	}
 	if timedOut {
 		c.JSON(http.StatusForbidden, gin.H{
-			"error":           "Member is timed out",
+			"error":           errMsgMemberTimedOut,
 			"code":            "member_timed_out",
 			"timed_out_until": timedOutUntil.Time,
 		})
+		return false
+	}
+	return true
+}
+
+// lockMessageChannelTx takes the channel parent lock before membership. This
+// is the authority-writer order; callers then lock the exact member row and
+// call authorizeMessageChannelTx with the type captured by this lock under the
+// same transaction.
+func (h *Handler) lockMessageChannelTx(
+	ctx context.Context, c *gin.Context, tx *sql.Tx, authorization messageChannelAuthorization,
+) (string, bool) {
+	var lockedChannelID, channelType string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id, type FROM channels WHERE id = $1 AND server_id = $2 FOR SHARE`, authorization.channelID, authorization.serverID,
+	).Scan(&lockedChannelID, &channelType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+			return "", false
+		}
+		h.log.Error("Failed to lock message channel", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": authorization.genericMsg})
+		return "", false
+	}
+	return channelType, true
+}
+
+func (h *Handler) authorizeMessageChannelTx(
+	ctx context.Context, c *gin.Context, tx *sql.Tx, authorization messageChannelAuthorization, channelType string,
+) bool {
+	perms, err := h.resolver.ResolveChannelPermissionsTx(ctx, tx, authorization.serverID, authorization.userID, authorization.channelID)
+	if err != nil {
+		if errors.Is(err, rbac.ErrNotMember) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+			return false
+		}
+		h.log.Error("Failed to resolve message permissions", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": authorization.genericMsg})
+		return false
+	}
+	hasRequired := perms.Has(authorization.required)
+	// Moderators may delete their own messages through ManageAll even when a
+	// custom role removed ManageOwn; the preflight has always allowed that.
+	if authorization.required == rbac.PermManageOwnMessages {
+		hasRequired = hasRequired || perms.Has(rbac.PermManageAllMessages)
+	}
+	viewPerm, viewable := channelViewPermission(channelType)
+	if !viewable || !perms.Has(viewPerm) || !hasRequired {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermsLower})
+		return false
+	}
+	return true
+}
+
+func (h *Handler) lockCurrentMessageMembership(ctx context.Context, c *gin.Context, tx *sql.Tx, serverID, userID, genericMsg string) bool {
+	var timedOutUntil sql.NullTime
+	var timedOut bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT timed_out_until, timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
+		 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, serverID, userID,
+	).Scan(&timedOutUntil, &timedOut); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+			return false
+		}
+		h.log.Error("Failed to lock message membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
+		return false
+	}
+	if timedOut {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgMemberTimedOut, "code": "member_timed_out", "timed_out_until": timedOutUntil.Time})
 		return false
 	}
 	return true
@@ -725,35 +807,44 @@ func (h *Handler) persistMessage(c *gin.Context, serverID string, membershipInca
 			h.log.Error("Failed to rollback message tx", "error", rbErr)
 		}
 	}()
+	// Serialize the message write with member removal. The preflight's immutable
+	// joined_at value prevents a kicked sender from writing through a same-key rejoin.
 	if guardErr := credepoch.GuardTx(ctx, tx, message.UserID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondGuardTxError(c, guardErr, errMsgFailedSendMessage)
+		return
+	}
+	authorization := messageChannelAuthorization{
+		serverID: serverID, channelID: message.ChannelID, userID: message.UserID,
+		required: rbac.PermSendMessages, genericMsg: errMsgFailedSendMessage,
+	}
+	channelType, locked := h.lockMessageChannelTx(ctx, c, tx, authorization)
+	if !locked {
 		return
 	}
 	var windowSeconds sql.NullInt64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT expiration_window_seconds FROM channels WHERE id = $1 FOR SHARE`, message.ChannelID,
 	).Scan(&windowSeconds); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-			return
-		}
-		h.log.Error("Failed to lock message channel", "error", err)
+		h.log.Error("Failed to read message expiration policy", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
 		return
 	}
-	// Serialize the message write with member removal. The preflight's immutable
-	// joined_at value prevents a kicked sender from writing through a same-key rejoin.
 	if !h.lockMessageMembership(ctx, c, tx, serverID, message.UserID, membershipIncarnation) {
 		return
 	}
-
-	var window any
-	if windowSeconds.Valid {
-		window = windowSeconds.Int64
+	if !h.authorizeMessageChannelTx(ctx, c, tx, authorization, channelType) {
+		return
 	}
+	// The initial epoch preflight can race a committed rotation while this
+	// transaction waits for the channel parent. Re-read the ledger after that
+	// lock, immediately before writing ciphertext.
+	if !h.enforceChannelEpoch(c, tx, message.ChannelID, message.KeyVersion) {
+		return
+	}
+
 	err := tx.QueryRowContext(ctx, insertQuery,
 		message.ID, message.ChannelID, message.UserID, message.Content, message.KeyVersion,
-		message.EmbedsSuppressed, message.ReplyToID, message.GifSlug, window,
+		message.EmbedsSuppressed, message.ReplyToID, message.GifSlug, windowSeconds,
 	).Scan(&message.CreatedAt, &message.UpdatedAt, &message.ExpiresAt)
 	if err != nil {
 		if isFKViolation(err) {
@@ -822,7 +913,7 @@ func (h *Handler) authorizeMessageUpdate(c *gin.Context, messageID, userID strin
 // On failure it writes the HTTP response and returns false.
 func (h *Handler) updateMessageCiphertext(
 	c *gin.Context,
-	messageID, channelID, userID string,
+	messageID, _, userID string,
 	req UpdateMessageRequest,
 ) (models.Message, bool) {
 	// Serialize the ledger check and edit against every revocation insert.
@@ -839,21 +930,28 @@ func (h *Handler) updateMessageCiphertext(
 		}
 	}()
 
-	// #2201: recheck the editor's credential epoch inside the edit transaction
-	// (users row FIRST, before the channel lock — the same users-first order
-	// every guarded write uses) so an edit admitted before a destructive key
-	// reset cannot commit ciphertext after it.
-	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
-		h.respondGuardTxError(c, guardErr, errMsgFailedUpdateMessage)
+	// The shared fence takes the users row (credential guard) before the channel
+	// parent, matching membership removal and preventing the user↔channel
+	// deadlock cycle.
+	lockedChannelID, _, _, authorized := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermManageOwnMessages, errMsgFailedUpdateMessage)
+	if !authorized {
 		return models.Message{}, false
 	}
-
-	var lockedChannelID string
+	channelID := lockedChannelID
+	var authorID string
 	if err = tx.QueryRowContext(c.Request.Context(),
-		`SELECT id FROM channels WHERE id = $1 FOR NO KEY UPDATE`, channelID,
-	).Scan(&lockedChannelID); err != nil {
-		h.log.Error("Failed to lock channel epoch", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		`SELECT user_id FROM messages WHERE id = $1 AND channel_id = $2 FOR SHARE`, messageID, channelID,
+	).Scan(&authorID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		} else {
+			h.log.Error("Failed to lock message update", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		}
+		return models.Message{}, false
+	}
+	if authorID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
 		return models.Message{}, false
 	}
 	if !h.enforceChannelEpoch(c, tx, channelID, req.KeyVersion) {
@@ -979,65 +1077,55 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	// Check if message exists and get author + server info + channel ID
-	var authorID, channelID, serverID string
-	checkQuery := `
-		SELECT m.user_id, m.channel_id, c.server_id
-		FROM messages m
-		INNER JOIN channels c ON m.channel_id = c.id
-		WHERE m.id = $1
-	`
-
-	err := h.db.QueryRow(checkQuery, messageID).Scan(&authorID, &channelID, &serverID)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to check message permissions", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+	preflight, authorized := h.preflightMessageDelete(c, messageID, userID)
+	if !authorized {
 		return
 	}
-
-	// Author can edit/delete own messages (if they have PermManageOwnMessages).
-	// Others need PermManageAllMessages to delete other people's messages or suppress embeds.
-	canDelete := false
-	if authorID == userID {
-		has, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermManageOwnMessages)
-		if permErr != nil {
-			h.log.Error("Failed to check PermManageOwnMessages", "error", permErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPerms})
-			return
-		}
-		canDelete = has
-	}
-	if !canDelete {
-		has, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermManageAllMessages)
-		if permErr != nil {
-			h.log.Error("Failed to check PermManageAllMessages", "error", permErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPerms})
-			return
-		}
-		canDelete = has
-	}
-
-	if !canDelete {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermsLower})
-		return
-	}
-
+	authorID, channelID, serverID := preflight.authorID, preflight.channelID, preflight.serverID
 	if h.purgeEngine == nil {
 		h.log.Error(errMsgFailedDeleteMessage, "error", "purge engine unavailable")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
 
-	// Delete message and retire any final-reference attachments atomically.
-	err = h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
+	responseWritten := false
+	// Re-authorize in the purge transaction so role/member changes cannot turn
+	// the cache-backed preflight above into a stale privileged delete.
+	err := h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
 		MessagesTable:    "messages",
 		ScopeColumn:      "channel_id",
 		ScopeID:          channelID,
 		AttachmentsTable: "message_attachments",
+		Guard: func(ctx context.Context, tx *sql.Tx) error {
+			lockedChannelID, lockedServerID, channelType, allowed := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermManageOwnMessages, errMsgFailedDeleteMessage)
+			if !allowed {
+				responseWritten = true
+				return errMessageDeleteGuardRejected
+			}
+			channelID, serverID = lockedChannelID, lockedServerID
+			if err := tx.QueryRowContext(ctx, `SELECT user_id FROM messages WHERE id = $1 AND channel_id = $2 FOR SHARE`, messageID, channelID).Scan(&authorID); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+				} else {
+					h.log.Error("Failed to lock message delete", "error", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+				}
+				responseWritten = true
+				return errMessageDeleteGuardRejected
+			}
+			if authorID != userID && !h.authorizeMessageChannelTx(ctx, c, tx, messageChannelAuthorization{
+				serverID: serverID, channelID: channelID, userID: userID,
+				required: rbac.PermManageAllMessages, genericMsg: errMsgFailedDeleteMessage,
+			}, channelType) {
+				responseWritten = true
+				return errMessageDeleteGuardRejected
+			}
+			return nil
+		},
 	})
+	if responseWritten {
+		return
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return
@@ -1063,6 +1151,59 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Message deleted successfully"})
+}
+
+type messageDeletePreflight struct {
+	authorID  string
+	channelID string
+	serverID  string
+}
+
+func (h *Handler) preflightMessageDelete(c *gin.Context, messageID, userID string) (messageDeletePreflight, bool) {
+	checkQuery := `
+		SELECT m.user_id, m.channel_id, c.server_id
+		FROM messages m
+		INNER JOIN channels c ON m.channel_id = c.id
+		WHERE m.id = $1
+	`
+	var preflight messageDeletePreflight
+	err := h.db.QueryRow(checkQuery, messageID).Scan(&preflight.authorID, &preflight.channelID, &preflight.serverID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return messageDeletePreflight{}, false
+	} else if err != nil {
+		h.log.Error("Failed to check message permissions", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return messageDeletePreflight{}, false
+	}
+
+	// Author can edit/delete own messages (if they have PermManageOwnMessages).
+	// Others need PermManageAllMessages to delete other people's messages or suppress embeds.
+	canDelete := false
+	if preflight.authorID == userID {
+		has, permErr := h.resolver.HasPermission(c.Request.Context(), preflight.serverID, userID, preflight.channelID, rbac.PermManageOwnMessages)
+		if permErr != nil {
+			h.log.Error("Failed to check PermManageOwnMessages", "error", permErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPerms})
+			return messageDeletePreflight{}, false
+		}
+		canDelete = has
+	}
+	if !canDelete {
+		has, permErr := h.resolver.HasPermission(c.Request.Context(), preflight.serverID, userID, preflight.channelID, rbac.PermManageAllMessages)
+		if permErr != nil {
+			h.log.Error("Failed to check PermManageAllMessages", "error", permErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPerms})
+			return messageDeletePreflight{}, false
+		}
+		canDelete = has
+	}
+
+	if !canDelete {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermsLower})
+		return messageDeletePreflight{}, false
+	}
+	return preflight, true
 }
 
 // SuppressEmbeds suppresses embedded content on a message (one-way ratchet).
@@ -1112,9 +1253,26 @@ func (h *Handler) SuppressEmbeds(c *gin.Context) {
 		return
 	}
 
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin embed suppression", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSuppressEmbeds})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("Failed to rollback embed suppression", "error", rbErr)
+		}
+	}()
+	lockedChannelID, _, _, authorized := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermManageAllMessages, errMsgFailedSuppressEmbeds)
+	if !authorized {
+		return
+	}
+	channelID = lockedChannelID
 	// One-way ratchet: suppress only (false → true). The row count, not a
 	// prior read, decides whether this request changed anything.
-	res, err := h.db.ExecContext(ctx,
+	res, err := tx.ExecContext(
+		c.Request.Context(),
 		`UPDATE messages SET embeds_suppressed = TRUE, updated_at = NOW() WHERE id = $1 AND embeds_suppressed = FALSE`,
 		messageID,
 	)
@@ -1126,6 +1284,11 @@ func (h *Handler) SuppressEmbeds(c *gin.Context) {
 	n, err := res.RowsAffected()
 	if err != nil {
 		h.log.Error("Failed to read suppress-embeds row count", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSuppressEmbeds})
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit embed suppression", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSuppressEmbeds})
 		return
 	}

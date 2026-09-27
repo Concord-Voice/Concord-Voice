@@ -17,6 +17,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
@@ -423,6 +424,105 @@ func TestUpdateChannelSuccess(t *testing.T) {
 	assert.Equal(t, "renamed-channel", channel["name"])
 }
 
+// A text-to-voice transition changes the channel's VIEW permission. The
+// transition must use the same authority fence as an RBAC mutation so a
+// member who loses voice VIEW cannot retain either durable key material or a
+// pending request captured before the type change.
+func TestUpdateChannel_TextToVoicePurgesDeniedDurableKeyState(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "text-to-voice-denied")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	var everyoneRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&everyoneRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", everyoneRoleID, 0, int64(rbac.PermViewVoiceChannels))
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
+		VALUES ($1, $2, $3, 1)`, channelID, member.ID, testhelpers.ValidCiphertext())
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, member.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID))
+	require.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID))
+
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
+		"name": "secret-channel", "type": "voice",
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID))
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID))
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID),
+		"a text-to-voice authority change must fence the old epoch exactly once")
+}
+
+// A request can preflight a text channel, then wait behind a committed
+// text-to-voice change. Its final text write must re-enter the authority path
+// and revoke a voice-only recipient's key instead of silently writing text.
+func TestUpdateChannel_ReconcilesTypeChangeAfterPreflight(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	voiceOnly := ts.CreateTestUser(t, "update-type-race-voice-only")
+	ts.AddMemberToServer(t, serverID, voiceOnly.ID, roleMember)
+	ts.CreateChannelOverride(t, channelID, "user", voiceOnly.ID,
+		int64(rbac.PermViewVoiceChannels), int64(rbac.PermViewTextChannels))
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	barrier, probe := holdGroupMutationVisibility(t, ts, serverID)
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest(http.MethodPatch, pathChannelsPrefix+channelID, map[string]interface{}{
+			"name": "reconciled-type-race", "type": "text",
+		}, testhelpers.AuthHeaders(owner.AccessToken))
+	}()
+	dbtest.WaitForAdvisoryLockWaiter(t, probe, mustGroupVisibilityKey(t, serverID))
+
+	_, err := barrier.Exec(`UPDATE channels SET type = 'voice' WHERE id = $1`, channelID)
+	require.NoError(t, err)
+	_, err = barrier.Exec(`
+		INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
+		VALUES ($1, $2, $3, 1)`, channelID, voiceOnly.ID, testhelpers.ValidCiphertext())
+	require.NoError(t, err)
+	_, err = barrier.Exec(`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, voiceOnly.ID)
+	require.NoError(t, err)
+	require.NoError(t, barrier.Commit())
+
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel update did not complete after visibility barrier released")
+	}
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 1, rowCount(t, ts, `SELECT COUNT(*) FROM channels WHERE id = $1 AND type = 'text'`, channelID))
+	assert.Equal(t, 0, rowCount(t, ts, `SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, voiceOnly.ID))
+	assert.Equal(t, 0, rowCount(t, ts, `SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, voiceOnly.ID))
+	assert.Equal(t, 1, rowCount(t, ts, `SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID))
+}
+
+func TestUpdateChannelInvalidID(t *testing.T) {
+	ts, user, _, _ := setupWithChannel(t)
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+"not-a-uuid", map[string]interface{}{
+		"name": "renamed", "type": "text",
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestUpdateChannelNotFound(t *testing.T) {
+	ts, user, _, _ := setupWithChannel(t)
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+uuid.NewString(), map[string]interface{}{
+		"name": "renamed", "type": "text",
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
 // --- Delete Channel ---
 
 func TestDeleteChannelAsOwner(t *testing.T) {
@@ -442,6 +542,18 @@ func TestDeleteChannelNotAdmin(t *testing.T) {
 
 	w := ts.DoRequest("DELETE", pathChannelsPrefix+channelID, nil, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestDeleteChannelInvalidID(t *testing.T) {
+	ts, user, _, _ := setupWithChannel(t)
+	w := ts.DoRequest("DELETE", pathChannelsPrefix+"not-a-uuid", nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestDeleteChannelNotFound(t *testing.T) {
+	ts, user, _, _ := setupWithChannel(t)
+	w := ts.DoRequest("DELETE", pathChannelsPrefix+uuid.NewString(), nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
 // --- Mark Read ---
@@ -584,6 +696,38 @@ func TestGetChannelKeys_HiddenChannelDeniedToMember(t *testing.T) {
 
 	w := ts.DoRequest("GET", pathChannelsPrefix+channelID+pathKeys, nil, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code, "view-denied member must not fetch channel keys")
+}
+
+func TestGetChannelKeys_VoiceStalePermissionCacheCannotRestoreRevokedTempGrant(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "stale_key_owner")
+	member := ts.CreateTestUser(t, "stale_key_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Stale Voice Key Cache")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-stale-key-cache")
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+	_, err := ts.DB.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`, channelID, member.ID, testhelpers.ValidCiphertext())
+	require.NoError(t, err)
+	// Model the durable temporary override's lifecycle: it existed, then was
+	// committed away. Redis is deliberately repopulated with the old allow below.
+	_, err = ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason)
+		VALUES ($1, 'user', $2, $3, 0, true, 'move_granted')
+		ON CONFLICT (channel_id, target_type, target_id) DO UPDATE
+		SET allow = EXCLUDED.allow, deny = 0, is_temporary = true,
+			temporary_reason = EXCLUDED.temporary_reason`,
+		channelID, member.ID, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice))
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`DELETE FROM channel_permission_overrides WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2 AND is_temporary`, channelID, member.ID)
+	require.NoError(t, err)
+	testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, channelID,
+		rbac.PermViewVoiceChannels|rbac.PermJoinVoice)
+
+	w := ts.DoRequest("GET", pathChannelsPrefix+channelID+pathKeys, nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "stale Redis allow must not authorize a voice-channel key fetch")
 }
 
 // TestDistributeChannelKeys_SkipsNoViewTarget covers CV-CAN-005: key distribution

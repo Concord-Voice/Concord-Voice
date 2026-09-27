@@ -193,7 +193,7 @@ func (r *Reconciler) Complete(
 		// so we disconnect whatever the capture held rather than assume either
 		// outcome.
 		r.Abandon(p, presencecapture.CauseCommitUnresolved)
-		return fmt.Errorf("commit graph mutation: %w", err)
+		return fmt.Errorf("%w: commit graph mutation: %w", presencecapture.ErrCommitUnresolved, err)
 	}
 	r.enqueue(p)
 	return nil

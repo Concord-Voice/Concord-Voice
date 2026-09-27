@@ -103,6 +103,52 @@ func TestPurgeChannel_PermissionResolutionHonorsSynchronousTimeout(t *testing.T)
 		`LOCK TABLE server_members IN ACCESS EXCLUSIVE MODE`, http.StatusInternalServerError)
 }
 
+func TestPurgeChannel_TimedOutManageOwnMemberRejectedAtBatchGuard(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "purge_timeout_guard_owner")
+	member := ts.CreateTestUser(t, "purge_timeout_guard_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "purge-timeout-guard-server")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.CreateTestMessage(t, channelID, owner, "must survive")
+	ts.CreateTestMessage(t, channelID, member, "timed out author")
+	_, err := ts.DB.Exec(`
+		UPDATE server_members SET timed_out_until = clock_timestamp() + interval '10 minutes'
+		WHERE server_id = $1 AND user_id = $2`, serverID, member.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(http.MethodDelete, purgeChannelPath(channelID),
+		map[string]any{"range": "all"}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	var response map[string]any
+	testhelpers.ParseJSON(t, w, &response)
+	assert.Equal(t, "member_timed_out", response["code"])
+	assert.Equal(t, 2, countChannelMessages(t, ts, channelID), "timed-out actor must not commit a purge batch")
+}
+
+func TestPurgeServer_TimedOutManageOwnMemberRejectedAtBatchGuard(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "server_purge_timeout_owner")
+	member := ts.CreateTestUser(t, "server_purge_timeout_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "server-purge-timeout-guard")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.CreateTestMessage(t, channelID, owner, "must survive")
+	ts.CreateTestMessage(t, channelID, member, "timed out author")
+	_, err := ts.DB.Exec(`
+		UPDATE server_members SET timed_out_until = clock_timestamp() + interval '10 minutes'
+		WHERE server_id = $1 AND user_id = $2`, serverID, member.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+		map[string]any{"range": "all"}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	var response map[string]any
+	testhelpers.ParseJSON(t, w, &response)
+	assert.Equal(t, "member_timed_out", response["code"])
+	assert.Equal(t, 2, countChannelMessages(t, ts, channelID), "timed-out actor must not commit a purge batch")
+}
+
 func assertPurgeChannelPreflightTimeout(t *testing.T, preflight, lockQuery string, wantStatus int) {
 	t.Helper()
 	ts := testhelpers.SetupTestServer(t)

@@ -553,6 +553,15 @@ func TestUpdateMessage_SerializesWithConcurrentRevocation(t *testing.T) {
 	revocationTx, err := ts.DB.Begin()
 	require.NoError(t, err)
 	defer func() { _ = revocationTx.Rollback() }()
+	// The real revocation path locks the channel FOR UPDATE before it records
+	// its ledger row. An INSERT alone holds only the FK key-share lock, which
+	// deliberately does not serialize with a message reader's FOR SHARE lock.
+	// Model the production authority fence so this test observes the actual
+	// writer/revoker contract rather than an unrelated FK implementation detail.
+	var lockedChannel string
+	require.NoError(t, revocationTx.QueryRow(
+		`SELECT id FROM channels WHERE id = $1 FOR UPDATE`, channelID,
+	).Scan(&lockedChannel))
 	_, err = revocationTx.Exec(
 		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
 		 VALUES ($1, 2, 3, 'concurrent test', $2)`,
@@ -575,10 +584,10 @@ func TestUpdateMessage_SerializesWithConcurrentRevocation(t *testing.T) {
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%SELECT id FROM channels WHERE id = $1 FOR NO KEY UPDATE%'
+			  AND query LIKE '%FROM channels WHERE id = $1 AND server_id = $2 FOR SHARE%'
 		)`).Scan(&waiting)
 		return queryErr == nil && waiting
-	}, time.Second, 10*time.Millisecond, "edit should wait on the channel epoch lock")
+	}, time.Second, 10*time.Millisecond, "edit should wait on the production channel epoch lock")
 
 	require.NoError(t, revocationTx.Commit())
 	select {
@@ -882,9 +891,9 @@ func TestSendMessage_MembershipLockWriterFirstIsPurgedAfterRemoval(t *testing.T)
 
 	// The removal must be parked behind the in-flight writer. WHICH statement it
 	// parks on moved in #2447: the removal path now captures presence inside its
-	// transaction, and the canonical lock order takes the users row FIRST, before
+	// transaction, and the canonical lock order takes the users rows FIRST, before
 	// the domain parent and before the mutation write. So the removal blocks on
-	// `SELECT id FROM users ... FOR NO KEY UPDATE` and never reaches
+	// `SELECT id FROM users WHERE id IN (...) ... FOR NO KEY UPDATE` and never reaches
 	// `DELETE FROM server_members` while the writer holds its locks.
 	//
 	// Accepting either statement keeps the assertion honest rather than weakening
@@ -900,7 +909,7 @@ func TestSendMessage_MembershipLockWriterFirstIsPurgedAfterRemoval(t *testing.T)
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
 			  AND (query LIKE '%DELETE FROM server_members%'
-			       OR query LIKE '%SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE%')
+			       OR query LIKE '%SELECT id FROM users%FOR NO KEY UPDATE%')
 		)`).Scan(&waiting)
 		return queryErr == nil && waiting
 	}, time.Second, 10*time.Millisecond, "removal should wait on the writer's membership lock")
@@ -955,6 +964,28 @@ func TestDeleteMessageAlreadyDeleted(t *testing.T) {
 	// Delete again — should be not found
 	w = ts.DoRequest("DELETE", pathAPIMsgSlash+msgID, nil, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestDeleteMessage_ManageAllAllowsOwnDeleteWithoutManageOwn(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "delmsgownowner")
+	author := ts.CreateTestUser(t, "delmsgownauthor")
+	other := ts.CreateTestUser(t, "delmsgownother")
+	serverID := ts.CreateTestServer(t, owner.ID, "Manage All Only Server")
+	channelID := ts.CreateTestChannel(t, serverID, "manage-all-only")
+	ts.AddMemberToServer(t, serverID, author.ID, "member")
+	ts.AddMemberToServer(t, serverID, other.ID, "member")
+	roleID := ts.CreateTestRole(t, serverID, "manage-all-only", 1, int64(rbac.PermManageAllMessages))
+	ts.AssignRoleToUser(t, serverID, author.ID, roleID)
+	msgID := ts.CreateTestMessage(t, channelID, author, testhelpers.ValidCiphertext())
+	ts.CreateChannelOverride(t, channelID, "user", author.ID, 0, int64(rbac.PermManageOwnMessages))
+
+	w := ts.DoRequest("DELETE", pathAPIMsgSlash+msgID, nil, testhelpers.AuthHeaders(author.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code, "ManageAll must authorize the author path even when ManageOwn is denied")
+
+	otherMessageID := ts.CreateTestMessage(t, channelID, owner, testhelpers.ValidCiphertext())
+	w = ts.DoRequest("DELETE", pathAPIMsgSlash+otherMessageID, nil, testhelpers.AuthHeaders(other.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "deleting another user's message requires ManageAll")
 }
 
 func TestDeleteMessageVerifyGone(t *testing.T) {

@@ -49,8 +49,12 @@ func TestWithOwnershipCapture_CaptureFailureRollsBackBeforeWrite(t *testing.T) {
 	h := &Handler{db: db, log: logger.New("ownership-test")}
 	h.SetPresenceRecheck(recheck)
 	writeCalled := false
+	ownerID := dbtest.CreateUser(t, db)
+	serverID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'capture failure server', $2)`, serverID, ownerID)
+	require.NoError(t, err)
 
-	_, changed, err := h.withOwnershipCapture(context.Background(), uuid.NewString(), func(context.Context, *sql.Tx) (bool, error) {
+	_, changed, err := h.withOwnershipCapture(context.Background(), serverID, func(context.Context, *sql.Tx) (bool, error) {
 		writeCalled = true
 		return true, nil
 	})
@@ -66,13 +70,14 @@ func TestCompleteExpiredTransfer_ZeroRowIsNoOp(t *testing.T) {
 	db, cleanup := dbtest.SetupTestDB(t)
 	defer cleanup()
 	ownerID := dbtest.CreateUser(t, db)
+	targetID := dbtest.CreateUser(t, db)
 	serverID := uuid.NewString()
 	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'capture test server', $2)`, serverID, ownerID)
 	require.NoError(t, err)
 	recheck := &ownershipCaptureFailureRecheck{}
 	h := &Handler{db: db, log: logger.New("ownership-test"), presenceRecheck: recheck}
 	changed, err := h.completeExpiredTransfer(context.Background(), expiredTransfer{
-		id: uuid.NewString(), serverID: serverID, fromUserID: ownerID.String(), toUserID: uuid.NewString(),
+		id: uuid.NewString(), serverID: serverID, fromUserID: ownerID.String(), toUserID: targetID.String(),
 	})
 	require.NoError(t, err)
 	require.False(t, changed)

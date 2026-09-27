@@ -58,6 +58,31 @@ func TestChannelMessageExpirationREST_StampAndHistory(t *testing.T) {
 	assert.Equal(t, expires, testhelpers.JSONField[string](t, first, "expires_at"))
 }
 
+func TestChannelMessageHistoryReturnsExpirationEventPayload(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "expirationeventhistory")
+	serverID := ts.CreateTestServer(t, user.ID, "Expiration Event History Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	payload := `{"kind":"set","window_seconds":3600,"revision":1}`
+	_, err := ts.DB.Exec(`
+		INSERT INTO messages (id, channel_id, user_id, content, type, expiration_event_payload, created_at, updated_at)
+		VALUES (gen_random_uuid(), $1, $2, '', 'expiration_event', $3::jsonb, NOW(), NOW())`,
+		channelID, user.ID, payload)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(http.MethodGet, "/api/v1/channels/"+channelID+"/messages", nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	entries := testhelpers.JSONField[[]interface{}](t, body, "messages")
+	require.Len(t, entries, 1)
+	event := testhelpers.JSONAs[map[string]interface{}](t, entries[0], "expiration history row")
+	assert.Equal(t, "expiration_event", testhelpers.JSONField[string](t, event, "type"))
+	returnedPayload := testhelpers.JSONField[map[string]interface{}](t, event, "expiration_event_payload")
+	assert.Equal(t, "set", testhelpers.JSONField[string](t, returnedPayload, "kind"))
+	assert.Equal(t, float64(3600), testhelpers.JSONField[float64](t, returnedPayload, "window_seconds"))
+}
+
 func TestChannelMessageExpirationREST_InvalidAndUnauthorized(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "messageexpirationerrors")

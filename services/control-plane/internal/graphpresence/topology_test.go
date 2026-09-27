@@ -1542,6 +1542,8 @@ func TestUnprovenCommitIsNotAPostCommitSentinel(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, presencecapture.ErrPostCommitDelivery),
 		"an unproven commit must not be reported as a durable mutation")
+	assert.True(t, errors.Is(err, presencecapture.ErrCommitUnresolved),
+		"callers must preserve the acknowledgement-lost branch for fail-closed recovery")
 }
 
 func TestSuccessfulCompletionIsNil(t *testing.T) {

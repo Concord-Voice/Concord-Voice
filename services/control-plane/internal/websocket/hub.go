@@ -4784,6 +4784,9 @@ func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) (admitted bool) 
 			}
 		}()
 	}
+	if msg.PruneOnly {
+		return true
+	}
 
 	data, err := json.Marshal(msg.Data)
 	if err != nil {
@@ -5014,6 +5017,25 @@ func (h *Hub) BroadcastToServerAndPrune(serverID uuid.UUID, msg OutgoingMessage,
 		// draining evictBroadcast at any time, so another drain is not guaranteed.
 		// Every client connection is closed on shutdown anyway, so no fanout can
 		// leak; bail rather than hang the caller.
+	}
+}
+
+// PruneServerSubscriber removes user's clients from serverID's subscription set
+// through the same priority queue as BroadcastToServerAndPrune, but does not
+// publish an event. Use it when a deauthorization write may have committed but
+// its acknowledgement was lost: fail closed against fanout without asserting a
+// removal to clients.
+func (h *Hub) PruneServerSubscriber(serverID, userID uuid.UUID) {
+	uid := userID
+	sbm := ServerBroadcastMessage{ServerID: serverID, PruneUserAfter: &uid, PruneOnly: true}
+	select {
+	case h.evictBroadcast <- sbm:
+		return
+	default:
+	}
+	select {
+	case h.evictBroadcast <- sbm:
+	case <-h.done:
 	}
 }
 

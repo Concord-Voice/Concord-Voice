@@ -11,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -18,9 +20,23 @@ import (
 
 const errMsgPurgeFailed = "Purge failed"
 
+var errPurgeMemberTimedOut = errors.New("purge actor is timed out")
+
 type channelScope struct {
 	id          string
 	channelType string
+}
+
+// serverPurgeRequest keeps the shared HTTP and moderation purge inputs paired.
+// The credential epoch remains optional because internal moderation has no bearer token.
+type serverPurgeRequest struct {
+	serverID        string
+	actorID         string
+	target          *string
+	reason          string
+	rangeFrom       *time.Time
+	rangeLabel      string
+	credentialEpoch *string
 }
 
 // purgeRequest is the shared body for the channel and server purge endpoints (#1352).
@@ -86,14 +102,40 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 			AttachmentsTable: "message_attachments",
 			Author:           author,
 		}},
+		Guard: func(ctx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
+			if ds.ScopeID != channelID || (ds.Author == nil) != (author == nil) || (ds.Author != nil && *ds.Author != *author) {
+				return errors.New("unexpected channel purge batch scope")
+			}
+			if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+				return err
+			}
+			var lockedServerID, lockedType string
+			if err := tx.QueryRowContext(ctx, `SELECT server_id, type FROM channels WHERE id = $1 FOR SHARE`, channelID).Scan(&lockedServerID, &lockedType); err != nil {
+				return err
+			}
+			var timedOut bool
+			if err := tx.QueryRowContext(ctx, `
+				SELECT timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
+				FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, lockedServerID, userID,
+			).Scan(&timedOut); err != nil {
+				return err
+			}
+			if timedOut {
+				return errPurgeMemberTimedOut
+			}
+			perms, err := h.resolver.ResolveChannelPermissionsTx(ctx, tx, lockedServerID, userID, channelID)
+			if err != nil {
+				return err
+			}
+			freshAuthor, allowed := purgeAuthorForPermissions(perms, userID, lockedType, req.TargetUserID)
+			if !allowed || (freshAuthor == nil) != (author == nil) || (freshAuthor != nil && *freshAuthor != *author) {
+				return errors.New("channel purge authority changed")
+			}
+			return nil
+		},
 	}
 	res, err := h.purgeEngine.Run(purgeCtx, plan)
-	if err != nil {
-		h.log.Error("Channel purge failed", "error", err, "channel_id", channelID)
-		if res.DeletedCount > 0 {
-			h.emitChannelPurged(channelID, userID, res.DeletedCount, req.Range)
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+	if h.respondChannelPurgeFailure(c, err, channelID, userID, req.Range, res) {
 		return
 	}
 
@@ -102,6 +144,28 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 	// hidden_count is structurally 0 for server contexts — returned so the response
 	// shape matches spec §4 { deleted_count, hidden_count } across ALL contexts.
 	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": 0})
+}
+
+// respondChannelPurgeFailure emits the required invalidation for a partially
+// completed purge and writes its HTTP failure response.
+func (h *Handler) respondChannelPurgeFailure(c *gin.Context, err error, channelID, userID, rangeLabel string, res purge.Result) bool {
+	if err == nil {
+		return false
+	}
+	h.log.Error("Channel purge failed", "error", err, "channel_id", channelID)
+	if res.DeletedCount > 0 {
+		h.emitChannelPurged(channelID, userID, res.DeletedCount, rangeLabel)
+	}
+	if res.DeletedCount == 0 && errors.Is(err, errPurgeMemberTimedOut) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Member is timed out", "code": "member_timed_out"})
+		return true
+	}
+	if res.DeletedCount == 0 && (errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked)) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return true
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+	return true
 }
 
 // PurgeStatus is the outcome of a server-scoped purge for one actor.
@@ -129,12 +193,22 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), purge.SynchronousRunTimeout)
 	defer cancel()
 
-	deleted, status, err := h.purgeServerCore(
-		purgeCtx, serverID, userID, req.TargetUserID, "manual", rangeFrom, req.Range)
+	deleted, status, err := h.purgeServerCore(purgeCtx, serverPurgeRequest{
+		serverID: serverID, actorID: userID, target: req.TargetUserID, reason: "manual",
+		rangeFrom: rangeFrom, rangeLabel: req.Range, credentialEpoch: ptr(middleware.TokenCredentialEpoch(c)),
+	})
 	switch status {
 	case PurgeSkippedUnauthorized:
 		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this server"})
 	case PurgeFailed:
+		if deleted == 0 && errors.Is(err, errPurgeMemberTimedOut) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Member is timed out", "code": "member_timed_out"})
+			return
+		}
+		if deleted == 0 && (errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked)) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			return
+		}
 		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
 	default:
@@ -157,13 +231,10 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 // channel is purgeable the caller gets SkippedUnauthorized with no audit row (the guard runs
 // before Engine.Run, which writes the audit). A nil error accompanies Completed and
 // SkippedUnauthorized; a non-nil error accompanies Failed.
-func (h *Handler) purgeServerCore(
-	ctx context.Context, serverID, actorID string, target *string,
-	reason string, rangeFrom *time.Time, rangeLabel string,
-) (int, PurgeStatus, error) {
-	rows, err := h.db.QueryContext(ctx, `SELECT id, type FROM channels WHERE server_id = $1`, serverID)
+func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (int, PurgeStatus, error) {
+	rows, err := h.db.QueryContext(ctx, `SELECT id, type FROM channels WHERE server_id = $1`, req.serverID)
 	if err != nil {
-		h.log.Error("Server purge: enumerate channels failed", "error", err, "server_id", serverID)
+		h.log.Error("Server purge: enumerate channels failed", "error", err, "server_id", req.serverID)
 		return 0, PurgeFailed, fmt.Errorf("enumerate server channels: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
@@ -183,30 +254,62 @@ func (h *Handler) purgeServerCore(
 	// Deliberately unwrapped: this is a pass-through of an error `serverPurgeDeletes`
 	// already wrapped, and on a non-error refusal (PurgeSkippedUnauthorized) `err` is
 	// nil — `fmt.Errorf` here would either double the context or fabricate one.
-	deletes, status, err := h.serverPurgeDeletes(ctx, serverID, actorID, target, channels)
+	deletes, status, err := h.serverPurgeDeletes(ctx, req.serverID, req.actorID, req.target, channels)
 	if status != PurgeCompleted {
 		return 0, status, err
 	}
 
 	plan := purge.Plan{
 		ContextType: purge.ContextServer,
-		ContextID:   serverID,
-		ServerID:    &serverID,
-		ActorID:     actorID,
-		Target:      target,
-		Reason:      reason,
-		RangeFrom:   rangeFrom,
+		ContextID:   req.serverID,
+		ServerID:    &req.serverID,
+		ActorID:     req.actorID,
+		Target:      req.target,
+		Reason:      req.reason,
+		RangeFrom:   req.rangeFrom,
 		Deletes:     deletes,
+		Guard: func(guardCtx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
+			if req.credentialEpoch != nil {
+				if err := credepoch.GuardTx(guardCtx, tx, req.actorID, *req.credentialEpoch); err != nil {
+					return err
+				}
+			}
+			var lockedType string
+			if err := tx.QueryRowContext(guardCtx,
+				`SELECT type FROM channels WHERE id = $1 AND server_id = $2 FOR SHARE`, ds.ScopeID, req.serverID,
+			).Scan(&lockedType); err != nil {
+				return err
+			}
+			var timedOut bool
+			if err := tx.QueryRowContext(guardCtx,
+				`SELECT timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
+				 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, req.serverID, req.actorID,
+			).Scan(&timedOut); err != nil {
+				return err
+			}
+			if timedOut {
+				return errPurgeMemberTimedOut
+			}
+			perms, err := h.resolver.ResolveChannelPermissionsTx(guardCtx, tx, req.serverID, req.actorID, ds.ScopeID)
+			if err != nil {
+				return err
+			}
+			freshAuthor, allowed := purgeAuthorForPermissions(perms, req.actorID, lockedType, req.target)
+			if !allowed || (freshAuthor == nil) != (ds.Author == nil) || (freshAuthor != nil && *freshAuthor != *ds.Author) {
+				return errors.New("server purge authority changed")
+			}
+			return nil
+		},
 	}
 	res, err := h.purgeEngine.Run(ctx, plan)
 	if err != nil {
-		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
+		h.log.Error("Server purge failed", "error", err, "server_id", req.serverID)
 		if res.DeletedCount > 0 {
-			h.emitServerPurgeEvents(serverID, actorID, rangeLabel, deletes)
+			h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes)
 		}
 		return res.DeletedCount, PurgeFailed, fmt.Errorf("run server purge: %w", err)
 	}
-	h.emitServerPurgeEvents(serverID, actorID, rangeLabel, deletes)
+	h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes)
 	return res.DeletedCount, PurgeCompleted, nil
 }
 
@@ -280,8 +383,12 @@ func (h *Handler) serverPurgeDeletes(ctx context.Context, serverID, actorID stri
 // the members package can consume it through a narrow interface without the range machinery.
 func (h *Handler) PurgeUserServerMessages(ctx context.Context, serverID, actorID, target, reason string) (int, PurgeStatus, error) {
 	t := target
-	return h.purgeServerCore(ctx, serverID, actorID, &t, reason, nil /* All Time */, "all")
+	return h.purgeServerCore(ctx, serverPurgeRequest{
+		serverID: serverID, actorID: actorID, target: &t, reason: reason, rangeLabel: "all",
+	})
 }
+
+func ptr(value string) *string { return &value }
 
 // resolvePurgeAuthor resolves the author filter for one channel per the RBAC matrix:
 // View → required first; ManageAll → requested target (or nil = all authors);

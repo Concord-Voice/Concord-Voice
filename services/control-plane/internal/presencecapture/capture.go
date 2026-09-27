@@ -313,6 +313,11 @@ var ErrCapturePending = errors.New("presencecapture: another presence operation 
 // describes the mutation as having happened.
 var ErrPostCommitDelivery = errors.New("presencecapture: the mutation committed and presence delivery failed")
 
+// ErrCommitUnresolved marks a transaction whose commit acknowledgement was
+// lost. Callers must not report success, but must apply idempotent fail-closed
+// deauthorization because the write may have landed.
+var ErrCommitUnresolved = errors.New("presencecapture: commit outcome unresolved")
+
 // PendingError carries the retry delay alongside ErrCapturePending.
 //
 // The delay crosses the package boundary as a plain time.Duration rather than

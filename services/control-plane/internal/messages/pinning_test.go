@@ -1,12 +1,22 @@
 package messages_test
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,6 +49,42 @@ func TestPinMessageSuccess(t *testing.T) {
 	assert.NotNil(t, resp["pinned_by"])
 }
 
+// Regression: transaction-local message authorization must use the locked
+// channel's visibility bit. A member that can view only voice channels may pin
+// voice history, while a later flip to text-only must stop the same mutation.
+func TestPinMessageVoiceChannelUsesLockedChannelViewPermission(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "pinvoiceowner")
+	member := ts.CreateTestUser(t, "pinvoicemember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Pin Voice Server")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-history")
+	messageID := ts.CreateTestMessage(t, channelID, owner, "pin voice history")
+
+	// The base role still supplies PinMessages. Denying text visibility leaves
+	// this member voice-only, which must be sufficient for a voice message.
+	ts.CreateChannelOverride(t, channelID, "user", member.ID, 0, int64(rbac.PermViewTextChannels))
+	w := ts.DoRequest(http.MethodPost, pinAPIMsg+messageID+pinPath, nil,
+		testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var pinnedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`SELECT pinned_at FROM messages WHERE id = $1`, messageID).Scan(&pinnedAt))
+	require.True(t, pinnedAt.Valid, "voice-visible member must pin the voice message")
+
+	// Flip the same member to text-only. PinMessages remains granted, so only
+	// the channel-type visibility gate can reject the unpin.
+	_, err := ts.DB.Exec(`UPDATE channel_permission_overrides SET deny = $1 WHERE channel_id = $2 AND target_type = 'user' AND target_id = $3`,
+		int64(rbac.PermViewVoiceChannels), channelID, member.ID)
+	require.NoError(t, err)
+	w = ts.DoRequest(http.MethodDelete, pinAPIMsg+messageID+pinPath, nil,
+		testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+
+	require.NoError(t, ts.DB.QueryRow(`SELECT pinned_at FROM messages WHERE id = $1`, messageID).Scan(&pinnedAt))
+	assert.True(t, pinnedAt.Valid, "text-only member must not unpin voice history")
+}
+
 func TestPinMessageAlreadyPinned(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "pinidempotent")
@@ -58,6 +104,54 @@ func TestPinMessageAlreadyPinned(t *testing.T) {
 	var resp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &resp)
 	assert.Equal(t, true, resp["already_pinned"])
+}
+
+func TestPinMessageAlreadyPinnedUsesOpenTransactionConnection(t *testing.T) {
+	fixtureDB, _ := testhelpers.SetupTestDB(t)
+	redis, cleanupRedis := testhelpers.SetupTestRedis(t)
+	t.Cleanup(cleanupRedis)
+	ts := &testhelpers.TestServer{DB: fixtureDB, Redis: redis}
+	user := ts.CreateTestUser(t, "pinpool_"+uuid.NewString()[:8])
+	serverID := ts.CreateTestServer(t, user.ID, "Pin Pool Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	msgID := ts.CreateTestMessage(t, channelID, user, "Pin with one connection")
+	_, err := fixtureDB.Exec(`UPDATE messages SET pinned_at = NOW(), pinned_by = $1 WHERE id = $2`, user.ID, msgID)
+	require.NoError(t, err)
+
+	db, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(redis), logger.New("test"))
+	handler := messages.NewHandler(db, logger.New("test"), nil, resolver, nil, nil)
+
+	request := func(ctx context.Context) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(response)
+		c.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, pinAPIMsg+msgID+pinPath, nil)
+		c.Params = gin.Params{{Key: "id", Value: msgID}}
+		c.Set("user_id", user.ID)
+		handler.PinMessage(c)
+		return response
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- request(ctx) }()
+
+	select {
+	case response := <-result:
+		assert.Equal(t, http.StatusOK, response.Code)
+	case <-ctx.Done():
+		// The pre-fix pool lookup ignores the request context. Releasing a second
+		// connection lets it unwind so this test fails without leaking a goroutine.
+		db.SetMaxOpenConns(2)
+		<-result
+		t.Fatal("idempotent pin checked the database pool instead of its transaction")
+	}
 }
 
 func TestPinMessageInvalidUUID(t *testing.T) {

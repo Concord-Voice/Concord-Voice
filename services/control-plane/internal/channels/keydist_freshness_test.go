@@ -3,6 +3,7 @@ package channels_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,22 @@ func TestDistributeChannelKeys_StaleRecipient_SkippedAndEnqueued(t *testing.T) {
 	assert.Equal(t, 1, rowCount(t, ts,
 		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID),
 		"stale recipient must be self-heal-enqueued")
+}
+
+func TestDistributeChannelKeys_CanonicalizesRecipientVersionKeys(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "canonicalchan")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	setRecipientPublicKeyVersion(t, ts, member.ID, 6)
+
+	w := distributePost(ts, owner.AccessToken, channelID,
+		map[string]string{strings.ToUpper(member.ID): testhelpers.ValidCiphertext()},
+		map[string]int{member.ID: 5})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID))
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID))
 }
 
 func TestDistributeChannelKeys_FreshRecipient_Delivered(t *testing.T) {

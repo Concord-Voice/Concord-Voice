@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,7 +74,7 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 		_, err = h.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actorID)
 		require.NoError(t, err)
 		c, w := pinBranchContext()
-		h.unpinDMMessage(c, messageID, actorID, ctx.conversationID)
+		h.unpinDMMessage(c, messageID, ctx.conversationID)
 		assert.Equal(t, http.StatusNotFound, w.Code)
 		var pinnedAt time.Time
 		var pinnedBy string
@@ -90,10 +91,68 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 		_, err := h.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actorID)
 		require.NoError(t, err)
 		c, w := pinBranchContext()
-		h.unpinDMMessage(c, messageID, actorID, ctx.conversationID)
+		h.unpinDMMessage(c, messageID, ctx.conversationID)
 		assert.Equal(t, http.StatusNotFound, w.Code)
 		var pinnedAt sql.NullTime
 		require.NoError(t, h.db.QueryRowContext(context.Background(), `SELECT pinned_at FROM dm_messages WHERE id = $1`, messageID).Scan(&pinnedAt))
 		assert.False(t, pinnedAt.Valid)
+	})
+}
+
+// TestDMPinClearAfterLookupCannotMutateHiddenMessage pins the transaction-time
+// visibility fence: a Clear committed after request lookup must invalidate both
+// pin and unpin writes, while the existing visibility delivery test proves the
+// unaffected peer still sees the persisted pin.
+func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
+	h := newReactionHelperHandler(t)
+	h.hub = websocket.NewHub(nil, nil)
+
+	t.Run("pin", func(t *testing.T) {
+		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
+		c, _ := pinBranchContext()
+		_, ok := h.lookupMessageContext(c, messageID, actorID)
+		require.True(t, ok)
+		_, err := h.db.Exec(`
+			INSERT INTO dm_message_hidden_ranges
+				(user_id, conversation_id, hidden_from, hidden_to, includes_own)
+			VALUES ($1, $2, '-infinity', NOW() + INTERVAL '1 minute', TRUE)`, actorID, conversationID)
+		require.NoError(t, err)
+
+		c, w := pinBranchContext()
+		c.Set("user_id", actorID)
+		h.pinDMMessage(c, messageID, actorID, conversationID)
+
+		assert.Equal(t, http.StatusNotFound, w.Code, "Clear committed after lookup must invalidate the pin mutation")
+		var pinnedAt sql.NullTime
+		require.NoError(t, h.db.QueryRowContext(context.Background(), `SELECT pinned_at FROM dm_messages WHERE id = $1`, messageID).Scan(&pinnedAt))
+		assert.False(t, pinnedAt.Valid, "hidden history was mutated by the stale pin request")
+	})
+
+	t.Run("unpin", func(t *testing.T) {
+		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
+		_, err := h.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $1 WHERE id = $2`, actorID, messageID)
+		require.NoError(t, err)
+		var before time.Time
+		require.NoError(t, h.db.QueryRow(`SELECT pinned_at FROM dm_messages WHERE id = $1`, messageID).Scan(&before))
+		c, _ := pinBranchContext()
+		_, ok := h.lookupMessageContext(c, messageID, actorID)
+		require.True(t, ok)
+		_, err = h.db.Exec(`
+			INSERT INTO dm_message_hidden_ranges
+				(user_id, conversation_id, hidden_from, hidden_to, includes_own)
+			VALUES ($1, $2, '-infinity', NOW() + INTERVAL '1 minute', TRUE)`, actorID, conversationID)
+		require.NoError(t, err)
+
+		c, w := pinBranchContext()
+		c.Set("user_id", actorID)
+		h.unpinDMMessage(c, messageID, conversationID)
+
+		assert.Equal(t, http.StatusNotFound, w.Code, "Clear committed after lookup must invalidate the unpin mutation")
+		var after sql.NullTime
+		require.NoError(t, h.db.QueryRowContext(context.Background(), `SELECT pinned_at FROM dm_messages WHERE id = $1`, messageID).Scan(&after))
+		assert.True(t, after.Valid, "hidden history was mutated by the stale unpin request")
+		if after.Valid {
+			assert.WithinDuration(t, before, after.Time, time.Microsecond)
+		}
 	})
 }

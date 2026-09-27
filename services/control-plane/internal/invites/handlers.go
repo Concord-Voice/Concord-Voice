@@ -462,6 +462,9 @@ func (h *Handler) JoinServer(c *gin.Context) {
 	// owns both the rollback and — through Complete — the commit. This handler
 	// no longer calls tx.Commit(): doing so would yield sql.ErrTxDone.
 	err := presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		if err := rbac.LockAuthorityPrincipalsTx(ctx, tx, []string{userID}); err != nil {
+			return fmt.Errorf("lock joining member: %w", err)
+		}
 		invite, lookupErr := h.lookupInvite(tx, req.Code)
 		if errors.Is(lookupErr, sql.ErrNoRows) {
 			return &joinRejection{status: http.StatusNotFound, msg: errMsgInvalidInviteCode}

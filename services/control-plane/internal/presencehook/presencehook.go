@@ -161,6 +161,12 @@ func Complete(
 ) error {
 	if capture == nil {
 		if err := tx.Commit(); err != nil {
+			// Only sql.ErrTxDone proves this terminal did not send a new COMMIT.
+			// A driver may return even a context-shaped error after it accepted the
+			// command, so every other error is an acknowledgement ambiguity.
+			if !errors.Is(err, sql.ErrTxDone) {
+				err = errors.Join(presencecapture.ErrCommitUnresolved, err)
+			}
 			// Wrapped, not bare, so the caller can still errors.Is against
 			// sql.ErrTxDone while getting the operation context backend.md
 			// requires on every returned error.

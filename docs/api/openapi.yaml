@@ -2159,7 +2159,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: The creator did not provide a current epoch-1 key
+          description: Server membership changed during creation, the server channel limit was reached,
+            the eligible key recipients exceeded 500, or the creator did not provide a current epoch-1 key
           content:
             application/json:
               schema:
@@ -2223,8 +2224,26 @@ paths:
                 properties:
                   channel:
                     $ref: '#/components/schemas/Channel'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Temporary move access is system-managed, or channel authority changed; retry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '410':
+          description: Channel was deleted during authority reconciliation
           content:
             application/json:
               schema:
@@ -2249,6 +2268,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions
           content:
@@ -2509,6 +2534,12 @@ paths:
                 $ref: '#/components/schemas/PurgeMessagesResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Authentication required (credential epoch changed during purge)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions to purge this channel
           content:
@@ -8754,6 +8785,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Not the message author or missing PermManageOwnMessages
           content:
@@ -8815,6 +8852,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions
           content:
@@ -8872,6 +8915,12 @@ paths:
                     description: Present only for DM messages
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Not a member of the channel's server or insufficient permissions
           content:
@@ -8936,6 +8985,12 @@ paths:
                     description: Present only for DM messages
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Not a member of the channel's server or insufficient permissions
           content:
@@ -9005,6 +9060,12 @@ paths:
                     $ref: '#/components/schemas/ReactionSummary'
         '400':
           description: Invalid message ID, request body, or emoji
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or stale bearer token
           content:
             application/json:
               schema:
@@ -9111,6 +9172,12 @@ paths:
                 $ref: '#/components/schemas/SuccessMessage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions (Manage All Messages required). Returned for every
             unprivileged caller, including a non-member, regardless of the message's current
@@ -11222,6 +11289,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Caller is not the original owner, password is invalid, or MFA is required/invalid
           content:
@@ -11248,7 +11321,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Ownership changed since the transfer, or original owner is no longer a member
+          description: Ownership changed since the transfer, original owner is no longer a member, or channel key cleanup exceeds 500 recipients
           content:
             application/json:
               schema:
@@ -11294,6 +11367,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: Account not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Account erasure failed or its commit outcome could not be confirmed; do not assume the account remains present
           content:
             application/json:
               schema:
@@ -11449,6 +11528,12 @@ paths:
                 $ref: '#/components/schemas/PurgeMessagesResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Authentication required (credential epoch changed during purge)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions to purge this server
           content:
@@ -11809,6 +11894,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions, target is the owner, or target has equal/higher role
             position
@@ -11916,6 +12007,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ChannelGroup'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Not authorized
           content:
@@ -11962,6 +12059,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ChannelGroup'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       tags:
       - ChannelGroups
@@ -11988,6 +12091,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Temporary move access is system-managed, channel authority changed; retry, or the channel group has more than 500 children
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/channels:
     get:
       tags:
@@ -12057,6 +12172,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Temporary move access is system-managed, or channel authority changed; retry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/invites:
     get:
       tags:
@@ -12334,8 +12461,20 @@ paths:
                     type: string
                   purge:
                     $ref: '#/components/schemas/PurgeOutcome'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Insufficient permissions or owner cannot leave
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Channel key cleanup exceeds 500 recipients; resolve access changes in batches of 500 or fewer
           content:
             application/json:
               schema:
@@ -13178,6 +13317,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Caller is not the server owner, password is invalid, or MFA is required/invalid
           content:
@@ -13292,6 +13437,12 @@ paths:
                 $ref: '#/components/schemas/SuccessMessage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Only the server owner can cancel the transfer
           content:
@@ -13335,6 +13486,12 @@ paths:
                     format: uuid
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing, invalid, or stale bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
           description: Only the server owner can confirm the transfer
           content:
@@ -13348,7 +13505,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Transfer already completed/cancelled or a party is no longer a member
+          description: Transfer already completed/cancelled, server ownership changed, a party is no longer a member, or channel key cleanup exceeds 500 recipients
           content:
             application/json:
               schema:

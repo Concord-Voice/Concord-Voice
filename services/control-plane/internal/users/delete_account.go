@@ -136,6 +136,7 @@ type committedAccountDeletion struct {
 	drained          drainedObligation
 	stranded         erasedMedia
 	survivorSubjects []uuid.UUID
+	commitUnresolved bool
 }
 
 // AccountService is the concrete AccountDeleter backed by the primary
@@ -263,7 +264,7 @@ func (s *AccountService) DeleteAccount(
 	)
 	if committed != nil {
 		s.runPostCommitObligations(ctx, userID, committed.channelIDs,
-			committed.serverIDs, committed.drained, committed.stranded)
+			committed.serverIDs, committed.drained, committed.stranded, committed.commitUnresolved)
 	}
 	return operationErr
 }
@@ -390,20 +391,24 @@ func (s *AccountService) deleteAccount(
 	// erased principal's Custom Status resident on every other replica, which is
 	// the precise gap publishErasureCleared exists to close. So record it and
 	// fall through (rbac review, PR #2840).
-	var deliveryErr error
-	if err := presencehook.Complete(ctx, s.graphPresence, tx, plan); err != nil {
-		if !errors.Is(err, presencecapture.ErrPostCommitDelivery) {
-			return nil, fmt.Errorf("delete account: commit: %w", err)
-		}
-		deliveryErr = err
-	}
 	committed := &committedAccountDeletion{
 		channelIDs: channelIDs, serverIDs: serverIDs, drained: drained,
 		stranded:         stranded,
 		survivorSubjects: append([]uuid.UUID(nil), (*survivorSubjects)...),
 	}
-	if deliveryErr != nil {
-		return committed, fmt.Errorf("delete account: presence delivery: %w", deliveryErr)
+	if err := presencehook.Complete(ctx, s.graphPresence, tx, plan); err != nil {
+		switch {
+		case errors.Is(err, presencecapture.ErrCommitUnresolved):
+			// The durable output was captured before the commit terminal. Keep it
+			// so idempotent privacy clearing still runs; media gets a separate
+			// absence proof before its destructive handoff below.
+			committed.commitUnresolved = true
+			return committed, fmt.Errorf("delete account: commit outcome unresolved: %w", err)
+		case errors.Is(err, presencecapture.ErrPostCommitDelivery):
+			return committed, fmt.Errorf("delete account: presence delivery: %w", err)
+		default:
+			return nil, fmt.Errorf("delete account: commit: %w", err)
+		}
 	}
 	return committed, nil
 }
@@ -417,12 +422,14 @@ func (s *AccountService) runPostCommitObligations(
 	channelIDs, serverIDs pq.StringArray,
 	drained drainedObligation,
 	stranded erasedMedia,
+	commitUnresolved bool,
 ) {
-	// Cross-replica Custom Status clear (#2447). AFTER the commit: publishing
-	// first would tell the fleet to clear an account that may still exist.
+	// Cross-replica Custom Status clear (#2447). It follows the commit terminal;
+	// an unresolved outcome clears fail-closed because stale disclosure is worse
+	// than a proportional reset for an account that may still exist.
 	s.publishErasureCleared(userID)
 	s.transferDrainedActivePlans(ctx, drained)
-	s.reclaimErasedMedia(ctx, stranded)
+	s.reclaimErasedMedia(ctx, userID, commitUnresolved, stranded)
 	if s.channelDeleted == nil {
 		return
 	}
@@ -432,14 +439,39 @@ func (s *AccountService) runPostCommitObligations(
 }
 
 // reclaimErasedMedia invokes the post-commit wake and Tier-2 queue handoff on
-// a detached bounded context.
-func (s *AccountService) reclaimErasedMedia(ctx context.Context, stranded erasedMedia) {
+// a detached bounded context. An unresolved commit must prove the user is gone
+// before it can hand objects to a destructive rail.
+func (s *AccountService) reclaimErasedMedia(
+	ctx context.Context,
+	userID string,
+	commitUnresolved bool,
+	stranded erasedMedia,
+) {
 	if s.reclaimMedia == nil {
 		if s.log != nil {
 			s.log.Error("delete account: no media reclaimer is wired; Tier-2 objects are not queued",
 				"tier2_objects", len(stranded.tier2))
 		}
 		return
+	}
+	if commitUnresolved {
+		var userAbsent bool
+		proofCtx, cancelProof := context.WithTimeout(
+			context.WithoutCancel(ctx), erasedMediaReclaimTimeout)
+		var proofErr error
+		if s.db != nil {
+			proofErr = s.db.QueryRowContext(proofCtx,
+				`SELECT NOT EXISTS (SELECT 1 FROM users WHERE id = $1)`, userID,
+			).Scan(&userAbsent)
+		}
+		cancelProof()
+		if proofErr != nil || !userAbsent {
+			if s.log != nil {
+				s.log.Error("delete account: unresolved commit media handoff skipped",
+					"failure_class", "absence_unproven")
+			}
+			return
+		}
 	}
 	detached, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), erasedMediaReclaimTimeout)

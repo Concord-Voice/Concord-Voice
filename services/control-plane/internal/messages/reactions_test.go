@@ -409,35 +409,22 @@ func TestReactions_DMMessage_NonParticipant_Returns404(t *testing.T) {
 		"non-participant should get 404 on GET reactions (privacy): %s", wGet.Body.String())
 }
 
-func TestReactions_DMMessage_InsertFailureRollsBack(t *testing.T) {
+func TestReactions_DMMessage_BlockedTopologyDeniedWithoutMutation(t *testing.T) {
 	ts := setupTS(t)
-	actor := ts.CreateTestUser(t, "dmreact_insert_failure")
-	peer := ts.CreateTestUser(t, "dmreact_insert_failure_peer")
-	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
-	msgID := insertDMMessageDirect(t, ts, convID, actor.ID, "transactional reaction")
+	u1 := ts.CreateTestUser(t, "dmreact_block_a")
+	u2 := ts.CreateTestUser(t, "dmreact_block_b")
+	convID := ts.CreateDMConversation(t, u1.ID, u2.ID)
+	msgID := insertDMMessageDirect(t, ts, convID, u1.ID, "blocked reaction")
+	ts.CreateFriendship(t, u1.ID, u2.ID, "blocked")
 
-	_, err := ts.DB.Exec(`
-		CREATE FUNCTION test_reject_dm_reaction_insert() RETURNS trigger AS $$
-		BEGIN RAISE EXCEPTION 'forced DM reaction insert failure'; END;
-		$$ LANGUAGE plpgsql;
-		CREATE TRIGGER test_reject_dm_reaction_insert
-		BEFORE INSERT ON dm_message_reactions
-		FOR EACH ROW EXECUTE FUNCTION test_reject_dm_reaction_insert()`)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, cleanupErr := ts.DB.Exec(`
-			DROP TRIGGER IF EXISTS test_reject_dm_reaction_insert ON dm_message_reactions;
-			DROP FUNCTION IF EXISTS test_reject_dm_reaction_insert()`)
-		if cleanupErr != nil {
-			t.Errorf("cleanup reaction trigger: %v", cleanupErr)
-		}
-	})
-
-	w := ts.DoRequest("PUT", reactURL(msgID), emojiBody("👍"), testhelpers.AuthHeaders(actor.AccessToken))
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	w := ts.DoRequest("PUT", reactURL(msgID), emojiBody("👍"), testhelpers.AuthHeaders(u1.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	var response map[string]string
+	testhelpers.ParseJSON(t, w, &response)
+	assert.Equal(t, "dm_unavailable", response["error"])
 	var count int
 	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_message_reactions WHERE message_id = $1`, msgID).Scan(&count))
-	assert.Zero(t, count, "failed reaction mutation must not persist a partial row")
+	assert.Zero(t, count)
 }
 
 func TestToggleReactionCascadeOnDelete(t *testing.T) {

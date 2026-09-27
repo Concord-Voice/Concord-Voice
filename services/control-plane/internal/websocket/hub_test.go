@@ -263,6 +263,60 @@ func TestBroadcastToServerAndPruneQueuesOrderedMessage(t *testing.T) {
 	}
 }
 
+func TestPruneServerSubscriberQueuesPruneWithoutDelivery(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	userID := uuid.New()
+
+	hub.PruneServerSubscriber(serverID, userID)
+
+	select {
+	case msg := <-hub.evictBroadcast:
+		assert.Equal(t, serverID, msg.ServerID)
+		assert.True(t, msg.PruneOnly)
+		assert.Empty(t, msg.Data.Type, "prune-only operation must not publish a server event")
+		if assert.NotNil(t, msg.PruneUserAfter) {
+			assert.Equal(t, userID, *msg.PruneUserAfter)
+		}
+	default:
+		t.Fatal("expected a prune-only operation to be queued")
+	}
+}
+
+func TestHandleServerBroadcastPruneOnlyEvictsWithoutPublishing(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	removedUser := uuid.New()
+	removedClient := newTestClient(hub, removedUser)
+	stayClient := newTestClient(hub, uuid.New())
+	hub.clients[removedClient.ID] = removedClient
+	hub.clients[stayClient.ID] = stayClient
+	hub.userClients[removedUser] = map[uuid.UUID]bool{removedClient.ID: true}
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{
+		removedClient.ID: true,
+		stayClient.ID:    true,
+	}
+
+	hub.handleServerBroadcast(ServerBroadcastMessage{
+		ServerID:       serverID,
+		PruneUserAfter: &removedUser,
+		PruneOnly:      true,
+	})
+
+	assert.NotContains(t, hub.serverSubscriptions[serverID], removedClient.ID)
+	assert.Contains(t, hub.serverSubscriptions[serverID], stayClient.ID)
+	select {
+	case <-removedClient.Send:
+		t.Fatal("prune-only operation must not publish a removal event to the target")
+	default:
+	}
+	select {
+	case <-stayClient.Send:
+		t.Fatal("prune-only operation must not publish a removal event to other members")
+	default:
+	}
+}
+
 // TestBroadcastToServerAndPruneBailsOnShutdown verifies the eviction send does not hang
 // forever once the hub is shutting down. After Run exits it no longer drains
 // evictBroadcast (buffered 16), so an unconditional send on a full buffer would leak the
