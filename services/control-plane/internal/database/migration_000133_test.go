@@ -29,9 +29,14 @@ func TestMigration000133_PreservesObservedLeaseAcrossLifecycleReplays(t *testing
 			t.Errorf("rollback migration 000133 transaction: %v", rollbackErr)
 		}
 	})
+
+	// Replaying down first lets this test prove the old trigger behavior, then
+	// the up migration's equality guard, within one rollback-only transaction.
 	_, err = tx.ExecContext(ctx, down)
 	require.NoError(t, err)
-	_, err = tx.ExecContext(ctx, `INSERT INTO voice_participants (channel_id, user_id, lifecycle_event_at) VALUES ($1, $2, $3)`, channel, owner.ID, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO voice_participants (channel_id, user_id, lifecycle_event_at)
+		VALUES ($1, $2, $3)`, channel, owner.ID, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
 	require.NoError(t, err)
 
 	oldSentinel := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
@@ -48,7 +53,9 @@ func TestMigration000133_PreservesObservedLeaseAcrossLifecycleReplays(t *testing
 	_, err = tx.ExecContext(ctx, up)
 	require.NoError(t, err)
 	insertBefore := txClock(t, tx)
-	_, err = tx.ExecContext(ctx, `INSERT INTO voice_participants (channel_id, user_id, lifecycle_event_at, lifecycle_observed_at) VALUES ($1, $2, $3, $4)`, channel, inserted.ID, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), oldSentinel)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO voice_participants (channel_id, user_id, lifecycle_event_at, lifecycle_observed_at)
+		VALUES ($1, $2, $3, $4)`, channel, inserted.ID, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), oldSentinel)
 	require.NoError(t, err)
 	var insertedObserved time.Time
 	require.NoError(t, tx.QueryRowContext(ctx, `SELECT lifecycle_observed_at FROM voice_participants WHERE user_id=$1`, inserted.ID).Scan(&insertedObserved))
@@ -60,7 +67,9 @@ func TestMigration000133_PreservesObservedLeaseAcrossLifecycleReplays(t *testing
 	require.NoError(t, err)
 	spoofedObserved := time.Date(2004, 5, 6, 7, 8, 9, 0, time.UTC)
 	equalBefore := txClock(t, tx)
-	_, err = tx.ExecContext(ctx, `UPDATE voice_participants SET lifecycle_event_at=lifecycle_event_at, lifecycle_observed_at=$1 WHERE user_id=$2`, spoofedObserved, owner.ID)
+	_, err = tx.ExecContext(ctx, `UPDATE voice_participants
+		SET lifecycle_event_at=lifecycle_event_at, lifecycle_observed_at=$1
+		WHERE user_id=$2`, spoofedObserved, owner.ID)
 	require.NoError(t, err)
 	equalAfter := txClock(t, tx)
 	var equalObserved time.Time

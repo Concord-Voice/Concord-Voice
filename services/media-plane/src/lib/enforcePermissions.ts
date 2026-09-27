@@ -1,6 +1,5 @@
 import type { RoomManager } from './roomManager.js';
 import { hasVoiceAccess } from './roomManager.js';
-import { handleForceDisconnect } from './forceDisconnect.js';
 import { isCanonicalEnforcementUUID } from './enforcementCommand.js';
 import { logger } from './logger.js';
 import { parsePermissionBitfield } from '../middleware/auth.js';
@@ -16,8 +15,10 @@ import type { EmitSecurityEvent } from './securityEvent.js';
 export interface EnforcePermissionsRoomManager {
   getParticipant: RoomManager['getParticipant'];
   getProvisionalParticipantSocketId: RoomManager['getProvisionalParticipantSocketId'];
+  updateProvisionalParticipantPermissions: RoomManager['updateProvisionalParticipantPermissions'];
   updateParticipantPermissions: RoomManager['updateParticipantPermissions'];
   closeForbiddenProducers: RoomManager['closeForbiddenProducers'];
+  leaveRoom: RoomManager['leaveRoom'];
   leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
 }
@@ -31,7 +32,11 @@ export interface EnforcePermissionsIO {
   sockets: {
     sockets: Map<
       string,
-      { emit: (event: string, ...args: unknown[]) => void; disconnect: (close?: boolean) => void }
+      {
+        emit: (event: string, ...args: unknown[]) => void;
+        disconnect: (close?: boolean) => void;
+        data?: { userId?: string; roomId?: string };
+      }
     >;
   };
 }
@@ -44,6 +49,102 @@ function safeObserveSecurityEvent(
     emit?.(event);
   } catch {
     // Permission enforcement remains authoritative over its observer.
+  }
+}
+
+function updateParticipantPermissionSnapshot(
+  roomManager: EnforcePermissionsRoomManager,
+  channelId: string,
+  userId: string,
+  permissions: bigint,
+  authorizationRevision: bigint | undefined
+): boolean {
+  return authorizationRevision === undefined
+    ? roomManager.updateParticipantPermissions(channelId, userId, permissions)
+    : roomManager.updateParticipantPermissions(
+        channelId,
+        userId,
+        permissions,
+        undefined,
+        authorizationRevision
+      );
+}
+
+function updateProvisionalPermissionSnapshot(
+  roomManager: EnforcePermissionsRoomManager,
+  channelId: string,
+  userId: string,
+  permissions: bigint,
+  authorizationRevision: bigint | undefined
+): boolean {
+  return authorizationRevision === undefined
+    ? roomManager.updateProvisionalParticipantPermissions(channelId, userId, permissions)
+    : roomManager.updateProvisionalParticipantPermissions(
+        channelId,
+        userId,
+        permissions,
+        authorizationRevision
+      );
+}
+
+function resolvePermissionUpdateArguments(
+  emitOrAuthorizationRevision: EmitSecurityEvent | bigint | undefined,
+  authorizationRevisionOrEmit: bigint | EmitSecurityEvent | undefined
+): { emit: EmitSecurityEvent | undefined; authorizationRevision: bigint | undefined } {
+  let emit: EmitSecurityEvent | undefined;
+  if (typeof emitOrAuthorizationRevision === 'function') {
+    emit = emitOrAuthorizationRevision;
+  } else if (typeof authorizationRevisionOrEmit === 'function') {
+    emit = authorizationRevisionOrEmit;
+  }
+  let authorizationRevision: bigint | undefined;
+  if (typeof emitOrAuthorizationRevision === 'bigint') {
+    authorizationRevision = emitOrAuthorizationRevision;
+  } else if (typeof authorizationRevisionOrEmit === 'bigint') {
+    authorizationRevision = authorizationRevisionOrEmit;
+  }
+  return { emit, authorizationRevision };
+}
+
+async function disconnectRevokedVoiceAccess({
+  roomManager,
+  io,
+  channelId,
+  userId,
+  participant,
+  participantPermissionsUpdated,
+  provisionalSocketId,
+  provisionalPermissionsUpdated,
+}: {
+  roomManager: EnforcePermissionsRoomManager;
+  io: EnforcePermissionsIO;
+  channelId: string;
+  userId: string;
+  participant: ReturnType<RoomManager['getParticipant']>;
+  participantPermissionsUpdated: boolean;
+  provisionalSocketId: string | undefined;
+  provisionalPermissionsUpdated: boolean;
+}): Promise<void> {
+  const activeSocketIDs = new Set<string>();
+  if (participantPermissionsUpdated && participant) {
+    activeSocketIDs.add(participant.socketId);
+    for (const [socketId, socket] of io.sockets.sockets) {
+      if (socket.data?.userId === userId && socket.data.roomId === channelId) {
+        activeSocketIDs.add(socketId);
+      }
+    }
+  }
+  if (provisionalPermissionsUpdated && provisionalSocketId) {
+    await roomManager.removeProvisionalParticipantForEnforcement(
+      channelId,
+      userId,
+      provisionalSocketId
+    );
+    io.sockets.sockets.get(provisionalSocketId)?.disconnect(true);
+  }
+  if (participantPermissionsUpdated && participant) {
+    await roomManager.leaveRoomIfSocketOwned(channelId, userId, participant.socketId);
+    for (const socketId of activeSocketIDs) io.sockets.sockets.get(socketId)?.disconnect(true);
   }
 }
 
@@ -80,31 +181,66 @@ export async function handlePermissionsUpdate(
   channelId: string,
   userId: string,
   permissions: bigint,
-  emit?: EmitSecurityEvent
+  emitOrAuthorizationRevision?: EmitSecurityEvent | bigint,
+  authorizationRevisionOrEmit?: bigint | EmitSecurityEvent
 ): Promise<void> {
+  const { emit, authorizationRevision } = resolvePermissionUpdateArguments(
+    emitOrAuthorizationRevision,
+    authorizationRevisionOrEmit
+  );
   const participant = roomManager.getParticipant(channelId, userId);
-  if (!participant) {
-    // Already gone — nothing to enforce. Idempotent.
-    return;
+  const provisionalSocketId = roomManager.getProvisionalParticipantSocketId(channelId, userId);
+  if (!participant && !provisionalSocketId) return;
+
+  // This method is deliberately a no-op for DMs. Check that condition before
+  // interpreting a server-RBAC bitfield as a reason to disconnect the peer.
+  let participantPermissionsUpdated = false;
+  if (participant) {
+    participantPermissionsUpdated = updateParticipantPermissionSnapshot(
+      roomManager,
+      channelId,
+      userId,
+      permissions,
+      authorizationRevision
+    );
+    if (!participantPermissionsUpdated && !provisionalSocketId) return;
   }
 
-  if (!roomManager.updateParticipantPermissions(channelId, userId, permissions)) {
-    // DM room (no server permission model) or participant raced out — do not
-    // bolt a permission model onto a room that never had one.
-    return;
+  // A voice-access revoke applies to both an established session and a staged
+  // reconnect for the same user. The shared teardown removes the exact staged
+  // socket and leaves the admitted session, if any.
+  let provisionalPermissionsUpdated = false;
+  if (provisionalSocketId) {
+    // Preserve a post-A2 enforcement snapshot for promotion. The staged
+    // candidate is not yet a participant, so producer auditing is inapplicable.
+    provisionalPermissionsUpdated = updateProvisionalPermissionSnapshot(
+      roomManager,
+      channelId,
+      userId,
+      permissions,
+      authorizationRevision
+    );
   }
 
-  // Losing either voice-access bit (ViewVoiceChannels | JoinVoice) means a fresh
-  // AuthorizeJoin would now reject this user, so they have no right to remain in
-  // the room at all. Closing their producers is not enough: the socket keeps its
-  // recv transports/consumers and would still receive future new-producer events
-  // (consume does not re-check voice access). Force-disconnect them via the same
-  // authoritative teardown the control-plane's voice.enforce.disconnect uses
-  // (leaveRoom closes transports/producers/consumers and emits user-left).
-  // Administrator bypasses (mirrors publishPermitted / rbac.Permission.Has).
   if (!hasVoiceAccess(permissions)) {
-    await handleForceDisconnect(roomManager, io, channelId, userId, emit, {
-      reason: 'access_revoked',
+    // Tear down only records that accepted this snapshot; never broad-scan a
+    // legacy message into a newer versioned successor.
+    await disconnectRevokedVoiceAccess({
+      roomManager,
+      io,
+      channelId,
+      userId,
+      participant,
+      participantPermissionsUpdated,
+      provisionalSocketId,
+      provisionalPermissionsUpdated,
+    });
+    safeObserveSecurityEvent(emit, {
+      eventType: 'media_authorization',
+      outcome: 'success',
+      severity: 'high',
+      reasonCode: 'revocation_enforced',
+      routeTemplate: 'socket.permissions_update',
     });
     logger.info('Force-disconnected peer on mid-session voice-access revocation', {
       channelId,
@@ -112,6 +248,8 @@ export async function handlePermissionsUpdate(
     });
     return;
   }
+
+  if (!participant || !participantPermissionsUpdated) return;
 
   const closedSources = await roomManager.closeForbiddenProducers(channelId, userId);
 
@@ -191,6 +329,8 @@ export async function handleEnforcePermissionsMessage(
     logger.warn('Ignoring malformed voice.enforce.permissions payload', { channelId, userId });
     return;
   }
+  const authorizationRevision = parsePermissionBitfield(natsData.authorizationRevision);
+  if (natsData.authorizationRevision !== undefined && authorizationRevision === undefined) return;
 
   // Serialize per participant so back-to-back pushes apply in publish order. A
   // prior update that rejected must not block or reject the next one, so isolate
@@ -199,7 +339,17 @@ export async function handleEnforcePermissionsMessage(
   const prior = permissionUpdateChains.get(key) ?? Promise.resolve();
   const next = prior
     .catch(() => undefined)
-    .then(() => handlePermissionsUpdate(roomManager, io, channelId, userId, permissions, emit));
+    .then(() =>
+      handlePermissionsUpdate(
+        roomManager,
+        io,
+        channelId,
+        userId,
+        permissions,
+        emit,
+        authorizationRevision
+      )
+    );
   permissionUpdateChains.set(key, next);
   try {
     await next;

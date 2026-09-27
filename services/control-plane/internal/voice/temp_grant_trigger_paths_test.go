@@ -36,9 +36,10 @@ func TestNATSSubscriber_SetPresenceRecheck_WiresItsOwnTempGrantManager(t *testin
 	senderID := env.joinVoice(t, env.channelID)
 	viewer := env.grantTemporaryAccess(t)
 
-	require.NoError(t, subscriber.tempGrant.revokeTemporaryChannelAccess(
-		context.Background(), env.serverID, env.channelID, viewer, "system",
-	))
+	_, err := subscriber.tempGrant.revokeTemporaryChannelAccess(
+		context.Background(), env.serverID, env.channelID, viewer, "",
+	)
+	require.NoError(t, err)
 	env.waitForDispatch(t)
 
 	assert.True(t, env.wasCleared(senderID, viewer),
@@ -58,9 +59,10 @@ func TestVoiceHandler_SetPresenceRecheck_WiresItsOwnTempGrantManager(t *testing.
 	senderID := env.joinVoice(t, env.channelID)
 	viewer := env.grantTemporaryAccess(t)
 
-	require.NoError(t, handler.tempGrant.revokeTemporaryChannelAccess(
+	_, err := handler.tempGrant.revokeTemporaryChannelAccess(
 		context.Background(), env.serverID, env.channelID, viewer, env.ownerID,
-	))
+	)
+	require.NoError(t, err)
 	env.waitForDispatch(t)
 
 	assert.True(t, env.wasCleared(senderID, viewer),

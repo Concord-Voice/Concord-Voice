@@ -535,6 +535,10 @@ func serverVoiceCleanupWired(reconciler *activepresence.Reconciler) bool {
 	return reconciler.HasServerVoiceCleanup()
 }
 
+func voicePendingAdmissionCleanupWired(reconciler *activepresence.Reconciler) bool {
+	return reconciler != nil && reconciler.HasVoicePendingAdmissionCleanup()
+}
+
 func dmBlockCleanupWired(reconciler *activepresence.Reconciler) bool {
 	return reconciler != nil && reconciler.HasDMBlockCleanup()
 }
@@ -725,6 +729,56 @@ func newAuditWriterWithSecurityEvents(db *sql.DB, log *logger.Logger, events sec
 	return audit
 }
 
+// wireVoicePendingAdmissionCleanup keeps expired A1 cleanup independent from
+// NATS startup, using the existing bounded active-plan pre-pass.
+func wireVoicePendingAdmissionCleanup(
+	db *sql.DB,
+	activePlanReconciler *activepresence.Reconciler,
+) {
+	activePlanReconciler.SetVoicePendingAdmissionCleanup(
+		func(ctx context.Context, limit int) (int, error) {
+			return voice.ReconcileExpiredVoicePendingAdmissions(ctx, db, limit)
+		},
+	)
+}
+
+// connectNATS keeps startup usable when the optional inter-service bus is
+// unavailable. Bus-dependent wiring remains guarded by the returned client.
+func connectNATS(cfg *config.Config, log *logger.Logger) *natsclient.Client {
+	nc, err := natsclient.Connect(cfg.NATSUrl)
+	if err != nil {
+		// Reaching here means a CONFIGURATION fault, not an outage.
+		// RetryOnFailedConnect (pkg/nats.Connect) makes an unreachable bus
+		// return a reconnecting client rather than an error (#2854 finding A),
+		// so what is left is an unparseable URL or bad credentials -- a
+		// deterministic deploy defect, and this is the line that says why.
+		//
+		// Deliberately NOT a list of affected features (#2875). The old text
+		// named only voice-state sync while the bus had since gained the
+		// erasure-clear leg, graph presence and voice permission enforcement, so
+		// an operator chasing "why is a deleted account's presence still
+		// visible" got no signal from it. An enumeration is exactly what goes
+		// stale when a subject is added, and nothing about adding one prompts
+		// anyone to revisit this string.
+		//
+		// The raw error is NOT logged: natsclient.Connect wraps nats.Connect,
+		// whose *url.Error formats the raw URL, so a nats://<user>:<pass>@host
+		// misconfiguration would write the credential into the log (CWE-532).
+		// "boot continues", NOT "boot will fail". This said the latter for its
+		// whole life and it was never true: there is no nil-natsClient fatal
+		// anywhere in the service (main.go and router.go only guard, and
+		// opsmetrics_runtime degrades). The process comes up with a permanently
+		// nil client, so /readyz reports nats down for its entire lifetime --
+		// which is why the readiness check classifies that case separately as
+		// nats_unconfigured rather than as a self-healing reconnect.
+		log.Warn("NATS configuration is invalid — every bus-dependent feature"+
+			" is degraded; boot continues with NATS unavailable",
+			"failure_class", "nats_config")
+		return nil
+	}
+	return nc
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	lifecycleCtx context.Context,
@@ -764,40 +818,9 @@ func NewRouter(
 		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 
-	// Initialize NATS (inter-service messaging with media plane)
-	var natsClient *natsclient.Client
-	nc, err := natsclient.Connect(cfg.NATSUrl)
-	if err != nil {
-		// Reaching here means a CONFIGURATION fault, not an outage.
-		// RetryOnFailedConnect (pkg/nats.Connect) makes an unreachable bus
-		// return a reconnecting client rather than an error (#2854 finding A),
-		// so what is left is an unparseable URL or bad credentials -- a
-		// deterministic deploy defect, and this is the line that says why.
-		//
-		// Deliberately NOT a list of affected features (#2875). The old text
-		// named only voice-state sync while the bus had since gained the
-		// erasure-clear leg, graph presence and voice permission enforcement, so
-		// an operator chasing "why is a deleted account's presence still
-		// visible" got no signal from it. An enumeration is exactly what goes
-		// stale when a subject is added, and nothing about adding one prompts
-		// anyone to revisit this string.
-		//
-		// The raw error is NOT logged: natsclient.Connect wraps nats.Connect,
-		// whose *url.Error formats the raw URL, so a nats://<user>:<pass>@host
-		// misconfiguration would write the credential into the log (CWE-532).
-		// "boot continues", NOT "boot will fail". This said the latter for its
-		// whole life and it was never true: there is no nil-natsClient fatal
-		// anywhere in the service (main.go and router.go only guard, and
-		// opsmetrics_runtime degrades). The process comes up with a permanently
-		// nil client, so /readyz reports nats down for its entire lifetime --
-		// which is why the readiness check classifies that case separately as
-		// nats_unconfigured rather than as a self-healing reconnect.
-		log.Warn("NATS configuration is invalid — every bus-dependent feature "+
-			"is degraded; boot continues with NATS unavailable",
-			"failure_class", "nats_config")
-	} else {
-		natsClient = nc
-	}
+	// Initialize NATS (inter-service messaging with media plane). A failed
+	// connection returns nil so NATS-independent startup can continue.
+	natsClient := connectNATS(cfg, log)
 
 	// #3106: background readiness prober. Runs on a ticker over the SERVING
 	// db/redis/nats handles established above -- never a dedicated handle --
@@ -1195,6 +1218,10 @@ func NewRouter(
 		}
 	})
 
+	// Expired A1 reservations are database-only and must not depend on NATS
+	// startup succeeding; the existing active-plan ticker supplies its bound.
+	wireVoicePendingAdmissionCleanup(db, activePlanReconciler)
+
 	// Start NATS voice event subscriber
 	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
 	voiceSub.SetOpsCounters(opsCounters)
@@ -1210,10 +1237,16 @@ func NewRouter(
 		if subErr := voiceSub.Subscribe(); subErr != nil {
 			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
 		} else {
+			activePlanReconciler.SetServerVoiceCleanup(
+				voiceSub.ReconcileStaleServerVoiceParticipants,
+			)
 			voicePermEnforcer.AddCloseHook(voiceSub.Close)
 		}
 	}
 	requireServerVoiceCleanupWired(log, activePlanReconciler)
+	if !voicePendingAdmissionCleanupWired(activePlanReconciler) {
+		log.Fatal("voice pending admission cleanup is not wired")
+	}
 	if !dmBlockCleanupWired(activePlanReconciler) {
 		log.Fatal("DM block reconciliation is not wired")
 	}
@@ -2430,7 +2463,7 @@ func NewRouter(
 					voiceHandler.GetParticipants,
 				)
 				channelRoutes.POST("/:id/voice/join",
-					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					middleware.RateLimitChannelVoiceJoin(redis),
 					voiceEnforcementSessionHandler.RequireMediaCapability,
 					voiceHandler.AuthorizeJoin,
 				)

@@ -319,26 +319,38 @@ export interface Participant {
    * publish whose required bit (Speak / Video / ScreenShare) is absent.
    */
   permissions?: bigint;
+  /** A post-A2 enforcement snapshot for a staged channel candidate only. */
+  enforcedPermissions?: bigint;
+  /** Monotonic control-plane authorization snapshot revision for channel rooms. */
+  authorizationRevision?: bigint;
+  /** Revision that supplied enforcedPermissions, when newer than A2. */
+  enforcedAuthorizationRevision?: bigint;
+  /** Revision of the complete server mute/deafen snapshot on this session. */
+  serverEnforcementRevision?: bigint;
+  /** Exact server-authorized A1 candidate identity for channel promotion. */
+  admissionId?: string;
   /** Media E2EE frame crypto format this participant joined with. */
   mediaFrameCryptoVersion: number;
 }
 
 export interface DMParticipantPromotion {
   callId?: string;
+  authorizationRevision?: bigint;
   identity: { username: string; displayName?: string; avatarUrl?: string };
   entitlement: MediaEntitlement;
   serverMuted: boolean;
   serverDeafened: boolean;
 }
 
-/** Refreshed A2 authority applied only when a channel candidate is promoted. */
 export interface ChannelParticipantPromotion {
   identity: { username: string; displayName?: string; avatarUrl?: string };
   entitlement: MediaEntitlement;
-  permissions?: bigint;
+  ownerTier: string;
+  permissions: bigint;
+  authorizationRevision?: bigint;
+  admissionId?: string;
   serverMuted: boolean;
   serverDeafened: boolean;
-  ownerTier?: string;
 }
 
 export interface ProvisionalDMParticipant {
@@ -986,6 +998,12 @@ export interface JoinRoomOptions {
    * at produce() to reject publishing without Speak / Video / ScreenShare.
    */
   permissions?: bigint;
+  /** Exact A1 identity supplied only by the media service hop. */
+  admissionId?: string;
+  /** Control-plane authorization revision paired with this A1 snapshot. */
+  authorizationRevision?: bigint;
+  /** Stage a channel candidate through A2 before making it authoritative. */
+  deferChannelPromotion?: boolean;
 }
 
 type RoomContext = NonNullable<JoinRoomOptions['roomContext']>;
@@ -1004,6 +1022,8 @@ export type RoomEvent =
       avatarUrl?: string;
       e2eeEpoch: number;
       callId?: string;
+      admissionId?: string;
+      socketId?: string;
     }
   | {
       type: 'user-left';
@@ -1207,6 +1227,82 @@ function applyDMCallContext(
   room.callRingId = roomContext?.callRingId;
   room.callCallerUserId = roomContext?.callCallerUserId ?? userId;
   room.callStartedAt = joinedAt;
+}
+
+/** Apply the refreshed A2 identity, entitlements, and moderation state to a DM participant. */
+function applyDMParticipantPromotion(
+  participant: Participant,
+  promotion: DMParticipantPromotion,
+  joinedAt: Date
+): void {
+  participant.username = promotion.identity.username;
+  participant.displayName = promotion.identity.displayName;
+  participant.avatarUrl = promotion.identity.avatarUrl;
+  participant.tier = promotion.entitlement.tier;
+  participant.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
+  participant.minPtimeMs = promotion.entitlement.minPtimeMs;
+  participant.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
+  const promotionRevision = promotion.authorizationRevision ?? participant.authorizationRevision;
+  const promotionRevisionForComparison = promotionRevision ?? 0n;
+  // A moderation snapshot received while this candidate was staged is newer
+  // than this A2 response for its flags. Do not restore stale A2 state.
+  if (
+    participant.serverEnforcementRevision === undefined ||
+    participant.serverEnforcementRevision < promotionRevisionForComparison
+  ) {
+    participant.serverMuted = promotion.serverMuted;
+    participant.serverDeafened = promotion.serverDeafened;
+    if (promotionRevision !== undefined) {
+      participant.serverEnforcementRevision = promotionRevision;
+    }
+  }
+  participant.joinedAt = joinedAt;
+}
+
+/** Apply refreshed A2 state without overwriting a newer staged enforcement snapshot. */
+function applyChannelParticipantPromotion(
+  participant: Participant,
+  promotion: ChannelParticipantPromotion,
+  joinedAt: Date
+): void {
+  participant.username = promotion.identity.username;
+  participant.displayName = promotion.identity.displayName;
+  participant.avatarUrl = promotion.identity.avatarUrl;
+  participant.tier = promotion.entitlement.tier;
+  participant.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
+  participant.minPtimeMs = promotion.entitlement.minPtimeMs;
+  participant.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
+
+  const promotionRevision = promotion.authorizationRevision ?? participant.authorizationRevision;
+  const promotionRevisionForComparison = promotionRevision ?? 0n;
+  if (
+    participant.enforcedPermissions !== undefined &&
+    (participant.enforcedAuthorizationRevision ?? 0n) >= promotionRevisionForComparison
+  ) {
+    participant.permissions = participant.enforcedPermissions;
+    if (participant.enforcedAuthorizationRevision !== undefined) {
+      participant.authorizationRevision = participant.enforcedAuthorizationRevision;
+    }
+  } else {
+    participant.permissions = promotion.permissions;
+    if (promotionRevision !== undefined) {
+      participant.authorizationRevision = promotionRevision;
+    }
+  }
+  delete participant.enforcedPermissions;
+  delete participant.enforcedAuthorizationRevision;
+
+  if (
+    participant.serverEnforcementRevision === undefined ||
+    participant.serverEnforcementRevision < promotionRevisionForComparison
+  ) {
+    participant.serverMuted = promotion.serverMuted;
+    participant.serverDeafened = promotion.serverDeafened;
+    if (promotionRevision !== undefined) {
+      participant.serverEnforcementRevision = promotionRevision;
+    }
+  }
+  participant.joinedAt = joinedAt;
 }
 
 /** Snapshot producer metadata without retaining participant or mediasoup objects. */
@@ -1694,7 +1790,10 @@ export class RoomManager {
       mediaFrameCryptoVersion,
       roomContext,
       permissions,
+      admissionId,
+      authorizationRevision,
       credentialEpoch,
+      deferChannelPromotion,
       voiceEnforcementSessionGeneration,
     } = options;
     this.assertDMCallOpen(roomContext);
@@ -1719,6 +1818,26 @@ export class RoomManager {
     // membership) is created, so a join that raced its own cooldown is
     // refused without leaving partial state behind.
     this.refuseDuringMediaPolicyCooldown(roomId, userId, 'socket.join');
+
+    // Refresh the channel owner cap tier on each non-deferred join (#1542) so a
+    // mid-call owner subscription change is honored for NEW produces (existing
+    // ones grandfather). Deferred channel A1 must wait for A2 promotion.
+    if (roomContext?.roomKind === 'channel' && !deferChannelPromotion) {
+      room.ownerTier = roomContext.ownerTier;
+    }
+
+    // Keep media admission exactly aligned with the authoritative control-plane
+    // heartbeat bound. This section is synchronous through participants.set, so
+    // simultaneous boundary joins cannot both reserve the final slot. Existing
+    // users may reconnect at capacity without evicting their valid old session.
+    const existing = room.participants.get(userId);
+    if (
+      room.roomKind === 'channel' &&
+      !existing &&
+      room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS
+    ) {
+      throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
+    }
 
     // Per-user media caps (#1300): from the parsed control-plane entitlement,
     // or the fail-closed free floor for pre-#1300 callers. Copy the tiers array
@@ -1754,6 +1873,8 @@ export class RoomManager {
       allowedAudioTiers: [...ent.allowedAudioTiers],
       minPtimeMs: ent.minPtimeMs,
       permissions,
+      admissionId,
+      authorizationRevision,
       mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
     };
 
@@ -1780,10 +1901,54 @@ export class RoomManager {
       );
     }
 
-    // A1 is visible to credential-epoch enforcement but is not authoritative:
-    // A stale candidate must never evict an admitted same-user session before A2.
-    room.pendingChannelParticipants.set(userId, participant);
-    return joinRoomResult(room, userId, parsedMediaFrameCryptoVersion);
+    if (deferChannelPromotion) {
+      // A1 is visible to credential-epoch enforcement but is not authoritative:
+      // a stale candidate must never evict an admitted same-user session before A2.
+      room.pendingChannelParticipants.set(userId, participant);
+      return joinRoomResult(
+        room,
+        userId,
+        room.mediaFrameCryptoVersion ?? parsedMediaFrameCryptoVersion
+      );
+    }
+
+    const activeMediaFrameCryptoVersion = this.guardSecurityDecision(
+      () => admitMediaFrameCryptoVersion(room, parsedMediaFrameCryptoVersion),
+      'crypto_version_invalid',
+      'socket.join'
+    );
+    let removedCameraProducer = false;
+    if (existing) {
+      removedCameraProducer = this.cleanupParticipantResources(room, roomId, existing);
+      room.participants.delete(userId);
+    }
+    room.participants.set(userId, participant);
+    if (removedCameraProducer || room.cameraLayerDemands.size > 0) {
+      this.recomputeCameraLayeringGate(room);
+    }
+    room.e2eeEpoch++;
+    this.emitEvent({
+      type: 'user-joined',
+      roomId,
+      userId,
+      username,
+      displayName,
+      avatarUrl,
+      e2eeEpoch: room.e2eeEpoch,
+      callId: room.callId,
+    });
+    return joinRoomResult(room, userId, activeMediaFrameCryptoVersion);
+  }
+
+  /** Read-only A2 prepare predicate; it must not alter membership or epochs. */
+  hasExactProvisionalChannelParticipant(
+    roomId: string,
+    userId: string,
+    socketId: string,
+    admissionId: string
+  ): boolean {
+    const pending = this.rooms.get(roomId)?.pendingChannelParticipants.get(userId);
+    return pending?.socketId === socketId && pending.admissionId === admissionId;
   }
 
   /** Atomically promote one exact A1 channel candidate after the matching A2 check. */
@@ -1801,47 +1966,43 @@ export class RoomManager {
     }
 
     const pending = room.pendingChannelParticipants.get(userId);
-    if (!pending) {
-      const admitted = room.participants.get(userId);
-      if (admitted?.socketId !== socketId) {
-        this.securityDeny('authorization_denied', 'socket.join');
-        throw new Error('Channel provisional participant is not owned by this socket');
-      }
-      commitSocketMembership();
-      return joinRoomResult(room, userId, admitted.mediaFrameCryptoVersion);
-    }
-    if (pending.socketId !== socketId) {
+    if (pending?.socketId !== socketId) {
       this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('Channel provisional participant is not owned by this socket');
     }
+    if (promotion.admissionId !== undefined && pending.admissionId !== promotion.admissionId) {
+      this.securityDeny('authorization_denied', 'socket.join');
+      throw new Error('Channel provisional participant admission does not match');
+    }
+    if (
+      room.mediaFrameCryptoVersion !== null &&
+      room.mediaFrameCryptoVersion !== pending.mediaFrameCryptoVersion
+    ) {
+      throw new CryptoVersionMismatchError(
+        room.mediaFrameCryptoVersion,
+        pending.mediaFrameCryptoVersion
+      );
+    }
 
-    // #2153 F1: joinRoom's re-check runs before the A1→A2 awaits (voice-
-    // enforcement session registration, reauthorization), so a cooldown
-    // ARMED during them is only visible here, at the last synchronous point
-    // before membership commits. A throw here rolls the provisional
-    // participant back like the refusals around it.
     this.refuseDuringMediaPolicyCooldown(roomId, userId, 'socket.join');
 
+    // An enforcement push may have refreshed this staged candidate after A2.
+    // Its snapshot wins over A2 so promotion cannot restore revoked authority.
+    // A full moderation snapshot may arrive after the A2 response but before
+    // this synchronous promotion. Its revision fences the stale A2 flags.
+    applyChannelParticipantPromotion(pending, promotion, new Date());
+
+    // A1 candidates do not reserve capacity. Recheck against the authoritative
+    // map immediately before the Socket.IO/admission commit; a same-user
+    // replacement does not consume a second slot.
     const existing = room.participants.get(userId);
     if (!existing && room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS) {
       this.securityDeny('structural_limit_exceeded', 'socket.join');
       throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
     }
 
-    pending.username = promotion.identity.username;
-    pending.displayName = promotion.identity.displayName;
-    pending.avatarUrl = promotion.identity.avatarUrl;
-    pending.tier = promotion.entitlement.tier;
-    pending.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
-    pending.minPtimeMs = promotion.entitlement.minPtimeMs;
-    pending.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
-    pending.permissions = promotion.permissions;
-    pending.serverMuted = promotion.serverMuted;
-    pending.serverDeafened = promotion.serverDeafened;
-    pending.joinedAt = new Date();
-
-    // Socket.IO membership must succeed before this candidate becomes visible
-    // in an authoritative room projection.
+    // Keep Socket.IO membership, authoritative replacement, and lifecycle
+    // publication ordered: an adapter failure must leave the old session live.
     commitSocketMembership();
 
     const activeMediaFrameCryptoVersion = this.guardSecurityDecision(
@@ -1849,27 +2010,18 @@ export class RoomManager {
       'crypto_version_invalid',
       'socket.join'
     );
-
-    // A2, not A1, supplies every authority-derived channel property.
-    room.ownerTier = promotion.ownerTier;
+    let removedCameraProducer = false;
     if (existing) {
-      logger.warn('User already in room, cleaning up old session', {
-        roomId,
-        userId,
-        oldSocketId: existing.socketId,
-        newSocketId: socketId,
-      });
-      this.removeParticipantSession(room, roomId, userId);
+      removedCameraProducer = this.cleanupParticipantResources(room, roomId, existing);
+      room.participants.delete(userId);
     }
 
     room.pendingChannelParticipants.delete(userId);
     room.participants.set(userId, pending);
-
-    // E2EE media-epoch (keyId) sync nudge — incremented on every join so
-    // receivers ratchet their per-frame keyId in lockstep. NOT a forward-secrecy
-    // boundary: the access boundary is the channel-key version (key_version) the
-    // frame now carries (#1878, Decision B). Inter-version forward secrecy lives
-    // in the CSK rotation/re-wrap on membership change, not here.
+    room.ownerTier = promotion.ownerTier;
+    if (removedCameraProducer || room.cameraLayerDemands.size > 0) {
+      this.recomputeCameraLayeringGate(room);
+    }
     room.e2eeEpoch++;
 
     logger.info('Participant joined room', {
@@ -1878,17 +2030,18 @@ export class RoomManager {
       username: pending.username,
       participantCount: room.participants.size,
     });
-
     this.emitEvent({
       type: 'user-joined',
       roomId,
       userId,
       username: pending.username,
       displayName: pending.displayName,
-      avatarUrl: pending.avatarUrl,
       e2eeEpoch: room.e2eeEpoch,
       callId: room.callId,
+      admissionId: pending.admissionId,
+      socketId: pending.socketId,
     });
+
     return joinRoomResult(room, userId, activeMediaFrameCryptoVersion);
   }
 
@@ -1956,16 +2109,7 @@ export class RoomManager {
       );
     }
     const admittedAt = new Date();
-    participant.username = promotion.identity.username;
-    participant.displayName = promotion.identity.displayName;
-    participant.avatarUrl = promotion.identity.avatarUrl;
-    participant.tier = promotion.entitlement.tier;
-    participant.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
-    participant.minPtimeMs = promotion.entitlement.minPtimeMs;
-    participant.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
-    participant.serverMuted = promotion.serverMuted;
-    participant.serverDeafened = promotion.serverDeafened;
-    participant.joinedAt = admittedAt;
+    applyDMParticipantPromotion(participant, promotion, admittedAt);
 
     // Socket.IO's configured in-memory adapter joins synchronously. Run that
     // potentially-throwing boundary after every admission check but before any
@@ -2096,7 +2240,7 @@ export class RoomManager {
       await this.closeRoom(
         roomId,
         room,
-        room.roomKind === 'dm' && room.callParticipantHistory.size > 0
+        room.roomKind === 'dm' ? room.callParticipantHistory.size > 0 : room.e2eeEpoch > 0
       );
     }
     return true;
@@ -2110,7 +2254,7 @@ export class RoomManager {
     return this.removeParticipantSession(room, roomId, userId);
   }
 
-  /** Exact-socket rollback for channel admission, including normal empty-room closure. */
+  /** Exact-socket rollback for a staged channel candidate or admitted session. */
   async leaveRoomIfSocketOwned(roomId: string, userId: string, socketId: string): Promise<boolean> {
     const room = this.rooms.get(roomId);
     const pendingChannel = room?.pendingChannelParticipants.get(userId);
@@ -2130,7 +2274,7 @@ export class RoomManager {
       room.pendingDMParticipants.size === 0 &&
       room.pendingChannelParticipants.size === 0
     ) {
-      await this.closeRoom(roomId, room);
+      await this.closeRoom(roomId, room, room.roomKind === 'dm' ? undefined : room.e2eeEpoch > 0);
     }
     return true;
   }
@@ -3903,12 +4047,14 @@ export class RoomManager {
   }
 
   /** Server-unmute a participant: clear flag but do NOT resume producers */
-  async serverUnmuteUser(roomId: string, userId: string): Promise<void> {
+  async serverUnmuteUser(roomId: string, userId: string): Promise<boolean> {
     const participant = this.getParticipant(roomId, userId);
-    if (!participant) return;
+    if (!participant) return true;
+    if (participant.serverEnforcementRevision !== undefined) return false;
 
     participant.serverMuted = false;
     logger.info('Server-unmuted user', { roomId, userId });
+    return true;
   }
 
   /** Server-deafen a participant: mute + deafen, pause audio producers and consumers */
@@ -3924,13 +4070,65 @@ export class RoomManager {
   }
 
   /** Server-undeafen a participant: clear deafen and mute flags, do NOT resume anything */
-  async serverUndeafenUser(roomId: string, userId: string): Promise<void> {
+  async serverUndeafenUser(roomId: string, userId: string): Promise<boolean> {
     const participant = this.getParticipant(roomId, userId);
-    if (!participant) return;
+    if (!participant) return true;
+    if (participant.serverEnforcementRevision !== undefined) return false;
 
     participant.serverDeafened = false;
     participant.serverMuted = false;
     logger.info('Server-undeafened user', { roomId, userId });
+    return true;
+  }
+
+  /**
+   * Apply one control-plane moderation snapshot to the active session and the
+   * exact current A1 candidate, if either still accepts its revision. The
+   * caller owns the NATS payload; no client data reaches this boundary.
+   */
+  async applyServerEnforcementSnapshot(
+    roomId: string,
+    userId: string,
+    serverMuted: boolean,
+    serverDeafened: boolean,
+    authorizationRevision: bigint
+  ): Promise<boolean> {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    const channelPending = room.pendingChannelParticipants.get(userId);
+    const dmPending = room.pendingDMParticipants.get(userId)?.participant;
+    const participant = room.participants.get(userId);
+    let applied = false;
+
+    for (const pending of [channelPending, dmPending]) {
+      if (pending && authorizationRevision > (pending.serverEnforcementRevision ?? 0n)) {
+        pending.serverMuted = serverMuted;
+        pending.serverDeafened = serverDeafened;
+        pending.serverEnforcementRevision = authorizationRevision;
+        applied = true;
+      }
+    }
+
+    if (participant && authorizationRevision > (participant.serverEnforcementRevision ?? 0n)) {
+      const shouldPauseAudio = serverMuted;
+      const shouldPauseConsumers = serverDeafened;
+      participant.serverMuted = serverMuted;
+      participant.serverDeafened = serverDeafened;
+      participant.serverEnforcementRevision = authorizationRevision;
+      if (shouldPauseAudio) await this.pauseAudioProducers(participant);
+      if (shouldPauseConsumers) await this.pauseAudioConsumers(participant);
+      applied = true;
+    }
+
+    if (applied) {
+      logger.info('Applied server enforcement snapshot', {
+        roomId,
+        userId,
+        serverMuted,
+        serverDeafened,
+      });
+    }
+    return applied;
   }
 
   /**
@@ -4029,15 +4227,65 @@ export class RoomManager {
    * Replace a channel-room participant's permission snapshot with a freshly
    * resolved server-authoritative bitfield (voice.enforce.permissions,
    * CV-CAN-007 review P1). Returns false — and changes nothing — when the
-   * participant is absent (already left) or the room carries no server
-   * permission model (`permissions === undefined`, i.e. a DM room): the
-   * enforcement subject only ever targets server channels, and a DM room must
-   * never have a permission model bolted on mid-session.
+   * participant is absent (already left), belongs to another socket when an
+   * expected socket is supplied, or the room carries no server permission
+   * model (`permissions === undefined`, i.e. a DM room): the enforcement
+   * subject only ever targets server channels, and a DM room must never have a
+   * permission model bolted on mid-session.
    */
-  updateParticipantPermissions(roomId: string, userId: string, permissions: bigint): boolean {
+  updateParticipantPermissions(
+    roomId: string,
+    userId: string,
+    permissions: bigint,
+    expectedSocketId?: string,
+    authorizationRevision?: bigint
+  ): boolean {
     const participant = this.getParticipant(roomId, userId);
-    if (participant?.permissions === undefined) return false;
+    if (
+      participant?.permissions === undefined ||
+      (expectedSocketId !== undefined && participant.socketId !== expectedSocketId)
+    ) {
+      return false;
+    }
+    if (
+      authorizationRevision !== undefined &&
+      participant.authorizationRevision !== undefined &&
+      authorizationRevision < participant.authorizationRevision
+    ) {
+      return false;
+    }
+    if (authorizationRevision === undefined && participant.authorizationRevision !== undefined) {
+      return false;
+    }
     participant.permissions = permissions;
+    if (authorizationRevision !== undefined)
+      participant.authorizationRevision = authorizationRevision;
+    return true;
+  }
+
+  /** Refresh one exact staged channel candidate without admitting it. */
+  updateProvisionalParticipantPermissions(
+    roomId: string,
+    userId: string,
+    permissions: bigint,
+    authorizationRevision?: bigint
+  ): boolean {
+    const pending = this.rooms.get(roomId)?.pendingChannelParticipants.get(userId);
+    if (pending?.permissions === undefined) return false;
+    if (
+      authorizationRevision !== undefined &&
+      pending.authorizationRevision !== undefined &&
+      authorizationRevision < pending.authorizationRevision
+    ) {
+      return false;
+    }
+    if (authorizationRevision === undefined && pending.authorizationRevision !== undefined) {
+      return false;
+    }
+    pending.permissions = permissions;
+    pending.enforcedPermissions = permissions;
+    pending.enforcedAuthorizationRevision = authorizationRevision ?? pending.authorizationRevision;
+    if (authorizationRevision !== undefined) pending.authorizationRevision = authorizationRevision;
     return true;
   }
 
@@ -4110,7 +4358,12 @@ export class RoomManager {
     roomId: string,
     userId: string
   ):
-    | { socketId: string; credentialEpoch: string; voiceEnforcementSessionGeneration?: string }
+    | {
+        socketId: string;
+        credentialEpoch: string;
+        voiceEnforcementSessionGeneration?: string;
+        admissionId?: string;
+      }
     | undefined {
     const room = this.rooms.get(roomId);
     const pending =
@@ -4121,6 +4374,7 @@ export class RoomManager {
           socketId: pending.socketId,
           credentialEpoch: pending.credentialEpoch,
           voiceEnforcementSessionGeneration: pending.voiceEnforcementSessionGeneration,
+          admissionId: pending.admissionId,
         }
       : undefined;
   }

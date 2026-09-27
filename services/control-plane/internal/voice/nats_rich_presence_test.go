@@ -1130,6 +1130,75 @@ func TestHandleJoined_ServerPersistsAuthoritativeRichPresence(t *testing.T) {
 	require.Equal(t, eventAt.UnixMicro(), state.SourceVersion)
 }
 
+func TestHandleJoined_ServerConsumesOnlyItsExactPendingAdmission(t *testing.T) {
+	for index, test := range []struct {
+		name             string
+		eventAdmissionID uuid.UUID
+		eventSocketID    string
+		wantRemaining    int
+		wantAdmissionID  uuid.UUID
+		wantSocketID     string
+	}{
+		{
+			name:             "matching reservation is consumed",
+			eventAdmissionID: uuid.New(),
+			eventSocketID:    "socket-current",
+			wantRemaining:    0,
+		},
+		{
+			name:             "newer reservation is retained",
+			eventAdmissionID: uuid.New(),
+			eventSocketID:    "socket-stale",
+			wantRemaining:    1,
+			wantAdmissionID:  uuid.New(),
+			wantSocketID:     "socket-successor",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ts := testhelpers.SetupTestServer(t)
+			sub := newTestSubscriber(ts)
+			sender := ts.CreateTestUser(t, fmt.Sprintf("rp_pending_admission_%d", index))
+			serverID := ts.CreateTestServer(t, sender.ID, "RP Pending Admission")
+			channelID := ts.CreateVoiceChannel(t, serverID, "rp-pending-admission")
+			storedAdmissionID := test.eventAdmissionID
+			storedSocketID := test.eventSocketID
+			if test.wantRemaining == 1 {
+				storedAdmissionID = test.wantAdmissionID
+				storedSocketID = test.wantSocketID
+			}
+			require.NoError(t, ts.DB.QueryRow(`
+				INSERT INTO voice_pending_admissions
+					(channel_id, user_id, admission_id, socket_id, expires_at)
+				VALUES ($1, $2, $3, $4, clock_timestamp() + INTERVAL '30 seconds')
+				RETURNING admission_id
+			`, channelID, sender.ID, storedAdmissionID, storedSocketID).Scan(&storedAdmissionID))
+
+			sub.HandleJoined(mustJSON(t, map[string]interface{}{
+				"channelId": channelID, "userId": sender.ID, "username": sender.Username,
+				"admissionId": test.eventAdmissionID, "socketId": test.eventSocketID,
+				"timestamp": time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+			}))
+
+			var remaining int
+			require.NoError(t, ts.DB.QueryRow(`
+				SELECT COUNT(*) FROM voice_pending_admissions WHERE channel_id = $1 AND user_id = $2
+			`, channelID, sender.ID).Scan(&remaining))
+			require.Equal(t, test.wantRemaining, remaining)
+			if test.wantRemaining == 1 {
+				var gotAdmissionID uuid.UUID
+				var gotSocketID string
+				require.NoError(t, ts.DB.QueryRow(`
+					SELECT admission_id, socket_id
+					FROM voice_pending_admissions
+					WHERE channel_id = $1 AND user_id = $2
+				`, channelID, sender.ID).Scan(&gotAdmissionID, &gotSocketID))
+				require.Equal(t, test.wantAdmissionID, gotAdmissionID)
+				require.Equal(t, test.wantSocketID, gotSocketID)
+			}
+		})
+	}
+}
+
 func TestHandleLeft_ServerStaleEventPreservesNewerParticipantAndActivity(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	sub := newTestSubscriber(ts)

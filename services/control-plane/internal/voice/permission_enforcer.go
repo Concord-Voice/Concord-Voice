@@ -190,7 +190,12 @@ func (e *PermissionEnforcer) voicePresenceChannelIDs(ctx context.Context, server
 	rows, err := e.db.QueryContext(ctx, `
 		SELECT vp.channel_id FROM voice_participants vp
 		JOIN channels c ON c.id = vp.channel_id
-		WHERE c.server_id = $1 AND vp.user_id = $2`, serverID, userID)
+		WHERE c.server_id = $1 AND vp.user_id = $2
+		UNION
+		SELECT pending.channel_id FROM voice_pending_admissions pending
+		JOIN channels c ON c.id = pending.channel_id
+		WHERE c.server_id = $1 AND pending.user_id = $2
+		  AND pending.expires_at > clock_timestamp()`, serverID, userID)
 	if err != nil {
 		e.log.Error(queryErrMsg, "error", err,
 			"server_id", sanitizeLogValue(serverID), "user_id", sanitizeLogValue(userID))
@@ -447,7 +452,10 @@ func (e *PermissionEnforcer) recheckChannelSync(ctx context.Context, serverID, c
 	queryCtx, cancel := context.WithTimeout(ctx, recheckTimeout)
 	defer cancel()
 	rows, err := e.db.QueryContext(queryCtx,
-		`SELECT user_id FROM voice_participants WHERE channel_id = $1`, channelID)
+		`SELECT user_id FROM voice_participants WHERE channel_id = $1
+		 UNION
+		 SELECT user_id FROM voice_pending_admissions
+		 WHERE channel_id = $1 AND expires_at > clock_timestamp()`, channelID)
 	if err != nil {
 		e.log.Error("Failed to query voice participants for permission recheck", "error", err,
 			"channel_id", sanitizeLogValue(channelID))
@@ -490,7 +498,11 @@ func (e *PermissionEnforcer) recheckServerSync(ctx context.Context, serverID str
 	rows, err := e.db.QueryContext(queryCtx, `
 		SELECT vp.channel_id, vp.user_id FROM voice_participants vp
 		JOIN channels c ON c.id = vp.channel_id
-		WHERE c.server_id = $1`, serverID)
+		WHERE c.server_id = $1
+		UNION
+		SELECT pending.channel_id, pending.user_id FROM voice_pending_admissions pending
+		JOIN channels c ON c.id = pending.channel_id
+		WHERE c.server_id = $1 AND pending.expires_at > clock_timestamp()`, serverID)
 	if err != nil {
 		e.log.Error("Failed to query server voice participants for permission recheck", "error", err,
 			"server_id", sanitizeLogValue(serverID))
@@ -547,10 +559,39 @@ func (e *PermissionEnforcer) recheckOneLocked(ctx context.Context, serverID, cha
 	// not the originating request or the batch-enumeration deadline.
 	ctx, cancel := context.WithTimeout(ctx, recheckTimeout)
 	defer cancel()
-	// Fresh (cache-READ-bypassing) resolve: an in-flight pre-mutation compute
-	// can repopulate the cache after the mutation invalidated it; publishing
-	// that stale entry would be sticky fail-open on the media-plane snapshot.
-	perms, err := e.resolver.ResolveEffectivePermissionsFresh(ctx, serverID, userID, channelID)
+	// Resolve and stamp a revision under the same server authority lock as the
+	// mutation writers. The lock is literally the first statement, then the
+	// user/server/channel/member row locks keep lifecycle writers out until this
+	// snapshot is committed.
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		e.failClosedRecheck("begin", err, serverID, channelID, userID)
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			e.log.Error("Voice permission recheck rollback failed", "error", rollbackErr, "server_id", sanitizeLogValue(serverID), "channel_id", sanitizeLogValue(channelID), "user_id", sanitizeLogValue(userID))
+		}
+	}()
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		e.failClosedRecheck("visibility_lock", err, serverID, channelID, userID)
+		return
+	}
+	var locked string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id=$1 FOR SHARE`, userID).Scan(&locked); err != nil {
+		e.failClosedRecheck("user_lock", err, serverID, channelID, userID)
+		return
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id=$1 FOR UPDATE`, serverID).Scan(&locked); err != nil {
+		e.failClosedRecheck("server_lock", err, serverID, channelID, userID)
+		return
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT c.id FROM channels c JOIN server_members sm ON sm.server_id=c.server_id AND sm.user_id=$2 WHERE c.id=$1 AND c.server_id=$3 FOR UPDATE OF c, sm`, channelID, userID, serverID).Scan(&locked); err != nil {
+		e.failClosedRecheck("channel_member_lock", err, serverID, channelID, userID)
+		return
+	}
+	// Fresh transaction-scoped resolve bypasses stale cache reads.
+	perms, err := e.resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, userID, channelID)
 	if errors.Is(err, rbac.ErrNotMember) {
 		// Definitive: no longer a server member — evict from the room (mirrors
 		// tempGrantManager.publishForceDisconnect, ADR-0023).
@@ -570,15 +611,36 @@ func (e *PermissionEnforcer) recheckOneLocked(ctx context.Context, serverID, cha
 		e.publishDisconnect(channelID, userID)
 		return
 	}
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('voice_authorization_revision_seq')`).Scan(&revision); err != nil || revision <= 0 {
+		if err == nil {
+			err = errors.New("invalid voice authorization revision")
+		}
+		e.failClosedRecheck("revision", err, serverID, channelID, userID)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		e.failClosedRecheck("commit", err, serverID, channelID, userID)
+		return
+	}
 	if err := e.nats.Publish(natsSubjectEnforcePermissions, map[string]interface{}{
-		"channelId":   channelID,
-		"userId":      userID,
-		"permissions": strconv.FormatInt(int64(perms), 10),
+		"channelId":             channelID,
+		"userId":                userID,
+		"permissions":           strconv.FormatInt(int64(perms), 10),
+		"authorizationRevision": strconv.FormatInt(revision, 10),
 	}); err != nil {
 		e.log.Error("Failed to publish permission recheck", "error", err,
 			"subject", natsSubjectEnforcePermissions,
 			"channel_id", sanitizeLogValue(channelID), "user_id", sanitizeLogValue(userID))
 	}
+}
+
+func (e *PermissionEnforcer) failClosedRecheck(step string, err error, serverID, channelID, userID string) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	e.log.Error("Voice permission recheck failed closed", "failure_class", "authority_snapshot", "step", step, "error", err, "server_id", sanitizeLogValue(serverID), "channel_id", sanitizeLogValue(channelID), "user_id", sanitizeLogValue(userID))
+	e.publishDisconnect(channelID, userID)
 }
 
 // publishDisconnect publishes a voice.enforce.disconnect for one (channel, user)

@@ -5,33 +5,437 @@ package voice
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/mediaproof"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
+const (
+	voiceAdmissionActivationSubject         = "voice.admission.activate"
+	voiceAdmissionActivationVersion         = "v1"
+	enforcementSnapshotSchemaVersion        = 1
+	voiceAdmissionActivationRequestPurpose  = "concord/voice-admission-activate/request/v1"
+	voiceAdmissionActivationResponsePurpose = "concord/voice-admission-activate/response/v1"
+	voiceAdmissionActivationNotReadyPurpose = "concord/voice-admission-activate/response/not-ready/v1"
+	errMsgInvalidVoiceJoinRequestBody       = "Invalid request body"
+	errMsgVoiceChannelAccessDenied          = "Channel not found or access denied"
+)
+
+type voiceAdmissionActivationAcknowledgement uint8
+
+const (
+	voiceAdmissionActivationRejected voiceAdmissionActivationAcknowledgement = iota
+	voiceAdmissionActivationNotReady
+	voiceAdmissionActivationAccepted
+)
+
+type voiceAdmissionActivationExpectation struct {
+	channelID, userID, admissionID, socketID, revision, nonce string
+}
+
+type voiceAdmissionActivationResponse struct {
+	Version, Timestamp, ChannelID, UserID, AdmissionID, SocketID, Revision, Nonce, Result, Proof string
+}
+
+type voiceJoinAdmission struct {
+	AdmissionID string `json:"admission_id"`
+	SocketID    string `json:"socket_id"`
+	Activate    bool   `json:"activate"`
+}
+
+func verifyVoiceAdmissionActivationResponse(
+	responseRaw []byte,
+	secret string,
+	expected voiceAdmissionActivationExpectation,
+) voiceAdmissionActivationAcknowledgement {
+	var response voiceAdmissionActivationResponse
+	if err := json.Unmarshal(responseRaw, &response); err != nil ||
+		response.Version != voiceAdmissionActivationVersion ||
+		response.ChannelID != expected.channelID || response.UserID != expected.userID ||
+		response.AdmissionID != expected.admissionID || response.SocketID != expected.socketID ||
+		response.Revision != expected.revision || response.Nonce != expected.nonce {
+		return voiceAdmissionActivationRejected
+	}
+	fields := []string{"activate", expected.channelID, expected.userID, expected.admissionID, expected.socketID, expected.revision, expected.nonce, response.Result}
+	switch response.Result {
+	case "not_ready":
+		if mediaproof.Verify(mediaproof.DeriveKey(secret, voiceAdmissionActivationNotReadyPurpose), response.Proof, voiceAdmissionActivationVersion, response.Timestamp, fields...) {
+			return voiceAdmissionActivationNotReady
+		}
+	case "ok":
+		if mediaproof.Verify(mediaproof.DeriveKey(secret, voiceAdmissionActivationResponsePurpose), response.Proof, voiceAdmissionActivationVersion, response.Timestamp, fields...) {
+			return voiceAdmissionActivationAccepted
+		}
+	}
+	return voiceAdmissionActivationRejected
+}
+
+func parseVoiceJoinAdmission(c *gin.Context, channelID string) (voiceJoinAdmission, bool) {
+	if _, err := uuid.Parse(channelID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelID})
+		return voiceJoinAdmission{}, false
+	}
+	if !middleware.IsMediaPlaneServiceHop(c) {
+		return voiceJoinAdmission{}, true
+	}
+
+	var admission voiceJoinAdmission
+	if err := c.ShouldBindJSON(&admission); err != nil || admission.SocketID == "" || len(admission.SocketID) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidVoiceJoinRequestBody})
+		return voiceJoinAdmission{}, false
+	}
+	parsedAdmissionID, err := uuid.Parse(admission.AdmissionID)
+	if err != nil || parsedAdmissionID == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidVoiceJoinRequestBody})
+		return voiceJoinAdmission{}, false
+	}
+	return admission, true
+}
+
+func (h *Handler) preflightVoiceJoinServer(c *gin.Context, channelID string) (string, bool) {
+	var serverID string
+	err := h.db.QueryRowContext(c.Request.Context(), `SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgVoiceChannelAccessDenied})
+		return "", false
+	}
+	if err != nil {
+		h.log.Error("Failed to preflight voice channel", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return "", false
+	}
+	return serverID, true
+}
+
+func (h *Handler) prepareMediaVoiceAdmission(
+	c *gin.Context,
+	tx *sql.Tx,
+	channelID, userID string,
+	admission voiceJoinAdmission,
+) (int64, bool) {
+	var authorizationRevision int64
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT nextval('voice_authorization_revision_seq')`).Scan(&authorizationRevision); err != nil {
+		h.log.Error("Failed to allocate voice authorization revision", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return 0, false
+	}
+	if !admission.Activate {
+		if _, err := tx.ExecContext(c.Request.Context(), `
+			INSERT INTO voice_pending_admissions (channel_id, user_id, admission_id, socket_id, expires_at)
+			VALUES ($1, $2, $3, $4, clock_timestamp() + INTERVAL '30 seconds')
+			ON CONFLICT (channel_id, user_id) DO UPDATE SET admission_id = EXCLUDED.admission_id, socket_id = EXCLUDED.socket_id, expires_at = EXCLUDED.expires_at
+		`, channelID, userID, admission.AdmissionID, admission.SocketID); err != nil {
+			h.log.Error("Failed to reserve pending voice admission", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+			return 0, false
+		}
+		return authorizationRevision, true
+	}
+
+	var matchedAdmissionID uuid.UUID
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT admission_id FROM voice_pending_admissions WHERE channel_id=$1 AND user_id=$2 AND admission_id=$3 AND socket_id=$4 AND expires_at > clock_timestamp() FOR UPDATE`, channelID, userID, admission.AdmissionID, admission.SocketID).Scan(&matchedAdmissionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+			return 0, false
+		}
+		h.log.Error("Failed to validate pending voice admission", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return 0, false
+	}
+	if !h.renewPendingVoiceAdmission(c, tx, channelID, userID, admission) {
+		return 0, false
+	}
+	return authorizationRevision, true
+}
+
+func (h *Handler) authorizeMediaVoiceAdmission(
+	c *gin.Context,
+	tx *sql.Tx,
+	channelID, userID string,
+	admission voiceJoinAdmission,
+) (int64, bool) {
+	authorizationRevision, ok := h.prepareMediaVoiceAdmission(c, tx, channelID, userID, admission)
+	if !ok || !admission.Activate {
+		return authorizationRevision, ok
+	}
+	if !h.activateMediaVoiceAdmission(c, channelID, userID, admission, authorizationRevision) {
+		return 0, false
+	}
+	return authorizationRevision, true
+}
+
+func (h *Handler) activateMediaVoiceAdmission(
+	c *gin.Context,
+	channelID, userID string,
+	admission voiceJoinAdmission,
+	authorizationRevision int64,
+) bool {
+	var nonceBytes [32]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		h.log.Error("Failed to generate voice admission nonce", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return false
+	}
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	revision := strconv.FormatInt(authorizationRevision, 10)
+	nonce := hex.EncodeToString(nonceBytes[:])
+	fields := []string{"activate", channelID, userID, admission.AdmissionID, admission.SocketID, revision, nonce}
+	requestKey := mediaproof.DeriveKey(h.cfg.JWTSecret, voiceAdmissionActivationRequestPurpose)
+	proof := mediaproof.Sign(requestKey, voiceAdmissionActivationVersion, timestamp, fields...)
+	request := gin.H{"version": voiceAdmissionActivationVersion, "timestamp": timestamp, "channelId": channelID, "userId": userID, "admissionId": admission.AdmissionID, "socketId": admission.SocketID, "revision": revision, "nonce": nonce, "proof": proof}
+	if h.nats == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return false
+	}
+	requestCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	responseRaw, requestErr := h.nats.RequestWithContext(requestCtx, voiceAdmissionActivationSubject, request)
+	cancel()
+	if requestErr != nil {
+		h.log.Error("Voice admission activation failed", "error", requestErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return false
+	}
+	expectedResponse := voiceAdmissionActivationExpectation{channelID, userID, admission.AdmissionID, admission.SocketID, revision, nonce}
+	acknowledgement := verifyVoiceAdmissionActivationResponse(responseRaw, h.cfg.JWTSecret, expectedResponse)
+	if acknowledgement == voiceAdmissionActivationNotReady {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return false
+	}
+	if acknowledgement != voiceAdmissionActivationAccepted {
+		h.log.Error("Voice admission activation acknowledgement rejected")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return false
+	}
+	return true
+}
+
+func (h *Handler) renewPendingVoiceAdmission(
+	c *gin.Context,
+	tx *sql.Tx,
+	channelID, userID string,
+	admission voiceJoinAdmission,
+) bool {
+	result, err := tx.ExecContext(c.Request.Context(), `
+		UPDATE voice_pending_admissions
+		SET expires_at = clock_timestamp() + INTERVAL '30 seconds'
+		WHERE channel_id = $1 AND user_id = $2 AND admission_id = $3 AND socket_id = $4
+	`, channelID, userID, admission.AdmissionID, admission.SocketID)
+	if err != nil {
+		h.log.Error("Failed to renew pending voice admission", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return false
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil || rowsAffected != 1 {
+		if err != nil {
+			h.log.Error("Failed to read pending voice admission renewal result", "error", err)
+		} else {
+			h.log.Error("Unexpected pending voice admission renewal result", "rows_affected", rowsAffected)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return false
+	}
+	return true
+}
+
+func (h *Handler) maybeAuthorizeMediaVoiceAdmission(
+	c *gin.Context,
+	tx *sql.Tx,
+	isMediaHop bool,
+	channelID, userID string,
+	admission voiceJoinAdmission,
+) (int64, bool) {
+	if !isMediaHop {
+		return 0, true
+	}
+	return h.authorizeMediaVoiceAdmission(c, tx, channelID, userID, admission)
+}
+
+func resolveVoiceJoinMediaEntitlements(
+	userTier, serverTier string,
+	audioQualityTier *string,
+) (entitlements.MediaEntitlements, string) {
+	channelTier := ""
+	if audioQualityTier != nil {
+		channelTier = *audioQualityTier
+	}
+	return entitlements.MediaForChannel(userTier, serverTier, channelTier), entitlements.RoomCapTierForServer(serverTier)
+}
+
+func addVoiceAdmissionRevision(response gin.H, isMediaHop bool, authorizationRevision int64) {
+	if isMediaHop {
+		response["authorization_revision"] = strconv.FormatInt(authorizationRevision, 10)
+	}
+}
+
+type voiceJoinAuthorization struct {
+	channelID        string
+	channelName      string
+	serverID         string
+	audioQualityTier *string
+	permissions      rbac.Permission
+	serverMuted      bool
+	serverDeafened   bool
+	username         string
+	displayName      sql.NullString
+	avatarURL        sql.NullString
+}
+
+// recheckActivatedVoiceJoin repeats every authority read after the out-of-tx
+// PREPARE acknowledgement. A prepared candidate is not admitted until this
+// transaction commits with the exact reservation still intact.
+func (h *Handler) recheckActivatedVoiceJoin(c *gin.Context, tx *sql.Tx, preflightServerID, channelID, userID string) (voiceJoinAuthorization, bool) {
+	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, preflightServerID); err != nil {
+		h.log.Error("voice join: lock visibility", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, false
+	}
+	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+		h.respondVoiceGuardTxError(c, err, errMsgFailedAuthorize)
+		return voiceJoinAuthorization{}, false
+	}
+	var lockedServerID string
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, preflightServerID).Scan(&lockedServerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgVoiceChannelAccessDenied})
+		} else {
+			h.log.Error("Failed to lock voice join server", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		}
+		return voiceJoinAuthorization{}, false
+	}
+	var result voiceJoinAuthorization
+	var channelType string
+	var timedOutUntil sql.NullTime
+	err := tx.QueryRowContext(c.Request.Context(), `
+		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
+		FROM channels c
+		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
+		WHERE c.id = $1 AND c.server_id = $3
+		FOR UPDATE OF c, sm
+	`, channelID, userID, lockedServerID).Scan(&result.channelID, &result.channelName, &channelType, &result.serverID, &result.audioQualityTier, &timedOutUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgVoiceChannelAccessDenied})
+		return voiceJoinAuthorization{}, false
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch channel for voice join", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, false
+	}
+	if channelType != "voice" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Not a voice channel"})
+		return voiceJoinAuthorization{}, false
+	}
+	result.permissions, err = h.resolver.ResolveChannelPermissionsTx(c.Request.Context(), tx, result.serverID, userID, result.channelID)
+	if err != nil {
+		h.log.Error("Failed to resolve effective voice permissions", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, false
+	}
+	if !result.permissions.Has(rbac.PermViewVoiceChannels) || !result.permissions.Has(rbac.PermJoinVoice) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return voiceJoinAuthorization{}, false
+	}
+	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Member is timed out", "code": "member_timed_out", "timed_out_until": timedOutUntil.Time})
+		return voiceJoinAuthorization{}, false
+	}
+	if err := tx.QueryRowContext(c.Request.Context(), `
+		SELECT sm.server_muted, sm.server_deafened, u.username, u.display_name, u.avatar_url
+		FROM server_members sm JOIN users u ON u.id = sm.user_id
+		WHERE sm.server_id = $1 AND sm.user_id = $2
+	`, result.serverID, userID).Scan(&result.serverMuted, &result.serverDeafened, &result.username, &result.displayName, &result.avatarURL); err != nil {
+		h.log.Error("Failed to query server enforcement flags", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, false
+	}
+	return result, true
+}
+
+func (h *Handler) completeActivatedVoiceAdmission(
+	c *gin.Context,
+	tx *sql.Tx,
+	preflightServerID, channelID, userID string,
+	admission voiceJoinAdmission,
+) (voiceJoinAuthorization, int64, bool) {
+	provisionalRevision, authorized := h.prepareMediaVoiceAdmission(c, tx, channelID, userID, admission)
+	if !authorized {
+		return voiceJoinAuthorization{}, 0, false
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("voice join: commit pre-activation transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, 0, false
+	}
+	if !h.activateMediaVoiceAdmission(c, channelID, userID, admission, provisionalRevision) {
+		return voiceJoinAuthorization{}, 0, false
+	}
+	if h.afterVoiceAdmissionPrepareForTest != nil {
+		h.afterVoiceAdmissionPrepareForTest()
+	}
+
+	finalTx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("voice join: begin final credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, 0, false
+	}
+	defer func() {
+		if rbErr := finalTx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("voice join: final credential transaction rollback", "error", rbErr)
+		}
+	}()
+	final, authorized := h.recheckActivatedVoiceJoin(c, finalTx, preflightServerID, channelID, userID)
+	if !authorized {
+		return voiceJoinAuthorization{}, 0, false
+	}
+	authorizationRevision, authorized := h.prepareMediaVoiceAdmission(c, finalTx, final.channelID, userID, admission)
+	if !authorized {
+		return voiceJoinAuthorization{}, 0, false
+	}
+	if err := finalTx.Commit(); err != nil {
+		h.log.Error("voice join: commit final credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinAuthorization{}, 0, false
+	}
+	return final, authorizationRevision, true
+}
+
 // Handler handles voice-related requests.
 type Handler struct {
-	db          *sql.DB
-	log         *logger.Logger
-	hub         *websocket.Hub
-	cfg         *config.Config
-	resolver    *rbac.Resolver
-	nats        *natsclient.Client
-	audit       *rbac.AuditWriter
-	entCache    *entitlements.Cache
-	serverTiers entitlements.ServerTierResolver
-	tempGrant   *tempGrantManager
+	db                                *sql.DB
+	log                               *logger.Logger
+	hub                               *websocket.Hub
+	cfg                               *config.Config
+	resolver                          *rbac.Resolver
+	nats                              *natsclient.Client
+	audit                             *rbac.AuditWriter
+	entCache                          *entitlements.Cache
+	serverTiers                       entitlements.ServerTierResolver
+	tempGrant                         *tempGrantManager
+	afterVoiceAdmissionPrepareForTest func()
+	commitVoiceEffectTxForTest        func(*sql.Tx) error
+	beforeTemporaryGrantForTest       func()
+	beforeVoiceEffectForTest          func()
 }
 
 // HandlerDeps groups the dependencies required to construct a Handler.
@@ -90,6 +494,15 @@ func (h *Handler) serverTier(ctx context.Context, serverID string) string {
 	return entitlements.ResolveServerTier(ctx, h.db, serverID)
 }
 
+func (h *Handler) respondVoiceGuardTxError(c *gin.Context, guardErr error, genericMsg string) {
+	if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+	h.log.Error("credential-epoch guard read failed", "error", guardErr)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
+}
+
 // Participant represents a user currently in a voice channel.
 type Participant struct {
 	UserID          string `json:"user_id"`
@@ -137,13 +550,13 @@ func (h *Handler) GetParticipants(c *gin.Context) {
 	// server member could enumerate hidden voice room occupancy (usernames,
 	// mute/deafen/video/screen-share state) by channel UUID. Server membership
 	// alone is insufficient; the WS subscribe path already enforces ViewVoice.
-	canView, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermViewVoiceChannels)
+	effectivePerms, permErr := h.resolver.ResolveEffectivePermissionsUncached(c.Request.Context(), serverID, userID, channelID)
 	if permErr != nil {
 		h.log.Error("Failed to check voice view permission", "error", permErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchParticipants})
 		return
 	}
-	if !canView {
+	if !effectivePerms.Has(rbac.PermViewVoiceChannels) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 		return
 	}
@@ -195,112 +608,52 @@ func (h *Handler) GetParticipants(c *gin.Context) {
 func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
-
-	if _, err := uuid.Parse(channelID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelID})
+	isMediaHop := middleware.IsMediaPlaneServiceHop(c)
+	admission, ok := parseVoiceJoinAdmission(c, channelID)
+	if !ok {
 		return
 	}
-
-	// Fetch channel details + verify membership in one query.
-	var channelName, channelType, serverID string
-	var audioQualityTier *string
-	var timedOutUntil sql.NullTime
-	err := h.db.QueryRow(`
-		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
-		FROM channels c
-		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
-		WHERE c.id = $1
-	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier, &timedOutUntil)
-
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Channel not found or access denied"})
+	// The visibility advisory lock needs a stable key before the transaction;
+	// revalidation under that lock below remains authoritative.
+	preflightServerID, ok := h.preflightVoiceJoinServer(c, channelID)
+	if !ok {
 		return
-	} else if err != nil {
-		h.log.Error("Failed to fetch channel for voice join", "error", err)
+	}
+	// Both resolvers may read through to Postgres. Do that before acquiring the
+	// credential and visibility fences so a cold cache cannot lease a second
+	// pool connection while the authorization transaction owns the first.
+	userTier := entitlements.TierFree
+	if h.entCache != nil {
+		userTier = h.entCache.GetTier(c.Request.Context(), userID)
+	}
+	serverTier := h.serverTier(c.Request.Context(), preflightServerID)
+
+	// The credential guard owns the users row until the authoritative channel,
+	// membership, and permission decision has been made. Committing it before
+	// those reads would let a concurrent credential reset linearize between the
+	// guard and the successful media-admission response.
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("voice join: begin credential transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
-
-	if channelType != "voice" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Not a voice channel"})
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("voice join: credential transaction rollback", "error", rbErr)
+		}
+	}()
+	authorization, authorized := h.recheckActivatedVoiceJoin(c, tx, preflightServerID, channelID, userID)
+	if !authorized {
 		return
 	}
+	channelID = authorization.channelID
 
-	// CV-CAN-006: voice access requires BOTH ViewVoice (see the channel) and
-	// JoinVoice. Previously only JoinVoice was checked, so a member granted
-	// JoinVoice but denied ViewVoice could join a hidden voice room by UUID.
-	// The WS subscribe gate and temp-grant mask already treat ViewVoice as part
-	// of voice visibility. Resolve effective permissions once (reused below for
-	// the media-plane bitfield) and gate on both bits — HasPermission and
-	// GetEffectivePermissions share the same computation, so this preserves the
-	// prior JoinVoice semantics (incl. the owner bypass).
-	effectivePerms, permErr := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, channelID)
-	if permErr != nil {
-		h.log.Error("Failed to resolve effective voice permissions", "error", permErr, "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(serverID))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return
-	}
-	if !effectivePerms.Has(rbac.PermViewVoiceChannels) || !effectivePerms.Has(rbac.PermJoinVoice) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return
-	}
-	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error":           "Member is timed out",
-			"code":            "member_timed_out",
-			"timed_out_until": timedOutUntil.Time,
-		})
-		return
-	}
-
-	// effectivePerms was resolved above (CV-CAN-006 dual-bit gate) and is reused
-	// here for the media-plane bitfield — the media plane enforces PermSpeak,
-	// PermScreenShare, PermMuteMembers, PermDeafenMembers, PermMoveMembers from it.
-
-	// Query server-enforced mute/deafen flags for this member AND the member's
-	// authoritative display identity (CV-CAN-017). The media-plane previously
-	// took username/display_name/avatar_url from client-supplied
-	// socket.handshake.auth and rebroadcast them as authoritative — letting an
-	// in-room member spoof its display identity to peers. We resolve them here
-	// from the AUTHENTICATED user_id (folded into this existing per-member query,
-	// so no extra round-trip) and return them in the response for the media-plane
-	// to use instead of the handshake values.
-	var serverMuted, serverDeafened bool
-	var username string
-	var displayName, avatarURL sql.NullString
-	if err := h.db.QueryRow(`
-		SELECT sm.server_muted, sm.server_deafened, u.username, u.display_name, u.avatar_url
-		FROM server_members sm
-		JOIN users u ON u.id = sm.user_id
-		WHERE sm.server_id = $1 AND sm.user_id = $2`,
-		serverID, userID).Scan(&serverMuted, &serverDeafened, &username, &displayName, &avatarURL); err != nil {
-		h.log.Error("Failed to query server enforcement flags", "error", err, "user_id", sanitizeLogValue(userID), "server_id", sanitizeLogValue(serverID))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return
-	}
-
-	// Resolve channel-aware media entitlements: the per-channel audio standard
-	// (admin-set) uplifts every member, bounded by the server's Mach tier. The
-	// joining user's tier is resolved server-side from the AUTHENTICATED user_id;
-	// the server-tier resolver is the #1521 seam (Groundspeed today, Mach when
-	// #1556 ships); MediaForChannel fails closed (Personal/free) on any unknown
-	// value. See [internal]rules/media-plane.md "Per-channel audio standard".
-	channelTier := ""
-	if audioQualityTier != nil {
-		channelTier = *audioQualityTier
-	}
 	// Resolve the server's Mach tier once and reuse it for both the media
 	// entitlement and the room-cap tier below: same serverID and request
 	// context, so the result is identical, and once #1556 makes serverTier a
 	// real (Redis read-through) resolution this avoids a redundant round-trip
 	// per channel join.
-	serverTier := h.serverTier(c.Request.Context(), serverID)
-	mediaEnt := entitlements.MediaForChannel(
-		h.entCache.GetTier(c.Request.Context(), userID),
-		serverTier,
-		channelTier,
-	)
-
 	// Room-scoped producer caps (#1542) follow the SERVER's Mach tier — the server
 	// SUBSCRIPTION provisions the channel's egress capacity, so neither a premium
 	// member nor a premium owner on a free server may raise a (large/public)
@@ -311,33 +664,56 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	// free/premium wire, fail-closed to free. The field name stays room_owner_tier
 	// for wire stability. DMs do NOT carry this field (see dm/handlers.go) — there
 	// the media-plane derives the cap from the max present-participant tier.
-	roomOwnerTier := entitlements.RoomCapTierForServer(serverTier)
+	mediaEnt, roomOwnerTier := resolveVoiceJoinMediaEntitlements(userTier, serverTier, authorization.audioQualityTier)
+	var authorizationRevision int64
+	if isMediaHop && admission.Activate {
+		var completed bool
+		authorization, authorizationRevision, completed = h.completeActivatedVoiceAdmission(c, tx, preflightServerID, channelID, userID, admission)
+		if !completed {
+			return
+		}
+		channelID = authorization.channelID
+		mediaEnt, roomOwnerTier = resolveVoiceJoinMediaEntitlements(userTier, serverTier, authorization.audioQualityTier)
+	} else {
+		var authorized bool
+		authorizationRevision, authorized = h.maybeAuthorizeMediaVoiceAdmission(c, tx, isMediaHop, channelID, userID, admission)
+		if !authorized {
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			h.log.Error("voice join: commit credential transaction", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+			return
+		}
+	}
 
-	h.log.Info("Voice join authorized", "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(serverID), "media_tier", mediaEnt.Tier)
+	h.log.Info("Voice join authorized", "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(authorization.serverID), "media_tier", mediaEnt.Tier)
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"allowed":            true,
 		"media_server_url":   h.cfg.MediaPlaneURL,
 		"ice_servers":        h.cfg.ICEServers(userID),
-		"permissions":        strconv.FormatInt(int64(effectivePerms), 10),
-		"server_muted":       serverMuted,
-		"server_deafened":    serverDeafened,
+		"permissions":        strconv.FormatInt(int64(authorization.permissions), 10),
+		"server_muted":       authorization.serverMuted,
+		"server_deafened":    authorization.serverDeafened,
 		"media_entitlements": mediaEnt,
 		"room_owner_tier":    roomOwnerTier,
 		// CV-CAN-017: server-authoritative display identity, resolved from the
 		// authenticated user_id. The media-plane uses these in place of the
 		// client-supplied handshake values so a member cannot spoof its display
 		// identity to peers. display_name/avatar_url are empty strings when unset.
-		"username":     username,
-		"display_name": displayName.String,
-		"avatar_url":   avatarURL.String,
+		"username":     authorization.username,
+		"display_name": authorization.displayName.String,
+		"avatar_url":   authorization.avatarURL.String,
 		"channel": gin.H{
 			"id":                 channelID,
-			"name":               channelName,
-			"server_id":          serverID,
-			"audio_quality_tier": audioQualityTier,
+			"name":               authorization.channelName,
+			"server_id":          authorization.serverID,
+			"audio_quality_tier": authorization.audioQualityTier,
 		},
-	})
+	}
+	addVoiceAdmissionRevision(response, isMediaHop, authorizationRevision)
+	c.JSON(http.StatusOK, response)
 }
 
 // AuthorizeVoiceAction checks whether a user has permission to perform a voice
@@ -362,9 +738,28 @@ func (h *Handler) AuthorizeVoiceAction(c *gin.Context) {
 		return
 	}
 
+	// Keep the users-row epoch fence through every DB-backed authorization read
+	// and the emitted authority response. A reset that acquires the users row
+	// first fails this request; otherwise it necessarily commits after it.
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("voice action: begin credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthAction})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("voice action: credential transaction rollback", "error", rbErr)
+		}
+	}()
+	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+		h.respondVoiceGuardTxError(c, err, errMsgFailedAuthAction)
+		return
+	}
+
 	// Get server ID from channel
 	var serverID string
-	err := h.db.QueryRow(`
+	err = tx.QueryRowContext(c.Request.Context(), `
 		SELECT c.server_id FROM channels c
 		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
 		WHERE c.id = $1
@@ -391,20 +786,20 @@ func (h *Handler) AuthorizeVoiceAction(c *gin.Context) {
 	}
 
 	// Check permission
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, perm)
+	effectivePerms, permErr := h.resolver.ResolveChannelPermissionsTx(c.Request.Context(), tx, serverID, userID, channelID)
 	if permErr != nil {
 		h.log.Error("Failed to check voice moderation permission", "error", permErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthAction})
 		return
 	}
-	if !hasPerm {
+	if !effectivePerms.Has(perm) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 		return
 	}
 
 	// Verify target user is a member of this server
 	var targetIsMember bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
 		serverID, req.TargetUserID).Scan(&targetIsMember); err != nil {
 		h.log.Error("Failed to check target membership", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthAction})
@@ -416,8 +811,13 @@ func (h *Handler) AuthorizeVoiceAction(c *gin.Context) {
 	}
 
 	// Hierarchy check: cannot moderate members with equal or higher role
-	if h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, req.TargetUserID) != nil {
+	if h.resolver.CheckHierarchyTx(c.Request.Context(), tx, serverID, userID, req.TargetUserID) != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgHierarchyViolation})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("voice action: commit credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthAction})
 		return
 	}
 
@@ -443,6 +843,8 @@ const (
 	errMsgInsufficientPerms      = "Insufficient permissions"
 	errMsgFailedCheckPerms       = "Failed to check permissions"
 	errMsgFailedCheckMember      = "Failed to check membership"
+	errMsgFailedUnmuteMember     = "Failed to unmute member"
+	errMsgFailedDisconnectMember = "Failed to disconnect member"
 	errMsgTargetNotMember        = "Target user is not a member of this server"
 	errMsgHierarchyViolation     = "Cannot moderate a member with equal or higher role position"
 	errMsgTargetNotInVoice       = "Target user is not in a voice channel"
@@ -455,10 +857,84 @@ type voiceModContext struct {
 	targetID string
 }
 
-// authorizeVoiceMod validates params, checks membership, permission, and optionally hierarchy.
-// For user-level actions (requireHierarchy=false), it also enforces the self-target guard.
+var (
+	errVoiceModActorNotMember = errors.New("voice moderation actor is not a member")
+	errVoiceModPermission     = errors.New("voice moderation permission denied")
+	errVoiceModHierarchy      = errors.New("voice moderation hierarchy denied")
+)
+
+// revalidateVoiceModAuthorityTx repeats the RBAC decision inside the effect
+// transaction. Credential epochs do not change for role or membership changes,
+// so the preflight check alone cannot authorize a later mutation.
+func revalidateVoiceModAuthorityTx(
+	ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver,
+	mod *voiceModContext, actorID string, perm rbac.Permission, requireHierarchy bool,
+) error {
+	member, err := serverMemberExistsTx(ctx, tx, mod.serverID, actorID)
+	if err != nil {
+		return fmt.Errorf("revalidate voice moderation membership: %w", err)
+	}
+	if !member {
+		return errVoiceModActorNotMember
+	}
+	perms, err := resolver.ResolveServerPermissionsTx(ctx, tx, mod.serverID, actorID)
+	if err != nil {
+		if errors.Is(err, rbac.ErrNotMember) {
+			return errVoiceModActorNotMember
+		}
+		return fmt.Errorf("revalidate voice moderation permission: %w", err)
+	}
+	if !perms.Has(perm) {
+		return errVoiceModPermission
+	}
+	if requireHierarchy && resolver.CheckHierarchyTx(ctx, tx, mod.serverID, actorID, mod.targetID) != nil {
+		return errVoiceModHierarchy
+	}
+	return nil
+}
+
+func (h *Handler) respondVoiceModAuthorityTxError(c *gin.Context, err error, genericMsg string) {
+	switch {
+	case errors.Is(err, errVoiceModActorNotMember):
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+	case errors.Is(err, errVoiceModPermission):
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+	case errors.Is(err, errVoiceModHierarchy):
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgHierarchyViolation})
+	default:
+		h.log.Error(genericMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
+	}
+}
+
+// guardVoiceModEffectTx establishes the server authority lock before the users
+// lock, then verifies the actor against the same committed RBAC state as the
+// mutation or external effect that follows.
+func (h *Handler) guardVoiceModEffectTx(
+	c *gin.Context, tx *sql.Tx, mod *voiceModContext, perm rbac.Permission, requireHierarchy bool, failMsg string,
+) bool {
+	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, mod.serverID); err != nil {
+		h.log.Error(failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return false
+	}
+	actorID := c.GetString("user_id")
+	if err := credepoch.GuardTx(c.Request.Context(), tx, actorID, middleware.TokenCredentialEpoch(c)); err != nil {
+		h.respondVoiceGuardTxError(c, err, failMsg)
+		return false
+	}
+	if err := revalidateVoiceModAuthorityTx(c.Request.Context(), tx, h.resolver, mod, actorID, perm, requireHierarchy); err != nil {
+		h.respondVoiceModAuthorityTxError(c, err, failMsg)
+		return false
+	}
+	return true
+}
+
+// authorizeVoiceMod validates params, membership, permission, and hierarchy.
+// ServerMove owns the sole ADR-0023 hierarchy exception and deliberately does
+// not call this helper.
 // Returns nil and sends the HTTP error response if any check fails.
-func (h *Handler) authorizeVoiceMod(c *gin.Context, perm rbac.Permission, requireHierarchy bool) *voiceModContext {
+func (h *Handler) authorizeVoiceMod(c *gin.Context, perm rbac.Permission) *voiceModContext {
 	actorID := c.GetString("user_id")
 	serverID := c.Param("id")
 	targetID := c.Param("userId")
@@ -477,14 +953,6 @@ func (h *Handler) authorizeVoiceMod(c *gin.Context, perm rbac.Permission, requir
 		return nil
 	}
 
-	if !requireHierarchy {
-		// User-level: self-target guard
-		if actorID == targetID {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCannotTargetSelf})
-			return nil
-		}
-	}
-
 	// Check permission
 	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, actorID, "", perm)
 	if err != nil {
@@ -497,7 +965,7 @@ func (h *Handler) authorizeVoiceMod(c *gin.Context, perm rbac.Permission, requir
 		return nil
 	}
 
-	if requireHierarchy && h.resolver.CheckHierarchy(c.Request.Context(), serverID, actorID, targetID) != nil {
+	if h.resolver.CheckHierarchy(c.Request.Context(), serverID, actorID, targetID) != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgHierarchyViolation})
 		return nil
 	}
@@ -522,16 +990,14 @@ func (h *Handler) checkMembership(c *gin.Context, serverID, userID string) bool 
 	return true
 }
 
-// findVoiceChannel queries the voice channel a target is connected to in a server.
-// Returns the channel ID (empty if not in voice) and any real DB error.
-func (h *Handler) findVoiceChannel(serverID, targetID string) (string, error) {
+func findVoiceChannelTx(ctx context.Context, tx *sql.Tx, serverID, targetID string) (string, error) {
 	var channelID string
-	err := h.db.QueryRow(`
+	err := tx.QueryRowContext(ctx, `
 		SELECT vp.channel_id FROM voice_participants vp
 		JOIN channels c ON c.id = vp.channel_id
 		WHERE c.server_id = $1 AND vp.user_id = $2
 	`, serverID, targetID).Scan(&channelID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
@@ -542,7 +1008,13 @@ func (h *Handler) findVoiceChannel(serverID, targetID string) (string, error) {
 
 // publishEnforcement publishes a NATS enforcement message if the target is in voice.
 func (h *Handler) publishEnforcement(subject, channelID, targetID, action string) {
-	if channelID == "" || h.nats == nil {
+	if channelID == "" {
+		return
+	}
+	if h.beforeVoiceEffectForTest != nil {
+		h.beforeVoiceEffectForTest()
+	}
+	if h.nats == nil {
 		return
 	}
 	if pubErr := h.nats.Publish(subject, map[string]interface{}{
@@ -550,6 +1022,102 @@ func (h *Handler) publishEnforcement(subject, channelID, targetID, action string
 	}); pubErr != nil {
 		h.log.Error("Failed to publish NATS enforcement", "error", pubErr, "subject", subject, "action", action)
 	}
+}
+
+type serverEnforcementSnapshot struct {
+	serverMuted     bool
+	serverDeafened  bool
+	authorizationID int64
+	channelIDs      []string
+}
+
+// serverEnforcementSnapshotTx reads the post-mutation moderation state and
+// gives it one monotonic control-plane revision before the surrounding
+// visibility-locked transaction commits. The media plane rejects older
+// snapshots, including one that races a staged A2 promotion.
+func serverEnforcementSnapshotTx(
+	ctx context.Context, tx *sql.Tx, serverID, targetID string,
+) (snapshot serverEnforcementSnapshot, returnErr error) {
+	if err := tx.QueryRowContext(ctx, `
+		SELECT server_muted, server_deafened
+		FROM server_members
+		WHERE server_id = $1 AND user_id = $2
+	`, serverID, targetID).Scan(&snapshot.serverMuted, &snapshot.serverDeafened); err != nil {
+		return serverEnforcementSnapshot{}, fmt.Errorf("read server enforcement state: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('voice_authorization_revision_seq')`).Scan(&snapshot.authorizationID); err != nil || snapshot.authorizationID <= 0 {
+		if err == nil {
+			err = errors.New("invalid voice authorization revision")
+		}
+		return serverEnforcementSnapshot{}, fmt.Errorf("allocate server enforcement revision: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT channel_id
+		FROM (
+			SELECT participant.channel_id, 0 AS source_priority
+			FROM voice_participants AS participant
+			JOIN channels AS channel ON channel.id = participant.channel_id
+			WHERE channel.server_id = $1 AND participant.user_id = $2
+			UNION ALL
+			SELECT pending.channel_id, 1 AS source_priority
+			FROM voice_pending_admissions AS pending
+			JOIN channels AS channel ON channel.id = pending.channel_id
+			WHERE channel.server_id = $1 AND pending.user_id = $2
+		) AS voice_channels
+		GROUP BY channel_id
+		ORDER BY MIN(source_priority), channel_id
+	`, serverID, targetID)
+	if err != nil {
+		return serverEnforcementSnapshot{}, fmt.Errorf("discover server enforcement channels: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close server enforcement channel discovery: %w", closeErr))
+		}
+	}()
+	for rows.Next() {
+		var channelID string
+		if err := rows.Scan(&channelID); err != nil {
+			return serverEnforcementSnapshot{}, fmt.Errorf("scan server enforcement channel: %w", err)
+		}
+		snapshot.channelIDs = append(snapshot.channelIDs, channelID)
+	}
+	if err := rows.Err(); err != nil {
+		return serverEnforcementSnapshot{}, fmt.Errorf("iterate server enforcement channels: %w", err)
+	}
+	return snapshot, nil
+}
+
+// publishServerEnforcementSnapshot sends the complete moderator-owned state to
+// each established or staged channel session. The subject remains action-scoped
+// for compatibility; fields are a control-plane snapshot, never client input.
+func (h *Handler) publishServerEnforcementSnapshot(
+	subject, targetID, action string, snapshot serverEnforcementSnapshot,
+) {
+	if h.nats == nil {
+		return
+	}
+	for _, channelID := range snapshot.channelIDs {
+		if pubErr := h.nats.Publish(subject, map[string]interface{}{
+			"channelId":             channelID,
+			"userId":                targetID,
+			"action":                action,
+			"serverMuted":           snapshot.serverMuted,
+			"serverDeafened":        snapshot.serverDeafened,
+			"authorizationRevision": strconv.FormatInt(snapshot.authorizationID, 10),
+			"version":               enforcementSnapshotSchemaVersion,
+		}); pubErr != nil {
+			h.log.Error("Failed to publish NATS enforcement", "error", pubErr, "subject", subject, "action", action)
+		}
+	}
+}
+
+func firstEnforcementChannel(snapshot serverEnforcementSnapshot) string {
+	if len(snapshot.channelIDs) == 0 {
+		return ""
+	}
+	return snapshot.channelIDs[0]
 }
 
 // broadcastVoiceStateUpdate sends a voice_state_update WS event to current server
@@ -575,6 +1143,7 @@ func (h *Handler) broadcastVoiceStateUpdate(serverID, targetID, channelID, actio
 // enforcementParams groups the per-action strings for applyServerEnforcement.
 type enforcementParams struct {
 	query       string // SQL UPDATE statement
+	permission  rbac.Permission
 	natsSubject string // NATS subject to publish on
 	natsAction  string // action field in NATS payload
 	wsAction    string // action field in WS broadcast
@@ -584,7 +1153,21 @@ type enforcementParams struct {
 
 // applyServerEnforcement executes the SQL update, finds voice channel, publishes NATS, broadcasts WS.
 func (h *Handler) applyServerEnforcement(c *gin.Context, ctx *voiceModContext, p enforcementParams) {
-	result, err := h.db.Exec(p.query, ctx.serverID, ctx.targetID)
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error(p.failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("voice enforcement rollback failed", "error", rbErr)
+		}
+	}()
+	if !h.guardVoiceModEffectTx(c, tx, ctx, p.permission, true, p.failMsg) {
+		return
+	}
+	result, err := tx.ExecContext(c.Request.Context(), p.query, ctx.serverID, ctx.targetID)
 	if err != nil {
 		h.log.Error(p.failMsg, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
@@ -600,23 +1183,48 @@ func (h *Handler) applyServerEnforcement(c *gin.Context, ctx *voiceModContext, p
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotMember})
 		return
 	}
-	channelID, findErr := h.findVoiceChannel(ctx.serverID, ctx.targetID)
-	if findErr != nil {
-		h.log.Error("Failed to find voice channel for enforcement", "error", findErr, "server_id", ctx.serverID, "target_id", ctx.targetID)
+	snapshot, err := serverEnforcementSnapshotTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID)
+	if err != nil {
+		h.log.Error(p.failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
+		return
 	}
-	h.publishEnforcement(p.natsSubject, channelID, ctx.targetID, p.natsAction)
-	h.broadcastVoiceStateUpdate(ctx.serverID, ctx.targetID, channelID, p.wsAction)
+	if err := tx.Commit(); err != nil {
+		h.log.Error(p.failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
+		return
+	}
+	h.publishServerEnforcementSnapshot(p.natsSubject, ctx.targetID, p.natsAction, snapshot)
+	h.broadcastVoiceStateUpdate(ctx.serverID, ctx.targetID, firstEnforcementChannel(snapshot), p.wsAction)
 	c.JSON(http.StatusOK, gin.H{"message": p.successMsg})
 }
 
 // userLevelAction sends a real-time user-level enforcement command via NATS.
 func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, natsSubject, natsAction, successMsg, failMsg string) {
-	ctx := h.authorizeVoiceMod(c, perm, false)
+	if c.GetString("user_id") == c.Param("userId") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCannotTargetSelf})
+		return
+	}
+	ctx := h.authorizeVoiceMod(c, perm)
 	if ctx == nil {
 		return
 	}
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error(failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("user voice action rollback failed", "error", rbErr)
+		}
+	}()
+	if !h.guardVoiceModEffectTx(c, tx, ctx, perm, true, failMsg) {
+		return
+	}
 
-	channelID, findErr := h.findVoiceChannel(ctx.serverID, ctx.targetID)
+	channelID, findErr := findVoiceChannelTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID)
 	if findErr != nil {
 		h.log.Error("Failed to find voice channel", "error", findErr, "server_id", ctx.serverID, "target_id", ctx.targetID)
 	}
@@ -634,6 +1242,11 @@ func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, natsSubj
 			return
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error(failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": successMsg})
 }
@@ -641,12 +1254,12 @@ func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, natsSubj
 // ServerMute applies a persistent server-level mute to a member.
 // POST /servers/:id/voice/:userId/mute
 func (h *Handler) ServerMute(c *gin.Context) {
-	ctx := h.authorizeVoiceMod(c, rbac.PermMuteMembers, true)
+	ctx := h.authorizeVoiceMod(c, rbac.PermMuteMembers)
 	if ctx == nil {
 		return
 	}
 	h.applyServerEnforcement(c, ctx, enforcementParams{
-		query:       `UPDATE server_members SET server_muted = true WHERE server_id = $1 AND user_id = $2`,
+		query: `UPDATE server_members SET server_muted = true WHERE server_id = $1 AND user_id = $2`, permission: rbac.PermMuteMembers,
 		natsSubject: "voice.enforce.mute", natsAction: "mute", wsAction: "server_muted",
 		successMsg: "Member server-muted", failMsg: "Failed to mute member",
 	})
@@ -655,21 +1268,35 @@ func (h *Handler) ServerMute(c *gin.Context) {
 // ServerUnmute removes a persistent server-level mute from a member.
 // DELETE /servers/:id/voice/:userId/mute
 func (h *Handler) ServerUnmute(c *gin.Context) {
-	ctx := h.authorizeVoiceMod(c, rbac.PermMuteMembers, true)
+	ctx := h.authorizeVoiceMod(c, rbac.PermMuteMembers)
 	if ctx == nil {
+		return
+	}
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("Failed to begin server-unmute transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("server-unmute rollback failed", "error", rbErr)
+		}
+	}()
+	if !h.guardVoiceModEffectTx(c, tx, ctx, rbac.PermMuteMembers, true, errMsgFailedUnmuteMember) {
 		return
 	}
 
 	// Check if target is server_deafened — cannot unmute without undeafening first
 	var serverDeafened bool
-	if err := h.db.QueryRow(`SELECT server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2`,
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2 FOR UPDATE`,
 		ctx.serverID, ctx.targetID).Scan(&serverDeafened); err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotMember})
 			return
 		}
 		h.log.Error("Failed to check deafen state", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmute member"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
 		return
 	}
 	if serverDeafened {
@@ -678,19 +1305,26 @@ func (h *Handler) ServerUnmute(c *gin.Context) {
 	}
 
 	// Remove server mute
-	if _, err := h.db.Exec(`UPDATE server_members SET server_muted = false WHERE server_id = $1 AND user_id = $2`,
+	if _, err := tx.ExecContext(c.Request.Context(), `UPDATE server_members SET server_muted = false WHERE server_id = $1 AND user_id = $2`,
 		ctx.serverID, ctx.targetID); err != nil {
 		h.log.Error("Failed to server-unmute member", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmute member"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
 		return
 	}
 
-	channelID, findErr := h.findVoiceChannel(ctx.serverID, ctx.targetID)
-	if findErr != nil {
-		h.log.Error("Failed to find voice channel for unmute enforcement", "error", findErr, "server_id", ctx.serverID, "target_id", ctx.targetID)
+	snapshot, err := serverEnforcementSnapshotTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID)
+	if err != nil {
+		h.log.Error(errMsgFailedUnmuteMember, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
+		return
 	}
-	h.publishEnforcement("voice.enforce.mute", channelID, ctx.targetID, "unmute")
-	h.broadcastVoiceStateUpdate(ctx.serverID, ctx.targetID, channelID, "server_unmuted")
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit server-unmute", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
+		return
+	}
+	h.publishServerEnforcementSnapshot("voice.enforce.mute", ctx.targetID, "unmute", snapshot)
+	h.broadcastVoiceStateUpdate(ctx.serverID, ctx.targetID, firstEnforcementChannel(snapshot), "server_unmuted")
 
 	c.JSON(http.StatusOK, gin.H{"message": "Member server-unmuted"})
 }
@@ -698,12 +1332,12 @@ func (h *Handler) ServerUnmute(c *gin.Context) {
 // ServerDeafen applies a persistent server-level deafen (implies mute) to a member.
 // POST /servers/:id/voice/:userId/deafen
 func (h *Handler) ServerDeafen(c *gin.Context) {
-	ctx := h.authorizeVoiceMod(c, rbac.PermDeafenMembers, true)
+	ctx := h.authorizeVoiceMod(c, rbac.PermDeafenMembers)
 	if ctx == nil {
 		return
 	}
 	h.applyServerEnforcement(c, ctx, enforcementParams{
-		query:       `UPDATE server_members SET server_muted = true, server_deafened = true WHERE server_id = $1 AND user_id = $2`,
+		query: `UPDATE server_members SET server_muted = true, server_deafened = true WHERE server_id = $1 AND user_id = $2`, permission: rbac.PermDeafenMembers,
 		natsSubject: "voice.enforce.deafen", natsAction: "deafen", wsAction: "server_deafened",
 		successMsg: "Member server-deafened", failMsg: "Failed to deafen member",
 	})
@@ -712,12 +1346,12 @@ func (h *Handler) ServerDeafen(c *gin.Context) {
 // ServerUndeafen removes a persistent server-level deafen (and mute) from a member.
 // DELETE /servers/:id/voice/:userId/deafen
 func (h *Handler) ServerUndeafen(c *gin.Context) {
-	ctx := h.authorizeVoiceMod(c, rbac.PermDeafenMembers, true)
+	ctx := h.authorizeVoiceMod(c, rbac.PermDeafenMembers)
 	if ctx == nil {
 		return
 	}
 	h.applyServerEnforcement(c, ctx, enforcementParams{
-		query:       `UPDATE server_members SET server_deafened = false, server_muted = false WHERE server_id = $1 AND user_id = $2`,
+		query: `UPDATE server_members SET server_deafened = false, server_muted = false WHERE server_id = $1 AND user_id = $2`, permission: rbac.PermDeafenMembers,
 		natsSubject: "voice.enforce.deafen", natsAction: "undeafen", wsAction: "server_undeafened",
 		successMsg: "Member server-undeafened", failMsg: "Failed to undeafen member",
 	})
@@ -746,20 +1380,34 @@ func (h *Handler) UserDeafen(c *gin.Context) {
 // Move Members permission and the target must currently be in a voice channel
 // in this server (else 409). The action publishes voice.enforce.disconnect so
 // the media plane closes the peer's transports; the resulting voice.left NATS
-// event drives any temp-grant cleanup automatically (revokeTempGrantIfHeld), so
+// event drives the composite temp-grant cleanup automatically, so
 // this handler does NOT duplicate that cleanup.
 //
 // POST /servers/:id/voice/:userId/disconnect
 func (h *Handler) ServerDisconnect(c *gin.Context) {
-	ctx := h.authorizeVoiceMod(c, rbac.PermMoveMembers, true)
+	ctx := h.authorizeVoiceMod(c, rbac.PermMoveMembers)
 	if ctx == nil {
 		return
 	}
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("disconnect: begin transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisconnectMember})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("disconnect: rollback", "error", rbErr)
+		}
+	}()
+	if !h.guardVoiceModEffectTx(c, tx, ctx, rbac.PermMoveMembers, true, errMsgFailedDisconnectMember) {
+		return
+	}
 
-	channelID, findErr := h.findVoiceChannel(ctx.serverID, ctx.targetID)
+	channelID, findErr := findVoiceChannelTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID)
 	if findErr != nil {
 		h.log.Error("disconnect: find current voice channel", "error", findErr, "server_id", ctx.serverID, "target_id", ctx.targetID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disconnect member"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisconnectMember})
 		return
 	}
 	if channelID == "" {
@@ -767,9 +1415,17 @@ func (h *Handler) ServerDisconnect(c *gin.Context) {
 		return
 	}
 
-	// Publish the force-disconnect command. The media plane closes the peer's
-	// transports and emits voice.left, which (via the NATSSubscriber) updates DB
-	// state and triggers revokeTempGrantIfHeld — no duplicate cleanup here.
+	// The successful guard transaction commit is the authorization decision
+	// point. Publish only afterwards: a failed or ambiguous commit must not close
+	// transports before the guard decision is confirmed.
+	if err := h.commitVoiceEffectTx(tx); err != nil {
+		h.log.Error("disconnect: commit transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisconnectMember})
+		return
+	}
+	// The media plane closes the peer's transports and emits voice.left, which
+	// (via the NATSSubscriber) updates DB state and triggers the composite
+	// temp-grant cleanup — no duplicate cleanup here.
 	h.publishEnforcement(natsSubjectEnforceDisconnect, channelID, ctx.targetID, "disconnect")
 
 	c.JSON(http.StatusOK, gin.H{"disconnected": true})
@@ -795,11 +1451,10 @@ type tempAccessRevokeRequest struct {
 //
 // DELETE /servers/:id/voice/:userId/temp-access  body {channel_id}
 func (h *Handler) RevokeTempAccess(c *gin.Context) {
-	ctx := h.authorizeVoiceMod(c, rbac.PermMoveMembers, true)
+	ctx := h.authorizeVoiceMod(c, rbac.PermMoveMembers)
 	if ctx == nil {
 		return
 	}
-
 	var req tempAccessRevokeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelIDBody})
@@ -823,27 +1478,35 @@ func (h *Handler) RevokeTempAccess(c *gin.Context) {
 		return
 	}
 
-	// Probe first so the response can report whether a temp grant actually existed.
-	held, probeErr := h.tempGrant.hasTemporaryGrant(reqCtx, req.ChannelID, ctx.targetID)
-	if probeErr != nil {
-		h.log.Error("temp-access revoke: hasTemporaryGrant probe", "error", probeErr, "channel_id", req.ChannelID, "target_id", ctx.targetID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRevokeTempAccess})
-		return
-	}
-	if !held {
-		// No temp grant (permanent grant or none) → no-op, never touch a permanent grant.
-		c.JSON(http.StatusOK, gin.H{"revoked": false})
-		return
-	}
-
+	// The shared transactional delete reports the actual result, avoiding a
+	// preflight-to-delete race that could otherwise claim a revoke occurred.
 	actorID := c.GetString("user_id")
-	if err := h.tempGrant.revokeTemporaryChannelAccess(reqCtx, ctx.serverID, req.ChannelID, ctx.targetID, actorID); err != nil {
+	removed, err := h.tempGrant.revokeTemporaryChannelAccessWithCredential(
+		reqCtx, ctx.serverID, req.ChannelID, ctx.targetID,
+		temporaryGrantAuthorization{
+			actorID:         actorID,
+			credentialEpoch: middleware.TokenCredentialEpoch(c),
+			guardCredential: true,
+			authority: func(txCtx context.Context, tx *sql.Tx) error {
+				return revalidateVoiceModAuthorityTx(txCtx, tx, h.resolver, ctx, actorID, rbac.PermMoveMembers, true)
+			},
+		},
+	)
+	if err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			h.respondVoiceGuardTxError(c, err, errMsgFailedRevokeTempAccess)
+			return
+		}
+		if errors.Is(err, errVoiceModActorNotMember) || errors.Is(err, errVoiceModPermission) || errors.Is(err, errVoiceModHierarchy) {
+			h.respondVoiceModAuthorityTxError(c, err, errMsgFailedRevokeTempAccess)
+			return
+		}
 		h.log.Error("temp-access revoke", "error", err, "channel_id", req.ChannelID, "target_id", ctx.targetID, "server_id", ctx.serverID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRevokeTempAccess})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"revoked": true})
+	c.JSON(http.StatusOK, gin.H{"revoked": removed})
 }
 
 // --- Move (#487 Scope B) ---
@@ -884,24 +1547,125 @@ func (h *Handler) ServerMove(c *gin.Context) {
 	}
 
 	selfMove := actorID == targetID
-
-	// Self-move: any user may relocate themselves; no permission, no hierarchy,
-	// no temp grant (they can already see channels they're allowed to join).
-	if !selfMove && !h.authorizeMove(c, serverID, actorID) {
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("move: begin credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("move: credential transaction rollback", "error", rbErr)
+		}
+	}()
+	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, serverID); err != nil {
+		h.log.Error("move: lock server authority", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		return
+	}
+	// The visibility lock serializes RBAC writers before the users lock is held
+	// through the no-grant move decision. That makes reset and the committed
+	// decision a single linearization point: reset first yields 401; guard first
+	// makes reset wait, then the committed decision may signal the move.
+	if err := credepoch.GuardTx(c.Request.Context(), tx, actorID, middleware.TokenCredentialEpoch(c)); err != nil {
+		h.respondVoiceGuardTxError(c, err, errMsgMovePrep)
 		return
 	}
 
-	fromChannelID, ok := h.resolveMoveSource(c, serverID, targetID, req.TargetChannelID)
-	if !ok {
+	isVoice, err := isVoiceChannelInServerTx(c.Request.Context(), tx, req.TargetChannelID, serverID)
+	if err != nil {
+		h.log.Error("move: target channel lookup", "error", err, "target_channel_id", req.TargetChannelID, "server_id", serverID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		return
+	}
+	if !isVoice {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTargetNotVoiceInSrv})
+		return
+	}
+	fromChannelID, err := findVoiceChannelTx(c.Request.Context(), tx, serverID, targetID)
+	if err != nil {
+		h.log.Error("move: find current voice channel", "error", err, "server_id", serverID, "target_id", targetID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		return
+	}
+	if fromChannelID == "" {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgTargetNotInVoice})
+		return
+	}
+	if fromChannelID == req.TargetChannelID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgAlreadyInTarget})
 		return
 	}
 
-	if !selfMove && !h.prepareModeratedMove(c, serverID, actorID, targetID, fromChannelID, req.TargetChannelID) {
+	canJoin := true
+	if !selfMove {
+		if authorityErr := revalidateVoiceModAuthorityTx(c.Request.Context(), tx, h.resolver, &voiceModContext{serverID: serverID, targetID: targetID}, actorID, rbac.PermMoveMembers, false); authorityErr != nil {
+			h.respondVoiceModAuthorityTxError(c, authorityErr, errMsgMovePrep)
+			return
+		}
+		targetPerms, permErr := h.resolver.ResolveChannelPermissionsTx(c.Request.Context(), tx, serverID, targetID, req.TargetChannelID)
+		if permErr != nil {
+			h.log.Error("move: target join-permission check", "error", permErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(req.TargetChannelID))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+			return
+		}
+		canJoin = targetPerms.Has(rbac.PermViewVoiceChannels) && targetPerms.Has(rbac.PermJoinVoice)
+	}
+
+	if canJoin {
+		if err := h.commitVoiceEffectTx(tx); err != nil {
+			h.log.Error("move: commit credential transaction", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+			return
+		}
+		h.signalMove(serverID, targetID, fromChannelID, req.TargetChannelID)
+		if !selfMove {
+			h.auditMoveIfCrossesHierarchy(c.Request.Context(), serverID, actorID, targetID, fromChannelID, req.TargetChannelID)
+		}
+		c.JSON(http.StatusOK, gin.H{"moved": true})
 		return
 	}
 
+	// A temporary grant has its own visibility/lifecycle mutation transaction and
+	// credential fence. Release this read/decision transaction before that nested
+	// mutation (preserving users-before-child lock order). A successful grant
+	// commit is the final move decision: reset before it is rejected by that
+	// transaction; reset after it cannot retroactively cancel the move signal.
+	if err := tx.Commit(); err != nil {
+		h.log.Error("move: commit pre-grant credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		return
+	}
+	if h.beforeTemporaryGrantForTest != nil {
+		h.beforeTemporaryGrantForTest()
+	}
+	if !h.prepareModeratedMove(c, serverID, actorID, targetID, fromChannelID, req.TargetChannelID) {
+		return
+	}
 	h.signalMove(serverID, targetID, fromChannelID, req.TargetChannelID)
+	h.auditMoveIfCrossesHierarchy(c.Request.Context(), serverID, actorID, targetID, fromChannelID, req.TargetChannelID)
 	c.JSON(http.StatusOK, gin.H{"moved": true})
+}
+
+func serverMemberExistsTx(ctx context.Context, tx *sql.Tx, serverID, userID string) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`, serverID, userID).Scan(&exists)
+	return exists, err
+}
+
+func isVoiceChannelInServerTx(ctx context.Context, tx *sql.Tx, channelID, serverID string) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM channels WHERE id = $1 AND server_id = $2 AND type = 'voice')`,
+		channelID, serverID).Scan(&exists)
+	return exists, err
+}
+
+func (h *Handler) commitVoiceEffectTx(tx *sql.Tx) error {
+	if h.commitVoiceEffectTxForTest != nil {
+		return h.commitVoiceEffectTxForTest(tx)
+	}
+	return tx.Commit()
 }
 
 // parseMoveRequest validates the path params + JSON body of a move request. It
@@ -923,77 +1687,11 @@ func (h *Handler) parseMoveRequest(c *gin.Context, serverID, targetID string) (m
 	return req, true
 }
 
-// authorizeMove checks server membership + PermMoveMembers for a moderated
-// (non-self) move. It writes the appropriate error response and returns false
-// when the actor is not authorized.
-//
-//	DELIBERATE HIERARCHY EXCEPTION (ADR-0023): requireHierarchy=false — the perm
-//	check below is NOT followed by a CheckHierarchy gate, so a designated organizer
-//	can move anyone (including higher roles and the owner) between same-server voice
-//	channels. This is the SINGLE sanctioned requireHierarchy=false voice action;
-//	the rbac-reviewer must treat any OTHER requireHierarchy=false voice action as a
-//	finding. Hierarchy-crossing moves are audit-logged (see prepareModeratedMove).
-//	See #487 and the ServerMove doc comment above.
-func (h *Handler) authorizeMove(c *gin.Context, serverID, actorID string) bool {
-	if !h.checkMembership(c, serverID, actorID) {
-		return false
-	}
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, actorID, "", rbac.PermMoveMembers)
-	if permErr != nil {
-		h.log.Error(errMsgFailedCheckPerms, "error", permErr, "permission", rbac.PermMoveMembers)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPerms})
-		return false
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return false
-	}
-	return true
-}
-
-// resolveMoveSource validates the target channel (voice type, in this server) and
-// resolves the user's current voice channel. It writes the error response and
-// returns ok=false on any validation failure (400/409/500). On success it returns
-// the user's current ("from") channel id.
-func (h *Handler) resolveMoveSource(c *gin.Context, serverID, targetID, targetChannelID string) (string, bool) {
-	reqCtx := c.Request.Context()
-
-	// Validate the target channel: voice type AND in this server.
-	isVoice, vErr := h.isVoiceChannelInServer(reqCtx, targetChannelID, serverID)
-	if vErr != nil {
-		h.log.Error("move: target channel lookup", "error", vErr, "target_channel_id", targetChannelID, "server_id", serverID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
-		return "", false
-	}
-	if !isVoice {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTargetNotVoiceInSrv})
-		return "", false
-	}
-
-	// The target user must currently be in a voice channel in this server.
-	fromChannelID, findErr := h.findVoiceChannel(serverID, targetID)
-	if findErr != nil {
-		h.log.Error("move: find current voice channel", "error", findErr, "server_id", serverID, "target_id", targetID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
-		return "", false
-	}
-	if fromChannelID == "" {
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgTargetNotInVoice})
-		return "", false
-	}
-	if fromChannelID == targetChannelID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgAlreadyInTarget})
-		return "", false
-	}
-	return fromChannelID, true
-}
-
-// prepareModeratedMove performs the moderated-move side effects before signaling:
-// audit a hierarchy-crossing move and grant temporary destination access if the
-// target cannot already join. It writes the error response and returns false on a
+// prepareModeratedMove prepares any temporary destination access before signaling.
+// It writes the error response and returns false on a
 // failed permission check, a failed grant, or when a permanent override prevents
 // the grant from conferring both required voice bits. Self-moves never reach here.
-func (h *Handler) prepareModeratedMove(c *gin.Context, serverID, actorID, targetID, fromChannelID, targetChannelID string) bool {
+func (h *Handler) prepareModeratedMove(c *gin.Context, serverID, actorID, targetID, sourceChannelID, targetChannelID string) bool {
 	reqCtx := c.Request.Context()
 
 	// GRANT BEFORE SIGNAL (ordering load-bearing — the client's subsequent
@@ -1005,7 +1703,7 @@ func (h *Handler) prepareModeratedMove(c *gin.Context, serverID, actorID, target
 	// would reject the moved client. grantTemporaryChannelAccess never downgrades a
 	// permanent grant, and the temp mask (tempGrantAllow) supplies both required
 	// bits (VIEW|CONNECT|SPEAK).
-	perms, permErr := h.resolver.GetEffectivePermissions(reqCtx, serverID, targetID, targetChannelID)
+	perms, permErr := h.resolver.ResolveEffectivePermissionsUncached(reqCtx, serverID, targetID, targetChannelID)
 	if permErr != nil {
 		h.log.Error("move: target join-permission check", "error", permErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
@@ -1013,37 +1711,43 @@ func (h *Handler) prepareModeratedMove(c *gin.Context, serverID, actorID, target
 	}
 	canJoin := perms.Has(rbac.PermViewVoiceChannels) && perms.Has(rbac.PermJoinVoice)
 	if !canJoin {
-		if grantErr := h.tempGrant.grantTemporaryChannelAccess(reqCtx, serverID, targetChannelID, targetID); grantErr != nil {
+		granted, grantErr := h.tempGrant.grantTemporaryChannelAccessWithCredential(
+			reqCtx, serverID, targetChannelID, targetID,
+			temporaryGrantAuthorization{
+				actorID:                 actorID,
+				credentialEpoch:         middleware.TokenCredentialEpoch(c),
+				expectedSourceChannelID: sourceChannelID,
+				guardCredential:         true,
+				authority: func(txCtx context.Context, tx *sql.Tx) error {
+					return revalidateVoiceModAuthorityTx(txCtx, tx, h.resolver, &voiceModContext{serverID: serverID, targetID: targetID}, actorID, rbac.PermMoveMembers, false)
+				},
+			},
+		)
+		if grantErr != nil {
+			if errors.Is(grantErr, credepoch.ErrEpochMismatch) || errors.Is(grantErr, credepoch.ErrBlocked) {
+				h.respondVoiceGuardTxError(c, grantErr, errMsgMovePrep)
+				return false
+			}
+			if errors.Is(grantErr, errTemporaryGrantSourceChanged) {
+				c.JSON(http.StatusConflict, gin.H{"error": errMsgTargetNotInVoice})
+				return false
+			}
+			if errors.Is(grantErr, errVoiceModActorNotMember) || errors.Is(grantErr, errVoiceModPermission) || errors.Is(grantErr, errVoiceModHierarchy) {
+				h.respondVoiceModAuthorityTxError(c, grantErr, errMsgMovePrep)
+				return false
+			}
 			h.log.Error("move: temp grant", "error", grantErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
 			return false
 		}
-
-		// grantTemporaryChannelAccess intentionally NO-OPs when a PERMANENT
-		// (non-temporary) user override already governs (channel, user): it must
-		// never mask or downgrade a permanent grant (grant integrity, §6.3). So a
-		// permanent DENY of ViewVoice (while JoinVoice is inherited from a role)
-		// survives the grant, leaving the target still short a required bit. Re-resolve
-		// and confirm BOTH bits are now present; if not, the move cannot complete —
-		// reject here rather than signal a false success that AuthorizeJoin would then
-		// refuse, which would 200 the moderator for a move that never lands.
-		postPerms, recheckErr := h.resolver.GetEffectivePermissions(reqCtx, serverID, targetID, targetChannelID)
-		if recheckErr != nil {
-			h.log.Error("move: post-grant permission recheck", "error", recheckErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
-			return false
-		}
-		if !postPerms.Has(rbac.PermViewVoiceChannels) || !postPerms.Has(rbac.PermJoinVoice) {
+		// A permanent user override makes the locked upsert a no-op. The preflight
+		// already established that the target lacks at least one required voice bit,
+		// so fail closed rather than signal a move that AuthorizeJoin will refuse.
+		if !granted {
 			c.JSON(http.StatusConflict, gin.H{"error": errMsgMoveTargetBlocked})
 			return false
 		}
 	}
-
-	// Audit a move that crosses hierarchy (target outranks-or-equals actor). Done
-	// AFTER the grant succeeds (finding #6) so an authorized-but-failed-to-prepare
-	// move does NOT emit a voice_member_moved audit row for a move that never
-	// happened.
-	h.auditMoveIfCrossesHierarchy(reqCtx, serverID, actorID, targetID, fromChannelID, targetChannelID)
 
 	return true
 }
@@ -1055,6 +1759,9 @@ func (h *Handler) signalMove(serverID, targetID, fromChannelID, targetChannelID 
 	if parseErr != nil {
 		h.log.Error("move: invalid target UUID for directed broadcast", "error", parseErr, "target_id", targetID)
 		return
+	}
+	if h.beforeVoiceEffectForTest != nil {
+		h.beforeVoiceEffectForTest()
 	}
 	h.hub.BroadcastToUser(targetUUID, websocket.OutgoingMessage{
 		Type: "voice_move",

@@ -1033,11 +1033,16 @@ sequenceDiagram
     participant MP as Media Plane
     participant NATS as NATS
 
-    C->>CP: POST /api/v1/channels/:id/voice/join (authorize)
-    CP-->>C: { allowed: true, media_server_url, ice_servers, server_muted, server_deafened }
-    C->>MP: Socket.IO connect → join-room {roomId, rtpCapabilities, mediaFrameCryptoVersion}
+    C->>CP: POST /api/v1/channels/:id/voice/join (A1 authorize)
+    CP->>CP: Lock authority and commit exact 30s pending reservation
+    CP-->>C: { admission_id, media_server_url, ice_servers, server_muted, server_deafened }
+    C->>MP: Socket.IO connect → join-room {roomId, admission_id, rtpCapabilities, mediaFrameCryptoVersion}
     Note over C,MP: userId is taken from the verified JWT, not the payload
-    MP->>MP: RoomManager.getOrCreateRoom → MediasoupService.getOrCreateRouter
+    MP->>MP: RoomManager.joinRoom → defer provisional candidate and create router
+    Note over MP: A1 state is provisional: no participant cap, epoch, or lifecycle promotion
+    MP->>CP: A2 re-authorize exact reservation; signed read-only prepare
+    CP-->>MP: positive authorization revision + prepare accepted
+    MP->>MP: Sole promotion: RoomManager membership + lifecycle mutation
     MP-->>C: router RTP capabilities
     C->>MP: create-transport (send) + create-transport (recv)
     C->>MP: connect-transport (DTLS) → produce (E2EE-encrypted audio frames)
@@ -1045,6 +1050,14 @@ sequenceDiagram
     MP-->>C: other participants' producers → consume
     Note over MP,C: If server_muted/server_deafened was set,<br/>enforcement is applied before room-joined
 ```
+
+ServerMove rechecks the user's exact source-channel membership while the
+temporary-grant transaction holds the visibility and per-user lifecycle locks.
+For a move that needs temporary destination access, the grant's confirmed
+commit is the move decision: the move signal and its enforcement effects are
+sent only after that commit is known to have succeeded. An ambiguous commit is
+compensated by the exact grant fence, with the existing five-second cleanup
+callback converging any orphaned grant after its grace period.
 
 Audio is forwarded as-is (SFU, no transcoding) for low latency. Frames are E2EE (see [Media E2EE](#media-e2ee-frame-encryption)). Redis holds crash-safe room membership (`voice:room:{channelId}` SET, `voice:user:{userId}` HASH, both 120s TTL).
 

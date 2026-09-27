@@ -15,6 +15,7 @@ import {
 import type {
   ChannelParticipantPromotion,
   DMParticipantPromotion,
+  JoinRoomResult,
   MediaSource,
 } from './lib/roomManager.js';
 import { emitCameraLayeringGate } from './lib/layeringGateBroadcast.js';
@@ -24,12 +25,14 @@ import { createMediaPolicerTick } from './lib/mediaPolicerTick.js';
 import { MEDIA_POLICY_PAUSED_RESUME_ACK, mediaPolicyCooldownAck } from './lib/mediaPolicyWire.js';
 import {
   createAuthMiddleware,
+  parsePermissionBitfield,
   releaseDMVoiceAuthorization,
   validateChannelAccess,
   resolveParticipantIdentity,
 } from './middleware/auth.js';
 import type { AuthenticatedSocketData } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
+import { createChannelAdmissionActivationHandler } from './lib/channelAdmissionActivation.js';
 import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
 import { RedisService } from './lib/redis.js';
 import { createExpressErrorHandler } from './lib/expressErrorHandler.js';
@@ -58,6 +61,7 @@ import { VoiceEnforcementExpiryFence, VoiceEnforcementLease } from './lib/voiceE
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import { handleNatsEnforcementCommand } from './lib/enforcementCommand.js';
 import { getIdentityAuthorityReasonCode } from './lib/identityAuthority.js';
+import { enqueueServerEnforcement } from './lib/serverEnforcement.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
 import {
   acknowledgeCloseRecvTransport,
@@ -87,6 +91,10 @@ const expectedKeyframeRequestErrors = new Set([
   'Requester not found',
   'Sender not found',
 ]);
+
+// Complete moderation snapshots are a versioned control-plane contract. Legacy
+// action-only enforcement remains intentionally unversioned for rollout compatibility.
+const SERVER_ENFORCEMENT_SNAPSHOT_VERSION = 1;
 
 // ── #2032 rate-limit rejection diagnostic ────────────────────────────────
 // At most one warn per (event, userId) per minute: an attacker who can trip a
@@ -191,6 +199,152 @@ function emitJoinError(
   socket.emit('error', errPayload);
 }
 
+type ServerEnforcementErrorContext = {
+  roomManager: RoomManager;
+  io: SocketIOServer;
+  subject: string;
+  channelId: string;
+  userId: string;
+  action: string;
+  applyAction: string;
+  hasSnapshot: boolean;
+  serverMuted: unknown;
+  serverDeafened: unknown;
+  error: unknown;
+};
+
+async function handleServerEnforcementError({
+  roomManager,
+  io,
+  subject,
+  channelId,
+  userId,
+  action,
+  applyAction,
+  hasSnapshot,
+  serverMuted,
+  serverDeafened,
+  error,
+}: ServerEnforcementErrorContext): Promise<void> {
+  logger.error(`Failed to handle ${subject}`, { error, channelId, userId, action });
+  if ((hasSnapshot && (serverMuted || serverDeafened)) || action === applyAction) {
+    try {
+      await handleForceDisconnect(roomManager, io, channelId, userId, undefined, {
+        reason: 'access_revoked',
+      });
+    } catch (disconnectErr) {
+      logger.error('Failed to fail closed after server enforcement error', {
+        error: disconnectErr,
+        channelId,
+        userId,
+      });
+    }
+  }
+}
+
+type ServerEnforcementCommandContext = {
+  serverEnforcementChains: Map<string, Promise<void>>;
+  natsData: Record<string, unknown>;
+  roomManager: RoomManager;
+  io: SocketIOServer;
+  subject: string;
+  channelId: string;
+  userId: string;
+  action: string | undefined;
+  applyAction: string;
+  removeAction: string;
+  applyFn: (roomId: string, userId: string) => void | Promise<void>;
+  removeFn: (roomId: string, userId: string) => boolean | Promise<boolean>;
+  eventName: string;
+  eventField: string;
+};
+
+async function applyServerEnforcementCommand({
+  serverEnforcementChains,
+  natsData,
+  roomManager,
+  io,
+  subject,
+  channelId,
+  userId,
+  action,
+  applyAction,
+  removeAction,
+  applyFn,
+  removeFn,
+  eventName,
+  eventField,
+}: ServerEnforcementCommandContext): Promise<void> {
+  await enqueueServerEnforcement(serverEnforcementChains, channelId, userId, async () => {
+    const authorizationRevision = parsePermissionBitfield(natsData.authorizationRevision);
+    const serverMuted = natsData.serverMuted;
+    const serverDeafened = natsData.serverDeafened;
+    const carriesSnapshot =
+      serverMuted !== undefined ||
+      serverDeafened !== undefined ||
+      natsData.authorizationRevision !== undefined ||
+      natsData.version !== undefined;
+    const hasSnapshot =
+      typeof serverMuted === 'boolean' &&
+      typeof serverDeafened === 'boolean' &&
+      authorizationRevision !== undefined &&
+      authorizationRevision > 0n &&
+      natsData.version === SERVER_ENFORCEMENT_SNAPSHOT_VERSION;
+    if (carriesSnapshot && !hasSnapshot) {
+      logger.warn('Rejecting malformed server enforcement snapshot', { channelId, userId });
+      try {
+        await handleForceDisconnect(roomManager, io, channelId, userId, undefined, {
+          reason: 'access_revoked',
+        });
+      } catch (disconnectErr) {
+        logger.error('Failed to fail closed after malformed server enforcement snapshot', {
+          error: disconnectErr,
+          channelId,
+          userId,
+        });
+      }
+      return;
+    }
+
+    try {
+      if (hasSnapshot) {
+        const applied = await roomManager.applyServerEnforcementSnapshot(
+          channelId,
+          userId,
+          serverMuted,
+          serverDeafened,
+          authorizationRevision
+        );
+        if (!applied) return;
+        io.to(channelId).emit(eventName, { userId, [eventField]: natsData[eventField] });
+        return;
+      }
+      if (action === applyAction) {
+        await applyFn(channelId, userId);
+        io.to(channelId).emit(eventName, { userId, [eventField]: true });
+      } else if (action === removeAction) {
+        const applied = await removeFn(channelId, userId);
+        if (!applied) return;
+        io.to(channelId).emit(eventName, { userId, [eventField]: false });
+      }
+    } catch (error) {
+      await handleServerEnforcementError({
+        roomManager,
+        io,
+        subject,
+        channelId,
+        userId,
+        action: action ?? '',
+        applyAction,
+        hasSnapshot,
+        serverMuted,
+        serverDeafened,
+        error,
+      });
+    }
+  });
+}
+
 function getKeyframeSenderUserId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== 'object' || !('senderUserId' in payload)) {
     return undefined;
@@ -211,6 +365,97 @@ function getExpectedKeyframeRequestError(error: unknown): string | undefined {
   }
 
   return expectedKeyframeRequestErrors.has(error.message) ? error.message : undefined;
+}
+
+type RoomJoinValue = {
+  authorizedCallId: string | undefined;
+  identity: ReturnType<typeof resolveParticipantIdentity>;
+  promotion: ChannelParticipantPromotion | DMParticipantPromotion | undefined;
+  result: JoinRoomResult;
+};
+
+function rollbackSocketMembership(
+  socket: Socket,
+  data: AuthenticatedSocketData,
+  roomId: string
+): void {
+  data.roomId = undefined;
+  try {
+    socket.leave(roomId);
+  } catch (leaveError) {
+    logger.error('Failed to roll back Socket.IO room membership', {
+      error: leaveError,
+      roomId,
+      userId: data.userId,
+    });
+  }
+}
+
+function commitChannelAdmission(
+  roomManager: RoomManager,
+  socket: Socket,
+  data: AuthenticatedSocketData,
+  roomId: string,
+  value: RoomJoinValue,
+  commitSocketMembership: () => void
+): RoomJoinValue {
+  if (!value.promotion) {
+    throw new Error('Room admission is missing its A2 promotion state');
+  }
+  if (!('permissions' in value.promotion)) {
+    throw new Error('Channel admission is missing its A2 promotion state');
+  }
+  try {
+    const displacedSocketId = roomManager.getParticipant(roomId, data.userId)?.socketId;
+    value.result = roomManager.promoteChannelParticipant(
+      roomId,
+      data.userId,
+      socket.id,
+      value.promotion,
+      commitSocketMembership
+    );
+    if (displacedSocketId && displacedSocketId !== socket.id) {
+      socket.nsp.sockets.get(displacedSocketId)?.disconnect(true);
+    }
+  } catch (error) {
+    // A custom/failed adapter must not strand Socket.IO membership or socket.data
+    // when its synchronous join boundary throws.
+    rollbackSocketMembership(socket, data, roomId);
+    throw error;
+  }
+  return value;
+}
+
+function commitDMAdmission(
+  roomManager: RoomManager,
+  socket: Socket,
+  data: AuthenticatedSocketData,
+  roomId: string,
+  value: RoomJoinValue,
+  commitSocketMembership: () => void
+): RoomJoinValue {
+  if (!value.promotion) {
+    throw new Error('Room admission is missing its A2 promotion state');
+  }
+  if (!value.authorizedCallId || !('callId' in value.promotion)) {
+    throw new Error('DM admission is missing its A2 promotion state');
+  }
+  try {
+    value.result = roomManager.promoteDMParticipant(
+      roomId,
+      data.userId,
+      socket.id,
+      value.authorizedCallId,
+      value.promotion,
+      commitSocketMembership
+    );
+  } catch (error) {
+    // A custom/failed adapter must not strand Socket.IO membership or socket.data
+    // when its synchronous join boundary throws.
+    rollbackSocketMembership(socket, data, roomId);
+    throw error;
+  }
+  return value;
 }
 
 async function rollbackRegisteredRoomJoin({
@@ -245,6 +490,7 @@ function registerJoinRoomHandler(
   {
     roomManager,
     dmJoinFence,
+    channelAdmissionFence,
     voiceEnforcementReleaseQueue,
     emitSecurityEvent,
     // Required: the per-connection wrapper carries this socket's security-event
@@ -255,6 +501,7 @@ function registerJoinRoomHandler(
   }: {
     roomManager: RoomManager;
     dmJoinFence: KeyedJoinFence;
+    channelAdmissionFence: KeyedJoinFence;
     voiceEnforcementReleaseQueue: VoiceEnforcementSessionReleaseQueue;
     emitSecurityEvent: EmitSecurityEvent | undefined;
     withRateLimit: <H extends SocketListener>(
@@ -317,19 +564,6 @@ function registerJoinRoomHandler(
         // through it silently missed exactly the participants this exists for.
         roomManager.emitCameraGateSnapshotFor(roomId, socket.id);
       };
-      const rollbackSocketMembership = () => {
-        data.roomId = undefined;
-        try {
-          socket.leave(roomId);
-        } catch (leaveError) {
-          logger.error('Failed to roll back Socket.IO room membership', {
-            error: leaveError,
-            roomId,
-            userId: data.userId,
-          });
-        }
-      };
-
       const roomKind: 'channel' | 'dm' =
         socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
       const token = socket.handshake.auth.token;
@@ -361,13 +595,17 @@ function registerJoinRoomHandler(
           logger.error(message, { error, roomId });
         }
       };
-      const authorizeRoom = async (requestedCallId?: string) => {
+      // One admission identity covers A1 registration and A2 activation. It is
+      // deliberately created by the media service, never accepted from a peer.
+      const admissionId = roomKind === 'channel' ? randomUUID() : undefined;
+      const authorizeRoom = async (requestedCallId?: string, activate = false) => {
         const access = await validateChannelAccess(
           data.userId,
           roomId,
           token,
           roomKind,
-          requestedCallId
+          requestedCallId,
+          admissionId ? { admissionId, socketId: socket.id, activate } : undefined
         );
         if (roomKind === 'dm') dmCallId.observe(access.callId);
         return access;
@@ -395,7 +633,7 @@ function registerJoinRoomHandler(
           // authorizes the JWT-derived user before any room mutation.
 
           const outcome = await runSocketBoundJoin({
-            authorize: () => authorizeRoom(inputCallId),
+            authorize: () => authorizeRoom(inputCallId, false),
             isAllowed: (access, authorizedAccess) =>
               access.allowed &&
               (roomKind === 'channel' ||
@@ -434,7 +672,6 @@ function registerJoinRoomHandler(
                 identity,
                 rtpCapabilities,
                 {
-                  credentialEpoch: data.credentialEpoch,
                   voiceEnforcementSessionGeneration: enforcementSession.sessionGeneration,
                   entitlement: {
                     tier: access.userTier,
@@ -452,7 +689,12 @@ function registerJoinRoomHandler(
                     callCallerUserId: access.callCallerUserId,
                   },
                   // Effective publish permissions apply only to channel joins.
-                  permissions: access.permissions,
+                  // A missing channel field fails closed to an empty bitfield.
+                  permissions: roomKind === 'channel' ? (access.permissions ?? 0n) : undefined,
+                  admissionId,
+                  authorizationRevision: access.authorizationRevision,
+                  credentialEpoch: data.credentialEpoch,
+                  deferChannelPromotion: roomKind === 'channel',
                 }
               );
 
@@ -465,28 +707,27 @@ function registerJoinRoomHandler(
               return {
                 authorizedCallId: access.callId,
                 identity,
-                promotion: undefined as DMParticipantPromotion | undefined,
-                channelPromotion: undefined as ChannelParticipantPromotion | undefined,
+                promotion: undefined as
+                  ChannelParticipantPromotion | DMParticipantPromotion | undefined,
                 result,
               };
             },
-            // Membership or credential epoch can change while asynchronous
-            // RoomManager registration is in flight. Reauthorize only after
-            // the exact session is visible to enforcement, before join/ack.
+            // Reauthorize only after the exact session is visible to enforcement.
             reauthorize: (access) =>
               reauthorizeAdmission(roomKind, access, inputCallId, authorizeRoom),
             finalize: async (access, value) => {
               // The second authorization is authoritative for both channel and
               // Private Call moderator state. Apply it before socket.join/ack.
+              const identity = resolveParticipantIdentity(access, {
+                username: data.username,
+                displayName: data.displayName,
+                avatarUrl: data.avatarUrl,
+              });
+              value.identity = identity;
               if (roomKind === 'dm') {
-                const identity = resolveParticipantIdentity(access, {
-                  username: data.username,
-                  displayName: data.displayName,
-                  avatarUrl: data.avatarUrl,
-                });
-                value.identity = identity;
                 value.promotion = {
                   callId: access.callId,
+                  authorizationRevision: access.authorizationRevision,
                   identity,
                   entitlement: {
                     tier: access.userTier,
@@ -499,14 +740,9 @@ function registerJoinRoomHandler(
                 };
                 return;
               }
-
-              const identity = resolveParticipantIdentity(access, {
-                username: data.username,
-                displayName: data.displayName,
-                avatarUrl: data.avatarUrl,
-              });
-              value.identity = identity;
-              value.channelPromotion = {
+              value.promotion = {
+                admissionId,
+                authorizationRevision: access.authorizationRevision,
                 identity,
                 entitlement: {
                   tier: access.userTier,
@@ -514,50 +750,31 @@ function registerJoinRoomHandler(
                   minPtimeMs: access.minPtimeMs,
                   maxManualBitrateBps: access.maxManualBitrateBps,
                 },
-                permissions: access.permissions,
+                ownerTier: access.roomOwnerTier ?? 'free',
+                permissions: access.permissions ?? 0n,
                 serverMuted: access.serverMuted,
                 serverDeafened: access.serverDeafened,
-                ownerTier: access.roomOwnerTier,
               };
             },
             commit: (_access, value) => {
               if (roomKind === 'channel') {
-                if (!value.channelPromotion) {
-                  throw new Error('Channel admission is missing its A2 promotion state');
-                }
-                try {
-                  value.result = roomManager.promoteChannelParticipant(
-                    roomId,
-                    data.userId,
-                    socket.id,
-                    value.channelPromotion,
-                    commitSocketMembership
-                  );
-                } catch (error) {
-                  rollbackSocketMembership();
-                  throw error;
-                }
-                return value;
-              }
-              if (!value.authorizedCallId || !value.promotion) {
-                throw new Error('DM admission is missing its A2 promotion state');
-              }
-              try {
-                value.result = roomManager.promoteDMParticipant(
+                return commitChannelAdmission(
+                  roomManager,
+                  socket,
+                  data,
                   roomId,
-                  data.userId,
-                  socket.id,
-                  value.authorizedCallId,
-                  value.promotion,
+                  value,
                   commitSocketMembership
                 );
-              } catch (error) {
-                // A custom/failed adapter must not strand Socket.IO membership
-                // or socket.data when its synchronous join boundary throws.
-                rollbackSocketMembership();
-                throw error;
               }
-              return value;
+              return commitDMAdmission(
+                roomManager,
+                socket,
+                data,
+                roomId,
+                value,
+                commitSocketMembership
+              );
             },
             rollback: async (access) => {
               await rollbackRegisteredRoomJoin({
@@ -694,7 +911,16 @@ function registerJoinRoomHandler(
 
       try {
         if (roomKind === 'dm') await withKeyedJoinFence(dmJoinFence, roomId, executeJoin);
-        else await executeJoin();
+        else {
+          // Serialize A1 through rollback for one channel user across sockets.
+          // A second session must not replace or roll back the first candidate
+          // while its A2 authorization is still in flight.
+          await withKeyedJoinFence(
+            channelAdmissionFence,
+            JSON.stringify([roomId, data.userId]),
+            executeJoin
+          );
+        }
       } finally {
         releaseSocketRoomClaim();
       }
@@ -935,13 +1161,17 @@ async function main() {
 
   // ── NATS subscriptions for enforcement commands from control plane ────
 
+  // NATS dispatches every subscription independently. Keep mute and deafen
+  // updates for one participant ordered without blocking other participants.
+  const serverEnforcementChains = new Map<string, Promise<void>>();
+
   /** Creates a NATS handler for server-level toggle enforcement (mute/deafen). */
   function createServerEnforcementHandler(
     subject: string,
     applyAction: string,
     removeAction: string,
     applyFn: (roomId: string, userId: string) => void | Promise<void>,
-    removeFn: (roomId: string, userId: string) => void | Promise<void>,
+    removeFn: (roomId: string, userId: string) => boolean | Promise<boolean>,
     eventName: string,
     eventField: string
   ) {
@@ -953,13 +1183,22 @@ async function main() {
           [applyAction, removeAction],
           async ({ channelId, userId, action }) => {
             cmd = { channelId, userId, action };
-            if (action === applyAction) {
-              await applyFn(channelId, userId);
-              io.to(channelId).emit(eventName, { userId, [eventField]: true });
-            } else {
-              await removeFn(channelId, userId);
-              io.to(channelId).emit(eventName, { userId, [eventField]: false });
-            }
+            await applyServerEnforcementCommand({
+              serverEnforcementChains,
+              natsData,
+              roomManager,
+              io,
+              subject,
+              channelId,
+              userId,
+              action,
+              applyAction,
+              removeAction,
+              applyFn,
+              removeFn,
+              eventName,
+              eventField,
+            });
           },
           (event) => securityEvents.emit(event)
         );
@@ -1040,7 +1279,7 @@ async function main() {
       await handleNatsEnforcementCommand(
         natsData,
         undefined,
-        ({ channelId, userId }) => {
+        ({ channelId, userId, socketId, admissionId }) => {
           cmd = { channelId, userId };
           return handleForceDisconnect(
             roomManager,
@@ -1048,7 +1287,7 @@ async function main() {
             channelId,
             userId,
             (event) => securityEvents.emit(event),
-            { reason: 'access_revoked' }
+            { reason: 'access_revoked', socketId, admissionId }
           );
         },
         (event) => securityEvents.emit(event)
@@ -1115,6 +1354,15 @@ async function main() {
     void enforceVoiceEnforcementLease();
   }, 1_000);
 
+  natsService.subscribeRequest(
+    'voice.admission.activate',
+    createChannelAdmissionActivationHandler(
+      roomManager,
+      config.jwtSecret,
+      (socketId) => io.sockets.sockets.get(socketId)?.connected === true
+    )
+  );
+
   // ── Mid-session permission push (CV-CAN-007 review P1) ────────────────
   // Control plane publishes voice.enforce.permissions {channelId, userId,
   // permissions} after an RBAC mutation touching a voice-connected member. The
@@ -1137,6 +1385,7 @@ async function main() {
   // ponytail: process-local serialization matches single-node room ownership;
   // use a distributed admission ID before one DM room can span media nodes.
   const dmJoinFence = new KeyedJoinFence();
+  const channelAdmissionFence = new KeyedJoinFence();
 
   io.on('connection', (socket) => {
     const data = socket.data as AuthenticatedSocketData;
@@ -1188,6 +1437,7 @@ async function main() {
     registerJoinRoomHandler(socket, data, {
       roomManager,
       dmJoinFence,
+      channelAdmissionFence,
       voiceEnforcementReleaseQueue,
       emitSecurityEvent: emitSocketSecurityEvent,
       withRateLimit,

@@ -23,7 +23,9 @@ const PERM_ADMINISTRATOR = 1n << 62n;
 /** Builds a fake RoomManager surface. */
 function makeRoomManager(opts: {
   participant?: { socketId: string };
+  provisionalSocketId?: string;
   updateResult?: boolean;
+  provisionalUpdateResult?: boolean;
   closedSources?: string[];
 }) {
   const getParticipant = vi.fn().mockReturnValue(opts.participant);
@@ -31,23 +33,29 @@ function makeRoomManager(opts: {
   const closeForbiddenProducers = vi.fn().mockResolvedValue(opts.closedSources ?? []);
   const leaveRoom = vi.fn().mockResolvedValue(undefined);
   const leaveRoomIfSocketOwned = vi.fn().mockResolvedValue(Boolean(opts.participant));
-  const getProvisionalParticipantSocketId = vi.fn().mockReturnValue(undefined);
-  const removeProvisionalParticipantIfSocketOwned = vi.fn().mockResolvedValue(false);
+  const getProvisionalParticipantSocketId = vi.fn().mockReturnValue(opts.provisionalSocketId);
+  const updateProvisionalParticipantPermissions = vi
+    .fn()
+    .mockReturnValue(opts.provisionalUpdateResult ?? true);
+  const removeProvisionalParticipantForEnforcement = vi.fn().mockResolvedValue(false);
   return {
     rm: {
       getParticipant,
       getProvisionalParticipantSocketId,
       updateParticipantPermissions,
+      updateProvisionalParticipantPermissions,
       closeForbiddenProducers,
       leaveRoom,
       leaveRoomIfSocketOwned,
-      removeProvisionalParticipantIfSocketOwned,
+      removeProvisionalParticipantForEnforcement,
     } as unknown as EnforcePermissionsRoomManager,
     getParticipant,
     updateParticipantPermissions,
+    updateProvisionalParticipantPermissions,
     closeForbiddenProducers,
     leaveRoom,
     leaveRoomIfSocketOwned,
+    removeProvisionalParticipantForEnforcement,
   };
 }
 
@@ -135,10 +143,6 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
     await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, PERM_JOIN_VOICE | PERM_SPEAK);
 
     expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
-    expect(emit).toHaveBeenCalledWith('force-disconnect', {
-      channelId: CHANNEL_ID,
-      reason: 'access_revoked',
-    });
     expect(disconnect).toHaveBeenCalledWith(true);
     // No producer audit / permissions-changed on the disconnect path.
     expect(closeForbiddenProducers).not.toHaveBeenCalled();
@@ -185,6 +189,77 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
     expect(updateParticipantPermissions).not.toHaveBeenCalled();
     expect(closeForbiddenProducers).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
+  });
+
+  it('updates a staged channel candidate so promotion cannot restore stale A2 permissions', async () => {
+    const {
+      rm,
+      updateParticipantPermissions,
+      updateProvisionalParticipantPermissions,
+      closeForbiddenProducers,
+    } = makeRoomManager({ participant: undefined, provisionalSocketId: SOCKET_ID });
+    const { io } = makeIO(SOCKET_ID);
+    const perms = PERM_VOICE_ACCESS | PERM_SPEAK;
+
+    await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, perms);
+
+    expect(updateProvisionalParticipantPermissions).toHaveBeenCalledWith(
+      CHANNEL_ID,
+      USER_ID,
+      perms
+    );
+    expect(updateParticipantPermissions).not.toHaveBeenCalled();
+    expect(closeForbiddenProducers).not.toHaveBeenCalled();
+  });
+
+  it('refreshes a staged reconnect as well as its admitted predecessor on a partial revoke', async () => {
+    const {
+      rm,
+      updateParticipantPermissions,
+      updateProvisionalParticipantPermissions,
+      closeForbiddenProducers,
+    } = makeRoomManager({
+      participant: { socketId: SOCKET_ID },
+      provisionalSocketId: 'socket-reconnect',
+      closedSources: [],
+    });
+    const { io } = makeIO(SOCKET_ID);
+    const perms = PERM_VOICE_ACCESS | PERM_SPEAK;
+
+    await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, perms);
+
+    expect(updateProvisionalParticipantPermissions).toHaveBeenCalledWith(
+      CHANNEL_ID,
+      USER_ID,
+      perms
+    );
+    expect(updateParticipantPermissions).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, perms);
+    expect(closeForbiddenProducers).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
+  });
+
+  it('force-disconnects a staged candidate when voice access is revoked', async () => {
+    const {
+      rm,
+      updateProvisionalParticipantPermissions,
+      leaveRoom,
+      removeProvisionalParticipantForEnforcement,
+    } = makeRoomManager({ participant: undefined, provisionalSocketId: SOCKET_ID });
+    const { io, disconnect } = makeIO(SOCKET_ID);
+
+    await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, PERM_SPEAK);
+
+    expect(updateProvisionalParticipantPermissions).toHaveBeenCalledWith(
+      CHANNEL_ID,
+      USER_ID,
+      PERM_SPEAK
+    );
+    expect(removeProvisionalParticipantForEnforcement).toHaveBeenCalledWith(
+      CHANNEL_ID,
+      USER_ID,
+      SOCKET_ID
+    );
+    expect(leaveRoom).not.toHaveBeenCalled();
+    expect(disconnect).toHaveBeenCalledWith(true);
   });
 
   it('does not audit or notify when the room has no permission model (DM)', async () => {
@@ -322,6 +397,51 @@ describe('handleEnforcePermissionsMessage (NATS payload validation)', () => {
     expect(getParticipant).not.toHaveBeenCalled();
   });
 
+  it('does not evict a versioned participant when an older revision is rejected', async () => {
+    const { rm, updateParticipantPermissions, closeForbiddenProducers, leaveRoom } =
+      makeRoomManager({ participant: { socketId: SOCKET_ID }, updateResult: false });
+    const { io, disconnect } = makeIO(SOCKET_ID);
+
+    await handleEnforcePermissionsMessage(rm, io, {
+      channelId: CHANNEL_ID,
+      userId: USER_ID,
+      permissions: PERM_VOICE_ACCESS.toString(),
+      authorizationRevision: '6',
+    });
+
+    expect(updateParticipantPermissions).toHaveBeenCalledWith(
+      CHANNEL_ID,
+      USER_ID,
+      PERM_VOICE_ACCESS,
+      undefined,
+      6n
+    );
+    expect(closeForbiddenProducers).not.toHaveBeenCalled();
+    expect(leaveRoom).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+  });
+
+  it('does not let a legacy unversioned message overwrite a versioned participant', async () => {
+    const { rm, updateParticipantPermissions, closeForbiddenProducers, leaveRoom } =
+      makeRoomManager({ participant: { socketId: SOCKET_ID }, updateResult: false });
+    const { io, disconnect } = makeIO(SOCKET_ID);
+
+    await handleEnforcePermissionsMessage(rm, io, {
+      channelId: CHANNEL_ID,
+      userId: USER_ID,
+      permissions: PERM_VOICE_ACCESS.toString(),
+    });
+
+    expect(updateParticipantPermissions).toHaveBeenCalledWith(
+      CHANNEL_ID,
+      USER_ID,
+      PERM_VOICE_ACCESS
+    );
+    expect(closeForbiddenProducers).not.toHaveBeenCalled();
+    expect(leaveRoom).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+  });
+
   it('serializes concurrent pushes for the same participant so the last bitfield wins', async () => {
     // closeForbiddenProducers on the FIRST push blocks on a manual deferred so
     // the two updates are forced to overlap the way the un-awaited NATS handler
@@ -335,9 +455,12 @@ describe('handleEnforcePermissionsMessage (NATS payload validation)', () => {
     const updateParticipantPermissions = vi.fn().mockReturnValue(true);
     const rm = {
       getParticipant: vi.fn().mockReturnValue({ socketId: SOCKET_ID }),
+      getProvisionalParticipantSocketId: vi.fn().mockReturnValue(undefined),
       updateParticipantPermissions,
+      updateProvisionalParticipantPermissions: vi.fn().mockReturnValue(false),
       closeForbiddenProducers,
       leaveRoom: vi.fn().mockResolvedValue(undefined),
+      removeProvisionalParticipantForEnforcement: vi.fn().mockResolvedValue(false),
     } as unknown as EnforcePermissionsRoomManager;
     const { io } = makeIO(SOCKET_ID);
 

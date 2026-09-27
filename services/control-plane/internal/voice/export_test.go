@@ -14,6 +14,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// ServerVoiceLifecycleAdvisoryKeyForTest exposes the production lock identity
+// for deterministic cross-connection reconciliation tests.
+func ServerVoiceLifecycleAdvisoryKeyForTest(sender uuid.UUID) (int64, error) {
+	return voiceLifecycleAdvisoryKey(presence.CategoryServerVoice, sender)
+}
+
 // TestServerVoiceMutationResult exposes the atomic participant-move result.
 type TestServerVoiceMutationResult struct {
 	Applied                bool
@@ -203,8 +209,7 @@ func (s *NATSSubscriber) ApplyServerVoiceParticipantMutationForTest(
 }
 
 // RunVoiceLifecycleMutationForTest exercises the same claim-then-mutate
-// ordering as production. It intentionally mirrors the pre-fence behavior
-// until withVoiceLifecycleClaim replaces this body during the TDD cycle.
+// ordering as production.
 func (s *NATSSubscriber) RunVoiceLifecycleMutationForTest(
 	ctx context.Context,
 	category presence.Category,
@@ -229,7 +234,7 @@ func (s *NATSSubscriber) UpsertServerVoiceParticipantForTest(
 	channelID, senderID uuid.UUID,
 	eventAt time.Time,
 ) (TestServerVoiceMutationResult, error) {
-	result, err := s.upsertServerVoiceParticipant(ctx, channelID, senderID, eventAt)
+	result, err := s.upsertServerVoiceParticipant(ctx, channelID, senderID, eventAt, nil)
 	return TestServerVoiceMutationResult{
 		Applied:                result.applied,
 		Added:                  result.added,
@@ -295,9 +300,26 @@ func (t *TestTempGrantManager) Grant(ctx context.Context, serverID, channelID, u
 	return t.m.grantTemporaryChannelAccess(ctx, serverID, channelID, userID)
 }
 
+// SetGrantCommitForTest replaces only the grant transaction's commit call. It
+// permits a test to model a successful COMMIT whose acknowledgement is lost.
+func (t *TestTempGrantManager) SetGrantCommitForTest(commit func(*sql.Tx) error) {
+	t.m.grantCommit = commit
+}
+
+// SetGrantRollbackForTest replaces only the ambiguous-grant rollback call.
+func (t *TestTempGrantManager) SetGrantRollbackForTest(rollback func(*sql.Tx) error) {
+	t.m.grantRollback = rollback
+}
+
+// SetPresenceRecheckForTest wires a focused fake capture executor.
+func (t *TestTempGrantManager) SetPresenceRecheckForTest(recheck rbac.PresenceRecheck) {
+	t.m.SetPresenceRecheck(recheck)
+}
+
 // Revoke exposes revokeTemporaryChannelAccess.
 func (t *TestTempGrantManager) Revoke(ctx context.Context, serverID, channelID, userID, actorID string) error {
-	return t.m.revokeTemporaryChannelAccess(ctx, serverID, channelID, userID, actorID)
+	_, err := t.m.revokeTemporaryChannelAccess(ctx, serverID, channelID, userID, actorID)
+	return err
 }
 
 // HasTemporaryGrant exposes hasTemporaryGrant.
@@ -317,6 +339,13 @@ func (s *TempGrantSweeper) SweepOrphanedTempGrants(ctx context.Context) (int, er
 // Use the *At forms whenever the clamp reference is what the test is about --
 // a fixture that needs a receipt clock distinct from wall clock, or one that
 // must prove a handler did not substitute its own time.Now() (#3205).
+// RevokeOrphanedTempGrantForTest exposes the post-selection guarded cleanup so
+// its fresh-rejoin recheck can be verified without weakening production scope.
+func (s *TempGrantSweeper) RevokeOrphanedTempGrantForTest(
+	ctx context.Context, serverID, channelID, userID string,
+) (bool, error) {
+	return s.mgr.revokeOrphanedTemporaryChannelAccess(ctx, serverID, channelID, userID)
+}
 
 // HandleJoined exposes handleJoined for testing.
 func (s *NATSSubscriber) HandleJoined(data []byte) { s.handleJoined(data, time.Now()) }
@@ -369,6 +398,12 @@ func (s *NATSSubscriber) HandleHeartbeat(data []byte) { s.handleHeartbeat(data, 
 // HandleHeartbeatAt exposes handleHeartbeat with an explicit NATS receipt time.
 func (s *NATSSubscriber) HandleHeartbeatAt(data []byte, receivedAt time.Time) {
 	s.handleHeartbeat(data, receivedAt)
+}
+
+// SetDisconnectAllRichPresenceClientsHookForTest prevents the conservative
+// reconnect from hiding messages emitted before a failed lifecycle operation.
+func (s *NATSSubscriber) SetDisconnectAllRichPresenceClientsHookForTest(hook func()) {
+	s.disconnectAllRichPresenceClientsHook = hook
 }
 
 // TestRoomContext is an exported wrapper around roomContext for testing.

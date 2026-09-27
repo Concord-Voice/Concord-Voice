@@ -47,21 +47,7 @@ func TestMigration000093_PhasedUpgradeFromBase92(t *testing.T) {
 
 	_, err := ts.DB.ExecContext(ctx, `DELETE FROM activity_settings_pending_cleanups`)
 	require.NoError(t, err)
-	_, err = ts.DB.ExecContext(ctx, downs[5])
-	require.NoError(t, err)
-	phase = 5
-	_, err = ts.DB.ExecContext(ctx, `DELETE FROM dm_voice_participants`)
-	require.NoError(t, err)
-	_, err = ts.DB.ExecContext(ctx, `DELETE FROM voice_participants`)
-	require.NoError(t, err)
-	for downPhase := 4; downPhase >= 0; downPhase-- {
-		_, err = ts.DB.ExecContext(ctx, downs[downPhase])
-		require.NoErrorf(t, err, "roll back migration phase %d", downPhase+1)
-		phase = downPhase
-	}
-	for _, table := range []string{"voice_participants", "dm_voice_participants"} {
-		migration000093AssertPhaseColumnMissing(t, ts.DB, table)
-	}
+	migration000093RollbackToBase92(ctx, t, ts.DB, downs, &phase)
 
 	owner := ts.CreateTestUser(t, "voice_lifecycle_phase_owner")
 	serverID := ts.CreateTestServer(t, owner.ID, "Voice lifecycle phase migration")
@@ -87,15 +73,12 @@ func TestMigration000093_PhasedUpgradeFromBase92(t *testing.T) {
 	_, err = ts.DB.ExecContext(ctx, ups[0])
 	require.NoError(t, err)
 	phase = 1
-	for _, table := range []string{"voice_participants", "dm_voice_participants"} {
-		migration000093AssertPhaseColumn(t, ts.DB, table, "YES")
-		migration000093AssertPhaseCheck(t, ts.DB, table, false, false)
-	}
-	migration000093AssertLifecycleTime(t, ts.DB, `
+	migration000093AssertPhaseColumns(t, ts.DB, "YES", false, false)
+	migration000093AssertLifecycleTime(ctx, t, ts.DB, `
 		SELECT lifecycle_event_at FROM voice_participants
 		WHERE channel_id = $1 AND user_id = $2
 	`, channelID, owner.ID, sql.NullTime{})
-	migration000093AssertLifecycleTime(t, ts.DB, `
+	migration000093AssertLifecycleTime(ctx, t, ts.DB, `
 		SELECT lifecycle_event_at FROM dm_voice_participants
 		WHERE conversation_id = $1 AND user_id = $2
 	`, conversationID, owner.ID, sql.NullTime{})
@@ -139,11 +122,11 @@ func TestMigration000093_PhasedUpgradeFromBase92(t *testing.T) {
 	require.NoError(t, err)
 	phase = 2
 
-	migration000093AssertLifecycleTime(t, ts.DB, `
+	migration000093AssertLifecycleTime(ctx, t, ts.DB, `
 		SELECT lifecycle_event_at FROM voice_participants
 		WHERE channel_id = $1 AND user_id = $2
 	`, channelID, owner.ID, sql.NullTime{Time: serverJoinedAt, Valid: true})
-	migration000093AssertLifecycleTime(t, ts.DB, `
+	migration000093AssertLifecycleTime(ctx, t, ts.DB, `
 		SELECT lifecycle_event_at FROM dm_voice_participants
 		WHERE conversation_id = $1 AND user_id = $2
 	`, conversationID, owner.ID, sql.NullTime{Time: privateJoinedAt, Valid: true})
@@ -352,6 +335,44 @@ func TestMigration000093_PhasedUpgradeFromBase92(t *testing.T) {
 	}
 }
 
+func migration000093RollbackToBase92(
+	ctx context.Context,
+	t *testing.T,
+	db *sql.DB,
+	downs []string,
+	phase *int,
+) {
+	t.Helper()
+	_, err := db.ExecContext(ctx, downs[5])
+	require.NoError(t, err)
+	*phase = 5
+	_, err = db.ExecContext(ctx, `DELETE FROM dm_voice_participants`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `DELETE FROM voice_participants`)
+	require.NoError(t, err)
+	for downPhase := 4; downPhase >= 0; downPhase-- {
+		_, err := db.ExecContext(ctx, downs[downPhase])
+		require.NoErrorf(t, err, "roll back migration phase %d", downPhase+1)
+		*phase = downPhase
+	}
+	for _, table := range []string{"voice_participants", "dm_voice_participants"} {
+		migration000093AssertPhaseColumnMissing(t, db, table)
+	}
+}
+
+func migration000093AssertPhaseColumns(
+	t *testing.T,
+	db *sql.DB,
+	wantNullable string,
+	wantExists, wantValidated bool,
+) {
+	t.Helper()
+	for _, table := range []string{"voice_participants", "dm_voice_participants"} {
+		migration000093AssertPhaseColumn(t, db, table, wantNullable)
+		migration000093AssertPhaseCheck(t, db, table, wantExists, wantValidated)
+	}
+}
+
 func migration000093AssertPhaseColumn(
 	t *testing.T,
 	db *sql.DB,
@@ -404,6 +425,7 @@ func migration000093AssertPhaseCheck(
 }
 
 func migration000093AssertLifecycleTime(
+	ctx context.Context,
 	t *testing.T,
 	db *sql.DB,
 	query, parentID, userID string,
@@ -411,7 +433,7 @@ func migration000093AssertLifecycleTime(
 ) {
 	t.Helper()
 	var got sql.NullTime
-	require.NoError(t, db.QueryRow(query, parentID, userID).Scan(&got))
+	require.NoError(t, db.QueryRowContext(ctx, query, parentID, userID).Scan(&got))
 	assert.Equal(t, want.Valid, got.Valid)
 	if want.Valid && got.Valid {
 		assert.Equal(t, want.Time, got.Time)

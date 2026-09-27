@@ -29,7 +29,7 @@ const { mockNc, mockConnect, mockEncode, mockDecode } = vi.hoisted(() => {
 });
 
 vi.mock('nats', () => ({
-  connect: (...args: any[]) => mockConnect(...args),
+  connect: (...args: unknown[]) => mockConnect(...args),
   JSONCodec: () => ({ encode: mockEncode, decode: mockDecode }),
 }));
 
@@ -171,6 +171,8 @@ describe('NatsService', () => {
         avatarUrl: 'https://example.test/alice.png',
         e2eeEpoch: 1,
         callId: 'call-1',
+        admissionId: 'admission-1',
+        socketId: 'socket-1',
       });
 
       expect(mockNc.publish).toHaveBeenCalled();
@@ -182,6 +184,8 @@ describe('NatsService', () => {
         displayName: 'Alice',
         avatarUrl: 'https://example.test/alice.png',
         callId: 'call-1',
+        admissionId: 'admission-1',
+        socketId: 'socket-1',
       });
       expect(encodedData).toHaveProperty('timestamp');
     });
@@ -328,6 +332,74 @@ describe('NatsService', () => {
 
       // active-speaker is handled locally via Socket.IO, not NATS
       expect(mockNc.publish).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('subscribeRequest', () => {
+    it('responds only after the awaited handler completes', async () => {
+      await service.connect();
+      let complete!: () => void;
+      const completed = new Promise<void>((resolve) => {
+        complete = resolve;
+      });
+      const respond = vi.fn();
+      mockNc.subscribe.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            data: JSON.stringify({ channelId: 'dm-1', userId: 'u-1' }),
+            reply: '_INBOX.1',
+            respond,
+          };
+        },
+      });
+
+      service.subscribeRequest('voice.enforce.disconnect.ack', async () => {
+        await completed;
+        return { version: 2, ok: true, proof: 'signed' };
+      });
+      await Promise.resolve();
+      expect(respond).not.toHaveBeenCalled();
+      complete();
+      await vi.waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+      expect(mockDecode).toHaveBeenCalled();
+      expect(mockEncode).toHaveBeenCalledWith({ version: 2, ok: true, proof: 'signed' });
+    });
+
+    it('does not reply for a rejected request or handler failure', async () => {
+      await service.connect();
+      const rejectedRespond = vi.fn();
+      const failedRespond = vi.fn();
+      mockNc.subscribe.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { data: JSON.stringify({}), reply: '_INBOX.reject', respond: rejectedRespond };
+          yield { data: JSON.stringify({}), reply: '_INBOX.fail', respond: failedRespond };
+        },
+      });
+      let attempts = 0;
+      service.subscribeRequest('voice.enforce.disconnect.ack', async () => {
+        attempts++;
+        if (attempts === 1) return undefined;
+        throw new Error('teardown failed');
+      });
+      await vi.waitFor(() => expect(attempts).toBe(2));
+      expect(rejectedRespond).not.toHaveBeenCalled();
+      expect(failedRespond).not.toHaveBeenCalled();
+    });
+
+    it('does not run a request handler without a reply inbox', async () => {
+      await service.connect();
+      const handler = vi.fn().mockResolvedValue({ version: 2, ok: true });
+      mockNc.subscribe.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { data: JSON.stringify({ channelId: 'dm-1', userId: 'u-1' }), reply: '' };
+        },
+      });
+
+      service.subscribeRequest('voice.enforce.disconnect.ack', handler);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(handler).not.toHaveBeenCalled();
     });
   });
 

@@ -20,9 +20,11 @@ func TestRevokeTemporaryChannelAccess_TempGrant_ClearsExactlyTheRevokedViewer(t 
 	viewer := env.grantTemporaryAccess(t)
 	retained := env.addPermanentViewer(t)
 
-	require.NoError(t, env.manager.revokeTemporaryChannelAccess(
-		context.Background(), env.serverID, env.channelID, viewer, "system",
-	))
+	removed, err := env.manager.revokeTemporaryChannelAccess(
+		context.Background(), env.serverID, env.channelID, viewer, "",
+	)
+	require.NoError(t, err)
+	assert.True(t, removed)
 	env.waitForDispatch(t)
 
 	assert.True(t, env.wasCleared(senderID, viewer),
@@ -40,9 +42,11 @@ func TestRevokeTemporaryChannelAccess_PermanentGrantOnly_IsATotalNoOp(t *testing
 	senderID := env.joinVoice(t, env.channelID)
 	permanent := env.addPermanentViewer(t)
 
-	require.NoError(t, env.manager.revokeTemporaryChannelAccess(
-		context.Background(), env.serverID, env.channelID, permanent, "system",
-	))
+	removed, err := env.manager.revokeTemporaryChannelAccess(
+		context.Background(), env.serverID, env.channelID, permanent, "",
+	)
+	require.NoError(t, err)
+	assert.False(t, removed)
 	env.waitForDispatch(t)
 
 	assert.Zero(t, env.refreshCount(senderID))

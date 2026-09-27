@@ -2,6 +2,7 @@ package voice_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	concordws "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -175,6 +177,25 @@ func TestServerVoiceMoveFencesTheRemovedChannelTerminalDelivery(t *testing.T) {
 }
 
 func TestServerVoiceCrossServerMoveFencesTheRemovedChannelTerminalDelivery(t *testing.T) {
+	publisher, err := natsclient.Connect(natsTestURL())
+	if err != nil {
+		t.Skipf("NATS unavailable (%v); skipping cross-server admission fence test", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+	observer, err := natsclient.Connect(natsTestURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = observer.Close() })
+	disconnects := make(chan map[string]interface{}, 1)
+	subscription, err := observer.Subscribe(natsSubjectEnforceDisconnectForTest, func(data []byte) {
+		var payload map[string]interface{}
+		if json.Unmarshal(data, &payload) == nil {
+			disconnects <- payload
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = subscription.Unsubscribe() })
+	require.NoError(t, observer.Flush())
+
 	ts := testhelpers.SetupTestServer(t)
 	owner := ts.CreateTestUser(t, "cross-server-move-fence-owner")
 	participant := ts.CreateTestUser(t, "cross-server-move-fence-participant")
@@ -186,13 +207,20 @@ func TestServerVoiceCrossServerMoveFencesTheRemovedChannelTerminalDelivery(t *te
 	oldChannelID := ts.CreateVoiceChannel(t, oldServerID, "cross-server-move-fence-old")
 	newChannelID := ts.CreateVoiceChannel(t, newServerID, "cross-server-move-fence-new")
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	sub := newTestSubscriberWithHub(ts, hub)
+	sub := newTestSubscriberWithHubAndNATS(ts, hub, publisher)
 	joinedAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
 	sub.HandleJoined(mustJSON(t, map[string]interface{}{
 		"channelId": oldChannelID, "userId": participant.ID, "username": participant.Username,
 		"timestamp": joinedAt.Format(time.RFC3339Nano),
 	}))
 	require.True(t, voiceParticipantExists(t, ts.DB, oldChannelID, participant.ID))
+	admissionID := uuid.New()
+	const socketID = "cross-server-move-a1-socket"
+	_, err = ts.DB.Exec(`
+		INSERT INTO voice_pending_admissions (channel_id, user_id, admission_id, socket_id, expires_at)
+		VALUES ($1, $2, $3, $4, clock_timestamp() + interval '30 seconds')
+	`, newChannelID, participant.ID, admissionID, socketID)
+	require.NoError(t, err)
 	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{
 		"type": "subscribe_server",
@@ -226,6 +254,7 @@ func TestServerVoiceCrossServerMoveFencesTheRemovedChannelTerminalDelivery(t *te
 	}()
 	movePayload := mustJSON(t, map[string]interface{}{
 		"channelId": newChannelID, "userId": participant.ID, "username": participant.Username,
+		"admissionId": admissionID.String(), "socketId": socketID,
 		"timestamp": joinedAt.Add(time.Second).Format(time.RFC3339Nano),
 	})
 	moveDone := make(chan struct{})
@@ -258,6 +287,21 @@ func TestServerVoiceCrossServerMoveFencesTheRemovedChannelTerminalDelivery(t *te
 		t.Fatalf("cross-server removed-channel terminal delivery settled at the mutation fence: %v", outcome)
 	default:
 	}
+	leftAt := joinedAt.Add(500 * time.Millisecond)
+	oldLeftPayload := mustJSON(t, map[string]interface{}{
+		"channelId": oldChannelID, "userId": participant.ID,
+		"timestamp": leftAt.Format(time.RFC3339Nano),
+	})
+	oldLeftDone := make(chan struct{})
+	go func() {
+		defer close(oldLeftDone)
+		sub.HandleLeft(oldLeftPayload)
+	}()
+	select {
+	case <-oldLeftDone:
+		t.Fatal("old voice.left settled while the A-to-B admission mutation still held its barrier")
+	case <-time.After(150 * time.Millisecond):
+	}
 
 	close(release)
 	released = true
@@ -266,8 +310,25 @@ func TestServerVoiceCrossServerMoveFencesTheRemovedChannelTerminalDelivery(t *te
 	case <-time.After(2 * time.Second):
 		t.Fatal("cross-server move did not complete")
 	}
+	select {
+	case <-oldLeftDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale old voice.left did not settle after the move")
+	}
 	require.False(t, voiceParticipantExists(t, ts.DB, oldChannelID, participant.ID))
 	require.True(t, voiceParticipantExists(t, ts.DB, newChannelID, participant.ID))
+	var pendingAdmissions int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT COUNT(*) FROM voice_pending_admissions
+		WHERE channel_id = $1 AND user_id = $2 AND admission_id = $3 AND socket_id = $4
+	`, newChannelID, participant.ID, admissionID, socketID).Scan(&pendingAdmissions))
+	require.Zero(t, pendingAdmissions, "the B admission must be consumed exactly once")
+	require.NoError(t, publisher.Flush())
+	select {
+	case payload := <-disconnects:
+		t.Fatalf("old A terminal delivery must not target B's admitted successor: %#v", payload)
+	case <-time.After(150 * time.Millisecond):
+	}
 	select {
 	case outcome := <-delivery.Outcome:
 		require.Equal(t, concordws.ServerVoiceTerminalDeliveryApplied, outcome)

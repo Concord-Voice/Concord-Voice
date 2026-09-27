@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   cleanupEmptyDMJoin,
   DMJoinCallIdTracker,
@@ -156,7 +157,7 @@ describe('runSocketBoundJoin', () => {
 
     await expect(
       runSocketBoundJoin({
-        authorize,
+        authorize: () => authorize(undefined, false),
         isAllowed: (access) => access.allowed,
         isConnected: () => true,
         join: async () => {
@@ -172,6 +173,8 @@ describe('runSocketBoundJoin', () => {
     ).resolves.toMatchObject({ status: 'revoked' });
 
     expect(authorize).toHaveBeenCalledTimes(2);
+    expect(authorize).toHaveBeenNthCalledWith(1, undefined, false);
+    expect(authorize).toHaveBeenNthCalledWith(2, undefined, true);
     expect(registered).toBe(false);
   });
 
@@ -224,7 +227,8 @@ describe('runSocketBoundJoin', () => {
         },
         isConnected: () => {
           connectedChecks++;
-          if (connectedChecks === 2) order.push('final-connected-check');
+          if (connectedChecks === 2) order.push('pre-reauthorize-connected-check');
+          if (connectedChecks === 3) order.push('final-connected-check');
           return true;
         },
         join: async () => {
@@ -252,12 +256,36 @@ describe('runSocketBoundJoin', () => {
 
     expect(order).toEqual([
       'register',
+      'pre-reauthorize-connected-check',
       'authorize-a2',
       'validate-a2',
       'apply-refreshed-state',
       'final-connected-check',
       'commit',
     ]);
+  });
+
+  it('does not start A2 after the staged socket disconnects', async () => {
+    let connected = true;
+    const reauthorize = vi.fn(async () => ({ allowed: true }));
+    const rollback = vi.fn(async () => undefined);
+
+    await expect(
+      runSocketBoundJoin({
+        authorize: async () => ({ allowed: true }),
+        isAllowed: (access) => access.allowed,
+        isConnected: () => connected,
+        join: async () => {
+          connected = false;
+          return 'staged';
+        },
+        reauthorize,
+        rollback,
+      })
+    ).resolves.toEqual({ access: { allowed: true }, status: 'canceled' });
+
+    expect(reauthorize).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledOnce();
   });
 
   it('rejects a rotated A2 generation before commit (#2407)', async () => {
@@ -332,10 +360,10 @@ describe('reauthorizeAdmission', () => {
     await expect(reauthorizeAdmission('dm', access, 'client-call', authorize)).resolves.toBe(
       access
     );
-    expect(authorize).toHaveBeenCalledExactlyOnceWith('server-call');
+    expect(authorize).toHaveBeenCalledExactlyOnceWith('server-call', false);
   });
 
-  it('reauthorizes a channel join after registration', async () => {
+  it('reauthorizes channels during A2 instead of trusting the A1 result', async () => {
     const access = { allowed: true, callId: 'channel-id' };
     const refreshed = { allowed: false, callId: 'channel-id' };
     const authorize = vi.fn(async () => refreshed);
@@ -343,7 +371,7 @@ describe('reauthorizeAdmission', () => {
     await expect(reauthorizeAdmission('channel', access, undefined, authorize)).resolves.toBe(
       refreshed
     );
-    expect(authorize).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(authorize).toHaveBeenCalledExactlyOnceWith(undefined, true);
   });
 });
 
@@ -364,6 +392,50 @@ it('serializes admission and rollback for the same room', async () => {
   expect(fence.pending('dm-1')).toBe(1);
   releaseSecond();
   expect(fence.pending('dm-1')).toBe(0);
+});
+
+it('serializes one channel user while allowing another user to proceed', async () => {
+  const fence = new KeyedJoinFence();
+  const releaseFirst = deferred<void>();
+  const firstStarted = deferred<void>();
+  const order: string[] = [];
+  const run = (userId: string, operation: () => Promise<void>) =>
+    withKeyedJoinFence(fence, JSON.stringify(['channel-1', userId]), operation);
+
+  const first = run('user-1', async () => {
+    order.push('user-1:start');
+    firstStarted.resolve();
+    await releaseFirst.promise;
+    order.push('user-1:end');
+  });
+  await firstStarted.promise;
+
+  const second = run('user-1', async () => {
+    order.push('user-1:second');
+  });
+  const independent = run('user-2', async () => {
+    order.push('user-2:start');
+  });
+
+  await independent;
+  expect(order).toEqual(['user-1:start', 'user-2:start']);
+  expect(fence.pending(JSON.stringify(['channel-1', 'user-1']))).toBe(2);
+
+  releaseFirst.resolve();
+  await Promise.all([first, second]);
+  expect(order).toEqual(['user-1:start', 'user-2:start', 'user-1:end', 'user-1:second']);
+});
+
+it('keeps the channel admission fence wired to the channel/user key', () => {
+  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const registration = source.slice(
+    source.indexOf('function registerJoinRoomHandler'),
+    source.indexOf('async function main')
+  );
+
+  expect(registration).toContain('JSON.stringify([roomId, data.userId]),\n            executeJoin');
+  expect(source).toContain('registerJoinRoomHandler(socket, data, {');
+  expect(source).toContain('channelAdmissionFence,');
 });
 
 it('hands a deferred A1 call ID to the last queued cleanup (#2407)', async () => {

@@ -74,7 +74,7 @@ function verifiesProof(
  */
 export interface ForceDisconnectRoomManager {
   getParticipant: RoomManager['getParticipant'];
-  getProvisionalParticipantSocketId: RoomManager['getProvisionalParticipantSocketId'];
+  getProvisionalParticipant: RoomManager['getProvisionalParticipant'];
   leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
 }
@@ -425,8 +425,13 @@ export function createVoiceEnforcementSessionEjectionHandler(
  * (#2153) must never be reported as a permission revocation.
  */
 export type ForceDisconnectOptions =
-  | { readonly reason: 'access_revoked' }
-  | { readonly reason: 'media_policy'; readonly retryAfterSec: number };
+  | { readonly reason: 'access_revoked'; readonly socketId?: string; readonly admissionId?: string }
+  | {
+      readonly reason: 'media_policy';
+      readonly retryAfterSec: number;
+      readonly socketId?: string;
+      readonly admissionId?: string;
+    };
 
 /** The `force-disconnect` payload the evicted socket receives. */
 export type ForceDisconnectPayload =
@@ -478,6 +483,31 @@ function resolveReason(channelId: string, options: ForceDisconnectOptions): Reso
   }
 }
 
+function resolveExactSessions(
+  participant: ReturnType<RoomManager['getParticipant']>,
+  provisional: ReturnType<RoomManager['getProvisionalParticipant']>,
+  socketId: string | undefined,
+  admissionId: string | undefined
+): { participant: typeof participant; provisional: typeof provisional; valid: boolean } {
+  if ((socketId === undefined) !== (admissionId === undefined)) {
+    return { participant: undefined, provisional: undefined, valid: false };
+  }
+  if (socketId === undefined) {
+    return { participant, provisional, valid: true };
+  }
+  return {
+    participant:
+      participant?.socketId === socketId && participant.admissionId === admissionId
+        ? participant
+        : undefined,
+    provisional:
+      provisional?.socketId === socketId && provisional.admissionId === admissionId
+        ? provisional
+        : undefined,
+    valid: true,
+  };
+}
+
 /**
  * Evicts a peer from one room: `voice.enforce.disconnect` from the control
  * plane (#487 P3, reason `access_revoked`) or the media policer's repeat-offender
@@ -512,8 +542,16 @@ export async function handleForceDisconnect(
   // Resolved before any teardown, so a malformed reason touches no session.
   const resolved = resolveReason(channelId, options);
   const participant = roomManager.getParticipant(channelId, userId);
-  const provisionalSocketId = roomManager.getProvisionalParticipantSocketId(channelId, userId);
-  if (!participant && !provisionalSocketId) {
+  const provisional = roomManager.getProvisionalParticipant(channelId, userId);
+  const exact = resolveExactSessions(
+    participant,
+    provisional,
+    options.socketId,
+    options.admissionId
+  );
+  if (!exact.valid) return;
+  const { participant: exactParticipant, provisional: exactProvisional } = exact;
+  if (!exactParticipant && !exactProvisional) {
     // Already gone — nothing to evict. Idempotent.
     return;
   }
@@ -525,28 +563,28 @@ export async function handleForceDisconnect(
   // through normal terminal lifecycle with history. Exact ownership prevents
   // this command from deleting a successor session.
   let changed = false;
-  if (provisionalSocketId) {
+  if (exactProvisional) {
     changed = await roomManager.removeProvisionalParticipantForEnforcement(
       channelId,
       userId,
-      provisionalSocketId
+      exactProvisional.socketId
     );
   }
 
   // Tear down the captured admitted session before force-closing its socket.
   // Socket.IO dispatches disconnect cleanup synchronously, which would otherwise
   // erase exact ownership before this authoritative RoomManager call can run.
-  if (participant) {
+  if (exactParticipant) {
     changed =
-      (await roomManager.leaveRoomIfSocketOwned(channelId, userId, participant.socketId)) ||
+      (await roomManager.leaveRoomIfSocketOwned(channelId, userId, exactParticipant.socketId)) ||
       changed;
   }
 
   // Tell every admitted/provisional session to leave, then force each socket
   // closed. A Set handles the defensive case where both registries name one ID.
   const socketIds = new Set<string>();
-  if (participant) socketIds.add(participant.socketId);
-  if (provisionalSocketId) socketIds.add(provisionalSocketId);
+  if (exactParticipant) socketIds.add(exactParticipant.socketId);
+  if (exactProvisional) socketIds.add(exactProvisional.socketId);
   for (const socketId of socketIds) {
     const socket = io.sockets.sockets.get(socketId);
     if (!socket) continue;

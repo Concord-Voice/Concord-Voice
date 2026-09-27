@@ -299,6 +299,7 @@ make migrate-create NAME=add_user_status
 ### How Migrations Work
 
 - Migrations run automatically when the server starts
+- Startup aborts on any dirty migration because its direction and application state are ambiguous; inspect and recover explicitly with `cmd/migrate force` before restarting
 - Each migration has an UP (apply) and DOWN (rollback) SQL file
 - Migrations use sequential version numbers (000001, 000002, etc.)
 - The `schema_migrations` table holds migration state

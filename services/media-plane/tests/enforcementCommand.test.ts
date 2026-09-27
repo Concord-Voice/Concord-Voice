@@ -28,6 +28,26 @@ describe('handleNatsEnforcementCommand', () => {
     expect(mutate).toHaveBeenCalledWith({ channelId: CHANNEL_ID, userId: USER_ID });
   });
 
+  it('passes a bounded admission identity only to an exact enforcement mutation', async () => {
+    const mutate = vi.fn();
+    await handleNatsEnforcementCommand(
+      {
+        channelId: CHANNEL_ID,
+        userId: USER_ID,
+        socketId: 'stale-socket',
+        admissionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      },
+      undefined,
+      mutate
+    );
+    expect(mutate).toHaveBeenCalledWith({
+      channelId: CHANNEL_ID,
+      userId: USER_ID,
+      socketId: 'stale-socket',
+      admissionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    });
+  });
+
   it('emits one closed failure event without replacing the enforcement error', async () => {
     const enforcementError = new Error('enforcement failed');
     const mutate = vi.fn().mockRejectedValue(enforcementError);
@@ -74,6 +94,20 @@ describe('handleNatsEnforcementCommand', () => {
     ],
     ['oversized target', { channelId: `${CHANNEL_ID}0`, userId: USER_ID, action: 'mute' }],
     ['unknown action', { channelId: CHANNEL_ID, userId: USER_ID, action: 'escalate' }],
+    ['empty socket ID', { channelId: CHANNEL_ID, userId: USER_ID, socketId: '' }],
+    ['oversized socket ID', { channelId: CHANNEL_ID, userId: USER_ID, socketId: 'x'.repeat(129) }],
+    [
+      'socket ID without admission ID',
+      { channelId: CHANNEL_ID, userId: USER_ID, socketId: 'socket' },
+    ],
+    [
+      'admission ID without socket ID',
+      { channelId: CHANNEL_ID, userId: USER_ID, admissionId: CHANNEL_ID },
+    ],
+    [
+      'invalid admission ID',
+      { channelId: CHANNEL_ID, userId: USER_ID, socketId: 'socket', admissionId: 'nope' },
+    ],
   ])('rejects %s with one verdict before a room mutation', async (_label, payload) => {
     const mutate = vi.fn();
     const emit = vi.fn();

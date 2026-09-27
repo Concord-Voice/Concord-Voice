@@ -621,6 +621,29 @@ func TestReconcilerDMBlockCleanupCallbackContract(t *testing.T) {
 	assert.True(t, hasDeadline, "DM cleanup must be bounded")
 }
 
+func TestReconcilerVoicePendingAdmissionCleanupCallbackContract(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	var log bytes.Buffer
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, logger.NewWithWriter(&log))
+	assert.False(t, r.HasVoicePendingAdmissionCleanup())
+	calls, gotLimit, bounded := 0, 0, false
+	r.SetVoicePendingAdmissionCleanup(func(ctx context.Context, limit int) (int, error) {
+		calls++
+		gotLimit = limit
+		_, bounded = ctx.Deadline()
+		return 0, context.Canceled
+	})
+	assert.True(t, r.HasVoicePendingAdmissionCleanup())
+	stats, err := r.ReconcilePass(context.Background(), 11)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Cleared)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 11, gotLimit)
+	assert.True(t, bounded)
+	assert.Contains(t, log.String(), "failure_class=voice_pending_admission_cleanup")
+	assert.NotContains(t, log.String(), context.Canceled.Error())
+}
+
 func TestReconcilePassRunsPrePlanCleanupUnderOneSharedDeadline(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, nil)

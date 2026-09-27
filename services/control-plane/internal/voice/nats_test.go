@@ -452,6 +452,39 @@ func TestHandleRoomEmpty_ServerChannel(t *testing.T) {
 	}
 }
 
+func TestHandleRoomEmpty_ServerTempGrantCommitsCleanupOnce(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriber(ts)
+	owner := ts.CreateTestUser(t, "empty_temp_owner")
+	mover := ts.CreateTestUser(t, "empty_temp_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "Empty Temp Server")
+	ts.AddMemberToServer(t, serverID, mover.ID, "member")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-empty-temp")
+	seedTempGrant(t, ts, serverID, channelID, mover.ID)
+	backdateGrantedAt(t, ts, channelID, mover.ID, 120)
+	tgSeedChannelKey(t, ts.DB, channelID, mover.ID)
+	tgSeedPendingKeyRequest(t, ts.DB, channelID, mover.ID)
+	insertVoiceParticipant(t, ts.DB, channelID, mover.ID)
+
+	sub.HandleRoomEmpty(mustJSON(t, map[string]interface{}{
+		"channelId": channelID,
+		"timestamp": "2026-03-30T00:00:00Z",
+	}))
+
+	assert.False(t, voiceParticipantExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tgPendingKeyRequestExists(t, ts.DB, channelID, mover.ID))
+	assert.Equal(t, 1, keyRevocationCount(t, ts.DB, channelID))
+
+	// A duplicate terminal event has no participant deletion to attach cleanup to.
+	sub.HandleRoomEmpty(mustJSON(t, map[string]interface{}{
+		"channelId": channelID,
+		"timestamp": "2026-03-30T00:00:01Z",
+	}))
+	assert.Equal(t, 1, keyRevocationCount(t, ts.DB, channelID))
+}
+
 func TestHandleRoomEmpty_DMConversation(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	sub := newTestSubscriber(ts)

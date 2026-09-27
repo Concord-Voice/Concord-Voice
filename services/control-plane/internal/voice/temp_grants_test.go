@@ -3,12 +3,17 @@ package voice_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,6 +24,21 @@ import (
 // nullable, REFERENCES users(id) ON DELETE SET NULL). Passing a non-empty,
 // non-existent UUID here would trip key_revocations_revoked_by_fkey.
 const tgActorSystem = ""
+
+type ambiguousGrantPlan struct{}
+
+func (ambiguousGrantPlan) HasWork() bool { return true }
+
+type ambiguousGrantRecheck struct{ abandoned int }
+
+func (r *ambiguousGrantRecheck) PrepareCapture(context.Context, string, []string, *string) (rbac.PresenceRecheckPlan, error) {
+	return ambiguousGrantPlan{}, nil
+}
+func (r *ambiguousGrantRecheck) CaptureVisibility(context.Context, *sql.Tx, rbac.PresenceRecheckPlan) error {
+	return errors.New("forced capture failure")
+}
+func (*ambiguousGrantRecheck) Execute(rbac.PresenceRecheckPlan)           {}
+func (r *ambiguousGrantRecheck) Abandon(rbac.PresenceRecheckPlan, string) { r.abandoned++ }
 
 // newTempGrantManager builds a tempGrantManager backed by the test DB/Redis/Hub.
 func newTempGrantManager(t *testing.T, ts *testhelpers.TestServer) *voice.TestTempGrantManager {
@@ -103,6 +123,29 @@ func tgLatestRevokedBy(t *testing.T, db *sql.DB, channelID string) sql.NullStrin
 }
 
 // --- Grant tests (#487 Scope C grant / T5) ---
+
+func TestGrantTemporaryChannelAccess_RejectsInvalidUserBeforeDatabaseAccess(t *testing.T) {
+	// Validation is deliberately first: malformed caller input must not reach a
+	// transaction or dereference the manager's database dependencies.
+	mgr := voice.NewTestTempGrantManager(nil, nil, nil, nil, nil)
+
+	err := mgr.Grant(context.Background(), "server", "channel", "not-a-uuid")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid temporary grant user")
+}
+
+func TestGrantTemporaryChannelAccess_BeginFailureIsReturned(t *testing.T) {
+	db, err := sql.Open("postgres", "postgres://invalid-host.invalid/concord")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	mgr := voice.NewTestTempGrantManager(db, logger.New("test"), nil, nil, nil)
+
+	err = mgr.Grant(context.Background(), uuid.NewString(), uuid.NewString(), uuid.NewString())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "temp grant begin")
+}
 
 func TestGrantTemporaryChannelAccess_InsertsTempOverride(t *testing.T) {
 	ts := setupTS(t)
@@ -193,6 +236,251 @@ func TestGrantTemporaryChannelAccess_IdempotentOnExistingTemp(t *testing.T) {
 	assert.True(t, isTemp)
 }
 
+func TestReconcileAmbiguousTemporaryGrant_ExactFenceRevokesCommittedUnsignaledGrant(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_ambiguous_owner")
+	mover := ts.CreateTestUser(t, "tg_ambiguous_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Ambiguous")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-ambiguous")
+
+	ackLoss := errors.New("temporary grant commit acknowledgement lost")
+	mgr.SetGrantCommitForTest(func(tx *sql.Tx) error {
+		require.NoError(t, tx.Commit()) // The durable grant is real.
+		return ackLoss                  // Only its acknowledgement is lost.
+	})
+
+	err := mgr.Grant(context.Background(), serverID, channelID, mover.ID)
+	require.ErrorIs(t, err, ackLoss)
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.Equal(t, 1, tgKeyRevocationCount(t, ts.DB, channelID))
+}
+
+func TestGrantTemporaryChannelAccess_RollbackCommitErrorDoesNotMutate(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_ambiguous_rollback_owner")
+	mover := ts.CreateTestUser(t, "tg_ambiguous_rollback_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Ambiguous Rollback")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-ambiguous-rollback")
+
+	commitRejected := errors.New("temporary grant commit rejected")
+	mgr.SetGrantCommitForTest(func(*sql.Tx) error { return commitRejected })
+	err := mgr.Grant(context.Background(), serverID, channelID, mover.ID)
+	require.ErrorIs(t, err, commitRejected)
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.Zero(t, tgKeyRevocationCount(t, ts.DB, channelID))
+}
+
+func TestGrantTemporaryChannelAccess_RollbackErrorInvalidatesAuthority(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_rollback_error_owner")
+	mover := ts.CreateTestUser(t, "tg_rollback_error_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Rollback Error")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-rollback-error")
+
+	cacheKey := "perm:" + serverID + ":" + mover.ID + ":" + channelID
+	require.NoError(t, ts.Redis.Set(context.Background(), cacheKey, int64(rbac.PermJoinVoice), time.Minute).Err())
+	commitErr := errors.New("temporary grant commit acknowledgement lost")
+	rollbackErr := errors.New("temporary grant rollback outcome unresolved")
+	mgr.SetGrantCommitForTest(func(*sql.Tx) error { return commitErr })
+	mgr.SetGrantRollbackForTest(func(tx *sql.Tx) error {
+		if err := tx.Rollback(); err != nil {
+			return err
+		}
+		return rollbackErr
+	})
+
+	err := mgr.Grant(context.Background(), serverID, channelID, mover.ID)
+	require.ErrorIs(t, err, commitErr)
+	require.ErrorIs(t, err, rollbackErr)
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.Zero(t, ts.Redis.Exists(context.Background(), cacheKey).Val(), "unresolved rollback must fail closed by invalidating cached authority")
+}
+
+func TestGrantTemporaryChannelAccess_ConfirmedCommitSurvivesCallerCancellation(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg-confirmed-cancel-owner")
+	mover := ts.CreateTestUser(t, "tg-confirmed-cancel-mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Confirmed Cancellation")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-confirmed-cancel")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.SetGrantCommitForTest(func(tx *sql.Tx) error {
+		err := tx.Commit()
+		cancel() // Models client cancellation immediately after the durable commit.
+		return err
+	})
+	t.Cleanup(cancel)
+
+	require.NoError(t, mgr.Grant(ctx, serverID, channelID, mover.ID))
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, mover.ID), "post-commit cache delivery is detached best effort, never a false failed move")
+}
+
+func TestReconcileAmbiguousTemporaryGrant_ExpiredCallerDeadlineUsesFreshContext(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg-expired-deadline-owner")
+	mover := ts.CreateTestUser(t, "tg-expired-deadline-mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Expired Deadline")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-expired-deadline")
+
+	ackLoss := errors.New("temporary grant commit acknowledgement lost after deadline")
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.SetGrantCommitForTest(func(tx *sql.Tx) error {
+		require.NoError(t, tx.Commit())
+		cancel() // The caller deadline/cancellation is observed after durable commit.
+		return ackLoss
+	})
+	t.Cleanup(cancel)
+
+	err := mgr.Grant(ctx, serverID, channelID, mover.ID)
+	require.ErrorIs(t, err, ackLoss)
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID),
+		"ambiguous compensation must reconcile even after the caller context expires")
+	assert.Equal(t, 1, tgKeyRevocationCount(t, ts.DB, channelID))
+}
+
+func TestGrantTemporaryChannelAccess_GrantAgeStartsAfterVisibilityLockWait(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg-grace-lock-owner")
+	mover := ts.CreateTestUser(t, "tg-grace-lock-mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Grace Lock")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-grace-lock")
+
+	visibilityBlocker, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = visibilityBlocker.Rollback() })
+	require.NoError(t, rbac.LockServerVisibilityCapture(context.Background(), visibilityBlocker, serverID))
+	lockKey, err := rbac.ServerVisibilityCaptureAdvisoryKey(serverID)
+	require.NoError(t, err)
+	lifecycleBlocker, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lifecycleBlocker.Rollback() })
+	userID := uuid.MustParse(mover.ID)
+	lifecycleKey, err := voice.ServerVoiceLifecycleAdvisoryKeyForTest(userID)
+	require.NoError(t, err)
+	require.NoError(t, voice.LockServerVoiceLifecycleTx(context.Background(), lifecycleBlocker, userID))
+	done := make(chan error, 1)
+	go func() { done <- mgr.Grant(context.Background(), serverID, channelID, mover.ID) }()
+	dbtest.WaitForAdvisoryLockWaiter(t, ts.DB, lockKey)
+	require.NoError(t, visibilityBlocker.Commit())
+	dbtest.WaitForAdvisoryLockWaiter(t, ts.DB, lifecycleKey)
+	// Use the database clock at the final lock boundary. A timestamp captured
+	// before either lock must be earlier than this value; production writes it
+	// after the lifecycle lock, so no Go-clock skew or timing slack is involved.
+	var releaseBoundary time.Time
+	require.NoError(t, ts.DB.QueryRow(`SELECT clock_timestamp()`).Scan(&releaseBoundary))
+	require.NoError(t, lifecycleBlocker.Commit())
+	require.NoError(t, <-done)
+
+	var grantedAt time.Time
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT granted_at
+		FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2`, channelID, mover.ID,
+	).Scan(&grantedAt))
+	assert.False(t, grantedAt.Before(releaseBoundary),
+		"grant age must begin at the post-lock write, not transaction start")
+}
+
+func TestReconcileAmbiguousTemporaryGrant_CaptureFailureAbandonsPreparedPresencePlan(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg-ambiguous-abandon-owner")
+	mover := ts.CreateTestUser(t, "tg-ambiguous-abandon-mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Ambiguous Abandon")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-ambiguous-abandon")
+	recheck := &ambiguousGrantRecheck{}
+	mgr.SetPresenceRecheckForTest(recheck)
+	mgr.SetGrantCommitForTest(func(tx *sql.Tx) error {
+		require.NoError(t, tx.Commit())
+		return errors.New("commit acknowledgement lost")
+	})
+
+	require.Error(t, mgr.Grant(context.Background(), serverID, channelID, mover.ID))
+	assert.Equal(t, 1, recheck.abandoned, "a prepared plan is fail-closed when ambiguity compensation cannot capture it")
+}
+
+func TestReconcileAmbiguousTemporaryGrant_NewerTupleWithSameGrantedAtSurvives(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_ambiguous_newer_owner")
+	mover := ts.CreateTestUser(t, "tg_ambiguous_newer_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Ambiguous Newer")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-ambiguous-newer")
+
+	ackLoss := errors.New("temporary grant commit acknowledgement lost after same-time refresh")
+	mgr.SetGrantCommitForTest(func(tx *sql.Tx) error {
+		require.NoError(t, tx.Commit())
+		// NOW() is transaction-start time and therefore not an operation fence:
+		// write a newer tuple while preserving granted_at exactly. Compensation
+		// must use the returned xmin, not the audit timestamp or stable row id.
+		_, refreshErr := ts.DB.Exec(`
+			UPDATE channel_permission_overrides
+			SET allow = allow
+			WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2
+			  AND is_temporary = TRUE`, channelID, mover.ID)
+		require.NoError(t, refreshErr)
+		return ackLoss
+	})
+	tgSeedChannelKey(t, ts.DB, channelID, mover.ID)
+	tgSeedPendingKeyRequest(t, ts.DB, channelID, mover.ID)
+
+	err := mgr.Grant(context.Background(), serverID, channelID, mover.ID)
+	require.ErrorIs(t, err, ackLoss)
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, mover.ID), "an old xmin fence must not erase a newer tuple with the same granted_at")
+	assert.True(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.True(t, tgPendingKeyRequestExists(t, ts.DB, channelID, mover.ID))
+	assert.Zero(t, tgKeyRevocationCount(t, ts.DB, channelID))
+}
+
+func TestReconcileAmbiguousTemporaryGrant_PermanentOverrideSurvives(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_ambiguous_permanent_owner")
+	mover := ts.CreateTestUser(t, "tg_ambiguous_permanent_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempGrant Ambiguous Permanent")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-ambiguous-permanent")
+
+	permanentAllow := int64(rbac.PermViewVoiceChannels | rbac.PermJoinVoice | rbac.PermSpeak | rbac.PermSendMessages)
+	tgSeedChannelKey(t, ts.DB, channelID, mover.ID)
+	ackLoss := errors.New("temporary grant commit acknowledgement lost after promotion")
+	mgr.SetGrantCommitForTest(func(tx *sql.Tx) error {
+		require.NoError(t, tx.Commit())
+		_, err := ts.DB.Exec(
+			`UPDATE channel_permission_overrides
+			 SET allow = $3, is_temporary = false, temporary_reason = NULL
+			 WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2`,
+			channelID, mover.ID, permanentAllow,
+		)
+		require.NoError(t, err)
+		return ackLoss
+	})
+
+	err := mgr.Grant(context.Background(), serverID, channelID, mover.ID)
+	require.ErrorIs(t, err, ackLoss)
+	exists, allow, _, isTemp, reason := tgOverride(t, ts.DB, channelID, mover.ID)
+	assert.True(t, exists)
+	assert.False(t, isTemp, "the exact temporary fence must not erase a permanent override")
+	assert.Equal(t, permanentAllow, allow)
+	assert.False(t, reason.Valid)
+	assert.True(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.Zero(t, tgKeyRevocationCount(t, ts.DB, channelID))
+}
+
 // TestGrantTemporaryChannelAccess_InsertError verifies the INSERT-failure branch:
 // granting against a channel_id that does not exist violates the
 // channel_permission_overrides FK (channel_id REFERENCES channels(id)). The grant
@@ -247,6 +535,96 @@ func TestRevokeTemporaryChannelAccess_DeletesTempAndPurges(t *testing.T) {
 	// not the literal empty string — otherwise the FK to users(id) is violated.
 	revokedBy := tgLatestRevokedBy(t, ts.DB, channelID)
 	assert.False(t, revokedBy.Valid, "actorless system revoke must store revoked_by as NULL")
+}
+
+func TestRevokeTemporaryChannelAccess_ChannelLockDeadlineRollsBackAtomically(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_atomic_lock_owner")
+	mover := ts.CreateTestUser(t, "tg_atomic_lock_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempRevoke Atomic Lock")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-atomic-lock")
+	require.NoError(t, mgr.Grant(context.Background(), serverID, channelID, mover.ID))
+	tgSeedChannelKey(t, ts.DB, channelID, mover.ID)
+	tgSeedPendingKeyRequest(t, ts.DB, channelID, mover.ID)
+
+	blocker, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = blocker.Rollback() })
+	var transactionID int64
+	require.NoError(t, blocker.QueryRow(`SELECT txid_current()`).Scan(&transactionID))
+	_, err = blocker.Exec(`SELECT id FROM channels WHERE id = $1 FOR UPDATE`, channelID)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	type revokeResult struct{ err error }
+	done := make(chan revokeResult, 1)
+	go func() { done <- revokeResult{mgr.Revoke(ctx, serverID, channelID, mover.ID, tgActorSystem)} }()
+	dbtest.WaitForRowLockWaiter(t, ts.DB, transactionID)
+	select {
+	case result := <-done:
+		require.Error(t, result.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("temporary-grant revoke did not exit after the caller deadline")
+	}
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.True(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.True(t, tgPendingKeyRequestExists(t, ts.DB, channelID, mover.ID))
+	assert.Zero(t, tgKeyRevocationCount(t, ts.DB, channelID))
+	require.NoError(t, blocker.Rollback())
+
+	require.NoError(t, mgr.Revoke(context.Background(), serverID, channelID, mover.ID, tgActorSystem))
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tgPendingKeyRequestExists(t, ts.DB, channelID, mover.ID))
+	assert.Equal(t, 1, tgKeyRevocationCount(t, ts.DB, channelID))
+}
+
+func TestRevokeTemporaryChannelAccess_KeyPurgeFailureRollsBackAndRetries(t *testing.T) {
+	ts := setupTS(t)
+	mgr := newTempGrantManager(t, ts)
+	owner := ts.CreateTestUser(t, "tg_atomic_purge_owner")
+	mover := ts.CreateTestUser(t, "tg_atomic_purge_mover")
+	serverID := ts.CreateTestServer(t, owner.ID, "TempRevoke Atomic Purge")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tg-atomic-purge")
+	require.NoError(t, mgr.Grant(context.Background(), serverID, channelID, mover.ID))
+	tgSeedChannelKey(t, ts.DB, channelID, mover.ID)
+	tgSeedPendingKeyRequest(t, ts.DB, channelID, mover.ID)
+	_, err := ts.DB.Exec(`
+		CREATE FUNCTION test_fail_temp_revoke_key_purge() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced temp revoke key purge failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER test_fail_temp_revoke_key_purge BEFORE DELETE ON channel_keys
+		FOR EACH ROW EXECUTE FUNCTION test_fail_temp_revoke_key_purge()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := ts.DB.Exec(`
+			DROP TRIGGER IF EXISTS test_fail_temp_revoke_key_purge ON channel_keys;
+			DROP FUNCTION IF EXISTS test_fail_temp_revoke_key_purge()`)
+		if cleanupErr != nil {
+			t.Errorf("drop temp revoke key-purge failure trigger: %v", cleanupErr)
+		}
+	})
+
+	err = mgr.Revoke(context.Background(), serverID, channelID, mover.ID, tgActorSystem)
+	require.Error(t, err)
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.True(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.True(t, tgPendingKeyRequestExists(t, ts.DB, channelID, mover.ID))
+	assert.Zero(t, tgKeyRevocationCount(t, ts.DB, channelID))
+	require.NoError(t, func() error {
+		_, dropErr := ts.DB.Exec(`DROP TRIGGER test_fail_temp_revoke_key_purge ON channel_keys; DROP FUNCTION test_fail_temp_revoke_key_purge()`)
+		return dropErr
+	}())
+
+	require.NoError(t, mgr.Revoke(context.Background(), serverID, channelID, mover.ID, tgActorSystem))
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tgChannelKeyExists(t, ts.DB, channelID, mover.ID))
+	assert.False(t, tgPendingKeyRequestExists(t, ts.DB, channelID, mover.ID))
+	assert.Equal(t, 1, tgKeyRevocationCount(t, ts.DB, channelID))
 }
 
 func TestRevokeTemporaryChannelAccess_DeletesOnlyTemporary(t *testing.T) {

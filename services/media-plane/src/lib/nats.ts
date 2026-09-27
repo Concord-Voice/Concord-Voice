@@ -184,6 +184,8 @@ export class NatsService {
             displayName: event.displayName,
             avatarUrl: event.avatarUrl,
             callId: event.callId,
+            admissionId: event.admissionId,
+            socketId: event.socketId,
             timestamp: this.nextVoiceLifecycleTimestamp(),
           });
           break;

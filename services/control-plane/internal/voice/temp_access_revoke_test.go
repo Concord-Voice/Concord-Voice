@@ -1,11 +1,16 @@
 package voice_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,6 +46,98 @@ func TestRevokeTempAccess_RevokesGrant(t *testing.T) {
 	assert.Equal(t, true, body["revoked"])
 	assert.False(t, tempOverrideExists(t, ts.DB, channelID, target.ID), "temp override deleted")
 	assert.Equal(t, 1, keyRevocationCount(t, ts.DB, channelID), "CSK rotated on revoke")
+}
+
+func TestRevokeTempAccess_SerializesOnTargetVoiceLifecycle(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "tar_lock_owner")
+	mover := ts.CreateTestUser(t, "tar_lock_mover")
+	target := ts.CreateTestUser(t, "tar_lock_target")
+	serverID := ts.CreateTestServer(t, owner.ID, "RevokeTemp Lifecycle Lock")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+	moverRole := ts.CreateTestRole(t, serverID, "Organizer", 5, int64(rbac.PermMoveMembers))
+	ts.AssignRoleToUser(t, serverID, mover.ID, moverRole)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tar-lock")
+	seedTempGrant(t, ts, serverID, channelID, target.ID)
+	tgSeedChannelKey(t, ts.DB, channelID, target.ID)
+	tgSeedPendingKeyRequest(t, ts.DB, channelID, target.ID)
+
+	blocker, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	targetID := uuid.MustParse(target.ID)
+	require.NoError(t, voice.LockServerVoiceLifecycleTx(context.Background(), blocker, targetID))
+	lockKey, err := voice.ServerVoiceLifecycleAdvisoryKeyForTest(targetID)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = blocker.Rollback() })
+
+	result := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest("DELETE", voiceEnforcePath(serverID, target.ID, pathTempAccess),
+			map[string]interface{}{"channel_id": channelID}, testhelpers.AuthHeaders(mover.AccessToken))
+		result <- w.Code
+	}()
+	dbtest.WaitForAdvisoryLockWaiter(t, ts.DB, lockKey)
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, target.ID),
+		"moderator revoke must wait for the target lifecycle lock")
+	assert.True(t, tgChannelKeyExists(t, ts.DB, channelID, target.ID))
+	assert.True(t, tgPendingKeyRequestExists(t, ts.DB, channelID, target.ID))
+	assert.Zero(t, keyRevocationCount(t, ts.DB, channelID))
+
+	require.NoError(t, blocker.Commit())
+	select {
+	case status := <-result:
+		assert.Equal(t, http.StatusOK, status)
+	case <-time.After(5 * time.Second):
+		t.Fatal("moderator revoke did not finish after lifecycle lock release")
+	}
+	assert.False(t, tempOverrideExists(t, ts.DB, channelID, target.ID))
+	assert.False(t, tgChannelKeyExists(t, ts.DB, channelID, target.ID))
+	assert.False(t, tgPendingKeyRequestExists(t, ts.DB, channelID, target.ID))
+	assert.Equal(t, 1, keyRevocationCount(t, ts.DB, channelID))
+}
+
+// Ordinary channel-override writes and temporary-grant cleanup may contend for
+// the same channel while holding different subject locks. Their shared order
+// must be visibility -> lifecycle -> channel: both requests should complete
+// under contention instead of forming a lock cycle.
+func TestOrdinaryChannelOverrideAndTempCleanupCompleteWithoutDeadlock(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "order_owner")
+	target := ts.CreateTestUser(t, "order_target")
+	other := ts.CreateTestUser(t, "order_other")
+	serverID := ts.CreateTestServer(t, owner.ID, "Authority lock order")
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, other.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "order-channel")
+	seedTempGrant(t, ts, serverID, channelID, target.ID)
+
+	start := make(chan struct{})
+	results := make(chan int, 2)
+	go func() {
+		<-start
+		w := ts.DoRequest("PUT", "/api/v1/channels/"+channelID+"/overrides", map[string]interface{}{
+			"target_type": "user", "target_id": other.ID, "allow": int64(rbac.PermViewVoiceChannels),
+		}, testhelpers.AuthHeaders(owner.AccessToken))
+		results <- w.Code
+	}()
+	go func() {
+		<-start
+		w := ts.DoRequest("DELETE", voiceEnforcePath(serverID, target.ID, pathTempAccess),
+			map[string]interface{}{"channel_id": channelID}, testhelpers.AuthHeaders(owner.AccessToken))
+		results <- w.Code
+	}()
+	close(start)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case status := <-results:
+			assert.Contains(t, []int{http.StatusOK, http.StatusConflict}, status,
+				"contending authority writes must return rather than deadlock")
+		case <-time.After(5 * time.Second):
+			t.Fatal("ordinary override and temporary cleanup did not complete")
+		}
+	}
 }
 
 func TestRevokeTempAccess_RotatesDuringInitialDistribution(t *testing.T) {

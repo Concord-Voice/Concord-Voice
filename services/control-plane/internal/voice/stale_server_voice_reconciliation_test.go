@@ -37,7 +37,6 @@ var (
 	errStalePlanCapture = errors.New("stale presence clear plan capture failed")
 	errStaleAffected    = errors.New("stale rows affected failed")
 	errStaleCommit      = errors.New("stale commit failed")
-	errStaleBusy        = errors.New("stale lifecycle lock busy")
 )
 
 const staleVoiceCandidateChannel = "11111111-1111-1111-1111-111111111111"
@@ -113,6 +112,11 @@ func (c *staleVoiceConn) firstChannelID() string {
 func (c *staleVoiceConn) QueryContext(
 	_ context.Context, query string, args []driver.NamedValue,
 ) (driver.Rows, error) {
+	if strings.Contains(query, "FROM channel_permission_overrides AS cpo") &&
+		strings.Contains(query, "LEFT JOIN voice_participants AS participant") {
+		// The independent five-second orphan sweep has no eligible rows in this fixture.
+		return staleVoiceRows(3, nil, nil), nil
+	}
 	if c.scenario == "missing_user" && c.missingUserSeen {
 		return nil, errors.New("missing user must short-circuit stale cleanup")
 	}
@@ -140,6 +144,18 @@ func (c *staleVoiceConn) QueryContext(
 			return nil, errors.New("unexpected stale voice terminal channel recheck arguments")
 		}
 		return staleVoiceRows(1, [][]driver.Value{{true}}, nil), nil
+	}
+	if strings.Contains(query, "FROM channel_permission_overrides") {
+		// Stale reconciliation now performs a read-only terminal-grant preflight
+		// before opening its cleanup transaction.  The fixture has no override
+		// for the candidate, so both temporary and permanent flags are false.
+		if c.grantProbeCount != nil && !strings.Contains(query, "FOR UPDATE") {
+			*c.grantProbeCount++
+		}
+		if strings.Contains(query, "FOR UPDATE") {
+			return staleVoiceRows(3, [][]driver.Value{{false, false, false}}, nil), nil
+		}
+		return staleVoiceRows(2, [][]driver.Value{{false, false}}, nil), nil
 	}
 	if strings.Contains(query, "FROM voice_participants AS participant") {
 		candidateServer := staleVoiceCandidateServer
@@ -268,12 +284,6 @@ func (c *staleVoiceConn) ExecContext(
 	if strings.Contains(query, "pg_advisory_xact_lock") {
 		if c.scenario == "lock_error" {
 			return nil, errStaleLock
-		}
-		if c.scenario == "busy_two" {
-			c.lockAttempts++
-			if c.lockAttempts == 1 {
-				return nil, errStaleBusy
-			}
 		}
 		return staleVoiceResult{rows: 0}, nil
 	}
@@ -497,8 +507,9 @@ func TestReconcileStaleServerVoiceParticipants_ContinuesPastPreAdmissionError(t 
 	assert.Equal(t, 1, removed, "the later candidate must still be cleaned")
 }
 
-func TestReconcileStaleServerVoiceParticipants_DoesNotProbeTemporaryGrant(t *testing.T) {
-	// #2907: stale participant convergence does not own the temporary-grant backstop.
+func TestReconcileStaleServerVoiceParticipants_PreflightsTemporaryGrantOnce(t *testing.T) {
+	// #2907: stale participant convergence preflights the terminal override
+	// before cleanup, while the temporary-grant backstop remains transactional.
 	var grantProbeCount int
 	db := openStaleVoiceDBWithGrantProbeCounter(t, "commit_control", &grantProbeCount)
 	sub := voice.NewNATSSubscriber(
@@ -509,8 +520,8 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotProbeTemporaryGrant(t *tes
 	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 1)
 	require.NoError(t, err)
 	assert.Equal(t, 1, removed, "the stale participant must still be removed")
-	assert.Zero(t, grantProbeCount,
-		"stale participant convergence must not probe or revoke temporary grants")
+	assert.Equal(t, 1, grantProbeCount,
+		"stale participant convergence must perform one read-only terminal-grant preflight")
 }
 
 func TestStaleVoiceTemporaryGrantProbeCounterControl(t *testing.T) {

@@ -1,11 +1,14 @@
 package voice_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -120,6 +123,31 @@ func TestAuthorizeJoin_NonexistentChannel(t *testing.T) {
 
 	w := ts.DoRequest("POST", pathChannelsPrefix+fakeID+pathVoiceJoin, nil, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestAuthorizeJoin_StalePermissionCacheCannotRestoreRevokedTempGrant(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "stale_join_owner")
+	member := ts.CreateTestUser(t, "stale_join_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Stale Join Cache")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-stale-cache")
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+
+	mgr := voice.NewTestTempGrantManager(ts.DB, logger.New("test"), ts.Hub, rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), logger.New("test")), nil)
+	require.NoError(t, mgr.Grant(context.Background(), serverID, channelID, member.ID))
+	require.NoError(t, mgr.Revoke(context.Background(), serverID, channelID, member.ID, owner.ID))
+	// Reintroduce the pre-revoke allow in Redis. AuthorizeJoin must use the
+	// durable, uncached resolver and fail closed on the revoked override.
+	cache := rbac.NewPermissionCache(ts.Redis)
+	tags := testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, member.ID)
+	require.NoError(t, cache.Set(context.Background(), serverID, member.ID, channelID,
+		rbac.PermViewVoiceChannels|rbac.PermJoinVoice, tags))
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "stale Redis allow must not authorize a revoked temp grant")
 }
 
 func TestAuthorizeJoin_TextChannelRejected(t *testing.T) {

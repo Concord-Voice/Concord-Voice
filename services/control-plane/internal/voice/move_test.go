@@ -1,6 +1,7 @@
 package voice_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -141,6 +142,36 @@ func TestServerMove_JoinInheritedViewDenied_GrantsTemp(t *testing.T) {
 	assert.True(t, moveTempOverrideExists(t, ts, to, target.ID),
 		"temp grant must be inserted when target inherits JoinVoice but is denied ViewVoice")
 	assert.Equal(t, 0, auditMoveCount(t, ts, serverID, target.ID), "no audit for a downward move")
+}
+
+func TestServerMove_StalePermissionCacheStillGrantsAccess(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "mv_stale_cache_owner")
+	mover := ts.CreateTestUser(t, "mv_stale_cache_mover")
+	target := ts.CreateTestUser(t, "mv_stale_cache_target")
+	serverID := ts.CreateTestServer(t, owner.ID, "Move Stale Cache")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	moverRole := ts.CreateTestRole(t, serverID, "Organizer", 5, int64(rbac.PermMoveMembers))
+	ts.AssignRoleToUser(t, serverID, mover.ID, moverRole)
+	from := ts.CreateVoiceChannel(t, serverID, "voice-stale-cache-from")
+	to := ts.CreateVoiceChannel(t, serverID, "voice-stale-cache-to")
+	hideVoiceChannel(t, ts, serverID, to)
+	joinVoice(t, ts, from, target.ID)
+
+	// The transactional move preflight sees the durable deny; the stale cache
+	// must not make the later grant decision skip the required temporary access.
+	cache := rbac.NewPermissionCache(ts.Redis)
+	tags := testhelpers.SeedPermissionGenerations(t, ts.Redis, serverID, target.ID)
+	require.NoError(t, cache.Set(context.Background(), serverID, target.ID, to,
+		rbac.PermViewVoiceChannels|rbac.PermJoinVoice, tags))
+
+	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathMove),
+		map[string]interface{}{"target_channel_id": to}, testhelpers.AuthHeaders(mover.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, moveTempOverrideExists(t, ts, to, target.ID),
+		"a stale cached allow must not suppress the preflight-required temporary grant")
 }
 
 // TestServerMove_PermanentViewDeny_RejectsBeforeSignal: the grant-integrity edge

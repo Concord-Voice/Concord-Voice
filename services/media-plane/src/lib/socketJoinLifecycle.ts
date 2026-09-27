@@ -168,14 +168,21 @@ export async function withKeyedJoinFence<Value>(
   }
 }
 
-/** Re-check admission after the participant becomes visible to enforcement. */
+/**
+ * Re-check every registration after it is visible to enforcement. DM uses its
+ * A1-issued call identity; a channel has no call ID but activates its exact
+ * A1 reservation during the A2 authorization.
+ */
 export async function reauthorizeAdmission<Access extends { callId?: string }>(
   roomKind: 'channel' | 'dm',
   access: Access,
   requestedCallId: string | undefined,
-  authorize: (exactCallId: string | undefined) => Promise<Access>
+  authorize: (exactCallId: string | undefined, activate: boolean) => Promise<Access>
 ): Promise<Access> {
-  return authorize(roomKind === 'dm' ? (access.callId ?? requestedCallId) : undefined);
+  return authorize(
+    roomKind === 'dm' ? (access.callId ?? requestedCallId) : undefined,
+    roomKind === 'channel'
+  );
 }
 
 export async function runSocketBoundJoin<Access, Value>({
@@ -200,6 +207,10 @@ export async function runSocketBoundJoin<Access, Value>({
 
   try {
     const value = await join(authorizedAccess);
+    if (!isConnected()) {
+      await rollback(authorizedAccess);
+      return { access: authorizedAccess, status: 'canceled' };
+    }
     const access = reauthorize ? await reauthorize(authorizedAccess) : authorizedAccess;
     if (!isAllowed(access, authorizedAccess)) {
       await rollback(authorizedAccess);

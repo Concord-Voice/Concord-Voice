@@ -100,9 +100,11 @@ describe('media policer integration (#2153 real RoomManager + MediaPolicer + tic
     // --- Join, promote, create a send transport, and produce a mic (free
     // entitlement: FREE_MEDIA_ENTITLEMENT). ---
     await manager.joinRoom(ROOM, USER, SOCKET, { username: 'alice' }, undefined, {
+      credentialEpoch: '',
       entitlement: undefined,
       mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-      roomContext: undefined,
+      roomContext: { roomKind: 'channel' },
+      deferChannelPromotion: true,
     });
     // joinRoom only registers a provisional participant; index.ts promotes it
     // once the voice-enforcement session is registered and reauthorized.

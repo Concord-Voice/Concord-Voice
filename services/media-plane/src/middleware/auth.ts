@@ -293,6 +293,8 @@ export interface ChannelAccessResult {
    * socket.handshake.auth.
    */
   permissions?: bigint;
+  /** Exact A1/A2 authorization generation for a staged room candidate. */
+  authorizationRevision?: bigint;
   error?: string;
 }
 
@@ -507,6 +509,7 @@ interface DmVoiceAuthorizationResponse {
   is_group: boolean;
   server_muted?: unknown;
   server_deafened?: unknown;
+  authorization_revision?: unknown;
   media_entitlements?: unknown;
   username?: unknown;
   display_name?: unknown;
@@ -520,6 +523,7 @@ interface ChannelJoinAuthorizationResponse {
   allowed: boolean;
   media_server_url: string;
   permissions?: unknown;
+  authorization_revision?: unknown;
   server_muted: boolean;
   server_deafened: boolean;
   channel: {
@@ -534,7 +538,13 @@ interface ChannelJoinAuthorizationResponse {
   avatar_url?: unknown;
 }
 
-const DM_VOICE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
+const VOICE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
+
+export interface ChannelAdmissionHop {
+  admissionId: string;
+  socketId: string;
+  activate: boolean;
+}
 
 /**
  * Control-plane paths this service re-validates against. Both sit under the
@@ -684,7 +694,7 @@ function dmVoiceMediaRequest(
     method,
     // Both admission and rollback run under a per-room fence. Bound either
     // network hop so a stalled control plane cannot head-of-line block the room.
-    signal: AbortSignal.timeout(DM_VOICE_CONTROL_PLANE_TIMEOUT_MS),
+    signal: AbortSignal.timeout(VOICE_CONTROL_PLANE_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
@@ -708,7 +718,8 @@ function channelAccessRequest(
   channelId: string,
   token: string,
   roomKind: RoomKind,
-  requestedCallId?: string
+  requestedCallId?: string,
+  admission?: ChannelAdmissionHop
 ): { endpoint: string; request: RequestInit } {
   const path =
     roomKind === 'dm' ? dmVoiceAuthorizePath(channelId) : channelVoiceJoinPath(channelId);
@@ -719,16 +730,30 @@ function channelAccessRequest(
       request: dmVoiceMediaRequest('POST', channelId, token, requestedCallId),
     };
   }
+  // RequireMediaCapability hashes the raw bytes it reads before the channel
+  // authorization handler. A1/A2 metadata must therefore be encoded once and
+  // the precise same string must be signed and transmitted.
+  const body = admission
+    ? JSON.stringify({
+        admission_id: admission.admissionId,
+        socket_id: admission.socketId,
+        activate: admission.activate,
+      })
+    : '';
   return {
     endpoint,
     request: {
       method: 'POST',
+      // A1 and A2 both pass here. A stalled re-authorization must terminate
+      // so the join lifecycle can roll back its provisional participant.
+      signal: AbortSignal.timeout(VOICE_CONTROL_PLANE_TIMEOUT_MS),
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         ...createServiceHopProofHeaders('POST', path, token),
-        ...createVoiceEnforcementCapabilityHeaders('POST', path, token, ''),
+        ...createVoiceEnforcementCapabilityHeaders('POST', path, token, body),
       },
+      body: body || undefined,
     },
   };
 }
@@ -760,10 +785,22 @@ function dmChannelAccessResult(
 ): ChannelAccessResult {
   const moderationStateValid =
     typeof response.server_muted === 'boolean' && typeof response.server_deafened === 'boolean';
-  const allowed = response.authorized === true && moderationStateValid;
+  const authorizationRevision = parsePermissionBitfield(response.authorization_revision);
+  const authorizationRevisionValid =
+    authorizationRevision !== undefined && authorizationRevision > 0n;
+  const allowed =
+    response.authorized === true && moderationStateValid && authorizationRevisionValid;
   const ent = parseMediaEntitlements(response.media_entitlements);
   const identity = parseAuthoritativeIdentity(response);
-  return {
+  let error: string | undefined;
+  if (moderationStateValid === false) {
+    error = 'Invalid DM voice moderation state';
+  } else if (authorizationRevisionValid === false) {
+    error = 'Invalid DM authorization revision';
+  } else if (response.authorized !== true) {
+    error = 'DM voice join not authorized';
+  }
+  const result: ChannelAccessResult = {
     allowed,
     channelId,
     serverId: '',
@@ -777,25 +814,41 @@ function dmChannelAccessResult(
     callId: nonEmptyResponseString(response.call_id),
     callRingId: nonEmptyResponseString(response.call_ring_id),
     callCallerUserId: nonEmptyResponseString(response.call_caller_user_id),
+    authorizationRevision,
     ...identity,
-    // A 200 with authorized=false is rare; preserve a specific denial reason
-    // instead of making the join handler fall back to generic "Access denied".
-    ...(allowed
-      ? {}
-      : {
-          error: moderationStateValid
-            ? 'DM voice join not authorized'
-            : 'Invalid DM voice moderation state',
-        }),
   };
+  // A 200 with authorized=false is rare; preserve a specific denial reason
+  // instead of making the join handler fall back to generic "Access denied".
+  if (error !== undefined) result.error = error;
+  return result;
 }
 
 function serverChannelAccessResult(
-  response: ChannelJoinAuthorizationResponse
+  response: ChannelJoinAuthorizationResponse,
+  requiresAdmissionRevision = false
 ): ChannelAccessResult {
   const ent = parseMediaEntitlements(response.media_entitlements);
   const identity = parseAuthoritativeIdentity(response);
   const permissions = parsePermissionBitfield(response.permissions) ?? 0n;
+  const authorizationRevision = parsePermissionBitfield(response.authorization_revision);
+  if (
+    requiresAdmissionRevision &&
+    (authorizationRevision === undefined || authorizationRevision <= 0n)
+  ) {
+    return {
+      allowed: false,
+      channelId: response.channel.id,
+      serverId: response.channel.server_id,
+      channelName: response.channel.name,
+      serverMuted: false,
+      serverDeafened: false,
+      userTier: ent.userTier,
+      allowedAudioTiers: ent.allowedAudioTiers,
+      minPtimeMs: ent.minPtimeMs,
+      maxManualBitrateBps: ent.maxManualBitrateBps,
+      error: 'Invalid channel authorization revision',
+    };
+  }
   return {
     allowed: true,
     channelId: response.channel.id,
@@ -810,6 +863,7 @@ function serverChannelAccessResult(
     roomOwnerTier: response.room_owner_tier === 'premium' ? 'premium' : 'free',
     ...identity,
     permissions,
+    authorizationRevision,
   };
 }
 
@@ -818,7 +872,8 @@ export async function validateChannelAccess(
   channelId: string,
   token: string,
   roomKind: RoomKind = 'channel',
-  requestedCallId?: string
+  requestedCallId?: string,
+  admission?: ChannelAdmissionHop
 ): Promise<ChannelAccessResult> {
   try {
     // Route to the appropriate control-plane endpoint based on room kind.
@@ -826,7 +881,13 @@ export async function validateChannelAccess(
     // join returns full channel + enforcement state; DM authorize returns
     // only { authorized, is_group }). Both serve the same purpose:
     // defense-in-depth re-validation of the user's access to the room.
-    const { endpoint, request } = channelAccessRequest(channelId, token, roomKind, requestedCallId);
+    const { endpoint, request } = channelAccessRequest(
+      channelId,
+      token,
+      roomKind,
+      requestedCallId,
+      admission
+    );
     const channelRes = await fetch(endpoint, request);
 
     if (!channelRes.ok) {
@@ -860,7 +921,10 @@ export async function validateChannelAccess(
       );
     }
 
-    return serverChannelAccessResult((await channelRes.json()) as ChannelJoinAuthorizationResponse);
+    return serverChannelAccessResult(
+      (await channelRes.json()) as ChannelJoinAuthorizationResponse,
+      admission !== undefined
+    );
   } catch (err) {
     logger.error('Failed to validate channel access', {
       userId,

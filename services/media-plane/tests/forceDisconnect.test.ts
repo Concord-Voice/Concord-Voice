@@ -29,18 +29,20 @@ const POLICED: ForceDisconnectOptions = { reason: 'media_policy', retryAfterSec:
 
 /** Builds a fake RoomManager surface. */
 function makeRoomManager(
-  participant: { socketId: string } | undefined,
+  participant: { socketId: string; admissionId?: string } | undefined,
   provisionalSocketId?: string
 ) {
   const leaveRoom = vi.fn().mockResolvedValue(undefined);
   const leaveRoomIfSocketOwned = vi.fn().mockResolvedValue(Boolean(participant));
   const getParticipant = vi.fn().mockReturnValue(participant);
-  const getProvisionalParticipantSocketId = vi.fn().mockReturnValue(provisionalSocketId);
+  const getProvisionalParticipant = vi
+    .fn()
+    .mockReturnValue(provisionalSocketId ? { socketId: provisionalSocketId } : undefined);
   const removeProvisionalParticipantIfSocketOwned = vi.fn().mockResolvedValue(true);
   return {
     rm: {
       getParticipant,
-      getProvisionalParticipantSocketId,
+      getProvisionalParticipant,
       leaveRoomIfSocketOwned,
       removeProvisionalParticipantIfSocketOwned,
       // The enforcement-specific seam intentionally shares this spy so these
@@ -48,7 +50,7 @@ function makeRoomManager(
       removeProvisionalParticipantForEnforcement: removeProvisionalParticipantIfSocketOwned,
     } as unknown as ForceDisconnectRoomManager,
     getParticipant,
-    getProvisionalParticipantSocketId,
+    getProvisionalParticipant,
     leaveRoom,
     leaveRoomIfSocketOwned,
     removeProvisionalParticipantIfSocketOwned,
@@ -117,17 +119,13 @@ describe('handleForceDisconnect (#487 P3)', () => {
 
   it('disconnects and silently removes an in-flight DM candidate (#2407)', async () => {
     const pendingSocketId = 'socket-pending';
-    const {
-      rm,
-      leaveRoom,
-      getProvisionalParticipantSocketId,
-      removeProvisionalParticipantIfSocketOwned,
-    } = makeRoomManager(undefined, pendingSocketId);
+    const { rm, leaveRoom, getProvisionalParticipant, removeProvisionalParticipantIfSocketOwned } =
+      makeRoomManager(undefined, pendingSocketId);
     const { io, emit, disconnect } = makeIO(pendingSocketId);
 
     await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
-    expect(getProvisionalParticipantSocketId).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
+    expect(getProvisionalParticipant).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
     expect(emit).toHaveBeenCalledWith('force-disconnect', {
       channelId: CHANNEL_ID,
       reason: 'access_revoked',
@@ -178,7 +176,9 @@ describe('handleForceDisconnect (#487 P3)', () => {
     });
     const rm = {
       getParticipant: vi.fn(() => (admitted ? { socketId: SOCKET_ID } : undefined)),
-      getProvisionalParticipantSocketId: vi.fn(() => (provisional ? pendingSocketId : undefined)),
+      getProvisionalParticipant: vi.fn(() =>
+        provisional ? { socketId: pendingSocketId } : undefined
+      ),
       leaveRoom,
       leaveRoomIfSocketOwned: vi.fn(async (_roomId: string, _userId: string, socketId: string) => {
         if (socketId !== SOCKET_ID || !admitted) return false;
@@ -236,7 +236,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     });
     const rm = {
       getParticipant: vi.fn(() => (admitted ? { socketId: SOCKET_ID } : undefined)),
-      getProvisionalParticipantSocketId: vi.fn(() => undefined),
+      getProvisionalParticipant: vi.fn(() => undefined),
       leaveRoomIfSocketOwned,
       removeProvisionalParticipantForEnforcement: vi.fn(),
     } as unknown as ForceDisconnectRoomManager;
@@ -265,6 +265,48 @@ describe('handleForceDisconnect (#487 P3)', () => {
     const emit = vi.fn();
     await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit, REVOKED);
     expect(emit).not.toHaveBeenCalled();
+  });
+
+  it('does not disconnect a successor that reused the rejected socket ID', async () => {
+    const { rm, leaveRoomIfSocketOwned } = makeRoomManager({
+      socketId: SOCKET_ID,
+      admissionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    });
+    const { io, emit, disconnect } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'access_revoked',
+      socketId: SOCKET_ID,
+      admissionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    });
+
+    expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+  });
+
+  it('does not remove a provisional successor with the same socket and a newer admission', async () => {
+    const remove = vi.fn();
+    const roomManager = {
+      getParticipant: vi.fn(() => undefined),
+      getProvisionalParticipant: vi.fn(() => ({
+        socketId: SOCKET_ID,
+        admissionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      })),
+      leaveRoomIfSocketOwned: vi.fn(),
+      removeProvisionalParticipantForEnforcement: remove,
+    } as unknown as ForceDisconnectRoomManager;
+    const { io, emit, disconnect } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(roomManager, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'access_revoked',
+      socketId: SOCKET_ID,
+      admissionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    });
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
   });
 
   it('continues the teardown when the optional observer throws', async () => {

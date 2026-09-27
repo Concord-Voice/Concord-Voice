@@ -81,15 +81,16 @@ var ErrReconcilerNotWired = errors.New("activepresence: reconciler is not wired"
 
 // Reconciler owns the claim/resolve/deliver/ack loop and its ticker.
 type Reconciler struct {
-	db                 *sql.DB
-	gate               Gate
-	reader             StateReader
-	deleter            GenerationDeleter
-	deliverer          Deliverer
-	log                *logger.Logger
-	interval           time.Duration
-	serverVoiceCleanup func(context.Context, int) (int, error)
-	dmBlockCleanup     func(context.Context, int) (int, error)
+	db                    *sql.DB
+	gate                  Gate
+	reader                StateReader
+	deleter               GenerationDeleter
+	deliverer             Deliverer
+	log                   *logger.Logger
+	interval              time.Duration
+	serverVoiceCleanup    func(context.Context, int) (int, error)
+	voiceAdmissionCleanup func(context.Context, int) (int, error)
+	dmBlockCleanup        func(context.Context, int) (int, error)
 }
 
 // NewReconciler wires the pass. log may be nil.
@@ -121,6 +122,14 @@ func (r *Reconciler) SetServerVoiceCleanup(cleanup func(context.Context, int) (i
 	}
 }
 
+// SetVoicePendingAdmissionCleanup attaches bounded expired A1 reservation
+// cleanup to this reconciler's existing pass and ticker.
+func (r *Reconciler) SetVoicePendingAdmissionCleanup(cleanup func(context.Context, int) (int, error)) {
+	if r != nil {
+		r.voiceAdmissionCleanup = cleanup
+	}
+}
+
 // SetDMBlockCleanup attaches durable DM-block reconciliation to this existing pass.
 func (r *Reconciler) SetDMBlockCleanup(cleanup func(context.Context, int) (int, error)) {
 	if r != nil {
@@ -131,6 +140,11 @@ func (r *Reconciler) SetDMBlockCleanup(cleanup func(context.Context, int) (int, 
 // HasServerVoiceCleanup reports whether the optional cleanup is wired.
 func (r *Reconciler) HasServerVoiceCleanup() bool {
 	return r != nil && r.serverVoiceCleanup != nil
+}
+
+// HasVoicePendingAdmissionCleanup reports that expired A1 reservation cleanup is wired.
+func (r *Reconciler) HasVoicePendingAdmissionCleanup() bool {
+	return r != nil && r.voiceAdmissionCleanup != nil
 }
 
 // HasDMBlockCleanup reports whether durable DM-block reconciliation is wired.
@@ -220,29 +234,39 @@ func (r *Reconciler) ReconcilePass(ctx context.Context, limit int) (PassStats, e
 }
 
 type prePlanCleanupResult struct {
-	serverVoice bool
-	removed     int
-	err         error
+	serverVoice    bool
+	voiceAdmission bool
+	removed        int
+	err            error
 }
 
 // runPrePlanCleanup keeps all bounded cleanup rails under the existing pass budget.
 func (r *Reconciler) runPrePlanCleanup(ctx context.Context, limit int) int {
 	serverVoiceCleanup := r.serverVoiceCleanup
+	voiceAdmissionCleanup := r.voiceAdmissionCleanup
 	dmBlockCleanup := r.dmBlockCleanup
-	if serverVoiceCleanup == nil && dmBlockCleanup == nil {
+	if serverVoiceCleanup == nil && voiceAdmissionCleanup == nil && dmBlockCleanup == nil {
 		return 0
 	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(ctx, claimTimeout)
 	defer cancelCleanup()
-	results := make(chan prePlanCleanupResult, 2)
+	results := make(chan prePlanCleanupResult, 3)
 	cleanupCount := 0
 	serverVoicePending := serverVoiceCleanup != nil
+	voiceAdmissionPending := voiceAdmissionCleanup != nil
 	dmBlockPending := dmBlockCleanup != nil
 	if serverVoiceCleanup != nil {
 		cleanupCount++
 		go func() {
 			removed, err := serverVoiceCleanup(cleanupCtx, limit)
 			results <- prePlanCleanupResult{serverVoice: true, removed: removed, err: err}
+		}()
+	}
+	if voiceAdmissionCleanup != nil {
+		cleanupCount++
+		go func() {
+			removed, err := voiceAdmissionCleanup(cleanupCtx, limit)
+			results <- prePlanCleanupResult{voiceAdmission: true, removed: removed, err: err}
 		}()
 	}
 	if dmBlockCleanup != nil {
@@ -254,11 +278,11 @@ func (r *Reconciler) runPrePlanCleanup(ctx context.Context, limit int) int {
 	}
 	serverVoiceRemoved := 0
 	for range cleanupCount {
-		result, ok := r.waitForPrePlanCleanupResult(cleanupCtx, results, serverVoicePending, dmBlockPending)
+		result, ok := r.waitForPrePlanCleanupResult(cleanupCtx, results, serverVoicePending, voiceAdmissionPending, dmBlockPending)
 		if !ok {
 			return serverVoiceRemoved
 		}
-		r.recordPrePlanCleanupResult(result, &serverVoiceRemoved, &serverVoicePending, &dmBlockPending)
+		r.recordPrePlanCleanupResult(result, &serverVoiceRemoved, &serverVoicePending, &voiceAdmissionPending, &dmBlockPending)
 	}
 	return serverVoiceRemoved
 }
@@ -266,7 +290,7 @@ func (r *Reconciler) runPrePlanCleanup(ctx context.Context, limit int) int {
 func (r *Reconciler) waitForPrePlanCleanupResult(
 	ctx context.Context,
 	results <-chan prePlanCleanupResult,
-	serverVoicePending, dmBlockPending bool,
+	serverVoicePending, voiceAdmissionPending, dmBlockPending bool,
 ) (prePlanCleanupResult, bool) {
 	select {
 	case result := <-results:
@@ -274,6 +298,9 @@ func (r *Reconciler) waitForPrePlanCleanupResult(
 	case <-ctx.Done():
 		if serverVoicePending {
 			r.logCleanupFailure("server voice participant cleanup timed out", "server_voice_cleanup")
+		}
+		if voiceAdmissionPending {
+			r.logCleanupFailure("voice pending admission cleanup timed out", "voice_pending_admission_cleanup")
 		}
 		if dmBlockPending {
 			r.logCleanupFailure("DM block reconciliation timed out", "dm_block_cleanup")
@@ -285,13 +312,20 @@ func (r *Reconciler) waitForPrePlanCleanupResult(
 func (r *Reconciler) recordPrePlanCleanupResult(
 	result prePlanCleanupResult,
 	serverVoiceRemoved *int,
-	serverVoicePending, dmBlockPending *bool,
+	serverVoicePending, voiceAdmissionPending, dmBlockPending *bool,
 ) {
 	if result.serverVoice {
 		*serverVoicePending = false
 		*serverVoiceRemoved = result.removed
 		if result.err != nil {
 			r.logCleanupFailure("server voice participant cleanup failed", "server_voice_cleanup")
+		}
+		return
+	}
+	if result.voiceAdmission {
+		*voiceAdmissionPending = false
+		if result.err != nil {
+			r.logCleanupFailure("voice pending admission cleanup failed", "voice_pending_admission_cleanup")
 		}
 		return
 	}

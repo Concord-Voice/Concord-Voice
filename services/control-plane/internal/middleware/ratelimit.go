@@ -99,6 +99,39 @@ func RateLimitByUser(redis *redis.Client, requests int, window time.Duration) gi
 	return rateLimit(redis, config)
 }
 
+const (
+	channelVoiceJoinRateLimit       = 10
+	channelVoiceJoinServiceHopLimit = channelVoiceJoinRateLimit * 2
+)
+
+func mediaPlaneVoiceJoinRateLimitKey(c *gin.Context) string {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		return rateLimitIPKey(c)
+	}
+	return fmt.Sprintf("ratelimit:media-plane:user:%v:%s:%s", userID, c.Request.Method, c.FullPath())
+}
+
+// RateLimitChannelVoiceJoin preserves the ten logical join-attempts per
+// minute budget. Each HMAC-verified media-plane join makes two authorization
+// hops (A1 and A2), so those hops share a separate twenty-request bucket.
+// Direct and invalid-proof requests retain the ordinary ten-request bucket.
+func RateLimitChannelVoiceJoin(redis *redis.Client) gin.HandlerFunc {
+	directLimiter := RateLimitByUser(redis, channelVoiceJoinRateLimit, time.Minute)
+	serviceHopLimiter := rateLimit(redis, RateLimitConfig{
+		Requests: channelVoiceJoinServiceHopLimit,
+		Window:   time.Minute,
+		KeyFunc:  mediaPlaneVoiceJoinRateLimitKey,
+	})
+	return func(c *gin.Context) {
+		if IsMediaPlaneServiceHop(c) {
+			serviceHopLimiter(c)
+			return
+		}
+		directLimiter(c)
+	}
+}
+
 // RateLimitGlobal creates a fail-open aggregate limiter shared by all callers.
 func RateLimitGlobal(redis *redis.Client, key string, requests int, window time.Duration) gin.HandlerFunc {
 	config := RateLimitConfig{

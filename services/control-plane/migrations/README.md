@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000159)
+## Existing Migrations (000001–000161)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -269,6 +269,8 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000157 | add_server_mfa_enforcement | Per-server `servers.enforce_mfa_dangerous_actions` toggle, default FALSE (#3453). The down is guarded: it refuses while any server enforces |
 | 000158 | add_user_mfa_totp_last_used_step | Nullable `user_mfa_totp.last_used_step BIGINT`, the last accepted TOTP time step, so a code is accepted at most once (RFC 6238 §5.2). No default, no backfill; the down is unguarded |
 | 000159 | add_voice_authorization_revision_sequence | Add the database-assigned monotonic revision watermark used by voice authorization snapshots; down refuses to drop a consumed sequence |
+| 000160 | add_voice_pending_admissions | Add the channel pending-admission base table and expiry index |
+| 000161 | version_voice_pending_admissions | Add exact admission and socket identity columns to pending admissions |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -329,6 +331,11 @@ monotonic revisions to voice authorization snapshots. Its down migration uses
 `ALTER SEQUENCE ... CACHE 1` before checking whether the sequence has been consumed,
 then refuses to drop it once any revision has been allocated; this preserves the
 watermark and prevents stale snapshots from becoming current after a rollback.
+
+Migration 000160 creates the bounded channel pending-admission table and expiry
+index. Migration 000161 adds the exact `admission_id` and `socket_id` identity
+columns. The authorization revision sequence already exists in 000159 and is not
+recreated or dropped by this pair.
 
 ## Troubleshooting
 

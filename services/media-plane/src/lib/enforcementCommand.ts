@@ -12,6 +12,12 @@ export interface NatsEnforcementCommand {
   channelId: string;
   userId: string;
   action?: string;
+  socketId?: string;
+  admissionId?: string;
+}
+
+function isSocketId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= 128;
 }
 
 /** Validates an enforcement command before it reaches a room mutation. */
@@ -24,9 +30,14 @@ export async function handleNatsEnforcementCommand(
   const channelId = data.channelId;
   const userId = data.userId;
   const action = data.action;
+  const socketId = data.socketId;
+  const admissionId = data.admissionId;
+  const hasExactAdmissionIdentity = socketId !== undefined || admissionId !== undefined;
   if (
     !isCanonicalEnforcementUUID(channelId) ||
     !isCanonicalEnforcementUUID(userId) ||
+    (hasExactAdmissionIdentity &&
+      (!isSocketId(socketId) || !isCanonicalEnforcementUUID(admissionId))) ||
     (allowedActions !== undefined &&
       (typeof action !== 'string' || !allowedActions.includes(action)))
   ) {
@@ -48,6 +59,8 @@ export async function handleNatsEnforcementCommand(
       channelId,
       userId,
       ...(typeof action === 'string' ? { action } : {}),
+      ...(socketId === undefined ? {} : { socketId }),
+      ...(admissionId === undefined ? {} : { admissionId }),
     });
   } catch (error) {
     try {

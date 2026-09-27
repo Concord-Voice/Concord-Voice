@@ -116,7 +116,7 @@ function makeHarness(options: HarnessOptions = {}) {
     latchPolicedProducer,
     pausePolicedProducer,
     getParticipant,
-    getProvisionalParticipantSocketId: vi.fn(() => undefined),
+    getProvisionalParticipant: vi.fn(() => undefined),
     leaveRoomIfSocketOwned,
     removeProvisionalParticipantForEnforcement: vi.fn(async () => false),
   } as unknown as MediaPolicerRoomManager;

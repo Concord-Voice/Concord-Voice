@@ -282,6 +282,30 @@ func TestPermissionEnforcer_RecheckChannel_PublishesForEachParticipant(t *testin
 	assert.True(t, got[m2.ID], "member 2 should receive a recheck")
 }
 
+func TestPermissionEnforcer_RecheckChannel_IncludesPendingAdmissionOnlyInItsChannel(t *testing.T) {
+	r := setupEnforcerRig(t)
+	owner := r.ts.CreateTestUser(t, "pependingowner")
+	pending := r.ts.CreateTestUser(t, "pependingmember")
+	unrelated := r.ts.CreateTestUser(t, "pependingother")
+	serverID := r.ts.CreateTestServer(t, owner.ID, "PermEnforce Pending")
+	r.ts.AddMemberToServer(t, serverID, pending.ID, "member")
+	r.ts.AddMemberToServer(t, serverID, unrelated.ID, "member")
+	channelID := r.ts.CreateVoiceChannel(t, serverID, "pe-pending")
+	unrelatedChannelID := r.ts.CreateVoiceChannel(t, serverID, "pe-pending-other")
+	_, err := r.ts.DB.Exec(`
+		INSERT INTO voice_pending_admissions (channel_id, user_id, admission_id, socket_id, expires_at)
+		VALUES ($1, $2, $3, 'pending-socket', clock_timestamp() + INTERVAL '30 seconds'),
+		       ($4, $5, $6, 'unrelated-socket', clock_timestamp() + INTERVAL '30 seconds')
+	`, channelID, pending.ID, uuid.New(), unrelatedChannelID, unrelated.ID, uuid.New())
+	require.NoError(t, err)
+
+	r.enforcer.RecheckChannel(serverID, channelID)
+
+	payload := waitPayloadFor(t, r.perms, "voice.enforce.permissions", map[string]bool{pending.ID: true})
+	assert.Equal(t, channelID, payload["channelId"])
+	assertNoEnforcementFor(t, r.perms, r.disc, unrelated.ID)
+}
+
 func TestPermissionEnforcer_RecheckParticipants_BatchesAuthoritativeHeartbeatSet(t *testing.T) {
 	r := setupEnforcerRig(t)
 	owner := r.ts.CreateTestUser(t, "peheartbeatowner")
@@ -402,8 +426,8 @@ func TestPermissionEnforcer_RecheckParticipants_ClearedTimeoutPublishesFreshPerm
 
 	lockTx := lockEnforcerTable(t, r.ts.DB, "servers")
 	r.enforcer.RecheckParticipant(blockerChannel, blocker.ID)
-	// The resolver's owner query; since #3453 it also reads the MFA flag.
-	waitForEnforcerQuery(t, monitor, "active", "Lock", "SELECT owner_id, enforce_mfa_dangerous_actions FROM servers")
+	// The snapshot's server row lock precedes the resolver's owner query.
+	waitForEnforcerQuery(t, monitor, "active", "Lock", "SELECT id FROM servers WHERE id=$1 FOR UPDATE")
 
 	r.enforcer.RecheckParticipants(
 		serverID, targetChannel, []uuid.UUID{uuid.MustParse(target.ID)},
@@ -452,10 +476,11 @@ func TestPermissionEnforcer_RecheckServer_CoversAllVoiceChannels(t *testing.T) {
 	assert.Equal(t, ch2, got[m2.ID], "member 2 rechecked in its own channel")
 }
 
-// TestPermissionEnforcer_ResolverErrorDisconnects locks the fail-closed
-// direction: after an authorization mutation, a fresh resolve failure must not
-// retain a potentially stale join-time permission snapshot.
-func TestPermissionEnforcer_ResolverErrorDisconnects(t *testing.T) {
+// TestPermissionEnforcer_TransactionalResolverIgnoresClosedStandaloneDB keeps the transaction-bound
+// resolver contract explicit: ResolveChannelPermissionsTx reads through the
+// enforcer's transaction, so a resolver whose standalone DB is closed does not
+// poison a healthy transactional recheck.
+func TestPermissionEnforcer_TransactionalResolverIgnoresClosedStandaloneDB(t *testing.T) {
 	r := setupEnforcerRig(t)
 	pubClient, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
@@ -467,29 +492,16 @@ func TestPermissionEnforcer_ResolverErrorDisconnects(t *testing.T) {
 	channelID := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-br")
 	r.addVoiceParticipant(t, channelID, member.ID)
 
-	sentinel := r.ts.CreateTestUser(t, "pesentinel5")
-	r.ts.AddMemberToServer(t, serverID, sentinel.ID, "member")
-	r.addVoiceParticipant(t, channelID, sentinel.ID)
-
-	// Presence queries use the healthy DB; the resolver's own queries hit a
-	// closed DB, so every per-user resolve errors (non-ErrNotMember).
+	// The resolver's standalone DB is closed, but ResolveChannelPermissionsTx
+	// intentionally uses the transaction supplied by PermissionEnforcer.
 	broken := voice.NewPermissionEnforcer(
 		r.ts.DB, logger.New("test"), testhelpers.BrokenResolver(t, r.ts.Redis), pubClient)
 
-	broken.RecheckUser(serverID, member.ID)
-	// Healthy sentinel push AFTER the broken recheck: when it arrives, the
-	// broken recheck has had a full round-trip's window to publish — so the
-	// silence assertions below are not vacuously passing on a dead observer.
-	r.enforcer.RecheckUser(serverID, sentinel.ID)
-
-	got := waitPayloadFor(t, r.perms, "voice.enforce.permissions",
-		map[string]bool{sentinel.ID: true, member.ID: true})
-	assert.Equal(t, sentinel.ID, got["userId"],
-		"only the healthy sentinel may receive a permission snapshot")
-	disconnect := waitPayloadFor(t, r.disc, "voice.enforce.disconnect",
+	broken.RecheckParticipant(channelID, member.ID)
+	permission := waitPayloadFor(t, r.perms, "voice.enforce.permissions",
 		map[string]bool{member.ID: true})
-	assert.Equal(t, channelID, disconnect["channelId"])
-	assertNoPayload(t, r.perms, "voice.enforce.permissions")
+	assert.Equal(t, channelID, permission["channelId"])
+	assertNoEnforcementFor(t, r.perms, r.disc, member.ID)
 }
 
 // TestPermissionEnforcer_RecheckParticipant_PushesOnJoin locks the join-race

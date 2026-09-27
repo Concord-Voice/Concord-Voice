@@ -139,6 +139,24 @@ describe('createAuthMiddleware', () => {
     expect(socket.data.avatarUrl).toBe('https://example.com/avatar.png');
   });
 
+  it('captures the signed credential epoch and normalizes legacy tokens to empty', () => {
+    const current = createMockSocket({
+      token: signToken({ user_id: TEST_USER_ID, cred_epoch: 'a'.repeat(32) }),
+      username: 'alice',
+    });
+    const legacy = createMockSocket({
+      token: signToken({ user_id: TEST_USER_ID }),
+      username: 'alice',
+    });
+    const next = vi.fn();
+
+    middleware(current as any, next);
+    middleware(legacy as any, next);
+
+    expect(current.data.credentialEpoch).toBe('a'.repeat(32));
+    expect(legacy.data.credentialEpoch).toBe('');
+  });
+
   it('populates socket.data.tier from the JWT tier claim', () => {
     const token = signToken({ user_id: TEST_USER_ID, tier: 'premium' });
     const socket = createMockSocket({ token, username: 'alice' });
@@ -238,6 +256,7 @@ describe('validateChannelAccess', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
   const mockFetch = () => globalThis.fetch as ReturnType<typeof vi.fn>;
@@ -266,7 +285,8 @@ describe('validateChannelAccess', () => {
     expect(result.channelName).toBe('General');
   });
 
-  it('passes Authorization header with bearer token', async () => {
+  it('passes the bearer token and a bounded request signal', async () => {
+    const timeout = vi.spyOn(AbortSignal, 'timeout');
     mockFetch().mockResolvedValueOnce({
       ok: true,
       json: () =>
@@ -289,6 +309,9 @@ describe('validateChannelAccess', () => {
         }),
       })
     );
+    const request = mockFetch().mock.calls[0][1] as RequestInit;
+    expect(request.signal).toBeInstanceOf(AbortSignal);
+    expect(timeout).toHaveBeenCalledWith(5_000);
   });
 
   it('returns denied for 401 response', async () => {
@@ -398,6 +421,7 @@ describe('validateChannelAccess', () => {
           is_group: false,
           server_muted: true,
           server_deafened: false,
+          authorization_revision: '41',
           call_id: callId,
           call_ring_id: ringId,
           call_caller_user_id: callerUserId,
@@ -413,6 +437,7 @@ describe('validateChannelAccess', () => {
     expect(result.callCallerUserId).toBe(callerUserId);
     expect(result.serverMuted).toBe(true);
     expect(result.serverDeafened).toBe(false);
+    expect(result.authorizationRevision).toBe(41n);
     // DM rooms don't carry server-channel metadata
     expect(result.serverId).toBe('');
     expect(result.channelName).toBe('');
@@ -753,6 +778,7 @@ describe('validateChannelAccess', () => {
           is_group: false,
           server_muted: false,
           server_deafened: false,
+          authorization_revision: '42',
           media_entitlements: premiumEntitlements,
         }),
     });
@@ -1202,6 +1228,7 @@ describe('resolveParticipantIdentity', () => {
 
 describe('service-hop proof on control-plane calls', () => {
   const SERVICE_PROOF_CONTEXT = 'concord/media-plane-service-hop/v1';
+  const VOICE_CAPABILITY_CONTEXT = 'concord/voice-enforcement-capability/v1';
   const originalFetch = globalThis.fetch;
 
   beforeEach(() => {
@@ -1220,6 +1247,25 @@ describe('service-hop proof on control-plane calls', () => {
     return createHmac('sha256', proofKey)
       .update(['v1', timestamp, method, path, tokenDigest].join('\n'))
       .digest('hex');
+  }
+
+  function acceptsVoiceCapabilityProof(
+    headers: Record<string, string>,
+    path: string,
+    token: string,
+    body: string
+  ): boolean {
+    const timestamp = headers['X-Concord-Voice-Enforcement-Capability-Timestamp'];
+    const nodeBootId = headers['X-Concord-Voice-Enforcement-Node-Boot-ID'];
+    const tokenDigest = createHash('sha256').update(token).digest('hex');
+    const bodyDigest = createHash('sha256').update(body).digest('hex');
+    const proofKey = createHmac('sha256', TEST_SIGNING_KEY)
+      .update(VOICE_CAPABILITY_CONTEXT)
+      .digest();
+    const expected = createHmac('sha256', proofKey)
+      .update(['v1', timestamp, 'POST', path, tokenDigest, nodeBootId, bodyDigest].join('\n'))
+      .digest('hex');
+    return headers['X-Concord-Voice-Enforcement-Capability-Proof'] === expected;
   }
 
   function okChannelResponse() {
@@ -1260,6 +1306,33 @@ describe('service-hop proof on control-plane calls', () => {
     expect(headers['X-Concord-Service-Proof']).toBe(
       expectedServiceProof(timestamp, 'POST', '/api/v1/channels/ch-1/voice/join', 'jwt-token')
     );
+  });
+
+  it('binds the exact A1/A2 channel admission bytes to the capability proof', async () => {
+    const path = '/api/v1/channels/ch-1/voice/join';
+    const admissionId = 'admission-1';
+    const socketId = 'socket-1';
+
+    for (const activate of [false, true]) {
+      mockFetch().mockResolvedValueOnce(okChannelResponse());
+      await validateChannelAccess('u-1', 'ch-1', 'jwt-token', 'channel', undefined, {
+        admissionId,
+        socketId,
+        activate,
+      });
+
+      const request = mockFetch().mock.calls.at(-1)?.[1] as RequestInit;
+      const headers = request.headers as Record<string, string>;
+      const body = JSON.stringify({
+        admission_id: admissionId,
+        socket_id: socketId,
+        activate,
+      });
+
+      expect(request.body).toBe(body);
+      expect(acceptsVoiceCapabilityProof(headers, path, 'jwt-token', body)).toBe(true);
+      expect(acceptsVoiceCapabilityProof(headers, path, 'jwt-token', `${body} `)).toBe(false);
+    }
   });
 
   it('binds a service-hop proof to the DM authorize path', async () => {

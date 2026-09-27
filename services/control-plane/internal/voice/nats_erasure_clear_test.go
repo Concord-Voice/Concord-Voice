@@ -2,6 +2,7 @@ package voice
 
 import (
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -172,9 +173,12 @@ func TestPresenceErasureClearProceedsWhenTheLookupFails(t *testing.T) {
 	require.Zero(t, o.disconnects)
 }
 
-type recordingUnsubscriber struct{ calls int }
+type recordingUnsubscriber struct {
+	calls int
+	err   error
+}
 
-func (r *recordingUnsubscriber) Unsubscribe() error { r.calls++; return nil }
+func (r *recordingUnsubscriber) Unsubscribe() error { r.calls++; return r.err }
 
 // Subscribe must leave nothing running when a later step in the same call fails.
 // Before this, a failed erasure subscribe returned with the dispatcher goroutine
@@ -189,7 +193,7 @@ func TestUnwindLifecycleSubscriptionReleasesEverything(t *testing.T) {
 	s := &NATSSubscriber{log: logger.New("test")}
 	s.lifecycleDispatcher = dispatcher
 
-	s.unwindLifecycleSubscription(sub, dispatcher)
+	require.NoError(t, s.unwindLifecycleSubscription(sub, dispatcher))
 
 	require.Equal(t, 1, sub.calls, "the wildcard subscription must be released")
 	s.lifecycleDispatchMu.Lock()
@@ -202,5 +206,14 @@ func TestUnwindLifecycleSubscriptionReleasesEverything(t *testing.T) {
 func TestUnwindLifecycleSubscriptionToleratesNils(t *testing.T) {
 	s := &NATSSubscriber{log: logger.New("test")}
 
-	require.NotPanics(t, func() { s.unwindLifecycleSubscription(nil, nil) })
+	require.NotPanics(t, func() { require.NoError(t, s.unwindLifecycleSubscription(nil, nil)) })
+}
+
+func TestUnwindLifecycleSubscriptionReportsUnsubscribeFailure(t *testing.T) {
+	unsubErr := errors.New("unsubscribe failed")
+	s := &NATSSubscriber{log: logger.New("test")}
+
+	err := s.unwindLifecycleSubscription(&recordingUnsubscriber{err: unsubErr}, nil)
+
+	require.ErrorIs(t, err, unsubErr)
 }

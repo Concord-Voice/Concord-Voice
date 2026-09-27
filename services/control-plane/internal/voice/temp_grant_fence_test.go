@@ -9,6 +9,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,7 +53,9 @@ func TestDeleteTemporaryGrantWithCapture_DoesNotFencePreparation(t *testing.T) {
 	t.Cleanup(release)
 
 	go func() {
-		_, _, err := manager.deleteTemporaryGrantWithCapture(context.Background(), "server", "channel", "user")
+		_, _, _, err := manager.deleteTemporaryGrantWithCapture(
+			context.Background(), uuid.NewString(), uuid.NewString(), uuid.NewString(), temporaryGrantAuthorization{},
+		)
 		result <- err
 	}()
 

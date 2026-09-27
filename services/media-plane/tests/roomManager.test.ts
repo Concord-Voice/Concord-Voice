@@ -62,6 +62,7 @@ import {
   FREE_MEDIA_ENTITLEMENT,
   MAX_RECV_TRANSPORTS_PER_PARTICIPANT,
   KEYFRAME_REQUEST_DELAY_MS,
+  MAX_SERVER_VOICE_PARTICIPANTS,
 } from '../src/lib/roomManager.js';
 import type { Room, Participant, RoomEvent, MediaSource } from '../src/lib/roomManager.js';
 import {
@@ -69,6 +70,7 @@ import {
   type ForceDisconnectIO,
   type ForceDisconnectRoomManager,
 } from '../src/lib/forceDisconnect.js';
+import { runSocketBoundJoin } from '../src/lib/socketJoinLifecycle.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
 import { logger } from '../src/lib/logger.js';
@@ -109,6 +111,7 @@ type JoinRoomResult = Awaited<ReturnType<RoomManager['joinRoom']>>;
 
 type TestDMParticipantPromotion = {
   callId?: string;
+  authorizationRevision?: bigint;
   identity: { username: string; displayName?: string; avatarUrl?: string };
   entitlement: {
     tier: string;
@@ -210,7 +213,8 @@ async function joinRoomWithSupportedCrypto(
     callId?: string;
     callRingId?: string;
     callCallerUserId?: string;
-  }
+  },
+  credentialEpoch = ''
 ) {
   const effectiveRoomContext =
     roomContext?.roomKind === 'dm'
@@ -219,15 +223,22 @@ async function joinRoomWithSupportedCrypto(
   const result = await manager.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, {
     entitlement,
     mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+    credentialEpoch,
+    // This helper completes the A1/A2 channel admission sequence below. Keep
+    // its channel setup provisional so its promotion remains exact-socket
+    // fenced; direct RoomManager callers deliberately exercise legacy
+    // immediate admission separately.
+    deferChannelPromotion: effectiveRoomContext?.roomKind !== 'dm',
     roomContext: effectiveRoomContext,
   });
   if (effectiveRoomContext?.roomKind !== 'dm') {
     return promoteChannelParticipant(manager, roomId, userId, socketId, {
       identity,
       entitlement: entitlement ?? { ...FREE_MEDIA_ENTITLEMENT },
+      permissions: undefined as unknown as bigint,
       serverMuted: false,
       serverDeafened: false,
-      ownerTier: effectiveRoomContext?.ownerTier,
+      ownerTier: effectiveRoomContext?.ownerTier ?? 'free',
     });
   }
 
@@ -269,6 +280,48 @@ describe('RoomManager', () => {
     mockRouter = createMockRouter();
     mockMediasoup = createMockMediasoupService(mockRouter);
     manager = new RoomManager(mockMediasoup as any);
+  });
+
+  it('selects exact-old admitted and provisional sessions, excluding fresh successors', async () => {
+    await joinRoomWithSupportedCrypto(
+      manager,
+      'room-old-admitted',
+      'u-1',
+      'sock-old-admitted',
+      { username: 'alice' },
+      undefined,
+      undefined,
+      { roomKind: 'channel' },
+      'old'
+    );
+    await manager.joinRoom(
+      'room-old-pending',
+      'u-1',
+      'sock-old-pending',
+      { username: 'alice' },
+      undefined,
+      {
+        credentialEpoch: 'old',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm', callId: 'call-old' },
+      }
+    );
+    await joinRoomWithSupportedCrypto(
+      manager,
+      'room-fresh',
+      'u-1',
+      'sock-fresh',
+      { username: 'alice' },
+      undefined,
+      undefined,
+      { roomKind: 'channel' },
+      'fresh'
+    );
+
+    expect(manager.getSupersededCredentialEpochSessions('u-1', 'old')).toEqual([
+      { roomId: 'room-old-admitted', socketId: 'sock-old-admitted', provisional: false },
+      { roomId: 'room-old-pending', socketId: 'sock-old-pending', provisional: true },
+    ]);
   });
 
   // ── Room lifecycle ──────────────────────────────────────────────────
@@ -1005,11 +1058,13 @@ describe('RoomManager', () => {
       await manager.joinRoom(roomId, 'u-1', 'sock-stale', { username: 'stale-a1' }, undefined, {
         credentialEpoch: 'revoked',
         mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        deferChannelPromotion: true,
         roomContext: { roomKind: 'channel' },
       });
       await manager.joinRoom(roomId, 'u-1', 'sock-current', { username: 'current-a1' }, undefined, {
         credentialEpoch: 'current',
         mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        deferChannelPromotion: true,
         roomContext: { roomKind: 'channel' },
       });
       promoteChannelParticipant(manager, roomId, 'u-1', 'sock-current', {
@@ -1046,6 +1101,7 @@ describe('RoomManager', () => {
         undefined,
         {
           mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          deferChannelPromotion: true,
           roomContext: { roomKind: 'channel' },
         }
       );
@@ -1143,6 +1199,74 @@ describe('RoomManager', () => {
       expect(manager.getRoom('channel-rollback')).toBeUndefined();
       expect(mockRouter.close).toHaveBeenCalledOnce();
       expect(mockMediasoup.removeRouter).toHaveBeenCalledWith('channel-rollback');
+    });
+
+    it('emits room-empty when enforcement removes the last pending channel candidate', async () => {
+      const roomId = 'channel-enforcement-pending';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+
+      await joinRoomWithSupportedCrypto(manager, roomId, 'u-1', 'sock-admitted', {
+        username: 'alice',
+      });
+      await manager.joinRoom(roomId, 'u-2', 'sock-pending', { username: 'bob' }, undefined, {
+        credentialEpoch: '',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        deferChannelPromotion: true,
+      });
+
+      await manager.leaveRoom(roomId, 'u-1');
+      await expect(
+        manager.removeProvisionalParticipantForEnforcement(roomId, 'u-2', 'sock-pending')
+      ).resolves.toBe(true);
+
+      expect(manager.getRoom(roomId)).toBeUndefined();
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(1);
+    });
+
+    it('emits room-empty when socket-owned rollback removes the last pending channel candidate', async () => {
+      const roomId = 'channel-rollback-pending';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+
+      await joinRoomWithSupportedCrypto(manager, roomId, 'u-1', 'sock-admitted', {
+        username: 'alice',
+      });
+      await manager.joinRoom(roomId, 'u-2', 'sock-pending', { username: 'bob' }, undefined, {
+        credentialEpoch: '',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        deferChannelPromotion: true,
+      });
+
+      await manager.leaveRoom(roomId, 'u-1');
+      await expect(manager.leaveRoomIfSocketOwned(roomId, 'u-2', 'sock-pending')).resolves.toBe(
+        true
+      );
+
+      expect(manager.getRoom(roomId)).toBeUndefined();
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(1);
+    });
+
+    it('silently closes a never-admitted provisional-only channel room', async () => {
+      const roomId = 'channel-fresh-pending';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+
+      await manager.joinRoom(roomId, 'u-1', 'sock-pending', { username: 'alice' }, undefined, {
+        credentialEpoch: '',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        deferChannelPromotion: true,
+      });
+
+      await expect(manager.leaveRoomIfSocketOwned(roomId, 'u-1', 'sock-pending')).resolves.toBe(
+        true
+      );
+
+      expect(manager.getRoom(roomId)).toBeUndefined();
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(0);
     });
 
     it('rejects a late join that reuses a completed DM call ID', async () => {
@@ -1363,6 +1487,7 @@ describe('RoomManager', () => {
     it('rejects a higher-version joiner without mutating a v3 active room', async () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 3,
+        deferChannelPromotion: true,
       });
       promoteChannelParticipant(manager, 'r', 'u1', 's1', {
         identity: { username: 'a' },
@@ -1375,6 +1500,7 @@ describe('RoomManager', () => {
 
       await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
         mediaFrameCryptoVersion: 5,
+        deferChannelPromotion: true,
       });
       expect(() =>
         promoteChannelParticipant(manager, 'r', 'u2', 's2', {
@@ -1399,6 +1525,7 @@ describe('RoomManager', () => {
     it('keeps the room version when an equal-version participant joins', async () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 5,
+        deferChannelPromotion: true,
       });
       promoteChannelParticipant(manager, 'r', 'u1', 's1', {
         identity: { username: 'a' },
@@ -1408,6 +1535,7 @@ describe('RoomManager', () => {
       });
       await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
         mediaFrameCryptoVersion: 5,
+        deferChannelPromotion: true,
       });
       const res = promoteChannelParticipant(manager, 'r', 'u2', 's2', {
         identity: { username: 'b' },
@@ -1423,6 +1551,7 @@ describe('RoomManager', () => {
     it('rejects a lower-version joiner without mutating a v5 active room', async () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 5,
+        deferChannelPromotion: true,
       });
       promoteChannelParticipant(manager, 'r', 'u1', 's1', {
         identity: { username: 'a' },
@@ -1435,6 +1564,7 @@ describe('RoomManager', () => {
 
       await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
         mediaFrameCryptoVersion: 3,
+        deferChannelPromotion: true,
       });
       expect(() =>
         promoteChannelParticipant(manager, 'r', 'u2', 's2', {
@@ -1532,6 +1662,511 @@ describe('RoomManager', () => {
       expect(result.participants).toHaveLength(1);
       const participant = manager.getParticipant('room-1', 'u-1');
       expect(participant?.socketId).toBe('sock-new');
+    });
+
+    it('keeps the old channel session authoritative when A2 denies its same-socket replacement', async () => {
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+      await joinRoomWithSupportedCrypto(manager, 'room-a2', 'u-1', 'sock-old', {
+        username: 'alice',
+      });
+      const oldTransport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(oldTransport);
+      await manager.createTransport('room-a2', 'u-1', 'send');
+      const oldParticipant = manager.getParticipant('room-a2', 'u-1');
+      const epochBefore = manager.getRoom('room-a2')?.e2eeEpoch;
+      events.length = 0;
+
+      await expect(
+        runSocketBoundJoin({
+          authorize: async () => ({ allowed: true }),
+          isAllowed: (access) => access.allowed,
+          isConnected: () => true,
+          join: async () => {
+            await manager.joinRoom('room-a2', 'u-1', 'sock-old', { username: 'alice' }, undefined, {
+              credentialEpoch: '',
+              mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+              roomContext: { roomKind: 'channel' },
+              permissions: 0n,
+              deferChannelPromotion: true,
+            });
+          },
+          reauthorize: async () => ({ allowed: false }),
+          rollback: () => manager.leaveRoomIfSocketOwned('room-a2', 'u-1', 'sock-old'),
+        })
+      ).resolves.toMatchObject({ status: 'revoked' });
+
+      expect(manager.getParticipant('room-a2', 'u-1')).toBe(oldParticipant);
+      expect(manager.getParticipant('room-a2', 'u-1')?.socketId).toBe('sock-old');
+      expect(oldTransport.close).not.toHaveBeenCalled();
+      expect(manager.getRoom('room-a2')?.e2eeEpoch).toBe(epochBefore);
+      expect(events).toEqual([]);
+    });
+
+    it('rechecks the channel cap when two A1 candidates race for the final slot', async () => {
+      const roomId = 'room-a2-cap';
+      for (let index = 0; index < MAX_SERVER_VOICE_PARTICIPANTS - 1; index++) {
+        await joinRoomWithSupportedCrypto(manager, roomId, `u-${index}`, `sock-${index}`, {
+          username: `user-${index}`,
+        });
+      }
+      const stage = (userId: string, socketId: string) =>
+        manager.joinRoom(roomId, userId, socketId, { username: userId }, undefined, {
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'channel' },
+          permissions: 0n,
+          deferChannelPromotion: true,
+        });
+      const promotion = {
+        identity: { username: 'authoritative' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        ownerTier: 'free',
+        permissions: 0n,
+        serverMuted: false,
+        serverDeafened: false,
+      };
+      await Promise.all([stage('u-final-a', 'sock-final-a'), stage('u-final-b', 'sock-final-b')]);
+
+      manager.promoteChannelParticipant(
+        roomId,
+        'u-final-a',
+        'sock-final-a',
+        promotion,
+        () => undefined
+      );
+      expect(manager.getRoom(roomId)?.participants.size).toBe(MAX_SERVER_VOICE_PARTICIPANTS);
+
+      const rejectedCommit = vi.fn();
+      expect(() =>
+        manager.promoteChannelParticipant(
+          roomId,
+          'u-final-b',
+          'sock-final-b',
+          promotion,
+          rejectedCommit
+        )
+      ).toThrow(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
+      expect(rejectedCommit).not.toHaveBeenCalled();
+      expect(manager.getRoom(roomId)?.participants.size).toBe(MAX_SERVER_VOICE_PARTICIPANTS);
+    }, 30_000);
+
+    it('uses A2 unless a later enforcement snapshot refreshed the staged candidate', async () => {
+      const roomId = 'room-a2-permission-fence';
+      const stage = (userId: string, socketId: string, permissions: bigint) =>
+        manager.joinRoom(roomId, userId, socketId, { username: userId }, undefined, {
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'channel' },
+          permissions,
+          deferChannelPromotion: true,
+        });
+      const promotion = (permissions: bigint) => ({
+        identity: { username: 'authoritative' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        ownerTier: 'free',
+        permissions,
+        serverMuted: false,
+        serverDeafened: false,
+      });
+
+      await stage('u-a2', 'sock-a2', 0n);
+      manager.promoteChannelParticipant(
+        roomId,
+        'u-a2',
+        'sock-a2',
+        promotion(1n << 17n),
+        () => undefined
+      );
+      expect(manager.getParticipant(roomId, 'u-a2')?.permissions).toBe(1n << 17n);
+
+      // An existing admitted session and its staged reconnect coexist briefly.
+      // The enforcement snapshot must bind to the staged socket too, so its
+      // later promotion cannot overwrite the post-A2 revoke with stale A2.
+      await stage('u-a2', 'sock-reconnect', 1n << 17n);
+      expect(manager.updateProvisionalParticipantPermissions(roomId, 'u-a2', 0n)).toBe(true);
+      manager.promoteChannelParticipant(
+        roomId,
+        'u-a2',
+        'sock-reconnect',
+        promotion(1n << 17n),
+        () => undefined
+      );
+      expect(manager.getParticipant(roomId, 'u-a2')).toMatchObject({
+        socketId: 'sock-reconnect',
+        permissions: 0n,
+      });
+    });
+
+    it('preserves newer moderation snapshots across channel and DM promotion', async () => {
+      const channelPromotion = {
+        identity: { username: 'channel-user' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        ownerTier: 'free',
+        permissions: 1n,
+        serverMuted: false,
+        serverDeafened: false,
+        authorizationRevision: 10n,
+      };
+      await manager.joinRoom(
+        'room-moderation-channel',
+        'u-channel',
+        'sock-channel',
+        { username: 'a1' },
+        undefined,
+        {
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'channel' },
+          permissions: 1n,
+          deferChannelPromotion: true,
+        }
+      );
+      await manager.applyServerEnforcementSnapshot(
+        'room-moderation-channel',
+        'u-channel',
+        true,
+        true,
+        11n
+      );
+      manager.promoteChannelParticipant(
+        'room-moderation-channel',
+        'u-channel',
+        'sock-channel',
+        channelPromotion,
+        () => undefined
+      );
+      expect(manager.getParticipant('room-moderation-channel', 'u-channel')).toMatchObject({
+        serverMuted: true,
+        serverDeafened: true,
+      });
+
+      await manager.joinRoom(
+        'room-moderation-channel-a2-wins',
+        'u-channel-a2',
+        'sock-channel-a2',
+        { username: 'a1' },
+        undefined,
+        {
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'channel' },
+          permissions: 1n,
+          deferChannelPromotion: true,
+        }
+      );
+      await manager.applyServerEnforcementSnapshot(
+        'room-moderation-channel-a2-wins',
+        'u-channel-a2',
+        true,
+        true,
+        10n
+      );
+      manager.promoteChannelParticipant(
+        'room-moderation-channel-a2-wins',
+        'u-channel-a2',
+        'sock-channel-a2',
+        {
+          ...channelPromotion,
+          authorizationRevision: 11n,
+        },
+        () => undefined
+      );
+      expect(
+        manager.getParticipant('room-moderation-channel-a2-wins', 'u-channel-a2')
+      ).toMatchObject({ serverMuted: false, serverDeafened: false });
+      await manager.applyServerEnforcementSnapshot(
+        'room-moderation-channel',
+        'u-channel',
+        false,
+        false,
+        10n
+      );
+      expect(manager.getParticipant('room-moderation-channel', 'u-channel')).toMatchObject({
+        serverMuted: true,
+        serverDeafened: true,
+      });
+
+      const callId = '29070000-0000-4000-8000-000000000001';
+      await manager.joinRoom(
+        'room-moderation-dm',
+        'u-dm',
+        'sock-dm',
+        { username: 'a1' },
+        undefined,
+        {
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'dm', callId },
+        }
+      );
+      await manager.applyServerEnforcementSnapshot('room-moderation-dm', 'u-dm', true, false, 11n);
+      promoteDMParticipant(manager, 'room-moderation-dm', 'u-dm', 'sock-dm', callId, {
+        callId,
+        identity: { username: 'dm-user' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
+        authorizationRevision: 10n,
+      });
+      expect(manager.getParticipant('room-moderation-dm', 'u-dm')).toMatchObject({
+        serverMuted: true,
+        serverDeafened: false,
+      });
+
+      const dmA2CallId = '29070000-0000-4000-8000-000000000002';
+      await manager.joinRoom(
+        'room-moderation-dm-a2-wins',
+        'u-dm-a2',
+        'sock-dm-a2',
+        { username: 'a1' },
+        undefined,
+        {
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'dm', callId: dmA2CallId },
+        }
+      );
+      await manager.applyServerEnforcementSnapshot(
+        'room-moderation-dm-a2-wins',
+        'u-dm-a2',
+        true,
+        true,
+        10n
+      );
+      promoteDMParticipant(
+        manager,
+        'room-moderation-dm-a2-wins',
+        'u-dm-a2',
+        'sock-dm-a2',
+        dmA2CallId,
+        {
+          callId: dmA2CallId,
+          identity: { username: 'dm-user-a2' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+          authorizationRevision: 11n,
+        }
+      );
+      expect(manager.getParticipant('room-moderation-dm-a2-wins', 'u-dm-a2')).toMatchObject({
+        serverMuted: false,
+        serverDeafened: false,
+      });
+    });
+
+    it('keeps legacy permissive events available after unrevisioned promotion', async () => {
+      await manager.joinRoom(
+        'room-legacy-channel-promotion',
+        'u-channel',
+        'sock-channel',
+        { username: 'a1' },
+        undefined,
+        {
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'channel' },
+          permissions: 1n,
+          deferChannelPromotion: true,
+        }
+      );
+      manager.promoteChannelParticipant(
+        'room-legacy-channel-promotion',
+        'u-channel',
+        'sock-channel',
+        {
+          identity: { username: 'a2' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          ownerTier: 'free',
+          permissions: 1n,
+          serverMuted: false,
+          serverDeafened: false,
+        },
+        () => undefined
+      );
+      expect(
+        manager.getParticipant('room-legacy-channel-promotion', 'u-channel')?.authorizationRevision
+      ).toBeUndefined();
+      expect(
+        manager.getParticipant('room-legacy-channel-promotion', 'u-channel')
+          ?.serverEnforcementRevision
+      ).toBeUndefined();
+      await manager.serverMuteUser('room-legacy-channel-promotion', 'u-channel');
+      await expect(
+        manager.serverUnmuteUser('room-legacy-channel-promotion', 'u-channel')
+      ).resolves.toBe(true);
+      await manager.serverDeafenUser('room-legacy-channel-promotion', 'u-channel');
+      await expect(
+        manager.serverUndeafenUser('room-legacy-channel-promotion', 'u-channel')
+      ).resolves.toBe(true);
+      expect(
+        manager.updateParticipantPermissions('room-legacy-channel-promotion', 'u-channel', 2n)
+      ).toBe(true);
+
+      const callId = '29070000-0000-4000-8000-000000000003';
+      await manager.joinRoom(
+        'room-legacy-dm-promotion',
+        'u-dm',
+        'sock-dm',
+        { username: 'a1' },
+        undefined,
+        {
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          credentialEpoch: '',
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'dm', callId },
+        }
+      );
+      promoteDMParticipant(manager, 'room-legacy-dm-promotion', 'u-dm', 'sock-dm', callId, {
+        callId,
+        identity: { username: 'a2' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
+      });
+      expect(
+        manager.getParticipant('room-legacy-dm-promotion', 'u-dm')?.authorizationRevision
+      ).toBeUndefined();
+      expect(
+        manager.getParticipant('room-legacy-dm-promotion', 'u-dm')?.serverEnforcementRevision
+      ).toBeUndefined();
+      await manager.serverMuteUser('room-legacy-dm-promotion', 'u-dm');
+      await expect(manager.serverUnmuteUser('room-legacy-dm-promotion', 'u-dm')).resolves.toBe(
+        true
+      );
+      await manager.serverDeafenUser('room-legacy-dm-promotion', 'u-dm');
+      await expect(manager.serverUndeafenUser('room-legacy-dm-promotion', 'u-dm')).resolves.toBe(
+        true
+      );
+    });
+
+    it('emits the exact channel admission identity only after promotion', async () => {
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+      const roomId = 'room-a2-admission-event';
+      const admissionId = '33333333-3333-4333-8333-333333333333';
+      await manager.joinRoom(roomId, 'u-1', 'sock-1', { username: 'staged' }, undefined, {
+        credentialEpoch: '',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        admissionId,
+        deferChannelPromotion: true,
+      });
+
+      manager.promoteChannelParticipant(
+        roomId,
+        'u-1',
+        'sock-1',
+        {
+          admissionId,
+          identity: { username: 'authoritative' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          ownerTier: 'free',
+          permissions: 0n,
+          serverMuted: false,
+          serverDeafened: false,
+        },
+        () => undefined
+      );
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'user-joined',
+          roomId,
+          userId: 'u-1',
+          admissionId,
+          socketId: 'sock-1',
+        })
+      );
+    });
+
+    it('rebuilds same-socket media state when A2 reduces authority', async () => {
+      const roomId = 'room-a2-rebuild';
+      await manager.joinRoom(roomId, 'u-1', 'sock-1', { username: 'before' }, undefined, {
+        credentialEpoch: '',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel', ownerTier: 'premium' },
+        entitlement: {
+          tier: 'premium',
+          allowedAudioTiers: ['minimum', 'studio'],
+          minPtimeMs: 10,
+          maxManualBitrateBps: 10_000_000,
+        },
+      });
+      const oldTransport = createMockTransport();
+      const oldProducer = createMockProducer();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(oldTransport);
+      await manager.createTransport(roomId, 'u-1', 'send');
+      oldTransport.produce.mockResolvedValueOnce(oldProducer);
+      await manager.produce(
+        roomId,
+        'u-1',
+        oldTransport.id,
+        'audio',
+        createRtpParameters() as any,
+        'mic'
+      );
+      const oldParticipant = manager.getParticipant(roomId, 'u-1');
+
+      await manager.joinRoom(roomId, 'u-1', 'sock-1', { username: 'stale-a1' }, undefined, {
+        credentialEpoch: '',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel', ownerTier: 'free' },
+        deferChannelPromotion: true,
+      });
+      expect(manager.getRoom(roomId)?.ownerTier).toBe('premium');
+      expect(resolveScreenProducerCap(manager.getRoom(roomId)!)).toBe(PREMIUM_SCREEN_PRODUCER_CAP);
+      const promotion = {
+        identity: {
+          username: 'authoritative',
+          displayName: 'Authoritative Name',
+          avatarUrl: 'https://example.test/avatar.png',
+        },
+        entitlement: {
+          tier: 'free',
+          allowedAudioTiers: ['minimum', 'standard'],
+          minPtimeMs: 20,
+          maxManualBitrateBps: 5_000_000,
+        },
+        ownerTier: 'free',
+        permissions: 0n,
+        serverMuted: false,
+        serverDeafened: false,
+      };
+
+      expect(() =>
+        manager.promoteChannelParticipant(roomId, 'u-1', 'sock-1', promotion, () => {
+          throw new Error('socket adapter failed');
+        })
+      ).toThrow('socket adapter failed');
+      expect(manager.getParticipant(roomId, 'u-1')?.username).toBe('before');
+      expect(manager.getRoom(roomId)?.ownerTier).toBe('premium');
+      expect(resolveScreenProducerCap(manager.getRoom(roomId)!)).toBe(PREMIUM_SCREEN_PRODUCER_CAP);
+      expect(oldTransport.close).not.toHaveBeenCalled();
+      expect(oldProducer.close).not.toHaveBeenCalled();
+
+      manager.promoteChannelParticipant(roomId, 'u-1', 'sock-1', promotion, () => undefined);
+      expect(manager.getRoom(roomId)?.ownerTier).toBe('free');
+      expect(resolveScreenProducerCap(manager.getRoom(roomId)!)).toBe(1);
+      expect(manager.getParticipant(roomId, 'u-1')).toMatchObject({
+        username: 'authoritative',
+        displayName: 'Authoritative Name',
+        avatarUrl: 'https://example.test/avatar.png',
+        tier: 'free',
+        allowedAudioTiers: ['minimum', 'standard'],
+        minPtimeMs: 20,
+        maxManualBitrateBps: 5_000_000,
+        permissions: 0n,
+        serverMuted: false,
+        serverDeafened: false,
+      });
+      expect(manager.getParticipant(roomId, 'u-1')).not.toBe(oldParticipant);
+      expect(manager.getParticipant(roomId, 'u-1')?.sendTransport).toBeNull();
+      expect(manager.getParticipant(roomId, 'u-1')?.producers.size).toBe(0);
+      expect(oldTransport.close).toHaveBeenCalled();
+      expect(oldProducer.close).toHaveBeenCalled();
     });
 
     it('replaces a sole DM participant without completing or recreating the call', async () => {
@@ -3077,7 +3712,9 @@ describe('RoomManager', () => {
 
     async function joinChannelWithPerms(userId: string, socketId: string, permissions: bigint) {
       await manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
+        credentialEpoch: '',
         mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        deferChannelPromotion: true,
         roomContext: { roomKind: 'channel' },
         permissions,
       });
@@ -3405,7 +4042,9 @@ describe('RoomManager', () => {
 
     async function joinChannelWithPerms(userId: string, socketId: string, permissions: bigint) {
       await manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
+        credentialEpoch: '',
         mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        deferChannelPromotion: true,
         roomContext: { roomKind: 'channel' },
         permissions,
       });
@@ -3437,13 +4076,13 @@ describe('RoomManager', () => {
       return { producer, producerId: result.producerId };
     }
 
-    it('updateParticipantPermissions replaces the snapshot so produce uses the new bitfield', async () => {
+    it('replaces the A1 permission snapshot with the socket-owned A2 bitfield', async () => {
       await joinChannelWithPerms('u-live', 'sock-live', PERM_SPEAK);
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-live', 'send');
 
-      expect(manager.updateParticipantPermissions('room-1', 'u-live', 0n)).toBe(true);
+      expect(manager.updateParticipantPermissions('room-1', 'u-live', 0n, 'sock-live')).toBe(true);
 
       // The revoked snapshot binds immediately: a fresh mic produce is rejected.
       await expect(
@@ -3456,6 +4095,15 @@ describe('RoomManager', () => {
           'mic'
         )
       ).rejects.toThrow('publish permission denied');
+    });
+
+    it('does not apply an A2 permission snapshot to a replacement socket', async () => {
+      await joinChannelWithPerms('u-replaced', 'sock-current', PERM_SPEAK);
+
+      expect(manager.updateParticipantPermissions('room-1', 'u-replaced', 0n, 'sock-stale')).toBe(
+        false
+      );
+      expect(manager.getParticipant('room-1', 'u-replaced')?.permissions).toBe(PERM_SPEAK);
     });
 
     it('updateParticipantPermissions returns false for an absent participant', () => {
@@ -6662,6 +7310,32 @@ describe('RoomManager', () => {
       return { recvTransport, consumer, result };
     }
 
+    it('retries a failed mute pause when a newer snapshot remains muted', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-snapshot-retry', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      const { producer } = await setupProducer(manager, mockRouter, 'room-snapshot-retry', 'u-1');
+      producer.pause.mockRejectedValueOnce(new Error('pause failed'));
+
+      await expect(
+        manager.applyServerEnforcementSnapshot('room-snapshot-retry', 'u-1', true, false, 10n)
+      ).rejects.toThrow('pause failed');
+      await expect(
+        manager.applyServerEnforcementSnapshot('room-snapshot-retry', 'u-1', true, false, 11n)
+      ).resolves.toBe(true);
+      expect(producer.pause).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps a revisioned mute when a delayed legacy unmute arrives', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-legacy-unmute', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      await manager.applyServerEnforcementSnapshot('room-legacy-unmute', 'u-1', true, false, 10n);
+
+      await expect(manager.serverUnmuteUser('room-legacy-unmute', 'u-1')).resolves.toBe(false);
+      expect(manager.getParticipant('room-legacy-unmute', 'u-1')?.serverMuted).toBe(true);
+    });
+
     describe('serverMuteUser', () => {
       it('should set serverMuted flag and pause audio producers', async () => {
         await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
@@ -8831,11 +9505,19 @@ describe('RoomManager #2153 — media-policy cooldown gate', () => {
   // promotion, which must refuse before Socket.IO membership commits.
   it('rejects channel promotion when the cooldown arms after joinRoom, before membership commits', async () => {
     h.manager.setMediaPolicyGate(ledger);
-    await h.manager.joinRoom(POLICER_ROOM, POLICER_USER, 'sock-u-1', { username: 'alice' }, undefined, {
-      entitlement: undefined,
-      mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-      roomContext: undefined,
-    });
+    await h.manager.joinRoom(
+      POLICER_ROOM,
+      POLICER_USER,
+      'sock-u-1',
+      { username: 'alice' },
+      undefined,
+      {
+        entitlement: undefined,
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        deferChannelPromotion: true,
+        roomContext: undefined,
+      }
+    );
     startCooldown();
     const commitSocketMembership = vi.fn();
 

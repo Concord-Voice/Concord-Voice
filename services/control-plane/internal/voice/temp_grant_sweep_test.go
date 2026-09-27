@@ -2,13 +2,17 @@ package voice_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -67,6 +71,71 @@ func TestSweep_LeavesPresentHolderUntouched(t *testing.T) {
 	assert.Equal(t, 0, n, "present holder is not an orphan")
 	assert.True(t, tempOverrideExists(t, ts.DB, channelID, present.ID), "present holder's grant survives")
 	assert.Equal(t, 0, keyRevocationCount(t, ts.DB, channelID), "no rotation when nothing is swept")
+}
+
+func TestSweep_PostSelectionRejoinRetainsTemporaryGrant(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sweeper := newTempGrantSweeper(t, ts)
+
+	owner := ts.CreateTestUser(t, "sweep_race_owner")
+	rejoined := ts.CreateTestUser(t, "sweep_race_user")
+	serverID := ts.CreateTestServer(t, owner.ID, "Sweep Rejoin Race Server")
+	ts.AddMemberToServer(t, serverID, rejoined.ID, "member")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-sweep-rejoin-race")
+	seedTempGrant(t, ts, serverID, channelID, rejoined.ID)
+	backdateGrantedAt(t, ts, channelID, rejoined.ID, 120)
+
+	// The outer sweep could have selected this aged orphan before its join won.
+	// The guarded cleanup must recheck under the lifecycle lock and do no work.
+	insertVoiceParticipant(t, ts.DB, channelID, rejoined.ID)
+	removed, err := sweeper.RevokeOrphanedTempGrantForTest(
+		context.Background(), serverID, channelID, rejoined.ID,
+	)
+	require.NoError(t, err)
+	assert.False(t, removed)
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, rejoined.ID))
+	assert.Equal(t, 0, keyRevocationCount(t, ts.DB, channelID))
+}
+
+func TestSweep_GrantRefreshWhileLockedSurvives(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sweeper := newTempGrantSweeper(t, ts)
+	owner := ts.CreateTestUser(t, "sweep_refresh_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Sweep Refresh Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-sweep-refresh")
+	seedTempGrant(t, ts, serverID, channelID, owner.ID)
+	backdateGrantedAt(t, ts, channelID, owner.ID, 120)
+
+	blocker, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if rollbackErr := blocker.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback sweep blocker: %v", rollbackErr)
+		}
+	})
+	ownerID := uuid.MustParse(owner.ID)
+	require.NoError(t, voice.LockServerVoiceLifecycleTx(context.Background(), blocker, ownerID))
+	lockKey, err := voice.ServerVoiceLifecycleAdvisoryKeyForTest(ownerID)
+	require.NoError(t, err)
+	done := make(chan struct {
+		removed bool
+		err     error
+	}, 1)
+	go func() {
+		removed, revokeErr := sweeper.RevokeOrphanedTempGrantForTest(context.Background(), serverID, channelID, owner.ID)
+		done <- struct {
+			removed bool
+			err     error
+		}{removed, revokeErr}
+	}()
+	dbtest.WaitForAdvisoryLockWaiter(t, ts.DB, lockKey)
+	_, err = blocker.Exec(`UPDATE channel_permission_overrides SET granted_at = NOW() WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2 AND is_temporary`, channelID, owner.ID)
+	require.NoError(t, err)
+	require.NoError(t, blocker.Commit())
+	result := <-done
+	require.NoError(t, result.err)
+	assert.False(t, result.removed, "a grant refreshed while cleanup waited must not be revoked")
+	assert.True(t, tempOverrideExists(t, ts.DB, channelID, owner.ID))
 }
 
 // backdateGrantedAt ages a temp grant's granted_at into the past so the sweep's

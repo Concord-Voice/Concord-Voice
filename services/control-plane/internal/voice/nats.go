@@ -11,13 +11,16 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -164,9 +167,223 @@ type serverVoiceTerminalOutcomes struct {
 	queueRescheduled    int
 }
 
+// serverVoiceTerminalResult is the committed durable outcome of one terminal
+// Server Voice mutation. Every commit-derived effect consumes this only after the
+// composite participant/grant/key transaction commits.
+type serverVoiceTerminalResult struct {
+	committed          bool
+	participantRemoved bool
+	temporaryRemoved   bool
+	plan               rbac.PresenceRecheckPlan
+	rotation           *keyrotation.Rotation
+}
+
+// withServerVoiceTerminalTransaction commits a participant terminal mutation
+// together with any eligible temporary grant revocation. The order is fixed:
+// visibility advisory lock, exact lifecycle lock, then the channel lock taken
+// by RecordKeyRevocationTx. A grant discovered after the preflight gets no
+// destructive mutation: retrying with a captured audience is fail-closed.
+func (s *NATSSubscriber) withServerVoiceTerminalTransaction(
+	ctx context.Context,
+	serverID string,
+	channelID, userID uuid.UUID,
+	respectGrace bool,
+	requalify func(context.Context, *sql.Tx) (bool, error),
+	deleteParticipant func(context.Context, *sql.Tx) (bool, error),
+) (result serverVoiceTerminalResult, returnErr error) {
+	preflightTemporary, preflightPermanent, err := s.preflightServerVoiceTerminalGrant(
+		ctx, channelID, userID, respectGrace,
+	)
+	if err != nil {
+		return result, fmt.Errorf("preflight terminal override: %w", err)
+	}
+	if preflightTemporary {
+		result.plan, err = s.tempGrant.prepareTemporaryGrantCapture(
+			ctx, serverID, channelID.String(), userID.String(),
+		)
+		if err != nil {
+			return result, err
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, fmt.Errorf("begin server voice terminal cleanup: %w", err)
+	}
+	defer func() {
+		returnErr = joinRollbackErr(returnErr, tx.Rollback(), "rollback server voice terminal cleanup")
+	}()
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return result, fmt.Errorf("lock server voice terminal visibility: %w", err)
+	}
+	if err := LockServerVoiceLifecycleTx(ctx, tx, userID); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return result, fmt.Errorf("lock server voice terminal lifecycle: %w", ctxErr)
+		}
+		return result, fmt.Errorf("lock server voice terminal lifecycle: %w", err)
+	}
+	qualified, err := requalify(ctx, tx)
+	if err != nil {
+		return result, err
+	}
+	if !qualified {
+		if err := tx.Commit(); err != nil {
+			return result, fmt.Errorf("commit server voice terminal no-op: %w", err)
+		}
+		return result, nil
+	}
+
+	temporary, permanent, temporaryFresh, err := terminalTemporaryGrantStateTx(ctx, tx, channelID, userID)
+	if err != nil {
+		return result, err
+	}
+	if permanent && respectGrace && !preflightPermanent {
+		if err := tx.Commit(); err != nil {
+			return result, fmt.Errorf("commit terminal permanent override no-op: %w", err)
+		}
+		return result, nil
+	}
+	if terminalTemporaryGrantInGrace(temporary, respectGrace, temporaryFresh) {
+		if err := tx.Commit(); err != nil {
+			return result, fmt.Errorf("commit terminal temporary grant grace no-op: %w", err)
+		}
+		return result, nil
+	}
+	if err := s.captureTerminalTemporaryGrant(ctx, tx, temporary, preflightTemporary, result.plan); err != nil {
+		return result, err
+	}
+
+	result.participantRemoved, err = deleteParticipant(ctx, tx)
+	if err != nil {
+		return result, err
+	}
+	if result.participantRemoved && temporary {
+		result.rotation, result.temporaryRemoved, err = s.tempGrant.deleteTemporaryGrantAlreadyLocked(
+			ctx, tx, channelID.String(), userID.String(), "",
+		)
+		if err != nil {
+			return result, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		// A failed acknowledgement leaves every write in this transaction
+		// unknown. A participant-only delete needs the same fail-closed cache
+		// and subscription recovery as a temporary-grant revocation.
+		if result.participantRemoved {
+			s.tempGrant.completeAmbiguousTemporaryGrantRevocation(
+				ctx, serverID, channelID.String(), userID.String(), result.plan,
+			)
+		}
+		return result, fmt.Errorf("commit server voice terminal cleanup: %w", err)
+	}
+	result.committed = true
+	return result, nil
+}
+
+func (s *NATSSubscriber) captureTerminalTemporaryGrant(
+	ctx context.Context, tx *sql.Tx, temporary, preflightTemporary bool, plan rbac.PresenceRecheckPlan,
+) error {
+	if !temporary {
+		return nil
+	}
+	if !preflightTemporary {
+		return errors.New("terminal temporary grant changed before visibility capture")
+	}
+	return s.tempGrant.captureTemporaryGrantVisibility(ctx, tx, plan)
+}
+
+func terminalTemporaryGrantInGrace(temporary, respectGrace, fresh bool) bool {
+	return temporary && respectGrace && fresh
+}
+
+func terminalTemporaryGrantStateTx(
+	ctx context.Context, tx *sql.Tx, channelID, userID uuid.UUID,
+) (temporary, permanent, fresh bool, err error) {
+	err = tx.QueryRowContext(ctx, `
+		SELECT is_temporary = FALSE,
+		       COALESCE(is_temporary AND temporary_reason = $3, FALSE),
+		       COALESCE(
+		           is_temporary AND temporary_reason = $3
+		           AND granted_at >= clock_timestamp() - INTERVAL '60 seconds',
+		           FALSE
+		       )
+		FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2
+		FOR UPDATE
+	`, channelID, userID, tempGrantReason).Scan(&permanent, &temporary, &fresh)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, false, nil
+	}
+	if err != nil {
+		return false, false, false, fmt.Errorf("inspect terminal temporary grant: %w", err)
+	}
+	return temporary, permanent, fresh, nil
+}
+
+func (s *NATSSubscriber) preflightServerVoiceTerminalGrant(
+	ctx context.Context, channelID, userID uuid.UUID, respectGrace bool,
+) (temporary, permanent bool, err error) {
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(
+		           is_temporary AND temporary_reason = $3
+		           AND (NOT $4 OR granted_at IS NULL
+		                OR granted_at < clock_timestamp() - INTERVAL '60 seconds'),
+		           FALSE
+		       ),
+		       COALESCE(is_temporary = FALSE, FALSE)
+		FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2
+	`, channelID, userID, tempGrantReason, respectGrace).Scan(&temporary, &permanent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("inspect terminal preflight override: %w", err)
+	}
+	return temporary, permanent, nil
+}
+
+// withServerVoiceTerminalClaim preserves the Redis lifecycle fence used by
+// heartbeat and explicit-left while delegating their durable mutation to the
+// composite terminal transaction.
+func (s *NATSSubscriber) withServerVoiceTerminalClaim(
+	ctx context.Context,
+	serverID string,
+	request voiceLifecycleClaimRequest,
+	respectGrace bool,
+	deleteParticipant func(context.Context, *sql.Tx) (bool, error),
+) (serverVoiceTerminalResult, bool, error) {
+	status := voiceLifecycleRejected
+	result, err := s.withServerVoiceTerminalTransaction(
+		ctx, serverID, request.token, request.senderID, respectGrace,
+		func(claimCtx context.Context, tx *sql.Tx) (bool, error) {
+			return s.serverVoiceLifecycleClaimQualified(claimCtx, tx, request)
+		},
+		func(claimCtx context.Context, tx *sql.Tx) (bool, error) {
+			var claimErr error
+			status, claimErr = s.claimVoiceLifecycleStatus(
+				claimCtx, request.category, request.senderID, request.token, request.eventAt, request.active,
+			)
+			if claimErr != nil || status == voiceLifecycleRejected {
+				return false, claimErr
+			}
+			if s.voiceLifecycleClaimedHook != nil {
+				s.voiceLifecycleClaimedHook(request.category, request.senderID, request.eventAt)
+			}
+			return deleteParticipant(claimCtx, tx)
+		},
+	)
+	if err != nil {
+		return result, false, err
+	}
+	return result, result.committed && (result.participantRemoved || status == voiceLifecycleDuplicate), nil
+}
+
 var (
-	errInvalidDMVoiceCallLifecycle = errors.New("invalid DM voice call lifecycle identity")
-	errAmbiguousServerVoiceScope   = errors.New("ambiguous current server voice scope")
+	errInvalidDMVoiceCallLifecycle   = errors.New("invalid DM voice call lifecycle identity")
+	errAmbiguousServerVoiceScope     = errors.New("ambiguous current server voice scope")
+	errServerVoiceParticipantLimit   = errors.New("server voice participant limit reached")
+	errVoicePendingAdmissionMismatch = errors.New("voice pending admission mismatch")
 )
 
 type voiceLifecycleClaimStatus int
@@ -633,15 +850,73 @@ func voiceLifecycleAdvisoryKey(
 // LockServerVoiceLifecycleTx shares the Server Voice lifecycle serialization
 // used by ingress with destructive writers that can remove participant evidence.
 func LockServerVoiceLifecycleTx(ctx context.Context, tx *sql.Tx, senderID uuid.UUID) error {
-	if tx == nil {
-		return errors.New("server voice lifecycle transaction unavailable")
+	return rbac.LockServerVoiceLifecycleTx(ctx, tx, senderID)
+}
+
+// lockVoiceParticipantUsersTx takes the users-side of each participant FK
+// before locking a channel or Private Call scope. The bounded, sorted order
+// composes with credential/key writers which take users before their domain
+// parents.
+func lockVoiceParticipantUsersTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	userIDs []uuid.UUID,
+	mode dmblock.LockMode,
+) (returnErr error) {
+	if tx == nil || len(userIDs) == 0 {
+		return errors.New("invalid voice participant user locks")
 	}
-	lockKey, err := voiceLifecycleAdvisoryKey(presence.CategoryServerVoice, senderID)
+	ordered := append([]uuid.UUID(nil), userIDs...)
+	sort.Slice(ordered, func(left, right int) bool {
+		return ordered[left].String() < ordered[right].String()
+	})
+	unique := ordered[:0]
+	for _, userID := range ordered {
+		if userID == uuid.Nil {
+			return errors.New("invalid voice participant user lock")
+		}
+		if len(unique) == 0 || unique[len(unique)-1] != userID {
+			unique = append(unique, userID)
+		}
+	}
+	if len(unique) > maxServerVoiceParticipantIDs {
+		return errors.New("voice participant user lock limit exceeded")
+	}
+	rawUserIDs := make([]string, 0, len(unique))
+	for _, userID := range unique {
+		rawUserIDs = append(rawUserIDs, userID.String())
+	}
+	var query string
+	switch mode {
+	case dmblock.LockShare:
+		query = `SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR SHARE`
+	case dmblock.LockNoKeyUpdate:
+		query = `SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE`
+	default:
+		return errors.New("invalid voice participant user lock mode")
+	}
+	rows, err := tx.QueryContext(ctx, query, pq.Array(rawUserIDs))
 	if err != nil {
-		return err
+		return fmt.Errorf("lock voice participant users: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
-		return fmt.Errorf("lock voice lifecycle mutation: %w", err)
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close voice participant user locks: %w", closeErr))
+		}
+	}()
+	locked := 0
+	for rows.Next() {
+		var userID uuid.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return fmt.Errorf("scan locked voice participant user: %w", err)
+		}
+		locked++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate locked voice participant users: %w", err)
+	}
+	if locked != len(unique) {
+		return errors.New("voice participant user disappeared during lock")
 	}
 	return nil
 }
@@ -663,6 +938,77 @@ func tryLockServerVoiceLifecycleTx(
 		return false, fmt.Errorf("try lock voice lifecycle mutation: %w", err)
 	}
 	return acquired, nil
+}
+
+// privateVoiceConversationSubjectsTx reads every member of advisory-locked
+// target/source scopes. Callers take this complete union before any ordinary
+// parent or child row.
+func privateVoiceConversationSubjectsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationIDs []uuid.UUID,
+) (subjects map[uuid.UUID][]uuid.UUID, returnErr error) {
+	if tx == nil || len(conversationIDs) == 0 {
+		return nil, errors.New("invalid private voice conversation subjects")
+	}
+	rawConversationIDs := make([]string, 0, len(conversationIDs))
+	subjects = make(map[uuid.UUID][]uuid.UUID, len(conversationIDs))
+	for _, conversationID := range conversationIDs {
+		if conversationID == uuid.Nil {
+			return nil, errors.New("invalid private voice conversation subject")
+		}
+		if _, seen := subjects[conversationID]; !seen {
+			subjects[conversationID] = nil
+			rawConversationIDs = append(rawConversationIDs, conversationID.String())
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT conversation_id, user_id FROM dm_participants
+		WHERE conversation_id = ANY($1::uuid[])
+		ORDER BY conversation_id, user_id LIMIT $2`, pq.Array(rawConversationIDs), maxPrivateVoiceParticipantIDs+1)
+	if err != nil {
+		return nil, fmt.Errorf("list private voice conversation subjects: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close private voice conversation subjects: %w", closeErr))
+		}
+	}()
+	count := 0
+	for rows.Next() {
+		var conversationID, userID uuid.UUID
+		if err := rows.Scan(&conversationID, &userID); err != nil {
+			return nil, fmt.Errorf("scan private voice conversation subject: %w", err)
+		}
+		subjects[conversationID] = append(subjects[conversationID], userID)
+		count++
+		if count > maxPrivateVoiceParticipantIDs {
+			return nil, errors.New("private voice conversation subject limit exceeded")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate private voice conversation subjects: %w", err)
+	}
+	return subjects, nil
+}
+
+// lockPrivateVoiceConversationUsersTx takes one complete, sorted users-first
+// prefix from advisory-serialized participant sets. It never upgrades an
+// already-held partial user lock.
+func lockPrivateVoiceConversationUsersTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	subjects map[uuid.UUID][]uuid.UUID,
+	principals []uuid.UUID,
+) (returnErr error) {
+	if tx == nil || len(subjects) == 0 {
+		return errors.New("invalid private voice conversation user locks")
+	}
+	userIDs := append([]uuid.UUID(nil), principals...)
+	for _, conversationSubjects := range subjects {
+		userIDs = append(userIDs, conversationSubjects...)
+	}
+	return lockVoiceParticipantUsersTx(ctx, tx, userIDs, dmblock.LockNoKeyUpdate)
 }
 
 func lockPrivateVoiceScopes(
@@ -803,24 +1149,6 @@ func advancePrivateVoiceParticipantRows(
 	return nil
 }
 
-func (s *NATSSubscriber) withVoiceLifecycleClaim(
-	ctx context.Context,
-	category presence.Category,
-	senderID, token uuid.UUID,
-	eventAt time.Time,
-	active bool,
-	mutation func(context.Context, *sql.Tx) (bool, error),
-) (applied bool, returnErr error) {
-	return s.withVoiceLifecycleClaimInParticipantSet(
-		ctx,
-		voiceLifecycleClaimRequest{
-			category: category, senderID: senderID, token: token,
-			eventAt: eventAt, active: active,
-		},
-		mutation,
-	)
-}
-
 type voiceLifecycleClaimRequest struct {
 	category       presence.Category
 	senderID       uuid.UUID
@@ -925,6 +1253,9 @@ func (s *NATSSubscriber) withServerVoiceLifecycleClaim(
 		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback voice lifecycle mutation")
 	}()
 	if err := LockServerVoiceLifecycleTx(ctx, tx, request.senderID); err != nil {
+		return false, voiceLifecycleRejected, err
+	}
+	if err := lockVoiceParticipantUsersTx(ctx, tx, []uuid.UUID{request.senderID}, dmblock.LockShare); err != nil {
 		return false, voiceLifecycleRejected, err
 	}
 	qualified, err := s.serverVoiceLifecycleClaimQualified(ctx, tx, request)
@@ -1610,6 +1941,9 @@ type privateVoiceLifecycleClaimsState struct {
 	senderIDs         []uuid.UUID
 	accepted          []uuid.UUID
 	scopeMemberships  []privateVoiceScopeMembership
+	preflightScopes   []privateVoiceScopeMembership
+	preflightTarget   []voiceParticipantRecord
+	preflightOldScope map[uuid.UUID][]voiceParticipantRecord
 	targetRecords     []voiceParticipantRecord
 	targetIDs         []uuid.UUID
 	oldMoved          map[uuid.UUID]map[uuid.UUID]bool
@@ -1624,6 +1958,19 @@ type privateVoiceLifecycleClaimsState struct {
 }
 
 func (s *NATSSubscriber) withVoiceLifecycleClaims(
+	ctx context.Context,
+	request privateVoiceLifecycleClaimsRequest,
+) (*privateVoiceLifecycleClaimsResult, bool, bool, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		claimResult, applied, reconnect, err := s.withVoiceLifecycleClaimsOnce(ctx, request)
+		if !errors.Is(err, dmblock.ErrMembershipChanged) || attempt == 1 {
+			return claimResult, applied, reconnect, err
+		}
+	}
+	return nil, false, false, dmblock.ErrMembershipChanged
+}
+
+func (s *NATSSubscriber) withVoiceLifecycleClaimsOnce(
 	ctx context.Context,
 	request privateVoiceLifecycleClaimsRequest,
 ) (claimResult *privateVoiceLifecycleClaimsResult, applied bool, reconnect bool, returnErr error) {
@@ -1720,15 +2067,17 @@ func (s *NATSSubscriber) lockGroupedPrivateVoiceScopes(
 	request privateVoiceLifecycleClaimsRequest,
 	state *privateVoiceLifecycleClaimsState,
 ) error {
-	if err := lockPrivateVoiceScopes(ctx, tx, state.senderIDs); err != nil {
-		return err
-	}
 	memberships, err := s.collectPrivateVoiceScopeMembershipsFrom(ctx, tx, state.senderIDs)
 	if err != nil {
 		return err
 	}
+	state.preflightScopes = append([]privateVoiceScopeMembership(nil), memberships...)
+	conversationIDs := groupedPrivateVoiceConversationIDs(request.conversationID, memberships)
+	if err := lockPrivateVoiceScopes(ctx, tx, state.senderIDs); err != nil {
+		return err
+	}
 	lockedConversationIDs, err := lockPrivateVoiceParticipantSets(
-		ctx, tx, groupedPrivateVoiceConversationIDs(request.conversationID, memberships),
+		ctx, tx, conversationIDs,
 	)
 	if err != nil {
 		return err
@@ -1737,16 +2086,66 @@ func (s *NATSSubscriber) lockGroupedPrivateVoiceScopes(
 	if err != nil {
 		return err
 	}
-	if !privateVoiceMembershipsWithinLocks(memberships, lockedConversationIDs) {
-		return errors.New("private voice scope changed during heartbeat lock acquisition")
+	if !privateVoiceMembershipsWithinLocks(memberships, lockedConversationIDs) ||
+		!samePrivateVoiceScopeMemberships(state.preflightScopes, memberships) {
+		return dmblock.ErrMembershipChanged
 	}
-	state.scopeMemberships = memberships
+	accepted, err := currentDMVoiceMembersNoLock(ctx, tx, request.conversationID, state.senderIDs)
+	if err != nil {
+		return err
+	}
+	targetRecords, err := s.collectVoiceParticipantRecordsFrom(ctx, tx, request.conversationID, true)
+	if err != nil {
+		return err
+	}
+	preflightOldScope := make(map[uuid.UUID][]voiceParticipantRecord)
+	lockedParticipantIDs := append(voiceParticipantRecordIDs(targetRecords), accepted...)
+	for _, membership := range memberships {
+		if _, found := preflightOldScope[membership.conversationID]; found {
+			continue
+		}
+		records, readErr := s.collectVoiceParticipantRecordsFrom(ctx, tx, membership.conversationID, true)
+		if readErr != nil {
+			return readErr
+		}
+		preflightOldScope[membership.conversationID] = records
+		lockedParticipantIDs = append(lockedParticipantIDs, voiceParticipantRecordIDs(records)...)
+	}
+	if _, err := lockPrivateVoiceParticipantLifecycles(ctx, tx, lockedParticipantIDs); err != nil {
+		return err
+	}
+	lockedSubjects, err := privateVoiceConversationSubjectsTx(ctx, tx, lockedConversationIDs)
+	if err != nil {
+		return err
+	}
+	if err := lockPrivateVoiceConversationUsersTx(ctx, tx, lockedSubjects, state.senderIDs); err != nil {
+		return err
+	}
+	targetSubjects, err := dmblock.PrepareConversationAfterUserLocksTx(
+		ctx,
+		tx,
+		request.conversationID.String(),
+		lockedSubjects[request.conversationID],
+		dmblock.LockNoKeyUpdate,
+	)
+	if err != nil {
+		return err
+	}
+	if !sameUUIDs(lockedSubjects[request.conversationID], targetSubjects) {
+		return dmblock.ErrMembershipChanged
+	}
 	state.accepted, err = s.currentDMVoiceMembers(
 		ctx, tx, request.conversationID, state.senderIDs,
 	)
 	if err != nil {
 		return err
 	}
+	if !sameUUIDs(accepted, state.accepted) {
+		return fmt.Errorf("%w: private voice members changed during heartbeat lock acquisition", dmblock.ErrMembershipChanged)
+	}
+	state.scopeMemberships = memberships
+	state.preflightTarget = targetRecords
+	state.preflightOldScope = preflightOldScope
 	return s.refreshGroupedPrivateVoiceLease(ctx, request, state.accepted)
 }
 
@@ -1807,6 +2206,9 @@ func (s *NATSSubscriber) prepareGroupedPrivateVoiceTarget(
 	)
 	if err != nil {
 		return err
+	}
+	if !sameVoiceParticipantRecords(state.preflightTarget, state.targetRecords) {
+		return fmt.Errorf("%w: private voice target changed during heartbeat lock acquisition", dmblock.ErrMembershipChanged)
 	}
 	state.targetIDs = voiceParticipantRecordIDs(state.targetRecords)
 	if !privateVoiceParticipantUnionWithinLimit(state.targetIDs, state.accepted) {
@@ -1903,20 +2305,13 @@ func (s *NATSSubscriber) prepareGroupedPrivateVoiceOldScopes(
 	state.oldScopePost = make(map[uuid.UUID][]uuid.UUID)
 	state.oldScopeStale = make(map[uuid.UUID][]uuid.UUID)
 	state.oldScopeCallIDs = make(map[uuid.UUID]uuid.UUID)
-	lockedParticipantIDs := append(append([]uuid.UUID(nil), state.targetIDs...), state.accepted...)
 	for conversationID, movedSet := range state.oldMoved {
-		participantIDs, rejected, err := s.prepareGroupedPrivateVoiceOldScope(
+		_, rejected, err := s.prepareGroupedPrivateVoiceOldScope(
 			ctx, tx, request.eventAt, conversationID, movedSet, state,
 		)
 		if err != nil || rejected {
 			return rejected, err
 		}
-		lockedParticipantIDs = append(lockedParticipantIDs, participantIDs...)
-	}
-	if _, err := lockPrivateVoiceParticipantLifecycles(
-		ctx, tx, lockedParticipantIDs,
-	); err != nil {
-		return false, err
 	}
 	var err error
 	state.oldScopeRevisions, err = s.capturePrivateVoiceOldScopeRevisions(
@@ -1936,6 +2331,9 @@ func (s *NATSSubscriber) prepareGroupedPrivateVoiceOldScope(
 	oldRecords, err := s.collectVoiceParticipantRecordsFrom(ctx, tx, conversationID, true)
 	if err != nil {
 		return nil, false, err
+	}
+	if !sameVoiceParticipantRecords(state.preflightOldScope[conversationID], oldRecords) {
+		return nil, false, fmt.Errorf("%w: private voice old scope changed during heartbeat lock acquisition", dmblock.ErrMembershipChanged)
 	}
 	candidates, rejected := partitionGroupedPrivateVoiceOldScope(
 		oldRecords, movedSet, eventAt,
@@ -2333,6 +2731,86 @@ func (s *NATSSubscriber) currentDMVoiceMembers(
 	return members, nil
 }
 
+func currentDMVoiceMembersNoLock(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID uuid.UUID,
+	participantIDs []uuid.UUID,
+) (members []uuid.UUID, returnErr error) {
+	if tx == nil || conversationID == uuid.Nil || len(participantIDs) == 0 ||
+		len(participantIDs) > maxPrivateVoiceParticipantIDs {
+		return nil, errors.New("invalid private voice member preflight")
+	}
+	rawParticipantIDs := make([]string, 0, len(participantIDs))
+	for _, participantID := range participantIDs {
+		if participantID == uuid.Nil {
+			return nil, errors.New("invalid private voice member preflight participant")
+		}
+		rawParticipantIDs = append(rawParticipantIDs, participantID.String())
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT user_id
+		FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = ANY($2::uuid[])
+		ORDER BY user_id
+	`, conversationID, pq.Array(rawParticipantIDs))
+	if err != nil {
+		return nil, fmt.Errorf("preflight private voice members: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close private voice member preflight rows: %w", closeErr))
+		}
+	}()
+	for rows.Next() {
+		var memberID uuid.UUID
+		if err := rows.Scan(&memberID); err != nil {
+			return nil, fmt.Errorf("scan private voice member preflight: %w", err)
+		}
+		members = append(members, memberID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate private voice member preflight: %w", err)
+	}
+	return members, nil
+}
+
+func sameUUIDs(left, right []uuid.UUID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameVoiceParticipantRecords(left, right []voiceParticipantRecord) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func samePrivateVoiceScopeMemberships(left, right []privateVoiceScopeMembership) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 type privateVoiceParticipantUpsertRequest struct {
 	conversationID uuid.UUID
 	senderID       uuid.UUID
@@ -2343,6 +2821,9 @@ type privateVoiceParticipantUpsertRequest struct {
 type privateVoiceParticipantUpsertState struct {
 	request                privateVoiceParticipantUpsertRequest
 	scopeMemberships       []privateVoiceScopeMembership
+	preflightScopes        []privateVoiceScopeMembership
+	preflightTarget        []voiceParticipantRecord
+	preflightOldScope      map[uuid.UUID][]voiceParticipantRecord
 	existingRecords        []voiceParticipantRecord
 	existingParticipantIDs []uuid.UUID
 	oldScopePost           map[uuid.UUID][]uuid.UUID
@@ -2360,6 +2841,22 @@ type privateVoiceParticipantUpsertState struct {
 }
 
 func (s *NATSSubscriber) upsertPrivateVoiceParticipant(
+	ctx context.Context,
+	conversationID, senderID, callID uuid.UUID,
+	eventAt time.Time,
+) (bool, *privateVoiceParticipantUpsertResult, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		applied, mutationResult, err := s.upsertPrivateVoiceParticipantOnce(
+			ctx, conversationID, senderID, callID, eventAt,
+		)
+		if !errors.Is(err, dmblock.ErrMembershipChanged) || attempt == 1 {
+			return applied, mutationResult, err
+		}
+	}
+	return false, nil, dmblock.ErrMembershipChanged
+}
+
+func (s *NATSSubscriber) upsertPrivateVoiceParticipantOnce(
 	ctx context.Context,
 	conversationID, senderID, callID uuid.UUID,
 	eventAt time.Time,
@@ -2422,9 +2919,6 @@ func (s *NATSSubscriber) lockPrivateVoiceParticipantUpsert(
 ) (bool, error) {
 	request := state.request
 	participantIDs := []uuid.UUID{request.senderID}
-	if err := lockPrivateVoiceScopes(ctx, tx, participantIDs); err != nil {
-		return false, err
-	}
 	memberships, err := s.collectPrivateVoiceScopeMembershipsFrom(ctx, tx, participantIDs)
 	if err != nil {
 		return false, err
@@ -2432,8 +2926,13 @@ func (s *NATSSubscriber) lockPrivateVoiceParticipantUpsert(
 	if s.privateVoiceParticipantSetLockAttemptHook != nil {
 		s.privateVoiceParticipantSetLockAttemptHook(request.conversationID)
 	}
+	preflightScopes := append([]privateVoiceScopeMembership(nil), memberships...)
+	conversationIDs := groupedPrivateVoiceConversationIDs(request.conversationID, memberships)
+	if err := lockPrivateVoiceScopes(ctx, tx, participantIDs); err != nil {
+		return false, err
+	}
 	lockedConversationIDs, err := lockPrivateVoiceParticipantSets(
-		ctx, tx, groupedPrivateVoiceConversationIDs(request.conversationID, memberships),
+		ctx, tx, conversationIDs,
 	)
 	if err != nil {
 		return false, err
@@ -2442,8 +2941,56 @@ func (s *NATSSubscriber) lockPrivateVoiceParticipantUpsert(
 	if err != nil {
 		return false, err
 	}
-	if !privateVoiceMembershipsWithinLocks(memberships, lockedConversationIDs) {
-		return false, errors.New("private voice scope changed during lock acquisition")
+	if !privateVoiceMembershipsWithinLocks(memberships, lockedConversationIDs) ||
+		!samePrivateVoiceScopeMemberships(preflightScopes, memberships) {
+		return false, dmblock.ErrMembershipChanged
+	}
+	preflightMembers, err := currentDMVoiceMembersNoLock(ctx, tx, request.conversationID, participantIDs)
+	if err != nil {
+		return false, err
+	}
+	if len(preflightMembers) == 0 {
+		return true, nil
+	}
+	preflightTarget, err := s.collectVoiceParticipantRecordsFrom(ctx, tx, request.conversationID, true)
+	if err != nil {
+		return false, err
+	}
+	preflightOldScope := make(map[uuid.UUID][]voiceParticipantRecord)
+	lockedParticipantIDs := append(voiceParticipantRecordIDs(preflightTarget), request.senderID)
+	for _, membership := range memberships {
+		if _, found := preflightOldScope[membership.conversationID]; found {
+			continue
+		}
+		records, readErr := s.collectVoiceParticipantRecordsFrom(ctx, tx, membership.conversationID, true)
+		if readErr != nil {
+			return false, readErr
+		}
+		preflightOldScope[membership.conversationID] = records
+		lockedParticipantIDs = append(lockedParticipantIDs, voiceParticipantRecordIDs(records)...)
+	}
+	if _, err := lockPrivateVoiceParticipantLifecycles(ctx, tx, lockedParticipantIDs); err != nil {
+		return false, err
+	}
+	lockedSubjects, err := privateVoiceConversationSubjectsTx(ctx, tx, lockedConversationIDs)
+	if err != nil {
+		return false, err
+	}
+	if err := lockPrivateVoiceConversationUsersTx(ctx, tx, lockedSubjects, participantIDs); err != nil {
+		return false, err
+	}
+	targetSubjects, err := dmblock.PrepareConversationAfterUserLocksTx(
+		ctx,
+		tx,
+		request.conversationID.String(),
+		lockedSubjects[request.conversationID],
+		dmblock.LockNoKeyUpdate,
+	)
+	if err != nil {
+		return false, err
+	}
+	if !sameUUIDs(lockedSubjects[request.conversationID], targetSubjects) {
+		return false, dmblock.ErrMembershipChanged
 	}
 	state.scopeMemberships = memberships
 	members, err := s.currentDMVoiceMembers(
@@ -2455,16 +3002,25 @@ func (s *NATSSubscriber) lockPrivateVoiceParticipantUpsert(
 	if len(members) == 0 {
 		return true, nil
 	}
+	if !sameUUIDs(preflightMembers, members) {
+		return false, fmt.Errorf("%w: private voice members changed during lock acquisition", dmblock.ErrMembershipChanged)
+	}
 	state.existingRecords, err = s.collectVoiceParticipantRecordsFrom(
 		ctx, tx, request.conversationID, true,
 	)
 	if err != nil {
 		return false, err
 	}
+	if !sameVoiceParticipantRecords(preflightTarget, state.existingRecords) {
+		return false, fmt.Errorf("%w: private voice target changed during lock acquisition", dmblock.ErrMembershipChanged)
+	}
 	state.existingParticipantIDs = voiceParticipantRecordIDs(state.existingRecords)
 	if !privateVoiceParticipantUnionWithinLimit(state.existingParticipantIDs, participantIDs) {
 		return false, errors.New("private voice participant limit exceeded")
 	}
+	state.preflightScopes = preflightScopes
+	state.preflightTarget = preflightTarget
+	state.preflightOldScope = preflightOldScope
 	return false, nil
 }
 
@@ -2478,9 +3034,6 @@ func (s *NATSSubscriber) preparePrivateVoiceParticipantUpsertOldScopes(
 	state.oldScopeCallIDs = make(map[uuid.UUID]uuid.UUID)
 	state.oldScopeMoved = make(map[uuid.UUID]map[uuid.UUID]bool)
 	state.seenOldScopes = make(map[uuid.UUID]bool)
-	lockedParticipantIDs := append(
-		append([]uuid.UUID(nil), state.existingParticipantIDs...), state.request.senderID,
-	)
 	for _, membership := range state.scopeMemberships {
 		conversationID := membership.conversationID
 		if conversationID == state.request.conversationID || state.seenOldScopes[conversationID] {
@@ -2488,18 +3041,12 @@ func (s *NATSSubscriber) preparePrivateVoiceParticipantUpsertOldScopes(
 		}
 		state.seenOldScopes[conversationID] = true
 		state.oldScopeMoved[conversationID] = map[uuid.UUID]bool{state.request.senderID: true}
-		participantIDs, rejected, err := s.preparePrivateVoiceParticipantUpsertOldScope(
+		_, rejected, err := s.preparePrivateVoiceParticipantUpsertOldScope(
 			ctx, tx, conversationID, state,
 		)
 		if err != nil || rejected {
 			return rejected, err
 		}
-		lockedParticipantIDs = append(lockedParticipantIDs, participantIDs...)
-	}
-	if _, err := lockPrivateVoiceParticipantLifecycles(
-		ctx, tx, lockedParticipantIDs,
-	); err != nil {
-		return false, err
 	}
 	var err error
 	state.oldScopeRevisions, err = s.capturePrivateVoiceOldScopeRevisions(
@@ -2517,6 +3064,9 @@ func (s *NATSSubscriber) preparePrivateVoiceParticipantUpsertOldScope(
 	oldRecords, err := s.collectVoiceParticipantRecordsFrom(ctx, tx, conversationID, true)
 	if err != nil {
 		return nil, false, err
+	}
+	if !sameVoiceParticipantRecords(state.preflightOldScope[conversationID], oldRecords) {
+		return nil, false, fmt.Errorf("%w: private voice old scope changed during lock acquisition", dmblock.ErrMembershipChanged)
 	}
 	candidates, rejected := partitionPrivateVoiceParticipantUpsertOldScope(
 		oldRecords, state.request.senderID, state.request.eventAt,
@@ -3175,9 +3725,10 @@ func (s *NATSSubscriber) upsertServerVoiceParticipant(
 	ctx context.Context,
 	channelID, senderID uuid.UUID,
 	eventAt time.Time,
+	admission *voiceJoinedAdmission,
 ) (serverVoiceMutationResult, error) {
 	mutationResult, applied, claimStatus, err := s.mutateServerVoiceParticipant(
-		ctx, channelID, senderID, eventAt,
+		ctx, channelID, senderID, eventAt, admission,
 	)
 	if err != nil || !applied {
 		return mutationResult, err
@@ -3191,6 +3742,7 @@ func (s *NATSSubscriber) mutateServerVoiceParticipant(
 	ctx context.Context,
 	channelID, senderID uuid.UUID,
 	eventAt time.Time,
+	admission *voiceJoinedAdmission,
 ) (serverVoiceMutationResult, bool, voiceLifecycleClaimStatus, error) {
 	var mutationResult serverVoiceMutationResult
 	applied, claimStatus, err := s.withVoiceLifecycleClaimStatus(
@@ -3207,7 +3759,7 @@ func (s *NATSSubscriber) mutateServerVoiceParticipant(
 		) (bool, error) {
 			var mutationErr error
 			mutationResult, mutationErr = moveServerVoiceParticipant(
-				ctx, tx, channelID, senderID, eventAt,
+				ctx, tx, channelID, senderID, eventAt, admission,
 			)
 			return mutationResult.applied, mutationErr
 		},
@@ -3251,7 +3803,26 @@ func moveServerVoiceParticipant(
 	tx *sql.Tx,
 	channelID, senderID uuid.UUID,
 	eventAt time.Time,
+	admission *voiceJoinedAdmission,
 ) (serverVoiceMutationResult, error) {
+	var lockedChannelID uuid.UUID
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM channels WHERE id = $1 FOR UPDATE`, channelID).Scan(&lockedChannelID); err != nil {
+		return serverVoiceMutationResult{}, fmt.Errorf("lock server voice channel for capacity: %w", err)
+	}
+	var (
+		participantCount int
+		alreadyPresent   bool
+	)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(BOOL_OR(user_id = $2), FALSE)
+		FROM voice_participants
+		WHERE channel_id = $1`, channelID, senderID,
+	).Scan(&participantCount, &alreadyPresent); err != nil {
+		return serverVoiceMutationResult{}, fmt.Errorf("count locked server voice participants: %w", err)
+	}
+	if participantCount >= maxServerVoiceParticipantIDs && !alreadyPresent {
+		return serverVoiceMutationResult{}, errServerVoiceParticipantLimit
+	}
 	var (
 		upsertedCount int
 		priorTarget   bool
@@ -3303,6 +3874,24 @@ func moveServerVoiceParticipant(
 		return serverVoiceMutationResult{}, fmt.Errorf(
 			"server voice participant upsert affected %d rows", upsertedCount,
 		)
+	}
+	if upsertedCount == 1 && admission != nil {
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM voice_pending_admissions
+			WHERE channel_id = $1 AND user_id = $2
+			  AND admission_id = $3 AND socket_id = $4
+			  AND expires_at > clock_timestamp()
+		`, channelID, senderID, admission.admissionID, admission.socketID)
+		if err != nil {
+			return serverVoiceMutationResult{}, fmt.Errorf("consume pending voice admission: %w", err)
+		}
+		if rowsAffected, err := result.RowsAffected(); err != nil {
+			return serverVoiceMutationResult{}, fmt.Errorf("read pending voice admission consume result: %w", err)
+		} else if rowsAffected != 1 {
+			return serverVoiceMutationResult{}, fmt.Errorf(
+				"%w: consume affected %d rows", errVoicePendingAdmissionMismatch, rowsAffected,
+			)
+		}
 	}
 	result := serverVoiceMutationResult{
 		applied: upsertedCount == 1,
@@ -3492,7 +4081,7 @@ func (s *NATSSubscriber) ReconcileStaleServerVoiceParticipants(
 		}
 	}
 
-	return s.reconcileServerVoiceCleanupBatch(
+	removed, returnErr = s.reconcileServerVoiceCleanupBatch(
 		ctx,
 		limit,
 		pendingCandidates,
@@ -3500,6 +4089,13 @@ func (s *NATSSubscriber) ReconcileStaleServerVoiceParticipants(
 		leaseSeconds,
 		&outcomes,
 	)
+	if ctx.Err() == nil {
+		// The same bounded five-second pass also converges one orphaned move grant.
+		// The nightly sweep is only a backstop, not this cleanup's delivery rail.
+		_, orphanErr := s.reconcileOrphanedTemporaryGrants(ctx, 1)
+		returnErr = errors.Join(returnErr, orphanErr)
+	}
+	return removed, returnErr
 }
 
 func (s *NATSSubscriber) recordServerVoiceTerminalOutboxOutcomes(outcomes serverVoiceTerminalOutcomes) {
@@ -3605,6 +4201,10 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 	leaseSeconds int64,
 	outcomes *serverVoiceTerminalOutcomes,
 ) (applied, admitted bool, returnErr error) {
+	preflightTemporary, preflightPermanent, temporaryGrantPlan, err := s.prepareStaleServerVoiceTerminalGrant(ctx, candidate)
+	if err != nil {
+		return false, false, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, false, fmt.Errorf("begin stale server voice participant cleanup: %w", err)
@@ -3625,6 +4225,9 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 			return false, false, fmt.Errorf("commit stale server voice participant missing user: %w", err)
 		}
 		return false, false, nil
+	}
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, candidate.serverID.String()); err != nil {
+		return false, false, fmt.Errorf("lock stale server voice visibility: %w", err)
 	}
 
 	acquired, err := tryLockServerVoiceLifecycleTx(ctx, tx, candidate.userID)
@@ -3659,6 +4262,29 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		}
 		return false, false, nil
 	}
+	temporary, permanent, temporaryFresh, err := terminalTemporaryGrantStateTx(
+		ctx, tx, candidate.channelID, candidate.userID,
+	)
+	if err != nil {
+		return false, false, err
+	}
+	if permanent && !preflightPermanent {
+		if err := tx.Commit(); err != nil {
+			return false, false, fmt.Errorf("commit stale server voice permanent override no-op: %w", err)
+		}
+		return false, false, nil
+	}
+	if terminalTemporaryGrantInGrace(temporary, true, temporaryFresh) {
+		if err := tx.Commit(); err != nil {
+			return false, false, fmt.Errorf("commit stale server voice temporary grant grace no-op: %w", err)
+		}
+		return false, false, nil
+	}
+	if err := s.captureTerminalTemporaryGrant(
+		ctx, tx, temporary, preflightTemporary, temporaryGrantPlan,
+	); err != nil {
+		return false, false, err
+	}
 
 	result, err := tx.ExecContext(ctx, `
 		DELETE FROM voice_participants
@@ -3676,6 +4302,18 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 	if rowsAffected != 0 && rowsAffected != 1 {
 		return false, false, fmt.Errorf("stale server voice participant delete affected %d rows", rowsAffected)
 	}
+	var (
+		temporaryGrantRemoved  bool
+		temporaryGrantRotation *keyrotation.Rotation
+	)
+	if rowsAffected == 1 && temporary {
+		temporaryGrantRotation, temporaryGrantRemoved, err = s.tempGrant.deleteTemporaryGrantAlreadyLocked(
+			ctx, tx, candidate.channelID.String(), candidate.userID.String(), "",
+		)
+		if err != nil {
+			return false, false, err
+		}
+	}
 	var operationID uuid.UUID
 	if rowsAffected == 1 {
 		operationID, err = captureStaleServerVoiceObligationsTx(ctx, tx, candidate)
@@ -3684,10 +4322,23 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		if rowsAffected == 1 {
+			s.tempGrant.completeAmbiguousTemporaryGrantRevocation(
+				ctx, candidate.serverID.String(), candidate.channelID.String(), candidate.userID.String(), temporaryGrantPlan,
+			)
+		}
 		return false, false, fmt.Errorf("commit stale server voice participant cleanup: %w", err)
 	}
 	if rowsAffected == 0 {
 		return false, false, nil
+	}
+	if temporaryGrantRemoved {
+		postCommitCtx, cancelPostCommit := detachedTempGrantCompensationContext(ctx)
+		s.tempGrant.completeTemporaryGrantRevocation(
+			postCommitCtx, candidate.serverID.String(), candidate.channelID.String(), candidate.userID.String(),
+			temporaryGrantPlan, temporaryGrantRotation,
+		)
+		cancelPostCommit()
 	}
 	outcomes.captured++
 	admitted, returnErr = s.drainServerVoiceTerminalOutboxCandidate(ctx, serverVoiceTerminalOutboxCandidate{
@@ -3696,6 +4347,25 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		operationID: operationID,
 	}, outcomes)
 	return true, admitted, returnErr
+}
+
+func (s *NATSSubscriber) prepareStaleServerVoiceTerminalGrant(
+	ctx context.Context, candidate staleServerVoiceParticipant,
+) (temporary, permanent bool, plan rbac.PresenceRecheckPlan, returnErr error) {
+	temporary, permanent, err := s.preflightServerVoiceTerminalGrant(ctx, candidate.channelID, candidate.userID, true)
+	if err != nil {
+		return false, false, plan, fmt.Errorf("preflight stale server voice temporary grant: %w", err)
+	}
+	if !temporary {
+		return temporary, permanent, plan, nil
+	}
+	plan, err = s.tempGrant.prepareTemporaryGrantCapture(
+		ctx, candidate.serverID.String(), candidate.channelID.String(), candidate.userID.String(),
+	)
+	if err != nil {
+		return false, false, plan, fmt.Errorf("prepare stale server voice temporary grant capture: %w", err)
+	}
+	return temporary, permanent, plan, nil
 }
 
 // captureStaleServerVoiceObligationsTx records both obligations a reap owes,
@@ -4101,6 +4771,50 @@ func (s *NATSSubscriber) renewServerVoiceTerminalClaim(
 	return nil
 }
 
+// ReconcileExpiredVoicePendingAdmissions removes a bounded oldest batch of
+// reservations which can no longer complete A2. It is deliberately a separate
+// pre-plan rail from participant reconciliation: an expired reservation must
+// not consume the durable Server Voice recovery budget.
+func ReconcileExpiredVoicePendingAdmissions(
+	ctx context.Context,
+	db *sql.DB,
+	limit int,
+) (int, error) {
+	if db == nil {
+		return 0, errors.New("voice pending admission reconciliation requires a database")
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+	if limit > maxServerVoiceParticipantIDs {
+		limit = maxServerVoiceParticipantIDs
+	}
+	result, err := db.ExecContext(ctx, `
+		WITH expired AS (
+			SELECT channel_id, user_id
+			FROM voice_pending_admissions
+			WHERE expires_at <= clock_timestamp()
+			ORDER BY expires_at, channel_id, user_id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM voice_pending_admissions AS pending
+		USING expired
+		WHERE pending.channel_id = expired.channel_id
+		  AND pending.user_id = expired.user_id
+	`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("remove expired voice pending admissions: %w", err)
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read expired voice pending admission removal result: %w", err)
+	}
+	if removed < 0 || removed > int64(limit) {
+		return 0, fmt.Errorf("expired voice pending admission removal affected %d rows", removed)
+	}
+	return int(removed), nil
+}
 func (s *NATSSubscriber) disconnectAllRichPresenceClients() {
 	if s.disconnectAllRichPresenceClientsHook != nil {
 		s.disconnectAllRichPresenceClientsHook()
@@ -4139,7 +4853,28 @@ type voiceJoinedEvent struct {
 	UserID      string `json:"userId"`
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName,omitempty"`
+	AdmissionID string `json:"admissionId,omitempty"`
+	SocketID    string `json:"socketId,omitempty"`
 	Timestamp   string `json:"timestamp"`
+}
+
+type voiceJoinedAdmission struct {
+	admissionID uuid.UUID
+	socketID    string
+}
+
+func parseVoiceJoinedAdmission(event voiceJoinedEvent) (*voiceJoinedAdmission, error) {
+	if event.AdmissionID == "" && event.SocketID == "" {
+		return nil, nil
+	}
+	if event.AdmissionID == "" || event.SocketID == "" || len(event.SocketID) > 128 {
+		return nil, errors.New("invalid voice joined admission")
+	}
+	admissionID, err := uuid.Parse(event.AdmissionID)
+	if err != nil || admissionID == uuid.Nil {
+		return nil, errors.New("invalid voice joined admission")
+	}
+	return &voiceJoinedAdmission{admissionID: admissionID, socketID: event.SocketID}, nil
 }
 
 // voiceLeftEvent matches the media plane's voice.left NATS payload.
@@ -4457,8 +5192,10 @@ func (s *NATSSubscriber) Subscribe() error {
 	if _, err := s.nats.Subscribe(
 		users.NATSSubjectPresenceErasureCleared, s.handlePresenceErasureCleared,
 	); err != nil {
-		s.unwindLifecycleSubscription(voiceSub, dispatcher)
-		return fmt.Errorf("subscribe presence erasure clear: %w", err)
+		return errors.Join(
+			fmt.Errorf("subscribe presence erasure clear: %w", err),
+			s.unwindLifecycleSubscription(voiceSub, dispatcher),
+		)
 	}
 
 	s.log.Info("Subscribed to voice NATS events")
@@ -4551,12 +5288,15 @@ type unsubscriber interface{ Unsubscribe() error }
 // other. Without this the leak fix would ship unexercised (CodeRabbit, PR #2840).
 func (s *NATSSubscriber) unwindLifecycleSubscription(
 	voiceSub unsubscriber, dispatcher *voiceLifecycleDispatcher,
-) {
+) error {
+	var unsubErr error
 	// A typed-nil *nats.Subscription is non-nil as an interface, so guard the
-	// call rather than the value — Unsubscribe on a nil subscription errors
-	// harmlessly, which is why the result is discarded.
+	// call rather than the value — a real unsubscribe error is joined with the
+	// subscription failure after the dispatcher is still safely unwound.
 	if voiceSub != nil {
-		_ = voiceSub.Unsubscribe()
+		if err := voiceSub.Unsubscribe(); err != nil {
+			unsubErr = fmt.Errorf("unsubscribe voice lifecycle subscription: %w", err)
+		}
 	}
 	s.lifecycleDispatchMu.Lock()
 	s.lifecycleDispatcher = nil
@@ -4564,6 +5304,7 @@ func (s *NATSSubscriber) unwindLifecycleSubscription(
 	if dispatcher != nil {
 		dispatcher.close()
 	}
+	return unsubErr
 }
 
 // handlePresenceErasureCleared retracts an erased principal's already-delivered
@@ -5026,6 +5767,13 @@ func (s *NATSSubscriber) handlePrivateVoiceJoined(
 		}
 	}
 	if activityErr != nil {
+		if !mutation.durablyApplied {
+			s.disconnectRejectedDMHeartbeatParticipants(conversationID, []uuid.UUID{mutation.senderID})
+		}
+		if isPrivateVoiceGuardRejection(activityErr) {
+			s.log.Warn("Private Call Rich Presence join unavailable", "failure_class", "unavailable")
+			return false
+		}
 		s.log.Error("Private Call Rich Presence refresh failed",
 			"failure_class", presence.PolicyErrorClass(activityErr))
 		s.disconnectAllRichPresenceClients()
@@ -5184,12 +5932,14 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 		s.log.Error("Rejected voice.joined with invalid room")
 		return false
 	}
+	admission, err := parseVoiceJoinedAdmission(event)
+	if err != nil {
+		s.log.Error("Rejected voice.joined with invalid admission")
+		return false
+	}
 	s.convergeServerVoiceParticipant(ctx, room, channelID, senderID)
 	if s.activity == nil {
 		s.log.Error(logServerBridgeUnavailable)
-		return false
-	}
-	if !s.serverVoiceJoinHasCapacity(ctx, channelID, senderID) {
 		return false
 	}
 	oldScope, oldServerID, hasOldScope, scopeErr := s.currentServerVoiceScope(ctx, senderID)
@@ -5206,7 +5956,19 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 	result, activityErr := s.applyServerHeartbeatParticipant(
 		ctx, room.serverUUID, channelID, senderID, eventAt,
 		previousServerVoiceScope{scope: oldScope, serverID: oldServerID, exists: hasOldScope},
+		admission,
 	)
+	if errors.Is(activityErr, errServerVoiceParticipantLimit) {
+		s.log.Warn("Deferred server voice join at participant limit", "failure_class", "capacity")
+		return false
+	}
+	if errors.Is(activityErr, errVoicePendingAdmissionMismatch) {
+		// The staged peer no longer owns the exact, unexpired A1 reservation.
+		// Its participant transaction rolled back, so eject only that peer.
+		s.publishForceDisconnect(channelID.String(), senderID.String(), admission.socketID, admission.admissionID.String())
+		s.log.Warn("Rejected voice.joined pending admission", "failure_class", "admission")
+		return false
+	}
 	if activityErr != nil {
 		s.log.Error("Server voice Rich Presence refresh failed",
 			"failure_class", presence.PolicyErrorClass(activityErr))
@@ -5230,31 +5992,6 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 			"action": "joined", "server_id": room.serverID,
 		},
 	})
-	return true
-}
-
-func (s *NATSSubscriber) serverVoiceJoinHasCapacity(
-	ctx context.Context,
-	channelID, senderID uuid.UUID,
-) bool {
-	participantIDs, err := s.collectVoiceParticipantIDs(ctx, channelID, false)
-	if err != nil {
-		s.log.Error("Server voice Rich Presence pre-join participant read failed",
-			"failure_class", "state_read")
-		s.disconnectAllRichPresenceClients()
-		return false
-	}
-	for _, participantID := range participantIDs {
-		if participantID == senderID {
-			return true
-		}
-	}
-	if len(participantIDs) >= maxServerVoiceParticipantIDs {
-		s.log.Warn("Deferred server voice join at participant limit",
-			"failure_class", "capacity")
-		s.disconnectAllRichPresenceClients()
-		return false
-	}
 	return true
 }
 
@@ -5527,6 +6264,7 @@ type serverVoiceLeaveMutation struct {
 	senderID   uuid.UUID
 	eventAt    time.Time
 	applied    bool
+	terminal   serverVoiceTerminalResult
 }
 
 func (mutation *serverVoiceLeaveMutation) deleteRow(
@@ -5557,10 +6295,15 @@ func (mutation *serverVoiceLeaveMutation) apply(ctx context.Context) (bool, erro
 	var err error
 	mutation.applied, err = mutation.subscriber.hub.ApplyServerVoiceChannelMutation(
 		mutation.serverID, mutation.channelID, func() (bool, error) {
-			return mutation.subscriber.withVoiceLifecycleClaim(
-				ctx, presence.CategoryServerVoice, mutation.senderID,
-				mutation.channelID, mutation.eventAt, false, mutation.deleteRow,
+			mutation.terminal, mutation.applied, err = mutation.subscriber.withServerVoiceTerminalClaim(
+				ctx, mutation.serverID.String(),
+				voiceLifecycleClaimRequest{
+					category: presence.CategoryServerVoice, senderID: mutation.senderID,
+					token: mutation.channelID, eventAt: mutation.eventAt, active: false,
+				},
+				false, mutation.deleteRow,
 			)
+			return mutation.applied, err
 		},
 	)
 	if err == nil && mutation.applied {
@@ -5609,8 +6352,18 @@ func (s *NATSSubscriber) handleServerVoiceLeft(
 	if !mutation.applied {
 		return false
 	}
-	s.broadcastServerVoiceParticipant(room, channelID, senderID, "left")
-	s.revokeTempGrantIfHeld(ctx, room.serverID, event.ChannelID, event.UserID, false)
+	if !mutation.terminal.committed || !mutation.terminal.participantRemoved {
+		return false
+	}
+	if mutation.terminal.committed && mutation.terminal.temporaryRemoved {
+		s.tempGrant.completeTemporaryGrantRevocation(
+			ctx, room.serverID, event.ChannelID, event.UserID,
+			mutation.terminal.plan, mutation.terminal.rotation,
+		)
+	}
+	if !s.broadcastServerVoiceParticipantContext(ctx, room, channelID, senderID, "left") {
+		s.log.Error("server voice participant leave delivery failed", "failure_class", "delivery")
+	}
 	return true
 }
 
@@ -6414,6 +7167,11 @@ func (s *NATSSubscriber) runDMHeartbeatBulkRefresh(
 		},
 	)
 	if bulkRefreshErr != nil {
+		s.disconnectRejectedDMHeartbeatParticipants(conversationID, participantIDs)
+		if isPrivateVoiceGuardRejection(bulkRefreshErr) {
+			s.log.Warn("Private Call Rich Presence heartbeat unavailable", "failure_class", "unavailable")
+			return dmHeartbeatRefreshResult{}, false
+		}
 		s.log.Error("Private Call Rich Presence heartbeat bulk refresh failed",
 			"failure_class", presence.PolicyErrorClass(bulkRefreshErr))
 		s.disconnectAllRichPresenceClients()
@@ -6448,6 +7206,10 @@ func privateVoiceRejectedParticipantIDs(
 		return rejected[left].String() < rejected[right].String()
 	})
 	return rejected
+}
+
+func isPrivateVoiceGuardRejection(err error) bool {
+	return errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged)
 }
 
 func bulkRefreshPrivateVoiceParticipants(
@@ -7103,7 +7865,12 @@ func (s *NATSSubscriber) refreshServerHeartbeatParticipant(
 	mutationResult, activityErr := s.applyServerHeartbeatParticipant(
 		ctx, room.serverUUID, channelID, participantID, eventAt,
 		previousServerVoiceScope{scope: oldScope, serverID: oldServerID, exists: hasOldScope},
+		nil,
 	)
+	if errors.Is(activityErr, errServerVoiceParticipantLimit) {
+		s.log.Warn("Deferred server voice heartbeat at participant limit", "failure_class", "capacity")
+		return false, false
+	}
 	if activityErr != nil {
 		s.log.Error("Server voice Rich Presence heartbeat refresh failed",
 			"failure_class", presence.PolicyErrorClass(activityErr))
@@ -7140,6 +7907,7 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
 	previous previousServerVoiceScope,
+	admission *voiceJoinedAdmission,
 ) (serverVoiceMutationResult, error) {
 	newScope := presence.Scope{
 		Category: presence.CategoryServerVoice, RoomID: channelID,
@@ -7157,7 +7925,7 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 		)
 		applyMutation := func() (bool, error) {
 			mutationResult, mutationApplied, claimStatus, mutationErr = s.mutateServerVoiceParticipant(
-				mutationCtx, channelID, participantID, eventAt,
+				mutationCtx, channelID, participantID, eventAt, admission,
 			)
 			// A commit error can leave the database outcome indeterminate. Fence
 			// that result too so terminal delivery retries rather than crossing it.
@@ -7369,9 +8137,6 @@ func (s *NATSSubscriber) reconcileServerHeartbeatParticipants(
 			) {
 				broadcastFailed.Store(true)
 			}
-			s.revokeTempGrantIfHeld(
-				ctx, room.serverID, channelID.String(), participantID.String(), true,
-			)
 		}
 		if activityErr != nil {
 			reconcileErrors.Lock()
@@ -7396,7 +8161,7 @@ func (s *NATSSubscriber) clearStaleServerHeartbeatParticipant(
 	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
 ) (bool, error) {
-	applied := false
+	var terminal serverVoiceTerminalResult
 	activityErr := s.activity.ClearServerVoice(
 		ctx,
 		participantID,
@@ -7405,32 +8170,40 @@ func (s *NATSSubscriber) clearStaleServerHeartbeatParticipant(
 			LifecycleID: channelID, EventAt: eventAt,
 		},
 		func(mutationCtx context.Context) (bool, error) {
-			mutationApplied, mutationErr := s.deleteStaleServerHeartbeatParticipant(
+			mutationApplied, mutationResult, mutationErr := s.deleteStaleServerHeartbeatParticipant(
 				mutationCtx, serverID, channelID, participantID, eventAt,
 			)
 			if mutationErr == nil && mutationApplied {
 				presence.InvalidateActivityBuildCache(mutationCtx)
 			}
-			applied = mutationApplied
+			terminal = mutationResult
 			return mutationApplied, mutationErr
 		},
 	)
-	return applied, activityErr
+	if terminal.committed && terminal.temporaryRemoved {
+		s.tempGrant.completeTemporaryGrantRevocation(
+			ctx, serverID.String(), channelID.String(), participantID.String(), terminal.plan, terminal.rotation,
+		)
+	}
+	return terminal.committed && terminal.participantRemoved, activityErr
 }
 
 func (s *NATSSubscriber) deleteStaleServerHeartbeatParticipant(
 	ctx context.Context,
 	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
-) (bool, error) {
-	return s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, func() (bool, error) {
-		return s.withVoiceLifecycleClaim(
-			ctx,
-			presence.CategoryServerVoice,
-			participantID,
-			channelID,
-			eventAt,
-			false,
+) (bool, serverVoiceTerminalResult, error) {
+	var terminal serverVoiceTerminalResult
+	var err error
+	applied, err := s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, func() (bool, error) {
+		var claimApplied bool
+		terminal, claimApplied, err = s.withServerVoiceTerminalClaim(
+			ctx, serverID.String(),
+			voiceLifecycleClaimRequest{
+				category: presence.CategoryServerVoice, senderID: participantID,
+				token: channelID, eventAt: eventAt, active: false,
+			},
+			true,
 			func(ctx context.Context, tx *sql.Tx) (bool, error) {
 				result, execErr := tx.ExecContext(ctx, `
 				DELETE FROM voice_participants
@@ -7452,7 +8225,9 @@ func (s *NATSSubscriber) deleteStaleServerHeartbeatParticipant(
 				return rowsAffected == 1, nil
 			},
 		)
+		return claimApplied, err
 	})
+	return applied, terminal, err
 }
 
 func parseSortedVoiceParticipantIDs(rawIDs []string, participantLimit int) ([]uuid.UUID, error) {
@@ -7704,45 +8479,6 @@ func (s *NATSSubscriber) collectVoiceParticipantRecordsFrom(
 	return participants, nil
 }
 
-// revokeTempGrantIfHeld is the #487 T8 cleanup-trigger guard shared by the
-// voice.left handler and the heartbeat stale-removal path. It cheaply checks
-// whether the departing user holds a temporary SBAC grant on the channel and, only
-// if so, drives the single revoke convergence point (revoke override + CSK rotation
-// + force-disconnect + directed notify). The common no-temp-grant case short-
-// circuits after the EXISTS probe so plain leaves stay cheap. actorID is "" because
-// these triggers are system-initiated (no human moderator) — the rotator stores
-// revoked_by as NULL.
-//
-// respectGrace=true (heartbeat reconcile path only, finding #7) additionally
-// requires the grant be past a 60s grace window, so a brand-new grant whose
-// voice.joined event has not yet landed in voice_participants is not revoked by a
-// heartbeat that races the join. The voice.left graceful-leave path passes
-// respectGrace=false: an explicit leave is authoritative regardless of grant age,
-// and the moderator-revoke endpoint never goes through this guard at all.
-func (s *NATSSubscriber) revokeTempGrantIfHeld(
-	ctx context.Context,
-	serverID, channelID, userID string,
-	respectGrace bool,
-) {
-	var held bool
-	var err error
-	if respectGrace {
-		held, err = s.tempGrant.hasTemporaryGrantPastGrace(ctx, channelID, userID)
-	} else {
-		held, err = s.tempGrant.hasTemporaryGrant(ctx, channelID, userID)
-	}
-	if err != nil {
-		s.log.Error("temp-grant cleanup probe failed", "failure_class", "state_read")
-		return
-	}
-	if !held {
-		return
-	}
-	if err := s.tempGrant.revokeTemporaryChannelAccess(ctx, serverID, channelID, userID, ""); err != nil {
-		s.log.Error("temp-grant cleanup revoke failed", "failure_class", "state_write")
-	}
-}
-
 func (s *NATSSubscriber) broadcastRoomEmpty(
 	lifecycleCtx context.Context,
 	channelID string,
@@ -7797,36 +8533,51 @@ const (
 // media plane closes that peer's transports and removes it from the room (#487
 // P3). Revoking VIEW/CONNECT does NOT eject an already-connected peer, so this
 // is the authoritative ejection path used by temporary-SBAC access revocation.
-// Delegates to the shared tempGrantManager so the publish primitive lives in one
-// place (the manager is also driven from the REST Handler's moderator-revoke
-// endpoint, DELETE /servers/:id/voice/:userId/temp-access — RevokeTempAccess).
-func (s *NATSSubscriber) publishForceDisconnect(channelID, userID string) {
+// Ordinary user-wide revocations delegate to tempGrantManager, which is also
+// driven by the REST moderator-revoke endpoint. A rejected A1/A2 admission is
+// narrower: its socket and admission IDs must reach the media plane unchanged.
+func (s *NATSSubscriber) publishForceDisconnect(channelID, userID string, exactIdentity ...string) {
+	if len(exactIdentity) == 2 {
+		if s.nats == nil {
+			return
+		}
+		if err := s.nats.Publish(natsSubjectEnforceDisconnect, map[string]interface{}{
+			"channelId": channelID, "userId": userID,
+			"socketId": exactIdentity[0], "admissionId": exactIdentity[1],
+		}); err != nil {
+			s.log.Error("Failed to publish exact force-disconnect", "failure_class", "dependency")
+		}
+		return
+	}
 	s.tempGrant.publishForceDisconnect(channelID, userID)
 }
 
-// publishEnforcementFlags publishes NATS enforcement commands for active mute/deafen flags.
+// publishEnforcementFlags publishes a complete, revisioned moderation snapshot
+// on one existing shared subject. The media plane applies it atomically and
+// ignores an older revision.
 func (s *NATSSubscriber) publishEnforcementFlags(
 	channelID, userID string,
 	serverMuted, serverDeafened bool,
+	authorizationRevision int64,
 ) {
-	if s.nats == nil {
+	if s.nats == nil || authorizationRevision <= 0 {
 		return
 	}
+	action := "unmute"
 	if serverMuted {
-		if err := s.nats.Publish(natsSubjectEnforceMute, map[string]interface{}{
-			"channelId": channelID, "userId": userID, "action": "mute",
-		}); err != nil {
-			s.log.Error("Failed to publish re-enforcement", "failure_class", "dependency",
-				"action", "mute")
-		}
+		action = "mute"
 	}
-	if serverDeafened {
-		if err := s.nats.Publish(natsSubjectEnforceDeafen, map[string]interface{}{
-			"channelId": channelID, "userId": userID, "action": "deafen",
-		}); err != nil {
-			s.log.Error("Failed to publish re-enforcement", "failure_class", "dependency",
-				"action", "deafen")
-		}
+	payload := map[string]interface{}{
+		"channelId":             channelID,
+		"userId":                userID,
+		"action":                action,
+		"serverMuted":           serverMuted,
+		"serverDeafened":        serverDeafened,
+		"authorizationRevision": strconv.FormatInt(authorizationRevision, 10),
+		"version":               enforcementSnapshotSchemaVersion,
+	}
+	if err := s.nats.Publish(natsSubjectEnforceMute, payload); err != nil {
+		s.log.Error("Failed to publish re-enforcement", "failure_class", "dependency")
 	}
 }
 
@@ -7848,23 +8599,51 @@ func (s *NATSSubscriber) reEnforceServer(
 	ctx context.Context,
 	serverID, channelID, userID string,
 ) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		s.log.Error("Failed to begin enforcement snapshot", "failure_class", "state_read")
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			s.log.Error("Failed to rollback enforcement snapshot", "failure_class", "state_read")
+		}
+	}()
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		s.log.Error("Failed to lock enforcement snapshot", "failure_class", "state_read")
+		return
+	}
 	var serverMuted, serverDeafened bool
-	if err := s.db.QueryRowContext(ctx, `SELECT server_muted, server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2`,
+	if err := tx.QueryRowContext(ctx, `SELECT server_muted, server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`,
 		serverID, userID).Scan(&serverMuted, &serverDeafened); err != nil {
 		s.log.Error("Failed to query enforcement flags", "failure_class", "state_read")
 		return
 	}
-	s.publishEnforcementFlags(channelID, userID, serverMuted, serverDeafened)
+	var authorizationRevision int64
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('voice_authorization_revision_seq')`).Scan(&authorizationRevision); err != nil || authorizationRevision <= 0 {
+		s.log.Error("Failed to allocate enforcement revision", "failure_class", "state_read")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		s.log.Error("Failed to commit enforcement snapshot", "failure_class", "state_read")
+		return
+	}
+	s.publishEnforcementFlags(channelID, userID, serverMuted, serverDeafened, authorizationRevision)
 }
 
 // reEnforceDM preserves the pre-existing group-DM hard-moderation convergence
 // when a participant joins an active call.
 func (s *NATSSubscriber) reEnforceDM(ctx context.Context, channelID, userID string) {
-	var serverMuted, serverDeafened bool
-	if err := s.db.QueryRowContext(ctx, `SELECT server_muted, server_deafened FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`,
-		channelID, userID).Scan(&serverMuted, &serverDeafened); err != nil {
+	snapshot, err := dm.ReadVoiceEnforcementSnapshot(ctx, s.db, channelID, userID)
+	if err != nil {
 		s.log.Error("Failed to query DM enforcement flags", "failure_class", "state_read")
 		return
 	}
-	s.publishEnforcementFlags(channelID, userID, serverMuted, serverDeafened)
+	s.publishEnforcementFlags(
+		channelID,
+		userID,
+		snapshot.ServerMuted,
+		snapshot.ServerDeafened,
+		snapshot.AuthorizationRevision,
+	)
 }

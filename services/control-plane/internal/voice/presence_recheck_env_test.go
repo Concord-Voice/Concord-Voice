@@ -541,9 +541,9 @@ func (e *tempGrantPresenceEnv) grantTemporaryAccess(t *testing.T) string {
 	t.Helper()
 	viewerID := e.addMember("tgtemp")
 	e.exec(`INSERT INTO channel_permission_overrides
-	          (id, channel_id, target_type, target_id, allow, deny, is_temporary, granted_at)
-	        VALUES ($1, $2, 'user', $3, $4, 0, TRUE, NOW() - INTERVAL '5 minutes')`,
-		uuid.New().String(), e.channelID, viewerID, int64(rbac.PermViewVoiceChannels))
+	          (id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+	        VALUES ($1, $2, 'user', $3, $4, 0, TRUE, $5, NOW() - INTERVAL '5 minutes')`,
+		uuid.New().String(), e.channelID, viewerID, int64(rbac.PermViewVoiceChannels), tempGrantReason)
 	return viewerID
 }
 

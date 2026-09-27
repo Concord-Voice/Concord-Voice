@@ -3,6 +3,8 @@ package voice
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -68,13 +70,16 @@ func (s *TempGrantSweeper) sweepOrphanedTempGrants(ctx context.Context) (int, er
 	}
 	revoked := 0
 	for _, o := range orphans {
-		if err := s.mgr.revokeTemporaryChannelAccess(ctx, o.serverID, o.channelID, o.userID, ""); err != nil {
+		removed, err := s.mgr.revokeOrphanedTemporaryChannelAccess(ctx, o.serverID, o.channelID, o.userID)
+		if err != nil {
 			// Log and continue — one bad row must not strand the rest of the sweep.
 			s.log.Error("temp-grant sweep: revoke orphan",
 				"error", err, "channel_id", o.channelID, "user_id", o.userID, "server_id", o.serverID)
 			continue
 		}
-		revoked++
+		if removed {
+			revoked++
+		}
 	}
 	return revoked, nil
 }
@@ -97,8 +102,9 @@ func (s *TempGrantSweeper) selectOrphanedTempGrants(ctx context.Context) ([]orph
 		JOIN channels c ON c.id = cpo.channel_id
 		LEFT JOIN voice_participants vp
 		  ON vp.channel_id = cpo.channel_id AND vp.user_id = cpo.target_id
-		WHERE cpo.is_temporary AND cpo.target_type = 'user' AND vp.user_id IS NULL
-		  AND (cpo.granted_at IS NULL OR cpo.granted_at < NOW() - INTERVAL '60 seconds')`)
+		WHERE cpo.is_temporary AND cpo.temporary_reason = $1
+		  AND cpo.target_type = 'user' AND vp.user_id IS NULL
+		  AND (cpo.granted_at IS NULL OR cpo.granted_at < NOW() - INTERVAL '60 seconds')`, tempGrantReason)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +122,67 @@ func (s *TempGrantSweeper) selectOrphanedTempGrants(ctx context.Context) ([]orph
 		return nil, err
 	}
 	return orphans, nil
+}
+
+// reconcileOrphanedTemporaryGrants is the bounded backstop used by the existing
+// five-second Server Voice reconciliation callback. It is intentionally separate
+// from the nightly sweeper: an ambiguous move-grant commit must converge without
+// adding another worker, ticker, or delivery rail.
+func (s *NATSSubscriber) reconcileOrphanedTemporaryGrants(ctx context.Context, limit int) (revoked int, returnErr error) {
+	if s.tempGrant == nil || limit <= 0 {
+		return 0, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT cpo.channel_id, cpo.target_id, channel.server_id
+		FROM channel_permission_overrides AS cpo
+		JOIN channels AS channel ON channel.id = cpo.channel_id
+		LEFT JOIN voice_participants AS participant
+		  ON participant.channel_id = cpo.channel_id AND participant.user_id = cpo.target_id
+		WHERE cpo.is_temporary = TRUE
+		  AND cpo.temporary_reason = $1
+		  AND cpo.target_type = 'user'
+		  AND participant.user_id IS NULL
+		  AND (cpo.granted_at IS NULL
+		       OR cpo.granted_at < clock_timestamp() - INTERVAL '60 seconds')
+		ORDER BY cpo.granted_at NULLS FIRST, cpo.channel_id, cpo.target_id
+		LIMIT $2`, tempGrantReason, limit)
+	if err != nil {
+		return 0, fmt.Errorf("discover orphaned temporary grants: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close orphaned temporary grant discovery: %w", closeErr))
+		}
+	}()
+
+	orphans := make([]orphanedTempGrant, 0, limit)
+	for rows.Next() {
+		var orphan orphanedTempGrant
+		if err := rows.Scan(&orphan.channelID, &orphan.userID, &orphan.serverID); err != nil {
+			return 0, fmt.Errorf("scan orphaned temporary grant: %w", err)
+		}
+		orphans = append(orphans, orphan)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate orphaned temporary grants: %w", err)
+	}
+
+	var reconcileErr error
+	for _, orphan := range orphans {
+		removed, err := s.tempGrant.revokeOrphanedTemporaryChannelAccess(
+			ctx, orphan.serverID, orphan.channelID, orphan.userID,
+		)
+		if err != nil {
+			// Keep going so one transient failure cannot starve later rows. The
+			// failed row remains eligible for the next five-second pass.
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("revoke orphaned temporary grant: %w", err))
+			continue
+		}
+		if removed {
+			revoked++
+		}
+	}
+	return revoked, reconcileErr
 }
 
 // TempGrantSweepDeps carries the sweep worker's collaborators.

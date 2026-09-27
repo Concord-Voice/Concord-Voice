@@ -21,11 +21,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// brokenResolverHandler builds a voice.Handler with a working DB (so
-// pre-permission queries succeed) but a resolver whose DB is closed (so the
-// effective-permission computation errors), plus a gin router that injects the
-// given userID as the authenticated principal. Used to cover the defensive
-// `permErr != nil` HTTP 500 branches the full-router tests cannot reach.
+// brokenResolverHandler builds a voice.Handler with a working handler DB but a
+// resolver whose own DB is closed. It covers non-transactional resolver errors.
 func brokenResolverHandler(t *testing.T, ts *testhelpers.TestServer, userID string) *gin.Engine {
 	t.Helper()
 	h := voice.NewHandler(voice.HandlerDeps{
@@ -38,7 +35,6 @@ func brokenResolverHandler(t *testing.T, ts *testhelpers.TestServer, userID stri
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set("user_id", userID); c.Next() })
 	router.GET("/api/v1/channels/:id/voice/participants", h.GetParticipants)
-	router.POST("/api/v1/channels/:id/voice/join", h.AuthorizeJoin)
 	return router
 }
 
@@ -325,10 +321,32 @@ func TestAuthorizeJoin_ResolverError_500(t *testing.T) {
 	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-rerr-join")
 
-	router := brokenResolverHandler(t, ts, member.ID)
-	req := httptest.NewRequest(http.MethodPost, pathChannelsPrefix+channelID+pathVoiceJoin, nil)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	lockTx, err := ts.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	_, err = lockTx.ExecContext(t.Context(), `LOCK TABLE channel_permission_overrides IN ACCESS EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, pathChannelsPrefix+channelID+pathVoiceJoin, nil).WithContext(ctx)
+	req.Header = testhelpers.AuthHeaders(member.AccessToken)
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		ts.Router.ServeHTTP(w, req)
+		result <- w
+	}()
+
+	waitForEnforcerQuery(t, ts.DB, "active", "Lock", "FROM channel_permission_overrides cpo")
+	cancel()
+
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("voice join did not return after permission query cancellation")
+	}
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
 }
@@ -657,12 +675,12 @@ func TestServerUndeafen(t *testing.T) {
 }
 
 func TestUserMute(t *testing.T) {
-	t.Run("NoHierarchyRequired", func(t *testing.T) {
+	t.Run("HierarchyBlocked", func(t *testing.T) {
 		ts := setupTS(t)
 		owner := ts.CreateTestUser(t, "umutehierown")
 		mod := ts.CreateTestUser(t, "umutehiermod")
 		admin := ts.CreateTestUser(t, "umutehieradm")
-		serverID := ts.CreateTestServer(t, owner.ID, "UserMute NoHierarchy")
+		serverID := ts.CreateTestServer(t, owner.ID, "UserMute Hierarchy")
 		ts.AddMemberToServer(t, serverID, mod.ID, roleMember)
 		ts.AddMemberToServer(t, serverID, admin.ID, roleMember)
 		channelID := ts.CreateVoiceChannel(t, serverID, "voice-umute")
@@ -679,9 +697,10 @@ func TestUserMute(t *testing.T) {
 		_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, admin.ID)
 		require.NoError(t, err)
 
-		// Mod user-mutes higher-ranked admin → should succeed (no hierarchy check)
+		// UserMute is a moderation action, so a lower-ranked moderator cannot
+		// target a higher-ranked administrator.
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, admin.ID, pathUserMute), nil, testhelpers.AuthHeaders(mod.AccessToken))
-		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, http.StatusForbidden, w.Code)
 	})
 
 	t.Run("TargetNotInVoice", func(t *testing.T) {
@@ -720,6 +739,26 @@ func TestUserMute(t *testing.T) {
 }
 
 func TestUserDeafen(t *testing.T) {
+	t.Run("HierarchyBlocked", func(t *testing.T) {
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "udeafhierown")
+		mod := ts.CreateTestUser(t, "udeafhiermod")
+		admin := ts.CreateTestUser(t, "udeafhieradm")
+		serverID := ts.CreateTestServer(t, owner.ID, "UserDeafen Hierarchy")
+		ts.AddMemberToServer(t, serverID, mod.ID, roleMember)
+		ts.AddMemberToServer(t, serverID, admin.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-udeafhier")
+		modRoleID := ts.CreateTestRole(t, serverID, "Mod", 5, int64(rbac.PermDeafenMembers))
+		ts.AssignRoleToUser(t, serverID, mod.ID, modRoleID)
+		adminRoleID := ts.CreateTestRole(t, serverID, "Admin", 10, int64(rbac.AdminPermissions))
+		ts.AssignRoleToUser(t, serverID, admin.ID, adminRoleID)
+		_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, admin.ID)
+		require.NoError(t, err)
+
+		w := ts.DoRequest("POST", voiceEnforcePath(serverID, admin.ID, pathUserDeafen), nil, testhelpers.AuthHeaders(mod.AccessToken))
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	})
+
 	t.Run("Success", func(t *testing.T) {
 		ts := setupTS(t)
 		owner := ts.CreateTestUser(t, "udeafown")

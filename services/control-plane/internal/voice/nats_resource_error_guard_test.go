@@ -178,17 +178,17 @@ func TestServerHeartbeatBulkFanoutStopsWithHub(t *testing.T) {
 		"a dropped terminal room-empty delta must force conservative reconnect")
 }
 
-func TestTempGrantHeartbeatCleanupUsesLifecycleContext(t *testing.T) {
+func TestTerminalTempGrantCleanupStaysInTheCompositeTransaction(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	require.True(t, ok)
 	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "nats.go")) // #nosec G304 -- runtime.Caller plus fixed repository path
 	require.NoError(t, err)
-	start := strings.Index(string(source), "func (s *NATSSubscriber) revokeTempGrantIfHeld(")
-	end := strings.Index(string(source), "func (s *NATSSubscriber) broadcastRoomEmpty(")
-	require.Greater(t, start, -1)
-	require.Greater(t, end, start)
-	require.NotContains(t, string(source[start:end]), "context.Background()",
-		"stale heartbeat cleanup must remain bounded by its lifecycle context")
+	text := string(source)
+	require.Contains(t, text, "func (s *NATSSubscriber) withServerVoiceTerminalTransaction(")
+	require.Contains(t, text, "rbac.LockServerVisibilityCapture(ctx, tx, serverID)")
+	require.Contains(t, text, "LockServerVoiceLifecycleTx(ctx, tx, userID)")
+	require.NotContains(t, text, "revokeTempGrantIfHeld",
+		"terminal paths must not defer durable temp-grant cleanup until after deletion")
 }
 
 func ignoredCleanupCalls(filename string, source []byte) ([]string, error) {

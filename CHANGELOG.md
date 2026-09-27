@@ -65,6 +65,7 @@ account can't provide, never your password twice.
 - **DM-block and credential-epoch cleanup now survives delivery failures** ([#3140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3140)) — guarded reconciliation records retryable voice-ejection obligations and fences stale callbacks by generation.
 - **Direct-message writes recheck current membership before durable side effects** ([#3141](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3141)) — removed recipients cannot regain keys, enroll pending keys, or attach encrypted uploads through stale authorization.
 - **Server mutations now serialize authority and membership changes at their write boundary** ([#3142](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3142)) — stale role, ownership, channel, and message operations fail closed instead of committing partial state.
+- **Voice joins now verify admission before opening a session** ([#3143](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3143)) — voice admission, disconnect cleanup and moderation updates now agree on the same current session, so an old disconnect cannot remove a newer join and everyone sees the same moderation state.
 
 ### Fixed
 

@@ -59,7 +59,11 @@ func TestVoiceJoinUnderClientVersionGate(t *testing.T) {
 	})
 
 	t.Run("a proven hop joins with no client-version header", func(t *testing.T) {
-		w := ts.DoRequest("POST", path, nil, hopHeaders(owner.AccessToken))
+		w := ts.DoRequest("POST", path, map[string]interface{}{
+			"admission_id": "24e27f2b-1d45-4fcf-90c3-3f0ff028a910",
+			"socket_id":    "client-gate-socket",
+			"activate":     false,
+		}, hopHeaders(owner.AccessToken))
 
 		assert.Equal(t, http.StatusOK, w.Code,
 			"the service-hop proof is what restores voice, with no client change")
