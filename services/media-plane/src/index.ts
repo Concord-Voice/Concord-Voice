@@ -1279,7 +1279,7 @@ async function main() {
       await handleNatsEnforcementCommand(
         natsData,
         undefined,
-        ({ channelId, userId, socketId, admissionId }) => {
+        ({ channelId, userId, socketId, admissionId, callId }) => {
           cmd = { channelId, userId };
           return handleForceDisconnect(
             roomManager,
@@ -1287,7 +1287,7 @@ async function main() {
             channelId,
             userId,
             (event) => securityEvents.emit(event),
-            { reason: 'access_revoked', socketId, admissionId }
+            { reason: 'access_revoked', socketId, admissionId, callId }
           );
         },
         (event) => securityEvents.emit(event)

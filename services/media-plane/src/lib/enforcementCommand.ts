@@ -14,6 +14,7 @@ export interface NatsEnforcementCommand {
   action?: string;
   socketId?: string;
   admissionId?: string;
+  callId?: string;
 }
 
 function isSocketId(value: unknown): value is string {
@@ -32,12 +33,14 @@ export async function handleNatsEnforcementCommand(
   const action = data.action;
   const socketId = data.socketId;
   const admissionId = data.admissionId;
+  const callId = data.callId;
   const hasExactAdmissionIdentity = socketId !== undefined || admissionId !== undefined;
   if (
     !isCanonicalEnforcementUUID(channelId) ||
     !isCanonicalEnforcementUUID(userId) ||
     (hasExactAdmissionIdentity &&
       (!isSocketId(socketId) || !isCanonicalEnforcementUUID(admissionId))) ||
+    (callId !== undefined && !isCanonicalEnforcementUUID(callId)) ||
     (allowedActions !== undefined &&
       (typeof action !== 'string' || !allowedActions.includes(action)))
   ) {
@@ -61,6 +64,7 @@ export async function handleNatsEnforcementCommand(
       ...(typeof action === 'string' ? { action } : {}),
       ...(socketId === undefined ? {} : { socketId }),
       ...(admissionId === undefined ? {} : { admissionId }),
+      ...(callId === undefined ? {} : { callId }),
     });
   } catch (error) {
     try {

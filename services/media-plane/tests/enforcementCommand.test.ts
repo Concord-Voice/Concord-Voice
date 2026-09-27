@@ -28,6 +28,21 @@ describe('handleNatsEnforcementCommand', () => {
     expect(mutate).toHaveBeenCalledWith({ channelId: CHANNEL_ID, userId: USER_ID });
   });
 
+  it('preserves a valid DM call ID for call-scoped disconnects', async () => {
+    const mutate = vi.fn();
+    const callId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    await handleNatsEnforcementCommand(
+      { channelId: CHANNEL_ID, userId: USER_ID, callId },
+      undefined,
+      mutate
+    );
+    expect(mutate, 'a valid call ID must reach the enforcement mutation').toHaveBeenCalledWith({
+      channelId: CHANNEL_ID,
+      userId: USER_ID,
+      callId,
+    });
+  });
+
   it('passes a bounded admission identity only to an exact enforcement mutation', async () => {
     const mutate = vi.fn();
     await handleNatsEnforcementCommand(
@@ -107,6 +122,10 @@ describe('handleNatsEnforcementCommand', () => {
     [
       'invalid admission ID',
       { channelId: CHANNEL_ID, userId: USER_ID, socketId: 'socket', admissionId: 'nope' },
+    ],
+    [
+      'malformed call ID',
+      { channelId: CHANNEL_ID, userId: USER_ID, action: 'mute', callId: 'call-B' },
     ],
   ])('rejects %s with one verdict before a room mutation', async (_label, payload) => {
     const mutate = vi.fn();

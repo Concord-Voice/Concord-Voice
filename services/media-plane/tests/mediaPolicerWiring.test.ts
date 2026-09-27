@@ -130,7 +130,13 @@ describe('media policer wiring contract (#2153)', () => {
       "'voice.enforce.disconnect'",
       "'voice.enforce.permissions'"
     );
-    expect(subscription).toContain("{ reason: 'access_revoked', socketId, admissionId }");
+    expect(subscription).toContain("reason: 'access_revoked'");
+    expect(subscription).toMatch(
+      /\(\{\s*channelId,\s*userId,\s*socketId,\s*admissionId,\s*callId\s*\}\)\s*=>/
+    );
+    expect(subscription).toMatch(
+      /\{\s*reason: 'access_revoked',\s*socketId,\s*admissionId,\s*callId\s*\}/
+    );
     expect(subscription).not.toContain('media_policy');
   });
 

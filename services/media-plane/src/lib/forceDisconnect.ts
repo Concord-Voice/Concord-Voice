@@ -73,6 +73,7 @@ function verifiesProof(
  * interface (rather than the full RoomManager) so unit tests can inject a fake.
  */
 export interface ForceDisconnectRoomManager {
+  getRoom: RoomManager['getRoom'];
   getParticipant: RoomManager['getParticipant'];
   getProvisionalParticipant: RoomManager['getProvisionalParticipant'];
   leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
@@ -425,7 +426,12 @@ export function createVoiceEnforcementSessionEjectionHandler(
  * (#2153) must never be reported as a permission revocation.
  */
 export type ForceDisconnectOptions =
-  | { readonly reason: 'access_revoked'; readonly socketId?: string; readonly admissionId?: string }
+  | {
+      readonly reason: 'access_revoked';
+      readonly socketId?: string;
+      readonly admissionId?: string;
+      readonly callId?: string;
+    }
   | {
       readonly reason: 'media_policy';
       readonly retryAfterSec: number;
@@ -508,6 +514,25 @@ function resolveExactSessions(
   };
 }
 
+function sessionsForCall(
+  roomManager: ForceDisconnectRoomManager,
+  channelId: string,
+  userId: string,
+  options: ForceDisconnectOptions
+) {
+  const participant = roomManager.getParticipant(channelId, userId);
+  const provisional = roomManager.getProvisionalParticipant(channelId, userId);
+  const callId = options.reason === 'access_revoked' ? options.callId : undefined;
+  if (callId === undefined) return { participant, provisional };
+
+  const room = roomManager.getRoom(channelId);
+  return {
+    participant: room?.callId === callId ? participant : undefined,
+    provisional:
+      room?.pendingDMParticipants.get(userId)?.callId === callId ? provisional : undefined,
+  };
+}
+
 /**
  * Evicts a peer from one room: `voice.enforce.disconnect` from the control
  * plane (#487 P3, reason `access_revoked`) or the media policer's repeat-offender
@@ -541,8 +566,7 @@ export async function handleForceDisconnect(
 ): Promise<void> {
   // Resolved before any teardown, so a malformed reason touches no session.
   const resolved = resolveReason(channelId, options);
-  const participant = roomManager.getParticipant(channelId, userId);
-  const provisional = roomManager.getProvisionalParticipant(channelId, userId);
+  const { participant, provisional } = sessionsForCall(roomManager, channelId, userId, options);
   const exact = resolveExactSessions(
     participant,
     provisional,

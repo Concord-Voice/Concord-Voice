@@ -29,20 +29,35 @@ const POLICED: ForceDisconnectOptions = { reason: 'media_policy', retryAfterSec:
 
 /** Builds a fake RoomManager surface. */
 function makeRoomManager(
-  participant: { socketId: string; admissionId?: string } | undefined,
-  provisionalSocketId?: string
+  participant: { socketId: string; admissionId?: string; callId?: string } | undefined,
+  provisionalSocketId?: string,
+  roomCallId?: string,
+  provisionalCallId?: string
 ) {
   const leaveRoom = vi.fn().mockResolvedValue(undefined);
   const leaveRoomIfSocketOwned = vi.fn().mockResolvedValue(Boolean(participant));
   const getParticipant = vi.fn().mockReturnValue(participant);
   const getProvisionalParticipant = vi
     .fn()
-    .mockReturnValue(provisionalSocketId ? { socketId: provisionalSocketId } : undefined);
+    .mockReturnValue(
+      provisionalSocketId ? { socketId: provisionalSocketId, callId: provisionalCallId } : undefined
+    );
+  const getRoom = vi.fn().mockReturnValue(
+    roomCallId || provisionalCallId
+      ? {
+          callId: roomCallId,
+          pendingDMParticipants: new Map(
+            provisionalCallId ? [[USER_ID, { callId: provisionalCallId }]] : []
+          ),
+        }
+      : undefined
+  );
   const removeProvisionalParticipantIfSocketOwned = vi.fn().mockResolvedValue(true);
   return {
     rm: {
       getParticipant,
       getProvisionalParticipant,
+      getRoom,
       leaveRoomIfSocketOwned,
       removeProvisionalParticipantIfSocketOwned,
       // The enforcement-specific seam intentionally shares this spy so these
@@ -103,6 +118,98 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
     expect(disconnect).not.toHaveBeenCalled();
+  });
+
+  it('leaves admitted and provisional successor call B connected after delayed call A revocation', async () => {
+    const callA = '11111111-1111-4111-8111-111111111111';
+    const callB = '22222222-2222-4222-8222-222222222222';
+    const { rm, leaveRoomIfSocketOwned, removeProvisionalParticipantIfSocketOwned } =
+      makeRoomManager(
+        { socketId: 'socket-b-admitted', callId: callB },
+        'socket-b-provisional',
+        callB,
+        callB
+      );
+    const { io, emit, disconnect } = makeIO('socket-b-admitted', 'socket-b-provisional');
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'access_revoked',
+      callId: callA,
+    } as unknown as ForceDisconnectOptions);
+
+    expect(
+      leaveRoomIfSocketOwned,
+      'delayed call A must not remove admitted call B'
+    ).not.toHaveBeenCalled();
+    expect(
+      removeProvisionalParticipantIfSocketOwned,
+      'delayed call A must not remove provisional call B'
+    ).not.toHaveBeenCalled();
+    expect(emit, 'delayed call A must not notify call B sockets').not.toHaveBeenCalled();
+    expect(disconnect, 'delayed call A must not disconnect call B sockets').not.toHaveBeenCalled();
+  });
+
+  it('evicts the matching call while preserving the unscoped revocation path', async () => {
+    const callB = '22222222-2222-4222-8222-222222222222';
+    const { rm, leaveRoomIfSocketOwned } = makeRoomManager(
+      { socketId: SOCKET_ID },
+      undefined,
+      callB
+    );
+    const { io, disconnect } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'access_revoked',
+      callId: callB,
+    } as unknown as ForceDisconnectOptions);
+    expect(
+      leaveRoomIfSocketOwned,
+      'a matching call revocation must evict the participant'
+    ).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(disconnect).toHaveBeenCalledWith(true);
+
+    const { rm: unscopedRM, leaveRoomIfSocketOwned: unscopedLeave } = makeRoomManager({
+      socketId: SOCKET_ID,
+    });
+    const { io: unscopedIO, disconnect: unscopedDisconnect } = makeIO(SOCKET_ID);
+    await handleForceDisconnect(unscopedRM, unscopedIO, CHANNEL_ID, USER_ID, undefined, REVOKED);
+    expect(
+      unscopedLeave,
+      'an unscoped revocation must retain legacy eviction behavior'
+    ).toHaveBeenCalled();
+    expect(unscopedDisconnect).toHaveBeenCalledWith(true);
+  });
+
+  it('uses the provisional call ID when a pending-only room has no admitted call ID', async () => {
+    const callA = '11111111-1111-4111-8111-111111111111';
+    const callB = '22222222-2222-4222-8222-222222222222';
+    const { rm, removeProvisionalParticipantIfSocketOwned } = makeRoomManager(
+      undefined,
+      'socket-b-provisional',
+      undefined,
+      callB
+    );
+    const { io, disconnect } = makeIO('socket-b-provisional');
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'access_revoked',
+      callId: callA,
+    } as unknown as ForceDisconnectOptions);
+    expect(
+      removeProvisionalParticipantIfSocketOwned,
+      'a pending-only successor call B must survive delayed call A revocation'
+    ).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'access_revoked',
+      callId: callB,
+    } as unknown as ForceDisconnectOptions);
+    expect(
+      removeProvisionalParticipantIfSocketOwned,
+      'matching call B revocation must remove its pending candidate'
+    ).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, 'socket-b-provisional');
+    expect(disconnect).toHaveBeenCalledWith(true);
   });
 
   it('still calls leaveRoom when the socket is already gone but the participant remains', async () => {
