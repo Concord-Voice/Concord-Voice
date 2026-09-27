@@ -241,6 +241,54 @@ func TestPendingCall_AcceptAfterTimeoutClaimReportsExpired(t *testing.T) {
 	assert.True(t, PendingDMCallExistsForTest(convID), "timeout-owned ring stays mapped until terminal side effects finish")
 }
 
+func TestPendingCall_DeclineCommitFailureSerializesLaterTerminalClaim(t *testing.T) {
+	convID := uuid.New()
+	firstDecliner := uuid.New()
+	lastDecliner := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{firstDecliner, lastDecliner}, time.Second)
+	pendingDMCalls.Store(convID, ring)
+	t.Cleanup(func() { pendingDMCalls.Delete(convID) })
+
+	commitStarted := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	type declineResult struct {
+		transition declineTransition
+		err        error
+	}
+	firstResult := make(chan declineResult, 1)
+	go func() {
+		transition, err := ring.tryDeclineWithCommit(firstDecliner, func() error {
+			close(commitStarted)
+			<-releaseCommit
+			return errors.New("commit failed")
+		})
+		firstResult <- declineResult{transition: transition, err: err}
+	}()
+	<-commitStarted
+
+	secondResult := make(chan declineResult, 1)
+	go func() {
+		transition, err := ring.tryDeclineWithCommit(lastDecliner, func() error { return nil })
+		secondResult <- declineResult{transition: transition, err: err}
+	}()
+	select {
+	case result := <-secondResult:
+		t.Fatalf("later decline observed an uncommitted state: %v", result.transition)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseCommit)
+	first := <-firstResult
+	require.Equal(t, declineTransitionPending, first.transition)
+	require.Error(t, first.err)
+	second := <-secondResult
+	require.Equal(t, declineTransitionPending, second.transition)
+	require.NoError(t, second.err)
+	assert.Contains(t, ring.RingingUserIDs, firstDecliner)
+	assert.Contains(t, ring.DeclinedUserIDs, lastDecliner)
+	assert.False(t, ring.terminalOwned)
+}
+
 func TestPendingCall_InitializationPrecedesTerminalTransition(t *testing.T) {
 	convID := uuid.New()
 	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{uuid.New()}, time.Second)

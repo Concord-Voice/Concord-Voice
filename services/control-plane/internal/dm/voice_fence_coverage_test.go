@@ -99,7 +99,9 @@ func TestInitializePendingDMCallLeavesExpiredRingForFailedStartCleanup(t *testin
 		pendingDMCalls.Delete(conversationID)
 	})
 
-	require.False(t, h.initializePendingDMCall(ring, conversationID, false, nil, nil))
+	initialized, announced := h.initializePendingDMCall(ring, conversationID, false, nil, nil)
+	require.False(t, initialized)
+	require.False(t, announced)
 	_, present := pendingDMCalls.Load(conversationID)
 	require.True(t, present, "failed initialization leaves cleanup ownership with the caller")
 	require.Nil(t, ring.TimeoutTimer)
@@ -107,6 +109,62 @@ func TestInitializePendingDMCallLeavesExpiredRingForFailedStartCleanup(t *testin
 	_, present = pendingDMCalls.Load(conversationID)
 	require.False(t, present)
 	require.Nil(t, ring.TimeoutTimer)
+}
+
+func TestInitializePendingDMCallRejectsUnclaimedRing(t *testing.T) {
+	conversationID := uuid.New()
+	ring := newPendingCall(conversationID, uuid.New(), []uuid.UUID{uuid.New()}, time.Minute)
+
+	ring.mu.Lock()
+	initialized, announced := (&Handler{}).initializePendingDMCall(
+		ring, conversationID, false, nil, nil,
+	)
+	ring.mu.Unlock()
+
+	require.False(t, initialized)
+	require.False(t, announced)
+	require.Nil(t, ring.TimeoutTimer)
+}
+
+func TestDiscardPendingDMCallLockedRemovesUnannouncedRing(t *testing.T) {
+	conversationID := uuid.New()
+	ring := newPendingCall(conversationID, uuid.New(), nil, time.Minute)
+	ring.TimeoutTimer = time.AfterFunc(time.Hour, func() {})
+	pendingDMCalls.Store(conversationID, ring)
+	t.Cleanup(func() {
+		ring.StopTimer()
+		pendingDMCalls.Delete(conversationID)
+	})
+
+	ring.mu.Lock()
+	discardPendingDMCallLocked(ring)
+	ring.mu.Unlock()
+	_, present := pendingDMCalls.Load(conversationID)
+	require.False(t, present)
+	require.False(t, ring.TimeoutTimer.Stop(), "discard must stop the pending timeout timer")
+}
+
+func TestNoDMVoiceCalleesErrorMessages(t *testing.T) {
+	t.Run("group", func(t *testing.T) {
+		require.Equal(t, "no online members to call", noDMVoiceCalleesError(true))
+	})
+	t.Run("direct", func(t *testing.T) {
+		require.Equal(t, "no callees in this conversation", noDMVoiceCalleesError(false))
+	})
+}
+
+func TestResolvePendingDMRingRejectsInvalidActorID(t *testing.T) {
+	ctx, recorder := voiceFenceTestContext()
+	ctx.Params = gin.Params{{Key: "id", Value: uuid.NewString()}}
+	ctx.Set("user_id", "not-a-uuid")
+
+	ring, convUUID, actorUUID, tx, ok := (&Handler{}).resolvePendingDMRing(ctx)
+	require.False(t, ok)
+	require.Nil(t, ring)
+	require.Equal(t, uuid.Nil, convUUID)
+	require.Equal(t, uuid.Nil, actorUUID)
+	require.Nil(t, tx)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }
 
 func TestRingDMCallFailsClosedWhenRedisFenceIsUnavailable(t *testing.T) {

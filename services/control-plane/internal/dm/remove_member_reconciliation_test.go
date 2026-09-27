@@ -1,6 +1,7 @@
 package dm
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,11 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -22,6 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -71,6 +75,7 @@ func TestRemoveMemberCapturesPlanAndDeletesVoiceEvidence(t *testing.T) {
 		"member removal must retain the conversation")
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target))
+	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_block_voice_ejections WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 }
 
@@ -82,6 +87,7 @@ func TestRemoveMemberWithoutActiveCallCapturesNothing(t *testing.T) {
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM presence_active_pending_plans`))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target))
+	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_block_voice_ejections WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 }
 
@@ -181,6 +187,7 @@ func TestRemoveMemberCaptureFailureRollsBackBothRows(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT created_by FROM dm_conversations WHERE id = $1`, convID).Scan(&createdBy))
 	require.Equal(t, creator, createdBy)
 	require.Equal(t, 0, countRows(t, db, `SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1 AND reason = 'member_removed'`, convID))
+	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_block_voice_ejections WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 }
 
 func TestRemoveMemberCandidateGrowthReturnsConflict(t *testing.T) {
@@ -202,9 +209,9 @@ func TestRemoveMemberCandidateGrowthReturnsConflict(t *testing.T) {
 }
 
 func TestRemoveMemberRevalidatesRevokedAdminInsideTransaction(t *testing.T) {
-	db, convID, creator, target, h, _ := seedMemberRemovalFixture(t, false)
-	h.afterCandidateReadHook = func() {
-		_, err := db.Exec(`
+	db, convID, creator, target, h, _ := seedMemberRemovalFixture(t, true)
+	h.afterUsersLockHook = func(tx *sql.Tx) {
+		_, err := tx.Exec(`
 			UPDATE dm_participants SET role = 'member'
 			WHERE conversation_id = $1 AND user_id = $2`, convID, creator)
 		require.NoError(t, err)
@@ -364,7 +371,7 @@ func TestRemoveMemberLocksUserBeforeConversation(t *testing.T) {
 		observed = true
 		relations := sampleRelationLocks(t, db, backendPID(t, tx))
 		require.Contains(t, relations, "users")
-		require.NotContains(t, relations, "dm_conversations")
+		require.Contains(t, relations, "dm_conversations")
 	}
 	require.Equal(t, 200, invokeRemoveMember(t, h, convID, creator.String(), target.String()).Code)
 	require.True(t, observed, "removal must expose the users-before-conversation lock point")
@@ -417,11 +424,11 @@ func TestRemoveMemberDoesNotDeadlockAgainstVoiceIngress(t *testing.T) {
 			t.Errorf("rollback voice transaction: %v", rollbackErr)
 		}
 	}()
+	var voiceTxID int64
+	require.NoError(t, voiceTx.QueryRowContext(ctx, `SELECT txid_current()`).Scan(&voiceTxID))
 	conversationID := uuid.MustParse(convID)
 	require.NoError(t, LockDMVoiceParticipantSetTx(ctx, voiceTx, conversationID))
 	require.NoError(t, lockVoiceCandidates(ctx, voiceTx, []uuid.UUID{target}))
-	lockKey, err := VoiceParticipantSetAdvisoryKey(conversationID)
-	require.NoError(t, err)
 	var lockedTarget uuid.UUID
 	require.NoError(t, voiceTx.QueryRowContext(ctx, `
 		SELECT user_id FROM dm_participants
@@ -429,11 +436,11 @@ func TestRemoveMemberDoesNotDeadlockAgainstVoiceIngress(t *testing.T) {
 
 	removeDone := make(chan error, 1)
 	go func() {
-		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), creator.String())
+		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), creator.String(), "")
 		removeDone <- removeErr
 	}()
 
-	dbtest.WaitForAdvisoryLockWaiter(t, db, lockKey)
+	dbtest.WaitForRowLockWaiter(t, db, voiceTxID)
 	_, joinErr := voiceTx.ExecContext(ctx, `
 		INSERT INTO dm_voice_participants (conversation_id, user_id, lifecycle_event_at)
 		VALUES ($1, $2, now())`, convID, creator)
@@ -442,6 +449,96 @@ func TestRemoveMemberDoesNotDeadlockAgainstVoiceIngress(t *testing.T) {
 	removeErr := <-removeDone
 
 	require.NoError(t, removeErr, "member removal must not deadlock with voice ingress")
+}
+
+func TestOpposingActiveMemberRemovalsDoNotDeadlockAfterPrivateVoiceScopes(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	users := []uuid.UUID{
+		dbtest.CreateUser(t, db),
+		dbtest.CreateUser(t, db),
+		dbtest.CreateUser(t, db),
+		dbtest.CreateUser(t, db),
+	}
+	slices.SortFunc(users, func(left, right uuid.UUID) int {
+		return bytes.Compare(left[:], right[:])
+	})
+	actorA, targetB := users[0], users[1]
+	actorC, targetD := users[2], users[3]
+
+	var conversationID string
+	require.NoError(t, db.QueryRow(`
+		INSERT INTO dm_conversations (is_group, name, created_by)
+		VALUES (true, 'opposing-removal lock order', $1) RETURNING id`, actorA).Scan(&conversationID))
+	for _, userID := range users {
+		_, err := db.Exec(`
+			INSERT INTO dm_participants (conversation_id, user_id, role)
+			VALUES ($1, $2, 'admin')`, conversationID, userID)
+		require.NoError(t, err)
+	}
+	for _, userID := range []uuid.UUID{targetB, targetD} {
+		_, err := db.Exec(`
+			INSERT INTO dm_voice_participants (conversation_id, user_id)
+			VALUES ($1, $2)`, conversationID, userID)
+		require.NoError(t, err)
+	}
+
+	hA, _ := newDMHandlerWithRail(t, db, conversationID)
+	hC, _ := newDMHandlerWithRail(t, db, conversationID)
+	preflightA, err := hA.readMemberRemovalPreflight(t.Context(), conversationID, targetB)
+	require.NoError(t, err)
+	preflightC, err := hC.readMemberRemovalPreflight(t.Context(), conversationID, targetD)
+	require.NoError(t, err)
+
+	// Each active target has a distinct private-voice scope. Once both requests
+	// hold those scopes, the next lock must be the complete UUID-sorted users
+	// set. The former subset-first prefix reached this point with A/B and C/D
+	// separately locked, making the following full-set expansion a 40P01 cycle.
+	privateScopesReady := make(chan struct{}, 2)
+	releaseUsers := make(chan struct{})
+	privateScopesHook := func() {
+		privateScopesReady <- struct{}{}
+		<-releaseUsers
+	}
+	hA.afterPrivateVoiceScopesLockHook = privateScopesHook
+	hC.afterPrivateVoiceScopesLockHook = privateScopesHook
+
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	type removalResult struct{ err error }
+	results := make(chan removalResult, 2)
+	go func() {
+		_, _, removeErr := hA.removeActiveMemberTx(ctx, conversationID, targetB, actorA.String(), "", preflightA)
+		results <- removalResult{err: removeErr}
+	}()
+	go func() {
+		_, _, removeErr := hC.removeActiveMemberTx(ctx, conversationID, targetD, actorC.String(), "", preflightC)
+		results <- removalResult{err: removeErr}
+	}()
+
+	for range 2 {
+		select {
+		case <-privateScopesReady:
+		case <-time.After(3 * time.Second):
+			t.Fatal("opposing removals did not both reach the private-voice scope boundary")
+		}
+	}
+	close(releaseUsers)
+
+	successes := 0
+	for range 2 {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				successes++
+				continue
+			}
+			var pqErr *pq.Error
+			require.False(t, errors.As(result.err, &pqErr) && string(pqErr.Code) == "40P01", "opposing removals must serialize, not deadlock: %v", result.err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("opposing member removals exceeded liveness bound")
+		}
+	}
+	require.Positive(t, successes, "at least one destructive removal must commit")
 }
 
 func TestInactiveCreatorRemovalSerializesBeforeErasureLocks(t *testing.T) {
@@ -465,7 +562,7 @@ func TestInactiveCreatorRemovalSerializesBeforeErasureLocks(t *testing.T) {
 
 	removalDone := make(chan error, 1)
 	go func() {
-		_, _, removeErr := h.removeMemberTx(ctx, convID, creator.String(), creator.String())
+		_, _, removeErr := h.removeMemberTx(ctx, convID, creator.String(), creator.String(), "")
 		removalDone <- removeErr
 	}()
 
@@ -523,7 +620,7 @@ func TestAdminRemovalAgainstCallerErasureCompletesWithoutDeadlock(t *testing.T) 
 
 	removalDone := make(chan error, 1)
 	go func() {
-		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), caller.String())
+		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), caller.String(), "")
 		removalDone <- removeErr
 	}()
 
@@ -566,6 +663,6 @@ func TestAdminRemovalAgainstCallerErasureCompletesWithoutDeadlock(t *testing.T) 
 	}
 	require.NoError(t, erasureErr,
 		"caller account erasure must complete without a deadlock victim")
-	require.ErrorIs(t, removalErr, errMemberRemovalStateDrifted,
-		"admin removal must fail closed with state drift after caller erasure, without a deadlock victim")
+	require.ErrorIs(t, removalErr, dmblock.ErrUnavailable,
+		"admin removal must fail closed as unavailable after caller erasure, without a deadlock victim")
 }

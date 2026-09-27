@@ -50,6 +50,7 @@ type VoiceCallLease struct {
 	RingID          uuid.UUID
 	CallerUserID    uuid.UUID
 	MediaAuthorized bool
+	Promoted        bool
 }
 
 func dmVoiceCallLeaseKey(conversationID uuid.UUID) string {
@@ -115,6 +116,15 @@ redis.call('HSET', KEYS[1], 'media_authorized', '1')
 return 1
 `)
 
+var activateAcceptedDMVoiceCallLeaseScript = redis.NewScript(`
+if redis.call('HGET', KEYS[1], 'call_id') ~= ARGV[1] or redis.call('HGET', KEYS[1], 'ring_id') ~= ARGV[1] then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'promoted', '1')
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+`)
+
 var beginDMVoiceCallCleanupScript = redis.NewScript(`
 redis.call('SET', KEYS[2], '1', 'PX', ARGV[2])
 local current = redis.call('HGET', KEYS[1], 'call_id')
@@ -137,6 +147,16 @@ if not current or current ~= ARGV[1] then
   return 0
 end
 redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
+return 1
+`)
+
+var retractDMVoiceJoinAuthorizationScript = redis.NewScript(`
+if ARGV[3] == '1' and redis.call('HGET', KEYS[1], 'call_id') == ARGV[1] and redis.call('HGET', KEYS[1], 'ring_id') == ARGV[2] and redis.call('HGET', KEYS[1], 'promoted') ~= '1' then
+  redis.call('DEL', KEYS[1])
+end
+if redis.call('GET', KEYS[2]) == ARGV[1] then
+  redis.call('DEL', KEYS[2])
+end
 return 1
 `)
 
@@ -177,6 +197,16 @@ if ring_id ~= '' or media_authorized ~= '1' or promoted == '1' or ttl <= 0 or tt
 end
 redis.call('SET', KEYS[2], '1', 'PX', ARGV[3])
 return redis.call('DEL', KEYS[1])
+`)
+
+var restoreAbortedDMVoiceCallReservationScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 0 then
+  return 0
+end
+redis.call('DEL', KEYS[2])
+redis.call('HSET', KEYS[1], 'call_id', ARGV[1], 'ring_id', '', 'caller_user_id', ARGV[2], 'media_authorized', '1', 'promoted', '0')
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return 1
 `)
 
 // RefreshDMVoiceCallLease claims or renews one exact conversation/call pair.
@@ -257,6 +287,32 @@ func MarkDMVoiceCallMediaAuthorized(
 	return nil
 }
 
+// ActivateAcceptedDMVoiceCallLease makes an exact accepted-ring lease
+// media-authorizable after its surrounding topology fence commits.
+func ActivateAcceptedDMVoiceCallLease(
+	ctx context.Context,
+	client *redis.Client,
+	conversationID, callID uuid.UUID,
+	ttl time.Duration,
+) error {
+	if client == nil {
+		return errors.New("DM voice call lease store unavailable")
+	}
+	if conversationID == uuid.Nil || callID == uuid.Nil || ttl <= 0 {
+		return errors.New("invalid accepted DM voice call lease")
+	}
+	result, err := activateAcceptedDMVoiceCallLeaseScript.Run(
+		ctx, client, []string{dmVoiceCallLeaseKey(conversationID)}, callID.String(), ttl.Milliseconds(),
+	).Int()
+	if err != nil {
+		return fmt.Errorf("activate accepted DM voice call lease: %w", err)
+	}
+	if result != 1 {
+		return ErrDMVoiceCallLeaseConflict
+	}
+	return nil
+}
+
 // RememberDMVoiceJoinAdmission binds a member's renderer-facing /voice/join
 // to one exact current lease for the short media handoff. The compare-and-set
 // prevents a delayed join from overwriting a newer admission. Legacy media
@@ -288,6 +344,35 @@ func RememberDMVoiceJoinAdmission(
 	}
 	if result != 1 {
 		return ErrDMVoiceCallLeaseConflict
+	}
+	return nil
+}
+
+// RetractDMVoiceJoinAuthorization removes the admission created by one failed
+// /voice/join fence and, when owned, its matching provisional lease. Exact
+// value checks preserve successors and an activation whose acknowledgement was
+// lost after Redis committed it.
+func RetractDMVoiceJoinAuthorization(
+	ctx context.Context,
+	client *redis.Client,
+	conversationID, userID, callID, ringID uuid.UUID,
+	retractLease bool,
+) error {
+	if client == nil {
+		return errors.New("DM voice join authorization store unavailable")
+	}
+	if conversationID == uuid.Nil || userID == uuid.Nil || callID == uuid.Nil {
+		return errors.New("invalid DM voice join authorization")
+	}
+	expectedRingID := ""
+	if ringID != uuid.Nil {
+		expectedRingID = ringID.String()
+	}
+	if _, err := retractDMVoiceJoinAuthorizationScript.Run(ctx, client,
+		[]string{dmVoiceCallLeaseKey(conversationID), dmVoiceJoinAdmissionKey(conversationID, userID)},
+		callID.String(), expectedRingID, boolToRedisFlag(retractLease),
+	).Result(); err != nil {
+		return fmt.Errorf("retract DM voice join authorization: %w", err)
 	}
 	return nil
 }
@@ -409,6 +494,7 @@ func LookupDMVoiceCallLease(
 		RingID:          ringID,
 		CallerUserID:    callerUserID,
 		MediaAuthorized: values["media_authorized"] == "1",
+		Promoted:        values["promoted"] == "1",
 	}, true, nil
 }
 
@@ -546,4 +632,31 @@ func AbortAuthorizedDMVoiceCallReservation(
 		return false, fmt.Errorf("abort authorized DM voice call reservation: %w", err)
 	}
 	return result == 1, nil
+}
+
+// RestoreAbortedDMVoiceCallReservation compensates an exact abort whose
+// surrounding durable fence failed to commit. It refuses a successor lease or
+// a missing exact tombstone, so compensation cannot resurrect stale authority.
+func RestoreAbortedDMVoiceCallReservation(
+	ctx context.Context,
+	client *redis.Client,
+	lease VoiceCallLease,
+) error {
+	if client == nil {
+		return errors.New("DM voice call lease store unavailable")
+	}
+	if lease.ConversationID == uuid.Nil || lease.CallID == uuid.Nil || lease.CallerUserID == uuid.Nil || lease.RingID != uuid.Nil || !lease.MediaAuthorized {
+		return errors.New("invalid aborted DM voice call reservation")
+	}
+	result, err := restoreAbortedDMVoiceCallReservationScript.Run(ctx, client,
+		[]string{dmVoiceCallLeaseKey(lease.ConversationID), dmVoiceCallClosedKey(lease.CallID)},
+		lease.CallID.String(), lease.CallerUserID.String(), DMVoiceCallReservationTTL.Milliseconds(),
+	).Int()
+	if err != nil {
+		return fmt.Errorf("restore aborted DM voice call reservation: %w", err)
+	}
+	if result != 1 {
+		return ErrDMVoiceCallLeaseConflict
+	}
+	return nil
 }

@@ -11,12 +11,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
 const errMsgPurgeFailed = "Purge failed"
+
+var (
+	errDMPurgeNotParticipant = errors.New("dm purge actor is not a participant")
+	errDMPurgeScopeChanged   = errors.New("dm purge authority changed")
+)
 
 // dmPurgeRequest is the body for DELETE /dm/conversations/:id/messages (#1352).
 // current_password/mfa_code are the step-up factors, required when the acting
@@ -95,6 +103,7 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 		hide = true    // ...and hide the rest from the actor's view
 	}
 
+	credentialEpoch := middleware.TokenCredentialEpoch(c)
 	plan := purge.Plan{
 		ContextType: ctxType,
 		ContextID:   convID,
@@ -110,18 +119,29 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 		}},
 		// With a hide to follow, the audit row stays in_progress until
 		// applyReceiverHide completes it in the hide's own transaction.
+		Guard: func(guardCtx context.Context, tx *sql.Tx, _ purge.DeleteSpec) error {
+			if err := guardDMPurgeTx(guardCtx, tx, convID, userID, author); err != nil {
+				return err
+			}
+			if err := credepoch.GuardTx(guardCtx, tx, userID, credentialEpoch); err != nil {
+				return fmt.Errorf("guard DM purge credential epoch: %w", err)
+			}
+			return nil
+		},
 		DeferCompletion: hide,
 	}
 
 	res, err := h.purgeEngine.Run(purgeCtx, plan)
 	if err != nil {
-		h.log.Error("DM purge failed", "error", err, "conversation_id", convID, "deleted", res.DeletedCount)
-		h.failPartialPurge(c, convID, userID, req.Range, res.DeletedCount)
+		h.handleDMPurgeRunError(c, convID, userID, req.Range, res.DeletedCount, err)
 		return
 	}
 
 	if hide {
-		hidden, err := h.applyReceiverHide(purgeCtx, userID, convID, rangeFrom, res.PurgeID, res.DeletedCount)
+		if h.afterDMPurgeDeleteHook != nil {
+			h.afterDMPurgeDeleteHook()
+		}
+		hidden, err := h.applyReceiverHide(purgeCtx, userID, convID, rangeFrom, res.PurgeID, res.DeletedCount, credentialEpoch)
 		if err != nil {
 			h.log.Error("DM purge hide failed", "error", err, "conversation_id", convID, "deleted", res.DeletedCount)
 			h.failPartialPurge(c, convID, userID, req.Range, res.DeletedCount)
@@ -136,6 +156,27 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": res.HiddenCount})
 }
 
+// handleDMPurgeRunError preserves retryable guard-denial responses only when
+// the engine has not committed a batch. Otherwise it reports the partial purge
+// so peers observe every irreversible delete.
+func (h *Handler) handleDMPurgeRunError(c *gin.Context, convID, userID, rng string, deleted int, runErr error) {
+	if deleted == 0 {
+		switch {
+		case errors.Is(runErr, errDMPurgeNotParticipant), errors.Is(runErr, errDMPurgeScopeChanged):
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+			return
+		case errors.Is(runErr, dmblock.ErrUnavailable), errors.Is(runErr, dmblock.ErrMembershipChanged):
+			c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+			return
+		case errors.Is(runErr, credepoch.ErrEpochMismatch), errors.Is(runErr, credepoch.ErrBlocked):
+			h.respondGuardTxError(c, runErr, errMsgPurgeFailed)
+			return
+		}
+	}
+	h.log.Error("DM purge failed", "error", runErr, "conversation_id", convID, "deleted", deleted)
+	h.failPartialPurge(c, convID, userID, rng, deleted)
+}
+
 // failPartialPurge answers a purge that stopped partway. Deletes that already
 // committed cannot be undone, so peers and the actor's other sessions still get
 // dm_purged for them — the same rule the channel and server purges follow.
@@ -148,49 +189,86 @@ func (h *Handler) failPartialPurge(c *gin.Context, convID, actorID, rng string, 
 
 // applyReceiverHide records the actor's hidden window for messages they cannot
 // delete-for-both and returns how many of the peers' messages it covers. The hide
-// and the audit completion commit in one transaction, so a failure leaves the
-// audit row in_progress with the committed deleted_count — the recovery handle
-// for the accepted delete/hide TOCTOU (spec §7).
-func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, rangeFrom *time.Time, purgeID string, deleted int) (int, error) {
+// runs in its own transaction; a failure leaves the audit row at in_progress, which
+// is the recovery handle for the accepted delete/hide TOCTOU (spec §7).
+func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, rangeFrom *time.Time, purgeID string, deleted int, credentialEpoch string) (int, error) {
 	// Hidden window: [range cutoff (or epoch for All Time), now].
 	from := time.Time{}
 	if rangeFrom != nil {
 		from = rangeFrom.UTC()
 	}
 
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("begin hide tx: %w", err)
-	}
-	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			h.log.Error("Failed to roll back DM purge hide transaction", "error", rollbackErr)
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, fmt.Errorf("begin hide tx: %w", err)
 		}
-	}()
-
-	// Take the FK parents before the participant row. Account erasure locks users
-	// before its conversations, and group deletion locks the conversation before
-	// removing participants.
-	var lockedUserID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, userID).Scan(&lockedUserID); err != nil {
-		return 0, fmt.Errorf("lock hide user: %w", err)
+		hidden := 0
+		err = func() error {
+			if err := guardDMPurgeTx(ctx, tx, convID, userID, &userID); err != nil {
+				return err
+			}
+			if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+				return fmt.Errorf("guard DM hide credential epoch: %w", err)
+			}
+			var err error
+			hidden, err = InsertHiddenRange(ctx, tx, userID, convID, from, time.Now().UTC())
+			if err != nil {
+				return fmt.Errorf("insert hidden range: %w", err)
+			}
+			if err := h.purgeEngine.FinalizeHiddenTx(ctx, tx, purgeID, deleted, hidden); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit hide tx: %w", err)
+			}
+			return nil
+		}()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return 0, fmt.Errorf("rollback hide tx: %w", rbErr)
+		}
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		return hidden, nil
 	}
-	var lockedConversationID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM dm_conversations WHERE id = $1 FOR KEY SHARE`, convID).Scan(&lockedConversationID); err != nil {
-		return 0, fmt.Errorf("lock hide conversation: %w", err)
-	}
+	return 0, dmblock.ErrMembershipChanged
+}
 
-	hidden, err := InsertHiddenRange(ctx, tx, userID, convID, from, time.Now().UTC())
+func guardDMPurgeTx(ctx context.Context, tx *sql.Tx, convID, userID string, expectedAuthor *string) error {
+	actor, err := uuid.Parse(userID)
 	if err != nil {
-		return 0, fmt.Errorf("insert hidden range: %w", err)
+		return dmblock.ErrUnavailable
 	}
-	if err := h.purgeEngine.FinalizeHiddenTx(ctx, tx, purgeID, deleted, hidden); err != nil {
-		return 0, err
+	if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockShare); err != nil {
+		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit hide tx: %w", err)
+	var conversationID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR SHARE`, convID,
+	).Scan(&conversationID); err != nil {
+		return fmt.Errorf("lock dm purge conversation: %w", err)
 	}
-	return hidden, nil
+	var isGroup bool
+	var role string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.role
+		FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1
+		FOR SHARE OF dc, dp
+	`, convID, userID).Scan(&isGroup, &role); errors.Is(err, sql.ErrNoRows) {
+		return errDMPurgeNotParticipant
+	} else if err != nil {
+		return fmt.Errorf("recheck dm purge participant: %w", err)
+	}
+	if (isGroup && role == "admin") != (expectedAuthor == nil) {
+		return errDMPurgeScopeChanged
+	}
+	return nil
 }
 
 // resolveDMRole resolves the actor's group flag and admin role in one query.

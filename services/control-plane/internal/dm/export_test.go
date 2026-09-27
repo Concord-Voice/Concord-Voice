@@ -3,7 +3,9 @@
 package dm
 
 import (
+	"context"
 	"database/sql"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -69,4 +71,20 @@ func SetDMVisibilityCommitHookForTest(h *Handler, hook func()) {
 // SetDMClearCommitForTest replaces Clear's commit for an ambiguous-ack test.
 func SetDMClearCommitForTest(h *Handler, commit func(*sql.Tx) error) {
 	h.clearCommitForTest = commit
+}
+
+// SetDMTopologyCommitHookForTest forces the cross-store fence's commit result.
+func SetDMTopologyCommitHookForTest(h *Handler, hook func(*sql.Tx) error) {
+	h.commitDMTopologyTx = hook
+}
+
+// SetDMVoiceActivationHookForTest simulates the exact Redis activation outcome.
+func SetDMVoiceActivationHookForTest(h *Handler, hook func(context.Context, uuid.UUID, uuid.UUID, time.Duration) error) {
+	h.activateAcceptedDMVoiceLeaseForTest = hook
+}
+
+// BeginDMTopologyEffectForTest exposes the held users-before-parent fence for
+// the deterministic Block-versus-external-effect regression.
+func BeginDMTopologyEffectForTest(ctx context.Context, h *Handler, convID string, extras []uuid.UUID) (*sql.Tx, error) {
+	return h.beginDMTopologyEffect(ctx, convID, extras)
 }

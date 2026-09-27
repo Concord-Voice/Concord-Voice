@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000158)
+## Existing Migrations (000001–000159)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -268,6 +268,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000156 | validate_message_purge_clear_reason | Validate `message_purges_reason_check`; down restores the broader `NOT VALID` check (#3462) |
 | 000157 | add_server_mfa_enforcement | Per-server `servers.enforce_mfa_dangerous_actions` toggle, default FALSE (#3453). The down is guarded: it refuses while any server enforces |
 | 000158 | add_user_mfa_totp_last_used_step | Nullable `user_mfa_totp.last_used_step BIGINT`, the last accepted TOTP time step, so a code is accepted at most once (RFC 6238 §5.2). No default, no backfill; the down is unguarded |
+| 000159 | add_voice_authorization_revision_sequence | Add the database-assigned monotonic revision watermark used by voice authorization snapshots; down refuses to drop a consumed sequence |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -322,6 +323,12 @@ acceptance advances under a compare-and-set guard so each code verifies once.
 It is safe to apply before the code that writes it: an older binary ignores the
 column. Its down drops the column unguarded, because the value only matters for
 the ~90 s a code stays inside its skew window.
+
+Migration 000159 adds the `voice_authorization_revision_seq` sequence used to assign
+monotonic revisions to voice authorization snapshots. Its down migration uses
+`ALTER SEQUENCE ... CACHE 1` before checking whether the sequence has been consumed,
+then refuses to drop it once any revision has been allocated; this preserves the
+watermark and prevents stale snapshots from becoming current after a rollback.
 
 ## Troubleshooting
 

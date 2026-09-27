@@ -6,6 +6,7 @@ package dm_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
@@ -100,13 +102,16 @@ func TestPurgeConversation_DeleteOwnHideOther(t *testing.T) {
 
 	// Audit row records both counts, no content.
 	var deleted, hidden int
-	var ctxType string
+	var ctxType, status string
+	var completedAt sql.NullTime
 	require.NoError(t, ts.DB.QueryRow(
-		`SELECT context_type, deleted_count, hidden_count FROM message_purges WHERE context_id = $1`,
-		convID).Scan(&ctxType, &deleted, &hidden))
+		`SELECT context_type, status, deleted_count, hidden_count, completed_at FROM message_purges WHERE context_id = $1`,
+		convID).Scan(&ctxType, &status, &deleted, &hidden, &completedAt))
 	assert.Equal(t, "dm", ctxType)
+	assert.Equal(t, "completed", status)
 	assert.Equal(t, 2, deleted)
 	assert.Equal(t, 1, hidden)
+	assert.True(t, completedAt.Valid)
 
 	// The hidden message must not resurface via the conversation-list preview (M3).
 	w = ts.DoRequest(http.MethodGet, "/api/v1/dm/conversations", nil,
@@ -261,6 +266,61 @@ func TestPurgeConversation_ReceiverHideTimeoutKeepsAuditOpenAndBroadcasts(t *tes
 	event := readUntilDMEvent(t, bobConn, "dm_purged")
 	assert.Equal(t, convID, event["conversation_id"])
 	assert.EqualValues(t, 1, event["deleted_count"])
+}
+
+// A failure completing the receiver-hide audit must not turn a committed
+// deletion into a successful response or leave a half-applied hide. The
+// trigger forces the deferred hidden_count update to fail.
+// The trigger keeps this regression on the atomic hide/audit boundary.
+func TestPurgeConversationHideAuditFailureIsAtomic(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "purge_audit_trigger_alice")
+	bob := ts.CreateTestUser(t, "purge_audit_trigger_bob")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+	insertDMMsg(t, ts, convID, alice.ID, "delete me")
+	insertDMMsg(t, ts, convID, bob.ID, "keep me")
+	_, err := ts.DB.Exec(`
+		CREATE OR REPLACE FUNCTION test_reject_dm_hide_audit() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.hidden_count > 0 THEN RAISE EXCEPTION 'forced receiver-hide audit failure'; END IF;
+			RETURN NEW;
+		END $$ LANGUAGE plpgsql`)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		CREATE TRIGGER test_reject_dm_hide_audit
+		BEFORE UPDATE OF hidden_count ON message_purges
+		FOR EACH ROW EXECUTE FUNCTION test_reject_dm_hide_audit()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, err := ts.DB.Exec(`DROP TRIGGER IF EXISTS test_reject_dm_hide_audit ON message_purges`); err != nil {
+			t.Errorf("drop purge audit test trigger: %v", err)
+		}
+		if _, err := ts.DB.Exec(`DROP FUNCTION IF EXISTS test_reject_dm_hide_audit()`); err != nil {
+			t.Errorf("drop purge audit test function: %v", err)
+		}
+	})
+
+	w := ts.DoRequest(http.MethodDelete, purgeConvPath(convID),
+		map[string]any{"range": "all", "current_password": alice.Password},
+		testhelpers.AuthHeaders(alice.AccessToken))
+	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	require.Equal(t, 1, countDMMessages(t, ts, convID), "peer message must remain")
+	var hiddenRanges int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM dm_message_hidden_ranges WHERE conversation_id = $1 AND user_id = $2`, convID, alice.ID,
+	).Scan(&hiddenRanges))
+	require.Zero(t, hiddenRanges, "failed hide must not commit a hidden range")
+	var status string
+	var deleted, hidden int
+	var completedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT status, deleted_count, hidden_count, completed_at
+		FROM message_purges WHERE context_id = $1`, convID).
+		Scan(&status, &deleted, &hidden, &completedAt))
+	require.Equal(t, "in_progress", status)
+	require.Equal(t, 1, deleted)
+	require.Zero(t, hidden)
+	require.False(t, completedAt.Valid)
 }
 
 // TestPurgeConversation_StepUpWrongPassword403 locks the step-up gate: a wrong
@@ -441,4 +501,83 @@ func TestPurgeConversation_P1EmailOnlyAccountPasswordAlone(t *testing.T) {
 		testhelpers.AuthHeaders(alice.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Equal(t, 0, countDMMessages(t, ts, convID))
+}
+
+// The stale credential passes the request-time role lookup but must be rejected
+// by the real Plan.Guard without deleting the message. Engine.Run leaves the
+// recovery audit in progress so the failure is observable and retryable.
+func TestPurgeConversationRejectsStaleCredentialWithoutDeleting(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "purge_stale_epoch")
+	bob := ts.CreateTestUser(t, "purge_stale_peer")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+	insertDMMsg(t, ts, convID, alice.ID, "stale purge must survive")
+	_, err := ts.DB.Exec(`
+		INSERT INTO privacy_settings (user_id, require_auth_before_purge)
+		VALUES ($1, FALSE) ON CONFLICT (user_id) DO UPDATE SET require_auth_before_purge = FALSE`, alice.ID)
+	require.NoError(t, err)
+	staleToken := ts.SimulateStaleEpochWindow(t, alice.ID)
+
+	w := ts.DoRequest(http.MethodDelete, purgeConvPath(convID), map[string]any{"range": "all"},
+		testhelpers.AuthHeaders(staleToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	require.Equal(t, 1, countDMMessages(t, ts, convID))
+	var status string
+	var deleted int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT status, deleted_count FROM message_purges WHERE context_id = $1`, convID,
+	).Scan(&status, &deleted))
+	require.NotEqual(t, "completed", status)
+	require.Zero(t, deleted)
+}
+
+// Group-admin scope is resolved before the engine transaction. Hold the users
+// fence so the real Plan.Guard waits, demote the admin during that window, and
+// verify the group message survives with an incomplete recovery audit.
+func TestPurgeConversationRejectsAdminDemotionAtGuard(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	admin := ts.CreateTestUser(t, "purge_demote_admin")
+	member := ts.CreateTestUser(t, "purge_demote_member")
+	convID := ts.CreateGroupDMConversation(t, admin.ID, member.ID)
+	_, err := ts.DB.Exec(`UPDATE dm_participants SET role = 'admin' WHERE conversation_id = $1 AND user_id = $2`, convID, admin.ID)
+	require.NoError(t, err)
+	insertDMMsg(t, ts, convID, member.ID, "demotion must preserve message")
+	_, err = ts.DB.Exec(`
+		INSERT INTO privacy_settings (user_id, require_auth_before_purge)
+		VALUES ($1, FALSE) ON CONFLICT (user_id) DO UPDATE SET require_auth_before_purge = FALSE`, admin.ID)
+	require.NoError(t, err)
+
+	barrier, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() { _ = barrier.Rollback() }()
+	var xid int64
+	require.NoError(t, barrier.QueryRow(`SELECT txid_current()`).Scan(&xid))
+	var locked string
+	require.NoError(t, barrier.QueryRow(`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, admin.ID).Scan(&locked))
+
+	result := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest(http.MethodDelete, purgeConvPath(convID), map[string]any{"range": "all"},
+			testhelpers.AuthHeaders(admin.AccessToken))
+		result <- w.Code
+	}()
+	dbtest.WaitForRowLockWaiter(t, ts.DB, xid)
+	_, err = ts.DB.Exec(`UPDATE dm_participants SET role = 'member' WHERE conversation_id = $1 AND user_id = $2`, convID, admin.ID)
+	require.NoError(t, err)
+	require.NoError(t, barrier.Commit())
+
+	select {
+	case status := <-result:
+		require.Equal(t, http.StatusForbidden, status)
+	case <-time.After(time.Second):
+		t.Fatal("group purge did not resume after releasing the users fence")
+	}
+	require.Equal(t, 1, countDMMessages(t, ts, convID))
+	var auditStatus string
+	var deleted int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT status, deleted_count FROM message_purges WHERE context_id = $1`, convID,
+	).Scan(&auditStatus, &deleted))
+	require.NotEqual(t, "completed", auditStatus)
+	require.Zero(t, deleted)
 }

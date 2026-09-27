@@ -500,6 +500,9 @@ func (h *Handler) completeKeyReplacementClear(
 	}
 	if fenceOp != nil && completion.Outcome == presencehistory.ForcedClearRolledBack {
 		fenceOp.Rollback(c.Request.Context()) // explicit rollback outcome — definite
+	} else if fenceOp != nil {
+		// The completion may have committed despite its failed acknowledgement.
+		fenceOp.ReconcileCommittedEviction(c.Request.Context())
 	}
 	// Any other completion error is an ambiguous commit: retain the blocked
 	// marker; its TTL plus DB read-through reconciles (#2201, spec §4.4 3c).
@@ -1745,6 +1748,8 @@ func settleCredentialFence(ctx context.Context, fenceOp *credepoch.Op, err error
 	switch {
 	case err == nil:
 		fenceOp.Commit(ctx)
+	case errors.Is(err, errCommitAmbiguous):
+		fenceOp.ReconcileCommittedEviction(ctx)
 	case !errors.Is(err, errCommitAmbiguous):
 		fenceOp.Rollback(ctx)
 	}

@@ -27,6 +27,7 @@ func TestDMVoiceCallLease_ExactOwnerRefreshAndDelete(t *testing.T) {
 		CallID:         callID,
 		RingID:         ringID,
 		CallerUserID:   callerUserID,
+		Promoted:       true,
 	}
 	require.NoError(t, dm.RefreshDMVoiceCallLease(ctx, redisClient, lease, time.Minute, true))
 
@@ -149,6 +150,7 @@ func TestDMVoiceCallCleanup_StaleBeginPreservesReplacement(t *testing.T) {
 		ConversationID: conversationID,
 		CallID:         uuid.New(),
 		CallerUserID:   uuid.New(),
+		Promoted:       true,
 	}
 	require.NoError(t, dm.RefreshDMVoiceCallLease(ctx, redisClient, replacement, time.Minute, true))
 
@@ -333,6 +335,7 @@ func TestClearUnpromotedDMVoiceCallReservation_PreservesPromotedLease(t *testing
 		ConversationID: uuid.New(),
 		CallID:         uuid.New(),
 		CallerUserID:   uuid.New(),
+		Promoted:       true,
 	}
 	require.NoError(t, dm.RefreshDMVoiceCallLease(
 		ctx, redisClient, lease, dm.DMVoiceCallLeaseTTL, true,
@@ -392,6 +395,7 @@ func TestAbortAuthorizedDMVoiceCallReservation_ExactShortDirectReservationOnly(t
 	))
 	promoted := replacement
 	promoted.CallID = uuid.New()
+	promoted.Promoted = true
 	record(promoted, dm.DMVoiceCallLeaseTTL)
 	require.NoError(t, redisClient.PExpire(
 		ctx, "dm_voice_call_lease:"+promoted.ConversationID.String(), 30*time.Second,

@@ -561,6 +561,12 @@ func (s *AccountService) deleteAccountTx(
 	if err != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM dm_block_reconciliations
+		WHERE user_a_id = $1 OR user_b_id = $1`, lockedUserID); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{},
+			fmt.Errorf("delete account: drain DM block reconciliation: %w", err)
+	}
 
 	result, err := tx.ExecContext(ctx,
 		`DELETE FROM users WHERE id = $1`,

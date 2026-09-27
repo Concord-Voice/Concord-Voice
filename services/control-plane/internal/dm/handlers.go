@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	messagehandlers "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -72,6 +74,8 @@ const (
 	errMsgFailedRemoveEnforcement    = "Failed to remove enforcement"
 	errMsgTargetNotParticipant       = "Target is not a participant"
 	errMsgCannotUnmuteWhileDeafened  = "Cannot unmute while server-deafened — remove deafen first"
+	dmVoiceDisconnectSubject         = "voice.enforce.disconnect"
+	voiceEnforcementSnapshotVersion  = 1
 )
 
 // dm_privacy_level enum values (matches migration 000032_dm_privacy_level.up.sql).
@@ -123,19 +127,33 @@ type Handler struct {
 	mfaVerifier stepup.MFAVerifier // step-up auth for DM/group purge and history clear
 	activePlans ActivePlanRail     // durable active-category reconciliation (#2448)
 
-	// Test seams for deleteGroupData's ordering, nil in production. The two
-	// windows they open — between the candidate read and the conversation lock,
-	// and between the users lock and the conversation lock — are exactly the
+	// Test seams for deleteGroupData's ordering, nil in production. The three
+	// windows they open — after private-voice scopes, between the candidate read
+	// and the conversation lock, and between the users lock and the conversation
+	// lock — are exactly the
 	// ones no external observer can reach, and the invariants that live in them
 	// (fail closed on drift; users before dm_conversations) are the whole point
 	// of #2448's restructure. A grep cannot verify a conditional acquisition.
-	afterCandidateReadHook func()
-	afterUsersLockHook     func(tx *sql.Tx)
+	afterCandidateReadHook          func()
+	afterPrivateVoiceScopesLockHook func()
+	afterUsersLockHook              func(tx *sql.Tx)
 
 	// afterDMVisibilityCommitHook is a test seam for the commit-to-publication
 	// ordering gate. It is nil in production.
 	afterDMVisibilityCommitHook func()
 	clearCommitForTest          func(*sql.Tx) error
+	// afterDMPurgeDeleteHook makes the post-delete receiver-hide boundary
+	// deterministic in tests. Production leaves it nil.
+	afterDMPurgeDeleteHook func()
+	// beforeDMVoiceEnforcementTxHook makes the stale preflight authorization
+	// window deterministic in tests. Production leaves it nil.
+	beforeDMVoiceEnforcementTxHook func()
+	// commitDMTopologyTx is a narrow test seam for the cross-store DM voice
+	// fence. Production always uses tx.Commit.
+	commitDMTopologyTx func(tx *sql.Tx) error
+	// activateAcceptedDMVoiceLease simulates a Redis acknowledgement loss after
+	// the exact activation script committed. Nil in production.
+	activateAcceptedDMVoiceLeaseForTest func(context.Context, uuid.UUID, uuid.UUID, time.Duration) error
 }
 
 type epochQueryRower interface {
@@ -527,22 +545,41 @@ func (h *Handler) OpenConversation(c *gin.Context) {
 		return
 	}
 
-	// Check for existing 1:1 conversation
-	if h.returnExistingConversation(c, userID, req.UserID) {
+	convID, created, err := h.createOneOnOneConversation(
+		c.Request.Context(), userID, req.UserID, middleware.TokenCredentialEpoch(c),
+	)
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		h.respondGuardTxError(c, err, errMsgFailedOpenConversation)
 		return
 	}
-
-	convID, err := h.createOneOnOneConversation(userID, req.UserID)
+	if errors.Is(err, errDMTopologyPrivacy) || errors.Is(err, errDMTopologyBlocked) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "privacy_blocked"})
+		return
+	}
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedOpenConversation})
 		return
 	}
 
-	h.log.Info("DM conversation created", "conversation_id", convID, "user_id", userID, "target", req.UserID)
-	h.notifyDMCreated(convID, req.UserID)
+	if created {
+		h.log.Info("DM conversation created", "conversation_id", convID, "user_id", userID, "target", req.UserID)
+		h.notifyDMCreated(convID, req.UserID)
+	}
 
 	conv := h.fetchConversationResponse(convID, userID)
-	c.JSON(http.StatusCreated, gin.H{"conversation": conv})
+	if conv == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedOpenConversation})
+		return
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	c.JSON(status, gin.H{"conversation": conv})
 }
 
 // enforceDMPrivacy checks privacy settings and returns true if the request was blocked.
@@ -613,6 +650,265 @@ func (h *Handler) fetchDMPrivacySettings(userID string) (int, bool, error) {
 	return dmPrivacyLevel, dmFriendsOfFriends, err
 }
 
+func dmTopologyBlockedTx(ctx context.Context, q dmRowQuerier, leftID, rightID string) (bool, error) {
+	var blocked bool
+	if err := q.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM friendships
+			WHERE ((requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1))
+			  AND status = 'blocked'
+		)`, leftID, rightID).Scan(&blocked); err != nil {
+		return false, fmt.Errorf("recheck dm topology block: %w", err)
+	}
+	if blocked {
+		return true, nil
+	}
+	var pending bool
+	if err := q.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM dm_block_reconciliations
+			WHERE (user_a_id = $1 AND user_b_id = $2) OR (user_a_id = $2 AND user_b_id = $1)
+		)`, leftID, rightID).Scan(&pending); err != nil {
+		return false, fmt.Errorf("recheck dm topology pending block: %w", err)
+	}
+	return pending, nil
+}
+
+func dmTopologyPermittedTx(ctx context.Context, q dmRowQuerier, senderID, targetID string) (bool, error) {
+	blocked, err := dmTopologyBlockedTx(ctx, q, senderID, targetID)
+	if err != nil || blocked {
+		return false, err
+	}
+	var level int
+	var fof bool
+	err = q.QueryRowContext(ctx, `SELECT dm_privacy_level, dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`, targetID).Scan(&level, &fof)
+	if errors.Is(err, sql.ErrNoRows) {
+		level = dmPrivacyFriendsAndServer
+	} else if err != nil {
+		return false, fmt.Errorf("recheck dm topology privacy: %w", err)
+	}
+	if level == dmPrivacyOff {
+		return false, nil
+	}
+	var friends bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM friendships WHERE ((requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)) AND status = 'accepted')`, senderID, targetID).Scan(&friends); err != nil {
+		return false, fmt.Errorf("recheck dm topology friendship: %w", err)
+	}
+	if friends || level >= dmPrivacyOpenToAll {
+		return true, nil
+	}
+	if fof {
+		var sharedFriend bool
+		if err := q.QueryRowContext(ctx, `
+			WITH sender_friends AS (SELECT CASE WHEN requester_id = $1 THEN addressee_id ELSE requester_id END AS id FROM friendships WHERE (requester_id = $1 OR addressee_id = $1) AND status = 'accepted'),
+			target_friends AS (SELECT CASE WHEN requester_id = $2 THEN addressee_id ELSE requester_id END AS id FROM friendships WHERE (requester_id = $2 OR addressee_id = $2) AND status = 'accepted')
+			SELECT EXISTS(SELECT 1 FROM sender_friends JOIN target_friends USING (id) WHERE id != $1 AND id != $2)`, senderID, targetID).Scan(&sharedFriend); err != nil {
+			return false, fmt.Errorf("recheck dm topology friends-of-friends: %w", err)
+		}
+		if sharedFriend {
+			return true, nil
+		}
+	}
+	if level < dmPrivacyFriendsAndServer {
+		return false, nil
+	}
+	var sharedServer bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM server_members l JOIN server_members r ON r.server_id = l.server_id WHERE l.user_id = $1 AND r.user_id = $2)`, senderID, targetID).Scan(&sharedServer); err != nil {
+		return false, fmt.Errorf("recheck dm topology shared server: %w", err)
+	}
+	return sharedServer, nil
+}
+
+func recheckDMTopologyTx(ctx context.Context, q dmRowQuerier, actor uuid.UUID, users []uuid.UUID) error {
+	for left := range users {
+		for right := left + 1; right < len(users); right++ {
+			blocked, err := dmTopologyBlockedTx(ctx, q, users[left].String(), users[right].String())
+			if err != nil {
+				return err
+			}
+			if blocked {
+				return errDMTopologyBlocked
+			}
+		}
+	}
+	for _, target := range users {
+		if target == actor {
+			continue
+		}
+		permitted, err := dmTopologyPermittedTx(ctx, q, actor.String(), target.String())
+		if err != nil {
+			return err
+		}
+		if !permitted {
+			return errDMTopologyPrivacy
+		}
+	}
+	return nil
+}
+
+func (h *Handler) commitDMTopologyEffect(tx *sql.Tx) error {
+	if h.commitDMTopologyTx != nil {
+		return h.commitDMTopologyTx(tx)
+	}
+	return tx.Commit()
+}
+
+func (h *Handler) beginDMTopologyEffect(ctx context.Context, convID string, extras []uuid.UUID) (*sql.Tx, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("begin dm topology guard: %w", err)
+		}
+		prepared, err := dmblock.PrepareConversationTx(ctx, tx, convID, extras, dmblock.LockShare, dmblock.LockShare)
+		if err == nil {
+			err = lockPreparedDMParticipantsTx(ctx, tx, convID, prepared)
+		}
+		if err == nil {
+			return tx, nil
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			return nil, errors.Join(err, fmt.Errorf("rollback dm topology guard: %w", rollbackErr))
+		}
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return nil, err
+	}
+	return nil, dmblock.ErrMembershipChanged
+}
+
+// beginDMTopologyEffectWithCredential holds the complete participant topology
+// and the actor's credential epoch until its caller has completed its external
+// voice effect. That makes a credential reset wait rather than racing a lease,
+// ring, or moderation action that was admitted under the old epoch.
+func (h *Handler) beginDMTopologyEffectWithCredential(ctx context.Context, convID, userID, credentialEpoch string, extras []uuid.UUID, parentLock dmblock.LockMode) (*sql.Tx, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("begin dm topology guard: %w", err)
+		}
+		prepared, prepareErr := dmblock.PrepareConversationTx(ctx, tx, convID, extras, dmblock.LockShare, parentLock)
+		err = prepareErr
+		if err == nil {
+			err = lockPreparedDMParticipantsTx(ctx, tx, convID, prepared)
+		}
+		if err == nil && userID != "" {
+			err = credepoch.GuardTx(ctx, tx, userID, credentialEpoch)
+		}
+		if err == nil {
+			return tx, nil
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+		}
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return nil, err
+	}
+	return nil, dmblock.ErrMembershipChanged
+}
+
+// VoiceEnforcementSnapshot is the moderation state paired with the global
+// authorization revision that fences media-plane re-enforcement messages.
+type VoiceEnforcementSnapshot struct {
+	ServerMuted           bool
+	ServerDeafened        bool
+	AuthorizationRevision int64
+}
+
+// ReadVoiceEnforcementSnapshot reads group-DM moderation state under the same
+// users-before-conversation fence used by hard moderation writers.
+func ReadVoiceEnforcementSnapshot(ctx context.Context, db *sql.DB, conversationID, userID string) (VoiceEnforcementSnapshot, error) {
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return VoiceEnforcementSnapshot{}, fmt.Errorf("parse DM enforcement user: %w", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return VoiceEnforcementSnapshot{}, fmt.Errorf("begin DM enforcement snapshot: %w", err)
+		}
+		prepared, err := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{userUUID}, dmblock.LockShare, dmblock.LockShare)
+		if err == nil {
+			err = lockPreparedDMParticipantsTx(ctx, tx, conversationID, prepared)
+		}
+		if err != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				err = errors.Join(err, fmt.Errorf("rollback DM enforcement snapshot: %w", rollbackErr))
+			}
+			if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+				continue
+			}
+			return VoiceEnforcementSnapshot{}, fmt.Errorf("prepare DM enforcement snapshot: %w", err)
+		}
+		snapshot, err := readDMVoiceEnforcementSnapshotTx(ctx, tx, conversationID, userID)
+		if err != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				err = errors.Join(err, fmt.Errorf("rollback DM enforcement snapshot: %w", rollbackErr))
+			}
+			return VoiceEnforcementSnapshot{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return VoiceEnforcementSnapshot{}, fmt.Errorf("commit DM enforcement snapshot: %w", err)
+		}
+		return snapshot, nil
+	}
+	return VoiceEnforcementSnapshot{}, dmblock.ErrMembershipChanged
+}
+
+func readDMVoiceEnforcementSnapshotTx(
+	ctx context.Context, tx *sql.Tx, conversationID, userID string,
+) (VoiceEnforcementSnapshot, error) {
+	var snapshot VoiceEnforcementSnapshot
+	if err := tx.QueryRowContext(ctx, `
+		SELECT server_muted, server_deafened
+		FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+	`, conversationID, userID).Scan(&snapshot.ServerMuted, &snapshot.ServerDeafened); err != nil {
+		return VoiceEnforcementSnapshot{}, fmt.Errorf("read DM enforcement snapshot: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('voice_authorization_revision_seq')`).Scan(&snapshot.AuthorizationRevision); err != nil || snapshot.AuthorizationRevision <= 0 {
+		if err == nil {
+			err = errors.New("invalid voice authorization revision")
+		}
+		return VoiceEnforcementSnapshot{}, fmt.Errorf("allocate DM enforcement revision: %w", err)
+	}
+	return snapshot, nil
+}
+
+func lockPreparedDMParticipantsTx(ctx context.Context, tx *sql.Tx, convID string, prepared []uuid.UUID) (returnErr error) {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM dm_participants WHERE conversation_id = $1 ORDER BY user_id FOR SHARE`, convID)
+	if err != nil {
+		return fmt.Errorf("lock prepared DM participants: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close prepared DM participants: %w", closeErr))
+		}
+	}()
+	current := make([]uuid.UUID, 0, len(prepared))
+	for rows.Next() {
+		var userID uuid.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return fmt.Errorf("scan prepared DM participant: %w", err)
+		}
+		current = append(current, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate prepared DM participants: %w", err)
+	}
+	if len(current) != len(prepared) {
+		return dmblock.ErrMembershipChanged
+	}
+	for index := range prepared {
+		if current[index] != prepared[index] {
+			return dmblock.ErrMembershipChanged
+		}
+	}
+	return nil
+}
+
 // isDMAllowedByRelationship checks if DM is allowed based on friends-of-friends
 // or shared-server relationship. The direct-friend case is already handled
 // upstream by enforceDMPrivacy at the call site, so this function covers only
@@ -664,38 +960,20 @@ func (h *Handler) isDMAllowedByRelationship(senderID, targetID string, privacyLe
 	return false, nil
 }
 
-// returnExistingConversation checks for an existing 1:1 conversation and returns it if found.
-// Returns true if the response was written (existing conversation found or DB error).
-func (h *Handler) returnExistingConversation(c *gin.Context, userID, targetUserID string) bool {
-	var existingID string
-	err := h.db.QueryRow(`
-		SELECT dc.id FROM dm_conversations dc
-		JOIN dm_participants p1 ON p1.conversation_id = dc.id AND p1.user_id = $1
-		JOIN dm_participants p2 ON p2.conversation_id = dc.id AND p2.user_id = $2
-		WHERE dc.is_group = FALSE
-		LIMIT 1
-	`, userID, targetUserID).Scan(&existingID)
-
-	if err == nil {
-		conv := h.fetchConversationResponse(existingID, userID)
-		if conv != nil {
-			c.JSON(http.StatusOK, gin.H{"conversation": conv})
-			return true
-		}
-	} else if err != sql.ErrNoRows {
-		h.log.Error("Failed to check existing DM", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedOpenConversation})
-		return true
-	}
-	return false
-}
-
 // createOneOnOneConversation creates a new 1:1 DM conversation with both participants.
-func (h *Handler) createOneOnOneConversation(userID, targetUserID string) (string, error) {
-	tx, err := h.db.Begin()
+func (h *Handler) createOneOnOneConversation(ctx context.Context, userID, targetUserID, credentialEpoch string) (string, bool, error) {
+	creator, err := uuid.Parse(userID)
+	if err != nil {
+		return "", false, fmt.Errorf("parse dm creator: %w", err)
+	}
+	target, err := uuid.Parse(targetUserID)
+	if err != nil {
+		return "", false, fmt.Errorf("parse dm target: %w", err)
+	}
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		h.log.Error(errMsgFailedStartTransaction, "error", err)
-		return "", err
+		return "", false, err
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
@@ -703,24 +981,53 @@ func (h *Handler) createOneOnOneConversation(userID, targetUserID string) (strin
 		}
 	}()
 
+	users := []uuid.UUID{creator, target}
+	if err := LockPrivateVoiceScopesTx(ctx, tx, users); err != nil {
+		return "", false, err
+	}
+	if err := dmblock.PrepareNewConversationTx(ctx, tx, users, dmblock.LockShare); err != nil {
+		return "", false, err
+	}
+	if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+		return "", false, err
+	}
+	if err := recheckDMTopologyTx(ctx, tx, creator, users); err != nil {
+		return "", false, err
+	}
+	var existingID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT dc.id FROM dm_conversations dc
+		JOIN dm_participants p1 ON p1.conversation_id = dc.id AND p1.user_id = $1
+		JOIN dm_participants p2 ON p2.conversation_id = dc.id AND p2.user_id = $2
+		WHERE dc.is_group = FALSE LIMIT 1`, userID, targetUserID).Scan(&existingID)
+	if err == nil {
+		if err := h.commitDMTopologyEffect(tx); err != nil {
+			return "", false, fmt.Errorf("commit existing dm lookup: %w", err)
+		}
+		return existingID, false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", false, fmt.Errorf("recheck existing dm: %w", err)
+	}
+
 	convID := uuid.New().String()
-	if _, err = tx.Exec(`INSERT INTO dm_conversations (id, is_group, created_by) VALUES ($1, FALSE, $2)`, convID, userID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO dm_conversations (id, is_group, created_by) VALUES ($1, FALSE, $2)`, convID, userID); err != nil {
 		h.log.Error("Failed to create DM conversation", "error", err)
-		return "", err
+		return "", false, err
 	}
-	if _, err = tx.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, userID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, userID); err != nil {
 		h.log.Error("Failed to add DM participant", "error", err)
-		return "", err
+		return "", false, err
 	}
-	if _, err = tx.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, targetUserID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, targetUserID); err != nil {
 		h.log.Error("Failed to add DM participant", "error", err)
-		return "", err
+		return "", false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := h.commitDMTopologyEffect(tx); err != nil {
 		h.log.Error("Failed to commit DM creation", "error", err)
-		return "", err
+		return "", false, err
 	}
-	return convID, nil
+	return convID, true, nil
 }
 
 // notifyDMCreated sends a dm_conversation_created WebSocket event to the target user.
@@ -786,7 +1093,25 @@ func (h *Handler) CreateGroup(c *gin.Context) {
 
 	allUserIDs := append([]string{userID}, req.UserIDs...)
 
-	convID, err := h.insertGroupConversation(req.Name, userID, allUserIDs)
+	convID, err := h.insertGroupConversation(
+		c.Request.Context(), req.Name, userID, allUserIDs, middleware.TokenCredentialEpoch(c),
+	)
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		h.respondGuardTxError(c, err, errMsgFailedCreateGroup)
+		return
+	}
+	if errors.Is(err, errDMTopologyPrivacy) || errors.Is(err, errDMTopologyBlocked) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "privacy_blocked"})
+		return
+	}
+	if errors.Is(err, errMemberRemovalStateDrifted) {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgFailedAddMember})
+		return
+	}
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to create group DM", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateGroup})
@@ -818,8 +1143,16 @@ func validateGroupMembers(userIDs []string, callerID string) string {
 	return ""
 }
 
-func (h *Handler) insertGroupConversation(name *string, creatorID string, allUserIDs []string) (string, error) {
-	tx, err := h.db.Begin()
+func (h *Handler) insertGroupConversation(ctx context.Context, name *string, creatorID string, allUserIDs []string, credentialEpoch string) (string, error) {
+	users := make([]uuid.UUID, 0, len(allUserIDs))
+	for _, raw := range allUserIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return "", fmt.Errorf("parse group participant: %w", err)
+		}
+		users = append(users, id)
+	}
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		h.log.Error(errMsgFailedStartTransaction, "error", err)
 		return "", err
@@ -830,8 +1163,20 @@ func (h *Handler) insertGroupConversation(name *string, creatorID string, allUse
 		}
 	}()
 
+	if err := LockPrivateVoiceScopesTx(ctx, tx, users); err != nil {
+		return "", err
+	}
+	if err := dmblock.PrepareNewConversationTx(ctx, tx, users, dmblock.LockShare); err != nil {
+		return "", err
+	}
+	if err := credepoch.GuardTx(ctx, tx, creatorID, credentialEpoch); err != nil {
+		return "", err
+	}
+	if err := recheckDMTopologyTx(ctx, tx, users[0], users); err != nil {
+		return "", err
+	}
 	convID := uuid.New().String()
-	if _, err = tx.Exec(`
+	if _, err = tx.ExecContext(ctx, `
 		INSERT INTO dm_conversations (id, is_group, name, created_by)
 		VALUES ($1, TRUE, $2, $3)
 	`, convID, name, creatorID); err != nil {
@@ -842,7 +1187,7 @@ func (h *Handler) insertGroupConversation(name *string, creatorID string, allUse
 		return "", err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := h.commitDMTopologyEffect(tx); err != nil {
 		h.log.Error("Failed to commit group DM creation", "error", err)
 		return "", err
 	}
@@ -964,14 +1309,73 @@ func (h *Handler) UpdateConversation(c *gin.Context) {
 		return
 	}
 
-	_, err = h.db.Exec(`UPDATE dm_conversations SET name = $1, updated_at = NOW() WHERE id = $2`, req.Name, convID)
+	actor, err := uuid.Parse(userID)
 	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		err = h.updateConversationTx(c.Request.Context(), convID, userID, actor, middleware.TokenCredentialEpoch(c), req.Name)
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		break
+	}
+	if err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			h.respondGuardTxError(c, err, errMsgFailedUpdateConversation)
+			return
+		}
+		if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+			return
+		}
 		h.log.Error("Failed to update conversation", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Conversation updated"})
+}
+
+// updateConversationTx repeats the preflight authority check under the
+// topology and credential fence. A caller who was removed or demoted between
+// the preflight and write therefore cannot rename the group.
+func (h *Handler) updateConversationTx(ctx context.Context, convID, userID string, actor uuid.UUID, credentialEpoch string, name *string) error {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+		}
+	}()
+	if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockNoKeyUpdate); err != nil {
+		return err
+	}
+	if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+		return err
+	}
+	var isGroup bool
+	var role string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.role FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1 FOR SHARE OF dc, dp
+	`, convID, userID).Scan(&isGroup, &role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return dmblock.ErrUnavailable
+		}
+		return err
+	}
+	if !isGroup || role != "admin" {
+		return dmblock.ErrUnavailable
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dm_conversations SET name = $1, updated_at = NOW() WHERE id = $2`, name, convID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // --- Member Management Endpoints ---
@@ -1030,27 +1434,7 @@ func (h *Handler) AddMember(c *gin.Context) {
 		return
 	}
 
-	// Check target user exists
-	var exists bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, req.UserID).Scan(&exists); err != nil {
-		h.log.Error("Failed to check user existence", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
-		return
-	}
-	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgUserNotFound})
-		return
-	}
-
-	// Check target not already a participant
-	var alreadyIn bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, req.UserID).Scan(&alreadyIn); err != nil {
-		h.log.Error("Failed to check participant", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
-		return
-	}
-	if alreadyIn {
-		c.JSON(http.StatusConflict, gin.H{"error": "User is already a participant"})
+	if !h.validateAddMemberTarget(c, convID, req.UserID) {
 		return
 	}
 
@@ -1059,9 +1443,21 @@ func (h *Handler) AddMember(c *gin.Context) {
 		return
 	}
 
-	// Begin transaction: insert participant + record key revocation
-	maxVersion, err := h.addMemberTx(convID, req.UserID)
-	if err != nil {
+	maxVersion, err := h.addMemberWithRetry(c.Request.Context(), convID, req.UserID, userID, middleware.TokenCredentialEpoch(c))
+	switch {
+	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+		h.respondGuardTxError(c, err, errMsgFailedAddMember)
+		return
+	case errors.Is(err, errDMTopologyPrivacy), errors.Is(err, errDMTopologyBlocked):
+		c.JSON(http.StatusForbidden, gin.H{"error": "privacy_blocked"})
+		return
+	case errors.Is(err, errMemberRemovalStateDrifted):
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgFailedAddMember})
+		return
+	case errors.Is(err, dmblock.ErrUnavailable), errors.Is(err, dmblock.ErrMembershipChanged):
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	case err != nil:
 		h.log.Error("Failed to add member", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
 		return
@@ -1074,10 +1470,62 @@ func (h *Handler) AddMember(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"conversation": conv})
 }
 
+// validateAddMemberTarget checks that the target user exists and is not already
+// in the group before the transactional topology recheck performed by addMemberTx.
+func (h *Handler) validateAddMemberTarget(c *gin.Context, convID, targetUserID string) bool {
+	var exists bool
+	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, targetUserID).Scan(&exists); err != nil {
+		h.log.Error("Failed to check user existence", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
+		return false
+	}
+	if !exists {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgUserNotFound})
+		return false
+	}
+
+	var alreadyIn bool
+	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, targetUserID).Scan(&alreadyIn); err != nil {
+		h.log.Error("Failed to check participant", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
+		return false
+	}
+	if alreadyIn {
+		c.JSON(http.StatusConflict, gin.H{"error": "User is already a participant"})
+		return false
+	}
+	return true
+}
+
 // addMemberTx inserts a new participant and records key revocation in a transaction.
 // Returns the max key version before revocation.
-func (h *Handler) addMemberTx(convID, targetUserID string) (int, error) {
-	tx, err := h.db.Begin()
+func (h *Handler) addMemberWithRetry(ctx context.Context, convID, targetUserID, callerUserID, credentialEpoch string) (int, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		preflight, err := h.fetchParticipantIDs(convID)
+		if err != nil {
+			return 0, fmt.Errorf("read group participants: %w", err)
+		}
+		maxVersion, err := h.addMemberTx(ctx, convID, targetUserID, callerUserID, credentialEpoch, preflight)
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return maxVersion, err
+	}
+	return 0, dmblock.ErrMembershipChanged
+}
+
+// addMemberTx retains the current successor-claim cue model while rechecking
+// the complete topology and credential epoch under the canonical lock prefix.
+func (h *Handler) addMemberTx(ctx context.Context, convID, targetUserID, callerUserID, credentialEpoch string, preflightParticipants []string) (int, error) {
+	users := make([]uuid.UUID, 0, len(preflightParticipants)+1)
+	for _, raw := range append(append([]string(nil), preflightParticipants...), targetUserID) {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return 0, fmt.Errorf("parse add-member topology user: %w", err)
+		}
+		users = append(users, id)
+	}
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -1087,14 +1535,75 @@ func (h *Handler) addMemberTx(convID, targetUserID string) (int, error) {
 		}
 	}()
 
-	var lockedConversationID string
-	if err := tx.QueryRow(
-		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
-	).Scan(&lockedConversationID); err != nil {
+	if err := LockPrivateVoiceScopesTx(ctx, tx, users); err != nil {
 		return 0, err
 	}
+	conversationUUID, err := uuid.Parse(convID)
+	if err != nil {
+		return 0, fmt.Errorf("parse add-member conversation: %w", err)
+	}
+	targetUUID, err := uuid.Parse(targetUserID)
+	if err != nil {
+		return 0, fmt.Errorf("parse add-member target: %w", err)
+	}
+	lockedSubjects, err := dmblock.LockConversationUsersTx(ctx, tx, convID, []uuid.UUID{targetUUID}, dmblock.LockShare)
+	if err != nil {
+		return 0, err
+	}
+	if err := LockDMVoiceParticipantSetTx(ctx, tx, conversationUUID); err != nil {
+		return 0, err
+	}
+	if _, err := dmblock.PrepareConversationAfterUserLocksTx(ctx, tx, convID, lockedSubjects, dmblock.LockNoKeyUpdate); err != nil {
+		return 0, err
+	}
+	if err := credepoch.GuardTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
+		return 0, err
+	}
+	currentParticipants, err := fetchParticipantIDsTx(ctx, tx, convID)
+	if err != nil {
+		return 0, err
+	}
+	if !sameStringSet(currentParticipants, preflightParticipants) {
+		return 0, dmblock.ErrMembershipChanged
+	}
+	caller, err := uuid.Parse(callerUserID)
+	if err != nil {
+		return 0, fmt.Errorf("parse add-member actor: %w", err)
+	}
+	if err := recheckDMTopologyTx(ctx, tx, caller, users); err != nil {
+		return 0, err
+	}
+	var isGroup bool
+	var role string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.role FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1 FOR SHARE OF dc, dp`, convID, callerUserID).Scan(&isGroup, &role); err != nil {
+		return 0, fmt.Errorf("recheck add-member authority: %w", err)
+	}
+	if !isGroup || role != "admin" {
+		return 0, dmblock.ErrMembershipChanged
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM dm_participants WHERE conversation_id = $1`, convID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("recheck participant count: %w", err)
+	}
+	if count >= 10 {
+		return 0, dmblock.ErrMembershipChanged
+	}
+	var pendingEjection int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1 FROM dm_block_voice_ejections
+		WHERE conversation_id = $1 AND user_id = $2
+	`, convID, targetUserID).Scan(&pendingEjection)
+	if err == nil {
+		return 0, errMemberRemovalStateDrifted
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("check pending member ejection: %w", err)
+	}
 
-	if _, err := tx.Exec(`INSERT INTO dm_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`, convID, targetUserID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO dm_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`, convID, targetUserID); err != nil {
 		return 0, err
 	}
 
@@ -1105,11 +1614,11 @@ func (h *Handler) addMemberTx(convID, targetUserID string) (int, error) {
 	// 2026-09-17 lockout — revoked the only epoch anyone held before any
 	// successor existed, and left the conversation unreadable until one did.
 	var maxVersion int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&maxVersion); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&maxVersion); err != nil {
 		return 0, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := h.commitDMTopologyEffect(tx); err != nil {
 		return 0, err
 	}
 	return maxVersion, nil
@@ -1242,9 +1751,15 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 
 	// Execute removal in transaction. A delivery error is post-commit: the
 	// membership change and its durable reconciliation plan both remain.
-	newCreatorID, maxVersion, err := h.removeMemberTx(c.Request.Context(), convID, targetUserID, userID)
+	newCreatorID, maxVersion, err := h.removeMemberTx(c.Request.Context(), convID, targetUserID, userID, middleware.TokenCredentialEpoch(c))
 	deliveryIncomplete := errors.Is(err, activepresence.ErrDeliveryIncomplete)
 	switch {
+	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+		h.respondGuardTxError(c, err, errMsgFailedRemoveMember)
+		return
+	case errors.Is(err, dmblock.ErrUnavailable), errors.Is(err, dmblock.ErrMembershipChanged):
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
 	case errors.Is(err, errCandidateSetDrifted), errors.Is(err, errMemberRemovalStateDrifted):
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgFailedRemoveMember})
 		return
@@ -1277,24 +1792,35 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 // Returns the new creator ID (empty if no transfer) and the max key version.
 func (h *Handler) removeMemberTx(
 	ctx context.Context,
-	convID, targetUserID, callerUserID string,
+	convID, targetUserID, callerUserID, credentialEpoch string,
 ) (string, int, error) {
 	targetID, err := uuid.Parse(targetUserID)
 	if err != nil {
 		return "", 0, fmt.Errorf("parse target user ID: %w", err)
 	}
-	preflight, err := h.readMemberRemovalPreflight(ctx, convID, targetID)
-	if err != nil {
-		return "", 0, err
-	}
-	if h.afterCandidateReadHook != nil {
-		h.afterCandidateReadHook()
-	}
+	for attempt := 0; attempt < 2; attempt++ {
+		preflight, preflightErr := h.readMemberRemovalPreflight(ctx, convID, targetID)
+		if preflightErr != nil {
+			return "", 0, preflightErr
+		}
+		if h.afterCandidateReadHook != nil {
+			h.afterCandidateReadHook()
+		}
 
-	if preflight.targetActive {
-		return h.removeActiveMemberTx(ctx, convID, targetID, callerUserID, preflight)
+		var removeErr error
+		var newCreatorID string
+		var maxVersion int
+		if preflight.targetActive {
+			newCreatorID, maxVersion, removeErr = h.removeActiveMemberTx(ctx, convID, targetID, callerUserID, credentialEpoch, preflight)
+		} else {
+			newCreatorID, maxVersion, removeErr = h.removeInactiveMemberTx(ctx, convID, targetID, callerUserID, credentialEpoch, preflight)
+		}
+		if errors.Is(removeErr, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return newCreatorID, maxVersion, removeErr
 	}
-	return h.removeInactiveMemberTx(ctx, convID, targetID, callerUserID, preflight)
+	return "", 0, dmblock.ErrMembershipChanged
 }
 
 type dmRowQuerier interface {
@@ -1304,6 +1830,7 @@ type dmRowQuerier interface {
 type memberRemovalPreflight struct {
 	creatorID       string
 	successorID     string
+	participantIDs  []string
 	targetActive    bool
 	successorActive bool
 	activeSubjects  []uuid.UUID
@@ -1320,6 +1847,11 @@ func (h *Handler) readMemberRemovalPreflight(
 	).Scan(&preflight.creatorID); err != nil {
 		return memberRemovalPreflight{}, fmt.Errorf("read member-removal creator: %w", err)
 	}
+	participantIDs, err := h.fetchParticipantIDs(convID)
+	if err != nil {
+		return memberRemovalPreflight{}, fmt.Errorf("read member-removal participants: %w", err)
+	}
+	preflight.participantIDs = participantIDs
 	candidates, err := readVoiceCandidates(ctx, h.db, convID)
 	if err != nil {
 		return memberRemovalPreflight{}, fmt.Errorf("read voice candidates: %w", err)
@@ -1355,6 +1887,7 @@ func (h *Handler) removeActiveMemberTx(
 	convID string,
 	targetID uuid.UUID,
 	callerUserID string,
+	credentialEpoch string,
 	preflight memberRemovalPreflight,
 ) (string, int, error) {
 	if h.activePlans == nil {
@@ -1363,14 +1896,37 @@ func (h *Handler) removeActiveMemberTx(
 	var newCreatorID string
 	var maxVersion int
 	err := h.activePlans.WithGatedTx(ctx, preflight.activeSubjects, func(tx *sql.Tx) error {
-		if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects, callerUserID); err != nil {
+		if err := lockMemberRemovalPrivateVoiceScopes(ctx, tx, preflight.activeSubjects); err != nil {
+			return err
+		}
+		if h.afterPrivateVoiceScopesLockHook != nil {
+			h.afterPrivateVoiceScopesLockHook()
+		}
+		actor, err := uuid.Parse(callerUserID)
+		if err != nil {
+			return fmt.Errorf("parse member-removal actor: %w", err)
+		}
+		lockedSubjects, err := dmblock.LockConversationUsersTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockNoKeyUpdate)
+		if err != nil {
+			return err
+		}
+		conversationID, err := uuid.Parse(convID)
+		if err != nil {
+			return fmt.Errorf("parse member-removal conversation: %w", err)
+		}
+		if err := LockDMVoiceParticipantSetTx(ctx, tx, conversationID); err != nil {
+			return err
+		}
+		if _, err := dmblock.PrepareResolutionConversationAfterUserLocksTx(ctx, tx, convID, lockedSubjects, dmblock.LockNoKeyUpdate); err != nil {
+			return err
+		}
+		if err := credepoch.GuardTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
 			return err
 		}
 		if h.afterUsersLockHook != nil {
 			h.afterUsersLockHook(tx)
 		}
 		var keys []activepresence.PlanKey
-		var err error
 		newCreatorID, maxVersion, keys, err = h.removeMemberRowsTx(
 			ctx, tx, convID, targetID, callerUserID, preflight,
 		)
@@ -1390,6 +1946,7 @@ func (h *Handler) removeInactiveMemberTx(
 	convID string,
 	targetID uuid.UUID,
 	callerUserID string,
+	credentialEpoch string,
 	preflight memberRemovalPreflight,
 ) (string, int, error) {
 	tx, err := h.db.BeginTx(ctx, nil)
@@ -1401,7 +1958,31 @@ func (h *Handler) removeInactiveMemberTx(
 			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
 		}
 	}()
-	if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects, callerUserID); err != nil {
+	if err := lockMemberRemovalPrivateVoiceScopes(ctx, tx, preflight.activeSubjects); err != nil {
+		return "", 0, err
+	}
+	if h.afterPrivateVoiceScopesLockHook != nil {
+		h.afterPrivateVoiceScopesLockHook()
+	}
+	actor, err := uuid.Parse(callerUserID)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse member-removal actor: %w", err)
+	}
+	lockedSubjects, err := dmblock.LockConversationUsersTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockNoKeyUpdate)
+	if err != nil {
+		return "", 0, err
+	}
+	conversationID, err := uuid.Parse(convID)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse member-removal conversation: %w", err)
+	}
+	if err := LockDMVoiceParticipantSetTx(ctx, tx, conversationID); err != nil {
+		return "", 0, err
+	}
+	if _, err := dmblock.PrepareResolutionConversationAfterUserLocksTx(ctx, tx, convID, lockedSubjects, dmblock.LockNoKeyUpdate); err != nil {
+		return "", 0, err
+	}
+	if err := credepoch.GuardTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
 		return "", 0, err
 	}
 
@@ -1417,26 +1998,15 @@ func (h *Handler) removeInactiveMemberTx(
 	return newCreatorID, maxVersion, nil
 }
 
-func lockMemberRemovalActiveSubjects(
+func lockMemberRemovalPrivateVoiceScopes(
 	ctx context.Context,
 	tx *sql.Tx,
 	subjects []uuid.UUID,
-	callerUserID string,
 ) error {
-	if len(subjects) > 0 {
-		if err := LockPrivateVoiceScopesTx(ctx, tx, subjects); err != nil {
-			return err
-		}
+	if len(subjects) == 0 {
+		return nil
 	}
-	callerID, err := uuid.Parse(callerUserID)
-	if err != nil {
-		return fmt.Errorf("parse caller user ID: %w", err)
-	}
-	candidates := subjects
-	if !slices.Contains(subjects, callerID) {
-		candidates = append([]uuid.UUID{callerID}, subjects...)
-	}
-	return lockVoiceCandidates(ctx, tx, candidates)
+	return LockPrivateVoiceScopesTx(ctx, tx, subjects)
 }
 
 // removeMemberRowsTx is the shared, ordered mutation body. Inactive-to-active
@@ -1450,15 +2020,12 @@ func (h *Handler) removeMemberRowsTx(
 	callerUserID string,
 	preflight memberRemovalPreflight,
 ) (string, int, []activepresence.PlanKey, error) {
-	conversationID, err := uuid.Parse(convID)
+	currentParticipants, err := fetchParticipantIDsTx(ctx, tx, convID)
 	if err != nil {
-		return "", 0, nil, fmt.Errorf("parse conversation ID: %w", err)
-	}
-	if err := LockDMVoiceParticipantSetTx(ctx, tx, conversationID); err != nil {
 		return "", 0, nil, err
 	}
-	if err := lockMemberRemovalConversation(ctx, tx, convID); err != nil {
-		return "", 0, nil, err
+	if !sameStringSet(currentParticipants, preflight.participantIDs) {
+		return "", 0, nil, dmblock.ErrMembershipChanged
 	}
 	createdBy, err := revalidateRemoveMemberAuthority(ctx, tx, convID, targetID, callerUserID)
 	if err != nil {
@@ -1484,8 +2051,14 @@ func (h *Handler) removeMemberRowsTx(
 	if err != nil {
 		return "", 0, nil, err
 	}
+	if err := dmblock.EnqueueVoiceEjectionsTx(ctx, tx, convID, []uuid.UUID{targetID}); err != nil {
+		return "", 0, nil, err
+	}
 	maxVersion, err := removeMemberRows(ctx, tx, convID, targetID)
 	if err != nil {
+		return "", 0, nil, err
+	}
+	if err := dmblock.ValidateConversationResolvedTx(ctx, tx, convID); err != nil {
 		return "", 0, nil, err
 	}
 	return newCreatorID, maxVersion, keys, nil
@@ -1582,19 +2155,6 @@ func removeMemberRows(
 		return 0, fmt.Errorf("read max key version: %w", err)
 	}
 	return maxVersion, nil
-}
-
-// lockMemberRemovalConversation locks the parent strongly enough to serialize
-// concurrent membership writes without taking the deletion-only FOR UPDATE
-// lock used by group deletion.
-func lockMemberRemovalConversation(ctx context.Context, tx *sql.Tx, convID string) error {
-	var lockedConversationID string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
-	).Scan(&lockedConversationID); err != nil {
-		return fmt.Errorf("lock member-removal conversation: %w", err)
-	}
-	return nil
 }
 
 // revalidateRemoveMemberAuthority locks the caller's membership after the
@@ -1866,6 +2426,15 @@ func (h *Handler) MarkRead(c *gin.Context) {
 
 // --- E2EE Key Endpoints ---
 
+type dmKeyResponse struct {
+	ID             string `json:"id"`
+	ConversationID string `json:"conversation_id"`
+	UserID         string `json:"user_id"`
+	WrappedKey     string `json:"wrapped_key"`
+	KeyVersion     int    `json:"key_version"`
+	CreatedAt      string `json:"created_at"`
+}
+
 // GetKeys returns the caller's wrapped key for a DM conversation.
 // GET /dm/conversations/:id/keys
 func (h *Handler) GetKeys(c *gin.Context) {
@@ -1876,50 +2445,80 @@ func (h *Handler) GetKeys(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
 		return
 	}
+	actor, err := uuid.Parse(userID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
 
-	if !h.isParticipant(convID, userID) {
+	var key dmKeyResponse
+	for attempt := 0; attempt < 2; attempt++ {
+		err = h.readDMKeyTx(c.Request.Context(), convID, userID, middleware.TokenCredentialEpoch(c), actor, &key)
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		break
+	}
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	if errors.Is(err, errMemberRemovalStateDrifted) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
 		return
 	}
-
-	// Existence check (all DMs are encrypted under E2EE-everywhere #201).
-	var exists bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_conversations WHERE id = $1)`, convID).Scan(&exists); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch keys"})
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		h.respondGuardTxError(c, err, "Failed to fetch keys")
 		return
 	}
-	if !exists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Conversation not found"})
-		return
-	}
-
-	type keyResponse struct {
-		ID             string `json:"id"`
-		ConversationID string `json:"conversation_id"`
-		UserID         string `json:"user_id"`
-		WrappedKey     string `json:"wrapped_key"`
-		KeyVersion     int    `json:"key_version"`
-		CreatedAt      string `json:"created_at"`
-	}
-
-	var key keyResponse
-	err := h.db.QueryRow(`
-		SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
-		FROM dm_channel_keys
-		WHERE conversation_id = $1 AND user_id = $2
-		ORDER BY key_version DESC LIMIT 1
-	`, convID, userID).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
-
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No encryption key available yet", "pending": true})
 		return
-	} else if err != nil {
+	}
+	if err != nil {
 		h.log.Error("Failed to fetch DM key", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch keys"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"key": key})
+}
+
+// readDMKeyTx fences key material behind the complete participant topology so
+// a blocked or concurrently removed member cannot read a stale wrapped key.
+func (h *Handler) readDMKeyTx(ctx context.Context, convID, userID, credentialEpoch string, actor uuid.UUID, key *dmKeyResponse) error {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dm key read: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+		}
+	}()
+	if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockShare); err != nil {
+		return err
+	}
+	if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+		return err
+	}
+	var participant string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, convID, userID,
+	).Scan(&participant); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errMemberRemovalStateDrifted
+		}
+		return fmt.Errorf("lock dm key participant: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
+		FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2
+		ORDER BY key_version DESC LIMIT 1
+	`, convID, userID).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // respondGuardTxError discriminates a credential-epoch fence rejection (#2201)
@@ -1982,25 +2581,29 @@ func (h *Handler) loadVoiceJoinState(c *gin.Context, convID, userID string) (voi
 // Redis voice-state mutation. Retirement's FOR UPDATE waits on this key-share
 // lock, so a successful voice transition cannot lose its conversation parent.
 func (h *Handler) beginDMVoiceMembershipTx(c *gin.Context, convID, userID string) (*sql.Tx, bool) {
-	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	userUUID, err := uuid.Parse(userID)
 	if err != nil {
-		h.log.Error("Failed to begin DM voice membership transaction", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCallerID})
 		return nil, false
 	}
-	if err := lockDMVoiceMembership(c.Request.Context(), tx, convID, userID); err != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			h.log.Error("Failed to roll back DM voice membership transaction", "error", rollbackErr)
-		}
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
-			return nil, false
-		}
-		h.log.Error("Failed to lock DM voice membership", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+	tx, err := h.beginDMTopologyEffectWithCredential(
+		c.Request.Context(), convID, userID, middleware.TokenCredentialEpoch(c),
+		[]uuid.UUID{userUUID}, dmblock.LockShare,
+	)
+	if err == nil {
+		return tx, true
+	}
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		h.respondGuardTxError(c, err, errMsgFailedAuthorize)
 		return nil, false
 	}
-	return tx, true
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return nil, false
+	}
+	h.log.Error("Failed to begin guarded DM voice membership transaction", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+	return nil, false
 }
 
 func lockDMVoiceMembership(ctx context.Context, tx *sql.Tx, convID, userID string) error {
@@ -2028,6 +2631,12 @@ func rollbackDMVoiceMembershipTx(tx *sql.Tx, log *logger.Logger) {
 	}
 }
 
+const dmVoiceJoinCompensationTimeout = 5 * time.Second
+
+func dmVoiceJoinCompensationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), dmVoiceJoinCompensationTimeout)
+}
+
 func loadVoiceJoinStateTx(ctx context.Context, tx *sql.Tx, convID, userID string) (voiceJoinState, error) {
 	var state voiceJoinState
 	err := tx.QueryRowContext(ctx, `
@@ -2042,15 +2651,38 @@ func loadVoiceJoinStateTx(ctx context.Context, tx *sql.Tx, convID, userID string
 	return state, nil
 }
 
-func (h *Handler) promotePendingDMVoiceCall(ctx context.Context, convUUID uuid.UUID, ring *PendingCall) error {
+func (h *Handler) reservePendingDMVoiceCall(ctx context.Context, convUUID uuid.UUID, ring *PendingCall) error {
 	if err := RefreshDMVoiceCallLease(ctx, h.redis, VoiceCallLease{
 		ConversationID: convUUID,
 		CallID:         ring.RingID,
 		RingID:         ring.RingID,
 		CallerUserID:   ring.CallerUserID,
-	}, acceptedDMCallCorrelationTTL, true); err != nil {
+	}, DMVoiceCallReservationTTL, true); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (h *Handler) activateAcceptedDMVoiceLease(ctx context.Context, convID, callID uuid.UUID) error {
+	var err error
+	if h.activateAcceptedDMVoiceLeaseForTest != nil {
+		err = h.activateAcceptedDMVoiceLeaseForTest(ctx, convID, callID, acceptedDMCallCorrelationTTL)
+	} else {
+		err = ActivateAcceptedDMVoiceCallLease(ctx, h.redis, convID, callID, acceptedDMCallCorrelationTTL)
+	}
+	if err == nil {
+		return nil
+	}
+	confirmCtx, cancelConfirm := dmVoiceJoinCompensationContext(ctx)
+	defer cancelConfirm()
+	lease, found, confirmErr := LookupDMVoiceCallLease(confirmCtx, h.redis, convID)
+	if confirmErr == nil && found && lease.CallID == callID && lease.RingID == callID && lease.Promoted {
+		return nil
+	}
+	return err
+}
+
+func (h *Handler) announceAcceptedDMVoiceCall(convUUID uuid.UUID, ring *PendingCall) {
 	rememberAcceptedDMCall(ring, acceptedDMCallCorrelationTTL)
 	h.hub.BroadcastToDMParticipants(convUUID, websocket.OutgoingMessage{
 		Type: "dm_voice_call_canceled",
@@ -2060,55 +2692,56 @@ func (h *Handler) promotePendingDMVoiceCall(ctx context.Context, convUUID uuid.U
 			"canceled_by":     "someone_accepted",
 		},
 	})
-	return nil
 }
 
 func (h *Handler) acceptPendingDMVoiceCall(
 	c *gin.Context,
 	convUUID, userUUID, requestedRingID uuid.UUID,
-) (uuid.UUID, bool) {
+	onAccepted func(*PendingCall) error,
+) (*PendingCall, uuid.UUID, bool, bool) {
 	storedAny, loaded := pendingDMCalls.Load(convUUID)
 	if !loaded {
-		return uuid.Nil, true
+		return nil, uuid.Nil, false, true
 	}
 	ring, ok := storedAny.(*PendingCall)
 	if !ok || ring.CallerUserID == userUUID {
-		return uuid.Nil, true
+		return nil, uuid.Nil, false, true
 	}
 	if requestedRingID != uuid.Nil && requestedRingID != ring.RingID {
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingChanged})
-		return uuid.Nil, false
+		return nil, uuid.Nil, false, false
 	}
 	transition, err := ring.tryAccept(userUUID, func() error {
-		return h.promotePendingDMVoiceCall(c.Request.Context(), convUUID, ring)
+		return onAccepted(ring)
 	})
 	if err != nil {
 		h.log.Error("Failed to establish accepted DM call lease", "error", err,
 			"conversation_id", sanitizeLogValue(c.Param("id")), "ring_id", ring.RingID.String())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return uuid.Nil, false
+		return nil, ring.RingID, false, false
 	}
 	if transition == acceptTransitionExpired {
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
-		return uuid.Nil, false
+		return nil, uuid.Nil, false, false
 	}
 	if transition != acceptTransitionAccepted {
-		return uuid.Nil, true
+		return nil, uuid.Nil, false, true
 	}
-	ring.finalizeTerminal()
-	return ring.RingID, true
+	return ring, ring.RingID, true, true
 }
 
 func (h *Handler) resolveVoiceJoinCallID(
 	c *gin.Context,
 	convUUID, userUUID, requestedRingID uuid.UUID,
-) (uuid.UUID, bool) {
-	callID, ok := h.acceptPendingDMVoiceCall(c, convUUID, userUUID, requestedRingID)
-	if !ok || callID != uuid.Nil {
-		return callID, ok
+	onAccepted func(*PendingCall) error,
+) (uuid.UUID, bool, *PendingCall, bool) {
+	ring, callID, accepted, ok := h.acceptPendingDMVoiceCall(c, convUUID, userUUID, requestedRingID, onAccepted)
+	if !ok || accepted {
+		return callID, accepted, ring, ok
 	}
 	if requestedRingID == uuid.Nil {
-		return h.resolveDirectVoiceJoinCallID(c, convUUID, userUUID)
+		callID, leaseOwned, ok := h.resolveDirectVoiceJoinCallID(c, convUUID, userUUID)
+		return callID, leaseOwned, nil, ok
 	}
 
 	lease, found, err := LookupDMVoiceCallLease(c.Request.Context(), h.redis, convUUID)
@@ -2116,23 +2749,23 @@ func (h *Handler) resolveVoiceJoinCallID(
 		h.log.Error("Failed to lookup accepted DM call lease", "error", err,
 			"conversation_id", sanitizeLogValue(c.Param("id")))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return uuid.Nil, false
+		return uuid.Nil, false, nil, false
 	}
 	if found && lease.CallID == requestedRingID && lease.RingID == requestedRingID {
-		return requestedRingID, true
+		return requestedRingID, false, nil, true
 	}
 	c.JSON(http.StatusConflict, gin.H{"error": "Voice call ring is no longer active"})
-	return uuid.Nil, false
+	return uuid.Nil, false, nil, false
 }
 
 func (h *Handler) resolveDirectVoiceJoinCallID(
 	c *gin.Context,
 	convUUID, userUUID uuid.UUID,
-) (uuid.UUID, bool) {
+) (uuid.UUID, bool, bool) {
 	// The ring caller may probe /voice/join while their invitation is still
 	// pending. Do not turn that unresolved ring into a competing direct call.
 	if _, ringing := pendingDMCalls.Load(convUUID); ringing {
-		return uuid.Nil, true
+		return uuid.Nil, false, true
 	}
 
 	lease, found, err := LookupDMVoiceCallLease(c.Request.Context(), h.redis, convUUID)
@@ -2140,10 +2773,10 @@ func (h *Handler) resolveDirectVoiceJoinCallID(
 		h.log.Error("Failed to lookup direct DM voice call lease", "error", err,
 			"conversation_id", sanitizeLogValue(c.Param("id")))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return uuid.Nil, false
+		return uuid.Nil, false, false
 	}
 	if found {
-		return lease.CallID, true
+		return lease.CallID, false, true
 	}
 
 	// Bind the short direct-call reservation to the renderer-facing join
@@ -2159,14 +2792,152 @@ func (h *Handler) resolveDirectVoiceJoinCallID(
 	); err != nil {
 		if errors.Is(err, ErrDMVoiceCallLeaseConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Voice call already active"})
-			return uuid.Nil, false
+			return uuid.Nil, false, false
 		}
 		h.log.Error("Failed to reserve direct DM voice call", "error", err,
 			"conversation_id", sanitizeLogValue(c.Param("id")))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return uuid.Nil, false
+		return uuid.Nil, false, false
 	}
-	return lease.CallID, true
+	return lease.CallID, true, true
+}
+
+func (h *Handler) authorizeVoiceJoinTx(
+	c *gin.Context,
+	convID, userID string,
+	convUUID, userUUID, requestedRingID uuid.UUID,
+) (voiceJoinState, uuid.UUID, bool) {
+	tx, started := h.beginDMVoiceMembershipTx(c, convID, userID)
+	if !started {
+		return voiceJoinState{}, uuid.Nil, false
+	}
+	committed := false
+	var callID uuid.UUID
+	var leaseRingID uuid.UUID
+	leaseOwned := false
+	retractJoinAuthorization := func() {
+		h.retractVoiceJoinAuthorization(c.Request.Context(), voiceJoinRetraction{
+			convUUID:    convUUID,
+			userUUID:    userUUID,
+			convID:      convID,
+			userID:      userID,
+			callID:      callID,
+			leaseRingID: leaseRingID,
+			leaseOwned:  leaseOwned,
+		})
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+		}
+		if !committed {
+			retractJoinAuthorization()
+		}
+	}()
+
+	joinState, err := loadVoiceJoinStateTx(c.Request.Context(), tx, convID, userID)
+	if err != nil {
+		h.log.Error("Failed to recheck locked DM voice membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinState{}, uuid.Nil, false
+	}
+
+	// A callee's join accepts an existing ring before a direct reservation can
+	// be considered. The lifecycle lock serializes that transition with ring
+	// cancellation and media-plane authorization.
+	unlockLifecycle := LockDMCallLifecycle(convUUID)
+	defer unlockLifecycle()
+	var acceptedRing *PendingCall
+	var resolved bool
+	callID, leaseOwned, acceptedRing, resolved = h.resolveVoiceJoinCallID(
+		c, convUUID, userUUID, requestedRingID,
+		func(ring *PendingCall) error {
+			callID = ring.RingID
+			leaseRingID = ring.RingID
+			if err := h.reservePendingDMVoiceCall(c.Request.Context(), convUUID, ring); err != nil {
+				return err
+			}
+			leaseOwned = true
+			if err := RememberDMVoiceJoinAdmission(
+				c.Request.Context(), h.redis, convUUID, userUUID, ring.RingID, DMVoiceCallReservationTTL,
+			); err != nil {
+				retractJoinAuthorization()
+				leaseOwned = false
+				return err
+			}
+			if err := h.commitDMTopologyEffect(tx); err != nil {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+					h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+				}
+				retractJoinAuthorization()
+				leaseOwned = false
+				return err
+			}
+			if err := h.activateAcceptedDMVoiceLease(c.Request.Context(), convUUID, ring.RingID); err != nil {
+				return err
+			}
+			committed = true
+			return nil
+		},
+	)
+	if !resolved {
+		return voiceJoinState{}, uuid.Nil, false
+	}
+	if acceptedRing != nil {
+		h.announceAcceptedDMVoiceCall(convUUID, acceptedRing)
+		acceptedRing.finalizeTerminal()
+		return joinState, callID, true
+	}
+	if !h.bindDMVoiceJoinAdmission(c, convUUID, userUUID, callID, convID) {
+		return voiceJoinState{}, uuid.Nil, false
+	}
+	if err := h.commitDMTopologyEffect(tx); err != nil {
+		h.log.Error("Failed to commit DM voice join authorization", "failure_class", "database")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return voiceJoinState{}, uuid.Nil, false
+	}
+	committed = true
+	return joinState, callID, true
+}
+
+type voiceJoinRetraction struct {
+	convUUID, userUUID  uuid.UUID
+	convID, userID      string
+	callID, leaseRingID uuid.UUID
+	leaseOwned          bool
+}
+
+func (h *Handler) retractVoiceJoinAuthorization(ctx context.Context, retraction voiceJoinRetraction) {
+	if retraction.callID == uuid.Nil {
+		return
+	}
+	compensationCtx, cancelCompensation := dmVoiceJoinCompensationContext(ctx)
+	defer cancelCompensation()
+	if err := RetractDMVoiceJoinAuthorization(
+		compensationCtx, h.redis, retraction.convUUID, retraction.userUUID,
+		retraction.callID, retraction.leaseRingID, retraction.leaseOwned,
+	); err != nil {
+		h.log.Error("Failed to compensate DM voice join", "failure_class", "dependency")
+	}
+	if retraction.leaseOwned {
+		h.dmPublishEnforcementUnconditionally(retraction.convID, retraction.userID, dmVoiceDisconnectSubject, "disconnect")
+	}
+}
+
+func (h *Handler) bindDMVoiceJoinAdmission(c *gin.Context, convUUID, userUUID, callID uuid.UUID, convID string) bool {
+	if callID == uuid.Nil {
+		return true
+	}
+	if err := RememberDMVoiceJoinAdmission(c.Request.Context(), h.redis, convUUID, userUUID, callID, DMVoiceCallReservationTTL); err == nil {
+		return true
+	} else if errors.Is(err, ErrDMVoiceCallLeaseConflict) {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
+	} else {
+		h.log.Error("Failed to bind DM voice join admission", "error", err,
+			"conversation_id", sanitizeLogValue(convID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+	}
+	return false
 }
 
 // AuthorizeVoiceJoin checks that a user can join a DM voice call.
@@ -2184,54 +2955,12 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 		return
 	}
 
-	// Verify participation and fetch enforcement state
-	joinState, authorized := h.loadVoiceJoinState(c, convID, userID)
+	// Retain the cheap preflight to reject an obvious non-member before the
+	// guarded transaction; authorizeVoiceJoinTx repeats it under the fence.
+	_, authorized := h.loadVoiceJoinState(c, convID, userID)
 	if !authorized {
 		return
 	}
-
-	// Accept-path coordination (Gitar #1231 finding G1, #1209 spec §6.1):
-	// when a CALLEE (not the original ring caller) authorizes a DM voice join
-	// while a pendingDMCall exists for this conversation, that's the signal
-	// to consummate the ring — clear it, stop the timeout timer, and broadcast
-	// dm_voice_call_canceled with canceled_by='someone_accepted' so the caller's
-	// state machine transitions out of outgoing-ringing and calls joinChannel
-	// itself (see handleCallCanceled in client/desktop/.../callStateMachine.ts).
-	// Without this hop, the caller stalls in outgoing-ringing until the 45s
-	// timeout fires even though the callee already joined the room.
-	unlockLifecycle := LockDMCallLifecycle(convUUID)
-	defer unlockLifecycle()
-	tx, locked := h.beginDMVoiceMembershipTx(c, convID, userID)
-	if !locked {
-		return
-	}
-	defer rollbackDMVoiceMembershipTx(tx, h.log)
-	joinState, err := loadVoiceJoinStateTx(c.Request.Context(), tx, convID, userID)
-	if err != nil {
-		h.log.Error("Failed to recheck locked DM voice membership", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return
-	}
-	callID, resolved := h.resolveVoiceJoinCallID(c, convUUID, userUUID, requestedRingID)
-	if !resolved {
-		return
-	}
-	if callID != uuid.Nil {
-		if err := RememberDMVoiceJoinAdmission(
-			c.Request.Context(), h.redis, convUUID, userUUID, callID, DMVoiceCallReservationTTL,
-		); err != nil {
-			if errors.Is(err, ErrDMVoiceCallLeaseConflict) {
-				c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
-				return
-			}
-			h.log.Error("Failed to bind DM voice join admission", "error", err,
-				"conversation_id", sanitizeLogValue(convID))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-			return
-		}
-	}
-	// A cache miss below may query through this DB pool; release the read locks first.
-	rollbackDMVoiceMembershipTx(tx, h.log)
 	// Resolve the joining user's media entitlements server-side from the
 	// AUTHENTICATED user_id (never a client value). Per-user enforcement is
 	// room-kind-independent, so DM voice joins carry the same media_entitlements
@@ -2239,7 +2968,17 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	// For("") returns the free caps for an unknown/empty tier — a resolution
 	// problem degrades to the free floor, never blocks the join, never grants
 	// premium (#1300 §3/§5).
-	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
+	userTier := entitlements.TierFree
+	if h.entCache != nil {
+		userTier = h.entCache.GetTier(c.Request.Context(), userID)
+	}
+	mediaEnt := entitlements.MediaFor(userTier)
+	joinState, callID, authorized := h.authorizeVoiceJoinTx(
+		c, convID, userID, convUUID, userUUID, requestedRingID,
+	)
+	if !authorized {
+		return
+	}
 
 	// NOTE (#1542): DM voice/join intentionally omits room_owner_tier. DMs have no
 	// owner; the media-plane resolves the per-room cap from the MAX tier among present
@@ -2543,87 +3282,165 @@ func (h *Handler) authorizeDMMessageUpdate(c *gin.Context, convID, messageID, us
 	return true
 }
 
-// updateDMMessageCiphertext serializes the epoch check and ciphertext update.
-// On failure it writes the response and returns false.
-func (h *Handler) updateDMMessageCiphertext(
-	c *gin.Context,
-	convID, messageID string,
-	req updateDMMessageRequest,
-) (updateDMMessageResult, bool) {
-	// Serialize the ledger check and edit against every revocation insert.
-	// READ COMMITTED gives the check below a fresh snapshot after a lock wait.
-	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		h.log.Error("Failed to begin DM message update", "error", err)
+func (h *Handler) prepareDMMessageCiphertextUpdate(c *gin.Context, tx *sql.Tx, convID string, actor uuid.UUID) error {
+	// The shared prepare locks the complete participant set before the parent,
+	// rejects blocked or pending topology, and precedes the credential guard.
+	_, err := dmblock.PrepareConversationTx(
+		c.Request.Context(), tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockNoKeyUpdate,
+	)
+	return err
+}
+
+func (h *Handler) recheckDMMessageCiphertextParticipant(c *gin.Context, tx *sql.Tx, convID, userID string) bool {
+	var participantID string
+	if err := tx.QueryRowContext(c.Request.Context(),
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, convID, userID,
+	).Scan(&participantID); errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+		return false
+	} else if err != nil {
+		h.log.Error("Failed to recheck DM message participant", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
-		return updateDMMessageResult{}, false
+		return false
 	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+	return true
+}
+
+func (h *Handler) respondDMMessageCiphertextPrepareError(c *gin.Context, err error) {
+	if errors.Is(err, dmblock.ErrUnavailable) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	h.log.Error("Failed to prepare DM message topology", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+}
+
+func (h *Handler) prepareDMMessageCiphertextAttempt(c *gin.Context, tx *sql.Tx, convID, userID string, actor uuid.UUID) (retry, prepared bool) {
+	if err := h.prepareDMMessageCiphertextUpdate(c, tx, convID, actor); err != nil {
+		if errors.Is(err, dmblock.ErrMembershipChanged) {
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+				return false, false
+			}
+			return true, false
 		}
-	}()
-
-	// #2201 (Codex #2397 review): a DM message edit rewrites ciphertext under the
-	// password-derived key material, so recheck the editor's credential epoch on
-	// the users row FIRST — before the dm_conversations lock, preserving the
-	// canonical users-first order (000087) — so an edit admitted before a
-	// destructive reset cannot commit old-key ciphertext after it.
-	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, c.GetString("user_id"), middleware.TokenCredentialEpoch(c)); guardErr != nil {
-		h.respondGuardTxError(c, guardErr, errMsgFailedUpdateMessage)
-		return updateDMMessageResult{}, false
+		h.respondDMMessageCiphertextPrepareError(c, err)
+		return false, false
 	}
+	// Guard only after the complete users-first topology fence. This prevents
+	// stale credentials from writing ciphertext after a destructive reset.
+	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+		h.respondGuardTxError(c, err, errMsgFailedUpdateMessage)
+		return false, false
+	}
+	return false, h.recheckDMMessageCiphertextParticipant(c, tx, convID, userID)
+}
 
-	var lockedConversationID string
-	if err = tx.QueryRowContext(c.Request.Context(),
-		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
-	).Scan(&lockedConversationID); err != nil {
-		h.log.Error("Failed to lock DM epoch", "error", err)
+func (h *Handler) lockDMMessageForCiphertextUpdate(c *gin.Context, tx *sql.Tx, convID, messageID, userID string) bool {
+	var authorID string
+	//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+	if err := tx.QueryRowContext(c.Request.Context(),
+		`SELECT m.user_id FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3)+` FOR UPDATE`,
+		messageID, convID, userID,
+	).Scan(&authorID); errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return false
+	} else if err != nil {
+		h.log.Error("Failed to recheck DM message author", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
-		return updateDMMessageResult{}, false
+		return false
 	}
-	if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
-		return updateDMMessageResult{}, false
+	if authorID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
+		return false
 	}
+	return true
+}
 
-	// Update ciphertext and its matching epoch atomically. Recheck membership
-	// and authorship under the conversation lock so a completed member removal
-	// cannot leave an autocommit preflight authorized. The server never decrypts content.
+func (h *Handler) writeDMMessageCiphertext(c *gin.Context, tx *sql.Tx, convID, messageID, userID string, req updateDMMessageRequest) (updateDMMessageResult, bool) {
 	var result updateDMMessageResult
-	err = tx.QueryRowContext(c.Request.Context(), `
+	//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+	err := tx.QueryRowContext(c.Request.Context(), `
 		UPDATE dm_messages AS m
 		SET content = $1, key_version = $2, edited_at = NOW(), updated_at = NOW()
 		WHERE m.id = $3 AND m.conversation_id = $4
-		  AND m.user_id = $5
-		  AND EXISTS (
-		      SELECT 1 FROM dm_participants
-		      WHERE conversation_id = $4 AND user_id = $5
-		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM dm_key_revocations
 		      WHERE conversation_id = $4 AND revoked_epoch = $2
 		  )`+hiddenRangeFilter(5)+`
 		RETURNING COALESCE(key_version, 1), edited_at, expires_at, created_at
-	`, req.Content, req.KeyVersion, messageID, convID, c.GetString("user_id")).Scan(&result.KeyVersion, &result.EditedAt, &result.ExpiresAt, &result.CreatedAt)
-	if err == sql.ErrNoRows {
+	`, req.Content, req.KeyVersion, messageID, convID, userID).Scan(&result.KeyVersion, &result.EditedAt, &result.ExpiresAt, &result.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
 		if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
 			return updateDMMessageResult{}, false
 		}
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return updateDMMessageResult{}, false
-	} else if err != nil {
+	}
+	if err != nil {
 		h.log.Error("Failed to update DM message", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
 		return updateDMMessageResult{}, false
 	}
 	result.Content = req.Content
-	if err = tx.Commit(); err != nil {
-		h.log.Error("Failed to commit DM message update", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+	return result, true
+}
+
+// updateDMMessageCiphertext retries only an uncommitted participant-snapshot
+// drift. No ciphertext write runs before the retry boundary.
+func (h *Handler) updateDMMessageCiphertext(c *gin.Context, convID, messageID string, req updateDMMessageRequest) (updateDMMessageResult, bool) {
+	userID := c.GetString("user_id")
+	actor, err := uuid.Parse(userID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
 		return updateDMMessageResult{}, false
 	}
+	for attempt := 0; attempt < 2; attempt++ {
+		result, retry, updated := h.updateDMMessageCiphertextAttempt(c, convID, messageID, userID, actor, req)
+		if !retry {
+			return result, updated
+		}
+		if attempt == 1 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+			return updateDMMessageResult{}, false
+		}
+	}
+	return updateDMMessageResult{}, false
+}
 
-	return result, true
+func (h *Handler) updateDMMessageCiphertextAttempt(c *gin.Context, convID, messageID, userID string, actor uuid.UUID, req updateDMMessageRequest) (updateDMMessageResult, bool, bool) {
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin DM message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return updateDMMessageResult{}, false, false
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+		}
+	}()
+	retry, prepared := h.prepareDMMessageCiphertextAttempt(c, tx, convID, userID, actor)
+	if retry || !prepared {
+		return updateDMMessageResult{}, retry, false
+	}
+	if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
+		return updateDMMessageResult{}, false, false
+	}
+	if !h.lockDMMessageForCiphertextUpdate(c, tx, convID, messageID, userID) {
+		return updateDMMessageResult{}, false, false
+	}
+	result, updated := h.writeDMMessageCiphertext(c, tx, convID, messageID, userID, req)
+	if !updated {
+		return updateDMMessageResult{}, false, false
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit DM message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return updateDMMessageResult{}, false, false
+	}
+	return result, false, true
 }
 
 // resolveDMMessageRequest runs the shared Update/DeleteMessage prologue:
@@ -2718,76 +3535,9 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
-
-	// Check message exists and user is the author
-	var authorID string
-	//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
-	if err := h.db.QueryRow(`SELECT m.user_id FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+
-		hiddenRangeFilter(3), messageID, convID, userID).Scan(&authorID); err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to check DM message author", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
-		return
-	}
-
-	if authorID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own messages"})
-		return
-	}
-	if h.purgeEngine == nil {
-		h.log.Error("Failed to delete DM message", "error", "purge engine unavailable")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
-		return
-	}
-
 	var deletedAuthorID uuid.UUID
 	var deletedCreatedAt time.Time
-	if err := h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
-		MessagesTable:    "dm_messages",
-		ScopeColumn:      "conversation_id",
-		ScopeID:          convID,
-		AttachmentsTable: "dm_message_attachments",
-		BeforeDeleteTx: func(ctx context.Context, tx *sql.Tx) error {
-			if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
-				return err
-			}
-			var lockedConversation string
-			if err := tx.QueryRowContext(ctx,
-				`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
-			).Scan(&lockedConversation); err != nil {
-				return err
-			}
-			var participant string
-			if err := tx.QueryRowContext(ctx,
-				`SELECT user_id FROM dm_participants WHERE user_id = $1 AND conversation_id = $2 FOR UPDATE`, userID, convID,
-			).Scan(&participant); err != nil {
-				return err
-			}
-			var lockedAuthor uuid.UUID
-			//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
-			if err := tx.QueryRowContext(ctx,
-				`SELECT m.user_id, m.created_at FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3),
-				messageID, convID, userID,
-			).Scan(&lockedAuthor, &deletedCreatedAt); err != nil {
-				return err
-			}
-			if lockedAuthor != actorUUID {
-				return sql.ErrNoRows
-			}
-			deletedAuthorID = lockedAuthor
-			return nil
-		},
-	}); errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		return
-	} else if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to delete DM message", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+	if !h.deleteDMMessage(c, convID, messageID, userID, &deletedAuthorID, &deletedCreatedAt) {
 		return
 	}
 
@@ -2808,6 +3558,87 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// deleteDMMessage rechecks authority under the complete topology and
+// credential fence. A member removed after the HTTP preflight receives 403,
+// never a misleading 404 caused by an unfenced purge lookup.
+func (h *Handler) deleteDMMessage(
+	c *gin.Context,
+	convID, messageID, userID string,
+	deletedAuthorID *uuid.UUID,
+	deletedCreatedAt *time.Time,
+) bool {
+	if h.purgeEngine == nil {
+		h.log.Error("Failed to delete DM message", "error", "purge engine unavailable")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return false
+	}
+	actor, err := uuid.Parse(userID)
+	if err != nil {
+		h.log.Error("Failed to parse DM message delete actor", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return false
+	}
+	err = h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
+		MessagesTable:    "dm_messages",
+		ScopeColumn:      "conversation_id",
+		ScopeID:          convID,
+		AttachmentsTable: "dm_message_attachments",
+		Guard: func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockShare); err != nil {
+				return err
+			}
+			if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+				return err
+			}
+			var participant string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT user_id FROM dm_participants WHERE user_id = $1 AND conversation_id = $2 FOR SHARE`, userID, convID,
+			).Scan(&participant); errors.Is(err, sql.ErrNoRows) {
+				return errDMPurgeNotParticipant
+			} else if err != nil {
+				return fmt.Errorf("recheck DM message participant: %w", err)
+			}
+			//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+			if err := tx.QueryRowContext(ctx,
+				`SELECT m.user_id, m.created_at FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3)+` FOR UPDATE`,
+				messageID, convID, userID,
+			).Scan(deletedAuthorID, deletedCreatedAt); err != nil {
+				return fmt.Errorf("recheck DM message author: %w", err)
+			}
+			if *deletedAuthorID != actor {
+				return errDMPurgeScopeChanged
+			}
+			return nil
+		},
+	})
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		h.respondGuardTxError(c, err, errMsgFailedDeleteMessage)
+		return false
+	}
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return false
+	}
+	if errors.Is(err, errDMPurgeNotParticipant) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+		return false
+	}
+	if errors.Is(err, errDMPurgeScopeChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own messages"})
+		return false
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return false
+	}
+	h.log.Error("Failed to delete DM message", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+	return false
 }
 
 func parseDMMessageDeliveryIDs(convID, messageID, actorID string) (uuid.UUID, uuid.UUID, uuid.UUID, error) {
@@ -2912,27 +3743,6 @@ func (h *Handler) authorizeDMGroupAdmin(c *gin.Context, errMsgNotAdmin string) (
 	return convID, targetID, true
 }
 
-// dmIsTargetInVoice checks whether the target is in a DM voice call.
-func (h *Handler) dmIsTargetInVoice(convID, targetID string) bool {
-	var inVoice bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2)`,
-		convID, targetID).Scan(&inVoice); err != nil {
-		h.log.Error("Failed to check DM voice status", "error", err, "conversation_id", convID, "target_id", targetID)
-		return false
-	}
-	return inVoice
-}
-
-// dmPublishEnforcement publishes a NATS enforcement message if the target has
-// an active DM voice-presence row. Hard mute/deafen transitions use this guard;
-// membership removal uses the unconditional variant to close registration races.
-func (h *Handler) dmPublishEnforcement(convID, targetID, subject, action string) {
-	if !h.dmIsTargetInVoice(convID, targetID) {
-		return
-	}
-	h.dmPublishEnforcementUnconditionally(convID, targetID, subject, action)
-}
-
 func (h *Handler) dmPublishEnforcementUnconditionally(
 	convID, targetID, subject, action string,
 ) {
@@ -2941,6 +3751,50 @@ func (h *Handler) dmPublishEnforcementUnconditionally(
 	}
 	if err := h.nats.Publish(subject, map[string]interface{}{
 		"channelId": convID, "userId": targetID, "action": action,
+	}); err != nil {
+		// Keep logs free of user-controlled conversation/member identifiers and
+		// broker error strings; the fixed subject/action classify the failed path.
+		h.log.Error("Failed to publish DM enforcement",
+			"failure_class", "delivery",
+			"subject", subject,
+			"action", action)
+	}
+}
+
+func dmVoiceEnforcementSnapshotTx(
+	ctx context.Context, tx *sql.Tx, convID, targetID string,
+) (VoiceEnforcementSnapshot, error) {
+	var snapshot VoiceEnforcementSnapshot
+	if err := tx.QueryRowContext(ctx, `
+		SELECT server_muted, server_deafened
+		FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+	`, convID, targetID).Scan(&snapshot.ServerMuted, &snapshot.ServerDeafened); err != nil {
+		return VoiceEnforcementSnapshot{}, fmt.Errorf("read DM server enforcement state: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('voice_authorization_revision_seq')`).Scan(&snapshot.AuthorizationRevision); err != nil || snapshot.AuthorizationRevision <= 0 {
+		if err == nil {
+			err = errors.New("invalid voice authorization revision")
+		}
+		return VoiceEnforcementSnapshot{}, fmt.Errorf("allocate DM server enforcement revision: %w", err)
+	}
+	return snapshot, nil
+}
+
+func (h *Handler) dmPublishEnforcementSnapshot(
+	convID, targetID, subject, action string, snapshot VoiceEnforcementSnapshot,
+) {
+	if h.nats == nil {
+		return
+	}
+	if err := h.nats.Publish(subject, map[string]interface{}{
+		"channelId":             convID,
+		"userId":                targetID,
+		"action":                action,
+		"serverMuted":           snapshot.ServerMuted,
+		"serverDeafened":        snapshot.ServerDeafened,
+		"authorizationRevision": strconv.FormatInt(snapshot.AuthorizationRevision, 10),
+		"version":               voiceEnforcementSnapshotVersion,
 	}); err != nil {
 		// Keep logs free of user-controlled conversation/member identifiers and
 		// broker error strings; the fixed subject/action classify the failed path.
@@ -2960,6 +3814,18 @@ func (h *Handler) dmBroadcastVoiceState(convID, targetID, action string) {
 			"conversation_id": convID, "user_id": targetID, "action": action,
 		},
 	})
+}
+
+func (h *Handler) respondDMVoiceTopologyEffectError(c *gin.Context, err error, logMsg, responseMsg string) {
+	switch {
+	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+		h.respondGuardTxError(c, err, responseMsg)
+	case errors.Is(err, dmblock.ErrUnavailable), errors.Is(err, dmblock.ErrMembershipChanged):
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+	default:
+		h.log.Error(logMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": responseMsg})
+	}
 }
 
 // DMUserMute soft-mutes a participant in a DM voice call (user can undo).
@@ -2982,11 +3848,32 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 		return
 	}
 
-	// Verify actor is a participant
+	actor, err := uuid.Parse(actorID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	target, err := uuid.Parse(targetID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	tx, err := h.beginDMTopologyEffectWithCredential(
+		c.Request.Context(), convID, actorID, middleware.TokenCredentialEpoch(c),
+		[]uuid.UUID{actor, target}, dmblock.LockNoKeyUpdate,
+	)
+	if err != nil {
+		h.respondDMVoiceTopologyEffectError(c, err, errMsgFailedCheckParticipation, errMsgFailedCheckParticipation)
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+		}
+	}()
 	var exists bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`,
-		convID, actorID).Scan(&exists); err != nil {
-		h.log.Error(errMsgFailedCheckParticipation, "error", err, "conversation_id", convID, "user_id", actorID)
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, actorID).Scan(&exists); err != nil {
+		h.log.Error(errMsgFailedCheckParticipation, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
 		return
 	}
@@ -2994,12 +3881,9 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
 		return
 	}
-
-	// Verify target is in DM voice
 	var targetInVoice bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2)`,
-		convID, targetID).Scan(&targetInVoice); err != nil {
-		h.log.Error(errMsgFailedCheckParticipation, "error", err, "conversation_id", convID, "target_id", targetID)
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, targetID).Scan(&targetInVoice); err != nil {
+		h.log.Error(errMsgFailedCheckParticipation, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
 		return
 	}
@@ -3007,16 +3891,18 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTargetNotInVoice})
 		return
 	}
-
 	if h.nats != nil {
-		if err := h.nats.Publish("voice.user_mute", map[string]interface{}{
-			"channelId": convID,
-			"userId":    targetID,
-		}); err != nil {
-			h.log.Error("Failed to publish DM user mute", "error", err, "conversation_id", convID, "target_id", targetID)
+		if err := h.nats.Publish("voice.user_mute", map[string]interface{}{"channelId": convID, "userId": targetID}); err != nil {
+			h.log.Error("Failed to publish DM user mute", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
+			return
 		}
 	}
-
+	if err := h.commitDMTopologyEffect(tx); err != nil {
+		h.log.Error(errMsgFailedCheckParticipation, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -3033,22 +3919,93 @@ type dmVoiceEnforcementChange struct {
 	broadcastState string
 }
 
+func revalidateDMVoiceEnforcementAuthority(ctx context.Context, tx *sql.Tx, convID, actorID string) error {
+	var isGroup bool
+	var role string
+	err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.role FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1 FOR SHARE OF dc, dp`, convID, actorID).Scan(&isGroup, &role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return dmblock.ErrUnavailable
+	}
+	if err != nil {
+		return fmt.Errorf("revalidate DM voice enforcement authority: %w", err)
+	}
+	if !isGroup || role != "admin" {
+		return dmblock.ErrUnavailable
+	}
+	return nil
+}
+
 // applyDMVoiceEnforcement runs the shared tail of the four DM hard-mute/deafen
 // handlers. RowsAffected 0 MUST stay a 404 — it is what stops an enforcement
 // call against a non-participant from fabricating success.
 func (h *Handler) applyDMVoiceEnforcement(c *gin.Context, convID, targetID string, change dmVoiceEnforcementChange) {
-	result, err := h.db.Exec(change.updateSQL, convID, targetID)
+	if h.beforeDMVoiceEnforcementTxHook != nil {
+		h.beforeDMVoiceEnforcementTxHook()
+	}
+	actor, err := uuid.Parse(c.GetString("user_id"))
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	target, err := uuid.Parse(targetID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	tx, err := h.beginDMTopologyEffectWithCredential(
+		c.Request.Context(), convID, actor.String(), middleware.TokenCredentialEpoch(c),
+		[]uuid.UUID{actor, target}, dmblock.LockNoKeyUpdate,
+	)
+	if err != nil {
+		h.respondDMVoiceTopologyEffectError(c, err, change.failLog, change.failErrMsg)
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+		}
+	}()
+	if err := revalidateDMVoiceEnforcementAuthority(c.Request.Context(), tx, convID, actor.String()); err != nil {
+		if errors.Is(err, dmblock.ErrUnavailable) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+			return
+		}
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return
+	}
+	result, err := tx.ExecContext(c.Request.Context(), change.updateSQL, convID, targetID)
 	if err != nil {
 		h.log.Error(change.failLog, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
 		return
 	}
-	if ra, _ := result.RowsAffected(); ra == 0 {
+	ra, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return
+	}
+	if ra == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
 		return
 	}
+	snapshot, err := dmVoiceEnforcementSnapshotTx(c.Request.Context(), tx, convID, targetID)
+	if err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return
+	}
+	if err := h.commitDMTopologyEffect(tx); err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return
+	}
 
-	h.dmPublishEnforcement(convID, targetID, change.subject, change.action)
+	h.dmPublishEnforcementSnapshot(convID, targetID, change.subject, change.action, snapshot)
 	h.dmBroadcastVoiceState(convID, targetID, change.broadcastState)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -3198,32 +4155,6 @@ func dmVoiceInvitedData(convID uuid.UUID, isGroup bool, caller map[string]interf
 		"ring_started_at":      ring.RingStartedAt.UTC().Format(time.RFC3339),
 		"ring_timeout_seconds": timeoutSeconds,
 	}
-}
-
-// fetchDMCalleesExcluding returns the user IDs of all dm_participants for
-// the conversation EXCEPT the given exclude user. Used by RingDMCall to
-// build the ringing-user-ids set (everyone in the conv minus the caller).
-func (h *Handler) fetchDMCalleesExcluding(convID, excludeUserID string) ([]uuid.UUID, error) {
-	rows, err := h.db.Query(`
-		SELECT user_id FROM dm_participants
-		WHERE conversation_id = $1 AND user_id != $2
-	`, convID, excludeUserID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	callees := []uuid.UUID{}
-	for rows.Next() {
-		var uid uuid.UUID
-		if err := rows.Scan(&uid); err != nil {
-			return nil, err
-		}
-		callees = append(callees, uid)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return callees, nil
 }
 
 // filterOnlineCallees returns the subset of callees with at least one live WS
@@ -3461,37 +4392,48 @@ type voiceRingRecipients struct {
 	isGroup   bool
 }
 
-func (h *Handler) loadVoiceRingRecipients(
-	c *gin.Context,
+// loadVoiceRingRecipientsTx returns the current recipients from the topology
+// transaction that fences their invitations. The caller must hold the complete
+// participant snapshot before invoking this helper.
+func (h *Handler) loadVoiceRingRecipientsTx(
+	ctx context.Context,
+	tx *sql.Tx,
 	convUUID uuid.UUID,
 	convID, callerID string,
-) (voiceRingRecipients, bool) {
-	callees, err := h.fetchDMCalleesExcluding(convID, callerID)
-	if err != nil {
-		h.log.Error("Failed to fetch DM callees for ring", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return voiceRingRecipients{}, false
-	}
-	if len(callees) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no callees in this conversation"})
-		return voiceRingRecipients{}, false
+) (recipients voiceRingRecipients, returnErr error) {
+	var isGroup bool
+	if err := tx.QueryRowContext(ctx, `SELECT is_group FROM dm_conversations WHERE id = $1`, convUUID).Scan(&isGroup); err != nil {
+		return voiceRingRecipients{}, fmt.Errorf("load DM ring group state: %w", err)
 	}
 
-	var isGroup bool
-	if err := h.db.QueryRow(`SELECT is_group FROM dm_conversations WHERE id = $1`, convUUID).Scan(&isGroup); err != nil {
-		h.log.Error("Failed to fetch is_group for ring", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return voiceRingRecipients{}, false
+	rows, err := tx.QueryContext(ctx, `
+		SELECT user_id FROM dm_participants
+		WHERE conversation_id = $1 AND user_id != $2
+	`, convID, callerID)
+	if err != nil {
+		return voiceRingRecipients{}, fmt.Errorf("load DM ring recipients: %w", err)
 	}
-	if !isGroup {
-		return voiceRingRecipients{calleeIDs: callees}, true
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && returnErr == nil {
+			returnErr = fmt.Errorf("close DM ring recipients: %w", closeErr)
+		}
+	}()
+
+	callees := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var calleeID uuid.UUID
+		if err := rows.Scan(&calleeID); err != nil {
+			return voiceRingRecipients{}, fmt.Errorf("scan DM ring recipient: %w", err)
+		}
+		callees = append(callees, calleeID)
 	}
-	callees = h.filterOnlineCallees(callees)
-	if len(callees) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no online members to call"})
-		return voiceRingRecipients{}, false
+	if err := rows.Err(); err != nil {
+		return voiceRingRecipients{}, fmt.Errorf("iterate DM ring recipients: %w", err)
 	}
-	return voiceRingRecipients{calleeIDs: callees, isGroup: true}, true
+	if isGroup {
+		callees = h.filterOnlineCallees(callees)
+	}
+	return voiceRingRecipients{calleeIDs: callees, isGroup: isGroup}, nil
 }
 
 func (h *Handler) initializePendingDMCall(
@@ -3500,29 +4442,33 @@ func (h *Handler) initializePendingDMCall(
 	isGroup bool,
 	callerInfo map[string]interface{},
 	callees []uuid.UUID,
-) bool {
+) (initialized, announced bool) {
+	if ring.terminalOwned || !ring.isCurrentLocked() {
+		return false, false
+	}
 	if ring.isExpired(time.Now()) {
-		return false
+		return false, false
 	}
 
 	invitedPayload := dmVoiceInvitedData(convUUID, isGroup, callerInfo, ring, DefaultRingTimeoutSeconds)
 	for _, calleeID := range callees {
 		if ring.isExpired(time.Now()) {
-			return false
+			return false, announced
 		}
 		h.hub.BroadcastToUser(calleeID, websocket.OutgoingMessage{
 			Type: "dm_voice_call_invited",
 			Data: invitedPayload,
 		})
+		announced = true
 	}
 	remaining := time.Until(ring.RingStartedAt.Add(time.Duration(DefaultRingTimeoutSeconds) * time.Second))
 	if remaining <= 0 {
-		return false
+		return false, announced
 	}
 	ring.startTimerLocked(remaining, func() {
 		h.onRingTimeout(convUUID, ring)
 	})
-	return true
+	return true, announced
 }
 
 func (h *Handler) cancelFailedPendingDMCall(convUUID uuid.UUID, ring *PendingCall) {
@@ -3538,6 +4484,22 @@ func (h *Handler) cancelFailedPendingDMCall(convUUID uuid.UUID, ring *PendingCal
 			"canceled_by":     "server_error",
 		},
 	})
+}
+
+// discardPendingDMCallLocked retracts an unannounced ring while ring.mu is
+// held. It must not send a terminal event because no invite became visible.
+func discardPendingDMCallLocked(ring *PendingCall) {
+	pendingDMCalls.CompareAndDelete(ring.ConversationID, ring)
+	if ring.TimeoutTimer != nil {
+		ring.TimeoutTimer.Stop()
+	}
+}
+
+func noDMVoiceCalleesError(isGroup bool) string {
+	if isGroup {
+		return "no online members to call"
+	}
+	return "no callees in this conversation"
 }
 
 // RingDMCall initiates a DM voice call ring. POST /api/v1/dm/conversations/:id/voice/ring.
@@ -3590,13 +4552,6 @@ func (h *Handler) RingDMCall(c *gin.Context) {
 		return
 	}
 
-	// Fetch is_group: drives both the presence-aware group ring filter (#1219 B2)
-	// and the dm_voice_call_invited is_group emission (#1219 B3).
-	recipients, foundRecipients := h.loadVoiceRingRecipients(c, convUUID, convIDStr, callerIDStr)
-	if !foundRecipients {
-		return
-	}
-
 	callerInfo, err := h.callerInfoFor(callerIDStr)
 	if err != nil {
 		h.log.Error("Failed to fetch caller info for ring", "error", err)
@@ -3609,52 +4564,69 @@ func (h *Handler) RingDMCall(c *gin.Context) {
 	// with the OTHER ring's metadata. This collapses the Load-then-Store
 	// window where two concurrent requests could both pass the Load check
 	// before either Stores.
-	ring := newPendingCall(convUUID, callerUUID, recipients.calleeIDs, time.Duration(DefaultRingTimeoutSeconds)*time.Second)
+	reservationID := uuid.New()
 	tx, locked := h.beginDMVoiceMembershipTx(c, convIDStr, callerIDStr)
 	if !locked {
 		return
 	}
 	defer rollbackDMVoiceMembershipTx(tx, h.log)
-	if err := MarkDMPendingVoiceCall(c.Request.Context(), h.redis, convUUID, ring.RingID); err != nil {
+	if err := MarkDMPendingVoiceCall(c.Request.Context(), h.redis, convUUID, reservationID); err != nil {
 		h.log.Error("Failed to mark pending DM voice call", "error", err,
 			"conversation_id", sanitizeLogValue(convIDStr))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
-	if ring.isExpired(time.Now()) {
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
-		return
-	}
-	// The membership transaction validates the durable prerequisite for this
-	// ring. Keep it private until commit succeeds: timeout and terminal
-	// handlers use the pending map as their admission point and must never emit
-	// history for an uncommitted ring.
-	if err := tx.Commit(); err != nil {
+	// T1 commits the durable topology effect before either a map claim or a
+	// user-visible invitation. A reset that wins after T1 therefore leaves no
+	// ephemeral ring to retract.
+	if err := h.commitDMTopologyEffect(tx); err != nil {
 		h.log.Error("Failed to commit pending DM voice call", "error", err,
 			"conversation_id", sanitizeLogValue(convIDStr))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
-	published := false
+
+	// T2 obtains a fresh credential fence after T1 and before acquiring ring.mu.
+	// Its read-only rollback releases that fence after invite/timer enqueue,
+	// which linearizes an invitation before any concurrent credential reset.
+	announcementTx, guarded := h.beginDMVoiceMembershipTx(c, convIDStr, callerIDStr)
+	if !guarded {
+		return
+	}
+	defer rollbackDMVoiceMembershipTx(announcementTx, h.log)
+	// B's locked participant snapshot is the authority for every invitation.
+	// This prevents a removed member from receiving an event during T1-to-B.
+	recipients, err := h.loadVoiceRingRecipientsTx(c.Request.Context(), announcementTx, convUUID, convIDStr, callerIDStr)
+	if err != nil {
+		h.log.Error("Failed to refresh DM ring recipients", "error", err,
+			"conversation_id", sanitizeLogValue(convIDStr))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if len(recipients.calleeIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": noDMVoiceCalleesError(recipients.isGroup)})
+		return
+	}
+
+	ring := newPendingCall(convUUID, callerUUID, recipients.calleeIDs, time.Duration(DefaultRingTimeoutSeconds)*time.Second)
+	ring.RingID = reservationID
+
+	var initialized, announced bool
 	existingAny, loaded := loadOrStoreInitializedPendingCall(ring, func() {
-		// Enqueue invitations and arm the timeout from the absolute ring
-		// deadline while the transition lock is held. A fast accept/cancel can
-		// load the claimed ring, but cannot terminally own it until initialization completes.
-		initialized := h.initializePendingDMCall(ring, convUUID, recipients.isGroup, callerInfo, recipients.calleeIDs)
-		stored, active := pendingDMCalls.Load(convUUID)
-		published = initialized && active && stored == ring
+		initialized, announced = h.initializePendingDMCall(ring, convUUID, recipients.isGroup, callerInfo, recipients.calleeIDs)
+		if !initialized && !announced {
+			discardPendingDMCallLocked(ring)
+		}
 	})
 	if loaded {
 		writeRingConflict(c, existingAny)
 		return
 	}
-	if !published {
-		h.cancelFailedPendingDMCall(convUUID, ring)
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
-		return
-	}
-	stored, active := pendingDMCalls.Load(convUUID)
-	if !active || stored != ring {
+
+	if !initialized {
+		if announced {
+			h.cancelFailedPendingDMCall(convUUID, ring)
+		}
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
 		return
 	}
@@ -3716,29 +4688,39 @@ func (h *Handler) onRingTimeout(convUUID uuid.UUID, ring *PendingCall) {
 // conversation and acting-user IDs, bind the optional ring_id, and resolve
 // the in-flight ring for the conversation, rejecting a stale ring_id with
 // 409. On failure the HTTP error has already been written and ok is false.
-func (h *Handler) resolvePendingDMRing(c *gin.Context) (ring *PendingCall, convUUID, actorUUID uuid.UUID, ok bool) {
+func (h *Handler) resolvePendingDMRing(c *gin.Context) (ring *PendingCall, convUUID, actorUUID uuid.UUID, tx *sql.Tx, ok bool) {
 	actorIDStr := c.GetString("user_id")
 	convIDStr := c.Param("id")
 
 	convUUID, err := uuid.Parse(convIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return nil, uuid.Nil, uuid.Nil, false
+		return nil, uuid.Nil, uuid.Nil, nil, false
 	}
 	actorUUID, err = uuid.Parse(actorIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCallerID})
-		return nil, uuid.Nil, uuid.Nil, false
+		return nil, uuid.Nil, uuid.Nil, nil, false
 	}
 	requestedRingID, validRequest := parseOptionalVoiceRingID(c, errMsgInvalidVoiceCallRequest)
 	if !validRequest {
-		return nil, uuid.Nil, uuid.Nil, false
+		return nil, uuid.Nil, uuid.Nil, nil, false
 	}
+	tx, guarded := h.beginDMVoiceMembershipTx(c, convIDStr, actorIDStr)
+	if !guarded {
+		return nil, uuid.Nil, uuid.Nil, nil, false
+	}
+	guardedTx := tx
+	defer func() {
+		if !ok {
+			rollbackDMVoiceMembershipTx(guardedTx, h.log)
+		}
+	}()
 
 	storedAny, loaded := pendingDMCalls.Load(convUUID)
 	if !loaded {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no active ring for this conversation"})
-		return nil, uuid.Nil, uuid.Nil, false
+		return nil, uuid.Nil, uuid.Nil, nil, false
 	}
 	pending, castOK := storedAny.(*PendingCall)
 	if !castOK {
@@ -3748,13 +4730,13 @@ func (h *Handler) resolvePendingDMRing(c *gin.Context) (ring *PendingCall, convU
 		// handlers via ring.mu.Lock / ring.CallerUserID on a nil interface
 		// (Copilot #1231 cycle-4 finding).
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return nil, uuid.Nil, uuid.Nil, false
+		return nil, uuid.Nil, uuid.Nil, nil, false
 	}
 	if requestedRingID != uuid.Nil && requestedRingID != pending.RingID {
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingChanged})
-		return nil, uuid.Nil, uuid.Nil, false
+		return nil, uuid.Nil, uuid.Nil, nil, false
 	}
-	return pending, convUUID, actorUUID, true
+	return pending, convUUID, actorUUID, tx, true
 }
 
 // DeclineDMCall handles a callee declining a DM voice call ring.
@@ -3777,14 +4759,21 @@ func (h *Handler) resolvePendingDMRing(c *gin.Context) (ring *PendingCall, convU
 // removes that decliner's ring; ring continues for others. Group-call tally
 // progress event (dm_voice_call_decline_progress) is deferred to #1219.
 func (h *Handler) DeclineDMCall(c *gin.Context) {
-	ring, convUUID, declinerUUID, ok := h.resolvePendingDMRing(c)
+	ring, convUUID, declinerUUID, tx, ok := h.resolvePendingDMRing(c)
 	if !ok {
 		return
 	}
+	defer rollbackDMVoiceMembershipTx(tx, h.log)
 
-	transition := ring.tryDecline(declinerUUID, func() {
-		// Enqueue the per-decliner tally while the transition lock is held so
-		// an accept/cancel/timeout event cannot overtake it on the Hub lane.
+	transition, err := ring.tryDeclineWithCommit(declinerUUID, func() error {
+		return h.commitDMTopologyEffect(tx)
+	})
+	if err != nil {
+		h.log.Error("Failed to commit DM voice decline", "failure_class", "database")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if transition == declineTransitionPending || transition == declineTransitionTerminal {
 		h.hub.BroadcastToUser(ring.CallerUserID, websocket.OutgoingMessage{
 			Type: "dm_voice_call_declined",
 			Data: map[string]interface{}{
@@ -3793,7 +4782,7 @@ func (h *Handler) DeclineDMCall(c *gin.Context) {
 				"decliner_user_id": declinerUUID.String(),
 			},
 		})
-	})
+	}
 	switch transition {
 	case declineTransitionInactive:
 		c.JSON(http.StatusConflict, gin.H{"error": "call state changed before decline"})
@@ -3846,10 +4835,11 @@ func (h *Handler) DeclineDMCall(c *gin.Context) {
 // conversation, clears pendingDMCalls, and inserts a canceled-status
 // call_event row.
 func (h *Handler) CancelDMCall(c *gin.Context) {
-	ring, convUUID, callerUUID, ok := h.resolvePendingDMRing(c)
+	ring, convUUID, callerUUID, tx, ok := h.resolvePendingDMRing(c)
 	if !ok {
 		return
 	}
+	defer rollbackDMVoiceMembershipTx(tx, h.log)
 
 	if ring.CallerUserID != callerUUID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the ring initiator can cancel"})
@@ -3858,6 +4848,12 @@ func (h *Handler) CancelDMCall(c *gin.Context) {
 
 	if !ring.tryTerminate() {
 		c.JSON(http.StatusConflict, gin.H{"error": "call state changed before cancellation"})
+		return
+	}
+	if err := h.commitDMTopologyEffect(tx); err != nil {
+		ring.rollbackTerminate()
+		h.log.Error("Failed to commit DM voice cancellation", "failure_class", "database")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
 	defer ring.finalizeTerminal()
@@ -3888,12 +4884,13 @@ func (h *Handler) CancelDMCall(c *gin.Context) {
 }
 
 type dmVoiceAuthorizeIdentity struct {
-	isGroup        bool
-	serverMuted    bool
-	serverDeafened bool
-	username       string
-	displayName    sql.NullString
-	avatarURL      sql.NullString
+	isGroup               bool
+	serverMuted           bool
+	serverDeafened        bool
+	authorizationRevision int64
+	username              string
+	displayName           sql.NullString
+	avatarURL             sql.NullString
 }
 
 func parseDMVoiceAuthorizeCallID(c *gin.Context) (uuid.UUID, bool) {
@@ -3992,6 +4989,10 @@ func (h *Handler) resolveDMVoiceAuthorizeLease(
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
 		return VoiceCallLease{}, false, false
 	}
+	if lease.RingID != uuid.Nil && !lease.Promoted {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
+		return VoiceCallLease{}, false, false
+	}
 	if requestedCallID == uuid.Nil {
 		admittedCallID, admitted, admissionErr := LookupDMVoiceJoinAdmission(
 			c.Request.Context(), h.redis, convUUID, userUUID,
@@ -4072,7 +5073,11 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	// no owner; the media-plane resolves the per-room cap from the MAX tier among
 	// present participants, each threaded from this media_entitlements object
 	// onto Participant.tier (ADR-0029).
-	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
+	userTier := entitlements.TierFree
+	if h.entCache != nil {
+		userTier = h.entCache.GetTier(c.Request.Context(), userID)
+	}
+	mediaEnt := entitlements.MediaFor(userTier)
 
 	// Serialize pre-existing lease resolution with /voice/ring, direct
 	// /voice/join reservation, and pending->accepted promotion. Every admitted
@@ -4084,7 +5089,18 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	if !locked {
 		return
 	}
-	defer rollbackDMVoiceMembershipTx(tx, h.log)
+	committed := false
+	var authorizedCallID uuid.UUID
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+		}
+		if !committed && authorizedCallID != uuid.Nil {
+			// The media plane may already have accepted this peer. A targeted
+			// disconnect is the only safe compensation for a shared lease.
+			h.dmPublishEnforcementUnconditionally(convID, userID, dmVoiceDisconnectSubject, "disconnect")
+		}
+	}()
 	identity, err := loadDMVoiceAuthorizeIdentityTx(c.Request.Context(), tx, convID, userID)
 	if err != nil {
 		h.log.Error("Failed to recheck locked DM voice authorization", "error", err)
@@ -4092,34 +5108,30 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 		return
 	}
 
-	lease, hasLease, resolved := h.resolveDMVoiceAuthorizeLease(c, convUUID, userUUID, requestedCallID)
-	if !resolved {
+	lease, hasLease, leaseAuthorized := h.authorizeDMVoiceMediaLease(c, convUUID, userUUID, requestedCallID, convID)
+	if !leaseAuthorized {
 		return
 	}
-	if !h.validDMVoiceMediaAuthorizationProof(c, convUUID, requestedCallID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Media authorization proof required"})
+	authorizedCallID = lease.CallID
+	identity.authorizationRevision, err = nextDMVoiceAuthorizationRevision(c.Request.Context(), tx)
+	if err != nil {
+		h.log.Error("Failed to allocate DM voice authorization revision", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
-	if hasLease {
-		if err := MarkDMVoiceCallMediaAuthorized(
-			c.Request.Context(), h.redis, convUUID, lease.CallID,
-		); err != nil {
-			if errors.Is(err, ErrDMVoiceCallLeaseConflict) {
-				c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
-				return
-			}
-			h.log.Error("Failed to mark DM voice media authorization", "error", err,
-				"conversation_id", sanitizeLogValue(convID))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-			return
-		}
+	if err := h.commitDMTopologyEffect(tx); err != nil {
+		h.log.Error("Failed to commit DM voice media authorization", "failure_class", "database")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
 	}
+	committed = true
 	response := gin.H{
-		"authorized":         true,
-		"is_group":           identity.isGroup,
-		"server_muted":       identity.serverMuted,
-		"server_deafened":    identity.serverDeafened,
-		"media_entitlements": mediaEnt,
+		"authorized":             true,
+		"is_group":               identity.isGroup,
+		"server_muted":           identity.serverMuted,
+		"server_deafened":        identity.serverDeafened,
+		"authorization_revision": strconv.FormatInt(identity.authorizationRevision, 10),
+		"media_entitlements":     mediaEnt,
 		// CV-CAN-017: server-authoritative display identity (see query above).
 		"username":     identity.username,
 		"display_name": identity.displayName.String,
@@ -4135,6 +5147,44 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// authorizeDMVoiceMediaLease resolves and marks an existing lease after the
+// caller's membership has been rechecked under the DM topology transaction.
+func (h *Handler) authorizeDMVoiceMediaLease(c *gin.Context, convUUID, userUUID, requestedCallID uuid.UUID, convID string) (VoiceCallLease, bool, bool) {
+	lease, hasLease, resolved := h.resolveDMVoiceAuthorizeLease(c, convUUID, userUUID, requestedCallID)
+	if !resolved {
+		return VoiceCallLease{}, false, false
+	}
+	if !h.validDMVoiceMediaAuthorizationProof(c, convUUID, requestedCallID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Media authorization proof required"})
+		return VoiceCallLease{}, false, false
+	}
+	if !hasLease {
+		return lease, false, true
+	}
+	if err := MarkDMVoiceCallMediaAuthorized(c.Request.Context(), h.redis, convUUID, lease.CallID); err != nil {
+		if errors.Is(err, ErrDMVoiceCallLeaseConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
+			return VoiceCallLease{}, false, false
+		}
+		h.log.Error("Failed to mark DM voice media authorization", "error", err,
+			"conversation_id", sanitizeLogValue(convID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return VoiceCallLease{}, false, false
+	}
+	return lease, true, true
+}
+
+func nextDMVoiceAuthorizationRevision(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('voice_authorization_revision_seq')`).Scan(&revision); err != nil {
+		return 0, err
+	}
+	if revision <= 0 {
+		return 0, errors.New("invalid voice authorization revision")
+	}
+	return revision, nil
+}
+
 // AbortDMVoiceMediaAuthorization releases a media-authorized direct handoff
 // when its socket disconnects before admission. The Redis CAS is exact and
 // refuses promoted calls, accepted rings, and successor call IDs.
@@ -4142,7 +5192,7 @@ func (h *Handler) AbortDMVoiceMediaAuthorization(c *gin.Context) {
 	userID := c.GetString("user_id")
 	convID := c.Param("id")
 
-	convUUID, _, validIDs := parseDMVoiceIDs(c, convID, userID)
+	convUUID, userUUID, validIDs := parseDMVoiceIDs(c, convID, userID)
 	if !validIDs {
 		return
 	}
@@ -4161,14 +5211,56 @@ func (h *Handler) AbortDMVoiceMediaAuthorization(c *gin.Context) {
 	if _, authorized := h.loadDMVoiceAuthorizeIdentity(c, convID, userID); !authorized {
 		return
 	}
+	tx, err := h.beginDMTopologyEffectWithCredential(
+		c.Request.Context(), convID, userID, middleware.TokenCredentialEpoch(c),
+		[]uuid.UUID{userUUID}, dmblock.LockShare,
+	)
+	if err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			h.respondGuardTxError(c, err, errMsgFailedAuthorize)
+		} else {
+			c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		}
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rollbackErr)
+		}
+	}()
 
 	unlockLifecycle := LockDMCallLifecycle(convUUID)
 	defer unlockLifecycle()
-	if _, err := AbortAuthorizedDMVoiceCallReservation(
+	lease, found, err := LookupDMVoiceCallLease(c.Request.Context(), h.redis, convUUID)
+	if err != nil {
+		h.log.Error("Failed to read DM voice media authorization", "error", err,
+			"conversation_id", sanitizeLogValue(convID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallNoLongerActive})
+		return
+	}
+	aborted, err := AbortAuthorizedDMVoiceCallReservation(
 		c.Request.Context(), h.redis, convUUID, callID,
-	); err != nil {
+	)
+	if err != nil {
 		h.log.Error("Failed to abort DM voice media authorization", "error", err,
 			"conversation_id", sanitizeLogValue(convID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if err := h.commitDMTopologyEffect(tx); err != nil {
+		if aborted {
+			compensationCtx, cancelCompensation := dmVoiceJoinCompensationContext(c.Request.Context())
+			defer cancelCompensation()
+			if restoreErr := RestoreAbortedDMVoiceCallReservation(compensationCtx, h.redis, lease); restoreErr != nil {
+				h.log.Error("Failed to restore DM voice media authorization after commit failure", "error", restoreErr,
+					"conversation_id", sanitizeLogValue(convID))
+			}
+		}
+		h.log.Error("Failed to commit DM voice media authorization abort", "failure_class", "database")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}

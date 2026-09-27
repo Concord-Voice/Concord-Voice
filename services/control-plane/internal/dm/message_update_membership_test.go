@@ -28,7 +28,7 @@ func TestUpdateDMMessageCiphertextRechecksMembershipAndAuthor(t *testing.T) {
 		result, recorder := invokeDMMessageCiphertextUpdate(t, db, convID, messageID, actor, "replacement")
 
 		assert.False(t, result)
-		assert.Equal(t, http.StatusNotFound, recorder.Code)
+		assert.Equal(t, http.StatusForbidden, recorder.Code)
 		assert.Equal(t, "original", storedUpdateTestMessage(t, db, messageID))
 	})
 
@@ -52,7 +52,7 @@ func TestUpdateDMMessageCiphertextRechecksMembershipAndAuthor(t *testing.T) {
 		result, recorder := invokeDMMessageCiphertextUpdate(t, db, convID, messageID, peer, "replacement")
 
 		assert.False(t, result)
-		assert.Equal(t, http.StatusNotFound, recorder.Code)
+		assert.Equal(t, http.StatusForbidden, recorder.Code)
 		assert.Equal(t, "original", storedUpdateTestMessage(t, db, messageID))
 	})
 }

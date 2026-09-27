@@ -258,6 +258,10 @@ func (p *PendingCall) tryAccept(user uuid.UUID, onAccepted func() error) (accept
 func (p *PendingCall) tryDecline(user uuid.UUID, onDeclined func()) declineTransition {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.tryDeclineLocked(user, onDeclined)
+}
+
+func (p *PendingCall) tryDeclineLocked(user uuid.UUID, onDeclined func()) declineTransition {
 	if p.terminalOwned || !p.isCurrentLocked() {
 		return declineTransitionInactive
 	}
@@ -279,6 +283,24 @@ func (p *PendingCall) tryDecline(user uuid.UUID, onDeclined func()) declineTrans
 	return declineTransitionPending
 }
 
+// tryDeclineWithCommit holds the ring transition lock through the durable
+// fence. A later decline therefore cannot derive a terminal result from an
+// earlier decline that subsequently rolls back.
+func (p *PendingCall) tryDeclineWithCommit(user uuid.UUID, commit func() error) (declineTransition, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	transition := p.tryDeclineLocked(user, nil)
+	if (transition != declineTransitionPending && transition != declineTransitionTerminal) || commit == nil {
+		return transition, nil
+	}
+	if err := commit(); err != nil {
+		p.rollbackDeclineLocked(user)
+		return transition, err
+	}
+	return transition, nil
+}
+
 // tryTerminate reserves a cancel/timeout/disconnect terminal transition. The
 // map entry intentionally remains until side effects are emitted, preventing a
 // replacement ring from being created and then canceled by the older event.
@@ -290,6 +312,28 @@ func (p *PendingCall) tryTerminate() bool {
 	}
 	p.terminalOwned = true
 	return true
+}
+
+// rollbackTerminate releases a terminal claim whose surrounding durable fence
+// did not commit, leaving the exact pending ring available for retry.
+func (p *PendingCall) rollbackTerminate() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.isCurrentLocked() {
+		p.terminalOwned = false
+	}
+}
+
+// rollbackDeclineLocked restores one caller's ringing state after its
+// surrounding durable fence fails to commit. The caller holds p.mu, so no
+// later transition can have observed this uncommitted decline.
+func (p *PendingCall) rollbackDeclineLocked(user uuid.UUID) {
+	if !p.isCurrentLocked() {
+		return
+	}
+	delete(p.DeclinedUserIDs, user)
+	p.RingingUserIDs[user] = struct{}{}
+	p.terminalOwned = false
 }
 
 // finalizeTerminal releases a transition claimed by tryAccept, tryDecline, or

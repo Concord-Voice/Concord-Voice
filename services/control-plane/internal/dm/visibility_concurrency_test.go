@@ -66,7 +66,7 @@ func TestClearWinsOverMessageMutationAfterInitialVisibilityPrecheck(t *testing.T
 				}
 				status <- ts.DoRequest(tt.method, pathDMConversationsPrefix+conversationID+pathMsgSlash+messageID, body, testhelpers.AuthHeaders(actor.AccessToken)).Code
 			}()
-			requireBlockedBy(t, ts.DB, blockerPID, "%FROM users WHERE id = $1 FOR SHARE%", 1, tt.name+" should reach its transactional recheck after the initial visibility precheck")
+			requireBlockedBy(t, ts.DB, blockerPID, "%FROM users WHERE id = ANY(%FOR SHARE%", 1, tt.name+" should reach its transactional topology fence after the initial visibility precheck")
 
 			var cutoff time.Time
 			require.NoError(t, clearTx.QueryRow(`SELECT clock_timestamp()`).Scan(&cutoff))

@@ -266,6 +266,19 @@ func LockConversationUsersTx(ctx context.Context, tx *sql.Tx, conversationID str
 // never takes another user lock: an intervening membership change must restart
 // the transaction rather than leave a new participant outside that prefix.
 func PrepareConversationAfterUserLocksTx(ctx context.Context, tx *sql.Tx, conversationID string, expectedSubjects []uuid.UUID, parentMode LockMode) ([]uuid.UUID, error) {
+	return prepareConversationAfterUserLocksTx(ctx, tx, conversationID, expectedSubjects, parentMode, true)
+}
+
+// PrepareResolutionConversationAfterUserLocksTx locks and revalidates a
+// conversation after the caller acquired the exact users-first snapshot for a
+// destructive membership operation. Unlike the ordinary preparation helper,
+// it deliberately does not reject a blocked pair: the caller is resolving that
+// membership and validates the remaining conversation after its delete.
+func PrepareResolutionConversationAfterUserLocksTx(ctx context.Context, tx *sql.Tx, conversationID string, expectedSubjects []uuid.UUID, parentMode LockMode) ([]uuid.UUID, error) {
+	return prepareConversationAfterUserLocksTx(ctx, tx, conversationID, expectedSubjects, parentMode, false)
+}
+
+func prepareConversationAfterUserLocksTx(ctx context.Context, tx *sql.Tx, conversationID string, expectedSubjects []uuid.UUID, parentMode LockMode, guardBlocked bool) ([]uuid.UUID, error) {
 	if tx == nil || len(expectedSubjects) == 0 {
 		return nil, ErrUnavailable
 	}
@@ -294,8 +307,10 @@ func PrepareConversationAfterUserLocksTx(ctx context.Context, tx *sql.Tx, conver
 	if !sameSubjects(expectedSubjects, fresh) {
 		return nil, ErrMembershipChanged
 	}
-	if err := guardBlockedConversationTx(ctx, tx, conversationID); err != nil {
-		return nil, err
+	if guardBlocked {
+		if err := guardBlockedConversationTx(ctx, tx, conversationID); err != nil {
+			return nil, err
+		}
 	}
 	return fresh, nil
 }

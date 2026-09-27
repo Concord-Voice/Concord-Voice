@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -804,15 +806,6 @@ func (h *Handler) executeBlockTx(
 		return nil, fmt.Errorf("capture block presence: %w", err)
 	}
 
-	// Record the durable reconciliation obligation before changing the friendship.
-	// RecordBlockTx takes the users-first transition fence, so a concurrent
-	// participant insert cannot commit after observing the old friendship graph.
-	// The deferred friendship constraint then proves this transaction left current
-	// directional reconciliation evidence for every blocked pair.
-	if err := dmblock.RecordBlockTx(ctx, tx, userID, targetUserID, uuid.NewString()); err != nil {
-		return plan, fmt.Errorf("record block reconciliation: %w", err)
-	}
-
 	res, err := tx.ExecContext(ctx, `
 		UPDATE friendships SET status = 'blocked', updated_at = NOW()
 		WHERE (requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)
@@ -858,6 +851,23 @@ func (h *Handler) notifyBlock(userID, targetUserID string) {
 	}
 }
 
+func (h *Handler) blockPresenceGate(ctx context.Context, userID, targetUserID string) (presencecapture.GraphPresenceCapture, bool) {
+	gated := h.graphPresence
+	if gated == nil {
+		return nil, false
+	}
+	principal, principalErr := uuid.Parse(userID)
+	counterpart, counterpartErr := uuid.Parse(targetUserID)
+	if principalErr != nil || counterpartErr != nil {
+		return gated, false
+	}
+	edge, err := presencehook.AcceptedEdgeExists(ctx, h.db, principal, counterpart)
+	if err != nil || edge {
+		return gated, false
+	}
+	return nil, true
+}
+
 // BlockUser blocks another user. If a friendship exists, it is updated to 'blocked'.
 // The transaction records a durable DM reconciliation obligation; the reconciler
 // later cues an atomic successor claim rather than revoking the current epoch.
@@ -877,6 +887,8 @@ func (h *Handler) BlockUser(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	tokenEpoch := middleware.TokenCredentialEpoch(c)
+	operationID := uuid.NewString()
 
 	// blockCaptureSpec is the single source for the gates, the capture and the
 	// focal set; executeBlockTx calls it again for its own Capture, so both
@@ -910,30 +922,40 @@ func (h *Handler) BlockUser(c *gin.Context) {
 	// accepted edge, so skip the gate". Only the second may raise ErrProbeStale;
 	// conflating them made every block of a real friend 503 on an unwired
 	// replica, refusing a safety affordance that should simply proceed.
-	gated := h.graphPresence
-	probeSkippedGate := false
-	if gated != nil {
-		if principal, pErr := uuid.Parse(userID); pErr == nil {
-			if counterpart, cErr := uuid.Parse(targetUserID); cErr == nil {
-				edge, probeErr := presencehook.AcceptedEdgeExists(ctx, h.db, principal, counterpart)
-				if probeErr == nil && !edge {
-					gated = nil
-					probeSkippedGate = true
-				}
-			}
-		}
-	}
+	gated, probeSkippedGate := h.blockPresenceGate(ctx, userID, targetUserID)
 
 	err := presencehook.WithGatedTx(ctx, gated, h.db, h.log, spec, func(tx *sql.Tx) error {
+		blocker, parseErr := uuid.Parse(userID)
+		if parseErr != nil {
+			return dmblock.ErrUnavailable
+		}
+		blocked, parseErr := uuid.Parse(targetUserID)
+		if parseErr != nil {
+			return dmblock.ErrUnavailable
+		}
+		if guardErr := dmblock.LockBlockSubjectsTx(ctx, tx, []uuid.UUID{blocker, blocked}); guardErr != nil {
+			return fmt.Errorf("guard block subjects: %w", guardErr)
+		}
+		if guardErr := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); guardErr != nil {
+			return fmt.Errorf("guard block credential epoch: %w", guardErr)
+		}
 		plan, blockErr := h.executeBlockTx(ctx, gated, probeSkippedGate, tx, userID, targetUserID)
 		if blockErr != nil {
 			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
 			return blockErr
 		}
+		if obligationErr := dmblock.RecordBlockTx(ctx, tx, userID, targetUserID, operationID); obligationErr != nil {
+			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("record block DM reconciliation: %w", obligationErr)
+		}
 
 		return presencehook.Complete(ctx, gated, tx, plan)
 	})
 	if err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			return
+		}
 		h.respondPresenceTerminal(c, errMsgFailedBlockUser, err)
 		return
 	}

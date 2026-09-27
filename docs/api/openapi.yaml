@@ -3644,7 +3644,8 @@ paths:
       tags:
       - DM
       summary: Get a DM conversation
-      description: 'Get details of a specific DM conversation.
+      description: 'Get details of a specific DM conversation. Access is checked against
+        current membership, not a cached authorization decision.
 
         Rate limit: 30 requests per minute (user-based).
 
@@ -3868,7 +3869,9 @@ paths:
       tags:
       - DM
       summary: Get DM encryption key
-      description: 'Get the wrapped E2EE key for a DM conversation.
+      description: 'Get the wrapped E2EE key for a DM conversation. The current
+        participant row is rechecked while the conversation parent is locked; a removed
+        recipient receives no key and cannot recreate one through a pending request.
 
         Rate limit: 30 requests per minute (user-based).
 

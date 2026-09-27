@@ -21,6 +21,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -56,6 +57,7 @@ const (
 	pathVoiceSlash = "/voice/"
 	pathPersonal   = "/personal"
 	pathMsgSlash   = "/messages/"
+	pathRotateKey  = "/rotate-key"
 )
 
 func setupTS(t *testing.T) *testhelpers.TestServer {
@@ -487,6 +489,90 @@ func TestOpenConversation_UserNotFound(t *testing.T) {
 		"user_id": fakeID,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestDMTopologyBlockRejectsNewConversationAndGroup(t *testing.T) {
+	ts := setupTS(t)
+	caller := ts.CreateTestUser(t, "topoblockcaller")
+	target := ts.CreateTestUser(t, "topoblocktarget")
+	conversationID := ts.CreateDMConversation(t, caller.ID, target.ID)
+	groupID := createTestGroup(t, ts, caller, target)
+	newMember := ts.CreateTestUser(t, "topoblocknewmember")
+
+	tx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	require.NoError(t, dmblock.RecordBlockTx(context.Background(), tx, caller.ID, target.ID, uuid.NewString()))
+	require.NoError(t, tx.Commit())
+
+	open := ts.DoRequest("POST", pathDMConversations, map[string]interface{}{
+		"user_id": target.ID,
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, open.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, open, &body)
+	assert.Equal(t, "dm_unavailable", body["error"])
+
+	messageID := insertDMMessage(t, ts, conversationID, caller.ID, "blocked message")
+	messages := ts.DoRequest("PATCH", pathDMConversationsPrefix+conversationID+pathMsgSlash+messageID,
+		map[string]interface{}{"content": testhelpers.ValidCiphertext(), "key_version": 1}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, messages.Code)
+	body = nil
+	testhelpers.ParseJSON(t, messages, &body)
+	assert.Equal(t, "dm_unavailable", body["error"])
+
+	rename := ts.DoRequest("PATCH", pathDMConversationsPrefix+groupID,
+		map[string]interface{}{"name": "blocked rename"}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, rename.Code)
+	body = nil
+	testhelpers.ParseJSON(t, rename, &body)
+	assert.Equal(t, "dm_unavailable", body["error"])
+
+	add := ts.DoRequest("POST", pathDMConversationsPrefix+groupID+pathMembers,
+		map[string]interface{}{"user_id": newMember.ID}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, add.Code)
+	body = nil
+	testhelpers.ParseJSON(t, add, &body)
+	assert.Equal(t, "privacy_blocked", body["error"])
+
+	ts.SeedDMKey(t, conversationID, caller.ID, 1)
+	ts.SeedDMKey(t, conversationID, target.ID, 1)
+	rotate := ts.DoRequest("POST", pathDMConversationsPrefix+conversationID+pathRotateKey,
+		map[string]interface{}{
+			"wrapped_keys": map[string]string{
+				caller.ID: "wrapped-topoblockcaller-v2",
+				target.ID: "wrapped-topoblocktarget-v2",
+			},
+			"key_version": 2,
+		}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusNotFound, rotate.Code, rotate.Body.String())
+	body = nil
+	testhelpers.ParseJSON(t, rotate, &body)
+	assert.Equal(t, "Context not found or access denied", body["error"])
+	var rotationWrites int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM dm_channel_keys WHERE conversation_id = $1 AND key_version = 2`, conversationID,
+	).Scan(&rotationWrites))
+	assert.Zero(t, rotationWrites, "blocked rotation must not write a successor key")
+	var revocations int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1`, conversationID,
+	).Scan(&revocations))
+	assert.Zero(t, revocations, "blocked rotation must not revoke the current epoch")
+
+	keys := ts.DoRequest("GET", pathDMConversationsPrefix+conversationID+"/keys",
+		nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, keys.Code)
+	body = nil
+	testhelpers.ParseJSON(t, keys, &body)
+	assert.Equal(t, "dm_unavailable", body["error"])
+
+	group := ts.DoRequest("POST", pathDMConversationsPrefix+"group", map[string]interface{}{
+		"user_ids": []string{target.ID},
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, group.Code)
+	body = nil
+	testhelpers.ParseJSON(t, group, &body)
+	assert.Equal(t, "dm_unavailable", body["error"])
 }
 
 func TestOpenConversation_PrivacyBlocked_DMDisabled(t *testing.T) {
@@ -1114,6 +1200,23 @@ func TestUpdateConversation_RenameGroup(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestUpdateConversationRejectsStaleCredentialEpoch(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "rename_stale_epoch_admin")
+	member := ts.CreateTestUser(t, "rename_stale_epoch_member")
+	convID := createTestGroup(t, ts, admin, member)
+
+	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	w := ts.DoRequest(http.MethodPatch, pathDMConversationsPrefix+convID, map[string]interface{}{
+		"name": "must not persist",
+	}, testhelpers.AuthHeaders(staleToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+
+	var name sql.NullString
+	require.NoError(t, ts.DB.QueryRow(`SELECT name FROM dm_conversations WHERE id = $1`, convID).Scan(&name))
+	assert.NotEqual(t, "must not persist", name.String, "stale rename must not update the conversation")
+}
+
 func TestUpdateConversation_CannotRenameOneOnOne(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "upconv1on1a")
@@ -1570,6 +1673,29 @@ func TestGetKeys_ReturnsLatestVersion(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	key := testhelpers.JSONField[map[string]interface{}](t, body, "key")
 	assert.Equal(t, float64(3), key["key_version"])
+}
+
+// A durable block must fence a previously admitted participant away from the
+// wrapped-key read. Without GetKeys' transaction-side topology guard this
+// returned the stale key with 200 after RecordBlockTx committed.
+func TestGetKeys_BlockedTopologyFailsClosed(t *testing.T) {
+	ts := setupTS(t)
+	caller := ts.CreateTestUser(t, "getkeysblockedcaller")
+	target := ts.CreateTestUser(t, "getkeysblockedtarget")
+	convID := ts.CreateDMConversation(t, caller.ID, target.ID)
+	ts.SeedDMKey(t, convID, caller.ID, 1)
+
+	tx, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, dmblock.RecordBlockTx(context.Background(), tx, caller.ID, target.ID, uuid.NewString()))
+	require.NoError(t, tx.Commit())
+
+	w := ts.DoRequest(http.MethodGet, pathDMConversationsPrefix+convID+"/keys", nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "dm_unavailable", body["error"])
+	assert.NotContains(t, body, "key")
 }
 
 // The legacy POST /dm/conversations/:id/keys was removed in #1218. It never had
@@ -2651,6 +2777,244 @@ func TestAddMemberSuccess(t *testing.T) {
 	assert.Len(t, participants, 3, "should now have 3 participants")
 }
 
+func TestAddMemberRetriesAfterLegacyParticipantSnapshotDrift(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "addretryadmin")
+	member := ts.CreateTestUser(t, "addretrymember")
+	legacy := ts.CreateTestUser(t, "addretrylegacy")
+	target := ts.CreateTestUser(t, "addretrytarget")
+	convID := createTestGroup(t, ts, admin, member)
+	ts.CreateFriendship(t, admin.ID, legacy.ID, statusAccepted)
+	ts.CreateFriendship(t, admin.ID, target.ID, statusAccepted)
+	ts.SeedDMKey(t, convID, admin.ID, 1)
+
+	// Hold the conversation row so a legacy insert queues before AddMember's
+	// parent lock. It commits between PrepareConversationTx's two snapshots.
+	blocker, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	var locked string
+	require.NoError(t, blocker.QueryRow(`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID).Scan(&locked))
+	legacyStatus := make(chan error, 1)
+	go func() {
+		_, insertErr := ts.DB.Exec(`INSERT INTO dm_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`, convID, legacy.ID)
+		legacyStatus <- insertErr
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND query LIKE '%INSERT INTO dm_participants%'
+		)`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond, "legacy participant insert should wait on the parent lock")
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathMembers,
+			map[string]interface{}{"user_id": target.ID}, testhelpers.AuthHeaders(admin.AccessToken))
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND query LIKE '%SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE%'
+			)`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond, "add-member transaction should wait on the parent lock")
+
+	require.NoError(t, blocker.Commit())
+	require.NoError(t, <-legacyStatus)
+
+	w := <-result
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target.ID).Scan(&count))
+	assert.Equal(t, 1, count, "retry must create exactly one target membership")
+}
+
+func TestDMHardMuteRetriesAfterParticipantSnapshotDrift(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "hardretryadmin")
+	target := ts.CreateTestUser(t, "hardretrytarget")
+	legacy := ts.CreateTestUser(t, "hardretrylegacy")
+	convID := createTestGroup(t, ts, admin, target)
+
+	blocker, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	var locked string
+	require.NoError(t, blocker.QueryRow(`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID).Scan(&locked))
+	legacyStatus := make(chan error, 1)
+	go func() {
+		_, insertErr := ts.DB.Exec(`INSERT INTO dm_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`, convID, legacy.ID)
+		legacyStatus <- insertErr
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%INSERT INTO dm_participants%')`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond)
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+pathMute, nil, testhelpers.AuthHeaders(admin.AccessToken))
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE%')`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond)
+
+	require.NoError(t, blocker.Commit())
+	select {
+	case err := <-legacyStatus:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("legacy participant insert did not finish")
+	}
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hard mute request did not finish")
+	}
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var serverMuted bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT server_muted FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target.ID).Scan(&serverMuted))
+	assert.True(t, serverMuted)
+}
+
+func TestDMHardMuteConcurrentRequestsDoNotDeadlock(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "hardconcurrentadmin")
+	targetOne := ts.CreateTestUser(t, "hardconcurrentone")
+	targetTwo := ts.CreateTestUser(t, "hardconcurrenttwo")
+	convID := createTestGroup(t, ts, admin, targetOne, targetTwo)
+
+	blocker, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	var locked string
+	require.NoError(t, blocker.QueryRow(`SELECT id FROM dm_conversations WHERE id = $1 FOR SHARE`, convID).Scan(&locked))
+
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for _, target := range []string{targetOne.ID, targetTwo.ID} {
+		go func(target string) {
+			results <- ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+target+pathMute, nil, testhelpers.AuthHeaders(admin.AccessToken))
+		}(target)
+	}
+	require.Eventually(t, func() bool {
+		var waiting int
+		err := ts.DB.QueryRow(`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE%'`).Scan(&waiting)
+		return err == nil && waiting >= 2
+	}, time.Second, 10*time.Millisecond, "both moderation requests should wait on the shared parent lock")
+
+	require.NoError(t, blocker.Commit())
+	for range 2 {
+		select {
+		case response := <-results:
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		case <-time.After(3 * time.Second):
+			t.Fatal("concurrent hard mute request did not finish")
+		}
+	}
+	for _, target := range []string{targetOne.ID, targetTwo.ID} {
+		var muted bool
+		require.NoError(t, ts.DB.QueryRow(`SELECT server_muted FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target).Scan(&muted))
+		assert.True(t, muted)
+	}
+}
+
+func TestDMUserMuteRetriesAfterParticipantSnapshotDrift(t *testing.T) {
+	ts := setupTS(t)
+	actor := ts.CreateTestUser(t, "softretryactor")
+	target := ts.CreateTestUser(t, "softretrytarget")
+	legacy := ts.CreateTestUser(t, "softretrylegacy")
+	ts.CreateFriendship(t, actor.ID, target.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, actor.ID, target.ID)
+	seedDMVoiceParticipant(t, ts, convID, actor.ID)
+	seedDMVoiceParticipant(t, ts, convID, target.ID)
+
+	blocker, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	var locked string
+	require.NoError(t, blocker.QueryRow(`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID).Scan(&locked))
+	legacyStatus := make(chan error, 1)
+	go func() {
+		_, insertErr := ts.DB.Exec(`INSERT INTO dm_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`, convID, legacy.ID)
+		legacyStatus <- insertErr
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%INSERT INTO dm_participants%')`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond)
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+pathUserMute, nil, testhelpers.AuthHeaders(actor.AccessToken))
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE%')`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond)
+
+	require.NoError(t, blocker.Commit())
+	select {
+	case err := <-legacyStatus:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("legacy participant insert did not finish")
+	}
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("soft mute request did not finish")
+	}
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+func TestAddMemberWaitsForPendingVoiceEjection(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "addfence1")
+	member := ts.CreateTestUser(t, "addfence2")
+	newUser := ts.CreateTestUser(t, "addfence3")
+
+	convID := createTestGroup(t, ts, admin, member)
+	ts.CreateFriendship(t, admin.ID, newUser.ID, statusAccepted)
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_block_voice_ejections (conversation_id, user_id, attempts, reconcile_after)
+		VALUES ($1, $2, 1, clock_timestamp() + interval '30 seconds')`, convID, newUser.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathMembers, map[string]interface{}{
+		"user_id": newUser.ID,
+	}, testhelpers.AuthHeaders(admin.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+	var participantCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, newUser.ID,
+	).Scan(&participantCount))
+	assert.Zero(t, participantCount)
+
+	_, err = ts.DB.Exec(`DELETE FROM dm_block_voice_ejections WHERE conversation_id = $1 AND user_id = $2`, convID, newUser.ID)
+	require.NoError(t, err)
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathMembers, map[string]interface{}{
+		"user_id": newUser.ID,
+	}, testhelpers.AuthHeaders(admin.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, newUser.ID,
+	).Scan(&participantCount))
+	assert.Equal(t, 1, participantCount)
+}
+
 func TestAddMemberNotAdmin(t *testing.T) {
 	ts := setupTS(t)
 	admin := ts.CreateTestUser(t, "addna1")
@@ -2753,6 +3117,29 @@ func TestAddMemberTriggersKeyRevocation(t *testing.T) {
 	assert.Equal(t, 0, count, "membership changes must not revoke an epoch ahead of its successor")
 }
 
+func TestAddMemberRejectsStaleCredentialEpoch(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "addstalepochadmin")
+	member := ts.CreateTestUser(t, "addstalepochmember")
+	target := ts.CreateTestUser(t, "addstalepochtarget")
+	convID := createTestGroup(t, ts, admin, member)
+	ts.CreateFriendship(t, admin.ID, target.ID, statusAccepted)
+	ts.SeedDMKey(t, convID, admin.ID, 1)
+
+	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	w := ts.DoRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathMembers, map[string]interface{}{
+		"user_id": target.ID,
+	}, testhelpers.AuthHeaders(staleToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+
+	var participantExists bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, target.ID).Scan(&participantExists))
+	assert.False(t, participantExists, "stale add must not create membership")
+	var revocationCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&revocationCount))
+	assert.Zero(t, revocationCount, "stale add must not rotate DM keys")
+}
+
 func TestRemoveMemberAdminRemovesOther(t *testing.T) {
 	ts := setupTS(t)
 	admin := ts.CreateTestUser(t, "rmadm1")
@@ -2815,6 +3202,26 @@ func TestRemoveMemberSelfLeave(t *testing.T) {
 	err := ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, leaver.ID).Scan(&exists)
 	require.NoError(t, err)
 	assert.False(t, exists, "self-leave user should be removed")
+}
+
+func TestRemoveMemberRejectsStaleCredentialEpoch(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "remstalepochadmin")
+	member := ts.CreateTestUser(t, "remstalepochmember")
+	target := ts.CreateTestUser(t, "remstalepochtarget")
+	convID := createTestGroup(t, ts, admin, member, target)
+	ts.SeedDMKey(t, convID, admin.ID, 1)
+
+	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	w := ts.DoRequest(http.MethodDelete, pathDMConversationsPrefix+convID+pathMembersSlash+target.ID, nil, testhelpers.AuthHeaders(staleToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+
+	var participantExists bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, target.ID).Scan(&participantExists))
+	assert.True(t, participantExists, "stale removal must preserve membership")
+	var revocationCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&revocationCount))
+	assert.Zero(t, revocationCount, "stale removal must not rotate DM keys")
 }
 
 func TestRemoveMemberAdminImmediatelyDisconnectsActiveDMVoiceTarget(t *testing.T) {
@@ -2966,6 +3373,26 @@ func TestUpdateMemberRolePromoteToAdmin(t *testing.T) {
 	assert.Equal(t, "admin", role)
 }
 
+func TestUpdateMemberRoleRejectsStaleCredentialEpoch(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "rolstalepochadmin")
+	member := ts.CreateTestUser(t, "rolstalepochmember")
+	convID := createTestGroup(t, ts, admin, member)
+
+	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	w := ts.DoRequest(http.MethodPatch, pathDMConversationsPrefix+convID+pathMembersSlash+member.ID, map[string]interface{}{
+		"role": "admin",
+	}, testhelpers.AuthHeaders(staleToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+
+	var role string
+	require.NoError(t, ts.DB.QueryRow(`SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, member.ID).Scan(&role))
+	assert.Equal(t, "member", role, "stale role update must not promote the member")
+	var revocationCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&revocationCount))
+	assert.Zero(t, revocationCount, "stale role update must not mutate the key ledger")
+}
+
 func TestUpdateMemberRoleDemoteToMember(t *testing.T) {
 	ts := setupTS(t)
 	creator := ts.CreateTestUser(t, "roldem1")
@@ -3072,6 +3499,24 @@ func TestDeleteGroupSuccess(t *testing.T) {
 	err = ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_participants WHERE conversation_id = $1`, convID).Scan(&pCount)
 	require.NoError(t, err)
 	assert.Equal(t, 0, pCount, "participants should be deleted")
+}
+
+func TestDeleteGroupRejectsStaleCredentialEpoch(t *testing.T) {
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "delgrpstale1")
+	member := ts.CreateTestUser(t, "delgrpstale2")
+	convID := createTestGroup(t, ts, admin, member)
+	messageID := insertDMMessage(t, ts, convID, admin.ID, "must survive stale delete")
+
+	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	w := ts.DoRequest(http.MethodDelete, pathDMConversationsPrefix+convID, nil, testhelpers.AuthHeaders(staleToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+
+	var conversationExists, messageExists bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_conversations WHERE id = $1)`, convID).Scan(&conversationExists))
+	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_messages WHERE id = $1)`, messageID).Scan(&messageExists))
+	require.True(t, conversationExists, "stale delete must leave the group intact")
+	require.True(t, messageExists, "stale delete must leave group messages intact")
 }
 
 func TestDeleteGroupSerializesWithConcurrentKeyRevocation(t *testing.T) {
@@ -3190,9 +3635,16 @@ func TestAddMemberSerializesBeforeConcurrentGroupDeletion(t *testing.T) {
 			t.Errorf("rollback user blocker: %v", rbErr)
 		}
 	}()
+	// The users-first prepare locks this exact set in UUID order. Blocking its
+	// greatest member guarantees AddMember already holds at least one existing
+	// participant's user row when it waits, so DeleteGroup must observe that
+	// canonical fence regardless of random fixture UUID ordering.
+	orderedTopology := []string{admin.ID, member.ID, target.ID}
+	sort.Strings(orderedTopology)
+	blockedUserID := orderedTopology[len(orderedTopology)-1]
 	var lockedUserID string
 	err = userBlockerTx.QueryRow(
-		`SELECT id FROM users WHERE id = $1 FOR UPDATE`, target.ID,
+		`SELECT id FROM users WHERE id = $1 FOR UPDATE`, blockedUserID,
 	).Scan(&lockedUserID)
 	require.NoError(t, err)
 
@@ -3213,10 +3665,10 @@ func TestAddMemberSerializesBeforeConcurrentGroupDeletion(t *testing.T) {
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%INSERT INTO dm_participants (conversation_id, user_id, role)%'
+			  AND query LIKE '%SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR SHARE%'
 		)`).Scan(&waiting)
 		return queryErr == nil && waiting
-	}, time.Second, 10*time.Millisecond, "member addition should wait on the target user lock")
+	}, time.Second, 10*time.Millisecond, "member addition should wait on the ordered topology user lock")
 
 	var probeConversationID string
 	parentLockProbeErr := ts.DB.QueryRow(
@@ -3240,10 +3692,10 @@ func TestAddMemberSerializesBeforeConcurrentGroupDeletion(t *testing.T) {
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE%'
+			  AND query LIKE '%SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE%'
 		)`).Scan(&waiting)
 		return queryErr == nil && waiting
-	}, time.Second, 10*time.Millisecond, "group deletion should wait behind member addition")
+	}, time.Second, 10*time.Millisecond, "group deletion should wait behind member addition's users-first fence")
 
 	require.NoError(t, userBlockerTx.Commit())
 	select {
@@ -3265,10 +3717,8 @@ func TestAddMemberSerializesBeforeConcurrentGroupDeletion(t *testing.T) {
 	).Scan(&conversationExists)
 	require.NoError(t, err)
 	assert.False(t, conversationExists)
-	require.Error(t, parentLockProbeErr, "member addition must lock the parent before child insert")
-	var lockErr *pq.Error
-	require.True(t, errors.As(parentLockProbeErr, &lockErr))
-	assert.Equal(t, "55P03", string(lockErr.Code))
+	require.NoError(t, parentLockProbeErr,
+		"the canonical users-first fence must not acquire the conversation parent while blocked on a user")
 }
 
 func TestRemoveMemberSerializesBeforeConcurrentGroupDeletion(t *testing.T) {
@@ -3332,10 +3782,10 @@ func TestRemoveMemberSerializesBeforeConcurrentGroupDeletion(t *testing.T) {
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE%'
+			  AND query LIKE '%SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE%'
 		)`).Scan(&waiting)
 		return queryErr == nil && waiting
-	}, time.Second, 10*time.Millisecond, "group deletion should wait on member removal's parent lock")
+	}, time.Second, 10*time.Millisecond, "group deletion should wait on member removal's users-first fence")
 
 	require.NoError(t, blockerTx.Commit())
 	select {
@@ -4584,6 +5034,12 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	assert.Equal(t, false, body["is_group"], "DM 1:1 = not group")
 	assert.Equal(t, true, body["server_muted"])
 	assert.Equal(t, true, body["server_deafened"])
+	revision, ok := body["authorization_revision"].(string)
+	require.True(t, ok, "authorization_revision should be a decimal string")
+	require.NotEmpty(t, revision)
+	parsedRevision, err := strconv.ParseInt(revision, 10, 64)
+	require.NoError(t, err)
+	assert.Positive(t, parsedRevision)
 	assert.Equal(t, callID, body["call_id"])
 	assert.Equal(t, user.ID, body["call_caller_user_id"])
 	lease, hasLease, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, uuid.MustParse(convID))
@@ -4618,6 +5074,34 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	require.Equal(t, http.StatusConflict, ring.Code,
 		"a media-authorized direct handoff must remain protected until joined or expired: %s",
 		ring.Body.String())
+}
+
+func TestDMHardMutePublishesCompleteEnforcementSnapshotWithoutVoiceParticipant(t *testing.T) {
+	messages := subscribeDMVoiceEnforcement(t, "voice.enforce.mute")
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "snapshotmuteadmin")
+	target := ts.CreateTestUser(t, "snapshotmutetarget")
+	convID := createTestGroup(t, ts, admin, target)
+
+	response := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+pathMute,
+		nil, testhelpers.AuthHeaders(admin.AccessToken))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	payload := waitDMVoiceEnforcement(t, messages, target.ID)
+	assert.Equal(t, convID, payload["channelId"])
+	assert.Equal(t, "mute", payload["action"])
+	assert.Equal(t, true, payload["serverMuted"])
+	assert.Equal(t, false, payload["serverDeafened"])
+	assert.Equal(t, float64(1), payload["version"])
+	revision, ok := payload["authorizationRevision"].(string)
+	require.True(t, ok, "authorizationRevision should be a decimal string")
+	parsedRevision, err := strconv.ParseInt(revision, 10, 64)
+	require.NoError(t, err)
+	assert.Positive(t, parsedRevision)
+
+	var voiceRows int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_voice_participants WHERE conversation_id = $1`, convID).Scan(&voiceRows))
+	assert.Zero(t, voiceRows)
 }
 
 func TestAuthorizeDMVoiceForMediaPlane_OmittedCallIDRejectsStaleJoinAdmission(t *testing.T) {

@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -41,14 +44,12 @@ const maxGroupVoiceCandidates = 16
 // call join, so it is self-clearing and client-retryable.
 var (
 	errCandidateSetDrifted = errors.New("dm: voice participant set changed under the conversation lock")
-	// errGroupDeleteStateDrifted reports that the caller's preflight admin
-	// authority changed before the destructive transaction acquired its locks.
-	// Retrying performs a fresh authorization decision.
-	errGroupDeleteStateDrifted = errors.New("dm: group delete authorization changed under transaction lock")
 	// errMemberRemovalStateDrifted reports that the preflight authorization or
 	// target membership changed before the destructive transaction acquired its
 	// locks. Retrying performs a fresh authorization decision.
 	errMemberRemovalStateDrifted = errors.New("dm: member removal state changed under transaction lock")
+	errDMTopologyBlocked         = errors.New("dm: participant topology blocked")
+	errDMTopologyPrivacy         = errors.New("dm: participant topology privacy denied")
 )
 
 // groupDeleteStatements is the child-first deletion order. dm_voice_participants
@@ -153,6 +154,15 @@ type UpdateRoleRequest struct {
 	Role string `json:"role" binding:"required"`
 }
 
+type dmRoleChange struct {
+	conversationID string
+	actorID        string
+	targetID       string
+	role           string
+	actor          uuid.UUID
+	target         uuid.UUID
+}
+
 // UpdateMemberRole changes a group DM participant's role (admin/member).
 func (h *Handler) UpdateMemberRole(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -183,57 +193,22 @@ func (h *Handler) UpdateMemberRole(c *gin.Context) {
 		return
 	}
 
-	// Verify caller is participant, admin, and conversation is a group
-	var isGroup bool
-	var createdBy string
-	var callerRole string
-	err := h.db.QueryRow(`
-		SELECT dc.is_group, dc.created_by, dp.role FROM dm_conversations dc
-		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
-		WHERE dc.id = $1`, convID, userID).Scan(&isGroup, &createdBy, &callerRole)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+	change, valid := h.preflightDMRoleChange(c, convID, userID, targetUserID, req.Role)
+	if !valid {
 		return
 	}
-	if err != nil {
-		h.log.Error("Failed to verify caller role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
-		return
+	updated := false
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		err = h.updateDMRoleTx(c.Request.Context(), change, middleware.TokenCredentialEpoch(c))
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		updated = err == nil
+		break
 	}
-	if !isGroup {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot change roles in non-group conversations"})
-		return
-	}
-	if callerRole != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only admins can change roles"})
-		return
-	}
-
-	// Verify target is a participant
-	var exists bool
-	err = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`,
-		convID, targetUserID).Scan(&exists)
-	if err != nil {
-		h.log.Error("Failed to check target participation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
-		return
-	}
-	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Target user is not a participant"})
-		return
-	}
-
-	// Cannot demote the group creator
-	if targetUserID == createdBy && req.Role == "member" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot demote the group creator"})
-		return
-	}
-
-	// Update the role
-	if _, err = h.db.Exec(`UPDATE dm_participants SET role = $1 WHERE conversation_id = $2 AND user_id = $3`,
-		req.Role, convID, targetUserID); err != nil {
-		h.log.Error("Failed to update member role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
+	if !updated {
+		h.respondDMRoleChangeError(c, err)
 		return
 	}
 
@@ -253,6 +228,128 @@ func (h *Handler) UpdateMemberRole(c *gin.Context) {
 		"user_id": targetUserID,
 		"role":    req.Role,
 	})
+}
+
+func (h *Handler) preflightDMRoleChange(c *gin.Context, convID, userID, targetUserID, role string) (dmRoleChange, bool) {
+	// Verify caller is participant, admin, and conversation is a group.
+	var isGroup bool
+	var createdBy string
+	var callerRole string
+	err := h.db.QueryRow(`
+		SELECT dc.is_group, dc.created_by, dp.role FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1`, convID, userID).Scan(&isGroup, &createdBy, &callerRole)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+		return dmRoleChange{}, false
+	}
+	if err != nil {
+		h.log.Error("Failed to verify caller role", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
+		return dmRoleChange{}, false
+	}
+	if !isGroup {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot change roles in non-group conversations"})
+		return dmRoleChange{}, false
+	}
+	if callerRole != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only admins can change roles"})
+		return dmRoleChange{}, false
+	}
+
+	// Verify target is a participant
+	var exists bool
+	err = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`,
+		convID, targetUserID).Scan(&exists)
+	if err != nil {
+		h.log.Error("Failed to check target participation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
+		return dmRoleChange{}, false
+	}
+	if !exists {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Target user is not a participant"})
+		return dmRoleChange{}, false
+	}
+
+	// Cannot demote the group creator
+	if targetUserID == createdBy && role == "member" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot demote the group creator"})
+		return dmRoleChange{}, false
+	}
+
+	actor, err := uuid.Parse(userID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return dmRoleChange{}, false
+	}
+	target, err := uuid.Parse(targetUserID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return dmRoleChange{}, false
+	}
+	return dmRoleChange{
+		conversationID: convID,
+		actorID:        userID,
+		targetID:       targetUserID,
+		role:           role,
+		actor:          actor,
+		target:         target,
+	}, true
+}
+
+func (h *Handler) updateDMRoleTx(ctx context.Context, change dmRoleChange, credentialEpoch string) error {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+		}
+	}()
+	if _, err := dmblock.PrepareConversationTx(ctx, tx, change.conversationID, []uuid.UUID{change.actor, change.target}, dmblock.LockShare, dmblock.LockNoKeyUpdate); err != nil {
+		return err
+	}
+	if err := credepoch.GuardTx(ctx, tx, change.actorID, credentialEpoch); err != nil {
+		return err
+	}
+	var isGroup bool
+	var creatorID, actorRole string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dc.created_by, dp.role FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1 FOR SHARE OF dc, dp`, change.conversationID, change.actorID,
+	).Scan(&isGroup, &creatorID, &actorRole); err != nil {
+		return err
+	}
+	if !isGroup || actorRole != "admin" || (change.targetID == creatorID && change.role == "member") {
+		return dmblock.ErrUnavailable
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE dm_participants SET role = $1 WHERE conversation_id = $2 AND user_id = $3`, change.role, change.conversationID, change.targetID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return dmblock.ErrUnavailable
+	}
+	return tx.Commit()
+}
+
+func (h *Handler) respondDMRoleChangeError(c *gin.Context, err error) {
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		h.respondGuardTxError(c, err, errMsgFailedUpdateRole)
+		return
+	}
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+		return
+	}
+	h.log.Error("Failed to update member role", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
 }
 
 // DeleteGroup permanently deletes a group DM conversation and all associated data.
@@ -298,9 +395,13 @@ func (h *Handler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Delete all group data in a transaction
-	if err := h.deleteGroupData(c.Request.Context(), convID, userID); err != nil {
-		h.respondDeleteGroupError(c, err)
+	// Delete all group data in a transaction.
+	if err := h.deleteGroupData(c.Request.Context(), convID, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			h.respondGuardTxError(c, err, errMsgFailedDeleteGroup)
+		} else {
+			h.respondDeleteGroupError(c, err)
+		}
 		return
 	}
 
@@ -314,9 +415,11 @@ func (h *Handler) DeleteGroup(c *gin.Context) {
 // retry the same request".
 func (h *Handler) respondDeleteGroupError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, errCandidateSetDrifted), errors.Is(err, errGroupDeleteStateDrifted):
-		// A conflict, not a server fault: either the active-call participant set
-		// or the caller's delete authority changed under the transaction lock.
+	case errors.Is(err, dmblock.ErrUnavailable), errors.Is(err, dmblock.ErrMembershipChanged):
+		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
+	case errors.Is(err, errCandidateSetDrifted), errors.Is(err, errMemberRemovalStateDrifted):
+		// A conflict, not a server fault: the active-call participant set or
+		// the caller's delete authority changed under the transaction lock.
 		// Client-retryable, so no in-handler retry loop — that would hold the
 		// sender gates across an indeterminate wait.
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgFailedDeleteGroup})
@@ -378,6 +481,46 @@ func (h *Handler) fetchParticipantIDs(convID string) ([]string, error) {
 	return ids, nil
 }
 
+func fetchParticipantIDsTx(ctx context.Context, tx *sql.Tx, convID string) (ids []string, returnErr error) {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM dm_participants WHERE conversation_id = $1 ORDER BY user_id`, convID)
+	if err != nil {
+		return nil, fmt.Errorf("query locked participants: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			ids = nil
+			returnErr = errors.Join(returnErr, fmt.Errorf("close locked participants: %w", closeErr))
+		}
+	}()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan locked participant: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate locked participants: %w", err)
+	}
+	return ids, nil
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	left = append([]string(nil), left...)
+	right = append([]string(nil), right...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // deleteGroupData deletes a group DM and captures the durable active-category
 // reconciliation obligation for every participant in an active call (#2448).
 //
@@ -402,23 +545,32 @@ func (h *Handler) fetchParticipantIDs(convID string) ([]string, error) {
 //
 // Plan capture sits after the conversation lock and before the first DELETE,
 // because DELETE FROM dm_voice_participants destroys the evidence.
-func (h *Handler) deleteGroupData(ctx context.Context, convID, actorUserID string) error {
-	// Resolved on the plain connection: the gates are acquired from this set,
-	// and acquiring them inside the transaction is what clause 1 forbids.
-	candidates, err := readVoiceCandidates(ctx, h.db, convID)
-	if err != nil {
-		return fmt.Errorf("read voice candidates: %w", err)
+func (h *Handler) deleteGroupData(ctx context.Context, convID, actorUserID, credentialEpoch string) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		// Resolved on the plain connection: the gates are acquired from this set,
+		// and acquiring them inside the transaction is what clause 1 forbids.
+		candidates, err := readVoiceCandidates(ctx, h.db, convID)
+		if err != nil {
+			return fmt.Errorf("read voice candidates: %w", err)
+		}
+		if h.afterCandidateReadHook != nil {
+			h.afterCandidateReadHook()
+		}
+		if len(candidates) > maxGroupVoiceCandidates {
+			return fmt.Errorf("%w: %d", activepresence.ErrTooManySubjects, len(candidates))
+		}
+		var deleteErr error
+		if h.activePlans == nil || len(candidates) == 0 {
+			deleteErr = h.deleteGroupRows(ctx, convID, actorUserID, credentialEpoch, candidates)
+		} else {
+			deleteErr = h.deleteGroupWithPlans(ctx, convID, actorUserID, credentialEpoch, candidates)
+		}
+		if errors.Is(deleteErr, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return deleteErr
 	}
-	if h.afterCandidateReadHook != nil {
-		h.afterCandidateReadHook()
-	}
-	if len(candidates) > maxGroupVoiceCandidates {
-		return fmt.Errorf("%w: %d", activepresence.ErrTooManySubjects, len(candidates))
-	}
-	if h.activePlans == nil || len(candidates) == 0 {
-		return h.deleteGroupRows(ctx, convID, actorUserID, candidates)
-	}
-	return h.deleteGroupWithPlans(ctx, convID, actorUserID, candidates)
+	return dmblock.ErrMembershipChanged
 }
 
 // deleteGroupWithPlans runs the gated, plan-capturing path. The rail owns the
@@ -427,10 +579,11 @@ func (h *Handler) deleteGroupWithPlans(
 	ctx context.Context,
 	convID string,
 	actorUserID string,
+	credentialEpoch string,
 	candidates []uuid.UUID,
 ) error {
 	return h.activePlans.WithGatedTx(ctx, candidates, func(tx *sql.Tx) error {
-		result, err := h.deleteGroupRowsTx(ctx, tx, convID, actorUserID, candidates)
+		result, err := h.deleteGroupRowsTx(ctx, tx, convID, actorUserID, credentialEpoch, candidates)
 		if err != nil {
 			return err
 		}
@@ -447,8 +600,8 @@ func (h *Handler) deleteGroupWithPlans(
 }
 
 // deleteGroupRows is the no-obligation path: no active call, or a replica whose
-// rail is unwired. It opens and commits its own transaction and takes no users
-// lock, because it names no subjects.
+// rail is unwired. It opens and commits its own transaction without voice sender
+// gates or plans, but still locks the DM topology's users-first prefix.
 //
 // It STILL revalidates. Red-team finding, #2448 pre-PR pass: routing on the
 // pre-transaction candidate count sent the EMPTY set -- the ordinary state of a
@@ -465,7 +618,7 @@ func (h *Handler) deleteGroupWithPlans(
 // transaction is the cycle the gate ordering exists to prevent.
 func (h *Handler) deleteGroupRows(
 	ctx context.Context,
-	convID, actorUserID string,
+	convID, actorUserID, credentialEpoch string,
 	candidates []uuid.UUID,
 ) error {
 	if h.purgeEngine == nil {
@@ -481,10 +634,18 @@ func (h *Handler) deleteGroupRows(
 		}
 	}()
 
-	if err := lockConversation(ctx, tx, convID); err != nil {
+	extra, err := topologyActor(actorUserID)
+	if err != nil {
 		return err
 	}
-	if err := revalidateGroupDeleteAuthority(ctx, tx, convID, actorUserID); err != nil {
+	participants, err := dmblock.PrepareResolutionConversationTx(ctx, tx, convID, extra, dmblock.LockNoKeyUpdate, dmblock.LockUpdate)
+	if err != nil {
+		return err
+	}
+	if err := credepoch.GuardTx(ctx, tx, actorUserID, credentialEpoch); err != nil {
+		return err
+	}
+	if err := revalidateDeleteGroupAuthority(ctx, tx, convID, actorUserID); err != nil {
 		return err
 	}
 	if err := revalidateVoiceCandidates(ctx, tx, convID, candidates); err != nil {
@@ -495,6 +656,9 @@ func (h *Handler) deleteGroupRows(
 	}
 	fileIDs, refs, err := h.purgeEngine.CaptureConversationBlobsTx(ctx, tx, convID)
 	if err != nil {
+		return err
+	}
+	if err := dmblock.EnqueueVoiceEjectionsTx(ctx, tx, convID, participants); err != nil {
 		return err
 	}
 	if err := execGroupChildDeletes(ctx, tx, convID); err != nil {
@@ -518,24 +682,30 @@ func (h *Handler) deleteGroupRows(
 func (h *Handler) deleteGroupRowsTx(
 	ctx context.Context,
 	tx *sql.Tx,
-	convID, actorUserID string,
+	convID, actorUserID, credentialEpoch string,
 	candidates []uuid.UUID,
 ) (groupDeleteResult, error) {
 	if h.purgeEngine == nil {
 		return groupDeleteResult{}, errors.New("group deletion: purge engine is unavailable")
 	}
-	// 1. users FIRST — clause 2 of deleteGroupData's contract.
-	if err := lockVoiceCandidates(ctx, tx, candidates); err != nil {
+	// 1. Complete topology users FIRST — candidates alone omit inactive
+	// participants and the creator referenced by the deletion.
+	extra, err := topologyActor(actorUserID)
+	if err != nil {
+		return groupDeleteResult{}, err
+	}
+	participants, err := dmblock.PrepareResolutionConversationTx(ctx, tx, convID, extra, dmblock.LockNoKeyUpdate, dmblock.LockUpdate)
+	if err != nil {
+		return groupDeleteResult{}, err
+	}
+	if err := credepoch.GuardTx(ctx, tx, actorUserID, credentialEpoch); err != nil {
 		return groupDeleteResult{}, err
 	}
 	if h.afterUsersLockHook != nil {
 		h.afterUsersLockHook(tx)
 	}
 	// 2. Then the domain parent.
-	if err := lockConversation(ctx, tx, convID); err != nil {
-		return groupDeleteResult{}, err
-	}
-	if err := revalidateGroupDeleteAuthority(ctx, tx, convID, actorUserID); err != nil {
+	if err := revalidateDeleteGroupAuthority(ctx, tx, convID, actorUserID); err != nil {
 		return groupDeleteResult{}, err
 	}
 	// 3. Re-validate under the lock, fail closed.
@@ -555,6 +725,9 @@ func (h *Handler) deleteGroupRowsTx(
 		return groupDeleteResult{}, err
 	}
 	// 5. The existing deletes, unchanged order.
+	if err := dmblock.EnqueueVoiceEjectionsTx(ctx, tx, convID, participants); err != nil {
+		return groupDeleteResult{}, err
+	}
 	if err := execGroupChildDeletes(ctx, tx, convID); err != nil {
 		return groupDeleteResult{}, err
 	}
@@ -570,6 +743,19 @@ func (h *Handler) deleteGroupRowsTx(
 type groupDeleteResult struct {
 	keys []activepresence.PlanKey
 	refs []media.BlobRef
+}
+
+// lockConversation serializes destructive retirement with participant inserts.
+// INSERT into dm_participants takes a KEY SHARE lock on its FK parent, which
+// conflicts with FOR UPDATE but not FOR NO KEY UPDATE.
+func lockConversation(ctx context.Context, tx *sql.Tx, convID string) error {
+	var lockedConversationID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		return fmt.Errorf("lock conversation: %w", err)
+	}
+	return nil
 }
 
 func lockConversationMessages(ctx context.Context, tx *sql.Tx, convID string) (returnErr error) {
@@ -615,6 +801,40 @@ func ensureNoAttachmentBridges(ctx context.Context, tx *sql.Tx, fileIDs []string
 	return fmt.Errorf("group deletion: attachment %s remains referenced", fileID)
 }
 
+func topologyActor(actorID string) ([]uuid.UUID, error) {
+	if actorID == "" {
+		return nil, nil
+	}
+	actor, err := uuid.Parse(actorID)
+	if err != nil {
+		return nil, fmt.Errorf("parse topology actor: %w", err)
+	}
+	return []uuid.UUID{actor}, nil
+}
+
+func revalidateDeleteGroupAuthority(ctx context.Context, tx *sql.Tx, convID, actorID string) error {
+	if actorID == "" {
+		return nil
+	}
+	var isGroup bool
+	var role string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.role
+		FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1
+		FOR SHARE OF dc, dp
+	`, convID, actorID).Scan(&isGroup, &role); errors.Is(err, sql.ErrNoRows) {
+		return errMemberRemovalStateDrifted
+	} else if err != nil {
+		return fmt.Errorf("revalidate group deletion authority: %w", err)
+	}
+	if !isGroup || role != "admin" {
+		return errMemberRemovalStateDrifted
+	}
+	return nil
+}
+
 // lockVoiceCandidates takes the users rows in database-side sorted order, so
 // two concurrent group deletions with overlapping call participants agree on
 // acquisition order and cannot self-deadlock. FOR NO KEY UPDATE, not FOR
@@ -630,49 +850,6 @@ func lockVoiceCandidates(ctx context.Context, tx *sql.Tx, candidates []uuid.UUID
 		pq.Array(ids),
 	); err != nil {
 		return fmt.Errorf("lock participants: %w", err)
-	}
-	return nil
-}
-
-// lockConversation takes the domain parent.
-//
-// FOR UPDATE, deliberately, and NOT the FOR NO KEY UPDATE its neighbours in
-// handlers.go use. Those are non-key UPDATEs of the conversation; this
-// transaction DELETES the row. FOR KEY SHARE — the lock an INSERT INTO
-// dm_participants takes on its FK parent — conflicts with FOR UPDATE and NOT
-// with FOR NO KEY UPDATE, so FOR UPDATE is the only mode that serializes group
-// deletion against a concurrent AddMember. Weakening it is silent: the
-// invariant is held by TestAddMemberSerializesBeforeConcurrentGroupDeletion and
-// TestRemoveMemberSerializesBeforeConcurrentGroupDeletion, not by this call
-// site, and two independent readers have already mistaken it for an outlier.
-func lockConversation(ctx context.Context, tx *sql.Tx, convID string) error {
-	var lockedConversationID string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID,
-	).Scan(&lockedConversationID); err != nil {
-		return fmt.Errorf("lock conversation: %w", err)
-	}
-	return nil
-}
-
-// revalidateGroupDeleteAuthority locks the caller's membership after the
-// conversation lock, so a preflight admin check cannot authorize deletion
-// after the caller is demoted or removed.
-func revalidateGroupDeleteAuthority(ctx context.Context, tx *sql.Tx, convID, actorUserID string) error {
-	var actorRole string
-	err := tx.QueryRowContext(ctx, `
-		SELECT role FROM dm_participants
-		WHERE conversation_id = $1 AND user_id = $2
-		FOR UPDATE
-	`, convID, actorUserID).Scan(&actorRole)
-	if errors.Is(err, sql.ErrNoRows) {
-		return errGroupDeleteStateDrifted
-	}
-	if err != nil {
-		return fmt.Errorf("lock group deletion caller membership: %w", err)
-	}
-	if actorRole != "admin" {
-		return errGroupDeleteStateDrifted
 	}
 	return nil
 }

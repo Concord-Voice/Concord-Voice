@@ -123,15 +123,31 @@ func TestClearReapPinsReadCommittedAgainstARepeatableReadDefault(t *testing.T) {
 			redteamClearAll(t, db, conv, time.Now())
 			newcomer := dbtest.CreateUser(t, db).String()
 			h := &Handler{db: db, log: log}
+			creator := conversationCreatorID(t, db, conv)
+			_, err := db.Exec(`UPDATE dm_participants SET role = 'admin' WHERE conversation_id = $1 AND user_id = $2`, conv, creator)
+			require.NoError(t, err)
+			preflight, err := h.fetchParticipantIDs(conv)
+			require.NoError(t, err)
+			for _, userID := range append(preflight, newcomer) {
+				setTopologyPrivacy(t, db, uuid.MustParse(userID), dmPrivacyOpenToAll, false)
+			}
 
 			// Stall the real addMemberTx after it has locked the parent and
 			// inserted the newcomer: its next statement reads dm_channel_keys.
 			blocker, err := db.Begin()
 			require.NoError(t, err)
+			defer func() {
+				if rollbackErr := blocker.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+					t.Errorf("rollback dm key table blocker: %v", rollbackErr)
+				}
+			}()
 			_, err = blocker.Exec(`LOCK TABLE dm_channel_keys IN ACCESS EXCLUSIVE MODE`)
 			require.NoError(t, err)
 			addDone := make(chan error, 1)
-			go func() { _, addErr := h.addMemberTx(conv, newcomer); addDone <- addErr }()
+			go func() {
+				_, addErr := h.addMemberTx(context.Background(), conv, newcomer, creator, "", preflight)
+				addDone <- addErr
+			}()
 			redteamWaitFor(t, db, "addMemberTx blocked holding the parent lock", `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
 				WHERE a.datname = current_database() AND NOT l.granted AND l.locktype = 'relation' AND l.relation = 'dm_channel_keys'::regclass`)
 

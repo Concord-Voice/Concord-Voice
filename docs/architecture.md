@@ -640,6 +640,7 @@ erDiagram
 > - migrations 000140–000143 add the guarded Server Voice terminal outbox, its account-erasure index, six aggregate operations counters, a recoverable delivery claim, and retry delivery through local Hub admission; account erasure or channel deletion cancels a retained user-owned obligation
 > - migration 000144 binds member roles to their server; migrations 000145–000153 serialize DM revocation, add durable block and media-ejection reconciliation, fence delivery generations, add credential-epoch ejections and rollout grace, and validate blocked-friendship compatibility
 > - migrations 000155–000156 widen and validate the `message_purges` reason check to admit `clear`, the reason the DM clear-reap purge-engine terminal writes when it deletes messages every current participant has cleared
+> - migration 000159 adds `voice_authorization_revision_seq`, a database-assigned monotonic watermark carried by voice authorization snapshots so media admission can reject stale snapshots; its down migration refuses to drop a consumed sequence and thereby prevents revision reuse
 
 DM participant visibility is private to the requesting account. `dm_participants.hidden_at`
 removes one participant's conversation from list reads without changing read state;
