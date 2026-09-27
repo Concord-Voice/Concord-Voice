@@ -1,7 +1,7 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
 **Generated:** 2026-09-23
-**MinIO distribution addendum updated:** 2026-07-12
+**MinIO distribution addendum updated:** 2026-09-27
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
 **Audit reference:** [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
@@ -96,21 +96,27 @@ shipped `node_modules`.
 
 ## Separately Distributed MinIO Server
 
-Concord builds and distributes an unchanged upstream MinIO server as a
-standalone container image. It is not linked into a Concord application binary
-and is not relicensed under CVSL 1.0.
+Concord distributes a standalone MinIO server derived from the upstream release
+below. The derivative applies a bounded dependency patch to `go.mod` and
+`go.sum`; it is not linked into a Concord application binary and is not
+relicensed under CVSL 1.0.
 
 | Item | Recorded value |
 | --- | --- |
 | Upstream release | `RELEASE.2025-10-15T17-29-55Z` |
 | Upstream commit | `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` |
+| Derivative commit | `823f9aa2bd624e7fa0bcc2217c4174d9ed6e1c8a` |
 | Upstream license | AGPL-3.0-or-later |
-| Runtime package | `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z` |
-| Corresponding-source package | `ghcr.io/concord-voice/minio-source:RELEASE.2025-10-15T17-29-55Z` |
+| Runtime package | `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62` |
+| Corresponding-source package | `ghcr.io/concord-voice/minio-source:RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62` |
 
-The corresponding-source package contains the exact upstream source archive,
-its checksum, Concord's Dockerfile, and the reproducible build recipe. The
-public build materials are maintained at
+The corresponding-source package contains the derivative source archive and
+checksum, the dependency patch and checksum, `go.mod` and `go.sum` checksums,
+source provenance, the runtime-manifest digest, Concord's Dockerfile, and the
+reproducible build recipe. The upstream tag and commit remain unchanged; the
+derivative commit records only the bounded manifest patch. See the
+[MinIO refresh runbook]([internal]refresh-minio-image.md) for verified
+release identities. The public build materials are maintained at
 [Concord-Voice/Concord-Voice `infrastructure/docker/minio`](https://github.com/Concord-Voice/Concord-Voice/tree/main/infrastructure/docker/minio).
 The runtime image preserves upstream `LICENSE`, `NOTICE`, and `CREDITS`
 unchanged under `/licenses`.

@@ -2,22 +2,19 @@
 
 > **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover still deferred
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-09-26 (approved dependency-only source exception documented)
+> **Last updated:** 2026-09-27 (published dependency-only derivative recorded)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
 
-> ### Corrected 2026-08-28 — the consumer step already happened
+> ### Consumer history
 >
-> This runbook described updating the shared `docker-compose.yml` as forbidden during
-> Phase 1 and pending in Phase 2. It landed on **2026-07-14** in
-> [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226) —
-> one day after the body was last revised. `docker-compose.yml:126` pins
-> `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z@sha256:08e1ba1a…`, the exact
-> digest the "Current Fixed Release" table below records.
+> [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226)
+> first pinned the shared `docker-compose.yml` consumer on **2026-07-14** to the
+> upstream-only release. The current consumer pin uses the published derivative
+> recorded in the "Current Fixed Release" table below.
 >
-> The **live cutover** is genuinely still deferred: nothing here replaced the running
-> MinIO container on the production server. That half cannot be confirmed from the
-> repository — check the host.
+> The live production cutover remains deferred; the repository cannot confirm
+> which image is running on the production server.
 
 ## Purpose
 
@@ -133,7 +130,7 @@ The publisher must verify, on native amd64 and arm64:
 - the production capability and `no-new-privileges` tuple
 - a clean SIGTERM exit
 
-For the proposed derivative, the native amd64 smoke uses the runner's `curl`
+For the derivative, the native amd64 smoke uses the runner's `curl`
 with AWS SigV4 signing instead of pulling a separate MinIO client image. With
 temporary protected credentials in a mode-0600 temporary curl config and the
 isolated smoke server, require exact HTTP statuses for bucket creation (200),
@@ -142,20 +139,21 @@ object PUT (200), HEAD (200), GET
 SHA-256 of the uploaded and downloaded bytes. This exercises standard S3
 operations only; it does not validate admin APIs. See the official
 [`CURLOPT_AWS_SIGV4` documentation](https://curl.se/libcurl/c/CURLOPT_AWS_SIGV4.html).
-Native arm64 validation remains startup, readiness, and clean shutdown; it is
-not full S3 coverage in the publisher workflow. Local isolated validation did
-pass the full S3 lifecycle, HEAD, and object-hash checks on native arm64. Its
-server-info response reported version `2025-10-15T17:29:55Z`, commit ID
-`823f9aa2bd624e7fa0bcc2217c4174d9ed6e1c8a`, and state `online`. Local amd64
-execution was emulated, so native amd64 publisher verification remains pending.
+The successful [publisher run](https://github.com/Concord-Voice/Concord-Voice-Alpha/actions/runs/36305893881)
+verified native amd64 S3 operations and runtime metadata, plus native arm64
+startup, readiness, shutdown, and metadata. The publisher arm64 job did not run
+full S3 checks; separate local native arm64 validation passed the full S3
+lifecycle and object-hash checks. After publication, both public artifacts were
+independently pulled from empty authentication stores by digest and verified;
+see [the tracker evidence](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1975#issuecomment-5854238424).
+The artifact checks do not establish production CVE coverage.
 
-The proposed derivative source inputs are recorded in
+The derivative source inputs are recorded in
 [`SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md), including
-the patch, manifest, derivative commit/tree, and archive hashes. Its proposed
-tag is `RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62`; it has no published
-runtime or source digest yet. Keep the current fixed-release table below at the
-last successfully published digests until a publisher summary and anonymous
-digest proofs establish a new release.
+the patch, manifest, derivative commit/tree, and archive hashes. The published
+tag is `RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62`, with derivative
+commit `823f9aa2bd624e7fa0bcc2217c4174d9ed6e1c8a`. The table below records the
+publisher's runtime and source digests.
 
 ## 2. Merge and Publish Private Artifacts
 
@@ -251,10 +249,11 @@ A logged-in pull is not anonymous-access evidence.
 
 ## 4. Shared Consumer and Future Servers
 
-**Done.** The shared `docker-compose.yml` was updated after both public digest proofs
-passed, by [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226) on
-2026-07-14. Verify with `grep -n 'image:.*minio' docker-compose.yml`: line 126 carries the
-exact Concord `tag@sha256:digest` with `pull_policy: missing` and no Docker Hub fallback.
+**Done.** The shared `docker-compose.yml` consumer was first added after public digest
+proofs passed, by [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226)
+on 2026-07-14. It now carries the current derivative's exact Concord
+`tag@sha256:digest`, retains `pull_policy: missing`, and has no Docker Hub fallback.
+Verify with `grep -n 'image:.*minio' docker-compose.yml`.
 
 The requirements still stand for any future re-pin. The MinIO service must use the exact
 Concord `tag@sha256:digest`, retain `pull_policy: missing`, and have no Docker Hub
@@ -266,9 +265,8 @@ reviewed digest when it is absent. Existing servers pre-pull it before a
 targeted replacement.
 
 No Phase 1 **publish** PR may change the consumer or claim production CVE coverage. The
-consumer pin was a deliberate separate change (PR #2226), not a Phase 1 publish. The CVE
-half is unchanged and still binding: the pin alone gives no production CVE coverage,
-because the running container on the live server has not been replaced.
+consumer pin remains a separate change from publishing. The pin alone gives no production
+CVE coverage because the running container on the live server has not been replaced.
 
 ## 5. Phase 2 Live-Cutover Gate
 
@@ -343,19 +341,22 @@ stop. Do not improvise destructive recovery.
 | --- | --- |
 | Upstream tag | `RELEASE.2025-10-15T17-29-55Z` |
 | Upstream commit | `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` |
-| Runtime tag | `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z` |
-| Source tag | `ghcr.io/concord-voice/minio-source:RELEASE.2025-10-15T17-29-55Z` |
-| Runtime digest | `sha256:08e1ba1a7396036f40c57fed2dfabe687ca722d233576484a817a8908bee66c5` |
-| Source digest | `sha256:749db4d34817703406a32e6c416e262c632a7a43b0b106947387fbb3c9ed84bd` |
+| Derivative commit | `823f9aa2bd624e7fa0bcc2217c4174d9ed6e1c8a` |
+| Runtime tag | `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62` |
+| Source tag | `ghcr.io/concord-voice/minio-source:RELEASE.2025-10-15T17-29-55Z.CONCORD.823f9aa2bd62` |
+| Runtime digest | `sha256:a1d35733ca68335cc4782e7a81eafa577d841c70ebf9e51fc07f54978fcfc494` |
+| Source digest | `sha256:66977d4270328fb09813b1509d492adc25bb6d7b8f2d369b80a6a8c22629bfe4` |
 
-Update this table only from a successful publisher workflow summary.
+These identities come from [successful publisher run 36305893881](https://github.com/Concord-Voice/Concord-Voice-Alpha/actions/runs/36305893881).
+The source archive checksum, derivative metadata, source-runtime binding, and
+exact-main recipe were verified. The independent anonymous digest pulls are
+recorded in [the tracker evidence](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1975#issuecomment-5854238424).
+The upstream tag and commit are unchanged.
 
-**The shared Compose consumer no longer "remains unchanged" — it is pinned to the runtime
-digest above** (`docker-compose.yml:126`, PR #2226, 2026-07-14). What is still outstanding
-is the **live server**: replacing the running MinIO container on production requires
-Concord to separately authorize, review, rehearse, and verify Phase 2. That half is **not
-verified from the repository** — the repository cannot show which image a running container
-was started from. Check the host directly:
+The shared Compose consumer is pinned to the runtime digest above. The **live server**
+still requires separate authorization, review, rehearsal, and verification under Phase 2.
+That deployment state is **not verified from the repository** — the repository cannot
+show which image a running container was started from. Check the host directly:
 
 ```bash
 docker inspect concordvoice-minio --format '{{.Image}} {{.Config.Image}}'
