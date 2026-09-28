@@ -1513,7 +1513,7 @@ type syncedChannelMoveRequest struct {
 }
 
 func newSyncedChannelMoveTarget(preflight channelAuthorityState, channelID string, req UpdateChannelRequest) syncedChannelMoveTarget {
-	target := syncedChannelMoveTarget{groupID: preflight.GroupID}
+	target := syncedChannelMoveTarget{groupID: preflight.GroupID, voiceIDs: []string{}}
 	if req.GroupID != nil {
 		target.groupID = req.GroupID
 	}

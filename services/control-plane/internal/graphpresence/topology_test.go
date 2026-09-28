@@ -2042,10 +2042,12 @@ func TestWithGatedTxToleratesAnUnwiredFence(t *testing.T) {
 	assert.NotContains(t, trace.snapshot(), stepFenceOpen)
 }
 
-// The three reaction rails own no audience-relation write, so there is no
+// These reaction-only files own no audience-relation write, so there is no
 // transaction to bracket and they correctly keep only the post-hoc epoch bump
 // via DisconnectAllRichPresenceClients. "Deliberately not wired" and "forgotten"
 // look identical in a diff; this asserts the former.
+// Voice lifecycle's nats.go also owns temporary-grant revocation writes, so a
+// whole-file no-bracket assertion cannot cover that reaction rail.
 //
 // This is a source inventory lock, NOT a logic test — the repo distrusts
 // grep-shaped assertions as behavioural proof, and it is used here only to make
@@ -2056,7 +2058,6 @@ func TestReactionRailsDoNotTakeTheAudienceBracket(t *testing.T) {
 		name string
 		path string
 	}{
-		{"voice lifecycle", "../voice/nats.go"},
 		{"active category reconciler", "../activepresence/reconciler.go"},
 		{"voice presence executor", "../voicepresence/executor.go"},
 	} {

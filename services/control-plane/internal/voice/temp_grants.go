@@ -31,6 +31,15 @@ const revokeReason = "temp_access_revoked"
 
 const tempGrantEffectTimeout = 10 * time.Second
 
+func beginAudienceRevocationForTemporaryGrant(hub *websocket.Hub, temporary bool) func() {
+	if temporary {
+		return hub.BeginAudienceRevocation()
+	}
+	return func() {
+		// No audience fence was opened for a permanent or absent grant.
+	}
+}
+
 func detachedTempGrantContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	detached := context.WithoutCancel(ctx)
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(time.Now().Add(tempGrantEffectTimeout)) {
@@ -418,14 +427,14 @@ func (m *tempGrantManager) revokeOrphanedTemporaryChannelAccess(
 	if err != nil {
 		return false, err
 	}
+	closeAudienceFence := beginAudienceRevocationForTemporaryGrant(m.hub, preflightTemporary)
+	defer closeAudienceFence()
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin orphan temporary grant cleanup: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			returnErr = errors.Join(returnErr, fmt.Errorf("rollback orphan temporary grant cleanup: %w", rollbackErr))
-		}
+		returnErr = joinRollbackErr(returnErr, tx.Rollback(), "rollback orphan temporary grant cleanup")
 	}()
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return false, fmt.Errorf("lock orphan temporary grant visibility: %w", err)
@@ -462,6 +471,7 @@ func (m *tempGrantManager) revokeOrphanedTemporaryChannelAccess(
 		}
 		return false, fmt.Errorf("commit orphan temporary grant cleanup: %w", err)
 	}
+	closeAudienceFence()
 	if removed {
 		m.completeTemporaryGrantRevocation(ctx, serverID, channelID, userID, plan, rotation)
 	}

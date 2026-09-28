@@ -4205,6 +4205,8 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 	if err != nil {
 		return false, false, err
 	}
+	closeAudienceFence := beginAudienceRevocationForTemporaryGrant(s.hub, preflightTemporary)
+	defer closeAudienceFence()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, false, fmt.Errorf("begin stale server voice participant cleanup: %w", err)
@@ -4329,6 +4331,7 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		}
 		return false, false, fmt.Errorf("commit stale server voice participant cleanup: %w", err)
 	}
+	closeAudienceFence()
 	if rowsAffected == 0 {
 		return false, false, nil
 	}

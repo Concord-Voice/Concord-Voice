@@ -76,7 +76,13 @@ type channelGroupDeleteRequest struct {
 	serverID, groupID, userID, tokenEpoch string
 }
 
+type channelGroupDeletePreflight struct {
+	allIDs   []string
+	voiceIDs []string
+}
+
 func syncedGroupChannelIDs(states []groupedChannelState) (all []string, voice []string) {
+	voice = []string{}
 	for _, state := range states {
 		if !state.SyncPermissions {
 			continue
@@ -288,6 +294,7 @@ func requestedChannelStatesTx(ctx context.Context, tx *sql.Tx, serverID string, 
 }
 
 func authorityAffectedChannelIDs(req ReorderChannelsRequest, states map[string]groupedChannelState) (all []string, voice []string) {
+	voice = []string{}
 	for _, change := range req.Channels {
 		state := states[change.ChannelID]
 		if !state.SyncPermissions || sameOptionalGroupID(state.GroupID, change.GroupID) {
@@ -549,11 +556,12 @@ func (h *Handler) DeleteChannelGroup(c *gin.Context) {
 			return
 		}
 		preflightIDs, preflightVoiceIDs := syncedGroupChannelIDs(preflight)
-		plan, err = h.authority.RunChannelAuthorityMutation(c.Request.Context(), serverID, preflightVoiceIDs,
+		preflightSet := channelGroupDeletePreflight{allIDs: preflightIDs, voiceIDs: preflightVoiceIDs}
+		plan, err = h.authority.RunChannelAuthorityMutation(c.Request.Context(), serverID, preflightSet.voiceIDs,
 			func(ctx context.Context, tx *sql.Tx) error {
 				var mutationErr error
 				lockedChannelIDs, rotations, deniedByChannel, mutationErr = h.deleteChannelGroupAuthorityTx(
-					ctx, tx, serverID, groupID, userID, tokenEpoch, preflightIDs,
+					ctx, tx, serverID, groupID, userID, tokenEpoch, preflightSet,
 				)
 				return mutationErr
 			}, userID,
@@ -651,8 +659,8 @@ func (h *Handler) respondChannelGroupDeleteMutationError(c *gin.Context, serverI
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedDeleteGroup})
 }
 
-func (h *Handler) deleteChannelGroupAuthorityTx(ctx context.Context, tx *sql.Tx, serverID, groupID, userID, tokenEpoch string, preflightIDs []string) ([]string, []keyrotation.Rotation, map[string][]string, error) {
-	actualIDs, err := h.lockAndAuthorizeChannelGroupDeleteTx(ctx, tx, serverID, groupID, userID, tokenEpoch, preflightIDs)
+func (h *Handler) deleteChannelGroupAuthorityTx(ctx context.Context, tx *sql.Tx, serverID, groupID, userID, tokenEpoch string, preflight channelGroupDeletePreflight) ([]string, []keyrotation.Rotation, map[string][]string, error) {
+	actualIDs, err := h.lockAndAuthorizeChannelGroupDeleteTx(ctx, tx, serverID, groupID, userID, tokenEpoch, preflight)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -670,7 +678,7 @@ func (h *Handler) deleteChannelGroupAuthorityTx(ctx context.Context, tx *sql.Tx,
 	return actualIDs, rotations, deniedByChannel, nil
 }
 
-func (h *Handler) lockAndAuthorizeChannelGroupDeleteTx(ctx context.Context, tx *sql.Tx, serverID, groupID, userID, tokenEpoch string, preflightIDs []string) ([]string, error) {
+func (h *Handler) lockAndAuthorizeChannelGroupDeleteTx(ctx context.Context, tx *sql.Tx, serverID, groupID, userID, tokenEpoch string, preflight channelGroupDeletePreflight) ([]string, error) {
 	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
 		return nil, err
 	}
@@ -684,8 +692,8 @@ func (h *Handler) lockAndAuthorizeChannelGroupDeleteTx(ctx context.Context, tx *
 	if err != nil {
 		return nil, err
 	}
-	actualIDs, _ := syncedGroupChannelIDs(locked)
-	if !sameChannelIDSet(preflightIDs, actualIDs) {
+	actualIDs, actualVoiceIDs := syncedGroupChannelIDs(locked)
+	if !sameChannelIDSet(preflight.allIDs, actualIDs) || !sameChannelIDSet(preflight.voiceIDs, actualVoiceIDs) {
 		return nil, errChannelAuthoritySetChanged
 	}
 	actorPerms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)

@@ -1773,7 +1773,7 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// unconditionally after the transaction commits: the media plane may have
 	// provisionally registered the peer before its voice-presence row exists.
 	h.dmPublishEnforcementUnconditionally(
-		convID, targetUserID, "voice.enforce.disconnect", "disconnect",
+		convID, targetUserID, "voice.enforce.disconnect", "disconnect", uuid.Nil,
 	)
 
 	// Broadcast events
@@ -2920,7 +2920,7 @@ func (h *Handler) retractVoiceJoinAuthorization(ctx context.Context, retraction 
 		h.log.Error("Failed to compensate DM voice join", "failure_class", "dependency")
 	}
 	if retraction.leaseOwned {
-		h.dmPublishEnforcementUnconditionally(retraction.convID, retraction.userID, dmVoiceDisconnectSubject, "disconnect")
+		h.dmPublishEnforcementUnconditionally(retraction.convID, retraction.userID, dmVoiceDisconnectSubject, "disconnect", retraction.callID)
 	}
 }
 
@@ -3744,14 +3744,18 @@ func (h *Handler) authorizeDMGroupAdmin(c *gin.Context, errMsgNotAdmin string) (
 }
 
 func (h *Handler) dmPublishEnforcementUnconditionally(
-	convID, targetID, subject, action string,
+	convID, targetID, subject, action string, callID uuid.UUID,
 ) {
 	if h.nats == nil {
 		return
 	}
-	if err := h.nats.Publish(subject, map[string]interface{}{
+	payload := map[string]interface{}{
 		"channelId": convID, "userId": targetID, "action": action,
-	}); err != nil {
+	}
+	if callID != uuid.Nil {
+		payload["callId"] = callID.String()
+	}
+	if err := h.nats.Publish(subject, payload); err != nil {
 		// Keep logs free of user-controlled conversation/member identifiers and
 		// broker error strings; the fixed subject/action classify the failed path.
 		h.log.Error("Failed to publish DM enforcement",
@@ -4502,6 +4506,13 @@ func noDMVoiceCalleesError(isGroup bool) string {
 	return "no callees in this conversation"
 }
 
+func (h *Handler) rejectFailedPendingDMCall(c *gin.Context, convUUID uuid.UUID, ring *PendingCall, announced bool) {
+	if announced {
+		h.cancelFailedPendingDMCall(convUUID, ring)
+	}
+	c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
+}
+
 // RingDMCall initiates a DM voice call ring. POST /api/v1/dm/conversations/:id/voice/ring.
 //
 // Validates caller ∈ dm_participants. Creates pendingDMCalls[convID] entry,
@@ -4624,10 +4635,7 @@ func (h *Handler) RingDMCall(c *gin.Context) {
 	}
 
 	if !initialized {
-		if announced {
-			h.cancelFailedPendingDMCall(convUUID, ring)
-		}
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
+		h.rejectFailedPendingDMCall(c, convUUID, ring, announced)
 		return
 	}
 
@@ -5098,7 +5106,7 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 		if !committed && authorizedCallID != uuid.Nil {
 			// The media plane may already have accepted this peer. A targeted
 			// disconnect is the only safe compensation for a shared lease.
-			h.dmPublishEnforcementUnconditionally(convID, userID, dmVoiceDisconnectSubject, "disconnect")
+			h.dmPublishEnforcementUnconditionally(convID, userID, dmVoiceDisconnectSubject, "disconnect", authorizedCallID)
 		}
 	}()
 	identity, err := loadDMVoiceAuthorizeIdentityTx(c.Request.Context(), tx, convID, userID)

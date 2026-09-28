@@ -1167,6 +1167,8 @@ If an unadmitted room is empty, and no competing local admission remains, a DELE
 
 Removing another group-DM member, or self-leaving, commits membership revocation first, then unconditionally publishes `voice.enforce.disconnect`. The media-plane consumer resolves both the user's admitted socket and any exact provisional reconnect socket. It removes the exact provisional candidate, runs exact admitted teardown for the captured admitted socket, and then force-closes the captured sockets. That ordering stops an already-issued A2 response from promoting after committed revocation, while preserving synchronous admitted teardown and terminal telemetry for a history-bearing call.
 
+A failed join's compensating disconnect carries the failed call ID, so delayed delivery cannot evict a later call. Membership removal omits that ID and still evicts any current session.
+
 If the admitted socket already left, the enforcement-specific candidate removal closes the now-empty room silently when it was never admitted. It publishes normal terminal lifecycle when admitted history exists. Each successful DM heartbeat also retries disconnects for media-reported users who no longer remain members.
 
 Current media builds present the exact ID. Omission remains a verify-existing-only compatibility path for already released clients, and it must match that member's short-lived `/voice/join` admission. Media `voice.joined` and non-empty 30-second `voice.heartbeat` events renew the exact conversation and call lease for 90 seconds. Reconnect authorization therefore stays correlated for long calls, while dropped terminal events expire instead of blocking a conversation forever.
