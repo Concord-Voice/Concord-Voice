@@ -6,6 +6,7 @@
  * from the App root so minVersion enforcement works regardless of auth state.
  */
 
+import { z } from 'zod';
 import { apiFetch } from './apiClient';
 import {
   useClientConfigStore,
@@ -18,14 +19,14 @@ const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STARTUP_DELAY_MS = 2_000; // 2s after mount — let auth + profile settle first
 const SPA_CHECK_MIN_INTERVAL_MS = 60_000;
 
-interface ServerConfigResponse {
-  minVersion: string;
-  featureFlags: { gifsEnabled?: boolean };
-  mediaPlaneUrl: string;
-  turn: { host?: string; realm?: string };
-  spaUrl?: string;
-  spaIpcContract?: number;
-}
+const ServerConfigSchema = z.object({
+  minVersion: z.string(),
+  featureFlags: z.object({ gifsEnabled: z.boolean().optional() }),
+  mediaPlaneUrl: z.string(),
+  turn: z.object({ host: z.string().optional(), realm: z.string().optional() }),
+  spaUrl: z.string().optional(),
+  spaIpcContract: z.number().int().nonnegative().optional(),
+});
 
 class ClientConfigService {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -137,8 +138,15 @@ class ClientConfigService {
         return;
       }
 
-      const data: ServerConfigResponse = await res.json();
+      const rawData: unknown = await res.json();
       if (!this.isCurrentConfigRequest(controller, generation)) return;
+      const parsed = ServerConfigSchema.safeParse(rawData);
+      if (!this.isCurrentConfigRequest(controller, generation)) return;
+      if (!parsed.success) {
+        console.warn('[ClientConfig] Invalid config response');
+        return;
+      }
+      const data = parsed.data;
       // Snapshot the previous config so we can decide whether to log a
       // change. Polling fires every 5 minutes; without this gate the
       // [ClientConfig] Updated config line spammed the console every poll
@@ -189,9 +197,9 @@ class ClientConfigService {
       if (isFirstFetch || changed) {
         console.debug('[ClientConfig] Updated config');
       }
-    } catch (err) {
+    } catch {
       if (this.isCurrentConfigRequest(controller, generation)) {
-        console.warn('[ClientConfig] Fetch error:', err instanceof Error ? err.message : 'unknown');
+        console.warn('[ClientConfig] Fetch error');
       }
     } finally {
       if (this.configAbortController === controller) {

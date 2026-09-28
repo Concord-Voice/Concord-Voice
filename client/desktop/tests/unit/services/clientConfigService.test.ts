@@ -96,6 +96,13 @@ afterEach(() => {
 });
 
 describe('clientConfigService', () => {
+  const validConfig = {
+    minVersion: '0.2.0',
+    featureFlags: { gifsEnabled: true },
+    mediaPlaneUrl: 'https://media.test/',
+    turn: { host: 'turn.test', realm: 'r' },
+  };
+
   describe('fetch', () => {
     // The prior `'fetches config and updates store'` test in this position
     // used snake_case keys (`min_version`, `feature_flags`, ...) that did
@@ -179,6 +186,208 @@ describe('clientConfigService', () => {
       await clientConfigService.fetch();
 
       expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+    });
+    it('issue #2240 rejects a malformed 200 config without mutation or SPA checking while capabilities update', async () => {
+      mockApiFetch.mockImplementation((path) =>
+        Promise.resolve(
+          jsonResponse(
+            path === '/api/v1/client/config'
+              ? {
+                  featureFlags: {},
+                  mediaPlaneUrl: 'https://media.test/',
+                  turn: {},
+                }
+              : serverCapabilitiesPayload(true)
+          )
+        )
+      );
+
+      await clientConfigService.fetch();
+
+      expect.soft(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'supported',
+      });
+      expect.soft(useClientConfigStore.getState().minVersion).toBe('');
+      expect.soft(useClientConfigStore.getState().lastFetchedAt).toBeNull();
+      expect.soft(mockSpaCheckForUpdate).not.toHaveBeenCalled();
+    });
+
+    it('accepts additive config fields, strips nested unknown keys, and defaults SPA fields', async () => {
+      mockApiFetch.mockImplementation((path) =>
+        Promise.resolve(
+          jsonResponse(
+            path === '/api/v1/client/config'
+              ? {
+                  ...validConfig,
+                  futureRoot: 'discard',
+                  featureFlags: { gifsEnabled: true, futureFlag: true },
+                  turn: { ...validConfig.turn, futureTurn: 'discard' },
+                }
+              : serverCapabilitiesPayload()
+          )
+        )
+      );
+
+      await clientConfigService.fetch();
+
+      expect(useClientConfigStore.getState()).toMatchObject({
+        ...validConfig,
+        spaUrl: '',
+        spaIpcContract: 0,
+      });
+      expect(useClientConfigStore.getState().lastFetchedAt).not.toBeNull();
+      expect(useClientConfigStore.getState().featureFlags).toEqual({ gifsEnabled: true });
+      expect(useClientConfigStore.getState().turn).toEqual(validConfig.turn);
+      expect('futureRoot' in useClientConfigStore.getState()).toBe(false);
+      expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['null root', null],
+      ['array root', []],
+      ['missing minVersion', { ...validConfig, minVersion: undefined }],
+      ['missing featureFlags', { ...validConfig, featureFlags: undefined }],
+      ['missing mediaPlaneUrl', { ...validConfig, mediaPlaneUrl: undefined }],
+      ['missing turn', { ...validConfig, turn: undefined }],
+      ['array featureFlags', { ...validConfig, featureFlags: [] }],
+      ['wrong gifsEnabled type', { ...validConfig, featureFlags: { gifsEnabled: 'true' } }],
+      ['null turn', { ...validConfig, turn: null }],
+      ['wrong TURN host type', { ...validConfig, turn: { host: 1 } }],
+      ['wrong SPA URL type', { ...validConfig, spaUrl: 1 }],
+      ['negative SPA IPC contract', { ...validConfig, spaIpcContract: -1 }],
+      ['fractional SPA IPC contract', { ...validConfig, spaIpcContract: 1.5 }],
+      ['string SPA IPC contract', { ...validConfig, spaIpcContract: '1' }],
+      ['null SPA IPC contract', { ...validConfig, spaIpcContract: null }],
+    ] as Array<[string, unknown]>)(
+      'rejects %s without mutation or SPA checking',
+      async (_label, payload) => {
+        mockApiFetch.mockImplementation((path) =>
+          Promise.resolve(
+            jsonResponse(
+              path === '/api/v1/client/config' ? payload : serverCapabilitiesPayload(true)
+            )
+          )
+        );
+
+        await clientConfigService.fetch();
+
+        expect.soft(useClientConfigStore.getState()).toMatchObject({
+          minVersion: '',
+          featureFlags: {},
+          mediaPlaneUrl: '',
+          turn: { host: '', realm: '' },
+          spaUrl: '',
+          spaIpcContract: 0,
+          lastFetchedAt: null,
+          activityHistoryCapability: { status: 'supported' },
+        });
+        expect.soft(mockSpaCheckForUpdate).not.toHaveBeenCalled();
+      }
+    );
+
+    it('keeps same-server last-known-good config after an invalid refresh', async () => {
+      let payload: unknown = validConfig;
+      mockApiFetch.mockImplementation((path) =>
+        Promise.resolve(
+          jsonResponse(path === '/api/v1/client/config' ? payload : serverCapabilitiesPayload())
+        )
+      );
+      await clientConfigService.fetch();
+      const before = useClientConfigStore.getState();
+      const spaChecks = mockSpaCheckForUpdate.mock.calls.length;
+
+      vi.advanceTimersByTime(61_000);
+      payload = { ...validConfig, minVersion: 99 };
+      await clientConfigService.fetch();
+
+      expect(useClientConfigStore.getState()).toMatchObject({
+        minVersion: before.minVersion,
+        featureFlags: before.featureFlags,
+        mediaPlaneUrl: before.mediaPlaneUrl,
+        turn: before.turn,
+        lastFetchedAt: before.lastFetchedAt,
+      });
+      expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(spaChecks);
+    });
+
+    it.each(['non-2xx', 'network'] as const)(
+      'keeps last-known-good config after a %s failure',
+      async (failure) => {
+        let fail = false;
+        mockApiFetch.mockImplementation((path) => {
+          if (path === '/api/v1/client/config' && fail) {
+            return failure === 'non-2xx'
+              ? Promise.resolve({ ok: false, status: 503 } as Response)
+              : Promise.reject(new Error('secret-sentinel'));
+          }
+          return Promise.resolve(
+            jsonResponse(
+              path === '/api/v1/client/config' ? validConfig : serverCapabilitiesPayload()
+            )
+          );
+        });
+        await clientConfigService.fetch();
+        const before = useClientConfigStore.getState();
+        const spaChecks = mockSpaCheckForUpdate.mock.calls.length;
+
+        vi.advanceTimersByTime(61_000);
+        fail = true;
+        await clientConfigService.fetch();
+
+        expect(useClientConfigStore.getState()).toMatchObject({
+          minVersion: before.minVersion,
+          mediaPlaneUrl: before.mediaPlaneUrl,
+          lastFetchedAt: before.lastFetchedAt,
+        });
+        expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(spaChecks);
+      }
+    );
+
+    it('keeps reset defaults when the first config after a runtime-server switch is invalid', async () => {
+      let payload: unknown = validConfig;
+      mockApiFetch.mockImplementation((path) =>
+        Promise.resolve(
+          jsonResponse(path === '/api/v1/client/config' ? payload : serverCapabilitiesPayload())
+        )
+      );
+      await clientConfigService.fetch();
+      payload = null;
+
+      await clientConfigService.resetAndRefreshRuntimeServer();
+
+      expect(useClientConfigStore.getState()).toMatchObject({
+        minVersion: '',
+        featureFlags: {},
+        mediaPlaneUrl: '',
+        turn: { host: '', realm: '' },
+        spaUrl: '',
+        spaIpcContract: 0,
+        lastFetchedAt: null,
+      });
+    });
+
+    it('does not log invalid JSON details or mutate config', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockApiFetch.mockImplementation((path) =>
+        Promise.resolve(
+          path === '/api/v1/client/config'
+            ? ({
+                ok: true,
+                json: () => Promise.reject(new SyntaxError('secret-sentinel')),
+              } as Response)
+            : jsonResponse(serverCapabilitiesPayload())
+        )
+      );
+
+      try {
+        await clientConfigService.fetch();
+
+        expect.soft(useClientConfigStore.getState().lastFetchedAt).toBeNull();
+        expect.soft(mockSpaCheckForUpdate).not.toHaveBeenCalled();
+        expect.soft(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-sentinel');
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 
@@ -548,6 +757,46 @@ describe('clientConfigService', () => {
       expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
         status: 'supported',
       });
+    });
+
+    it('ignores an old config body that finishes parsing after a server switch', async () => {
+      const oldBody = deferred<unknown>();
+      const oldJson = vi.fn(() => oldBody.promise);
+      mockApiFetch
+        .mockResolvedValueOnce({ ok: true, json: oldJson } as Response)
+        .mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(false)))
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...validConfig,
+            mediaPlaneUrl: 'https://new-media.test',
+            spaUrl: 'https://new-spa.test',
+          })
+        )
+        .mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(true)));
+
+      const oldFetch = clientConfigService.fetch();
+      await flushFetchPath();
+      expect(oldJson).toHaveBeenCalledOnce();
+
+      await clientConfigService.resetAndRefreshRuntimeServer();
+      const acceptedRevision = useClientConfigStore.getState().acceptedConfigRevision;
+      const spaChecks = mockSpaCheckForUpdate.mock.calls.length;
+      expect(spaChecks).toBe(1);
+
+      oldBody.resolve({
+        ...validConfig,
+        mediaPlaneUrl: 'https://old-media.test',
+        spaUrl: 'https://old-spa.test',
+      });
+      await oldFetch;
+
+      expect(useClientConfigStore.getState()).toMatchObject({
+        mediaPlaneUrl: 'https://new-media.test',
+        spaUrl: 'https://new-spa.test',
+        acceptedConfigRevision: acceptedRevision,
+        activityHistoryCapability: { status: 'supported' },
+      });
+      expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(spaChecks);
     });
   });
 

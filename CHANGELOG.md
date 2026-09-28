@@ -69,6 +69,7 @@ account can't provide, never your password twice.
 
 ### Fixed
 
+- **A malformed server response no longer replaces the desktop's working configuration** ([#3481](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3481), [#2240](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2240)) — the app keeps the last valid settings for that server, or safe defaults after switching servers, until a valid response arrives.
 - **Signing in with two-factor authentication no longer hangs when your encryption keys can't be unlocked** ([#3466](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3466), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) —
   the offer to reset your encryption keys appeared only on the password page, so an account with
   two-factor authentication waited on it forever after entering its code. It now appears on the
