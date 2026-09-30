@@ -24,14 +24,7 @@ Thumbs.db
 * 3.*
 
 # IDEs and Editors
-# Ignore .vscode/ contents (not the directory itself) so the carve-outs below
-# can re-include specific files. Per gitignore(5): a re-include rule cannot
-# resurrect files under a parent directory that is itself excluded.
-.vscode/*
-# Team-shared VS Code config carve-outs (per docs/policies/mcp-server-policy.md §3).
-# Personal settings (.vscode/settings.json, launch.json, etc.) remain ignored.
-!.vscode/mcp.json
-!.vscode/extensions.json
+.vscode/
 .idea/
 # #1211 dep-refresh analysis artifacts (post-hoc reconstruction of the
 # upstream audit + upgrade-analysis that fed the issue body).

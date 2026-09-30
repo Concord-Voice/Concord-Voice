@@ -381,28 +381,6 @@ Tests use Vitest + Testing Library + MSW. See `client/desktop/tests/README.md` f
 
 ### Go Services
 
-**VS Code**:
-
-Create `.vscode/launch.json`:
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Control Plane",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/services/control-plane/cmd/server",
-      "env": {
-        "DATABASE_URL": "postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable"
-      }
-    }
-  ]
-}
-```
-
 **Delve** (CLI):
 
 ```bash
@@ -411,20 +389,6 @@ dlv debug cmd/server/main.go
 ```
 
 ### Node.js Services
-
-**VS Code**:
-
-```json
-{
-  "name": "Media Plane",
-  "type": "node",
-  "request": "launch",
-  "runtimeExecutable": "npm",
-  "runtimeArgs": ["run", "dev"],
-  "cwd": "${workspaceFolder}/services/media-plane",
-  "console": "integratedTerminal"
-}
-```
 
 **Chrome DevTools**:
 
@@ -670,37 +634,6 @@ npm install --global windows-build-tools
 - Verify `ANNOUNCED_IP` is correct — on a host with a LAN interface it must be that address, not `127.0.0.1`. This failure is silent and distinctive: the SFU reports ICE `connected` but `dtlsState` never leaves `connecting`, and no consumer receives a packet
 - Test with localhost first before remote connections
 - Check browser console for ICE errors
-
-## IDE Setup
-
-### VS Code Extensions
-
-Recommended:
-
-- **Go** (golang.go)
-- **ESLint** (dbaeumer.vscode-eslint)
-- **Prettier** (esbenp.prettier-vscode)
-- **Thunder Client** (rangav.vscode-thunder-client) - API testing
-- **Docker** (ms-azuretools.vscode-docker)
-
-### Settings
-
-```json
-{
-  "go.useLanguageServer": true,
-  "go.lintTool": "golangci-lint",
-  "editor.formatOnSave": true,
-  "editor.codeActionsOnSave": {
-    "source.fixAll.eslint": true
-  },
-  "[go]": {
-    "editor.defaultFormatter": "golang.go"
-  },
-  "[typescript]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  }
-}
-```
 
 ## Performance Tips
 
