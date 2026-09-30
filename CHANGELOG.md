@@ -306,6 +306,9 @@ account can't provide, never your password twice.
 
 ### Security
 
+- **Updated the voice server's connection library to close a published advisory** ([#3507](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3507)) —
+  resolves GHSA-2GC4-CQFQ-P2GV, a denial-of-service flaw in the connection that carries voice and
+  video signalling.
 - **An authenticator-app code now works only once** ([#3466](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3466), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — each code from your
   authenticator app is accepted once. Using it again, for a second change or on another screen, is
   refused just like a wrong code, so a code someone sees over your shoulder or in a screen share

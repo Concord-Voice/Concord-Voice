@@ -17,10 +17,11 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 
 ### Required
 
-- **Node.js** 24+ and npm 10+ for the desktop and media-plane workspaces.
-  `client/admin` needs **Node.js >= 24.15.0** (Node 26 included). Go-only work
-  does not require Node.js
-- **Go** 1.26.1+
+- **Node.js** and npm 10+ for the Node workspaces. `client/desktop` and
+  `client/admin` need **Node.js >= 24.15.0**, and `services/media-plane` needs
+  **>= 24.11.0**. Node 26 is included. Each workspace's `package.json` `engines`
+  field is authoritative. Go-only work does not require Node.js
+- **Go** 1.26.6+ (the floor is `services/control-plane/go.mod`)
 - **Docker** and **Docker Compose**
 - **Git**
 - **Python 3** (for `pre-commit` hooks framework and mediasoup build)

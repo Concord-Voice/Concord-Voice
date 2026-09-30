@@ -14,7 +14,7 @@ WebRTC Selective Forwarding Unit (SFU) for routing voice and video media in Conc
 
 ## Tech Stack
 
-- **Node.js** 24+
+- **Node.js** 24.11+ (the `engines` floor in `package.json`; Babel 8 needs it)
 - **TypeScript**
 - **mediasoup** - WebRTC SFU library
 - **Socket.IO** - WebSocket signaling
@@ -72,7 +72,7 @@ Run `ls src/lib/` for the current set. The modules group as follows.
 
 ### Prerequisites
 
-- Node.js 24+
+- Node.js 24.11+
 - npm 10+
 - Python 3 (for mediasoup build)
 - Build tools (make, g++)

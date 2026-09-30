@@ -36,7 +36,7 @@ See [GETTING_STARTED.md](../docs/GETTING_STARTED.md) for detailed setup instruct
 
 ### Prerequisites
 
-- Node.js 24+
+- Node.js 24.15+ (the highest `engines` floor across the Node workspaces)
 - Go 1.26.6+ (the floor is `services/control-plane/go.mod`; CI resolves from it)
 - Python 3
 - pre-commit (`pip install pre-commit` or `brew install pre-commit`)
