@@ -88,6 +88,7 @@ import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -292,6 +293,33 @@ describe('resetService', () => {
       expect(useSubscriptionStore.getState().degraded).toBe(false);
     });
 
+    // #3406, Codex round 7: the permission store holds the previous account's
+    // roles, effective permissions and overrides, and the record of override
+    // writes still in flight. Surviving an account change, those in-flight
+    // records made the next account's settings modals treat the prior
+    // session's request as inherited and lock until it settled, indefinitely
+    // for a hung fetch.
+    it('clears the prior account’s permission state, including writes still in flight (#3406)', () => {
+      usePermissionStore.setState({
+        serverRoles: { 'server-1': [{ id: 'role-1' }] as never },
+        roleViewer: { 'server-1': { max_position: 3 } } as never,
+        serverPermissions: { 'server-1': 1024n },
+        channelPermissions: { 'channel-1': 1024n },
+        channelOverrides: { 'channel-1': [{ id: 'override-1' }] as never },
+        permissionWritesInFlight: { 'channel-1': [7], 'category:cat-1': [8] },
+      });
+
+      gracefulReset();
+
+      const state = usePermissionStore.getState();
+      expect(state.permissionWritesInFlight).toEqual({});
+      expect(state.serverRoles).toEqual({});
+      expect(state.roleViewer).toEqual({});
+      expect(state.serverPermissions).toEqual({});
+      expect(state.channelPermissions).toEqual({});
+      expect(state.channelOverrides).toEqual({});
+    });
+
     it('clears the friend-request eligibility cache (#1241 cross-account leak fix)', () => {
       // The verdict cache is module-scope, not a store, so resetAllStores() and
       // every store-level clear leave it untouched. This asserts the
@@ -463,6 +491,18 @@ describe('resetService', () => {
       expect(useChannelStore.getState().channels).toHaveLength(1);
       expect(useDMStore.getState().conversations).toHaveLength(1);
       expect(useFriendStore.getState().friends).toHaveLength(1);
+    });
+
+    it('retains permission state and writes in flight — the account did not change (#3406)', () => {
+      usePermissionStore.setState({
+        serverPermissions: { 'server-1': 1024n },
+        permissionWritesInFlight: { 'channel-1': [7] },
+      });
+
+      recoveryReset();
+
+      expect(usePermissionStore.getState().serverPermissions).toEqual({ 'server-1': 1024n });
+      expect(usePermissionStore.getState().permissionWritesInFlight).toEqual({ 'channel-1': [7] });
     });
 
     it('retains the authenticated user — the account did not change', () => {

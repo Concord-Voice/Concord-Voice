@@ -38,6 +38,11 @@
   transition: all 0.2s ease;
 }
 
+.sync-toggle[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .sync-toggle.active {
   background: var(--accent-fill);
   border-color: var(--accent-primary);

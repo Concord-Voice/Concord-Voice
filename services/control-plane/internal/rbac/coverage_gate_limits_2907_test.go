@@ -58,7 +58,8 @@ func Test2907AuthorityLimitFailsClosed(t *testing.T) {
 	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`, serverID, member.ID, assignedRoleID).Scan(&assignmentCount))
 	assert.Equal(t, 1, assignmentCount)
 
-	assertLimit("PUT", fmt.Sprintf("/api/v1/categories/%s/overrides", categoryID), map[string]interface{}{"target_type": "role", "target_id": assignedRoleID, "allow": 1, "deny": 0})
+	// #3406: allow/deny carry a `,string` JSON tag now, so send decimal strings.
+	assertLimit("PUT", fmt.Sprintf("/api/v1/categories/%s/overrides", categoryID), map[string]interface{}{"target_type": "role", "target_id": assignedRoleID, "allow": "1", "deny": "0"})
 	var deny int64
 	require.NoError(t, ts.DB.QueryRow(`SELECT deny FROM category_permission_overrides WHERE id = $1`, overrideID).Scan(&deny))
 	assert.Equal(t, int64(1), deny)

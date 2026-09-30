@@ -123,7 +123,7 @@ import {
   type InsertableStreamsReceiver,
 } from '../e2ee/voiceE2eeTransforms';
 import { errorMessage } from '../../utils/runtime/redactError';
-import { hasPermission, SPEAK } from '../../utils/policy/permissions';
+import { hasPermission, parseEffectivePermissions, SPEAK } from '../../utils/policy/permissions';
 import {
   clampScreenForSubscription,
   effectiveCameraSpatialCap,
@@ -2965,11 +2965,12 @@ class VoiceService {
   ): void {
     // Store effective permissions
     if (joinData.permissions) {
-      try {
-        store.setEffectivePermissions(BigInt(joinData.permissions));
-      } catch {
-        store.setEffectivePermissions(0n);
-      }
+      // An effective-permission set, so parseEffectivePermissions: it fails
+      // closed like parsePermissions (BigInt() would accept "-1", which
+      // sign-extends into bit 62 and reads as Administrator), and it keeps the
+      // legacy decode of a pre-#3406 server's rounded administrator value
+      // (#3406 review).
+      store.setEffectivePermissions(parseEffectivePermissions(joinData.permissions));
     }
 
     // Apply server enforcement flags (local audio state only;
@@ -3789,12 +3790,11 @@ class VoiceService {
    */
   private joinPermitsSpeak(joinData: JoinResponse): boolean {
     if (joinData.permissions === undefined) return true;
-    let bits: bigint;
-    try {
-      bits = BigInt(joinData.permissions);
-    } catch {
-      return false;
-    }
+    // parseEffectivePermissions returns 0n for anything but a plain decimal,
+    // a safe integer or a pre-#3406 administrator value, so a malformed
+    // bitfield (including "-1", which BigInt() would read as bit 62) grants no
+    // Speak.
+    const bits = parseEffectivePermissions(joinData.permissions);
     return hasPermission(bits, SPEAK);
   }
 

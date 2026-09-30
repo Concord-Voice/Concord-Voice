@@ -4,7 +4,11 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useMutualServersForAll } from '@/renderer/hooks/messaging/useMutualServers';
-import { INVITE, hasPermission, parsePermissions } from '@/renderer/utils/policy/permissions';
+import {
+  INVITE,
+  hasPermission,
+  parseEffectivePermissions,
+} from '@/renderer/utils/policy/permissions';
 import type { ServerWithRole } from '@/renderer/types/server';
 import ContextMenu from '@/renderer/components/ui/ContextMenu';
 import './InviteServerPicker.css';
@@ -54,7 +58,7 @@ function canInviteTo(
   // thing absence means — so it takes the same path. A genuine zero arrives as
   // `'0'`, which is truthy here and correctly denies.
   if (server.permissions) {
-    return hasPermission(parsePermissions(server.permissions), INVITE);
+    return hasPermission(parseEffectivePermissions(server.permissions), INVITE);
   }
   return hasServerPermission(server.id, INVITE);
 }

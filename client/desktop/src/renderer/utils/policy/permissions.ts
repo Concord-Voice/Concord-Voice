@@ -121,9 +121,16 @@ export const Permissions = {
   ADMINISTRATOR,
 } as const;
 
-/** Count the number of set bits in a permission bitfield */
+/**
+ * Count the number of set bits in a permission bitfield.
+ *
+ * Non-bigint input is decoded via {@link parsePermissions}, whose strict-decimal
+ * regex fails closed to `0n` on anything the wire never emits (hex, a negative
+ * sign, a non-integer). A bare `BigInt(n || 0)` accepted `"0x40"` as hex and threw
+ * a `RangeError` on `1.5` instead of returning 0 (#3406).
+ */
 export function countBits(n: number | string | bigint): number {
-  let v = typeof n === 'bigint' ? n : BigInt(n || 0);
+  let v = typeof n === 'bigint' ? n : parsePermissions(n);
   let count = 0;
   while (v > 0n) {
     if (v & 1n) count++;
@@ -149,9 +156,79 @@ export function removePermission(bitfield: bigint, perm: bigint): bigint {
   return bitfield & ~perm;
 }
 
-/** Parse a permissions string (from API) into a BigInt */
-export function parsePermissions(permsStr: string | number | undefined): bigint {
-  if (permsStr === undefined || permsStr === null) return 0n;
+/** A bitfield as it arrives on the wire: a decimal string, or a pre-#3406 number. */
+type WireBitfield = string | number | undefined;
+
+/**
+ * Strictly decode a wire bitfield, or null when the value is not one. The wire
+ * form is a decimal string (#3406). A number is what a pre-#3406 control plane
+ * sends, and is exact as a safe non-negative integer. Above 2^53 it may have
+ * lost its low bits, so decoding it as-is would yield a different, still
+ * plausible bitfield, and it is refused. An exactly representable number such
+ * as 2^62 + 1024 is refused as well: nothing on the wire says it was not
+ * rounded. parseEffectivePermissions below relaxes this for one case only.
+ */
+function decodeBitfield(value: unknown): bigint | null {
+  if (typeof value === 'string') return /^\d+$/.test(value) ? BigInt(value) : null;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  return null;
+}
+
+/**
+ * The legacy Administrator decode, sound for EFFECTIVE permissions only.
+ *
+ * A number in (2^62, 2^63] carries bit 62: the server's int64 tops out at
+ * 2^63 - 1, and every value from 2^63 - 512 up rounds to exactly 2^63 as a
+ * float, so 2^63 itself is included. Bit 62 is an administrator's value, of
+ * which the Administrator grant is the one fact that survives rounding. It
+ * decodes to that grant alone, which hasPermission treats as every permission,
+ * so an administrator keeps their controls on an older server.
+ *
+ * That is sound only where the Administrator bit subsumes every other, which
+ * is true of an effective-permission response and false of an override or
+ * role mask, a literal set of bits (Codex review, round seven). A mask such as
+ * deny = 2^62 + 1024 would lose its low bit, so masks go through
+ * parsePermissions, which refuses it, and an editor that writes a mask back
+ * checks parseExactPermissions first.
+ *
+ * 2^62 itself is excluded (Codex review, round six). Every value from
+ * 2^62 - 256 up rounds to it, and those carry bits 8 through 61 but not bit
+ * 62: a role an owner can write through UpdateRole. No value without bit 62
+ * rounds above 2^62, so the strict bound admits only values that carry it. An
+ * administrator arrives above 2^62 in practice, because every member holds the
+ * managed @all role, whose permissions cannot change and whose view and send
+ * bits keep the value at least 2^62 + 1024. The exception is a server created
+ * before @all existed: an administrator there whose other bits sum to at most
+ * 512 reads as no grant from an older server. That is display only, since the
+ * server decides every action, and ends when the control plane reaches #3406,
+ * which sends exact strings.
+ *
+ * A number above 2^53 without bit 62 can exist, because an owner may store
+ * undefined high bits through UpdateRole, but it carries no Administrator
+ * grant and its low bits are scrambled, so it fails closed. So does anything
+ * above 2^63, which no int64 rounds to.
+ */
+function decodeLegacyAdministrator(value: unknown): bigint | null {
+  return typeof value === 'number' && value > 2 ** 62 && value <= 2 ** 63 ? ADMINISTRATOR : null;
+}
+
+/**
+ * Decode a permission MASK exactly, or null when it cannot be read bit for bit.
+ *
+ * A caller that writes the mask back, such as the override editor, must refuse
+ * to edit a mask this rejects. parsePermissions' 0n fallback is safe to display
+ * but not to save: the editor would show an empty mask, and a Save would erase
+ * every bit the mask held, its denies included (Codex review, round seven).
+ */
+export function parseExactPermissions(value: WireBitfield): bigint | null {
+  return decodeBitfield(value);
+}
+
+/**
+ * Parse a permission MASK (an override's allow or deny, a role's permissions)
+ * or any bitfield read literally, bit for bit. Fails closed to 0n.
+ */
+export function parsePermissions(permsStr: WireBitfield): bigint {
   // Strict decimal, because `BigInt()` alone does NOT fail closed and this
   // function's whole contract is that it does. `BigInt` accepts `0x40`, `0o100`,
   // `0b1000000`, `+64`, and surrounding whitespace — none of which the wire
@@ -165,14 +242,20 @@ export function parsePermissions(permsStr: string | number | undefined): bigint 
   // COALESCE'd BIT_OR only produces plain non-negative decimal — so this is
   // hardening, not a live defect. It is worth the regex anyway: the failure
   // direction is OPEN, and this decode is the only thing standing between a
-  // wire value and a permission check (red-team, PR #3350).
-  if (typeof permsStr === 'string' && !/^\d+$/.test(permsStr)) return 0n;
-  if (typeof permsStr === 'number' && (!Number.isInteger(permsStr) || permsStr < 0)) return 0n;
-  try {
-    return BigInt(permsStr);
-  } catch {
-    return 0n;
-  }
+  // wire value and a permission check (red-team, PR #3350). Anything but a
+  // string or a number is refused too: BigInt() stringifies an array first, so
+  // ['-1'] would decode to -1n (red-team, #3406).
+  return decodeBitfield(permsStr) ?? 0n;
+}
+
+/**
+ * Parse an EFFECTIVE-permission response: a server's or channel's resolved
+ * permissions for the caller, or the voice join's. Exactly parsePermissions,
+ * plus the legacy Administrator decode above for a pre-#3406 server's
+ * rounded numeric value. Never use it for a mask.
+ */
+export function parseEffectivePermissions(permsStr: WireBitfield): bigint {
+  return decodeBitfield(permsStr) ?? decodeLegacyAdministrator(permsStr) ?? 0n;
 }
 
 /**
@@ -183,8 +266,8 @@ export function parsePermissions(permsStr: string | number | undefined): bigint 
 export interface PermissionOverride {
   target_type: 'user' | 'role';
   target_id: string;
-  allow: number | string;
-  deny: number | string;
+  allow: string;
+  deny: string;
 }
 
 /**
@@ -228,12 +311,20 @@ export function resolveChannelPermissions(
   let userDeny = 0n;
 
   for (const o of overrides) {
-    if (o.target_type === 'role' && viewerRoleIds.has(o.target_id)) {
-      roleAllow |= parsePermissions(o.allow);
-      roleDeny |= parsePermissions(o.deny);
-    } else if (o.target_type === 'user' && o.target_id === viewerUserId) {
-      userAllow |= parsePermissions(o.allow);
-      userDeny |= parsePermissions(o.deny);
+    const isRole = o.target_type === 'role' && viewerRoleIds.has(o.target_id);
+    const isUser = o.target_type === 'user' && o.target_id === viewerUserId;
+    if (!isRole && !isUser) continue;
+    // Fail closed on a malformed override. Decoding it to 0n would be closed for
+    // an allow but OPEN for a deny: "no deny" widens the result (#3406 review).
+    const allow = decodeBitfield(o.allow);
+    const deny = decodeBitfield(o.deny);
+    if (allow === null || deny === null) return 0n;
+    if (isRole) {
+      roleAllow |= allow;
+      roleDeny |= deny;
+    } else {
+      userAllow |= allow;
+      userDeny |= deny;
     }
   }
 

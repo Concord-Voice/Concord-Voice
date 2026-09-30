@@ -2,8 +2,13 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { usePermissionStore, type ChannelOverride } from '@/renderer/stores/chat/permissionStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { server } from '../../../mocks/server';
+import { http, HttpResponse } from 'msw';
 import type { ChannelGroup } from '@/renderer/types/chat';
 import type { Role } from '@/renderer/types/server';
+
+const API_BASE = 'http://localhost:8080';
 
 // Mock PermissionGrid since it has complex internal logic not relevant to this test
 vi.mock('@/renderer/components/Permissions/PermissionGrid', () => ({
@@ -604,5 +609,132 @@ describe('CategorySettingsModal', () => {
     });
 
     expect(targetSelect).toHaveValue('');
+  });
+});
+
+/**
+ * V6-V7 (#3406 regression): real store actions against a mocked network, not
+ * `setState` stubs. `handleUpsert`/`handleDelete` hand the store's boolean to
+ * `OverridePanel`; before #3406 they discarded it, as `ChannelSettingsModal` did.
+ */
+describe('CategorySettingsModal — V6-V7 regression (#3406)', () => {
+  const mockOnClose = vi.fn();
+  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  afterAll(() => server.close());
+  afterEach(() => server.resetHandlers());
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    useAuthStore.getState().setAccessToken('mock-token');
+    usePermissionStore.setState({
+      fetchRoles: vi.fn(),
+      serverRoles: { 'server-1': [mockRole, mockRole2] },
+    });
+    useMemberStore.setState({
+      members: [
+        {
+          user_id: 'user-1',
+          username: 'testuser',
+          display_name: 'Test User',
+          role: 'member' as const,
+          joined_at: '2025-01-01T00:00:00Z',
+          roles: [],
+        },
+      ],
+    });
+  });
+
+  it('V6: a rejected PUT sends decimal-string bits and keeps the editor open with the alert; a retry the server accepts closes it', async () => {
+    const bigOverride: ChannelOverride = {
+      ...mockRoleOverride,
+      allow: '4611686018427387904',
+      deny: '0',
+    };
+    usePermissionStore.setState({ channelOverrides: { 'category:cat-1': [bigOverride] } });
+
+    let call = 0;
+    const bodies: Array<{ allow: unknown; deny: unknown }> = [];
+    server.use(
+      http.put(`${API_BASE}/api/v1/categories/cat-1/overrides`, async ({ request }) => {
+        call += 1;
+        bodies.push((await request.json()) as { allow: unknown; deny: unknown });
+        if (call === 1) return new HttpResponse(null, { status: 400 });
+        return HttpResponse.json({});
+      }),
+      http.get(`${API_BASE}/api/v1/categories/cat-1/overrides`, () =>
+        HttpResponse.json({ overrides: [bigOverride] })
+      )
+    );
+
+    render(
+      <CategorySettingsModal
+        isOpen
+        category={mockCategory}
+        serverId="server-1"
+        onClose={mockOnClose}
+      />
+    );
+    clickOverrideItem('Moderator');
+    fireEvent.click(screen.getByTestId('set-allow'));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save Override'));
+    });
+
+    expect(bodies[0]).toMatchObject({ allow: '4611686018427387905', deny: '0' });
+    expect(screen.getByText('Editing: Moderator')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Failed to save permission override. Your changes are still here — try again.'
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save Override'));
+    });
+
+    expect(screen.queryByText('Editing: Moderator')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('V7: a DELETE returning 500 leaves the row with the delete alert; a 200 removes it', async () => {
+    usePermissionStore.setState({ channelOverrides: { 'category:cat-1': [mockRoleOverride] } });
+
+    let call = 0;
+    server.use(
+      http.delete(`${API_BASE}/api/v1/categories/cat-1/overrides/override-1`, () => {
+        call += 1;
+        if (call === 1) return new HttpResponse(null, { status: 500 });
+        return new HttpResponse(null, { status: 204 });
+      })
+    );
+
+    render(
+      <CategorySettingsModal
+        isOpen
+        category={mockCategory}
+        serverId="server-1"
+        onClose={mockOnClose}
+      />
+    );
+    clickOverrideItem('Moderator');
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Delete override'));
+    });
+
+    expect(
+      screen.getByText('Moderator', { selector: '.override-target-name' })
+    ).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Failed to remove permission override. Try again.'
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Delete override'));
+    });
+
+    expect(
+      screen.queryByText('Moderator', { selector: '.override-target-name' })
+    ).not.toBeInTheDocument();
   });
 });

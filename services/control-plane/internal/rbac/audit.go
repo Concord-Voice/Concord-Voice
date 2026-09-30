@@ -1,9 +1,13 @@
 package rbac
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"io"
+	"strconv"
 	"sync"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
@@ -54,7 +58,7 @@ func (a *AuditWriter) securityEventEmitter() securityevent.Emitter {
 // - targetID: the ID of the affected resource (nil if not applicable)
 // - metadata: additional context as key-value pairs (marshaled to JSONB)
 func (a *AuditWriter) Log(ctx context.Context, serverID string, actorID *string, action, targetType string, targetID *string, metadata map[string]interface{}) error {
-	metadataJSON, err := json.Marshal(metadata)
+	metadataJSON, err := json.Marshal(auditMetadataForStorage(metadata))
 	if err != nil {
 		a.log.Error("Failed to marshal audit metadata", "error", err)
 		a.emitAuditWriteFailure(ctx)
@@ -141,16 +145,85 @@ func (a *AuditWriter) GetAuditLog(ctx context.Context, serverID string, limit, o
 			continue
 		}
 
-		// Unmarshal metadata JSONB
+		// Unmarshal metadata JSONB (bitfield keys re-emitted exactly, #3406)
 		if len(metadataJSON) > 0 {
-			if err := json.Unmarshal(metadataJSON, &entry.Metadata); err != nil {
+			meta, err := decodeAuditMetadata(entry.Action, metadataJSON)
+			if err != nil {
 				a.log.Error("Failed to unmarshal audit metadata", "error", err)
-				entry.Metadata = map[string]interface{}{"_error": "failed to parse metadata"}
+				meta = map[string]interface{}{"_error": "failed to parse metadata"}
 			}
+			entry.Metadata = meta
 		}
 
 		entries = append(entries, entry)
 	}
 
 	return entries, rows.Err()
+}
+
+// auditMetadataForStorage returns a copy of metadata in which every
+// Permission value is its exact decimal string, because a JSON number above
+// 2^53 loses its low bits in any float64 reader (#3406). It keys on the
+// Permission type, not on int64: AuditWriter also records non-permission
+// events, and a member timeout's duration_seconds must stay a number. A writer
+// that records a bitfield passes it as Permission, which keeps a new audit
+// action from needing an auditBitfieldKeys entry to stay exact.
+func auditMetadataForStorage(metadata map[string]interface{}) map[string]interface{} {
+	if metadata == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(metadata))
+	for k, v := range metadata {
+		if p, ok := v.(Permission); ok {
+			out[k] = strconv.FormatInt(int64(p), 10)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// auditBitfieldKeys names, per audit action, the metadata keys that carry a
+// permission bitfield in rows written before #3406, when writers stored them
+// as JSON numbers. JSONB keeps those exactly as numeric, and stored rows are
+// never rewritten, so GetAuditLog re-emits exactly these keys as decimal
+// strings. Rows written since store the writers' Permission values as strings
+// already (auditMetadataForStorage) and pass through unchanged.
+var auditBitfieldKeys = map[string][]string{
+	"role_created":              {"permissions"},
+	"role_updated":              {"new_permissions"},
+	"channel_override_created":  {"allow", "deny"},
+	"channel_override_updated":  {"allow", "deny"},
+	"category_override_created": {"allow", "deny"},
+	"category_override_updated": {"allow", "deny"},
+}
+
+// errAuditMetadataTrailingData refuses a second value after the metadata
+// document, which json.Unmarshal refused before #3406.
+var errAuditMetadataTrailingData = errors.New("trailing data after audit metadata document")
+
+// decodeAuditMetadata decodes a stored metadata document without losing
+// numeric precision: UseNumber keeps every number as its exact digits, so a
+// value above 2^53 re-marshals unchanged. The bitfield keys registered for
+// the action then become decimal strings. The conversion is keyed by action,
+// never by key name alone, and never clamps: a negative value written before
+// #2869 is audit evidence and is re-emitted as it was stored.
+func decodeAuditMetadata(action string, raw []byte) (map[string]interface{}, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var meta map[string]interface{}
+	if err := dec.Decode(&meta); err != nil {
+		return nil, err
+	}
+	// json.Unmarshal, which this reader used before #3406, refuses a second
+	// value after the document; a streaming Decoder does not, so check for it.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errAuditMetadataTrailingData
+	}
+	for _, key := range auditBitfieldKeys[action] {
+		if n, ok := meta[key].(json.Number); ok {
+			meta[key] = n.String()
+		}
+	}
+	return meta, nil
 }

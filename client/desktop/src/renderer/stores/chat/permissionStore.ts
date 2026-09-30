@@ -3,23 +3,29 @@
  * Integrates with the backend RBAC/SBAC system.
  */
 
+import type { StoreApi } from 'zustand';
 import { createStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
+import { useChannelStore } from './channelStore';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
 import {
   Role,
   type ReorderOutcome,
   type RoleReorderPayload,
   type RoleViewer,
 } from '../../types/server';
-import { hasPermission, parsePermissions } from '../../utils/policy/permissions';
+import { hasPermission, parseEffectivePermissions } from '../../utils/policy/permissions';
 
 export interface ChannelOverride {
   id: string;
   channel_id: string;
   target_type: 'user' | 'role';
   target_id: string;
-  allow: number | string;
-  deny: number | string;
+  allow: string;
+  deny: string;
   created_at: string;
   updated_at: string;
 }
@@ -93,6 +99,127 @@ async function readDenialReason(res: Response): Promise<string> {
   return REORDER_DENIED_FALLBACK;
 }
 
+/** No permission write is in flight for a scope. One shared instance, so a
+ *  selector falling back to it returns a stable reference. */
+export const NO_PERMISSION_WRITES: readonly number[] = [];
+
+let nextPermissionWriteId = 0;
+
+/**
+ * Record a permission write in `permissionWritesInFlight[scopeKey]` from the
+ * moment it is called until its request settles (#3406 review, round 6). The
+ * record is taken before the first await, so a caller that renders in the same
+ * tick already sees it, and it is dropped only on settlement, success or not.
+ */
+async function trackPermissionWrite<T>(
+  set: StoreApi<PermissionState>['setState'],
+  scopeKey: string,
+  write: () => Promise<T>
+): Promise<T> {
+  const id = ++nextPermissionWriteId;
+  set((state) => ({
+    permissionWritesInFlight: {
+      ...state.permissionWritesInFlight,
+      [scopeKey]: [...(state.permissionWritesInFlight[scopeKey] ?? []), id],
+    },
+  }));
+  try {
+    return await write();
+  } finally {
+    set((state) => {
+      const next = { ...state.permissionWritesInFlight };
+      const remaining = (next[scopeKey] ?? []).filter((w) => w !== id);
+      if (remaining.length > 0) next[scopeKey] = remaining;
+      else delete next[scopeKey];
+      return { permissionWritesInFlight: next };
+    });
+  }
+}
+
+/**
+ * Read sequencing per scope (#3406 review, round 9). A settings modal reads its
+ * overrides when it opens, and a save made before that read answers refetches
+ * the list; the older response then landed on top of the fresh one, so an added
+ * override vanished or a saved mask reverted, and saving the stale row again
+ * erased the bits just written. Role writes, which patch the list locally, and
+ * `roles_reordered` refetches have the same race.
+ *
+ * A read takes a ticket when it starts. A write that has CONFIRMED raises the
+ * scope's floor to a fresh ticket, so every read begun before that point is
+ * known to be older than the write. Keys match `channelOverrides` (a channel id
+ * or `category:<id>`) and `rolesScope` for roles. Tickets only ever grow, so
+ * nothing here needs resetting with the store: an account change is fenced by
+ * the auth lifecycle before a read ever reaches `settleRead`.
+ */
+interface ReadSequence {
+  next: number;
+  floor: number;
+  committed: number;
+}
+
+const readSequences = new Map<string, ReadSequence>();
+
+function readSequence(scopeKey: string): ReadSequence {
+  let sequence = readSequences.get(scopeKey);
+  if (sequence === undefined) {
+    sequence = { next: 0, floor: 0, committed: 0 };
+    readSequences.set(scopeKey, sequence);
+  }
+  return sequence;
+}
+
+function beginRead(scopeKey: string): number {
+  return ++readSequence(scopeKey).next;
+}
+
+function markWriteConfirmed(scopeKey: string): void {
+  const sequence = readSequence(scopeKey);
+  sequence.floor = ++sequence.next;
+}
+
+/**
+ * What a read that succeeded does with its result:
+ * - `commit`: it began after the scope's last confirmed write and after every
+ *   read already committed, so it is the freshest view there is.
+ * - `stale`: it began before a confirmed write, and no read begun since that
+ *   write has landed. Its data predates the write, and the view holds only the
+ *   write's local patch, so the caller reads again.
+ * - `skip`: the view already holds a read begun after the last confirmed write
+ *   and after this one, so it is at least as fresh as this result.
+ */
+function settleRead(scopeKey: string, ticket: number): 'commit' | 'stale' | 'skip' {
+  const sequence = readSequence(scopeKey);
+  if (ticket > sequence.floor && ticket > sequence.committed) {
+    sequence.committed = ticket;
+    return 'commit';
+  }
+  if (ticket <= sequence.floor && sequence.committed <= sequence.floor) return 'stale';
+  return 'skip';
+}
+
+/** The read-sequence key of a server's role list, apart from override scopes. */
+function rolesScope(serverId: string): string {
+  return `roles:${serverId}`;
+}
+
+/**
+ * The store update that drops one override from a scope's list, keyed like
+ * channelOverrides. Module-level so the delete actions, which run inside
+ * trackPermissionWrite, do not nest a fifth function.
+ */
+function withoutOverride(
+  state: PermissionState,
+  scopeKey: string,
+  overrideId: string
+): Pick<PermissionState, 'channelOverrides'> {
+  return {
+    channelOverrides: {
+      ...state.channelOverrides,
+      [scopeKey]: (state.channelOverrides[scopeKey] ?? []).filter((o) => o.id !== overrideId),
+    },
+  };
+}
+
 interface PermissionState {
   // Server roles keyed by server ID
   serverRoles: Record<string, Role[]>;
@@ -104,9 +231,19 @@ interface PermissionState {
   channelPermissions: Record<string, bigint>;
   // Channel overrides keyed by channel ID
   channelOverrides: Record<string, ChannelOverride[]>;
+  // Override writes and category syncs whose request has not settled, keyed
+  // like channelOverrides: a channel id, or `category:<id>`. A sync is recorded
+  // under its channel's key, since it replaces that channel's overrides. The
+  // settings modals unmount when closed, which destroys their own write locks
+  // while the request can still commit, so a reopened modal reads this record
+  // to stay locked until that request settles (#3406 review, round 6).
+  permissionWritesInFlight: Record<string, readonly number[]>;
 
   // --- Permission checks ---
   hasServerPermission: (serverId: string, perm: bigint) => boolean;
+
+  /** Drop every field: all of it is the signed-in account's view (#3406). */
+  reset: () => void;
 
   // --- Role management ---
   fetchRoles: (serverId: string) => Promise<boolean>;
@@ -155,6 +292,25 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   serverPermissions: {},
   channelPermissions: {},
   channelOverrides: {},
+  permissionWritesInFlight: {},
+
+  // An account change must not carry the previous account's roles, effective
+  // permissions or overrides, nor its writes in flight: a reopened settings
+  // modal would treat those as inherited and lock until they settle (#3406
+  // review, round 7). A write that settles after this only removes its own id.
+  // Reset cannot cancel a request already dispatched, so every action below
+  // captures the account before its request and re-checks it before any write
+  // that follows an await (round 8): a continuation from the previous account
+  // writes nothing.
+  reset: () =>
+    set({
+      serverRoles: {},
+      roleViewer: {},
+      serverPermissions: {},
+      channelPermissions: {},
+      channelOverrides: {},
+      permissionWritesInFlight: {},
+    }),
 
   hasServerPermission: (serverId: string, perm: bigint): boolean => {
     const perms = get().serverPermissions[serverId];
@@ -172,11 +328,21 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   // reconciled while the view still showed pre-write data. That is one-sided in
   // the unsafe direction, and `roles_reordered` makes concurrent fetches routine.
   // Existing callers that ignore the value keep the previous swallow behaviour.
+  //
+  // A read begun before a confirmed role write re-reads rather than landing on
+  // top of it (round 9); a read overtaken by a newer one reports true, since the
+  // view already holds data at least as new as this call's start.
   fetchRoles: async (serverId: string): Promise<boolean> => {
+    const lifecycle = captureAuthLifecycle();
+    const ticket = beginRead(rolesScope(serverId));
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles`);
       if (!res.ok) return false;
       const data = await res.json();
+      if (!isSameAuthLifecycle(lifecycle)) return false;
+      const verdict = settleRead(rolesScope(serverId), ticket);
+      if (verdict === 'stale') return await get().fetchRoles(serverId);
+      if (verdict === 'skip') return true;
       set((state) => ({
         serverRoles: { ...state.serverRoles, [serverId]: data.roles ?? [] },
         roleViewer: { ...state.roleViewer, [serverId]: parseRoleViewer(data.viewer) },
@@ -189,6 +355,7 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   },
 
   createRole: async (serverId: string, data) => {
+    const lifecycle = captureAuthLifecycle();
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles`, {
         method: 'POST',
@@ -198,6 +365,8 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
       if (!res.ok) return null;
       const json = await res.json();
       const role = json.role as Role;
+      if (!isSameAuthLifecycle(lifecycle)) return null;
+      markWriteConfirmed(rolesScope(serverId));
       // Add to local state
       set((state) => ({
         serverRoles: {
@@ -214,6 +383,7 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   },
 
   updateRole: async (serverId: string, roleId: string, data) => {
+    const lifecycle = captureAuthLifecycle();
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles/${roleId}`, {
         method: 'PATCH',
@@ -223,6 +393,8 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
       if (!res.ok) return false;
       const json = await res.json();
       const serverRole = json.role as Role | undefined;
+      if (!isSameAuthLifecycle(lifecycle)) return false;
+      markWriteConfirmed(rolesScope(serverId));
       set((state) => ({
         serverRoles: {
           ...state.serverRoles,
@@ -251,11 +423,13 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   },
 
   deleteRole: async (serverId: string, roleId: string) => {
+    const lifecycle = captureAuthLifecycle();
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles/${roleId}`, {
         method: 'DELETE',
       });
-      if (!res.ok) return false;
+      if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
+      markWriteConfirmed(rolesScope(serverId));
       set((state) => ({
         serverRoles: {
           ...state.serverRoles,
@@ -269,6 +443,7 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   },
 
   reorderRoles: async (serverId: string, payload: RoleReorderPayload): Promise<ReorderOutcome> => {
+    const lifecycle = captureAuthLifecycle();
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles/reorder`, {
         method: 'PATCH',
@@ -278,6 +453,10 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
       });
 
       if (res.ok) {
+        // The write committed either way, but after an account change the
+        // re-read would run for the new account: report the view unreconciled.
+        if (!isSameAuthLifecycle(lifecycle)) return { ok: true, reconciled: false };
+        markWriteConfirmed(rolesScope(serverId));
         // Refetch to pick up the new positions. `reconciled` reports whether THIS
         // read landed: the write is committed either way, but the view may be
         // stale, and the UI says so rather than lying in either direction.
@@ -328,14 +507,16 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   // ─── Server Permissions ────────────────────────────────────────────
 
   fetchServerPermissions: async (serverId: string) => {
+    const lifecycle = captureAuthLifecycle();
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/permissions`);
       if (!res.ok) return;
       const data = await res.json();
+      if (!isSameAuthLifecycle(lifecycle)) return;
       set((state) => ({
         serverPermissions: {
           ...state.serverPermissions,
-          [serverId]: parsePermissions(data.permissions),
+          [serverId]: parseEffectivePermissions(data.permissions),
         },
       }));
     } catch {
@@ -344,14 +525,16 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   },
 
   fetchChannelPermissions: async (channelId: string) => {
+    const lifecycle = captureAuthLifecycle();
     try {
       const res = await apiFetch(`/api/v1/channels/${channelId}/permissions`);
       if (!res.ok) return;
       const data = await res.json();
+      if (!isSameAuthLifecycle(lifecycle)) return;
       set((state) => ({
         channelPermissions: {
           ...state.channelPermissions,
-          [channelId]: parsePermissions(data.permissions),
+          [channelId]: parseEffectivePermissions(data.permissions),
         },
       }));
     } catch {
@@ -362,10 +545,16 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   // ─── Channel Overrides (SBAC) ──────────────────────────────────────
 
   fetchChannelOverrides: async (channelId: string) => {
+    const lifecycle = captureAuthLifecycle();
+    const ticket = beginRead(channelId);
     try {
       const res = await apiFetch(`/api/v1/channels/${channelId}/overrides`);
       if (!res.ok) return;
       const data = await res.json();
+      if (!isSameAuthLifecycle(lifecycle)) return;
+      const verdict = settleRead(channelId, ticket);
+      if (verdict === 'stale') await get().fetchChannelOverrides(channelId);
+      if (verdict !== 'commit') return;
       set((state) => ({
         channelOverrides: {
           ...state.channelOverrides,
@@ -377,47 +566,54 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     }
   },
 
-  upsertChannelOverride: async (channelId: string, data: UpsertOverrideRequest) => {
-    try {
-      const res = await apiFetch(`/api/v1/channels/${channelId}/overrides`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      if (!res.ok) return false;
-      // Refetch to get updated list
-      await get().fetchChannelOverrides(channelId);
-      return true;
-    } catch {
-      return false;
-    }
-  },
+  upsertChannelOverride: (channelId: string, data: UpsertOverrideRequest) =>
+    trackPermissionWrite(set, channelId, async () => {
+      const lifecycle = captureAuthLifecycle();
+      try {
+        const res = await apiFetch(`/api/v1/channels/${channelId}/overrides`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
+        markWriteConfirmed(channelId);
+        // Refetch to get updated list
+        await get().fetchChannelOverrides(channelId);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
 
-  deleteChannelOverride: async (channelId: string, overrideId: string) => {
-    try {
-      const res = await apiFetch(`/api/v1/channels/${channelId}/overrides/${overrideId}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok) return false;
-      set((state) => ({
-        channelOverrides: {
-          ...state.channelOverrides,
-          [channelId]: (state.channelOverrides[channelId] ?? []).filter((o) => o.id !== overrideId),
-        },
-      }));
-      return true;
-    } catch {
-      return false;
-    }
-  },
+  deleteChannelOverride: (channelId: string, overrideId: string) =>
+    trackPermissionWrite(set, channelId, async () => {
+      const lifecycle = captureAuthLifecycle();
+      try {
+        const res = await apiFetch(`/api/v1/channels/${channelId}/overrides/${overrideId}`, {
+          method: 'DELETE',
+        });
+        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
+        markWriteConfirmed(channelId);
+        set((state) => withoutOverride(state, channelId, overrideId));
+        return true;
+      } catch {
+        return false;
+      }
+    }),
 
   // ─── Category Overrides ────────────────────────────────────────────
 
   fetchCategoryOverrides: async (categoryId: string) => {
+    const lifecycle = captureAuthLifecycle();
+    const ticket = beginRead(`category:${categoryId}`);
     try {
       const res = await apiFetch(`/api/v1/categories/${categoryId}/overrides`);
       if (!res.ok) return;
       const data = await res.json();
+      if (!isSameAuthLifecycle(lifecycle)) return;
+      const verdict = settleRead(`category:${categoryId}`, ticket);
+      if (verdict === 'stale') await get().fetchCategoryOverrides(categoryId);
+      if (verdict !== 'commit') return;
       set((state) => ({
         channelOverrides: {
           ...state.channelOverrides,
@@ -429,53 +625,65 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     }
   },
 
-  upsertCategoryOverride: async (categoryId: string, data: UpsertOverrideRequest) => {
-    try {
-      const res = await apiFetch(`/api/v1/categories/${categoryId}/overrides`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      if (!res.ok) return false;
-      await get().fetchCategoryOverrides(categoryId);
-      return true;
-    } catch {
-      return false;
-    }
-  },
+  upsertCategoryOverride: (categoryId: string, data: UpsertOverrideRequest) =>
+    trackPermissionWrite(set, `category:${categoryId}`, async () => {
+      const lifecycle = captureAuthLifecycle();
+      try {
+        const res = await apiFetch(`/api/v1/categories/${categoryId}/overrides`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
+        markWriteConfirmed(`category:${categoryId}`);
+        await get().fetchCategoryOverrides(categoryId);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
 
-  deleteCategoryOverride: async (categoryId: string, overrideId: string) => {
-    try {
-      const res = await apiFetch(`/api/v1/categories/${categoryId}/overrides/${overrideId}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok) return false;
-      set((state) => ({
-        channelOverrides: {
-          ...state.channelOverrides,
-          [`category:${categoryId}`]: (
-            state.channelOverrides[`category:${categoryId}`] ?? []
-          ).filter((o) => o.id !== overrideId),
-        },
-      }));
-      return true;
-    } catch {
-      return false;
-    }
-  },
+  deleteCategoryOverride: (categoryId: string, overrideId: string) =>
+    trackPermissionWrite(set, `category:${categoryId}`, async () => {
+      const lifecycle = captureAuthLifecycle();
+      try {
+        const res = await apiFetch(`/api/v1/categories/${categoryId}/overrides/${overrideId}`, {
+          method: 'DELETE',
+        });
+        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
+        markWriteConfirmed(`category:${categoryId}`);
+        set((state) => withoutOverride(state, `category:${categoryId}`, overrideId));
+        return true;
+      } catch {
+        return false;
+      }
+    }),
 
   // ─── Category Sync ─────────────────────────────────────────────────
 
-  setCategorySync: async (channelId: string, sync: boolean) => {
-    try {
-      const res = await apiFetch(`/api/v1/channels/${channelId}/permission-sync`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sync_permissions: sync }),
-      });
-      return res.ok;
-    } catch {
-      return false;
-    }
-  },
+  // The result is recorded here, not by the modal that asked: that modal may
+  // have been closed before the request settled, the server sends no channel
+  // update for a sync, and a reopened modal starts from a snapshot of the
+  // channel (#3406 review, round 8). Turning sync on also replaces the
+  // channel's overrides, so they are re-read in the same write.
+  setCategorySync: (channelId: string, sync: boolean) =>
+    trackPermissionWrite(set, channelId, async () => {
+      const lifecycle = captureAuthLifecycle();
+      try {
+        const res = await apiFetch(`/api/v1/channels/${channelId}/permission-sync`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sync_permissions: sync }),
+        });
+        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
+        useChannelStore.getState().updateChannel(channelId, { sync_permissions: sync });
+        if (sync) {
+          markWriteConfirmed(channelId);
+          await get().fetchChannelOverrides(channelId);
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }),
 }));

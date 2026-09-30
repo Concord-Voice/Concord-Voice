@@ -37,7 +37,8 @@ func TestMFAEnforcement_LostCommitAckStillRefreshesPermissions(t *testing.T) {
 			testhelpers.AuthHeaders(f.admin.AccessToken))
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 		var body struct {
-			Permissions int64 `json:"permissions"`
+			// #3406: the endpoint returns permissions as a decimal string.
+			Permissions int64 `json:"permissions,string"`
 		}
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 		return rbac.Permission(body.Permissions)

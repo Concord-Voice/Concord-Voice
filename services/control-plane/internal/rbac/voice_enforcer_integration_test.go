@@ -133,11 +133,12 @@ func TestUpsertChannelOverride_PushesVoicePermissionRecheck(t *testing.T) {
 	addVoiceParticipantRow(t, ts, channelID, member.ID)
 
 	// Deny-Speak user override on the voice channel for the member.
+	// #3406: allow/deny carry a `,string` JSON tag now, so send decimal strings.
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSpeak),
+		"allow":       "0",
+		"deny":        strconv.FormatInt(int64(rbac.PermSpeak), 10),
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body,
 		testhelpers.AuthHeaders(owner.AccessToken))

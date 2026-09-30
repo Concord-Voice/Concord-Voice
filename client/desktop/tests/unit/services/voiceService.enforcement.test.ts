@@ -683,6 +683,23 @@ describe('VoiceService enforcement guards', () => {
       expect(useVoiceStore.getState().effectivePermissions).toBe(12345n);
     });
 
+    // #3406, Codex round 7: the join response is an EFFECTIVE permission set,
+    // so a pre-#3406 server's rounded numeric administrator value still reads
+    // as the Administrator grant here, through parseEffectivePermissions. Only
+    // masks lost that decode.
+    it('reads a pre-#3406 numeric administrator value as the Administrator grant (#3406)', () => {
+      const legacyAdministrator = JSON.parse('4611686018912075264') as number;
+      svc.applyJoinMetadata(
+        useVoiceStore.getState(),
+        { server_muted: false, server_deafened: false, permissions: legacyAdministrator },
+        'channel',
+        'ch-1'
+      );
+
+      expect(useVoiceStore.getState().effectivePermissions).toBe(2n ** 62n);
+      expect(svc.joinPermitsSpeak({ permissions: legacyAdministrator })).toBe(true);
+    });
+
     it('should fall back to 0n for invalid permissions string', () => {
       svc.applyJoinMetadata(
         useVoiceStore.getState(),
@@ -693,6 +710,22 @@ describe('VoiceService enforcement guards', () => {
 
       expect(useVoiceStore.getState().effectivePermissions).toBe(0n);
     });
+
+    it.each(['-1', '0x40', '+64', ' 64'])(
+      'fails closed to 0n for the non-decimal permissions %j (#3406 review)',
+      (permissions) => {
+        svc.applyJoinMetadata(
+          useVoiceStore.getState(),
+          { server_muted: false, server_deafened: false, permissions },
+          'channel',
+          'ch-1'
+        );
+
+        // BigInt() accepts every one of these; "-1" sign-extends into bit 62,
+        // which hasPermission reads as Administrator.
+        expect(useVoiceStore.getState().effectivePermissions).toBe(0n);
+      }
+    );
 
     it('should set DM call state and group DM info for DM joins', () => {
       svc.applyJoinMetadata(

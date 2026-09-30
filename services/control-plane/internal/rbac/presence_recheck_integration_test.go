@@ -483,8 +483,6 @@ type rbacPresenceEnv struct {
 	viewRole       string
 	secondViewRole string
 
-	forceWriteFailure bool
-
 	cleanupServers []string
 	cleanupUsers   []string
 }
@@ -611,11 +609,6 @@ func (e *rbacPresenceEnv) createHiddenVoiceChannel(t *testing.T, categoryID stri
 	        VALUES ($1, $2, 'role', $3, 0, $4)`,
 		uuid.New().String(), channelID, e.viewRole, int64(PermViewVoiceChannels))
 	return channelID
-}
-
-func (e *rbacPresenceEnv) anyChannelID(t *testing.T) string {
-	t.Helper()
-	return e.createVoiceChannel(t, e.createCategory(t), false)
 }
 
 func (e *rbacPresenceEnv) joinVoiceWith(
@@ -762,11 +755,6 @@ func (e *rbacPresenceEnv) addViewerWithUserAllowOverride(t *testing.T, channelID
 	return viewerID
 }
 
-func (e *rbacPresenceEnv) addViewerWithSight(t *testing.T, _ []string) string {
-	t.Helper()
-	return e.addViewerViaRole(t, e.viewRole)
-}
-
 func (e *rbacPresenceEnv) createRoleWithChannelDeny(t *testing.T, channelID string) string {
 	t.Helper()
 	roleID := e.createRole("deny", 0)
@@ -831,8 +819,10 @@ func (e *rbacPresenceEnv) grantViewToUserAsync(channelID, userID string) int {
 	status, _ := e.do(http.MethodPut, "/channels/"+channelID+"/overrides", map[string]any{
 		"target_type": "user",
 		"target_id":   userID,
-		"allow":       int64(PermViewVoiceChannels),
-		"deny":        int64(0),
+		// #3406: allow/deny carry a `,string` JSON tag now, so a bare number
+		// is refused with 400 -- send the decimal-string wire form.
+		"allow": strconv.FormatInt(int64(PermViewVoiceChannels), 10),
+		"deny":  "0",
 	})
 	return status
 }
@@ -845,59 +835,28 @@ func (e *rbacPresenceEnv) upsertChannelOverride(t *testing.T, channelID string) 
 
 func (e *rbacPresenceEnv) upsertChannelOverrideWithBody(t *testing.T, channelID string) (int, string) {
 	t.Helper()
-	targetID := e.viewRole
-	if e.forceWriteFailure {
-		// Induce a failure in the write closure inside withAuthorityCapture — a
-		// GENERIC 500 — without touching production code.
-		//
-		// NOT via an out-of-domain target_type: UpsertOverrideRequest binds
-		// `oneof=user role`, so a bogus type is rejected at BINDING time with 400
-		// and never reaches the write at all. A syntactically valid but
-		// nonexistent role id passes binding and fails at the write instead.
-		targetID = uuid.New().String()
-	}
-	// allow/deny are int64 on UpsertOverrideRequest. Sending them as JSON
-	// strings fails ShouldBindJSON and yields 400 before any capture runs —
-	// which is what made every UpsertChannelOverride test in this file fail.
+	// #3406: allow/deny are int64 with a `,string` JSON tag on
+	// UpsertOverrideRequest -- sending them as bare JSON numbers now fails
+	// ShouldBindJSON and yields 400 before any capture runs, so they must be
+	// sent as their decimal-string wire form instead.
 	return e.do(http.MethodPut, "/channels/"+channelID+"/overrides", map[string]any{
 		"target_type": "role",
-		"target_id":   targetID,
-		"allow":       int64(0),
-		"deny":        int64(PermViewVoiceChannels),
+		"target_id":   e.viewRole,
+		"allow":       "0",
+		"deny":        strconv.FormatInt(int64(PermViewVoiceChannels), 10),
 	})
-}
-
-func (e *rbacPresenceEnv) denyViewOnCategory(t *testing.T, categoryID string) {
-	t.Helper()
-	e.exec(`INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
-	        VALUES ($1, $2, 'role', $3, 0, $4)
-	        ON CONFLICT (category_id, target_type, target_id) DO UPDATE SET deny = EXCLUDED.deny`,
-		uuid.New().String(), categoryID, e.viewRole, int64(PermViewVoiceChannels))
-}
-
-func (e *rbacPresenceEnv) setSyncFlagOnly(t *testing.T, channelID string, synced bool) {
-	t.Helper()
-	e.exec(`UPDATE channels SET sync_permissions = $2 WHERE id = $1`, channelID, synced)
 }
 
 // ── failure injection ────────────────────────────────────────────────────────
 
 func (e *rbacPresenceEnv) injectCaptureFailure() { e.recheck.failCapture() }
 
-func (e *rbacPresenceEnv) clearInjectedFailure() {
-	e.recheck.clearInjected()
-	e.forceWriteFailure = false
-}
+func (e *rbacPresenceEnv) clearInjectedFailure() { e.recheck.clearInjected() }
 
-func (e *rbacPresenceEnv) injectWriteFailure() { e.forceWriteFailure = true }
-
-// visibilityQueryCount is the #1794 observable: the number of in-transaction
-// visibility queries the capture issued. Equal counts across two arms mean the
-// authority transaction ran the SAME statement sequence, which is the property
-// an attacker timing the endpoint could otherwise distinguish.
 // refreshErrors surfaces every non-nil RefreshServerVoiceRecheck error. A
 // harness that swallowed these would assert on zero DeliveryPlans and pass
-// vacuously, which is exactly how a missing ActiveGenerationVerifier hid.
+// vacuously, which is exactly how a missing ActiveGenerationVerifier hid;
+// waitForDispatch is where the suite reads it.
 func (e *rbacPresenceEnv) refreshErrors() []error {
 	e.recheck.mu.Lock()
 	defer e.recheck.mu.Unlock()
@@ -906,6 +865,10 @@ func (e *rbacPresenceEnv) refreshErrors() []error {
 	return out
 }
 
+// visibilityQueryCount is the #1794 observable: the number of in-transaction
+// visibility queries the capture issued. Equal counts across two arms mean the
+// authority transaction ran the SAME statement sequence, which is the property
+// an attacker timing the endpoint could otherwise distinguish.
 func (e *rbacPresenceEnv) visibilityQueryCount() int {
 	e.recheck.mu.Lock()
 	defer e.recheck.mu.Unlock()
@@ -916,8 +879,13 @@ func (e *rbacPresenceEnv) visibilityQueryCount() int {
 
 // waitForDispatch is a named barrier, not a sleep: harnessRecheck.Execute runs
 // synchronously on the request goroutine, so every DeliveryPlan is already
-// recorded when the HTTP call returns.
-func (e *rbacPresenceEnv) waitForDispatch(t *testing.T) { t.Helper() }
+// recorded when the HTTP call returns. It also fails the test on any refresh
+// error, because a refresh that errored delivers nothing, and every "was not
+// cleared" assertion that follows would then pass without testing anything.
+func (e *rbacPresenceEnv) waitForDispatch(t *testing.T) {
+	t.Helper()
+	require.Empty(t, e.refreshErrors(), "a Server Voice refresh failed, so the delivery assertions below would be vacuous")
+}
 
 func (e *rbacPresenceEnv) refreshCount(senderID string) int {
 	e.recheck.mu.Lock()

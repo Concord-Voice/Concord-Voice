@@ -364,6 +364,28 @@ read_valid_pid() {
 
 # process_start_identity() — print a locale-stable start identity. Returns 1
 # only when the PID is absent and 2 when ps itself could not answer safely.
+# Whether a process has started exiting: 0 when its thread-group leader is a
+# zombie (Z) or dead (X), 1 when it is running or absent, 2 when ps fails.
+#
+# An exiting process keeps its PID and start time until it is reaped, but not
+# the rest of its identity. Measured on a node listener after SIGTERM: `ps`
+# reported `Z [MainThread] <defunct>` while lsof still resolved its cwd through
+# a thread that had not finished. Compared against the recorded command, that
+# reads as PID reuse, which it cannot be: the kernel does not recycle a PID
+# until the zombie is reaped.
+process_is_exiting() {
+  local pid="$1"
+  local output rc
+  if output=$(LC_ALL=C ps -p "$pid" -o stat= 2>/dev/null); then
+    [[ "$output" =~ ^[[:space:]]*[ZX] ]] && return 0
+    return 1
+  else
+    rc=$?
+  fi
+  [[ $rc -eq 1 ]] && return 1
+  return 2
+}
+
 process_start_identity() {
   local pid="$1"
   local output rc
@@ -787,7 +809,30 @@ repo_listener_identity_state() {
   local expected_start="$4"
   local expected_root="$5"
   local expected_command="${6:-}"
-  local current_command rc
+  local current_command current_start rc
+  # An exiting process is judged by the start time alone, which it keeps until
+  # it is reaped (see process_is_exiting). It is still the listener while it
+  # holds the port, and gone once it does not.
+  if process_is_exiting "$pid"; then
+    if current_start=$(process_start_identity "$pid"); then
+      :
+    else
+      rc=$?
+      [[ $rc -eq 1 ]] && return 1
+      return 2
+    fi
+    [[ "$current_start" == "$expected_start" ]] || return 2
+    if listener_pid_matches "$pid" "$port"; then
+      return 0
+    else
+      rc=$?
+    fi
+    [[ $rc -eq 1 ]] && return 1
+    return 2
+  else
+    rc=$?
+    [[ $rc -eq 2 ]] && return 2
+  fi
   if process_identity_state "$pid" "$expected_start" "$expected_cwd"; then
     :
   else

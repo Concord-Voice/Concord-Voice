@@ -3,6 +3,7 @@ package voice_test
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -117,7 +118,9 @@ func TestOrdinaryChannelOverrideAndTempCleanupCompleteWithoutDeadlock(t *testing
 	go func() {
 		<-start
 		w := ts.DoRequest("PUT", "/api/v1/channels/"+channelID+"/overrides", map[string]interface{}{
-			"target_type": "user", "target_id": other.ID, "allow": int64(rbac.PermViewVoiceChannels),
+			// Decimal string, as every override bitfield travels since #3406: a
+			// JSON number is refused at bind with 400 before either write runs.
+			"target_type": "user", "target_id": other.ID, "allow": strconv.FormatInt(int64(rbac.PermViewVoiceChannels), 10),
 		}, testhelpers.AuthHeaders(owner.AccessToken))
 		results <- w.Code
 	}()

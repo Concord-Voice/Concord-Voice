@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -103,6 +104,22 @@ func grantPermToUser(t *testing.T, ts *testhelpers.TestServer, serverID, userID 
 	ts.AssignRoleToUser(t, serverID, userID, roleID)
 	invalidatePermCache(t, ts, serverID, userID)
 	return roleID
+}
+
+// bitsJSON renders a permission bitfield in the decimal-string wire form every
+// RBAC endpoint takes (#3406). A JSON number is refused with 400.
+func bitsJSON(v int64) string { return strconv.FormatInt(v, 10) }
+
+// effectivePermissions reads the decimal-string "permissions" field the two
+// effective-permission endpoints return (#3406), failing the test on any other
+// shape rather than coercing it.
+func effectivePermissions(t *testing.T, resp map[string]interface{}) int64 {
+	t.Helper()
+	raw, ok := resp["permissions"].(string)
+	require.True(t, ok, "permissions must be a decimal string, got %T (%v)", resp["permissions"], resp["permissions"])
+	v, err := strconv.ParseInt(raw, 10, 64)
+	require.NoError(t, err, "permissions must parse as a decimal int64")
+	return v
 }
 
 // createRoleViaAPI is a helper that creates a role through the API and returns the role ID.
@@ -1868,10 +1885,10 @@ func TestGetMyServerPermissions_Success(t *testing.T) {
 
 	var resp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &resp)
-	perms, ok := resp["permissions"]
+	_, ok := resp["permissions"]
 	assert.True(t, ok, "response should contain permissions field")
 	// Owner should have OwnerPermissions (a non-zero value)
-	permVal := int64(perms.(float64))
+	permVal := effectivePermissions(t, resp)
 	assert.NotZero(t, permVal, "owner should have non-zero permissions")
 }
 
@@ -1883,7 +1900,7 @@ func TestGetMyServerPermissions_BaseMember(t *testing.T) {
 
 	var resp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &resp)
-	perms := int64(resp["permissions"].(float64))
+	perms := effectivePermissions(t, resp)
 	assert.Equal(t, int64(rbac.BasePermissions), perms, "base member should have BasePermissions")
 }
 
@@ -2012,8 +2029,8 @@ func TestUpsertChannelOverride_Success(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -2037,8 +2054,8 @@ func TestUpsertChannelOverride_RoleTargetRotatesChannelEpoch(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "role",
 		"target_id":   allRoleID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -2056,15 +2073,15 @@ func TestUpsertChannelOverride_UpsertUpdatesExisting(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	// First upsert (insert)
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 
 	// Second upsert (update)
-	body["deny"] = int64(rbac.PermAttachFiles)
+	body["deny"] = bitsJSON(int64(rbac.PermAttachFiles))
 	w = ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -2091,8 +2108,8 @@ func TestUpsertChannelOverride_PermanentUpdateClearsTemporaryGrantMetadata(t *te
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermMoveMembers),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermMoveMembers)),
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
@@ -2146,8 +2163,8 @@ func TestUpsertChannelOverride_SupersededTemporaryGrantLosingViewRevokesKeys(t *
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermViewVoiceChannels),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermViewVoiceChannels)),
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
@@ -2211,8 +2228,8 @@ func TestUpsertChannelOverride_SupersededTemporaryGrantRetainingViewDoesNotRotat
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermViewVoiceChannels),
-		"deny":        int64(rbac.PermJoinVoice),
+		"allow":       bitsJSON(int64(rbac.PermViewVoiceChannels)),
+		"deny":        bitsJSON(int64(rbac.PermJoinVoice)),
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
@@ -2282,8 +2299,8 @@ func TestUpsertChannelOverride_SupersededTemporaryGrantPurgeFailureRollsBack(t *
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermViewVoiceChannels),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermViewVoiceChannels)),
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
 
@@ -2327,8 +2344,8 @@ func TestUpsertChannelOverride_NonMoveTemporaryGrantUsesOrdinaryFence(t *testing
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermViewVoiceChannels),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermViewVoiceChannels)),
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
@@ -2356,8 +2373,8 @@ func TestUpsertChannelOverride_BaseMember_Forbidden(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -2373,8 +2390,8 @@ func TestUpsertChannelOverride_PrivilegeEscalation_Blocked(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermBan), // member doesn't have PermBan
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermBan)), // member doesn't have PermBan
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -2395,53 +2412,52 @@ func TestUpsertChannelOverride_DenyBitsNoEscalationCheck(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermBan | rbac.PermAdministrator), // deny does not escalate
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermBan | rbac.PermAdministrator)), // deny does not escalate
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+// TestUpsertChannelOverride_InvalidBody derives each 400 from a body the
+// control proves valid, changing one field at a time. Without the control a
+// JSON-number body would pass every case on the wire-form refusal alone (#3406).
 func TestUpsertChannelOverride_InvalidBody(t *testing.T) {
-	ts, owner, _, serverID := setupOwnerAndMember(t)
+	ts, owner, member, serverID := setupOwnerAndMember(t)
 	channelID := ts.CreateTestChannel(t, serverID, "invalid-body")
+	categoryID := createTestCategory(t, ts, serverID, "invalid-body-cat")
 
-	tests := []struct {
-		name string
-		body map[string]interface{}
+	base := func() map[string]interface{} {
+		return map[string]interface{}{"target_type": "user", "target_id": member.ID, "allow": "0", "deny": "0"}
+	}
+	cases := []struct {
+		name   string
+		mutate func(map[string]interface{})
 	}{
-		{
-			name: "missing target_type",
-			body: map[string]interface{}{
-				"target_id": uuid.New().String(),
-				"allow":     0,
-				"deny":      0,
-			},
-		},
-		{
-			name: "invalid target_type",
-			body: map[string]interface{}{
-				"target_type": "invalid",
-				"target_id":   uuid.New().String(),
-				"allow":       0,
-				"deny":        0,
-			},
-		},
-		{
-			name: "missing target_id",
-			body: map[string]interface{}{
-				"target_type": "user",
-				"allow":       0,
-				"deny":        0,
-			},
-		},
+		{"missing target_type", func(b map[string]interface{}) { delete(b, "target_type") }},
+		{"invalid target_type", func(b map[string]interface{}) { b["target_type"] = "invalid" }},
+		{"missing target_id", func(b map[string]interface{}) { delete(b, "target_id") }},
+		{"target_id not a uuid", func(b map[string]interface{}) { b["target_id"] = "not-a-uuid" }},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			w := ts.DoRequest("PUT", channelOverridesPath(channelID), tc.body, testhelpers.AuthHeaders(owner.AccessToken))
-			assert.Equal(t, http.StatusBadRequest, w.Code)
+	for _, tgt := range []struct{ label, path string }{
+		{"channel", channelOverridesPath(channelID)},
+		{"category", categoryOverridesPath(categoryID)},
+	} {
+		path := tgt.path
+		t.Run(tgt.label+"/control", func(t *testing.T) {
+			w := ts.DoRequest("PUT", path, base(), testhelpers.AuthHeaders(owner.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code, "CONTROL: the unmodified base body must be accepted: %s", w.Body.String())
 		})
+
+		for _, tc := range cases {
+			t.Run(tgt.label+"/"+tc.name, func(t *testing.T) {
+				body := base()
+				tc.mutate(body)
+				w := ts.DoRequest("PUT", path, body, testhelpers.AuthHeaders(owner.AccessToken))
+				assert.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			})
+		}
 	}
 }
 
@@ -2451,8 +2467,8 @@ func TestUpsertChannelOverride_ChannelNotFound(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   uuid.New().String(),
-		"allow":       0,
-		"deny":        0,
+		"allow":       "0",
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(uuid.New().String()), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -2466,8 +2482,8 @@ func TestDeleteChannelOverride_Success(t *testing.T) {
 	upsertBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), upsertBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2567,8 +2583,8 @@ func TestDeleteChannelOverride_BaseMember_Forbidden(t *testing.T) {
 	upsertBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), upsertBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2628,8 +2644,8 @@ func TestGetMyChannelPermissions_WithOverride(t *testing.T) {
 	upsertBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), upsertBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2643,7 +2659,7 @@ func TestGetMyChannelPermissions_WithOverride(t *testing.T) {
 
 	var resp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &resp)
-	perms := rbac.Permission(int64(resp["permissions"].(float64)))
+	perms := rbac.Permission(effectivePermissions(t, resp))
 	assert.False(t, perms.Has(rbac.PermSendMessages), "member should be denied SendMessages in this channel")
 }
 
@@ -2729,8 +2745,8 @@ func TestUpsertCategoryOverride_Success(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -2749,8 +2765,8 @@ func TestUpsertCategoryOverride_BaseMember_Forbidden(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -2766,8 +2782,8 @@ func TestUpsertCategoryOverride_PrivilegeEscalation_Blocked(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermBan),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermBan)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -2779,8 +2795,8 @@ func TestUpsertCategoryOverride_NotFound(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   uuid.New().String(),
-		"allow":       0,
-		"deny":        0,
+		"allow":       "0",
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(uuid.New().String()), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -2796,8 +2812,8 @@ func TestUpsertCategoryOverride_SyncsToChlid(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2820,8 +2836,8 @@ func TestDeleteCategoryOverride_Success(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2849,8 +2865,8 @@ func TestDeleteCategoryOverride_CascadesToSyncedChannels(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2896,8 +2912,8 @@ func TestDeleteCategoryOverride_BaseMember_Forbidden(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2938,8 +2954,8 @@ func TestSetChannelPermSync_EnableSync(t *testing.T) {
 	catBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), catBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2979,7 +2995,7 @@ func TestCategorySyncWriters_RefuseSystemManagedTemporaryMoveGrant(t *testing.T)
 
 	categoryBody := map[string]interface{}{
 		"target_type": "user", "target_id": member.ID,
-		"allow": 0, "deny": int64(rbac.PermJoinVoice),
+		"allow": "0", "deny": bitsJSON(int64(rbac.PermJoinVoice)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(categoryID), categoryBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
@@ -3108,7 +3124,7 @@ func TestRBACFlow_CreateAssignVerifyPermissions(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	var permResp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &permResp)
-	startPerms := int64(permResp["permissions"].(float64))
+	startPerms := effectivePermissions(t, permResp)
 	assert.Equal(t, int64(rbac.BasePermissions), startPerms, "member starts with base permissions")
 
 	// 2. Owner creates a moderator role
@@ -3124,7 +3140,7 @@ func TestRBACFlow_CreateAssignVerifyPermissions(t *testing.T) {
 	w = ts.DoRequest("GET", serverPermissionsPath(serverID), nil, testhelpers.AuthHeaders(member.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &permResp)
-	newPerms := rbac.Permission(int64(permResp["permissions"].(float64)))
+	newPerms := rbac.Permission(effectivePermissions(t, permResp))
 	assert.True(t, newPerms.Has(rbac.PermManageAllMessages), "member should now have ManageAllMessages")
 	assert.True(t, newPerms.Has(rbac.PermKick), "member should now have Kick")
 	assert.True(t, newPerms.Has(rbac.PermMuteMembers), "member should now have MuteMembers")
@@ -3137,7 +3153,7 @@ func TestRBACFlow_CreateAssignVerifyPermissions(t *testing.T) {
 	w = ts.DoRequest("GET", serverPermissionsPath(serverID), nil, testhelpers.AuthHeaders(member.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &permResp)
-	finalPerms := int64(permResp["permissions"].(float64))
+	finalPerms := effectivePermissions(t, permResp)
 	assert.Equal(t, int64(rbac.BasePermissions), finalPerms, "member should be back to base permissions after unassign")
 }
 
@@ -3150,15 +3166,15 @@ func TestRBACFlow_ChannelOverrideAffectsPermissions(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	var permResp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &permResp)
-	perms := rbac.Permission(int64(permResp["permissions"].(float64)))
+	perms := rbac.Permission(effectivePermissions(t, permResp))
 	assert.True(t, perms.Has(rbac.PermSendMessages), "member should have SendMessages initially")
 
 	// 2. Owner creates a channel override denying SendMessages for member
 	overrideBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w = ts.DoRequest("PUT", channelOverridesPath(channelID), overrideBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3170,14 +3186,14 @@ func TestRBACFlow_ChannelOverrideAffectsPermissions(t *testing.T) {
 	w = ts.DoRequest("GET", channelPermissionsPath(channelID), nil, testhelpers.AuthHeaders(member.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &permResp)
-	perms = rbac.Permission(int64(permResp["permissions"].(float64)))
+	perms = rbac.Permission(effectivePermissions(t, permResp))
 	assert.False(t, perms.Has(rbac.PermSendMessages), "member should be denied SendMessages after override")
 
 	// 4. But server-level permissions should still include SendMessages
 	w = ts.DoRequest("GET", serverPermissionsPath(serverID), nil, testhelpers.AuthHeaders(member.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &permResp)
-	serverPerms := rbac.Permission(int64(permResp["permissions"].(float64)))
+	serverPerms := rbac.Permission(effectivePermissions(t, permResp))
 	assert.True(t, serverPerms.Has(rbac.PermSendMessages), "server-level permissions should still include SendMessages")
 }
 
@@ -3233,8 +3249,8 @@ func TestAuditLog_RecordsChannelOverrideLifecycle(t *testing.T) {
 	overrideBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), overrideBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3244,7 +3260,7 @@ func TestAuditLog_RecordsChannelOverrideLifecycle(t *testing.T) {
 	overrideID := upsertResp["override"].(map[string]interface{})["id"].(string)
 
 	// Update override (same target_type+target_id triggers upsert update path)
-	overrideBody["deny"] = int64(rbac.PermAttachFiles)
+	overrideBody["deny"] = bitsJSON(int64(rbac.PermAttachFiles))
 	w = ts.DoRequest("PUT", channelOverridesPath(channelID), overrideBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 
@@ -3307,7 +3323,7 @@ func TestGetMyServerPermissions_ReturnsCorrectBitmask(t *testing.T) {
 
 	var resp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &resp)
-	perms := rbac.Permission(int64(resp["permissions"].(float64)))
+	perms := rbac.Permission(effectivePermissions(t, resp))
 
 	assert.True(t, perms.Has(rbac.PermKick), "should have Kick")
 	assert.True(t, perms.Has(rbac.PermMuteMembers), "should have MuteMembers")
@@ -3531,11 +3547,14 @@ func TestUpsertChannelOverrideInvalidChannelID(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   uuid.New().String(),
-		"allow":       0,
-		"deny":        0,
+		"allow":       "0",
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(invalidUUID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// The path check runs before bind, and bind reports "Invalid request body";
+	// asserting the text keeps this test from passing on a body refusal (#3406).
+	assert.Contains(t, w.Body.String(), "Invalid channel ID")
 }
 
 func TestListChannelOverridesWithExistingOverrides(t *testing.T) {
@@ -3545,8 +3564,8 @@ func TestListChannelOverridesWithExistingOverrides(t *testing.T) {
 	upsertBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), upsertBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3573,8 +3592,8 @@ func TestListCategoryOverridesWithExistingOverrides(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3606,11 +3625,14 @@ func TestUpsertCategoryOverrideInvalidCategoryID(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   uuid.New().String(),
-		"allow":       0,
-		"deny":        0,
+		"allow":       "0",
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(invalidUUID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// The path check runs before bind, and bind reports "Invalid request body";
+	// asserting the text keeps this test from passing on a body refusal (#3406).
+	assert.Contains(t, w.Body.String(), "Invalid category ID")
 }
 
 func TestUpsertCategoryOverrideUpsertUpdatesExisting(t *testing.T) {
@@ -3620,13 +3642,13 @@ func TestUpsertCategoryOverrideUpsertUpdatesExisting(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 
-	body["deny"] = int64(rbac.PermAttachFiles)
+	body["deny"] = bitsJSON(int64(rbac.PermAttachFiles))
 	w = ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -3670,8 +3692,8 @@ func TestDeleteCategoryOverrideCascadeNoSyncChannels(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3703,8 +3725,8 @@ func TestDeleteChannelOverrideMemberWithManageChannels(t *testing.T) {
 	upsertBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), upsertBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3726,8 +3748,8 @@ func TestUpsertChannelOverrideMemberWithManageChannels(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -3752,8 +3774,8 @@ func TestUpsertCategoryOverrideMemberWithManageChannels(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -3768,8 +3790,8 @@ func TestDeleteCategoryOverrideMemberWithManageChannels(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermSendMessages),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermSendMessages)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3843,8 +3865,8 @@ func TestSetChannelPermSyncDisableSyncWithExistingOverrides(t *testing.T) {
 	catBody := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermSendMessages),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermSendMessages)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), catBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -3947,8 +3969,8 @@ func TestUpsertCategoryOverrideDenyBitsNoEscalation(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       0,
-		"deny":        int64(rbac.PermBan | rbac.PermAdministrator),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermBan | rbac.PermAdministrator)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -3992,8 +4014,8 @@ func TestSetChannelPermSyncEnableSyncWithExistingChannelOverrides(t *testing.T) 
 	catBody := map[string]interface{}{
 		"target_type": "role",
 		"target_id":   allRoleID,
-		"allow":       0,
-		"deny":        int64(rbac.PermAttachFiles),
+		"allow":       "0",
+		"deny":        bitsJSON(int64(rbac.PermAttachFiles)),
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), catBody, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -4157,8 +4179,8 @@ func TestUpsertChannelOverrideAdminBypassesEscalation(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermBan | rbac.PermKick),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermBan | rbac.PermKick)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -4173,8 +4195,8 @@ func TestUpsertCategoryOverrideAdminBypassesEscalation(t *testing.T) {
 	body := map[string]interface{}{
 		"target_type": "user",
 		"target_id":   member.ID,
-		"allow":       int64(rbac.PermBan | rbac.PermKick),
-		"deny":        0,
+		"allow":       bitsJSON(int64(rbac.PermBan | rbac.PermKick)),
+		"deny":        "0",
 	}
 	w := ts.DoRequest("PUT", categoryOverridesPath(catID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -4252,7 +4274,7 @@ func TestPermissionBitfieldWrites_RejectNegatives(t *testing.T) {
 	}
 	overrideBody := func(field string) func(int64) interface{} {
 		return func(v int64) interface{} {
-			return map[string]interface{}{"target_type": "role", "target_id": target, field: v}
+			return map[string]interface{}{"target_type": "role", "target_id": target, field: bitsJSON(v)}
 		}
 	}
 	for _, tc := range []struct {
@@ -4301,7 +4323,7 @@ func TestOverrideUpsert_RejectsForeignRoleTarget(t *testing.T) {
 			{"role", foreignRole, http.StatusBadRequest},
 		} {
 			w := ts.DoRequest("PUT", path, map[string]interface{}{
-				"target_type": tc.targetType, "target_id": tc.targetID, "allow": 0, "deny": 0,
+				"target_type": tc.targetType, "target_id": tc.targetID, "allow": "0", "deny": "0",
 			}, testhelpers.AuthHeaders(owner.AccessToken))
 			assert.Equal(t, tc.want, w.Code, "%s %s: %s", path, tc.targetType, w.Body.String())
 		}
@@ -4342,7 +4364,7 @@ func TestCategoryCascadeDropsLegacyForeignRoleTarget(t *testing.T) {
 
 	// Sync cascade: a guard-passing category upsert re-copies the category.
 	w := ts.DoRequest("PUT", categoryOverridesPath(categoryID), map[string]interface{}{
-		"target_type": "role", "target_id": homeRole, "allow": 0, "deny": 0,
+		"target_type": "role", "target_id": homeRole, "allow": "0", "deny": "0",
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Equal(t, 1, copied(syncedCh, homeRole), "CONTROL: the same-server role is synced")
@@ -4355,4 +4377,284 @@ func TestCategoryCascadeDropsLegacyForeignRoleTarget(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Equal(t, 1, copied(laterCh, homeRole), "CONTROL: the same-server role is copied")
 	assert.Zero(t, copied(laterCh, foreignRole), "copy must not copy a foreign-role target")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3406 reproduction: override bitfields as JSON strings (I1-I3)
+//
+// [internal]specs/2026-09-26-3406-override-bitfield-wire-form-design.md
+// §4 "Integration". Bodies are json.RawMessage literals so the exact wire
+// bytes are controlled, since DoRequest marshals whatever body it is given
+// and json.Marshal of a json.RawMessage reproduces it byte-for-byte.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const wireFormBitsAllow = "4611686018427387905" // (1<<62)|1, exact above 2^53
+
+// setupAdministratorAndTarget returns a member holding Administrator through a
+// role, and a second member to aim overrides at. The owner cannot be the
+// actor here: OwnerPermissions deliberately excludes PermAdministrator, and
+// every bit above 2^53 is either bit 62 or unassigned, so an override's
+// subset check refuses any such value from an actor without Administrator.
+func setupAdministratorAndTarget(t *testing.T) (*testhelpers.TestServer, testhelpers.TestUser, testhelpers.TestUser, string) {
+	t.Helper()
+	ts, _, admin, serverID := setupOwnerAndMember(t)
+	grantPermToUser(t, ts, serverID, admin.ID, 5, int64(rbac.PermAdministrator))
+	target := ts.CreateTestUser(t, "wiretarget"+uuid.New().String()[:6])
+	ts.AddMemberToServer(t, serverID, target.ID, "member")
+	return ts, admin, target, serverID
+}
+
+// TestOverrideUpsert_BitfieldWireForm is I1, run over both the channel and
+// category override paths.
+func TestOverrideUpsert_BitfieldWireForm(t *testing.T) {
+	type overrideTarget struct {
+		name          string
+		overridesPath func(id string) string
+		newTarget     func(t *testing.T, ts *testhelpers.TestServer, serverID string) string
+		table         string
+		idColumn      string
+	}
+
+	targets := []overrideTarget{
+		{
+			name:          "channel",
+			overridesPath: channelOverridesPath,
+			newTarget: func(t *testing.T, ts *testhelpers.TestServer, serverID string) string {
+				return ts.CreateTestChannel(t, serverID, "wireform-ch-"+uuid.New().String()[:8])
+			},
+			table:    "channel_permission_overrides",
+			idColumn: "channel_id",
+		},
+		{
+			name:          "category",
+			overridesPath: categoryOverridesPath,
+			newTarget: func(t *testing.T, ts *testhelpers.TestServer, serverID string) string {
+				return createTestCategory(t, ts, serverID, "wireform-cat-"+uuid.New().String()[:8])
+			},
+			table:    "category_permission_overrides",
+			idColumn: "category_id",
+		},
+	}
+
+	for _, tgt := range targets {
+		t.Run(tgt.name, func(t *testing.T) {
+			ts, admin, target, serverID := setupAdministratorAndTarget(t)
+			targetID := tgt.newTarget(t, ts, serverID)
+
+			readStoredAllow := func(t *testing.T) int64 {
+				t.Helper()
+				var allow int64
+				require.NoError(t, ts.DB.QueryRow(
+					`SELECT allow FROM `+tgt.table+` WHERE `+tgt.idColumn+` = $1 AND target_id = $2`,
+					targetID, target.ID,
+				).Scan(&allow))
+				return allow
+			}
+
+			// Control: the decimal-string form must be accepted, stored exactly,
+			// and read back on GET as the exact same string.
+			control := json.RawMessage(`{"target_type":"user","target_id":"` + target.ID + `","allow":"` + wireFormBitsAllow + `","deny":"0"}`)
+			w := ts.DoRequest("PUT", tgt.overridesPath(targetID), control, testhelpers.AuthHeaders(admin.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code,
+				"%s override PUT must accept the decimal-string wire form (allow must round-trip as a decimal string, #3406), got %d: %s",
+				tgt.name, w.Code, w.Body.String())
+
+			assert.Equal(t, int64(1<<62|1), readStoredAllow(t), "%s override allow must be stored exactly, not truncated", tgt.name)
+
+			getW := ts.DoRequest("GET", tgt.overridesPath(targetID), nil, testhelpers.AuthHeaders(admin.AccessToken))
+			require.Equal(t, http.StatusOK, getW.Code)
+			var listResp map[string]interface{}
+			testhelpers.ParseJSON(t, getW, &listResp)
+			overrides := listResp["overrides"].([]interface{})
+			require.Len(t, overrides, 1)
+			override := overrides[0].(map[string]interface{})
+			allowWire, ok := override["allow"].(string)
+			require.True(t, ok, "%s override GET must return allow as a JSON string, got %T (%v)", tgt.name, override["allow"], override["allow"])
+			assert.Equal(t, wireFormBitsAllow, allowWire, "%s override GET allow must round-trip as the exact decimal string", tgt.name)
+
+			// Refused forms: each must 400 and leave the stored row unchanged.
+			refused := []struct {
+				name string
+				body string
+			}{
+				{"number", `{"target_type":"user","target_id":"` + target.ID + `","allow":1024,"deny":"0"}`},
+				{"hex", `{"target_type":"user","target_id":"` + target.ID + `","allow":"0x40","deny":"0"}`},
+				{"exponent", `{"target_type":"user","target_id":"` + target.ID + `","allow":"1e3","deny":"0"}`},
+				{"leading plus", `{"target_type":"user","target_id":"` + target.ID + `","allow":"+64","deny":"0"}`},
+			}
+			for _, r := range refused {
+				t.Run(r.name, func(t *testing.T) {
+					w := ts.DoRequest("PUT", tgt.overridesPath(targetID), json.RawMessage(r.body), testhelpers.AuthHeaders(admin.AccessToken))
+					assert.Equal(t, http.StatusBadRequest, w.Code,
+						"%s override PUT must refuse the %s form for allow, got %d: %s", tgt.name, r.name, w.Code, w.Body.String())
+					assert.Equal(t, int64(1<<62|1), readStoredAllow(t), "a refused write (%s) must leave the stored row unchanged", r.name)
+				})
+			}
+		})
+	}
+}
+
+// TestGetMyPermissions_BitfieldWireForm is I2: both effective-permission
+// endpoints must return "permissions" as a JSON string, exact above 2^53.
+func TestGetMyPermissions_BitfieldWireForm(t *testing.T) {
+	ts, _, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateTestChannel(t, serverID, "wireform-perms")
+	grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermAdministrator|rbac.PermManageChannels))
+
+	expectedStr := strconv.FormatInt(int64(rbac.BasePermissions|rbac.PermAdministrator|rbac.PermManageChannels), 10)
+
+	t.Run("server", func(t *testing.T) {
+		w := ts.DoRequest("GET", serverPermissionsPath(serverID), nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		got, ok := resp["permissions"].(string)
+		require.True(t, ok, "GetMyServerPermissions must return permissions as a JSON string above 2^53, got %T (%v)", resp["permissions"], resp["permissions"])
+		assert.Equal(t, expectedStr, got, "GetMyServerPermissions permissions must be exact above 2^53")
+	})
+
+	t.Run("channel", func(t *testing.T) {
+		w := ts.DoRequest("GET", channelPermissionsPath(channelID), nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		got, ok := resp["permissions"].(string)
+		require.True(t, ok, "GetMyChannelPermissions must return permissions as a JSON string above 2^53, got %T (%v)", resp["permissions"], resp["permissions"])
+		assert.Equal(t, expectedStr, got, "GetMyChannelPermissions permissions must be exact above 2^53")
+	})
+}
+
+// findAuditEntry locates an audit-log entry by predicate, or nil.
+func findAuditEntry(entries []interface{}, match func(entry map[string]interface{}) bool) map[string]interface{} {
+	for _, e := range entries {
+		entry, ok := e.(map[string]interface{})
+		if ok && match(entry) {
+			return entry
+		}
+	}
+	return nil
+}
+
+// TestGetAuditLog_BitfieldWireForm is I3.
+func TestGetAuditLog_BitfieldWireForm(t *testing.T) {
+	t.Run("historical numeric JSONB row round-trips as an exact string", func(t *testing.T) {
+		ts, owner, _, serverID := setupOwnerAndMember(t)
+		entryID := uuid.New().String()
+		plantedTargetID := uuid.New().String()
+		metadata := `{"target_type":"user","target_id":"` + plantedTargetID + `","allow":4611686018427387905,"deny":0}`
+		_, err := ts.DB.Exec(
+			`INSERT INTO audit_log (id, server_id, actor_id, action, target_type, target_id, metadata, created_at)
+			 VALUES ($1, $2, $3, 'channel_override_created', 'channel', $4, $5::jsonb, NOW())`,
+			entryID, serverID, owner.ID, plantedTargetID, metadata,
+		)
+		require.NoError(t, err)
+
+		w := ts.DoRequest("GET", auditLogPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		entries := resp["entries"].([]interface{})
+
+		found := findAuditEntry(entries, func(entry map[string]interface{}) bool { return entry["id"] == entryID })
+		require.NotNil(t, found, "planted historical audit row must be returned")
+		meta := found["metadata"].(map[string]interface{})
+		allow, ok := meta["allow"].(string)
+		require.True(t, ok, "audit-log allow must be re-emitted as a JSON string above 2^53, got %T (%v)", meta["allow"], meta["allow"])
+		assert.Equal(t, wireFormBitsAllow, allow, "audit-log must re-emit the exact stored digits, not a float64-rounded value (e.g. …388000)")
+	})
+
+	// A stored document the reader cannot decode still answers 200 with the
+	// "_error" fallback on that entry alone. JSONB cannot hold trailing data,
+	// so a top-level array stands in for every undecodable shape here; the
+	// trailing-data refusal itself is pinned at the unit layer.
+	t.Run("undecodable stored metadata falls back per entry", func(t *testing.T) {
+		ts, owner, _, serverID := setupOwnerAndMember(t)
+		badID, goodID := uuid.New().String(), uuid.New().String()
+		for _, row := range []struct{ id, meta string }{
+			{badID, `[1, 2]`},
+			{goodID, `{"allow":1,"deny":0}`},
+		} {
+			_, err := ts.DB.Exec(
+				`INSERT INTO audit_log (id, server_id, actor_id, action, target_type, target_id, metadata, created_at)
+				 VALUES ($1, $2, $3, 'channel_override_created', 'channel', $4, $5::jsonb, NOW())`,
+				row.id, serverID, owner.ID, uuid.New().String(), row.meta,
+			)
+			require.NoError(t, err)
+		}
+
+		w := ts.DoRequest("GET", auditLogPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, "one undecodable row must not fail the page: %s", w.Body.String())
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		entries := resp["entries"].([]interface{})
+
+		bad := findAuditEntry(entries, func(e map[string]interface{}) bool { return e["id"] == badID })
+		require.NotNil(t, bad)
+		assert.Equal(t, map[string]interface{}{"_error": "failed to parse metadata"}, bad["metadata"])
+		good := findAuditEntry(entries, func(e map[string]interface{}) bool { return e["id"] == goodID })
+		require.NotNil(t, good)
+		assert.Equal(t, "1", good["metadata"].(map[string]interface{})["allow"], "the neighbouring row still decodes")
+	})
+
+	t.Run("live owner role update reads back exact", func(t *testing.T) {
+		ts, owner, _, serverID := setupOwnerAndMember(t)
+		roleID := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "WireFormRole", 0)
+
+		body := json.RawMessage(`{"permissions":"` + wireFormBitsAllow + `"}`)
+		w := ts.DoRequest("PATCH", rolePath(serverID, roleID), body, testhelpers.AuthHeaders(owner.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, "owner may delegate bit 62 (decided 2026-09-23), got %d: %s", w.Code, w.Body.String())
+
+		w = ts.DoRequest("GET", auditLogPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		entries := resp["entries"].([]interface{})
+
+		found := findAuditEntry(entries, func(entry map[string]interface{}) bool {
+			return entry["action"] == "role_updated" && entry["target_id"] == roleID
+		})
+		require.NotNil(t, found, "role_updated audit entry must exist")
+		meta := found["metadata"].(map[string]interface{})
+		got, ok := meta["new_permissions"].(string)
+		require.True(t, ok, "audit-log new_permissions must be a JSON string above 2^53, got %T (%v)", meta["new_permissions"], meta["new_permissions"])
+		assert.Equal(t, wireFormBitsAllow, got, "audit-log new_permissions must be exact above 2^53")
+
+		var storedType string
+		require.NoError(t, ts.DB.QueryRow(
+			`SELECT jsonb_typeof(metadata->'new_permissions') FROM audit_log WHERE action = 'role_updated' AND target_id = $1`, roleID,
+		).Scan(&storedType))
+		assert.Equal(t, "string", storedType, "a new audit row stores the bitfield as a string, so no unregistered reader can round it")
+	})
+
+	t.Run("live Administrator channel override upsert reads back exact", func(t *testing.T) {
+		ts, admin, target, serverID := setupAdministratorAndTarget(t)
+		channelID := ts.CreateTestChannel(t, serverID, "wireform-audit")
+
+		body := json.RawMessage(`{"target_type":"user","target_id":"` + target.ID + `","allow":"` + wireFormBitsAllow + `","deny":"0"}`)
+		w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(admin.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code,
+			"channel override PUT must accept the decimal-string wire form before its audit entry can be checked (#3406), got %d: %s",
+			w.Code, w.Body.String())
+
+		w = ts.DoRequest("GET", auditLogPath(serverID), nil, testhelpers.AuthHeaders(admin.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		entries := resp["entries"].([]interface{})
+
+		found := findAuditEntry(entries, func(entry map[string]interface{}) bool {
+			return entry["action"] == "channel_override_created" && entry["target_id"] == channelID
+		})
+		require.NotNil(t, found, "channel_override_created audit entry must exist")
+		meta := found["metadata"].(map[string]interface{})
+		got, ok := meta["allow"].(string)
+		require.True(t, ok, "audit-log allow must be a JSON string above 2^53, got %T (%v)", meta["allow"], meta["allow"])
+		assert.Equal(t, wireFormBitsAllow, got, "audit-log allow must be exact above 2^53")
+
+		var storedType string
+		require.NoError(t, ts.DB.QueryRow(
+			`SELECT jsonb_typeof(metadata->'allow') FROM audit_log WHERE action = 'channel_override_created' AND target_id = $1`, channelID,
+		).Scan(&storedType))
+		assert.Equal(t, "string", storedType, "a new audit row stores the bitfield as a string, so no unregistered reader can round it")
+	})
 }

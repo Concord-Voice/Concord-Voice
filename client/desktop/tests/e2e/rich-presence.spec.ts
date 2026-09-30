@@ -649,8 +649,8 @@ test.describe('Rich Presence cross-stack privacy acceptance', () => {
         {
           target_type: 'user',
           target_id: denied.session.userId,
-          allow: 0,
-          deny: VIEW_VOICE_CHANNELS,
+          allow: '0',
+          deny: String(VIEW_VOICE_CHANNELS),
         },
         200
       );

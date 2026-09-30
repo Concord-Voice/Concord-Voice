@@ -2891,9 +2891,12 @@ paths:
                 type: object
                 properties:
                   permissions:
-                    type: integer
-                    format: int64
-                    description: Permission bitfield
+                    type: string
+                    pattern: '^[0-9]+$'
+                    description: >-
+                      The caller's effective permission bitfield, decimal encoded.
+                      A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+                    example: '484687360'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -12947,9 +12950,12 @@ paths:
                 type: object
                 properties:
                   permissions:
-                    type: integer
-                    format: int64
-                    description: Permission bitfield
+                    type: string
+                    pattern: '^[0-9]+$'
+                    description: >-
+                      The caller's effective permission bitfield, decimal encoded.
+                      A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+                    example: '484687360'
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
@@ -17725,6 +17731,7 @@ components:
             type: integer
           permissions:
             type: string
+            pattern: '^[0-9]+$'
             description: >-
               The caller's effective server-scope permission bitfield, decimal
               encoded. A string rather than an integer because the bitfield
@@ -18980,13 +18987,27 @@ components:
           format: uuid
           description: UUID of the targeted user or role
         allow:
-          type: integer
-          format: int64
-          description: Permission bitfield to explicitly allow
+          type: string
+          nullable: true
+          description: >-
+            Permission bitfield to explicitly allow, decimal encoded.
+            A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+            The canonical form is decimal digits only. A JSON number, hex, exponent,
+            a leading `+`, whitespace or a negative value is refused with 400 (#3406).
+            `null`, `"null"`, `"-0"` or an omitted field is read as 0, and leading
+            zeros are accepted, so this request field carries no digits-only pattern.
+          example: '1024'
         deny:
-          type: integer
-          format: int64
-          description: Permission bitfield to explicitly deny
+          type: string
+          nullable: true
+          description: >-
+            Permission bitfield to explicitly deny, decimal encoded.
+            A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+            The canonical form is decimal digits only. A JSON number, hex, exponent,
+            a leading `+`, whitespace or a negative value is refused with 400 (#3406).
+            `null`, `"null"`, `"-0"` or an omitted field is read as 0, and leading
+            zeros are accepted, so this request field carries no digits-only pattern.
+          example: '1024'
     ChannelOverride:
       type: object
       properties:
@@ -19005,13 +19026,19 @@ components:
           type: string
           format: uuid
         allow:
-          type: integer
-          format: int64
-          description: Permission bitfield explicitly allowed
+          type: string
+          pattern: '^[0-9]+$'
+          description: >-
+            Permission bitfield explicitly allowed, decimal encoded.
+            A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+          example: '1024'
         deny:
-          type: integer
-          format: int64
-          description: Permission bitfield explicitly denied
+          type: string
+          pattern: '^[0-9]+$'
+          description: >-
+            Permission bitfield explicitly denied, decimal encoded.
+            A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+          example: '1024'
         created_at:
           type: string
           format: date-time
@@ -19036,13 +19063,19 @@ components:
           type: string
           format: uuid
         allow:
-          type: integer
-          format: int64
-          description: Permission bitfield explicitly allowed
+          type: string
+          pattern: '^[0-9]+$'
+          description: >-
+            Permission bitfield explicitly allowed, decimal encoded.
+            A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+          example: '1024'
         deny:
-          type: integer
-          format: int64
-          description: Permission bitfield explicitly denied
+          type: string
+          pattern: '^[0-9]+$'
+          description: >-
+            Permission bitfield explicitly denied, decimal encoded.
+            A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
+          example: '1024'
         created_at:
           type: string
           format: date-time
@@ -19426,6 +19459,7 @@ components:
           description: Hierarchy position (higher = more senior; @all is 0)
         permissions:
           type: string
+          pattern: '^[0-9]+$'
           description: Permission bitfield (int64) encoded as a decimal string
           example: '2048'
         is_default:
@@ -19524,8 +19558,13 @@ components:
           type: string
         permissions:
           type: string
-          description: Permission bitfield (int64) encoded as a decimal string; must be a subset of the
-            actor's permissions
+          nullable: true
+          description: >-
+            Permission bitfield (int64) encoded as a decimal string; must be a subset of the
+            actor's permissions. The canonical form is decimal digits only. A JSON number or a
+            negative value is refused with 400. `null`, `"null"`, `"-0"` or an omitted field is
+            read as 0, and leading zeros are accepted, so this request field carries no
+            digits-only pattern.
           example: '2048'
         mentionable:
           type: boolean
@@ -19544,7 +19583,13 @@ components:
           type: string
         permissions:
           type: string
-          description: Permission bitfield (int64) encoded as a decimal string
+          nullable: true
+          description: >-
+            Permission bitfield (int64) encoded as a decimal string. The canonical form is
+            decimal digits only. A JSON number or a negative value is refused with 400.
+            `null` or `"null"` is read as omitted, leaving the role's permissions unchanged;
+            `"-0"` is read as 0 and leading zeros are accepted, so this request field carries
+            no digits-only pattern.
         mentionable:
           type: boolean
         display_separately:
@@ -19670,6 +19715,16 @@ components:
         metadata:
           type: object
           additionalProperties: true
+          description: >-
+            Action-specific details. Permission bitfields are decimal-encoded
+            strings, exact above 2^53: `permissions` on `role_created`,
+            `new_permissions` on `role_updated`, and `allow`/`deny` on
+            `channel_override_created`, `channel_override_updated`,
+            `category_override_created` and `category_override_updated`. Rows
+            stored as JSON numbers before #3406 are re-emitted in the same
+            string form. A value may carry a leading `-` on a row written
+            before #2869 made the bitfields non-negative; such a value is audit
+            evidence, not a grant.
         created_at:
           type: string
       required:

@@ -1,5 +1,7 @@
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import type { Channel } from '@/renderer/types/chat';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
@@ -796,6 +798,19 @@ describe('permissionStore', () => {
       expect(perms).toBe(1023n);
     });
 
+    // #3406, Codex round 7: an effective-permission response keeps the legacy
+    // Administrator decode for a pre-#3406 server's rounded numeric value.
+    it('reads a pre-#3406 numeric administrator value as the Administrator grant (#3406)', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers/:id/permissions`, () => {
+          return HttpResponse.json({ permissions: JSON.parse('4611686018912075264') as number });
+        })
+      );
+
+      await usePermissionStore.getState().fetchServerPermissions('server-1');
+      expect(usePermissionStore.getState().serverPermissions['server-1']).toBe(ADMINISTRATOR);
+    });
+
     it('handles API error silently', async () => {
       server.use(
         http.get(`${API_BASE}/api/v1/servers/:id/permissions`, () => {
@@ -847,6 +862,17 @@ describe('permissionStore', () => {
       await usePermissionStore.getState().fetchChannelPermissions('ch-1');
       const perms = usePermissionStore.getState().channelPermissions['ch-1'];
       expect(perms).toBe(2048n);
+    });
+
+    it('reads a pre-#3406 numeric administrator value as the Administrator grant (#3406)', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/channels/:id/permissions`, () => {
+          return HttpResponse.json({ permissions: JSON.parse('4611686018912075264') as number });
+        })
+      );
+
+      await usePermissionStore.getState().fetchChannelPermissions('ch-1');
+      expect(usePermissionStore.getState().channelPermissions['ch-1']).toBe(ADMINISTRATOR);
     });
 
     it('handles API error silently', async () => {
@@ -1263,6 +1289,71 @@ describe('permissionStore', () => {
       expect(result).toBe(false);
     });
 
+    // #3406 review, round 8: the result is recorded by the store, because the
+    // modal that asked may have closed and the server sends no channel update.
+    describe('records its result for a modal that may have closed', () => {
+      const syncChannel = (sync_permissions: boolean): Channel => ({
+        id: 'ch-1',
+        server_id: 'server-1',
+        name: 'general',
+        type: 'text',
+        position: 0,
+        group_id: 'group-1',
+        sync_permissions,
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+      const storedFlag = () =>
+        useChannelStore.getState().channels.find((c) => c.id === 'ch-1')?.sync_permissions;
+
+      function serve(status: number) {
+        let overrideReads = 0;
+        server.use(
+          http.put(`${API_BASE}/api/v1/channels/:id/permission-sync`, () =>
+            status === 200
+              ? HttpResponse.json({ sync_permissions: true })
+              : HttpResponse.json({ error: 'Forbidden' }, { status })
+          ),
+          http.get(`${API_BASE}/api/v1/channels/ch-1/overrides`, () => {
+            overrideReads += 1;
+            return HttpResponse.json({ overrides: [] });
+          })
+        );
+        return () => overrideReads;
+      }
+
+      it('turning sync on stores the flag and re-reads the replaced overrides', async () => {
+        useChannelStore.setState({ channels: [syncChannel(false)] });
+        const reads = serve(200);
+
+        await usePermissionStore.getState().setCategorySync('ch-1', true);
+
+        expect(storedFlag()).toBe(true);
+        expect(reads()).toBe(1);
+        expect(usePermissionStore.getState().channelOverrides['ch-1']).toEqual([]);
+      });
+
+      it('turning sync off stores the flag and reads nothing', async () => {
+        useChannelStore.setState({ channels: [syncChannel(true)] });
+        const reads = serve(200);
+
+        await usePermissionStore.getState().setCategorySync('ch-1', false);
+
+        expect(storedFlag()).toBe(false);
+        expect(reads()).toBe(0);
+      });
+
+      it('a refused sync leaves the stored flag alone', async () => {
+        useChannelStore.setState({ channels: [syncChannel(false)] });
+        const reads = serve(403);
+
+        await usePermissionStore.getState().setCategorySync('ch-1', true);
+
+        expect(storedFlag()).toBe(false);
+        expect(reads()).toBe(0);
+      });
+    });
+
     it('returns false on network error', async () => {
       server.use(
         http.put(`${API_BASE}/api/v1/channels/:id/permission-sync`, () => {
@@ -1274,4 +1365,63 @@ describe('permissionStore', () => {
       expect(result).toBe(false);
     });
   });
+
+  /**
+   * V8 (#3406) — regression pin, expected GREEN at baseline. The wire-form
+   * defect is server-side (decode) and modal-side (discarded boolean); the
+   * store itself already builds the request body from the caller-supplied
+   * string fields and does not re-encode them. This pins that the store
+   * never regresses into sending a JSON number, which is the outermost-
+   * effect pairing for the ChannelSettingsModal/CategorySettingsModal V6
+   * reproduction tests.
+   */
+  describe.each<{
+    label: string;
+    resource: 'channels' | 'categories';
+    id: string;
+    action: 'upsertChannelOverride' | 'upsertCategoryOverride';
+    target: { target_type: 'role' | 'user'; target_id: string };
+  }>([
+    {
+      label: 'channel',
+      resource: 'channels',
+      id: 'channel-1',
+      action: 'upsertChannelOverride',
+      target: { target_type: 'role', target_id: 'role-1' },
+    },
+    {
+      label: 'category',
+      resource: 'categories',
+      id: 'cat-1',
+      action: 'upsertCategoryOverride',
+      target: { target_type: 'user', target_id: 'user-1' },
+    },
+  ])(
+    'upsertChannelOverride / upsertCategoryOverride — V8 (#3406 regression pin)',
+    ({ label, resource, id, action, target }) => {
+      it(`V8: sends allow/deny as decimal strings on the wire for a ${label} override`, async () => {
+        let captured: { allow: unknown; deny: unknown } | undefined;
+        server.use(
+          http.put(`${API_BASE}/api/v1/${resource}/:id/overrides`, async ({ request }) => {
+            captured = (await request.json()) as { allow: unknown; deny: unknown };
+            return HttpResponse.json({});
+          }),
+          http.get(`${API_BASE}/api/v1/${resource}/:id/overrides`, () =>
+            HttpResponse.json({ overrides: [] })
+          )
+        );
+
+        const ok = await usePermissionStore.getState()[action](id, {
+          ...target,
+          allow: '4611686018427387905',
+          deny: '0',
+        });
+
+        expect(ok).toBe(true);
+        expect(captured).toMatchObject({ allow: '4611686018427387905', deny: '0' });
+        expect(typeof captured?.allow).toBe('string');
+        expect(typeof captured?.deny).toBe('string');
+      });
+    }
+  );
 });

@@ -113,4 +113,26 @@ describe('resolveChannelPermissions', () => {
     const eff = resolveChannelPermissions(MENTION_USERS, overrides, VIEWER, roleSet);
     expect(eff & MENTION_USERS).toBe(MENTION_USERS);
   });
+
+  it('fails closed to 0n when a matching override is malformed (#3406 review)', () => {
+    const base = MENTION_USERS | MENTION_ROLES;
+    const malformed = [
+      { target_type: 'role', target_id: ROLE, allow: '0', deny: '0x40' },
+      { target_type: 'user', target_id: VIEWER, allow: '0', deny: ['1'] },
+      { target_type: 'role', target_id: ROLE, allow: String(MENTION_EVERYONE), deny: '-1' },
+    ];
+    for (const o of malformed) {
+      expect(
+        resolveChannelPermissions(base, [o as unknown as PermissionOverride], VIEWER, roleSet)
+      ).toBe(0n);
+    }
+  });
+
+  it('ignores a malformed override that does not apply to the viewer', () => {
+    const base = MENTION_USERS;
+    const other = { target_type: 'role', target_id: 'someone-else', allow: '0', deny: '0x40' };
+    expect(
+      resolveChannelPermissions(base, [other as unknown as PermissionOverride], VIEWER, roleSet)
+    ).toBe(base);
+  });
 });

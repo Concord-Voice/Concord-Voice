@@ -32,6 +32,7 @@ import { useDMStore } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useChatStore } from '../../stores/chat/chatStore';
@@ -140,6 +141,11 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // was in.
   clearMutualServersCache();
   useMemberStore.getState().clearMembers();
+  // #3406: roles, effective permissions, overrides and the record of override
+  // writes in flight all belong to the account that is ending. The in-flight
+  // record would otherwise lock the next account's settings modals behind the
+  // previous session's requests.
+  usePermissionStore.getState().reset();
   useUnreadStore.getState().clearAll();
   useVoiceStore.getState().reset();
   // #2153: reset() preserves the eviction/cooldown interrupt by design; an account

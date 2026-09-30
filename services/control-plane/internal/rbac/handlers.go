@@ -868,7 +868,7 @@ func (h *Handler) announceRoleCreated(
 
 	if h.audit != nil {
 		h.logAudit(c.Request.Context(), serverID, &userID, "role_created", "role", &roleID,
-			map[string]interface{}{"role_name": req.Name, "permissions": req.Permissions})
+			map[string]interface{}{"role_name": req.Name, "permissions": Permission(req.Permissions)})
 	}
 
 	serverUUID, _ := uuid.Parse(serverID)
@@ -1138,7 +1138,7 @@ func (h *Handler) auditRoleUpdate(c *gin.Context, serverID, userID, roleID strin
 		metadata["new_name"] = *req.Name
 	}
 	if req.Permissions != nil {
-		metadata["new_permissions"] = *req.Permissions
+		metadata["new_permissions"] = Permission(*req.Permissions)
 	}
 	h.logAudit(c.Request.Context(), serverID, &userID, "role_updated", "role", &roleID, metadata)
 }
@@ -1949,7 +1949,9 @@ func (h *Handler) GetMyServerPermissions(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"permissions": int64(perms)})
+	// #3406: a decimal string, like every RBAC bitfield on the wire; a
+	// float64 reader loses the low bits once bit 62 is set.
+	c.JSON(http.StatusOK, gin.H{"permissions": strconv.FormatInt(int64(perms), 10)})
 }
 
 // GetAuditLog returns paginated audit log entries for a server
@@ -1995,8 +1997,8 @@ type ChannelOverride struct {
 	ChannelID  string `json:"channel_id"`
 	TargetType string `json:"target_type"` // "user" or "role"
 	TargetID   string `json:"target_id"`
-	Allow      int64  `json:"allow"`
-	Deny       int64  `json:"deny"`
+	Allow      int64  `json:"allow,string"` // #3406: decimal string on the wire (bit 62 exceeds 2^53)
+	Deny       int64  `json:"deny,string"`
 	CreatedAt  string `json:"created_at"`
 	UpdatedAt  string `json:"updated_at"`
 }
@@ -2005,8 +2007,11 @@ type ChannelOverride struct {
 type UpsertOverrideRequest struct {
 	TargetType string `json:"target_type" binding:"required,oneof=user role"`
 	TargetID   string `json:"target_id" binding:"required,uuid"`
-	Allow      int64  `json:"allow" binding:"gte=0"` // #2869: administrators skip the allow subset check
-	Deny       int64  `json:"deny" binding:"gte=0"`  // #2869: deny is never subset-checked
+	// #3406: allow/deny cross JSON as decimal strings, like role permissions;
+	// a JSON number is refused with 400. `,string` still decodes "-1" to -1,
+	// so gte=0 keeps refusing a negative bitfield (#2869).
+	Allow int64 `json:"allow,string" binding:"gte=0"` // #2869: administrators skip the allow subset check
+	Deny  int64 `json:"deny,string" binding:"gte=0"`  // #2869: deny is never subset-checked
 }
 
 // ListChannelOverrides returns all permission overrides for a channel
@@ -2250,7 +2255,7 @@ func (h *Handler) auditChannelOverrideWrite(ctx context.Context, req channelOver
 		action = "channel_override_created"
 	}
 	h.logAudit(ctx, req.serverID, &req.userID, action, "channel", &req.channelID,
-		map[string]interface{}{"target_type": req.request.TargetType, "target_id": req.request.TargetID, "allow": req.request.Allow, "deny": req.request.Deny})
+		map[string]interface{}{"target_type": req.request.TargetType, "target_id": req.request.TargetID, "allow": Permission(req.request.Allow), "deny": Permission(req.request.Deny)})
 }
 
 type channelOverrideWriteState struct {
@@ -2478,7 +2483,9 @@ func (h *Handler) GetMyChannelPermissions(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"permissions": int64(perms)})
+	// #3406: a decimal string, like every RBAC bitfield on the wire; a
+	// float64 reader loses the low bits once bit 62 is set.
+	c.JSON(http.StatusOK, gin.H{"permissions": strconv.FormatInt(int64(perms), 10)})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2491,8 +2498,8 @@ type CategoryOverride struct {
 	CategoryID string `json:"category_id"`
 	TargetType string `json:"target_type"` // "user" or "role"
 	TargetID   string `json:"target_id"`
-	Allow      int64  `json:"allow"`
-	Deny       int64  `json:"deny"`
+	Allow      int64  `json:"allow,string"` // #3406: decimal string on the wire (bit 62 exceeds 2^53)
+	Deny       int64  `json:"deny,string"`
 	CreatedAt  string `json:"created_at"`
 	UpdatedAt  string `json:"updated_at"`
 }
@@ -2863,8 +2870,8 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 			map[string]interface{}{
 				"target_type": req.TargetType,
 				"target_id":   req.TargetID,
-				"allow":       req.Allow,
-				"deny":        req.Deny,
+				"allow":       Permission(req.Allow),
+				"deny":        Permission(req.Deny),
 			})
 	}
 

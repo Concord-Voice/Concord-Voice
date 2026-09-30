@@ -3,8 +3,14 @@ import { Eraser } from 'lucide-react';
 import Modal from '../ui/Modal';
 import OverridePanel from '../Permissions/OverridePanel';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
-import { usePermissionStore, ChannelOverride } from '../../stores/chat/permissionStore';
+import {
+  usePermissionStore,
+  ChannelOverride,
+  UpsertOverrideRequest,
+  NO_PERMISSION_WRITES,
+} from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
 import {
   MANAGE_ALL_MESSAGES,
   MANAGE_OWN_MESSAGES,
@@ -35,8 +41,30 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
   const channelOverrides = usePermissionStore((s) => s.channelOverrides);
   const members = useMemberStore((s) => s.members);
 
-  const [synced, setSynced] = useState(channel.sync_permissions ?? false);
+  // The channel prop is a snapshot taken when the modal opened; the store holds
+  // the current flag, which a sync started before a close and reopen may have
+  // changed since (#3406 review, round 8).
+  const storedSync = useChannelStore(
+    (s) => s.channels.find((c) => c.id === channel.id)?.sync_permissions
+  );
+  const channelSync = storedSync ?? channel.sync_permissions ?? false;
+  const [synced, setSynced] = useState(channelSync);
   const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false);
+  // The category sync and the override panel's writes exclude each other
+  // (#3406): a sync that lands while an override write is in flight would hide
+  // that write's failure with the editor, and the two writes race on the
+  // server.
+  const [isOverrideWritePending, setIsOverrideWritePending] = useState(false);
+  const [isSyncPending, setIsSyncPending] = useState(false);
+  const isSyncLocked = isOverrideWritePending || isSyncPending;
+  // Both flags above die with this modal when it is closed, while the request
+  // can still commit. The store's record of this channel's writes, including a
+  // sync, survives a close and reopen; the panel inherits the ones in flight
+  // when it mounts and reports them through onWritePendingChange, which locks
+  // the switch too (#3406 review, round 6).
+  const writesInFlight = usePermissionStore(
+    (s) => s.permissionWritesInFlight[channel.id] ?? NO_PERMISSION_WRITES
+  );
 
   // Either manage-messages bit authorizes a purge; a ManageOwn-only actor gets
   // a self-scoped one rather than no entry point at all (spec §4.2). Per-channel
@@ -59,38 +87,30 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
     }
   }, [isOpen, channel.id, serverId, fetchChannelOverrides, fetchRoles]);
 
-  // Reset synced state when modal opens
+  // Reset synced state when modal opens, and follow the stored flag after
   useEffect(() => {
     if (isOpen) {
-      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets synced from channel props when modal opens or channel changes; not a render loop
-      setSynced(channel.sync_permissions ?? false);
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets synced from the channel's stored flag when the modal opens or the flag changes; not a render loop
+      setSynced(channelSync);
     }
-  }, [isOpen, channel.id, channel.sync_permissions]);
+  }, [isOpen, channel.id, channelSync]);
 
   const handleSyncToggle = useCallback(async () => {
+    if (isSyncLocked) return;
     const newSync = !synced;
-    const success = await setCategorySync(channel.id, newSync);
-    if (success) {
-      setSynced(newSync);
-      if (newSync) {
-        // Refetch overrides since they may have been replaced
-        fetchChannelOverrides(channel.id);
-      }
+    setIsSyncPending(true);
+    try {
+      // The store records the new flag and re-reads replaced overrides itself.
+      const success = await setCategorySync(channel.id, newSync);
+      if (success) setSynced(newSync);
+    } finally {
+      setIsSyncPending(false);
     }
-  }, [synced, channel.id, setCategorySync, fetchChannelOverrides]);
+  }, [isSyncLocked, synced, channel.id, setCategorySync]);
 
-  const handleUpsert = async (data: {
-    target_type: 'user' | 'role';
-    target_id: string;
-    allow: string;
-    deny: string;
-  }) => {
-    await upsertChannelOverride(channel.id, data);
-  };
+  const handleUpsert = (data: UpsertOverrideRequest) => upsertChannelOverride(channel.id, data);
 
-  const handleDelete = async (overrideId: string) => {
-    await deleteChannelOverride(channel.id, overrideId);
-  };
+  const handleDelete = (overrideId: string) => deleteChannelOverride(channel.id, overrideId);
 
   return (
     <Modal
@@ -115,6 +135,7 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
             onClick={handleSyncToggle}
             role="switch"
             aria-checked={synced}
+            aria-disabled={isSyncLocked}
             tabIndex={0}
             onKeyDown={(e) => {
               if (e.key === 'Enter' || e.key === ' ') {
@@ -140,6 +161,9 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
         onUpsert={handleUpsert}
         onDelete={handleDelete}
         disabled={synced}
+        locked={isSyncPending}
+        onWritePendingChange={setIsOverrideWritePending}
+        writesInFlight={writesInFlight}
         emptyMessage="No permission overrides configured for this channel."
       />
 

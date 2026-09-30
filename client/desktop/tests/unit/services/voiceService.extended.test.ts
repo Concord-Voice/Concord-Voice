@@ -680,6 +680,16 @@ describe('VoiceService Extended', () => {
       expect(mockGetUserMedia).not.toHaveBeenCalled();
     });
 
+    it('joins listen-only when the permissions bitfield is malformed (#3406 review)', async () => {
+      // BigInt('-1') is -1n, which sets bit 62; hasPermission reads that as
+      // Administrator and would grant Speak. A malformed bitfield must fail
+      // closed to listen-only instead.
+      const { sendTransport } = await joinVoiceChannel(undefined, { permissions: '-1' });
+
+      expect(sendTransport.produce).not.toHaveBeenCalled();
+      expect(useVoiceStore.getState().isMuted).toBe(true);
+    });
+
     it('auto-produces mic when the join grants Speak', async () => {
       const withSpeak = (VIEW_VOICE | JOIN_VOICE | SPEAK).toString();
       const { sendTransport } = await joinVoiceChannel(undefined, { permissions: withSpeak });

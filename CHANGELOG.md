@@ -73,6 +73,18 @@ account can't provide, never your password twice.
 - **Text-only channel changes work on busy voice servers** ([#3480](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3480)) — they no longer scan every active voice channel, and deleting a channel group retries if a child becomes a voice channel during the change.
 - **Voice access cleanup no longer sends an in-flight voice update to someone whose access was revoked** ([#3480](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3480)) — temporary access removal holds the audience check through the database change.
 - **A malformed server response no longer replaces the desktop's working configuration** ([#3481](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3481), [#2240](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2240)) — the app keeps the last valid settings for that server, or safe defaults after switching servers, until a valid response arrives.
+- **Channel and category permission overrides save again, and a failed save now says so instead of closing** ([#3473](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3473), [#3406](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3406)) — every
+  override save from the app was being refused, and the editor closed as if it had worked. Saving,
+  adding and deleting an override now works. If the server refuses one, the editor stays open with
+  your changes and a message saying it did not save. While a server is still on an older release,
+  an override the app cannot read exactly is marked "Can't be shown" and can be deleted but not
+  edited, so saving it can never drop permissions it held.
+  **Breaking change for API clients:** every permission bitfield on the RBAC endpoints now crosses
+  JSON as a decimal string. That covers override `allow`/`deny` in both directions, `permissions`
+  from `GET /servers/{id}/permissions` and `GET /channels/{id}/permissions`, and the bitfield keys in
+  audit-log `metadata`. The role `permissions` field already worked this way. A JSON number in an
+  override request is now refused with 400, because numbers above 2^53 lose their low bits in
+  transit. Send `"allow":"1024"`, not `"allow":1024`.
 - **Signing in with two-factor authentication no longer hangs when your encryption keys can't be unlocked** ([#3466](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3466), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) —
   the offer to reset your encryption keys appeared only on the password page, so an account with
   two-factor authentication waited on it forever after entering its code. It now appears on the

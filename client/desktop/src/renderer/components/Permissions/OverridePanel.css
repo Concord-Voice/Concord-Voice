@@ -35,6 +35,17 @@
   background: var(--bg-primary);
 }
 
+/* A Save or Add in flight locks the list (#3406): the row shows it cannot be
+   picked, and keeps its resting background rather than inviting a click. */
+.override-item-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.override-item:has(.override-item-select:disabled):hover {
+  background: var(--bg-tertiary);
+}
+
 .override-item.selected {
   outline: 1px solid var(--accent-primary);
 }
@@ -88,6 +99,17 @@
   background: var(--bg-secondary);
 }
 
+/* A delete is locked while its own delete, or any save or add, is in flight
+   (#3406): it must not invite a click or warm to red on hover, so the hover
+   rule above is undone for a disabled button. */
+.override-delete-btn:disabled,
+.override-delete-btn:disabled:hover {
+  opacity: 0.5;
+  cursor: not-allowed;
+  color: var(--text-secondary);
+  background: none;
+}
+
 .add-override-section {
   border-top: 1px solid var(--border-color);
   padding-top: 16px;
@@ -110,6 +132,11 @@
   color: var(--text-primary);
   font-size: calc(13px * var(--font-scale, 1));
   flex: 1;
+}
+
+.add-override-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .add-override-btn {
@@ -148,4 +175,27 @@
   text-align: center;
   color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
+}
+
+/* A rejected save/add/delete (#3406). --danger fails WCAG AA as label text in 9 of
+   30 scheme×theme combinations (worst: Spooky dark 3.45:1, Cotton Candy light
+   3.49:1) — measured, not assumed — while clearing the 3:1 floor for UI components
+   throughout. So the message carries --text-primary and only the glyph carries
+   --danger, mirroring the chat-header purge button. */
+.override-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.override-error svg {
+  color: var(--danger);
+  flex-shrink: 0;
 }

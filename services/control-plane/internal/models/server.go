@@ -41,8 +41,9 @@ type ServerWithRole struct {
 	// Permissions is the caller's effective SERVER-level permission bitfield,
 	// decimal-encoded as a string. A string rather than a number because the
 	// bitfield reaches bit 62 (PermAdministrator) and JSON numbers lose
-	// precision above 2^53 — GET /servers/{id}/permissions emits an int64 and
-	// carries that hazard; this field does not inherit it.
+	// precision above 2^53. GET /servers/{id}/permissions and
+	// GET /channels/{id}/permissions use the same decimal-string form since
+	// #3406; before it they emitted an int64 and carried that hazard.
 	//
 	// `omitempty` is load-bearing, not style. ListServers is today the only
 	// producer, and it always computes a value — a member with no roles yields

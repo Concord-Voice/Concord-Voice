@@ -1,7 +1,12 @@
 import React, { useEffect } from 'react';
 import Modal from '../ui/Modal';
 import OverridePanel from '../Permissions/OverridePanel';
-import { usePermissionStore, ChannelOverride } from '../../stores/chat/permissionStore';
+import {
+  usePermissionStore,
+  ChannelOverride,
+  UpsertOverrideRequest,
+  NO_PERMISSION_WRITES,
+} from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { ChannelGroup } from '../../types/chat';
 import './CategorySettingsModal.css';
@@ -29,6 +34,11 @@ const CategorySettingsModal: React.FC<CategorySettingsModalProps> = ({
 
   const storeKey = `category:${category.id}`;
   const overrides: ChannelOverride[] = channelOverrides[storeKey] ?? [];
+  // Survives a close and reopen, unlike the panel's own write lock (#3406
+  // review, round 6).
+  const writesInFlight = usePermissionStore(
+    (s) => s.permissionWritesInFlight[storeKey] ?? NO_PERMISSION_WRITES
+  );
   const roles = serverRoles[serverId] ?? [];
 
   useEffect(() => {
@@ -38,18 +48,9 @@ const CategorySettingsModal: React.FC<CategorySettingsModalProps> = ({
     }
   }, [isOpen, category.id, serverId, fetchCategoryOverrides, fetchRoles]);
 
-  const handleUpsert = async (data: {
-    target_type: 'user' | 'role';
-    target_id: string;
-    allow: string;
-    deny: string;
-  }) => {
-    await upsertCategoryOverride(category.id, data);
-  };
+  const handleUpsert = (data: UpsertOverrideRequest) => upsertCategoryOverride(category.id, data);
 
-  const handleDelete = async (overrideId: string) => {
-    await deleteCategoryOverride(category.id, overrideId);
-  };
+  const handleDelete = (overrideId: string) => deleteCategoryOverride(category.id, overrideId);
 
   return (
     <Modal
@@ -64,6 +65,7 @@ const CategorySettingsModal: React.FC<CategorySettingsModalProps> = ({
         members={members}
         onUpsert={handleUpsert}
         onDelete={handleDelete}
+        writesInFlight={writesInFlight}
         emptyMessage="No permission overrides configured for this category."
       />
     </Modal>
