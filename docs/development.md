@@ -661,4 +661,3 @@ npm install --global windows-build-tools
 - Read [API Documentation](./api/): the OpenAPI 3.0 specification. `scripts/api/check-openapi-coverage.sh` enforces full live-route coverage
 - Review [Architecture](./architecture.md): system diagrams, database ERD, message flows
 - Check [Contributing Guidelines](../.github/CONTRIBUTING.md)
-- Join the Discord for discussions

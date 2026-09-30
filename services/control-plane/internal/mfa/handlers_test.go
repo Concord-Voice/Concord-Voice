@@ -421,11 +421,23 @@ func TestEmailSmsVerifyInvalidMethod(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "emailsmsverbad")
 
+	// Hardened mode is the column default (000030), and ValidateHardenedModeCodes
+	// rejects a codes map lacking email+sms with its own 400 before the method
+	// check runs. Turn it off so the request reaches verifyEmailSmsCodes; with it
+	// on, this test passed on the hardened-mode branch instead.
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
 	w := ts.DoRequest("POST", urlEmailSmsVerify, map[string]interface{}{
-		"codes": map[string]string{"telegram": "123456"},
+		"codes": map[string]string{"fax": "123456"},
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// Pin the branch, not just the status: any earlier 400 would also pass the
+	// status check alone.
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Contains(t, body["error"], "invalid method: fax")
 }
 
 // --- Email/SMS Disable ---
@@ -3953,6 +3965,11 @@ func TestEmailSmsVerifyHardenedRequiresBoth(t *testing.T) {
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// Pin the hardened-mode branch: the invalid-method 400 would also pass the
+	// status check alone.
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Contains(t, body["error"], "Hardened mode requires both")
 }
 
 // --- WebAuthn Register Finish: No body ---

@@ -247,7 +247,7 @@ export const useNotificationPrefsStore = wrapStore(
 /**
  * True if THIS channel should be treated as muted right now.
  *
- * Resolution order (the Discord-style override the issue spec calls out):
+ * Resolution order (the channel-over-server override the issue spec calls out):
  *   1. channel-level pref     — wins outright (mute OR explicit unmute)
  *   2. server-level pref      — used only when the channel has no opinion
  *   3. default                — not muted

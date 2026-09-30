@@ -216,7 +216,7 @@ set — each row is a different way an app can render audio:
 | App | Why it is on the list | include | exclude | Verdict | Notes |
 |---|---|---|---|---|---|
 | Chrome (a YouTube tab) | Renders from a child audio service — the canonical `INCLUDE_TREE` case | | | | |
-| An Electron app (Slack, VS Code, Discord) | Same multi-process shape as our own client | | | | |
+| An Electron app (VS Code, or any other multi-process Electron app) | Same multi-process shape as our own client | | | | |
 | Spotify (desktop) | Single-vendor app, its own mixer | | | | |
 | VLC | Classic Win32 audio path | | | | |
 | A game (any 3D title) | Exclusive/low-latency paths, often WASAPI-exclusive | | | | |

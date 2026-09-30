@@ -5,7 +5,7 @@
 // THE POLICY FOR ADR-0043 D4b RISK 2, in the core rather than a backend, for
 // the reason acceptsSourceFormat and buildTarget live here: rt/platform/ may call
 // the OS and may not hold policy. A window's audio is usually rendered by a
-// helper process (Discord Helper (Renderer), Chrome's audio service), so the
+// helper process (an Electron app's renderer helper, Chrome's audio service), so the
 // owner PID alone taps a process that makes no sound (#3394 PR 2, evidence E1).
 //
 // EVERY ARM FAILS CLOSED. A pid is included only when its parent chain reaches

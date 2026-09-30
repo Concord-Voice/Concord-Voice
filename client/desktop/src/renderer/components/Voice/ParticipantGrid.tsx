@@ -611,7 +611,7 @@ export const AudioOutputs: React.FC = () => {
 
 /**
  * Screen-share tile for the Tile view: a tuned-in stream rendered as a grid
- * sibling of the user frames (Discord-style). Clicking it switches to the
+ * sibling of the user frames. Clicking it switches to the
  * Front 'n Center view focused on that stream.
  */
 const StreamGridTile: React.FC<{

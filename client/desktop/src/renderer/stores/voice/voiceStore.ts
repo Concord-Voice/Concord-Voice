@@ -198,8 +198,8 @@ export interface AvailableScreenShare {
 export const MAX_TUNED_SCREEN_SHARES = 5;
 
 /** Voice view mode while streams are tuned in:
- *  'front-center' = user-frame strip above a dominant stream stage (Zoom-style);
- *  'tile' = streams + user frames as sibling tiles in one grid (Discord-style). */
+ *  'front-center' = user-frame strip above a dominant stream stage;
+ *  'tile' = streams + user frames as sibling tiles in one uniform grid. */
 export type VoiceViewMode = 'tile' | 'front-center';
 
 /** Owner metadata for every ACTIVE screen-share producer (available AND
@@ -393,8 +393,8 @@ interface VoiceState {
   //               'focus' = one dominant stream + others in bottom StreamBar
   stageLayout: 'equal' | 'focus';
 
-  // Voice view mode while streams are tuned in: 'front-center' (Zoom-style
-  // dominant stage) vs 'tile' (Discord-style uniform grid of streams + frames)
+  // Voice view mode while streams are tuned in: 'front-center' (dominant
+  // stage) vs 'tile' (uniform grid of streams + frames)
   voiceViewMode: VoiceViewMode;
 
   // PiP state

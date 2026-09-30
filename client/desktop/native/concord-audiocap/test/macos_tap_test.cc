@@ -920,7 +920,7 @@ static void test_tree_filtersToObjectHoldingDescendants() {
 }
 
 static void test_tree_ownerWithoutObjectUsesDescendants() {
-  resetFake();   // the Discord shape (E1): the owner has an object, only a helper renders
+  resetFake();   // the helper-rendered shape (E1): the owner has an object, only a helper renders
   g_parentOf[1284] = 1068u; g_parentOf[1068] = 1u;
   object(5u, 1284u);
   const macos::HalApi hal = fakeHal();

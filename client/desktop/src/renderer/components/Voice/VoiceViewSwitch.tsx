@@ -10,7 +10,7 @@ const OPTIONS: ReadonlyArray<{ mode: VoiceViewMode; label: string; icon: React.R
 
 /**
  * Segmented Tile ↔ Front 'n Center layout switch, overlaid in the top-left of
- * the voice area (Zoom/Meet-style, over the content it reorganizes). Both modes
+ * the voice area (over the content it reorganizes). Both modes
  * are always visible with the active one highlighted, so it reads as *state*
  * rather than a destination-labeled action — no danger color, no swapping label
  * that inverts the meaning (the confusions of the old bar button, #2059-era).

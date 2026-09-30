@@ -468,9 +468,8 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
         className={`voice-view__content ${isVerticalLayout ? 'voice-view__content--vertical' : 'voice-view__content--horizontal'}`}
       >
         {/* Voice area — one resizable entity vs text chat.
-            With tuned-in streams: 'front-center' = strip + dominant stage
-            (Zoom-style); 'tile' = streams as grid tiles beside the user
-            frames (Discord-style). */}
+            With tuned-in streams: 'front-center' = strip + dominant stage;
+            'tile' = streams as grid tiles beside the user frames. */}
         <div className="voice-view__voice-area" ref={voiceAreaRef} tabIndex={-1}>
           {/* Tile ↔ Front 'n Center switch — floats over the voice area, shown
               only while a stream is tuned in (both modes exist). Relocated here

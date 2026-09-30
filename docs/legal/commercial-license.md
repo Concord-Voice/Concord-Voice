@@ -299,9 +299,9 @@ or community. Multiple servers operated on the same physical or virtual
 infrastructure count as separate servers if they serve distinct
 customer organizations.
 
-A single server may host multiple Concord Voice communities (analogous
-to Discord "servers" within a single Concord Voice instance); this is
-not the same as Fleet licensing. Fleet count is at the instance level,
+A single server may host multiple Concord Voice communities (each one a
+"server" in the app's own interface); this is not the same as Fleet
+licensing. Fleet count is at the instance level,
 not the community level.
 
 ### What counts as a "Competing Use"?

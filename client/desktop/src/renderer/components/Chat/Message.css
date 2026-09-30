@@ -411,7 +411,7 @@
 }
 
 /* @mention highlights — uses theme accent via color-mix so the highlight
-   adapts per-theme instead of leaking Discord blurple. */
+   adapts per-theme instead of leaking a hard-coded blue. */
 .mention-highlight {
   border-radius: 3px;
   padding: 0 2px;

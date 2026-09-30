@@ -383,10 +383,10 @@ export const config = {
   freeVideoPublisherCap: parsePositiveIntEnv(process.env.FREE_VIDEO_PUBLISHER_CAP, 8),
 
   // Free per-room concurrent screenshare-producer cap (#1542; raised 1→8 for
-  // Discord parity — Discord caps stream quality, not concurrency). The premium
-  // value (16) is a code constant in roomManager (PREMIUM_SCREEN_PRODUCER_CAP),
-  // resolved per room tier by resolveScreenProducerCap — same shape as the
-  // camera cap above.
+  // competitive parity — major comms platforms cap stream quality, not
+  // concurrency). The premium value (16) is a code constant in roomManager
+  // (PREMIUM_SCREEN_PRODUCER_CAP), resolved per room tier by
+  // resolveScreenProducerCap — same shape as the camera cap above.
   freeScreenProducerCap: parsePositiveIntEnv(process.env.FREE_SCREEN_PRODUCER_CAP, 8),
 
   // Audio last-N (#1544): free default forwarded-speaker cap. Tier-aware paid

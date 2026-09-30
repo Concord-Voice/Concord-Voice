@@ -529,9 +529,9 @@ export const MAX_SERVER_VOICE_PARTICIPANTS = 1000;
  * Premium per-room caps (#1542) — mirror the Go entitlements source of truth
  * (`entitlements.go` MaxWebcamPublishers 25 / MaxScreensharePublishers 16).
  * Free values come from config (`freeVideoPublisherCap` / `freeScreenProducerCap`).
- * Screenshare raised free 1→8 / premium 3→16 for competitive parity: Discord
- * caps stream QUALITY, not concurrency (every voice-channel participant can
- * Go Live simultaneously), so a 1-stream free room was a visible product gap.
+ * Screenshare raised free 1→8 / premium 3→16 for competitive parity: major
+ * comms platforms cap stream QUALITY, not concurrency (every voice-channel
+ * participant can share at once), so a 1-stream free room was a visible product gap.
  */
 export const PREMIUM_VIDEO_PUBLISHER_CAP = 25;
 export const PREMIUM_SCREEN_PRODUCER_CAP = 16;

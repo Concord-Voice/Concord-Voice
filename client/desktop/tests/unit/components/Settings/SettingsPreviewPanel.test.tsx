@@ -36,7 +36,7 @@ describe('SettingsPreviewPanel (#489)', () => {
       expect(chatUsernames).toEqual(['alice', 'bob']);
     });
 
-    it('includes a reply preview (Discord-style quoted parent)', () => {
+    it('includes a reply preview (quoted parent)', () => {
       render(<SettingsPreviewPanel />);
       expect(screen.getByText('@alice')).toBeInTheDocument();
       expect(screen.getByText(/shipped the migration last night/)).toBeInTheDocument();

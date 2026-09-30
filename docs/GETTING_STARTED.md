@@ -438,7 +438,6 @@ concord/
 - Check [development.md](./development.md) for detailed guides
 - Review [architecture.md](./architecture.md) for design decisions
 - Open an issue on GitHub
-- Join our Discord (link TBD)
 
 ## What's Next?
 

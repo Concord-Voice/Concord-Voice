@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Server represents a Concord server (Discord-like community)
+// Server represents a Concord server (a community with channels and roles)
 type Server struct {
 	ID        string  `json:"id" db:"id"`
 	Name      string  `json:"name" db:"name"`

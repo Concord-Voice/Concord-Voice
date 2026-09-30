@@ -71,7 +71,7 @@ describe('notificationPrefsStore', () => {
     });
 
     it('upserts an explicit unmute (muted=false stays in the map)', () => {
-      // The Discord-style override: a channel set to muted=false MUST persist
+      // The channel-over-server override: a channel set to muted=false MUST persist
       // as a row so it can defeat its server's mute. Removing the row would
       // collapse "explicitly unmuted" into "no opinion" — wrong outcome.
       useNotificationPrefsStore.getState().setMute('channel', CHANNEL_ID, false, null);

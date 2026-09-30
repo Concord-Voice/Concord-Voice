@@ -54,7 +54,7 @@
   font-size: calc(12px * var(--font-scale, 1));
   color: var(--text-secondary);
   margin-bottom: 4px;
-  /* Discord-style left border to indicate a quoted parent. */
+  /* Left border to indicate a quoted parent. */
   border-left: 2px solid var(--accent-primary);
   padding-left: 8px;
   opacity: 0.85;
