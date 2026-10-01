@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-09-23
+**Generated:** 2026-09-30
 **MinIO distribution addendum updated:** 2026-09-27
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -166,7 +166,7 @@ current tree rather than a guarantee.
 | github.com/gin-contrib/sse | v1.1.2 | MIT |
 | github.com/gin-gonic/gin | v1.12.0 | MIT |
 | github.com/go-jose/go-jose/v4 | v4.1.5 | Apache-2.0 |
-| github.com/go-playground/locales | v0.14.1 | MIT |
+| github.com/go-playground/locales | v0.14.2 | MIT |
 | github.com/go-playground/universal-translator | v0.18.2 | MIT |
 | github.com/go-playground/validator/v10 | v10.30.5 | MIT |
 | github.com/go-viper/mapstructure/v2 | v2.5.0 | MIT |
@@ -179,7 +179,7 @@ current tree rather than a guarantee.
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause |
 | github.com/gorilla/websocket | v1.5.3 | BSD-2-Clause |
 | github.com/joho/godotenv | v1.5.1 | MIT |
-| github.com/klauspost/compress | v1.20.0 | MIT |
+| github.com/klauspost/compress | v1.20.1 | MIT |
 | github.com/klauspost/cpuid/v2 | v2.4.0 | MIT |
 | github.com/klauspost/crc32 | v1.3.0 | BSD-3-Clause |
 | github.com/leodido/go-urn | v1.5.0 | MIT |
@@ -307,7 +307,7 @@ bundle (client/desktop):
 | lodash.isequal | 4.5.0 | MIT | https://github.com/lodash/lodash |
 | longest-streak | 3.1.0 | MIT | https://github.com/wooorm/longest-streak |
 | lowlight | 3.3.0 | MIT | https://github.com/wooorm/lowlight |
-| lucide-react | 1.46.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.47.0 | ISC | https://github.com/lucide-icons/lucide |
 | markdown-table | 3.0.4 | MIT | https://github.com/wooorm/markdown-table |
 | mdast-util-find-and-replace | 3.0.2 | MIT | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | mdast-util-from-markdown | 2.0.3 | MIT | https://github.com/syntax-tree/mdast-util-from-markdown |
@@ -435,7 +435,7 @@ bundle (services/media-plane):
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/node | 26.5.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/node | 26.6.2 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/triple-beam | 1.3.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |
@@ -468,7 +468,7 @@ bundle (services/media-plane):
 | enabled | 2.0.0 | MIT | https://github.com/3rd-Eden/enabled |
 | encodeurl | 2.0.0 | MIT | https://github.com/pillarjs/encodeurl |
 | engine.io-parser | 5.2.3 | MIT | https://github.com/socketio/socket.io |
-| engine.io | 6.6.8 | MIT | https://github.com/socketio/socket.io |
+| engine.io | 6.6.11 | MIT | https://github.com/socketio/socket.io |
 | es-define-property | 1.0.1 | MIT | https://github.com/ljharb/es-define-property |
 | es-errors | 1.3.0 | MIT | https://github.com/ljharb/es-errors |
 | es-object-atoms | 1.1.2 | MIT | https://github.com/ljharb/es-object-atoms |
@@ -591,7 +591,7 @@ guarantee — do not read either table as covering the other.
 
 | Package | Version | License | Repository |
 |---|---|---|---|
-| lucide-react | 1.46.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.47.0 | ISC | https://github.com/lucide-icons/lucide |
 | react-dom | 19.3.0 | MIT | https://github.com/react/react |
 | react | 19.3.0 | MIT | https://github.com/react/react |
 | scheduler | 0.28.0 | MIT | https://github.com/react/react |
