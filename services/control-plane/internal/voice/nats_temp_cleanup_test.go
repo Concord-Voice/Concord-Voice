@@ -3,6 +3,9 @@ package voice_test
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,7 +13,10 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	concordws "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/google/uuid"
+	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -324,7 +330,9 @@ func TestHandleLeft_AmbiguousCommitFailsClosed(t *testing.T) {
 	`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = ts.DB.Exec(`DROP TRIGGER IF EXISTS test_fail_terminal_commit ON voice_participants; DROP FUNCTION IF EXISTS test_fail_terminal_commit();`)
+		if _, err := ts.DB.Exec(`DROP TRIGGER IF EXISTS test_fail_terminal_commit ON voice_participants; DROP FUNCTION IF EXISTS test_fail_terminal_commit();`); err != nil {
+			t.Errorf("drop terminal fault-injection trigger: %v", err)
+		}
 	})
 
 	sub.HandleLeft(mustJSON(t, map[string]interface{}{
@@ -337,30 +345,137 @@ func TestHandleLeft_AmbiguousCommitFailsClosed(t *testing.T) {
 	assert.Zero(t, keyRevocationCount(t, ts.DB, channelID), "ambiguous commit must not announce a rotation")
 }
 
-func TestHandleHeartbeat_AmbiguousCommitEmitsNoRosterOrCountRemoval(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
-	sub := newTestSubscriber(ts)
-	owner := ts.CreateTestUser(t, "heartbeat_ambiguous_owner")
-	stale := ts.CreateTestUser(t, "heartbeat_ambiguous_stale")
-	viewer := ts.CreateTestUser(t, "heartbeat_ambiguous_viewer")
-	serverID := ts.CreateTestServer(t, owner.ID, "Ambiguous Heartbeat Server")
+// observerKeepingDelivery forwards Rich Presence delivery to the hub but swallows
+// the activity service's two fail-closed disconnects. The fleet one closes EVERY
+// local client, and an ambiguous commit takes it before the heartbeat returns, so
+// without this the observer is gone before any roster or count frame could reach
+// it. Each stub still bumps the audience fence as the hub does, so the socket close
+// is the only thing that differs from production. disconnectAll counts the
+// swallowed fleet disconnects, so a test can still prove the fail-closed path fired.
+// The embedded hub's DeliverRichPresenceClearsThenDisconnect is a third path that
+// closes clients and is NOT stubbed; if it ever runs here, the observer window
+// fails on its deadline guard rather than passing silently.
+type observerKeepingDelivery struct {
+	*concordws.Hub
+	disconnectAll atomic.Int32
+}
+
+func (d *observerKeepingDelivery) DisconnectRichPresenceClients(context.Context, map[uuid.UUID]bool) error {
+	d.InvalidatePresenceAudiences()
+	return nil
+}
+
+func (d *observerKeepingDelivery) DisconnectAllRichPresenceClients(context.Context) error {
+	d.InvalidatePresenceAudiences()
+	d.disconnectAll.Add(1)
+	return nil
+}
+
+// heartbeatObserver is a viewer subscribed to a server whose voice channel holds
+// one stale participant that the next empty heartbeat reconciles out.
+type heartbeatObserver struct {
+	sub       *voice.NATSSubscriber
+	delivery  *observerKeepingDelivery
+	conn      *gorillaWS.Conn
+	serverID  string
+	channelID string
+	staleID   string
+}
+
+func newHeartbeatObserver(t *testing.T, ts *testhelpers.TestServer) heartbeatObserver {
+	t.Helper()
+	delivery := &observerKeepingDelivery{Hub: ts.Hub}
+	sub := newTestSubscriberWithDelivery(ts, ts.Hub, nil, delivery)
+	owner := ts.CreateTestUser(t, "heartbeat_observer_owner")
+	stale := ts.CreateTestUser(t, "heartbeat_observer_stale")
+	viewer := ts.CreateTestUser(t, "heartbeat_observer_viewer")
+	serverID := ts.CreateTestServer(t, owner.ID, "Heartbeat Observer Server")
 	ts.AddMemberToServer(t, serverID, stale.ID, "member")
 	ts.AddMemberToServer(t, serverID, viewer.ID, "member")
-	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ambiguous-heartbeat")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-heartbeat-observer")
 
 	conn := connectVoiceWireClient(t, ts, viewer)
+	// Two count frames precede the heartbeat, unordered against each other and
+	// against connection_ready: the registration snapshot (sent once presence
+	// bootstrap completes) and the subscribe catch-up. Either one arriving late
+	// reads as a heartbeat emission, so drain each by construction. Before
+	// subscribing, the registration snapshot is the only count frame possible.
+	waitForVoiceWireType(t, conn, "server_voice_counts")
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{
 		"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID},
 	}))
-	synchronizeVoiceWireClient(t, conn)
-	waitForVoiceWireType(t, conn, "server_voice_counts") // Drain the subscription catch-up.
+	// The catch-up names every subscribed server, so it also proves the
+	// subscription is committed.
+	catchUp := waitForVoiceWireType(t, conn, "server_voice_counts")
+	require.Contains(t, catchUp.Data["counts"], serverID)
 	// Keep the observer connected so a pre-disconnect roster/count emission is
 	// visible instead of being hidden by the conservative recovery disconnect.
 	sub.SetDisconnectAllRichPresenceClientsHookForTest(func() {})
-	// Insert after the on-subscribe count catch-up so the assertion observes only
-	// the heartbeat's own output; this direct fixture write emits no count signal.
+	// Insert after both count catch-ups so the window observes only the
+	// heartbeat's own output; this direct fixture write emits no count signal.
 	insertVoiceParticipant(t, ts.DB, channelID, stale.ID)
-	cacheKey := "perm:" + serverID + ":" + stale.ID + ":" + channelID
+	return heartbeatObserver{
+		sub: sub, delivery: delivery, conn: conn,
+		serverID: serverID, channelID: channelID, staleID: stale.ID,
+	}
+}
+
+func (o heartbeatObserver) heartbeat(t *testing.T) {
+	t.Helper()
+	o.sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
+		"channelId": o.channelID,
+		"userIds":   []string{},
+		"timestamp": "2026-06-15T00:00:00Z",
+	}))
+}
+
+// heartbeatFrames holds the first frame of each kind the observer saw: the two
+// wire forms of a roster removal (a per-user left and a channel-wide room_empty)
+// and a count frame naming the server.
+type heartbeatFrames struct{ left, roomEmpty, count *voiceWireEnvelope }
+
+// observe reads for 500 ms and returns the heartbeat frames seen. Only the
+// deadline may end the window: any other read error means a fail-closed path the
+// stubs do not cover closed the observer, and a window that ends early observed
+// nothing.
+func (o heartbeatObserver) observe(t *testing.T) heartbeatFrames {
+	t.Helper()
+	var seen heartbeatFrames
+	require.NoError(t, o.conn.SetReadDeadline(time.Now().Add(500*time.Millisecond)))
+	for {
+		var envelope voiceWireEnvelope
+		if err := o.conn.ReadJSON(&envelope); err != nil {
+			var netErr net.Error
+			require.Truef(t, errors.As(err, &netErr) && netErr.Timeout(),
+				"observer window ended before its deadline: %v", err)
+			return seen
+		}
+		switch {
+		case envelope.Type == "voice_state_update" && envelope.Data["channel_id"] == o.channelID:
+			switch envelope.Data["action"] {
+			case "left":
+				if seen.left == nil && envelope.Data["user_id"] == o.staleID {
+					seen.left = &envelope
+				}
+			case "room_empty":
+				if seen.roomEmpty == nil {
+					seen.roomEmpty = &envelope
+				}
+			}
+		case envelope.Type == "server_voice_counts":
+			counts, ok := envelope.Data["counts"].(map[string]interface{})
+			require.Truef(t, ok, "server_voice_counts with non-object counts: %v", envelope.Data)
+			if _, sent := counts[o.serverID]; sent && seen.count == nil {
+				seen.count = &envelope
+			}
+		}
+	}
+}
+
+func TestHandleHeartbeat_AmbiguousCommitEmitsNoRosterOrCountRemoval(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	o := newHeartbeatObserver(t, ts)
+	cacheKey := "perm:" + o.serverID + ":" + o.staleID + ":" + o.channelID
 	require.NoError(t, ts.Redis.Set(context.Background(), cacheKey, int64(rbac.PermJoinVoice), time.Minute).Err())
 
 	_, err := ts.DB.Exec(`
@@ -373,39 +488,42 @@ func TestHandleHeartbeat_AmbiguousCommitEmitsNoRosterOrCountRemoval(t *testing.T
 	`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = ts.DB.Exec(`DROP TRIGGER IF EXISTS test_fail_heartbeat_terminal_commit ON voice_participants; DROP FUNCTION IF EXISTS test_fail_heartbeat_terminal_commit();`)
+		if _, err := ts.DB.Exec(`DROP TRIGGER IF EXISTS test_fail_heartbeat_terminal_commit ON voice_participants; DROP FUNCTION IF EXISTS test_fail_heartbeat_terminal_commit();`); err != nil {
+			t.Errorf("drop heartbeat fault-injection trigger: %v", err)
+		}
 	})
 
-	sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
-		"channelId": channelID,
-		"userIds":   []string{},
-		"timestamp": "2026-06-15T00:00:00Z",
-	}))
+	o.heartbeat(t)
 
-	require.True(t, voiceParticipantExists(t, ts.DB, channelID, stale.ID),
+	require.True(t, voiceParticipantExists(t, ts.DB, o.channelID, o.staleID),
 		"ambiguous commit must leave the participant durable")
 	cacheExists, err := ts.Redis.Exists(context.Background(), cacheKey).Result()
 	require.NoError(t, err)
 	assert.Zero(t, cacheExists, "ambiguous participant deletion must invalidate cached channel authority")
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(500*time.Millisecond)))
-	for {
-		var envelope voiceWireEnvelope
-		if err := conn.ReadJSON(&envelope); err != nil {
-			break // Reconciliation failure may fail closed by disconnecting the client.
-		}
-		if envelope.Type == "voice_state_update" && envelope.Data["action"] == "left" &&
-			envelope.Data["channel_id"] == channelID && envelope.Data["user_id"] == stale.ID {
-			require.Fail(t, "ambiguous commit emitted a stale participant roster-left update")
-		}
-		if envelope.Type == "server_voice_counts" {
-			counts, ok := envelope.Data["counts"].(map[string]interface{})
-			if ok {
-				if _, sent := counts[serverID]; sent {
-					require.Failf(t, "ambiguous commit emitted a server voice count update", "%v", envelope.Data)
-				}
-			}
-		}
-	}
+	assert.Positive(t, o.delivery.disconnectAll.Load(),
+		"ambiguous commit must take the fail-closed fleet disconnect")
+	seen := o.observe(t)
+	require.Nil(t, seen.left, "ambiguous commit emitted a stale participant roster-left update")
+	require.Nil(t, seen.roomEmpty, "ambiguous commit emitted a channel-wide room_empty roster removal")
+	require.Nil(t, seen.count, "ambiguous commit emitted a server voice count update")
+}
+
+// TestHandleHeartbeat_CommittedRemovalReachesTheObserver is the positive control
+// for the ambiguous-commit test above: the same observer, stimulus and read
+// window, with the commit allowed to land. Without it, that test's negative
+// assertions could pass because the observer cannot see either frame at all.
+func TestHandleHeartbeat_CommittedRemovalReachesTheObserver(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	o := newHeartbeatObserver(t, ts)
+
+	o.heartbeat(t)
+
+	require.False(t, voiceParticipantExists(t, ts.DB, o.channelID, o.staleID),
+		"committed heartbeat must remove the stale participant")
+	seen := o.observe(t)
+	require.NotNil(t, seen.left, "committed removal must reach the observer as a roster-left update")
+	require.NotNil(t, seen.roomEmpty, "emptying the channel must reach the observer as a room_empty update")
+	require.NotNil(t, seen.count, "committed removal must reach the observer as a server voice count update")
 }
 
 // TestHandleHeartbeat_StaleTempGrantHolder_TriggersRevoke verifies the

@@ -48,6 +48,18 @@ func newTestSubscriberWithHubAndNATS(
 	hub *concordws.Hub,
 	nats *natsclient.Client,
 ) *voice.NATSSubscriber {
+	return newTestSubscriberWithDelivery(ts, hub, nats, hub)
+}
+
+// newTestSubscriberWithDelivery lets a test interpose on the Rich Presence
+// delivery the activity service writes through, while the subscriber keeps the
+// real hub for everything else.
+func newTestSubscriberWithDelivery(
+	ts *testhelpers.TestServer,
+	hub *concordws.Hub,
+	nats *natsclient.Client,
+	delivery presence.Delivery,
+) *voice.NATSSubscriber {
 	log := logger.New("test")
 	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
 	activityStore := presence.NewActivityStore(ts.Redis)
@@ -59,7 +71,7 @@ func newTestSubscriberWithHubAndNATS(
 		activityStore,
 		ts.DB,
 		resolver,
-		hub,
+		delivery,
 		permitAllPresence{},
 	)
 	return voice.NewNATSSubscriber(ts.DB, log, hub, nats, ts.Redis, resolver, activity)
@@ -687,11 +699,13 @@ func TestHandleRoomEmpty_DMParticipantDeleteRetriesTransientFailure(t *testing.T
 	`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = ts.DB.Exec(`
+		if _, err := ts.DB.Exec(`
 			DROP TRIGGER IF EXISTS test_fail_first_dm_voice_delete ON dm_voice_participants;
 			DROP FUNCTION IF EXISTS test_fail_first_dm_voice_delete();
 			DROP SEQUENCE IF EXISTS test_dm_voice_delete_attempt;
-		`)
+		`); err != nil {
+			t.Errorf("drop DM voice fault-injection trigger: %v", err)
+		}
 	})
 
 	sub.HandleRoomEmpty(mustJSON(t, map[string]interface{}{
@@ -793,10 +807,18 @@ func TestHandleHeartbeat_PrivateCallRetriesDisconnectForReportedNonMember(t *tes
 	if err != nil {
 		t.Skipf("NATS unavailable (%v); skipping heartbeat revocation retry test", err)
 	}
-	t.Cleanup(func() { _ = publisher.Close() })
+	t.Cleanup(func() {
+		if err := publisher.Close(); err != nil {
+			t.Logf("close NATS publisher: %v", err)
+		}
+	})
 	observer, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = observer.Close() })
+	t.Cleanup(func() {
+		if err := observer.Close(); err != nil {
+			t.Logf("close NATS observer: %v", err)
+		}
+	})
 	disconnects := make(chan map[string]interface{}, 4)
 	subscription, err := observer.Subscribe(natsSubjectEnforceDisconnectForTest, func(data []byte) {
 		var payload map[string]interface{}
@@ -805,7 +827,11 @@ func TestHandleHeartbeat_PrivateCallRetriesDisconnectForReportedNonMember(t *tes
 		}
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = subscription.Unsubscribe() })
+	t.Cleanup(func() {
+		if err := subscription.Unsubscribe(); err != nil {
+			t.Logf("unsubscribe NATS observer: %v", err)
+		}
+	})
 	require.NoError(t, observer.Flush())
 
 	ts := testhelpers.SetupTestServer(t)
@@ -1194,7 +1220,11 @@ func TestHandleVoiceLifecycle_DMRedisErrorFailsClosedBeforePresenceMutation(t *t
 		WriteTimeout: 10 * time.Millisecond,
 		MaxRetries:   -1,
 	})
-	t.Cleanup(func() { _ = brokenRedis.Close() })
+	t.Cleanup(func() {
+		if err := brokenRedis.Close(); err != nil {
+			t.Logf("close broken Redis client: %v", err)
+		}
+	})
 	log := logger.New("test")
 	resolver := rbac.NewResolver(
 		ts.DB, rbac.NewPermissionCache(brokenRedis), log,
