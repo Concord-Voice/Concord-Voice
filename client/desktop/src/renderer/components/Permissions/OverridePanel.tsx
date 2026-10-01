@@ -462,11 +462,7 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
             >
               Save Override
             </button>
-            <button
-              className="add-override-btn"
-              style={{ opacity: 0.7 }}
-              onClick={handleCancelEdit}
-            >
+            <button className="override-cancel-btn" onClick={handleCancelEdit}>
               Cancel
             </button>
           </div>

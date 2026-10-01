@@ -33,6 +33,8 @@ export interface DerivedThemeVariables {
   '--accent-color': string;
   '--state-focused': string;
   '--gradient-brand': string;
+  '--brand-fill': string;
+  '--on-brand': string;
   '--border-color': string;
   '--on-accent': string;
   '--on-accent-secondary': string;
@@ -65,6 +67,8 @@ const THEME_VARIABLE_KEYS: (keyof DerivedThemeVariables)[] = [
   '--accent-color',
   '--state-focused',
   '--gradient-brand',
+  '--brand-fill',
+  '--on-brand',
   '--border-color',
   '--on-accent',
   '--on-accent-secondary',
@@ -297,6 +301,74 @@ function searchDirection(
   return { hit: null, best, score };
 }
 
+// ─── Brand Fill ──────────────────────────────────────────────────────────────
+
+/** 4.5:1 plus headroom, the same margin the text tiers above take. */
+const BRAND_FLOOR = 4.6;
+const BRAND_SAMPLES = 100;
+
+/** `a` moved toward `b` by `t`, per sRGB channel: gradients interpolate this way. */
+function mixHex(a: string, b: string, t: number): string {
+  const channel = (hex: string, i: number) => Number.parseInt(hex.substring(i, i + 2), 16);
+  return (
+    '#' +
+    [1, 3, 5]
+      .map((i) => Math.round(channel(a, i) + (channel(b, i) - channel(a, i)) * t))
+      .map((v) => v.toString(16).padStart(2, '0'))
+      .join('')
+  );
+}
+
+export interface BrandPair {
+  /** The value for `--brand-fill`. */
+  fill: string;
+  /** The value for `--on-brand`. */
+  text: string;
+}
+
+/**
+ * The fill and label colour for brand-filled controls in a custom theme.
+ *
+ * The label sits on a gradient between two colours the user chose, so no fixed
+ * colour can be right for every pair: checking one end is not enough either,
+ * because the sRGB midpoint of two passing ends can fail. Every point of the
+ * gradient is sampled. `preferredText` is tried first, then black, then white.
+ * When no label colour holds, the lightest black or white scrim that lets one
+ * hold is laid over `base`, so the user's colours still show through. A 100%
+ * scrim is a solid fill, so the search always ends.
+ *
+ * `base` is the gradient the fill paints: the theme's own `var(--gradient-brand)`
+ * for a custom theme, or the literal gradient of another user's colours when the
+ * pair is for their initials.
+ */
+export function deriveBrandPair(
+  from: string,
+  to: string,
+  preferredText: string,
+  base = 'var(--gradient-brand)'
+): BrandPair {
+  const samples = Array.from({ length: BRAND_SAMPLES + 1 }, (_, i) =>
+    mixHex(from, to, i / BRAND_SAMPLES)
+  );
+  const worst = (text: string, fills: string[]) =>
+    Math.min(...fills.map((fill) => contrastRatio(text, fill)));
+  for (const text of [preferredText, '#000000', '#ffffff']) {
+    if (worst(text, samples) >= BRAND_FLOOR) return { fill: base, text };
+  }
+  const scrim = (rgb: string, pct: number) =>
+    `linear-gradient(rgb(${rgb} / ${pct}%), rgb(${rgb} / ${pct}%)), ${base}`;
+  for (let pct = 5; pct < 100; pct += 5) {
+    const darkened = samples.map((fill) => mixHex(fill, '#000000', pct / 100));
+    if (worst('#ffffff', darkened) >= BRAND_FLOOR)
+      return { fill: scrim('0 0 0', pct), text: '#ffffff' };
+    const lightened = samples.map((fill) => mixHex(fill, '#ffffff', pct / 100));
+    if (worst('#000000', lightened) >= BRAND_FLOOR) {
+      return { fill: scrim('255 255 255', pct), text: '#000000' };
+    }
+  }
+  return { fill: scrim('0 0 0', 100), text: '#ffffff' };
+}
+
 // ─── Theme Derivation ────────────────────────────────────────────────────────
 
 export function deriveThemeVariables(colors: CustomColors, isDark: boolean): DerivedThemeVariables {
@@ -311,6 +383,8 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
   const a1 = colors.accentPrimary;
   const a2 = colors.accentSecondary;
   const darkSurfaces = [bg, lighten(bg, 5), lighten(bg, 10), lighten(bg, 8), lighten(bg, 12)];
+  // Dark text on the fill first, as the preset dark themes use their --bg-primary.
+  const brand = deriveBrandPair(a1, a2, bg);
 
   return {
     '--bg-primary': bg,
@@ -332,6 +406,8 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
     // user's raw secondary, which can equal the background and paint rings at 1:1.
     '--state-focused': liftToContrast(a2, darkSurfaces, 3.2, true),
     '--gradient-brand': `linear-gradient(90deg, ${a1} 0%, ${a2} 100%)`,
+    '--brand-fill': brand.fill,
+    '--on-brand': brand.text,
     '--border-color': lighten(bg, 15),
     '--on-accent': contrastColor(a1),
     '--on-accent-secondary': contrastColor(a2),
@@ -367,6 +443,7 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
   // Slightly darker accents for contrast on light bg
   const lightA1 = darken(a1, 8);
   const lightA2 = darken(a2, 8);
+  const brand = deriveBrandPair(lightA1, lightA2, textDark);
   const lightSurfaces = [
     bgLight,
     lighten(bgLight, 2),
@@ -393,6 +470,8 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
     // the [data-theme='light'] block's literal, which knows nothing of this palette.
     '--state-focused': liftToContrast(lightA2, lightSurfaces, 3.2, false),
     '--gradient-brand': `linear-gradient(90deg, ${lightA1} 0%, ${lightA2} 100%)`,
+    '--brand-fill': brand.fill,
+    '--on-brand': brand.text,
     '--border-color': darken(bgLight, 15),
     '--on-accent': contrastColor(lightA1),
     '--on-accent-secondary': contrastColor(lightA2),

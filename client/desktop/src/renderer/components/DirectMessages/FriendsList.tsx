@@ -22,7 +22,7 @@ import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { useFriendOrgStore, type FriendCategory } from '../../stores/chat/friendOrgStore';
 import ContextMenu from '../ui/ContextMenu';
 import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import AddFriendModal from './AddFriendModal';
 import CategoryManagerPanel from './CategoryManagerPanel';
 import { errorMessage } from '../../utils/runtime/redactError';
@@ -624,12 +624,7 @@ const FriendsList: React.FC<FriendsListProps> = ({
               className="member-avatar-img"
             />
           ) : (
-            <span
-              className="member-avatar-initial"
-              style={
-                friendColors ? { background: friendColors.gradient, color: '#fff' } : undefined
-              }
-            >
+            <span className="member-avatar-initial" style={identityInitialStyle(friendColors)}>
               {displayName.charAt(0).toUpperCase()}
             </span>
           )}

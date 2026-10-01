@@ -2,7 +2,7 @@ import React from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { presentRemoteActivities } from '../../utils/ui/richPresencePresentation';
 
 interface MemberItemProps {
@@ -57,10 +57,7 @@ const MemberItem: React.FC<MemberItemProps> = ({
             className="member-avatar-img"
           />
         ) : (
-          <span
-            className="member-avatar-initial"
-            style={memberColors ? { background: memberColors.gradient, color: '#fff' } : undefined}
-          >
+          <span className="member-avatar-initial" style={identityInitialStyle(memberColors)}>
             {member.username.charAt(0).toUpperCase()}
           </span>
         )}

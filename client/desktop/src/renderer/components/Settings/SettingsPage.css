@@ -1288,8 +1288,10 @@
   color: var(--on-accent);
 }
 
+/* Lift rather than fade, as .btn-primary does. */
 .os-perm-actions .btn-primary:hover:not(:disabled) {
-  opacity: 0.9;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent-color) 30%, transparent);
 }
 
 .os-perm-actions .btn-secondary {

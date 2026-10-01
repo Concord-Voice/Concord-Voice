@@ -1,6 +1,151 @@
 import { resolveUserAccentColors, resolveUserThemeScope } from '@/renderer/utils/ui/schemeColors';
+import { contrastRatio, sampleFill, toRgb } from '../styles/contrastPairs';
 
 describe('schemeColors', () => {
+  // --- initials pair (review of #3514) ---
+
+  describe("initials on another user's colours", () => {
+    // Initials drawn on a user's colours took the raw gradient with #fff or the
+    // viewer's --on-brand, neither chosen for that gradient: white on Hacker's
+    // green read 1.37:1. Every scheme now carries a fill and label pair.
+    const worst = (fill?: string, text?: string) => {
+      const samples = fill ? sampleFill(fill) : null;
+      const rgb = text ? toRgb(text) : null;
+      if (!samples || !rgb) return 0; // no pair to measure
+      return Math.min(...samples.map((bg) => contrastRatio(rgb, bg)));
+    };
+
+    it.each([
+      'concord',
+      'morky',
+      'bardic',
+      'hacker',
+      'foxden',
+      'spooky',
+      'leviathan',
+      'grassynill',
+      'cottoncandy',
+      'driftwood',
+      'eclipse',
+      'midnightsky',
+      'agency',
+      'defacto',
+      'pride',
+    ])('holds 4.5:1 at every point of the %s fill', (scheme) => {
+      const colors = resolveUserAccentColors(JSON.stringify({ scheme }));
+      expect(worst(colors?.fill, colors?.text)).toBeGreaterThanOrEqual(4.5);
+    });
+
+    it('keeps two custom pairs that share a colour apart', () => {
+      // Custom pairs are cached; a key on one colour would hand the second user
+      // the first user's fill.
+      const first = resolveUserAccentColors(
+        JSON.stringify({ scheme: 'custom', accentPrimary: '#ffff00', accentSecondary: '#0000ff' })
+      );
+      const second = resolveUserAccentColors(
+        JSON.stringify({ scheme: 'custom', accentPrimary: '#ffff00', accentSecondary: '#00ff00' })
+      );
+      expect(second?.gradient).toContain('#00ff00');
+      expect(second?.fill).not.toBe(first?.fill);
+    });
+
+    const hex = (i: number) => `#${i.toString(16).padStart(6, '0')}`;
+    // The cache is module state shared by every case here. Each timed case starts
+    // its clock ten minutes past the last one, so every pair an earlier case left
+    // behind is idle rather than stamped by a clock that has since moved back.
+    let clock = Date.now() + 86_400_000;
+    const freshClock = () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      clock += 10 * 60_000;
+      vi.setSystemTime(clock);
+    };
+
+    it('drops a pair idle for a minute past the soft limit, never a pair in use', () => {
+      // Past the soft limit only an idle pair is dropped. A plain count bound
+      // thrashed on a large list (the next case), so idleness is what stops the
+      // cache growing with every palette ever seen (review of #3514).
+      freshClock();
+      try {
+        const custom = (primary: string) =>
+          resolveUserAccentColors(
+            JSON.stringify({ scheme: 'custom', accentPrimary: primary, accentSecondary: '#abcdef' })
+          );
+        const kept = custom('#123456');
+        const idle = custom(hex(1));
+        vi.advanceTimersByTime(60_000);
+        for (let i = 2; i < 302; i += 1) {
+          expect(custom('#123456'), 'a pair in use is never rebuilt').toBe(kept);
+          custom(hex(i));
+        }
+        expect(custom('#123456')).toBe(kept);
+        expect(custom(hex(1)), 'a pair idle for a minute is dropped').not.toBe(idle);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("restarts a pair's idle clock each time it is used", () => {
+      // A pair used 30 seconds ago is not idle, even once every pair ahead of it
+      // has been dropped and it comes up for eviction.
+      freshClock();
+      try {
+        const custom = (i: number) =>
+          resolveUserAccentColors(
+            JSON.stringify({ scheme: 'custom', accentPrimary: hex(i), accentSecondary: '#0d0e0f' })
+          );
+        for (let i = 1; i <= 300; i += 1) custom(0x300000 + i);
+        const kept = custom(0x300000);
+        vi.advanceTimersByTime(60_000);
+        expect(custom(0x300000)).toBe(kept);
+        vi.advanceTimersByTime(30_000);
+        for (let i = 301; i <= 600; i += 1) custom(0x300000 + i);
+        expect(custom(0x300000), 'used 30 seconds ago, so not idle').toBe(kept);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stays bounded at the hard limit however fast palettes churn', () => {
+      // Nothing here is idle, so only the hard limit can drop the oldest pair.
+      const custom = (i: number) =>
+        resolveUserAccentColors(
+          JSON.stringify({ scheme: 'custom', accentPrimary: hex(i), accentSecondary: '#0a0b0c' })
+        );
+      const first = custom(0x200000);
+      for (let i = 1; i <= 4096; i += 1) custom(0x200000 + i);
+      expect(custom(0x200000), 'the oldest pair is dropped at the hard limit').not.toBe(first);
+    });
+
+    it('keeps every pair of a list larger than the bound across renders', () => {
+      // Codex on #3514: least-recently-used eviction thrashes on a list rendered
+      // in the same order each time. With 300 palettes and room for 256, each
+      // insert evicted the next row's pair just before it was reached, so every
+      // render rebuilt all 300. The member and friend lists are not virtualized,
+      // so a large server renders every row at once.
+      const custom = (i: number) =>
+        resolveUserAccentColors(
+          JSON.stringify({
+            scheme: 'custom',
+            accentPrimary: `#${i.toString(16).padStart(6, '0')}`,
+            accentSecondary: '#fedcba',
+          })
+        );
+      const rows = Array.from({ length: 300 }, (_, i) => i + 0x100);
+      const first = rows.map(custom);
+      const second = rows.map(custom);
+      const rebuilt = second.filter((colors, i) => colors !== first[i]).length;
+      expect(rebuilt, 'pairs rebuilt on the second render').toBe(0);
+    });
+
+    it('holds 4.5:1 for a custom pair no plain label colour can hold', () => {
+      // White fails on the yellow end and black on the blue one.
+      const colors = resolveUserAccentColors(
+        JSON.stringify({ scheme: 'custom', accentPrimary: '#ffff00', accentSecondary: '#0000ff' })
+      );
+      expect(worst(colors?.fill, colors?.text)).toBeGreaterThanOrEqual(4.5);
+    });
+  });
+
   // --- resolveUserAccentColors ---
 
   describe('resolveUserAccentColors', () => {

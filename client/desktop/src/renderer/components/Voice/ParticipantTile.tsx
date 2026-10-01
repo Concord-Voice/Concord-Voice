@@ -16,7 +16,7 @@ import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProf
 import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
 import { useVoiceStore, type VoiceParticipant } from '../../stores/voice/voiceStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { useRenderStateReporter } from '../../hooks/voice/useRenderStateReporter';
 import './ParticipantTile.css';
@@ -159,10 +159,7 @@ function ParticipantAvatar({
           className="participant-tile__avatar-img"
         />
       ) : (
-        <div
-          className="participant-tile__avatar-fallback"
-          style={userColors ? { background: userColors.gradient } : undefined}
-        >
+        <div className="participant-tile__avatar-fallback" style={identityInitialStyle(userColors)}>
           {displayName.charAt(0).toUpperCase()}
         </div>
       )}

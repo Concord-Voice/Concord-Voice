@@ -8,12 +8,12 @@
   background-color: var(--bg-tertiary);
   display: flex;
   flex-direction: column;
-  /* Magnification animation — fast attack, slower release. The added filter +
-     box-shadow easing drive the active-speaker/inactive contrast (#1040); the
-     global [data-reduce-animations] rule zeroes all three durations. */
+  /* Magnification animation — fast attack, slower release. The box-shadow
+     easing drives the active-speaker contrast (#1040), and the surfaces below
+     ease their own inactive filter; the global [data-reduce-animations] rule
+     zeroes every duration. */
   transition:
     transform 120ms ease-out,
-    filter var(--motion-duration-base) var(--motion-curve-decel),
     box-shadow var(--motion-duration-base) var(--motion-curve-base);
   /* Padding reserve for magnification overflow */
   margin: 6px;
@@ -29,8 +29,19 @@
   z-index: 2;
 }
 
-/* Non-speaking tile while someone else speaks — desaturate to recede. */
-.participant-tile--inactive {
+/* Non-speaking tile while someone else speaks — desaturate to recede. Only
+   the surfaces with no text take the filter: on the tile it post-processed the
+   initials and the name as well, and took Morky's initials from 5.04:1 to
+   about 3.49:1 (#3514). A child cannot undo its parent's filter. */
+.participant-tile__banner,
+.participant-tile__avatar-img,
+.participant-tile__video {
+  transition: filter var(--motion-duration-base) var(--motion-curve-decel);
+}
+
+.participant-tile--inactive .participant-tile__banner,
+.participant-tile--inactive .participant-tile__avatar-img,
+.participant-tile--inactive .participant-tile__video {
   filter: saturate(0.7) brightness(0.9);
 }
 
@@ -88,17 +99,15 @@
   width: 56px;
   height: 56px;
   border-radius: 50%;
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: calc(22px * var(--font-scale, 1));
   font-weight: 700;
-  /* Use bg-primary (the opposite end of the brightness range from
-     gradient-brand in every theme) for the letter so it stays readable
-     in High Contrast mode where gradient-brand is bright yellow→cyan.
-     Matches the .avatar-circle pattern in Message.css. */
-  color: var(--bg-primary);
+  /* --on-brand is chosen per theme block to hold 4.5:1 across the whole
+     fill, including High Contrast's bright yellow→cyan. */
+  color: var(--on-brand);
   border: 2px solid var(--bg-primary);
 }
 

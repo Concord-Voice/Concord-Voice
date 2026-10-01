@@ -84,8 +84,6 @@ src/renderer/components/Purge/purgeMessages.css	.purge-modal__confirm:hover:not(
 src/renderer/components/Servers/DeleteServerModal.css	.delete-server-confirm-btn	3.83
 src/renderer/components/Servers/DeleteServerModal.css	.delete-server-confirm-btn:hover:not(:disabled)	4.04
 src/renderer/components/Servers/ServerList.css	.server-error-btn	3.45
-src/renderer/components/Servers/ServerSettingsPage.css	.invite-copy-btn:hover	2.19
-src/renderer/components/Servers/ServerSettingsPage.css	.invite-generate-btn:hover:not(:disabled)	2.19
 src/renderer/components/Servers/ServerSettingsPage.css	.role-reorder-apply-btn	2.19
 src/renderer/components/Servers/ServerSettingsPage.css	.role-reorder-apply-btn:hover:not(:disabled)	2.68
 src/renderer/components/Settings/AboutUpdateSection.css	.about-info-copy-btn:hover	2.68

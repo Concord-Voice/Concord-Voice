@@ -315,19 +315,21 @@
   padding: 8px 16px;
   border: 0;
   border-radius: 6px;
-  background: var(--gradient-brand);
-  color: var(--bg-primary);
+  background: var(--brand-fill);
+  color: var(--on-brand);
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 700;
   cursor: pointer;
   transition:
-    filter 0.15s ease,
+    box-shadow 0.15s ease,
     transform 0.15s ease;
 }
 
+/* Lift rather than fade: the fill and label are tuned to hold 4.5:1, and an
+   opacity or brightness change on hover would take several schemes below it. */
 .category-manager .server-settings-submit-btn:hover {
-  filter: brightness(1.05);
   transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
 }
 
 .category-manager .server-settings-submit-btn:active {

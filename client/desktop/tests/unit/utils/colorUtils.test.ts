@@ -7,6 +7,7 @@ import {
   contrastColor,
   isValidHex,
   deriveThemeVariables,
+  deriveBrandPair,
   liftToContrast,
   contrastRatio,
   applyCustomThemeVariables,
@@ -198,10 +199,13 @@ describe('deriveThemeVariables', () => {
     accentSecondary: '#ffe13f',
   };
 
-  it('returns all 28 expected CSS property keys', () => {
+  it('returns all 30 expected CSS property keys', () => {
     const vars = deriveThemeVariables(defaultColors, true);
     const keys = Object.keys(vars);
-    expect(keys).toHaveLength(28);
+    expect(keys).toHaveLength(30);
+    // The fill and label of brand-filled controls, derived from the user's gradient.
+    expect(keys).toContain('--brand-fill');
+    expect(keys).toContain('--on-brand');
     // Every focus ring draws in --state-focused (#798). Not derived, it resolves to the
     // user's raw --accent-secondary in dark mode and to a scheme block's literal in light.
     expect(keys).toContain('--state-focused');
@@ -425,5 +429,79 @@ describe('deriveThemeVariables', () => {
       const seed = '#ffffff';
       expect(liftToContrast(seed, SURFACES_DARK, 4.6, true)).toBe(seed);
     });
+  });
+});
+
+// ─── deriveBrandPair ─────────────────────────────────────────────────────────
+
+describe('deriveBrandPair', () => {
+  // Measures the pair the way a reader sees it, independently of the code under
+  // test: the fill is sampled along the gradient, any scrim is composited over
+  // each sample, and the label is checked against every resulting colour.
+  const hex = (h: string) => [1, 3, 5].map((i) => Number.parseInt(h.slice(i, i + 2), 16));
+  const toHex = (rgb: number[]) =>
+    '#' + rgb.map((v) => Math.round(v).toString(16).padStart(2, '0')).join('');
+  function worstOnFill(from: string, to: string, pair: { fill: string; text: string }): number {
+    const scrim = /^linear-gradient\(rgb\((\d+) (\d+) (\d+) \/ (\d+)%\)/.exec(pair.fill);
+    let worst = Infinity;
+    for (let i = 0; i <= 200; i++) {
+      const t = i / 200;
+      let rgb = hex(from).map((v, j) => v + (hex(to)[j] - v) * t);
+      if (scrim) {
+        const a = Number(scrim[4]) / 100;
+        rgb = rgb.map((v, j) => Number(scrim[j + 1]) * a + v * (1 - a));
+      }
+      worst = Math.min(worst, contrastRatio(pair.text, toHex(rgb)));
+    }
+    return worst;
+  }
+
+  it.each([
+    ['Concord', '#fa709a', '#ffe13f', '#0d0821'],
+    ['a yellow to cyan gradient', '#ffff00', '#00ffff', '#000000'],
+    ['a pink to blue gradient whose midpoint dips', '#ff2880', '#00a0f0', '#0a0810'],
+    ['an orange to purple gradient no label colour holds on', '#ff6a00', '#8b20aa', '#0a0a0a'],
+    ['a mid grey on both ends', '#777777', '#777777', '#0d0821'],
+    ['a dark gradient', '#1a1a2e', '#3a0ca3', '#0d0821'],
+  ])('holds 4.5:1 across the whole fill for %s', (_label, from, to, preferred) => {
+    expect(worstOnFill(from, to, deriveBrandPair(from, to, preferred))).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it('keeps the plain gradient and the preferred label when that label already holds', () => {
+    expect(deriveBrandPair('#fa709a', '#ffe13f', '#0d0821')).toEqual({
+      fill: 'var(--gradient-brand)',
+      text: '#0d0821',
+    });
+  });
+
+  it('lays the lightest scrim that works when no label colour holds on the gradient', () => {
+    // Black fails on the purple end and white fails on the orange end.
+    expect(contrastRatio('#000000', '#8b20aa')).toBeLessThan(4.5);
+    expect(contrastRatio('#ffffff', '#ff6a00')).toBeLessThan(4.5);
+    const pair = deriveBrandPair('#ff6a00', '#8b20aa', '#0a0a0a');
+    expect(pair.fill).toMatch(
+      /^linear-gradient\(rgb\(\d+ \d+ \d+ \/ \d+%\).*var\(--gradient-brand\)$/
+    );
+    const pct = Number(/\/ (\d+)%/.exec(pair.fill)![1]);
+    // One step lighter would not hold.
+    const lighter = { ...pair, fill: pair.fill.replaceAll(`/ ${pct}%`, `/ ${pct - 5}%`) };
+    expect(worstOnFill('#ff6a00', '#8b20aa', lighter)).toBeLessThan(4.6);
+  });
+
+  it('is what both theme modes publish, and clearing removes it', () => {
+    const colors: CustomColors = {
+      background: '#0d0821',
+      accentPrimary: '#ff6a00',
+      accentSecondary: '#8b20aa',
+    };
+    for (const isDark of [true, false]) {
+      const vars = deriveThemeVariables(colors, isDark);
+      expect(vars['--brand-fill']).toBeDefined();
+      expect(vars['--on-brand']).toMatch(/^#[0-9a-f]{6}$/);
+    }
+    applyCustomThemeVariables(deriveThemeVariables(colors, true));
+    clearCustomThemeVariables();
+    expect(document.documentElement.style.getPropertyValue('--brand-fill')).toBe('');
+    expect(document.documentElement.style.getPropertyValue('--on-brand')).toBe('');
   });
 });

@@ -268,16 +268,21 @@
   padding: 10px 32px;
   border: none;
   border-radius: 6px;
-  background: var(--gradient-brand);
-  color: #fff;
+  background: var(--brand-fill);
+  color: var(--on-brand);
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: opacity 0.15s ease;
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
-.voice-view__join-btn:hover {
-  opacity: 0.9;
+/* Lift rather than fade: the fill and label are tuned to hold 4.5:1, and an
+   opacity or brightness change on hover would take several schemes below it. */
+.voice-view__join-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
 }
 
 .voice-view__join-btn:disabled {

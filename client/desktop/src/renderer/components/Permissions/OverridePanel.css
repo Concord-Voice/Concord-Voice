@@ -141,10 +141,10 @@
 
 .add-override-btn {
   padding: 8px 20px;
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   border: none;
   border-radius: 6px;
-  color: var(--bg-primary);
+  color: var(--on-brand);
   font-weight: 700;
   font-family: var(--font-display-stack);
   font-size: calc(12px * var(--font-scale, 1));
@@ -160,6 +160,26 @@
 .add-override-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* A secondary action is drawn as one, not as the brand pair dimmed with opacity:
+   that blended the label into the panel (2.8:1 in Hacker light). */
+.override-cancel-btn {
+  padding: 8px 20px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  font-size: calc(12px * var(--font-scale, 1));
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  transition: all 0.2s ease;
+}
+
+.override-cancel-btn:hover {
+  background: var(--bg-tertiary);
 }
 
 .section-header {

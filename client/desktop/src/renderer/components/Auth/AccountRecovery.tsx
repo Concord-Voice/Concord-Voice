@@ -692,10 +692,9 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
               )}
               <button
                 type="button"
-                className="login-submit-btn"
+                className={`login-submit-btn${acknowledgeDataLoss ? ' login-submit-btn--danger' : ''}`}
                 disabled={!acknowledgeDataLoss}
                 onClick={() => setStep('new-password')}
-                style={{ background: acknowledgeDataLoss ? '#dc2626' : undefined }}
               >
                 Continue with Account Reset
               </button>

@@ -1,11 +1,12 @@
 import React from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { MessageWithStatus } from '../../types/chat';
+import { identityInitialStyle, type SchemeAccentColors } from '../../utils/ui/schemeColors';
 
 export interface MessageAvatarProps {
   message: MessageWithStatus;
   showAvatar: boolean;
-  senderColors?: { gradient: string } | null;
+  senderColors?: Pick<SchemeAccentColors, 'fill' | 'text'> | null;
   /**
    * Opens the author's profile card anchored at the given viewport point.
    * State + resolution live in the Message parent via useMessageProfileCard
@@ -62,10 +63,7 @@ const MessageAvatar: React.FC<MessageAvatarProps> = ({
           alt={message.username}
         />
       ) : (
-        <div
-          className="avatar-circle"
-          style={senderColors ? { background: senderColors.gradient } : undefined}
-        >
+        <div className="avatar-circle" style={identityInitialStyle(senderColors)}>
           {getInitials(message.display_name || message.username)}
         </div>
       )}

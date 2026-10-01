@@ -4,7 +4,7 @@ import type { DMParticipant, DMConversation } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/system/apiClient';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import './DMProfileModal.css';
 
@@ -230,9 +230,7 @@ const DMProfileModal: React.FC<DMProfileModalProps> = ({
               ) : (
                 <span
                   className="dm-profile-modal-avatar-initial"
-                  style={
-                    userColors ? { background: userColors.gradient, color: '#fff' } : undefined
-                  }
+                  style={identityInitialStyle(userColors)}
                 >
                   {peer.username.charAt(0).toUpperCase()}
                 </span>

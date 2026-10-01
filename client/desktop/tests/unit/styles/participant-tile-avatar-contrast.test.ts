@@ -9,20 +9,21 @@
  * fallback's `color` was originally hardcoded to `#fff`, which collapses
  * against the HCM yellow start-stop to ~1.07:1 (effectively unreadable).
  *
- * The fix, applied during #489, changed the rule to `color: var(--bg-primary)`,
- * which is at the opposite end of the brightness spectrum in every theme
- * (black on yellow/cyan in HCM dark; white on blue/purple in HCM light;
- * theme-appropriate near-black/near-white in every non-HCM scheme). This
- * pattern is the same one used by `.avatar-circle` in `Message.css`.
+ * #489 changed the rule to `color: var(--bg-primary)`, on the claim that it
+ * sits at the opposite end of the brightness range in every theme. It did not:
+ * once the contrast ratchet learned to measure gradients, the same pair read
+ * 1.20:1 in Concord light and below 4.5:1 in 18 of the 32 scheme and theme
+ * combinations. Brand-filled controls now take `--brand-fill` and `--on-brand`,
+ * a pair each theme block chooses to hold 4.5:1 across the whole fill, and the
+ * ratchet measures it in every block.
  *
  * ## What this test asserts
  *
  *   1. The `.participant-tile__avatar-fallback` rule declares
- *      `color: var(--bg-primary)` — NOT `#fff`, `white`, or any other
- *      hardcoded literal that would defeat HCM and other dark schemes.
- *   2. The rule's `background` is `var(--gradient-brand)` (the load-bearing
- *      pairing — if the background changes, the color choice may need to
- *      change with it).
+ *      `color: var(--on-brand)` — NOT `#fff`, `white`, any other hardcoded
+ *      literal, or a background token that only happens to contrast.
+ *   2. The rule's `background` is `var(--brand-fill)`, the fill that
+ *      `--on-brand` is chosen against.
  *
  * A source-inspection test is the right shape here: JSDOM does not resolve
  * custom-property values from stylesheet rules (only inline styles), so a
@@ -85,26 +86,23 @@ describe('ParticipantTile avatar-fallback HCM contrast (#489)', () => {
     expect(body, `Missing rule ${SELECTOR} in ParticipantTile.css`).not.toBeNull();
   });
 
-  it('color is var(--bg-primary) — not a hardcoded literal', () => {
-    // The bug: `color: #fff` (or `white`) was unreadable against the HCM
-    // bright-yellow gradient start-stop. The fix uses `var(--bg-primary)` so
-    // the letter color flips with the theme (black in HCM dark, white in HCM
-    // light), staying at the opposite end of the brightness spectrum from
-    // `--gradient-brand` in every theme.
+  it('color is var(--on-brand) — not a hardcoded literal', () => {
+    // The first bug: `color: #fff` read ~1.07:1 on the HCM yellow stop. The
+    // second: `var(--bg-primary)` read 1.20:1 in Concord light. --on-brand is
+    // chosen per theme block against the whole fill.
     const color = extractDeclaration(body ?? '', 'color');
     expect(color, `${SELECTOR} must declare a color`).not.toBeNull();
     expect(
       color,
-      `${SELECTOR} color must be var(--bg-primary) — hardcoded white collapses to ~1:1 against the HCM yellow accent. Got: '${color}'`
-    ).toBe('var(--bg-primary)');
+      `${SELECTOR} color must be var(--on-brand) — it is the colour chosen for the brand fill. Got: '${color}'`
+    ).toBe('var(--on-brand)');
   });
 
-  it('background is var(--gradient-brand) — the load-bearing pairing', () => {
-    // If the background changes away from --gradient-brand, the `color:
-    // var(--bg-primary)` choice may need to change with it. This guard makes
-    // such a change visible in review rather than silent.
+  it('background is var(--brand-fill) — the load-bearing pairing', () => {
+    // --on-brand is chosen against --brand-fill. A different background would
+    // need its own foreground, so this guard makes such a change visible.
     const background = extractDeclaration(body ?? '', 'background');
     expect(background, `${SELECTOR} must declare a background`).not.toBeNull();
-    expect(background).toBe('var(--gradient-brand)');
+    expect(background).toBe('var(--brand-fill)');
   });
 });

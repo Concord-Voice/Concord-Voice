@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom';
 import { MicOff, HeadphoneOff, Lock, Clock } from 'lucide-react';
 import type { ServerMember } from '../../stores/chat/memberStore';
 import type { Role } from '../../types/server';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import MemberContextMenu from '../Members/MemberContextMenu';
 import UserProfileModal from '../Members/UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
@@ -281,10 +281,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
                 ) : (
                   <div
                     className="member-avatar member-avatar--initial"
-                    style={(() => {
-                      const colors = resolveUserAccentColors(member.color_scheme);
-                      return colors ? { background: colors.gradient } : undefined;
-                    })()}
+                    style={identityInitialStyle(resolveUserAccentColors(member.color_scheme))}
                   >
                     {initial}
                   </div>

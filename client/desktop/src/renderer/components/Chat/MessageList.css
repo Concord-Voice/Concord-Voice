@@ -139,8 +139,8 @@
   bottom: calc(16px * var(--sp, 1));
   left: 50%;
   transform: translateX(-50%);
-  background: var(--gradient-brand);
-  color: var(--bg-primary);
+  background: var(--brand-fill);
+  color: var(--on-brand);
   border: none;
   border-radius: 24px;
   padding: calc(10px * var(--sp, 1)) calc(20px * var(--sp, 1));

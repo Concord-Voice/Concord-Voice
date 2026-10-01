@@ -21,7 +21,7 @@ import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { describeMessagePreview, truncateSenderName } from '../../utils/messaging/messagePreview';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import CreateGroupModal from './CreateGroupModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
@@ -97,10 +97,7 @@ const ConversationAvatar: React.FC<ConversationAvatarProps> = ({
   ) : (
     <span
       className="conversation-avatar-initial"
-      style={(() => {
-        const colors = resolveUserAccentColors(other?.colorScheme);
-        return colors ? { background: colors.gradient } : undefined;
-      })()}
+      style={identityInitialStyle(resolveUserAccentColors(other?.colorScheme))}
     >
       {getInitial(conv, currentUserId)}
     </span>

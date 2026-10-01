@@ -502,6 +502,17 @@ describe('AccountRecovery', () => {
     expect(continueBtn).not.toBeDisabled();
   });
 
+  it('gives the enabled reset button its own red fill and label pair', async () => {
+    // An inline #dc2626 kept the brand label: #0d0821 on it read 4.05:1 in
+    // Concord and 3.14:1 in Fox Den. The class carries both halves, where the
+    // contrast ratchet can measure them.
+    await advanceToResetWarningStep();
+    fireEvent.click(screen.getByRole('checkbox'));
+    const continueBtn = screen.getByText('Continue with Account Reset');
+    expect(continueBtn).toHaveClass('login-submit-btn--danger');
+    expect(continueBtn.style.background).toBe('');
+  });
+
   it('shows "I found my recovery key" link when recovery key exists', async () => {
     await advanceToResetWarningStep();
     expect(screen.getByText('I found my recovery key')).toBeInTheDocument();

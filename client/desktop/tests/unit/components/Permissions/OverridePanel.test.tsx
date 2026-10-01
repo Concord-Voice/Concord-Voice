@@ -236,6 +236,18 @@ describe('OverridePanel', () => {
     expect(screen.queryByText('Editing: Moderator')).not.toBeInTheDocument();
   });
 
+  // 11b. Cancel is a secondary action, not a dimmed brand button
+  it('draws Cancel as an opaque secondary action', () => {
+    // opacity: 0.7 on the brand pair blended white into the light panel: 2.8:1 in
+    // Hacker light, and the contrast ratchet cannot see opacity.
+    render(<OverridePanel {...defaultProps} overrides={[mockRoleOverride]} />);
+    clickOverrideItem('Moderator');
+    const cancel = screen.getByText('Cancel');
+    expect(cancel.style.opacity).toBe('');
+    expect(cancel).toHaveClass('override-cancel-btn');
+    expect(cancel).not.toHaveClass('add-override-btn');
+  });
+
   // 12. Delete calls onDelete
   it('delete calls onDelete', async () => {
     const onDelete = vi.fn().mockResolvedValue(true);

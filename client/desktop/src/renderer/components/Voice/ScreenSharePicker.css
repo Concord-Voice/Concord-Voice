@@ -261,12 +261,19 @@
 }
 
 .screen-picker__btn--confirm {
-  background: var(--gradient-brand);
-  color: #fff;
+  background: var(--brand-fill);
+  color: var(--on-brand);
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
-.screen-picker__btn--confirm:hover {
-  opacity: 0.9;
+/* Lift rather than fade: the fill and label are tuned to hold 4.5:1, and an
+   opacity or brightness change on hover would take several schemes below it. */
+.screen-picker__btn--confirm:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
 }
 
 .screen-picker__btn--confirm:disabled {

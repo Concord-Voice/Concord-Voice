@@ -17,7 +17,7 @@ import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { voiceService } from '../../services/voice/voiceService';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { getThreadName } from '../../utils/messaging/dmThreadName';
 import GroupInfoPanel from './GroupInfoPanel';
 import VoiceView from '../Voice/VoiceView';
@@ -406,7 +406,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
                     ? activeConv.participants.find((p) => p.userId !== currentUserId)
                     : null;
                 const colors = resolveUserAccentColors(other?.colorScheme);
-                return colors ? { fontSize: 12, background: colors.gradient } : { fontSize: 12 };
+                return { fontSize: 12, ...identityInitialStyle(colors) };
               })()}
             >
               {threadName.charAt(0).toUpperCase()}

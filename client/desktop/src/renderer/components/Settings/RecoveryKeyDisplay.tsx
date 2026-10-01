@@ -66,7 +66,9 @@ const RecoveryKeyDisplay: React.FC<RecoveryKeyDisplayProps> = ({
           <button
             type="button"
             className="btn btn-primary"
-            style={{ background: '#dc2626' }}
+            // The fill is set here, so its label is too: .btn-primary's
+            // --on-accent is chosen for the accent. White on #dc2626 is 4.83:1.
+            style={{ background: '#dc2626', color: '#ffffff' }}
             onClick={onSkip}
           >
             Skip Without Recovery Key

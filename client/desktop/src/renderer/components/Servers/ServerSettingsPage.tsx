@@ -499,7 +499,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
           ) : (
             <button
               type="button"
-              className="invite-generate-btn"
+              className="server-settings-invite-btn"
               disabled={isCreatingInvite}
               onClick={async () => {
                 setIsCreatingInvite(true);

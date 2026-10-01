@@ -173,10 +173,10 @@
 
 .invite-popup-action-btn {
   padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
-  background: var(--gradient-brand, var(--accent-primary));
+  background: var(--brand-fill);
   border: none;
   border-radius: 6px;
-  color: var(--bg-primary);
+  color: var(--on-brand);
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;

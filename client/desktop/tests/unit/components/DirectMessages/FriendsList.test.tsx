@@ -39,7 +39,9 @@ vi.mock('@/renderer/components/Members/MemberProfileCard', () => ({
   ),
 }));
 
-vi.mock('@/renderer/utils/ui/schemeColors', () => ({
+// Only the colour lookup is stubbed; identityInitialStyle stays real.
+vi.mock('@/renderer/utils/ui/schemeColors', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/renderer/utils/ui/schemeColors')>()),
   resolveUserAccentColors: vi.fn().mockReturnValue(null),
 }));
 

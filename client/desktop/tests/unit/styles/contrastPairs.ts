@@ -102,10 +102,13 @@ function parseThemeBlocks(): ThemeBlock[] {
     while (open > 0 && !/\{\s*$/.test(lines[open])) open--;
     let close = i;
     while (close < lines.length && !/^\s*\}/.test(lines[close])) close++;
+    // Read the block as one text rather than line by line. Pride's
+    // --gradient-brand spans eight lines, and a per-line match never saw it, so
+    // that scheme silently measured Concord's gradient inherited from :root.
     const tokens: Record<string, string> = {};
-    for (let t = open; t <= close; t++) {
-      const decl = /^\s*(--[A-Za-z0-9_-]+)\s*:\s*([^;]+);/.exec(lines[t]);
-      if (decl) tokens[decl[1]] = decl[2].trim();
+    const body = lines.slice(open + 1, close).join('\n');
+    for (const decl of body.matchAll(/(--[A-Za-z0-9_-]+)\s*:\s*([^;{}]+);/g)) {
+      tokens[decl[1]] = decl[2].replace(/\s+/g, ' ').trim();
     }
     blocks.push({ selector: lines[open].replace(/\{\s*$/, '').trim(), tokens });
   }
@@ -193,6 +196,235 @@ export function contrastRatio(fg: [number, number, number], bg: [number, number,
   const a = luminance(fg);
   const b = luminance(bg);
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
+
+/** Split at commas that are not inside parentheses. */
+function splitTopLevel(value: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of value) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      parts.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current.trim());
+  return parts;
+}
+
+/**
+ * Expand every `var()` in a value through one theme block, fallbacks included.
+ *
+ * `resolveIn` only follows a value that IS a single `var()`. A fill that embeds
+ * one — Pride's `--brand-fill` lays a scrim over `var(--gradient-brand)` — needs
+ * each reference replaced where it stands. Returns null when a reference has no
+ * declaration and no fallback, which keeps the pair unresolvable rather than
+ * measured against a guess.
+ */
+export function expandVars(
+  tokens: Record<string, string>,
+  value: string,
+  depth = 0
+): string | null {
+  if (depth > 8) return null;
+  let out = '';
+  let i = 0;
+  while (i < value.length) {
+    const start = value.indexOf('var(', i);
+    if (start < 0) {
+      out += value.slice(i);
+      break;
+    }
+    out += value.slice(i, start);
+    let level = 0;
+    let end = start + 3;
+    for (; end < value.length; end++) {
+      if (value[end] === '(') level++;
+      else if (value[end] === ')' && --level === 0) break;
+    }
+    if (level !== 0) return null;
+    const [name, ...rest] = splitTopLevel(value.slice(start + 4, end));
+    const replacement = tokens[name] ?? (rest.length > 0 ? rest.join(', ') : undefined);
+    if (replacement === undefined) return null;
+    const expanded = expandVars(tokens, replacement, depth + 1);
+    if (expanded === null) return null;
+    out += expanded;
+    i = end + 1;
+  }
+  return out.trim();
+}
+
+type Rgba = [number, number, number, number];
+
+/** A colour with its alpha: hex, the named colours above, `rgb()` or `rgba()`. */
+function toRgba(value: string): Rgba | null {
+  const opaque = toRgb(value);
+  if (opaque) return [...opaque, 1];
+  const m =
+    /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*(?:[,/]\s*([\d.]+)(%?))?\s*\)$/i.exec(
+      value.trim()
+    );
+  if (!m) return null;
+  // CSS clamps out-of-range components: rgb(999 999 999) paints white.
+  const clamp = (v: number, max: number) => Math.min(max, Math.max(0, v));
+  const alpha = m[4] === undefined ? 1 : Number(m[4]) / (m[5] === '%' ? 100 : 1);
+  return [
+    clamp(Number(m[1]), 255),
+    clamp(Number(m[2]), 255),
+    clamp(Number(m[3]), 255),
+    clamp(alpha, 1),
+  ];
+}
+
+const GRADIENT_SAMPLES = 100;
+
+/** Samples inside each transition, so one narrower than 1% is still measured. */
+const SEGMENT_SAMPLES = 32;
+
+type Stop = { color: Rgba; at: number };
+
+/** The only first argument that is not a colour stop: a direction or an angle. */
+const DIRECTION =
+  /^(?:to\s+(?:left|right|top|bottom)(?:\s+(?:left|right|top|bottom))?|-?[\d.]+(?:deg|rad|grad|turn))$/i;
+
+/**
+ * The stops of one `linear-gradient` layer, placed where CSS places them.
+ *
+ * Interpolation is in sRGB, which is what Chromium does for a gradient with no
+ * interpolation clause. The first argument is skipped only when it is a direction
+ * or an angle; anything else there is read as a stop. An argument this parser
+ * cannot read, an interpolation clause (`in oklab`) included, returns null, so an
+ * unsupported gradient stays unresolvable instead of being measured without it.
+ *
+ * Positions follow CSS: a missing first or last position is 0% or 100%, a
+ * position before an earlier one is raised to it, and a run of stops with no
+ * position is spread evenly between the stops on either side of it.
+ */
+function gradientStops(layer: string): Stop[] | null {
+  const m = /^linear-gradient\(([\s\S]*)\)$/.exec(layer.trim());
+  if (!m) return null;
+  const args = splitTopLevel(m[1]);
+  if (args.length > 0 && DIRECTION.test(args[0])) args.shift();
+  const parsed = args.map((arg) => {
+    const pos = /\s+(-?[\d.]+)%$/.exec(arg);
+    const colour = pos ? arg.slice(0, pos.index) : arg;
+    return { color: toRgba(colour), at: pos ? Number(pos[1]) / 100 : null };
+  });
+  if (parsed.length < 2 || parsed.some((stop) => stop.color === null)) return null;
+  const at = parsed.map((stop) => stop.at);
+  at[0] ??= 0;
+  at[at.length - 1] ??= 1;
+  let highest = -Infinity;
+  for (let i = 0; i < at.length; i++) {
+    const position = at[i];
+    if (position === null) continue;
+    highest = Math.max(highest, position);
+    at[i] = highest;
+  }
+  for (let i = 1; i < at.length; i++) {
+    if (at[i] !== null) continue;
+    let next = i;
+    while (at[next] === null) next++;
+    const from = at[i - 1] as number;
+    const to = at[next] as number;
+    for (let k = i; k < next; k++) at[k] = from + ((to - from) * (k - i + 1)) / (next - i + 1);
+    i = next;
+  }
+  return parsed.map((stop, i) => ({ color: stop.color as Rgba, at: at[i] as number }));
+}
+
+/** The colour a layer paints at `t`, interpolated with premultiplied alpha as CSS does. */
+function colorAt(stops: Stop[], t: number): Rgba {
+  let k = 0;
+  while (k < stops.length - 2 && t > stops[k + 1].at) k++;
+  const from = stops[k];
+  const to = stops[k + 1];
+  const span = to.at - from.at;
+  let u = 0;
+  if (span > 0) u = Math.min(1, Math.max(0, (t - from.at) / span));
+  else if (t >= to.at) u = 1;
+  const alpha = from.color[3] + (to.color[3] - from.color[3]) * u;
+  if (alpha === 0) return [0, 0, 0, 0];
+  const premultiplied = (j: number) =>
+    from.color[j] * from.color[3] + (to.color[j] * to.color[3] - from.color[j] * from.color[3]) * u;
+  return [premultiplied(0) / alpha, premultiplied(1) / alpha, premultiplied(2) / alpha, alpha];
+}
+
+/**
+ * The colours one varying layer paints between 0% and 100%.
+ *
+ * The first GRADIENT_SAMPLES + 1 entries are evenly spaced, one per 1%, so a
+ * caller can index them by percentage. Then come SEGMENT_SAMPLES points inside
+ * every transition between two stops, clipped to the element, because a
+ * transition narrower than the spacing can dip between two samples. Last come
+ * the stops' own colours, but only for stops the element paints: a stop past
+ * either end still shapes the colours inside, which colorAt accounts for, and
+ * is never painted itself.
+ */
+function paintedSamples(stops: Stop[]): Rgba[] {
+  const out = Array.from({ length: GRADIENT_SAMPLES + 1 }, (_, i) =>
+    colorAt(stops, i / GRADIENT_SAMPLES)
+  );
+  for (let k = 0; k + 1 < stops.length; k++) {
+    const from = Math.max(0, stops[k].at);
+    const to = Math.min(1, stops[k + 1].at);
+    if (to <= from) continue;
+    for (let j = 1; j < SEGMENT_SAMPLES; j++) {
+      out.push(colorAt(stops, from + ((to - from) * j) / SEGMENT_SAMPLES));
+    }
+  }
+  for (const stop of stops) if (stop.at >= 0 && stop.at <= 1) out.push(stop.color);
+  return out;
+}
+
+function isUniform(stops: Stop[]): boolean {
+  return stops.every((stop) => stop.color.every((v, j) => v === stops[0].color[j]));
+}
+
+/**
+ * Every colour a background can paint behind its text, or null when that is not
+ * knowable from the stylesheet.
+ *
+ * A solid colour is one sample. A `linear-gradient` is sampled along its length,
+ * inside every transition and at each stop it paints (see paintedSamples), so a
+ * narrow stripe or transition between two samples is still measured, and a
+ * contrast check takes the worst sample: a label can sit over any part of the
+ * fill. Layers above the last are composited over it, so a
+ * translucent scrim over a gradient is measured as the colours it produces.
+ *
+ * At most one layer may vary. Each layer runs in its own direction, and matching
+ * two varying layers point by point would pair colours that never meet on
+ * screen, so two varying layers stay unresolvable. A layer that paints one colour
+ * throughout, like Pride's scrim, composites the same way in any direction. The
+ * bottom layer must be opaque; what shows through a translucent one depends on
+ * the ancestor, so that stays unresolvable too.
+ */
+export function sampleFill(value: string | null): Array<[number, number, number]> | null {
+  if (value === null) return null;
+  const solid = toRgb(value);
+  if (solid) return [solid];
+  const layers = splitTopLevel(value).map(gradientStops);
+  if (layers.some((layer) => layer === null)) return null;
+  const stacked = layers as Stop[][];
+  if (stacked[stacked.length - 1].some((stop) => stop.color[3] !== 1)) return null;
+  const varying = stacked.filter((layer) => !isUniform(layer));
+  if (varying.length > 1) return null;
+  const moving = varying[0];
+  const painted = moving ? paintedSamples(moving) : [stacked[0][0].color];
+  return painted.map((colour) => {
+    let out: [number, number, number] = [0, 0, 0];
+    for (let k = stacked.length - 1; k >= 0; k--) {
+      const over = stacked[k] === moving ? colour : stacked[k][0].color;
+      const a = over[3];
+      out = [0, 1, 2].map((j) => over[j] * a + out[j] * (1 - a)) as [number, number, number];
+    }
+    return out;
+  });
 }
 
 interface Rule {
@@ -370,10 +602,12 @@ function measure(): { checked: number; unresolvable: number; failures: Map<strin
     let resolvedAnywhere = false;
     for (const block of blocks) {
       const fg = toRgb(resolveIn(block, pair.color));
-      const bg = toRgb(resolveIn(block, pair.background));
-      if (!fg || !bg) continue;
+      const bgs = sampleFill(
+        pair.background === null ? null : expandVars(block.tokens, pair.background)
+      );
+      if (!fg || !bgs) continue;
       resolvedAnywhere = true;
-      const ratio = contrastRatio(fg, bg);
+      const ratio = Math.min(...bgs.map((bg) => contrastRatio(fg, bg)));
       if (ratio < worst) {
         worst = ratio;
         worstBlock = block.selector;

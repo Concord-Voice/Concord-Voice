@@ -253,10 +253,10 @@
 
 .profile-save-btn {
   padding: 12px 24px;
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   border: none;
   border-radius: 8px;
-  color: var(--bg-primary);
+  color: var(--on-brand);
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 700;
   font-family: var(--font-display-stack);

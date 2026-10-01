@@ -88,8 +88,10 @@
   color: #fff;
   font-weight: 600;
 }
+/* Lift rather than fade: a fade would take the 4.83:1 pair below the floor. */
 .key-recovery-prompt__danger:hover:not(:disabled) {
-  opacity: 0.9;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);
 }
 .key-recovery-prompt__actions button:disabled {
   opacity: 0.5;

@@ -4,7 +4,7 @@ import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { presentRemoteActivities } from '../../utils/ui/richPresencePresentation';
 import SendFriendRequestButton from './SendFriendRequestButton';
@@ -204,7 +204,7 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
           ) : (
             <span
               className="member-profile-avatar-initial"
-              style={userColors ? { background: userColors.gradient, color: '#fff' } : undefined}
+              style={identityInitialStyle(userColors)}
             >
               {member.username.charAt(0).toUpperCase()}
             </span>

@@ -274,13 +274,15 @@
   margin-right: 0;
 }
 
-.member-item.offline,
-.member-item--compact.invisible {
+/* Offline dims the avatar image only. Opacity on the row would fade the
+   initials pair and the name into the list behind them. */
+.member-item.offline .member-avatar-img,
+.member-item--compact.invisible .member-avatar-img {
   opacity: 0.45;
 }
 
-.member-item.offline:hover,
-.member-item--compact.invisible:hover {
+.member-item.offline:hover .member-avatar-img,
+.member-item--compact.invisible:hover .member-avatar-img {
   opacity: 0.75;
 }
 

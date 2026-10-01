@@ -5,7 +5,9 @@ import type { ServerMember, PresenceStatus } from '@/renderer/stores/chat/member
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
-vi.mock('@/renderer/utils/ui/schemeColors', () => ({
+// Only the colour lookup is stubbed; identityInitialStyle stays real.
+vi.mock('@/renderer/utils/ui/schemeColors', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/renderer/utils/ui/schemeColors')>()),
   resolveUserAccentColors: vi.fn(() => null),
 }));
 

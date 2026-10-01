@@ -7,12 +7,25 @@
  */
 
 import type { CSSProperties } from 'react';
-import { deriveThemeVariables, isValidHex, type DerivedThemeVariables } from './colorUtils';
+import {
+  deriveBrandPair,
+  deriveThemeVariables,
+  isValidHex,
+  type DerivedThemeVariables,
+} from './colorUtils';
 
 export interface SchemeAccentColors {
   accentPrimary: string;
   accentSecondary: string;
+  /** The user's gradient, for surfaces that carry no text: banners, swatches. */
   gradient: string;
+  /**
+   * The fill for initials drawn on the user's colours, and the label colour that
+   * holds 4.5:1 at every point of it. The viewer's `--on-brand` is chosen for the
+   * viewer's gradient, not this one, so initials take both or neither.
+   */
+  fill: string;
+  text: string;
 }
 
 export interface UserThemeScope {
@@ -44,10 +57,62 @@ function buildGradient(primary: string, secondary: string): string {
   return `linear-gradient(135deg, ${primary} 0%, ${secondary} 100%)`;
 }
 
+function buildColors(primary: string, secondary: string): SchemeAccentColors {
+  const gradient = buildGradient(primary, secondary);
+  const { fill, text } = deriveBrandPair(primary, secondary, '#ffffff', gradient);
+  return { accentPrimary: primary, accentSecondary: secondary, gradient, fill, text };
+}
+
 // Pre-build the full SchemeAccentColors objects for each preset
 const PRESET_COLORS: Record<string, SchemeAccentColors> = {};
 for (const [name, [p, s]] of Object.entries(SCHEME_ACCENTS)) {
-  PRESET_COLORS[name] = { accentPrimary: p, accentSecondary: s, gradient: buildGradient(p, s) };
+  PRESET_COLORS[name] = buildColors(p, s);
+}
+
+// Custom colours are resolved on every message render, and deriving a pair
+// samples the whole gradient, so each pair is kept. The keys come from other
+// members' profiles, so the cache is bounded, but not by a plain count: the
+// member and friend lists are not virtualized, and a list rendering more
+// palettes than a fixed bound, in the same order each time, evicts the pair
+// the next row needs on every insert and rebuilds all of them on every render.
+// So past the soft limit only a pair idle for a minute is dropped, which keeps a
+// list's whole working set, and the hard limit bounds memory whatever the churn.
+// A Map iterates in insertion order and each use re-inserts its key, so the
+// least recently used pair is always first.
+const CUSTOM_COLORS = new Map<string, { colors: SchemeAccentColors; usedAt: number }>();
+const CUSTOM_COLORS_SOFT_LIMIT = 256;
+const CUSTOM_COLORS_HARD_LIMIT = 4096;
+const CUSTOM_COLORS_IDLE_MS = 60_000;
+
+function customColors(primary: string, secondary: string): SchemeAccentColors {
+  const key = `${primary}|${secondary}`;
+  const now = Date.now();
+  const cached = CUSTOM_COLORS.get(key);
+  if (cached) {
+    CUSTOM_COLORS.delete(key);
+    CUSTOM_COLORS.set(key, { colors: cached.colors, usedAt: now });
+    return cached.colors;
+  }
+  const colors = buildColors(primary, secondary);
+  evictCustomColors(now);
+  CUSTOM_COLORS.set(key, { colors, usedAt: now });
+  return colors;
+}
+
+function evictCustomColors(now: number): void {
+  for (const [key, entry] of CUSTOM_COLORS) {
+    if (CUSTOM_COLORS.size < CUSTOM_COLORS_SOFT_LIMIT) return;
+    const idle = now - entry.usedAt >= CUSTOM_COLORS_IDLE_MS;
+    if (!idle && CUSTOM_COLORS.size < CUSTOM_COLORS_HARD_LIMIT) return;
+    CUSTOM_COLORS.delete(key);
+  }
+}
+
+/** The inline style for initials on a user's colours, or nothing for the theme's own. */
+export function identityInitialStyle(
+  colors: Pick<SchemeAccentColors, 'fill' | 'text'> | null | undefined
+): CSSProperties | undefined {
+  return colors ? { background: colors.fill, color: colors.text } : undefined;
 }
 
 /**
@@ -75,11 +140,7 @@ export function resolveUserAccentColors(
     const primary = parsed.accentPrimary ?? '';
     const secondary = parsed.accentSecondary ?? '';
     if (parsed.scheme === 'custom' && isValidHex(primary) && isValidHex(secondary)) {
-      return {
-        accentPrimary: primary,
-        accentSecondary: secondary,
-        gradient: buildGradient(primary, secondary),
-      };
+      return customColors(primary, secondary);
     }
 
     // Preset scheme — own-key lookup, so a scheme named 'constructor' is not a colour set

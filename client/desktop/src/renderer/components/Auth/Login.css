@@ -103,10 +103,10 @@
 .login-submit-btn {
   width: 100%;
   padding: 14px 24px;
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   border: none;
   border-radius: 8px;
-  color: var(--bg-primary);
+  color: var(--on-brand);
   font-size: calc(15px * var(--font-scale, 1));
   font-weight: 700;
   font-family: var(--font-display-stack);
@@ -123,6 +123,13 @@
 
 .login-submit-btn:active:not(:disabled) {
   transform: translateY(0);
+}
+
+/* The account-reset action is destructive and takes a theme-invariant red pair
+   (4.83:1), as .key-recovery-prompt__danger does, not the brand label. */
+.login-submit-btn--danger {
+  background: #dc2626;
+  color: #ffffff;
 }
 
 .login-submit-btn:focus-visible {

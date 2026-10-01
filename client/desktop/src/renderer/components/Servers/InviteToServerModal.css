@@ -169,10 +169,10 @@
 /* Generate button */
 .invite-generate-btn {
   padding: 12px 24px;
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   border: none;
   border-radius: 8px;
-  color: var(--bg-primary);
+  color: var(--on-brand);
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 700;
   font-family: var(--font-display-stack);
@@ -189,8 +189,8 @@
 }
 
 .invite-generate-btn:hover:not(:disabled) {
-  background: var(--gradient-brand);
-  color: var(--bg-primary);
+  background: var(--brand-fill);
+  color: var(--on-brand);
   transform: translateY(-1px);
   box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
 }

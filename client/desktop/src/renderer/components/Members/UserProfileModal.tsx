@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/system/apiClient';
-import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './UserProfileModal.css';
@@ -191,9 +191,7 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
               ) : (
                 <span
                   className="user-profile-modal-avatar-initial"
-                  style={
-                    userColors ? { background: userColors.gradient, color: '#fff' } : undefined
-                  }
+                  style={identityInitialStyle(userColors)}
                 >
                   {member.username.charAt(0).toUpperCase()}
                 </span>

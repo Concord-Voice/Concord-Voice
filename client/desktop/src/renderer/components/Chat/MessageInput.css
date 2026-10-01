@@ -188,7 +188,7 @@
 }
 
 .send-button {
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   border: none;
   border-radius: 6px;
   width: 28px;
@@ -198,7 +198,7 @@
   justify-content: center;
   cursor: pointer;
   transition: all 0.15s ease;
-  color: var(--bg-primary);
+  color: var(--on-brand);
   flex-shrink: 0;
 }
 

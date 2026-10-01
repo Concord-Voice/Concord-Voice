@@ -469,11 +469,13 @@
   background-color: var(--bg-tertiary);
 }
 
-.friend-item.offline {
+/* Offline dims the avatar image only. Opacity on the row would fade the
+   initials pair and the name into the list behind them. */
+.friend-item.offline .member-avatar-img {
   opacity: 0.45;
 }
 
-.friend-item.offline:hover {
+.friend-item.offline:hover .member-avatar-img {
   opacity: 0.75;
 }
 
@@ -1272,10 +1274,6 @@
 .friend-request-btn:disabled {
   opacity: 0.5;
   cursor: default;
-}
-
-.friend-request-outgoing {
-  opacity: 0.65;
 }
 
 .friend-request-pending-label {

@@ -32,9 +32,14 @@
   font: inherit;
 }
 
-.message-avatar:hover .avatar-image,
-.message-avatar:hover .avatar-circle {
+.message-avatar:hover .avatar-image {
   opacity: 0.8;
+}
+
+/* The initial is text on its fill: fading both blends them into the row behind
+   (Hacker light fell to 3.29:1), so the circle takes a ring instead. */
+.message-avatar:hover .avatar-circle {
+  box-shadow: 0 0 0 2px var(--accent-primary);
 }
 
 /* Gutter for grouped messages — holds hover timestamp */
@@ -61,14 +66,14 @@
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  background: var(--gradient-brand);
+  background: var(--brand-fill);
   display: flex;
   align-items: center;
   justify-content: center;
   font-family: var(--font-display-stack);
   font-size: calc(16px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--bg-primary);
+  color: var(--on-brand);
 }
 
 .avatar-image {

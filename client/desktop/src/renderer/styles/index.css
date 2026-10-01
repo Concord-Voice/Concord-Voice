@@ -134,6 +134,11 @@
   --accent-secondary: #ffe13f;
   --accent-hover: #ff8bb0;
   --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  /* Brand-filled controls that carry text: the fill, and the text on it,
+     chosen per block to hold 4.5:1 at every point of the fill.
+     --gradient-brand stays the identity for decoration with no text on it. */
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0d0821;
   --success: #43b581;
   --danger: #f04747;
   --border-color: #2a2440;
@@ -261,6 +266,8 @@
   --accent-secondary: #ffe13f;
   --accent-hover: #ff8bb0;
   --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0d0821;
   --success: #2d9f6f;
   --danger: #e03e3e;
   --border-color: #d4d4de;
@@ -318,6 +325,8 @@
   --accent-secondary: #ffe13f;
   --accent-hover: #ff8bb0;
   --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0d0821;
   --success: #43b581;
   --danger: #f04747;
   --border-color: #2a2440;
@@ -375,6 +384,8 @@
   --accent-secondary: #ffe13f;
   --accent-hover: #ff8bb0;
   --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0d0821;
   --success: #2d9f6f;
   --danger: #e03e3e;
   --border-color: #d4d4de;
@@ -432,6 +443,8 @@
   --accent-secondary: #ff6b35;
   --accent-hover: #ff4d5e;
   --gradient-brand: linear-gradient(90deg, #e63946 0%, #ff6b35 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0a0a0a;
   --success: #4caf50;
   --danger: #f44336;
   --border-color: #2a2a2a;
@@ -489,6 +502,8 @@
   --accent-secondary: #ff6b35;
   --accent-hover: #ff4d5e;
   --gradient-brand: linear-gradient(90deg, #e63946 0%, #ff6b35 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0a0a0a;
   --success: #2e7d32;
   --danger: #c62828;
   --border-color: #d0d0d0;
@@ -546,6 +561,8 @@
   --accent-secondary: #f64f8e;
   --accent-hover: #d999f5;
   --gradient-brand: linear-gradient(90deg, #c471ed 0%, #f64f8e 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #120a1e;
   --success: #6bcb77;
   --danger: #e05279;
   --border-color: #332548;
@@ -603,6 +620,8 @@
   --accent-secondary: #e8447e;
   --accent-hover: #c87ae5;
   --gradient-brand: linear-gradient(90deg, #b04fd9 0%, #e8447e 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #120a1e;
   --success: #2e8b4a;
   --danger: #c23660;
   --border-color: #d8cce5;
@@ -660,6 +679,8 @@
   --accent-secondary: #ff9100;
   --accent-hover: #ff8a24;
   --gradient-brand: linear-gradient(90deg, #ff6d00 0%, #ff9100 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #3d1e00;
   --success: #8bc34a;
   --danger: #ef5350;
   --border-color: #6b3f10;
@@ -724,6 +745,8 @@
   --accent-secondary: #ef6c00;
   --accent-hover: #ff7d1a;
   --gradient-brand: linear-gradient(90deg, #e65100 0%, #ef6c00 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #1a0e02;
   --success: #558b2f;
   --danger: #c62828;
   --border-color: #f0c890;
@@ -785,6 +808,8 @@
   --accent-secondary: #00ee38;
   --accent-hover: #44ff77;
   --gradient-brand: linear-gradient(90deg, #00ff41 0%, #00ee38 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #000000;
   --success: #00ff41;
   --danger: #ff2020;
   --border-color: #0a2a0a;
@@ -842,6 +867,8 @@
   --accent-secondary: #007018;
   --accent-hover: #00aa2a;
   --gradient-brand: linear-gradient(90deg, #008a20 0%, #007018 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #008a20;
   --danger: #cc1111;
   --border-color: #c0dcc0;
@@ -899,6 +926,8 @@
   --accent-secondary: #8b20aa;
   --accent-hover: #ff8833;
   --gradient-brand: linear-gradient(90deg, #ff6a00 0%, #8b20aa 100%);
+  --brand-fill: linear-gradient(90deg, #c45003 0%, #8b20aa 100%);
+  --on-brand: #ffffff;
   --success: #4a8a3a;
   --danger: #cc2222;
   --border-color: #2a1e1e;
@@ -956,6 +985,8 @@
   --accent-secondary: #7a18a0;
   --accent-hover: #e06600;
   --gradient-brand: linear-gradient(90deg, #cc5500 0%, #7a18a0 100%);
+  --brand-fill: linear-gradient(90deg, #c25103 0%, #7a18a0 100%);
+  --on-brand: #ffffff;
   --success: #3a7a2e;
   --danger: #b81c1c;
   --border-color: #d4c4b0;
@@ -1013,6 +1044,8 @@
   --accent-secondary: #06b6d4;
   --accent-hover: #38bdf8;
   --gradient-brand: linear-gradient(90deg, #0ea5e9 0%, #06b6d4 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #020c14;
   --success: #2dd4bf;
   --danger: #f43f5e;
   --border-color: #122a3e;
@@ -1070,6 +1103,8 @@
   --accent-secondary: #0891b2;
   --accent-hover: #0ea5e9;
   --gradient-brand: linear-gradient(90deg, #0284c7 0%, #0891b2 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #020c14;
   --success: #0d9488;
   --danger: #e11d48;
   --border-color: #b8d8ea;
@@ -1127,6 +1162,8 @@
   --accent-secondary: #8b7355;
   --accent-hover: #7fa828;
   --gradient-brand: linear-gradient(90deg, #6b8e23 0%, #8b7355 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #000000;
   --success: #6b8e23;
   --danger: #b85c38;
   --border-color: #2a3020;
@@ -1184,6 +1221,8 @@
   --accent-secondary: #7a6345;
   --accent-hover: #6b8e23;
   --gradient-brand: linear-gradient(90deg, #5a7a1a 0%, #7a6345 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #5a7a1a;
   --danger: #a04e2e;
   --border-color: #c8d0b8;
@@ -1241,6 +1280,8 @@
   --accent-secondary: #40c8ff;
   --accent-hover: #ff90be;
   --gradient-brand: linear-gradient(90deg, #ff6ea8 0%, #40c8ff 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #0a0810;
   --success: #40c8ff;
   --danger: #ff5080;
   --border-color: #26202e;
@@ -1298,6 +1339,8 @@
   --accent-secondary: #00a0f0;
   --accent-hover: #ff50a0;
   --gradient-brand: linear-gradient(90deg, #ff2880 0%, #00a0f0 100%);
+  --brand-fill: linear-gradient(90deg, #e4066e 0%, #037ab9 100%);
+  --on-brand: #ffffff;
   --success: #00a0f0;
   --danger: #ff1060;
   --border-color: #a8c8f0;
@@ -1355,6 +1398,8 @@
   --accent-secondary: #a07848;
   --accent-hover: #d8b880;
   --gradient-brand: linear-gradient(90deg, #c8a46c 0%, #a07848 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #120e0a;
   --success: #8a9a5a;
   --danger: #c45a3a;
   --border-color: #322820;
@@ -1412,6 +1457,8 @@
   --accent-secondary: #7a5c30;
   --accent-hover: #b08c50;
   --gradient-brand: linear-gradient(90deg, #9a7840 0%, #7a5c30 100%);
+  --brand-fill: linear-gradient(90deg, #906f36 0%, #7a5c30 100%);
+  --on-brand: #ffffff;
   --success: #6a7a3c;
   --danger: #a84428;
   --border-color: #d0c4b0;
@@ -1469,6 +1516,8 @@
   --accent-secondary: #880000;
   --accent-hover: #ee2020;
   --gradient-brand: linear-gradient(90deg, #cc0000 0%, #880000 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #aa2020;
   --danger: #ff1a1a;
   --border-color: #2a1010;
@@ -1526,6 +1575,8 @@
   --accent-secondary: #700000;
   --accent-hover: #cc0000;
   --gradient-brand: linear-gradient(90deg, #aa0000 0%, #700000 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #f4e8e8;
   --success: #881818;
   --danger: #cc0000;
   --border-color: #d0b0b0;
@@ -1583,6 +1634,8 @@
   --accent-secondary: #a78bfa;
   --accent-hover: #8da6ff;
   --gradient-brand: linear-gradient(90deg, #6d8cff 0%, #a78bfa 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #060a18;
   --success: #6ee7b7;
   --danger: #fb7185;
   --border-color: #1c2848;
@@ -1640,6 +1693,8 @@
   --accent-secondary: #7c5cc8;
   --accent-hover: #6d8cff;
   --gradient-brand: linear-gradient(90deg, #4a6ae0 0%, #7c5cc8 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #059669;
   --danger: #e11d48;
   --border-color: #b8c0dc;
@@ -1699,6 +1754,8 @@
   --accent-secondary: #017fa4;
   --accent-hover: #ff1860;
   --gradient-brand: linear-gradient(90deg, #e0004e 0%, #017fa4 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #6ccdb8;
   --danger: #ff2050;
   --border-color: #1e3258;
@@ -1767,6 +1824,8 @@
   --accent-secondary: #015a73;
   --accent-hover: #c8004a;
   --gradient-brand: linear-gradient(90deg, #a30038 0%, #015a73 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #f5f7fa;
   --success: #2a8a72;
   --danger: #c4003d;
   --border-color: #b8c4d4;
@@ -1834,6 +1893,8 @@
   --accent-secondary: #79c0ff;
   --accent-hover: #79c0ff;
   --gradient-brand: linear-gradient(90deg, #58a6ff 0%, #79c0ff 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #1c1c1f;
   --success: #3fb950;
   --danger: #f85149;
   --border-color: #3a3a40;
@@ -1891,6 +1952,8 @@
   --accent-secondary: #218bff;
   --accent-hover: #0860ca;
   --gradient-brand: linear-gradient(90deg, #0969da 0%, #218bff 100%);
+  --brand-fill: linear-gradient(90deg, #0969da 0%, #0372dd 100%);
+  --on-brand: #ffffff;
   --success: #1a7f37;
   --danger: #cf222e;
   --border-color: #d0d7de;
@@ -1956,6 +2019,8 @@
     #004dff 80%,
     #750787 100%
   );
+  --brand-fill: linear-gradient(rgb(0 0 0 / 50%), rgb(0 0 0 / 50%)), var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #2fbf71;
   --danger: #ff5c5c;
   --border-color: #352b44;
@@ -2021,6 +2086,8 @@
     #004dff 80%,
     #750787 100%
   );
+  --brand-fill: linear-gradient(rgb(0 0 0 / 45%), rgb(0 0 0 / 45%)), var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #2e8b4a;
   --danger: #d33d3d;
   --border-color: #ead9e4;
@@ -2419,6 +2486,8 @@ a[target='_blank']:not(.update-security-banner__cta, .attestation-modal__downloa
   --state-focused: #00ffff;
   --accent-color: #ffff00;
   --gradient-brand: linear-gradient(90deg, #ffff00 0%, #00ffff 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #000000;
   --success: #00ff00;
   --danger: #ff4040;
   --border-color: #ffffff;
@@ -2455,6 +2524,8 @@ a[target='_blank']:not(.update-security-banner__cta, .attestation-modal__downloa
   --state-focused: #800080;
   --accent-color: #0000cc;
   --gradient-brand: linear-gradient(90deg, #0000cc 0%, #800080 100%);
+  --brand-fill: var(--gradient-brand);
+  --on-brand: #ffffff;
   --success: #006600;
   --danger: #cc0000;
   --border-color: #000000;

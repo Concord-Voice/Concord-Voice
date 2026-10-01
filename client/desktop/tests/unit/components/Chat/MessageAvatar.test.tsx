@@ -3,6 +3,8 @@ import MessageAvatar from '@/renderer/components/Chat/MessageAvatar';
 import { API_BASE } from '@/renderer/config';
 import { mockMessage } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { inlinePairWorst } from '../../helpers/inlinePairContrast';
+import { resolveUserAccentColors } from '@/renderer/utils/ui/schemeColors';
 
 // MessageAvatar is a pure trigger after #226 — it renders the avatar and calls
 // onOpenProfile with a viewport position. The member-resolution + profile-card
@@ -57,17 +59,32 @@ describe('MessageAvatar', () => {
     expect(circle!.textContent).toBe('T'); // "Test User" → "T"
   });
 
-  it('applies sender gradient colors to avatar circle', () => {
+  it("applies the sender's fill and label to the avatar circle", () => {
     render(
       <MessageAvatar
         message={mockMessage}
         showAvatar={true}
-        senderColors={{ gradient: 'linear-gradient(135deg, #ff0000, #00ff00)' }}
+        senderColors={{ fill: 'linear-gradient(135deg, #ff0000, #00ff00)', text: '#000000' }}
         onOpenProfile={vi.fn()}
       />
     );
     const circle = document.querySelector('.avatar-circle') as HTMLElement;
     expect(circle.style.background).toContain('linear-gradient');
+    expect(circle.style.color).toBe('rgb(0, 0, 0)');
+  });
+
+  it("pairs the initial's colour with the sender's fill, not the viewer's theme", () => {
+    // A Hacker sender's green with the viewer's label read 1.37:1 in Eclipse dark.
+    render(
+      <MessageAvatar
+        message={mockMessage}
+        showAvatar={true}
+        senderColors={resolveUserAccentColors(JSON.stringify({ scheme: 'hacker' }))}
+        onOpenProfile={vi.fn()}
+      />
+    );
+    const circle = document.querySelector('.avatar-circle') as HTMLElement;
+    expect(inlinePairWorst(circle)).toBeGreaterThanOrEqual(4.5);
   });
 
   it('renders gutter timestamp when showAvatar is false', () => {

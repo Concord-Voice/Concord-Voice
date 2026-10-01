@@ -19,8 +19,10 @@ import { readFileSync } from 'node:fs';
  *   - A rule that sets a foreground and inherits its background from an ancestor.
  *     Resolving that needs the DOM, not the stylesheet. 287 pairs in the
  *     tree carry a colour this cannot pair with anything.
- *   - Backgrounds that are gradients, `rgba(...)`, `color-mix(...)`, or keywords.
- *     Alpha compositing depends on what is behind the element.
+ *   - Backgrounds that are `rgba(...)`, `color-mix(...)`, keywords, or a gradient
+ *     whose bottom layer is translucent. Alpha compositing there depends on what
+ *     is behind the element. A `linear-gradient` with opaque stops IS measured,
+ *     at its worst point, and so is a translucent layer stacked on top of one.
  *   - Font size. WCAG allows 3:1 for large text; this uses 4.5:1 everywhere, so
  *     a large-text pair between 3 and 4.5 lands in the allowlist rather than
  *     being waved through. That is deliberate: a wrong exemption is invisible,
@@ -30,12 +32,14 @@ import { readFileSync } from 'node:fs';
 import {
   ALLOWLIST,
   baseSelectorOf,
+  expandVars,
   winningDeclaration,
   contrastRatio,
   inheritStateColors,
   measure,
   mergeBySelector,
   parseThemeBlocks,
+  sampleFill,
   splitSelectorList,
   toRgb,
 } from './contrastPairs';
@@ -327,5 +331,189 @@ describe('contrastRatio', () => {
   ])('%s on %s ≈ %s', (fg, bg, expected) => {
     const ratio = contrastRatio(toRgb(fg)!, toRgb(bg)!);
     expect(ratio).toBeCloseTo(expected as number, 1);
+  });
+});
+
+describe('sampleFill', () => {
+  // The brand buttons put text on --gradient-brand, and this guard skipped every
+  // gradient: 20 rules measured nothing while Concord light sat at 1.20:1. These
+  // cases fail if gradients go back to being unresolvable or to one sample.
+  const worst = (fg: string, fill: string) =>
+    Math.min(...sampleFill(fill)!.map((bg) => contrastRatio(toRgb(fg)!, bg)));
+
+  it('measures a gradient at its worst point, not at one end', () => {
+    // White passes on the black end and fails on the yellow end.
+    expect(worst('#ffffff', 'linear-gradient(90deg, #000000 0%, #ffff00 100%)')).toBeCloseTo(
+      1.07,
+      1
+    );
+  });
+
+  it('finds a dip between two stops that both pass', () => {
+    // Both ends pass with black text; their sRGB midpoint does not.
+    const fill = 'linear-gradient(90deg, #ff2880 0%, #00a0f0 100%)';
+    expect(contrastRatio(toRgb('#000000')!, toRgb('#ff2880')!)).toBeGreaterThan(4.5);
+    expect(contrastRatio(toRgb('#000000')!, toRgb('#00a0f0')!)).toBeGreaterThan(4.5);
+    expect(worst('#000000', fill)).toBeLessThan(4.5);
+  });
+
+  it('spreads stops without positions evenly, as CSS does', () => {
+    expect(sampleFill('linear-gradient(to right, #000000, #ffffff, #000000)')!).toContainEqual([
+      255, 255, 255,
+    ]);
+  });
+
+  it('composites a translucent layer over the gradient beneath it', () => {
+    const scrim =
+      'linear-gradient(rgb(0 0 0 / 50%), rgb(0 0 0 / 50%)), linear-gradient(90deg, #ffffff 0%, #ffffff 100%)';
+    expect(sampleFill(scrim)![0].map(Math.round)).toEqual([128, 128, 128]);
+  });
+
+  it('leaves a fill unresolvable when what shows through depends on an ancestor', () => {
+    expect(sampleFill('linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5))')).toBeNull();
+    expect(sampleFill('radial-gradient(#000000, #ffffff)')).toBeNull();
+    expect(sampleFill('transparent')).toBeNull();
+  });
+
+  // The four cases below came from review of #3514. Each is a gradient the
+  // sampler used to measure as passing while the browser paints a failing pair.
+
+  it('places an unpositioned stop between its positioned neighbours, as CSS does', () => {
+    // CSS puts the cyan halfway between 99% and 100%. Spreading it by index put it
+    // at 66.7%, behind the 99% stop, and the sampler never reached it.
+    const fill = 'linear-gradient(#000000 0%, #800000 99%, #00ffff, #000000 100%)';
+    expect(worst('#ffffff', fill)).toBeCloseTo(1.25, 1);
+  });
+
+  it('clamps a stop placed before an earlier one up to that position', () => {
+    // CSS moves the 20% stop up to 50%: a hard edge from black to white, then a
+    // fade back to black. White text meets that white at 1:1. Read literally, the
+    // positions run backwards and the sampler never lands on the white.
+    const fill = 'linear-gradient(#000000 0%, #000000 50%, #ffffff 20%, #000000 100%)';
+    expect(worst('#ffffff', fill)).toBeCloseTo(1, 1);
+  });
+
+  it('paints the colours between stops where CSS places those stops', () => {
+    // Sampling each stop's own colour finds a stripe, but not a misplaced blend:
+    // these pin the colour painted at one point, which only the placement decides.
+    // The samples run along the gradient, one per 1%.
+    const at = (fill: string, pct: number) => sampleFill(fill)![pct].map(Math.round);
+    // The unpositioned black goes halfway between 20% and 100%, at 60%, so 65% is
+    // an eighth of the way to white. Spread by index it lands at 66.7%, still black.
+    expect(at('linear-gradient(#000000 0%, #000000 20%, #000000, #ffffff 100%)', 65)).toEqual([
+      32, 32, 32,
+    ]);
+    // The 20% stop is raised to 60%, so 80% is halfway to white. Unclamped, the
+    // last segment starts at 20% and 80% is three quarters of the way.
+    expect(at('linear-gradient(#000000 0%, #000000 60%, #000000 20%, #ffffff 100%)', 80)).toEqual([
+      128, 128, 128,
+    ]);
+  });
+
+  it('keeps a first stop it cannot parse as unresolvable, never as a direction', () => {
+    // Skipping any unparsed first argument dropped the yellow HSL stop and
+    // measured black on black at 21:1; the browser paints yellow at 1.07:1.
+    expect(sampleFill('linear-gradient(hsl(60 100% 50%), #000000, #000000)')).toBeNull();
+    // An interpolation clause changes the colours in between, so it is not sRGB.
+    expect(sampleFill('linear-gradient(in oklab, #000000, #ffffff)')).toBeNull();
+    // A real direction or angle is still skipped.
+    expect(sampleFill('linear-gradient(to bottom right, #000000, #ffffff)')).not.toBeNull();
+    expect(sampleFill('linear-gradient(-45deg, #000000, #ffffff)')).not.toBeNull();
+    expect(sampleFill('linear-gradient(0.25turn, #000000, #ffffff)')).not.toBeNull();
+  });
+
+  it('interpolates translucent stops with premultiplied alpha, as CSS does', () => {
+    // Interpolating raw channels and alpha separately reports 4.76:1 here.
+    const fill =
+      'linear-gradient(rgba(255, 255, 255, 0.5), rgba(255, 0, 0, 1)), linear-gradient(#000000, #000000)';
+    expect(worst('#000000', fill)).toBeCloseTo(4.02, 1);
+  });
+
+  it('leaves two layers that both vary unresolvable, since their directions can differ', () => {
+    // The top layer runs left to right and the bottom right to left, so the left
+    // edge is transparent over white: 1:1 with white text. Pairing samples by
+    // index put that transparency over black instead.
+    const fill =
+      'linear-gradient(90deg, rgba(0, 0, 0, 0) 0%, #000000 100%), linear-gradient(270deg, #000000 0%, #ffffff 100%)';
+    expect(sampleFill(fill)).toBeNull();
+  });
+
+  // The three cases below came from the fourth review of #3514.
+
+  it('finds a dip inside a transition narrower than the sample spacing', () => {
+    // Both stops pass with black text, and the 1% samples fall at 49% and 50%,
+    // on either side of the 0.8% transition. The browser paints a worst point of
+    // about 4.13:1, 60% of the way through it; the 1% samples alone report 4.92.
+    const fill = 'linear-gradient(#fe4087 49.1%, #138c59 49.9%)';
+    expect(contrastRatio(toRgb('#000000')!, toRgb('#fe4087')!)).toBeGreaterThan(4.5);
+    expect(contrastRatio(toRgb('#000000')!, toRgb('#138c59')!)).toBeGreaterThan(4.5);
+    expect(worst('#000000', fill)).toBeCloseTo(4.13, 2);
+  });
+
+  it('clamps out-of-range rgb() channels and alpha, as CSS does', () => {
+    // Chromium paints rgb(999 999 999) as white: 1:1 with white text. Unclamped,
+    // the luminance of 999 reads as brighter than white and the pair passes.
+    expect(worst('#ffffff', 'linear-gradient(rgb(999 999 999), rgb(999 999 999))')).toBeCloseTo(
+      1,
+      2
+    );
+    // An alpha above 1 is opaque, not a brighter-than-opaque composite.
+    expect(
+      sampleFill(
+        'linear-gradient(rgb(0 0 0 / 150%), rgb(0 0 0 / 150%)), linear-gradient(#ffffff, #ffffff)'
+      )
+    ).toEqual([[0, 0, 0]]);
+  });
+
+  it('measures only the stops the element actually paints', () => {
+    // The white stop sits at 200%, past the end of the element, so the browser
+    // paints black throughout: 21:1 with white text.
+    expect(worst('#ffffff', 'linear-gradient(#000000 0%, #000000 100%, #ffffff 200%)')).toBeCloseTo(
+      21,
+      0
+    );
+    // An off-canvas stop still shapes what is painted inside: the fade from black
+    // at 0% to white at 200% is halfway to white at 100%, the brightest point
+    // painted. Dropping the stop altogether would measure black at 21:1.
+    expect(worst('#ffffff', 'linear-gradient(#000000 0%, #ffffff 200%)')).toBeCloseTo(
+      contrastRatio(toRgb('#ffffff')!, [127.5, 127.5, 127.5]),
+      2
+    );
+  });
+
+  it('still composites a constant scrim over a gradient that varies', () => {
+    // Pride's --brand-fill is this shape: one uniform layer over the flag.
+    const fill =
+      'linear-gradient(rgb(0 0 0 / 50%), rgb(0 0 0 / 50%)), linear-gradient(90deg, #ffffff 0%, #000000 100%)';
+    const samples = sampleFill(fill)!;
+    expect(samples[0].map(Math.round)).toEqual([128, 128, 128]);
+    expect(samples[samples.length - 1].map(Math.round)).toEqual([0, 0, 0]);
+  });
+});
+
+describe('expandVars', () => {
+  it('expands a var() embedded in a longer value, following chains', () => {
+    const tokens = { '--a': 'var(--b)', '--b': '#123456' };
+    expect(expandVars(tokens, 'linear-gradient(90deg, var(--a) 0%, #ffffff 100%)')).toBe(
+      'linear-gradient(90deg, #123456 0%, #ffffff 100%)'
+    );
+  });
+
+  it('uses the fallback only when the token is undeclared', () => {
+    expect(expandVars({ '--a': '#111111' }, 'var(--a, #222222)')).toBe('#111111');
+    expect(expandVars({}, 'var(--missing, var(--also-missing, #333333))')).toBe('#333333');
+    expect(expandVars({}, 'var(--missing)')).toBeNull();
+  });
+});
+
+describe('multi-line theme tokens', () => {
+  it("reads Pride's own --gradient-brand, not the one :root lays under it", () => {
+    // Pride writes its six-stripe flag across several lines. Read line by line,
+    // the declaration never matched and the block measured Concord's gradient.
+    const blocks = parseThemeBlocks();
+    const pride = blocks.find((b) => b.selector === "[data-scheme='pride']");
+    const root = blocks.find((b) => b.selector === ':root');
+    expect(pride!.tokens['--gradient-brand']).toContain('#750787');
+    expect(pride!.tokens['--gradient-brand']).not.toBe(root!.tokens['--gradient-brand']);
   });
 });

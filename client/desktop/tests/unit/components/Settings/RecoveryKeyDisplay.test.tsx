@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { vi } from 'vitest';
 import RecoveryKeyDisplay from '@/renderer/components/Settings/RecoveryKeyDisplay';
+import { inlinePairWorst } from '../../helpers/inlinePairContrast';
 
 describe('RecoveryKeyDisplay', () => {
   const onConfirm = vi.fn();
@@ -189,6 +190,16 @@ describe('RecoveryKeyDisplay', () => {
     // Should show the recovery key again
     expect(screen.getByText(recoveryKey)).toBeInTheDocument();
     expect(screen.queryByText(/Are you sure?/)).not.toBeInTheDocument();
+  });
+
+  it('pairs the skip label with its red fill', () => {
+    // The fill is set inline, so the label must be too: .btn-primary's
+    // --on-accent is chosen for the accent, not for #dc2626.
+    render(<RecoveryKeyDisplay recoveryKey={recoveryKey} onConfirm={onConfirm} onSkip={onSkip} />);
+    fireEvent.click(screen.getByText('Skip for now'));
+    expect(inlinePairWorst(screen.getByText('Skip Without Recovery Key'))).toBeGreaterThanOrEqual(
+      4.5
+    );
   });
 
   it('calls onSkip when "Skip Without Recovery Key" is clicked', () => {
