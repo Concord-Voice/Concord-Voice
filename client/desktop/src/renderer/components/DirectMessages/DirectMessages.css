@@ -2042,6 +2042,34 @@
   background: rgba(255, 70, 70, 0.1);
 }
 
+/* Hide is reversible: neutral surface and a neutral filled confirm, not Delete
+   Server's danger pair (DMThreadRemovalDialog). --text-primary on --bg-tertiary
+   is the pair .group-info-action-btn already clears AA with; the accent fill with
+   --on-accent measures 2.68:1 in :root and lives only on the contrast allowlist. */
+.delete-server-warning.dm-removal-neutral {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+}
+
+.delete-server-warning.dm-removal-neutral p {
+  color: var(--text-primary);
+}
+
+.delete-server-confirm-btn.dm-removal-neutral {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+}
+
+.delete-server-confirm-btn.dm-removal-neutral:hover:not(:disabled) {
+  background: var(--bg-primary);
+  box-shadow: none;
+}
+
+.delete-server-confirm-btn.dm-removal-neutral:focus-visible {
+  outline-color: var(--state-focused);
+}
+
 .group-info-actions-divider {
   height: 1px;
   margin: calc(6px * var(--sp, 1)) 0;

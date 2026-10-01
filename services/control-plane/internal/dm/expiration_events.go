@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/google/uuid"
@@ -45,11 +46,11 @@ func insertDMExpirationEvent(
 	conversationID uuid.UUID,
 	actorUserID string,
 	payload expiration.EventPayload,
-) (uuid.UUID, error) {
+) (uuid.UUID, []uuid.UUID, error) {
 	messageID := uuid.New()
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("marshal DM expiration event payload: %w", err)
+		return uuid.Nil, nil, fmt.Errorf("marshal DM expiration event payload: %w", err)
 	}
 	var createdAt time.Time
 	if err := tx.QueryRowContext(ctx, `
@@ -58,12 +59,13 @@ func insertDMExpirationEvent(
 		        CASE WHEN $7::integer IS NULL THEN NULL ELSE $6::timestamptz + make_interval(secs => $7) END)
 		RETURNING created_at
 	`, messageID, conversationID, actorUserID, expirationEventDMMessagesType, payloadJSON, payload.ChangedAt, payload.WindowSeconds).Scan(&createdAt); err != nil {
-		return uuid.Nil, fmt.Errorf("insert dm_messages expiration_event row: %w", err)
+		return uuid.Nil, nil, fmt.Errorf("insert dm_messages expiration_event row: %w", err)
 	}
-	if err := respawnDMParticipantVisibility(ctx, tx, conversationID, createdAt); err != nil {
-		return uuid.Nil, fmt.Errorf("respawn expiration-event participant visibility: %w", err)
+	respawned, err := dmvisibility.Respawn(ctx, tx, conversationID, createdAt)
+	if err != nil {
+		return uuid.Nil, nil, fmt.Errorf("respawn expiration-event participant visibility: %w", err)
 	}
-	return messageID, nil
+	return messageID, respawned, nil
 }
 
 // broadcastDMExpirationEvent sends the durable row to every participant who

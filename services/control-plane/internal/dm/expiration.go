@@ -66,7 +66,7 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 	}
 	policy := transition.Current
 
-	staged, ok := h.stageDMExpirationEvent(mutationCtx, c, tx, conversationUUID, userID, request, transition)
+	staged, respawned, ok := h.stageDMExpirationEvent(mutationCtx, c, tx, conversationUUID, userID, request, transition)
 	if !ok {
 		return
 	}
@@ -77,6 +77,7 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		return
 	}
 	if staged.Present {
+		h.hub.PublishDMRespawn(conversationUUID, respawned)
 		h.broadcastDMExpirationEvent(conversationUUID, staged.MessageID, userID, staged.Payload, policy)
 	}
 	if !policy.BackfillPending {
@@ -178,18 +179,18 @@ func (h *Handler) stageDMExpirationEvent(
 	userID string,
 	request expiration.Request,
 	transition expiration.Transition,
-) (expiration.StagedEvent, bool) {
+) (expiration.StagedEvent, []uuid.UUID, bool) {
 	payload, ok := expiration.EventFor(request, transition, userID)
 	if !ok {
-		return expiration.StagedEvent{}, true
+		return expiration.StagedEvent{}, nil, true
 	}
-	messageID, err := insertDMExpirationEvent(ctx, tx, conversationID, userID, payload)
+	messageID, respawned, err := insertDMExpirationEvent(ctx, tx, conversationID, userID, payload)
 	if err != nil {
 		h.log.Error("Failed to insert DM expiration_event row", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
-		return expiration.StagedEvent{}, false
+		return expiration.StagedEvent{}, nil, false
 	}
-	return expiration.StagedEvent{MessageID: messageID, Payload: payload, Present: true}, true
+	return expiration.StagedEvent{MessageID: messageID, Payload: payload, Present: true}, respawned, true
 }
 
 // respondDMExpirationBackfill runs the post-commit resume batch and writes the

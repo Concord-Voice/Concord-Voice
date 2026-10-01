@@ -253,6 +253,9 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   };
 
   const disabled = busy || clearStage === 'uncertain' || (isVerifying && credential.trim() === '');
+  // Hide is reversible (the thread respawns on the next message), so it must not
+  // borrow the destructive styling Clear and Leave share with Delete Server.
+  const tone = target.action === 'hide' ? ' dm-removal-neutral' : '';
 
   return (
     <Modal
@@ -264,7 +267,7 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
       initialFocusRef={cancelRef}
     >
       <div className="delete-server-content">
-        <div className="delete-server-warning">
+        <div className={`delete-server-warning${tone}`}>
           <div className="confirm-action-message">
             <p>{REMOVAL_COPY[target.action]}</p>
           </div>
@@ -311,7 +314,7 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
           </button>
           <button
             type="button"
-            className="delete-server-confirm-btn"
+            className={`delete-server-confirm-btn${tone}`}
             onClick={() => void submitRemoval()}
             disabled={disabled}
           >

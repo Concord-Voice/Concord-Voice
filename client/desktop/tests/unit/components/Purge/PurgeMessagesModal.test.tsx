@@ -38,24 +38,24 @@ describe('PurgeMessagesModal — configure stage', () => {
     const user = userEvent.setup();
     renderChannelModal();
 
-    for (const radio of screen.getAllByRole('radio')) {
-      expect(radio).not.toBeChecked();
-    }
+    expect(screen.getByRole('combobox', { name: 'Range' })).toHaveValue('');
     expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeDisabled();
 
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeEnabled();
   });
 
   it('offers the nine server-accepted ranges and no others', () => {
     renderChannelModal();
-    expect(screen.getAllByRole('radio')).toHaveLength(9);
+    expect(
+      screen.getAllByRole('option').filter((o) => !(o as HTMLOptionElement).disabled)
+    ).toHaveLength(9);
   });
 
   it('echoes scope and range qualitatively, with no count', async () => {
     const user = userEvent.setup();
     renderChannelModal();
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
 
     expect(screen.getByText(/purge all messages from the last 7 days in/i)).toBeInTheDocument();
     // No count-preview endpoint exists; a number here would be invented.
@@ -64,7 +64,7 @@ describe('PurgeMessagesModal — configure stage', () => {
 
   it('names the last option with its "no time limit" qualifier', () => {
     renderChannelModal();
-    expect(screen.getByRole('radio', { name: /^All messages/ })).toHaveAccessibleName(
+    expect(screen.getByRole('option', { name: /^All messages/ })).toHaveAccessibleName(
       'All messages — no time limit'
     );
   });
@@ -72,7 +72,10 @@ describe('PurgeMessagesModal — configure stage', () => {
   it('requires typing PURGE when the range is all', async () => {
     const user = userEvent.setup();
     renderChannelModal();
-    await user.click(screen.getByRole('radio', { name: /^All messages/ }));
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Range' }),
+      'All messages — no time limit'
+    );
 
     const confirm = screen.getByRole('button', { name: 'Purge Messages' });
     expect(confirm).toBeDisabled();
@@ -84,7 +87,10 @@ describe('PurgeMessagesModal — configure stage', () => {
   it('rejects a typed confirmation that is not an exact match', async () => {
     const user = userEvent.setup();
     renderChannelModal();
-    await user.click(screen.getByRole('radio', { name: /^All messages/ }));
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Range' }),
+      'All messages — no time limit'
+    );
 
     await user.type(screen.getByLabelText(/type purge to confirm/i), 'purge');
     expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeDisabled();
@@ -96,16 +102,17 @@ describe('PurgeMessagesModal — configure stage', () => {
     // isOpen, so it survives close — a satisfied PURGE would otherwise make the
     // reopened first paint one click away from deleting an entire history.
     const { rerender } = render(channelModal(true));
-    await user.click(screen.getByRole('radio', { name: /^All messages/ }));
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Range' }),
+      'All messages — no time limit'
+    );
     await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
     expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeEnabled();
 
     rerender(channelModal(false));
     rerender(channelModal(true));
 
-    for (const radio of screen.getAllByRole('radio')) {
-      expect(radio).not.toBeChecked();
-    }
+    expect(screen.getByRole('combobox', { name: 'Range' })).toHaveValue('');
     expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeDisabled();
     expect(screen.queryByLabelText(/type purge to confirm/i)).not.toBeInTheDocument();
   });
@@ -118,7 +125,7 @@ describe('PurgeMessagesModal — configure stage', () => {
     );
     const user = userEvent.setup();
     const { rerender } = render(channelModal(true));
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
     await screen.findByText('Purged 4 messages.');
 
@@ -128,7 +135,9 @@ describe('PurgeMessagesModal — configure stage', () => {
     // The result stage has no route back to configure, so a stale result would
     // strand the reopened dialog on the previous run's outcome.
     expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
-    expect(screen.getAllByRole('radio')).toHaveLength(9);
+    expect(
+      screen.getAllByRole('option').filter((o) => !(o as HTMLOptionElement).disabled)
+    ).toHaveLength(9);
   });
 
   it('requires typing PURGE in server context at any range', async () => {
@@ -142,16 +151,33 @@ describe('PurgeMessagesModal — configure stage', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last hour' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
     expect(screen.getByRole('button', { name: 'Purge Messages' })).toBeDisabled();
   });
 });
 
 describe('PurgeMessagesModal — per-context body copy', () => {
+  it('states what a 1:1 DM purge deletes before any range is chosen', () => {
+    render(<PurgeMessagesModal context="dm" isOpen scopeId="d1" scopeName="Alex" onClose={noop} />);
+
+    expect(screen.getByRole('combobox', { name: 'Range' })).toHaveValue('');
+    expect(screen.getByText(/your own messages are removed for both of you/i)).toBeInTheDocument();
+    expect(screen.getByText(/messages from alex stay for them/i)).toBeInTheDocument();
+  });
+
+  it('states a group member scope before any range is chosen', () => {
+    render(
+      <PurgeMessagesModal context="group" isOpen scopeId="g1" scopeName="Crew" onClose={noop} />
+    );
+
+    expect(screen.getByText(/your own messages are removed for everyone/i)).toBeInTheDocument();
+    expect(screen.getByText(/messages from others stay for them/i)).toBeInTheDocument();
+  });
+
   it('tells a 1:1 DM actor that the deletion is asymmetric', async () => {
     const user = userEvent.setup();
     render(<PurgeMessagesModal context="dm" isOpen scopeId="d1" scopeName="Alex" onClose={noop} />);
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
 
     expect(screen.getByText(/your own messages are removed for both of you/i)).toBeInTheDocument();
     expect(screen.getByText(/hidden only for you/i)).toBeInTheDocument();
@@ -168,7 +194,7 @@ describe('PurgeMessagesModal — per-context body copy', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last hour' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
 
     expect(
       screen.getAllByText(/channels you cannot moderate will be skipped/i).length
@@ -187,9 +213,9 @@ describe('PurgeMessagesModal — per-context body copy', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
 
-    expect(screen.getByText(/messages are removed for everyone in the group/i)).toBeInTheDocument();
+    expect(screen.getByText(/you remove messages for everyone in the group/i)).toBeInTheDocument();
   });
 
   it('states the asymmetry to a group member, which is also the default', async () => {
@@ -203,14 +229,39 @@ describe('PurgeMessagesModal — per-context body copy', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
 
     // Defaulting to the member sentence is the safe direction: it never
     // promises symmetric deletion the backend would not perform.
     expect(screen.getByText(/your own messages are removed for everyone/i)).toBeInTheDocument();
     expect(
-      screen.queryByText(/messages are removed for everyone in the group/i)
+      screen.queryByText(/you remove messages for everyone in the group/i)
     ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['channel', 'c1', 'general'],
+    ['server', 's1', 'Test Server'],
+  ] as const)('shows no scope note in %s context', (context, scopeId, scopeName) => {
+    render(
+      <PurgeMessagesModal
+        context={context}
+        isOpen
+        scopeId={scopeId}
+        scopeName={scopeName}
+        onClose={noop}
+      />
+    );
+
+    // Channel and server copy states its scope in the confirm sentence; a
+    // note here would repeat it before any range is chosen.
+    expect(document.querySelector('.purge-modal__scope-note')).toBeNull();
+  });
+
+  it('opens with focus on the Range picker', async () => {
+    render(<PurgeMessagesModal context="dm" isOpen scopeId="d1" scopeName="Alex" onClose={noop} />);
+
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Range' })).toHaveFocus());
   });
 });
 
@@ -240,12 +291,14 @@ describe('PurgeMessagesModal — step-up handoff', () => {
     );
     const user = userEvent.setup();
     render(<PurgeMessagesModal context="dm" isOpen scopeId="d1" scopeName="Alex" onClose={noop} />);
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
 
     // The credential challenge is a stage, not an outcome — the generic
     // "no permission" copy would be a false explanation.
-    await waitFor(() => expect(screen.queryByRole('radio')).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByRole('combobox', { name: 'Range' })).not.toBeInTheDocument()
+    );
     expect(screen.queryByText(/you may not have permission/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
   });
@@ -255,7 +308,7 @@ describe('PurgeMessagesModal — result stage', () => {
   async function submitChannelPurge(range = 'Last 7 days') {
     const user = userEvent.setup();
     renderChannelModal();
-    await user.click(screen.getByRole('radio', { name: range }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), range);
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
     return user;
   }
@@ -392,7 +445,7 @@ describe('PurgeMessagesModal — result stage', () => {
     server.use(http.delete('*/api/v1/channels/:id/messages', () => HttpResponse.error()));
     const user = userEvent.setup();
     const { rerender } = render(channelModal(true));
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
     await screen.findByRole('alert');
 
@@ -421,7 +474,7 @@ describe('PurgeMessagesModal — result stage', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last hour' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
     await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
     await screen.findByRole('alert');
@@ -474,7 +527,7 @@ describe('PurgeMessagesModal — result stage', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last hour' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
     await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
     await screen.findByText(/messages purged/i);
@@ -498,7 +551,7 @@ describe('PurgeMessagesModal — result stage', () => {
     });
     const user = userEvent.setup();
     render(<PurgeMessagesModal context="dm" isOpen scopeId="d1" scopeName="Alex" onClose={noop} />);
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
 
     const alert = await screen.findByRole('alert');
@@ -547,7 +600,7 @@ describe('PurgeMessagesModal — result stage', () => {
         }}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
 
     const done = await screen.findByRole('button', { name: 'Done' });
@@ -572,7 +625,7 @@ describe('PurgeMessagesModal — result stage', () => {
         onClose={noop}
       />
     );
-    await user.click(screen.getByRole('radio', { name: 'Last hour' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
     await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
 
@@ -600,7 +653,7 @@ describe('PurgeMessagesModal — result stage', () => {
     );
     expect(screen.getByRole('heading', { name: 'Purge Server Messages' })).toBeInTheDocument();
 
-    await user.click(screen.getByRole('radio', { name: 'Last hour' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
     await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
 
@@ -623,7 +676,7 @@ describe('PurgeMessagesModal — result stage', () => {
 
     // Native <fieldset disabled> removes descendants from the tab order for
     // free; pointer-events:none + aria-disabled would not.
-    await waitFor(() => expect(screen.getByRole('radio', { name: 'Last hour' })).toBeDisabled());
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Range' })).toBeDisabled());
     release?.();
     await screen.findByText('Purged 1 message.');
   });

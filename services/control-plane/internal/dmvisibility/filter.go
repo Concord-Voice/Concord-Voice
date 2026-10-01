@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -19,6 +20,39 @@ func HiddenRangeFilterForViewerExpr(alias, viewerExpr string) string {
   WHERE hr.user_id = %[2]s AND hr.conversation_id = %[1]s.conversation_id
     AND %[1]s.created_at >= hr.hidden_from AND %[1]s.created_at < hr.hidden_to
     AND (hr.includes_own OR %[1]s.user_id <> %[2]s))`, alias, viewerExpr)
+}
+
+// Respawn clears hidden_at for every participant who hid the conversation
+// before createdAt and returns who was respawned. Callers publish a
+// dm_conversation_hidden {hidden_at: null} event to exactly those users after
+// the transaction commits: a hidden thread's client has discarded its view and
+// unsubscribed, so no message-derived frame can bring the thread back (#2822).
+func Respawn(ctx context.Context, tx *sql.Tx, conversationID uuid.UUID, createdAt time.Time) (respawned []uuid.UUID, err error) {
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE dm_participants SET hidden_at = NULL
+		WHERE conversation_id = $1 AND hidden_at < $2
+		RETURNING user_id`, conversationID, createdAt)
+	if err != nil {
+		return nil, fmt.Errorf("respawn DM participant visibility: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			// Never return IDs beside an error: callers publish the list, and
+			// an errored transaction rolls back the respawn it describes.
+			respawned, err = nil, fmt.Errorf("close respawned DM participants: %w", closeErr)
+		}
+	}()
+	for rows.Next() {
+		var userID uuid.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("scan respawned DM participant: %w", err)
+		}
+		respawned = append(respawned, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate respawned DM participants: %w", err)
+	}
+	return respawned, nil
 }
 
 // LockParticipantsForWrite preserves the users -> conversation -> participants

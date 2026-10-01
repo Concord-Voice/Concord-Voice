@@ -816,9 +816,11 @@ export const DMSubscribedSchema = z.object({
 
 /**
  * `dm_conversation_hidden` — a participant's DM visibility state changed.
- * Server emitter: `services/control-plane/internal/dm/visibility.go`
- * (`emitDMVisibility` after HideConversation or UnhideConversation commits).
- * `hidden_at` is null for an unhide event.
+ * Server emitters: `services/control-plane/internal/dm/visibility.go`
+ * (`emitDMVisibility` after HideConversation or UnhideConversation commits)
+ * and `services/control-plane/internal/websocket/dm_respawn.go` (after a new
+ * DM row respawns a hidden participant, sent to that participant only).
+ * `hidden_at` is null for an unhide or respawn event.
  */
 export const DMConversationHiddenSchema = z.object({
   type: z.literal('dm_conversation_hidden'),

@@ -151,13 +151,16 @@ const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({
             Purge Messages
           </button>
 
+          {/* Leave is irreversible and revokes this member's keys, so it gets its
+              own destructive section rather than sitting beside Purge (#2822). */}
+          <div className="group-info-actions-divider" aria-hidden="true" />
           <button
             type="button"
-            className="group-info-action-btn"
+            className="group-info-action-btn group-info-delete-btn"
             onClick={() => onRequestRemoval({ conversation, action: 'leave' })}
           >
             <LogOut size={14} />
-            Leave Group
+            Leave group
           </button>
 
           {(isCreator || isCurrentUserAdmin) && (

@@ -672,6 +672,15 @@ writes. Its participant-visible delivery uses the shared visibility-gated
 message path, including the actor; the separate striped publication gate is
 reserved for actor-only Hide/Unhide/Clear invalidation events.
 
+Every respawning writer (WebSocket message, call-event, expiration-event)
+takes the respawned participants from `dmvisibility.Respawn` and, after the
+transaction commits, publishes `dm_conversation_hidden` with `hidden_at: null`
+to exactly those users. A hidden thread's client has discarded its view and
+unsubscribed, so a message-derived frame alone cannot bring the thread back;
+the null state makes the renderer refetch its conversation list. The hub's own
+message path publishes directly on `Run` (the only consumer of the user
+broadcast channel); every other writer goes through `Hub.PublishDMRespawn`.
+
 #### Admin auth surface (#1688)
 
 The admin console is a **separate identity domain** — it never shares state with end-user auth (no JWT, no `users` table, no refresh tokens).

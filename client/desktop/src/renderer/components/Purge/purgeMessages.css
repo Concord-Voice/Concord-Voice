@@ -64,14 +64,10 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  border: none;
-  margin: 0;
-  padding: 0;
   min-width: 0;
 }
 
-.purge-modal__ranges legend {
-  padding: 0 0 8px;
+.purge-modal__ranges label {
   color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
@@ -79,40 +75,28 @@
   text-transform: uppercase;
 }
 
-.purge-modal__range {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: calc(14px * var(--font-scale, 1));
+.purge-modal__range-select {
   cursor: pointer;
-}
-
-.purge-modal__range:hover {
-  background: var(--bg-tertiary);
-}
-
-.purge-modal__range:has(input:checked) {
-  border-color: var(--accent-primary);
-  background: var(--bg-tertiary);
-}
-
-/* The widest option is set apart structurally, so an accidental click on it is
-   a deliberate reach. Its accessible name carries the same weight (deck §3). */
-.purge-modal__range--all {
-  margin-top: 12px;
-  border-top: 1px solid var(--border-color);
-  border-radius: 0 0 6px 6px;
-  padding-top: 16px;
 }
 
 .purge-modal__ranges-helper {
   margin: 4px 0 0;
   color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+/* DM/group scope note: what the purge deletes and what it only hides, shown
+   before a range is chosen. Informational, not the destructive echo below, so
+   it stays untinted; --text-primary because --text-secondary on --bg-tertiary
+   falls below AA in Midnight Sky ([internal], #1351). */
+.purge-modal__scope-note {
+  margin: 0;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
   line-height: 1.5;
 }
 

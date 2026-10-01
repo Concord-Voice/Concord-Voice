@@ -88,7 +88,8 @@ func (h *Handler) insertCallEvent(ctx context.Context, convID uuid.UUID, payload
 		return fmt.Errorf("marshal call event payload: %w", err)
 	}
 
-	return withCallEventTransaction(ctx, h.db, "dm call event transaction", func(tx *sql.Tx) error {
+	var respawned []uuid.UUID
+	if err := withCallEventTransaction(ctx, h.db, "dm call event transaction", func(tx *sql.Tx) error {
 		windowSeconds, err := prepareCallEventInsert(ctx, tx, convID, payload.CallerUserID)
 		if err != nil {
 			return err
@@ -106,8 +107,13 @@ func (h *Handler) insertCallEvent(ctx context.Context, convID uuid.UUID, payload
 		`, uuid.New(), convID, payload.CallerUserID, dmMessagesCallEventType, payloadJSON, windowSeconds).Scan(&createdAt); err != nil {
 			return fmt.Errorf("insert dm_messages call_event row: %w", err)
 		}
-		return respawnDMParticipantVisibility(ctx, tx, convID, createdAt)
-	})
+		respawned, err = dmvisibility.Respawn(ctx, tx, convID, createdAt)
+		return err
+	}); err != nil {
+		return err
+	}
+	h.hub.PublishDMRespawn(convID, respawned)
+	return nil
 }
 
 func withCallEventTransaction(
@@ -160,15 +166,6 @@ func lockDMCallEventPolicy(ctx context.Context, tx *sql.Tx, convID, callerID uui
 		return sql.NullInt64{}, fmt.Errorf("lock call-event conversation: %w", err)
 	}
 	return windowSeconds, nil
-}
-
-func respawnDMParticipantVisibility(ctx context.Context, tx *sql.Tx, convID uuid.UUID, createdAt time.Time) error {
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE dm_participants SET hidden_at = NULL
-		WHERE conversation_id = $1 AND hidden_at < $2`, convID, createdAt); err != nil {
-		return fmt.Errorf("respawn call-event participant visibility: %w", err)
-	}
-	return nil
 }
 
 // callEventMissed constructs a CallEventPayload for the ring-timeout
@@ -251,13 +248,13 @@ func insertCompletedCallEvent(
 	messageID uuid.UUID,
 	payload CallEventPayload,
 	replaceExisting bool,
-) (err error) {
+) (respawned []uuid.UUID, err error) {
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal completed call event payload: %w", err)
+		return nil, fmt.Errorf("marshal completed call event payload: %w", err)
 	}
 
-	return withCallEventTransaction(ctx, db, "completed dm call event transaction", func(tx *sql.Tx) error {
+	err = withCallEventTransaction(ctx, db, "completed dm call event transaction", func(tx *sql.Tx) error {
 		windowSeconds, err := prepareCallEventInsert(ctx, tx, convID, payload.CallerUserID)
 		if err != nil {
 			return err
@@ -302,19 +299,25 @@ func insertCompletedCallEvent(
 		if err != nil {
 			return fmt.Errorf("insert completed call event row: %w", err)
 		}
-		return respawnDMParticipantVisibility(ctx, tx, convID, createdAt)
+		respawned, err = dmvisibility.Respawn(ctx, tx, convID, createdAt)
+		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+	return respawned, nil
 }
 
 // InsertCompletedCallEvent persists one idempotent completed-call row from the
 // media plane's terminal room snapshot. The server-authoritative call ID doubles
 // as the message ID, so duplicate NATS delivery cannot create duplicate history.
+// It returns the participants the row respawned; the caller publishes them.
 func InsertCompletedCallEvent(
 	ctx context.Context,
 	db *sql.DB,
 	convID uuid.UUID,
 	summary CompletedCallSummary,
-) error {
+) ([]uuid.UUID, error) {
 	// room_empty is authoritative even when best-effort history persistence
 	// fails. Never let an insert error retain the short-lived local handoff and
 	// block a later call until its timer expires.
@@ -324,7 +327,7 @@ func InsertCompletedCallEvent(
 	if summary.CallID == uuid.Nil || summary.CallerUserID == uuid.Nil ||
 		len(summary.ParticipantUserIDs) == 0 || summary.StartedAt.IsZero() ||
 		summary.EndedAt.IsZero() || summary.EndedAt.Before(summary.StartedAt) {
-		return fmt.Errorf("invalid completed call summary")
+		return nil, fmt.Errorf("invalid completed call summary")
 	}
 
 	durationSeconds := int(summary.EndedAt.Sub(summary.StartedAt).Seconds())
@@ -341,10 +344,7 @@ func InsertCompletedCallEvent(
 		Status:             status,
 		DurationSeconds:    durationSeconds,
 	}
-	if err := insertCompletedCallEvent(ctx, db, convID, summary.CallID, payload, true); err != nil {
-		return err
-	}
-	return nil
+	return insertCompletedCallEvent(ctx, db, convID, summary.CallID, payload, true)
 }
 
 // InsertCompletedCallEventForDMHeartbeat persists an exact, idempotent
@@ -356,19 +356,19 @@ func InsertCompletedCallEventForDMHeartbeat(
 	db *sql.DB,
 	convID, callID, ringID, callerUserID uuid.UUID,
 	endedAt time.Time,
-) error {
+) ([]uuid.UUID, error) {
 	if callID == uuid.Nil || callerUserID == uuid.Nil || endedAt.IsZero() {
-		return fmt.Errorf("invalid completed heartbeat call identity")
+		return nil, fmt.Errorf("invalid completed heartbeat call identity")
 	}
 	if ringID != uuid.Nil {
 		defer forgetAcceptedDMCall(convID, ringID)
 	}
 	participants, startedAt, err := loadLiveDMCallParticipants(ctx, db, convID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(participants) == 0 {
-		return nil
+		return nil, nil
 	}
 	if endedAt.Before(startedAt) {
 		startedAt = endedAt
@@ -395,7 +395,7 @@ func InsertCompletedCallEventForDMHeartbeat(
 // recover history only when live presence still exists and no exact shared call
 // owns the conversation. New callers must prefer InsertCompletedCallEvent
 // because voice.left may already have erased those rows.
-func InsertCompletedCallEventForDMRoom(ctx context.Context, db *sql.DB, convID uuid.UUID) error {
+func InsertCompletedCallEventForDMRoom(ctx context.Context, db *sql.DB, convID uuid.UUID) ([]uuid.UUID, error) {
 	accepted, hasAccepted := lookupAcceptedDMCallForConversation(convID)
 	if hasAccepted {
 		// A terminal event must release short-lived caller correlation even when
@@ -405,10 +405,10 @@ func InsertCompletedCallEventForDMRoom(ctx context.Context, db *sql.DB, convID u
 
 	participants, startedAt, err := loadLiveDMCallParticipants(ctx, db, convID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(participants) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	callerUserID := participants[0]
@@ -432,10 +432,7 @@ func InsertCompletedCallEventForDMRoom(ctx context.Context, db *sql.DB, convID u
 		Status:             CallEventCompleted,
 		DurationSeconds:    int(endedAt.Sub(startedAt).Seconds()),
 	}
-	if err := insertCompletedCallEvent(ctx, db, convID, uuid.New(), payload, false); err != nil {
-		return err
-	}
-	return nil
+	return insertCompletedCallEvent(ctx, db, convID, uuid.New(), payload, false)
 }
 
 // callEventCanceled constructs a CallEventPayload for the caller-canceled

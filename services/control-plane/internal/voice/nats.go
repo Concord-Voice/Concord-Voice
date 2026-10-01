@@ -6385,10 +6385,12 @@ func (s *NATSSubscriber) persistDMRoomEmptySummary(
 		// Persist an exact old-call summary even when a newer call now owns
 		// live presence. The call ID makes this insert idempotent and distinct
 		// from the replacement lifecycle.
-		if dm.InsertCompletedCallEvent(ctx, s.db, conversationID, summary) != nil {
+		respawned, insertErr := dm.InsertCompletedCallEvent(ctx, s.db, conversationID, summary)
+		if insertErr != nil {
 			s.log.Error("Failed to insert completed call_event row",
 				"failure_class", "state_write")
 		}
+		s.publishDMRespawn(ctx, conversationID, respawned)
 	default:
 		// Best-effort legacy fallback only. ID-less media events cannot renew or
 		// terminate an exact shared lease and therefore do not provide complete
@@ -6839,12 +6841,12 @@ func (s *NATSSubscriber) persistDMRoomEmptyFallback(
 	endedAt time.Time,
 ) {
 	if event.CallID == "" {
-		if err := dm.InsertCompletedCallEventForDMRoom(
-			ctx, s.db, conversationID,
-		); err != nil {
+		respawned, err := dm.InsertCompletedCallEventForDMRoom(ctx, s.db, conversationID)
+		if err != nil {
 			s.log.Error("Failed to insert legacy completed call_event row",
 				"failure_class", "state_write")
 		}
+		s.publishDMRespawn(ctx, conversationID, respawned)
 		return
 	}
 
@@ -6866,12 +6868,14 @@ func (s *NATSSubscriber) persistDMRoomEmptyFallback(
 			"failure_class", "invalid_event")
 		return
 	}
-	if err := dm.InsertCompletedCallEventForDMHeartbeat(
+	respawned, err := dm.InsertCompletedCallEventForDMHeartbeat(
 		ctx, s.db, conversationID, callID, ringID, callerUserID, endedAt,
-	); err != nil {
+	)
+	if err != nil {
 		s.log.Error("Failed to insert exact heartbeat completed call_event row",
 			"failure_class", "state_write")
 	}
+	s.publishDMRespawn(ctx, conversationID, respawned)
 }
 
 func (s *NATSSubscriber) handleEmptyDMHeartbeat(
@@ -8649,4 +8653,14 @@ func (s *NATSSubscriber) reEnforceDM(ctx context.Context, channelID, userID stri
 		snapshot.ServerDeafened,
 		snapshot.AuthorizationRevision,
 	)
+}
+
+// publishDMRespawn publishes a respawn within the caller's cleanup budget.
+// A frame dropped at the deadline only delays the thread's return until the
+// client's next conversation-list fetch, so it is logged, not retried.
+func (s *NATSSubscriber) publishDMRespawn(ctx context.Context, conversationID uuid.UUID, respawned []uuid.UUID) {
+	if !s.hub.PublishDMRespawnContext(ctx, conversationID, respawned) {
+		s.log.Warn("DM respawn frame dropped at the cleanup deadline",
+			"failure_class", "delivery")
+	}
 }

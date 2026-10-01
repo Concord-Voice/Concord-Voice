@@ -94,9 +94,9 @@ describe('GroupInfoPanel', () => {
     expect(screen.getByTestId('member-user-3')).toBeInTheDocument();
   });
 
-  it('shows Leave Group button for all members', () => {
+  it('shows Leave group button for all members', () => {
     renderPanel();
-    expect(screen.getByText('Leave Group')).toBeInTheDocument();
+    expect(screen.getByText('Leave group')).toBeInTheDocument();
   });
 
   it('shows Hide, Clear, Purge, and a separate Leave action without using native confirm', () => {
@@ -109,7 +109,7 @@ describe('GroupInfoPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Hide thread' }));
     fireEvent.click(screen.getByRole('button', { name: 'Clear history for me' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Leave Group' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Leave group' }));
     expect(mockOnRequestRemoval).toHaveBeenNthCalledWith(1, {
       conversation: mockConversation,
       action: 'hide',
@@ -123,6 +123,19 @@ describe('GroupInfoPanel', () => {
       action: 'leave',
     });
     expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it('puts Leave in its own destructive section, apart from Hide/Clear and Purge', () => {
+    renderPanel();
+    const leave = screen.getByRole('button', { name: 'Leave group' });
+    const purge = screen.getByRole('button', { name: 'Purge Messages' });
+
+    expect(leave).toHaveClass('group-info-delete-btn');
+    expect(leave.previousElementSibling).toHaveClass('group-info-actions-divider');
+    expect(purge.previousElementSibling).toHaveClass('group-info-actions-divider');
+    expect(screen.getByRole('button', { name: 'Hide thread' })).not.toHaveClass(
+      'group-info-delete-btn'
+    );
   });
 
   it('shows Delete Group button for admin/creator', () => {
@@ -154,9 +167,9 @@ describe('GroupInfoPanel', () => {
     expect(screen.queryByLabelText('Edit group name')).not.toBeInTheDocument();
   });
 
-  it('requests Leave confirmation on Leave Group click', () => {
+  it('requests Leave confirmation on Leave group click', () => {
     renderPanel();
-    fireEvent.click(screen.getByRole('button', { name: 'Leave Group' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Leave group' }));
     expect(mockOnRequestRemoval).toHaveBeenCalledWith({
       conversation: mockConversation,
       action: 'leave',

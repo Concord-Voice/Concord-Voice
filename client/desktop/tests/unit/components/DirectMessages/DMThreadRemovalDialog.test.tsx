@@ -129,6 +129,23 @@ describe('DMThreadRemovalDialog', () => {
     expect(screen.getByRole('button', { name: 'Leave group' })).toBeInTheDocument();
   });
 
+  it('styles reversible Hide as neutral and Clear/Leave as destructive', () => {
+    const cases = [
+      { action: 'hide', target: conversation, name: 'Hide thread', neutral: true },
+      { action: 'clear', target: conversation, name: 'Continue', neutral: false },
+      { action: 'leave', target: groupConversation, name: 'Leave group', neutral: false },
+    ] as const;
+    for (const { action, target, name, neutral } of cases) {
+      const { unmount } = renderDialog(action, target);
+      const confirm = screen.getByRole('button', { name });
+      expect(confirm.classList.contains('dm-removal-neutral')).toBe(neutral);
+      expect(document.querySelector('.delete-server-warning.dm-removal-neutral') !== null).toBe(
+        neutral
+      );
+      unmount();
+    }
+  });
+
   it('omits every removal action for personal threads', () => {
     renderDialog('hide', personalConversation);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();

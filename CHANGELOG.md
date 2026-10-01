@@ -25,6 +25,8 @@ account can't provide, never your password twice.
 - **The control plane now supports private DM hide and history-clear operations** ([#3306](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3306)) — authenticated API clients can hide a direct message or group chat from one participant's list, or clear that participant's history before a server-stamped cutoff. Hide preserves history, read state, and the original hide timestamp on retries. Clear uses MFA when enabled or the current password otherwise when Privacy & Security requires authentication; the existing permanent purge action keeps its current password-and-MFA behavior.
 - **Server owners can require MFA for dangerous actions, through the API** ([#3464](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3464), [#3453](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3453)) — a server's owner or an Administrator can turn on `PUT /api/v1/servers/{id}/mfa-enforcement`. While it is on, a member without an authenticator app or security key cannot use the dangerous permissions: managing the server, its roles or its channels, kicking, banning, deleting other members' messages, rotating channel keys, and managing developer resources. Email and text-message codes do not count. That member keeps every other permission and still sees every channel they could see before. Turning it on requires your own authenticator app or security key; turning it off requires a code from one. The app has no setting for it yet ([#3456](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3456)), so for now only API clients can change it.
 - **Direct messages now offer separate Hide, Clear history for me, and Leave group controls** ([#3434](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3434)) — Hide removes a thread from your list until a new message arrives; Clear removes its earlier messages only from your view and asks for account verification when required. Leaving a group ends your membership and access to its messages. Purge Messages remains a separate action.
+- **Purge Messages now uses one range menu and says up front what it deletes** ([#3468](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3468)) — the time range is a single dropdown instead of nine buttons, and in a direct message or group the dialog now says before you choose a range that only your own messages are removed; everyone else's stay for them and are hidden only from you.
+- **Hide now looks like the reversible action it is, and Leave group has its own section** ([#3468](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3468)) — the Hide confirmation no longer uses the red warning styling of Clear history and Leave group, and Group Info now places Leave group in its own section, styled as destructive and separated from Purge Messages.
 - **Font Size is back under Appearance** ([#3401](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3401), [#2367](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2367)) — the
   Small / Default / Large text size now sits in Appearance ▸ Application Font, next to the font it
   changes, instead of in Accessibility ▸ Display. The UI Scale slider stays in Accessibility. Font
@@ -69,6 +71,7 @@ account can't provide, never your password twice.
 
 ### Fixed
 
+- **A hidden conversation now comes back as soon as someone messages it** ([#3468](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3468)) — after you hid a direct message or group, a new message (or call) brought it back only after you restarted the app; it now reappears right away with its full history.
 - **Group messages from before someone left are readable again** ([#3472](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3472)) — when a
   member left or was removed from a group chat, the people who stayed saw
   "Unable to decrypt" on every earlier message after reloading, and in the
@@ -105,7 +108,6 @@ account can't provide, never your password twice.
   permission set the server gives a server's owner did not include the right to mention everyone, so
   an owner's @all or @here was silently removed from the message unless one of their roles also
   granted it. Owners now always have it.
-
 - **Try again on the recovery-key screen now shows each attempt** ([#3433](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3433)) — when creating a recovery
   key failed again after Try again, the screen looked exactly the same, so the button seemed to do
   nothing. The message now counts the attempts.

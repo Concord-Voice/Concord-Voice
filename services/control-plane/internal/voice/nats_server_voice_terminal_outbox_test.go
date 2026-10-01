@@ -659,9 +659,7 @@ func TestServerVoiceTerminalOutbox_MissingChannelSettlesAndBroadcastsCounts(t *t
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
 	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
-	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
-	synchronizeVoiceWireClient(t, conn)
-	waitForVoiceWireType(t, conn, "server_voice_counts")
+	subscribeVoiceWireServer(t, conn, serverID)
 	sub := newTestSubscriberWithHub(ts, hub)
 	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 1)
 	require.NoError(t, err)

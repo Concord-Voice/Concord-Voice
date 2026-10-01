@@ -5214,6 +5214,10 @@ type dmMessageInput struct {
 	mentionAddendum *MentionAddendum
 	attachmentIDs   []string
 	gifSlug         *string
+	// respawned is written by the persist attempt that committed and read by
+	// handleDMMessage afterwards; both run on Run, and each attempt resets it
+	// so a retried transaction cannot publish the rolled-back attempt's users.
+	respawned []uuid.UUID
 }
 
 // dmUnreadLastMessage holds last-message metadata included in dm_unread_notify
@@ -5422,6 +5426,7 @@ func (h *Hub) persistDMMessageWithExpiryAttempt(ctx context.Context, messageID, 
 	var createdAt, updatedAt time.Time
 	var expiresAt *time.Time
 	var attachmentSummaries []models.AttachmentSummary
+	input.respawned = nil
 	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return createdAt, updatedAt, expiresAt, nil, err
@@ -5484,7 +5489,8 @@ func (h *Hub) persistDMMessageWithExpiryAttempt(ctx context.Context, messageID, 
 	).Scan(&createdAt, &updatedAt, &expiresAt); err != nil {
 		return createdAt, updatedAt, expiresAt, nil, err
 	}
-	if err := respawnDMParticipantVisibility(ctx, tx, convUUID, createdAt); err != nil {
+	respawned, err := dmvisibility.Respawn(ctx, tx, convUUID, createdAt)
+	if err != nil {
 		return createdAt, updatedAt, expiresAt, nil, err
 	}
 	attachmentSummaries, err = h.linkDMAttachments(ctx, tx, messageID, userID.String(), input.attachmentIDs, convUUID.String())
@@ -5494,6 +5500,7 @@ func (h *Hub) persistDMMessageWithExpiryAttempt(ctx context.Context, messageID, 
 	if err := tx.Commit(); err != nil {
 		return createdAt, updatedAt, expiresAt, nil, err
 	}
+	input.respawned = respawned
 	return createdAt, updatedAt, expiresAt, attachmentSummaries, nil
 }
 
@@ -5619,6 +5626,8 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 	if input.msgType == "user" && h.opsCounter != nil {
 		h.opsCounter.Increment(opsmetrics.MetricDMMessagesTotal)
 	}
+
+	h.publishDMRespawnFromRun(convUUID, input.respawned)
 
 	nonce, _ := msg.Data[keyNonce].(string)
 	h.sendDMMessageAck(dmMessageAckParams{
@@ -6099,15 +6108,6 @@ func rollbackDMMessageDelivery(tx *sql.Tx) {
 	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 		log.Printf("DM message-derived delivery rollback failed: class=%s", dmMessageDeliveryFailureClass(err))
 	}
-}
-
-func respawnDMParticipantVisibility(ctx context.Context, tx *sql.Tx, conversationID uuid.UUID, createdAt time.Time) error {
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE dm_participants SET hidden_at = NULL
-		WHERE conversation_id = $1 AND hidden_at < $2`, conversationID, createdAt); err != nil {
-		return fmt.Errorf("respawn DM participant visibility: %w", err)
-	}
-	return nil
 }
 
 // userHasDMSubscription checks whether any of a user's clients are subscribed

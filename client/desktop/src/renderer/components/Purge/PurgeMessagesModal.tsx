@@ -67,7 +67,6 @@ type Stage = 'configure' | 'stepup' | 'result';
  */
 function scopeSentence(
   context: PurgeContext,
-  role: 'admin' | 'member',
   scopeName: string,
   phrase: string,
   selfScopeOnly: boolean
@@ -91,24 +90,48 @@ function scopeSentence(
         name: scopeName,
         tail: `? This action cannot be undone. ${SERVER_RANGE_HELPER}`,
       };
+    // DM and group scope is stated by scopeNote, visible before a range is
+    // chosen, so the confirmation sentence does not repeat it.
     case 'dm':
       return {
         lead: `${lead}in your conversation with `,
         name: scopeName,
-        tail:
-          '? This action cannot be undone. Your own messages are removed for both of you; ' +
-          `messages from ${scopeName} are hidden only for you.`,
+        tail: '? This action cannot be undone.',
       };
     case 'group':
       return {
         lead: `${lead}in `,
         name: scopeName,
-        tail:
-          role === 'admin'
-            ? '? This action cannot be undone. Messages are removed for everyone in the group.'
-            : '? This action cannot be undone. Your own messages are removed for everyone; ' +
-              'messages from others are hidden only for you.',
+        tail: '? This action cannot be undone.',
       };
+  }
+}
+
+/**
+ * What a DM or group purge actually deletes, shown from the first paint: a
+ * 1:1 or group-member purge deletes only the actor's own messages and merely
+ * hides everyone else's (#1352 spec §5), which users otherwise read as a purge
+ * that "missed" messages. Channel and server copy already says it in the
+ * sentence.
+ */
+function scopeNote(
+  context: PurgeContext,
+  role: 'admin' | 'member',
+  scopeName: string
+): string | null {
+  switch (context) {
+    case 'dm':
+      return (
+        'Your own messages are removed for both of you. ' +
+        `Messages from ${scopeName} stay for them and are hidden only for you.`
+      );
+    case 'group':
+      return role === 'admin'
+        ? 'As a group admin, you remove messages for everyone in the group.'
+        : 'Your own messages are removed for everyone. ' +
+            'Messages from others stay for them and are hidden only for you.';
+    default:
+      return null;
   }
 }
 
@@ -131,7 +154,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
   const [stepUp, setStepUp] = useState<StepUpPurgeResult | null>(null);
-  const firstRangeRef = useRef<HTMLInputElement>(null);
+  const firstRangeRef = useRef<HTMLSelectElement>(null);
   const stageHeadingRef = useRef<HTMLHeadingElement>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
   const codeRef = useRef<HTMLInputElement>(null);
@@ -315,7 +338,8 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   const sentence =
     range === null
       ? null
-      : scopeSentence(context, role, scopeName, PURGE_RANGE_PHRASES[range], selfScopeOnly);
+      : scopeSentence(context, scopeName, PURGE_RANGE_PHRASES[range], selfScopeOnly);
+  const note = scopeNote(context, role, scopeName);
 
   return (
     <Modal
@@ -410,6 +434,8 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
               firstOptionRef={firstRangeRef}
               helper={context === 'server' ? SERVER_RANGE_HELPER : undefined}
             />
+
+            {note !== null && <p className="purge-modal__scope-note">{note}</p>}
 
             {sentence !== null && (
               <p className="purge-modal__scope">

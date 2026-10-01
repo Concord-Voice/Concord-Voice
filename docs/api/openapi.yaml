@@ -4275,7 +4275,13 @@ paths:
         persisted DM message
         respawns a hidden participant, it does so only when `hidden_at` is
         strictly earlier than the persisted message `created_at`; equality
-        remains hidden. Clear shares the configurable fail-closed per-actor
+        remains hidden. After that write commits, each respawned participant,
+        and no one else, receives `dm_conversation_hidden` with `hidden_at`
+        null. This is the one visibility event the recipient did not
+        initiate: a hidden thread's client has unsubscribed, so no
+        message-derived frame would reach it. Every writer that can respawn
+        publishes it — DM messages, call events, and expiration-policy
+        system rows. Clear shares the configurable fail-closed per-actor
         destructive-operation limit with the other purge routes. Operators set
         the request count and window with `PURGE_RATE_LIMIT` and
         `PURGE_RATE_WINDOW_SEC`; an exceeded limit returns 429 with

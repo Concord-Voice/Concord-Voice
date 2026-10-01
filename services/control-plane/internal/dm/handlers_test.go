@@ -5467,7 +5467,7 @@ func TestInsertCompletedCallEventForDMRoom_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 
 	convUUID := uuid.MustParse(convID)
-	err = dm.InsertCompletedCallEventForDMRoom(context.Background(), ts.DB, convUUID)
+	_, err = dm.InsertCompletedCallEventForDMRoom(context.Background(), ts.DB, convUUID)
 	require.NoError(t, err)
 
 	dbType, payload, found := fetchLatestCallEvent(t, ts, convID)
@@ -5501,7 +5501,7 @@ func TestInsertCompletedCallEventForDMRoom_FutureJoinClampsDuration(t *testing.T
 	`, convID, caller.ID)
 	require.NoError(t, err)
 
-	err = dm.InsertCompletedCallEventForDMRoom(
+	_, err = dm.InsertCompletedCallEventForDMRoom(
 		context.Background(),
 		ts.DB,
 		uuid.MustParse(convID),
@@ -5528,8 +5528,9 @@ func TestInsertCompletedCallEventForDMRoom_NoParticipants_NoOp(t *testing.T) {
 
 	// No dm_voice_participants rows — graceful no-op
 	convUUID := uuid.MustParse(convID)
-	err := dm.InsertCompletedCallEventForDMRoom(context.Background(), ts.DB, convUUID)
+	respawned, err := dm.InsertCompletedCallEventForDMRoom(context.Background(), ts.DB, convUUID)
 	assert.NoError(t, err, "no participants is a graceful no-op, not an error")
+	assert.Empty(t, respawned)
 
 	_, _, found := fetchLatestCallEvent(t, ts, convID)
 	assert.False(t, found, "no call_event row inserted when no participants")

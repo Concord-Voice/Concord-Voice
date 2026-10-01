@@ -402,17 +402,7 @@ func assertPeerVisibilityEventAbsentBeforeBarrier(t *testing.T, conn *gorillaWS.
 		"type": "subscribe_dm",
 		"data": map[string]interface{}{"conversation_id": convID},
 	}))
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
-	for {
-		var frame visibilityWSFrame
-		require.NoError(t, conn.ReadJSON(&frame))
-		if frame.Type == "dm_conversation_hidden" || frame.Type == "dm_conversation_cleared" {
-			t.Fatalf("peer received actor-only visibility event %q", frame.Type)
-		}
-		if frame.Type == "dm_subscribed" {
-			return
-		}
-	}
+	readUntilWithoutVisibilityEvent(t, conn, "dm_subscribed")
 }
 
 func TestDMVisibility_EventsAreActorOnlyAndStatePreserved(t *testing.T) {

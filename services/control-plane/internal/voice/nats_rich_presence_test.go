@@ -177,6 +177,29 @@ func synchronizeVoiceWireClient(t *testing.T, conn *gorillaWS.Conn) {
 	waitForVoiceWireType(t, conn, "connection_ready")
 }
 
+// subscribeVoiceWireServer subscribes conn to serverID and returns once both
+// voice-count frames a fresh connection receives have arrived: the
+// registration snapshot and the subscribe catch-up. Draining only the first
+// counts frame leaves the other in flight, and it then lands in the caller's
+// assertion window carrying a count queried before the fixture wrote
+// participants — a false emission for a negative assertion, a vacuous pass
+// for a positive one.
+func subscribeVoiceWireServer(t *testing.T, conn *gorillaWS.Conn, serverID string) {
+	t.Helper()
+	// Nothing is subscribed yet, so this counts frame can only be the
+	// registration snapshot.
+	waitForVoiceWireType(t, conn, "server_voice_counts")
+	require.NoError(t, conn.WriteJSON(map[string]interface{}{
+		"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID},
+	}))
+	for {
+		counts, _ := waitForVoiceWireType(t, conn, "server_voice_counts").Data["counts"].(map[string]interface{})
+		if _, ok := counts[serverID]; ok {
+			return
+		}
+	}
+}
+
 func TestServerVoiceMissingLifecycleRejectsStaleCrossScopeEventBeforeClaim(t *testing.T) {
 	for _, eventKind := range []string{"join", "heartbeat"} {
 		t.Run(eventKind, func(t *testing.T) {

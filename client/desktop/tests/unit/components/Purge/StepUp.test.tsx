@@ -72,7 +72,7 @@ function renderDm(onClose: () => void = noop) {
 }
 
 async function reachStepUp(user: ReturnType<typeof userEvent.setup>): Promise<void> {
-  await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+  await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
   await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
 }
 

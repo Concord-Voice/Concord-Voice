@@ -1041,7 +1041,7 @@ describe('ChatView', () => {
     const user = userEvent.setup();
     await user.click(manage);
     const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
-    await user.click(screen.getByLabelText('Last hour'));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
     expect(dialog).toHaveTextContent('your messages');
   });
 
@@ -1060,7 +1060,7 @@ describe('ChatView', () => {
     const user = userEvent.setup();
     await user.click(await screen.findByRole('button', { name: /^Purge messages in this/ }));
     const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
-    await user.click(screen.getByLabelText('Last hour'));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
 
     act(() =>
       useChannelStore.setState({

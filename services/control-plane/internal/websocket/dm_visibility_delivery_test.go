@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -373,8 +374,10 @@ func TestRespawnDMParticipantVisibility_StrictlyRequiresLaterMessage(t *testing.
 	t.Run("later timestamp clears both hides", func(t *testing.T) {
 		tx, err := db.Begin()
 		require.NoError(t, err)
-		require.NoError(t, respawnDMParticipantVisibility(context.Background(), tx, conversationID, hiddenAt.Add(time.Microsecond)))
+		respawned, err := dmvisibility.Respawn(context.Background(), tx, conversationID, hiddenAt.Add(time.Microsecond))
+		require.NoError(t, err)
 		require.NoError(t, tx.Commit())
+		assert.ElementsMatch(t, []uuid.UUID{actorID, peerID}, respawned, "Respawn reports exactly the users it revealed")
 
 		var hiddenCount int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, conversationID).Scan(&hiddenCount))
@@ -386,8 +389,10 @@ func TestRespawnDMParticipantVisibility_StrictlyRequiresLaterMessage(t *testing.
 	t.Run("equal timestamp remains hidden", func(t *testing.T) {
 		tx, err := db.Begin()
 		require.NoError(t, err)
-		require.NoError(t, respawnDMParticipantVisibility(context.Background(), tx, conversationID, hiddenAt))
+		respawned, err := dmvisibility.Respawn(context.Background(), tx, conversationID, hiddenAt)
+		require.NoError(t, err)
 		require.NoError(t, tx.Commit())
+		assert.Empty(t, respawned, "no user is reported when nothing was revealed")
 
 		var hiddenCount int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, conversationID).Scan(&hiddenCount))

@@ -267,7 +267,8 @@ func TestCompletedCallEventUsesEndedAtAndPreservesExpiryOnConflict(t *testing.T)
 			_, err := ts.DB.Exec(`UPDATE dm_conversations SET expiration_window_seconds = $1 WHERE id = $2`, tc.window, convID)
 			require.NoError(t, err)
 			summary.CallID = uuid.New()
-			require.NoError(t, dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, summary))
+			_, err = dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, summary)
+			require.NoError(t, err)
 			var created time.Time
 			var expires sql.NullTime
 			require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, summary.CallID).Scan(&created, &expires))
@@ -287,12 +288,14 @@ func TestCompletedCallEventUsesEndedAtAndPreservesExpiryOnConflict(t *testing.T)
 	first := summary
 	first.CallID = conflictID
 	first.EndedAt = endedAt
-	require.NoError(t, dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, first))
+	_, err = dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, first)
+	require.NoError(t, err)
 	var firstCreated, firstExpires time.Time
 	require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, conflictID).Scan(&firstCreated, &firstExpires))
 	second := first
 	second.EndedAt = endedAt.Add(24 * time.Hour)
-	require.NoError(t, dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, second))
+	_, err = dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, second)
+	require.NoError(t, err)
 	var created, expires time.Time
 	require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, conflictID).Scan(&created, &expires))
 	assert.Equal(t, firstCreated, created, "upsert preserves persisted message creation time")

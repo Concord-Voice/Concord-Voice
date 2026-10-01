@@ -189,10 +189,12 @@ describe('Group DM purge entry point', () => {
     );
 
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
-    expect(screen.getAllByRole('radio')).toHaveLength(9);
+    expect(
+      screen.getAllByRole('option').filter((o) => !(o as HTMLOptionElement).disabled)
+    ).toHaveLength(9);
 
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
-    expect(screen.getByText(/removed for everyone in the group/i)).toBeInTheDocument();
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
+    expect(screen.getByText(/you remove messages for everyone in the group/i)).toBeInTheDocument();
   });
 
   it('passes the member role for a non-admin participant', async () => {
@@ -212,7 +214,7 @@ describe('Group DM purge entry point', () => {
     );
 
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     expect(screen.getByText(/hidden only for you/i)).toBeInTheDocument();
   });
 });
@@ -231,7 +233,7 @@ describe('ManageOwn-only self-scope copy', () => {
       />
     );
 
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     expect(screen.getByText(/purge your messages from the last 7 days/i)).toBeInTheDocument();
   });
 
@@ -248,7 +250,7 @@ describe('ManageOwn-only self-scope copy', () => {
       />
     );
 
-    await user.click(screen.getByRole('radio', { name: 'Last 7 days' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     expect(screen.getByText(/in channels you moderate/i)).toBeInTheDocument();
   });
 });

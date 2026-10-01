@@ -175,7 +175,7 @@ func TestInsertCompletedCallEvent_ForgetsAcceptedCorrelationOnInsertFailure(t *t
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	err = InsertCompletedCallEvent(context.Background(), db, convID, CompletedCallSummary{
+	_, err = InsertCompletedCallEvent(context.Background(), db, convID, CompletedCallSummary{
 		CallID:             ring.RingID,
 		RingID:             ring.RingID,
 		CallerUserID:       ring.CallerUserID,
@@ -198,8 +198,24 @@ func TestInsertCompletedCallEventForDMRoom_ForgetsAcceptedCorrelationOnFallbackF
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	err = InsertCompletedCallEventForDMRoom(context.Background(), db, convID)
+	_, err = InsertCompletedCallEventForDMRoom(context.Background(), db, convID)
 	require.Error(t, err)
 	_, ok := lookupAcceptedDMCall(convID, ring.RingID)
 	assert.False(t, ok, "legacy terminal cleanup must not depend on live presence or history persistence")
+}
+
+// The validation guards return before any database work, so a nil *sql.DB is
+// safe here and proves nothing was written or respawned.
+func TestInsertCompletedCallEvent_RejectsAnIncompleteSummary(t *testing.T) {
+	respawned, err := InsertCompletedCallEvent(context.Background(), nil, uuid.New(), CompletedCallSummary{})
+	require.Error(t, err)
+	assert.Nil(t, respawned)
+}
+
+func TestInsertCompletedCallEventForDMHeartbeat_RejectsAMissingIdentity(t *testing.T) {
+	respawned, err := InsertCompletedCallEventForDMHeartbeat(
+		context.Background(), nil, uuid.New(), uuid.Nil, uuid.Nil, uuid.Nil, time.Time{},
+	)
+	require.Error(t, err)
+	assert.Nil(t, respawned)
 }
