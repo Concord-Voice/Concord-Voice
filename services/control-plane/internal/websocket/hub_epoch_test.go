@@ -549,3 +549,24 @@ func TestExtractKeyVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleDMMessageUnissuedEpochRejected(t *testing.T) {
+	setup := setupEpochTest(t, true, false)
+
+	setup.hub.handleDMMessage(IncomingMessage{
+		Type:     msgTypeDM,
+		UserID:   setup.user1,
+		ClientID: setup.client.ID,
+		Data: map[string]interface{}{
+			keyConversationID: setup.convID,
+			keyContent:        "labelled with an epoch nobody holds",
+			"key_version":     float64(2),
+		},
+	})
+
+	resp := readClientMsg(t, setup.client)
+	assert.Equal(t, "error", resp["type"])
+	var rows int
+	require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&rows))
+	assert.Zero(t, rows)
+}

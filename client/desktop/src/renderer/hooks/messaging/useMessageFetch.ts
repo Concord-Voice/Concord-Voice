@@ -117,7 +117,10 @@ export function reconcileFetchedMessages(
 }
 
 /**
- * Decrypt a single ciphertext using the appropriate key version.
+ * Decrypt a single ciphertext with the key epoch it is labelled with. Epoch 1
+ * is an epoch like any other: after a member leaves, the current key is epoch
+ * 2, and treating 1 as "current" loses the pre-leave history. Only an
+ * unlabelled row uses the current key.
  * Prefers pre-fetched keys from the batch maps; falls back to on-demand fetch.
  */
 async function decryptContent(
@@ -130,10 +133,17 @@ async function decryptContent(
 ): Promise<string> {
   operationGuard.assertCurrent();
   let plaintext: string;
-  if (keyVersion && keyVersion > 1) {
+  if (keyVersion) {
     const vKey = versionedKeys.get(keyVersion);
+    // A row labelled 1 that its own key cannot open may predate #2832. The
+    // service owns that legacy fallback, so hand the row over rather than fail.
     plaintext = vKey
-      ? await e2eeService.decryptWithKey(ciphertext, vKey, operationGuard)
+      ? await e2eeService.decryptWithKey(ciphertext, vKey, operationGuard).catch((err) => {
+          // A superseded operation is a fence, never a miss to retry.
+          operationGuard.assertCurrent();
+          if (keyVersion !== 1) throw err;
+          return e2eeService.decryptForChannelWithVersion(channelId, ciphertext, 1);
+        })
       : await e2eeService.decryptForChannelWithVersion(channelId, ciphertext, keyVersion);
   } else {
     plaintext = channelKey
@@ -177,19 +187,22 @@ async function decryptMessages(
   try {
     channelKey = await e2eeService.getChannelKey(channelId);
   } catch {
-    // Key not available yet — individual messages will show pending/failed state
+    // A superseded operation is a fence, never a miss: stop before the
+    // versioned prefetch runs under the new key generation. A plain miss
+    // leaves individual messages to show pending/failed state.
+    operationGuard.assertCurrent();
   }
 
-  // Pre-fetch each unique historical key version ONCE to avoid N parallel
-  // getChannelKeyByVersion() calls.
+  // Pre-fetch each labelled key version ONCE to avoid N parallel
+  // getChannelKeyByVersion() calls. The current epoch is a cache hit there.
   const versionedKeys = new Map<number, CryptoKey>();
   const uniqueVersions = new Set<number>();
   for (const m of rawMsgs) {
-    if (m.key_version && m.key_version > 1) {
+    if (m.key_version) {
       uniqueVersions.add(m.key_version);
     }
     const rt = m.replied_to;
-    if (rt?.key_version && rt.key_version > 1) {
+    if (rt?.key_version) {
       uniqueVersions.add(rt.key_version);
     }
   }

@@ -17,6 +17,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -3656,6 +3657,24 @@ func (h *Hub) enforceWSEpoch(msg IncomingMessage, channelUUID uuid.UUID, channel
 		})
 		return false
 	}
+	issued, err := keyrotation.IssuedChannelEpoch(context.Background(), h.db, channelUUID.String())
+	return h.admitIssuedEpoch(msg, keyVersion, issued, err)
+}
+
+// admitIssuedEpoch rejects a label above the context's newest issued epoch.
+// Such a ciphertext names a key nobody holds, and every reader that sees the
+// label fetches a key that does not exist (#2822). A lookup failure fails
+// closed.
+func (h *Hub) admitIssuedEpoch(msg IncomingMessage, keyVersion, issued int, lookupErr error) bool {
+	if lookupErr != nil {
+		log.Printf("Failed to resolve issued key epoch: %v", lookupErr)
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
+		return false
+	}
+	if keyVersion > issued {
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
+		return false
+	}
 	return true
 }
 
@@ -3929,6 +3948,20 @@ func (h *Hub) persistMessageWithExpiry(p persistMessageParams) (uuid.UUID, time.
 	}
 	if timedOutUntil != nil {
 		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgMemberTimedOut, timedOutUntil
+	}
+	// enforceWSEpoch ran before this transaction. A rotation holds the channel
+	// row FOR UPDATE until it commits its revocation, so under the FOR SHARE
+	// above this read sees any revocation committed since (the REST and DM
+	// writers recheck the same way).
+	var revoked bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = $2)`,
+		p.channelUUID, p.keyVersion,
+	).Scan(&revoked); err != nil || revoked {
+		if err != nil {
+			log.Printf("Failed to recheck message key epoch: %v", err)
+		}
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedVerifyKeyEpoch, nil
 	}
 	var window any
 	if windowSeconds.Valid {
@@ -5186,11 +5219,12 @@ type dmMessageInput struct {
 // dmUnreadLastMessage holds last-message metadata included in dm_unread_notify
 // so that clients can update conversation previews and ordering in real-time.
 type dmUnreadLastMessage struct {
-	messageID uuid.UUID
-	content   string
-	userID    string
-	username  string
-	createdAt time.Time
+	messageID  uuid.UUID
+	content    string
+	keyVersion int
+	userID     string
+	username   string
+	createdAt  time.Time
 	// Attachment metadata for the sidebar preview (#2364). Populated from
 	// attachments[0] — linkAttachmentsToTable re-sorts by position ascending and
 	// returns only successfully-linked rows, so [0] is "lowest position, live
@@ -5344,7 +5378,8 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 		return false
 	}
 	if !epochRevoked {
-		return true
+		issued, err := keyrotation.IssuedDMEpoch(context.Background(), h.db, convUUID.String())
+		return h.admitIssuedEpoch(msg, keyVersion, issued, err)
 	}
 	currentEpoch := 1
 	if err := h.db.QueryRow(
@@ -5596,11 +5631,12 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 		attachments: attachments, convPersonal: convPersonal,
 	})
 	lastMsg := dmUnreadLastMessage{
-		messageID: messageID,
-		content:   input.content,
-		userID:    msg.UserID.String(),
-		username:  client.Username,
-		createdAt: createdAt,
+		messageID:  messageID,
+		content:    input.content,
+		keyVersion: input.keyVersion,
+		userID:     msg.UserID.String(),
+		username:   client.Username,
+		createdAt:  createdAt,
 	}
 	if len(attachments) > 0 {
 		lastMsg.attachmentType = attachments[0].FileType
@@ -5622,6 +5658,11 @@ func (h *Hub) sendDMUnreadNotify(conversationID, senderUserID uuid.UUID, lastMsg
 		keyUserID:    lastMsg.userID,
 		keyUsername:  lastMsg.username,
 		keyCreatedAt: lastMsg.createdAt,
+	}
+	// The preview ciphertext's epoch, so a client does not have to guess it
+	// is the current key (it is not, across a rotation).
+	if lastMsg.keyVersion > 0 {
+		lastMessage[keyKeyVersion] = lastMsg.keyVersion
 	}
 	// Conditional, mirroring the REST side's omitempty: an absent key and an
 	// empty string must not mean the same thing to the client.

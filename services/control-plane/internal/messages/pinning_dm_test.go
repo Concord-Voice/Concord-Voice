@@ -301,6 +301,44 @@ func TestGetChannelPins_DM_ReturnsPins(t *testing.T) {
 	}
 }
 
+// A pinned DM row must carry its key epoch: after a group member leaves, the
+// current key is epoch 2 and a pre-leave pin opens only with the epoch-1 key
+// (#2822). A NULL legacy label reads as 1, matching the DM message fetch.
+func TestGetChannelPins_DM_CarriesKeyVersion(t *testing.T) {
+	ts := setupTS(t)
+	u1 := ts.CreateTestUser(t, "dmpinkv_a")
+	u2 := ts.CreateTestUser(t, "dmpinkv_b")
+	convID := ts.CreateDMConversation(t, u1.ID, u2.ID)
+
+	want := map[string]float64{}
+	for label, kv := range map[string]interface{}{"epoch two": 2, "epoch one": 1, "legacy": nil} {
+		id := insertDMMessageDirect(t, ts, convID, u1.ID, label)
+		_, err := ts.DB.Exec(
+			`UPDATE dm_messages SET key_version = $2, pinned_at = NOW(), pinned_by = $3 WHERE id = $1`,
+			id, kv, u1.ID,
+		)
+		require.NoError(t, err)
+		want[id] = 1
+		if kv == 2 {
+			want[id] = 2
+		}
+	}
+
+	w := ts.DoRequest("GET", pinAPICh+convID+pinsPath, nil,
+		testhelpers.AuthHeaders(u1.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, bodyFmtPlaceholder, w.Body.String())
+	var resp struct {
+		PinnedMessages []map[string]interface{} `json:"pinned_messages"`
+	}
+	testhelpers.ParseJSON(t, w, &resp)
+	require.Len(t, resp.PinnedMessages, len(want))
+	for _, m := range resp.PinnedMessages {
+		id, ok := m["id"].(string)
+		require.True(t, ok)
+		assert.Equal(t, want[id], m["key_version"], "pin %s", id)
+	}
+}
+
 func TestGetChannelPins_DM_NonParticipant_404(t *testing.T) {
 	ts := setupTS(t)
 	u1 := ts.CreateTestUser(t, "dmgetpins_np_a")

@@ -323,6 +323,52 @@ describe('ws-events schemas — happy path (one per event)', () => {
       expect(data.last_message?.attachment_mime).toBe('image/jpeg');
     });
 
+    it('preserves the preview key epoch on dm_unread_notify and dm_conversation_created', () => {
+      const unread = WebSocketEventSchema.safeParse({
+        type: 'dm_unread_notify',
+        data: {
+          conversation_id: UUID_A,
+          last_message: { content: 'ct', user_id: UUID_B, created_at: ISO_NOW, key_version: 2 },
+        },
+      });
+      const created = WebSocketEventSchema.safeParse({
+        type: 'dm_conversation_created',
+        data: {
+          conversation: {
+            id: UUID_A,
+            is_group: true,
+            created_at: ISO_NOW,
+            last_message: { content: 'ct', user_id: UUID_B, created_at: ISO_NOW, key_version: 1 },
+          },
+        },
+      });
+      expect(unread.success && created.success).toBe(true);
+      if (!unread.success || !created.success) return;
+      const unreadData = unread.data.data as { last_message?: Record<string, unknown> };
+      const createdData = created.data.data as {
+        conversation: { last_message?: Record<string, unknown> };
+      };
+      expect(unreadData.last_message?.key_version).toBe(2);
+      expect(createdData.conversation.last_message?.key_version).toBe(1);
+    });
+
+    it.each([0, -1, 1.5])(
+      'drops a malformed preview key epoch (%s) without rejecting the frame',
+      (bad) => {
+        const parsed = WebSocketEventSchema.safeParse({
+          type: 'dm_unread_notify',
+          data: {
+            conversation_id: UUID_A,
+            last_message: { content: 'ct', user_id: UUID_B, created_at: ISO_NOW, key_version: bad },
+          },
+        });
+        expect(parsed.success).toBe(true);
+        if (!parsed.success) return;
+        const data = parsed.data.data as { last_message?: Record<string, unknown> };
+        expect(data.last_message?.key_version).toBeUndefined();
+      }
+    );
+
     it('accepts a frame with both fields absent', () => {
       const parsed = WebSocketEventSchema.safeParse({
         type: 'dm_unread_notify',

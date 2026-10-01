@@ -99,6 +99,9 @@ func TestHandleDMMessage_UnreadNotifyCarriesRealAttachmentMetadata(t *testing.T)
 	require.True(t, ok, "last_message must be present in dm_unread_notify")
 	assert.Equal(t, "photo", lm["attachment_type"])
 	assert.Equal(t, "image/jpeg", lm["attachment_mime"])
+	// The preview's epoch rides along, so the recipient opens it with that
+	// key rather than the current one (which a later rotation replaces).
+	assert.Equal(t, float64(1), lm[keyKeyVersion])
 }
 
 // TestHandleDMMessage_UnreadNotifyUsesFirstAttachmentWhenMultiple pins that

@@ -194,6 +194,7 @@ func TestSendMessageE2EEWithKeyVersion(t *testing.T) {
 	user := ts.CreateTestUser(t, "sendkeyver")
 	serverID := ts.CreateTestServer(t, user.ID, "KeyVer Server")
 	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	issueChannelEpoch(t, ts, channelID, user.ID, 2)
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
 		"channel_id":  channelID,
@@ -392,6 +393,7 @@ func TestUpdateMessage_StoresKeyVersion(t *testing.T) {
 	msgID := ts.CreateTestMessage(t, channelID, user, originalCiphertext)
 	editedCiphertext := testhelpers.ValidCiphertext()
 	require.NotEqual(t, originalCiphertext, editedCiphertext)
+	issueChannelEpoch(t, ts, channelID, user.ID, 2)
 
 	w := ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
 		"content":     editedCiphertext,
@@ -1193,6 +1195,7 @@ func TestSendMessagePersistsSubmittedKeyVersion(t *testing.T) {
 	user := ts.CreateTestUser(t, "sendkv3")
 	serverID := ts.CreateTestServer(t, user.ID, "KV3 Server")
 	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	issueChannelEpoch(t, ts, channelID, user.ID, 3)
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
 		"channel_id":  channelID,
@@ -1314,4 +1317,57 @@ func TestSendMessagePermissionDenied(t *testing.T) {
 	}, testhelpers.AuthHeaders(member.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// A write labelled with an epoch the channel never issued names a key nobody
+// holds: every reader that sees the label fetches a key that does not exist.
+func TestSendMessage_RejectsUnissuedEpoch(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "sendunissued")
+	serverID := ts.CreateTestServer(t, user.ID, "Unissued Epoch Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+
+	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 7,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "epoch_unissued", body["code"])
+	var rows int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM messages WHERE channel_id = $1`, channelID).Scan(&rows))
+	assert.Zero(t, rows)
+}
+
+func TestUpdateMessage_RejectsUnissuedEpoch(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updunissued")
+	serverID := ts.CreateTestServer(t, user.ID, "Update Unissued Epoch Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := ts.CreateTestMessage(t, channelID, user, originalCiphertext)
+
+	w := ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 7,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var storedContent string
+	require.NoError(t, ts.DB.QueryRow(`SELECT content FROM messages WHERE id = $1`, msgID).Scan(&storedContent))
+	assert.Equal(t, originalCiphertext, storedContent)
+}
+
+// issueChannelEpoch rotates channelID up to epoch, as the rotator would, so a
+// write may claim it: writers refuse a label above the issued epoch (#2822).
+func issueChannelEpoch(t *testing.T, ts *testhelpers.TestServer, channelID, userID string, epoch int) {
+	t.Helper()
+	for successor := 2; successor <= epoch; successor++ {
+		_, err := ts.DB.Exec(`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+			VALUES ($1, $2, $3, 'rotation', $4)`, channelID, successor-1, successor, userID)
+		require.NoError(t, err)
+	}
 }

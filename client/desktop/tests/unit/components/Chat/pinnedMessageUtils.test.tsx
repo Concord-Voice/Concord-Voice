@@ -265,6 +265,85 @@ describe('decryptPins', () => {
     expect(mockDecryptWithKey).toHaveBeenCalledWith('ct-v3', vKey, mockOperationGuard);
   });
 
+  it('opens a key_version 1 pin with the epoch-1 key, not the current key', async () => {
+    await setE2EEInitialized(true);
+    const currentKey = {} as CryptoKey;
+    const epochOneKey = {} as CryptoKey;
+    mockGetChannelKey.mockResolvedValue(currentKey);
+    mockGetChannelKeyByVersion.mockResolvedValue(epochOneKey);
+    mockDecryptWithKey.mockImplementation(async (_content: string, key: CryptoKey) => {
+      if (key === epochOneKey) return 'pinned before the leave';
+      throw new Error('wrong key');
+    });
+
+    const pin = { ...baseMsg, content: 'ct-v1', key_version: 1 };
+    const result = await decryptPins('ctx-1', [pin]);
+
+    expect(result[0].content).toBe('pinned before the leave');
+    expect(mockGetChannelKeyByVersion).toHaveBeenCalledWith('ctx-1', 1);
+  });
+
+  it('hands a key_version 1 pin its own key cannot open to the service fallback (#2832)', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockGetChannelKeyByVersion.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockRejectedValue(new Error('OperationError'));
+    mockDecryptForChannelWithVersion.mockResolvedValue('legacy pin');
+
+    const pin = { ...baseMsg, content: 'ct-legacy', key_version: 1 };
+    const result = await decryptPins('ctx-1', [pin]);
+
+    expect(result[0].content).toBe('legacy pin');
+    expect(mockDecryptForChannelWithVersion).toHaveBeenCalledWith('ctx-1', 'ct-legacy', 1);
+  });
+
+  it('does not read a superseded key_version 1 pin as a miss to retry', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockGetChannelKeyByVersion.mockResolvedValue({} as CryptoKey);
+    const fence = new Error('superseded');
+    let superseded = false;
+    mockOperationGuard.assertCurrent.mockImplementation(() => {
+      if (superseded) throw fence;
+    });
+    mockDecryptWithKey.mockImplementation(async () => {
+      superseded = true;
+      throw fence;
+    });
+
+    try {
+      const pin = { ...baseMsg, content: 'ct-fenced', key_version: 1 };
+      await decryptPins('ctx-1', [pin]).catch(() => {});
+
+      expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
+    } finally {
+      mockOperationGuard.assertCurrent.mockReset();
+    }
+  });
+
+  it('does not read a prefetch the key generation superseded as a miss to refetch', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    const fence = new Error('superseded');
+    let superseded = false;
+    mockOperationGuard.assertCurrent.mockImplementation(() => {
+      if (superseded) throw fence;
+    });
+    // The rotation lands while the epoch-1 prefetch is in flight.
+    mockGetChannelKeyByVersion.mockImplementation(async () => {
+      superseded = true;
+      throw fence;
+    });
+
+    try {
+      const pin = { ...baseMsg, content: 'ct-prefetch-fenced', key_version: 1 };
+      await expect(decryptPins('ctx-1', [pin])).rejects.toBe(fence);
+      expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
+    } finally {
+      mockOperationGuard.assertCurrent.mockReset();
+    }
+  });
+
   it('falls back to decryptForChannelWithVersion when versioned key fetch fails', async () => {
     await setE2EEInitialized(true);
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);

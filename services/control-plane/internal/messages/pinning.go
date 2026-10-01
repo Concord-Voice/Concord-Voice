@@ -591,6 +591,7 @@ type dmPinnedMessage struct {
 	UserID         string     `json:"user_id"`
 	Content        string     `json:"content"`
 	Type           string     `json:"type"`
+	KeyVersion     int        `json:"key_version"`
 	PinnedAt       *time.Time `json:"pinned_at"`
 	PinnedBy       *string    `json:"pinned_by"`
 	EditedAt       *time.Time `json:"edited_at,omitempty"`
@@ -628,7 +629,7 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 	//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	rows, err := h.db.Query(`
-		SELECT dm.id, dm.conversation_id, dm.user_id, dm.content, dm.type,
+		SELECT dm.id, dm.conversation_id, dm.user_id, dm.content, dm.type, COALESCE(dm.key_version, 1),
 		       dm.pinned_at, dm.pinned_by, dm.edited_at, dm.expires_at, dm.created_at, dm.updated_at,
 		       u.username, u.display_name, u.avatar_url
 		FROM dm_messages dm
@@ -648,7 +649,7 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 	for rows.Next() {
 		var m dmPinnedMessage
 		if scanErr := rows.Scan(
-			&m.ID, &m.ConversationID, &m.UserID, &m.Content, &m.Type,
+			&m.ID, &m.ConversationID, &m.UserID, &m.Content, &m.Type, &m.KeyVersion,
 			&m.PinnedAt, &m.PinnedBy, &m.EditedAt, &m.ExpiresAt, &m.CreatedAt, &m.UpdatedAt,
 			&m.Username, &m.DisplayName, &m.AvatarURL,
 		); scanErr != nil {

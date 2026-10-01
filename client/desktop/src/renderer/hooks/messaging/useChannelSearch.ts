@@ -65,7 +65,7 @@ export async function decryptMessageContent(
     return null;
   }
   try {
-    if (msg.key_version && msg.key_version > 1) {
+    if (msg.key_version) {
       return await e2eeService.decryptForChannelWithVersion(scope, msg.content, msg.key_version);
     }
     return await e2eeService.decryptForChannel(scope, msg.content);

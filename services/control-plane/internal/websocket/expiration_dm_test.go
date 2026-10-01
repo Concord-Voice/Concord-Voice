@@ -86,6 +86,25 @@ func TestPersistMessage_UsesSharedExpirationPolicy(t *testing.T) {
 	}
 }
 
+// enforceWSEpoch runs before the write transaction, so a rotation committing
+// in between must be caught inside it (Codex #3472 review).
+func TestPersistMessage_RechecksRevocationInsideTransaction(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelID := mustUUID(t, setup.convID)
+	incarnation := membershipIncarnation(t, setup.db, setup.user2, setup.user1)
+	_, err := setup.db.Exec(`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by) VALUES ($1, 1, 2, 'test', $2)`, channelID, setup.user1)
+	require.NoError(t, err)
+
+	_, _, _, _, _, persistErr, _ := setup.hub.persistMessageWithExpiry(persistMessageParams{
+		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		content: "ciphertext", keyVersion: 1,
+	})
+	assert.Equal(t, errMsgFailedVerifyKeyEpoch, persistErr)
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE channel_id = $1`, channelID).Scan(&count))
+	assert.Zero(t, count, "a revoked-epoch frame must not be persisted")
+}
+
 func TestSendDMMessageAckIncludesExpiry(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
 	var messageID uuid.UUID

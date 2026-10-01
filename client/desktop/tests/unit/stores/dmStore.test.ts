@@ -282,6 +282,19 @@ describe('dmStore', () => {
       // conv-2 (no lastMessage, createdAt=2025-01-02) should sort before conv-1 (lastMessage=2024)
       expect(useDMStore.getState().conversations[0].id).toBe('conv-2');
     });
+
+    // An older server's notify carries no key_version (Codex #3472 review).
+    it('keeps the preview epoch when a notify for the same ciphertext omits it', () => {
+      useDMStore.getState().addConversation(mockConversation);
+      const base = { userId: 'user-1', username: 'alice', createdAt: '2025-06-01T00:00:00Z' };
+      useDMStore.getState().updateLastMessage('conv-1', { ...base, content: 'C', keyVersion: 1 });
+
+      useDMStore.getState().updateLastMessage('conv-1', { ...base, content: 'C' });
+      expect(useDMStore.getState().conversations[0].lastMessage?.keyVersion).toBe(1);
+
+      useDMStore.getState().updateLastMessage('conv-1', { ...base, content: 'D' });
+      expect(useDMStore.getState().conversations[0].lastMessage?.keyVersion).toBeUndefined();
+    });
   });
 
   // ── bumpConversation ──────────────────────────────────────────────────
@@ -501,6 +514,7 @@ describe('dmStore', () => {
                   user_id: 'user-1',
                   username: 'alice',
                   created_at: '2025-01-01T12:00:00Z',
+                  key_version: 1,
                 },
                 unread_count: 3,
                 created_at: '2025-01-01T00:00:00Z',
@@ -514,7 +528,35 @@ describe('dmStore', () => {
       const conv = useDMStore.getState().conversations[0];
       expect(conv.lastMessage?.content).toBe('Hi!');
       expect(conv.lastMessage?.userId).toBe('user-1');
+      // The preview's epoch survives mapping, so it decrypts with its own key.
+      expect(conv.lastMessage?.keyVersion).toBe(1);
       expect(conv.unreadCount).toBe(3);
+    });
+
+    it('drops a malformed REST preview key epoch', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, () =>
+          HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-bad-epoch',
+                is_group: false,
+                participants: [],
+                last_message: {
+                  content: 'ct',
+                  user_id: 'user-1',
+                  created_at: '2025-01-01T12:00:00Z',
+                  key_version: 1.5,
+                },
+                created_at: '2025-01-01T00:00:00Z',
+              },
+            ],
+          })
+        )
+      );
+
+      await useDMStore.getState().fetchConversations();
+      expect(useDMStore.getState().conversations[0].lastMessage?.keyVersion).toBeUndefined();
     });
 
     it('maps call-event metadata from the last message', async () => {

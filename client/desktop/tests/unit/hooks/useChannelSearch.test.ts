@@ -170,12 +170,13 @@ describe('useChannelSearch helpers', () => {
       expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
     });
 
-    it('decrypts with decryptForChannel for version 1', async () => {
-      mockDecryptForChannel.mockResolvedValueOnce('decrypted text');
+    it('decrypts version 1 with its own epoch, not the current key', async () => {
+      mockDecryptForChannelWithVersion.mockResolvedValueOnce('decrypted text');
       const msg = makeMsg({ key_version: 1, content: 'enc' });
       const result = await decryptMessageContent(msg, 'ch-1');
       expect(result).toBe('decrypted text');
-      expect(mockDecryptForChannel).toHaveBeenCalledWith('ch-1', 'enc');
+      expect(mockDecryptForChannelWithVersion).toHaveBeenCalledWith('ch-1', 'enc', 1);
+      expect(mockDecryptForChannel).not.toHaveBeenCalled();
     });
 
     it('decrypts with decryptForChannelWithVersion for version > 1', async () => {
@@ -187,7 +188,7 @@ describe('useChannelSearch helpers', () => {
     });
 
     it('returns null on decryption failure', async () => {
-      mockDecryptForChannel.mockRejectedValueOnce(new Error('key not found'));
+      mockDecryptForChannelWithVersion.mockRejectedValueOnce(new Error('key not found'));
       const msg = makeMsg({ key_version: 1, content: 'enc' });
       const result = await decryptMessageContent(msg, 'ch-1');
       expect(result).toBeNull();
@@ -303,7 +304,7 @@ describe('useChannelSearch helpers', () => {
 
     it('skips message when decryption fails', async () => {
       mockIsIndexed.mockReturnValueOnce(false);
-      mockDecryptForChannel.mockRejectedValueOnce(new Error('fail'));
+      mockDecryptForChannelWithVersion.mockRejectedValueOnce(new Error('fail'));
       const onNewResult = vi.fn();
       const msg = makeMsg({ key_version: 1, content: 'enc' });
       await processBackfillMessage(msg, 'ch-1', 'test', new Set(), mockBackfillGuard, onNewResult);

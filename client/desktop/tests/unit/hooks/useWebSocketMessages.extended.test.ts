@@ -521,6 +521,32 @@ describe('useWebSocketMessages — extended handlers', () => {
       expect(conversation?.lastMessage).toBeNull();
       expect(notificationSoundService.play).not.toHaveBeenCalled();
     });
+
+    it('stores the preview key epoch so the sidebar decrypts with the right key', () => {
+      const ws = createMockWsService();
+      addDMConversation('conv-1');
+      renderHook(() => useWebSocketMessages(ws as never));
+
+      const handler = ws.handlers.get('dm_unread_notify')!;
+      act(() => {
+        handler({
+          type: 'dm_unread_notify',
+          data: {
+            conversation_id: 'conv-1',
+            last_message: {
+              content: 'ciphertext',
+              user_id: 'user-2',
+              username: 'alice',
+              created_at: '2025-01-01T02:00:00Z',
+              key_version: 2,
+            },
+          },
+        });
+      });
+
+      const conversation = useDMStore.getState().conversations.find((c) => c.id === 'conv-1');
+      expect(conversation?.lastMessage?.keyVersion).toBe(2);
+    });
   });
 
   describe('dm_conversation_created handler', () => {

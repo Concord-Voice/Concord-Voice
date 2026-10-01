@@ -1949,6 +1949,9 @@ func TestUpdateMessage_StoresKeyVersion(t *testing.T) {
 	msgID := insertDMMessage(t, ts, convID, user1.ID, originalCiphertext)
 	editedCiphertext := testhelpers.ValidCiphertext()
 	require.NotEqual(t, originalCiphertext, editedCiphertext)
+	// Epoch 2 must be issued before an edit may claim it.
+	_, err := ts.DB.Exec(`INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped-v2', 2)`, convID, user1.ID)
+	require.NoError(t, err)
 
 	w := ts.DoRequest("PATCH", pathDMConversationsPrefix+convID+pathMsgSlash+msgID, map[string]interface{}{
 		"content":     editedCiphertext,
@@ -1965,7 +1968,7 @@ func TestUpdateMessage_StoresKeyVersion(t *testing.T) {
 
 	var storedContent string
 	var storedKeyVersion int
-	err := ts.DB.QueryRow(
+	err = ts.DB.QueryRow(
 		`SELECT content, key_version FROM dm_messages WHERE id = $1`,
 		msgID,
 	).Scan(&storedContent, &storedKeyVersion)
@@ -6137,12 +6140,12 @@ func TestDMLastMessage_AttachmentMetadata(t *testing.T) {
 	}
 }
 
-// TestDMLastMessage_KeySetIsExactlySixFields is the C2 lock: catches a
+// TestDMLastMessage_KeySetIsExactlySevenFields is the C2 lock: catches a
 // filename, size, or count being added later. The message is inserted with an
 // explicit empty `type` (rather than insertDMMessage's hardcoded 'text') so
 // `type` and `call_event_payload` are correctly absent via omitempty — this
 // is NOT an assertion that a call-event row omits them.
-func TestDMLastMessage_KeySetIsExactlySixFields(t *testing.T) {
+func TestDMLastMessage_KeySetIsExactlySevenFields(t *testing.T) {
 	for _, endpoint := range []string{"list", "single"} {
 		t.Run(endpoint, func(t *testing.T) {
 			ts := setupTS(t)
@@ -6163,8 +6166,48 @@ func TestDMLastMessage_KeySetIsExactlySixFields(t *testing.T) {
 			sort.Strings(keys)
 			require.Equal(t, []string{
 				"attachment_mime", "attachment_type", "content",
-				"created_at", "expires_at", "user_id",
+				"created_at", "expires_at", "key_version", "user_id",
 			}, keys)
+		})
+	}
+}
+
+// TestDMLastMessage_CarriesKeyVersion: the preview carries the epoch its
+// ciphertext was written under. After a group member leaves, the current key
+// is a later epoch and the pre-leave preview only opens with its own key.
+func TestDMLastMessage_CarriesKeyVersion(t *testing.T) {
+	for _, endpoint := range []string{"list", "single"} {
+		t.Run(endpoint, func(t *testing.T) {
+			ts := setupTS(t)
+			convID, token, userID := newDMConversation(t, ts)
+			_, err := ts.DB.Exec(
+				`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version) VALUES ($1, $2, $3, $4, 3)`,
+				uuid.New().String(), convID, userID, "ciphertext",
+			)
+			require.NoError(t, err)
+
+			lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+			assert.Equal(t, float64(3), lm["key_version"])
+		})
+	}
+}
+
+// An unlabelled legacy row previews as epoch 1, the label history and pins
+// give it. Previewed as 0 (dropped by omitempty), the sidebar tried only the
+// current key and failed a row the chat itself could open.
+func TestDMLastMessage_NullKeyVersionPreviewsAsEpochOne(t *testing.T) {
+	for _, endpoint := range []string{"list", "single"} {
+		t.Run(endpoint, func(t *testing.T) {
+			ts := setupTS(t)
+			convID, token, userID := newDMConversation(t, ts)
+			_, err := ts.DB.Exec(
+				`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version) VALUES ($1, $2, $3, $4, NULL)`,
+				uuid.New().String(), convID, userID, "legacy ciphertext",
+			)
+			require.NoError(t, err)
+
+			lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+			assert.Equal(t, float64(1), lm["key_version"])
 		})
 	}
 }
@@ -6213,4 +6256,27 @@ func TestDMLastMessage_HiddenMessageAttachmentNeverSurfaces(t *testing.T) {
 			require.False(t, hasType)
 		})
 	}
+}
+
+func TestUpdateMessage_RejectsUnissuedEpoch(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "updatemsgunissued1")
+	user2 := ts.CreateTestUser(t, "updatemsgunissued2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := insertDMMessage(t, ts, convID, user1.ID, originalCiphertext)
+
+	w := ts.DoRequest("PATCH", pathDMConversationsPrefix+convID+pathMsgSlash+msgID, map[string]interface{}{
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 7,
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "epoch_unissued", body["code"])
+	var storedContent string
+	require.NoError(t, ts.DB.QueryRow(`SELECT content FROM dm_messages WHERE id = $1`, msgID).Scan(&storedContent))
+	assert.Equal(t, originalCiphertext, storedContent)
 }

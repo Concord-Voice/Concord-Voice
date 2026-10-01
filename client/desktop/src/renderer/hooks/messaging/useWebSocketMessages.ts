@@ -752,10 +752,10 @@ function decryptAndStoreMessageContent({
     return;
   }
 
-  const decryptPromise =
-    keyVersion && keyVersion > 1
-      ? e2eeService.decryptForChannelWithVersion(channelId, ciphertext, keyVersion)
-      : e2eeService.decryptForChannel(channelId, ciphertext);
+  // Decrypt with the epoch the row is labelled with; 1 is not "current".
+  const decryptPromise = keyVersion
+    ? e2eeService.decryptForChannelWithVersion(channelId, ciphertext, keyVersion)
+    : e2eeService.decryptForChannel(channelId, ciphertext);
 
   decryptPromise
     .then((plaintext) => {
@@ -1079,10 +1079,9 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           'reply-decrypt'
         );
         const rtKv = rt.key_version;
-        const decryptFn =
-          rtKv && rtKv > 1
-            ? e2eeService.decryptForChannelWithVersion(channelId, rt.content, rtKv)
-            : e2eeService.decryptForChannel(channelId, rt.content);
+        const decryptFn = rtKv
+          ? e2eeService.decryptForChannelWithVersion(channelId, rt.content, rtKv)
+          : e2eeService.decryptForChannel(channelId, rt.content);
         decryptFn
           .then((plaintext) => {
             if (!claimMessageContentOperation(replyOperation)) return;
@@ -1938,6 +1937,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         userId: data.user_id,
         username: data.username || 'Unknown',
         createdAt: data.created_at || new Date().toISOString(),
+        ...(dmKeyVersion ? { keyVersion: dmKeyVersion } : {}),
         ...(data.attachments?.length
           ? {
               attachmentType: data.attachments[0].file_type,
@@ -2084,6 +2084,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           userId: data.last_message.user_id || data.user_id || '',
           username: data.last_message.username || '',
           createdAt: data.last_message.created_at || new Date().toISOString(),
+          keyVersion: data.last_message.key_version,
           attachmentType: data.last_message.attachment_type,
           attachmentMime: data.last_message.attachment_mime,
         });

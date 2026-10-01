@@ -142,6 +142,8 @@ const DMConversationSummarySchema = z.object({
       content: z.string(),
       user_id: UUID,
       created_at: ISOTimestamp,
+      // A bad preview epoch is dropped, never allowed to reject the frame.
+      key_version: z.number().int().positive().optional().catch(undefined),
     })
     .nullable()
     .optional(),
@@ -702,6 +704,9 @@ export const DMUnreadNotifySchema = z.object({
         user_id: UUID.optional(),
         username: z.string().optional(),
         created_at: ISOTimestamp.optional(),
+        // The preview ciphertext's epoch. A bad value is dropped rather than
+        // rejecting the frame, as with the attachment fields below.
+        key_version: z.number().int().positive().optional().catch(undefined),
         // #2364. `.optional()` and never `.nullable()`: Go `omitempty` on a
         // non-pointer string emits the key or omits it and can never emit null,
         // so `.nullable()` would be dead shape. Display-only; attachment_mime is

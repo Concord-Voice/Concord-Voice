@@ -13,7 +13,7 @@ import (
 // handlers_test.go's external `dm_test` package because lastMessageResponse
 // is unexported and no export_test.go alias exists for it.
 //
-// This is not redundant with TestDMLastMessage_KeySetIsExactlySixFields
+// This is not redundant with TestDMLastMessage_KeySetIsExactlySevenFields
 // (handlers_test.go): that test round-trips one fixture through JSON and
 // asserts the emitted key set, so a new field added with `omitempty` that
 // happens to be empty for that fixture's content would slip past it
@@ -27,6 +27,7 @@ func TestLastMessageResponse_JSONTags(t *testing.T) {
 		"CreatedAt":        "created_at",
 		"Type":             "type,omitempty",
 		"CallEventPayload": "call_event_payload,omitempty",
+		"KeyVersion":       "key_version,omitempty",
 		"AttachmentType":   "attachment_type,omitempty",
 		"AttachmentMime":   "attachment_mime,omitempty",
 	}

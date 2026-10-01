@@ -88,13 +88,16 @@ export async function decryptPins(
   try {
     channelKey = await e2eeService.getChannelKey(contextId);
   } catch {
-    // Key may not be available yet
+    // A superseded operation is a fence, never a miss: stop before any
+    // on-demand fetch runs under the new key generation.
+    operationGuard.assertCurrent();
   }
 
-  // Collect unique key versions for batch pre-fetch
+  // Collect labelled key versions for batch pre-fetch. Epoch 1 is an epoch,
+  // not "the current key" — after a member leaves, current is epoch 2.
   const versions = new Set<number>();
   for (const m of msgs) {
-    if (m.key_version && m.key_version > 1) {
+    if (m.key_version) {
       versions.add(m.key_version);
     }
   }
@@ -103,7 +106,8 @@ export async function decryptPins(
     try {
       versionedKeys.set(v, await e2eeService.getChannelKeyByVersion(contextId, v));
     } catch {
-      // Will fall back to on-demand fetch per message
+      // Same fence; a plain miss falls back to the per-message fetch.
+      operationGuard.assertCurrent();
     }
   }
 
@@ -113,10 +117,19 @@ export async function decryptPins(
       try {
         const kv = message.key_version;
         let plaintext: string;
-        if (kv && kv > 1) {
+        if (kv) {
           const vKey = versionedKeys.get(kv);
+          // A row labelled 1 its own key cannot open may predate #2832; the
+          // service owns that legacy fallback.
           plaintext = vKey
-            ? await e2eeService.decryptWithKey(message.content, vKey, operationGuard)
+            ? await e2eeService
+                .decryptWithKey(message.content, vKey, operationGuard)
+                .catch((err) => {
+                  // A superseded operation is a fence, never a miss to retry.
+                  operationGuard.assertCurrent();
+                  if (kv !== 1) throw err;
+                  return e2eeService.decryptForChannelWithVersion(contextId, message.content, 1);
+                })
             : await e2eeService.decryptForChannelWithVersion(contextId, message.content, kv);
         } else {
           plaintext = channelKey

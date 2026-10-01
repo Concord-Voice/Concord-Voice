@@ -4538,11 +4538,15 @@ paths:
                         type: string
                         format: date-time
         '400':
-          description: Invalid conversation/message ID, request body, ciphertext, or key_version
+          description: Invalid conversation/message ID, request body, ciphertext, or key_version.
+            A key_version above the conversation's newest issued epoch is refused with
+            code epoch_unissued, and current_epoch names that epoch.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/UnissuedKeyEpochError'
         '403':
           description: Not a participant, or not the message author
           content:
@@ -5685,7 +5689,7 @@ paths:
                         type: string
                         format: date-time
         '404':
-          description: No key found for this context (`code` NO_KEY_YET, with `pending` true once the caller is enrolled for a rewrap), or the caller's current DM epoch is revoked (`code` REVOKED_EPOCH, with `successor_epoch` naming the ledger's replacement so the client can claim it)
+          description: No key found for this context (`code` NO_KEY_YET, with `pending` true once the caller is enrolled for a rewrap). A `?version` request for any epoch other than the newest issued one (the higher of the newest wrapped epoch and the newest revocation successor) answers `pending` false and enrolls nothing, because a rewrap only ever delivers the issued epoch. Or the caller's current DM epoch is revoked (`code` REVOKED_EPOCH, with `successor_epoch` naming the ledger's replacement so the client can claim it)
           content:
             application/json:
               schema:
@@ -8729,11 +8733,39 @@ paths:
                   message:
                     $ref: '#/components/schemas/Message'
         '400':
-          description: Validation error or E2EE enforcement failure
+          description: Validation error or E2EE enforcement failure.
+            A key_version above the channel's newest issued epoch is refused with
+            code epoch_unissued, and current_epoch names that epoch.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/UnissuedKeyEpochError'
+        '409':
+          description: The supplied key epoch has been revoked; re-encrypt with current_epoch
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                - code
+                - current_epoch
+                - channel_id
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - epoch_revoked
+                  current_epoch:
+                    type: integer
+                    minimum: 1
+                  channel_id:
+                    type: string
+                    format: uuid
         '403':
           description: 'Not a member of the channel''s server; missing the channel''s view
             permission (PermViewTextChannels for a text or bulletin channel, PermViewVoiceChannels
@@ -8783,11 +8815,15 @@ paths:
                   message:
                     $ref: '#/components/schemas/Message'
         '400':
-          description: Invalid request body, ciphertext, or key_version
+          description: Invalid request body, ciphertext, or key_version.
+            A key_version above the channel's newest issued epoch is refused with
+            code epoch_unissued, and current_epoch names that epoch.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/UnissuedKeyEpochError'
         '401':
           description: Missing, invalid, or stale bearer token
           content:
@@ -16544,6 +16580,29 @@ components:
           type: string
       required:
       - error
+    UnissuedKeyEpochError:
+      type: object
+      description: A key_version above the scope's newest issued epoch. The client
+        re-encrypts under current_epoch.
+      required:
+      - error
+      - code
+      - current_epoch
+      properties:
+        error:
+          type: string
+          example: Key epoch has not been issued
+        code:
+          type: string
+          enum:
+          - epoch_unissued
+        current_epoch:
+          type: integer
+          minimum: 1
+        conversation_id:
+          type: string
+          format: uuid
+          description: Present on DM message writes.
     RevokedChannelKeyEpochError:
       type: object
       additionalProperties: false
@@ -18282,6 +18341,15 @@ components:
                   enum: [completed, missed, declined, canceled, failed]
                 duration_seconds:
                   type: integer
+            key_version:
+              type: integer
+              minimum: 1
+              description: >-
+                The channel-key epoch the preview `content` was encrypted under,
+                as attested by its sender. Clients decrypt with that epoch's
+                key rather than the current one: after a group member leaves,
+                the current key is a later epoch. System rows carry the column
+                default and are never decrypted.
             attachment_type:
               type: string
               enum: [photo, animated, video, audio, file]

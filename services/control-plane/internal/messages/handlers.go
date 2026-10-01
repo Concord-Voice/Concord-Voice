@@ -13,6 +13,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -43,6 +44,7 @@ const (
 	errMsgInvalidCiphertext      = "Invalid ciphertext format for E2EE channel"
 	errMsgInvalidKeyVersion      = "key_version is required and must be a positive integer"
 	errMsgMemberTimedOut         = "Member is timed out"
+	errMsgFailedVerifyKeyEpoch   = "Failed to verify key epoch"
 	messageWriteTimeout          = 3 * time.Second
 )
 
@@ -564,11 +566,11 @@ func (h *Handler) enforceChannelEpoch(c *gin.Context, q epochQueryRower, channel
 		channelID, keyVersion,
 	).Scan(&epochRevoked); err != nil {
 		h.log.Error("Failed to check epoch revocation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyKeyEpoch})
 		return false
 	}
 	if !epochRevoked {
-		return true
+		return h.enforceIssuedChannelEpoch(c, q, channelID, keyVersion)
 	}
 
 	var currentEpoch int
@@ -582,7 +584,7 @@ func (h *Handler) enforceChannelEpoch(c *gin.Context, q epochQueryRower, channel
 		channelID,
 	).Scan(&currentEpoch); err != nil {
 		h.log.Error("Failed to resolve current key epoch", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyKeyEpoch})
 		return false
 	}
 	c.JSON(http.StatusConflict, gin.H{
@@ -592,6 +594,27 @@ func (h *Handler) enforceChannelEpoch(c *gin.Context, q epochQueryRower, channel
 		"channel_id":    channelID,
 	})
 	return false
+}
+
+// enforceIssuedChannelEpoch rejects a label above the channel's newest issued
+// epoch. Such a ciphertext names a key nobody holds, and every reader that
+// sees the label fetches a key that does not exist (#2822).
+func (h *Handler) enforceIssuedChannelEpoch(c *gin.Context, q epochQueryRower, channelID string, keyVersion int) bool {
+	issued, err := keyrotation.IssuedChannelEpoch(c.Request.Context(), q, channelID)
+	if err != nil {
+		h.log.Error("Failed to resolve issued key epoch", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyKeyEpoch})
+		return false
+	}
+	if keyVersion > issued {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":         "Key epoch has not been issued",
+			"code":          "epoch_unissued",
+			"current_epoch": issued,
+		})
+		return false
+	}
+	return true
 }
 
 // enforceE2EE validates ciphertext shape and epoch revocation for the channel.

@@ -5042,3 +5042,15 @@ func TestPresenceTTLLapseIsCounted(t *testing.T) {
 		assert.Zero(t, counter.count(opsmetrics.MetricPresenceTTLLapsedTotal))
 	})
 }
+
+func TestEnforceWSEpoch_RejectsUnissuedEpoch(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, _ := uuid.Parse(setup.convID)
+	msg := IncomingMessage{ClientID: setup.client.ID}
+
+	assert.True(t, setup.hub.enforceWSEpoch(msg, channelUUID, setup.convID, 1), "epoch 1 is issued from the start")
+	assert.False(t, setup.hub.enforceWSEpoch(msg, channelUUID, setup.convID, 5))
+
+	resp := readClientMsg(t, setup.client)
+	assert.Equal(t, "error", resp["type"])
+}

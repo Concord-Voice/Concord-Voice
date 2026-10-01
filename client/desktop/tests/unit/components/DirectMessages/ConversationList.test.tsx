@@ -20,6 +20,7 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
     isInitialized: false,
     createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
     decryptForChannel: vi.fn().mockResolvedValue(null),
+    decryptForChannelWithVersion: vi.fn().mockResolvedValue(null),
     invalidateChannelKey: vi.fn(),
     revokeChannelAccess: vi.fn(),
   },
@@ -310,6 +311,64 @@ describe('ConversationList', () => {
     });
     render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
     await waitFor(() => expect(screen.getByText('Hey there!')).toBeInTheDocument());
+    (e2eeService as any).isInitialized = false;
+  });
+
+  it('decrypts a pre-rotation preview with its own key epoch', async () => {
+    // After a group member leaves, the current key is epoch 2 and the last
+    // message is still epoch 1: the current key cannot open it.
+    (e2eeService as any).isInitialized = true;
+    const versioned = e2eeService.decryptForChannelWithVersion as ReturnType<typeof vi.fn>;
+    versioned.mockResolvedValueOnce('Before the leave');
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          lastMessage: {
+            content: 'epoch-one-ciphertext',
+            keyVersion: 1,
+            userId: 'user-2',
+            username: 'alice',
+            createdAt: '2025-01-01T12:00:00Z',
+          },
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+    await waitFor(() => expect(screen.getByText('Before the leave')).toBeInTheDocument());
+    expect(versioned).toHaveBeenCalledWith(expect.any(String), 'epoch-one-ciphertext', 1);
+    (e2eeService as any).isInitialized = false;
+  });
+
+  it('retries a failed preview when the same ciphertext later arrives with its epoch', async () => {
+    // A rolling deploy can deliver the preview unlabelled first; the current
+    // key cannot open an epoch-1 row, so that attempt fails. The REST refresh
+    // then labels the SAME ciphertext 1, and that decrypt must still run.
+    (e2eeService as any).isInitialized = true;
+    const current = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+    const versioned = e2eeService.decryptForChannelWithVersion as ReturnType<typeof vi.fn>;
+    current.mockRejectedValueOnce(new DOMException('auth tag mismatch', 'OperationError'));
+    versioned.mockResolvedValueOnce('Relabelled history');
+    const lastMessage = {
+      content: 'relabelled-ciphertext',
+      userId: 'user-2',
+      username: 'alice',
+      createdAt: '2025-01-01T12:00:00Z',
+    };
+    useDMStore.setState({
+      conversations: [makeConversation({ lastMessage })],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+    await waitFor(() => expect(current).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: { ...lastMessage, keyVersion: 1 } })],
+      });
+    });
+    await waitFor(() => expect(screen.getByText('Relabelled history')).toBeInTheDocument());
+    expect(versioned).toHaveBeenCalledWith(expect.any(String), 'relabelled-ciphertext', 1);
     (e2eeService as any).isInitialized = false;
   });
 

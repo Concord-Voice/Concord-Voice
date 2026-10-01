@@ -50,6 +50,33 @@ const CHANNEL_KEY_CACHE_TTL = Number.MAX_SAFE_INTEGER;
 const MISSING_KEY_BACKOFF_MS = 30_000;
 const PENDING_KEY_RETRY_DELAY_MS = 60_000;
 
+function isPendingKeyMiss(err: unknown): boolean {
+  return err instanceof E2EEKeyUnavailableError && err.pending;
+}
+
+function isNotMember(err: unknown): boolean {
+  return err instanceof E2EEKeyUnavailableError && err.code === 'NOT_MEMBER';
+}
+
+/**
+ * Picks the error decryptEpochOne reports when both the epoch-1 key and the
+ * current-key fallback failed; that method's comment gives the reasoning.
+ * Kept pure so the whole rule reads in one place.
+ */
+function epochOneFailure(epochOneError: unknown, fallbackError: unknown): unknown {
+  if (isPendingKeyMiss(fallbackError)) return fallbackError;
+  // Only an AES-GCM authentication failure means the current key is here and
+  // cannot open the row; a network error proves nothing either way.
+  const currentKeyCannotOpen =
+    fallbackError instanceof DOMException && fallbackError.name === 'OperationError';
+  if (currentKeyCannotOpen) {
+    return isPendingKeyMiss(epochOneError) ? fallbackError : epochOneError;
+  }
+  return isNotMember(fallbackError) || !isPendingKeyMiss(epochOneError)
+    ? fallbackError
+    : epochOneError;
+}
+
 interface CachedWrappedKey {
   wrappedKey: string;
   keyVersion: number;
@@ -1417,6 +1444,14 @@ class E2EEService {
       return channelKey;
     }
 
+    // A version the server just refused is not asked for again inside the
+    // backoff window, exactly as the current-key path does. Without it a row
+    // labelled with an epoch the caller never held re-fetched (and re-fired
+    // requestRewrap) on every re-decrypt, and one 429 from that stream set the
+    // shared rateLimitedUntil and failed every other channel's fetches.
+    const missKey = `${channelId}:v${version}`;
+    this.assertVersionNotBackedOff(missKey);
+
     // If we're rate-limited, don't fire another request
     if (Date.now() < this.rateLimitedUntil) {
       throw new E2EEKeyUnavailableError('NO_KEY_YET', false);
@@ -1439,11 +1474,57 @@ class E2EEService {
     this.pendingVersionedKeyFetches.set(dedupKey, fetchPromise);
     try {
       return await fetchPromise;
+    } catch (err) {
+      // Record a real refusal only. A fetch that invalidation superseded
+      // rejects with the same code, and recording it would block the
+      // replacement fetch the invalidation started (see noteKeyMiss).
+      if (
+        err instanceof E2EEKeyUnavailableError &&
+        (err.code === 'NO_KEY_YET' || err.code === 'REVOKED_EPOCH') &&
+        sessionGeneration === this.keySessionGeneration &&
+        channelGeneration === this.getChannelKeyGeneration(channelId)
+      ) {
+        this.pruneExpiredKeyMisses();
+        this.keyMissBackoff.set(missKey, {
+          until: Date.now() + MISSING_KEY_BACKOFF_MS,
+          code: err.code,
+          pending: err.pending,
+          successorEpoch: err.successorEpoch,
+        });
+      }
+      throw err;
     } finally {
       if (this.pendingVersionedKeyFetches.get(dedupKey) === fetchPromise) {
         this.pendingVersionedKeyFetches.delete(dedupKey);
       }
     }
+  }
+
+  /**
+   * Drops every expired backoff entry. A per-version entry is keyed by a
+   * sender-chosen label, so poisoned history could name a new version on every
+   * row; swept on each insert, the map holds at most one backoff window of
+   * refusals.
+   */
+  private pruneExpiredKeyMisses(): void {
+    const now = Date.now();
+    for (const [key, miss] of this.keyMissBackoff) {
+      if (miss.until <= now) this.keyMissBackoff.delete(key);
+    }
+  }
+
+  /**
+   * Rethrows a recorded refusal while its backoff window is open. Labels are
+   * sender-chosen, so an expired per-version entry is pruned on read rather
+   * than left to accumulate until the next invalidation.
+   */
+  private assertVersionNotBackedOff(missKey: string): void {
+    const miss = this.keyMissBackoff.get(missKey);
+    if (!miss) return;
+    if (Date.now() < miss.until) {
+      throw new E2EEKeyUnavailableError(miss.code, miss.pending, miss.successorEpoch);
+    }
+    this.keyMissBackoff.delete(missKey);
   }
 
   /**
@@ -1545,17 +1626,19 @@ class E2EEService {
   }
 
   /**
-   * Decrypt a message using a specific key version.
-   * Falls back to current key if version is 0 or 1 (legacy).
+   * Decrypt a message using the key epoch it is labelled with. Only an
+   * unlabelled row (version 0) falls back to the current key.
    */
   async decryptForChannelWithVersion(
     channelId: string,
     ciphertext: string,
     version: number
   ): Promise<string> {
-    // Version 0 or 1 = use current key (legacy/default)
-    if (!version || version <= 1) {
+    if (!version || version < 1) {
       return this.decryptForChannel(channelId, ciphertext);
+    }
+    if (version === 1) {
+      return this.decryptEpochOne(channelId, ciphertext);
     }
 
     // Check if the requested version matches current cached version
@@ -1572,6 +1655,55 @@ class E2EEService {
     const plaintext = await decryptMessage(ciphertext, channelKey);
     this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     return plaintext;
+  }
+
+  /**
+   * Epoch 1 is an epoch, not an alias for "the current key". Once a group
+   * member leaves, the current key is epoch 2 and epoch-1 history needs the
+   * epoch-1 wrap, which the server keeps serving to its holders. Treating 1 as
+   * "current" made every remaining member's pre-leave history undecryptable.
+   *
+   * Before #2832 a write could be labelled 1 while encrypted under a later
+   * epoch, and a member who joined after epoch 1 holds no epoch-1 wrap. Both
+   * fall back to the current key — the old behaviour, now only a fallback.
+   *
+   * When both fail, the error reported is the one that says whether waiting
+   * can help. A pending current key can still arrive, so the row waits. A
+   * current key that is here but cannot open the row leaves epoch 1 as the
+   * only key that could, and the pending queue only ever delivers the current
+   * epoch, so a pending epoch-1 miss would never settle: the row fails;
+   * otherwise the epoch-1 error describes the label the row carries.
+   *
+   * A current-key attempt that reached no verdict on the row (a network
+   * error, a refusal) is reported over the epoch-1 error: reporting epoch 1
+   * would turn "the current key never arrived" into "this row cannot be
+   * opened" for a pre-#2832 row the current key could still open. The one
+   * exception keeps a waiting row waiting: a pending epoch-1 miss still wins,
+   * unless the refusal is NOT_MEMBER, which ends every epoch at once. An
+   * epoch-1 NOT_MEMBER ends them before the fallback runs, so a current key
+   * still in the cache cannot open a row the server has just refused.
+   */
+  private async decryptEpochOne(channelId: string, ciphertext: string): Promise<string> {
+    const sessionGeneration = this.keySessionGeneration;
+    const channelGeneration = this.getChannelKeyGeneration(channelId);
+    try {
+      // A main-cache hit when the channel is still at epoch 1: no fetch.
+      const epochOneKey = await this.getChannelKeyByVersion(channelId, 1);
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+      const plaintext = await decryptMessage(ciphertext, epochOneKey);
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+      return plaintext;
+    } catch (epochOneError) {
+      // A changed session or key generation is a fence, never a miss.
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+      if (isNotMember(epochOneError)) throw epochOneError;
+      try {
+        return await this.decryptForChannel(channelId, ciphertext);
+      } catch (fallbackError) {
+        this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+        throw epochOneFailure(epochOneError, fallbackError);
+      }
+    }
   }
 
   /**
@@ -1875,6 +2007,12 @@ class E2EEService {
     for (const dedupKey of this.pendingVersionedKeyFetches.keys()) {
       if (dedupKey.startsWith(versionedPrefix)) {
         this.pendingVersionedKeyFetches.delete(dedupKey);
+      }
+    }
+    // By-version refusals share the prefix: a key arrival re-arms them too.
+    for (const missKey of this.keyMissBackoff.keys()) {
+      if (missKey.startsWith(versionedPrefix)) {
+        this.keyMissBackoff.delete(missKey);
       }
     }
     // #1878: DO NOT clear highestSeenVersion here. invalidateChannelKey is the

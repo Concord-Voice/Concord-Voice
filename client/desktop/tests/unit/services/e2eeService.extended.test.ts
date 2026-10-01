@@ -430,7 +430,7 @@ describe('e2eeService — extended', () => {
       expect(decrypted).toBe('Test v0');
     });
 
-    it('falls back to current key for version 1', async () => {
+    it('uses the epoch-1 key for version 1 while the channel is still at epoch 1', async () => {
       await e2eeService.initialize(
         testPassword,
         regKeys.wrappedPrivateKey,
@@ -448,6 +448,227 @@ describe('e2eeService — extended', () => {
       const encrypted = await encryptMessage('Test v1', channelKey);
       const decrypted = await e2eeService.decryptForChannelWithVersion('ch-v1', encrypted, 1);
       expect(decrypted).toBe('Test v1');
+    });
+
+    // Epoch 1 is an epoch, not an alias for "the current key". After a member
+    // leaves, the current key is epoch 2 and epoch-1 history needs the epoch-1
+    // wrap, which the server keeps serving to its holders.
+    async function twoEpochChannel(
+      epochOneResponse?: Partial<Response>,
+      currentResponse?: Partial<Response>
+    ) {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const epochOne = await generateChannelKey();
+      const epochTwo = await generateChannelKey();
+      const wrappedOne = await wrapChannelKey(epochOne, regKeys.publicKey);
+      const wrappedTwo = await wrapChannelKey(epochTwo, regKeys.publicKey);
+      mockApiFetch.mockImplementation(async (url: RequestInfo | URL) => {
+        if (String(url).endsWith('?version=1')) {
+          return (epochOneResponse ?? {
+            ok: true,
+            json: () => Promise.resolve({ key: { wrapped_key: wrappedOne, key_version: 1 } }),
+          }) as Response;
+        }
+        return (currentResponse ?? {
+          ok: true,
+          json: () => Promise.resolve({ key: { wrapped_key: wrappedTwo, key_version: 2 } }),
+        }) as Response;
+      });
+      return { epochOne, epochTwo };
+    }
+
+    const keyMiss = (pending: boolean) => ({
+      ok: false,
+      status: 404,
+      headers: new Headers(),
+      json: () => Promise.resolve({ code: 'NO_KEY_YET', pending }),
+    });
+    const noEpochOneWrap = keyMiss(false);
+    const versionFetches = () =>
+      mockApiFetch.mock.calls.filter(([url]) => String(url).endsWith('?version=1')).length;
+
+    it('decrypts epoch-1 history with the epoch-1 key once the channel is at epoch 2', async () => {
+      const { epochOne } = await twoEpochChannel();
+      // The current key is cached and is epoch 2, so a stale cache is not
+      // what this exercises.
+      await e2eeService.getChannelKey('ch-rotated');
+
+      const encrypted = await encryptMessage('before the leave', epochOne);
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-rotated', encrypted, 1)
+      ).resolves.toBe('before the leave');
+      expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/e2ee/keys/ch-rotated?version=1');
+    });
+
+    it('decrypts epoch-1 history on a cold cache once the channel is at epoch 2', async () => {
+      const { epochOne } = await twoEpochChannel();
+      const encrypted = await encryptMessage('cold history', epochOne);
+      await expect(e2eeService.decryptForChannelWithVersion('ch-cold', encrypted, 1)).resolves.toBe(
+        'cold history'
+      );
+    });
+
+    it('falls back to the current key for a row labelled 1 that epoch 1 cannot open (#2832)', async () => {
+      const { epochTwo } = await twoEpochChannel();
+      const encrypted = await encryptMessage('mislabelled legacy row', epochTwo);
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-legacy', encrypted, 1)
+      ).resolves.toBe('mislabelled legacy row');
+    });
+
+    it('falls back to the current key when the caller holds no epoch-1 wrap', async () => {
+      const { epochTwo } = await twoEpochChannel(noEpochOneWrap);
+      const encrypted = await encryptMessage('joined at epoch 2', epochTwo);
+      await expect(e2eeService.decryptForChannelWithVersion('ch-late', encrypted, 1)).resolves.toBe(
+        'joined at epoch 2'
+      );
+    });
+
+    it('reports the epoch-1 failure when neither key opens the row', async () => {
+      await twoEpochChannel(noEpochOneWrap);
+      const encrypted = await encryptMessage('unreadable', await generateChannelKey());
+      const failure = e2eeService.decryptForChannelWithVersion('ch-none', encrypted, 1);
+      await expect(failure).rejects.toBeInstanceOf(E2EEKeyUnavailableError);
+      await expect(failure).rejects.toMatchObject({ code: 'NO_KEY_YET' });
+    });
+
+    // The server answers a missing wrap with pending:true, but the pending
+    // queue only ever delivers the CURRENT epoch. When the current key is here
+    // and cannot open the row, epoch 1 alone could, and it will never arrive:
+    // the row must settle as failed, not wait forever.
+    it('settles a row only epoch 1 could open as failed, not pending', async () => {
+      await twoEpochChannel(keyMiss(true));
+      const encrypted = await encryptMessage('pre-join history', await generateChannelKey());
+      const failure = e2eeService.decryptForChannelWithVersion('ch-prejoin', encrypted, 1);
+      await expect(failure).rejects.toBeDefined();
+      const err = await failure.catch((e: unknown) => e);
+      expect(err instanceof E2EEKeyUnavailableError && err.pending).toBe(false);
+    });
+
+    it('does not settle as failed when the current-key fetch errored rather than opened', async () => {
+      // A network failure is not "the current key cannot open this row".
+      await twoEpochChannel();
+      mockApiFetch.mockImplementation(async (url: RequestInfo | URL) => {
+        if (String(url).endsWith('?version=1')) return keyMiss(true) as unknown as Response;
+        throw new TypeError('network down');
+      });
+      const encrypted = await encryptMessage('pre-join history', await generateChannelKey());
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-netfail', encrypted, 1)
+      ).rejects.toMatchObject({ code: 'NO_KEY_YET', pending: true });
+    });
+
+    // The epoch-1 key is here and cannot open the row, which a pre-#2832 label
+    // leaves for the current key to open. A failed current-key fetch reached
+    // no verdict, so it is reported rather than "this row cannot be opened".
+    it('reports a current-key fetch failure over an epoch-1 key that cannot open the row', async () => {
+      await twoEpochChannel(undefined, {
+        ok: false,
+        status: 500,
+        headers: new Headers(),
+        json: () => Promise.resolve({ code: 'INTERNAL_ERROR', pending: false }),
+      });
+      const encrypted = await encryptMessage('neither epoch', await generateChannelKey());
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-fetchfail', encrypted, 1)
+      ).rejects.toMatchObject({ code: 'INTERNAL_ERROR' });
+    });
+
+    // Removal ends every epoch: a pending epoch-1 miss would otherwise hold
+    // the row waiting for a key a non-member is never sent.
+    it('reports NOT_MEMBER over a pending epoch-1 miss', async () => {
+      await twoEpochChannel(keyMiss(true), {
+        ok: false,
+        status: 403,
+        headers: new Headers(),
+        json: () => Promise.resolve({ code: 'NOT_MEMBER', pending: false }),
+      });
+      const encrypted = await encryptMessage('removed mid-read', await generateChannelKey());
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-removed', encrypted, 1)
+      ).rejects.toMatchObject({ code: 'NOT_MEMBER', pending: false });
+    });
+
+    // The server just refused this member: a current key still in the cache
+    // must not open the row anyway (Codex #3472 review).
+    it('does not fall back to a cached current key after an epoch-1 NOT_MEMBER', async () => {
+      const { epochTwo } = await twoEpochChannel({
+        ok: false,
+        status: 403,
+        headers: new Headers(),
+        json: () => Promise.resolve({ code: 'NOT_MEMBER', pending: false }),
+      });
+      await e2eeService.getChannelKey('ch-refused');
+      const encrypted = await encryptMessage('mislabelled legacy row', epochTwo);
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-refused', encrypted, 1)
+      ).rejects.toMatchObject({ code: 'NOT_MEMBER' });
+    });
+
+    // Labels are sender-chosen, so poisoned history can name a new version on
+    // every row. Expired refusals are swept as new ones are recorded, so the
+    // map holds at most one backoff window of them (Codex #3472 review).
+    it('sweeps expired per-version refusals when recording a new one', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      mockApiFetch.mockImplementation(async () => keyMiss(false) as unknown as Response);
+      const misses = () =>
+        (e2eeService as unknown as { keyMissBackoff: Map<string, unknown> }).keyMissBackoff;
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      try {
+        await e2eeService.getChannelKeyByVersion('ch-sweep', 7).catch(() => {});
+        expect(misses().has('ch-sweep:v7')).toBe(true);
+        now.mockReturnValue(1_000_000 + 31_000);
+        await e2eeService.getChannelKeyByVersion('ch-sweep', 8).catch(() => {});
+        expect([...misses().keys()]).toEqual(['ch-sweep:v8']);
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it('waits for the current key when that is what the row still needs', async () => {
+      await twoEpochChannel(noEpochOneWrap, keyMiss(true));
+      const encrypted = await encryptMessage(
+        'mislabelled, current key en route',
+        await generateChannelKey()
+      );
+      await expect(
+        e2eeService.decryptForChannelWithVersion('ch-enroute', encrypted, 1)
+      ).rejects.toMatchObject({ code: 'NO_KEY_YET', pending: true });
+    });
+
+    it('does not refetch a refused epoch-1 key inside the backoff window', async () => {
+      await twoEpochChannel(keyMiss(true));
+      const encrypted = await encryptMessage('pre-join history', await generateChannelKey());
+      for (let pass = 0; pass < 5; pass++) {
+        await e2eeService.decryptForChannelWithVersion('ch-backoff', encrypted, 1).catch(() => {});
+      }
+      expect(versionFetches()).toBe(1);
+    });
+
+    it('refetches a refused epoch-1 key once the channel key is invalidated', async () => {
+      await twoEpochChannel(keyMiss(true));
+      const encrypted = await encryptMessage('pre-join history', await generateChannelKey());
+      await e2eeService.decryptForChannelWithVersion('ch-rearm', encrypted, 1).catch(() => {});
+      e2eeService.invalidateChannelKey('ch-rearm');
+      await e2eeService.decryptForChannelWithVersion('ch-rearm', encrypted, 1).catch(() => {});
+      expect(versionFetches()).toBe(2);
+    });
+
+    it('does not fall back past a key-generation fence', async () => {
+      const { epochTwo } = await twoEpochChannel();
+      const encrypted = await encryptMessage('fenced', epochTwo);
+      const pending = e2eeService.decryptForChannelWithVersion('ch-fence', encrypted, 1);
+      // Invalidate the channel's keys while the epoch-1 fetch is in flight.
+      e2eeService.invalidateChannelKey('ch-fence');
+      await expect(pending).rejects.toMatchObject({ code: 'NO_KEY_YET', pending: true });
     });
 
     it('uses current key when requested version matches cached', async () => {

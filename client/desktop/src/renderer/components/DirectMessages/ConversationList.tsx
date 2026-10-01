@@ -173,6 +173,9 @@ interface DecryptedPreview {
   status: PreviewStatus;
   text: string;
   cipher: string;
+  /** The epoch the decrypt used. A rolling deploy can deliver a ciphertext
+   *  unlabelled and later with its label; the labelled attempt must run. */
+  keyVersion?: number;
 }
 
 /**
@@ -683,78 +686,96 @@ const ConversationList: React.FC<ConversationListProps> = ({
   }, [fetchConversations, forgetPreview]);
 
   // Decrypt last message previews for encrypted conversations
-  const decryptPreview = useCallback(async (convId: string, ciphertext: string) => {
-    // Keyed by conversation AND ciphertext. Keyed by conversation alone, a new
-    // message arriving while the previous decrypt was in flight was DROPPED:
-    // the effect called through, returned here immediately, and the in-flight
-    // decrypt then failed its ownership check and committed nothing — so
-    // nothing re-armed the new ciphertext until some unrelated store update.
-    const inFlightKey = `${convId}:${ciphertext}`;
-    if (decryptingRef.current.has(inFlightKey)) return;
-    decryptingRef.current.add(inFlightKey);
-    try {
-      if (!e2eeService.isInitialized) return;
-      const operationGuard = e2eeService.createChannelOperationGuard(convId);
-
-      // NARROW inner try: it captures the DECRYPT's own outcome and nothing
-      // else. assertCurrent() throws deliberately when this operation has been
-      // superseded, and that throw must NOT be readable as a decryption
-      // failure — recording 'failed' for a superseded operation would re-arm
-      // the preview-resurrection class the guard exists to prevent (R9/C3).
-      let plaintext: string | null = null;
-      let decryptFailed = false;
-      let keyStillPending = false;
+  const decryptPreview = useCallback(
+    async (convId: string, ciphertext: string, keyVersion?: number) => {
+      // Keyed by conversation AND ciphertext. Keyed by conversation alone, a new
+      // message arriving while the previous decrypt was in flight was DROPPED:
+      // the effect called through, returned here immediately, and the in-flight
+      // decrypt then failed its ownership check and committed nothing — so
+      // nothing re-armed the new ciphertext until some unrelated store update.
+      // The epoch is part of the identity: the same ciphertext relabelled by a
+      // later REST refresh is a different decrypt (#2822).
+      // String() keeps an absent label distinct from any number, as the
+      // effect's `!==` comparison does.
+      const inFlightKey = `${convId}:${String(keyVersion)}:${ciphertext}`;
+      if (decryptingRef.current.has(inFlightKey)) return;
+      decryptingRef.current.add(inFlightKey);
       try {
-        plaintext = await e2eeService.decryptForChannel(convId, ciphertext);
-      } catch (err) {
-        decryptFailed = true;
-        // A key that has not ARRIVED yet is a transient state, not a verdict.
-        // The error object is inspected, never logged — see C4 below.
-        keyStillPending = err instanceof E2EEKeyUnavailableError && err.pending;
+        if (!e2eeService.isInitialized) return;
+        const operationGuard = e2eeService.createChannelOperationGuard(convId);
+
+        // NARROW inner try: it captures the DECRYPT's own outcome and nothing
+        // else. assertCurrent() throws deliberately when this operation has been
+        // superseded, and that throw must NOT be readable as a decryption
+        // failure — recording 'failed' for a superseded operation would re-arm
+        // the preview-resurrection class the guard exists to prevent (R9/C3).
+        let plaintext: string | null = null;
+        let decryptFailed = false;
+        let keyStillPending = false;
+        try {
+          // The preview's own epoch: after a group member leaves, the last
+          // message predates the rotation and the current key cannot open it.
+          plaintext = keyVersion
+            ? await e2eeService.decryptForChannelWithVersion(convId, ciphertext, keyVersion)
+            : await e2eeService.decryptForChannel(convId, ciphertext);
+        } catch (err) {
+          decryptFailed = true;
+          // A key that has not ARRIVED yet is a transient state, not a verdict.
+          // The error object is inspected, never logged — see C4 below.
+          keyStillPending = err instanceof E2EEKeyUnavailableError && err.pending;
+        }
+
+        // Committing 'failed' for a pending key would satisfy the effect's
+        // re-decrypt predicate (the cached cipher now matches), latching the
+        // placeholder for the rest of the connection. `main` retried precisely
+        // because it cached nothing, so this restores that behaviour for the one
+        // case that is genuinely retryable. Anything unrecognised falls through
+        // to 'failed', which is the fail-closed direction.
+        if (keyStillPending) return;
+
+        // Both fences run OUTSIDE that try. Either one throwing leaves the cache
+        // untouched: a superseded operation commits nothing, not even 'failed'.
+        operationGuard.assertCurrent();
+        const conversationStillOwnsCiphertext = useDMStore
+          .getState()
+          .conversations.some(
+            (conversation) =>
+              conversation.id === convId &&
+              conversation.lastMessage?.content === ciphertext &&
+              conversation.lastMessage.keyVersion === keyVersion
+          );
+        if (!conversationStillOwnsCiphertext) return;
+
+        // 'empty' is asserted only from a decrypt that actually SUCCEEDED and
+        // yielded blank text. Emptiness is never inferred from a failure.
+        const status: PreviewStatus = decryptFailed ? 'failed' : statusForPlaintext(plaintext);
+        setDecryptedPreviews((prev) => ({
+          ...prev,
+          [convId]: { status, text: plaintext ?? '', cipher: ciphertext, keyVersion },
+        }));
+      } catch {
+        // Superseded operation or guard construction failure — commit nothing.
+        // No log line: correlating a conversation id with a decrypt outcome is
+        // exactly the signal C4 forbids.
+      } finally {
+        decryptingRef.current.delete(inFlightKey);
       }
-
-      // Committing 'failed' for a pending key would satisfy the effect's
-      // re-decrypt predicate (the cached cipher now matches), latching the
-      // placeholder for the rest of the connection. `main` retried precisely
-      // because it cached nothing, so this restores that behaviour for the one
-      // case that is genuinely retryable. Anything unrecognised falls through
-      // to 'failed', which is the fail-closed direction.
-      if (keyStillPending) return;
-
-      // Both fences run OUTSIDE that try. Either one throwing leaves the cache
-      // untouched: a superseded operation commits nothing, not even 'failed'.
-      operationGuard.assertCurrent();
-      const conversationStillOwnsCiphertext = useDMStore
-        .getState()
-        .conversations.some(
-          (conversation) =>
-            conversation.id === convId && conversation.lastMessage?.content === ciphertext
-        );
-      if (!conversationStillOwnsCiphertext) return;
-
-      // 'empty' is asserted only from a decrypt that actually SUCCEEDED and
-      // yielded blank text. Emptiness is never inferred from a failure.
-      const status: PreviewStatus = decryptFailed ? 'failed' : statusForPlaintext(plaintext);
-      setDecryptedPreviews((prev) => ({
-        ...prev,
-        [convId]: { status, text: plaintext ?? '', cipher: ciphertext },
-      }));
-    } catch {
-      // Superseded operation or guard construction failure — commit nothing.
-      // No log line: correlating a conversation id with a decrypt outcome is
-      // exactly the signal C4 forbids.
-    } finally {
-      decryptingRef.current.delete(inFlightKey);
-    }
-  }, []);
+    },
+    []
+  );
 
   useEffect(() => {
     for (const conv of conversations) {
       if (conv.lastMessage?.content && !conv.lastMessage.plaintextPreview) {
-        // Re-decrypt if no cache entry or the ciphertext changed (new message)
+        // Re-decrypt if no cache entry, the ciphertext changed (new message), or
+        // the same ciphertext now carries a different epoch label.
         const cached = decryptedPreviews[conv.id];
-        if (!cached || cached.cipher !== conv.lastMessage.content) {
-          decryptPreview(conv.id, conv.lastMessage.content);
+        if (
+          !cached ||
+          cached.cipher !== conv.lastMessage.content ||
+          cached.keyVersion !== conv.lastMessage.keyVersion
+        ) {
+          decryptPreview(conv.id, conv.lastMessage.content, conv.lastMessage.keyVersion);
         }
       }
     }
@@ -776,7 +797,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
       // in-flight set is keyed by conversation AND ciphertext, so a delivery
       // landing mid-decrypt cannot start a second attempt at the same one.
       if (!last?.content || last.plaintextPreview !== undefined) return;
-      decryptPreview(deliveredId, last.content);
+      decryptPreview(deliveredId, last.content, last.keyVersion);
     };
     globalThis.addEventListener('e2ee-key-delivered', handler);
     return () => globalThis.removeEventListener('e2ee-key-delivered', handler);

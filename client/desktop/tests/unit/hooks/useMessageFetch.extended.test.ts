@@ -228,13 +228,17 @@ describe('useMessageFetch — extended coverage', () => {
         },
       };
 
+      // The channel is at epoch 3. Epoch 1 is an epoch, not an alias for the
+      // current key: the v1 parent must be opened with the epoch-1 key.
       const mockCurrentKey = {} as CryptoKey;
+      const mockV1Key = {} as CryptoKey;
       const mockV3Key = {} as CryptoKey;
       mockGetChannelKey.mockResolvedValue(mockCurrentKey);
-      mockGetChannelKeyByVersion.mockResolvedValue(mockV3Key);
-      // Parent uses current key (version 1), replied_to uses version 3
+      mockGetChannelKeyByVersion.mockImplementation(async (_channelId: string, version: number) =>
+        version === 1 ? mockV1Key : mockV3Key
+      );
       mockDecryptWithKey.mockImplementation(async (content: string, key: CryptoKey) => {
-        if (key === mockCurrentKey) return 'decrypted parent v1';
+        if (key === mockV1Key) return 'decrypted parent v1';
         if (key === mockV3Key) return 'decrypted reply v3';
         throw new Error('unexpected key');
       });
@@ -249,8 +253,112 @@ describe('useMessageFetch — extended coverage', () => {
         expect(stored![0].replied_to?.content).toBe('decrypted reply v3');
       });
 
-      // Should have pre-fetched version 3 key
+      // Both labelled epochs are pre-fetched once.
+      expect(mockGetChannelKeyByVersion).toHaveBeenCalledWith('channel-1', 1);
       expect(mockGetChannelKeyByVersion).toHaveBeenCalledWith('channel-1', 3);
+    });
+
+    it('hands a row labelled 1 that its epoch-1 key cannot open to the service fallback (#2832)', async () => {
+      const legacyRow: MessageWithStatus = {
+        ...mockMessage,
+        id: 'legacy-v1',
+        content: 'mislabelled-ciphertext',
+        key_version: 1,
+      };
+      mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+      mockGetChannelKeyByVersion.mockResolvedValue({} as CryptoKey);
+      mockDecryptWithKey.mockRejectedValue(new Error('OperationError'));
+      mockDecryptForChannelWithVersion.mockResolvedValue('legacy plaintext');
+      mockFetchResponse([legacyRow]);
+
+      renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+
+      await waitFor(() => {
+        const stored = useChatStore.getState().messagesByChannel.get('channel-1');
+        expect(stored?.[0].content).toBe('legacy plaintext');
+      });
+      expect(mockDecryptForChannelWithVersion).toHaveBeenCalledWith(
+        'channel-1',
+        'mislabelled-ciphertext',
+        1
+      );
+    });
+
+    it('does not read a superseded epoch-1 decrypt as a miss to retry', async () => {
+      const v1Row: MessageWithStatus = {
+        ...mockMessage,
+        id: 'fenced-v1',
+        content: 'fenced-ciphertext',
+        key_version: 1,
+      };
+      mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+      mockGetChannelKeyByVersion.mockResolvedValue({} as CryptoKey);
+      let superseded = false;
+      mockOperationGuard.assertCurrent.mockImplementation(() => {
+        if (superseded) throw new Error('superseded');
+      });
+      mockDecryptWithKey.mockImplementation(async () => {
+        superseded = true;
+        throw new Error('superseded');
+      });
+      try {
+        mockFetchResponse([v1Row]);
+        renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+        await waitFor(() => expect(mockDecryptWithKey).toHaveBeenCalled());
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
+      } finally {
+        mockOperationGuard.assertCurrent.mockReset();
+      }
+    });
+
+    it('does not start the versioned prefetch after a superseded current-key fetch', async () => {
+      const v1Row: MessageWithStatus = {
+        ...mockMessage,
+        id: 'prefetch-fenced-v1',
+        content: 'prefetch-fenced-ciphertext',
+        key_version: 1,
+      };
+      let superseded = false;
+      mockOperationGuard.assertCurrent.mockImplementation(() => {
+        if (superseded) throw new Error('superseded');
+      });
+      // The rotation lands while the current-key prefetch is in flight.
+      mockGetChannelKey.mockImplementation(async () => {
+        superseded = true;
+        throw new Error('superseded');
+      });
+      mockGetChannelKeyByVersion.mockClear();
+      try {
+        mockFetchResponse([v1Row]);
+        renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+        await waitFor(() => expect(mockGetChannelKey).toHaveBeenCalled());
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(mockGetChannelKeyByVersion).not.toHaveBeenCalled();
+      } finally {
+        mockOperationGuard.assertCurrent.mockReset();
+      }
+    });
+
+    it('does not hand a failed epoch-2 row to the epoch-1 fallback', async () => {
+      const v2Row: MessageWithStatus = {
+        ...mockMessage,
+        id: 'bad-v2',
+        content: 'bad-v2-ciphertext',
+        key_version: 2,
+      };
+      mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+      mockGetChannelKeyByVersion.mockResolvedValue({} as CryptoKey);
+      mockDecryptWithKey.mockRejectedValue(new Error('OperationError'));
+      mockFetchResponse([v2Row]);
+
+      renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+
+      await waitFor(() => {
+        const stored = useChatStore.getState().messagesByChannel.get('channel-1');
+        expect(stored?.[0].decryptFailed).toBe(true);
+      });
+      expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
     });
 
     it('decrypts replied_to content alongside parent message', async () => {
@@ -302,11 +410,16 @@ describe('useMessageFetch — extended coverage', () => {
       };
 
       const mockKey = {} as CryptoKey;
+      const mockReplyKey = {} as CryptoKey;
       mockGetChannelKey.mockResolvedValue(mockKey);
-      // replied_to decryption fails first, then parent succeeds
-      mockDecryptWithKey
-        .mockRejectedValueOnce(new Error('decryption failed'))
-        .mockResolvedValueOnce('decrypted parent');
+      mockGetChannelKeyByVersion.mockResolvedValue(mockReplyKey);
+      // The v1 reply fails under its own key and under the service fallback;
+      // the unlabelled parent succeeds under the current key.
+      mockDecryptWithKey.mockImplementation(async (_content: string, key: CryptoKey) => {
+        if (key === mockKey) return 'decrypted parent';
+        throw new Error('decryption failed');
+      });
+      mockDecryptForChannelWithVersion.mockRejectedValue(new Error('decryption failed'));
       mockFetchResponse([msgWithBadReply]);
 
       renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));

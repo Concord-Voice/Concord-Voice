@@ -618,7 +618,8 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('blanks edited ciphertext and marks decrypt failure when channel decryption rejects', async () => {
       const { handler } = setupHandler('message_update');
-      mockDecryptForChannel.mockRejectedValue(new Error('decrypt failed'));
+      // key_version 1 is an epoch and decrypts through the versioned path.
+      mockDecryptForChannelWithVersion.mockRejectedValue(new Error('decrypt failed'));
 
       useChatStore.getState().addMessage('channel-1', {
         id: 'msg-edit-failed',

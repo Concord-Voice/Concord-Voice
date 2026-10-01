@@ -3623,6 +3623,11 @@ func (h *Handler) getChannelKeyResponse(c *gin.Context, contextID, userID string
 		return
 	}
 	if err == sql.ErrNoRows {
+		issued := func() (int, error) { return keyrotation.IssuedChannelEpoch(c.Request.Context(), h.db, contextID) }
+		if h.undeliverableVersionedMiss(issued, contextID, c.Query("version")) {
+			respondUndeliverableVersionedMiss(c, e2eekeys.KindChannel)
+			return
+		}
 		// Auto-enroll caller into pending_key_requests (#1023 — missing-wrap recovery).
 		// Idempotent via ON CONFLICT DO NOTHING. Complement to POST /rewrap
 		// (RequestRewrap): gives immediate enrollment without requiring a second
@@ -3713,6 +3718,45 @@ type dmKey struct {
 	WrappedKey     string `json:"wrapped_key"`
 	KeyVersion     int    `json:"key_version"`
 	CreatedAt      string `json:"created_at"`
+}
+
+// undeliverableVersionedMiss reports whether a versioned fetch that found no
+// row asked for an epoch no pending request can deliver. A pending request is
+// only ever fulfilled with the context's issued epoch (the channel query's
+// active-epoch join, appendDMPendingRequests), so a miss for any other epoch —
+// superseded, or above anything issued — would only page holders for a key
+// they will never send, and pending:true leaves the row waiting forever
+// (#2822). The issued epoch itself stays pending, including a successor whose
+// wraps are still being distributed. A lookup failure reports false, which
+// keeps the pre-existing enroll-and-wait contract.
+func (h *Handler) undeliverableVersionedMiss(issued func() (int, error), contextID, versionStr string) bool {
+	if versionStr == "" {
+		return false
+	}
+	var requested int
+	if _, err := fmt.Sscanf(versionStr, "%d", &requested); err != nil {
+		return false
+	}
+	issuedEpoch, err := issued()
+	if err != nil {
+		h.log.Error("e2ee key fetch: issued epoch lookup failed",
+			"kind", "issued_epoch_lookup_db_error",
+			"context_id", contextID,
+			"error", err)
+		return false
+	}
+	return requested != issuedEpoch
+}
+
+// respondUndeliverableVersionedMiss answers a versioned miss no holder can
+// deliver: final, no enrollment.
+func respondUndeliverableVersionedMiss(c *gin.Context, kind e2eekeys.Kind) {
+	c.JSON(http.StatusNotFound, e2eekeys.ErrorResponse{
+		Error:   errMsgNoEncryptionKey,
+		Code:    e2eekeys.CodeNoKeyYet,
+		Kind:    kind,
+		Pending: false,
+	})
 }
 
 // fetchDMKeyLocked performs membership, key selection and the epoch decision
@@ -3869,6 +3913,11 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 	}
 
 	if err == sql.ErrNoRows {
+		issued := func() (int, error) { return keyrotation.IssuedDMEpoch(c.Request.Context(), h.db, contextID) }
+		if h.undeliverableVersionedMiss(issued, contextID, c.Query("version")) {
+			respondUndeliverableVersionedMiss(c, e2eekeys.KindDM)
+			return
+		}
 		// Auto-enroll caller into dm_pending_key_requests (#1023).
 		// Mirror of getChannelKeyResponse auto-enroll path.
 		inserted, enrollErr := h.enrollDMPendingGuarded(c.Request.Context(), contextID, userID)

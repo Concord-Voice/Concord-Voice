@@ -1178,7 +1178,7 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 // ===========================================================================
 
 func TestGetUnifiedKeysAllPaths(t *testing.T) {
-	ts, user, _, channelID := setupEncryptedChannel(t)
+	ts, user, serverID, channelID := setupEncryptedChannel(t)
 
 	t.Run("ChannelSuccess", func(t *testing.T) {
 		w := ts.DoRequest("GET", pathE2EEKeys+channelID, nil, testhelpers.AuthHeaders(user.AccessToken))
@@ -1259,7 +1259,11 @@ func TestGetUnifiedKeysAllPaths(t *testing.T) {
 	})
 
 	t.Run("EnvelopeShape_Channel_NoKeyYet", func(t *testing.T) {
-		w := ts.DoRequest("GET", pathE2EEKeys+channelID+"?version=999", nil, testhelpers.AuthHeaders(user.AccessToken))
+		// A member with no wrap for the current epoch: a holder can deliver it,
+		// so the miss is pending. (An unissued version such as 999 is final.)
+		unwrapped := ts.CreateTestUser(t, "ukchan_unwrapped")
+		ts.AddMemberToServer(t, serverID, unwrapped.ID, roleMember)
+		w := ts.DoRequest("GET", pathE2EEKeys+channelID+"?version=1", nil, testhelpers.AuthHeaders(unwrapped.AccessToken))
 		assert.Equal(t, http.StatusNotFound, w.Code)
 
 		var body e2eekeys.ErrorResponse
