@@ -1,75 +1,81 @@
 package mfa
 
-// Reproduction for the WebAuthn inline-token consume error path: a Redis fault
-// on the GETDEL wraps the raw driver error via fmt.Errorf("...: %w", err), and
-// a go-redis hook that annotates its error with the failing command's
-// arguments (as one legitimately can) puts the live, spendable token — the
-// key's own suffix — into the error handlers.go's callers then log. The
-// property under test: the error consumeWebAuthnInlineToken (via VerifyCode)
-// returns on a Redis fault must never contain the submitted token, while still
-// being a non-nil error (fail closed).
+// The WebAuthn inline-token consume error path must never carry the token. A
+// faulted spend returns an error its callers log, and a driver or client hook
+// may annotate that error with the statement's own arguments (as one
+// legitimately can). Before #3509 the token lived in a Redis key that embedded
+// it, so such an annotation leaked a live, spendable token. Since #3509 the
+// spend is a SQL DELETE on step_up_tokens whose only token-derived argument is
+// SHA-256(token): the property under test is that the token is hashed BEFORE it
+// reaches the store, so even an argument-echoing fault cannot reveal it, while
+// the consume still fails closed with a non-nil error.
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
 
-// iteFaultHook fails GETDEL (and GET+DEL, in case of an implementation split)
-// for keys under the inline-token prefix, annotating the returned error with
-// the command's own arguments — modeling a go-redis client hook that logs or
-// wraps a command's argument list, which necessarily includes the key.
-type iteFaultHook struct{}
+// iteArgsEchoConnector fails every statement on step_up_tokens with an error
+// that carries the statement's arguments verbatim.
+type iteArgsEchoConnector struct{ base driver.Connector }
 
-func (iteFaultHook) DialHook(next redis.DialHook) redis.DialHook { return next }
-
-func (iteFaultHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
-	return func(ctx context.Context, cmd redis.Cmder) error {
-		name := cmd.Name()
-		if name == "getdel" || name == "get" || name == "del" {
-			if args := cmd.Args(); len(args) >= 2 {
-				if k, ok := args[1].(string); ok && strings.HasPrefix(k, "mfa_inline_purpose_token:") {
-					err := fmt.Errorf("redis: %v", cmd.Args())
-					cmd.SetErr(err)
-					return err
-				}
-			}
-		}
-		return next(ctx, cmd)
+func (c iteArgsEchoConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.base.Connect(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return iteArgsEchoConn{Conn: conn}, nil
 }
 
-func (iteFaultHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return next
+func (c iteArgsEchoConnector) Driver() driver.Driver { return c.base.Driver() }
+
+type iteArgsEchoConn struct{ driver.Conn }
+
+func (c iteArgsEchoConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "step_up_tokens") {
+		values := make([]string, 0, len(args))
+		for _, a := range args {
+			values = append(values, fmt.Sprintf("%s|%x", a.Value, a.Value))
+		}
+		return nil, fmt.Errorf("db: %s", strings.Join(values, ","))
+	}
+	return c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
 }
 
-// TestInlineToken_ConsumeErrorDoesNotCarryTheToken: a Redis fault on consuming
+// TestInlineToken_ConsumeErrorDoesNotCarryTheToken: a store fault on consuming
 // a WebAuthn inline token must fail closed without leaking the live token
 // through the returned (and subsequently logged) error.
+//
+// Mutant killed: passing the token itself to the spend statement instead of
+// its hash (the echoed argument then carries the canary).
 func TestInlineToken_ConsumeErrorDoesNotCarryTheToken(t *testing.T) {
-	db := iuNewTestDB(t)
-	kr := iuKeyring(t)
-	clean := iuNewTestRedis(t)
-	hooked := redis.NewClient(&redis.Options{Addr: clean.Options().Addr})
-	t.Cleanup(func() { _ = hooked.Close() })
-	hooked.AddHook(iteFaultHook{})
-
-	userID := iuCreateUser(t, db, "ite-password-1")
-	h := iuHandler(db, hooked, kr)
+	dbtest.SetupTestDB(t)
+	base, err := pq.NewConnector(dbtest.DatabaseURL())
+	require.NoError(t, err)
+	db := sql.OpenDB(iteArgsEchoConnector{base: base})
+	t.Cleanup(func() { _ = db.Close() })
+	h := &Handler{db: db}
 
 	const canary = "this-is-a-leak-canary-not-a-token" // > 20 chars: required to reach the consume path
 
-	verified, err := h.VerifyCode(context.Background(), userID, stepup.PurposeBackupEmailSet, canary)
+	verified, err := h.VerifyCode(context.Background(), "00000000-0000-0000-0000-000000000001", stepup.PurposeBackupEmailSet, canary)
 
-	assert.False(t, verified, "a Redis fault on token consumption must never verify")
-	require.Error(t, err, "a Redis fault on token consumption must fail closed, not silently pass")
+	assert.False(t, verified, "a store fault on token consumption must never verify")
+	require.Error(t, err, "a store fault on token consumption must fail closed, not silently pass")
+	require.Contains(t, err.Error(), "db: ", "precondition: the argument-echoing fault fired")
 	assert.NotContains(t, err.Error(), canary,
 		"the error returned from a faulted inline-token consume must not carry the submitted token")
+	assert.NotContains(t, err.Error(), fmt.Sprintf("%x", canary),
+		"nor its bytes in hex")
 }

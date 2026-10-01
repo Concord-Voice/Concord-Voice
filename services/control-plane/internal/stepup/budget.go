@@ -28,13 +28,17 @@ const (
 // a deploy does not reset counters in flight.
 const MFASettingsBudgetPrefix = "stepup:mfa_settings:"
 
-// ErrMsgTooManyAttempts is the 429 body when the budget is exhausted.
+// ErrMsgTooManyAttempts is the 429 body when the budget is exhausted. The body
+// also carries "step_up_budget_exhausted": true, so a client can tell it from
+// the route limiter's 429 without matching copy (#3455).
 const ErrMsgTooManyAttempts = "Too many verification attempts"
 
 // ErrMsgBudgetUnavailable is the 503 body when the budget cannot be
 // evaluated. It is deliberately NOT the 429: telling a user "too many
 // attempts" during a Redis outage misreports a server fault as their own
-// doing and locks the form for a window that is not running.
+// doing and locks the form for a window that is not running. The body also
+// carries "step_up_budget_unavailable": true, which tells it from a gate's
+// other 503s (#3455).
 const ErrMsgBudgetUnavailable = "Verification is temporarily unavailable. Try again in a few minutes."
 
 var errBudgetUnwired = errors.New("step-up attempt budget has no Redis client")
@@ -83,7 +87,10 @@ func (b Budget) Consume(ctx context.Context, userID string) *Error {
 		return budgetUnavailable(fmt.Errorf("consume step-up attempt: %w", err))
 	}
 	if !allowed {
-		return &Error{Status: http.StatusTooManyRequests, Body: gin.H{"error": ErrMsgTooManyAttempts}}
+		return &Error{
+			Status: http.StatusTooManyRequests,
+			Body:   gin.H{"error": ErrMsgTooManyAttempts, "step_up_budget_exhausted": true},
+		}
 	}
 	return nil
 }
@@ -105,7 +112,7 @@ func (b Budget) Clear(ctx context.Context, userID string) error {
 func budgetUnavailable(cause error) *Error {
 	return &Error{
 		Status: http.StatusServiceUnavailable,
-		Body:   gin.H{"error": ErrMsgBudgetUnavailable},
+		Body:   gin.H{"error": ErrMsgBudgetUnavailable, "step_up_budget_unavailable": true},
 		Cause:  cause,
 	}
 }

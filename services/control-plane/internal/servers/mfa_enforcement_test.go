@@ -265,6 +265,15 @@ func mfaValueBody(value bool) string {
 }
 func mfaErrorBody(message string) string { return fmt.Sprintf(`{"error":%q}`, message) }
 
+// The two budget refusals and the lock conflict each carry a machine-readable
+// flag beside their copy (#3455 X17). Spelled out rather than built from the
+// exported constants, so a changed flag or copy fails here.
+const (
+	mfaBudgetExhaustedBody   = `{"error":"Too many verification attempts","step_up_budget_exhausted":true}`
+	mfaBudgetUnavailableBody = `{"error":"Verification is temporarily unavailable. Try again in a few minutes.","step_up_budget_unavailable":true}`
+	mfaBusyBody              = `{"error":"The server is busy. Try again.","lock_conflict":true}`
+)
+
 func requireEnrollmentRequired(t *testing.T, w *httptest.ResponseRecorder, msg string) {
 	t.Helper()
 	require.Equal(t, http.StatusForbidden, w.Code, msg)
@@ -564,7 +573,7 @@ func TestMFAEnforcement_SixthOffAttemptIs429(t *testing.T) {
 	}
 	w := putMFA(env, f.owner, f.serverID, bodyOff(mfaBackupCode))
 	require.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
-	assert.JSONEq(t, mfaErrorBody(stepup.ErrMsgTooManyAttempts), w.Body.String())
+	assert.JSONEq(t, mfaBudgetExhaustedBody, w.Body.String())
 	assert.True(t, readMFAFlag(t, env, f.serverID))
 	assert.False(t, backupCodeSpent(t, env, f.owner.ID), "a 429 must not reach the verifier")
 }
@@ -606,7 +615,7 @@ func TestMFAEnforcement_UnevaluableBudgetIs503(t *testing.T) {
 
 	w := putMFA(env, f.owner, f.serverID, bodyOff(mfaBackupCode))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
-	assert.JSONEq(t, mfaErrorBody(stepup.ErrMsgBudgetUnavailable), w.Body.String())
+	assert.JSONEq(t, mfaBudgetUnavailableBody, w.Body.String())
 	assert.True(t, readMFAFlag(t, env, f.serverID))
 	assert.False(t, backupCodeSpent(t, env, f.owner.ID))
 
@@ -638,7 +647,7 @@ func TestMFAEnforcement_LockConflictIs503WithRetryAfter(t *testing.T) {
 		w := putMFA(env, f.owner, f.serverID, bodyOn())
 		assert.Equal(t, http.StatusServiceUnavailable, w.Code, name)
 		assert.Equal(t, "1", w.Header().Get("Retry-After"), name)
-		assert.JSONEq(t, mfaErrorBody("The server is busy. Try again."), w.Body.String(), name)
+		assert.JSONEq(t, mfaBusyBody, w.Body.String(), name)
 		assert.Contains(t, logs.String(), "mfa_gate_lock", name)
 	}
 	assert.False(t, readMFAFlag(t, env, f.serverID))

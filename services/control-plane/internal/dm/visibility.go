@@ -35,9 +35,12 @@ func lockDMVisibilityPublication(actorID, conversationID uuid.UUID) func() {
 	return lock.Unlock
 }
 
+// clearConversationRequest is Clear's body: the own-rule step-up fields every
+// own-rule route shares (stepup.Fields), so a body that still carries
+// current_password is a 400 and the password reaches only the mint endpoint
+// (#3509).
 type clearConversationRequest struct {
-	CurrentPassword string `json:"current_password"`
-	MFACode         string `json:"mfa_code"`
+	stepup.Fields
 }
 
 // HideConversation hides a conversation from the caller's list without
@@ -112,7 +115,8 @@ func (h *Handler) setConversationHidden(c *gin.Context, hidden bool) {
 
 // ClearConversation records an actor-only history range. Step-up is required
 // when the actor has not explicitly disabled purge protection; MFA replaces
-// password when enabled and is verified on this transaction.
+// the password when enabled. Either factor is spent on this transaction: the
+// MFA code, or the password step-up token minted for dm.clear (#3509).
 func (h *Handler) ClearConversation(c *gin.Context) {
 	actorID, conversationID, ok := visibilityRequestIDs(c)
 	if !ok {
@@ -200,6 +204,10 @@ func bindClearRequest(c *gin.Context) (clearConversationRequest, bool) {
 	bodyBytes, bodyIsBytes := body.([]byte)
 	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) || !bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("{")) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return req, false
+	}
+	if _, stepErr := req.Input(); stepErr != nil {
+		stepErr.Write(c)
 		return req, false
 	}
 	return req, true
@@ -337,19 +345,16 @@ func (h *Handler) loadClearStepUpSubject(ctx context.Context, tx *sql.Tx, userID
 	return stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForNoKeyUpdate, tokenEpoch)
 }
 
-var clearStepUpCopy = stepup.Copy{
-	NoFactors:          "Clear history requires verification, but this account has no password and no MFA method. Set a password, enable MFA, or turn off \"Require authentication before purging\" in Privacy & Security.",
-	CredentialRequired: "Current password required to clear history",
-}
+// clearStepUpCopy is Clear's own-rule copy, shared with the password mint
+// (stepup.OwnRuleCopy).
+var clearStepUpCopy = stepup.OwnRuleCopy(stepup.PurposeDMClear)
 
+// verifyClearStepUp is the own-rule seam (stepup.VerifyOwnRuleTx) bound to
+// Clear's purpose and copy. #3455's deletes and self-purges share the seam.
 func (h *Handler) verifyClearStepUp(ctx context.Context, tx *sql.Tx, userID string, subject stepup.Subject, req clearConversationRequest) *stepup.Error {
-	if subject.MFAEnabled {
-		if h.mfaVerifier == nil {
-			return &stepup.Error{Status: http.StatusInternalServerError, Body: gin.H{"error": stepup.ErrMsgVerificationFailed}}
-		}
-		return stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, stepup.PurposeDMClear, req.MFACode, subject.MFAMethods)
-	}
-	return stepup.VerifyPasswordFactor(subject, req.CurrentPassword, clearStepUpCopy)
+	return stepup.VerifyOwnRuleTx(ctx, tx, h.mfaVerifier, userID,
+		stepup.OwnRuleRoute{Purpose: stepup.PurposeDMClear, Copy: clearStepUpCopy},
+		stepup.Input{MFACode: req.MFACode, StepUpToken: req.StepUpToken}, subject)
 }
 
 // enforceClearStepUp verifies the step-up only when the actor's

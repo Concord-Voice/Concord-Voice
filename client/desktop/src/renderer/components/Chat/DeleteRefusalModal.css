@@ -1,0 +1,110 @@
+/* #3455: no --danger and no glyphs anywhere in this modal (T8) — nothing
+   destructive is confirmed here, since that already happened in
+   DeleteMessageModal or was skipped by shift-click. The title text is the
+   status signal, so nothing here is colour-only. */
+
+.delete-refusal-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.delete-refusal-modal__body {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-primary);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.delete-refusal-modal__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.delete-refusal-modal__field label {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.delete-refusal-modal__field input {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.delete-refusal-modal__field input:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 1px;
+}
+
+.delete-refusal-modal__field-error {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.delete-refusal-modal__actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.delete-refusal-modal__cancel {
+  padding: 10px 20px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.delete-refusal-modal__cancel:hover {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* The primary action is told apart from Cancel by its accent border and
+   weight, not by an accent FILL: --on-accent on the accent measures 2.68:1 in
+   :root, so a filled accent button cannot carry text here. --text-primary on
+   --bg-tertiary measures 8.76:1 at worst across all 34 theme blocks. */
+.delete-refusal-modal__confirm {
+  padding: 10px 20px;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--accent-primary);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.delete-refusal-modal__confirm:focus-visible,
+.delete-refusal-modal__cancel:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
+.delete-refusal-modal__confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Visually-hidden live region — mirrors MessageInput.css's .sr-only. */
+.delete-refusal-modal .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

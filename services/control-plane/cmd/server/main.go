@@ -34,6 +34,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage/probe"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/subscriptions"
@@ -1072,6 +1073,10 @@ func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, l
 	}
 }
 
+// stepUpSweepBudget is the expired step-up token sweep's share of
+// runCleanup's 30 s: what it has not drained by then waits for the next hour.
+const stepUpSweepBudget = 10 * time.Second
+
 func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, log *logger.Logger, ownershipCleanup func(context.Context)) {
 	taskCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -1100,10 +1105,24 @@ func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, log 
 		log.Info("Cleanup: purged old revoked sessions", logKeyCount, n)
 	}
 
-	// Task 3: Clean stale Redis presence keys
+	// Task 3: Purge expired step-up tokens (#3509, migration 000162). Each
+	// mint already deletes its own user's expired rows; this catches users who
+	// never mint again. Rows a request holds are skipped, never waited on. The
+	// sweep commits in batches and runs on its own budget inside taskCtx, so a
+	// backlog keeps what it drained and cannot starve the tasks after it.
+	sweepCtx, sweepCancel := context.WithTimeout(taskCtx, stepUpSweepBudget)
+	n, err := stepup.SweepExpiredTokens(sweepCtx, db)
+	sweepCancel()
+	if err != nil {
+		log.Error("Cleanup: failed to purge expired step-up tokens", "error", err, logKeyCount, n)
+	} else if n > 0 {
+		log.Info("Cleanup: purged expired step-up tokens", logKeyCount, n)
+	}
+
+	// Task 4: Clean stale Redis presence keys
 	cleanupStalePresence(taskCtx, redisClient, log)
 
-	// Task 4: Auto-complete expired ownership transfers through the ownership
+	// Task 5: Auto-complete expired ownership transfers through the ownership
 	// handler, which owns its capture-bound authority transaction.
 	if ownershipCleanup != nil {
 		ownershipCleanup(taskCtx)

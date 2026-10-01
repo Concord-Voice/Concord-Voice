@@ -22,6 +22,7 @@ import {
 import { getDesktopClientVersion } from '../../utils/runtime/clientVersion';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import type { TerminalAttestationCode } from '../../stores/auth/attestationFailureStore';
+import type { ApiRequestContext } from './requestContext';
 
 export { API_BASE } from '../../config';
 
@@ -911,15 +912,20 @@ async function handle401Recovery(
  *   session is dead: third-party content proxies (KLIPY, #1957) and best-effort
  *   background first-party sync (encrypted preferences, #1956). These still
  *   attempt one refresh+retry but never call handleRefreshFailure.
+ * @param opts.context The operation this request belongs to
+ *   (`captureApiRequestContext` in `requestContext.ts`). The request is
+ *   admitted against that account and server, so it refuses to dispatch if
+ *   either changed since the capture. Without one, the request is its own
+ *   operation, admitted against the account and server current at the call.
  */
 export async function apiFetch(
   path: string,
   init?: RequestInit,
-  opts?: { authoritative?: boolean }
+  opts?: { authoritative?: boolean; context?: ApiRequestContext }
 ): Promise<Response> {
-  const serverSelection = captureRuntimeServerSelection();
+  const serverSelection = opts?.context?.serverSelection ?? captureRuntimeServerSelection();
   const requestApiBase = serverSelection.apiBase;
-  const admittedAuthLifecycle = captureAuthLifecycle();
+  const admittedAuthLifecycle = opts?.context?.authLifecycle ?? captureAuthLifecycle();
 
   const headers = new Headers(init?.headers);
   const mid = getMachineIdSync(requestApiBase);

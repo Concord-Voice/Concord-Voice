@@ -188,7 +188,7 @@ func TestPurgeFenceStepUp_RedisOutageDenies(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	require.Equal(t, map[string]interface{}{"error": stepup.ErrMsgBudgetUnavailable}, body)
+	require.Equal(t, map[string]interface{}{"error": stepup.ErrMsgBudgetUnavailable, "step_up_budget_unavailable": true}, body)
 	require.True(t, storedPurgeFence(t, ts, user.ID),
 		"a denied attempt must not lower the fence")
 }

@@ -26,7 +26,6 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
-	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
@@ -416,9 +415,9 @@ func TestTOTPStepReplay_GuardBackupCodeAndWebAuthnTokenIndependentOfTOTP(t *test
 	assert.True(t, okTOTP1, "guard: consuming a backup code must not affect TOTP verification")
 
 	// WebAuthn inline token: single-use already, by its own mechanism
-	// (consumeWebAuthnInlineToken, internal/mfa/handlers.go:326).
-	token := uuid.New().String() // > 20 chars, required by consumeWebAuthnInlineToken
-	require.NoError(t, ts.Redis.Set(ctx, "mfa_inline_purpose_token:"+user.ID+":"+string(stepReplayPurpose)+":"+token, "1", time.Minute).Err())
+	// (consumeWebAuthnInlineToken spends it from step_up_tokens, #3509).
+	token, mintErr := stepup.MintToken(ctx, ts.DB, user.ID, stepup.FactorWebAuthn, stepReplayPurpose, "")
+	require.Nil(t, mintErr)
 
 	ok3, err := h.VerifyCode(ctx, user.ID, stepReplayPurpose, token)
 	require.NoError(t, err)

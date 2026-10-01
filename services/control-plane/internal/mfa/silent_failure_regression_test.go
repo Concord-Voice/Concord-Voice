@@ -718,10 +718,11 @@ func TestSilentFailureInlineFinish_SessionConsumeFault_IssuesNoToken(t *testing.
 	assert.Nil(t, body["mfa_token"], "no inline token may be issued from a session that is still reusable")
 }
 
+// Since #3509 the token is written to step_up_tokens, not Redis, so the fault
+// is on that INSERT.
 func TestSilentFailureInlineFinish_TokenWriteFault_FailsClosed(t *testing.T) {
-	hook, hits := sfFault("set", "mfa_inline_purpose_token:")
-	db := iuNewTestDB(t)
-	h, clean, auth, userID := sfInlineFixture(t, db, hook)
+	db, hits := sfFaultDB(t, "INSERT INTO step_up_tokens")
+	h, clean, auth, userID := sfInlineFixture(t, db)
 	status, body := sfInlineVerify(t, h, clean, auth, userID)
 	sfRequireFired(t, hits)
 	assert.Equal(t, http.StatusInternalServerError, status, "a token that could not be stored must not be returned")

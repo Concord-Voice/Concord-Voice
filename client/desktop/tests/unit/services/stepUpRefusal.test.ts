@@ -102,6 +102,73 @@ describe('classifyStepUpRefusal — the wire contract, one case per row', () => 
   });
 });
 
+describe('classifyStepUpRefusal — delete-rate soft-lock (#3455)', () => {
+  it('delete_rate_limited + mfa_required → deleteRateLimited, keeping only string methods', () => {
+    expect(
+      classifyStepUpRefusal(403, {
+        error: 'Confirm it is you',
+        delete_rate_limited: true,
+        mfa_required: true,
+        methods: ['totp', 9, 'webauthn'],
+      })
+    ).toEqual({ kind: 'deleteRateLimited', methods: ['totp', 'webauthn'] });
+  });
+
+  it('deleteRateLimited wins over mfaRequired when both flags are present', () => {
+    const refusal = classifyStepUpRefusal(403, {
+      mfa_required: true,
+      delete_rate_limited: true,
+      methods: ['totp'],
+    });
+    expect(refusal.kind).toBe('deleteRateLimited');
+  });
+
+  it('deleteRateLimited wins over passwordRequired when the body also asks for MFA', () => {
+    expect(
+      classifyStepUpRefusal(403, {
+        delete_rate_limited: true,
+        mfa_required: true,
+        password_required: true,
+        methods: ['totp'],
+      }).kind
+    ).toBe('deleteRateLimited');
+  });
+
+  it("an older route's plain mfa_required is unchanged", () => {
+    expect(
+      classifyStepUpRefusal(403, { mfa_required: true, methods: ['totp', 'webauthn'] })
+    ).toEqual({ kind: 'mfaRequired', methods: ['totp', 'webauthn'] });
+  });
+
+  it('delete_rate_limited without mfa_required is not the soft-lock challenge', () => {
+    expect(
+      classifyStepUpRefusal(403, { delete_rate_limited: true, error: 'Delete blocked' })
+    ).toEqual({ kind: 'failed', message: 'Delete blocked' });
+  });
+
+  it('delete_rate_limited + password_required stays a password challenge', () => {
+    expect(
+      classifyStepUpRefusal(403, { delete_rate_limited: true, password_required: true })
+    ).toEqual({ kind: 'passwordRequired' });
+  });
+
+  it('flags are matched strictly: a truthy non-boolean delete_rate_limited is not the flag', () => {
+    expect(
+      classifyStepUpRefusal(403, { delete_rate_limited: 'yes', mfa_required: true, methods: [] })
+    ).toEqual({ kind: 'mfaRequired', methods: [] });
+  });
+
+  it('a non-array methods list becomes an empty one', () => {
+    expect(
+      classifyStepUpRefusal(403, { delete_rate_limited: true, mfa_required: true, methods: 'totp' })
+    ).toEqual({ kind: 'deleteRateLimited', methods: [] });
+  });
+
+  it('is not a factor refusal: a settings dialog must not pick it up as its own field', () => {
+    expect(isStepUpFactorRefusal({ kind: 'deleteRateLimited', methods: ['totp'] })).toBe(false);
+  });
+});
+
 describe('isStepUpFactorRefusal', () => {
   it('is true only for the four field-owned kinds', () => {
     expect(isStepUpFactorRefusal({ kind: 'passwordRequired' })).toBe(true);

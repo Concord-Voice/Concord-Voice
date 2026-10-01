@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '../../../test-utils';
+import { act, fireEvent, render, screen, userEvent, waitFor, within } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
@@ -13,6 +13,25 @@ vi.mock('@/renderer/services/messaging/dmVisibilityApi', () => ({
 
 const mockClearDMHistory = vi.mocked(clearDMHistory);
 const mockHideDMThread = vi.mocked(hideDMThread);
+
+// Clear's MFA stage is the shared MFAVerifyPrompt (#3509 review): a code is
+// typed into its digit boxes rather than one text field.
+type FactorField = 'Password' | 'Digit 1';
+
+async function enterFactor(field: FactorField, value: string): Promise<() => HTMLElement> {
+  if (field === 'Password') {
+    fireEvent.change(await screen.findByLabelText('Password'), { target: { value } });
+    return () => screen.getByLabelText('Password');
+  }
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('textbox', { name: 'Digit 1' }));
+  await user.keyboard(value);
+  // The prompt remounts after a refused code, so look the box up again.
+  return () => screen.getByRole('textbox', { name: 'Digit 1' });
+}
+
+const required = (kind: 'passwordRequired' | 'mfaRequired') =>
+  kind === 'mfaRequired' ? { kind, methods: ['totp'] } : { kind };
 
 const conversation: DMConversation = {
   id: 'dm-1',
@@ -250,22 +269,20 @@ describe('DMThreadRemovalDialog', () => {
 
   it.each([
     ['password', 'password_required', 'Password', 'current_password'],
-    ['MFA', 'mfa_required', 'Authentication code', 'mfa_code'],
+    ['MFA', 'mfa_required', 'Digit 1', 'mfa_code'],
   ] as const)('asks only for the server-selected %s factor', async (_name, kind, label, field) => {
-    mockClearDMHistory.mockResolvedValueOnce({
-      kind: kind === 'password_required' ? 'passwordRequired' : 'mfaRequired',
-    });
+    mockClearDMHistory.mockResolvedValueOnce(
+      required(kind === 'password_required' ? 'passwordRequired' : 'mfaRequired')
+    );
     renderDialog('clear');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
 
-    const input = await screen.findByLabelText(label);
-    expect(input).toBeInTheDocument();
-    expect(
-      screen.queryByLabelText(field === 'current_password' ? 'Authentication code' : 'Password')
-    ).not.toBeInTheDocument();
-    fireEvent.change(input, {
-      target: { value: field === 'current_password' ? 'test-password-123' : '123456' },
-    });
+    await enterFactor(label, field === 'current_password' ? 'test-password-123' : '123456');
+    if (field === 'current_password') {
+      expect(screen.queryByRole('textbox', { name: 'Digit 1' })).not.toBeInTheDocument();
+    } else {
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    }
     fireEvent.click(screen.getByRole('button', { name: 'Verify and clear' }));
     await waitFor(() =>
       expect(mockClearDMHistory).toHaveBeenLastCalledWith('dm-1', {
@@ -282,12 +299,7 @@ describe('DMThreadRemovalDialog', () => {
       'Password',
       /password is not correct/i,
     ],
-    [
-      { kind: 'invalidMfaCode' as const },
-      'mfaRequired',
-      'Authentication code',
-      /code is not correct/i,
-    ],
+    [{ kind: 'invalidMfaCode' as const }, 'mfaRequired', 'Digit 1', /code is not correct/i],
     [
       { kind: 'rateLimited' as const, retryAfterSeconds: 30 },
       'passwordRequired',
@@ -297,22 +309,17 @@ describe('DMThreadRemovalDialog', () => {
   ] as const)(
     'keeps Clear open with an actionable factor or rate-limit error',
     async (result, requiredKind, label, message) => {
-      mockClearDMHistory.mockResolvedValueOnce({
-        kind: requiredKind === 'mfaRequired' ? 'mfaRequired' : 'passwordRequired',
-      });
+      mockClearDMHistory.mockResolvedValueOnce(required(requiredKind));
       mockClearDMHistory.mockResolvedValueOnce(result);
       renderDialog('clear');
       fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-      if (label) {
-        const input = await screen.findByLabelText(label);
-        fireEvent.change(input, { target: { value: 'bad-factor' } });
-        fireEvent.click(screen.getByRole('button', { name: 'Verify and clear' }));
-        if (result.kind === 'invalidPassword' || result.kind === 'invalidMfaCode') {
-          await waitFor(() => {
-            expect(input).toHaveFocus();
-            expect(input).toHaveValue('');
-          });
-        }
+      const input = await enterFactor(label, label === 'Password' ? 'bad-factor' : '000000');
+      fireEvent.click(screen.getByRole('button', { name: 'Verify and clear' }));
+      if (result.kind === 'invalidPassword' || result.kind === 'invalidMfaCode') {
+        await waitFor(() => {
+          expect(input()).toHaveFocus();
+          expect(input()).toHaveValue('');
+        });
       }
       await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(message));
       expect(screen.getByRole('dialog')).toBeInTheDocument();

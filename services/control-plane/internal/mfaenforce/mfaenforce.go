@@ -36,7 +36,7 @@
 //
 // # Errors
 //
-// Classify a LockGateTx error in this order: IsLockConflict (503, Retry-After),
+// Classify a LockGateTx error in this order: IsLockConflict (answer WriteBusy),
 // then errors.As into *stepup.Error (write its status and body), then
 // errors.Is ErrServerNotFound (404), then 500. IsLockConflict must come first:
 // a lock timeout on the users row arrives as a 500 *stepup.Error whose Cause
@@ -49,10 +49,10 @@
 // # Imports
 //
 // This is a leaf. It imports stepup and the standard library, plus lib/pq for
-// SQLSTATE matching and gin for the *stepup.Error body type, which stepup
-// already imports. The packages that consume it (rbac, servers, members,
-// channels, api) must never become its dependencies; imports_test.go enforces
-// that over the whole transitive closure.
+// SQLSTATE matching and gin for the *stepup.Error body type and WriteBusy
+// (stepup already imports gin). The packages that consume it (rbac, servers,
+// members, channels, api) must never become its dependencies; imports_test.go
+// enforces that over the whole transitive closure.
 package mfaenforce
 
 import (
@@ -238,9 +238,21 @@ func RequireConfirmationTx(
 	return ConfirmTx(ctx, tx, g.Subject, v, actorID, purpose, code)
 }
 
+// ErrMsgBusy is the lock-conflict 503's copy. WriteBusy is its only writer.
+const ErrMsgBusy = "The server is busy. Try again."
+
+// WriteBusy answers a lock conflict: 503, Retry-After: 1, and a lock_conflict
+// flag that lets a client tell it from a gated route's other 503s without
+// matching copy (#3455). It is the one writer of that body, so the toggle and
+// the gated routes cannot drift apart on it.
+func WriteBusy(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": ErrMsgBusy, "lock_conflict": true})
+}
+
 // IsLockConflict reports whether err carries PostgreSQL deadlock_detected
 // (40P01) or lock_not_available (55P03) anywhere in its chain, including
-// inside a *stepup.Error's Cause. Callers answer it with 503 and Retry-After.
+// inside a *stepup.Error's Cause. Callers answer it with WriteBusy.
 // Under the lock order above it is a backstop that should not fire.
 func IsLockConflict(err error) bool {
 	var pqErr *pq.Error

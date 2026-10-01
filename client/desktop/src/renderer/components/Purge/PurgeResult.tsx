@@ -99,10 +99,35 @@ function ResultBody({
         </p>
       );
     }
+    case 'verificationLimited': {
+      // #3455: too many wrong codes or passwords on the step-up budget, which
+      // the self-purge confirmation charges before any batch runs.
+      const countdown =
+        result.retryAfterSeconds === undefined ? null : formatRetryAfter(result.retryAfterSeconds);
+      return (
+        <p role="alert">
+          Too many verification attempts. Nothing was purged.
+          {countdown === null ? ' Try again later.' : ` Try again in ${countdown}.`}
+        </p>
+      );
+    }
     case 'unavailable':
       // The limiter failed closed because its backend is unreachable. The user
       // hit no limit, so no countdown exists and none is invented.
       return <p role="alert">Temporarily unavailable. Try again shortly.</p>;
+    case 'softLockFailed': {
+      // #3455: a soft-lock 403 that is not a challenge (e.g. the account has no
+      // authenticator app or security key yet). The gate runs before any purge
+      // batch, so — like `sessionExpired` — this may say nothing was purged.
+      const countdown =
+        result.retryAfterSeconds === undefined ? null : formatRetryAfter(result.retryAfterSeconds);
+      return (
+        <p role="alert">
+          {result.message ?? "This purge couldn't be completed."} Nothing was purged.
+          {countdown !== null && ` You can try again in ${countdown}.`}
+        </p>
+      );
+    }
     case 'notFound':
       return <p role="alert">{GONE_COPY[context]}</p>;
     case 'sessionExpired':

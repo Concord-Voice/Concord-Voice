@@ -3,6 +3,7 @@ package dm_test
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,51 +179,89 @@ func enableVisibilityTOTP(t *testing.T, ts *testhelpers.TestServer, user testhel
 	}
 }
 
-func TestDMVisibility_ClearMFAReplacesPassword(t *testing.T) {
+// mintPasswordStepUp exchanges the user's password for a password step-up
+// token at the real mint endpoint (#3509), and returns the response.
+func mintPasswordStepUp(t *testing.T, ts *testhelpers.TestServer, user testhelpers.TestUser, password, purpose string) (int, map[string]interface{}) {
+	t.Helper()
+	w := ts.DoRequest("POST", "/api/v1/auth/step-up/password",
+		map[string]string{"current_password": password, "purpose": purpose}, testhelpers.AuthHeaders(user.AccessToken))
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	return w.Code, body
+}
+
+// mintClearToken mints a dm.clear password token with the user's real
+// password, and fails the test if the mint does not succeed.
+func mintClearToken(t *testing.T, ts *testhelpers.TestServer, user testhelpers.TestUser) string {
+	t.Helper()
+	status, body := mintPasswordStepUp(t, ts, user, testhelpers.TestAuthPlaintext, "dm.clear")
+	require.Equal(t, http.StatusOK, status, "mint: %v", body)
+	return testhelpers.JSONField[string](t, body, "step_up_token")
+}
+
+// Rewritten for #3509: the password reaches only the mint endpoint, so the
+// case that paired a wrong MFA code with the correct password now pairs it
+// with a valid password step-up token, minted before TOTP was enrolled (the
+// mint refuses an MFA account). Either way the MFA account's code governs.
+func TestDMVisibility_ClearMFAReplacesThePasswordToken(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
-		password   string
+		withToken  bool
+		wrongCode  bool
 		wantStatus int
 	}{
-		{name: "valid MFA without password", password: "", wantStatus: http.StatusOK},
-		{name: "valid MFA with wrong password", password: "wrong-password", wantStatus: http.StatusOK},
-		{name: "wrong MFA with correct password", password: testhelpers.TestAuthPlaintext, wantStatus: http.StatusForbidden},
+		{name: "valid MFA without token", wantStatus: http.StatusOK},
+		{name: "valid MFA with password token", withToken: true, wantStatus: http.StatusOK},
+		{name: "wrong MFA with password token", withToken: true, wrongCode: true, wantStatus: http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := setupTS(t)
-			actor := ts.CreateTestUser(t, "clear_mfa_"+tc.name[:3])
-			peer := ts.CreateTestUser(t, "clear_mfa_peer_"+tc.name[:3])
+			actor := ts.CreateTestUser(t, "clear_mfa_"+tc.name[:3]+tc.name[len(tc.name)-3:])
+			peer := ts.CreateTestUser(t, "clear_mfa_peer_"+tc.name[:3]+tc.name[len(tc.name)-3:])
 			ts.CreateFriendship(t, actor.ID, peer.ID, statusAccepted)
 			convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
-			code := enableVisibilityTOTP(t, ts, actor)()
-			body := map[string]string{"mfa_code": code, "current_password": tc.password}
-			if tc.name == "wrong MFA with correct password" {
+			body := map[string]string{}
+			if tc.withToken {
+				body["step_up_token"] = mintClearToken(t, ts, actor)
+			}
+			body["mfa_code"] = enableVisibilityTOTP(t, ts, actor)()
+			if tc.wrongCode {
 				body["mfa_code"] = "000000"
 			}
 			w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/clear", body, testhelpers.AuthHeaders(actor.AccessToken))
-			assert.Equal(t, tc.wantStatus, w.Code)
+			assert.Equal(t, tc.wantStatus, w.Code, w.Body.String())
 		})
 	}
 }
 
-func TestDMVisibility_ClearPasswordOnlyRequiresCorrectPassword(t *testing.T) {
-	for _, tc := range []struct {
-		name, password string
-		wantStatus     int
-	}{
-		{name: "correct password", password: testhelpers.TestAuthPlaintext, wantStatus: http.StatusOK},
-		{name: "wrong password", password: "wrong-password", wantStatus: http.StatusForbidden},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ts := setupTS(t)
-			actor := ts.CreateTestUser(t, "clear_password_"+tc.name[:3])
-			peer := ts.CreateTestUser(t, "clear_password_peer_"+tc.name[:3])
-			ts.CreateFriendship(t, actor.ID, peer.ID, statusAccepted)
-			convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
-			w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/clear", map[string]string{"current_password": tc.password}, testhelpers.AuthHeaders(actor.AccessToken))
-			assert.Equal(t, tc.wantStatus, w.Code)
-		})
+// Rewritten for #3509: a password account clears with a token the mint
+// endpoint issued for the correct password; a wrong password is refused at
+// the mint, and a token that matches nothing re-prompts at Clear.
+func TestDMVisibility_ClearPasswordOnlyRequiresAMintedToken(t *testing.T) {
+	ts := setupTS(t)
+	actor := ts.CreateTestUser(t, "clear_password_actor")
+	peer := ts.CreateTestUser(t, "clear_password_peer")
+	ts.CreateFriendship(t, actor.ID, peer.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
+	clearHistory := func(body map[string]string) (int, map[string]interface{}) {
+		w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/clear", body, testhelpers.AuthHeaders(actor.AccessToken))
+		var out map[string]interface{}
+		testhelpers.ParseJSON(t, w, &out)
+		return w.Code, out
 	}
+
+	status, body := mintPasswordStepUp(t, ts, actor, "wrong-password", "dm.clear")
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Equal(t, "Invalid password", body["error"])
+
+	status, body = clearHistory(map[string]string{"step_up_token": strings.Repeat("0", 43)}) // never minted
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Equal(t, true, body["password_required"])
+	assert.Equal(t, true, body["step_up_token_invalid"])
+
+	token := mintClearToken(t, ts, actor)
+	status, body = clearHistory(map[string]string{"step_up_token": token})
+	assert.Equal(t, http.StatusOK, status, "%v", body)
 }
 
 func TestDMVisibility_HiddenMessageCannotBeEditedOrDeleted(t *testing.T) {
@@ -300,7 +339,8 @@ func TestDMVisibility_HiddenCursorDoesNotExposeOlderVisibleMessage(t *testing.T)
 // TestDMVisibility_ClearP1EmailOnlyAccountPasswordAlone locks policy P1 on
 // Clear: the MFA branch applies only to an inline-verifiable factor read from
 // the factor tables, so an email/SMS-only account proves itself with its
-// password rather than being asked for a code it has nowhere to enter.
+// password — through a minted token since #3509 — rather than being asked for
+// a code it has nowhere to enter.
 func TestDMVisibility_ClearP1EmailOnlyAccountPasswordAlone(t *testing.T) {
 	ts := setupTS(t)
 	actor := ts.CreateTestUser(t, "clear_p1_email")
@@ -310,8 +350,10 @@ func TestDMVisibility_ClearP1EmailOnlyAccountPasswordAlone(t *testing.T) {
 	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = TRUE, mfa_methods = '{email}' WHERE id = $1`, actor.ID)
 	require.NoError(t, err)
 
+	// The mint applies P1 too: an email-only account is not an MFA account,
+	// so its password mints a token (#3509).
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/clear",
-		map[string]string{"current_password": testhelpers.TestAuthPlaintext}, testhelpers.AuthHeaders(actor.AccessToken))
+		map[string]string{"step_up_token": mintClearToken(t, ts, actor)}, testhelpers.AuthHeaders(actor.AccessToken))
 
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
@@ -329,8 +371,10 @@ func TestDMVisibility_ClearP1StaleFlagsStillRequireCode(t *testing.T) {
 	_, err := ts.DB.Exec(`UPDATE users SET mfa_enabled = FALSE, mfa_methods = '{}' WHERE id = $1`, actor.ID)
 	require.NoError(t, err)
 
+	// No factor at all (#3509: a password no longer reaches Clear): the P1
+	// read alone decides the refusal is the MFA prompt.
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/clear",
-		map[string]string{"current_password": testhelpers.TestAuthPlaintext}, testhelpers.AuthHeaders(actor.AccessToken))
+		map[string]string{}, testhelpers.AuthHeaders(actor.AccessToken))
 
 	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
 	var body map[string]interface{}

@@ -24,11 +24,28 @@ export interface StepUpRefusalBody {
   mfa_required?: unknown;
   methods?: unknown;
   inline_factor_required?: unknown;
+  /** #3455: set on the delete-rate soft-lock's three 403 refusals only. */
+  delete_rate_limited?: unknown;
+  /**
+   * #3509: set beside `password_required` when an own-rule route was sent a
+   * `step_up_token` that matched nothing (spent, expired, or stranded by a
+   * credential change). The remedy is the same password prompt, again.
+   */
+  step_up_token_invalid?: unknown;
 }
 
 export type StepUpRefusal =
-  | { kind: 'passwordRequired' }
+  /** `tokenExpired`: the route refused a password step-up token (#3509). */
+  | { kind: 'passwordRequired'; tokenExpired?: true }
   | { kind: 'mfaRequired'; methods: string[] }
+  /**
+   * #3455: the delete-rate soft-lock's MFA refusal. Carries the same
+   * `methods` shape as `mfaRequired` but is a distinct kind so a delete-path
+   * consumer can route it to its own confirm view without a route it does
+   * not own (a settings dialog, a purge fence) picking it up by accident —
+   * those map it to their generic failure arm instead.
+   */
+  | { kind: 'deleteRateLimited'; methods: string[] }
   | { kind: 'invalidPassword' }
   | { kind: 'invalidMfaCode' }
   | { kind: 'rateLimited' }
@@ -57,7 +74,20 @@ function serverMessage(body: StepUpRefusalBody): string | undefined {
 }
 
 function classifyForbidden(body: StepUpRefusalBody): StepUpRefusal {
-  if (body.password_required === true) return { kind: 'passwordRequired' };
+  // Matched first (#3455 §2.10): the delete-rate soft-lock always pairs
+  // `delete_rate_limited` with `mfa_required`, and a route that does not know
+  // about the soft-lock must never mistake this for its own `mfaRequired`.
+  if (body.delete_rate_limited === true && body.mfa_required === true) {
+    const methods = Array.isArray(body.methods)
+      ? body.methods.filter((m): m is string => typeof m === 'string')
+      : [];
+    return { kind: 'deleteRateLimited', methods };
+  }
+  if (body.password_required === true) {
+    return body.step_up_token_invalid === true
+      ? { kind: 'passwordRequired', tokenExpired: true }
+      : { kind: 'passwordRequired' };
+  }
   if (body.mfa_required === true) {
     const methods = Array.isArray(body.methods)
       ? body.methods.filter((m): m is string => typeof m === 'string')

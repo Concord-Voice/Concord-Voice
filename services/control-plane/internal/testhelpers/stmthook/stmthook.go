@@ -51,6 +51,11 @@ type Hook struct {
 	// context from one that does not. A callback rather than a stored context:
 	// the hook keeps nothing request-scoped past the statement.
 	observe func(context.Context)
+	// commitFault, when set, is what the next transaction's Commit reports,
+	// after committing it when commitCommits is true and after rolling it
+	// back otherwise. See ArmCommit.
+	commitFault   error
+	commitCommits bool
 }
 
 // Arm resets the hook. between, when non-nil, runs at the hooked statement and
@@ -340,4 +345,53 @@ func RequireInterleaved(t *testing.T, db *sql.DB, hook *Hook, sc Scenario, want 
 	} else {
 		require.Equal(t, 1, serverRows, "a control must leave the server in place")
 	}
+}
+
+// ArmCommit makes the next transaction committed through this pool report
+// fault from Commit. When committed is true the transaction commits first, as
+// one whose COMMIT reached the server and whose acknowledgement was then lost
+// would; otherwise it is rolled back, as a COMMIT the server refused would be.
+// It fires once and is independent of Arm.
+func (h *Hook) ArmCommit(committed bool, fault error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.commitFault, h.commitCommits = fault, committed
+}
+
+// takeCommitFault disarms and returns ArmCommit's fault, if any.
+func (h *Hook) takeCommitFault() (committed bool, fault error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	committed, fault = h.commitCommits, h.commitFault
+	h.commitFault, h.commitCommits = nil, false
+	return committed, fault
+}
+
+func (c *hookConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	tx, err := c.hookableConn.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return hookTx{Tx: tx, hook: c.hook}, nil
+}
+
+// hookTx is a transaction whose Commit ArmCommit can fault.
+type hookTx struct {
+	driver.Tx
+	hook *Hook
+}
+
+func (t hookTx) Commit() error {
+	committed, fault := t.hook.takeCommitFault()
+	if fault == nil {
+		return t.Tx.Commit()
+	}
+	end := t.Rollback
+	if committed {
+		end = t.Tx.Commit
+	}
+	if err := end(); err != nil {
+		return errors.Join(fault, err)
+	}
+	return fault
 }

@@ -1141,7 +1141,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                 return (
                   <React.Fragment key={message.id}>
                     {dateDivider}
-                    <div data-message-id={message.id}>
+                    <div data-message-id={message.id} tabIndex={-1}>
                       <MessageExpirationEventMessage
                         kind={payload.kind}
                         windowSeconds={
@@ -1162,7 +1162,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                 return (
                   <React.Fragment key={message.id}>
                     {dateDivider}
-                    <div data-message-id={message.id}>
+                    <div data-message-id={message.id} tabIndex={-1}>
                       <CallEventMessage
                         payload={message.call_event_payload}
                         isGroup={isGroupConversation}
@@ -1177,6 +1177,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                   {dateDivider}
                   <div
                     data-message-id={message.id}
+                    tabIndex={-1}
                     className={
                       highlightedMessageId === message.id ? 'message-highlight' : undefined
                     }

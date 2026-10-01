@@ -216,6 +216,18 @@ func (h *Handler) SetActivePlanRail(rail ActivePlanRail) {
 // the wiring line deleted.
 func (h *Handler) HasActivePlanRail() bool { return h != nil && h.activePlans != nil }
 
+// HasMFAVerifier reports whether the handler was constructed with a non-nil
+// MFA verifier. dm.Handler takes its verifier through HandlerDeps rather than
+// a setter (it already backs the #1352 bulk-purge step-up gate), so this asks
+// the FIELD the constructor populated. The delete-rate soft-lock's boot guard
+// (#3455) shares this predicate with that existing purge gate.
+func (h *Handler) HasMFAVerifier() bool { return h != nil && h.mfaVerifier != nil }
+
+// HasRedis reports whether the handler was constructed with a non-nil Redis
+// client. Shared by the #1352 purge gate and the #3455 delete-rate soft-lock's
+// boot guard.
+func (h *Handler) HasRedis() bool { return h != nil && h.redis != nil }
+
 // dmMessageResponse represents a DM message in API responses.
 type dmMessageResponse struct {
 	ID               string          `json:"id"`
@@ -3548,7 +3560,9 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": result})
 }
 
-// DeleteMessage deletes a DM message.
+// DeleteMessage deletes a DM message. Past the delete-rate soft-lock (#3455)
+// the author confirms under their own require_auth_before_purge rule; see
+// deleteDMMessageUnderSoftLock.
 func (h *Handler) DeleteMessage(c *gin.Context) {
 	convID, messageID, userID, ok := h.resolveDMMessageRequest(c)
 	if !ok {
@@ -3559,9 +3573,54 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
-	var deletedAuthorID uuid.UUID
-	var deletedCreatedAt time.Time
-	if !h.deleteDMMessage(c, convID, messageID, userID, &deletedAuthorID, &deletedCreatedAt) {
+	in, bodyErr := stepup.ReadOptionalStepUp(c)
+	if bodyErr != nil {
+		bodyErr.Write(c)
+		return
+	}
+
+	// Check message exists and user is the author. The same statement reads the
+	// author's own require_auth_before_purge — a missing row means ON, as it
+	// does for Clear — which is the soft-lock population. Nothing branches on it
+	// before the author 403 below (I7).
+	//
+	// This read is unlocked and is NOT the authority: deleteDMMessageTx
+	// rechecks participation and authorship under the topology locks. It exists
+	// because the soft-lock counts before that transaction opens, so a
+	// non-author or a missing row must be refused here, uncounted.
+	var authorID string
+	var ownRule bool
+	//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+	if err := h.db.QueryRow(`SELECT m.user_id,
+		       COALESCE((SELECT require_auth_before_purge FROM privacy_settings WHERE user_id = $3), TRUE)
+		FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+
+		hiddenRangeFilter(3), messageID, convID, userID).Scan(&authorID, &ownRule); err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return
+	} else if err != nil {
+		h.log.Error("Failed to check DM message author", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return
+	}
+
+	if authorID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own messages"})
+		return
+	}
+	if h.purgeEngine == nil {
+		h.log.Error("Failed to delete DM message", "error", "purge engine unavailable")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return
+	}
+
+	deleted, ok := h.deleteDMMessageUnderSoftLock(c, dmMessageDeleteTarget{
+		convID:     convID,
+		messageID:  messageID,
+		userID:     userID,
+		actorUUID:  actorUUID,
+		tokenEpoch: middleware.TokenCredentialEpoch(c),
+	}, in, ownRule)
+	if !ok {
 		return
 	}
 
@@ -3575,94 +3634,13 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	if h.hub != nil {
 		h.hub.BroadcastToDMMessageAllParticipants(
 			conversationUUID,
-			websocket.NewDeletedDMMessageVisibilitySource(deletedAuthorID, deletedCreatedAt),
+			websocket.NewDeletedDMMessageVisibilitySource(deleted.authorID, deleted.createdAt),
 			actorUUID,
 			msg,
 		)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// deleteDMMessage rechecks authority under the complete topology and
-// credential fence. A member removed after the HTTP preflight receives 403,
-// never a misleading 404 caused by an unfenced purge lookup.
-func (h *Handler) deleteDMMessage(
-	c *gin.Context,
-	convID, messageID, userID string,
-	deletedAuthorID *uuid.UUID,
-	deletedCreatedAt *time.Time,
-) bool {
-	if h.purgeEngine == nil {
-		h.log.Error("Failed to delete DM message", "error", "purge engine unavailable")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
-		return false
-	}
-	actor, err := uuid.Parse(userID)
-	if err != nil {
-		h.log.Error("Failed to parse DM message delete actor", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
-		return false
-	}
-	err = h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
-		MessagesTable:    "dm_messages",
-		ScopeColumn:      "conversation_id",
-		ScopeID:          convID,
-		AttachmentsTable: "dm_message_attachments",
-		Guard: func(ctx context.Context, tx *sql.Tx) error {
-			if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockShare); err != nil {
-				return err
-			}
-			if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
-				return err
-			}
-			var participant string
-			if err := tx.QueryRowContext(ctx,
-				`SELECT user_id FROM dm_participants WHERE user_id = $1 AND conversation_id = $2 FOR SHARE`, userID, convID,
-			).Scan(&participant); errors.Is(err, sql.ErrNoRows) {
-				return errDMPurgeNotParticipant
-			} else if err != nil {
-				return fmt.Errorf("recheck DM message participant: %w", err)
-			}
-			//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
-			if err := tx.QueryRowContext(ctx,
-				`SELECT m.user_id, m.created_at FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3)+` FOR UPDATE`,
-				messageID, convID, userID,
-			).Scan(deletedAuthorID, deletedCreatedAt); err != nil {
-				return fmt.Errorf("recheck DM message author: %w", err)
-			}
-			if *deletedAuthorID != actor {
-				return errDMPurgeScopeChanged
-			}
-			return nil
-		},
-	})
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-		h.respondGuardTxError(c, err, errMsgFailedDeleteMessage)
-		return false
-	}
-	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
-		return false
-	}
-	if errors.Is(err, errDMPurgeNotParticipant) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
-		return false
-	}
-	if errors.Is(err, errDMPurgeScopeChanged) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own messages"})
-		return false
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		return false
-	}
-	h.log.Error("Failed to delete DM message", "error", err)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
-	return false
 }
 
 func parseDMMessageDeliveryIDs(convID, messageID, actorID string) (uuid.UUID, uuid.UUID, uuid.UUID, error) {

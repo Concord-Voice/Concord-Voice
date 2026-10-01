@@ -245,19 +245,20 @@ func TestVerifyFailsClosedWhenItCannotReadTheReuseOrLockoutGuard(t *testing.T) {
 }
 
 const (
-	// inlineFactor is a WebAuthn inline token a step-up test stores for one
-	// purpose (storeInlineFactor). It verifies without the database.
+	// inlineFactor is a WebAuthn inline token a step-up test presents. It
+	// verifies when the scripted database answers its spend (inlineFactorSpent).
 	inlineFactor = "webauthn-inline-token-123456"
 	// wrongFactor is wrong for an account with no TOTP secret, which is every
 	// fixture that uses it.
 	wrongFactor = "000000"
 )
 
-// storeInlineFactor stores inlineFactor as a token minted for purpose.
-func storeInlineFactor(t *testing.T, redisClient *redis.Client, purpose stepup.Purpose) {
-	t.Helper()
-	require.NoError(t, redisClient.Set(context.Background(), inlineTokenKey(enrollUser, purpose, inlineFactor), "1", time.Minute).Err())
-}
+// inlineFactorSpent answers stepup.SpendToken's DELETE … RETURNING 1 with one
+// row: the scripted database's stand-in for a live WebAuthn token minted for
+// the route under test. Since #3509 the token lives in step_up_tokens, not in
+// Redis, so the spend is a query these fixtures script like any other; purpose
+// binding itself is pinned against a real database in inline_token_purpose_test.go.
+var inlineFactorSpent = scriptedAnswer{match: "DELETE FROM step_up_tokens", values: []driver.Value{int64(1)}}
 
 // state is an account whose only factor is this fixture's confirmed TOTP.
 func (f realTOTPFixture) state() *mfaEventDB {
@@ -818,11 +819,10 @@ func TestEmailSmsSetupRefusesAnEmailServiceThatOnlyLogs(t *testing.T) {
 			// which is the Standard factor email/SMS setup requires.
 			h, redisClient := scriptedHandler(t, &mfaEventDB{passwordHash: hash}, tc.environment,
 				scriptedAnswer{match: "FROM users u WHERE u.id", values: []driver.Value{hash, true, false}},
-				scriptedAnswer{match: "SELECT email FROM users", values: []driver.Value{"email-fixture@example.test"}})
+				scriptedAnswer{match: "SELECT email FROM users", values: []driver.Value{"email-fixture@example.test"}},
+				// The step-up factor: an inline WebAuthn token minted for this route.
+				inlineFactorSpent)
 			h.SetEmailService(loggingEmailService(tc.environment))
-			// The step-up factor: an inline WebAuthn token minted for this
-			// route verifies without the database.
-			storeInlineFactor(t, redisClient, stepup.PurposeEmailSmsSetup)
 			c, response := enrollRequest("/api/v1/mfa/email-sms/setup",
 				`{"password":"correct","mfa_code":"`+inlineFactor+`","methods":["email"]}`, "session-a")
 
@@ -1535,9 +1535,8 @@ func TestBeginWebAuthnLoginFailsWhenItCannotStoreTheSession(t *testing.T) {
 // An unreadable pre-existing-enrollment check must stop setup: reading it as
 // absent would let the upsert replace an active TOTP and turn MFA off.
 func TestTOTPSetupFailsWhenItCannotCheckExistingEnrollment(t *testing.T) {
-	h, redisClient := scriptedHandler(t, &mfaEventDB{passwordHash: correctPasswordHash(t)}, "test",
-		scriptedAnswer{match: "SELECT confirmed FROM user_mfa_totp", err: errReadFailed})
-	storeInlineFactor(t, redisClient, stepup.PurposeTOTPSetup)
+	h, _ := scriptedHandler(t, &mfaEventDB{passwordHash: correctPasswordHash(t)}, "test",
+		scriptedAnswer{match: "SELECT confirmed FROM user_mfa_totp", err: errReadFailed}, inlineFactorSpent)
 	c, response := enrollRequest("/api/v1/auth/mfa/totp/setup", `{"password":"correct","mfa_code":"`+inlineFactor+`"}`, "session-a")
 
 	h.TOTPSetup(c)

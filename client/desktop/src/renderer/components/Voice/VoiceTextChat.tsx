@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { MessageSquare, Volume2, PanelBottom, PanelRight } from 'lucide-react';
 import MessageList from '../Chat/MessageList';
 import MessageInput from '../Chat/MessageInput';
+import DeleteRefusalModal from '../Chat/DeleteRefusalModal';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useDMStore } from '../../stores/chat/dmStore';
@@ -28,6 +29,9 @@ const VoiceTextChat: React.FC = () => {
     sendMessage,
     editMessage,
     deleteMessage,
+    deleteRefusal,
+    confirmDelete,
+    dismissDeleteRefusal,
     replyingTo,
     handleReply,
     cancelReply,
@@ -228,6 +232,13 @@ const VoiceTextChat: React.FC = () => {
           />
         </div>
       )}
+
+      <DeleteRefusalModal
+        refusal={deleteRefusal}
+        onConfirm={confirmDelete}
+        onDismiss={dismissDeleteRefusal}
+        purpose={ctx.type === 'dm' ? 'dm.message_delete' : 'messages.delete'}
+      />
     </div>
   );
 };

@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000161)
+## Existing Migrations (000001–000162)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -271,6 +271,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000159 | add_voice_authorization_revision_sequence | Add the database-assigned monotonic revision watermark used by voice authorization snapshots; down refuses to drop a consumed sequence |
 | 000160 | add_voice_pending_admissions | Add the channel pending-admission base table and expiry index |
 | 000161 | version_voice_pending_admissions | Add exact admission and socket identity columns to pending admissions |
+| 000162 | add_step_up_tokens | `step_up_tokens` — single-use, purpose-bound password and WebAuthn step-up tokens, stored as SHA-256 only and spent in the consumer's transaction (#3455, PR #3509) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -336,6 +337,20 @@ Migration 000160 creates the bounded channel pending-admission table and expiry
 index. Migration 000161 adds the exact `admission_id` and `socket_id` identity
 columns. The authorization revision sequence already exists in 000159 and is not
 recreated or dropped by this pair.
+
+Migration 000162 creates `step_up_tokens`, the store for the password step-up
+tokens `POST /api/v1/auth/step-up/password` mints and the WebAuthn inline tokens
+`verify-inline/finish` mints (the latter lived in Redis before). A consumer spends
+one with a single `DELETE … RETURNING` inside its own transaction, so a rollback
+restores it. The table is new and empty, so its two indexes are plain
+`CREATE INDEX` (golang-migrate runs each file as one transaction, so
+`CONCURRENTLY` was not available anyway). Apply it before the binary that
+mints; CHECKs pin the hash length, a non-empty purpose and the credential
+epoch's 32-hex format. A token binds to the user and the credential epoch,
+not to a session. Every mint deletes the minting user's expired rows and keeps at
+most 16 live rows per user, oldest first; the hourly cleanup job sweeps expired
+rows globally. The down drops the table: every row is at most 60 seconds from
+expiry, so a rollback costs at most one re-prompt.
 
 ## Troubleshooting
 

@@ -41,7 +41,14 @@ func TestChannelMessageMutationsRejectStaleCredentialEpoch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ts, user, messageID := staleMessageFixture(t)
 			staleToken := ts.SimulateStaleEpochWindow(t, user.ID)
-			w := ts.DoRequest(tt.method, "/api/v1/messages/"+messageID+tt.suffix, tt.body,
+			// A nil map must go out as NO body: DoRequest marshals a typed nil
+			// to `null`, which the delete route's optional step-up body refuses
+			// with 400 before any fence runs (#3455).
+			var body interface{}
+			if tt.body != nil {
+				body = tt.body
+			}
+			w := ts.DoRequest(tt.method, "/api/v1/messages/"+messageID+tt.suffix, body,
 				testhelpers.AuthHeaders(staleToken))
 			require.Equal(t, http.StatusUnauthorized, w.Code)
 			if tt.name == "delete" {

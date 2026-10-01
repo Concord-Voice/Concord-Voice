@@ -42,6 +42,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servercapabilities"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/sessions"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/subscriptions"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/updates"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
@@ -673,6 +674,33 @@ func requireServersMFAVerifierWired(log *logger.Logger, h *servers.Handler) {
 	}
 }
 
+// requireMessageDeleteGuardWired fatal-exits when either message-delete
+// handler lacks a dependency of the delete-rate soft-lock's MFA confirmation
+// (#3455).
+//
+// Both fail CLOSED, which is the safe direction but a silent one: with no
+// verifier every over-threshold delete is a 500, and with no Redis client the
+// soft-lock counter and its step-up attempt budget deny every delete with a
+// 503 — so an unwired replica would silently break message deletion for
+// every user. Boot is where that should surface. It interrogates the
+// HANDLERS, never the values the router holds, for the reason
+// requirePermissionInvalidatorWired gives. Extracted from NewRouter, which
+// sits at the go:S3776 limit. #3454 reuses this guard.
+func requireMessageDeleteGuardWired(log *logger.Logger, messagesH *messages.Handler, dmH *dm.Handler) {
+	if messagesH == nil || !messagesH.HasMFAVerifier() {
+		log.Fatal("messages handler has no MFA verifier: the delete-rate soft-lock's confirmation would fail for every channel delete")
+	}
+	if !messagesH.HasRedis() {
+		log.Fatal("messages handler has no Redis client: the delete-rate soft-lock would deny every channel delete")
+	}
+	if dmH == nil || !dmH.HasMFAVerifier() {
+		log.Fatal("dm handler has no MFA verifier: the delete-rate soft-lock's confirmation would fail for every DM delete")
+	}
+	if !dmH.HasRedis() {
+		log.Fatal("dm handler has no Redis client: the delete-rate soft-lock would deny every DM delete")
+	}
+}
+
 // wireMediaHandler injects the media handler's optional dependencies.
 //
 // Extracted from NewRouter rather than inlined, and the reason is mechanical:
@@ -1008,6 +1036,11 @@ func NewRouter(
 
 	purgeRateLimit, purgeRateWindow := resolvePurgeRateLimit(cfg)
 	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache, purgeEngine, opsCounters)
+	// #3455: the delete-rate soft-lock's MFA confirmation, wired the same way as
+	// serversHandler's above. requireMessageDeleteGuardWired below checks both
+	// this and the dmHandler side once dmHandler exists.
+	messagesHandler.SetMFAVerifier(mfaHandler)
+	messagesHandler.SetRedis(redis)
 	// #1353: give the members handler the purge capability for optional purge-on-ban/kick,
 	// sharing the standalone purge endpoint's fail-closed rate-limit config (Codex P2 review).
 	membersHandler.SetServerMessagePurger(messagesHandler, purgeRateLimit, purgeRateWindow)
@@ -1052,6 +1085,7 @@ func NewRouter(
 		MFAVerifier: mfaHandler,
 		ActivePlans: activePlanRail,
 	})
+	requireMessageDeleteGuardWired(log, messagesHandler, dmHandler)
 	// Wire DM voice ring cleanup-on-disconnect (#1209 plan task B7 Part 2).
 	// When a user's last WS connection drops, the hub invokes
 	// HandleUserDisconnect to cancel any rings they initiated.
@@ -1140,6 +1174,10 @@ func NewRouter(
 		credFence, middleware.SecurityHeaderSet(cfg.Environment, cfg.HSTSHeaderValue))
 	wsHandler.SetMinimumClientVersion(cfg.ClientMinVersion)
 	wsTicketHandler := auth.NewWSTicketHandler(redis, cfg.JWTSecret)
+	// The one endpoint an own-rule route's password reaches (#3509). It
+	// verifies through authHandler, so it counts against /login's lockout.
+	stepUpPasswordHandler := stepup.NewPasswordTokenHandler(db, authHandler, redis, log)
+	stepUpPasswordHandler.SetSecurityEvents(securityEvents)
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
 	// Mirrors the registration condition of the chunked upload session routes
@@ -1631,6 +1669,15 @@ func NewRouter(
 			protected.POST("/auth/ws-ticket",
 				middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 				wsTicketHandler.IssueTicket,
+			)
+
+			// Password step-up token mint (#3509): the only endpoint the password
+			// of an own-rule route (DM Clear, the message deletes, the
+			// self-purges) reaches. Authenticated, so it sits here rather than in
+			// the public authRoutes group, under the same /auth path. See
+			// stepUpPasswordRouteGuards for its limiters.
+			protected.POST("/auth/step-up/password",
+				append(stepUpPasswordRouteGuards(redis), stepUpPasswordHandler.MintPasswordToken)...,
 			)
 
 			// Age-verification claim ingest (#1623). Identity-blind: stores only
@@ -3123,6 +3170,7 @@ var nightwatchFallbackEvents = map[securityevent.RouteTemplate]securityevent.Eve
 	securityevent.RouteServerTransferOwnership:   {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerTransferOwnership},
 	securityevent.RouteServerTransferOwnershipOK: {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerTransferOwnershipOK},
 	securityevent.RouteServerMFAEnforcement:      {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMFAEnforcement},
+	securityevent.RouteStepUpPassword:            {EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, RouteTemplate: securityevent.RouteStepUpPassword},
 }
 
 var nightwatchRoutes = map[string]securityevent.RouteTemplate{
@@ -3138,6 +3186,37 @@ var nightwatchRoutes = map[string]securityevent.RouteTemplate{
 	"DELETE /api/v1/servers/:id/members/:user_id/roles/:role_id": securityevent.RouteServerMemberRoleDelete, "POST /api/v1/servers/:id/transfer-ownership": securityevent.RouteServerTransferOwnership,
 	"POST /api/v1/servers/:id/transfer-ownership/confirm": securityevent.RouteServerTransferOwnershipOK,
 	"PUT /api/v1/servers/:id/mfa-enforcement":             securityevent.RouteServerMFAEnforcement,
+	"POST /api/v1/auth/step-up/password":                  securityevent.RouteStepUpPassword,
+}
+
+// The password step-up mint's limits (#3509 review, security L2). Both counts
+// are login's per-IP cap, so the per-user cap is no looser than the per-IP one.
+const (
+	stepUpMintIPLimit   = 10
+	stepUpMintUserLimit = 10
+	stepUpMintWindow    = 15 * time.Minute
+)
+
+// stepUpPasswordRouteGuards are POST /api/v1/auth/step-up/password's
+// middleware, in order. The route verifies a password, so it must never be a
+// cheaper password oracle than /login:
+//
+//   - AuthBanCheck, /login's per-IP auth-failure ban, which the handler feeds;
+//   - the per-IP limit /login has, but FAIL-CLOSED: a Redis outage that lets
+//     /login fall back on the email lockout must not leave this route open to
+//     unbounded Argon2 guesses from a live session;
+//   - a fail-closed per-user limit, so a session cannot spread its guesses
+//     across addresses. /login has no session to key one on.
+//
+// Both limiters answer their standard 429 when exceeded and the standard 503
+// when Redis refuses the count. The account's email-keyed lockout is the
+// handler's, shared with /login and unchanged.
+func stepUpPasswordRouteGuards(rdb *redis.Client) []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.AuthBanCheck(rdb),
+		middleware.RateLimitByIPFailClosedWithHandlers(rdb, authFlowTestRateLimit(stepUpMintIPLimit), stepUpMintWindow, nil, nil),
+		middleware.RateLimitByUserFailClosed(rdb, stepUpMintUserLimit, stepUpMintWindow),
+	}
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

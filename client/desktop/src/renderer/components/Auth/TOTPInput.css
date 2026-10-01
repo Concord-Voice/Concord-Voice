@@ -40,7 +40,15 @@
 }
 
 .totp-error {
-  color: var(--error-color, #ed4245);
+  /* #3455 E2: measured at 4.5:1 across all 30 scheme×theme combinations —
+     --error-color on --bg-secondary fails in 9 (worst: Spooky dark 3.45:1,
+     Cotton Candy light 3.49:1). --text-primary is the [internal]-documented
+     replacement for exactly this pairing (the migration-000137 system-row
+     precedent): it is guaranteed-strong everywhere, and the refusal's title
+     text already carries the "this is an error" signal, so colour was never
+     load-bearing here. This is every MFA prompt's error text, not a local
+     override scoped to one surface — #3455 is only the issue that measured it. */
+  color: var(--text-primary);
   font-size: 13px;
   margin: 0;
 }

@@ -13,6 +13,47 @@ that keeps sending far more than your plan allows, and asks for the right
 proof of identity in the right places — never a code an email/text-only
 account can't provide, never your password twice.
 
+### Added
+
+- **Deleting many messages quickly now asks you to confirm it is you** ([#3455](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3455), [#3509](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3509)) — if you delete more than 15
+  messages within 30 seconds, or more than 100 within 24 hours, the app asks for your authenticator or
+  security-key code, or your password if your account has no code method, before it deletes the next
+  one. Purging your own messages from a channel or server counts the same way; a purge of more than 15
+  of your own messages always asks. The rule applies when your "Require authentication before purging"
+  privacy setting is on (the default) and you delete your own messages, and on servers that require MFA
+  for dangerous actions. If you cannot confirm, the app shows how long to wait. Deletes that were
+  refused used to fail silently on the desktop; each one now opens a dialog. Your password is sent only
+  to a new confirmation endpoint, never to the delete, purge or clear request itself — DM "Clear
+  history" included — and a security-key confirmation is no longer used up by an attempt that fails
+  partway. **API clients:** a delete or self-purge request may carry an optional JSON body
+  `{"mfa_code", "step_up_token"}` (up to 4 KiB). An account without inline MFA gets the token from the
+  new authenticated `POST /api/v1/auth/step-up/password` with `{current_password, purpose}`: it shares
+  login's lockout (423 `account_locked`) and rate limit, refuses an account with MFA (403
+  `mfa_required` with `mfa_methods`), and returns a single-use `{step_up_token, expires_in: 60}` bound
+  to one route's purpose. It allows 10 attempts per 15 minutes per IP address and 10 per account,
+  answers 503 rather than skipping those limits when it cannot check them, refuses an account that
+  has neither a password nor MFA with the target route's own 400 message (flagged
+  `step_up_unavailable: true`, as is that route's own 400 for the same account), and records every wrong
+  password, lockout and success as a security event the way login does. In the app, a password
+  prompt whose account has since gained an authenticator moves to the code prompt instead of a dead
+  end, a server too old to offer the endpoint says so instead of blaming your password, the password
+  field is emptied after each attempt, a purge that finishes after you closed its dialog no
+  longer reports its result in the next one, and if another account signs in, or another server is
+  selected, while your password is being confirmed, the delete, purge or Clear is not sent at all. DM Clear takes `step_up_token` in place of `current_password` too, and any
+  delete, self-purge or Clear body that still carries `current_password` is now a 400. A WebAuthn
+  confirmation is spent inside the request's own transaction, so a request that rolls back leaves it
+  usable (migration 000162). A channel or server purge body must now be exactly one JSON object: a second JSON value
+  or trailing bytes after it are refused with 400. New refusal bodies on the channel and DM message-delete routes and the channel and server
+  purge routes: 403 with `delete_rate_limited: true` and a `Retry-After` header (`mfa_required` with
+  `methods`, `Invalid MFA code`, `password_required` — with `step_up_token_invalid` when the token sent
+  matched nothing — or `mfa_enrollment_required`);
+  429 with `step_up_budget_exhausted: true` when too many factors were sent; and three different 503
+  bodies: soft-lock unavailable (`Retry-After: 30`, no flag), `step_up_budget_unavailable: true`, and
+  `lock_conflict: true` (`Retry-After: 1`). While Redis refuses writes, deletes by users the rule covers
+  return the first 503. The shared step-up budget's 429 and 503 now carry those two flags on every
+  route that charges it: the MFA settings routes, the "Require authentication before purging" setting,
+  and the server MFA-enforcement toggle.
+
 ### Changed
 
 - **Voice now pauses a stream that keeps sending far more than your plan allows** ([#3413](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3413), [#2153](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2153)) — the voice server now
@@ -80,6 +121,10 @@ account can't provide, never your password twice.
   open with the key they were written under.
 - **Requests to a server that is deleted mid-request no longer fail with a server error** ([#3508](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3508)) — if a server is deleted, or its owner's account is erased, while a request to it is in flight, permission and membership checks and role, channel-permission-override, channel-sync, channel, channel-group, member-add and member-moderation requests now answer as they would for a non-member instead of returning 500. Most now return 403, including creating or reordering roles, adding or banning a member, role unassignment, channel-override deletion and synced channel moves; the last three, and a role reorder, returned 404 in that window ("Role not found" for the reorder), as did a ban by an owner whose own account was being erased; changing a member's role, timing out or removing a member returns 404 "User is not a member of this server", renaming or reordering a channel group returns 404 "Channel group not found", and a server's visible-channel list comes back empty. Relatedly, a database failure while checking membership when changing a member's role or removing a member, or while checking the role hierarchy when removing, timing out or banning a member, now returns 500 instead of wrongly answering 403 or 404, even when the server is deleted at the same moment; a role reorder whose actor's account disappears while the server remains returns 500 rather than 404 "Role not found". And if the database fails to discard an interrupted change to a server's members, roles or channel groups, or an interrupted ban or block, the request now returns 500 instead of the refusal the change had reached.
 - **Buttons and avatars on the brand colours are readable in every colour scheme** ([#3514](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3514)) — the label on Continue, Sign In, Send and other brand-coloured buttons, and the initials on brand-coloured avatars, could nearly disappear: in Concord light they measured 1.20:1 against the fill, and 18 of the 32 scheme and theme combinations fell below the 4.5:1 readability line. Each scheme now pairs its brand fill with a text colour chosen against the whole gradient, so every combination clears 4.5:1. Pride keeps its flag under a dark tint with white text, and Spooky and Cotton Candy light use slightly darker gradients. Custom themes get the same guarantee. Hovering a brand button, the Create Channel and system-permission buttons, or the reset-keys button now lifts it instead of fading it. Initials on another member's avatar colours now use a label chosen for those colours rather than your theme's (white on a green avatar read 1.37:1). The Cancel button in the permission-override editor, the account-reset button and the skip-recovery-key button keep a readable label too, and so do the initials and name on a voice tile that dims while someone else speaks. Offline members and friends, and outgoing friend requests, no longer fade their initials and name: only the avatar picture dims. Opening Server Settings no longer restyles the invite window's Generate button, and the Server Settings invite buttons keep a readable label on hover (they read 2.19:1 in Concord light).
+- **Error text in code and security-key prompts is easier to read** ([#3455](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3455), [#3509](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3509)) — the red error message under
+  a code or security-key prompt failed the 4.5:1 contrast minimum in 9 of the 30 theme and light or
+  dark combinations (as low as 3.45:1 in Spooky dark). It now uses the primary text colour, so it
+  reads in every theme; the message text still says what went wrong.
 - **A failed voice join no longer removes someone who joined the next call** ([#3479](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3479), [#3480](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3480)) — delayed cleanup now applies only to the call that failed.
 - **Text-only channel changes work on busy voice servers** ([#3480](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3480)) — they no longer scan every active voice channel, and deleting a channel group retries if a child becomes a voice channel during the change.
 - **Voice access cleanup no longer sends an in-flight voice update to someone whose access was revoked** ([#3480](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3480)) — temporary access removal holds the audience check through the database change.

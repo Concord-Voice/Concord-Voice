@@ -373,7 +373,7 @@ func TestStepUpSettingsEvents_ByStage(t *testing.T) {
 		}
 
 		assert.Equal(t, http.StatusTooManyRequests, w.Code)
-		assert.Equal(t, map[string]interface{}{"error": "Too many verification attempts"}, iuBody(t, w))
+		assert.Equal(t, map[string]interface{}{"error": "Too many verification attempts", "step_up_budget_exhausted": true}, iuBody(t, w))
 		require.Len(t, recorder.events, 1)
 		assert.Equal(t, securityevent.EventSecurityControl, recorder.events[0].EventType)
 		assert.Equal(t, securityevent.OutcomeDenied, recorder.events[0].Outcome)
@@ -396,7 +396,7 @@ func TestStepUpSettingsEvents_ByStage(t *testing.T) {
 		// with its own body, never the 429 "too many attempts" that locked the
 		// form for a window that was not running (F7).
 		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-		assert.Equal(t, map[string]interface{}{"error": stepup.ErrMsgBudgetUnavailable}, iuBody(t, w))
+		assert.Equal(t, map[string]interface{}{"error": stepup.ErrMsgBudgetUnavailable, "step_up_budget_unavailable": true}, iuBody(t, w))
 		require.Len(t, recorder.events, 1)
 		assert.Equal(t, securityevent.EventSecurityControl, recorder.events[0].EventType)
 		assert.Equal(t, securityevent.OutcomeDegraded, recorder.events[0].Outcome)

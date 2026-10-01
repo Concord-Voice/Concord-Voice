@@ -56,6 +56,10 @@ type DeleteSpec struct {
 	ScopeID          string  // the channel_id / conversation_id value
 	AttachmentsTable string  // "message_attachments" | "dm_message_attachments"
 	Author           *string // nil = all authors; set = only this user_id
+	// OnlyIDs, when non-nil, limits the batches to these message ids. The
+	// self-purge soft-lock sets it to the messages it counted, so one sent
+	// after the count is not deleted uncounted; empty deletes nothing.
+	OnlyIDs []string
 	// BeforeDeleteTx is an optional single-delete authorization hook. It runs
 	// after the transaction opens and before the victim row is locked; bulk
 	// purge paths never invoke it.
@@ -82,7 +86,34 @@ type Plan struct {
 	// DeferCompletion leaves the audit in_progress for a caller that must
 	// complete it atomically with a follow-on transaction.
 	DeferCompletion bool
+	// Admit, when set, runs first in the transaction that writes the
+	// in_progress audit row, so what it writes commits with that row or not at
+	// all, and its error aborts the purge before any audit row exists. The
+	// self-purge soft-lock confirms here: a single-use factor is spent only by
+	// a purge that was admitted (#3455).
+	Admit func(context.Context, *sql.Tx) error
 }
+
+// ErrNotAdmitted wraps every error Run returns from admitting a purge —
+// Plan.Admit and the in_progress audit row — so a caller can tell that
+// nothing Admit wrote committed and nothing was deleted.
+var ErrNotAdmitted = errors.New("purge: not admitted")
+
+// ErrAdmissionUnknown is what Run returns when the admission's COMMIT
+// reported an error and the read that would settle whether it committed
+// failed too (reconcileAdmission). It is deliberately NOT ErrNotAdmitted:
+// what Admit wrote and the audit row may both have committed, so a caller may
+// neither claim nothing happened nor settle anything that depends on the
+// admission. Nothing was deleted: Run stops before the batches.
+var ErrAdmissionUnknown = errors.New("purge: admission outcome unknown")
+
+// admissionReconcileTimeout bounds reconcileAdmission's read, which runs
+// detached from the request's context.
+const admissionReconcileTimeout = 5 * time.Second
+
+// admissionReconcileQuery is reconcileAdmission's witness: the audit row the
+// admission generated, by its id.
+const admissionReconcileQuery = `SELECT EXISTS (SELECT 1 FROM message_purges WHERE id = $1)`
 
 // ExpiryPlan is the restricted, worker-only purge contract. It does not expose
 // tables, scope columns, authors, or arbitrary deletion criteria to its caller.
@@ -138,6 +169,7 @@ var deleteQueries = map[string]deleteQuerySet{
 WHERE channel_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
   AND ($3::uuid IS NULL OR user_id = $3)
+  AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
 ORDER BY created_at, id
 LIMIT $4
 FOR UPDATE`,
@@ -166,6 +198,7 @@ FOR UPDATE`,
 WHERE conversation_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
   AND ($3::uuid IS NULL OR user_id = $3)
+  AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
 ORDER BY created_at, id
 LIMIT $4
 FOR UPDATE`,
@@ -247,9 +280,12 @@ func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
 		}
 	}
 
-	purgeID, err := e.writeAuditInProgress(ctx, p)
-	if err != nil {
+	purgeID, err := e.admit(ctx, p)
+	if errors.Is(err, ErrAdmissionUnknown) {
 		return Result{}, err
+	}
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %w", ErrNotAdmitted, err)
 	}
 
 	total := 0
@@ -530,7 +566,7 @@ func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries de
 		}
 	}
 
-	rows, err := tx.QueryContext(ctx, queries.selectBatch, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch)
+	rows, err := tx.QueryContext(ctx, queries.selectBatch, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch, pq.Array(ds.OnlyIDs))
 	if err != nil {
 		return 0, nil, fmt.Errorf("purge: select batch victims: %w", err)
 	}
@@ -775,10 +811,79 @@ func contextError(ctx context.Context, err error) error {
 	return err
 }
 
+// admit writes the in_progress audit row, in one transaction with Plan.Admit
+// when the plan has one.
+func (e *Engine) admit(ctx context.Context, p Plan) (string, error) {
+	if p.Admit == nil {
+		return e.writeAuditInProgress(ctx, p)
+	}
+	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return "", fmt.Errorf("purge: begin admission: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			e.log.Warn("purge: failed to roll back admission", "error", rbErr)
+		}
+	}()
+	if err := p.Admit(ctx, tx); err != nil {
+		return "", err
+	}
+	id, err := insertAuditInProgress(ctx, tx, p)
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return e.reconcileAdmission(ctx, id, fmt.Errorf("purge: commit admission: %w", err))
+	}
+	return id, nil
+}
+
+// reconcileAdmission classifies an admission whose COMMIT reported an error.
+// The error alone cannot say whether the transaction committed: an
+// acknowledgement lost with the connection arrives after the server
+// committed. The audit row the admission generated is the witness, read on
+// the pool, detached from ctx (whose end may be what failed the COMMIT) and
+// bounded by admissionReconcileTimeout:
+//
+//   - the row is there: the admission committed, Admit's writes with it, so
+//     the purge is admitted and Run carries on with id;
+//   - the row is absent: nothing committed, so the COMMIT's error, which Run
+//     reports as ErrNotAdmitted;
+//   - the read fails: neither is provable, so ErrAdmissionUnknown.
+//
+// A COMMIT still being applied when the read runs reads as absent: the purge
+// is then refused although its audit row commits, which deletes nothing and
+// leaves that row in_progress. It never runs a purge that was not admitted.
+func (e *Engine) reconcileAdmission(ctx context.Context, id string, commitErr error) (string, error) {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), admissionReconcileTimeout)
+	defer cancel()
+	var committed bool
+	err := e.db.QueryRowContext(readCtx, admissionReconcileQuery, id).Scan(&committed)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("%w: %w; reconcile: %w", ErrAdmissionUnknown, commitErr, err)
+	case committed:
+		e.log.Warn("purge: admission committed although its COMMIT reported an error", "error", commitErr)
+		return id, nil
+	default:
+		return "", commitErr
+	}
+}
+
 // writeAuditInProgress inserts the in_progress audit row and returns its id.
 func (e *Engine) writeAuditInProgress(ctx context.Context, p Plan) (string, error) {
+	return insertAuditInProgress(ctx, e.db, p)
+}
+
+// rowQuerier is what insertAuditInProgress needs of a *sql.DB or *sql.Tx.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func insertAuditInProgress(ctx context.Context, q rowQuerier, p Plan) (string, error) {
 	var id string
-	err := e.db.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		INSERT INTO message_purges
 		    (actor_id, context_type, context_id, server_id, target_user_id, range_from, reason, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'in_progress')

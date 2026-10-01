@@ -57,9 +57,18 @@ const (
 	PurposeOwnershipTransfer Purpose = "ownership.transfer_initiate"
 	PurposeOwnershipReverse  Purpose = "ownership.transfer_reverse"
 
-	// internal/dm.
-	PurposeDMPurge Purpose = "dm.purge"
-	PurposeDMClear Purpose = "dm.clear"
+	// internal/dm. PurposeDMMessageDelete confirms a DM message delete past the
+	// delete-rate soft-lock (#3455).
+	PurposeDMPurge         Purpose = "dm.purge"
+	PurposeDMClear         Purpose = "dm.clear"
+	PurposeDMMessageDelete Purpose = "dm.message_delete"
+
+	// internal/messages: a channel message delete, and a channel or server
+	// self-purge, past the delete-rate soft-lock (#3455). The two purge routes
+	// take one purpose each, never a shared "messages.purge".
+	PurposeMessageDelete Purpose = "messages.delete"
+	PurposeChannelPurge  Purpose = "messages.channel_purge"
+	PurposeServerPurge   Purpose = "messages.server_purge"
 
 	// internal/servers, through mfaenforce.ConfirmTx.
 	PurposeServerMFAEnforcementOff Purpose = "servers.mfa_enforcement_disable"
@@ -93,7 +102,37 @@ var allPurposes = [...]Purpose{
 	PurposeOwnershipReverse,
 	PurposeDMPurge,
 	PurposeDMClear,
+	PurposeDMMessageDelete,
+	PurposeMessageDelete,
+	PurposeChannelPurge,
+	PurposeServerPurge,
 	PurposeServerMFAEnforcementOff,
+}
+
+// ownRulePurposes are the routes stepup.VerifyOwnRuleTx guards: the only
+// purposes a password step-up token may be minted for (#3509). Each is also in
+// allPurposes. A purpose outside this list is refused at the mint endpoint
+// before the password is verified, so a password token can never be spent on
+// an MFA-settings, session or ownership route, whose consumers never read one
+// anyway. TestOwnRulePurposes_ClosedSet pins the list and
+// client/desktop/src/renderer/components/Auth/stepUpPurpose.ts mirrors it.
+var ownRulePurposes = [...]Purpose{
+	PurposeDMClear,
+	PurposeDMMessageDelete,
+	PurposeMessageDelete,
+	PurposeChannelPurge,
+	PurposeServerPurge,
+}
+
+// OwnRule reports whether p is one of the own-rule purposes a password
+// step-up token may be minted for.
+func (p Purpose) OwnRule() bool {
+	return slices.Contains(ownRulePurposes[:], p)
+}
+
+// OwnRulePurposes returns a copy of the own-rule set, in declaration order.
+func OwnRulePurposes() []Purpose {
+	return slices.Clone(ownRulePurposes[:])
 }
 
 // Valid reports whether p is one of the closed set of consumer purposes. The

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
+import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import {
   clearDMHistory,
   hideDMThread,
@@ -85,9 +86,18 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   const [clearStage, setClearStage] = useState<ClearStage>('confirm');
   const [credential, setCredential] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // The methods Clear or the mint named when it asked for MFA, and a key that
+  // remounts the prompt so a cleared credential also clears its typed code.
+  const [mfaMethods, setMfaMethods] = useState<string[]>(['totp']);
+  const [promptKey, setPromptKey] = useState(0);
+
+  const resetCredential = () => {
+    setCredential('');
+    setPromptKey((key) => key + 1);
+  };
 
   useEffect(() => {
-    if (!busy && (clearStage === 'password' || clearStage === 'mfa')) factorRef.current?.focus();
+    if (!busy && clearStage === 'password') factorRef.current?.focus();
   }, [busy, clearStage, error]);
 
   if (
@@ -98,7 +108,6 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   }
 
   const isVerifying = clearStage === 'password' || clearStage === 'mfa';
-  const factorLabel = clearStage === 'password' ? 'Password' : 'Authentication code';
 
   const invalidateAndRefetch = async (lifecycle: AuthLifecycleSnapshot): Promise<boolean> => {
     if (!isSameAuthLifecycle(lifecycle)) return false;
@@ -117,7 +126,7 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
       // implementation still leaves this operation unresolved and retry-blocked.
     }
     if (!isSameAuthLifecycle(lifecycle)) return;
-    setCredential('');
+    resetCredential();
     setClearStage('uncertain');
     setError(CLEAR_UNCERTAIN_ERROR);
   };
@@ -137,16 +146,25 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
       if (!isSameAuthLifecycle(lifecycle)) return;
       switch (result.kind) {
         case 'passwordRequired':
+          resetCredential();
+          setClearStage('password');
+          return;
         case 'mfaRequired':
-          setCredential('');
-          setClearStage(result.kind === 'passwordRequired' ? 'password' : 'mfa');
+          resetCredential();
+          setMfaMethods(result.methods);
+          setClearStage('mfa');
           return;
         case 'invalidPassword':
-          setCredential('');
+          resetCredential();
           setError('That password is not correct.');
           return;
+        case 'passwordRefused':
+          // #3509: the mint refused the password, or Clear refused the token.
+          resetCredential();
+          setError(result.message);
+          return;
         case 'invalidMfaCode':
-          setCredential('');
+          resetCredential();
           setError('That code is not correct or has expired.');
           return;
         case 'success':
@@ -158,7 +176,7 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
           await setUncertainClear(lifecycle);
           return;
         case 'rateLimited':
-          setCredential('');
+          resetCredential();
           setError(
             result.retryAfterSeconds === undefined
               ? 'Try again later.'
@@ -166,21 +184,21 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
           );
           return;
         case 'sessionExpired':
-          setCredential('');
+          resetCredential();
           setError('Sign in again to clear history.');
           return;
         case 'notFound':
-          setCredential('');
+          resetCredential();
           setError('This thread is no longer available.');
           return;
         case 'stepUpImpossible':
-          setCredential('');
+          resetCredential();
           setError(
             'Set a password, enable MFA, or turn off purge protection in Privacy & Security.'
           );
           return;
         case 'refused':
-          setCredential('');
+          resetCredential();
           setError('History could not be cleared.');
           return;
       }
@@ -273,23 +291,43 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
           </div>
         </div>
 
-        {isVerifying && (
+        {clearStage === 'password' && (
           <div className="delete-server-confirm">
             <label className="form-label" htmlFor="dm-thread-removal-factor">
-              {factorLabel}
+              Password
             </label>
             <input
               id="dm-thread-removal-factor"
               ref={factorRef}
               className="form-input"
-              type={clearStage === 'password' ? 'password' : 'text'}
-              autoComplete={clearStage === 'password' ? 'current-password' : 'one-time-code'}
-              inputMode={clearStage === 'mfa' ? 'numeric' : undefined}
+              type="password"
+              autoComplete="current-password"
               value={credential}
               aria-invalid={error !== null}
               onChange={(event) => {
                 setCredential(event.target.value);
                 setError(null);
+              }}
+              disabled={busy}
+            />
+          </div>
+        )}
+
+        {clearStage === 'mfa' && (
+          <div className="delete-server-confirm">
+            {/* The prompt offers every method the server named, a security key
+                included; its token is minted for dm.clear alone. */}
+            <MFAVerifyPrompt
+              key={promptKey}
+              methods={mfaMethods}
+              purpose="dm.clear"
+              onVerify={(code) => {
+                setCredential(code);
+                setError(null);
+              }}
+              onCodeChange={(code) => {
+                setCredential(code);
+                if (code !== '') setError(null);
               }}
               disabled={busy}
             />

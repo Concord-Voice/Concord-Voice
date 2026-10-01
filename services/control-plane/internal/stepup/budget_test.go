@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -30,7 +31,9 @@ func TestBudget_AdmitsUpToTheLimitThen429(t *testing.T) {
 	e := b.Consume(ctx, "u1")
 	require.NotNil(t, e)
 	require.Equal(t, http.StatusTooManyRequests, e.Status)
-	require.Equal(t, ErrMsgTooManyAttempts, e.Body["error"])
+	// The flag lets a client tell this 429 from the route limiter's without
+	// matching copy (#3455 X17); the 503's flag must not appear on it.
+	require.Equal(t, gin.H{"error": ErrMsgTooManyAttempts, "step_up_budget_exhausted": true}, e.Body)
 	require.Nil(t, e.Cause, "an exhausted budget is an outcome, not a fault")
 	require.Nil(t, b.Consume(ctx, "u2"), "the budget is per user")
 }
@@ -43,7 +46,7 @@ func TestBudget_UnwiredOrFailingRedisIs503(t *testing.T) {
 	e := NewBudget(nil, "stepup:test:").Consume(ctx, "u1")
 	require.NotNil(t, e)
 	require.Equal(t, http.StatusServiceUnavailable, e.Status)
-	require.Equal(t, ErrMsgBudgetUnavailable, e.Body["error"])
+	require.Equal(t, gin.H{"error": ErrMsgBudgetUnavailable, "step_up_budget_unavailable": true}, e.Body)
 	require.ErrorIs(t, e, errBudgetUnwired)
 
 	rdb, mr := newBudgetRedis(t)
@@ -51,7 +54,7 @@ func TestBudget_UnwiredOrFailingRedisIs503(t *testing.T) {
 	e = NewBudget(rdb, "stepup:test:").Consume(ctx, "u1")
 	require.NotNil(t, e)
 	require.Equal(t, http.StatusServiceUnavailable, e.Status)
-	require.Equal(t, ErrMsgBudgetUnavailable, e.Body["error"])
+	require.Equal(t, gin.H{"error": ErrMsgBudgetUnavailable, "step_up_budget_unavailable": true}, e.Body)
 	require.NotNil(t, e.Cause, "the transport error is kept for the caller to log")
 }
 

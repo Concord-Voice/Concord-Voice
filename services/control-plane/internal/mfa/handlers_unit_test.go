@@ -12,7 +12,6 @@ import (
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/lib/pq"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -173,14 +172,19 @@ func TestDecodeCircleSharesMultiple(t *testing.T) {
 	assert.Equal(t, []byte("def"), decoded[1].EncryptedShare)
 }
 
+// Rewritten for #3509: the token store is Postgres (step_up_tokens), spent on
+// the verifier's own store, so the unavailable store is a closed database
+// rather than an unreachable Redis. It still fails closed with an error.
 func TestVerifyCodeFailsClosedWhenWebAuthnTokenStoreIsUnavailable(t *testing.T) {
-	h := &Handler{redis: redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})}
-	t.Cleanup(func() { require.NoError(t, h.redis.Close()) })
+	db, err := sql.Open("postgres", "postgres://127.0.0.1:1/unreachable?sslmode=disable")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	h := &Handler{db: db}
 
 	verified, err := h.VerifyCode(context.Background(), "user-fixture", stepup.PurposeTOTPSetup, "webauthn-inline-token-123456")
 
 	require.False(t, verified)
-	require.ErrorContains(t, err, "consume WebAuthn inline verification token")
+	require.ErrorContains(t, err, "spend step-up token")
 }
 
 // conflictingBackupCodeStore simulates another consumer committing after this

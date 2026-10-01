@@ -123,4 +123,30 @@ describe('MFAVerifyPrompt security-key refusal', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Security key verified');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
+
+  // #3455 E2: an inline colour hides from the contrast guard, so both refusal
+  // paragraphs take the stylesheet class the code inputs already use.
+  it('gives a refusal passed as error the totp-error class', () => {
+    render(
+      <MFAVerifyPrompt
+        purpose="messages.delete"
+        methods={['webauthn']}
+        onVerify={onVerify}
+        error={REFUSAL}
+      />
+    );
+    expect(screen.getByRole('alert')).toHaveClass('totp-error');
+  });
+
+  it('gives a failed ceremony message the totp-error class', async () => {
+    mockApiFetch.mockRejectedValueOnce(new Error('Ceremony blew up'));
+    render(
+      <MFAVerifyPrompt purpose="messages.delete" methods={['webauthn']} onVerify={onVerify} />
+    );
+    fireEvent.click(screen.getByText('Verify with security key'));
+
+    const message = await screen.findByText('Ceremony blew up');
+    expect(message).toHaveClass('totp-error');
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+  });
 });

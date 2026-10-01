@@ -23,6 +23,7 @@ import GroupInfoPanel from './GroupInfoPanel';
 import VoiceView from '../Voice/VoiceView';
 import Modal from '../ui/Modal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import DeleteRefusalModal from '../Chat/DeleteRefusalModal';
 import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
 import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
 import { expirationClause, expirationControlLabel } from '../Chat/MessageExpirationIndicator';
@@ -241,6 +242,9 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
     sendMessage,
     editMessage,
     deleteMessage,
+    deleteRefusal,
+    confirmDelete,
+    dismissDeleteRefusal,
     replyingTo,
     handleReply,
     cancelReply,
@@ -670,6 +674,13 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
           role={purgeTarget.role}
         />
       )}
+
+      <DeleteRefusalModal
+        refusal={deleteRefusal}
+        onConfirm={confirmDelete}
+        onDismiss={dismissDeleteRefusal}
+        purpose="dm.message_delete"
+      />
     </div>
   );
 };

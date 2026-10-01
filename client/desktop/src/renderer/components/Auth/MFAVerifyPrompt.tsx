@@ -9,6 +9,10 @@ import {
   type MFAMethodCategory,
 } from './MFAMethodPicker';
 import type { StepUpPurpose } from './stepUpPurpose';
+// .totp-error, for the refusal copy below. Imported here rather than left to a
+// host that happens to load it, since the delete and purge refusal dialogs
+// (#3455) host this prompt without importing the stylesheet themselves.
+import './TOTPInput.css';
 
 // ── WebAuthn helpers (module-level, outside component) ─────────────────
 
@@ -60,12 +64,13 @@ function classifyWebAuthnError(err: unknown): string | null {
   return err instanceof Error ? err.message : 'Verification failed';
 }
 
-/** Error copy in the security-key branch, for the ceremony's and the parent's. */
-const REFUSAL_STYLE: React.CSSProperties = {
-  margin: '0 0 8px',
-  fontSize: '13px',
-  color: 'var(--error-color, #ed4245)',
-};
+/** Error copy in the security-key branch, for the ceremony's and the parent's.
+ *  It takes `.totp-error`, the code inputs' error class, rather than an inline
+ *  colour: `--error-color` on the prompt's background fails 4.5:1 in 9 of 30
+ *  scheme×theme combinations (#3455 E2), and the contrast guard only sees
+ *  stylesheet pairs, so an inline colour would hide the next regression. */
+const REFUSAL_CLASS = 'totp-error';
+const REFUSAL_STYLE: React.CSSProperties = { margin: '0 0 8px' };
 
 // ── Method-link descriptors ────────────────────────────────────────────
 
@@ -300,7 +305,7 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
               {/* Every parent routes a code refusal only to this prompt, so
                   security-key mode must show it as the code inputs do. */}
               {error && (
-                <p role="alert" style={REFUSAL_STYLE}>
+                <p role="alert" className={REFUSAL_CLASS} style={REFUSAL_STYLE}>
                   {error}
                 </p>
               )}
@@ -349,7 +354,9 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
           )}
           {webauthnStatus === 'error' && (
             <>
-              <p style={REFUSAL_STYLE}>{webauthnError}</p>
+              <p className={REFUSAL_CLASS} style={REFUSAL_STYLE}>
+                {webauthnError}
+              </p>
               <button
                 type="button"
                 className="btn btn-primary"

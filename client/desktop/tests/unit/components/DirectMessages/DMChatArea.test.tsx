@@ -1213,23 +1213,25 @@ describe('DMChatArea', () => {
       if (opts?.method === 'DELETE') {
         return Promise.resolve({
           ok: false,
+          status: 500,
+          headers: new Headers(),
           json: async () => ({ error: 'Delete not allowed' }),
         });
       }
       return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
     });
 
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     useDMStore.setState({ conversations: [makeConversation()] });
 
     render(<DMChatArea selectedThreadId="conv-1" />);
 
     fireEvent.click(screen.getByTestId('trigger-delete'));
 
-    await waitFor(() => {
-      expect(consoleSpy).toHaveBeenCalledWith('Failed to delete DM message:', expect.any(String));
-    });
-    consoleSpy.mockRestore();
+    // #3455: the failure is no longer swallowed into console.error — it is
+    // reported in the refusal dialog, and the message stays where it was.
+    expect(
+      await screen.findByRole('dialog', { name: "Couldn't delete that message" })
+    ).toHaveTextContent('Delete not allowed');
   });
 
   // --- handleUnseenOnLeave ---

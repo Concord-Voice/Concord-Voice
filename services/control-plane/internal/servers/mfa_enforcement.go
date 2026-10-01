@@ -61,7 +61,6 @@ const (
 	errMsgMFAEnforcementInvalidBody = "Invalid request body"
 	errMsgMFAEnforcementFailed      = "Failed to update MFA enforcement"
 	errMsgMFAEnforcementFetchFailed = "Failed to fetch MFA enforcement"
-	errMsgMFAEnforcementBusy        = "The server is busy. Try again."
 )
 
 // The failure classes this route logs. mfa_gate_lock is the design's (§7); a
@@ -373,8 +372,7 @@ func (h *Handler) respondMFAEnforcementError(c *gin.Context, err error) {
 			cause = stepErr.Cause // a users-row timeout arrives inside a *stepup.Error
 		}
 		h.log.Warn(errMsgMFAEnforcementFailed, "failure_class", failureClassMFAGateLock, "error", cause)
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgMFAEnforcementBusy})
+		mfaenforce.WriteBusy(c)
 		return
 	}
 	if isStepErr {

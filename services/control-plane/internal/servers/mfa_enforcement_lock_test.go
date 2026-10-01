@@ -416,7 +416,7 @@ func TestMFAEnforcement_LockTimeoutIs503WithinTheBound(t *testing.T) {
 			// The holder is still open here, so the answer is the timeout's.
 			assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
 			assert.Equal(t, "1", w.Header().Get("Retry-After"))
-			assert.JSONEq(t, mfaErrorBody("The server is busy. Try again."), w.Body.String())
+			assert.JSONEq(t, mfaBusyBody, w.Body.String())
 			assert.GreaterOrEqual(t, elapsed, 3*time.Second, "the 503 must come from the 3 s lock_timeout, not a fast failure")
 			logged := env.logs.String()
 			assert.Contains(t, logged, "failure_class=mfa_gate_lock")

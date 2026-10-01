@@ -55,7 +55,7 @@ func TestMFAEnforcement_ToggleGuessesSpendTheMFASettingsBudget(t *testing.T) {
 		map[string]any{"mfa_code": mfaWrongCode}, testhelpers.AuthHeaders(f.owner.AccessToken))
 	assert.Equal(t, http.StatusTooManyRequests, w.Code,
 		"one settings guess plus four toggle guesses spend the one shared budget: %s", w.Body.String())
-	assert.JSONEq(t, mfaErrorBody(stepup.ErrMsgTooManyAttempts), w.Body.String())
+	assert.JSONEq(t, mfaBudgetExhaustedBody, w.Body.String())
 }
 
 // MFA-settings guesses spend the budget the toggle then refuses on, even with
@@ -80,7 +80,7 @@ func TestMFAEnforcement_SettingsGuessesSpendTheToggleBudget(t *testing.T) {
 	w := putMFA(env, f.owner, f.serverID, bodyOff(mfaBackupCode))
 	assert.Equal(t, http.StatusTooManyRequests, w.Code,
 		"five settings guesses spend the budget the toggle charges: %s", w.Body.String())
-	assert.JSONEq(t, mfaErrorBody(stepup.ErrMsgTooManyAttempts), w.Body.String())
+	assert.JSONEq(t, mfaBudgetExhaustedBody, w.Body.String())
 	assert.True(t, readMFAFlag(t, env, f.serverID), "a 429 changes nothing")
 	assert.False(t, backupCodeSpent(t, env, f.owner.ID), "a 429 must not reach the verifier")
 }

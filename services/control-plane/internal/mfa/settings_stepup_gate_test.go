@@ -684,7 +684,7 @@ func TestStepUpSettings_Budget(t *testing.T) {
 		assert.Equal(t, http.StatusTooManyRequests, last.Code)
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, last, &body)
-		assert.Equal(t, map[string]interface{}{"error": "Too many verification attempts"}, body)
+		assert.Equal(t, map[string]interface{}{"error": "Too many verification attempts", "step_up_budget_exhausted": true}, body)
 	})
 
 	t.Run("credential-less requests do not consume budget", func(t *testing.T) {
@@ -1006,7 +1006,7 @@ func TestStepUpSettings_PoolRouteBudget(t *testing.T) {
 		assert.Equal(t, http.StatusTooManyRequests, last.Code)
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, last, &body)
-		assert.Equal(t, map[string]interface{}{"error": "Too many verification attempts"}, body)
+		assert.Equal(t, map[string]interface{}{"error": "Too many verification attempts", "step_up_budget_exhausted": true}, body)
 	})
 
 	t.Run("verified success clears the budget", func(t *testing.T) {

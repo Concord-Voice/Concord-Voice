@@ -3,18 +3,23 @@ package messages
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
@@ -37,14 +42,35 @@ type serverPurgeRequest struct {
 	rangeFrom       *time.Time
 	rangeLabel      string
 	credentialEpoch *string
+	// admit is the plan's Plan.Admit: an over-threshold self-purge's
+	// confirmation on the HTTP route, nil on the ban/kick path.
+	admit func(context.Context, *sql.Tx) error
 }
 
 // purgeRequest is the shared body for the channel and server purge endpoints (#1352).
 // Range is recent-ward ("1h".."90d") or "all"; TargetUserID narrows to one author
 // (requires ManageAllMessages — an actor with only ManageOwnMessages is forced to self).
+//
+// The embedded stepup.Fields confirm a self-purge past the delete-rate
+// soft-lock (#3455): mfa_code, or the single-use step_up_token the mint
+// endpoint returned for the password (#3509). They are the fields and caps of
+// stepup.ReadOptionalStepUp, so the desktop sends one shape to every
+// own-rule route, and a body that still carries current_password is a 400.
 type purgeRequest struct {
 	Range        string  `json:"range" binding:"required"`
 	TargetUserID *string `json:"target_user_id"`
+	stepup.Fields
+}
+
+// maxPurgeBodyBytes is the delete routes' ReadOptionalStepUp limit: the purge
+// body carries the same step-up fields, and both at their caps fit with room
+// to spare. Without it the body was read unbounded.
+const maxPurgeBodyBytes = 4 << 10
+
+// stepUp is the step-up bindPurgeRequest already validated through
+// stepup.Fields.Input.
+func (r purgeRequest) stepUp() stepup.Input {
+	return stepup.Input{MFACode: r.MFACode, StepUpToken: r.StepUpToken}
 }
 
 // PurgeChannel handles DELETE /channels/:id/messages — bulk-delete a channel's
@@ -87,6 +113,27 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		return
 	}
 
+	deletes := []purge.DeleteSpec{{
+		MessagesTable:    "messages",
+		ScopeColumn:      "channel_id",
+		ScopeID:          channelID,
+		AttachmentsTable: "message_attachments",
+		Author:           author,
+	}}
+	softLock, ok := h.gateSelfPurge(purgeCtx, c, selfPurge{
+		serverID: serverID, userID: userID, purpose: stepup.PurposeChannelPurge,
+		input: req.stepUp(), epoch: middleware.TokenCredentialEpoch(c),
+		rangeFrom: rangeFrom, deletes: deletes, notFound: "Channel not found",
+	})
+	if !ok {
+		return
+	}
+	deletes = softLock.fence(deletes, userID)
+
+	guard := channelPurgeGuard{
+		channelID: channelID, actorID: userID, epoch: middleware.TokenCredentialEpoch(c),
+		author: author, target: req.TargetUserID,
+	}
 	plan := purge.Plan{
 		ContextType: purge.ContextChannel,
 		ContextID:   channelID,
@@ -95,46 +142,17 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		Target:      req.TargetUserID,
 		Reason:      "manual",
 		RangeFrom:   rangeFrom,
-		Deletes: []purge.DeleteSpec{{
-			MessagesTable:    "messages",
-			ScopeColumn:      "channel_id",
-			ScopeID:          channelID,
-			AttachmentsTable: "message_attachments",
-			Author:           author,
-		}},
+		Deletes:     deletes,
 		Guard: func(ctx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
-			if ds.ScopeID != channelID || (ds.Author == nil) != (author == nil) || (ds.Author != nil && *ds.Author != *author) {
-				return errors.New("unexpected channel purge batch scope")
-			}
-			if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
-				return err
-			}
-			var lockedServerID, lockedType string
-			if err := tx.QueryRowContext(ctx, `SELECT server_id, type FROM channels WHERE id = $1 FOR SHARE`, channelID).Scan(&lockedServerID, &lockedType); err != nil {
-				return err
-			}
-			var timedOut bool
-			if err := tx.QueryRowContext(ctx, `
-				SELECT timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
-				FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, lockedServerID, userID,
-			).Scan(&timedOut); err != nil {
-				return err
-			}
-			if timedOut {
-				return errPurgeMemberTimedOut
-			}
-			perms, err := h.resolver.ResolveChannelPermissionsTx(ctx, tx, lockedServerID, userID, channelID)
-			if err != nil {
-				return err
-			}
-			freshAuthor, allowed := purgeAuthorForPermissions(perms, userID, lockedType, req.TargetUserID)
-			if !allowed || (freshAuthor == nil) != (author == nil) || (freshAuthor != nil && *freshAuthor != *author) {
-				return errors.New("channel purge authority changed")
-			}
-			return nil
+			return h.guardChannelPurgeBatch(ctx, tx, guard, ds)
 		},
+		Admit: h.selfPurgeAdmit(softLock),
 	}
 	res, err := h.purgeEngine.Run(purgeCtx, plan)
+	if h.refuseSelfPurge(c, softLock) {
+		return
+	}
+	h.settleSelfPurge(purgeCtx, softLock, err)
 	if h.respondChannelPurgeFailure(c, err, channelID, userID, req.Range, res) {
 		return
 	}
@@ -144,6 +162,60 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 	// hidden_count is structurally 0 for server contexts — returned so the response
 	// shape matches spec §4 { deleted_count, hidden_count } across ALL contexts.
 	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": 0})
+}
+
+// channelPurgeGuard is what a channel purge's per-batch Guard checks each
+// batch against: the actor, the token's credential epoch, and the author filter
+// the plan was built with.
+type channelPurgeGuard struct {
+	channelID, actorID, epoch string
+	author, target            *string
+}
+
+// guardChannelPurgeBatch is a channel purge's per-batch Guard. It refuses a
+// batch outside the planned scope, then under the batch's transaction
+// re-fences the credential epoch, locks the channel and the actor's
+// membership, refuses a timed-out actor, and re-derives the author filter
+// from fresh permissions, refusing the batch when it no longer matches.
+func (h *Handler) guardChannelPurgeBatch(ctx context.Context, tx *sql.Tx, g channelPurgeGuard, ds purge.DeleteSpec) error {
+	if ds.ScopeID != g.channelID || !samePurgeAuthor(ds.Author, g.author) {
+		return errors.New("unexpected channel purge batch scope")
+	}
+	if err := credepoch.GuardTx(ctx, tx, g.actorID, g.epoch); err != nil {
+		return err
+	}
+	var lockedServerID, lockedType string
+	if err := tx.QueryRowContext(ctx, `SELECT server_id, type FROM channels WHERE id = $1 FOR SHARE`, g.channelID).Scan(&lockedServerID, &lockedType); err != nil {
+		return err
+	}
+	var timedOut bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
+		FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, lockedServerID, g.actorID,
+	).Scan(&timedOut); err != nil {
+		return err
+	}
+	if timedOut {
+		return errPurgeMemberTimedOut
+	}
+	perms, err := h.resolver.ResolveChannelPermissionsTx(ctx, tx, lockedServerID, g.actorID, g.channelID)
+	if err != nil {
+		return err
+	}
+	freshAuthor, allowed := purgeAuthorForPermissions(perms, g.actorID, lockedType, g.target)
+	if !allowed || !samePurgeAuthor(freshAuthor, g.author) {
+		return errors.New("channel purge authority changed")
+	}
+	return nil
+}
+
+// samePurgeAuthor reports whether two author filters select the same rows:
+// both absent (every author), or both present and naming the same user.
+func samePurgeAuthor(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // respondChannelPurgeFailure emits the required invalidation for a partially
@@ -182,7 +254,11 @@ const (
 )
 
 // PurgeServer handles DELETE /servers/:id/messages — bulk-delete across a server's
-// channels (#1352). It parses the range/target request and delegates to purgeServerCore.
+// channels (#1352). It parses the range/target request, authorizes every channel,
+// runs the self-purge soft-lock (#3455), and then the purge. It composes
+// authorizeServerPurge and runServerPurge itself rather than calling
+// purgeServerCore, because the soft-lock sits between the two and the ban/kick
+// path through purgeServerCore must never reach it.
 func (h *Handler) PurgeServer(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
@@ -193,10 +269,35 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), purge.SynchronousRunTimeout)
 	defer cancel()
 
-	deleted, status, err := h.purgeServerCore(purgeCtx, serverPurgeRequest{
-		serverID: serverID, actorID: userID, target: req.TargetUserID, reason: "manual",
-		rangeFrom: rangeFrom, rangeLabel: req.Range, credentialEpoch: ptr(middleware.TokenCredentialEpoch(c)),
+	deletes, status, err := h.authorizeServerPurge(purgeCtx, serverID, userID, req.TargetUserID)
+	if status != PurgeCompleted {
+		h.respondServerPurge(c, serverID, userID, 0, status, err)
+		return
+	}
+	epoch := middleware.TokenCredentialEpoch(c)
+	softLock, ok := h.gateSelfPurge(purgeCtx, c, selfPurge{
+		serverID: serverID, userID: userID, purpose: stepup.PurposeServerPurge,
+		input: req.stepUp(), epoch: epoch,
+		rangeFrom: rangeFrom, deletes: deletes, notFound: "Server not found",
 	})
+	if !ok {
+		return
+	}
+	deletes = softLock.fence(deletes, userID)
+	deleted, status, err := h.runServerPurge(purgeCtx, serverPurgeRequest{
+		serverID: serverID, actorID: userID, target: req.TargetUserID, reason: "manual",
+		rangeFrom: rangeFrom, rangeLabel: req.Range, credentialEpoch: ptr(epoch),
+		admit: h.selfPurgeAdmit(softLock),
+	}, deletes)
+	if h.refuseSelfPurge(c, softLock) {
+		return
+	}
+	h.settleSelfPurge(purgeCtx, softLock, err)
+	h.respondServerPurge(c, serverID, userID, deleted, status, err)
+}
+
+// respondServerPurge writes PurgeServer's outcome.
+func (h *Handler) respondServerPurge(c *gin.Context, serverID, userID string, deleted int, status PurgeStatus, err error) {
 	switch status {
 	case PurgeSkippedUnauthorized:
 		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this server"})
@@ -219,9 +320,20 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 	}
 }
 
-// purgeServerCore is the single authorization + purge path across a server's channels,
-// shared by the HTTP PurgeServer endpoint (range-aware, reason "manual") and the ban/kick
-// moderation path (All Time, reason "ban"/"kick").
+// purgeServerCore is the ban/kick moderation path's authorization + purge across a
+// server's channels (All Time, reason "ban"/"kick"). The HTTP PurgeServer endpoint
+// runs the same two halves with the self-purge soft-lock between them; this path has
+// none, because a moderation purge is never counted (#3455 D-1).
+func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (int, PurgeStatus, error) {
+	deletes, status, err := h.authorizeServerPurge(ctx, req.serverID, req.actorID, req.target)
+	if status != PurgeCompleted {
+		return 0, status, err
+	}
+	return h.runServerPurge(ctx, req, deletes)
+}
+
+// authorizeServerPurge enumerates a server's channels and authorizes the actor in each,
+// returning the delete specs a purge may run.
 //
 // SECURITY (review finding M1, #1352): authorization is re-resolved PER CHANNEL, never once
 // at server scope. computeEffectivePermissions skips applyChannelOverrides when channelID is
@@ -231,11 +343,13 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 // channel is purgeable the caller gets SkippedUnauthorized with no audit row (the guard runs
 // before Engine.Run, which writes the audit). A nil error accompanies Completed and
 // SkippedUnauthorized; a non-nil error accompanies Failed.
-func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (int, PurgeStatus, error) {
-	rows, err := h.db.QueryContext(ctx, `SELECT id, type FROM channels WHERE server_id = $1`, req.serverID)
+func (h *Handler) authorizeServerPurge(
+	ctx context.Context, serverID, actorID string, target *string,
+) ([]purge.DeleteSpec, PurgeStatus, error) {
+	rows, err := h.db.QueryContext(ctx, `SELECT id, type FROM channels WHERE server_id = $1`, serverID)
 	if err != nil {
-		h.log.Error("Server purge: enumerate channels failed", "error", err, "server_id", req.serverID)
-		return 0, PurgeFailed, fmt.Errorf("enumerate server channels: %w", err)
+		h.log.Error("Server purge: enumerate channels failed", "error", err, "server_id", serverID)
+		return nil, PurgeFailed, fmt.Errorf("enumerate server channels: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -243,22 +357,25 @@ func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (
 	for rows.Next() {
 		var channel channelScope
 		if err := rows.Scan(&channel.id, &channel.channelType); err != nil {
-			return 0, PurgeFailed, fmt.Errorf("scan server channel: %w", err)
+			return nil, PurgeFailed, fmt.Errorf("scan server channel: %w", err)
 		}
 		channels = append(channels, channel)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, PurgeFailed, fmt.Errorf("iterate server channels: %w", err)
+		return nil, PurgeFailed, fmt.Errorf("iterate server channels: %w", err)
 	}
 
 	// Deliberately unwrapped: this is a pass-through of an error `serverPurgeDeletes`
 	// already wrapped, and on a non-error refusal (PurgeSkippedUnauthorized) `err` is
 	// nil — `fmt.Errorf` here would either double the context or fabricate one.
-	deletes, status, err := h.serverPurgeDeletes(ctx, req.serverID, req.actorID, req.target, channels)
-	if status != PurgeCompleted {
-		return 0, status, err
-	}
+	return h.serverPurgeDeletes(ctx, serverID, actorID, target, channels)
+}
 
+// runServerPurge runs an authorized server purge and fans out its events. Its
+// batch guard re-authorizes every channel under lock (#3142), and fences the
+// credential epoch when the request carries one (the HTTP route does; the
+// ban/kick path has no bearer token).
+func (h *Handler) runServerPurge(ctx context.Context, req serverPurgeRequest, deletes []purge.DeleteSpec) (int, PurgeStatus, error) {
 	plan := purge.Plan{
 		ContextType: purge.ContextServer,
 		ContextID:   req.serverID,
@@ -269,41 +386,18 @@ func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (
 		RangeFrom:   req.rangeFrom,
 		Deletes:     deletes,
 		Guard: func(guardCtx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
-			if req.credentialEpoch != nil {
-				if err := credepoch.GuardTx(guardCtx, tx, req.actorID, *req.credentialEpoch); err != nil {
-					return err
-				}
-			}
-			var lockedType string
-			if err := tx.QueryRowContext(guardCtx,
-				`SELECT type FROM channels WHERE id = $1 AND server_id = $2 FOR SHARE`, ds.ScopeID, req.serverID,
-			).Scan(&lockedType); err != nil {
-				return err
-			}
-			var timedOut bool
-			if err := tx.QueryRowContext(guardCtx,
-				`SELECT timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
-				 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, req.serverID, req.actorID,
-			).Scan(&timedOut); err != nil {
-				return err
-			}
-			if timedOut {
-				return errPurgeMemberTimedOut
-			}
-			perms, err := h.resolver.ResolveChannelPermissionsTx(guardCtx, tx, req.serverID, req.actorID, ds.ScopeID)
-			if err != nil {
-				return err
-			}
-			freshAuthor, allowed := purgeAuthorForPermissions(perms, req.actorID, lockedType, req.target)
-			if !allowed || (freshAuthor == nil) != (ds.Author == nil) || (freshAuthor != nil && *freshAuthor != *ds.Author) {
-				return errors.New("server purge authority changed")
-			}
-			return nil
+			return h.guardServerPurgeBatch(guardCtx, tx, req, ds)
 		},
+		Admit: req.admit,
 	}
 	res, err := h.purgeEngine.Run(ctx, plan)
 	if err != nil {
-		h.log.Error("Server purge failed", "error", err, "server_id", req.serverID)
+		// A failed admission on the soft-locked route is answered, and logged,
+		// by PurgeServer: a soft-lock refusal must not reach a line that
+		// carries server_id (C7).
+		if req.admit == nil || !errors.Is(err, purge.ErrNotAdmitted) {
+			h.log.Error("Server purge failed", "error", err, "server_id", req.serverID)
+		}
 		if res.DeletedCount > 0 {
 			h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes)
 		}
@@ -311,6 +405,44 @@ func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (
 	}
 	h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes)
 	return res.DeletedCount, PurgeCompleted, nil
+}
+
+// guardServerPurgeBatch is a server purge's per-batch Guard. Under the
+// batch's transaction it re-fences the credential epoch, locks the channel
+// and the actor's membership, refuses a timed-out actor, and re-derives the
+// author filter from fresh permissions, refusing the batch when it no longer
+// matches the one the plan was built with.
+func (h *Handler) guardServerPurgeBatch(guardCtx context.Context, tx *sql.Tx, req serverPurgeRequest, ds purge.DeleteSpec) error {
+	if req.credentialEpoch != nil {
+		if err := credepoch.GuardTx(guardCtx, tx, req.actorID, *req.credentialEpoch); err != nil {
+			return err
+		}
+	}
+	var lockedType string
+	if err := tx.QueryRowContext(guardCtx,
+		`SELECT type FROM channels WHERE id = $1 AND server_id = $2 FOR SHARE`, ds.ScopeID, req.serverID,
+	).Scan(&lockedType); err != nil {
+		return err
+	}
+	var timedOut bool
+	if err := tx.QueryRowContext(guardCtx,
+		`SELECT timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
+		 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, req.serverID, req.actorID,
+	).Scan(&timedOut); err != nil {
+		return err
+	}
+	if timedOut {
+		return errPurgeMemberTimedOut
+	}
+	perms, err := h.resolver.ResolveChannelPermissionsTx(guardCtx, tx, req.serverID, req.actorID, ds.ScopeID)
+	if err != nil {
+		return err
+	}
+	freshAuthor, allowed := purgeAuthorForPermissions(perms, req.actorID, lockedType, req.target)
+	if !allowed || !samePurgeAuthor(freshAuthor, ds.Author) {
+		return errors.New("server purge authority changed")
+	}
+	return nil
 }
 
 // emitServerPurgeEvents fans out the invalidation events for a server purge that
@@ -510,9 +642,13 @@ func bindPurgeRequest(c *gin.Context, scopeID, invalidIDMsg string) (purgeReques
 		c.JSON(http.StatusBadRequest, gin.H{"error": invalidIDMsg})
 		return req, nil, false
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
-		return req, nil, false
+	if err := readPurgeBody(c, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return purgeRequest{}, nil, false
+	}
+	if _, stepErr := req.Input(); stepErr != nil {
+		stepErr.Write(c)
+		return purgeRequest{}, nil, false
 	}
 	rangeFrom, err := purge.ParseRange(req.Range)
 	if err != nil {
@@ -520,4 +656,229 @@ func bindPurgeRequest(c *gin.Context, scopeID, invalidIDMsg string) (purgeReques
 		return req, nil, false
 	}
 	return req, rangeFrom, true
+}
+
+// readPurgeBody reads the whole body, at most maxPurgeBodyBytes, as exactly one
+// JSON object, then applies req's binding tags. It reads the body itself, as
+// stepup.ReadOptionalStepUp does, because ShouldBindJSON's decoder stops at the
+// end of the first value: a second value, or kilobytes after a valid object,
+// were never read, so the cap bounded nothing (review of #3509).
+func readPurgeBody(c *gin.Context, req *purgeRequest) error {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPurgeBodyBytes)
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return err
+	}
+	// json.Unmarshal refuses trailing data and every non-object, and decodes an
+	// empty body or null as nothing, which range's required tag then refuses.
+	if err := json.Unmarshal(raw, req); err != nil {
+		return err
+	}
+	return binding.Validator.ValidateStruct(req)
+}
+
+// selfPurgeCountCap bounds the self-purge COUNT. A count at the cap already
+// exceeds both soft-lock tiers, so counting further could change no verdict.
+const selfPurgeCountCap = stepup.DeleteSoftLockDayThreshold + 1
+
+// selfPurgeSoftLockQuery reads, in the one round trip D-1 budgets for the
+// COUNT, the soft-lock's population inputs — the server's enforcement flag and
+// the actor's own-rule setting, a missing row reading TRUE — and the ids of a
+// bounded set of the actor's messages the purge will delete; their number is
+// the count. The predicate is the engine's selectBatch predicate over the
+// self-authored specs' channels.
+const selfPurgeSoftLockQuery = `
+	SELECT s.enforce_mfa_dangerous_actions,
+	       COALESCE((SELECT ps.require_auth_before_purge FROM privacy_settings ps WHERE ps.user_id = $2), TRUE),
+	       (SELECT array_agg(own.id) FROM (
+	            SELECT id FROM messages
+	            WHERE channel_id = ANY($3::uuid[])
+	              AND user_id = $2
+	              AND ($4::timestamptz IS NULL OR created_at >= $4::timestamptz)
+	            LIMIT $5) own)
+	FROM servers s WHERE s.id = $1`
+
+// selfPurge is what the self-purge soft-lock needs to know about an authorized
+// channel or server purge.
+type selfPurge struct {
+	serverID, userID string
+	purpose          stepup.Purpose
+	input            stepup.Input
+	epoch            string
+	rangeFrom        *time.Time
+	deletes          []purge.DeleteSpec
+	// notFound is the route's 404 copy for a server deleted in flight.
+	notFound string
+}
+
+// selfPurgeOutcome is what the self-purge soft-lock hands the purge.
+type selfPurgeOutcome struct {
+	// confirm, when non-nil, is what the purge's admission must pass, which
+	// selfPurgeAdmit runs: an over-threshold purge's confirmation, or, for a
+	// purge the unlocked read put outside the population, the re-read of the
+	// server's enforcement flag (recheck).
+	confirm *selfPurgeConfirmation
+	// victims, when non-nil, are the only messages of the actor's own the purge
+	// may delete: the ones the soft-lock counted. It is nil when nothing was
+	// counted and when a confirmation governs the whole purge.
+	victims []string
+}
+
+// selfPurgeConfirmation is a self-purge's admission check: an over-threshold
+// purge's confirmation, or an outside-population purge's recheck. It runs as
+// purge.Plan.Admit, in the transaction that writes the purge's audit
+// row, so a refusal leaves no audit row and a factor it verifies is spent
+// only by a purge that was admitted (review of #3509).
+type selfPurgeConfirmation struct {
+	gate       softLockGate
+	retryAfter time.Duration
+	notFound   string
+	// recheck runs recheckSoftLockTx rather than confirmSoftLockTx: the
+	// unlocked read put the actor outside the population, so the admission
+	// confirms only if the server has since turned enforcement on.
+	recheck bool
+	// verified is set when a factor verified in the admission transaction. It
+	// counts only if that transaction committed; see settleSelfPurge.
+	verified bool
+	// err is the confirmation's own error, which refuseSelfPurge answers.
+	err error
+}
+
+// selfPurgeAdmit returns the purge's Plan.Admit: the confirmation, for an
+// over-threshold self-purge, the recheck, for one outside the population, and
+// nil otherwise.
+func (h *Handler) selfPurgeAdmit(o selfPurgeOutcome) func(context.Context, *sql.Tx) error {
+	sc := o.confirm
+	if sc == nil {
+		return nil
+	}
+	confirm := h.confirmSoftLockTx
+	if sc.recheck {
+		confirm = h.recheckSoftLockTx
+	}
+	h.runBeforeSoftLockConfirmHook()
+	return func(ctx context.Context, tx *sql.Tx) error {
+		sc.verified, sc.err = confirm(ctx, tx, sc.gate)
+		return sc.err
+	}
+}
+
+// refuseSelfPurge answers a confirmation that failed inside the purge's
+// admission — a refusal, a lock conflict or a fault — and reports whether it
+// did. The admission rolled back, so nothing was audited or deleted.
+func (h *Handler) refuseSelfPurge(c *gin.Context, o selfPurgeOutcome) bool {
+	sc := o.confirm
+	if sc == nil || sc.err == nil {
+		return false
+	}
+	h.respondSoftLockError(c, sc.err, sc.retryAfter, sc.notFound, errMsgPurgeFailed)
+	return true
+}
+
+// settleSelfPurge follows a purge whose confirmation verified a factor. The
+// budget is cleared once the admission that spent the factor committed; the
+// counters are reset only after a purge that succeeded. A purge that was not
+// admitted spent nothing, so both stay as they are, and so do they for an
+// admission whose outcome is unknown: settling one that did not commit would
+// clear a budget no factor was spent against.
+func (h *Handler) settleSelfPurge(ctx context.Context, o selfPurgeOutcome, runErr error) {
+	sc := o.confirm
+	if sc == nil || !sc.verified ||
+		errors.Is(runErr, purge.ErrNotAdmitted) || errors.Is(runErr, purge.ErrAdmissionUnknown) {
+		return
+	}
+	h.clearSoftLockBudget(ctx, sc.gate)
+	if runErr == nil {
+		h.resetSoftLock(ctx, sc.gate)
+	}
+}
+
+// fence limits the actor's own delete specs to the counted victims, so a
+// message sent after the count is not deleted uncounted (review of #3509).
+// Specs for other authors are never counted, so they are left as they are.
+func (o selfPurgeOutcome) fence(deletes []purge.DeleteSpec, userID string) []purge.DeleteSpec {
+	if o.victims == nil {
+		return deletes
+	}
+	fenced := make([]purge.DeleteSpec, len(deletes))
+	copy(fenced, deletes)
+	for i := range fenced {
+		if isSelfSpec(fenced[i], userID) {
+			fenced[i].OnlyIDs = o.victims
+		}
+	}
+	return fenced
+}
+
+// isSelfSpec reports whether a delete spec's resolved author is the actor.
+func isSelfSpec(ds purge.DeleteSpec, userID string) bool {
+	return ds.Author != nil && *ds.Author == userID
+}
+
+// gateSelfPurge is the delete-rate soft-lock for a channel or server purge
+// (#3455 D-1). It counts only the delete specs whose resolved author is the
+// actor — the ManageOwn-forced or explicit self target — and only for a
+// population member; a purge of other authors is never counted, and the
+// ban/kick path (PurgeUserServerMessages) never calls it.
+//
+// The count and the purge are separate reads, so under the threshold the
+// outcome carries the counted messages' ids and the caller fences its own
+// specs to them. Over it, a verified confirmation covers the whole purge,
+// and so does a server that stopped enforcing with no rule left to apply.
+//
+// Outside the population, as the unlocked read sees it, nothing is counted
+// or fenced, but the admission still re-reads the enforcement flag under the
+// servers-row lock (recheckSoftLockTx): the per-batch guard never reads it,
+// so a server that turned enforcement on after that read would otherwise let
+// the purge run with no confirmation and no count.
+//
+// Over the threshold the governing rule confirms ONCE, in the transaction
+// that admits the purge by writing its audit row (selfPurgeAdmit): the
+// engine's batches are separate transactions and a TOTP code verifies once,
+// so a confirmation per batch would be wrong, and one committed on its own
+// would spend the factor even when the admission then failed. A refusal rolls
+// the admission back, so nothing is purged and nothing is audited.
+//
+// It returns ok=false once it has written a response.
+func (h *Handler) gateSelfPurge(ctx context.Context, c *gin.Context, p selfPurge) (selfPurgeOutcome, bool) {
+	own := make([]string, 0, len(p.deletes))
+	for _, ds := range p.deletes {
+		if isSelfSpec(ds, p.userID) {
+			own = append(own, ds.ScopeID)
+		}
+	}
+	if len(own) == 0 {
+		return selfPurgeOutcome{}, true
+	}
+
+	g := softLockGate{userID: p.userID, serverID: p.serverID, purpose: p.purpose, input: p.input, epoch: p.epoch}
+	var counted pq.StringArray
+	if err := h.db.QueryRowContext(ctx, selfPurgeSoftLockQuery,
+		p.serverID, p.userID, pq.Array(own), p.rangeFrom, selfPurgeCountCap,
+	).Scan(&g.enforcing, &g.ownRule, &counted); err != nil {
+		h.log.Error("Self-purge soft-lock read failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+		return selfPurgeOutcome{}, false
+	}
+	if !g.inPopulation() {
+		return selfPurgeOutcome{confirm: &selfPurgeConfirmation{gate: g, notFound: p.notFound, recheck: true}}, true
+	}
+	// Counted from here on, so the purge may delete only what was counted —
+	// nothing, when the count was zero.
+	victims := append([]string{}, counted...)
+	if len(victims) == 0 {
+		return selfPurgeOutcome{victims: victims}, true
+	}
+
+	verdict, ok := h.chargeSoftLock(ctx, c, g, int64(len(victims)))
+	if !ok {
+		return selfPurgeOutcome{}, false
+	}
+	if !verdict.Over {
+		return selfPurgeOutcome{victims: victims}, true
+	}
+	if !h.consumeSoftLockBudget(ctx, c, g) {
+		return selfPurgeOutcome{}, false
+	}
+	return selfPurgeOutcome{confirm: &selfPurgeConfirmation{gate: g, retryAfter: verdict.RetryAfter, notFound: p.notFound}}, true
 }

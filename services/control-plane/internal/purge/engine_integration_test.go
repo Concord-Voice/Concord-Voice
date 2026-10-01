@@ -146,6 +146,122 @@ func TestEngineRun_DeletesAllAndCompletesAudit(t *testing.T) {
 	assert.Equal(t, 0, hidden, "engine leaves hidden_count to the DM caller")
 }
 
+// TestEngineRun_AdmitCommitsWithTheAuditRow pins Plan.Admit (#3455): it runs
+// in the transaction that writes the in_progress audit row, so its write
+// commits with that row or not at all, and either failure is ErrNotAdmitted
+// with no audit row and nothing deleted.
+func TestEngineRun_AdmitCommitsWithTheAuditRow(t *testing.T) {
+	f := seedEngineFixture(t)
+	f.seedMessages(t, f.authorID, 3, 0)
+	e := f.newEngine(5000)
+	marked := func() bool {
+		var n int
+		require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM privacy_settings WHERE user_id = $1`, f.otherID).Scan(&n))
+		return n == 1
+	}
+	mark := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO privacy_settings (user_id, require_auth_before_purge) VALUES ($1, FALSE)`, f.otherID)
+		return err
+	}
+	audits := func() int {
+		var n int
+		require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_purges WHERE context_id = $1`, f.channelID).Scan(&n))
+		return n
+	}
+
+	refused := errors.New("admission refused")
+	plan := f.channelPlan()
+	plan.Admit = func(context.Context, *sql.Tx) error { return refused }
+	_, err := e.Run(context.Background(), plan)
+	require.ErrorIs(t, err, ErrNotAdmitted)
+	require.ErrorIs(t, err, refused, "the Admit error stays reachable")
+	assert.Zero(t, audits(), "a refused admission writes no audit row")
+	assert.Equal(t, 3, f.countMessages(t))
+
+	plan = f.channelPlan()
+	plan.ContextType = "not-a-context" // fails message_purges_context_type_check
+	plan.Admit = mark
+	_, err = e.Run(context.Background(), plan)
+	require.ErrorIs(t, err, ErrNotAdmitted)
+	assert.False(t, marked(), "a failed audit write rolls back what Admit wrote")
+	assert.Equal(t, 3, f.countMessages(t))
+
+	plan = f.channelPlan()
+	plan.Admit = mark
+	res, err := e.Run(context.Background(), plan)
+	require.NoError(t, err)
+	assert.Equal(t, 3, res.DeletedCount)
+	assert.True(t, marked(), "an admitted purge commits what Admit wrote")
+	status, deleted, _ := f.auditRow(t)
+	assert.Equal(t, "completed", status)
+	assert.Equal(t, 3, deleted)
+}
+
+// TestEngineRun_OnlyIDsLimitsEveryBatch pins DeleteSpec.OnlyIDs on both
+// tables, the fence the self-purge soft-lock puts on the messages it counted
+// (#3455). A batch size of two makes the channel purge take several batches,
+// so a fence applied to the first batch only would still delete the rest; an
+// empty fence deletes nothing.
+func TestEngineRun_OnlyIDsLimitsEveryBatch(t *testing.T) {
+	f := seedEngineFixture(t)
+	rows, err := f.db.Query(`
+		INSERT INTO messages (channel_id, user_id, content)
+		SELECT $1, $2, 'fenced-' || g FROM generate_series(1, 8) g
+		RETURNING id`, f.channelID, f.authorID)
+	require.NoError(t, err)
+	var ids []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	e := f.newEngine(2)
+
+	plan := f.channelPlan()
+	plan.Deletes[0].OnlyIDs = []string{}
+	res, err := e.Run(context.Background(), plan)
+	require.NoError(t, err)
+	assert.Zero(t, res.DeletedCount, "an empty fence deletes nothing")
+
+	plan.Deletes[0].OnlyIDs = ids[:5]
+	res, err = e.Run(context.Background(), plan)
+	require.NoError(t, err)
+	assert.Equal(t, 5, res.DeletedCount)
+	var left []string
+	require.NoError(t, f.db.QueryRow(`SELECT array_agg(id ORDER BY id) FROM messages WHERE channel_id = $1`,
+		f.channelID).Scan(pq.Array(&left)))
+	assert.ElementsMatch(t, ids[5:], left, "only the fenced ids are deleted, across every batch")
+
+	var conversationID, kept, fenced string
+	require.NoError(t, f.db.QueryRow(`
+		INSERT INTO dm_conversations (is_group, is_personal, created_by)
+		VALUES (true, false, $1) RETURNING id`, f.authorID).Scan(&conversationID))
+	t.Cleanup(func() {
+		if _, cleanupErr := f.db.Exec(`DELETE FROM dm_conversations WHERE id = $1`, conversationID); cleanupErr != nil {
+			t.Errorf("cleanup fenced conversation: %v", cleanupErr)
+		}
+	})
+	for _, id := range []*string{&kept, &fenced} {
+		require.NoError(t, f.db.QueryRow(`
+			INSERT INTO dm_messages (conversation_id, user_id, content, type)
+			VALUES ($1, $2, 'fenced', 'text') RETURNING id`, conversationID, f.authorID).Scan(id))
+	}
+	res, err = e.Run(context.Background(), Plan{
+		ContextType: ContextGroup, ContextID: conversationID, ActorID: f.authorID, Reason: "manual",
+		Deletes: []DeleteSpec{{
+			MessagesTable: "dm_messages", ScopeColumn: "conversation_id", ScopeID: conversationID,
+			AttachmentsTable: "dm_message_attachments", OnlyIDs: []string{fenced},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.DeletedCount)
+	var keptExists bool
+	require.NoError(t, f.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM dm_messages WHERE id = $1)`, kept).Scan(&keptExists))
+	assert.True(t, keptExists, "the dm_messages batch honours the fence too")
+}
+
 func TestEngineRunExpiryBatch_RechecksScopeAndCutoffAndAuditsExpiry(t *testing.T) {
 	f := seedEngineFixture(t)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 123456000, time.UTC).Truncate(time.Microsecond)

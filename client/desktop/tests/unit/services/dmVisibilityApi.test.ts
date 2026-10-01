@@ -31,9 +31,12 @@ describe('dm visibility API', () => {
     await expect(hideDMThread(CONVERSATION_ID)).resolves.toBe(false);
   });
 
-  it('posts an empty object, then only the server-selected password factor', async () => {
+  // Rewritten for #3509: the password goes only to the mint endpoint, and
+  // Clear gets the single-use token it returned.
+  it('posts an empty object, then exchanges the password and sends only the token', async () => {
     mockApiFetch
       .mockResolvedValueOnce(response(403, { password_required: true }))
+      .mockResolvedValueOnce(response(200, { step_up_token: 'minted-token', expires_in: 60 }))
       .mockResolvedValueOnce(
         response(200, {
           conversation_id: CONVERSATION_ID,
@@ -53,11 +56,27 @@ describe('dm visibility API', () => {
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
     });
-    expect(mockApiFetch.mock.calls[1]?.[1]).toMatchObject({
+    expect(mockApiFetch.mock.calls[1]).toEqual([
+      '/api/v1/auth/step-up/password',
+      expect.objectContaining({
+        method: 'POST',
+        body: '{"current_password":"test-password-123","purpose":"dm.clear"}', // pragma: allowlist secret
+      }),
+      { context: expect.any(Object) },
+    ]);
+    expect(mockApiFetch.mock.calls[2]?.[0]).toBe(
+      `/api/v1/dm/conversations/${CONVERSATION_ID}/clear`
+    );
+    expect(mockApiFetch.mock.calls[2]?.[1]).toMatchObject({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{"current_password":"test-password-123"}', // pragma: allowlist secret
+      body: '{"step_up_token":"minted-token"}',
     });
+    // The exchange and the Clear are admitted against ONE captured context,
+    // so the token is never spent by an account that did not mint it (#3509).
+    const mintOpts = mockApiFetch.mock.calls[1]?.[2] as { context?: unknown } | undefined;
+    const clearOpts = mockApiFetch.mock.calls[2]?.[2] as { context?: unknown } | undefined;
+    expect(clearOpts?.context).toBe(mintOpts?.context);
   });
 
   it('posts only the server-selected MFA factor after MFA is required', async () => {
@@ -68,7 +87,11 @@ describe('dm visibility API', () => {
       })
     );
 
-    await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({ kind: 'mfaRequired' });
+    // A refusal that names no methods still gets a code prompt.
+    await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({
+      kind: 'mfaRequired',
+      methods: ['totp'],
+    });
     await expect(
       clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' })
     ).resolves.toEqual({ kind: 'success' });

@@ -20,11 +20,13 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -88,6 +90,15 @@ type Handler struct {
 	tiers       entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
 	purgeEngine *purge.Engine             // bulk message purge (#1352)
 	ops         OpsCounter
+	redis       *redis.Client            // delete-rate soft-lock counter + its MFA confirmation's attempt budget (#3455)
+	mfaVerifier stepup.MFATxCodeVerifier // step-up auth for the delete-rate soft-lock's MFA confirmation (#3455)
+
+	// beforeSoftLockConfirmHook is a test-only ordering seam (the dm
+	// afterCandidateReadHook precedent): it runs after the soft-lock's
+	// unlocked population read and before the transaction that re-reads it
+	// under lock, so a test can flip the server's enforcement in flight. Nil
+	// in production: NewHandler never sets it and only export_test.go can.
+	beforeSoftLockConfirmHook func()
 }
 
 // OpsCounter is the optional aggregate counter sink used after committed writes.
@@ -124,6 +135,24 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rb
 	}
 	return handler
 }
+
+// SetMFAVerifier wires the verifier that checks the delete-rate soft-lock's
+// MFA confirmation (#3455). An unwired verifier fails closed (500 on every
+// over-threshold delete), which is why the router boot guard asks
+// HasMFAVerifier. Pattern mirrors servers.Handler's own SetMFAVerifier.
+func (h *Handler) SetMFAVerifier(v stepup.MFATxCodeVerifier) { h.mfaVerifier = v }
+
+// HasMFAVerifier reports whether SetMFAVerifier was called with a non-nil
+// verifier. The router's boot guard interrogates the HANDLER through this.
+func (h *Handler) HasMFAVerifier() bool { return h.mfaVerifier != nil }
+
+// SetRedis wires the client behind the delete-rate soft-lock counter and its
+// MFA confirmation's attempt budget (#3455). A nil client fails the soft-lock
+// closed (503), which is safe but silent, so the boot guard asks HasRedis.
+func (h *Handler) SetRedis(client *redis.Client) { h.redis = client }
+
+// HasRedis reports whether SetRedis was called with a non-nil client.
+func (h *Handler) HasRedis() bool { return h.redis != nil }
 
 // SendMessageRequest represents a request to send a message.
 // Max content length is 65536 bytes (64 KiB) of ciphertext — sized for a future
@@ -1089,14 +1118,31 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": message})
 }
 
-// DeleteMessage deletes a message
+// DeleteMessage deletes a message.
+//
+// Sequence (design spec §2.4): validate the id and the optional step-up body;
+// preflight the row with the soft-lock's population inputs and the cached
+// permission, refusing before anything population-derived (I7); then, for a
+// population member only, count the attempt. The delete transaction then
+// re-authorizes under #3142's locks (authorizeMessageDeleteTx). Under the
+// threshold, or outside the population, that is all it does, and any step-up
+// the body carried is ignored. Over it, the budget is charged when a factor
+// is present, confirmSoftLockTx confirms as the transaction's first
+// statement, and a verified, committed delete resets the counters and clears
+// the budget.
 func (h *Handler) DeleteMessage(c *gin.Context) {
 	userID := c.GetString("user_id")
 	messageID := c.Param("id")
+	ctx := c.Request.Context()
 
 	// Validate message ID
 	if _, err := uuid.Parse(messageID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidMessageID})
+		return
+	}
+	input, bodyErr := stepup.ReadOptionalStepUp(c)
+	if bodyErr != nil {
+		bodyErr.Write(c)
 		return
 	}
 
@@ -1104,42 +1150,48 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	if !authorized {
 		return
 	}
-	authorID, channelID, serverID := preflight.authorID, preflight.channelID, preflight.serverID
 	if h.purgeEngine == nil {
 		h.log.Error(errMsgFailedDeleteMessage, "error", "purge engine unavailable")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
 
-	responseWritten := false
-	// Re-authorize in the purge transaction so role/member changes cannot turn
-	// the cache-backed preflight above into a stale privileged delete.
-	err := h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
+	gate := softLockGate{
+		userID:    userID,
+		serverID:  preflight.serverID,
+		enforcing: preflight.enforcing,
+		ownRule:   preflight.authorID == userID && preflight.actorOwnRule,
+		purpose:   stepup.PurposeMessageDelete,
+		input:     input,
+		epoch:     middleware.TokenCredentialEpoch(c),
+	}
+	verdict, ok := h.chargeMessageDelete(ctx, c, gate)
+	if !ok {
+		return
+	}
+	h.runBeforeSoftLockConfirmHook()
+
+	var confirmed, responseWritten bool
+	locked := preflight
+	err := h.purgeEngine.DeleteOne(ctx, messageID, purge.DeleteSpec{
 		MessagesTable:    "messages",
 		ScopeColumn:      "channel_id",
-		ScopeID:          channelID,
+		ScopeID:          preflight.channelID,
 		AttachmentsTable: "message_attachments",
-		Guard: func(ctx context.Context, tx *sql.Tx) error {
-			lockedChannelID, lockedServerID, channelType, allowed := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermManageOwnMessages, errMsgFailedDeleteMessage)
-			if !allowed {
-				responseWritten = true
-				return errMessageDeleteGuardRejected
-			}
-			channelID, serverID = lockedChannelID, lockedServerID
-			if err := tx.QueryRowContext(ctx, `SELECT user_id FROM messages WHERE id = $1 AND channel_id = $2 FOR SHARE`, messageID, channelID).Scan(&authorID); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-				} else {
-					h.log.Error("Failed to lock message delete", "error", err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		Guard: func(ctx context.Context, tx *sql.Tx) (err error) {
+			if verdict.Over {
+				// First, before #3142's channel and member locks: see
+				// confirmSoftLockTx. Overwritten on every attempt, never
+				// carried over: DeleteOne retries once on ErrMembershipChanged,
+				// which no channel-delete guard returns today. On such a retry a
+				// TOTP or backup code re-verifies after the rollback, while a
+				// WebAuthn token was already spent, so the retry fails closed as
+				// Invalid MFA code.
+				if confirmed, err = h.confirmSoftLockTx(ctx, tx, gate); err != nil {
+					return err
 				}
-				responseWritten = true
-				return errMessageDeleteGuardRejected
 			}
-			if authorID != userID && !h.authorizeMessageChannelTx(ctx, c, tx, messageChannelAuthorization{
-				serverID: serverID, channelID: channelID, userID: userID,
-				required: rbac.PermManageAllMessages, genericMsg: errMsgFailedDeleteMessage,
-			}, channelType) {
+			if !h.authorizeMessageDeleteTx(c, tx, messageID, userID, &locked) {
 				responseWritten = true
 				return errMessageDeleteGuardRejected
 			}
@@ -1149,26 +1201,25 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	if responseWritten {
 		return
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+	if err != nil {
+		h.respondSoftLockError(c, err, verdict.RetryAfter, errMsgMessageNotFound, errMsgFailedDeleteMessage)
 		return
 	}
-	if err != nil {
-		h.log.Error(errMsgFailedDeleteMessage, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
-		return
+	if confirmed {
+		h.resetSoftLock(ctx, gate)
+		h.clearSoftLockBudget(ctx, gate)
 	}
 
-	h.log.Info("Message deleted", "message_id", messageID, "deleted_by", userID, "author", authorID)
+	h.log.Info("Message deleted", "message_id", messageID, "deleted_by", userID, "author", locked.authorID)
 
 	// Broadcast deletion to channel subscribers via WebSocket
-	channelUUID, err := uuid.Parse(channelID)
+	channelUUID, err := uuid.Parse(locked.channelID)
 	if err == nil {
 		h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
 			Type: "message_delete",
 			Data: map[string]interface{}{
 				"id":         messageID,
-				"channel_id": channelID,
+				"channel_id": locked.channelID,
 			},
 		})
 	}
@@ -1176,21 +1227,67 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Message deleted successfully"})
 }
 
+// authorizeMessageDeleteTx re-authorizes a delete inside its transaction so
+// role or member changes cannot turn the cache-backed preflight into a stale
+// privileged delete (#3142): the shared mutation fence (credential epoch,
+// channel, membership, ManageOwn-or-ManageAll, the message FOR UPDATE), then
+// the author, then ManageAll for someone else's message. It records the
+// locked placement and author in locked. On a refusal it has written the
+// response and returns false.
+func (h *Handler) authorizeMessageDeleteTx(c *gin.Context, tx *sql.Tx, messageID, userID string, locked *messageDeletePreflight) bool {
+	ctx := c.Request.Context()
+	channelID, serverID, channelType, allowed := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermManageOwnMessages, errMsgFailedDeleteMessage)
+	if !allowed {
+		return false
+	}
+	locked.channelID, locked.serverID = channelID, serverID
+	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM messages WHERE id = $1 AND channel_id = $2 FOR SHARE`, messageID, channelID).Scan(&locked.authorID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		} else {
+			h.log.Error("Failed to lock message delete", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		}
+		return false
+	}
+	return locked.authorID == userID || h.authorizeMessageChannelTx(ctx, c, tx, messageChannelAuthorization{
+		serverID: serverID, channelID: channelID, userID: userID,
+		required: rbac.PermManageAllMessages, genericMsg: errMsgFailedDeleteMessage,
+	}, channelType)
+}
+
+// messageDeletePreflight is DeleteMessage's unlocked row read: the message's
+// placement plus the two population inputs of the delete-rate soft-lock
+// (#3455), read in the same statement so the population costs no round trip
+// (design spec §2.2).
 type messageDeletePreflight struct {
 	authorID  string
 	channelID string
 	serverID  string
+	// enforcing is servers.enforce_mfa_dangerous_actions, read unlocked.
+	enforcing bool
+	// actorOwnRule is the ACTOR's require_auth_before_purge, a missing row
+	// reading TRUE. It governs only when the actor is also the author.
+	actorOwnRule bool
 }
 
+// deleteTargetQuery joins servers for the enforcement flag and reads the
+// actor's own-rule setting. Neither input is consulted before the permission
+// check (I7), and neither is ever logged (C7).
+const deleteTargetQuery = `
+	SELECT m.user_id, m.channel_id, c.server_id, s.enforce_mfa_dangerous_actions,
+	       COALESCE((SELECT ps.require_auth_before_purge FROM privacy_settings ps WHERE ps.user_id = $2), TRUE)
+	FROM messages m
+	INNER JOIN channels c ON m.channel_id = c.id
+	INNER JOIN servers s ON s.id = c.server_id
+	WHERE m.id = $1`
+
+// preflightMessageDelete reads the message DeleteMessage acts on and checks
+// the cached permission. On failure it has written the 404, 403 or 500.
 func (h *Handler) preflightMessageDelete(c *gin.Context, messageID, userID string) (messageDeletePreflight, bool) {
-	checkQuery := `
-		SELECT m.user_id, m.channel_id, c.server_id
-		FROM messages m
-		INNER JOIN channels c ON m.channel_id = c.id
-		WHERE m.id = $1
-	`
 	var preflight messageDeletePreflight
-	err := h.db.QueryRow(checkQuery, messageID).Scan(&preflight.authorID, &preflight.channelID, &preflight.serverID)
+	err := h.db.QueryRow(deleteTargetQuery, messageID, userID).Scan(
+		&preflight.authorID, &preflight.channelID, &preflight.serverID, &preflight.enforcing, &preflight.actorOwnRule)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return messageDeletePreflight{}, false

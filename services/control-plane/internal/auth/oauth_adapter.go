@@ -273,7 +273,7 @@ func (h *Handler) VerifyPassword(ctx context.Context, userID, password string) (
 		`SELECT email, password_hash, credential_epoch FROM users WHERE id = $1`, userID,
 	).Scan(&email, &passwordHash, &credentialEpoch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", errors.New("invalid_credentials")
+			return "", ErrInvalidCredentials
 		}
 		return "", fmt.Errorf("lookup user: %w", err)
 	}
@@ -296,7 +296,7 @@ func (h *Handler) VerifyPassword(ctx context.Context, userID, password string) (
 		// FOLLOWING request, matching /auth/login's UX where the threshold-
 		// reaching request still gets 401, not 423.
 		h.recordFailedLogin(ctx, email)
-		return "", errors.New("invalid_credentials")
+		return "", ErrInvalidCredentials
 	}
 
 	// Successful verify clears the counter — same posture as /auth/login.

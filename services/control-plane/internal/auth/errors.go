@@ -18,6 +18,17 @@ import "errors"
 //     distinct from generic 401 invalid_credentials.
 var ErrAccountLocked = errors.New("account_locked: too many failed attempts")
 
+// ErrInvalidCredentials is returned by VerifyPassword when the password does
+// not match (or the user does not exist), after the failure has been counted
+// against the shared lockout. Its text is the "invalid_credentials" the
+// unexported error carried before it became a sentinel.
+//
+// Used by:
+//   - internal/oauth.Handler.CompleteLink — any non-lockout error is its 401.
+//   - internal/stepup.PasswordTokenHandler — answers 403 "Invalid password",
+//     and tells it apart from a lookup or hash fault, which is a 500.
+var ErrInvalidCredentials = errors.New("invalid_credentials")
+
 // ErrAccountDisabled is returned by IssueAccessAndRefresh when the target account
 // is terminally disabled (users.disabled = TRUE, e.g. by the #1623 age-verification
 // valid_age=false path). It gates the SSO token-mint path the same way the password

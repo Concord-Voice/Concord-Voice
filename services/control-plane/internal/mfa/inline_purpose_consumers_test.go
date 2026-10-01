@@ -5,7 +5,7 @@ package mfa
 // seeded key, so these tests do not depend on how a token is stored.
 //
 // Levels: the fourteen MFA-settings consumers are driven at the HANDLER; the
-// ten consumers outside this package are driven through the entry point each
+// thirteen consumers outside this package are driven through the entry point each
 // calls with the real verifier (stepup.VerifyMFAFactor/Tx, mfaenforce.ConfirmTx,
 // or VerifyCode/VerifyCodeTx directly), because their handlers live in packages
 // this one cannot import.
@@ -118,7 +118,7 @@ func TestInlinePurpose_EveryMFASettingsConsumer(t *testing.T) {
 	}
 }
 
-// TestInlinePurpose_EveryOtherConsumerPurpose drives the eleven consumers outside
+// TestInlinePurpose_EveryOtherConsumerPurpose drives the fifteen consumers outside
 // internal/mfa through the exact entry point each calls.
 func TestInlinePurpose_EveryOtherConsumerPurpose(t *testing.T) {
 	db := iuNewTestDB(t)
@@ -191,6 +191,10 @@ func TestInlinePurpose_EveryOtherConsumerPurpose(t *testing.T) {
 		{stepup.PurposeDMPurge, "stepup.VerifyMFAFactor (dm.verifyPurgeStepUp)", factor},
 		{stepup.PurposeDMClear, "stepup.VerifyMFAFactorTx (dm.verifyClearStepUp)", factorTx},
 		{stepup.PurposeServerMFAEnforcementOff, "mfaenforce.ConfirmTx (servers toggle OFF)", confirm},
+		{stepup.PurposeMessageDelete, "mfaenforce.ConfirmTx (messages channel delete, via RequireConfirmationTx)", confirm},
+		{stepup.PurposeDMMessageDelete, "stepup.VerifyMFAFactorTx (dm message delete, via the Clear seam)", factorTx},
+		{stepup.PurposeChannelPurge, "mfaenforce.ConfirmTx (messages channel self-purge soft-lock, via RequireConfirmationTx)", confirm},
+		{stepup.PurposeServerPurge, "mfaenforce.ConfirmTx (messages server self-purge soft-lock, via RequireConfirmationTx)", confirm},
 	} {
 		t.Run(string(c.purpose), func(t *testing.T) {
 			userID := iuCreateUser(t, db, iuPassword)
@@ -213,7 +217,7 @@ func TestInlinePurpose_EveryOtherConsumerPurpose(t *testing.T) {
 // route passing another route's purpose: that is pinned at the handler, as in
 // internal/users/key_reset_inline_purpose_test.go.
 func TestInlinePurpose_TablesCoverTheClosedSet(t *testing.T) {
-	require.Len(t, stepup.Purposes(), 14+11)
+	require.Len(t, stepup.Purposes(), 14+15)
 }
 
 func TestInlinePurpose_VerifyCodeRefusesAnInvalidPurpose(t *testing.T) {

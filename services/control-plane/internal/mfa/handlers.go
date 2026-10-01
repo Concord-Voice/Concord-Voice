@@ -306,7 +306,7 @@ func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, u
 func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerificationStore, userID string, purpose stepup.Purpose, code string) (bool, string, error) {
 	// A WebAuthn inline token (from WebAuthnVerifyInlineFinish) counts only for
 	// the purpose it was minted for; noInlinePurpose reads none.
-	inlineVerified, err := h.consumeWebAuthnInlineToken(ctx, userID, purpose, code)
+	inlineVerified, err := h.consumeWebAuthnInlineToken(ctx, store, userID, purpose, code)
 	if err != nil {
 		return false, "", err
 	}
@@ -347,20 +347,6 @@ func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerific
 	return false, "", nil
 }
 
-// inlineTokenKey is where WebAuthnVerifyInlineFinish stores a token minted for
-// purpose, and the only key a consumer of that purpose claims.
-//
-// Both inline keys use the mfa_inline_purpose_ prefix, which a binary from
-// before purpose binding never builds. That binary claims
-// mfa_inline_token:<uid>:<code> and finishes mfa_inline_session:<uid>. If the
-// new keys shared those prefixes, then during a rolling deploy an old replica
-// would spend a purpose-bound token sent as mfa_code "<purpose>:<token>" on
-// any route, and would finish a new ceremony into an unbound token. Disjoint
-// prefixes leave each binary able to reach only its own keys.
-func inlineTokenKey(userID string, purpose stepup.Purpose, token string) string {
-	return fmt.Sprintf("mfa_inline_purpose_token:%s:%s:%s", userID, purpose, token)
-}
-
 // inlineSessionKey holds the one pending inline ceremony for userID: the
 // WebAuthn session data and the purpose begin was given. A second begin
 // replaces it, challenge and purpose together.
@@ -368,31 +354,19 @@ func inlineSessionKey(userID string) string {
 	return fmt.Sprintf("mfa_inline_purpose_session:%s", userID)
 }
 
-// errInlineTokenStoreUnavailable replaces a Redis error from the inline-token
-// consume. The raw error is deliberately not wrapped: the key embeds the live
-// token, and a client hook may annotate a go-redis error with the command's
-// arguments, so wrapping it would put a spendable token into the log line of
-// every caller that logs a verification dependency failure. The finish path
-// withholds its SET error for the same reason. The consume still fails closed.
-var errInlineTokenStoreUnavailable = errors.New("consume WebAuthn inline verification token: token store unavailable")
-
-// consumeWebAuthnInlineToken claims a token minted for purpose. It GETDELs only
-// that purpose's key, so a token minted for another purpose is an absent key:
-// refused exactly like an invalid code, and not consumed. Nothing here logs or
-// counts which of the two a refusal was (observability.md principle 7). An
-// invalid purpose (noInlinePurpose) reads nothing.
-func (h *Handler) consumeWebAuthnInlineToken(ctx context.Context, userID string, purpose stepup.Purpose, code string) (bool, error) {
+// consumeWebAuthnInlineToken spends a WebAuthn inline token minted for purpose
+// on store: the caller's transaction under VerifyCodeTx, so a rollback restores
+// it like a TOTP step or a backup code, or the pool under VerifyCode. It is
+// stepup.SpendToken with the factor fixed, so a token minted for another
+// purpose, or a password step-up token, matches no row: refused exactly like
+// an invalid code, and not consumed. Nothing here logs or counts which a
+// refusal was (observability.md principle 7). An invalid purpose
+// (noInlinePurpose) and a code too short to be a token read nothing.
+func (h *Handler) consumeWebAuthnInlineToken(ctx context.Context, store codeVerificationStore, userID string, purpose stepup.Purpose, code string) (bool, error) {
 	if !purpose.Valid() || len(code) <= 20 {
 		return false, nil
 	}
-	token, err := h.redis.GetDel(ctx, inlineTokenKey(userID, purpose, code)).Result()
-	if errors.Is(err, redis.Nil) {
-		return false, nil
-	}
-	if err != nil {
-		return false, errInlineTokenStoreUnavailable
-	}
-	return token != "", nil
+	return stepup.SpendToken(ctx, store, userID, stepup.FactorWebAuthn, purpose, code)
 }
 
 // acceptTOTPStep finishes verifyCodeMatchedMethod for a TOTP code that matched
@@ -2791,19 +2765,16 @@ func (h *Handler) WebAuthnVerifyInlineFinish(c *gin.Context) {
 		return
 	}
 
-	// Generate a short-lived verification token (60s, single-use)
-	tokenBytes := make([]byte, 24)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		h.log.Error("Failed to generate an inline WebAuthn token", "user_id", userID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
-		return
-	}
-	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	// A token the server never stored is one it will never accept. The key
-	// embeds the token, so the error — which a client hook may annotate with
-	// the key — is deliberately not logged.
-	if err := h.redis.Set(ctx, inlineTokenKey(userID, session.Purpose, token), "1", 60*time.Second).Err(); err != nil {
-		h.log.Error("Failed to store inline WebAuthn token", "user_id", userID)
+	// A short-lived, single-use verification token in step_up_tokens (#3509),
+	// spent by the purpose's consumer inside its own transaction. The mint
+	// fences the session's credential epoch and binds the token to it.
+	token, mintErr := stepup.MintToken(ctx, h.db, userID, stepup.FactorWebAuthn, session.Purpose, middleware.TokenCredentialEpoch(c))
+	if mintErr != nil {
+		if mintErr.Status != http.StatusInternalServerError {
+			mintErr.Write(c)
+			return
+		}
+		h.log.Error("Failed to store inline WebAuthn token", "user_id", userID, "error", mintErr.Cause)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}

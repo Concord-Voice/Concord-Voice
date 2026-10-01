@@ -25,6 +25,7 @@ import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
 import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
 import Modal from '../ui/Modal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import DeleteRefusalModal from './DeleteRefusalModal';
 import {
   MANAGE_ALL_MESSAGES,
   MANAGE_OWN_MESSAGES,
@@ -125,6 +126,9 @@ const ChatView: React.FC = () => {
     sendMessage,
     editMessage,
     deleteMessage,
+    deleteRefusal,
+    confirmDelete,
+    dismissDeleteRefusal,
     replyingTo,
     handleReply,
     cancelReply,
@@ -462,6 +466,13 @@ const ChatView: React.FC = () => {
           selfScopeOnly={purgeTarget.selfScopeOnly}
         />
       )}
+
+      <DeleteRefusalModal
+        refusal={deleteRefusal}
+        onConfirm={confirmDelete}
+        onDismiss={dismissDeleteRefusal}
+        purpose="messages.delete"
+      />
     </div>
   );
 };

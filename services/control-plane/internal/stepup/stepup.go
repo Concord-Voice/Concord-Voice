@@ -17,12 +17,13 @@
 // no-password-factor handling here is deliberate defence-in-depth for a state
 // the schema forbids today; see VerifyPasswordFactor.
 //
-// Its internal imports are internal/auth (password verification),
-// internal/credepoch (the epoch fence LockSubjectTx applies) and
-// internal/middleware (the fail-closed attempt budget); it otherwise depends on
-// stdlib, gin (Error carries a gin.H body and Write emits it onto a
-// gin.Context) and go-redis (Budget). None of the three imports this package,
-// so no cycle is possible. The MFA dependency is declared here, at the
+// Its internal imports are internal/auth (password verification and the
+// shared-lockout sentinels), internal/credepoch (the epoch fence LockSubjectTx
+// and MintToken apply) and internal/middleware (the fail-closed attempt budget,
+// the session's epoch claim, and the per-IP auth-failure ban the password mint
+// feeds); it otherwise depends on stdlib, gin (Error carries a gin.H body and
+// Write emits it onto a gin.Context), go-redis (Budget) and pkg/logger. None
+// of the three imports this package, so no cycle is possible. The MFA dependency is declared here, at the
 // consumer, following the rbac.PresenceRecheck precedent, so internal/mfa is
 // not imported.
 //

@@ -1890,6 +1890,127 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SSOError'
+  /auth/step-up/password:
+    post:
+      tags:
+      - Auth
+      summary: Exchange the account password for a single-use step-up token
+      description: >-
+        The only endpoint an own-rule route's password reaches (#3455, PR
+        #3509). An account with no inline MFA method confirms DM Clear, a
+        channel or DM message delete past the delete-rate soft-lock, or a
+        channel or server self-purge past it, by sending its password HERE
+        with the route's `purpose`. The answer is a single-use
+        `step_up_token`, bound to that one purpose and to the account's
+        current credential epoch, which the route accepts in its own
+        `step_up_token` field for 60 seconds. The routes themselves refuse any
+        body that carries `current_password`.
+
+
+        Authenticated: the access token and its credential-epoch fence apply as
+        on any authenticated route. It is mounted under `/auth` but is not part
+        of the public auth group.
+
+
+        Checks run in this order, and each refusal comes before the next check:
+        the body (400), the `purpose` (400, before the password is looked at),
+        inline MFA (403 `mfa_required`, before the password is verified: an
+        account with TOTP or WebAuthn confirms these routes with MFA, never a
+        password), no usable password factor (400 with the route's own
+        NoFactors copy, before the password is verified), then the password
+        itself.
+
+
+        The password is verified through the same email-keyed lockout as
+        `POST /auth/login` (five failures lock both, and a lock set by either
+        refuses both), and a wrong password also counts toward the per-IP
+        authentication-failure ban. The route carries login's ban check and
+        two limits that fail CLOSED: login's per-IP limit (10 per 15 minutes)
+        and a per-user limit of the same size, so a Redis outage answers 503
+        rather than letting guesses through. Every wrong password, lockout and
+        mint is recorded in /login's security-event shapes. This endpoint is
+        never a cheaper password oracle than login. The password reaches no
+        log and no storage; only SHA-256 of the token is stored. A token binds
+        to the user and the credential epoch, not to the session: only a
+        credential-epoch rotation strands an outstanding token.
+      operationId: mintPasswordStepUpToken
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordStepUpTokenRequest'
+      responses:
+        '200':
+          description: 'Token minted. The response carries `Cache-Control: no-store`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordStepUpTokenResponse'
+        '400':
+          description: >-
+            `Invalid request body` (not one JSON object of at most 4 KiB, a
+            non-string field, or an empty password or one over 1024 bytes),
+            `A valid verification purpose is required` for a purpose outside the
+            five own-rule purposes, or, for an account with no password and no
+            MFA method, the same NoFactors copy the purpose's route answers
+            with, and `step_up_unavailable: true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpUnavailableError'
+        '401':
+          description: Missing or invalid access token, or a credential epoch that no longer matches the session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: >-
+            `Invalid password` (byte-exact, the step-up seam's refusal), or an
+            account with inline MFA: `mfa_required: true` with `mfa_methods`,
+            refused before the password is verified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordStepUpTokenRefusal'
+              examples:
+                invalidPassword:
+                  summary: Wrong password
+                  value:
+                    error: Invalid password
+                mfaRequired:
+                  summary: The account confirms with MFA
+                  value:
+                    error: MFA verification required
+                    mfa_required: true
+                    mfa_methods:
+                    - totp
+        '423':
+          description: 'The account''s shared login lockout is engaged (`error_code: account_locked`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordStepUpTokenRefusal'
+              example:
+                error: Too many incorrect passwords. Try again later.
+                error_code: account_locked
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: The rate-limit backend refused the count, so the mint is refused (fail closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/ws-ticket:
     post:
       tags:
@@ -2513,7 +2634,19 @@ paths:
 
 
         Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
-        allows).'
+        allows).
+
+
+        Delete-rate soft-lock (#3455): a purge whose resolved author scope is the
+        actor (an actor with only `Manage Own Messages`, or an explicit
+        `target_user_id` equal to the actor) counts the messages it will delete,
+        up to 101, against the same counters as single deletes. Over the
+        threshold the request is refused with a 403 carrying
+        `delete_rate_limited: true` before any batch runs, and nothing is purged
+        or audited. Repeat the request with `mfa_code`, or with a
+        `step_up_token` from `POST /auth/step-up/password` when the refusal
+        asked for a password; a body carrying `current_password` is a 400.
+        A purge of other authors'' messages is never counted.'
       operationId: purgeChannelMessages
       security:
       - BearerAuth: []
@@ -2533,19 +2666,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/PurgeMessagesResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: >-
+            Validation error: an invalid ID, range or request body. Past the
+            delete-rate soft-lock, a self-purge by an account with neither a
+            password nor an inline MFA method answers the soft-lock's
+            NoFactors copy with `step_up_unavailable: true`, since no step-up
+            can confirm it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpUnavailableError'
         '401':
-          description: Authentication required (credential epoch changed during purge)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/DeleteSessionRejected'
         '403':
-          description: Insufficient permissions to purge this channel
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/DeleteSoftLockForbidden'
         '404':
           description: Channel not found
           content:
@@ -2559,7 +2693,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/DeleteRateOrBudgetLimited'
+        '503':
+          $ref: '#/components/responses/DeleteSoftLockUnavailable'
     get:
       tags:
       - Messages
@@ -4258,8 +4394,10 @@ paths:
         delete their messages. The default and fail-closed behavior requires
         step-up authentication according to `require_auth_before_purge` in
         the caller's Privacy & Security settings. When MFA is enabled, submit
-        `mfa_code` only; otherwise submit `current_password`. When protection
-        is disabled, `{}` is accepted and no factor is required. Unknown or
+        `mfa_code` only; otherwise submit the `step_up_token` that
+        `POST /auth/step-up/password` minted for `dm.clear` (#3509). A body
+        that carries `current_password` is a 400. When protection is
+        disabled, `{}` is accepted and no factor is required. Unknown or
         nonparticipant conversations return the same 404. A successful retry
         advances the cutoff; after an ambiguous 500 response, refetch before
         retrying because the prior transaction may have committed. The
@@ -4311,11 +4449,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/DMClearResponse'
         '400':
-          description: Invalid conversation ID or request body, or protection is enabled but the account has no usable local verification factor
+          description: >-
+            Invalid conversation ID or request body (including any
+            `current_password` field, or an `mfa_code` or `step_up_token` over
+            256 characters), or protection is enabled but the account has no
+            usable local verification factor, which carries
+            `step_up_unavailable: true`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpUnavailableError'
         '401':
           description: Access-token credential epoch is stale
           content:
@@ -4323,11 +4466,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Required step-up verification failed
+          description: >-
+            Required step-up verification failed. The body sets
+            `password_required` when a password step-up token is still needed
+            (with `step_up_token_invalid` too when the one sent matched
+            nothing: spent, expired, minted for another route, or stranded by a
+            credential change), or `mfa_required` together with `methods` when
+            a code is still needed; a wrong code returns "Invalid MFA code".
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
         '404':
           description: Conversation not found or caller is not a participant
           content:
@@ -4403,11 +4552,16 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
-          description: Not a participant, or step-up verification required/failed
+          description: >-
+            Not a participant, or step-up verification required/failed. A
+            step-up refusal sets `password_required` when a password is still
+            needed, or `mfa_required` together with `methods` when a code is
+            still needed; a supplied-but-wrong factor returns "Invalid
+            password" or "Invalid MFA code" instead.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpError'
         '500':
           description: Purge failed or timed out
           content:
@@ -4593,11 +4747,25 @@ paths:
       tags:
       - DM
       summary: Delete a DM message
-      description: 'Delete your own DM message.
+      description: >-
+        Delete your own DM message.
+
 
         Rate limit: 10 requests per minute (user-based).
 
-        '
+
+        **Delete-rate soft-lock (#3455).** The request body is optional. When
+        the author's `require_auth_before_purge` privacy setting is on (a
+        missing row counts as on), the server counts each delete and, past the
+        threshold, refuses with a 403 carrying `delete_rate_limited: true`. The
+        threshold is more than 15 counted deletes inside 30 seconds across all
+        of the user's DMs, or more than 100 inside 24 hours across all scopes.
+        The client repeats the same request with the author's own factor: the
+        MFA code when the account has an inline MFA method (TOTP or WebAuthn),
+        otherwise the current password. A factor sent while under the threshold
+        is ignored. When the setting is off, the delete is never counted and
+        never refused by the soft-lock. The 403, 429 and 503 refusals below are
+        told apart by their body flags, not by status alone.
       operationId: deleteDMMessage
       security:
       - BearerAuth: []
@@ -4616,6 +4784,12 @@ paths:
           type: string
           format: uuid
         description: Message UUID
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteStepUpRequest'
       responses:
         '200':
           description: Message deleted
@@ -4627,23 +4801,40 @@ paths:
                   success:
                     type: boolean
         '400':
-          description: Invalid conversation or message ID
+          description: >-
+            Invalid conversation or message ID; a request body the server
+            cannot read (larger than 4 KiB, not a JSON object, trailing data, a
+            non-string field, an `mfa_code` or `step_up_token` over 256
+            characters, or any `current_password` field), which answers
+            `Invalid request body`; or, past the soft-lock, an account with neither a
+            password nor an inline MFA method, which has nothing to confirm with
+            and carries `step_up_unavailable: true`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpUnavailableError'
+        '401':
+          $ref: '#/components/responses/DeleteSessionRejected'
         '403':
-          description: Not a participant, or not the message author
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/DeleteSoftLockForbidden'
         '404':
           description: Message not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/DeleteRateOrBudgetLimited'
+        '500':
+          description: >-
+            The delete failed, or the confirmation could not be verified
+            (`Verification failed`). Nothing was deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/DeleteSoftLockUnavailable'
   /dm/conversations/{id}/read:
     post:
       tags:
@@ -8876,11 +9067,34 @@ paths:
       tags:
       - Messages
       summary: Delete a message
-      description: 'Delete a message. Author, server owner, or admin can delete.
+      description: >-
+        Delete a message. The author (with `Manage Own Messages`) or a member
+        holding `Manage All Messages` can delete.
 
-        Rate limit: 10 requests per minute.
 
-        '
+        Rate limit: 10 requests per minute (user-based).
+
+
+        **Delete-rate soft-lock (#3455).** The request body is optional. A
+        request with no body deletes as before. Past the soft-lock threshold the
+        server refuses the delete with a 403 that carries
+        `delete_rate_limited: true`; the client repeats the same request with
+        the factor the refusal asked for: `mfa_code`, or, for
+        `password_required`, a `step_up_token` from
+        `POST /auth/step-up/password`. The password itself is never sent here.
+        The threshold is more than 15 counted deletes inside 30 seconds for one
+        scope, or more than 100 inside 24 hours across all scopes. A factor
+        sent while under the threshold is ignored: it is neither verified nor
+        counted. The 403, 429 and 503 refusals below are told apart by their
+        body flags, not by status alone. Every step-up refusal on this route
+        leaves the message in place.
+
+
+        A delete that fails the epoch check of the caller's session returns
+        401: the delete transaction re-authorizes the actor under lock
+        (#3142), and past the soft-lock the confirmation fences the session
+        as well.
+      operationId: deleteMessage
       security:
       - BearerAuth: []
       parameters:
@@ -8890,6 +9104,12 @@ paths:
         schema:
           type: string
           format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteStepUpRequest'
       responses:
         '200':
           description: Message deleted
@@ -8897,18 +9117,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '400':
+          description: >-
+            Invalid message ID, or a request body the server cannot read:
+            larger than 4 KiB, not a JSON object, trailing data after the
+            object, a non-string field, an `mfa_code` or `step_up_token` over 256
+            characters, or any `current_password` field (#3509). The body is
+            `Invalid request body` in that case. Past the delete-rate
+            soft-lock, an account with neither a password nor an inline MFA
+            method answers the NoFactors copy with `step_up_unavailable: true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpUnavailableError'
         '401':
-          description: Missing, invalid, or stale bearer token
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/DeleteSessionRejected'
         '403':
-          description: Insufficient permissions
+          $ref: '#/components/responses/DeleteSoftLockForbidden'
+        '404':
+          description: Message not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/DeleteRateOrBudgetLimited'
+        '500':
+          description: >-
+            The delete failed, or the confirmation could not be verified
+            (`Verification failed`). Nothing was deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/DeleteSoftLockUnavailable'
   /messages/{id}/pin:
     post:
       tags:
@@ -11121,6 +11364,10 @@ paths:
                   - ownership.transfer_reverse
                   - dm.purge
                   - dm.clear
+                  - dm.message_delete
+                  - messages.delete
+                  - messages.channel_purge
+                  - messages.server_purge
                   - servers.mfa_enforcement_disable
       responses:
         '200':
@@ -11552,7 +11799,19 @@ paths:
 
 
         Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
-        allows).'
+        allows).
+
+
+        Delete-rate soft-lock (#3455): the messages the actor authored in the
+        channels this purge covers are counted, up to 101, against the same
+        counters as single deletes, when the purge deletes the actor''s own
+        messages. Over the threshold the request is refused with a 403 carrying
+        `delete_rate_limited: true` before any batch runs, and nothing is purged
+        or audited. Repeat the request with `mfa_code`, or with a
+        `step_up_token` from `POST /auth/step-up/password` when the refusal
+        asked for a password; a body carrying `current_password` is a 400.
+        A purge of other authors'' messages is never counted, and neither is the
+        purge a ban or kick can trigger.'
       operationId: purgeServerMessages
       security:
       - BearerAuth: []
@@ -11572,15 +11831,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/PurgeMessagesResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          description: Authentication required (credential epoch changed during purge)
+          description: >-
+            Validation error: an invalid ID, range or request body. Past the
+            delete-rate soft-lock, a self-purge by an account with neither a
+            password nor an inline MFA method answers the soft-lock's
+            NoFactors copy with `step_up_unavailable: true`, since no step-up
+            can confirm it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/StepUpUnavailableError'
+        '401':
+          $ref: '#/components/responses/DeleteSessionRejected'
         '403':
-          description: Insufficient permissions to purge this server
+          $ref: '#/components/responses/DeleteSoftLockForbidden'
+        '404':
+          description: Server not found (only reachable past the soft-lock confirmation, when the server is deleted in flight)
           content:
             application/json:
               schema:
@@ -11592,7 +11858,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/DeleteRateOrBudgetLimited'
+        '503':
+          $ref: '#/components/responses/DeleteSoftLockUnavailable'
   /servers/{id}:
     get:
       tags:
@@ -12922,9 +13190,11 @@ paths:
         '503':
           description: >-
             Either the step-up attempt budget could not be evaluated (Redis
-            unreachable), or the request hit a row-lock conflict (PostgreSQL
-            40P01 or 55P03) while locking the caller's user row or the server
-            row. Nothing was written; retry after the given delay.
+            unreachable; body flag `step_up_budget_unavailable`), or the
+            request hit a row-lock conflict (PostgreSQL 40P01 or 55P03) while
+            locking the caller's user row or the server row (body flag
+            `lock_conflict`, with `Retry-After: 1`). Nothing was written; retry
+            after the given delay.
           headers:
             Retry-After:
               description: Seconds to wait before retrying
@@ -12934,7 +13204,20 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                oneOf:
+                - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+                - $ref: '#/components/schemas/LockConflictError'
+              examples:
+                budgetUnavailable:
+                  summary: Step-up attempt budget unavailable
+                  value:
+                    error: Verification is temporarily unavailable. Try again in a few minutes.
+                    step_up_budget_unavailable: true
+                lockConflict:
+                  summary: Row-lock conflict
+                  value:
+                    error: The server is busy. Try again.
+                    lock_conflict: true
   /servers/{id}/mute-states:
     get:
       tags:
@@ -16355,26 +16638,210 @@ components:
       description: >-
         Too many step-up verification attempts for this user (5 per 15
         minutes). Every `/mfa/*` route that returns this response shares one
-        budget per account with `PUT /servers/{id}/mfa-enforcement`; `PATCH
-        /users/me/privacy` has its own. Cleared only after a verified,
-        committed success on a route that charges it.
+        budget per account with `PUT /servers/{id}/mfa-enforcement` and with the
+        delete-rate soft-lock's confirmations on the message-delete and purge
+        routes (#3455); `PATCH /users/me/privacy` has its own. Cleared only after a verified,
+        committed success on a route that charges it. The body carries
+        `step_up_budget_exhausted: true`, which tells it apart from every
+        other 429 without matching the message text.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/StepUpBudgetExhaustedError'
+          example:
+            error: Too many verification attempts
+            step_up_budget_exhausted: true
     StepUpBudgetUnavailable:
       description: >-
         The step-up attempt budget could not be evaluated (its Redis-backed store
         is unreachable). Nothing was checked, verified, or changed — this is
         deliberately NOT the 429 above, since reporting a server fault as "too
         many attempts" would misattribute it to the caller and lock the form for
-        a window that never started. Retry shortly.
+        a window that never started. Retry shortly. The body carries
+        `step_up_budget_unavailable: true`, which tells it apart from a
+        row-lock conflict's 503 (`lock_conflict: true`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+          example:
+            error: Verification is temporarily unavailable. Try again in a few minutes.
+            step_up_budget_unavailable: true
+    DeleteSessionRejected:
+      description: >-
+        A missing, invalid or stale bearer token, or a session whose
+        credential epoch no longer matches the account, so the request is
+        refused before anything is deleted. The epoch refusal's body is
+        `Authentication required`. A purge rechecks the epoch in every batch
+        transaction, and a change there answers this 401 only while nothing
+        has been deleted; after a batch has committed it is a 500. On the
+        soft-lock confirmation path a missing user row answers `Session no
+        longer valid` instead. All are 401s; sign in again.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-          example:
-            error: Verification is temporarily unavailable. Try again in a few minutes.
+          examples:
+            epochMismatch:
+              summary: Credential epoch rotated in flight
+              value:
+                error: Authentication required
+            userRowGone:
+              summary: Account removed (confirmation path only)
+              value:
+                error: Session no longer valid
+    DeleteSoftLockForbidden:
+      description: >-
+        The delete was refused. Two families share this status.
+
+
+        The route's own refusals are unchanged and are always evaluated first:
+        insufficient permission, not the message author, no longer a member or
+        participant, a timed-out member (`code: member_timed_out`), a DM whose
+        membership changed or is blocked (`dm_unavailable`), or, for a purge,
+        no purgeable channel. A delete transaction re-checks these under lock
+        (#3141, #3142). They carry no `delete_rate_limited` flag.
+
+
+        The delete-rate soft-lock's refusals (#3455) all carry
+        `delete_rate_limited: true` and a `Retry-After` header: whole seconds
+        until the window that tripped rolls over, at least 1. The flag is set
+        on these five variants and on no other 403. A client tells them apart
+        by their body flag: `mfa_required` with `methods` (a subset of `totp`
+        and `webauthn`) asks for `mfa_code`; `password_required` asks for a
+        `step_up_token` from `POST /auth/step-up/password` (#3509), and also
+        carries `step_up_token_invalid` when the token sent matched nothing;
+        `Invalid MFA code` reports a wrong or replayed code; `mfa_enrollment_required` reports that the
+        actor has no inline MFA method to confirm with, which no retry with a
+        code can fix, so the client can only wait out `Retry-After`.
+        `mfa_enrollment_required` occurs only where a server enforces MFA on
+        dangerous actions. `Invalid MFA code` is byte-exact.
+      headers:
+        Retry-After:
+          description: >-
+            Seconds until the tripped window rolls over. Present on every
+            soft-lock 403.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/DeleteRateLimitedError'
+          examples:
+            permission:
+              summary: Insufficient permission (unchanged, no flag)
+              value:
+                error: insufficient permissions
+            mfaRequired:
+              summary: Over the threshold, no code sent
+              value:
+                error: MFA verification required
+                mfa_required: true
+                methods:
+                - totp
+                delete_rate_limited: true
+            invalidMfaCode:
+              summary: Over the threshold, wrong or replayed code
+              value:
+                error: Invalid MFA code
+                delete_rate_limited: true
+            passwordRequired:
+              summary: Over the threshold under the author's own rule, no step-up token sent
+              value:
+                error: Current password required to keep deleting messages
+                password_required: true
+                delete_rate_limited: true
+            stepUpTokenInvalid:
+              summary: Over the threshold, a step-up token that matched nothing
+              value:
+                error: Your confirmation expired. Enter your password again.
+                password_required: true
+                step_up_token_invalid: true
+                delete_rate_limited: true
+            mfaEnrollmentRequired:
+              summary: Enforcing server, actor has no inline MFA method
+              value:
+                error: Set up an authenticator app or security key to do this.
+                mfa_enrollment_required: true
+                delete_rate_limited: true
+    DeleteRateOrBudgetLimited:
+      description: >-
+        Two different 429s share this status; tell them apart by the body flag,
+        never by the message text. The route limiter's body is
+        `RateLimitError` (`error: Rate limit exceeded`) with the usual
+        rate-limit headers. The step-up attempt budget's body is `error: Too many
+        verification attempts` with `step_up_budget_exhausted: true`: the actor
+        sent too many factors (5 per 15 minutes, shared with the MFA settings
+        routes). A hit on the route limiter is never counted by the soft-lock.
+      headers:
+        Retry-After:
+          description: Seconds until the limit resets, when the limiter supplies it
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/RateLimitError'
+            - $ref: '#/components/schemas/StepUpBudgetExhaustedError'
+          examples:
+            routeLimiter:
+              summary: Route limiter
+              value:
+                error: Rate limit exceeded
+                message: Rate limit reached. Try again in 41 seconds.
+                retry_after: 41
+            budgetExhausted:
+              summary: Step-up attempt budget spent
+              value:
+                error: Too many verification attempts
+                step_up_budget_exhausted: true
+    DeleteSoftLockUnavailable:
+      description: >-
+        The delete could not be evaluated. Nothing was deleted. Three different
+        503s share this status; tell them apart by the body flag. On a purge
+        route the purge limiter's own fail-closed 503 also uses this status.
+
+
+        A soft-lock counter that cannot be read (Redis refusing writes, or a
+        command timing out) answers the first body with `Retry-After: 30` and
+        no flag. It applies only to a user the soft-lock counts, so a client
+        cannot read it as a statement about any setting. The step-up attempt
+        budget being unreadable answers with `step_up_budget_unavailable: true`.
+        A row-lock conflict during the confirmation answers with
+        `lock_conflict: true` and `Retry-After: 1`. The flagged bodies also
+        satisfy `Error`, so the schema is `anyOf`, not `oneOf`: route on the
+        flag.
+      headers:
+        Retry-After:
+          description: >-
+            30 for the soft-lock counter, 1 for a lock conflict. Absent on the
+            budget-unavailable body.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            anyOf:
+            - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+            - $ref: '#/components/schemas/LockConflictError'
+            - $ref: '#/components/schemas/Error'
+          examples:
+            softLockUnavailable:
+              summary: Soft-lock counter unavailable (Retry-After 30, no flag)
+              value:
+                error: Deleting messages is temporarily unavailable. Try again in a moment.
+            budgetUnavailable:
+              summary: Step-up attempt budget unavailable
+              value:
+                error: Verification is temporarily unavailable. Try again in a few minutes.
+                step_up_budget_unavailable: true
+            lockConflict:
+              summary: Row-lock conflict (Retry-After 1)
+              value:
+                error: The server is busy. Try again.
+                lock_conflict: true
     StepUpVerificationFailed:
       description: >-
         The step-up factor could not be verified due to a server-side failure —
@@ -17459,6 +17926,23 @@ components:
           description: 'Restrict the purge to one author. Requires `Manage All Messages`;
             an actor holding only `Manage Own Messages` is forced to their own messages
             and this field is ignored. Omit to purge all authors.'
+        mfa_code:
+          type: string
+          maxLength: 256
+          description: >-
+            Confirms a self-purge that tripped the delete-rate soft-lock (#3455).
+            Read only when the request would delete the actor's own messages
+            past the threshold; ignored otherwise. Counted in characters.
+        step_up_token:
+          type: string
+          maxLength: 256
+          description: >-
+            Confirms a self-purge that tripped the delete-rate soft-lock (#3455)
+            under the actor's own `require_auth_before_purge` setting, when the
+            account has no inline MFA method: the single-use token
+            `POST /auth/step-up/password` minted for `messages.channel_purge` or
+            `messages.server_purge`. Ignored otherwise. A body that carries
+            `current_password` at all is a 400 (#3509).
     PurgeDMMessagesRequest:
       type: object
       description: Bulk message-purge parameters for DM/group contexts, including the
@@ -18217,15 +18701,18 @@ components:
       type: object
       description: >-
         Supply the active factor selected by the account policy. MFA-enabled
-        accounts use `mfa_code`; accounts without MFA use `current_password`.
-        When `require_auth_before_purge` is disabled, an empty object is
-        accepted and no factor is required.
+        accounts use `mfa_code`; accounts without MFA use `step_up_token`, from
+        `POST /auth/step-up/password` with purpose `dm.clear`. A body that
+        carries `current_password` is a 400 (#3509). When
+        `require_auth_before_purge` is disabled, an empty object is accepted
+        and no factor is required.
       properties:
-        current_password:
+        step_up_token:
           type: string
-          format: password
+          maxLength: 256
         mfa_code:
           type: string
+          maxLength: 256
     DMVisibilityResponse:
       type: object
       required:
@@ -18649,6 +19136,172 @@ components:
           type: string
           format: date-time
           nullable: true
+    DeleteStepUpRequest:
+      type: object
+      description: >-
+        Optional body of the message-delete routes (#3455). Send it only when
+        a `delete_rate_limited` refusal asked for a factor; a delete under the
+        threshold takes no body. Unknown fields are ignored and no
+        `Content-Type` is required. The whole body may not exceed 4 KiB. A
+        body that carries `current_password` at all, whatever its value, is a
+        400 (#3509): the password goes only to `POST /auth/step-up/password`.
+      properties:
+        mfa_code:
+          type: string
+          maxLength: 256
+          description: TOTP or backup code, or the WebAuthn token minted for the route's purpose. Counted in characters.
+        step_up_token:
+          type: string
+          maxLength: 256
+          description: >-
+            The single-use password step-up token `POST /auth/step-up/password`
+            minted for this route's purpose (`messages.delete` or
+            `dm.message_delete`), for the own-rule path when the account has no
+            inline MFA method. Counted in characters.
+    PasswordStepUpTokenRequest:
+      type: object
+      required:
+      - current_password
+      - purpose
+      properties:
+        current_password:
+          type: string
+          format: password
+          maxLength: 1024
+          description: The account password. The limit is 1024 bytes, because it bounds the password-hash input.
+        purpose:
+          type: string
+          description: >-
+            The one own-rule route the token is for. Any other value is a 400
+            before the password is looked at.
+          enum:
+          - dm.clear
+          - dm.message_delete
+          - messages.delete
+          - messages.channel_purge
+          - messages.server_purge
+    PasswordStepUpTokenResponse:
+      type: object
+      required:
+      - step_up_token
+      - expires_in
+      properties:
+        step_up_token:
+          type: string
+          description: >-
+            Single-use, 32 random bytes in unpadded base64url. Send it as the
+            route's `step_up_token`. A rollback of the route's transaction
+            leaves it spendable; a password change or credential revocation
+            strands it.
+        expires_in:
+          type: integer
+          description: Seconds the token stays spendable.
+          example: 60
+    PasswordStepUpTokenRefusal:
+      description: >-
+        A refusal from `POST /auth/step-up/password`. `mfa_required` with
+        `mfa_methods` means the account confirms with MFA instead;
+        `error_code: account_locked` is the shared login lockout.
+      allOf:
+      - $ref: '#/components/schemas/Error'
+      - type: object
+        properties:
+          mfa_required:
+            type: boolean
+          mfa_methods:
+            type: array
+            items:
+              type: string
+              enum:
+              - totp
+              - webauthn
+          error_code:
+            type: string
+            enum:
+            - account_locked
+    StepUpBudgetExhaustedError:
+      description: >-
+        The step-up attempt budget's 429 (`internal/stepup`, 5 attempts per 15
+        minutes). `step_up_budget_exhausted` is what tells it apart from a
+        route limiter's 429; never match the message text.
+      allOf:
+      - $ref: '#/components/schemas/Error'
+      - type: object
+        required:
+        - step_up_budget_exhausted
+        properties:
+          step_up_budget_exhausted:
+            type: boolean
+            enum:
+            - true
+    StepUpBudgetUnavailableError:
+      description: >-
+        The step-up attempt budget's 503 when its store is unreachable. Nothing
+        was checked or changed. `step_up_budget_unavailable` tells it apart from
+        a lock conflict's 503 and from a soft-lock counter's.
+      allOf:
+      - $ref: '#/components/schemas/Error'
+      - type: object
+        required:
+        - step_up_budget_unavailable
+        properties:
+          step_up_budget_unavailable:
+            type: boolean
+            enum:
+            - true
+    LockConflictError:
+      description: >-
+        A row-lock conflict (PostgreSQL 40P01 or 55P03) while a step-up
+        confirmation held its locks (`mfaenforce.WriteBusy`). Nothing was
+        written; retry after `Retry-After`, which is 1.
+      allOf:
+      - $ref: '#/components/schemas/Error'
+      - type: object
+        required:
+        - lock_conflict
+        properties:
+          lock_conflict:
+            type: boolean
+            enum:
+            - true
+    StepUpUnavailableError:
+      description: >-
+        A 400 from a route an own-rule step-up guards (DM Clear, the channel
+        and DM message deletes past the delete-rate soft-lock, the channel and
+        server self-purges) or from `POST /auth/step-up/password`.
+        `step_up_unavailable` is present and true only when the account has
+        neither a password nor an inline MFA method, so no step-up can confirm
+        the action, and `error` is then the route's NoFactors copy. Every other
+        400 on these routes (an invalid ID, a malformed body) omits it, so a
+        client routes on the flag, never on the message text.
+      allOf:
+      - $ref: '#/components/schemas/Error'
+      - type: object
+        properties:
+          step_up_unavailable:
+            type: boolean
+            enum:
+            - true
+    DeleteRateLimitedError:
+      description: >-
+        A step-up refusal from a delete route. It is the `StepUpError` body plus
+        the soft-lock's own flags. `delete_rate_limited` is set only on the five
+        soft-lock refusals.
+      allOf:
+      - $ref: '#/components/schemas/StepUpError'
+      - type: object
+        properties:
+          delete_rate_limited:
+            type: boolean
+            description: >-
+              Present and true on a delete-rate soft-lock refusal (#3455). It
+              is always sent with a `Retry-After` header.
+          mfa_enrollment_required:
+            type: boolean
+            description: >-
+              Present and true when the actor has no inline MFA method (TOTP
+              or WebAuthn) on a server that enforces MFA on dangerous actions,
+              so there is no code they could send.
     StepUpError:
       type: object
       description: >-
@@ -18670,6 +19323,17 @@ components:
           description: >-
             Present and true when the account has a password and none was
             supplied. Absent when the password factor was already satisfied.
+            On the own-rule routes (DM Clear, the message deletes, the
+            self-purges) the password factor is a `step_up_token`, never the
+            password itself (#3509).
+        step_up_token_invalid:
+          type: boolean
+          description: >-
+            Present and true, beside `password_required`, when an own-rule
+            route was sent a `step_up_token` that matched no live token: spent,
+            expired, minted for another route or factor, or stranded by a
+            credential change. Nothing was consumed. Ask for the password
+            again and mint a fresh token (#3509).
         mfa_required:
           type: boolean
           description: >-

@@ -252,6 +252,23 @@
   color: var(--danger);
 }
 
+/* #3455 self-purge soft-lock stage. The rejection text takes --text-primary,
+   not --danger: --danger as label text on --bg-secondary fails AA in 9 of the
+   30 scheme x theme combinations. The message still travels with aria-invalid
+   and role="alert", so nothing is colour-only. */
+.purge-modal__softlock-error {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.purge-modal__softlock-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 /* Result ------------------------------------------------------------------ */
 
 .purge-modal__result p {
