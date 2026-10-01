@@ -802,37 +802,72 @@ listener_pid_matches() {
   return 2
 }
 
+# An exiting process is judged by the start time, which it keeps until it is
+# reaped (see process_is_exiting), and by the repository it was found in. It is
+# still the listener while it holds the port, and gone once it does not.
+exiting_listener_identity_state() {
+  local pid="$1"
+  local port="$2"
+  local expected_start="$3"
+  local expected_root="$4"
+  local current_start rc
+  if current_start=$(process_start_identity "$pid"); then
+    :
+  else
+    rc=$?
+    [[ $rc -eq 1 ]] && return 1
+    return 2
+  fi
+  [[ "$current_start" == "$expected_start" ]] || return 2
+  # --force skips the current-worktree comparison and relies on this check to
+  # keep SIGKILL inside this repository, so an exiting process needs it too.
+  registered_worktree_contains "$expected_root" || return 2
+  if listener_pid_matches "$pid" "$port"; then
+    return 0
+  else
+    rc=$?
+  fi
+  [[ $rc -eq 1 ]] && return 1
+  return 2
+}
+
 repo_listener_identity_state() {
+  local pid="$1"
+  local port="$2"
+  local expected_start="$4"
+  local expected_root="$5"
+  local rc
+  if process_is_exiting "$pid"; then
+    exiting_listener_identity_state "$pid" "$port" "$expected_start" "$expected_root"
+    return
+  else
+    rc=$?
+    [[ $rc -eq 2 ]] && return 2
+  fi
+  if running_listener_identity_state "$@"; then
+    return 0
+  else
+    rc=$?
+  fi
+  [[ $rc -eq 1 ]] && return 1
+  # The leader can become a zombie after the stat probe above, and then fail
+  # the cwd or command comparison for that reason alone. Ask again before
+  # calling it a different process.
+  if process_is_exiting "$pid"; then
+    exiting_listener_identity_state "$pid" "$port" "$expected_start" "$expected_root"
+    return
+  fi
+  return 2
+}
+
+running_listener_identity_state() {
   local pid="$1"
   local port="$2"
   local expected_cwd="$3"
   local expected_start="$4"
   local expected_root="$5"
   local expected_command="${6:-}"
-  local current_command current_start rc
-  # An exiting process is judged by the start time alone, which it keeps until
-  # it is reaped (see process_is_exiting). It is still the listener while it
-  # holds the port, and gone once it does not.
-  if process_is_exiting "$pid"; then
-    if current_start=$(process_start_identity "$pid"); then
-      :
-    else
-      rc=$?
-      [[ $rc -eq 1 ]] && return 1
-      return 2
-    fi
-    [[ "$current_start" == "$expected_start" ]] || return 2
-    if listener_pid_matches "$pid" "$port"; then
-      return 0
-    else
-      rc=$?
-    fi
-    [[ $rc -eq 1 ]] && return 1
-    return 2
-  else
-    rc=$?
-    [[ $rc -eq 2 ]] && return 2
-  fi
+  local current_command rc
   if process_identity_state "$pid" "$expected_start" "$expected_cwd"; then
     :
   else
@@ -925,7 +960,7 @@ wait_for_repo_listener_exit() {
   local expected_start="$4"
   local expected_root="$5"
   local expected_command="${6:-}"
-  local count=0 rc
+  local count=0 rc current_start
   while [[ $count -lt 10 ]]; do
     if repo_listener_identity_state "$pid" "$port" "$expected_cwd" "$expected_start" "$expected_root" "$expected_command"; then
       sleep 1
@@ -935,6 +970,24 @@ wait_for_repo_listener_exit() {
       rc=$?
     fi
     [[ $rc -eq 1 ]] && return 0
+    # A process tearing down after a signal can fail an identity probe before
+    # its leader reads as a zombie: the kernel releases its command line and
+    # working directory earlier in exit than it marks the leader, and that can
+    # outlast repo_listener_identity_state's recheck. It keeps its start time
+    # until it is reaped, so an unchanged start time means the PID has not been
+    # reused: keep waiting for it. This only waits; it never signals. A process
+    # that is still mismatched when the wait ends is refused by the identity
+    # check before escalation, which has no such allowance.
+    if current_start=$(process_start_identity "$pid"); then
+      if [[ "$current_start" == "$expected_start" ]]; then
+        sleep 1
+        count=$((count + 1))
+        continue
+      fi
+    else
+      rc=$?
+      [[ $rc -eq 1 ]] && return 0
+    fi
     return 2
   done
   return 1
