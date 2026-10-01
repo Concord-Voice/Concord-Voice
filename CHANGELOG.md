@@ -112,6 +112,7 @@ account can't provide, never your password twice.
 
 ### Fixed
 
+- **Email MFA can be turned on again, and SMS shows as coming soon** ([#3519](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3519)) — switching on email codes in Settings ▸ Multi-Factor Auth failed for every account, because a hardened-recovery setting that was on by default also asked for a text-message code, and text-message codes are not available yet. Email codes now turn on with the email code alone. The SMS option and the hardened-recovery switch, which needs it, are marked "Coming soon" until text-message codes launch.
 - **A hidden conversation now comes back as soon as someone messages it** ([#3468](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3468)) — after you hid a direct message or group, a new message (or call) brought it back only after you restarted the app; it now reappears right away with its full history.
 - **Group messages from before someone left are readable again** ([#3472](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3472)) — when a
   member left or was removed from a group chat, the people who stayed saw
@@ -373,6 +374,7 @@ account can't provide, never your password twice.
 
 ### Security
 
+- **The control plane now treats an unset `ENVIRONMENT` as production** ([#3519](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3519)) — it used to fall back to development, which skipped the production safety checks and allowed development-only behaviour such as logging verification codes. The bundled deploy files and the self-host installer already set `ENVIRONMENT=production`, so they are unaffected. A custom deployment that never set it will now refuse to start until it does; local development sets `ENVIRONMENT=development`. `CONCORD_ENV=test`, which writes plaintext verification codes and relaxes the sign-in rate limits, is now refused under any `ENVIRONMENT` other than `development` or `test`, not only under `production`.
 - **Updated the voice server's connection library to close a published advisory** ([#3507](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3507)) —
   resolves GHSA-2GC4-CQFQ-P2GV, a denial-of-service flaw in the connection that carries voice and
   video signalling.

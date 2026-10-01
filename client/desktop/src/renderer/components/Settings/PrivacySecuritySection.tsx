@@ -98,7 +98,6 @@ async function fetchSessionsData(): Promise<SessionsFetchResult> {
 interface MFAStatusFetchResult {
   methods: string[];
   recoveryOnly: string[];
-  recoveryHardened: boolean;
   backupRemaining: number | undefined;
   backupEmail: string;
   credentials: WebAuthnCredential[];
@@ -118,7 +117,6 @@ async function fetchMFAStatusData(): Promise<MFAStatusFetchResult | null> {
     const result: MFAStatusFetchResult = {
       methods: data.methods || [],
       recoveryOnly: data.recovery_only_methods || [],
-      recoveryHardened: data.recovery_hardened || false,
       backupRemaining: data.backup_codes_remaining,
       backupEmail: data.backup_email || '',
       credentials: [],
@@ -725,7 +723,6 @@ const PrivacySecuritySection: React.FC = () => {
   // MFA state
   const [mfaMethods, setMfaMethods] = useState<string[]>([]);
   const [mfaRecoveryOnly, setMfaRecoveryOnly] = useState<string[]>([]);
-  const [mfaRecoveryHardened, setMfaRecoveryHardened] = useState(false);
   const [mfaBackupRemaining, setMfaBackupRemaining] = useState<number | undefined>();
   const [mfaWebauthnCredentials, setMfaWebauthnCredentials] = useState<WebAuthnCredential[]>([]);
   const [mfaBackupEmail, setMfaBackupEmail] = useState('');
@@ -969,7 +966,6 @@ const PrivacySecuritySection: React.FC = () => {
     setMfaStatusLoad('ready');
     setMfaMethods(data.methods);
     setMfaRecoveryOnly(data.recoveryOnly);
-    setMfaRecoveryHardened(data.recoveryHardened);
     setMfaBackupRemaining(data.backupRemaining);
     setMfaBackupEmail(data.backupEmail);
     setMfaWebauthnCredentials(data.credentials);
@@ -1352,27 +1348,14 @@ const PrivacySecuritySection: React.FC = () => {
     return result;
   };
 
-  const handleToggleRecoveryHardened = async (
+  // Nothing shows the flag while the hardened toggle is dormant, so an
+  // accepted change has no state to update.
+  const handleToggleRecoveryHardened = (
     enabled: boolean,
     password: string,
     mfaCode = ''
-  ): Promise<MfaStepUpResult> => {
-    const result = await submitMfaStepUp(
-      '/api/v1/mfa/recovery-hardened',
-      'PUT',
-      { enabled },
-      { password, mfaCode }
-    );
-    if (result.kind === 'accepted') {
-      const data = result.data as { recovery_hardened?: unknown } | null;
-      if (typeof data?.recovery_hardened === 'boolean') {
-        setMfaRecoveryHardened(data.recovery_hardened);
-      } else {
-        fetchMFAStatus();
-      }
-    }
-    return result;
-  };
+  ): Promise<MfaStepUpResult> =>
+    submitMfaStepUp('/api/v1/mfa/recovery-hardened', 'PUT', { enabled }, { password, mfaCode });
 
   const handleToggleRecoveryOnly = async (
     method: string,
@@ -1390,18 +1373,13 @@ const PrivacySecuritySection: React.FC = () => {
       { password, mfaCode }
     );
     if (result.kind === 'accepted') {
-      const data = result.data as {
-        recovery_only_methods?: unknown;
-        recovery_hardened?: unknown;
-      } | null;
+      const data = result.data as { recovery_only_methods?: unknown } | null;
       const methods = data?.recovery_only_methods;
       if (!Array.isArray(methods)) {
         fetchMFAStatus();
         return result;
       }
       setMfaRecoveryOnly(methods.filter((m): m is string => typeof m === 'string'));
-      const hardened = data?.recovery_hardened;
-      if (typeof hardened === 'boolean') setMfaRecoveryHardened(hardened);
     }
     return result;
   };
@@ -1456,7 +1434,6 @@ const PrivacySecuritySection: React.FC = () => {
         <MFATierSelector
           activeMethods={mfaMethods}
           recoveryOnlyMethods={mfaRecoveryOnly}
-          recoveryHardened={mfaRecoveryHardened}
           backupCodesRemaining={mfaBackupRemaining}
           webauthnCredentials={mfaWebauthnCredentials}
           backupEmail={mfaBackupEmail}

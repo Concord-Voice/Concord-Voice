@@ -21,7 +21,8 @@ const API_BASE = `http://localhost:${E2E_API_PORT}`;
  * CI workflow's "Start control-plane (background)" step used to set this —
  * CI enforcement was removed in #1435; these specs run manually via
  * `npm run test:e2e`.) Local-dev backends typically do NOT set it, so start
- * the backend with CONCORD_ENV=test before a manual run.
+ * the backend with ENVIRONMENT=development CONCORD_ENV=test before a manual
+ * run (the server refuses CONCORD_ENV=test under any other ENVIRONMENT).
  *
  * @throws if the key is absent after `timeoutMs`, with a hint about
  *         the most likely cause (CONCORD_ENV not set).

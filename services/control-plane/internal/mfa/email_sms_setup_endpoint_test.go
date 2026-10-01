@@ -79,3 +79,32 @@ func TestEmailSmsSetupReturnsWhenEmailSendFails(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "Failed to send verification email")
 	assert.Equal(t, int64(0), redisClient.Exists(context.Background(), fmt.Sprintf(redisEmailSmsSetup, userID)).Val())
 }
+
+// SMS cannot be enrolled outside development and test, so hardened mode's SMS
+// half is dormant there: an account carrying the default TRUE flag must still
+// activate email MFA with the email code alone. Before this, every production
+// activation answered 400 "Hardened mode requires both email and SMS codes".
+func TestEmailSmsVerifyHardenedIsDormantWithoutSms(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "harddormant")
+	enrollTOTP(t, ts, user)
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = TRUE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+	require.NoError(t, ts.Redis.Set(context.Background(), fmt.Sprintf(redisEmailSmsSetup, user.ID), "123456", 10*time.Minute).Err())
+
+	ring, err := mfa.ParseKeyring(strings.Repeat("00", 32), 1, "")
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "production")
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", user.ID)
+	c.Request = httptest.NewRequest(http.MethodPost, urlEmailSmsVerify, strings.NewReader(`{"codes":{"email":"123456"}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.EmailSmsVerify(c)
+
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "Hardened mode")
+}

@@ -15,10 +15,14 @@ vi.mock('@/renderer/components/Settings/ToggleSwitch', () => ({
     checked,
     onChange,
     disabled,
+    'aria-disabled': ariaDisabled,
+    'aria-describedby': ariaDescribedBy,
   }: {
     checked: boolean;
     onChange: (v: boolean) => void;
     disabled?: boolean;
+    'aria-disabled'?: boolean;
+    'aria-describedby'?: string;
   }) => (
     <input
       type="checkbox"
@@ -26,6 +30,8 @@ vi.mock('@/renderer/components/Settings/ToggleSwitch', () => ({
       checked={checked}
       onChange={(e) => onChange(e.target.checked)}
       disabled={disabled}
+      aria-disabled={ariaDisabled}
+      aria-describedby={ariaDescribedBy}
     />
   ),
 }));
@@ -82,7 +88,6 @@ import { apiFetch } from '@/renderer/services/system/apiClient';
 const defaultProps = {
   activeMethods: [] as string[],
   recoveryOnlyMethods: [] as string[],
-  recoveryHardened: false,
   backupCodesRemaining: 0,
   webauthnCredentials: [],
   backupEmail: '',
@@ -507,7 +512,38 @@ describe('MFATierSelector', () => {
 
   it('shows hardened mode toggle for active last-resort tier', () => {
     render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'email']} />);
-    expect(screen.getByText('Hardened mode')).toBeInTheDocument();
+    expect(screen.getByText(/Hardened mode/)).toBeInTheDocument();
+  });
+
+  // SMS is not offered yet: the server refuses SMS enrolment outside dev/test.
+  it('tags SMS as coming soon and leaves email untagged', () => {
+    render(<MFATierSelector {...defaultProps} />);
+    // Exact text, so the space a screen reader needs between the two is pinned.
+    expect(screen.getByText('SMS code').textContent).toBe('SMS code Coming soon');
+    expect(screen.getByText('Email code')).not.toHaveTextContent('Coming soon');
+  });
+
+  // Hardened mode needs an SMS code, so its toggle is dormant: focusable,
+  // aria-disabled, described by its tag, never checked, and inert on click.
+  it('keeps the hardened toggle dormant until SMS ships', () => {
+    const onToggleRecoveryHardened = vi.fn();
+    render(
+      <MFATierSelector
+        {...defaultProps}
+        activeMethods={['totp', 'email']}
+        onToggleRecoveryHardened={onToggleRecoveryHardened}
+      />
+    );
+    const toggle = screen.getAllByTestId('toggle-switch')[1];
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toHaveAttribute('aria-disabled', 'true');
+    expect(toggle).not.toBeDisabled();
+    const describedBy = toggle.getAttribute('aria-describedby');
+    expect(describedBy && document.getElementById(describedBy)).toHaveTextContent('Coming soon');
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(onToggleRecoveryHardened).not.toHaveBeenCalled();
   });
 
   it('shows recovery-only preview text for eligible but inactive tiers', () => {
@@ -931,23 +967,6 @@ describe('MFATierSelector', () => {
       fillCode();
       await confirm('Confirm');
       expect(onToggleRecoveryOnly).toHaveBeenCalledWith('email', true, 'pw', '123456');
-    });
-
-    it('toggle-hardened → onToggleRecoveryHardened(value, password, code)', async () => {
-      const onToggleRecoveryHardened = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
-      render(
-        <MFATierSelector
-          {...defaultProps}
-          activeMethods={['totp', 'email']}
-          recoveryHardened={false}
-          onToggleRecoveryHardened={onToggleRecoveryHardened}
-        />
-      );
-      fireEvent.click(screen.getAllByTestId('toggle-switch')[1]);
-      fillPassword();
-      fillCode();
-      await confirm('Confirm');
-      expect(onToggleRecoveryHardened).toHaveBeenCalledWith(true, 'pw', '123456');
     });
 
     it('disable-emailsms → onDisableEmailSms(password, code)', async () => {

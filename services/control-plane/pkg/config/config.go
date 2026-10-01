@@ -422,7 +422,12 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Environment:              getEnv("ENVIRONMENT", "development"),
+		// Fail closed: an unset ENVIRONMENT means production, so a deploy path
+		// that forgets it meets the production guards below instead of silently
+		// running with development behaviour (codes logged or returned, SMS
+		// enrolment, SMTP dev mode). Local development sets it explicitly
+		// (.env.example, concord-dev.sh).
+		Environment:              getEnv("ENVIRONMENT", "production"),
 		HSTSHeaderValue:          getEnv("HSTS_HEADER_VALUE", ""),
 		Port:                     getEnv("PORT", "8080"),
 		DatabaseURL:              getEnv("DATABASE_URL", defaultDevDatabaseURL()),
@@ -778,6 +783,20 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateAttachmentWriteBackend(); err != nil {
 		return err
+	}
+	// #1283 env-integrity invariant. CONCORD_ENV=test enables two test-only
+	// backdoors: auth.isTestEnv() writes the plaintext `test_only:`
+	// verification code, and isE2ETestEnv() (#1277) relaxes the per-IP auth
+	// rate limits on /register, /register/confirm, /login. They belong to
+	// development and test only, so this runs before the production branch:
+	// an unrecognised ENVIRONMENT ("staging", a typo such as "prod") skips
+	// the production guards and must not carry them either. An unset
+	// ENVIRONMENT defaults to production and is refused here too; the test
+	// packages that run under CI's CONCORD_ENV=test name development
+	// themselves. Read via os.Getenv, NOT a Config field: CONCORD_ENV must not
+	// be added to any writer surface / canonical-consumer path.
+	if os.Getenv("CONCORD_ENV") == "test" && c.Environment != "development" && c.Environment != "test" {
+		return fmt.Errorf("CONCORD_ENV=test is forbidden unless ENVIRONMENT is development or test (got %q); it would relax auth rate limits and leak verification codes", c.Environment)
 	}
 	return c.validateProduction()
 }
@@ -1212,18 +1231,6 @@ func (c *Config) validateProduction() error {
 		// require ≥32 chars when present. Generate with: openssl rand -hex 32.
 		{c.RedemptionAdminToken != "" && len(c.RedemptionAdminToken) < 32,
 			"REDEMPTION_ADMIN_TOKEN must be ≥32 chars when set (it gates the admin code-generation endpoint). Generate with: openssl rand -hex 32. Leave it unset to disable the HTTP generation endpoint (CLI issuance still works)."},
-		// #1283 — env-integrity invariant. CONCORD_ENV=test enables two
-		// test-only backdoors: auth.isTestEnv() writes the plaintext
-		// `test_only:` verification code, and isE2ETestEnv() (#1277) relaxes
-		// the per-IP auth rate limits on /register, /register/confirm, /login.
-		// Neither may ever be live in production. Guard only evaluates on the
-		// production branch (validate() early-returns otherwise), so CI — which
-		// sets CONCORD_ENV=test with a non-production ENVIRONMENT — is
-		// unaffected. Read via os.Getenv, NOT a Config field: CONCORD_ENV is
-		// forbidden-in-production, so it must not be added to any writer
-		// surface / canonical-consumer path.
-		{os.Getenv("CONCORD_ENV") == "test",
-			"CONCORD_ENV=test is forbidden when ENVIRONMENT=production (would relax auth rate limits and leak verification codes)."},
 		// CV-CAN-014 — a wildcard ALLOWED_ORIGINS is a CWE-942 credentialed
 		// cross-origin hijack: middleware/cors.go reflects the request Origin
 		// AND sets Access-Control-Allow-Credentials: true when the allowlist

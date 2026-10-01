@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -14,6 +15,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// runMain calls config.Load, and an unset ENVIRONMENT now means production,
+// whose guards refuse the dev secrets these tests run with.
+func TestMain(m *testing.M) {
+	if os.Getenv("ENVIRONMENT") == "" {
+		_ = os.Setenv("ENVIRONMENT", "development")
+	}
+	os.Exit(m.Run())
+}
 
 func TestParseFlags_Defaults(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)

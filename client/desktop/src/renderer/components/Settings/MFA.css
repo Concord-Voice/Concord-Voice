@@ -124,6 +124,19 @@
 
 /* ── Recovery-Only / Hardened Toggle Rows ─────────────────────── */
 
+/* A listed method or setting that is not offered yet. Full-contrast text on a
+   bordered pill: the word carries the meaning, never colour alone. */
+.mfa-coming-soon {
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--border-color, #555);
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
 .mfa-tier-badge-recovery {
   background: var(--warning-color, #f0a020);
 }

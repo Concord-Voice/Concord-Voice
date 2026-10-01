@@ -16,7 +16,7 @@ const browserLaunchOptions = {
  * Requires the backend to be running separately (API + PostgreSQL + Redis).
  *
  * Usage:
- *   1. Start backend: cd services/control-plane && go run ./cmd/server
+ *   1. Start backend: cd services/control-plane && ENVIRONMENT=development CONCORD_ENV=test go run ./cmd/server
  *   2. Run tests: cd client/desktop && npm run test:e2e
  *
  * The webServer config below auto-starts the Vite dev server on port 3001.

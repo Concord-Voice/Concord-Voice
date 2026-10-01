@@ -157,10 +157,13 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("default values", func(t *testing.T) {
+		// The dev defaults below only load under development. The ENVIRONMENT
+		// default itself is production; TestLoadUnsetEnvironmentFailsClosedToProduction
+		// pins it, because loading with it unset fatal-exits on the guards.
+		t.Setenv("ENVIRONMENT", "development")
 		cfg, err := Load()
 		require.NoError(t, err)
 
-		assert.Equal(t, "development", cfg.Environment)
 		assert.Equal(t, "8080", cfg.Port)
 		assert.Contains(t, cfg.DatabaseURL, "postgres://")
 		assert.Contains(t, cfg.RedisURL, "redis://")

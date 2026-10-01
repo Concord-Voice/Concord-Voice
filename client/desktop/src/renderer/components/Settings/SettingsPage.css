@@ -1195,8 +1195,11 @@
   pointer-events: none;
 }
 
-/* Disabled toggle styling */
-.settings-toggle input:disabled + .settings-toggle-track {
+/* Disabled toggle styling. A dormant toggle stays focusable with
+   aria-disabled instead of native disabled (the PremiumGate rule), so it
+   must dim the same way or it reads as a live switch. */
+.settings-toggle input:disabled + .settings-toggle-track,
+.settings-toggle input[aria-disabled='true'] + .settings-toggle-track {
   opacity: 0.4;
   cursor: not-allowed;
 }

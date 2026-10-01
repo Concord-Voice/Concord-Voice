@@ -14,6 +14,9 @@ import (
 
 func captureRolloutOutput(t *testing.T, run func() int) (int, string, string) {
 	t.Helper()
+	// The rollout loads config outside any deploy, so it names the environment
+	// the way local development does; unset now means production.
+	t.Setenv("ENVIRONMENT", "development")
 	oldStdout, oldStderr := os.Stdout, os.Stderr
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	require.NoError(t, err)

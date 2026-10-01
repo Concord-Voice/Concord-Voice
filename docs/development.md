@@ -70,8 +70,10 @@ cd services/control-plane
 # Install Go dependencies
 go mod download
 
-# Create .env file (optional, has defaults)
+# Create .env file. ENVIRONMENT is required: unset means production, whose
+# checks refuse the development defaults below.
 cat > .env << EOF
+ENVIRONMENT=development
 DATABASE_URL=postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable
 REDIS_URL=redis://:concord_dev_redis@localhost:6379
 JWT_SECRET=dev_jwt_secret_change_in_production
@@ -467,7 +469,7 @@ directory belong to the intended service.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENVIRONMENT` | `development` | Environment mode |
+| `ENVIRONMENT` | `production` | Environment mode. Unset means production, which runs the production checks and refuses the development defaults, so local runs set `development` |
 | `HSTS_HEADER_VALUE` | empty → `max-age=63072000; includeSubDomains; preload` | Optional production STS policy. Nonempty values must pass the structural STS grammar |
 | `PORT` | `8080` | HTTP server port |
 | `DATABASE_URL` | (see above) | PostgreSQL connection |

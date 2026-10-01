@@ -189,7 +189,8 @@ func adminCtlEnvironmentFromLookup(lookup func(string) (string, bool)) (adminCtl
 		result.config.replicaCount = parsed
 	}
 	result.instanceType = adminCtlEnvironmentValue(lookup, "INSTANCE_TYPE", "saas")
-	result.environment = adminCtlEnvironmentValue(lookup, "ENVIRONMENT", "development")
+	// Fails closed like config.Load: unset means production.
+	result.environment = adminCtlEnvironmentValue(lookup, "ENVIRONMENT", "production")
 	result.operatorName, _ = lookup("ACTIVITY_HISTORY_OPERATOR_NAME")
 	result.privacyPolicyURL, _ = lookup("ACTIVITY_HISTORY_PRIVACY_POLICY_URL")
 	return result, nil

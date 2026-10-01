@@ -34,6 +34,8 @@ interface MFATier {
   locked?: boolean;
   lockReason?: string;
   recoveryOnlyEligible?: boolean;
+  /** Methods listed but not yet offered; each renders a "Coming soon" tag. */
+  comingSoon?: readonly string[];
 }
 
 const tiers: MFATier[] = [
@@ -74,6 +76,9 @@ const tiers: MFATier[] = [
     name: 'Last Resort — Email / SMS',
     methodKey: 'email',
     methods: ['Email code', 'SMS code'],
+    // The server refuses SMS enrolment outside development and test until a
+    // provider is integrated (mfa validateEmailSmsMethods).
+    comingSoon: ['SMS code'],
     description:
       'Better than nothing, but phone numbers get SIM-swapped and emails get phished. Requires a real MFA method first.',
     locked: true,
@@ -354,7 +359,6 @@ function getTierCredentials(
 interface MFATierSelectorProps {
   activeMethods: string[];
   recoveryOnlyMethods?: string[];
-  recoveryHardened?: boolean;
   backupCodesRemaining?: number;
   webauthnCredentials?: WebAuthnCredential[];
   backupEmail?: string;
@@ -381,7 +385,6 @@ interface MFATierSelectorProps {
 const MFATierSelector: React.FC<MFATierSelectorProps> = ({
   activeMethods,
   recoveryOnlyMethods = [],
-  recoveryHardened = true,
   backupCodesRemaining: _backupCodesRemaining,
   webauthnCredentials = [],
   backupEmail,
@@ -632,6 +635,12 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                 {tier.methods.map((m) => (
                   <span key={m} className="mfa-tier-method">
                     {m}
+                    {tier.comingSoon?.includes(m) && (
+                      <>
+                        {' '}
+                        <span className="mfa-coming-soon">Coming soon</span>
+                      </>
+                    )}
                   </span>
                 ))}
               </div>
@@ -770,24 +779,34 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
               </div>
             )}
 
-            {/* Hardened mode toggle — shown whenever Email/SMS is active */}
+            {/* Hardened mode needs an SMS code, and SMS is not offered yet, so the
+                toggle is dormant: focusable, aria-disabled, and described by its
+                "Coming soon" tag (the PremiumGate a11y rule). When SMS ships, restore
+                its onChange (it opened the 'toggle-hardened' action modal, which
+                runToggleHardened still serves) and pass the server's
+                recovery_hardened back in for checked. */}
             {tier.level === 'last-resort' && isActive && onToggleRecoveryHardened && (
               <div className="mfa-toggle-row mfa-hardened-toggle">
                 <div className="mfa-toggle-text">
-                  <span className="mfa-recovery-only-label">Hardened mode</span>
+                  <span className="mfa-recovery-only-label">
+                    Hardened mode{' '}
+                    <span id="mfa-hardened-coming-soon" className="mfa-coming-soon">
+                      Coming soon
+                    </span>
+                  </span>
                   <span className="mfa-recovery-only-hint">
-                    Require BOTH an email code AND an SMS code for recovery. An attacker must
-                    compromise both your email and your phone — neither alone is sufficient.
+                    Require BOTH an email code AND an SMS code for recovery. Available once SMS
+                    verification launches.
                   </span>
                 </div>
                 <ToggleSwitch
-                  checked={recoveryHardened}
-                  onChange={(checked) => {
-                    openActionModal({
-                      type: 'toggle-hardened',
-                      toggleValue: checked,
-                    });
+                  checked={false}
+                  onChange={() => {
+                    // Dormant until SMS verification ships; see the comment above.
                   }}
+                  label="Hardened mode"
+                  aria-disabled
+                  aria-describedby="mfa-hardened-coming-soon"
                 />
               </div>
             )}

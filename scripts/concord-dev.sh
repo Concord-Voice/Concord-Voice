@@ -1385,7 +1385,9 @@ _up_control_plane() {
     go build -o bin/control-plane ./cmd/server
   fi
 
-  nohup ./bin/control-plane > "$LOG_DIR/control-plane.log" 2>&1 &
+  # An unset ENVIRONMENT means production to the control plane (fail closed),
+  # so local dev names its environment rather than inheriting a default.
+  ENVIRONMENT="${ENVIRONMENT:-development}" nohup ./bin/control-plane > "$LOG_DIR/control-plane.log" 2>&1 &
   local control_pid=$!
   if ! track_started_process "$LOG_DIR/control-plane.pid" "$control_pid" \
     "$PROJECT_ROOT/services/control-plane" "Control Plane"; then

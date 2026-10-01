@@ -464,16 +464,6 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     });
   });
 
-  it('onToggleRecoveryHardened refetches the status when the echo lacks the field', async () => {
-    const h = await renderAndCaptureHandlers();
-    const statusReads = () =>
-      mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/mfa/status').length;
-    await vi.waitFor(() => expect(statusReads()).toBe(1));
-    mockApiFetch.mockResolvedValueOnce(ok({}));
-    await h.onToggleRecoveryHardened(true, 'pw', '123456');
-    await vi.waitFor(() => expect(statusReads()).toBe(2));
-  });
-
   it('onToggleRecoveryOnly adds a method and resolves accepted', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(

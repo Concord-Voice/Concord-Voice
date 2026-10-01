@@ -135,7 +135,7 @@ cd services/control-plane
 : "${DATABASE_URL:?set isolated PostgreSQL URL}"
 : "${REDIS_URL:?set isolated Redis database URL}"
 : "${NATS_URL:?set isolated NATS URL}"
-CONCORD_ENV=test go run ./cmd/server
+ENVIRONMENT=development CONCORD_ENV=test go run ./cmd/server
 ```
 
 In another shell, from the repository root, set `REDIS_URL` to the exact same isolated

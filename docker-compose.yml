@@ -227,6 +227,10 @@ services:
     env_file:
       - spa.env.example
     environment:
+      # Unset means production here as in the control plane's own config, so a
+      # stack that forgets it meets the production guards. The production,
+      # staging and ZAP overlays name it; a dev run exports ENVIRONMENT=development.
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:?}@postgres:5432/concord?sslmode=disable
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
       NATS_URL: nats://nats:4222

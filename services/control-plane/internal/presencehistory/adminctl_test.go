@@ -441,7 +441,7 @@ func TestAdminCtlEnvironmentParsingIsStrictAndScoped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, adminCtlConfig{}, defaults.config)
 	assert.Equal(t, "saas", defaults.instanceType)
-	assert.Equal(t, "development", defaults.environment)
+	assert.Equal(t, "production", defaults.environment)
 
 	for _, values := range []map[string]string{
 		{},

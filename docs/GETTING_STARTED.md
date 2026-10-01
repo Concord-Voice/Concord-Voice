@@ -112,7 +112,8 @@ Open a new terminal:
 ```bash
 cd services/control-plane
 go mod download          # First time only
-go run cmd/server/main.go
+# Unset ENVIRONMENT means production, whose checks refuse the dev defaults.
+ENVIRONMENT=development go run cmd/server/main.go
 ```
 
 You should see:
@@ -309,7 +310,7 @@ Follow the GitHub Flow process:
 3. **Test your changes**
    ```bash
    # Restart control plane (Ctrl+C then re-run)
-   go run cmd/server/main.go
+   ENVIRONMENT=development go run cmd/server/main.go
 
    # Test the endpoint
    curl http://localhost:8080/hello/Developer

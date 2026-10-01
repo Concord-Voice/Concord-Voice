@@ -3217,7 +3217,16 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 		return
 	}
 
-	if recoveryHardened {
+	// Hardened mode also asks for an SMS code, and SMS cannot be enrolled
+	// outside development and test until a provider is integrated
+	// (validateEmailSmsMethods). Until then its dual-code rule is dormant
+	// there, and the settings UI shows the toggle dormant: enforced, it made
+	// email MFA impossible to activate, because recovery_hardened defaults to
+	// TRUE (000030). Development and test still enforce it, so an account
+	// holding the default cannot activate email alone there.
+	// ponytail: revisit that default before SMS ships, or every account will
+	// start demanding an SMS code at activation.
+	if recoveryHardened && h.devCodesAllowed() {
 		if errMsg := ValidateHardenedModeCodes(req.Codes); errMsg != "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 			return

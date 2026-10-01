@@ -49,7 +49,6 @@ import MFATierSelector from '@/renderer/components/Settings/MFATierSelector';
 const defaultProps = {
   activeMethods: ['totp'] as string[],
   recoveryOnlyMethods: [] as string[],
-  recoveryHardened: false,
   backupCodesRemaining: 0,
   webauthnCredentials: [],
   backupEmail: '',
