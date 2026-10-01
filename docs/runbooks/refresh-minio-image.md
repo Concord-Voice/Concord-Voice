@@ -2,7 +2,7 @@
 
 > **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover complete (2026-10-01)
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-10-01 (production now runs the published derivative)
+> **Last updated:** 2026-10-01 (production now runs the published derivative; second dependency-only derivative and its not-affected record added)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
 
@@ -40,7 +40,8 @@ The container is disposable. The data is not.
 This procedure never authorizes:
 
 - an unreviewed patch to the upstream MinIO tree; the sole approved dependency
-  exception is limited to #3441 and #3469 as described below
+  exceptions are limited to #3441 and #3469, and to #3527, #3528 and
+  #3530–#3534, as described below
 - publication or use of `latest`
 - a fallback to Docker Hub or an unrelated third-party image
 - a change to the current static SigV4, internal-only, no-STS authentication
@@ -49,11 +50,17 @@ This procedure never authorizes:
 
 The general policy remains: any source patch or authentication-model change
 needs its own design, security, and legal review. The approved design exception
-for #3441 and #3469 is limited to a dependency-only derivative of this upstream
-commit. It changes only `go.mod` and `go.sum`, uses AMQP 1.13.0, gRPC 1.83.2,
-and the pinned Go 1.26.8 builder. Required security review and recorded legal
-approval remain gates before publication dispatch. No application edits,
-authentication changes, or live cutover are authorized by the exception.
+covers two dependency-only derivatives of this upstream commit: the first for
+#3441 and #3469, and a second for #3527, #3528 and #3530–#3534. Each changes
+only `go.mod` and `go.sum` and uses the pinned Go 1.26.8 builder. The second
+adds nine module bumps to the first derivative's two and is accompanied by an
+OpenVEX not-affected record for the findings that remain. The record is bound to
+platform image digests. The module and identity values for both
+are in
+[`SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md). Required
+security review and recorded legal approval remain gates before publication
+dispatch. No application edits, authentication changes, or live cutover are
+authorized by the exception.
 
 ## Release Contract
 
@@ -129,6 +136,7 @@ The publisher must verify, on native amd64 and arm64:
 - exactly `linux/amd64` and `linux/arm64`
 - liveness and readiness
 - authenticated S3 create, PUT, stat, GET, checksum, delete, and bucket removal
+  (native amd64 only; the publisher's arm64 job does not run it)
 - the production capability and `no-new-privileges` tuple
 - a clean SIGTERM exit
 
@@ -248,6 +256,61 @@ docker --config "$EMPTY_DOCKER_CONFIG" pull \
 ```
 
 A logged-in pull is not anonymous-access evidence.
+
+## 3a. VEX Verification
+
+Run this after the artifacts are public and before the consumer change in
+Section 4. The not-affected record,
+`infrastructure/docker/minio/minio.openvex.json`, is described in
+[`SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md). Its
+products are platform image digests, so the record suppresses nothing on a new
+derivative until the consumer PR adds that derivative's digests. A local build
+has no registry digest for the record's OCI product to match, so the record can
+only be checked against the published image.
+
+Prerequisites:
+
+- Trivy 0.74 or later
+- anonymous pull access to the runtime image by digest, with an empty
+  authentication store as in Section 3
+
+Steps:
+
+1. Record the `linux/amd64` and `linux/arm64` platform digests of the new
+   runtime index.
+2. Extract `/usr/bin/minio` from each platform image. Repeat the symbol checks
+   in `SOURCE-BUILD.md` on those published binaries: the canary counts 0, the
+   absent packages count 0, and the positive controls count at least 1.
+3. In the consumer PR, add both platform digests as products to each statement
+   the measurement still supports. Set the subcomponents to the measured module
+   versions. Update the measurement date in each impact statement. Remove an old
+   digest only when no deployment or rollback path still references its image.
+   Update the pinned products and pairs in
+   `scripts/tests/test-publish-minio-image.sh` in the same PR; the contract test
+   pins both.
+4. Run Trivy once per platform digest without `--vex`. It must report the
+   recorded findings. If it reports none, a zero in the next step proves nothing.
+5. Run the command below once per platform digest.
+
+Use `--image-src remote`: Trivy silently ignores `--platform` for an image that
+is already in the local Docker cache, so a cached architecture would be scanned
+in place of the one you named.
+
+```bash
+trivy image --image-src remote --platform linux/<arch> --scanners vuln \
+  --pkg-types library \
+  --vex infrastructure/docker/minio/minio.openvex.json \
+  ghcr.io/concord-voice/minio@<platform digest>
+```
+
+Pass condition: zero library findings on both `linux/amd64` and `linux/arm64`.
+
+If any finding remains, stop. Do not open the consumer PR. Re-measure the
+symbols for that advisory in the binary. Then either bump the dependency
+through a new design decision, or add a VEX statement backed by that
+measurement. Never widen a product to the repository, and never widen a
+subcomponent to a version-less identifier: the digest and the exact version pin
+are what make a statement lapse when the image or the dependency changes.
 
 ## 4. Shared Consumer and Future Servers
 

@@ -1,0 +1,165 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://concordvoice.com/vex/minio-derivative-2026-10-01",
+  "author": "Concord Voice",
+  "timestamp": "2026-10-01T00:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42151"
+      },
+      "products": [
+        {
+          "@id": "pkg:oci/minio@sha256:3c38547c532e8436526725b8696a33efcdf61a79f88bcb2b5979050e41b5c44e?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/minio@sha256:c9aa69ce251b22a4e3a4c4cabd9f9e36f7019ef2778c140803ecc267846da25b?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "Only model/histogram is linked (via madmin-go/prom2json); storage/remote, storage/remote/azuread and web are absent from /usr/bin/minio in both listed platform images (symbol check 2026-10-01)."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42154"
+      },
+      "products": [
+        {
+          "@id": "pkg:oci/minio@sha256:3c38547c532e8436526725b8696a33efcdf61a79f88bcb2b5979050e41b5c44e?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/minio@sha256:c9aa69ce251b22a4e3a4c4cabd9f9e36f7019ef2778c140803ecc267846da25b?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "Only model/histogram is linked (via madmin-go/prom2json); storage/remote, storage/remote/azuread and web are absent from /usr/bin/minio in both listed platform images (symbol check 2026-10-01)."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40179"
+      },
+      "products": [
+        {
+          "@id": "pkg:oci/minio@sha256:3c38547c532e8436526725b8696a33efcdf61a79f88bcb2b5979050e41b5c44e?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/minio@sha256:c9aa69ce251b22a4e3a4c4cabd9f9e36f7019ef2778c140803ecc267846da25b?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "Only model/histogram is linked (via madmin-go/prom2json); storage/remote, storage/remote/azuread and web are absent from /usr/bin/minio in both listed platform images (symbol check 2026-10-01)."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-44903"
+      },
+      "products": [
+        {
+          "@id": "pkg:oci/minio@sha256:3c38547c532e8436526725b8696a33efcdf61a79f88bcb2b5979050e41b5c44e?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/minio@sha256:c9aa69ce251b22a4e3a4c4cabd9f9e36f7019ef2778c140803ecc267846da25b?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/github.com/prometheus/prometheus@v0.303.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "Only model/histogram is linked (via madmin-go/prom2json); storage/remote, storage/remote/azuread and web are absent from /usr/bin/minio in both listed platform images (symbol check 2026-10-01)."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-81870"
+      },
+      "products": [
+        {
+          "@id": "pkg:oci/minio@sha256:3c38547c532e8436526725b8696a33efcdf61a79f88bcb2b5979050e41b5c44e?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/go.opentelemetry.io/otel/sdk@v1.44.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/minio@sha256:c9aa69ce251b22a4e3a4c4cabd9f9e36f7019ef2778c140803ecc267846da25b?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/go.opentelemetry.io/otel/sdk@v1.44.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "go.opentelemetry.io/otel/sdk/trace, which holds NewTracerProvider, is absent from /usr/bin/minio in both listed platform images (symbol check 2026-10-01). Other otel/sdk packages are linked; the trace SDK is not."
+    },
+    {
+      "vulnerability": {
+        "name": "GO-2026-5932"
+      },
+      "products": [
+        {
+          "@id": "pkg:oci/minio@sha256:3c38547c532e8436526725b8696a33efcdf61a79f88bcb2b5979050e41b5c44e?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/golang.org/x/crypto@v0.55.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/minio@sha256:c9aa69ce251b22a4e3a4c4cabd9f9e36f7019ef2778c140803ecc267846da25b?repository_url=ghcr.io/concord-voice/minio",
+          "subcomponents": [
+            {
+              "@id": "pkg:golang/golang.org/x/crypto@v0.55.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "golang.org/x/crypto/openpgp and its sub-packages are absent from /usr/bin/minio in both listed platform images: no openpgp function name is in the binary (symbol check 2026-10-01). govulncheck -mode=binary reports only a package-level match for this symbol-less advisory."
+    }
+  ]
+}
