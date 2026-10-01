@@ -447,6 +447,25 @@ describe('Register', () => {
     ).not.toBeInTheDocument();
   });
 
+  it('keeps native registration and hides SSO buttons and divider for an empty provider array', () => {
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: [] },
+      features: {},
+    });
+
+    render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+
+    expect(screen.getByPlaceholderText('you@example.com')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('your_username')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Create a strong password')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Confirm your password')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in with google/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in with apple/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('separator', { name: /or sign up with email/i })
+    ).not.toBeInTheDocument();
+  });
+
   it('renders only SSO providers advertised by server capabilities', () => {
     useClientConfigStore.getState().setServerCapabilities({
       auth: { oauthProviders: ['apple'] },

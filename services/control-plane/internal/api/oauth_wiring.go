@@ -5,28 +5,39 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"io"
+	"net/http"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/cfkv"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/oauth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/hkdf"
 )
 
-// buildOAuthHandler constructs the SSO endpoints handler. When
-// cfg.GoogleSSO.Enabled is true, registers a GoogleProvider built from the
-// configured client credentials. When disabled, returns a handler whose
-// registry is empty — every /sso/:provider route then 404s with
-// unknown_provider, which is the correct behaviour for an SSO-disabled
-// deployment.
+// requireSSODeployment rejects hosted-only SSO before any route handler runs.
+func requireSSODeployment(cfg *config.Config) gin.HandlerFunc {
+	selfHosted := config.IsSelfHostedInstance(cfg.InstanceType)
+	return func(c *gin.Context) {
+		if selfHosted {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error_code": "sso_disabled_self_hosted"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// buildOAuthHandler constructs the SSO endpoints handler. Google and Apple
+// providers are registered only when their raw enable flags and deployment
+// policy allow them. Self-hosted deployments always have an empty registry;
+// the SSO route group independently rejects requests before handlers run.
 //
-// Production guard: cfg.Load already errors out at startup if
-// GOOGLE_SSO_ENABLED=true but credentials are missing. By the time we get
-// here, the credential pair is either present (Enabled=true) or both empty
-// (Enabled=false). A NewGoogleProvider failure here is fatal because it
-// means a previously-validated config has somehow regressed — keep loud.
+// Config.Load still validates the credentials of every raw-enabled provider
+// at startup, including on self-hosted deployments. Provider constructor
+// failures remain fatal because previously validated configuration has
+// unexpectedly regressed.
 //
 // Google's seed RedirectURI is a fallback — each /sso/google initiate request
 // supplies the real loopback URI (via redirect_uri query param), stored in the
@@ -43,7 +54,8 @@ func buildOAuthHandler(
 	log *logger.Logger,
 ) *oauth.Handler {
 	registry := oauth.NewRegistry()
-	if cfg.GoogleSSO.Enabled {
+	selfHosted := config.IsSelfHostedInstance(cfg.InstanceType)
+	if cfg.GoogleSSO.Enabled && !selfHosted {
 		provider, err := oauth.NewGoogleProvider(oauth.GoogleConfig{
 			ClientID: cfg.GoogleSSO.ClientID,
 			// Fallback only — the constructor requires a non-empty RedirectURI,
@@ -57,10 +69,10 @@ func buildOAuthHandler(
 		registry.Register(provider)
 		log.Info("Google SSO enabled", "client_id", cfg.GoogleSSO.ClientID)
 	} else {
-		log.Info("Google SSO disabled (GOOGLE_SSO_ENABLED=false)")
+		log.Info("Google SSO disabled by configuration or deployment policy")
 	}
 
-	if cfg.AppleSSO.Enabled {
+	if cfg.AppleSSO.Enabled && !selfHosted {
 		provider, err := oauth.NewAppleProvider(oauth.AppleConfig{
 			ClientID:   cfg.AppleSSO.ClientID,
 			TeamID:     cfg.AppleSSO.TeamID,
@@ -73,7 +85,7 @@ func buildOAuthHandler(
 		registry.Register(provider)
 		log.Info("Apple SSO enabled", "client_id", cfg.AppleSSO.ClientID, "team_id", cfg.AppleSSO.TeamID)
 	} else {
-		log.Info("Apple SSO disabled (APPLE_SSO_ENABLED=false)")
+		log.Info("Apple SSO disabled by configuration or deployment policy")
 	}
 
 	// Cloudflare KV bridge (#973): publishes apple state→loopback-port

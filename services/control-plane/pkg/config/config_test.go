@@ -1657,3 +1657,38 @@ func TestValidateProductionRejectsAppleWithoutBridge(t *testing.T) {
 	cfg.CloudflareKVBridge.Enabled = false
 	assert.NoError(t, cfg.validate(), "apple disabled needs no bridge")
 }
+
+// Suppression is runtime policy, not permission to erase raw enabled flags or
+// swallow a startup misconfiguration on a self-hosted instance.
+func TestLoad_SelfHostedSSOStillValidatesCredentials(t *testing.T) {
+	t.Run("google missing client ID", func(t *testing.T) {
+		t.Setenv("INSTANCE_TYPE", "self-hosted")
+		t.Setenv("ENVIRONMENT", "test")
+		t.Setenv("GOOGLE_SSO_ENABLED", "true")
+		t.Setenv("GOOGLE_CLIENT_ID", "")
+		t.Setenv("APPLE_SSO_ENABLED", "false")
+		_, err := Load()
+		require.ErrorContains(t, err, "GoogleSSO enabled but GOOGLE_CLIENT_ID")
+	})
+	for _, missing := range []string{"APPLE_CLIENT_ID", "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY"} {
+		t.Run("apple missing "+missing, func(t *testing.T) {
+			t.Setenv("INSTANCE_TYPE", "self-hosted")
+			t.Setenv("ENVIRONMENT", "test")
+			t.Setenv("GOOGLE_SSO_ENABLED", "false")
+			t.Setenv("APPLE_SSO_ENABLED", "true")
+			t.Setenv("APPLE_CLIENT_ID", "chat.test.signin")
+			t.Setenv("APPLE_TEAM_ID", "TEAM123ABC")
+			t.Setenv("APPLE_KEY_ID", "KEYID12345")
+			t.Setenv("APPLE_PRIVATE_KEY", string(generateTestApplePEM(t)))
+			t.Setenv(missing, "")
+			_, err := Load()
+			require.ErrorContains(t, err, missing)
+			assert.Contains(t, err.Error(), "AppleSSO enabled")
+			for _, present := range []string{"APPLE_CLIENT_ID", "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY"} {
+				if present != missing {
+					assert.NotContains(t, err.Error(), present)
+				}
+			}
+		})
+	}
+}

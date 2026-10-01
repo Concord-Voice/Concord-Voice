@@ -6,7 +6,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -217,4 +221,64 @@ func TestBuildOAuthHandler_CloudflareKVBridgeDisabled(t *testing.T) {
 
 	h := buildOAuthHandler(nil, nil, cfg, nil, log)
 	require.NotNil(t, h)
+}
+
+// Calling Initiate without the deployment middleware proves the configured
+// registry itself omits hosted providers; a route guard cannot hide a bad registry.
+func TestBuildOAuthHandler_DeploymentProviderAvailability(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	key := generateTestApplePEM(t)
+	modes := []struct {
+		name, raw  string
+		selfHosted bool
+	}{
+		{"self-hosted", "self-hosted", true},
+		{"normalized self-hosted", " \tSELF-HOSTED\n", true},
+		{"saas", "saas", false},
+		{"empty fallback", "", false},
+		{"unknown fallback", "enterprise", false},
+	}
+	flags := []struct {
+		name          string
+		google, apple bool
+	}{
+		{"disabled", false, false}, {"google only", true, false},
+		{"apple only", false, true}, {"both enabled", true, true},
+	}
+	for _, mode := range modes {
+		for _, flag := range flags {
+			t.Run(mode.name+"/"+flag.name, func(t *testing.T) {
+				cfg := &config.Config{InstanceType: mode.raw, Environment: "test",
+					GoogleSSO: config.GoogleSSOConfig{Enabled: flag.google, ClientID: "test-client.apps.googleusercontent.com"},
+					AppleSSO: config.AppleSSOConfig{Enabled: flag.apple, ClientID: "chat.test.signin",
+						TeamID: "TEAM123ABC", KeyID: "KEYID12345", PrivateKey: key},
+				}
+				h := buildOAuthHandler(nil, nil, cfg, nil, logger.NewWithWriter(io.Discard))
+				router := gin.New()
+				router.GET("/sso/:provider", h.Initiate)
+				for _, provider := range []struct {
+					name    string
+					enabled bool
+				}{{"google", flag.google}, {"apple", flag.apple}} {
+					t.Run(provider.name, func(t *testing.T) {
+						w := httptest.NewRecorder()
+						// No loopback inputs, credentials or state: registered providers
+						// reach input validation before any external work.
+						router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/sso/"+provider.name, nil))
+						var body struct {
+							ErrorCode string `json:"error_code"`
+						}
+						require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+						if mode.selfHosted || !provider.enabled {
+							assert.Equal(t, http.StatusNotFound, w.Code)
+							assert.Equal(t, "unknown_provider", body.ErrorCode)
+						} else {
+							assert.Equal(t, http.StatusBadRequest, w.Code)
+							assert.Equal(t, "invalid_redirect_uri", body.ErrorCode)
+						}
+					})
+				}
+			})
+		}
+	}
 }

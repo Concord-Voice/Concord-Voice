@@ -15,7 +15,7 @@ import (
 const (
 	entitlementSelfHosted = "self-hosted-unlocked"
 	defaultServerVersion  = "dev"
-	policyVersion         = "2026-06-01"
+	policyVersion         = "2026-10-01"
 	maxMembersPerServer   = 500
 )
 
@@ -105,11 +105,12 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 		mfaMethods = append(mfaMethods, "webauthn")
 	}
 
+	selfHosted := config.IsSelfHostedInstance(instanceType)
 	oauthProviders := []string{}
-	if h.cfg.GoogleSSO.Enabled {
+	if h.cfg.GoogleSSO.Enabled && !selfHosted {
 		oauthProviders = append(oauthProviders, "google")
 	}
-	if h.cfg.AppleSSO.Enabled {
+	if h.cfg.AppleSSO.Enabled && !selfHosted {
 		oauthProviders = append(oauthProviders, "apple")
 	}
 

@@ -24,6 +24,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -90,6 +91,7 @@ type Handler struct {
 	// package reads it.
 	redis                              *redis.Client
 	log                                *logger.Logger
+	instanceType                       string
 	hub                                *websocket.Hub
 	presenceHistory                    *presencehistory.Service
 	activitySuppressor                 ActivitySettingsSuppressor
@@ -119,18 +121,24 @@ type Handler struct {
 // internal/oauth use rather than growing this list again.
 func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier MFAVerifier, tiers entitlements.TierResolver, credFence *credepoch.Fence, tokenPairs TokenPairIssuer) *Handler {
 	h := &Handler{
-		db:          db,
-		log:         log,
-		hub:         hub,
-		mfaVerifier: mfaVerifier,
-		tiers:       tiers,
-		credFence:   credFence,
-		tokenPairs:  tokenPairs,
+		db:           db,
+		log:          log,
+		instanceType: config.InstanceTypeSaaS,
+		hub:          hub,
+		mfaVerifier:  mfaVerifier,
+		tiers:        tiers,
+		credFence:    credFence,
+		tokenPairs:   tokenPairs,
 	}
 	if hub != nil {
 		h.sessionDisconnector = hub
 	}
 	return h
+}
+
+// SetInstanceType injects deployment policy before the handler serves requests.
+func (h *Handler) SetInstanceType(instanceType string) {
+	h.instanceType = config.NormalizeInstanceType(instanceType)
 }
 
 // SetRedis wires the client backing the fail-closed step-up attempt budget
@@ -2738,9 +2746,8 @@ func (h *Handler) ListSSOIdentities(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"identities": out})
 }
 
-// GetSecurity returns the authenticated user's SSO-related security flags so
-// the Settings panel can hydrate the toggles on mount instead of defaulting
-// to false. Mirrors the columns PatchSecurity writes to.
+// GetSecurity returns effective password-login policy and the stored SSO trust
+// preference so the Settings panel can hydrate the toggles on mount.
 //
 // GET /api/v1/users/me/security
 func (h *Handler) GetSecurity(c *gin.Context) {
@@ -2760,7 +2767,7 @@ func (h *Handler) GetSecurity(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"password_login_disabled": pld,
+		"password_login_disabled": auth.EffectivePasswordLoginDisabled(h.instanceType, pld),
 		"trust_sso_security":      trust,
 	})
 }
@@ -2825,32 +2832,28 @@ func (h *Handler) PatchSecurity(c *gin.Context) {
 		return
 	}
 
-	// Lockout check: if the user is asking to disable password login, ensure
-	// they have at least one SSO identity to fall back on. Otherwise the next
-	// /auth/login attempt would 403 with account_uses_sso → empty providers
-	// list → permanent lockout. This mirrors DeleteSSOIdentity's would_lock_out
-	// gate from the other side: that endpoint refuses to remove the LAST
-	// identity when password is disabled; this endpoint refuses to disable
-	// password when there are NO identities. Together they form a structural
-	// invariant: password OR ≥1 SSO identity, always.
+	// Refuse self-hosted disablement before any transaction or identity read.
 	if req.PasswordLoginDisabled != nil && *req.PasswordLoginDisabled { // pragma: allowlist secret
-		var ssoCount int64
-		if err := h.db.QueryRowContext(c.Request.Context(),
-			`SELECT COUNT(*) FROM user_sso_identities WHERE user_id = $1`, userID,
-		).Scan(&ssoCount); err != nil {
-			h.log.Error("Failed to count SSO identities for lockout check", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error_code": "lookup_failed"})
-			return
-		}
-		if ssoCount == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error_code": "would_lock_out",
-				"detail":     "Link an SSO provider before disabling password login.",
-			})
+		if config.IsSelfHostedInstance(h.instanceType) {
+			c.JSON(http.StatusForbidden, gin.H{"error_code": "password_login_required_self_hosted"})
 			return
 		}
 	}
 
+	query, args := securityPatchUpdate(userID, req)
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error_code": "no_fields"})
+		return
+	}
+	if !h.applySecurityPatch(c, userID, req, query, args) {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// securityPatchUpdate builds only the supplied security flags; proof is never
+// included in the parameterized update. An empty query means no fields were supplied.
+func securityPatchUpdate(userID string, req patchSecurityRequest) (string, []any) {
 	// Build a dynamic UPDATE so we only set provided fields. Column names are
 	// hardcoded literals (not user input); only the values are bound via $N.
 	var sets []string
@@ -2867,8 +2870,7 @@ func (h *Handler) PatchSecurity(c *gin.Context) {
 		idx++
 	}
 	if len(sets) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error_code": "no_fields"})
-		return
+		return "", nil
 	}
 	args = append(args, userID)
 	// Safe: column names in `sets` are hardcoded literals from the if-blocks above;
@@ -2877,52 +2879,101 @@ func (h *Handler) PatchSecurity(c *gin.Context) {
 		"UPDATE users SET %s WHERE id = $%d",
 		strings.Join(sets, ", "), idx,
 	)
-	// nosemgrep: go.net.sql.go-vanillasql-format-string-sqli-taint-med-conf.go-vanillasql-format-string-sqli-taint-med-conf,go.net.sql.go-vanillasql-format-string-sqli-taint.go-vanillasql-format-string-sqli-taint
-	if _, err := h.db.ExecContext(c.Request.Context(), q, args...); err != nil { //nolint:gosec // q composed above from hardcoded column names + integer idx via fmt.Sprintf; user values flow only through args... as parameterized $N placeholders.
-		h.log.Error("Failed to update security settings", "error", err)
+	return q, args
+}
+
+// applySecurityPatch serializes fallback checks and writes with unlink. READ
+// COMMITTED gives the count its own snapshot after the standalone users lock.
+func (h *Handler) applySecurityPatch(c *gin.Context, userID string, req patchSecurityRequest, query string, args []any) bool {
+	ctx := c.Request.Context()
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin security settings transaction", "error_class", "begin")
 		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "update_failed"})
-		return
+		return false
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back security settings transaction", "error_class", "rollback")
+		}
+	}()
+
+	var lockedUserID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+	).Scan(&lockedUserID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusUnauthorized, gin.H{"error_code": "invalid_credentials"})
+		return false
+	}
+	if err != nil {
+		h.log.Error("Failed to lock user for security settings", "error_class", "lookup")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "lookup_failed"})
+		return false
+	}
+
+	if req.PasswordLoginDisabled != nil && *req.PasswordLoginDisabled { // pragma: allowlist secret
+		var ssoCount int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM user_sso_identities WHERE user_id = $1`, userID,
+		).Scan(&ssoCount); err != nil {
+			h.log.Error("Failed to count SSO identities for lockout check", "error_class", "lookup")
+			c.JSON(http.StatusInternalServerError, gin.H{"error_code": "lookup_failed"})
+			return false
+		}
+		if ssoCount == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error_code": "would_lock_out",
+				"detail":     "Link an SSO provider before disabling password login.",
+			})
+			return false
+		}
+	}
+
+	// nosemgrep: go.net.sql.go-vanillasql-format-string-sqli-taint-med-conf.go-vanillasql-format-string-sqli-taint-med-conf,go.net.sql.go-vanillasql-format-string-sqli-taint.go-vanillasql-format-string-sqli-taint
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil { //nolint:gosec // query is built by securityPatchUpdate from hardcoded column names + integer idx; values flow only through parameterized args.
+		h.log.Error("Failed to update security settings", "error_class", "write")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "update_failed"})
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit security settings transaction", "error_class", "commit")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "update_failed"})
+		return false
+	}
+	return true
 }
 
 // DeleteSSOIdentity unlinks a provider from the authenticated user.
 // Refuses if doing so would leave the user with no authentication method.
 // DELETE /api/v1/users/me/sso-identities/:provider
 //
-// The lockout check + delete run inside a single transaction with SELECT FOR
-// UPDATE on the users row to defend against TOCTOU: without the lock, two
-// concurrent requests could both observe a "still has fallback" state, both
-// pass the wouldHaveAnyAuth gate, and both delete different identities, jointly
-// leaving the user locked out. The row lock serializes the check-and-delete so
-// the second request observes the post-delete state and refuses.
+// The READ COMMITTED transaction first locks the users row in a standalone
+// statement, then counts identities with a new snapshot before deleting. A final
+// self-hosted deletion also clears stored password disablement in this transaction.
+// Both unlink and PatchSecurity hold the account lock through their checked commit.
 func (h *Handler) DeleteSSOIdentity(c *gin.Context) {
 	userID := c.GetString("user_id")
 	provider := c.Param("provider")
 
 	ctx := c.Request.Context()
-	tx, err := h.db.BeginTx(ctx, nil)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("Failed to begin transaction for SSO identity delete", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "delete_failed"})
 		return
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back security settings transaction", "error_class", "rollback")
+		}
+	}()
 
-	// Lock the users row for the duration of the tx — concurrent
-	// DeleteSSOIdentity / PatchSecurity calls for the same user must serialize
-	// against this lock. The correlated subquery counts identities EXCLUDING
-	// the one being deleted (i.e., the post-delete identity count).
+	// Acquire the account lock before the child count takes its snapshot.
 	var pld bool
-	var identityCount int64
 	err = tx.QueryRowContext(ctx,
-		`SELECT u.password_login_disabled, (
-		    SELECT COUNT(*) FROM user_sso_identities WHERE user_id = u.id AND provider != $2
-		 )
-		 FROM users u WHERE u.id = $1
-		 FOR UPDATE`,
-		userID, provider,
-	).Scan(&pld, &identityCount)
+		`SELECT password_login_disabled FROM users WHERE id = $1 FOR UPDATE`, userID,
+	).Scan(&pld)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error_code": "user_not_found"})
 		return
@@ -2932,7 +2983,15 @@ func (h *Handler) DeleteSSOIdentity(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "lookup_failed"})
 		return
 	}
-	wouldHaveAnyAuth := !pld /* password counts when not disabled */ || identityCount > 0
+	var identityCount int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM user_sso_identities WHERE user_id = $1 AND provider != $2`, userID, provider,
+	).Scan(&identityCount); err != nil {
+		h.log.Error("Failed to count remaining SSO identities", "error_class", "lookup")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "lookup_failed"})
+		return
+	}
+	wouldHaveAnyAuth := !auth.EffectivePasswordLoginDisabled(h.instanceType, pld) || identityCount > 0
 	if !wouldHaveAnyAuth {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error_code": "would_lock_out",
@@ -2959,10 +3018,29 @@ func (h *Handler) DeleteSSOIdentity(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error_code": "not_linked"})
 		return
 	}
+	if err := h.restorePasswordFallbackAfterUnlink(ctx, tx, userID, pld, identityCount); err != nil {
+		h.log.Error("Failed to restore password fallback after SSO unlink", "error_class", "write")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "delete_failed"})
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit SSO identity delete", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "delete_failed"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// restorePasswordFallbackAfterUnlink follows a confirmed owner-bound deletion.
+// Keep the durable password door available if the instance later returns to SaaS.
+func (h *Handler) restorePasswordFallbackAfterUnlink(ctx context.Context, tx *sql.Tx, userID string, storedDisabled bool, remainingIdentities int64) error {
+	if !storedDisabled || remainingIdentities > 0 || !config.IsSelfHostedInstance(h.instanceType) {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET password_login_disabled = FALSE WHERE id = $1`, userID,
+	); err != nil {
+		return fmt.Errorf("restore password fallback after SSO unlink: %w", err)
+	}
+	return nil
 }

@@ -43,7 +43,7 @@ before allocation; it does not change existing rows or reads.
 | `auth.emailVerificationRequired` | boolean | Always `true` — password registration always requires email verification; SMTP only changes delivery (real email vs the dev stdout/Redis code path). |
 | `auth.mfaEnabled` | boolean | Always `true` (MFA is structurally available). |
 | `auth.mfaMethods` | string[] | `["totp"]`, plus `"webauthn"` when a WebAuthn RP is configured. Always present (never `null`). |
-| `auth.oauthProviders` | string[] | Subset of `["google","apple"]` per server SSO config. Empty array (not `null`) suppresses SSO. |
+| `auth.oauthProviders` | string[] | Subset of `["google","apple"]` per server SSO config on SaaS. Always `[]` on self-hosted, even when provider enable flags are true. Empty array (not `null`) suppresses the primary SSO options. |
 | `auth.ldapEnabled` | boolean | Currently always `false` (no backend yet; additive). |
 | `auth.samlEnabled` | boolean | Currently always `false` (no backend yet; additive). |
 | `features.voiceTiersSupported` | boolean | `true` on SaaS; `false` on self-hosted (all features unlocked, tiers moot). |
@@ -52,7 +52,30 @@ before allocation; it does not change existing rows or reads.
 | `features.entitlementMode` | string | `"saas"` or `"self-hosted-unlocked"` (derived from `instanceType`). On self-hosted, the control-plane entitlement resolver returns the maximal current entitlement set for every user. |
 | `features.activityHistorySupported` | boolean, optional | Emitted as `true` only when the cluster gate is enabled and the replica count was explicitly set to one. Otherwise omitted; the backend does not emit `false`. |
 | `features.chunkedAttachmentUpload` | boolean | Whether the chunked upload session routes are reachable on this deployment (#2157). Always emitted — deliberately not `omitempty`, because an explicit `false` is the useful answer when object storage or the session Redis is absent. Mirrors the route-registration condition exactly (`internal/api/router.go:816`). A server that predates the field omits it; the client's zero value is `false`, so it fails closed to the single-shot path. |
-| `policyVersion` | string | Bumped when the server policy set changes. |
+| `policyVersion` | string | Bumped when the server policy set changes. Current value: `"2026-10-01"`, including the self-hosted SSO policy. |
+
+### SSO deployment policy
+
+`INSTANCE_TYPE=self-hosted` forces Google and Apple SSO unavailable. Requests
+that reach the registered `/api/v1/auth/sso/:provider` group, including its
+session, registration, linking, and secret-signing paths, return HTTP 403 with
+`{"error_code":"sso_disabled_self_hosted"}` before its handler runs, regardless
+of the provider path value. Existing parent authentication checks can reject
+requests earlier. Raw-enabled providers still require the credential fields
+checked by configuration loading; suppressed Apple providers are not constructed,
+so their private keys are not parsed by the provider at startup.
+Unknown or empty instance types retain the existing SaaS fallback.
+
+Self-hosted password login remains available even when an existing account stores
+`password_login_disabled=true`. Password verification, account lockout, disabled
+account checks, and MFA still apply. `GET /users/me/security` reports the effective
+password-disable flag as `false`; attempting to set it to `true` returns HTTP 403
+with `password_login_required_self_hosted`. Explicitly enabling password login and
+unlinking an old SSO identity remain available. Unlinking the final identity on a
+self-hosted instance clears the stored password-disable flag in the same
+transaction, so password login remains available if the instance returns to SaaS.
+Partial unlink, login, security reads and recovery preserve the stored preference.
+Recovery can replace the password without a separate flag reset before native login.
 
 ### Activity History support state
 
@@ -109,7 +132,7 @@ GET /api/v1/server/capabilities
     "activityHistorySupported": true,
     "chunkedAttachmentUpload": true
   },
-  "policyVersion": "2026-06-01"
+  "policyVersion": "2026-10-01"
 }
 ```
 
@@ -133,7 +156,7 @@ GET /api/v1/server/capabilities
     "entitlementMode": "self-hosted-unlocked",
     "chunkedAttachmentUpload": false
   },
-  "policyVersion": "2026-06-01"
+  "policyVersion": "2026-10-01"
 }
 ```
 

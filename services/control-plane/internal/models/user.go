@@ -23,13 +23,10 @@ type User struct {
 	UpdatedAt         time.Time       `json:"updated_at" db:"updated_at"`
 	UsernameChangedAt *time.Time      `json:"username_changed_at,omitempty" db:"username_changed_at"`
 
-	// PasswordLoginDisabled indicates the account has SSO-only login. Set via
-	// PATCH /api/v1/users/me/security (with passphrase confirmation); cleared
-	// via the same endpoint or by the account-recovery flow. The field is also
-	// initialised by POST /api/v1/auth/sso/:provider/complete-registration when
-	// a user completes first-time SSO registration without a password. Loaded
-	// by lookupUserForLogin so POST /api/v1/auth/login can short-circuit with
-	// HTTP 403 account_uses_sso instead of returning 401 invalid_credentials.
+	// PasswordLoginDisabled stores the account's SSO-only login preference.
+	// SSO registration initializes it; passphrase-confirmed security settings
+	// can change it. Recovery retains it. Self-hosted login policy does not
+	// rewrite it; a successful final self-hosted identity unlink clears it.
 	PasswordLoginDisabled bool `json:"-" db:"password_login_disabled"`
 
 	// Disabled is the soft-disable flag set terminally by the age-verification

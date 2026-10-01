@@ -51,6 +51,7 @@ func TestGetCapabilities_SaaS(t *testing.T) {
 	assert.True(t, resp.Features.VoiceTiersSupported)
 	assert.True(t, resp.Features.E2EEEnforcedEverywhere)
 	assert.Equal(t, "saas", resp.Features.EntitlementMode)
+	assert.Equal(t, "2026-10-01", resp.PolicyVersion)
 }
 
 func TestGetCapabilities_SelfHosted(t *testing.T) {
@@ -70,6 +71,7 @@ func TestGetCapabilities_SelfHosted(t *testing.T) {
 	assert.Equal(t, []string{}, resp.Auth.OAuthProviders)
 	assert.False(t, resp.Features.VoiceTiersSupported)
 	assert.Equal(t, "self-hosted-unlocked", resp.Features.EntitlementMode)
+	assert.Equal(t, "2026-10-01", resp.PolicyVersion)
 }
 
 func TestGetCapabilities_UnknownInstanceTypeFailsSafeToSaaS(t *testing.T) {
@@ -99,8 +101,7 @@ func TestGetCapabilities_InstanceTypeCaseAndWhitespaceTolerant(t *testing.T) {
 }
 
 func TestGetCapabilities_PartialOAuth_GoogleOnly(t *testing.T) {
-	// The most likely real self-hosted-with-one-provider config — exercises the
-	// individual SSO branch arms (google enabled, apple disabled).
+	// SaaS preserves the enabled Google-only subset.
 	cfg := &config.Config{InstanceType: "saas"}
 	cfg.GoogleSSO.Enabled = true
 	cfg.AppleSSO.Enabled = false
@@ -333,5 +334,65 @@ func TestGetCapabilities_AttachmentEnvelopeVersions_ReaderFloor(t *testing.T) {
 			require.NoError(t, json.Unmarshal(rawVersions, &versions))
 			assert.Equal(t, tc.want, versions)
 		})
+	}
+}
+
+// An enabled raw flag must not advertise hosted SSO on a self-hosted deployment.
+func TestGetCapabilities_OAuthDeploymentPolicy(t *testing.T) {
+	modes := []struct {
+		name, raw, wantType string
+		selfHosted          bool
+	}{
+		{"self-hosted", "self-hosted", "self-hosted", true},
+		{"normalized self-hosted", " \tSELF-HOSTED\n", "self-hosted", true},
+		{"saas", "saas", "saas", false},
+		{"empty fallback", "", "saas", false},
+		{"unknown fallback", "enterprise", "saas", false},
+	}
+	flags := []struct {
+		name          string
+		google, apple bool
+		want          []string
+	}{
+		{"disabled", false, false, []string{}},
+		{"google only", true, false, []string{"google"}},
+		{"apple only", false, true, []string{"apple"}},
+		{"both enabled", true, true, []string{"google", "apple"}},
+	}
+	for _, mode := range modes {
+		for _, flag := range flags {
+			t.Run(mode.name+"/"+flag.name, func(t *testing.T) {
+				cfg := &config.Config{InstanceType: mode.raw,
+					GoogleSSO: config.GoogleSSOConfig{Enabled: flag.google, ClientID: "fixture-google-client-id"},
+					AppleSSO: config.AppleSSOConfig{Enabled: flag.apple, ClientID: "fixture-apple-client-id",
+						TeamID: "fixture-team-id", KeyID: "fixture-key-id", PrivateKey: []byte("fixture-private-key")},
+				}
+				w, c := newTestContext()
+				servercapabilities.NewHandler(cfg).GetCapabilities(c)
+				require.Equal(t, http.StatusOK, w.Code)
+				var resp servercapabilities.Response
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+				want := flag.want
+				if mode.selfHosted {
+					want = []string{}
+				}
+				assert.Equal(t, want, resp.Auth.OAuthProviders)
+				assert.Equal(t, mode.wantType, resp.Server.InstanceType)
+				var encoded struct {
+					Auth struct {
+						Providers json.RawMessage `json:"oauthProviders"`
+					} `json:"auth"`
+				}
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &encoded))
+				if len(want) == 0 {
+					assert.Equal(t, "[]", string(encoded.Auth.Providers))
+				}
+				assert.Equal(t, "no-store, no-cache, must-revalidate, max-age=0", w.Header().Get("Cache-Control"))
+				assert.Equal(t, "no-cache", w.Header().Get("Pragma"))
+				for _, credential := range []string{"fixture-google-client-id", "fixture-apple-client-id", "fixture-team-id", "fixture-key-id", "fixture-private-key"} {
+					assert.NotContains(t, w.Body.String(), credential)
+				}
+			})
+		}
 	}
 }

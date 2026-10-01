@@ -182,6 +182,16 @@ The Concord Voice desktop app should show:
 
 For self-hosted testing, choose **Self-Hosted** in the connection selector and enter the server origin. The desktop shell probes `/api/v1/client/config` and `/api/v1/server/capabilities` before routing login/registration to that origin.
 
+With `INSTANCE_TYPE=self-hosted`, Google and Apple SSO are unavailable even if
+their enable flags are true. The server advertises an empty provider array and
+refuses its SSO routes. Enabled providers still require complete credentials at
+startup, so leave their enable flags false when SSO is unused.
+Existing accounts keep password sign-in and any configured two-step verification.
+Self-hosted security settings cannot require SSO; use password recovery if the
+account's password is unavailable.
+Unlinking the final old SSO identity also enables the stored password-login
+setting, so the account keeps password sign-in if the deployment returns to SaaS.
+
 ## Verify Everything Works
 
 Run these checks:

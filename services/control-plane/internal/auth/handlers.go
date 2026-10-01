@@ -30,6 +30,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -146,6 +147,7 @@ type Handler struct {
 	redis                     *redis.Client
 	log                       *logger.Logger
 	jwtSecret                 string
+	instanceType              string
 	hub                       SessionDisconnector
 	presenceHistory           *presencehistory.Service
 	mfaChecker                MFAChecker
@@ -280,13 +282,14 @@ func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSe
 }
 
 // NewHandlerForInstance creates a new authentication handler with the
-// deployment-mode entitlement seam used for JWT tier claims.
+// deployment mode used for native login policy and JWT tier claims.
 func NewHandlerForInstance(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSecret string, hub SessionDisconnector, instanceType string) *Handler {
 	return &Handler{
 		db:             db,
 		redis:          redisClient,
 		log:            log,
 		jwtSecret:      jwtSecret,
+		instanceType:   config.NormalizeInstanceType(instanceType),
 		hub:            hub,
 		pending:        NewPendingRepo(db),
 		entCache:       entitlements.NewCacheForInstance(redisClient, db, instanceType),
@@ -1257,10 +1260,10 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	// SSO-only account: surface a helpful error so the renderer can swap the
+	// Effective SSO-only account: surface an error so the renderer can swap the
 	// password form for the SSO button. Does NOT engage the lockout counter —
 	// lockout is for password-credential-bruteforce, not user-error.
-	if user.PasswordLoginDisabled {
+	if EffectivePasswordLoginDisabled(h.instanceType, user.PasswordLoginDisabled) {
 		providers, perr := h.listSSOProviders(ctx, user.ID)
 		if perr != nil {
 			// Differentiate from "no providers linked" (an impossible-state

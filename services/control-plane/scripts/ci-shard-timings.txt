@@ -1,48 +1,92 @@
-# ci-shard-timings.txt — advisory per-package `go test -race` run-times used by
+# ci-shard-timings.txt — advisory per-package Go test run-times used by
 # ci-shard-packages.sh to balance the control-plane test matrix (greedy LPT).
 #
-# Format:  <module-relative-package>  <seconds>
+# Format: <module-relative-package> <seconds>
 #
 # ADVISORY ONLY. Correctness (a complete, disjoint partition covering every
 # package) comes from `go list ./...` at run time, never this file. Packages
-# missing here get CI_SHARD_DEFAULT_WEIGHT; stale entries for removed packages
-# are ignored. Refresh periodically from a real run's per-package `ok <pkg> Ns`
-# lines when balance drifts (e.g. `blacksmith jobs logs <job> --step "Run tests
-# with coverage (shard 1/2)"`). Values below captured 2026-07-04 from
-# "build / Control Plane / Test + Coverage" (job 85183497421).
+# missing here get CI_SHARD_DEFAULT_WEIGHT; stale entries are ignored.
+# Refresh from real race+integration+coverage runs when balance drifts.
 #
-# Only packages with test files appear; no-test packages run in ~0s and fall
-# through to the default weight, which is fine (they add negligible imbalance).
-internal/auth               57.7
-internal/mfa                35.3
-internal/rbac               26.9
-internal/dm                 22.5
-internal/users              22.3
-internal/voice              18.4
-internal/websocket          16.6
-internal/admin              16.2
-internal/ownership          14.8
-internal/attestation        14.0
-internal/channels           13.5
-internal/messages           13.3
-internal/servers            10.8
-internal/friends            10.8
-internal/middleware         10.2
-internal/members             9.8
-internal/oauth               7.9
-internal/media               7.9
-internal/age                 6.8
-internal/sessions            6.7
-internal/entitlements        6.5
-internal/invites             5.4
-internal/redemption          3.7
-internal/notifications       2.8
-internal/presence            2.2
-internal/api                 2.0
-internal/clientconfig        1.7
-internal/privacy             1.7
-internal/testhelpers         1.7
-internal/database            1.7
-internal/subscriptions       1.6
-internal/keyrotation         1.6
-internal/servercapabilities  1.2
+# Refreshed 2026-10-01 from PR #3546 run 36924183427, head 829a2640:
+# shard 1 job 110577617713 (completed packages before the job timeout) and
+# shard 2 job 110577617810 (successful). The 65 completed measurements are
+# used directly. Four uncompleted packages retain run 36918189886, head
+# b6fcb8db, job 110558032414 measurements: internal/users,
+# internal/voicepresence, pkg/clientversion and pkg/e2eekeys. pkg/nats retains
+# the passing run 36866185765, head 80bde124, job 110382387697 measurement.
+# A measured package runtime is a balancing weight, not a wall-time guarantee;
+# compilation and job setup add overhead. No test, tag, race/coverage flag,
+# serialization, runner, timeout or quality gate is changed by these weights.
+#
+# Packages without test files remain absent and use the default weight.
+cmd/issue-codes                   1.030
+cmd/mfa-rekey                     2.563
+cmd/migrate-media                 7.709
+cmd/server                        4.817
+internal/activepresence           16.729
+internal/admin                    30.598
+internal/age                      9.444
+internal/api                      16.740
+internal/attestation              25.129
+internal/auth                     186.080
+internal/cfkv                     1.031
+internal/channels                 103.708
+internal/clientconfig             3.178
+internal/credepoch                21.952
+internal/database                 22.916
+internal/dm                       225.258
+internal/dmblock                  11.012
+internal/dmvisibility             1.294
+internal/email                    1.056
+internal/entitlements             7.991
+internal/expiration               9.294
+internal/feedback                 1.152
+internal/friends                  38.266
+internal/graphpresence            9.409
+internal/health                   4.339
+internal/ingressbudget            1.162
+internal/invites                  8.746
+internal/keyrotation              3.403
+internal/klipy                    1.889
+internal/media                    71.334
+internal/members                  48.290
+internal/messages                 105.020
+internal/mfa                      173.508
+internal/mfaenforce               4.076
+internal/middleware               29.316
+internal/models                   1.019
+internal/notifications            8.169
+internal/oauth                    18.939
+internal/opsmetrics               3.213
+internal/ownership                58.845
+internal/presence                 20.805
+internal/presencecapture          1.012
+internal/presencehistory          20.848
+internal/presencehook             1.813
+internal/privacy                  3.546
+internal/purge                    9.694
+internal/rbac                     89.785
+internal/redemption               8.384
+internal/securityevent            1.454
+internal/servercapabilities       1.306
+internal/servers                  32.991
+internal/sessions                 20.098
+internal/stepup                   22.874
+internal/storage                  1.015
+internal/storage/probe            4.228
+internal/subscriptions            5.229
+internal/testhelpers              2.497
+internal/testhelpers/redistest    2.761
+internal/testhelpers/stmthook     1.289
+internal/updates                  1.014
+internal/users                    99.852
+internal/voice                    113.805
+internal/voicepresence            1.054
+internal/websocket                81.845
+pkg/clientversion                 1.011
+pkg/config                        2.115
+pkg/e2eekeys                      1.010
+pkg/logger                        1.011
+pkg/mediaproof                    1.010
+pkg/nats                          1.032

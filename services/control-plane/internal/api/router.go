@@ -1006,6 +1006,7 @@ func NewRouter(
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	sessionsHandler.SetSecurityEvents(securityEvents)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
+	usersHandler.SetInstanceType(cfg.InstanceType)
 	usersHandler.SetRedis(redis)
 	usersHandler.SetTier1ErasureWake(dependencies.Tier1ErasureWake)
 	requireStepUpBudgetWired(log, usersHandler)
@@ -1429,6 +1430,7 @@ func NewRouter(
 			//   exchange for all providers (#974 apple, #975 google). Callback
 			//   route removed in #975 — all providers are now client-driven.
 			ssoRoutes := authRoutes.Group("/sso")
+			ssoRoutes.Use(requireSSODeployment(cfg))
 			{
 				ssoRoutes.GET("/:provider",
 					middleware.RateLimitByIP(redis, 10, 15*time.Minute),

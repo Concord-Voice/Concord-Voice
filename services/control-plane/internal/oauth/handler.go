@@ -82,9 +82,9 @@ type AuthAdapter interface {
 	VerifyPassword(ctx context.Context, userID, password string) (credentialEpoch string, err error)
 	// HashPassword computes an Argon2id hash of the supplied passphrase, used
 	// by the new-user SSO registration path to populate users.password_hash.
-	// Even when password login is disabled, the column is NOT NULL — the hash
-	// is stored as a placeholder that becomes usable only if the user later
-	// flips password_login_disabled (e.g., via account-recovery flow).
+	// The hash remains a valid step-up credential when SaaS password login is
+	// disabled. Native login also uses it after the user enables password login
+	// or deployment policy requires it on a self-hosted instance.
 	HashPassword(ctx context.Context, password string) (string, error)
 	// ValidateUsername delegates to internal/auth/username.ValidateUsername:
 	// charset (alphanumeric + . _ -), length bounds, no consecutive specials,
