@@ -298,8 +298,8 @@ The Phase 2 procedure must include all of these controls:
 - Fully restore PostgreSQL before cutover, and compare active storage keys.
 - Restore MinIO into fresh named volumes. Test both the candidate digest and the
   exact previous digest against inventory and representative-object hashes.
-- Prepare unopened MinIO, PostgreSQL-data, and PostgreSQL-WAL rollback volumes
-  before cutover.
+- Prepare unopened MinIO and PostgreSQL-data rollback volumes before cutover.
+  (The data volume holds `pg_wal`; there is no separate WAL archive since #3522.)
 - Write a root-private, non-secret, phase-aware recovery checkpoint, so an SSH
   disconnect does not force you to reconstruct state.
 - Replace only MinIO, with `--pull never`. Prove the `/data` mount identity does
@@ -314,8 +314,7 @@ Rollback has two explicit boundaries:
 - **Before writers reopen:** stop the candidate and start the previous digest on
   the unopened restored MinIO volume. Keep PostgreSQL unchanged.
 - **After writers reopen:** stop writers cleanly. Then start the previous MinIO
-  with the pre-restored PostgreSQL data and WAL volumes, as one paired
-  checkpoint.
+  with the pre-restored PostgreSQL data volume, as one paired checkpoint.
 
 The previous MinIO binary must never open a production volume after the new
 binary has opened it.
