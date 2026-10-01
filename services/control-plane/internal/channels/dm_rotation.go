@@ -313,8 +313,11 @@ func (h *Handler) dmParticipantExists(convID, userID string) (bool, error) {
 // an epoch was revoked and which one succeeds it — the same key_revocation
 // event the server-channel rotator emits, so the client's existing handler
 // invalidates its cached key and runs the rotation coordinator. Post-commit
-// only; a failed lookup drops the broadcast, and the next key fetch answers
-// REVOKED_EPOCH, which the client treats the same way.
+// only; a failed lookup drops the broadcast. The successor wraps are already
+// committed, so a current-key fetch returns the successor, not REVOKED_EPOCH.
+// A device that missed the event recovers on its next send at the revoked
+// epoch: enforceDMEpoch refuses it with an epoch_revoked error, which the
+// client handles the same way.
 func (h *Handler) broadcastDMKeyRevocation(convID string, revokedEpoch, successorEpoch int, reason string) {
 	h.broadcastToDMParticipants(convID, "", websocket.OutgoingMessage{
 		Type: "key_revocation",

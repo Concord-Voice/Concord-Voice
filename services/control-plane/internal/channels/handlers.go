@@ -4805,8 +4805,9 @@ func (h *Handler) RotateKey(c *gin.Context) {
 }
 
 // ValidateEpochs checks if any of the client's cached key epochs have been revoked.
-// Called on reconnect to catch missed key_revocation WebSocket events.
-// POST /api/channels/validate-epochs
+// Called on reconnect to catch missed key_revocation WebSocket events. It reads
+// key_revocations only, so it covers server channels, not DM conversations.
+// POST /api/v1/e2ee/validate-epochs
 func (h *Handler) ValidateEpochs(c *gin.Context) {
 	userID := c.GetString("user_id")
 
