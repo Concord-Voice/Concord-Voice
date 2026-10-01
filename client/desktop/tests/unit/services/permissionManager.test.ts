@@ -8,7 +8,7 @@ const mockGetNotificationSettings = vi.fn().mockReturnValue({
 });
 const mockIsSupported = vi.fn().mockReturnValue(true);
 const mockNotificationShow = vi.fn();
-const mockIsEncryptionAvailable = vi.fn().mockReturnValue(true);
+const mockSecureStorageAvailable = vi.fn().mockReturnValue(true);
 const mockOpenExternal = vi.fn();
 const mockHandle = vi.fn();
 const mockSend = vi.fn();
@@ -30,9 +30,6 @@ vi.mock('electron', () => ({
     },
     { isSupported: () => mockIsSupported() }
   ),
-  safeStorage: {
-    isEncryptionAvailable: () => mockIsEncryptionAvailable(),
-  },
   shell: {
     openExternal: (...args: unknown[]) => mockOpenExternal(...args),
   },
@@ -41,6 +38,11 @@ vi.mock('electron', () => ({
     askForMediaAccess: (...args: unknown[]) => mockAskForMediaAccess(...args),
     getNotificationSettings: (...args: unknown[]) => mockGetNotificationSettings(...args),
   },
+}));
+
+// permissionManager only maps the gate's boolean; secureStorage.test.ts covers the gate.
+vi.mock('@/main/secureStorage', () => ({
+  isSecureStorageAvailable: async () => mockSecureStorageAvailable(),
 }));
 
 import {
@@ -64,7 +66,7 @@ describe('permissionManager', () => {
     // queued value is served to the next test. See [internal]rules/tests.md
     // § The *Once queue outlives the test that queued it.
     // Proving a branch does NOT consult the OS is exactly a test that queues a
-    // value it never consumes. mockIsSupported/mockIsEncryptionAvailable carry no
+    // value it never consumes. mockIsSupported/mockSecureStorageAvailable carry no
     // *Once but are set with PERSISTENT mockReturnValue, which leaks the same way.
     // mockReset() also clears the implementation, so each default is restored.
     mockGetMediaAccessStatus.mockReset();
@@ -77,111 +79,111 @@ describe('permissionManager', () => {
     mockIsPackaged.mockReturnValue(true);
     mockIsSupported.mockReset();
     mockIsSupported.mockReturnValue(true);
-    mockIsEncryptionAvailable.mockReset();
-    mockIsEncryptionAvailable.mockReturnValue(true);
+    mockSecureStorageAvailable.mockReset();
+    mockSecureStorageAvailable.mockReturnValue(true);
   });
 
   describe('checkPermission', () => {
-    it('microphone: granted on macOS', () => {
+    it('microphone: granted on macOS', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('granted');
-      expect(checkPermission('microphone')).toBe('granted');
+      expect(await checkPermission('microphone')).toBe('granted');
     });
 
-    it('microphone: denied on macOS', () => {
+    it('microphone: denied on macOS', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('denied');
-      expect(checkPermission('microphone')).toBe('denied');
+      expect(await checkPermission('microphone')).toBe('denied');
     });
 
-    it('microphone: restricted on macOS', () => {
+    it('microphone: restricted on macOS', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('restricted');
-      expect(checkPermission('microphone')).toBe('restricted');
+      expect(await checkPermission('microphone')).toBe('restricted');
     });
 
-    it('microphone: not-determined on macOS', () => {
+    it('microphone: not-determined on macOS', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('not-determined');
-      expect(checkPermission('microphone')).toBe('not-determined');
+      expect(await checkPermission('microphone')).toBe('not-determined');
     });
 
-    it('microphone: unavailable for unknown macOS status', () => {
+    it('microphone: unavailable for unknown macOS status', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('unknown');
-      expect(checkPermission('microphone')).toBe('unavailable');
+      expect(await checkPermission('microphone')).toBe('unavailable');
     });
 
-    it('microphone: granted on Windows', () => {
+    it('microphone: granted on Windows', async () => {
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-      expect(checkPermission('microphone')).toBe('granted');
+      expect(await checkPermission('microphone')).toBe('granted');
     });
 
-    it('camera: uses macOS media access', () => {
+    it('camera: uses macOS media access', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('granted');
-      expect(checkPermission('camera')).toBe('granted');
+      expect(await checkPermission('camera')).toBe('granted');
     });
 
-    it('camera: granted on non-macOS', () => {
+    it('camera: granted on non-macOS', async () => {
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-      expect(checkPermission('camera')).toBe('granted');
+      expect(await checkPermission('camera')).toBe('granted');
     });
 
-    it('screen: uses macOS media access', () => {
+    it('screen: uses macOS media access', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValueOnce('denied');
-      expect(checkPermission('screen')).toBe('denied');
+      expect(await checkPermission('screen')).toBe('denied');
     });
 
-    it('screen: granted on Windows', () => {
+    it('screen: granted on Windows', async () => {
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-      expect(checkPermission('screen')).toBe('granted');
+      expect(await checkPermission('screen')).toBe('granted');
     });
 
-    it('secureStorage: granted when available', () => {
-      mockIsEncryptionAvailable.mockReturnValue(true);
-      expect(checkPermission('secureStorage')).toBe('granted');
+    it('secureStorage: granted when available', async () => {
+      mockSecureStorageAvailable.mockReturnValue(true);
+      expect(await checkPermission('secureStorage')).toBe('granted');
     });
 
-    it('secureStorage: unavailable when not available', () => {
-      mockIsEncryptionAvailable.mockReturnValue(false);
-      expect(checkPermission('secureStorage')).toBe('unavailable');
+    it('secureStorage: unavailable when not available', async () => {
+      mockSecureStorageAvailable.mockReturnValue(false);
+      expect(await checkPermission('secureStorage')).toBe('unavailable');
     });
 
-    it('notifications: unavailable when not supported', () => {
+    it('notifications: unavailable when not supported', async () => {
       mockIsSupported.mockReturnValue(false);
-      expect(checkPermission('notifications')).toBe('unavailable');
+      expect(await checkPermission('notifications')).toBe('unavailable');
     });
 
-    it('notifications: granted on macOS when authorized', () => {
+    it('notifications: granted on macOS when authorized', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockIsSupported.mockReturnValue(true);
       mockGetNotificationSettings.mockReturnValueOnce({ authorizationStatus: 'authorized' });
-      expect(checkPermission('notifications')).toBe('granted');
+      expect(await checkPermission('notifications')).toBe('granted');
     });
 
-    it('notifications: denied on macOS', () => {
+    it('notifications: denied on macOS', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockIsSupported.mockReturnValue(true);
       mockGetNotificationSettings.mockReturnValueOnce({ authorizationStatus: 'denied' });
-      expect(checkPermission('notifications')).toBe('denied');
+      expect(await checkPermission('notifications')).toBe('denied');
     });
 
-    it('notifications: provisional treated as granted', () => {
+    it('notifications: provisional treated as granted', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockIsSupported.mockReturnValue(true);
       mockGetNotificationSettings.mockReturnValueOnce({ authorizationStatus: 'provisional' });
-      expect(checkPermission('notifications')).toBe('granted');
+      expect(await checkPermission('notifications')).toBe('granted');
     });
 
-    it('notifications: granted on Windows', () => {
+    it('notifications: granted on Windows', async () => {
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
       mockIsSupported.mockReturnValue(true);
-      expect(checkPermission('notifications')).toBe('granted');
+      expect(await checkPermission('notifications')).toBe('granted');
     });
 
-    it('notifications: granted in dev mode (unpackaged) on macOS', () => {
+    it('notifications: granted in dev mode (unpackaged) on macOS', async () => {
       // macOS caches notification authorization per-process, and the dev
       // Electron binary isn't a registered notification provider — so we
       // short-circuit to 'granted' in dev mode regardless of the OS state.
@@ -190,31 +192,31 @@ describe('permissionManager', () => {
       mockIsPackaged.mockReturnValueOnce(false);
       // Deliberately return 'denied' from the OS to prove we don't ask:
       mockGetNotificationSettings.mockReturnValueOnce({ authorizationStatus: 'denied' });
-      expect(checkPermission('notifications')).toBe('granted');
+      expect(await checkPermission('notifications')).toBe('granted');
     });
 
-    it('notifications: falls through to macOS check in packaged mode', () => {
+    it('notifications: falls through to macOS check in packaged mode', async () => {
       // Sanity check the opposite branch: when packaged, we DO call the
       // real macOS API and respect its answer.
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockIsSupported.mockReturnValue(true);
       mockIsPackaged.mockReturnValueOnce(true);
       mockGetNotificationSettings.mockReturnValueOnce({ authorizationStatus: 'denied' });
-      expect(checkPermission('notifications')).toBe('denied');
+      expect(await checkPermission('notifications')).toBe('denied');
     });
 
-    it('unknown type: unavailable', () => {
-      expect(checkPermission('unknown' as OsPermissionType)).toBe('unavailable');
+    it('unknown type: unavailable', async () => {
+      expect(await checkPermission('unknown' as OsPermissionType)).toBe('unavailable');
     });
   });
 
   describe('checkAllPermissions', () => {
-    it('returns all permission types', () => {
+    it('returns all permission types', async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
       mockGetMediaAccessStatus.mockReturnValue('granted');
       mockIsSupported.mockReturnValue(true);
       mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'authorized' });
-      const result = checkAllPermissions();
+      const result = await checkAllPermissions();
       // Assert the VALUES, not just the keys. Presence-only assertions passed
       // whatever this fixture said: before the *Once drain landed, `notifications`
       // read 'denied' off a value leaked from the dev-mode case two tests above,
@@ -320,7 +322,7 @@ describe('permissionManager', () => {
     });
 
     it('secureStorage: returns check result', async () => {
-      mockIsEncryptionAvailable.mockReturnValue(true);
+      mockSecureStorageAvailable.mockReturnValue(true);
       expect(await requestPermission('secureStorage')).toBe('granted');
     });
 
@@ -402,14 +404,14 @@ describe('permissionManager', () => {
       expect(() => handler(trustedIpcEvent, 'invalid')).toThrow('Unknown permission type');
     });
 
-    it('check handler returns status', () => {
+    it('check handler returns status', async () => {
       registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:check'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      mockIsEncryptionAvailable.mockReturnValue(true);
-      expect(handler(trustedIpcEvent, 'secureStorage')).toBe('granted');
+      mockSecureStorageAvailable.mockReturnValue(true);
+      expect(await handler(trustedIpcEvent, 'secureStorage')).toBe('granted');
     });
 
     it('request handler notifies renderer', async () => {
@@ -419,7 +421,7 @@ describe('permissionManager', () => {
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      mockIsEncryptionAvailable.mockReturnValue(true);
+      mockSecureStorageAvailable.mockReturnValue(true);
       await handler(trustedIpcEvent, 'secureStorage');
       expect(mockSend).toHaveBeenCalledWith('permission:changed', {
         type: 'secureStorage',
@@ -434,7 +436,7 @@ describe('permissionManager', () => {
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      mockIsEncryptionAvailable.mockReturnValue(true);
+      mockSecureStorageAvailable.mockReturnValue(true);
       await handler(trustedIpcEvent, 'secureStorage');
       expect(mockSend).not.toHaveBeenCalled();
     });
@@ -445,7 +447,7 @@ describe('permissionManager', () => {
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      mockIsEncryptionAvailable.mockReturnValue(true);
+      mockSecureStorageAvailable.mockReturnValue(true);
       await handler(trustedIpcEvent, 'secureStorage');
       expect(mockSend).not.toHaveBeenCalled();
     });

@@ -10,7 +10,7 @@ import type { IpcMainInvokeEvent } from 'electron';
 const {
   mockGetMediaAccessStatus,
   mockAskForMediaAccess,
-  mockIsEncryptionAvailable,
+  mockSecureStorageAvailable,
   mockIsSupported,
   mockOpenExternal,
   mockGetNotificationSettings,
@@ -20,7 +20,7 @@ const {
 } = vi.hoisted(() => ({
   mockGetMediaAccessStatus: vi.fn(),
   mockAskForMediaAccess: vi.fn(),
-  mockIsEncryptionAvailable: vi.fn(() => true),
+  mockSecureStorageAvailable: vi.fn(() => true),
   mockIsSupported: vi.fn(() => true),
   mockOpenExternal: vi.fn(),
   mockGetNotificationSettings: vi.fn(() => ({ authorizationStatus: 'authorized' })),
@@ -43,7 +43,6 @@ vi.mock('electron', () => {
     BrowserWindow: vi.fn(),
     ipcMain: { handle: mockIpcMainHandle },
     Notification: MockNotification,
-    safeStorage: { isEncryptionAvailable: mockIsEncryptionAvailable },
     shell: { openExternal: mockOpenExternal },
     systemPreferences: {
       getMediaAccessStatus: mockGetMediaAccessStatus,
@@ -52,6 +51,11 @@ vi.mock('electron', () => {
     },
   };
 });
+
+// permissionManager only maps the gate's boolean; secureStorage.test.ts covers the gate.
+vi.mock('@/main/secureStorage', () => ({
+  isSecureStorageAvailable: async () => mockSecureStorageAvailable(),
+}));
 
 import {
   checkPermission,
@@ -81,7 +85,7 @@ function setPlatform(platform: string) {
 describe('permissionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockIsEncryptionAvailable.mockReturnValue(true);
+    mockSecureStorageAvailable.mockReturnValue(true);
     mockIsSupported.mockReturnValue(true);
     mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'authorized' });
     mockApp.isPackaged = true;
@@ -95,156 +99,156 @@ describe('permissionManager', () => {
 
   describe('checkPermission', () => {
     describe('microphone', () => {
-      it('returns macOS media access status on darwin', () => {
+      it('returns macOS media access status on darwin', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('granted');
-        expect(checkPermission('microphone')).toBe('granted');
+        expect(await checkPermission('microphone')).toBe('granted');
         expect(mockGetMediaAccessStatus).toHaveBeenCalledWith('microphone');
       });
 
-      it('returns denied on darwin when denied', () => {
+      it('returns denied on darwin when denied', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('denied');
-        expect(checkPermission('microphone')).toBe('denied');
+        expect(await checkPermission('microphone')).toBe('denied');
       });
 
-      it('returns not-determined on darwin', () => {
+      it('returns not-determined on darwin', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('not-determined');
-        expect(checkPermission('microphone')).toBe('not-determined');
+        expect(await checkPermission('microphone')).toBe('not-determined');
       });
 
-      it('returns restricted on darwin', () => {
+      it('returns restricted on darwin', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('restricted');
-        expect(checkPermission('microphone')).toBe('restricted');
+        expect(await checkPermission('microphone')).toBe('restricted');
       });
 
-      it('maps unknown status to unavailable on darwin', () => {
+      it('maps unknown status to unavailable on darwin', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('unknown');
-        expect(checkPermission('microphone')).toBe('unavailable');
+        expect(await checkPermission('microphone')).toBe('unavailable');
       });
 
-      it('returns granted on win32', () => {
+      it('returns granted on win32', async () => {
         setPlatform('win32');
-        expect(checkPermission('microphone')).toBe('granted');
+        expect(await checkPermission('microphone')).toBe('granted');
         expect(mockGetMediaAccessStatus).not.toHaveBeenCalled();
       });
 
-      it('returns granted on linux', () => {
+      it('returns granted on linux', async () => {
         setPlatform('linux');
-        expect(checkPermission('microphone')).toBe('granted');
+        expect(await checkPermission('microphone')).toBe('granted');
       });
     });
 
     describe('camera', () => {
-      it('returns macOS media access status on darwin', () => {
+      it('returns macOS media access status on darwin', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('granted');
-        expect(checkPermission('camera')).toBe('granted');
+        expect(await checkPermission('camera')).toBe('granted');
         expect(mockGetMediaAccessStatus).toHaveBeenCalledWith('camera');
       });
 
-      it('returns granted on win32', () => {
+      it('returns granted on win32', async () => {
         setPlatform('win32');
-        expect(checkPermission('camera')).toBe('granted');
+        expect(await checkPermission('camera')).toBe('granted');
       });
     });
 
     describe('screen', () => {
-      it('returns macOS media access status on darwin', () => {
+      it('returns macOS media access status on darwin', async () => {
         setPlatform('darwin');
         mockGetMediaAccessStatus.mockReturnValue('denied');
-        expect(checkPermission('screen')).toBe('denied');
+        expect(await checkPermission('screen')).toBe('denied');
         expect(mockGetMediaAccessStatus).toHaveBeenCalledWith('screen');
       });
 
-      it('returns granted on win32', () => {
+      it('returns granted on win32', async () => {
         setPlatform('win32');
-        expect(checkPermission('screen')).toBe('granted');
+        expect(await checkPermission('screen')).toBe('granted');
       });
 
-      it('returns granted on linux', () => {
+      it('returns granted on linux', async () => {
         setPlatform('linux');
-        expect(checkPermission('screen')).toBe('granted');
+        expect(await checkPermission('screen')).toBe('granted');
       });
     });
 
     describe('secureStorage', () => {
-      it('returns granted when encryption is available', () => {
-        mockIsEncryptionAvailable.mockReturnValue(true);
-        expect(checkPermission('secureStorage')).toBe('granted');
+      it('returns granted when encryption is available', async () => {
+        mockSecureStorageAvailable.mockReturnValue(true);
+        expect(await checkPermission('secureStorage')).toBe('granted');
       });
 
-      it('returns unavailable when encryption is not available', () => {
-        mockIsEncryptionAvailable.mockReturnValue(false);
-        expect(checkPermission('secureStorage')).toBe('unavailable');
+      it('returns unavailable when encryption is not available', async () => {
+        mockSecureStorageAvailable.mockReturnValue(false);
+        expect(await checkPermission('secureStorage')).toBe('unavailable');
       });
     });
 
     describe('notifications', () => {
-      it('returns unavailable when Notification is not supported', () => {
+      it('returns unavailable when Notification is not supported', async () => {
         mockIsSupported.mockReturnValue(false);
-        expect(checkPermission('notifications')).toBe('unavailable');
+        expect(await checkPermission('notifications')).toBe('unavailable');
       });
 
-      it('returns granted on darwin when authorized', () => {
+      it('returns granted on darwin when authorized', async () => {
         setPlatform('darwin');
         mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'authorized' });
-        expect(checkPermission('notifications')).toBe('granted');
+        expect(await checkPermission('notifications')).toBe('granted');
       });
 
-      it('returns denied on darwin when denied', () => {
+      it('returns denied on darwin when denied', async () => {
         setPlatform('darwin');
         mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'denied' });
-        expect(checkPermission('notifications')).toBe('denied');
+        expect(await checkPermission('notifications')).toBe('denied');
       });
 
-      it('returns granted on darwin when provisional', () => {
+      it('returns granted on darwin when provisional', async () => {
         setPlatform('darwin');
         mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'provisional' });
-        expect(checkPermission('notifications')).toBe('granted');
+        expect(await checkPermission('notifications')).toBe('granted');
       });
 
-      it('returns not-determined on darwin when not-determined', () => {
+      it('returns not-determined on darwin when not-determined', async () => {
         setPlatform('darwin');
         mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'not-determined' });
-        expect(checkPermission('notifications')).toBe('not-determined');
+        expect(await checkPermission('notifications')).toBe('not-determined');
       });
 
-      it('returns not-determined on darwin with unknown authorizationStatus', () => {
+      it('returns not-determined on darwin with unknown authorizationStatus', async () => {
         setPlatform('darwin');
         mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'something-else' });
-        expect(checkPermission('notifications')).toBe('not-determined');
+        expect(await checkPermission('notifications')).toBe('not-determined');
       });
 
-      it('returns granted on win32 when notifications are supported', () => {
+      it('returns granted on win32 when notifications are supported', async () => {
         setPlatform('win32');
-        expect(checkPermission('notifications')).toBe('granted');
+        expect(await checkPermission('notifications')).toBe('granted');
       });
 
-      it('returns granted on linux when notifications are supported', () => {
+      it('returns granted on linux when notifications are supported', async () => {
         setPlatform('linux');
-        expect(checkPermission('notifications')).toBe('granted');
+        expect(await checkPermission('notifications')).toBe('granted');
       });
     });
 
-    it('returns unavailable for unknown permission type', () => {
+    it('returns unavailable for unknown permission type', async () => {
       // Force an unknown type to test the fallback
-      expect(checkPermission('unknown' as never)).toBe('unavailable');
+      expect(await checkPermission('unknown' as never)).toBe('unavailable');
     });
   });
 
   // ─── checkAllPermissions ──────────────────────────────────────────
 
   describe('checkAllPermissions', () => {
-    it('returns status for all 5 permission types', () => {
+    it('returns status for all 5 permission types', async () => {
       setPlatform('win32');
-      mockIsEncryptionAvailable.mockReturnValue(true);
+      mockSecureStorageAvailable.mockReturnValue(true);
       mockIsSupported.mockReturnValue(true);
 
-      const result = checkAllPermissions();
+      const result = await checkAllPermissions();
 
       expect(result).toEqual({
         microphone: 'granted',
@@ -255,17 +259,17 @@ describe('permissionManager', () => {
       });
     });
 
-    it('reflects individual permission states', () => {
+    it('reflects individual permission states', async () => {
       setPlatform('darwin');
       mockGetMediaAccessStatus.mockImplementation((type: string) => {
         if (type === 'microphone') return 'denied';
         if (type === 'camera') return 'not-determined';
         return 'granted';
       });
-      mockIsEncryptionAvailable.mockReturnValue(false);
+      mockSecureStorageAvailable.mockReturnValue(false);
       mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'denied' });
 
-      const result = checkAllPermissions();
+      const result = await checkAllPermissions();
 
       expect(result.microphone).toBe('denied');
       expect(result.camera).toBe('not-determined');
@@ -384,13 +388,13 @@ describe('permissionManager', () => {
 
     describe('secureStorage', () => {
       it('returns granted when encryption is available', async () => {
-        mockIsEncryptionAvailable.mockReturnValue(true);
+        mockSecureStorageAvailable.mockReturnValue(true);
         const result = await requestPermission('secureStorage');
         expect(result).toBe('granted');
       });
 
       it('returns unavailable when encryption is not available', async () => {
-        mockIsEncryptionAvailable.mockReturnValue(false);
+        mockSecureStorageAvailable.mockReturnValue(false);
         const result = await requestPermission('secureStorage');
         expect(result).toBe('unavailable');
       });
@@ -519,7 +523,7 @@ describe('permissionManager', () => {
       const electron = await import('electron');
       const sp = electron.systemPreferences as Record<string, unknown>;
       sp.getNotificationSettings = undefined;
-      const result = checkPermission('notifications');
+      const result = await checkPermission('notifications');
       expect(result).toBe('not-determined');
       sp.getNotificationSettings = original;
     });
@@ -587,9 +591,9 @@ describe('permissionManager', () => {
         expect(mockWindow.webContents.send).not.toHaveBeenCalled();
       });
 
-      it('permission:checkAll returns all permissions', () => {
+      it('permission:checkAll returns all permissions', async () => {
         setPlatform('win32');
-        const result = handlers['permission:checkAll'](trustedIpcEvent);
+        const result = await handlers['permission:checkAll'](trustedIpcEvent);
         expect(result).toHaveProperty('microphone');
         expect(result).toHaveProperty('camera');
         expect(result).toHaveProperty('screen');
@@ -597,9 +601,9 @@ describe('permissionManager', () => {
         expect(result).toHaveProperty('notifications');
       });
 
-      it('permission:check returns status for valid type', () => {
+      it('permission:check returns status for valid type', async () => {
         setPlatform('win32');
-        const result = handlers['permission:check'](trustedIpcEvent, 'microphone');
+        const result = await handlers['permission:check'](trustedIpcEvent, 'microphone');
         expect(result).toBe('granted');
       });
 

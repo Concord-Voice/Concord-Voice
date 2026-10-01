@@ -2568,6 +2568,17 @@ function isValidApiBase(value: unknown): value is string {
   }
 }
 
+// Caps on credential IPC fields, matching ipc/sso.ts. They bound what each
+// queued tokenManager disk write can hold: a refresh token is 44 characters,
+// a symmetric key 44, a wrapped RSA-4096 key about 3.2 KB.
+const MAX_TOKEN_LENGTH = 8192;
+const MAX_SYMMETRIC_KEY_LENGTH = 1024;
+const MAX_WRAPPED_KEY_LENGTH = 16_384;
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength;
+}
+
 function isStoreRefreshTokenPayload(data: unknown): data is {
   refreshToken: string;
   rememberMe: boolean;
@@ -2576,10 +2587,11 @@ function isStoreRefreshTokenPayload(data: unknown): data is {
 } {
   return (
     isRecord(data) &&
-    isNonEmptyString(data.refreshToken) &&
+    isBoundedString(data.refreshToken, MAX_TOKEN_LENGTH) &&
     typeof data.rememberMe === 'boolean' &&
     isValidApiBase(data.apiBase) &&
-    (data.accessToken === undefined || typeof data.accessToken === 'string')
+    (data.accessToken === undefined ||
+      (typeof data.accessToken === 'string' && data.accessToken.length <= MAX_TOKEN_LENGTH))
   );
 }
 
@@ -2590,9 +2602,9 @@ function isStoreE2EEKeysPayload(data: unknown): data is {
 } {
   return (
     isRecord(data) &&
-    isNonEmptyString(data.wrappingKeyBase64) &&
-    isNonEmptyString(data.preferencesKeyBase64) &&
-    isNonEmptyString(data.wrappedPrivateKeyBase64)
+    isBoundedString(data.wrappingKeyBase64, MAX_SYMMETRIC_KEY_LENGTH) &&
+    isBoundedString(data.preferencesKeyBase64, MAX_SYMMETRIC_KEY_LENGTH) &&
+    isBoundedString(data.wrappedPrivateKeyBase64, MAX_WRAPPED_KEY_LENGTH)
   );
 }
 
@@ -2614,7 +2626,7 @@ ipcMain.handle('auth:restoreSession', (event) => {
   if (restoreSessionPromise) return restoreSessionPromise;
 
   restoreSessionPromise = (async () => {
-    const restored = restoreRefreshToken();
+    const restored = await restoreRefreshToken();
     if (restored.status !== 'ok') {
       return { status: restored.status };
     }
@@ -2647,9 +2659,10 @@ ipcMain.handle('auth:restoreSession', (event) => {
       if (ownerCheck.credentialOwner !== restoreOwner) {
         return { status: 'refresh_failed' };
       }
-      // Also restore E2EE keys if available. No await follows the owner check,
-      // so main-process state cannot interleave before this result is built.
-      const e2eeKeys = restoreE2EEKeys();
+      // Also restore E2EE keys if available. The restore awaits a decrypt, so a
+      // login can land inside it: the owner re-check after it is what keeps
+      // these keys paired with the access token above.
+      const e2eeKeys = await restoreE2EEKeys();
       const custody = getCredentialCustodyState();
       if (custody.credentialOwner !== restoreOwner) {
         return { status: 'refresh_failed' };

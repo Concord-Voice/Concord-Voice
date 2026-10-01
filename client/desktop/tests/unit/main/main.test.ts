@@ -245,7 +245,9 @@ vi.mock('electron-squirrel-startup', () => ({ default: false }));
 
 vi.mock('../../../src/main/tokenManager', () => ({
   storeRefreshToken: vi.fn(() => 41),
-  restoreRefreshToken: vi.fn(() => ({
+  // Async like the real functions: a sync mock would let main.ts drop its
+  // `await` and still pass, since awaiting a plain value changes nothing.
+  restoreRefreshToken: vi.fn(async () => ({
     status: 'ok',
     token: 'mock-token',
     apiBase: 'http://localhost:8080',
@@ -260,7 +262,7 @@ vi.mock('../../../src/main/tokenManager', () => ({
   getCapabilities: vi.fn(() => ({ safeStorage: true, secureKeychain: true })),
   storeE2EEKeys: vi.fn(),
   storeE2EEKeysIfOwner: vi.fn((_data: unknown, owner: number) => owner === 41),
-  restoreE2EEKeys: vi.fn(() => ({
+  restoreE2EEKeys: vi.fn(async () => ({
     wrappingKeyBase64: 'key',
     preferencesKeyBase64: 'pkey',
     wrappedPrivateKeyBase64: 'wpk',
@@ -1209,6 +1211,38 @@ describe('main.ts', () => {
       expect(setUpdateFeedUrl).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['an oversized refresh token', { refreshToken: 'r'.repeat(8193) }],
+      ['an oversized access token', { refreshToken: 'tok', accessToken: 'a'.repeat(8193) }],
+    ])('auth:storeRefreshToken rejects %s', async (_label, fields) => {
+      const { storeRefreshToken } = await import('../../../src/main/tokenManager');
+      (storeRefreshToken as Mock).mockClear();
+
+      const result = await handlers.get('auth:storeRefreshToken')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        { rememberMe: true, apiBase: 'https://api.concordvoice.chat', ...fields }
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeRefreshToken).not.toHaveBeenCalled();
+    });
+
+    it('auth:storeRefreshToken accepts a token at the size cap', async () => {
+      const { storeRefreshToken } = await import('../../../src/main/tokenManager');
+      (storeRefreshToken as Mock).mockClear();
+
+      await handlers.get('auth:storeRefreshToken')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        {
+          refreshToken: 'r'.repeat(8192),
+          rememberMe: true,
+          apiBase: 'https://api.concordvoice.chat',
+        }
+      );
+
+      expect(storeRefreshToken).toHaveBeenCalledTimes(1);
+    });
+
     it('auth:storeRefreshToken rejects unvalidated non-SaaS apiBase values in packaged builds (#1872)', async () => {
       const { storeRefreshToken } = await import('../../../src/main/tokenManager');
       const { setUpdateFeedUrl } = await import('../../../src/main/updater');
@@ -1295,7 +1329,7 @@ describe('main.ts', () => {
     it('auth:restoreSession reports owner-bound E2EE custody as pending', async () => {
       const { getCredentialCustodyState, restoreE2EEKeys } =
         await import('../../../src/main/tokenManager');
-      (restoreE2EEKeys as Mock).mockReturnValueOnce(null);
+      (restoreE2EEKeys as Mock).mockResolvedValueOnce(null);
       (getCredentialCustodyState as Mock)
         .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
         .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
@@ -1330,9 +1364,42 @@ describe('main.ts', () => {
       expect(restoreE2EEKeys).not.toHaveBeenCalled();
     });
 
+    it('auth:restoreSession refuses keys when a login lands during the key restore', async () => {
+      const { getCredentialCustodyState, restoreE2EEKeys } =
+        await import('../../../src/main/tokenManager');
+      (restoreE2EEKeys as Mock).mockClear();
+      // Owner read at restore, re-checked after the refresh, then after the
+      // restoreE2EEKeys await: a login inside that await changes the third read.
+      (getCredentialCustodyState as Mock)
+        .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
+        .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
+        .mockReturnValueOnce({ credentialOwner: 42, pendingE2EEUnlock: false });
+
+      const result = await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+
+      expect(restoreE2EEKeys).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ status: 'refresh_failed' });
+    });
+
+    it('auth:restoreSession stops at a tampered token without refreshing', async () => {
+      const { restoreRefreshToken, performRefresh } =
+        await import('../../../src/main/tokenManager');
+      (performRefresh as Mock).mockClear();
+      (restoreRefreshToken as Mock).mockResolvedValueOnce({ status: 'tampered' });
+
+      const result = await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+
+      expect(result).toEqual({ status: 'tampered' });
+      expect(performRefresh).not.toHaveBeenCalled();
+    });
+
     it('auth:restoreSession returns rememberMe=false for memory-only sessions', async () => {
       const { restoreRefreshToken } = await import('../../../src/main/tokenManager');
-      (restoreRefreshToken as Mock).mockReturnValueOnce({
+      (restoreRefreshToken as Mock).mockResolvedValueOnce({
         status: 'ok',
         token: 'memory-token',
         apiBase: 'http://localhost:8080',
@@ -1425,6 +1492,47 @@ describe('main.ts', () => {
 
       expect(result).toBe(true);
       expect(storeE2EEKeysIfOwner).toHaveBeenCalledWith(data, 41);
+    });
+
+    it.each([
+      ['wrappingKeyBase64', 1025],
+      ['preferencesKeyBase64', 1025],
+      ['wrappedPrivateKeyBase64', 16_385],
+    ])('auth:storeE2EEKeysIfOwner rejects an oversized %s', async (field, length) => {
+      const { storeE2EEKeysIfOwner } = await import('../../../src/main/tokenManager');
+      (storeE2EEKeysIfOwner as Mock).mockClear();
+      const data = {
+        wrappingKeyBase64: 'a',
+        preferencesKeyBase64: 'b',
+        wrappedPrivateKeyBase64: 'c',
+        [field]: 'k'.repeat(length),
+      };
+
+      const result = await handlers.get('auth:storeE2EEKeysIfOwner')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        data,
+        41
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('auth:storeE2EEKeysIfOwner accepts keys at the size caps', async () => {
+      const { storeE2EEKeysIfOwner } = await import('../../../src/main/tokenManager');
+      (storeE2EEKeysIfOwner as Mock).mockClear();
+
+      await handlers.get('auth:storeE2EEKeysIfOwner')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        {
+          wrappingKeyBase64: 'k'.repeat(1024),
+          preferencesKeyBase64: 'k'.repeat(1024),
+          wrappedPrivateKeyBase64: 'k'.repeat(16_384),
+        },
+        41
+      );
+
+      expect(storeE2EEKeysIfOwner).toHaveBeenCalledTimes(1);
     });
 
     it('auth:storeE2EEKeysIfOwner rejects invalid owners', async () => {

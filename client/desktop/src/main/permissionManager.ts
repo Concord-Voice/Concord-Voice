@@ -11,16 +11,9 @@
  * - Push events (permission:changed) notify the renderer of status changes
  */
 
-import {
-  app,
-  BrowserWindow,
-  ipcMain,
-  Notification,
-  safeStorage,
-  shell,
-  systemPreferences,
-} from 'electron';
+import { app, BrowserWindow, ipcMain, Notification, shell, systemPreferences } from 'electron';
 import { requireTrustedSender } from './ipc/frameValidation';
+import { isSecureStorageAvailable } from './secureStorage';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -94,11 +87,15 @@ function checkMacMediaOrGranted(mediaType: 'microphone' | 'camera' | 'screen'): 
   return 'granted';
 }
 
-const PERMISSION_CHECKERS: Record<OsPermissionType, () => OsPermissionStatus> = {
+const PERMISSION_CHECKERS: Record<
+  OsPermissionType,
+  () => OsPermissionStatus | Promise<OsPermissionStatus>
+> = {
   microphone: () => checkMacMediaOrGranted('microphone'),
   camera: () => checkMacMediaOrGranted('camera'),
   screen: () => checkMacMediaOrGranted('screen'),
-  secureStorage: () => (safeStorage.isEncryptionAvailable() ? 'granted' : 'unavailable'),
+  // 'unavailable' also covers Linux's hardcoded-key fallback (see secureStorage.ts).
+  secureStorage: async () => ((await isSecureStorageAvailable()) ? 'granted' : 'unavailable'),
   notifications: () => {
     if (!Notification.isSupported()) return 'unavailable';
     // In dev mode, the Electron binary isn't a registered notification
@@ -112,15 +109,15 @@ const PERMISSION_CHECKERS: Record<OsPermissionType, () => OsPermissionStatus> = 
   },
 };
 
-export function checkPermission(type: OsPermissionType): OsPermissionStatus {
+export async function checkPermission(type: OsPermissionType): Promise<OsPermissionStatus> {
   const checker = PERMISSION_CHECKERS[type];
   return checker ? checker() : 'unavailable';
 }
 
-export function checkAllPermissions(): OsPermissionState {
+export async function checkAllPermissions(): Promise<OsPermissionState> {
   const state = {} as OsPermissionState;
   for (const type of PERMISSION_TYPES) {
-    state[type] = checkPermission(type);
+    state[type] = await checkPermission(type);
   }
   return state;
 }
