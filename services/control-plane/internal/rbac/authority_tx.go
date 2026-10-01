@@ -158,9 +158,9 @@ func (h *Handler) withAuthorityCapture(
 	onlyUserID *string,
 	write func(context.Context, *sql.Tx) error,
 	principalIDs ...string,
-) (PresenceRecheckPlan, error) {
+) (plan PresenceRecheckPlan, err error) {
 	// PHASE 1 - pre-transaction, outside the advisory lock.
-	plan, err := h.preparePresenceCapture(ctx, serverID, channelIDs, onlyUserID)
+	plan, err = h.preparePresenceCapture(ctx, serverID, channelIDs, onlyUserID)
 	if err != nil {
 		// The capture fan-out bound is a DETERMINISTIC, configuration-reachable
 		// failure, not a transient one: a server whose active voice channel count
@@ -195,11 +195,8 @@ func (h *Handler) withAuthorityCapture(
 	if err != nil {
 		return nil, fmt.Errorf("begin authority transaction: %w", err)
 	}
-	defer func() {
-		// discard: Rollback is a no-op after a successful Commit and there is no
-		// recovery available on the failure paths, which already return an error.
-		_ = tx.Rollback()
-	}()
+	// See discardOutcome. Every error return below already returns a nil plan.
+	defer func() { err = discardOutcome(tx.Rollback(), "authority transaction", err) }()
 
 	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return nil, err
@@ -213,12 +210,23 @@ func (h *Handler) withAuthorityCapture(
 	// assigned_by FKs, while CaptureVisibility itself deliberately takes no user
 	// lock; lock every supplied actor/FK principal in one canonical query first.
 	if err := LockAuthorityPrincipalsTx(ctx, tx, principalIDs); err != nil {
-		return nil, err
+		return nil, principalLockError(ctx, tx, serverID, err)
 	}
 	// This parent fence serializes CreateChannel's server FK lock. It must be
 	// taken before the capture's domain reads, after all user/FK principals.
+	//
+	// Nothing above holds the servers row, so a server deleted after this
+	// request was admitted — by DeleteServer, or by the owner's erasure through
+	// servers.owner_id's ON DELETE CASCADE — reaches this lock with no row. The
+	// actor is not a member of a server that no longer exists: ErrNotMember, the
+	// denial every caller already maps (see ownerReadError). ONLY sql.ErrNoRows
+	// is reclassified; any other error is a real fault and stays one.
 	var lockedServerID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&lockedServerID); err != nil {
+	err = tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&lockedServerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotMember
+	}
+	if err != nil {
 		return nil, fmt.Errorf("lock authority server parent: %w", err)
 	}
 	// PHASE 2 - under the advisory and parent fences, before the write.
@@ -237,6 +245,85 @@ func (h *Handler) withAuthorityCapture(
 		return nil, fmt.Errorf("%w: %v", errAmbiguousAuthorityCommit, err)
 	}
 	return plan, nil
+}
+
+// GuardActorGoneWithServer reports whether a credepoch.GuardTx failure is the
+// acting user's row gone together with the server. An owner's erasure deletes
+// both, through servers.owner_id's ON DELETE CASCADE, so an owner acting
+// mid-erasure fails the guard's users read before any servers lock can see the
+// server is gone; the caller then gives its own vanished-server answer. Only a
+// missing row is considered, and only once the server is confirmed absent: a
+// missing actor on a server that still exists reports false and stays the
+// caller's fault. A failed server read is returned as the error, never folded
+// into false, so the cause of the failed authorization read reaches the
+// caller's log (#3508).
+func GuardActorGoneWithServer(ctx context.Context, tx *sql.Tx, serverID string, guardErr error) (bool, error) {
+	if !errors.Is(guardErr, sql.ErrNoRows) {
+		return false, nil
+	}
+	gone, err := serverGoneTx(ctx, tx, serverID)
+	if err != nil {
+		return false, fmt.Errorf("confirm server after a missing epoch-guard row: %w", err)
+	}
+	return gone, nil
+}
+
+// serverGoneTx reports whether the servers row is absent, read in the caller's
+// transaction. An error is the caller's fault to report: it confirms nothing.
+func serverGoneTx(ctx context.Context, tx *sql.Tx, serverID string) (bool, error) {
+	var exists bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)`, serverID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return !exists, nil
+}
+
+// discardOutcome folds a deferred Rollback's result into a transaction's
+// outcome. A failed discard replaces the work's own outcome, as it does for
+// every gated graph mutation (graphpresence.runInTx): the work's error survives
+// only as quoted text, so a denial sentinel such as ErrNotMember cannot match,
+// and a refusal after an unresolved rollback is reported as the fault it is.
+// ErrTxDone is what Rollback returns after any Commit, successful or not, so a
+// committed transaction's outcome — including an ambiguous-commit error — is
+// never replaced.
+func discardOutcome(rbErr error, what string, err error) error {
+	if rbErr == nil || errors.Is(rbErr, sql.ErrTxDone) {
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("discard %s after %q: %w", what, err.Error(), rbErr)
+	}
+	return fmt.Errorf("discard %s: %w", what, rbErr)
+}
+
+// errAuthorityPrincipalGone is LockAuthorityPrincipalsTx's answer when a
+// principal's users row no longer exists.
+var errAuthorityPrincipalGone = errors.New("authority principal no longer exists")
+
+// principalLockError keeps a vanished server's answer when the principal lock
+// comes up short. An owner's erasure deletes their users row and, through
+// servers.owner_id's ON DELETE CASCADE, the server, so an owner acting
+// mid-erasure finds their own row gone at the principal lock, before the parent
+// lock below can see the server is. That lock answers ErrNotMember for a missing
+// server, so this does too once the server is confirmed gone. A principal
+// missing from a server that still exists stays a fault, and so does a failed
+// read.
+func principalLockError(ctx context.Context, tx *sql.Tx, serverID string, err error) error {
+	if !errors.Is(err, errAuthorityPrincipalGone) {
+		return err
+	}
+	var exists bool
+	if probeErr := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)`, serverID,
+	).Scan(&exists); probeErr != nil {
+		return fmt.Errorf("check authority server after principal lock: %w", probeErr)
+	}
+	if !exists {
+		return ErrNotMember
+	}
+	return err
 }
 
 func splitAuthorityLifecyclePrincipals(principalIDs []string) ([]string, []string) {
@@ -321,7 +408,7 @@ func LockAuthorityPrincipalsTx(ctx context.Context, tx *sql.Tx, principalIDs []s
 		return fmt.Errorf("iterate authority principals: %w", err)
 	}
 	if count != len(ids) {
-		return errors.New("authority principal no longer exists")
+		return errAuthorityPrincipalGone
 	}
 	return nil
 }

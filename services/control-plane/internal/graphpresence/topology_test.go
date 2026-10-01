@@ -372,6 +372,37 @@ func TestWithGatedTxFailsClosedWhenTheDiscardingRollbackFails(t *testing.T) {
 	assert.ErrorIs(t, err, rollbackErr)
 }
 
+// Codex on #3508: runInTx joined a failed discard INTO work's error, so a
+// denial sentinel work returned still matched errors.Is. AddMember's
+// errServerGone then answered a clean 403, and the moderation classifiers
+// their 403s and 404s, over a transaction whose discard had failed. A failed
+// discard leaves the mutation's fate unknown whatever work said, so it must not
+// read as work's own outcome; work's text stays in the error for the log.
+func TestWithGatedTxFailedDiscardOverridesWorksOwnOutcome(t *testing.T) {
+	denied := errors.New("work's own denial")
+	run := func(rollbackErr error) error {
+		trace := &callTrace{}
+		reconciler := &Reconciler{
+			db:   openTracedDB(t, gatedTxConnector{trace: trace, rollbackErr: rollbackErr}),
+			rail: &railStub{trace: trace},
+		}
+		return reconciler.WithGatedTx(
+			context.Background(), removeSubject(uuid.New(), uuid.New()),
+			func(*sql.Tx) error { return denied },
+		)
+	}
+
+	rollbackErr := errors.New("connection already closed")
+	err := run(rollbackErr)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, rollbackErr, "the discard failure is reported")
+	assert.NotErrorIs(t, err, denied, "work's denial must not survive a failed discard")
+	assert.Contains(t, err.Error(), denied.Error(), "work's outcome stays in the text")
+
+	// Control: a discard that succeeds returns work's outcome as it was.
+	assert.ErrorIs(t, run(nil), denied)
+}
+
 // An unwired replica keeps the pre-PR-2 behaviour: a plain transaction, no gate.
 func TestWithGatedTxRunsWithoutGatesWhenTheRailIsUnwired(t *testing.T) {
 	trace := &callTrace{}

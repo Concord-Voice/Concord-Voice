@@ -520,7 +520,7 @@ func TestUnwiredHandlerBehavesAsBefore(t *testing.T) {
 
 	tx, err := env.DB.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin")
-	defer presencehook.RollbackUnlessDone(tx, logger.New("test"))
+	defer func() { _ = presencehook.DiscardOutcome(tx.Rollback(), logger.New("test"), nil) }()
 
 	plan, err := presencehook.Capture(ctx, capture, tx, presencehook.Spec{
 		Family:        presencecapture.FamilyFriendshipRemove,

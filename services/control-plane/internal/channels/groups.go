@@ -26,6 +26,8 @@ const (
 	errInsufficientPerms        = "insufficient permissions"
 	errFailedCreateGroup        = "Failed to create channel group"
 	errFailedUpdateGroup        = "Failed to update channel group"
+	logMsgGroupRollbackFailed   = "Failed to rollback channel group transaction"
+	errChannelGroupNotFound     = "Channel group not found"
 	errFailedDeleteGroup        = "Failed to delete channel group"
 	errFailedReorderChannels    = "Failed to reorder channels"
 	errTemporaryOverrideManaged = "Temporary move access is system-managed"
@@ -389,46 +391,11 @@ func (h *Handler) CreateChannelGroup(c *gin.Context) {
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			h.log.Error("Failed to rollback channel group transaction", "operation", "create", "error", rollbackErr)
+			h.log.Error(logMsgGroupRollbackFailed, "operation", "create", "error", rollbackErr)
 		}
 	}()
-	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, serverID); err != nil {
-		h.log.Error("Lock channel group create visibility", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateGroup})
-		return
-	}
-	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
-		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateGroup})
-		}
-		return
-	}
-	var lockedServer string
-	switch err := tx.QueryRowContext(c.Request.Context(), `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&lockedServer); {
-	case errors.Is(err, sql.ErrNoRows):
-		c.JSON(http.StatusNotFound, gin.H{"error": "Server not found"})
-		return
-	case err != nil:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateGroup})
-		return
-	}
-	switch err := tx.QueryRowContext(c.Request.Context(), `SELECT user_id FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, serverID, userID).Scan(new(string)); {
-	case errors.Is(err, sql.ErrNoRows):
-		c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
-		return
-	case err != nil:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateGroup})
-		return
-	}
-	perms, err := h.resolver.ResolveServerPermissionsTx(c.Request.Context(), tx, serverID, userID)
-	if err != nil || !perms.Has(rbac.PermManageChannels) {
-		if errors.Is(err, rbac.ErrNotMember) || err == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateGroup})
-		}
+	if r := h.authorizeChannelGroupCreateTx(c, tx, serverID, userID); r != nil {
+		h.refuseAfterRollback(c, tx, r, errFailedCreateGroup, "create")
 		return
 	}
 	var maxPos int
@@ -481,7 +448,7 @@ func (h *Handler) UpdateChannelGroup(c *gin.Context) {
 	var serverID string
 	err := h.db.QueryRow(`SELECT server_id FROM channel_groups WHERE id = $1`, groupID).Scan(&serverID)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Channel group not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errChannelGroupNotFound})
 		return
 	} else if err != nil {
 		h.log.Error("Failed to fetch group", "error", err)
@@ -497,10 +464,11 @@ func (h *Handler) UpdateChannelGroup(c *gin.Context) {
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			h.log.Error("Failed to rollback channel group transaction", "operation", "update", "error", rollbackErr)
+			h.log.Error(logMsgGroupRollbackFailed, "operation", "update", "error", rollbackErr)
 		}
 	}()
-	if !h.authorizeChannelGroupUpdateTx(c, tx, serverID, userID) {
+	if r := h.authorizeChannelGroupUpdateTx(c, tx, serverID, userID); r != nil {
+		h.refuseAfterRollback(c, tx, r, errFailedUpdateGroup, "update")
 		return
 	}
 	err = tx.QueryRowContext(c.Request.Context(),
@@ -606,7 +574,7 @@ func (h *Handler) prepareChannelGroupDelete(c *gin.Context) (channelGroupDeleteR
 	}
 	if err := h.db.QueryRow(`SELECT server_id FROM channel_groups WHERE id = $1`, request.groupID).Scan(&request.serverID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Channel group not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errChannelGroupNotFound})
 		} else {
 			h.log.Error("Failed to fetch group", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedDeleteGroup})
@@ -748,41 +716,134 @@ func (h *Handler) closeRows(rows *sql.Rows, what string) {
 	}
 }
 
-func (h *Handler) authorizeChannelGroupUpdateTx(c *gin.Context, tx *sql.Tx, serverID, userID string) bool {
+// groupRefusal is the answer a channel-group transaction reached before its
+// write. The authorization helpers return it rather than writing it, because
+// it may only be written once the transaction is known to be discarded.
+type groupRefusal struct {
+	status int
+	msg    string
+	// cause is why a 500 refusal was reached, logged before the discard.
+	cause error
+}
+
+// groupFault is the route's 500, carrying the error that caused it.
+func groupFault(msg string, cause error) *groupRefusal {
+	return &groupRefusal{status: http.StatusInternalServerError, msg: msg, cause: cause}
+}
+
+// refuseAfterRollback discards tx and then writes the refusal it reached. A
+// refusal describes what the transaction read; a discard that neither
+// succeeded nor found the transaction resolved leaves its fate unknown, so the
+// answer is the route's fault rather than a clean 403 or 404 (#3508).
+func (h *Handler) refuseAfterRollback(c *gin.Context, tx *sql.Tx, r *groupRefusal, faultMsg, operation string) {
+	if r.cause != nil {
+		h.log.Error("Channel group authorization failed", "operation", operation, "error", r.cause)
+	}
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		h.log.Error(logMsgGroupRollbackFailed, "operation", operation, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": faultMsg})
+		return
+	}
+	c.JSON(r.status, gin.H{"error": r.msg})
+}
+
+// guardChannelGroupTx runs the credential-epoch guard for a channel-group
+// transaction and returns the refusal when it fails. goneMessage is the route's
+// vanished-server answer: an owner's erasure deletes their users row and,
+// through servers.owner_id's ON DELETE CASCADE, the server and its groups, so
+// an owner acting mid-erasure fails the guard's read before the server lock
+// below can see the server is gone. Any other guard failure, and a failed
+// server read after a missing row, is a 500 carrying its cause.
+func guardChannelGroupTx(c *gin.Context, tx *sql.Tx, serverID, userID, goneMessage, faultMessage string) *groupRefusal {
+	err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c))
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		return &groupRefusal{status: http.StatusUnauthorized, msg: "Authentication required"}
+	}
+	gone, probeErr := rbac.GuardActorGoneWithServer(c.Request.Context(), tx, serverID, err)
+	switch {
+	case probeErr != nil:
+		return groupFault(faultMessage, probeErr)
+	case gone:
+		return &groupRefusal{status: http.StatusNotFound, msg: goneMessage}
+	default:
+		return groupFault(faultMessage, fmt.Errorf("channel group epoch guard: %w", err))
+	}
+}
+
+// lockGroupServerTx takes the servers row lock. Only the advisory lock and the
+// epoch guard precede it, and neither holds the servers row, so a server
+// deleted since the request began arrives here with no row: that is the
+// route's vanished answer (goneMessage), because its groups went with it
+// (ON DELETE CASCADE). Only sql.ErrNoRows is reclassified; any other error
+// stays a 500.
+func lockGroupServerTx(ctx context.Context, tx *sql.Tx, serverID, goneMessage, faultMessage string) *groupRefusal {
+	err := tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(new(string))
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, sql.ErrNoRows):
+		return &groupRefusal{status: http.StatusNotFound, msg: goneMessage}
+	default:
+		return groupFault(faultMessage, fmt.Errorf("lock channel group server: %w", err))
+	}
+}
+
+// groupManagerRefusalTx checks the actor's membership row and then Manage
+// Channels, both inside the transaction.
+func (h *Handler) groupManagerRefusalTx(ctx context.Context, tx *sql.Tx, serverID, userID, faultMessage string) *groupRefusal {
+	err := tx.QueryRowContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, serverID, userID).Scan(new(string))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return &groupRefusal{status: http.StatusForbidden, msg: errInsufficientPerms}
+	case err != nil:
+		return groupFault(faultMessage, fmt.Errorf("check channel group membership: %w", err))
+	}
+	perms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
+	switch {
+	case err == nil && perms.Has(rbac.PermManageChannels):
+		return nil
+	case err == nil, errors.Is(err, rbac.ErrNotMember):
+		return &groupRefusal{status: http.StatusForbidden, msg: errInsufficientPerms}
+	default:
+		return groupFault(faultMessage, fmt.Errorf("resolve channel group permissions: %w", err))
+	}
+}
+
+// authorizeChannelGroupCreateTx takes CreateChannelGroup's locks and checks in
+// order: the visibility advisory lock, the credential epoch, the servers row,
+// the actor's membership, and Manage Channels. It returns the refusal from the
+// first one that fails, or nil.
+func (h *Handler) authorizeChannelGroupCreateTx(c *gin.Context, tx *sql.Tx, serverID, userID string) *groupRefusal {
 	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, serverID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedUpdateGroup})
-		return false
+		return groupFault(errFailedCreateGroup, fmt.Errorf("lock channel group create visibility: %w", err))
 	}
-	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
-		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedUpdateGroup})
-		}
-		return false
+	if r := guardChannelGroupTx(c, tx, serverID, userID, "Server not found", errFailedCreateGroup); r != nil {
+		return r
 	}
-	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(new(string)); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedUpdateGroup})
-		return false
+	if r := lockGroupServerTx(c.Request.Context(), tx, serverID, "Server not found", errFailedCreateGroup); r != nil {
+		return r
 	}
-	if err := tx.QueryRowContext(c.Request.Context(), `SELECT user_id FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, serverID, userID).Scan(new(string)); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedUpdateGroup})
-		}
-		return false
+	return h.groupManagerRefusalTx(c.Request.Context(), tx, serverID, userID, errFailedCreateGroup)
+}
+
+// authorizeChannelGroupUpdateTx is authorizeChannelGroupCreateTx for
+// UpdateChannelGroup, whose vanished answer is the preflight's own for a
+// missing group: a server deleted since the preflight read of the group took
+// the group with it.
+func (h *Handler) authorizeChannelGroupUpdateTx(c *gin.Context, tx *sql.Tx, serverID, userID string) *groupRefusal {
+	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, serverID); err != nil {
+		return groupFault(errFailedUpdateGroup, fmt.Errorf("lock channel group update visibility: %w", err))
 	}
-	perms, err := h.resolver.ResolveServerPermissionsTx(c.Request.Context(), tx, serverID, userID)
-	if err != nil || !perms.Has(rbac.PermManageChannels) {
-		if errors.Is(err, rbac.ErrNotMember) || err == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedUpdateGroup})
-		}
-		return false
+	if r := guardChannelGroupTx(c, tx, serverID, userID, errChannelGroupNotFound, errFailedUpdateGroup); r != nil {
+		return r
 	}
-	return true
+	if r := lockGroupServerTx(c.Request.Context(), tx, serverID, errChannelGroupNotFound, errFailedUpdateGroup); r != nil {
+		return r
+	}
+	return h.groupManagerRefusalTx(c.Request.Context(), tx, serverID, userID, errFailedUpdateGroup)
 }
 
 func (h *Handler) broadcastChannelGroupCreated(serverID string, group models.ChannelGroup) {
@@ -1004,27 +1065,7 @@ func (h *Handler) reorderSyncedChannels(c *gin.Context, serverID, userID string,
 		break
 	}
 	if err != nil {
-		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
-			return
-		}
-		if errors.Is(err, errManageChannelsDenied) || errors.Is(err, rbac.ErrNotMember) {
-			c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
-			return
-		}
-		if errors.Is(err, rbac.ErrTemporaryChannelOverrideManaged) {
-			c.JSON(http.StatusConflict, gin.H{"error": errTemporaryOverrideManaged})
-			return
-		}
-		if errors.Is(err, errChannelAuthoritySetChanged) {
-			c.JSON(http.StatusConflict, gin.H{"error": errChannelAuthorityRetry})
-			return
-		}
-		if rbac.IsAmbiguousAuthorityCommit(err) {
-			h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, affected)
-		}
-		h.log.Error("Failed to reorder synchronized channels", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedReorderChannels})
+		h.respondReorderSyncedError(c, serverID, affected, err)
 		return
 	}
 	h.authority.CompleteChannelAuthorityMutationWithRotations(c.Request.Context(), serverID, affected, plan, rotations, deniedByChannel)
@@ -1034,6 +1075,32 @@ func (h *Handler) reorderSyncedChannels(c *gin.Context, serverID, userID string,
 	}
 	h.log.Info("Channels reordered", "server_id", serverID, "user_id", userID, "count", len(req.Channels))
 	c.JSON(http.StatusOK, gin.H{"message": "Channels reordered"})
+}
+
+// respondReorderSyncedError answers a failed synchronized reorder. An ambiguous
+// commit fails the affected channels closed before the 500, as it did inline.
+func (h *Handler) respondReorderSyncedError(c *gin.Context, serverID string, affected []string, err error) {
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+		return
+	}
+	if errors.Is(err, errManageChannelsDenied) || errors.Is(err, rbac.ErrNotMember) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
+		return
+	}
+	if errors.Is(err, rbac.ErrTemporaryChannelOverrideManaged) {
+		c.JSON(http.StatusConflict, gin.H{"error": errTemporaryOverrideManaged})
+		return
+	}
+	if errors.Is(err, errChannelAuthoritySetChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": errChannelAuthorityRetry})
+		return
+	}
+	if rbac.IsAmbiguousAuthorityCommit(err) {
+		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, affected)
+	}
+	h.log.Error("Failed to reorder synchronized channels", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedReorderChannels})
 }
 
 func (h *Handler) reorderChannelAuthorityTx(ctx context.Context, tx *sql.Tx, request reorderChannelAuthorityRequest) ([]string, []keyrotation.Rotation, map[string][]string, error) {

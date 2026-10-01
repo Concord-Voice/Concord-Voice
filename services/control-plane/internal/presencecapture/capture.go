@@ -366,7 +366,7 @@ const (
 // transaction did not commit.
 //
 // Every hooked site abandons and then returns, leaving its deferred
-// RollbackUnlessDone to discard the transaction, so for these causes NO write
+// rollback (presencehook.DiscardOutcome on the unwired path) to discard the transaction, so for these causes NO write
 // landed: no viewer's authorization changed and there is nothing stale to
 // clear. Disconnecting anyway hands an unauthenticated-relationship caller a
 // fan-out over a stranger's whole captured audience (#2738), which is the same

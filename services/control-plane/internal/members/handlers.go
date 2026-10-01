@@ -28,21 +28,23 @@ import (
 )
 
 const (
-	errMsgInvalidServerID        = "Invalid server ID"
-	errMsgInvalidUserID          = "Invalid user ID"
-	errMsgInvalidRequestBody     = "Invalid request body"
-	errMsgInsufficientPerms      = "insufficient permissions"
-	errMsgFailedFetchMembers     = "Failed to fetch members"
-	errMsgMissingMemberPublicKey = "Every server member needs a public key for secure channel creation"
-	errMsgFailedAddMember        = "Failed to add member"
-	errMsgFailedUpdateMember     = "Failed to update member"
-	errMsgFailedRemoveMember     = "Failed to remove member"
-	errMsgFailedBanMember        = "Failed to ban member"
-	errMsgFailedTimeoutMember    = "Failed to timeout member"
-	errMsgFailedGetServerOwner   = "Failed to get server owner"
-	errMsgFailedCheckPerms       = "Failed to check permissions"
-	errMsgUserNotMember          = "User is not a member of this server"
-	errMsgNotMember              = "Not a member of this server"
+	errMsgInvalidServerID             = "Invalid server ID"
+	errMsgInvalidUserID               = "Invalid user ID"
+	errMsgInvalidRequestBody          = "Invalid request body"
+	errMsgInsufficientPerms           = "insufficient permissions"
+	errMsgFailedFetchMembers          = "Failed to fetch members"
+	errMsgMissingMemberPublicKey      = "Every server member needs a public key for secure channel creation"
+	errMsgFailedAddMember             = "Failed to add member"
+	errMsgFailedUpdateMember          = "Failed to update member"
+	errMsgFailedRemoveMember          = "Failed to remove member"
+	errMsgFailedBanMember             = "Failed to ban member"
+	errMsgFailedTimeoutMember         = "Failed to timeout member"
+	errMsgFailedGetServerOwner        = "Failed to get server owner"
+	errMsgFailedCheckPerms            = "Failed to check permissions"
+	errMsgUserNotMember               = "User is not a member of this server"
+	errMsgNotMember                   = "Not a member of this server"
+	errMsgFailedCheckTargetMembership = "Failed to check target membership"
+	errMsgFailedCheckHierarchy        = "Failed to check role hierarchy"
 
 	minTimeoutDuration = time.Minute
 	maxTimeoutDuration = 7 * 24 * time.Hour
@@ -512,13 +514,6 @@ func (h *Handler) AddMember(c *gin.Context) {
 		return
 	}
 
-	insertQuery := `
-		INSERT INTO server_members (server_id, user_id, role, joined_at)
-		VALUES ($1, $2, 'member', NOW())
-		ON CONFLICT (server_id, user_id) DO NOTHING
-		RETURNING joined_at
-	`
-
 	var member models.ServerMember
 	member.ServerID = serverID
 	member.UserID = req.UserID
@@ -564,93 +559,10 @@ func (h *Handler) AddMember(c *gin.Context) {
 	// default-role insert used to be a blank-discarded h.db.Exec, so a failure
 	// left a member with no roles and still returned 201.
 	err = presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
-		// The ban and existing-membership reads run INSIDE the transaction and
-		// BEFORE the capture, for two separate reasons.
-		//
-		// Ban: this read used to be an autocommit h.db.QueryRow before the
-		// transaction opened, so a ban committing in that window still lost the
-		// race — the ON CONFLICT insert below would re-establish membership for a
-		// user who is banned. invites.JoinServer already reads it in-transaction;
-		// this is the same shape (rbac review, PR #2840).
-		//
-		// Membership: capturing first would take the TARGET's sender gate and
-		// write topology markers (users / user_presence_settings /
-		// presence_settings_pending_operations FOR UPDATE on them) before
-		// discovering the add is a no-op. Since AddMember needs no consent from
-		// the target, that let an actor repeatedly re-add an existing member and
-		// hold a stranger's presence locks, surfacing to them as 503s on their own
-		// presence writes (security review, PR #2840).
-		if err := rbac.LockAuthorityPrincipalsTx(ctx, tx, []string{req.UserID}); err != nil {
-			return fmt.Errorf("lock added member: %w", err)
-		}
-		var isBanned bool
-		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM server_bans WHERE server_id = $1 AND user_id = $2)`,
-			serverID, req.UserID,
-		).Scan(&isBanned); err != nil {
-			return fmt.Errorf("check ban status: %w", err)
-		}
-		if isBanned {
-			return errMemberBanned
-		}
-
-		var alreadyMember bool
-		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
-			serverID, req.UserID,
-		).Scan(&alreadyMember); err != nil {
-			return fmt.Errorf("check existing membership: %w", err)
-		}
-		if alreadyMember {
-			return errMemberAlreadyPresent
-		}
-
-		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
-		if captureErr != nil {
-			return fmt.Errorf("capture member add presence: %w", captureErr)
-		}
-
-		scanErr := tx.QueryRowContext(ctx, insertQuery, serverID, req.UserID).Scan(&member.JoinedAt)
-		if errors.Is(scanErr, sql.ErrNoRows) {
-			// Nothing was written, so drop the plan WITHOUT disconnecting anyone:
-			// the rollback also discards the topology markers, which is what keeps
-			// a no-op add from suppressing a Custom Status snapshot for the whole
-			// grace window.
-			return errMemberAlreadyPresent
-		}
-		if scanErr != nil {
-			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
-			return fmt.Errorf("insert server member: %w", scanErr)
-		}
-
-		// Assign all default roles (including @all) to the new member.
-		if _, roleErr := tx.ExecContext(ctx, `
-			INSERT INTO member_roles (server_id, user_id, role_id)
-			SELECT $1, $2, id FROM roles
-			WHERE server_id = $1 AND is_default = TRUE
-			ON CONFLICT DO NOTHING
-		`, serverID, req.UserID); roleErr != nil {
-			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
-			return fmt.Errorf("assign default roles: %w", roleErr)
-		}
-
-		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+		return h.addMemberTx(ctx, tx, spec, &member)
 	})
-	if errors.Is(err, errMemberBanned) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "User is banned from this server"})
-		return
-	}
-	if errors.Is(err, errMemberAlreadyPresent) {
-		c.JSON(http.StatusConflict, gin.H{"error": "User is already a member"})
-		return
-	}
 	if err != nil {
-		failure := presencehook.Classify(err)
-		if retryAfter, ok := failure.RetryAfterHeader(); ok {
-			c.Header(presencehook.HeaderRetryAfter, retryAfter)
-		}
-		h.log.Error("Failed to add member", "failure_class", failure.Code, "error", err)
-		c.JSON(failure.Status, gin.H{"error": failure.Body(errMsgFailedAddMember)})
+		h.respondAddMemberError(c, err)
 		return
 	}
 
@@ -665,8 +577,6 @@ func (h *Handler) AddMember(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"member": member})
 }
 
-// errMemberAlreadyPresent is the in-transaction signal for a no-op add. It never
-// reaches the client as an error string; AddMember maps it to 409.
 // classifyMutationOutcome splits a hooked-mutation error into the two outcomes
 // the handlers must treat differently, so neither has to re-derive the
 // distinction inline.
@@ -732,6 +642,121 @@ func (h *Handler) respondDurableDeliveryFailure(
 	c.JSON(failure.Status, body)
 }
 
+// addMemberInsertQuery inserts the added member. ON CONFLICT DO NOTHING makes a
+// concurrent add a no-op that returns no row.
+const addMemberInsertQuery = `
+		INSERT INTO server_members (server_id, user_id, role, joined_at)
+		VALUES ($1, $2, 'member', NOW())
+		ON CONFLICT (server_id, user_id) DO NOTHING
+		RETURNING joined_at
+	`
+
+// addMemberTx is AddMember's transaction, run inside WithGatedTx's sender
+// gates. It sets member.JoinedAt when the member is added.
+func (h *Handler) addMemberTx(ctx context.Context, tx *sql.Tx, spec presencehook.Spec, member *models.ServerMember) error {
+	serverID, targetUserID := member.ServerID, member.UserID
+
+	// The ban and existing-membership reads run INSIDE the transaction and
+	// BEFORE the capture, for two separate reasons.
+	//
+	// Ban: this read used to be an autocommit h.db.QueryRow before the
+	// transaction opened, so a ban committing in that window still lost the
+	// race — the ON CONFLICT insert below would re-establish membership for a
+	// user who is banned. invites.JoinServer already reads it in-transaction;
+	// this is the same shape (rbac review, PR #2840).
+	//
+	// Membership: capturing first would take the TARGET's sender gate and
+	// write topology markers (users / user_presence_settings /
+	// presence_settings_pending_operations FOR UPDATE on them) before
+	// discovering the add is a no-op. Since AddMember needs no consent from
+	// the target, that let an actor repeatedly re-add an existing member and
+	// hold a stranger's presence locks, surfacing to them as 503s on their own
+	// presence writes (security review, PR #2840).
+	if err := rbac.LockAuthorityPrincipalsTx(ctx, tx, []string{targetUserID}); err != nil {
+		return fmt.Errorf("lock added member: %w", err)
+	}
+	var isBanned bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_bans WHERE server_id = $1 AND user_id = $2)`,
+		serverID, targetUserID,
+	).Scan(&isBanned); err != nil {
+		return fmt.Errorf("check ban status: %w", err)
+	}
+	if isBanned {
+		return errMemberBanned
+	}
+
+	var alreadyMember bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
+		serverID, targetUserID,
+	).Scan(&alreadyMember); err != nil {
+		return fmt.Errorf("check existing membership: %w", err)
+	}
+	if alreadyMember {
+		return errMemberAlreadyPresent
+	}
+
+	plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
+	if captureErr != nil {
+		return fmt.Errorf("capture member add presence: %w", captureErr)
+	}
+
+	scanErr := tx.QueryRowContext(ctx, addMemberInsertQuery, serverID, targetUserID).Scan(&member.JoinedAt)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		// Nothing was written, so drop the plan WITHOUT disconnecting anyone:
+		// the rollback also discards the topology markers, which is what keeps
+		// a no-op add from suppressing a Custom Status snapshot for the whole
+		// grace window.
+		return errMemberAlreadyPresent
+	}
+	if scanErr != nil {
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		if rbac.IsServerFKViolation(scanErr, serverMembersServerFKConstraint) {
+			// Nothing here holds the servers row, so the server can be
+			// deleted after the permission check; see errServerGone.
+			return errServerGone
+		}
+		return fmt.Errorf("insert server member: %w", scanErr)
+	}
+
+	// Assign all default roles (including @all) to the new member.
+	if _, roleErr := tx.ExecContext(ctx, `
+		INSERT INTO member_roles (server_id, user_id, role_id)
+		SELECT $1, $2, id FROM roles
+		WHERE server_id = $1 AND is_default = TRUE
+		ON CONFLICT DO NOTHING
+	`, serverID, targetUserID); roleErr != nil {
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		return fmt.Errorf("assign default roles: %w", roleErr)
+	}
+
+	return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+}
+
+// respondAddMemberError writes AddMember's response for a transaction that did
+// not commit.
+func (h *Handler) respondAddMemberError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, errMemberBanned):
+		c.JSON(http.StatusForbidden, gin.H{"error": "User is banned from this server"})
+	case errors.Is(err, errMemberAlreadyPresent):
+		c.JSON(http.StatusConflict, gin.H{"error": "User is already a member"})
+	case errors.Is(err, errServerGone):
+		// AddMember's permission check is this route's membership check.
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+	default:
+		failure := presencehook.Classify(err)
+		if retryAfter, ok := failure.RetryAfterHeader(); ok {
+			c.Header(presencehook.HeaderRetryAfter, retryAfter)
+		}
+		h.log.Error("Failed to add member", "failure_class", failure.Code, "error", err)
+		c.JSON(failure.Status, gin.H{"error": failure.Body(errMsgFailedAddMember)})
+	}
+}
+
+// errMemberAlreadyPresent is the in-transaction signal for a no-op add. It never
+// reaches the client as an error string; AddMember maps it to 409.
 var errMemberAlreadyPresent = errors.New("members: user is already a member")
 
 // errMemberBanned is the in-transaction signal for a banned target. Like
@@ -861,24 +886,32 @@ func (h *Handler) UpdateMember(c *gin.Context) {
 		return
 	}
 	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		status, msg := h.refusalUnlessServerGone(c.Request.Context(), serverID, updateVanished, http.StatusForbidden, errMsgInsufficientPerms, nil)
+		c.JSON(status, gin.H{"error": msg})
 		return
 	}
 
-	// Verify target is a member
-	var targetExists bool
-	_ = h.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
-		serverID, targetUserID,
-	).Scan(&targetExists)
+	// Verify target is a member. An EXISTS always returns a row, so a missing
+	// target is false; an error is a fault, never "not a member".
+	targetExists, err := h.checkMembership(c.Request.Context(), serverID, targetUserID)
+	if err != nil {
+		h.log.Error(errMsgFailedCheckTargetMembership, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMember})
+		return
+	}
 	if !targetExists {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
 		return
 	}
 
 	// Cannot change the owner's legacy role
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
+	ownerID, err := h.getServerOwnerID(c.Request.Context(), serverID)
+	if errors.Is(err, errServerGone) {
+		// Deleted since the target check above: the target is no longer a member.
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return
+	}
+	if err != nil {
 		h.log.Error(errMsgFailedGetServerOwner, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMember})
 		return
@@ -902,6 +935,13 @@ func (h *Handler) UpdateMember(c *gin.Context) {
 	member.Role = req.Role
 
 	err = h.db.QueryRow(updateQuery, req.Role, serverID, targetUserID).Scan(&member.JoinedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The row is gone since the owner read: the server was deleted (its
+		// cascade removes the row) or the target left. Either way the target is
+		// no longer a member. Any other error is a fault.
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to update member role", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMember})
@@ -925,7 +965,8 @@ func (h *Handler) authorizeTimeout(c *gin.Context, serverID, userID, targetUserI
 		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
 	}
 	if !hasPerm {
-		return http.StatusForbidden, errMsgInsufficientPerms, false
+		status, msg := h.refusalUnlessServerGone(c.Request.Context(), serverID, timeoutVanished, http.StatusForbidden, errMsgInsufficientPerms, nil)
+		return status, msg, false
 	}
 	if targetUserID == userID {
 		return http.StatusBadRequest, "Cannot timeout yourself", false
@@ -933,14 +974,18 @@ func (h *Handler) authorizeTimeout(c *gin.Context, serverID, userID, targetUserI
 
 	targetExists, err := h.checkMembership(c.Request.Context(), serverID, targetUserID)
 	if err != nil {
-		h.log.Error("Failed to check target membership", "error", err)
+		h.log.Error(errMsgFailedCheckTargetMembership, "error", err)
 		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
 	}
 	if !targetExists {
 		return http.StatusNotFound, errMsgUserNotMember, false
 	}
 
-	ownerID, err := h.getServerOwnerID(serverID)
+	ownerID, err := h.getServerOwnerID(c.Request.Context(), serverID)
+	if errors.Is(err, errServerGone) {
+		// Deleted since the target check above: the target is no longer a member.
+		return http.StatusNotFound, errMsgUserNotMember, false
+	}
 	if err != nil {
 		h.log.Error(errMsgFailedGetServerOwner, "error", err)
 		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
@@ -948,8 +993,9 @@ func (h *Handler) authorizeTimeout(c *gin.Context, serverID, userID, targetUserI
 	if targetUserID == ownerID {
 		return http.StatusForbidden, "Cannot timeout the server owner", false
 	}
-	if h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID) != nil {
-		return http.StatusForbidden, "Cannot timeout a member with equal or higher role position", false
+	if err := h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID); err != nil {
+		status, msg := h.hierarchyRefusal(c.Request.Context(), serverID, timeoutVanished, "Cannot timeout a member with equal or higher role position", err)
+		return status, msg, false
 	}
 
 	return 0, "", true
@@ -1006,10 +1052,16 @@ func (h *Handler) TimeoutMember(c *gin.Context) {
 
 	timedOutUntil := time.Now().UTC().Add(duration)
 	var storedUntil time.Time
-	if err := h.db.QueryRowContext(c.Request.Context(),
+	err := h.db.QueryRowContext(c.Request.Context(),
 		"UPDATE server_members SET timed_out_until = $1 WHERE server_id = $2 AND user_id = $3 RETURNING timed_out_until",
 		timedOutUntil, serverID, targetUserID,
-	).Scan(&storedUntil); err != nil {
+	).Scan(&storedUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Gone since the owner read, as in UpdateMember: not a member any more.
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return
+	}
+	if err != nil {
 		h.log.Error("Failed to timeout member", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedTimeoutMember})
 		return
@@ -1100,10 +1152,90 @@ func (h *Handler) checkMembership(ctx context.Context, serverID, userID string) 
 	return exists, err
 }
 
-func (h *Handler) getServerOwnerID(serverID string) (string, error) {
+// errServerGone reports a servers row found absent after the request was
+// admitted: getServerOwnerID's answer for sql.ErrNoRows, and AddMember's for an
+// INSERT that fails server_members.server_id's foreign key. Every caller has
+// already seen the server — the route admitted the request and each caller
+// checked membership or permission first — so an absent row means the server
+// was deleted since, by DeleteServer or by the owner's erasure through
+// servers.owner_id's ON DELETE CASCADE. Each caller answers it the way it
+// answers membership that vanished one check earlier, never with a 500.
+//
+// ONLY those two signals become errServerGone. Any other error is returned
+// unchanged and stays a fault: an outage must never read as a denial.
+var errServerGone = errors.New("members: server no longer exists")
+
+// serverMembersServerFKConstraint is server_members.server_id's foreign key.
+const serverMembersServerFKConstraint = "server_members_server_id_fkey"
+
+func (h *Handler) getServerOwnerID(ctx context.Context, serverID string) (string, error) {
 	var ownerID string
-	err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID)
+	err := h.db.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errServerGone
+	}
 	return ownerID, err
+}
+
+// vanishedAnswer is a moderation route's answer for a server deleted
+// mid-request, and the body of its 500.
+type vanishedAnswer struct {
+	status   int
+	msg      string
+	faultMsg string
+}
+
+var (
+	removalVanished = vanishedAnswer{http.StatusNotFound, errMsgUserNotMember, errMsgFailedRemoveMember}
+	updateVanished  = vanishedAnswer{http.StatusNotFound, errMsgUserNotMember, errMsgFailedUpdateMember}
+	timeoutVanished = vanishedAnswer{http.StatusNotFound, errMsgUserNotMember, errMsgFailedTimeoutMember}
+	// A ban's vanished answer is the 403 its permission check gives, because a
+	// pre-emptive ban's target need not be a member at all.
+	banVanished = vanishedAnswer{http.StatusForbidden, errMsgInsufficientPerms, errMsgFailedBanMember}
+)
+
+// refusalUnlessServerGone answers a refusal reached after the request was
+// admitted: a missing permission, a hierarchy violation, or a hierarchy read
+// that found no row (cause). A server deleted since admission reaches all
+// three — its membership rows are gone, so a permission lookup that misses the
+// cache finds none (where a cached grant would let the request on to the
+// route's vanished answer), and the role positions compare as a violation, and
+// the hierarchy's own owner read finds no row — so the servers row is read
+// again first. Gone, the route's vanished answer wins; a failed re-read is a
+// fault; otherwise the refusal stands, and a hierarchy read that found no row
+// is a fault, never a denial.
+func (h *Handler) refusalUnlessServerGone(ctx context.Context, serverID string, v vanishedAnswer, status int, msg string, cause error) (int, string) {
+	_, err := h.getServerOwnerID(ctx, serverID)
+	if errors.Is(err, errServerGone) {
+		return v.status, v.msg
+	}
+	if err != nil {
+		h.log.Error(errMsgFailedGetServerOwner, "error", err)
+		return http.StatusInternalServerError, v.faultMsg
+	}
+	if cause != nil {
+		h.log.Error(errMsgFailedCheckHierarchy, "error", cause)
+		return http.StatusInternalServerError, v.faultMsg
+	}
+	return status, msg
+}
+
+// hierarchyRefusal answers a CheckHierarchy error after the owner read: a
+// violation is the route's 403 (unless the server has gone), and a missing row
+// is a fault unless the server has gone. Only those two can be a deletion the
+// check misread, so only they re-read the server; any other error is a fault
+// outright, because confirming a deletion that merely coincides with an outage
+// would turn the outage into the route's vanished answer.
+func (h *Handler) hierarchyRefusal(ctx context.Context, serverID string, v vanishedAnswer, violationMsg string, err error) (int, string) {
+	switch {
+	case errors.Is(err, rbac.ErrHierarchyViolation):
+		return h.refusalUnlessServerGone(ctx, serverID, v, http.StatusForbidden, violationMsg, nil)
+	case errors.Is(err, sql.ErrNoRows):
+		return h.refusalUnlessServerGone(ctx, serverID, v, http.StatusInternalServerError, v.faultMsg, err)
+	default:
+		h.log.Error(errMsgFailedCheckHierarchy, "error", err)
+		return http.StatusInternalServerError, v.faultMsg
+	}
 }
 
 type removalAuth struct {
@@ -1133,13 +1265,15 @@ func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserI
 		return nil, http.StatusInternalServerError, errMsgFailedRemoveMember
 	}
 	if !hasPerm {
-		return nil, http.StatusForbidden, errMsgInsufficientPerms
+		status, msg := h.refusalUnlessServerGone(c.Request.Context(), serverID, removalVanished, http.StatusForbidden, errMsgInsufficientPerms, nil)
+		return nil, status, msg
 	}
 	if targetUserID == ownerID {
 		return nil, http.StatusForbidden, "Cannot remove the server owner"
 	}
-	if h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID) != nil {
-		return nil, http.StatusForbidden, "Cannot remove a member with equal or higher role position"
+	if err := h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID); err != nil {
+		status, msg := h.hierarchyRefusal(c.Request.Context(), serverID, removalVanished, "Cannot remove a member with equal or higher role position", err)
+		return nil, status, msg
 	}
 
 	return &removalAuth{isSelfRemoval: false}, 0, ""
@@ -1226,8 +1360,16 @@ func (h *Handler) prepareRemovalFenceTx(
 	}
 
 	// Revalidate mutable server facts after all authoritative locks are held.
+	// None of them holds the servers row, so a server deleted since the
+	// preflight arrives here with no row: the target is no longer a member,
+	// which is this transaction's own answer for a vanished membership. Only
+	// sql.ErrNoRows is reclassified; any other error stays a fault.
 	var ownerID string
-	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+	err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errModerationTargetGone
+	}
+	if err != nil {
 		return fmt.Errorf("query current server owner for member removal: %w", err)
 	}
 	if ownerID == targetUserID {
@@ -1364,6 +1506,34 @@ func moderationTarget(c *gin.Context) (serverID, targetUserID string, ok bool) {
 	return parsedServerID.String(), parsedTargetUserID.String(), true
 }
 
+// requireRemovalParties writes RemoveMember's refusal and returns false unless
+// both the requester and the target are members of the server. A membership
+// read that fails is a fault, never "not a member": only a false EXISTS is a
+// missing member.
+func (h *Handler) requireRemovalParties(c *gin.Context, serverID, userID, targetUserID string) bool {
+	requesterExists, err := h.checkMembership(c.Request.Context(), serverID, userID)
+	if err != nil {
+		h.log.Error("Failed to check requester membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
+		return false
+	}
+	if !requesterExists {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+		return false
+	}
+	targetExists, err := h.checkMembership(c.Request.Context(), serverID, targetUserID)
+	if err != nil {
+		h.log.Error(errMsgFailedCheckTargetMembership, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
+		return false
+	}
+	if !targetExists {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return false
+	}
+	return true
+}
+
 // RemoveMember removes a member from a server (kick or leave)
 func (h *Handler) RemoveMember(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -1383,18 +1553,16 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	requesterExists, err := h.checkMembership(c.Request.Context(), serverID, userID)
-	if err != nil || !requesterExists {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
-		return
-	}
-	targetExists, err := h.checkMembership(c.Request.Context(), serverID, targetUserID)
-	if err != nil || !targetExists {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+	if !h.requireRemovalParties(c, serverID, userID, targetUserID) {
 		return
 	}
 
-	ownerID, err := h.getServerOwnerID(serverID)
+	ownerID, err := h.getServerOwnerID(c.Request.Context(), serverID)
+	if errors.Is(err, errServerGone) {
+		// Deleted since the target check above: the target is no longer a member.
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return
+	}
 	if err != nil {
 		h.log.Error(errMsgFailedGetServerOwner, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
@@ -1651,7 +1819,7 @@ func lockBanActorAndServerTx(ctx context.Context, tx *sql.Tx, req banFenceReques
 		return "", fmt.Errorf("lock member ban server: %w", err)
 	}
 	if err := lockModerationUsersTx(ctx, tx, req.actorID, req.targetUserID); err != nil {
-		return "", err
+		return "", banUsersLockError(ctx, tx, req.serverID, err)
 	}
 	// The stronger, sorted user-pair lock prevents GuardTx's actor FOR SHARE
 	// read from creating a lock-upgrade cycle before the target is locked.
@@ -1697,9 +1865,43 @@ func (h *Handler) lockBanAuthorityTx(
 	return true, nil
 }
 
+// banUsersLockError keeps the ban's vanished-server answer when the users lock
+// comes up short. An owner's erasure deletes their users row and, through
+// servers.owner_id's ON DELETE CASCADE, the server with it, so an owner banning
+// mid-erasure finds their own row gone here, before lockBanServerOwnerTx can
+// see the server is. The lock reports errModerationTargetGone, the removal
+// routes' vanished-server answer (404); the ban's is
+// errModerationPermissionDenied (403), since a pre-emptive ban's target need
+// not be a member. A short lock on a server that still exists stays the
+// ordinary target-gone 404.
+func banUsersLockError(ctx context.Context, tx *sql.Tx, serverID string, err error) error {
+	if !errors.Is(err, errModerationTargetGone) {
+		return err
+	}
+	var exists bool
+	if probeErr := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)`, serverID,
+	).Scan(&exists); probeErr != nil {
+		return fmt.Errorf("check member ban server after users lock: %w", probeErr)
+	}
+	if !exists {
+		return errModerationPermissionDenied
+	}
+	return err
+}
+
 func lockBanServerOwnerTx(ctx context.Context, tx *sql.Tx, serverID, targetUserID string) (string, error) {
+	// Nothing locked before this holds the servers row, so a server deleted
+	// since the preflight arrives here with no row. The moderator is no longer
+	// a member of it: errModerationPermissionDenied, the ban preflight's own
+	// answer (a pre-emptive ban's target need not be a member, so the target's
+	// membership says nothing). Only sql.ErrNoRows is reclassified.
 	var ownerID string
-	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+	err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errModerationPermissionDenied
+	}
+	if err != nil {
 		return "", fmt.Errorf("query current server owner for member ban: %w", err)
 	}
 	if ownerID == targetUserID {
@@ -1776,6 +1978,49 @@ func (h *Handler) execBanTx(
 	return err
 }
 
+// authorizeBan writes BanMember's refusal and returns false unless the actor
+// holds PermBan and the target is neither the owner, nor the actor, nor at or
+// above the actor in the role hierarchy.
+func (h *Handler) authorizeBan(c *gin.Context, serverID, userID, targetUserID string) bool {
+	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermBan)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
+		return false
+	}
+	if !hasPerm {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return false
+	}
+
+	ownerID, err := h.getServerOwnerID(c.Request.Context(), serverID)
+	if errors.Is(err, errServerGone) {
+		// Deleted since the permission check above, which is the only one a ban
+		// makes: a pre-emptive ban's target need not be a member at all.
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return false
+	}
+	if err != nil {
+		h.log.Error(errMsgFailedGetServerOwner, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
+		return false
+	}
+	if targetUserID == ownerID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot ban the server owner"})
+		return false
+	}
+	if targetUserID == userID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot ban yourself"})
+		return false
+	}
+
+	if err := h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID); err != nil {
+		status, msg := h.hierarchyRefusal(c.Request.Context(), serverID, banVanished, "Cannot ban a member with equal or higher role position", err)
+		c.JSON(status, gin.H{"error": msg})
+		return false
+	}
+	return true
+}
+
 // BanMember bans a member from a server (removes + prevents rejoin)
 func (h *Handler) BanMember(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -1786,33 +2031,7 @@ func (h *Handler) BanMember(c *gin.Context) {
 	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
 	defer purgeCancel()
 
-	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermBan)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
-		return
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return
-	}
-
-	ownerID, err := h.getServerOwnerID(serverID)
-	if err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
-		return
-	}
-	if targetUserID == ownerID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot ban the server owner"})
-		return
-	}
-	if targetUserID == userID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot ban yourself"})
-		return
-	}
-
-	if h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID) != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot ban a member with equal or higher role position"})
+	if !h.authorizeBan(c, serverID, userID, targetUserID) {
 		return
 	}
 

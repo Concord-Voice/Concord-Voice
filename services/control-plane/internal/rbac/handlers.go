@@ -646,16 +646,25 @@ func (h *Handler) resolveNewRolePosition(ctx context.Context, tx *sql.Tx, server
 			   INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 			   WHERE mr.server_id = $1 AND mr.user_id = $2)
 	`
-	var ownerID string
+	var ownerID sql.NullString
 	var maxPosition, actorMaxPosition int
 	if err := tx.QueryRowContext(ctx, snapshotQuery, serverID, userID).
 		Scan(&ownerID, &maxPosition, &actorMaxPosition); err != nil {
 		return 0, false, fmt.Errorf("create role: resolve position snapshot: %w", err)
 	}
+	// servers.owner_id is NOT NULL, so a NULL here means the scalar subquery
+	// found no servers row: the server was deleted after this transaction's
+	// permission resolve, since nothing in it holds the servers row. The actor
+	// is not a member of a server that no longer exists — ErrNotMember, which
+	// mapGuardError renders as the 403 it gives any non-member. A Scan error
+	// above is unchanged and stays a fault.
+	if !ownerID.Valid {
+		return 0, false, ErrNotMember
+	}
 
 	// Owner bypass is identity on servers.owner_id, matching the role guard --
 	// never PermAdministrator.
-	if ownerID == userID {
+	if ownerID.String == userID {
 		return maxPosition + 1, false, nil
 	}
 
@@ -769,20 +778,21 @@ func (h *Handler) CreateRole(c *gin.Context) {
 	// paths already use — BeginTx -> LockServerVisibilityCapture -> work -> Commit
 	// — so it joins the per-server advisory total order without adding a fifth
 	// transaction pattern (#2721).
-	err := func() error {
+	err := func() (err error) {
 		ctx := c.Request.Context()
 		tx, txErr := h.db.BeginTx(ctx, nil)
 		if txErr != nil {
 			return fmt.Errorf("begin create role transaction: %w", txErr)
 		}
-		defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+		// See discardOutcome: a failed discard is a fault, never the denial.
+		defer func() { err = discardOutcome(tx.Rollback(), "create role", err) }()
 
 		// FIRST statement, and the only advisory key this transaction takes.
 		if lockErr := LockServerVisibilityCapture(ctx, tx, serverID); lockErr != nil {
 			return fmt.Errorf("lock server for create role: %w", lockErr)
 		}
 		if guardErr := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
-			return guardErr
+			return roleGuardError(ctx, tx, serverID, guardErr)
 		}
 		if toErr := applyGuardLockTimeout(ctx, tx); toErr != nil {
 			return toErr
@@ -829,9 +839,7 @@ func (h *Handler) CreateRole(c *gin.Context) {
 			query, roleID, serverID, req.Name, req.Color, req.Emoji,
 			role.Position, req.Permissions, req.Mentionable, req.DisplaySeparately,
 		).Scan(&role.CreatedAt, &role.UpdatedAt); insErr != nil {
-			// %w, not %v: errors.As unwraps, so the call site's
-			// errors.As(err, &pqErr) still sees the 23505 and renders the 409.
-			return fmt.Errorf("create role: insert: %w", insErr)
+			return roleInsertError(insErr)
 		}
 		return tx.Commit()
 	}()
@@ -854,6 +862,24 @@ func (h *Handler) CreateRole(c *gin.Context) {
 
 	h.announceRoleCreated(c, serverID, userID, roleID, req, role, shifted)
 	c.JSON(http.StatusCreated, gin.H{"role": role})
+}
+
+// roleServerFKConstraint is roles.server_id's foreign key to servers(id).
+const roleServerFKConstraint = "roles_server_id_fkey"
+
+// roleInsertError classifies CreateRole's INSERT failure. The server can be
+// deleted after the position snapshot just as before it: for the owner nothing
+// in the transaction holds the servers row (a non-owner's position shift locks
+// the roles rows a server delete must cascade through, so that delete waits).
+// A violation of roles.server_id's FK is the same fact the snapshot answers with
+// ErrNotMember, so it gets the same 403. Everything else is wrapped with %w, not
+// %v: errors.As unwraps, so the call site's errors.As(err, &pqErr) still sees
+// the 23505 and renders the 409.
+func roleInsertError(err error) error {
+	if IsServerFKViolation(err, roleServerFKConstraint) {
+		return ErrNotMember
+	}
+	return fmt.Errorf("create role: insert: %w", err)
 }
 
 // announceRoleCreated performs every post-commit side effect of a successful
@@ -1574,7 +1600,7 @@ func (h *Handler) ReorderRoles(c *gin.Context) {
 // CWE-367 straddle issue #2851 proves with a PoC. And it stops two concurrent
 // reorders from taking row locks in opposite CLIENT-SUPPLIED orders, which was
 // a 40P01 deadlock reproducible on main with no attacker and no privilege.
-func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID, tokenEpoch string, roleIDs []string) error {
+func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID, tokenEpoch string, roleIDs []string) (err error) {
 	// READ COMMITTED is REQUIRED, not incidental, and is pinned rather than
 	// inherited from the server default. The lock is the first statement, so
 	// under READ COMMITTED the guard SELECT below takes its snapshot AFTER the
@@ -1590,17 +1616,15 @@ func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID, toke
 	if err != nil {
 		return fmt.Errorf("begin reorder transaction: %w", err)
 	}
-	defer func() {
-		// discard: Rollback is a no-op after a successful Commit, and the
-		// failure paths already return an error.
-		_ = tx.Rollback()
-	}()
+	// See discardOutcome: a failed discard is a fault, never a denial such as
+	// reorderDeniedError, errRolePermissionDenied or ErrNotMember.
+	defer func() { err = discardOutcome(tx.Rollback(), "reorder transaction", err) }()
 
 	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return err
 	}
 	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
-		return err
+		return roleGuardError(ctx, tx, serverID, err)
 	}
 	if err := h.requireRoleMutationPermissionTx(ctx, tx, serverID, userID, PermManageRoles); err != nil {
 		return err
@@ -1610,7 +1634,7 @@ func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID, toke
 	// only; this is the decision.
 	verdict, err := evaluateReorderGuards(ctx, tx, serverID, userID, roleIDs)
 	if err != nil {
-		return fmt.Errorf("evaluate reorder guards: %w", err)
+		return reorderGuardQueryError(err)
 	}
 	if verdict.denied {
 		return &reorderDeniedError{reason: verdict.reason}
@@ -1656,13 +1680,64 @@ func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID, toke
 	// asked for. `unique` on the binding tag guarantees no id is counted twice,
 	// so this comparison is exact.
 	if affected != int64(len(roleIDs)) {
-		return fmt.Errorf("reorder matched %d of %d roles: %w", affected, len(roleIDs), sql.ErrNoRows)
+		return reorderShortfallError(ctx, tx, serverID, affected, len(roleIDs))
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit reorder transaction: %w", err)
 	}
 	return nil
+}
+
+// reorderGuardQueryError classifies the authoritative guard query's failure.
+// Its only row source is the servers row (the actor ceiling is an aggregate),
+// and nothing in the transaction holds that row, so no row means the server
+// was deleted after the epoch guard: the non-member ErrNotMember, never
+// ReorderRoles' "Role not found". Any other error is a fault.
+func reorderGuardQueryError(err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotMember
+	}
+	return fmt.Errorf("evaluate reorder guards: %w", err)
+}
+
+// reorderShortfallError explains a reorder UPDATE that matched fewer roles
+// than were named. A server deleted after the guard took its roles with it
+// (ON DELETE CASCADE), which is the non-member ErrNotMember; on a server that
+// still exists, an ID names no role there, the 404. A failed existence read is
+// a fault, never either answer.
+func reorderShortfallError(ctx context.Context, tx *sql.Tx, serverID string, affected int64, named int) error {
+	gone, err := serverGoneTx(ctx, tx, serverID)
+	if err != nil {
+		return fmt.Errorf("confirm reorder server after a shortfall: %w", err)
+	}
+	if gone {
+		return ErrNotMember
+	}
+	return fmt.Errorf("reorder matched %d of %d roles: %w", affected, named, sql.ErrNoRows)
+}
+
+// roleGuardError classifies credepoch.GuardTx's failure inside CreateRole's and
+// ReorderRoles' transactions. An owner acting mid-erasure finds their own row
+// and, through servers.owner_id's cascade, the server gone: that is the
+// non-member ErrNotMember, the 403 each route already gives a non-member. Any
+// other missing row is a fault, and its sql.ErrNoRows is cut from the chain so
+// it cannot reach ReorderRoles' "Role not found" arm, which belongs to the
+// reorder UPDATE's shortfall. A failed server read is a fault carrying that
+// read's error. Everything else, credepoch.ErrEpochMismatch included, passes
+// through unchanged.
+func roleGuardError(ctx context.Context, tx *sql.Tx, serverID string, guardErr error) error {
+	gone, probeErr := GuardActorGoneWithServer(ctx, tx, serverID, guardErr)
+	switch {
+	case probeErr != nil:
+		return fmt.Errorf("role transaction epoch guard %q: %w", guardErr.Error(), probeErr)
+	case gone:
+		return ErrNotMember
+	case errors.Is(guardErr, sql.ErrNoRows):
+		return fmt.Errorf("role transaction epoch guard: %s", guardErr.Error())
+	default:
+		return guardErr
+	}
 }
 
 // AssignRole assigns a role to a member

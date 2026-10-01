@@ -389,7 +389,7 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 	var enforcing bool
 	ownerQuery := `SELECT owner_id, enforce_mfa_dangerous_actions FROM servers WHERE id = $1`
 	if err := db.QueryRowContext(ctx, ownerQuery, serverID).Scan(&ownerID, &enforcing); err != nil {
-		return 0, false, MFAMask{}, fmt.Errorf("failed to fetch server owner: %w", err)
+		return 0, false, MFAMask{}, ownerReadError(err)
 	}
 	mask, err := MaskFor(ctx, db, userID, enforcing)
 	if err != nil {
@@ -407,6 +407,42 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 		return 0, false, MFAMask{}, fmt.Errorf("failed to compute role permissions: %w", err)
 	}
 	return basePerms, false, mask, nil
+}
+
+// ownerReadError classifies a failed read of the servers row that follows a
+// membership read which found the caller a member.
+//
+// server_members cascades from servers, so within one snapshot a membership row
+// implies its server row. Outside a caller-supplied snapshot the two reads are
+// separate READ COMMITTED statements, and a server deleted between them — by
+// DeleteServer, or by the owner's erasure through servers.owner_id's ON DELETE
+// CASCADE — leaves the owner read with no row. The caller is not a member of a
+// server that no longer exists, so that is ErrNotMember: the denial every
+// caller already maps, never the 500 a database fault earns.
+//
+// ONLY sql.ErrNoRows is reclassified. Every other error is a real fault and
+// stays one, so this cannot turn an outage into a quiet denial, and it can only
+// ever narrow what counts as membership — never widen it.
+func ownerReadError(err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotMember
+	}
+	return fmt.Errorf("failed to fetch server owner: %w", err)
+}
+
+// IsServerFKViolation reports whether err is a foreign-key violation (23503)
+// on exactly the named constraint, which must be the FK from the inserted row
+// to servers(id). An INSERT that fails it lost its server to a concurrent
+// delete — DeleteServer, or the owner's erasure through servers.owner_id's
+// ON DELETE CASCADE — after the request was admitted, because nothing the
+// caller held kept the servers row. The caller answers that the way it answers
+// a non-member (see ownerReadError).
+//
+// The constraint NAME is checked, not just the code: a 23503 on any other
+// foreign key, and every other error, is a real fault and stays one.
+func IsServerFKViolation(err error, serverFKConstraint string) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23503" && pqErr.Constraint == serverFKConstraint
 }
 
 // computeRolePermissions is RawRolePermissions; see that function's comment.
@@ -700,7 +736,11 @@ func (r *Resolver) visibleChannelIDs(ctx context.Context, serverID, userID strin
 	// resolver disagree with the endpoints it feeds.
 	var ownerID string
 	if err := r.db.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		return nil, fmt.Errorf("failed to fetch server owner: %w", err)
+		readErr := ownerReadError(err)
+		if errors.Is(readErr, ErrNotMember) {
+			return []string{}, nil // the non-member answer above: see ownerReadError
+		}
+		return nil, readErr
 	}
 	if ownerID == userID {
 		return r.getAllChannelIDs(ctx, serverID)

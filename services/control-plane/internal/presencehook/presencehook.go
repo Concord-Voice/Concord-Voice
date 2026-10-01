@@ -33,12 +33,27 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
-// RollbackUnlessDone is the deferred rollback for hooked transactions.
-// sql.ErrTxDone means the terminal already committed and is not an error — it
-// is in fact the normal successful path, because Complete owns the commit.
+// DiscardOutcome folds an unhooked transaction's deferred rollback into the
+// outcome its caller must report: err itself when the rollback (rbErr)
+// succeeded or found the transaction already resolved, otherwise the failed
+// discard IN PLACE OF err. sql.ErrTxDone means the terminal already committed
+// and is not an error — it is in fact the normal successful path, because
+// Complete owns the commit.
 //
-// A genuine failure emits BOTH a fixed classification and the driver error,
-// which is the shape this feature's other terminals already use:
+// It takes the rollback's result rather than the transaction so the caller's
+// deferred closure calls tx.Rollback() itself, where a reader — and
+// godre:S8168, which does not follow a helper — can see the transaction is
+// discarded.
+//
+// Replacing rather than joining is graphpresence's runInTx rule (#3508): a
+// discard that neither succeeded nor found the transaction resolved leaves the
+// write's fate unknown, so returning work's nil would report success for a
+// write nobody can prove landed, and joined, a denial sentinel work returned
+// would still match errors.Is and be answered as a clean 403 or 404. Work's
+// error stays in the text for the log, but not in the chain.
+//
+// A genuine failure also emits BOTH a fixed classification and the driver
+// error, which is the shape this feature's other terminals already use:
 // internal/friends/handlers.go and internal/users/handlers.go each have exactly
 // ONE classified failure sink — respondPresenceTerminal — and both log the
 // classification alongside the error it came from. (They name the field
@@ -46,9 +61,7 @@ import (
 // recorded, not resolved here.) The constant is the stable grep target; the
 // error is the cause. Neither substitutes for the other.
 //
-// Keeping the error is load-bearing HERE specifically, because this defer has
-// no return value — the log is the only place a failed discard is ever
-// recorded. Exactly ONE production call site reaches it: WithGatedTx's own
+// Exactly ONE production call site reaches it: runUnhooked, WithGatedTx's
 // unwired fallback below. A hooked handler lands on that fallback whenever it
 // passes a nil capture, which is NOT only the unhooked replica.
 //
@@ -62,18 +75,20 @@ import (
 //
 // The last two arrived with #2854 stage C and change this fallback's character:
 // it is no longer a degraded-replica path but a HOT one carrying real writes —
-// stranger blocks and pre-emptive bans — on every replica. Its divergence from
-// graphpresence's runInTx (this defer logs the driver error rather than joining
-// it into a return value, because it has no return value) is therefore now
-// load-bearing for ordinary production traffic, not just for an unhooked boot. A non-nil capture
-// routes the call into graphpresence's runInTx instead, whose defer joins the
-// cause into what it returns and so does not depend on its log. Dropping the
-// error here leaves a rollback failure permanently undiagnosable.
-func RollbackUnlessDone(tx *sql.Tx, log *logger.Logger) {
-	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-		log.Error("presence-hooked transaction rollback failed",
-			"failure_class", "gated_rollback", "error", err)
+// stranger blocks and pre-emptive bans — on every replica. That is why it must
+// answer a failed discard exactly as runInTx does: a pre-emptive ban whose
+// discard failed after it reached its vanished-server 403 answered that 403
+// until #3508's sixth review.
+func DiscardOutcome(rbErr error, log *logger.Logger, err error) error {
+	if rbErr == nil || errors.Is(rbErr, sql.ErrTxDone) {
+		return err
 	}
+	log.Error("presence-hooked transaction rollback failed",
+		"failure_class", "gated_rollback", "error", rbErr)
+	if err != nil {
+		return fmt.Errorf("discard unhooked graph mutation after %q: %w", err.Error(), rbErr)
+	}
+	return fmt.Errorf("discard unhooked graph mutation: %w", rbErr)
 }
 
 // Spec is a handler's capture request: the two enum choices the call site
@@ -200,9 +215,10 @@ func Abandon(
 // presencehistory.WithReadySenderModeBeforeReconcile) and only then opens its
 // transaction and takes the same users row.
 //
-// Unwired: a plain db.BeginTx plus the deferred RollbackUnlessDone — the
+// Unwired: a plain db.BeginTx plus the deferred DiscardOutcome — the
 // pre-#2446-PR-2 shape — so a replica without the hook behaves as it did
-// before and degrades to the pre-existing <=90s presence TTL.
+// before and degrades to the pre-existing <=90s presence TTL, except that a
+// failed discard is now a fault on both paths (#3508).
 //
 // It never commits on either path. work's Complete owns the commit.
 //
@@ -212,19 +228,10 @@ func Abandon(
 // unwired path deliberately parses NOTHING, matching Capture: an unwired
 // handler must not start failing on an ID it never had to parse before.
 //
-// TWO deliberate differences from the wired bridge, and the second follows from
-// the first:
-//
-//   - graphpresence's runInTx JOINS a failed discard into the returned error
-//     (internal/graphpresence/topology.go); this fallback does not. The join
-//     would change the outcome for exactly one case — work returning nil
-//     without having committed — which the Complete-owns-the-commit contract
-//     excludes, so preserving the pre-existing shape costs nothing.
-//   - RollbackUnlessDone therefore logs the driver error alongside the fixed
-//     failure_class, while runInTx's defer logs the class alone. That defer
-//     loses nothing by omitting it, because it just joined the same error into
-//     what it returns; this one has no return value, so its log is the only
-//     record of the cause.
+// One difference from the wired bridge remains: DiscardOutcome logs the
+// driver error alongside the fixed failure_class, where graphpresence's
+// runInTx defer logs the class alone. Both return a failed discard IN PLACE OF
+// work's error, so neither lets a denial sentinel survive it.
 func WithGatedTx(
 	ctx context.Context,
 	capture presencecapture.GraphPresenceCapture,
@@ -237,18 +244,24 @@ func WithGatedTx(
 		if db == nil {
 			return errors.New("presencehook: unhooked gated transaction requires a database")
 		}
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin unhooked graph mutation: %w", err)
-		}
-		defer RollbackUnlessDone(tx, log)
-		return work(tx)
+		return runUnhooked(ctx, db, log, work)
 	}
 	subject, err := spec.Subject()
 	if err != nil {
 		return err
 	}
 	return capture.WithGatedTx(ctx, subject, work)
+}
+
+// runUnhooked is WithGatedTx's unwired fallback: a plain transaction whose
+// discard decides the reported outcome through DiscardOutcome.
+func runUnhooked(ctx context.Context, db *sql.DB, log *logger.Logger, work func(tx *sql.Tx) error) (err error) {
+	tx, beginErr := db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return fmt.Errorf("begin unhooked graph mutation: %w", beginErr)
+	}
+	defer func() { err = DiscardOutcome(tx.Rollback(), log, err) }()
+	return work(tx)
 }
 
 // HeaderRetryAfter is the response header RetryAfterHeader's value belongs in.

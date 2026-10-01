@@ -185,8 +185,16 @@ func (r *Reconciler) runInTx(
 		// Fail closed. A discard that neither succeeded nor found the
 		// transaction already resolved leaves the mutation's fate unknown, so
 		// returning work's nil here would report success for a write nobody can
-		// prove landed.
-		err = errors.Join(err, fmt.Errorf("discard gated graph mutation: %w", rollbackErr))
+		// prove landed. For the same reason the failure REPLACES work's error
+		// rather than joining it: joined, a denial sentinel work returned still
+		// matched errors.Is, and callers answered a clean 403 or 404 over a
+		// transaction whose fate was unknown (#3508). Work's error stays in the
+		// text for the log, but not in the chain.
+		if err != nil {
+			err = fmt.Errorf("discard gated graph mutation after %q: %w", err.Error(), rollbackErr)
+			return
+		}
+		err = fmt.Errorf("discard gated graph mutation: %w", rollbackErr)
 	}()
 	return work(tx)
 }

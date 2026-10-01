@@ -62,16 +62,21 @@ func (c *stubCapture) WithGatedTx(
 	if beginErr != nil {
 		return fmt.Errorf("begin gated graph mutation: %w", beginErr)
 	}
-	// Fail closed by JOINING a failed discard, exactly as runInTx does, rather
-	// than panicking: TestFirstWriteFoFRaceStillCapturesTheNarrowing drives the
-	// handler on its own goroutine, where a panic kills the package binary with
-	// no attribution to the case that caused it.
+	// Fail closed by returning a failed discard IN PLACE OF work's error,
+	// exactly as runInTx does, rather than panicking:
+	// TestFirstWriteFoFRaceStillCapturesTheNarrowing drives the handler on its
+	// own goroutine, where a panic kills the package binary with no attribution
+	// to the case that caused it.
 	defer func() {
 		rollbackErr := tx.Rollback()
 		if rollbackErr == nil || errors.Is(rollbackErr, sql.ErrTxDone) {
 			return
 		}
-		err = errors.Join(err, fmt.Errorf("discard gated graph mutation: %w", rollbackErr))
+		if err != nil {
+			err = fmt.Errorf("discard gated graph mutation after %q: %w", err.Error(), rollbackErr)
+			return
+		}
+		err = fmt.Errorf("discard gated graph mutation: %w", rollbackErr)
 	}()
 	return work(tx)
 }

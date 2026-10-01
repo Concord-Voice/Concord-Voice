@@ -91,6 +91,16 @@ type TestServer struct {
 // SetupTestServer creates a test server backed by a real database and Redis.
 func SetupTestServer(t *testing.T) *TestServer {
 	t.Helper()
+	return SetupTestServerWithRouterDB(t, nil)
+}
+
+// SetupTestServerWithRouterDB is SetupTestServer with the router's database
+// pool replaced by routerDB when it is non-nil — for example a stmthook pool
+// that forces an interleaving inside a real request. Fixtures still write
+// through the returned TestServer's DB, the ordinary test pool, so only the
+// router's own traffic crosses routerDB.
+func SetupTestServerWithRouterDB(t *testing.T, routerDB *sql.DB) *TestServer {
+	t.Helper()
 
 	// Ensure handlers that gate test-only behaviour (e.g. writing the plaintext
 	// verification code to Redis) activate correctly in integration tests.
@@ -137,9 +147,12 @@ func SetupTestServer(t *testing.T) *TestServer {
 		redisCleanup()
 		dbCleanup()
 	})
+	if routerDB == nil {
+		routerDB = db
+	}
 	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, activePlanReconciler, completeExpiredTransfers, err := api.NewRouter(
 		t.Context(),
-		db,
+		routerDB,
 		redisClient,
 		cfg,
 		nil,

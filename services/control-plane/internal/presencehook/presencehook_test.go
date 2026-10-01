@@ -127,16 +127,18 @@ func (c *stubCapture) Abandon(_ presencecapture.Plan, cause presencecapture.Caus
 	c.abandons = append(c.abandons, string(cause))
 }
 
-// --- RollbackUnlessDone ----------------------------------------------------
+// --- DiscardOutcome --------------------------------------------------------
 
 // An open transaction really is rolled back, and nothing is logged.
-func TestRollbackUnlessDoneRollsBackOpenTransaction(t *testing.T) {
+func TestDiscardOutcomeRollsBackOpenTransaction(t *testing.T) {
 	db := openStubDB(t, nil)
 	tx, err := db.Begin()
 	require.NoError(t, err)
 	log, buf := bufferedLogger()
 
-	presencehook.RollbackUnlessDone(tx, log)
+	denial := errors.New("denied")
+	assert.Same(t, denial, presencehook.DiscardOutcome(tx.Rollback(), log, denial),
+		"a successful discard keeps work's own outcome")
 
 	assert.ErrorIs(t, tx.Commit(), sql.ErrTxDone, "the transaction must already be finished")
 	assert.Empty(t, buf.String(), "a successful rollback must log nothing")
@@ -145,30 +147,40 @@ func TestRollbackUnlessDoneRollsBackOpenTransaction(t *testing.T) {
 // The already-committed case is the NORMAL successful path: Complete owns the
 // commit, so the deferred rollback always fires against a finished transaction.
 // Logging there would put a spurious error on every 2xx.
-func TestRollbackUnlessDoneToleratesCommittedTransaction(t *testing.T) {
+func TestDiscardOutcomeToleratesCommittedTransaction(t *testing.T) {
 	db := openStubDB(t, nil)
 	tx, err := db.Begin()
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 	log, buf := bufferedLogger()
 
-	assert.NotPanics(t, func() { presencehook.RollbackUnlessDone(tx, log) })
+	assert.NotPanics(t, func() { assert.NoError(t, presencehook.DiscardOutcome(tx.Rollback(), log, nil)) })
 	assert.Empty(t, buf.String(), "sql.ErrTxDone is not an error condition")
 }
 
 // A rollback that fails for any OTHER reason is a real failure, and it reaches
 // the sink as BOTH the fixed failure_class and the driver error — the shape
 // internal/friends/handlers.go already uses for its capture terminal. The
-// constant is the stable grep target; the error is the only record of the
-// cause, because this defer has no return value to carry it.
-func TestRollbackUnlessDoneLogsGenuineFailureWithClassAndCause(t *testing.T) {
-	db := openStubDB(t, errors.New("connection reset"))
+// constant is the stable grep target; the error is the cause. It also replaces
+// work's outcome, so a denial work returned no longer matches (#3508).
+func TestDiscardOutcomeLogsGenuineFailureWithClassAndCause(t *testing.T) {
+	rollbackErr := errors.New("connection reset")
+	db := openStubDB(t, rollbackErr)
 	tx, err := db.Begin()
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 	log, buf := bufferedLogger()
+	denial := errors.New("denied")
 
-	presencehook.RollbackUnlessDone(tx, log)
+	got := presencehook.DiscardOutcome(tx.Rollback(), log, denial)
+
+	assert.ErrorIs(t, got, rollbackErr, "the failed discard is the outcome")
+	assert.NotErrorIs(t, got, denial, "work's denial must not survive a failed discard")
+	second, err := db.Begin()
+	require.NoError(t, err)
+	defer func() { _ = second.Rollback() }()
+	assert.ErrorIs(t, presencehook.DiscardOutcome(second.Rollback(), log, nil), rollbackErr,
+		"a failed discard after work's nil is not a success")
 
 	logged := buf.String()
 	assert.Contains(t, logged, "rollback failed")
@@ -598,7 +610,7 @@ func TestWithGatedTxSurfacesTheCaptureTerminalForClassification(t *testing.T) {
 }
 
 // The unwired fallback is the pre-#2446-PR-2 shape — db.BeginTx plus the
-// deferred RollbackUnlessDone — so a replica without the hook behaves as it
+// deferred DiscardOutcome — so a replica without the hook behaves as it
 // did before. These pin the whole branch, including the path a successful
 // handler actually takes.
 func TestWithGatedTxUnwiredOpensItsOwnTransaction(t *testing.T) {
