@@ -1,8 +1,8 @@
 # Concord MinIO Source Publication and Cutover Gate
 
-> **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover still deferred
+> **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover complete (2026-10-01)
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-09-27 (published dependency-only derivative recorded)
+> **Last updated:** 2026-10-01 (production now runs the published derivative)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
 
@@ -13,8 +13,10 @@
 > upstream-only release. The current consumer pin uses the published derivative
 > recorded in the "Current Fixed Release" table below.
 >
-> The live production cutover remains deferred; the repository cannot confirm
-> which image is running on the production server.
+> The live production cutover ran on 2026-10-01 under a reviewed, rehearsed,
+> host-specific Phase 2 procedure (a private operational record). The
+> production container was verified, on the host, to run the runtime digest in
+> the "Current Fixed Release" table below.
 
 ## Purpose
 
@@ -309,12 +311,18 @@ The Phase 2 procedure must include all of these controls:
 - Retain pre-upgrade, post-upgrade, and rollback volumes through the incident
   retention window.
 
-Rollback has two explicit boundaries:
+Rollback has two explicit boundaries, and it ends when ingress reopens:
 
 - **Before writers reopen:** stop the candidate and start the previous digest on
   the unopened restored MinIO volume. Keep PostgreSQL unchanged.
-- **After writers reopen:** stop writers cleanly. Then start the previous MinIO
-  with the pre-restored PostgreSQL data volume, as one paired checkpoint.
+- **After writers reopen, before ingress reopens:** stop writers cleanly. Then
+  start the previous MinIO with the pre-restored PostgreSQL data volume, as one
+  paired checkpoint.
+- **After ingress reopens:** there is no scripted rollback. Restoring PostgreSQL
+  under live users discards their writes. It also brings back revoked refresh
+  credentials, removed permission grants (which Redis also caches) and media
+  authorizations. Treat a failure at this stage as disaster recovery, designed
+  for the incident.
 
 The previous MinIO binary must never open a production volume after the new
 binary has opened it.
@@ -353,9 +361,11 @@ recorded in [the tracker evidence](https://github.com/Concord-Voice/Concord-Voic
 The upstream tag and commit are unchanged.
 
 The shared Compose consumer is pinned to the runtime digest above. The **live server**
-still requires separate authorization, review, rehearsal, and verification under Phase 2.
-That deployment state is **not verified from the repository** — the repository cannot
-show which image a running container was started from. Check the host directly:
+was cut over to it on 2026-10-01 under Phase 2, after operations, security, database
+and network review and a disposable rehearsal of every recovery path. Every §5 control
+was applied or recorded as a reviewed deviation. The pre-cutover volumes are retained
+through the incident retention window. The repository still cannot show which image a
+running container was started from, so re-check the host directly before relying on it:
 
 ```bash
 docker inspect concordvoice-minio --format '{{.Image}} {{.Config.Image}}'
