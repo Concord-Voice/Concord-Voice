@@ -1,0 +1,7 @@
+# Applies to services/control-plane/go.mod only. Why this waiver is keyed on an
+# id with no expiry, and what re-opens it: [internal]quality-gate-definition.md
+# ("One Go waiver").
+
+[[IgnoredVulns]]
+id = "GO-2026-5932"
+reason = "golang.org/x/crypto/openpgp is deprecated, and the advisory has no fixed version. No version bump clears it. Nothing in the build graph imports openpgp: go list -deps ./... finds none, and govulncheck reports the module-level match as not called (verified 2026-10-01)."

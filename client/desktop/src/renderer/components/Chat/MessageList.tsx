@@ -415,7 +415,6 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // The badge while not following: unread rows still below the viewport.
     const refreshBadge = useCallback(
       (list: HTMLElement) => {
-        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the badge is re-derived from geometry after a landing or a scroll; not a render loop
         setNewMessageCount(
           unreadBelow(
             list,
@@ -447,7 +446,6 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         leaveLatest();
         arrivedWhileAwayRef.current += others.length;
         refreshBadge(list);
-        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the button is re-derived from geometry when a batch overflows; not a render loop
         setShowScrollButton(true);
         return true;
       },
@@ -770,7 +768,6 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       (list: HTMLElement | null, others: MessageWithStatus[]) => {
         isNearBottomRef.current = true;
         if (list) list.scrollTop = list.scrollHeight;
-        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the badge clears when the list follows the latest row; not a render loop
         setNewMessageCount(0);
         arrivedWhileAwayRef.current = 0;
         seededRef.current = 0;
@@ -870,6 +867,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     }, [
       messages,
       isLoading,
+      persistenceKey,
       currentUserId,
       isArrival,
       noteEmptyList,

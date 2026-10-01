@@ -1256,6 +1256,40 @@ describe('MessageList', () => {
       expect(onLatestSeen).toHaveBeenCalledTimes(1);
     });
 
+    it('fires for the first arrival after a key change that kept the same rows array', () => {
+      // The key change resets the arrival bookkeeping; the messages effect
+      // must re-seed it even when `messages` kept its identity, or the new
+      // thread's first live row reads as hydration and is never reported.
+      const onLatestSeen = vi.fn();
+      const held = [mockMessage];
+      const { rerender } = render(
+        <MessageList
+          messages={held}
+          currentUserId="user-1"
+          persistenceKey="a"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      rerender(
+        <MessageList
+          messages={held}
+          currentUserId="user-1"
+          persistenceKey="b"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      onLatestSeen.mockClear();
+      rerender(
+        <MessageList
+          messages={[mockMessage, arrival()]}
+          currentUserId="user-1"
+          persistenceKey="b"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
     it('does not fire when the arriving message is the user’s own', () => {
       const onLatestSeen = vi.fn();
       const { rerender } = render(

@@ -7,6 +7,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// unmatchedRoutePath stands in for the path of a request that matched no route.
+const unmatchedRoutePath = "<unmatched>"
+
 // Logger returns a gin.HandlerFunc that logs requests
 func Logger(log *logger.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -19,16 +22,15 @@ func Logger(log *logger.Logger) gin.HandlerFunc {
 		// this field (routing, latency-by-endpoint, status distribution) while
 		// dropping the secret.
 		//
-		// FullPath is empty only when no route matched, i.e. a 404 — there is no
-		// pattern to log and no route parameter was ever bound. The raw fallback
-		// keeps 404s diagnosable. Residual, stated rather than hidden: a 404 whose
-		// URL happens to contain a code-shaped string still logs it. That request
-		// matched nothing and the code was never accepted, so it is not a
-		// disclosure of a code in use; the trailing-slash 301 does not reach here
-		// at all, because gin redirects from the tree walk before the chain runs.
+		//
+		// FullPath is empty when no route matched, and that is NOT only a refused
+		// 404: CORS answers every preflight 204 before routing matters, and the
+		// desktop client preflights each invite and friend-code call, so an
+		// unmatched path carries a code in use (PR #3541, @red-team PoC). Log a
+		// constant instead; a 404 is still visible by method and status.
 		path := c.FullPath()
 		if path == "" {
-			path = c.Request.URL.Path
+			path = unmatchedRoutePath
 		}
 		method := c.Request.Method
 
@@ -37,17 +39,17 @@ func Logger(log *logger.Logger) gin.HandlerFunc {
 		duration := time.Since(start)
 		status := c.Writer.Status()
 
-		fields := []any{
+		// Constant keys at the call, never a spread []any: the log-injection
+		// query can prove a value safe only when it sees the key beside it.
+		// RequestID is mounted on the engine and sets the key before any handler
+		// returns, and this reads it after c.Next(), so request_id is always set.
+		log.Info("HTTP Request",
 			"method", method,
 			"path", path,
 			"status", status,
 			"duration", duration,
-			"ip", c.ClientIP(),
-		}
-		if reqID, exists := c.Get(RequestIDContextKey); exists {
-			fields = append(fields, "request_id", reqID)
-		}
-
-		log.Info("HTTP Request", fields...)
+			"ip", c.ClientIP(), // kept on purpose: abuse forensics and per-IP ban correlation need it (PR #3541)
+			"request_id", c.GetString(RequestIDContextKey),
+		)
 	}
 }

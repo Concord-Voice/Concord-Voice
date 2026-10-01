@@ -44,13 +44,6 @@ func NewWithWriter(w io.Writer) *Logger {
 	return &Logger{Logger: slog.New(handler)}
 }
 
-// With returns a new logger with additional context
-func (l *Logger) With(args ...any) *Logger {
-	return &Logger{
-		Logger: l.Logger.With(args...),
-	}
-}
-
 // Fatal logs a fatal error and exits
 func (l *Logger) Fatal(msg string, args ...any) {
 	l.Error(msg, args...)
