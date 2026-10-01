@@ -2654,8 +2654,9 @@ paths:
 
 
         Authorization: `Manage All Messages` permits purging any/all authors. An actor
-        holding only `Manage Own Messages` is forced to their own messages regardless
-        of `target_user_id`. Neither → 403 with nothing deleted and no audit row.
+        holding only `Manage Own Messages` may purge their own messages; an explicit
+        `target_user_id` naming another author returns 403. Neither → 403 with
+        nothing deleted and no audit row.
 
 
         Deletion is batched internally; the batch size is not a cap on how many
@@ -18126,9 +18127,11 @@ components:
         target_user_id:
           type: string
           format: uuid
-          description: 'Restrict the purge to one author. Requires `Manage All Messages`;
-            an actor holding only `Manage Own Messages` is forced to their own messages
-            and this field is ignored. Omit to purge all authors.'
+          description: 'Restrict the purge to one author. A valid UUID is normalized
+            before authorization; an invalid value returns 400. `Manage All Messages`
+            may target any author; `Manage Own Messages` alone may target only the
+            caller. Omission selects all authors for `Manage All Messages` and the
+            caller''s own messages for `Manage Own Messages`.'
         mfa_code:
           type: string
           maxLength: 256

@@ -646,6 +646,14 @@ func bindPurgeRequest(c *gin.Context, scopeID, invalidIDMsg string) (purgeReques
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
 		return purgeRequest{}, nil, false
 	}
+	if req.TargetUserID != nil {
+		targetID, err := uuid.Parse(*req.TargetUserID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid target user ID"})
+			return purgeRequest{}, nil, false
+		}
+		*req.TargetUserID = targetID.String()
+	}
 	if _, stepErr := req.Input(); stepErr != nil {
 		stepErr.Write(c)
 		return purgeRequest{}, nil, false

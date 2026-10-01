@@ -214,6 +214,38 @@ func TestPurgeChannel_ManageOwnOnlyForcedToSelf(t *testing.T) {
 	assert.Equal(t, 1, countChannelMessages(t, ts, channelID), "owner's message must survive")
 }
 
+func TestPurge_ManageOwnCanonicalizedSelfTarget(t *testing.T) {
+	for _, scope := range []string{"channel", "server"} {
+		t.Run(scope, func(t *testing.T) {
+			ts := testhelpers.SetupTestServer(t)
+			owner := ts.CreateTestUser(t, "target_owner")
+			member := ts.CreateTestUser(t, "target_member")
+			serverID := ts.CreateTestServer(t, owner.ID, "target-server")
+			ts.AddMemberToServer(t, serverID, member.ID, "member")
+			channelID := ts.CreateTestChannel(t, serverID, "general")
+			ts.CreateTestMessage(t, channelID, owner, "owner-msg")
+			ts.CreateTestMessage(t, channelID, member, "member-msg-1")
+			ts.CreateTestMessage(t, channelID, member, "member-msg-2")
+
+			path := purgeChannelPath(channelID)
+			if scope == "server" {
+				path = purgeServerPath(serverID)
+			}
+			w := ts.DoRequest(http.MethodDelete, path,
+				map[string]any{"range": "all", "target_user_id": strings.ToUpper(member.ID)},
+				testhelpers.AuthHeaders(member.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var remaining int
+			require.NoError(t, ts.DB.QueryRow(
+				`SELECT count(*) FROM messages WHERE channel_id = $1 AND user_id = $2`,
+				channelID, member.ID).Scan(&remaining))
+			assert.Zero(t, remaining, "the explicit self target must delete the member's messages")
+			assert.Equal(t, 1, countChannelMessages(t, ts, channelID), "the owner's message must survive")
+		})
+	}
+}
+
 // TestPurgeChannel_ManageOwnRejectsForeignTarget locks the review finding that a
 // ManageOwn-only actor asking to purge SOMEONE ELSE's messages must be DENIED — not
 // silently redirected onto their own.
