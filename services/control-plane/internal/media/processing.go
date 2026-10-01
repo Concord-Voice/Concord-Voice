@@ -47,8 +47,16 @@ const (
 	maxGifTotalPixels int64 = 4 * maxDecodePixels
 )
 
-// mimeGIF is the content type stored and served for animation-preserving output.
-const mimeGIF = "image/gif"
+// Canonical Tier 1 image MIME types, defined once so the allowlists and the
+// image-type error bodies reference named constants rather than repeating the
+// literals (SonarCloud S1192). mimeGIF is also the content type stored and
+// served for animation-preserving output.
+const (
+	mimeGIF  = "image/gif"
+	mimeJPEG = "image/jpeg"
+	mimePNG  = "image/png"
+	mimeWebP = "image/webp"
+)
 
 // ProcessedImage holds the result of server-side image processing.
 type ProcessedImage struct {
@@ -106,7 +114,7 @@ func ProcessImage(r io.Reader, maxWidth, maxHeight int) (*ProcessedImage, error)
 		if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: 85}); err != nil {
 			return "", fmt.Errorf("media: failed to encode processed image: %w", err)
 		}
-		return "image/jpeg", nil
+		return mimeJPEG, nil
 	})
 }
 
@@ -116,7 +124,7 @@ func ProcessImagePNG(r io.Reader, maxWidth, maxHeight int) (*ProcessedImage, err
 		if err := png.Encode(buf, img); err != nil {
 			return "", fmt.Errorf("media: failed to encode processed image as PNG: %w", err)
 		}
-		return "image/png", nil
+		return mimePNG, nil
 	})
 }
 

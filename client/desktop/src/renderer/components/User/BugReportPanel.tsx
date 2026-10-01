@@ -1,8 +1,10 @@
-import React, { useCallback, useId, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { ImagePlus, Loader2, X } from 'lucide-react';
 import { collect as collectSystemInfo } from '../../services/system/systemInfoService';
 import { formatEntries, getEntries } from '../../services/system/logBufferService';
 import { pseudonymizeLogUuids } from '../../utils/runtime/pseudonymizeLogUuids';
 import { type FeedbackDiagnostics, type FeedbackSubmission } from './feedbackTypes';
+import { useFeedbackScreenshot } from '../../hooks/feedback/useFeedbackScreenshot';
 import DiagnosticsPreviewModal from './DiagnosticsPreviewModal';
 import './BugReportPanel.css';
 
@@ -21,12 +23,25 @@ import './BugReportPanel.css';
  * `aria-describedby` — a privacy feature should make the data it transmits
  * obvious, not hide it behind a hover the keyboard / screen-reader user may
  * never discover.
+ *
+ * Screenshots (#1747): opt-in image attachments upload to the Tier-1 media
+ * endpoint, which re-encodes them (stripping EXIF/GPS metadata) and returns an
+ * unguessable path. The control-plane embeds that path as a server-authored
+ * image link in the filed (public-ish) feedback issue — so an attached
+ * screenshot becomes as visible as the report itself. The picker hint states
+ * the metadata-stripping and the per-file / type / count caps.
  */
 
 // Field caps per #159 spec (stricter than the control-plane's 200B / 8000B
 // guards — the server is defense-in-depth; these are the UX limits).
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 5000;
+
+// Screenshot attachment caps (#1747) — mirrored server-side as defense-in-depth.
+const MAX_SCREENSHOTS = 4;
+const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024; // 5 MB
+const ALLOWED_SCREENSHOT_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+const SCREENSHOT_ACCEPT = ALLOWED_SCREENSHOT_TYPES.join(',');
 
 // Guided-template prompts shown as the textarea placeholder. Placeholder
 // (not pre-filled value) so the prompts guide without polluting the GitHub
@@ -92,6 +107,42 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [includeLogs, setIncludeLogs] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const screenshotInputRef = useRef<HTMLInputElement>(null);
+  const { screenshots, addFiles, remove, uploadedRefs, isUploading, atCapacity } =
+    useFeedbackScreenshot({
+      maxCount: MAX_SCREENSHOTS,
+      maxSize: MAX_SCREENSHOT_BYTES,
+      allowedTypes: ALLOWED_SCREENSHOT_TYPES,
+      onError: setAttachError,
+    });
+
+  // Focus management for screenshot removal (a11y). Removing a thumbnail
+  // deletes its `<li>` — and the focused remove button along with it — so the
+  // browser drops focus to `document.body` with no keyboard/SR signal of
+  // where it went. `removeButtonRef` mirrors the rendered list by index;
+  // `pendingRemoveFocusIndexRef` records which index the user just removed so
+  // the effect below (which runs once the shorter list has committed) can
+  // land focus on whichever remove button now occupies that slot, fall back
+  // to the previous slot, or — once the list is empty — the attach button.
+  const removeButtonRef = useRef<(HTMLButtonElement | null)[]>([]);
+  const attachButtonRef = useRef<HTMLButtonElement>(null);
+  const pendingRemoveFocusIndexRef = useRef<number | null>(null);
+  const prevScreenshotCountRef = useRef(screenshots.length);
+
+  useEffect(() => {
+    const prevCount = prevScreenshotCountRef.current;
+    prevScreenshotCountRef.current = screenshots.length;
+    const pendingIndex = pendingRemoveFocusIndexRef.current;
+    if (pendingIndex === null || screenshots.length >= prevCount) return;
+    pendingRemoveFocusIndexRef.current = null;
+    if (screenshots.length === 0) {
+      attachButtonRef.current?.focus();
+      return;
+    }
+    const targetIndex = Math.min(pendingIndex, screenshots.length - 1);
+    removeButtonRef.current[targetIndex]?.focus();
+  }, [screenshots.length]);
 
   // "What's in the logs?" preview (#2078). The preview renders the EXACT bundle
   // `buildDiagnostics()` would submit — one code path, so the preview cannot
@@ -120,7 +171,7 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
   const descriptionTrimmedLength = description.trim().length;
   const titleValid = titleTrimmedLength > 0 && title.length <= TITLE_MAX;
   const descriptionValid = descriptionTrimmedLength > 0 && description.length <= DESCRIPTION_MAX;
-  const canSubmit = titleValid && descriptionValid && !isSubmitting;
+  const canSubmit = titleValid && descriptionValid && !isSubmitting && !isUploading;
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -133,6 +184,10 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
           title: title.trim(),
           description: description.trim(),
         };
+        const refs = uploadedRefs();
+        if (refs.length > 0) {
+          payload.attachments = refs;
+        }
         if (includeLogs) {
           try {
             payload.diagnostics = await buildDiagnostics();
@@ -148,7 +203,16 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
         submittingRef.current = false;
       }
     },
-    [title, description, includeLogs, titleValid, descriptionValid, isSubmitting, onSubmit]
+    [
+      title,
+      description,
+      includeLogs,
+      titleValid,
+      descriptionValid,
+      isSubmitting,
+      onSubmit,
+      uploadedRefs,
+    ]
   );
 
   const handleOpenPreview = useCallback(async () => {
@@ -232,6 +296,84 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
           <button type="button" className="bug-report-preview-link" onClick={handleOpenPreview}>
             What&apos;s in the logs?
           </button>
+        </div>
+
+        {/* Screenshots (#1747) */}
+        <div className="bug-report-field">
+          <span className="bug-report-label">Screenshots (optional)</span>
+          <input
+            ref={screenshotInputRef}
+            type="file"
+            accept={SCREENSHOT_ACCEPT}
+            multiple
+            hidden
+            disabled={isSubmitting || atCapacity}
+            onChange={(e) => {
+              if (e.target.files) addFiles(e.target.files);
+              e.target.value = ''; // allow re-selecting the same file after removal
+            }}
+          />
+          {screenshots.length > 0 && (
+            <ul className="bug-report-screenshots" aria-label="Attached screenshots">
+              {screenshots.map((s, index) => (
+                <li key={s.id} className="bug-report-screenshot">
+                  <img src={s.previewUrl} alt="" className="bug-report-screenshot-thumb" />
+                  {s.status === 'uploading' && (
+                    <span className="bug-report-screenshot-overlay" aria-hidden="true">
+                      <Loader2 size={16} className="spinner" />
+                    </span>
+                  )}
+                  {s.status === 'error' && (
+                    <span
+                      role="img"
+                      className="bug-report-screenshot-overlay bug-report-screenshot-overlay--error"
+                      aria-label="Upload failed"
+                    >
+                      !
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    ref={(el) => {
+                      removeButtonRef.current[index] = el;
+                    }}
+                    className="bug-report-screenshot-remove"
+                    aria-label={`Remove screenshot ${index + 1}`}
+                    disabled={isSubmitting}
+                    onClick={() => {
+                      setAttachError(null);
+                      pendingRemoveFocusIndexRef.current = index;
+                      remove(s.id);
+                    }}
+                  >
+                    <X size={14} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            ref={attachButtonRef}
+            className="bug-report-attach-btn"
+            disabled={isSubmitting || atCapacity}
+            onClick={() => {
+              setAttachError(null);
+              screenshotInputRef.current?.click();
+            }}
+          >
+            <ImagePlus size={16} />
+            {atCapacity ? `Maximum ${MAX_SCREENSHOTS} screenshots` : 'Attach screenshots'}
+          </button>
+          <p className="bug-report-screenshot-hint">
+            PNG, JPEG, or WebP — up to {MAX_SCREENSHOTS}, 5&nbsp;MB each. Image metadata is stripped
+            on upload.
+          </p>
+          {attachError && (
+            <p className="bug-report-screenshot-error" role="alert">
+              {attachError}
+            </p>
+          )}
         </div>
 
         {/* Submit */}

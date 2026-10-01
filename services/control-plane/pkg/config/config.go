@@ -227,6 +227,12 @@ type Config struct {
 	SpaIpcContract   int    // Minimum IPC contract version required by the remote SPA; 0 = no remote SPA
 	SpaConfigFile    string // Path to mounted spa.env for hot-reload; empty = static config from env vars
 
+	// Absolute public origin for server-authored media URLs, e.g.
+	// "https://api.concordvoice.chat". Used to embed bug-report screenshots into
+	// filed GitHub issues as absolute, camo-fetchable URLs (#1747). Non-secret;
+	// empty = the feedback handler skips attachment embeds (graceful, never fatal).
+	PublicMediaBaseURL string // PUBLIC_MEDIA_BASE_URL: absolute public media origin; empty disables screenshot embeds
+
 	// Self-hosted capability seam (#662). InstanceType ∈ {"saas","self-hosted"};
 	// unknown/empty is normalized to "saas" at the capabilities handler so a
 	// misconfigured value can never accidentally unlock self-hosted mode.
@@ -444,6 +450,7 @@ func Load() (*Config, error) {
 		SpaURL:                   getEnv("SPA_URL", ""),
 		SpaIpcContract:           getEnvInt("SPA_IPC_CONTRACT", 0),
 		SpaConfigFile:            getEnv("SPA_CONFIG_FILE", ""),
+		PublicMediaBaseURL:       strings.TrimRight(getEnv("PUBLIC_MEDIA_BASE_URL", ""), "/"),
 		InstanceType:             getEnv("INSTANCE_TYPE", "saas"),
 		ServerVersion:            getEnv("SERVER_VERSION", "dev"),
 		ReleasesDir:              getEnv("RELEASES_DIR", ""),

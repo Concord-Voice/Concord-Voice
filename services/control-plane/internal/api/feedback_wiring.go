@@ -36,5 +36,5 @@ func buildFeedbackHandler(cfg *config.Config, log *logger.Logger) *feedback.Hand
 	); err != nil {
 		log.Fatal("Failed to derive feedback correlation key", "error", err)
 	}
-	return feedback.NewHandler(log, github, corrKey)
+	return feedback.NewHandler(log, github, corrKey, cfg.PublicMediaBaseURL)
 }

@@ -2913,3 +2913,107 @@ func TestProfileTier1OwnedAdmissionAndSlotResolution(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, admitted)
 }
+
+// =====================================================================
+// Feedback Screenshot Upload/Proxy Tests (#1747 review)
+// =====================================================================
+
+const pathUploadFeedbackScreenshot = "/api/v1/media/upload/feedback-screenshot"
+const feedbackScreenshotsPathPrefix = "/api/v1/media/feedback-screenshots/"
+
+func TestUploadFeedbackScreenshotSuccess(t *testing.T) {
+	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
+	userID := ts.createTestUser(t, "screenshotuser")
+
+	body, ct := multipartBody(t, "file", "screenshot.png", makePNG(t, 200, 200), nil)
+
+	w := ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+
+	require.Equal(t, http.StatusCreated, w.Code)
+	resp := parseBody(t, w)
+	url, ok := resp["url"].(string)
+	require.True(t, ok, "url must be a string, got %#v", resp["url"])
+	id, ok := strings.CutPrefix(url, "/api/v1/media/feedback-screenshots/")
+	require.True(t, ok, "url must be shaped /api/v1/media/feedback-screenshots/<uuid>, got %q", url)
+	parsed, err := uuid.Parse(id)
+	require.NoError(t, err)
+	assert.Equal(t, parsed.String(), id, "the served id must be the canonical UUID form")
+	assert.Equal(t, 1, counters.uploads)
+}
+
+func TestUploadFeedbackScreenshotRejectsNonImage(t *testing.T) {
+	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
+	userID := ts.createTestUser(t, "screenshotbadtype")
+
+	body, ct := multipartBody(t, "file", "notes.txt", []byte("not an image"), nil)
+
+	w := ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	resp := parseBody(t, w)
+	assert.Contains(t, resp["error"], "Invalid image type")
+	assert.Zero(t, counters.uploads)
+}
+
+// TestUploadFeedbackScreenshotRejectsGIF locks in Fix 2 (#1747 review): the
+// feedback-screenshot purpose narrows the shared Tier 1 allowlist to
+// PNG/JPEG/WebP. GIF remains a valid Tier 1 type for every OTHER purpose
+// (avatars/banners/dm-icons/server-icons) — see TestUploadAvatarInvalidType's
+// sibling coverage for those, which this test must not narrow.
+func TestUploadFeedbackScreenshotRejectsGIF(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "screenshotgif")
+
+	frame := solidPalettedFrame(t, image.Rect(0, 0, 10, 10), gifColRed, gifTestPalette())
+	gifData := encodeTestGIF(t, []*image.Paletted{frame}, []int{0}, []byte{0}, 0, 10, 10)
+	body, ct := multipartBody(t, "file", "screenshot.gif", gifData, nil)
+
+	w := ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	resp := parseBody(t, w)
+	assert.Contains(t, resp["error"], "Invalid image type")
+	assert.NotContains(t, resp["allowed_types"], mimeGIF)
+}
+
+func TestProxyFeedbackScreenshotServesByKeyWithNoAuthCheck(t *testing.T) {
+	ts := setupMediaTest(t)
+	id := uuid.New().String()
+	key := fmt.Sprintf("feedback-screenshots/%s", id)
+	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
+
+	// Public route registered with no auth middleware (router.go) — invoke
+	// without setting user_id in the gin context, and with no media_files row
+	// backing the object, to lock in that ProxyFeedbackScreenshot performs
+	// neither an auth check nor a DB admission check; it streams straight from
+	// the object store by key, like a DM icon or server icon.
+	w := ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", feedbackScreenshotsPathPrefix+id, gin.Params{{Key: "id", Value: id}})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
+}
+
+func TestProxyFeedbackScreenshotInvalidID(t *testing.T) {
+	ts := setupMediaTest(t)
+
+	w := ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", feedbackScreenshotsPathPrefix+valueNotUUID, gin.Params{{Key: "id", Value: valueNotUUID}})
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestProxyFeedbackScreenshotRejectsNonCanonicalID locks in the ProxyFeedbackScreenshot
+// half of Fix 1 (#1747 review): uuid.Parse alone accepts non-canonical forms
+// (braces, urn:uuid:, uppercase, ...), so a :id in one of those shapes must be
+// rejected with 400 rather than falling through to a 404 at storage.
+func TestProxyFeedbackScreenshotRejectsNonCanonicalID(t *testing.T) {
+	ts := setupMediaTest(t)
+	braced := "{" + uuid.New().String() + "}"
+
+	w := ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", feedbackScreenshotsPathPrefix+braced, gin.Params{{Key: "id", Value: braced}})
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}

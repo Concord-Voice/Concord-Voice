@@ -69,6 +69,17 @@ const (
 	cacheControlNoStore               = "no-store"
 )
 
+// Feedback bug-report screenshot upload limits (#1747). The image is re-encoded
+// through the Tier-1 pipeline (which strips any EXIF/GPS metadata) and capped to
+// FeedbackScreenshotMaxDim on its longest edge. It is served via the public,
+// unguessable-UUID proxy route (ProxyFeedbackScreenshot) with no membership
+// check — like a DM icon — so GitHub's camo image proxy can fetch it.
+const (
+	purposeFeedbackScreenshot   = "feedback-screenshot"
+	FeedbackScreenshotMaxDim    = 2560            // fit within 2560x2560
+	feedbackScreenshotMaxUpload = 5 * 1024 * 1024 // 5 MB per screenshot
+)
+
 const profileTier1MediaAdmittedQuery = `
 	SELECT EXISTS (
 		SELECT 1 FROM media_files
@@ -168,10 +179,47 @@ const (
 
 // Allowed MIME types for Tier 1 image uploads
 var allowedImageTypes = map[string]bool{
-	"image/jpeg": true,
-	"image/png":  true,
-	"image/gif":  true,
-	"image/webp": true,
+	mimeJPEG: true,
+	mimePNG:  true,
+	mimeGIF:  true,
+	mimeWebP: true,
+}
+
+// allowedFeedbackScreenshotTypes narrows the Tier 1 allowlist for the
+// feedback-screenshot purpose only (#1747 review): the client, UI hint, and
+// CHANGELOG advertise PNG/JPEG/WebP alone, so GIF is rejected here even though
+// it remains a valid Tier 1 type everywhere else (avatars/banners/dm-icons/
+// server-icons keep the full allowedImageTypes set).
+var allowedFeedbackScreenshotTypes = map[string]bool{
+	mimeJPEG: true,
+	mimePNG:  true,
+	mimeWebP: true,
+}
+
+// allowedImageTypesFor returns the MIME allowlist for a given Tier 1 upload
+// purpose. Only purposeFeedbackScreenshot gets the narrowed set; every other
+// purpose keeps the shared allowedImageTypes map.
+func allowedImageTypesFor(purpose string) map[string]bool {
+	if purpose == purposeFeedbackScreenshot {
+		return allowedFeedbackScreenshotTypes
+	}
+	return allowedImageTypes
+}
+
+// imageTypeErrorBody returns the 400 response body for an image-type
+// rejection, scoped to the purpose's own allowlist so the error message never
+// advertises a type the purpose does not actually accept.
+func imageTypeErrorBody(purpose string) gin.H {
+	if purpose == purposeFeedbackScreenshot {
+		return gin.H{
+			"error":         "Invalid image type. Allowed: JPEG, PNG, WebP",
+			"allowed_types": []string{mimeJPEG, mimePNG, mimeWebP},
+		}
+	}
+	return gin.H{
+		"error":         "Invalid image type. Allowed: JPEG, PNG, GIF, WebP",
+		"allowed_types": []string{mimeJPEG, mimePNG, mimeGIF, mimeWebP},
+	}
 }
 
 // FileType classifies uploaded files for client-side rendering hints.
@@ -322,6 +370,19 @@ func (h *Handler) UploadServerBanner(c *gin.Context) {
 func (h *Handler) UploadDMIcon(c *gin.Context) {
 	userID := c.GetString("user_id")
 	h.handleTier1Upload(c, userID, purposeDMIcon, iconMaxUpload, IconMaxDim, IconMaxDim)
+}
+
+// UploadFeedbackScreenshot handles screenshot/photo uploads for in-app bug
+// reports (#1747). Authenticated; reuses the Tier-1 pipeline, so the image is
+// re-encoded as JPEG (stripping any EXIF/GPS metadata, and keeping the stored
+// object well under GitHub camo's 5 MiB proxy cap) and dimension-capped. The
+// returned `url` is a public, unguessable proxy path that the feedback handler
+// re-authors into a server-controlled absolute URL when building the GitHub
+// issue (see internal/feedback/handlers.go) — the client never controls the host.
+// POST /api/v1/media/upload/feedback-screenshot
+func (h *Handler) UploadFeedbackScreenshot(c *gin.Context) {
+	userID := c.GetString("user_id")
+	h.handleTier1Upload(c, userID, purposeFeedbackScreenshot, feedbackScreenshotMaxUpload, FeedbackScreenshotMaxDim, FeedbackScreenshotMaxDim)
 }
 
 // UploadAttachment handles E2EE file uploads for chat attachments (Tier 2).
@@ -828,6 +889,31 @@ func (h *Handler) ProxyDMIcon(c *gin.Context) {
 	h.proxyTier1Media(c, fmt.Sprintf("dm-icons/%s", conversationID), true)
 }
 
+// ProxyFeedbackScreenshot serves a bug-report screenshot through the control plane.
+// GET /api/v1/media/feedback-screenshots/:id
+// PUBLIC: the unguessable UUID is the only identifier. Registered without auth so
+// GitHub's image proxy (camo) can fetch a screenshot embedded in a filed issue
+// without an Authorization header. Do NOT add JWT/membership assumptions here — see
+// router.go for the registration. Like a DM icon, proxyTier1Media streams it by
+// object-store key without a media_files admission check, so the object outlives an
+// uploader's account-erasure cascade until it is reaped (tracked: #3153). (#1747)
+func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
+	id := c.Param("id")
+	// Require the CANONICAL lowercase 36-char UUID form, not merely something
+	// uuid.Parse accepts — it also parses `{braces}`, `urn:uuid:...`, 32-hex,
+	// and uppercase. Mirrors internal/feedback.isValidScreenshotPath, which is
+	// the trust boundary that only ever hands out canonical IDs; a non-canonical
+	// :id here means the request bypassed that boundary, so reject it with 400
+	// rather than falling through to a 404 at storage.
+	parsed, err := uuid.Parse(id)
+	if err != nil || parsed.String() != id {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid screenshot ID"})
+		return
+	}
+
+	h.proxyTier1Media(c, fmt.Sprintf("feedback-screenshots/%s", id), true)
+}
+
 // DeleteMedia soft-deletes a media file and removes it from object storage.
 // DELETE /api/v1/media/:file_id
 // Only the uploader can delete their own Tier 2 (attachment) files.
@@ -913,7 +999,7 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		return
 	}
 
-	contentType, ok := validateImageType(c, file, header)
+	contentType, ok := validateImageType(c, file, header, purpose)
 	if !ok {
 		return
 	}
@@ -1070,12 +1156,13 @@ func validateTier1Context(c *gin.Context, h *Handler, userID, purpose string) (s
 	return serverID, conversationID, true
 }
 
-// validateImageType checks the upload against the Tier 1 image allowlist and
-// returns the resolved content type (declared, or sniffed when the declared
-// type is absent/unrecognized).
-func validateImageType(c *gin.Context, file multipart.File, header *multipart.FileHeader) (string, bool) {
+// validateImageType checks the upload against the Tier 1 image allowlist for
+// the given purpose (allowedImageTypesFor) and returns the resolved content
+// type (declared, or sniffed when the declared type is absent/unrecognized).
+func validateImageType(c *gin.Context, file multipart.File, header *multipart.FileHeader, purpose string) (string, bool) {
+	allowed := allowedImageTypesFor(purpose)
 	contentType := header.Header.Get(headerContentType)
-	if contentType == "" || !allowedImageTypes[contentType] {
+	if contentType == "" || !allowed[contentType] {
 		buf := make([]byte, 512)
 		n, readErr := file.Read(buf)
 		if readErr != nil && readErr != io.EOF {
@@ -1092,18 +1179,19 @@ func validateImageType(c *gin.Context, file multipart.File, header *multipart.Fi
 			return "", false
 		}
 	}
-	if !allowedImageTypes[contentType] {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":         "Invalid image type. Allowed: JPEG, PNG, GIF, WebP",
-			"allowed_types": []string{"image/jpeg", "image/png", mimeGIF, "image/webp"},
-		})
+	if !allowed[contentType] {
+		c.JSON(http.StatusBadRequest, imageTypeErrorBody(purpose))
 		return "", false
 	}
 	return contentType, true
 }
 
 func processImage(file io.Reader, purpose string, maxW, maxH int) (*ProcessedImage, error) {
-	if purpose == purposeBanner || purpose == purposeServerBanner {
+	// Feedback screenshots are embedded in public GitHub issues through GitHub's
+	// camo proxy, which refuses images over its 5,242,880-byte Content-Length cap.
+	// A lossless PNG of a 2560px photo routinely exceeds that and would render as
+	// a broken image, so they take the JPEG path alongside banners (#1747 review).
+	if purpose == purposeBanner || purpose == purposeServerBanner || purpose == purposeFeedbackScreenshot {
 		return ProcessImage(file, maxW, maxH)
 	}
 	return ProcessImagePNG(file, maxW, maxH)
@@ -1231,6 +1319,11 @@ func tier1StorageKey(purpose, userID, serverID, conversationID string) string {
 		return fmt.Sprintf("server-banners/%s", serverID)
 	case purposeDMIcon:
 		return fmt.Sprintf("dm-icons/%s", conversationID)
+	case purposeFeedbackScreenshot:
+		// Per-upload UUID: unguessable and never overwritten, unlike the
+		// per-user / per-entity keys above. This UUID becomes the :id of the
+		// public serve route GET /api/v1/media/feedback-screenshots/:id (#1747).
+		return fmt.Sprintf("feedback-screenshots/%s", uuid.New().String())
 	}
 	return fmt.Sprintf("media/%s/%s", purpose, userID)
 }

@@ -13,11 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const (
-	mimeJPEG = "image/jpeg"
-	mimePNG  = "image/png"
-)
-
 // createTestJPEG creates a simple JPEG image for testing.
 func createTestJPEG(t *testing.T, w, h int) *bytes.Buffer {
 	t.Helper()

@@ -44,4 +44,17 @@ export interface FeedbackSubmission {
   category?: string;
   /** Bug-only; populated when the user checks "Include diagnostic logs". */
   diagnostics?: FeedbackDiagnostics;
+  /**
+   * Bug-only; screenshot/photo attachments (#1747). Each `url` is a relative
+   * Concord media path the client received from the feedback-screenshot upload
+   * endpoint; the control-plane re-authors it into an absolute image embed in
+   * the filed GitHub issue and re-validates the exact path shape server-side.
+   */
+  attachments?: FeedbackAttachment[];
+}
+
+/** A single bug-report screenshot reference. */
+export interface FeedbackAttachment {
+  /** Relative Concord media path, e.g. /api/v1/media/feedback-screenshots/<uuid>. */
+  url: string;
 }

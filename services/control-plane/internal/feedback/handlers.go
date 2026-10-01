@@ -11,6 +11,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -38,6 +39,14 @@ const (
 	// MaxRequestBytes is the total POST body size cap enforced at decode
 	// time. Anything larger triggers 413 before we touch JSON parsing.
 	MaxRequestBytes = 128 * 1024
+
+	// maxAttachmentCount bounds bug-report screenshots (#1747). Mirrors the
+	// client cap; enforced server-side as defense against a patched client.
+	maxAttachmentCount = 4
+	// feedbackScreenshotPathPrefix is the only media path a client may reference
+	// as an attachment. buildIssue re-authors it into an absolute URL, so
+	// "this prefix + a UUID" is the injection trust boundary (isValidScreenshotPath).
+	feedbackScreenshotPathPrefix = "/api/v1/media/feedback-screenshots/"
 )
 
 // reportType is the discriminator the client sets. The handler dispatches
@@ -57,6 +66,16 @@ type submitRequest struct {
 	Description string       `json:"description"`
 	Category    string       `json:"category,omitempty"`
 	Diagnostics *diagnostics `json:"diagnostics,omitempty"`
+	// Attachments are bug-only screenshot references (#1747). Each URL must be a
+	// /api/v1/media/feedback-screenshots/<uuid> path the client received from the
+	// upload endpoint; validate() bounds the count and enforces that exact shape.
+	Attachments []attachmentRef `json:"attachments,omitempty"`
+}
+
+// attachmentRef is a single bug-report screenshot reference. Only the relative
+// media path crosses the wire; the server supplies the absolute origin.
+type attachmentRef struct {
+	URL string `json:"url"`
 }
 
 type diagnostics struct {
@@ -107,14 +126,19 @@ type Handler struct {
 	log     *logger.Logger
 	github  GitHubIssueCreator
 	corrKey []byte // HKDF-derived correlation key (see buildFeedbackHandler)
+	// mediaBaseURL is the absolute public origin (config.PublicMediaBaseURL) used
+	// to author camo-fetchable screenshot URLs in filed issues (#1747). Empty =
+	// attachment embeds are skipped.
+	mediaBaseURL string
 }
 
 // NewHandler builds a Handler. Pass `nil` for `github` in dev to enable the
 // log-and-skip stub. `corrKey` is the HKDF-derived correlation key (see
 // buildFeedbackHandler), used to derive the non-reversible reporter correlation
-// token (see DeriveCorrelationToken).
-func NewHandler(log *logger.Logger, github GitHubIssueCreator, corrKey []byte) *Handler {
-	return &Handler{log: log, github: github, corrKey: corrKey}
+// token (see DeriveCorrelationToken). `mediaBaseURL` is the absolute origin for
+// embedded screenshot URLs (empty disables attachment embeds).
+func NewHandler(log *logger.Logger, github GitHubIssueCreator, corrKey []byte, mediaBaseURL string) *Handler {
+	return &Handler{log: log, github: github, corrKey: corrKey, mediaBaseURL: mediaBaseURL}
 }
 
 // Submit handles POST /api/v1/feedback. Requires the AuthRequired
@@ -178,7 +202,7 @@ func (h *Handler) Submit(c *gin.Context) {
 	// non-reversible HMAC correlation token, never the raw internal UUID.
 	// The token is stable across a user's reports so triage can dedup.
 	reporterToken := DeriveCorrelationToken(h.corrKey, userID)
-	title, body, labels := buildIssue(&req, reporterToken)
+	title, body, labels := buildIssue(&req, reporterToken, h.mediaBaseURL)
 
 	// Dev stub: log the body and return success without calling GitHub.
 	if h.github == nil {
@@ -244,7 +268,38 @@ func validate(req *submitRequest) error {
 	if req.Diagnostics != nil && len(req.Diagnostics.Logs) > maxLogsBytes {
 		return fmt.Errorf("logs exceed %d bytes", maxLogsBytes)
 	}
+	if len(req.Attachments) > 0 && req.Type != reportTypeBug {
+		return fmt.Errorf("attachments are only allowed on bug reports")
+	}
+	if len(req.Attachments) > maxAttachmentCount {
+		return fmt.Errorf("attachments exceed %d items", maxAttachmentCount)
+	}
+	for _, att := range req.Attachments {
+		if !isValidScreenshotPath(att.URL) {
+			return fmt.Errorf("invalid attachment reference")
+		}
+	}
 	return nil
+}
+
+// isValidScreenshotPath accepts only a relative media path of the exact shape
+// /api/v1/media/feedback-screenshots/<uuid>. buildIssue re-authors it into an
+// absolute URL, so this is the trust boundary that stops a client from injecting
+// an arbitrary (SSRF / markdown-probe) URL into the issue body (#1747). The
+// suffix must be the CANONICAL lowercase 36-char UUID form — uuid.Parse alone is
+// not a validator: it also accepts `{braces}`, `urn:uuid:...`, 32-hex-no-hyphens,
+// and uppercase, and the 38-byte braces form lets the first and last bytes be
+// arbitrary (including a raw newline) while still parsing successfully. The
+// round-trip through parsed.String() (always canonical lowercase) rejects every
+// non-canonical form, so what survives is hex + hyphens only, in the one exact
+// shape, with no path traversal, query strings, or control characters.
+func isValidScreenshotPath(u string) bool {
+	rest, ok := strings.CutPrefix(u, feedbackScreenshotPathPrefix)
+	if !ok {
+		return false
+	}
+	parsed, err := uuid.Parse(rest)
+	return err == nil && parsed.String() == rest
 }
 
 // neutralizeAutolinks inserts a zero-width space (U+200B) after Markdown
@@ -416,7 +471,7 @@ func inlineCode(s string) string {
 // rune-boundary-aware head-keep (header + the start of the Description block),
 // dropping the remainder. The truncation is marked inline so triagers know it
 // happened.
-func buildIssue(req *submitRequest, reporterToken string) (title, body string, labels []string) {
+func buildIssue(req *submitRequest, reporterToken, mediaBaseURL string) (title, body string, labels []string) {
 	var b strings.Builder
 
 	switch req.Type {
@@ -432,6 +487,9 @@ func buildIssue(req *submitRequest, reporterToken string) (title, body string, l
 		fencedBlock(&b, req.Description)
 		if req.Diagnostics != nil {
 			writeDiagnostics(&b, req.Diagnostics)
+		}
+		if mediaBaseURL != "" && len(req.Attachments) > 0 {
+			writeAttachments(&b, req.Attachments, mediaBaseURL)
 		}
 
 	case reportTypeFeature:
@@ -450,6 +508,19 @@ func buildIssue(req *submitRequest, reporterToken string) (title, body string, l
 		body = truncateBody(body)
 	}
 	return title, body, labels
+}
+
+// writeAttachments appends server-authored markdown image embeds for bug-report
+// screenshots (#1747). Every component of the URL is server-controlled:
+// mediaBaseURL comes from config and each att.URL was validated by
+// isValidScreenshotPath to be exactly /api/v1/media/feedback-screenshots/<uuid>.
+// No user-controlled text reaches the markdown link, so the body's
+// injection-inert posture (fencedBlock/inlineCode for all user free-text) holds.
+func writeAttachments(b *strings.Builder, attachments []attachmentRef, mediaBaseURL string) {
+	b.WriteString("\n## Screenshots\n\n")
+	for i, att := range attachments {
+		fmt.Fprintf(b, "![screenshot-%d](%s%s)\n", i+1, mediaBaseURL, att.URL)
+	}
 }
 
 // truncateBody applies a blunt HEAD-keep truncation when the assembled body

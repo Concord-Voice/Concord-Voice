@@ -6205,7 +6205,7 @@ paths:
 
 
         Authenticated, verified-email gated, attestation gated. Bug + feature submissions
-        share a 3 per 1 hour per-user rate limit. The server re-sanitizes user-supplied
+        share a 10 per 1 hour per-user rate limit. The server re-sanitizes user-supplied
         fields (title, description, logs) as defense-in-depth against a compromised
         client that bypasses the client-side scrub.
 
@@ -6300,6 +6300,25 @@ paths:
                         scrub at capture time strips emails, JWTs, IPs, filesystem
                         paths, and long hex/base64 blobs; the server re-runs the same
                         scrub before filing the issue.
+                attachments:
+                  type: array
+                  description: 'Bug-only screenshot references (#1747). Each url is
+                    a relative Concord media path of the exact shape
+                    `/api/v1/media/feedback-screenshots/<uuid>` returned by
+                    `POST /media/upload/feedback-screenshot`. The server bounds the
+                    count (max 4), rejects any other URL shape, and re-authors each
+                    into a server-controlled absolute image embed in the filed issue
+                    — the only trusted link in the body. Rejected (400) for `type: feature`.'
+                  maxItems: 4
+                  items:
+                    type: object
+                    required:
+                    - url
+                    properties:
+                      url:
+                        type: string
+                        description: Relative Concord media path
+                          (`/api/v1/media/feedback-screenshots/<uuid>`).
       responses:
         '200':
           description: Submission accepted
@@ -8033,6 +8052,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /media/feedback-screenshots/{id}:
+    get:
+      tags:
+      - Media
+      summary: Get a bug-report screenshot image
+      operationId: mediaProxyFeedbackScreenshot
+      description: 'Public Tier 1 image proxy — the unguessable per-upload UUID is the only identifier (#1747).
+
+        Registered without auth so GitHub''s camo image proxy can fetch a screenshot embedded in a filed feedback issue.
+
+        Rate limit: 120 requests per minute (IP-based).
+
+        '
+      security: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Per-upload screenshot UUID
+      responses:
+        '200':
+          description: Screenshot image stream (content type from storage)
+          headers:
+            Cache-Control:
+              description: public, max-age=3600, must-revalidate
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid screenshot ID (not a UUID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No screenshot stored for this ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Media storage not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /media/server-banners/{server_id}:
     get:
       tags:
@@ -8690,6 +8764,63 @@ paths:
                 $ref: '#/components/schemas/Error'
         '403':
           description: Caller is not a group DM participant or not a group admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: File exceeds the maximum upload size
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaFileTooLargeError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Media storage not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /media/upload/feedback-screenshot:
+    post:
+      tags:
+      - Media
+      summary: Upload a bug-report screenshot image
+      operationId: mediaUploadFeedbackScreenshot
+      description: 'Tier 1 authenticated upload for in-app bug-report screenshots (#1747).
+
+        Image is resized to fit 2560x2560 and re-encoded (stripping EXIF/GPS metadata); max raw upload 5 MiB.
+        Returns an unguessable public media path (`/api/v1/media/feedback-screenshots/<uuid>`) the client passes
+        to POST /feedback as attachments[].url.
+
+        Rate limit: 12 requests per minute.
+
+        '
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image file (PNG, JPEG, or WebP)
+      responses:
+        '201':
+          description: Image processed and stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaTier1UploadResponse'
+        '400':
+          description: Missing file, invalid image type, or image processing failure
           content:
             application/json:
               schema:

@@ -1542,6 +1542,12 @@ func NewRouter(
 				middleware.RateLimitByIP(redis, 60, 1*time.Minute),
 				mediaHandler.ProxyDMIcon,
 			)
+			// Public so GitHub's camo image proxy can fetch screenshots embedded
+			// in filed bug-report issues without an Authorization header (#1747).
+			v1.GET("/media/feedback-screenshots/:id",
+				middleware.RateLimitByIP(redis, 120, 1*time.Minute),
+				mediaHandler.ProxyFeedbackScreenshot,
+			)
 		} else {
 			// Match the protected fallback below so misconfiguration fails
 			// with a clear 503 instead of a 404 for all public Tier 1 routes.
@@ -1554,6 +1560,7 @@ func NewRouter(
 			v1.GET("/media/server-icons/:server_id", mediaUnavailable)
 			v1.GET("/media/server-banners/:server_id", mediaUnavailable)
 			v1.GET("/media/dm-icons/:conversationId", mediaUnavailable)
+			v1.GET("/media/feedback-screenshots/:id", mediaUnavailable)
 		}
 
 		// Client attestation routes (#677). Verify takes the configured TTL via
@@ -3024,6 +3031,12 @@ func NewRouter(
 				middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 				mediaHandler.UploadDMIcon,
 			)
+			// Bug-report screenshots (#1747): up to 4 per report, so allow a
+			// modest burst above the dm-icon rate.
+			mediaRoutes.POST("/upload/feedback-screenshot",
+				middleware.RateLimitByUser(redis, 12, 1*time.Minute),
+				mediaHandler.UploadFeedbackScreenshot,
+			)
 
 			// Tier 2 upload (E2EE attachments — ciphertext stored as-is)
 			mediaRoutes.POST("/upload/attachment",
@@ -3058,6 +3071,7 @@ func NewRouter(
 			mediaRoutes.POST("/upload/server-icon", mediaUnavailable503)
 			mediaRoutes.POST("/upload/server-banner", mediaUnavailable503)
 			mediaRoutes.POST("/upload/dm-icon", mediaUnavailable503)
+			mediaRoutes.POST("/upload/feedback-screenshot", mediaUnavailable503)
 			mediaRoutes.POST("/upload/attachment", mediaUnavailable503)
 			mediaRoutes.GET("/attachments/:file_id", mediaUnavailable503)
 			mediaRoutes.DELETE("/:file_id", mediaUnavailable503)

@@ -16,6 +16,16 @@ vi.mock('@/renderer/services/system/logBufferService', () => ({
   formatEntries: () => mockFormatEntries(),
 }));
 
+// Screenshot attachments (#1747) — useFeedbackScreenshot uploads through
+// apiFetch/safeJson. Mirrors the mocking pattern in
+// tests/unit/hooks/useFileUpload.test.ts.
+const mockApiFetch = vi.fn();
+const mockSafeJson = vi.fn();
+vi.mock('@/renderer/services/system/apiClient', () => ({
+  apiFetch: (...args: unknown[]) => mockApiFetch(...args),
+  safeJson: (...args: unknown[]) => mockSafeJson(...args),
+}));
+
 const SAMPLE_SYSTEM_INFO: SystemInfo = {
   appVersion: '0.1.63',
   platform: 'darwin',
@@ -341,6 +351,149 @@ describe('BugReportPanel', () => {
       await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
       // Sanity: the single submit still carried diagnostics.
       expect(onSubmit.mock.calls[0][0].diagnostics).toBeDefined();
+    });
+  });
+
+  describe('screenshots (#1747)', () => {
+    function pngFile(name = 'shot.png', size = 1000) {
+      return new File([new Uint8Array(size)], name, { type: 'image/png' });
+    }
+
+    function selectFile(container: HTMLElement, file: File) {
+      const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+      fireEvent.change(input, { target: { files: [file] } });
+    }
+
+    function selectFiles(container: HTMLElement, files: File[]) {
+      const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+      fireEvent.change(input, { target: { files } });
+    }
+
+    it('renders the "Attach screenshots" control', () => {
+      render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+      expect(screen.getByRole('button', { name: /attach screenshots/i })).toBeInTheDocument();
+    });
+
+    it('selecting a file renders a thumbnail with a remove button, and removing it clears the thumbnail', async () => {
+      mockApiFetch.mockResolvedValue({ ok: true, status: 200 });
+      mockSafeJson.mockResolvedValue({ url: '/api/v1/media/feedback-screenshots/abc' });
+      const { container } = render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      selectFile(container, pngFile());
+
+      expect(
+        await screen.findByRole('button', { name: 'Remove screenshot 1' })
+      ).toBeInTheDocument();
+      expect(container.querySelectorAll('.bug-report-screenshot-thumb')).toHaveLength(1);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove screenshot 1' }));
+
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: 'Remove screenshot 1' })).toBeNull()
+      );
+    });
+
+    it('moves focus to the next remove button after removing a middle screenshot', async () => {
+      mockApiFetch.mockResolvedValue({ ok: true, status: 200 });
+      mockSafeJson.mockResolvedValue({ url: '/api/v1/media/feedback-screenshots/abc' });
+      const { container } = render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      selectFiles(container, [pngFile('a.png'), pngFile('b.png'), pngFile('c.png')]);
+      await screen.findByRole('button', { name: 'Remove screenshot 3' });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove screenshot 2' }));
+
+      // The item that was third is now second, and inherits focus.
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Remove screenshot 2' })).toHaveFocus()
+      );
+    });
+
+    it('moves focus to the previous remove button after removing the last screenshot', async () => {
+      mockApiFetch.mockResolvedValue({ ok: true, status: 200 });
+      mockSafeJson.mockResolvedValue({ url: '/api/v1/media/feedback-screenshots/abc' });
+      const { container } = render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      selectFiles(container, [pngFile('a.png'), pngFile('b.png')]);
+      await screen.findByRole('button', { name: 'Remove screenshot 2' });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove screenshot 2' }));
+
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Remove screenshot 1' })).toHaveFocus()
+      );
+    });
+
+    it('moves focus to "Attach screenshots" after removing the last remaining screenshot', async () => {
+      mockApiFetch.mockResolvedValue({ ok: true, status: 200 });
+      mockSafeJson.mockResolvedValue({ url: '/api/v1/media/feedback-screenshots/abc' });
+      const { container } = render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      selectFile(container, pngFile());
+      await screen.findByRole('button', { name: 'Remove screenshot 1' });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove screenshot 1' }));
+
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /attach screenshots/i })).toHaveFocus()
+      );
+    });
+
+    it('exposes a failed upload as an accessible "Upload failed" indicator', async () => {
+      mockApiFetch.mockResolvedValue({ ok: false, status: 500 });
+      const { container } = render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      selectFile(container, pngFile());
+
+      // role="img" gives the overlay an accessible name from its aria-label —
+      // a bare <span> (role="generic") is excluded from name computation.
+      expect(await screen.findByRole('img', { name: 'Upload failed' })).toBeInTheDocument();
+    });
+
+    it('disables the submit button while a screenshot upload is in flight', async () => {
+      mockApiFetch.mockReturnValue(new Promise(() => {})); // never resolves
+      const { container } = render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+      fillForm('Crash on send', 'It crashed.');
+      expect(screen.getByRole('button', { name: 'Submit Bug Report' })).toBeEnabled();
+
+      selectFile(container, pngFile());
+
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Submit Bug Report' })).toBeDisabled()
+      );
+    });
+
+    it('includes uploaded attachments in the submitted payload', async () => {
+      mockApiFetch.mockResolvedValue({ ok: true, status: 200 });
+      mockSafeJson.mockResolvedValue({ url: '/api/v1/media/feedback-screenshots/abc' });
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      const { container } = render(<BugReportPanel onSubmit={onSubmit} isSubmitting={false} />);
+      fillForm('Crash on send', 'It crashed.');
+
+      selectFile(container, pngFile());
+
+      // Wait for the upload to finish (isUploading clears → submit re-enables)
+      // before submitting, mirroring the real form's disabled-while-uploading UX.
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Submit Bug Report' })).toBeEnabled()
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'Submit Bug Report' }));
+
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+      const payload = onSubmit.mock.calls[0][0];
+      expect(payload.attachments).toEqual([{ url: '/api/v1/media/feedback-screenshots/abc' }]);
+    });
+
+    it('does not include an attachments field when no screenshot was attached', async () => {
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      render(<BugReportPanel onSubmit={onSubmit} isSubmitting={false} />);
+      fillForm('Crash on send', 'It crashed.');
+      fireEvent.click(screen.getByRole('button', { name: 'Submit Bug Report' }));
+
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+      expect(onSubmit.mock.calls[0][0].attachments).toBeUndefined();
+      expect(mockApiFetch).not.toHaveBeenCalled();
     });
   });
 });

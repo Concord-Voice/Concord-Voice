@@ -15,6 +15,7 @@ account can't provide, never your password twice.
 
 ### Added
 
+- **Bug reports can now include screenshots** ([#1747](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1747)) — the in-app bug-report form now lets you attach up to four images (PNG, JPEG, or WebP, up to 5 MB each), so a visual glitch can be shown rather than described. Attached images are re-encoded before upload, which removes embedded camera metadata such as GPS location, and they appear inline in the filed report.
 - **Deleting many messages quickly now asks you to confirm it is you** ([#3455](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3455), [#3509](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3509)) — if you delete more than 15
   messages within 30 seconds, or more than 100 within 24 hours, the app asks for your authenticator or
   security-key code, or your password if your account has no code method, before it deletes the next

@@ -512,12 +512,20 @@ Uploaded images carry EXIF, XMP, and IPTC metadata — GPS coordinates, device
 identifiers, capture timestamps. Both tiers remove it, by **different mechanisms
 for a structural reason**: the server can only strip what it can read.
 
-**Tier 1 (avatars, banners, server icons, group-DM icons) — server-side.**
-`internal/media/processing.go` fully decodes and re-encodes every upload through
-Go's standard-library encoders, which emit no EXIF/XMP/IPTC segment. The
-animated-GIF branch builds a fresh `gif.GIF` struct, so comment and application
-extension blocks are dropped too. Re-encoding also neutralises polyglot and
-malformed-image payloads, which a metadata-only strip would leave intact.
+**Tier 1 (avatars, banners, server icons, group-DM icons, bug-report
+screenshots) — server-side.** `internal/media/processing.go` fully decodes and
+re-encodes every upload through Go's standard-library encoders, which emit no
+EXIF/XMP/IPTC segment. The animated-GIF branch builds a fresh `gif.GIF`
+struct, so comment and application extension blocks are dropped too.
+Re-encoding also neutralises polyglot and malformed-image payloads, which a
+metadata-only strip would leave intact.
+
+Bug-report / feedback screenshots (`purposeFeedbackScreenshot`, #1747) go
+through this same path, which is what makes the feature's "removes embedded
+camera metadata such as GPS location" claim true rather than aspirational.
+They live under the `feedback-screenshots/` object-key namespace and are
+served publicly by unguessable UUID (`/api/v1/media/feedback-screenshots/<uuid>`)
+with no DB admission check — the UUID itself is the access control.
 
 Removal is therefore a **side effect of processing**, not a dedicated step.
 `processing_metadata_test.go` pins it as an invariant — including the

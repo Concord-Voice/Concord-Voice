@@ -68,8 +68,12 @@ func doPost(t *testing.T, r *gin.Engine, payload interface{}) *httptest.Response
 // uses so reporter tokens are deterministic across a test run.
 var testCorrKey = []byte("test-corr-key-0000000000000000000") // pragma: allowlist secret -- test fixture
 
+// testMediaBaseURL is the fixed mediaBaseURL the test handler is constructed
+// with — used to author absolute screenshot embed URLs in filed issues (#1747).
+const testMediaBaseURL = "https://media.test"
+
 func newTestHandler(github GitHubIssueCreator) *Handler {
-	return NewHandler(logger.New("test"), github, testCorrKey)
+	return NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────
@@ -740,7 +744,7 @@ func TestBuildIssue_NoRawUserID(t *testing.T) {
 	const uid = "550e8400-e29b-41d4-a716-446655440000"
 	token := DeriveCorrelationToken([]byte("s"), uid)
 
-	_, body, _ := buildIssue(req, token)
+	_, body, _ := buildIssue(req, token, testMediaBaseURL)
 
 	assert.NotContains(t, body, uid, "raw UUID must never appear in the issue body")
 	assert.Contains(t, body, "**Reported by:** report `"+token+"`")
@@ -753,3 +757,110 @@ type fakeError string
 func (e fakeError) Error() string { return string(e) }
 
 func assertGitHubError(msg string) error { return fakeError("github: " + msg) }
+
+// ─── Bug-report screenshot attachments (#1747) ────────────────────────────
+
+const testAttachmentUUID = "550e8400-e29b-41d4-a716-446655440000"
+
+// mk builds a minimal, otherwise-valid submitRequest with the given type and
+// attachments — the shared table-test fixture for TestValidate_AttachmentReferences.
+func mk(typ reportType, atts []attachmentRef) *submitRequest {
+	return &submitRequest{Type: typ, Title: "title", Description: "description", Attachments: atts}
+}
+
+func ref(u string) attachmentRef { return attachmentRef{URL: u} }
+
+func TestValidate_AttachmentReferences(t *testing.T) {
+	validURL := feedbackScreenshotPathPrefix + testAttachmentUUID
+
+	fourValid := make([]attachmentRef, 0, maxAttachmentCount)
+	for i := 0; i < maxAttachmentCount; i++ {
+		fourValid = append(fourValid, ref(validURL))
+	}
+	fiveValid := append(append([]attachmentRef{}, fourValid...), ref(validURL))
+
+	cases := []struct {
+		name    string
+		req     *submitRequest
+		wantErr bool
+	}{
+		{"valid screenshot path", mk(reportTypeBug, []attachmentRef{ref(validURL)}), false},
+		{"no attachments (nil)", mk(reportTypeBug, nil), false},
+		{"max count (4) is allowed", mk(reportTypeBug, fourValid), false},
+		{"over max count (5) is rejected", mk(reportTypeBug, fiveValid), true},
+		{"attachments on a feature request are rejected", mk(reportTypeFeature, []attachmentRef{ref(validURL)}), true},
+		{"absolute URL is rejected", mk(reportTypeBug, []attachmentRef{ref("https://evil.example/x.png")}), true},
+		{"wrong path prefix is rejected", mk(reportTypeBug, []attachmentRef{ref("/api/v1/media/avatars/" + testAttachmentUUID)}), true},
+		{"non-uuid suffix is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + "not-a-uuid")}), true},
+		{"path traversal is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + "../../../etc/passwd")}), true},
+		// uuid.Parse is not a validator: it also accepts braces, urn:uuid:,
+		// 32-hex, and uppercase forms. isValidScreenshotPath must reject every
+		// non-canonical form via the parsed.String() round-trip (#1747 review).
+		{"braces-wrapped uuid is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + "{" + testAttachmentUUID + "}")}), true},
+		{"urn:uuid: form is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + "urn:uuid:" + testAttachmentUUID)}), true},
+		{"32-hex unhyphenated form is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + strings.ReplaceAll(testAttachmentUUID, "-", ""))}), true},
+		{"uppercase canonical form is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + strings.ToUpper(testAttachmentUUID))}), true},
+		// The 38-byte braces form only examines the middle 36 bytes, so the
+		// first/last byte can be ANYTHING that parses -- including a raw
+		// newline, which would otherwise reach the public GitHub issue body.
+		{"trailing-newline braces form is rejected", mk(reportTypeBug, []attachmentRef{ref(feedbackScreenshotPathPrefix + "{" + testAttachmentUUID + "\n")}), true},
+		{"newline injection is rejected", mk(reportTypeBug, []attachmentRef{ref(validURL + "\n![x](http://evil)")}), true},
+		{"query suffix is rejected", mk(reportTypeBug, []attachmentRef{ref(validURL + "?x=1")}), true},
+		{"empty url is rejected", mk(reportTypeBug, []attachmentRef{ref("")}), true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validate(c.req)
+			if c.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestBuildIssue_Screenshots(t *testing.T) {
+	id1 := testAttachmentUUID
+	id2 := "660e8400-e29b-41d4-a716-446655440001"
+
+	bugReqWithAttachments := &submitRequest{
+		Type:        reportTypeBug,
+		Title:       "Crash on send",
+		Description: "Steps to reproduce: 1...",
+		Attachments: []attachmentRef{
+			ref(feedbackScreenshotPathPrefix + id1),
+			ref(feedbackScreenshotPathPrefix + id2),
+		},
+	}
+
+	t.Run("bug report with attachments and a configured mediaBaseURL embeds screenshots", func(t *testing.T) {
+		_, body, _ := buildIssue(bugReqWithAttachments, "report-token", "https://media.test")
+
+		assert.Contains(t, body, "## Screenshots")
+		assert.Contains(t, body, "![screenshot-1](https://media.test"+feedbackScreenshotPathPrefix+id1+")")
+		assert.Contains(t, body, "![screenshot-2](https://media.test"+feedbackScreenshotPathPrefix+id2+")")
+		// The description free text is still present alongside the screenshots.
+		assert.Contains(t, body, "Steps to reproduce")
+	})
+
+	t.Run("empty mediaBaseURL skips the screenshots section entirely", func(t *testing.T) {
+		_, body, _ := buildIssue(bugReqWithAttachments, "report-token", "")
+
+		assert.NotContains(t, body, "## Screenshots")
+		assert.NotContains(t, body, "![screenshot")
+	})
+
+	t.Run("feature requests never emit a screenshots section, even with attachments set", func(t *testing.T) {
+		featureReq := &submitRequest{
+			Type:        reportTypeFeature,
+			Title:       "Add dark mode",
+			Description: "Would help.",
+			Attachments: []attachmentRef{ref(feedbackScreenshotPathPrefix + id1)},
+		}
+		_, body, _ := buildIssue(featureReq, "report-token", "https://media.test")
+
+		assert.NotContains(t, body, "## Screenshots")
+	})
+}
