@@ -135,13 +135,10 @@ if (typeof window !== 'undefined') {
   }) as unknown as typeof HTMLCanvasElement.prototype.toBlob;
   HTMLCanvasElement.prototype.toDataURL = vi.fn(() => 'data:image/png;base64,mock');
 
-  // Mock URL.createObjectURL / revokeObjectURL (jsdom doesn't support blob URLs)
-  if (!URL.createObjectURL) {
-    URL.createObjectURL = vi.fn(() => 'blob:mock-url');
-  }
-  if (!URL.revokeObjectURL) {
-    URL.revokeObjectURL = vi.fn();
-  }
+  // URL.createObjectURL / revokeObjectURL are NOT stubbed here. Node's URL (which
+  // Vitest keeps under jsdom) already has both, so a `!URL.createObjectURL` guard
+  // never fired; Vitest's jsdom environment routes jsdom Blobs through its own
+  // compat shim. A test that needs predictable URLs installs its own stub.
 
   // Mock navigator.clipboard — jsdom defines it as a getter-only property so
   // Object.assign() throws. Use Object.defineProperty to install writable vi.fn()s.

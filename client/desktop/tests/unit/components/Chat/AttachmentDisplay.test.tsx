@@ -1016,8 +1016,8 @@ describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
     vi.clearAllMocks();
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);
     revoked = [];
-    // setup.ts stubs createObjectURL with a CONSTANT url, which cannot express
-    // "which entry was evicted" — hand out a distinct url per blob instead.
+    // The real createObjectURL returns unpredictable urls, which cannot express
+    // "which entry was evicted" — hand out a distinct, predictable url per blob.
     URL.createObjectURL = () => `blob:cache-${++urlSeq}`;
     URL.revokeObjectURL = (url: string) => {
       revoked.push(url);
