@@ -30,9 +30,12 @@ export const ANIMATION_SNIFF_BYTES = 64 * 1024;
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
+/** Callers must keep `at + len <= b.length`: `fromCodePoint` throws a
+ *  RangeError on the `undefined` an out-of-bounds read returns. Both callers
+ *  bound-check before reading. */
 function ascii(b: Uint8Array, at: number, len: number): string {
   let out = '';
-  for (let i = 0; i < len; i++) out += String.fromCharCode(b[at + i]);
+  for (let i = 0; i < len; i++) out += String.fromCodePoint(b[at + i]);
   return out;
 }
 

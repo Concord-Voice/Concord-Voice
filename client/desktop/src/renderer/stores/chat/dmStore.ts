@@ -609,19 +609,15 @@ function resolveExpirationReaders(
   for (const { read, resolve } of readers) resolve(result(read));
 }
 
+/** The DMState keys a conversation-list fetch reads and reconciles. */
+type ConversationListKey = 'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds';
+
 function completeConversationFetch(
   data: unknown,
   journal: ConversationFetchJournal,
   read: ExpirationPolicyReadRequest | undefined,
-  set: (
-    state: Partial<
-      Pick<
-        DMState,
-        'conversations' | 'activeConversationId' | 'error' | 'invalidExpirationPolicyIds'
-      >
-    >
-  ) => void,
-  get: () => Pick<DMState, 'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds'>
+  set: (state: Partial<Pick<DMState, ConversationListKey | 'error'>>) => void,
+  get: () => Pick<DMState, ConversationListKey>
 ): ExpirationPolicyReadResult | undefined {
   if (!isRecord(data) || !Array.isArray(data.conversations)) {
     set({ error: 'Failed to load conversations' });
@@ -662,11 +658,8 @@ function failedConversationFetch(
 function reconcileConversationResponse(
   rows: Record<string, unknown>[],
   journal: ConversationFetchJournal,
-  currentState: Pick<
-    DMState,
-    'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds'
-  >
-): Pick<DMState, 'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds'> {
+  currentState: Pick<DMState, ConversationListKey>
+): Pick<DMState, ConversationListKey> {
   const currentById = new Map(
     currentState.conversations.map((conversation) => [conversation.id, conversation])
   );

@@ -60,7 +60,7 @@ export function useMutualServersForAll(userIds: readonly string[]): ReadonlySet<
     let active = true;
     void Promise.all(ids.map((id) => getMutualServers(id))).then((results) => {
       if (!active) return;
-      if (results.some((result) => result === null)) {
+      if (results.includes(null)) {
         setSettled({ key, servers: NONE });
         return;
       }
