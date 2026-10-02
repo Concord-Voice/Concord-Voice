@@ -55,6 +55,16 @@ export default defineConfig(() => {
       // assumption, not 31 sloppy tests, so the default is pinned rather than
       // the tests rewritten.
       clearMocks: false,
+      // A real `require('electron')` must never reach the network. CI installs with
+      // `npm ci --ignore-scripts`, so the Electron binary is never fetched, and the
+      // package's index.js then downloads it at IMPORT time. vi.mock cannot intercept a
+      // plain CommonJS require: main.ts's `require('electron-squirrel-startup')` loads
+      // the real package, which requires the real `electron`, so every suite that
+      // imports main.ts depended on a ~100 MB download and failed whenever it did
+      // (quitLifecycle.deadlock.test.ts, PR #3562). With an override the package
+      // returns a path string without touching disk or network, exactly what it
+      // returns in Node when the binary is present. Nothing here executes Electron.
+      env: { ELECTRON_OVERRIDE_DIST_PATH: 'vitest-no-electron-binary' },
       environment: 'jsdom',
       // Node 26 defines both storage globals -- `localStorage` as an accessor returning
       // `undefined` without --localstorage-file (so .clear() throws), `sessionStorage` as
