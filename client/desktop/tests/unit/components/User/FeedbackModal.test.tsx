@@ -1,10 +1,17 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 import FeedbackModal from '@/renderer/components/User/FeedbackModal';
+import { resetAllStores } from '../../../helpers/store-helpers';
+import type { SystemInfo } from '@/renderer/services/system/systemInfoService';
+
+const mockCollect = vi.fn();
+vi.mock('@/renderer/services/system/systemInfoService', () => ({
+  collect: () => mockCollect(),
+}));
 
 // Mock the connection store the systemInfoService imports
 vi.mock('@/renderer/stores/ui/connectionStore', () => ({
-  useConnectionStore: { getState: () => ({ phase: 'stable' }) },
+  useConnectionStore: { getState: () => ({ phase: 'stable', reset: vi.fn() }) },
 }));
 
 // Mock apiClient — both apiFetch and safeJson
@@ -16,7 +23,10 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 
 describe('FeedbackModal', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
+    mockApiFetch.mockReset();
+    mockCollect.mockReset();
   });
 
   describe('rendering', () => {
@@ -258,6 +268,94 @@ describe('FeedbackModal', () => {
       // Success surface renders through the whole stack.
       expect(await screen.findByText(/Thank you for the feedback/)).toBeInTheDocument();
     });
+
+    it.each([
+      {
+        name: 'removing the only uploaded screenshot',
+        filenames: ['only.png'],
+        expectedAttachments: undefined,
+      },
+      {
+        name: 'removing one of two uploaded screenshots',
+        filenames: ['removed.png', 'remaining.png'],
+        expectedAttachments: [
+          { url: '/api/v1/media/feedback-screenshots/22222222-2222-4222-8222-222222222222' },
+        ],
+      },
+    ])(
+      'omits $name from feedback submitted after diagnostics',
+      async ({ filenames, expectedAttachments }) => {
+        const screenshotUrls = [
+          '/api/v1/media/feedback-screenshots/11111111-1111-4111-8111-111111111111',
+          '/api/v1/media/feedback-screenshots/22222222-2222-4222-8222-222222222222',
+        ];
+        mockApiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+          if (path === '/api/v1/media/upload/feedback-screenshot') {
+            const file = (init?.body as FormData).get('file') as File;
+            return new Response(
+              JSON.stringify({ url: screenshotUrls[filenames.indexOf(file.name)] }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              }
+            );
+          }
+          return new Response(JSON.stringify({ dev: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        });
+
+        let resolveCollect!: (value: SystemInfo) => void;
+        mockCollect.mockReturnValue(
+          new Promise((resolve) => {
+            resolveCollect = resolve;
+          })
+        );
+
+        render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
+        fireEvent.change(screen.getByLabelText(/Title/), { target: { value: 'A bug' } });
+        fireEvent.change(screen.getByLabelText(/Description/), { target: { value: 'It broke.' } });
+        const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+        fireEvent.change(input, {
+          target: {
+            files: filenames.map(
+              (name) => new File([new Uint8Array(100)], name, { type: 'image/png' })
+            ),
+          },
+        });
+        await waitFor(() =>
+          expect(screen.getByRole('button', { name: 'Submit Bug Report' })).toBeEnabled()
+        );
+        fireEvent.click(screen.getByLabelText('Include diagnostic logs'));
+        fireEvent.click(screen.getByRole('button', { name: 'Submit Bug Report' }));
+
+        await waitFor(() => expect(mockCollect).toHaveBeenCalledTimes(1));
+        expect(mockApiFetch.mock.calls.some(([path]) => path === '/api/v1/feedback')).toBe(false);
+        fireEvent.click(screen.getByRole('button', { name: 'Remove screenshot 1' }));
+        expect(screen.queryAllByRole('button', { name: /Remove screenshot/ })).toHaveLength(
+          filenames.length - 1
+        );
+        resolveCollect({
+          appVersion: '1.0.0',
+          platform: 'darwin',
+          userAgent: 'test',
+          machineIdPrefix: '12345678',
+          gpu: { vendor: 'test', renderer: 'test' },
+          display: { width: 1, height: 1, scaleFactor: 1, refreshRate: 60 },
+          connectionPhase: 'stable',
+        });
+
+        expect(await screen.findByText(/Thank you for the feedback/)).toBeInTheDocument();
+        const feedbackCall = mockApiFetch.mock.calls.find(([path]) => path === '/api/v1/feedback');
+        expect(feedbackCall).toBeDefined();
+        const payload = JSON.parse(feedbackCall![1].body as string);
+        expect(
+          payload.attachments,
+          'removed-screenshot property must not reach the feedback POST'
+        ).toEqual(expectedAttachments);
+      }
+    );
   });
 
   describe('feature submission integration (real FeatureRequestPanel → submit → apiFetch)', () => {

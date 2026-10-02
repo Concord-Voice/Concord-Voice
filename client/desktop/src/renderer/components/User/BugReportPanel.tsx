@@ -184,10 +184,6 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
           title: title.trim(),
           description: description.trim(),
         };
-        const refs = uploadedRefs();
-        if (refs.length > 0) {
-          payload.attachments = refs;
-        }
         if (includeLogs) {
           try {
             payload.diagnostics = await buildDiagnostics();
@@ -195,6 +191,11 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
             // collect() is best-effort and shouldn't throw; if it somehow does,
             // send the report without diagnostics rather than blocking the user.
           }
+        }
+        // Diagnostics can yield while the user removes a screenshot.
+        const refs = uploadedRefs();
+        if (refs.length > 0) {
+          payload.attachments = refs;
         }
         await onSubmit(payload);
       } finally {
