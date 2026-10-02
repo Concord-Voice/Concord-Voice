@@ -69,7 +69,6 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 }));
 
 // E2EE service
-const mockEncryptForChannel = vi.fn();
 const mockEncryptForChannelWithVersion = vi.fn();
 const mockGetCurrentKeyVersion = vi.fn(() => 1);
 const mockInvalidateChannelKey = vi.fn();
@@ -77,7 +76,6 @@ let mockE2EEIsInitialized = true;
 
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
-    encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
     encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
@@ -318,7 +316,6 @@ describe('useChatController', () => {
     });
 
     it('binds channel edit ciphertext and key version from one encryption result', async () => {
-      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-content');
       mockEncryptForChannelWithVersion.mockResolvedValue({
         ciphertext: 'encrypted-content',
         keyVersion: 7,
@@ -358,7 +355,6 @@ describe('useChatController', () => {
     });
 
     it('binds DM edit ciphertext and key version from one encryption result', async () => {
-      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-dm-content');
       mockEncryptForChannelWithVersion.mockResolvedValue({
         ciphertext: 'encrypted-dm-content',
         keyVersion: 7,
@@ -416,7 +412,6 @@ describe('useChatController', () => {
     });
 
     it('stores plaintext and the encryption epoch while clearing stale decrypt state', async () => {
-      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-content');
       mockEncryptForChannelWithVersion.mockResolvedValue({
         ciphertext: 'encrypted-content',
         keyVersion: 7,
@@ -459,7 +454,6 @@ describe('useChatController', () => {
     });
 
     it('preserves a GIF slug inside the canonical plaintext edit envelope', async () => {
-      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-content');
       mockEncryptForChannelWithVersion.mockResolvedValue({
         ciphertext: 'encrypted-gif-envelope',
         keyVersion: 7,

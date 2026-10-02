@@ -113,7 +113,6 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     initializeFromStoredKeys: (...args: unknown[]) => mockInitializeFromStoredKeys(...args),
-    encryptForChannel: vi.fn(),
     decryptForChannel: vi.fn(),
     getChannelKey: vi.fn(),
     invalidateChannelKey: vi.fn(),

@@ -244,14 +244,14 @@ async function readImageDimensions(file: File): Promise<{ width: number; height:
  *  two upload helpers take a context rather than a parameter list nobody can
  *  read at the call site. */
 interface UploadContext {
-  /** Non-nullable, and `keyVersion` likewise required — #2843/#2848 removed the
-   *  fail-open `channelKey ? encrypt : plaintext` branch and narrowed these
-   *  across the upload path so `tsc` re-proves the plaintext case unreachable
-   *  on every build. Bundling them into this context must not re-widen them:
-   *  that would restore the representability of a plaintext upload while
-   *  compiling perfectly cleanly, since widening is not a type error. */
-  channelKey: CryptoKey;
-  keyVersion: number;
+  /** The key context (DM conversation or channel). Key material is NOT carried
+   *  here: uploadSingleFile reads it per FILE, so a key_revocation processed
+   *  mid-batch cannot leave later files sealed under the revoked epoch. There,
+   *  `channelKey` and `keyVersion` stay non-nullable — #2843/#2848 removed the
+   *  fail-open `channelKey ? encrypt : plaintext` branch, and widening them
+   *  would make a plaintext upload representable again while compiling
+   *  cleanly, since widening is not a type error. */
+  keyChannelId: string;
   channelId: string;
   conversationId: string | undefined;
   /** Whether the connected control plane exposes the chunked upload session.
@@ -564,11 +564,24 @@ async function uploadSingleFile(
   signal: AbortSignal,
   onChunkCommitted: (index: number, total: number) => void = () => {}
 ): Promise<UploadResponse> {
-  const { channelKey, keyVersion, channelId, conversationId } = ctx;
+  const { channelId, conversationId } = ctx;
 
   if (ctx.chunkedUploadSupported) {
+    const uploadable = await stripToUploadable(entry.file);
+    // Per FILE, not per batch, and after the strip: a pair read at batch start
+    // kept sealing every later file under it, including files encrypted after
+    // the client processed key_revocation, under an epoch the removed member
+    // holds and attachment uploads still accept. One call still returns both
+    // halves, so the label is the epoch of the key that seals this file.
+    //
+    // The guard is taken BEFORE the read and asserted after every chunk seal.
+    // The session open is a network round trip and a 410 restart re-seals the
+    // whole file with this key, so a key_revocation processed after the read
+    // must stop every part that has not left yet.
+    const keyGuard = e2eeService.createChannelOperationGuard(ctx.keyChannelId);
+    const { channelKey, keyVersion } = await e2eeService.getChannelKeyMaterial(ctx.keyChannelId);
     return uploadAttachmentChunked(
-      await stripToUploadable(entry.file),
+      uploadable,
       channelKey,
       {
         // EXACTLY ONE. A DM carries the conversation id in BOTH `channelId` and
@@ -585,17 +598,12 @@ async function uploadSingleFile(
         onChunkCommitted,
         onSessionOpened: (id) => ctx.liveSessions.add(id),
         onSessionClosed: (id) => ctx.liveSessions.delete(id),
+        assertKeyCurrent: keyGuard.assertCurrent,
       }
     );
   }
 
-  const formData = await encryptAndBuildForm(
-    entry,
-    channelKey,
-    keyVersion,
-    channelId,
-    conversationId
-  );
+  const formData = await encryptAndBuildForm(entry, ctx.keyChannelId, channelId, conversationId);
   const response = await apiFetch('/api/v1/media/upload/attachment', {
     method: 'POST',
     body: formData,
@@ -618,15 +626,17 @@ async function uploadSingleFile(
  * gate that selected that branch but left the branch itself, so a null key
  * would have silently uploaded the file in the clear.
  *
- * `e2eeService.getChannelKey` returns `Promise<CryptoKey>` and throws rather
- * than resolving null, so the null case is unrepresentable — expressing that in
- * the type is what keeps it unrepresentable. `key_version` is likewise always
- * sent: `getCurrentKeyVersion` returns a number, never undefined.
+ * `e2eeService.getChannelKeyMaterial` throws rather than resolving a null key,
+ * so the null case is unrepresentable — expressing that in the type is what
+ * keeps it unrepresentable. `key_version` is likewise always sent, and it is the
+ * version of the key that encrypted the file: both come from that one call,
+ * made after the metadata strip so the key is as current as it can be when
+ * the file is sealed, and a cache change cannot pair this key with another
+ * epoch.
  */
 async function encryptAndBuildForm(
   entry: FileUploadState,
-  channelKey: CryptoKey,
-  keyVersion: number,
+  keyChannelId: string,
   channelId: string,
   conversationId?: string
 ): Promise<FormData> {
@@ -645,7 +655,13 @@ async function encryptAndBuildForm(
   // errored — the upload fails rather than silently sending unstripped bytes.
   const { data: fileData } = stripFileMetadata(raw, entry.file.type);
 
+  // The twin of encryptForChannelWithVersion's post-encrypt fence: a
+  // key_revocation processed while the AES-GCM runs stops this upload, as it
+  // stops a message.
+  const keyGuard = e2eeService.createChannelOperationGuard(keyChannelId);
+  const { channelKey, keyVersion } = await e2eeService.getChannelKeyMaterial(keyChannelId);
   const uploadData = await encryptFile(fileData, channelKey);
+  keyGuard.assertCurrent();
 
   const formData = new FormData();
   formData.append('file', new Blob([uploadData]), entry.file.name);
@@ -890,13 +906,13 @@ export function useFileUpload() {
       // size guard in uploadAdditionalFiles is only safe because of it.
       try {
         const keyChannelId = conversationId || channelId;
-        const channelKey = await e2eeService.getChannelKey(keyChannelId);
-        const keyVersion = e2eeService.getCurrentKeyVersion(keyChannelId);
+        // Fail fast when there is no key, before any file work. Each file then
+        // reads its own key material (see uploadSingleFile).
+        await e2eeService.getChannelKeyMaterial(keyChannelId);
 
         // Upload pending files from React state (user-added via picker / drag-drop).
         const ctx: UploadContext = {
-          channelKey,
-          keyVersion,
+          keyChannelId,
           channelId,
           conversationId,
           chunkedUploadSupported,

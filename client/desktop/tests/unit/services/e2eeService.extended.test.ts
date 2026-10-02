@@ -260,7 +260,7 @@ describe('e2eeService — extended', () => {
 
       mockApiFetch.mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
       } as Response);
 
       // Get the key and use it directly
@@ -726,7 +726,7 @@ describe('e2eeService — extended', () => {
 
       mockApiFetch.mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
       } as Response);
 
       const newMemberKeys = await generateRegistrationKeys('NewMember!');
@@ -902,7 +902,7 @@ describe('e2eeService — extended', () => {
         } as Response)
         .mockResolvedValueOnce({
           ok: true,
-          json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+          json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
         } as Response)
         .mockResolvedValueOnce({
           ok: true,
@@ -1785,10 +1785,6 @@ describe('e2eeService — extended', () => {
 
   describe('async key lifecycle boundaries', () => {
     it.each([
-      [
-        'current-version encryption',
-        (channelId: string) => e2eeService.encryptForChannel(channelId, 'revoked plaintext'),
-      ],
       [
         'version-bound encryption',
         (channelId: string) =>

@@ -9,10 +9,10 @@ export function createMockE2EEService() {
     isInitialized: true,
     initialize: vi.fn().mockResolvedValue(undefined),
     getChannelKey: vi.fn().mockResolvedValue({} as CryptoKey),
-    encryptForChannel: vi
+    encryptForChannelWithVersion: vi
       .fn()
       .mockImplementation((_channelId: string, plaintext: string) =>
-        Promise.resolve(`encrypted:${plaintext}`)
+        Promise.resolve({ ciphertext: `encrypted:${plaintext}`, keyVersion: 1 })
       ),
     decryptForChannel: vi
       .fn()

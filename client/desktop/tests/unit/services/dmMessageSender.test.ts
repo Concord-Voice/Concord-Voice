@@ -38,11 +38,12 @@ vi.mock('@/renderer/services/messaging/messageQueue', () => ({
   }),
 }));
 
-const mockEncryptForChannel = vi.fn();
+const mockEncryptForChannelWithVersion = vi.fn();
+const mockGetCurrentKeyVersion = vi.fn((..._args: unknown[]): number | undefined => undefined);
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
-    encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
-    getCurrentKeyVersion: () => undefined,
+    encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
+    getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
     invalidateChannelKey: vi.fn(),
     isInitialized: true,
   },
@@ -74,7 +75,10 @@ describe('dmMessageSender.sendDMMessage', () => {
 
   it('encrypts and sends via the websocket transport when connected', async () => {
     const encrypted = 'encrypted-base64-content-that-is-long-enough-for-validation';
-    mockEncryptForChannel.mockResolvedValue(encrypted);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encrypted,
+      keyVersion: 1,
+    });
     sendDMMessage('dm-conv-1', 'https://invite.concordvoice.chat/GHJKMNPQ');
     await vi.waitFor(() => {
       expect(mockSendDMMessage).toHaveBeenCalledWith(
@@ -160,5 +164,36 @@ describe('dmMessageSender.sendDMMessage', () => {
         attachmentMime: last?.attachmentMime,
       }).phrase
     ).toBe('a Doc');
+  });
+
+  // regression: dm-send-atomic-epoch
+  it('sends the key_version of the key that encrypted the DM, even when the channel-key cache reads 0', async () => {
+    const ciphertext = 'encrypted-base64-content-that-is-long-enough-for-validation';
+    // The atomic API reports the epoch of the key it actually encrypted with.
+    mockEncryptForChannelWithVersion.mockResolvedValue({ ciphertext, keyVersion: 4 });
+    // The cache now reads the keyVersion:0 malformed-wrap marker slot.
+    mockGetCurrentKeyVersion.mockReturnValue(0);
+    mockGetCurrentKeyVersion.mockClear();
+
+    sendDMMessage('dm-conv-1', 'https://invite.concordvoice.chat/GHJKMNPQ');
+
+    await vi.waitFor(() => {
+      expect(mockSendDMMessage, 'the DM must actually reach the transport').toHaveBeenCalledTimes(
+        1
+      );
+    });
+
+    const [, sentContent, sentOpts] = mockSendDMMessage.mock.calls[0];
+    expect(sentContent).toBe(ciphertext);
+    expect
+      .soft(
+        sentOpts.keyVersion,
+        'the key_version sent with a DM ciphertext must equal the epoch of the key that encrypted it (4), not the separate channel-key cache read (0)'
+      )
+      .toBe(4);
+    expect(
+      mockGetCurrentKeyVersion,
+      'the DM send path must not read the epoch via a separate getCurrentKeyVersion call after encrypting'
+    ).not.toHaveBeenCalled();
   });
 });

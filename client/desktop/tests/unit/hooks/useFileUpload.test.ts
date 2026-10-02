@@ -13,6 +13,7 @@ import {
   resolveAttachmentLimit,
 } from '@/renderer/utils/policy/entitlementLimits';
 import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import {
   CHUNK_PLAINTEXT_BYTES,
   ENVELOPE_HEADER_BYTES,
@@ -49,7 +50,12 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
       return true;
     },
     getChannelKey: vi.fn().mockResolvedValue({} as CryptoKey),
+    // vi.fn(impl), so a mockReset() restores this default rather than wiping it.
+    getChannelKeyMaterial: vi.fn(async () => ({ channelKey: {} as CryptoKey, keyVersion: 1 })),
     getCurrentKeyVersion: vi.fn().mockReturnValue(1),
+    // A key context that never moves. The fence itself is exercised against the
+    // real service in attachmentStaleKeyFence.test.ts.
+    createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
   },
 }));
 
@@ -890,6 +896,55 @@ describe('useFileUpload', () => {
 
     const body = mockApiFetch.mock.calls[0][1].body as FormData;
     expect(body.get('key_version')).toBe('1');
+  });
+
+  // regression: dm-send-atomic-epoch
+  it('uploads with the key_version of the key that encrypted the file, even when the channel-key cache reads 0', async () => {
+    // The atomic API returns the key together with the epoch it belongs to.
+    vi.mocked(e2eeService.getChannelKeyMaterial).mockResolvedValue({
+      channelKey: {} as CryptoKey,
+      keyVersion: 4,
+    } as Awaited<ReturnType<typeof e2eeService.getChannelKeyMaterial>>);
+    // The legacy two-call shape still completes so today's code reaches the upload.
+    vi.mocked(e2eeService.getChannelKey).mockResolvedValue({} as CryptoKey);
+    // The cache reads the keyVersion:0 malformed-wrap marker slot.
+    vi.mocked(e2eeService.getCurrentKeyVersion).mockReturnValue(0);
+
+    try {
+      mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
+      mockSafeJson.mockResolvedValue({
+        file_id: 'attach-epoch-1',
+        file_type: 'photo',
+        file_size: 1000,
+      });
+
+      const { result } = renderHook(() => useFileUpload());
+
+      await act(async () => {
+        await result.current.addFiles([createMockFile('epoch.png', 1000, 'image/png')]);
+      });
+      vi.mocked(e2eeService.getCurrentKeyVersion).mockClear();
+
+      await act(async () => {
+        await result.current.uploadAll('channel-1');
+      });
+
+      expect(mockApiFetch, 'the upload must actually reach the transport').toHaveBeenCalledTimes(1);
+      const body = mockApiFetch.mock.calls[0][1].body as FormData;
+      expect
+        .soft(
+          body.get('key_version'),
+          'the key_version sent with an uploaded attachment must equal the epoch of the key that encrypted it (4), not the separate channel-key cache read (0)'
+        )
+        .toBe('4');
+      expect(
+        e2eeService.getCurrentKeyVersion,
+        'the upload path must not read the epoch via a separate getCurrentKeyVersion call after fetching the key'
+      ).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(e2eeService.getCurrentKeyVersion).mockReturnValue(1);
+      vi.mocked(e2eeService.getChannelKeyMaterial).mockReset();
+    }
   });
 
   it('uploads with conversationId for DMs', async () => {

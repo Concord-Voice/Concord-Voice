@@ -180,7 +180,6 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
     isInitialized: true,
     createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
     decryptForChannel: vi.fn(),
-    encryptForChannel: vi.fn(),
     encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getChannelKey: vi.fn(),
     revokeChannelAccess: vi.fn(),

@@ -73,7 +73,7 @@ describe('uploadAttachmentChunked', () => {
       key,
       ctx,
       new AbortController().signal,
-      { onChunkCommitted: (i, t) => committed.push([i, t]) }
+      { assertKeyCurrent: () => {}, onChunkCommitted: (i, t) => committed.push([i, t]) }
     );
 
     expect(calls()).toEqual([
@@ -98,6 +98,7 @@ describe('uploadAttachmentChunked', () => {
 
     const plaintext = 4096;
     await uploadAttachmentChunked(fileOf(plaintext), key, ctx, new AbortController().signal, {
+      assertKeyCurrent: () => {},
       onChunkCommitted: () => {},
     });
 
@@ -124,7 +125,7 @@ describe('uploadAttachmentChunked', () => {
       key,
       { ...ctx, envelopeVersion: 2 },
       new AbortController().signal,
-      { onChunkCommitted: () => {} }
+      { assertKeyCurrent: () => {}, onChunkCommitted: () => {} }
     );
 
     const sent = JSON.parse(apiFetch.mock.calls[0][1].body as string);
@@ -139,6 +140,7 @@ describe('uploadAttachmentChunked', () => {
 
     await expect(
       uploadAttachmentChunked(fileOf(4096), key, ctx, new AbortController().signal, {
+        assertKeyCurrent: () => {},
         onChunkCommitted: () => {},
       })
     ).rejects.toThrow();
@@ -170,7 +172,7 @@ describe('uploadAttachmentChunked', () => {
       key,
       ctx,
       new AbortController().signal,
-      { onChunkCommitted: () => {} }
+      { assertKeyCurrent: () => {}, onChunkCommitted: () => {} }
     );
 
     expect(calls()).toEqual([
@@ -200,6 +202,7 @@ describe('uploadAttachmentChunked', () => {
       .mockResolvedValueOnce(commitOK());
 
     await uploadAttachmentChunked(fileOf(4096), key, ctx, new AbortController().signal, {
+      assertKeyCurrent: () => {},
       onChunkCommitted: () => {},
     });
 
@@ -224,6 +227,7 @@ describe('uploadAttachmentChunked', () => {
 
     await expect(
       uploadAttachmentChunked(fileOf(CHUNK_PLAINTEXT_BYTES + 10), key, ctx, ac.signal, {
+        assertKeyCurrent: () => {},
         onChunkCommitted: () => {},
       })
     ).rejects.toThrow(/abort/i);
@@ -248,6 +252,7 @@ describe('uploadAttachmentChunked', () => {
 
     await expect(
       uploadAttachmentChunked(fileOf(4096), key, ctx, new AbortController().signal, {
+        assertKeyCurrent: () => {},
         onChunkCommitted: () => {},
       })
     ).rejects.toThrow();
@@ -286,7 +291,7 @@ describe('uploadAttachmentChunked', () => {
         envelopeVersion: 3,
       },
       new AbortController().signal,
-      { onChunkCommitted: () => {} }
+      { assertKeyCurrent: () => {}, onChunkCommitted: () => {} }
     );
 
     expect(out.file_id).toBe('file-1');
@@ -300,7 +305,7 @@ describe('uploadAttachmentChunked', () => {
 // extraction and observing the suite stay green. Three behaviours had no test
 // at all, which is exactly the class a refactor can break in silence.
 describe('uploadAttachmentChunked — previously uncovered expiry and repair paths', () => {
-  const noopCb = { onChunkCommitted: () => {} };
+  const noopCb = { assertKeyCurrent: () => {}, onChunkCommitted: () => {} };
 
   it('restarts with a NEW fileNonce when a chunk PUT returns 410', () => {
     // Expiry mid-upload is recoverable: the session is gone but the file is not.
@@ -408,6 +413,7 @@ describe('uploadAttachmentChunked — the abort signal must REACH the transport'
       .mockResolvedValueOnce(commitOK());
 
     await uploadAttachmentChunked(fileOf(1024), key, ctx, controller.signal, {
+      assertKeyCurrent: () => {},
       onChunkCommitted: () => {},
     });
 
@@ -432,6 +438,7 @@ describe('uploadAttachmentChunked — the abort signal must REACH the transport'
 
     await expect(
       uploadAttachmentChunked(fileOf(1024), key, ctx, controller.signal, {
+        assertKeyCurrent: () => {},
         onChunkCommitted: () => {},
       })
     ).rejects.toThrow();
@@ -470,7 +477,7 @@ describe('uploadAttachmentChunked — exactly one upload target', () => {
         envelopeVersion: 3,
       },
       new AbortController().signal,
-      { onChunkCommitted: () => {} }
+      { assertKeyCurrent: () => {}, onChunkCommitted: () => {} }
     );
 
     const body = initBodyOf(0);
@@ -496,7 +503,7 @@ describe('uploadAttachmentChunked — exactly one upload target', () => {
         envelopeVersion: 3,
       },
       new AbortController().signal,
-      { onChunkCommitted: () => {} }
+      { assertKeyCurrent: () => {}, onChunkCommitted: () => {} }
     );
 
     const body = initBodyOf(0);
@@ -526,7 +533,7 @@ describe('uploadAttachmentChunked — exactly one upload target', () => {
           envelopeVersion: 3,
         },
         new AbortController().signal,
-        { onChunkCommitted: () => {} }
+        { assertKeyCurrent: () => {}, onChunkCommitted: () => {} }
       );
 
       const body = initBodyOf(0);
@@ -556,6 +563,7 @@ describe('uploadAttachmentChunked — server responses are validated, not truste
 
       await expect(
         uploadAttachmentChunked(fileOf(1024), key, ctx, new AbortController().signal, {
+          assertKeyCurrent: () => {},
           onChunkCommitted: () => {},
         })
       ).rejects.toThrow(/usable upload session id/i);
@@ -577,6 +585,7 @@ describe('uploadAttachmentChunked — server responses are validated, not truste
 
     await expect(
       uploadAttachmentChunked(fileOf(1024), key, ctx, new AbortController().signal, {
+        assertKeyCurrent: () => {},
         onChunkCommitted: () => {},
       })
     ).rejects.toThrow(/not valid chunk indices/i);

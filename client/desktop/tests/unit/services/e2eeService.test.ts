@@ -174,7 +174,7 @@ describe('e2eeService', () => {
       // Mock the API response
       mockApiFetch.mockResolvedValueOnce({
         ok: true,
-        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
       } as Response);
 
       const unwrapped = await e2eeService.getChannelKey('channel-1');
@@ -194,7 +194,7 @@ describe('e2eeService', () => {
 
       mockApiFetch.mockResolvedValueOnce({
         ok: true,
-        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
       } as Response);
 
       // First call fetches from server
@@ -230,7 +230,7 @@ describe('e2eeService', () => {
     });
   });
 
-  describe('encryptForChannel / decryptForChannel', () => {
+  describe('encryptForChannelWithVersion / decryptForChannel', () => {
     it('round-trips a message', async () => {
       await e2eeService.initialize(
         testPassword,
@@ -243,10 +243,14 @@ describe('e2eeService', () => {
 
       mockApiFetch.mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
       } as Response);
 
-      const encrypted = await e2eeService.encryptForChannel('channel-1', 'Secret message');
+      const { ciphertext: encrypted, keyVersion } = await e2eeService.encryptForChannelWithVersion(
+        'channel-1',
+        'Secret message'
+      );
+      expect(keyVersion).toBeGreaterThanOrEqual(1);
       expect(typeof encrypted).toBe('string');
       expect(encrypted).not.toBe('Secret message');
 
@@ -268,7 +272,7 @@ describe('e2eeService', () => {
 
       mockApiFetch.mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
       } as Response);
 
       await e2eeService.getChannelKey('channel-1');

@@ -43,7 +43,6 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
-    encryptForChannel: vi.fn(),
     invalidateChannelKey: vi.fn(),
     revokeChannelAccess: vi.fn(),
   },

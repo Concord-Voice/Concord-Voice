@@ -64,13 +64,13 @@ vi.mock('@/renderer/services/messaging/messageQueue', () => ({
 }));
 
 // Mock e2eeService
-const mockEncryptForChannel = vi.fn();
-const mockGetCurrentKeyVersion = vi.fn(() => undefined);
+const mockEncryptForChannelWithVersion = vi.fn();
+const mockGetCurrentKeyVersion = vi.fn((..._args: unknown[]): number | undefined => undefined);
 const mockInvalidateChannelKey = vi.fn();
 
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
-    encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
+    encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
     isInitialized: true,
@@ -137,8 +137,10 @@ describe('useMessaging', () => {
 
   it('sendMessage sends via websocket when connected', async () => {
     const encryptedContent = 'encrypted-base64-content-that-is-long-enough-for-validation';
-    mockEncryptForChannel.mockResolvedValue(encryptedContent);
-    mockGetCurrentKeyVersion.mockReturnValue(undefined);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encryptedContent,
+      keyVersion: 1,
+    });
 
     const { result } = renderHook(() => useMessaging());
 
@@ -150,7 +152,7 @@ describe('useMessaging', () => {
     await vi.waitFor(() => {
       expect(mockSendMessage).toHaveBeenCalledWith('channel-1', encryptedContent, {
         nonce: 'client-msg-1',
-        keyVersion: undefined,
+        keyVersion: 1,
         mentionMeta: undefined,
         replyToId: undefined,
         attachmentIds: undefined,
@@ -159,10 +161,10 @@ describe('useMessaging', () => {
   });
 
   it('sendMessage encrypts for E2EE channels', async () => {
-    mockEncryptForChannel.mockResolvedValue(
-      'encrypted-base64-content-that-is-long-enough-for-validation'
-    );
-    mockGetCurrentKeyVersion.mockReturnValue(3);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: 'encrypted-base64-content-that-is-long-enough-for-validation',
+      keyVersion: 3,
+    });
 
     const { result } = renderHook(() => useMessaging());
 
@@ -171,7 +173,7 @@ describe('useMessaging', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mockEncryptForChannel).toHaveBeenCalledWith('channel-2', 'Secret message');
+      expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith('channel-2', 'Secret message');
       expect(mockSendMessage).toHaveBeenCalledWith(
         'channel-2',
         'encrypted-base64-content-that-is-long-enough-for-validation',
@@ -186,8 +188,43 @@ describe('useMessaging', () => {
     });
   });
 
+  // regression: dm-send-atomic-epoch
+  it('sendMessage sends the key_version of the key that encrypted the message, even when the channel-key cache reads 0', async () => {
+    const ciphertext = 'encrypted-base64-content-that-is-long-enough-for-validation';
+    mockEncryptForChannelWithVersion.mockResolvedValue({ ciphertext, keyVersion: 4 });
+    // The cache reads the keyVersion:0 malformed-wrap marker slot.
+    mockGetCurrentKeyVersion.mockReturnValue(0);
+
+    const { result } = renderHook(() => useMessaging());
+    mockGetCurrentKeyVersion.mockClear();
+
+    act(() => {
+      result.current.sendMessage('channel-2', 'Secret message', 'testuser');
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        mockSendMessage,
+        'the message must actually reach the transport'
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    const [, sentContent, sentOpts] = mockSendMessage.mock.calls[0];
+    expect(sentContent).toBe(ciphertext);
+    expect
+      .soft(
+        sentOpts.keyVersion,
+        'the key_version sent with a channel ciphertext must equal the epoch of the key that encrypted it (4), not the separate channel-key cache read (0)'
+      )
+      .toBe(4);
+    expect(
+      mockGetCurrentKeyVersion,
+      'the immediate channel send path must not read the epoch via a separate getCurrentKeyVersion call after encrypting'
+    ).not.toHaveBeenCalled();
+  });
+
   it('sendMessage marks as failed when encryption fails', async () => {
-    mockEncryptForChannel.mockRejectedValue(new Error('Key not available'));
+    mockEncryptForChannelWithVersion.mockRejectedValue(new Error('Key not available'));
 
     const { result } = renderHook(() => useMessaging());
 
@@ -203,7 +240,7 @@ describe('useMessaging', () => {
   });
 
   it('sendMessage terminally fails on NOT_MEMBER with code-specific copy', async () => {
-    mockEncryptForChannel.mockRejectedValue(new E2EEKeyUnavailableError('NOT_MEMBER'));
+    mockEncryptForChannelWithVersion.mockRejectedValue(new E2EEKeyUnavailableError('NOT_MEMBER'));
 
     const { result } = renderHook(() => useMessaging());
 
@@ -221,7 +258,9 @@ describe('useMessaging', () => {
   });
 
   it('sendMessage invalidates cache and terminally fails on REVOKED_EPOCH', async () => {
-    mockEncryptForChannel.mockRejectedValue(new E2EEKeyUnavailableError('REVOKED_EPOCH'));
+    mockEncryptForChannelWithVersion.mockRejectedValue(
+      new E2EEKeyUnavailableError('REVOKED_EPOCH')
+    );
 
     const { result } = renderHook(() => useMessaging());
 
@@ -389,8 +428,10 @@ describe('useMessaging', () => {
 
   it('sendDMMessage sends via websocket sendDMMessage when connected', async () => {
     const encryptedContent = 'encrypted-base64-content-that-is-long-enough-for-validation';
-    mockEncryptForChannel.mockResolvedValue(encryptedContent);
-    mockGetCurrentKeyVersion.mockReturnValue(undefined);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encryptedContent,
+      keyVersion: 1,
+    });
 
     const { result } = renderHook(() => useMessaging());
 
@@ -401,7 +442,7 @@ describe('useMessaging', () => {
     await vi.waitFor(() => {
       expect(mockSendDMMessage).toHaveBeenCalledWith('dm-conv-1', encryptedContent, {
         nonce: 'client-msg-1',
-        keyVersion: undefined,
+        keyVersion: 1,
         mentionMeta: undefined,
         attachmentIds: undefined,
         replyToId: undefined,
@@ -410,10 +451,10 @@ describe('useMessaging', () => {
   });
 
   it('sendDMMessage encrypts for E2EE conversations and includes keyVersion', async () => {
-    mockEncryptForChannel.mockResolvedValue(
-      'encrypted-base64-content-that-is-long-enough-for-validation'
-    );
-    mockGetCurrentKeyVersion.mockReturnValue(5);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: 'encrypted-base64-content-that-is-long-enough-for-validation',
+      keyVersion: 5,
+    });
 
     const { result } = renderHook(() => useMessaging());
 
@@ -422,7 +463,7 @@ describe('useMessaging', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mockEncryptForChannel).toHaveBeenCalledWith('dm-conv-1', 'Secret DM');
+      expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith('dm-conv-1', 'Secret DM');
       expect(mockSendDMMessage).toHaveBeenCalledWith(
         'dm-conv-1',
         'encrypted-base64-content-that-is-long-enough-for-validation',
@@ -438,8 +479,7 @@ describe('useMessaging', () => {
   });
 
   it('sendDMMessage marks as failed when encryption produces invalid output', async () => {
-    mockEncryptForChannel.mockResolvedValue('short');
-    mockGetCurrentKeyVersion.mockReturnValue(2);
+    mockEncryptForChannelWithVersion.mockResolvedValue({ ciphertext: 'short', keyVersion: 2 });
 
     const { result } = renderHook(() => useMessaging());
 
@@ -456,9 +496,10 @@ describe('useMessaging', () => {
   });
 
   it('sendDMMessage rolls back bumpConversation when send fails on new conversation', async () => {
-    mockEncryptForChannel.mockResolvedValue(
-      'encrypted-base64-content-that-is-long-enough-for-validation'
-    );
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: 'encrypted-base64-content-that-is-long-enough-for-validation',
+      keyVersion: 1,
+    });
     useDMStore.setState({
       conversations: [
         {
@@ -551,8 +592,10 @@ describe('useMessaging', () => {
 
   it('processQueuedMessage routes dm_message to sendDMMessage', async () => {
     const encryptedDM = 'encrypted-dm-base64-content-that-is-long-enough-for-validation';
-    mockEncryptForChannel.mockResolvedValue(encryptedDM);
-    mockGetCurrentKeyVersion.mockReturnValue(undefined);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encryptedDM,
+      keyVersion: 1,
+    });
 
     renderHook(() => useMessaging());
 
@@ -578,7 +621,7 @@ describe('useMessaging', () => {
 
     expect(mockSendDMMessage).toHaveBeenCalledWith('dm-conv-1', encryptedDM, {
       nonce: 'queued-dm-1',
-      keyVersion: undefined,
+      keyVersion: 1,
       mentionMeta: undefined,
       replyToId: undefined,
     });
@@ -587,8 +630,10 @@ describe('useMessaging', () => {
 
   it('processQueuedMessage routes regular message to sendMessage', async () => {
     const encryptedMsg = 'encrypted-msg-base64-content-that-is-long-enough-for-validation';
-    mockEncryptForChannel.mockResolvedValue(encryptedMsg);
-    mockGetCurrentKeyVersion.mockReturnValue(undefined);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encryptedMsg,
+      keyVersion: 1,
+    });
 
     renderHook(() => useMessaging());
 
@@ -611,7 +656,7 @@ describe('useMessaging', () => {
 
     expect(mockSendMessage).toHaveBeenCalledWith('channel-1', encryptedMsg, {
       nonce: 'queued-msg-1',
-      keyVersion: undefined,
+      keyVersion: 1,
       mentionMeta: undefined,
       replyToId: undefined,
     });
@@ -647,10 +692,10 @@ describe('useMessaging', () => {
   });
 
   it('processQueuedMessage encrypts DM messages via encryptQueuedContent', async () => {
-    mockEncryptForChannel.mockResolvedValue(
-      'encrypted-base64-content-that-is-long-enough-for-validation'
-    );
-    mockGetCurrentKeyVersion.mockReturnValue(7);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: 'encrypted-base64-content-that-is-long-enough-for-validation',
+      keyVersion: 7,
+    });
 
     renderHook(() => useMessaging());
 
@@ -673,7 +718,10 @@ describe('useMessaging', () => {
       });
     });
 
-    expect(mockEncryptForChannel).toHaveBeenCalledWith('dm-conv-1', 'Encrypted DM via queue');
+    expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith(
+      'dm-conv-1',
+      'Encrypted DM via queue'
+    );
     expect(mockSendDMMessage).toHaveBeenCalledWith(
       'dm-conv-1',
       'encrypted-base64-content-that-is-long-enough-for-validation',
@@ -684,6 +732,52 @@ describe('useMessaging', () => {
         replyToId: undefined,
       }
     );
+  });
+
+  // regression: dm-send-atomic-epoch
+  it('processQueuedMessage sends the key_version of the key that encrypted the queued message, even when the channel-key cache reads 0', async () => {
+    const ciphertext = 'encrypted-base64-content-that-is-long-enough-for-validation';
+    mockEncryptForChannelWithVersion.mockResolvedValue({ ciphertext, keyVersion: 4 });
+    // The cache reads the keyVersion:0 malformed-wrap marker slot.
+    mockGetCurrentKeyVersion.mockReturnValue(0);
+
+    renderHook(() => useMessaging());
+
+    const connectionHandler = mockOnConnectionChange.mock.calls[0][0];
+    act(() => {
+      connectionHandler(ConnectionState.CONNECTED);
+    });
+    const processCallback = mockStartProcessing.mock.calls[0][0];
+    mockGetCurrentKeyVersion.mockClear();
+
+    await act(async () => {
+      await processCallback({
+        id: 'queued-msg-epoch',
+        channelId: 'channel-2',
+        content: 'Queued secret',
+        type: 'message',
+        status: 'pending',
+        createdAt: Date.now(),
+        retries: 0,
+      });
+    });
+
+    expect(
+      mockSendMessage,
+      'the queued message must actually reach the transport'
+    ).toHaveBeenCalledTimes(1);
+    const [, sentContent, sentOpts] = mockSendMessage.mock.calls[0];
+    expect(sentContent).toBe(ciphertext);
+    expect
+      .soft(
+        sentOpts.keyVersion,
+        'the key_version sent with a queued ciphertext must equal the epoch of the key that encrypted it (4), not the separate channel-key cache read (0)'
+      )
+      .toBe(4);
+    expect(
+      mockGetCurrentKeyVersion,
+      'the queue flush/retry path must not read the epoch via a separate getCurrentKeyVersion call after encrypting'
+    ).not.toHaveBeenCalled();
   });
 });
 
@@ -704,9 +798,10 @@ describe('useMessaging connection-ready gate', () => {
   });
 
   it('calls whenConnectionReady before sending a queued message', async () => {
-    mockEncryptForChannel.mockResolvedValue(
-      'encrypted-base64-content-that-is-long-enough-for-validation'
-    );
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: 'encrypted-base64-content-that-is-long-enough-for-validation',
+      keyVersion: 1,
+    });
     renderHook(() => useMessaging());
 
     const connectionHandler = mockOnConnectionChange.mock.calls[0][0];
@@ -739,8 +834,10 @@ describe('useMessaging connection-ready gate', () => {
 
   it('awaits the gate promise before proceeding (deferred resolution)', async () => {
     const encryptedDeferred = 'encrypted-deferred-base64-content-long-enough-for-validation-x';
-    mockEncryptForChannel.mockResolvedValue(encryptedDeferred);
-    mockGetCurrentKeyVersion.mockReturnValue(undefined);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encryptedDeferred,
+      keyVersion: 1,
+    });
 
     let resolveReady!: () => void;
     const readyPromise = new Promise<void>((r) => {
@@ -778,7 +875,7 @@ describe('useMessaging connection-ready gate', () => {
 
     expect(mockSendMessage).toHaveBeenCalledWith('channel-1', encryptedDeferred, {
       nonce: 'queued-gate-2',
-      keyVersion: undefined,
+      keyVersion: 1,
       mentionMeta: undefined,
       replyToId: undefined,
     });
@@ -786,8 +883,10 @@ describe('useMessaging connection-ready gate', () => {
 
   it('proceeds best-effort when whenConnectionReady rejects (timeout fallback)', async () => {
     const encryptedFallback = 'encrypted-fallback-base64-content-long-enough-for-validation-x';
-    mockEncryptForChannel.mockResolvedValue(encryptedFallback);
-    mockGetCurrentKeyVersion.mockReturnValue(undefined);
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: encryptedFallback,
+      keyVersion: 1,
+    });
 
     mockWhenConnectionReady.mockReturnValueOnce(
       Promise.reject(new Error('connection_ready timeout after 5s'))
@@ -818,7 +917,7 @@ describe('useMessaging connection-ready gate', () => {
     // Even after rejection, message should be sent (fail-open)
     expect(mockSendMessage).toHaveBeenCalledWith('channel-1', encryptedFallback, {
       nonce: 'queued-gate-3',
-      keyVersion: undefined,
+      keyVersion: 1,
       mentionMeta: undefined,
       replyToId: undefined,
     });

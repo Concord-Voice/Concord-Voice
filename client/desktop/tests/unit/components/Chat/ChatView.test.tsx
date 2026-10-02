@@ -126,7 +126,6 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
     getChannelKey: vi.fn(),
     invalidateChannelKey: vi.fn(),
     revokeChannelAccess: vi.fn(),
-    encryptForChannel: vi.fn(),
   },
 }));
 

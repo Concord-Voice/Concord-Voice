@@ -116,8 +116,8 @@ export function sendDMMessage(
     const doSend = async () => {
       try {
         const plaintext = wrapContentWithGifSlug(content, gifSlug);
-        const sendContent = await e2eeService.encryptForChannel(conversationId, plaintext);
-        const keyVersion = e2eeService.getCurrentKeyVersion(conversationId);
+        const { ciphertext: sendContent, keyVersion } =
+          await e2eeService.encryptForChannelWithVersion(conversationId, plaintext);
         if (!sendContent || sendContent.length < 40) {
           throw new Error('Encryption produced invalid output');
         }

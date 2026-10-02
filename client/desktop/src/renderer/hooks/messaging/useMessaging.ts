@@ -41,11 +41,14 @@ async function encryptQueuedContent(
     );
   }
   const plaintext = wrapContentWithGifSlug(content, gifSlug);
-  const ciphertext = await e2eeService.encryptForChannel(channelId, plaintext);
+  const { ciphertext, keyVersion } = await e2eeService.encryptForChannelWithVersion(
+    channelId,
+    plaintext
+  );
   if (!ciphertext || ciphertext.length < 40) {
     throw new Error(`Encryption produced invalid output for message ${msgId}`);
   }
-  return { ciphertext, keyVersion: e2eeService.getCurrentKeyVersion(channelId) };
+  return { ciphertext, keyVersion };
 }
 
 export function useMessaging() {
@@ -223,8 +226,8 @@ export function useMessaging() {
             // Wrap content in JSON when gif_slug is present, then encrypt
             const plaintext = wrapContentWithGifSlug(content, gifSlug);
             // Fail-closed: if encryption fails, do NOT send
-            const sendContent = await e2eeService.encryptForChannel(channelId, plaintext);
-            const keyVersion = e2eeService.getCurrentKeyVersion(channelId);
+            const { ciphertext: sendContent, keyVersion } =
+              await e2eeService.encryptForChannelWithVersion(channelId, plaintext);
             // Validate encrypted output: must be non-empty base64 with minimum size
             // (12-byte IV + 16-byte auth tag = 28 bytes minimum decoded)
             if (!sendContent || sendContent.length < 40) {

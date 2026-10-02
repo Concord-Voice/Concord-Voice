@@ -75,6 +75,12 @@ export interface UploadSessionCallbacks {
    *  cannot otherwise see it. */
   onSessionOpened?(sessionId: string): void;
   onSessionClosed?(sessionId: string): void;
+  /** Throws once the channel key context has moved since the caller read its
+   *  key. Run after every seal and before that part's PUT, so no part sealed
+   *  after a processed key_revocation leaves the client — including the
+   *  re-seals of a 410 restart and a 409 repair. Required, so a caller that
+   *  forgets the fence is a compile error rather than an unfenced upload. */
+  assertKeyCurrent(): void;
 }
 
 /** Byte-identical to the legacy single-shot upload response, so callers parse
@@ -188,9 +194,11 @@ async function putChunk(
   source: ChunkSource,
   key: CryptoKey,
   index: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  assertKeyCurrent: () => void
 ): Promise<Response> {
   const part = await buildUploadPart(source, key, sess.header, index);
+  assertKeyCurrent();
   return apiFetch(`${SESSION_PATH}/${sess.sessionId}/chunk/${index}`, {
     method: 'PUT',
     signal,
@@ -273,7 +281,7 @@ async function sendAllChunks(
 ): Promise<PhaseOutcome> {
   for (let i = 0; i < sess.header.totalChunks; i++) {
     throwIfAborted(signal);
-    const res = await putChunk(sess, source, key, i, signal);
+    const res = await putChunk(sess, source, key, i, signal, cb.assertKeyCurrent);
     if (res.status === 410) return EXPIRED;
     if (!res.ok) {
       throw new Error(`Chunk ${i} failed (${res.status}): ${await errorTextOf(res)}`);
@@ -292,11 +300,12 @@ async function resendMissingChunks(
   source: ChunkSource,
   key: CryptoKey,
   signal: AbortSignal,
-  missing: readonly number[]
+  missing: readonly number[],
+  assertKeyCurrent: () => void
 ): Promise<PhaseOutcome> {
   for (const index of missing) {
     throwIfAborted(signal);
-    const put = await putChunk(sess, source, key, index, signal);
+    const put = await putChunk(sess, source, key, index, signal, assertKeyCurrent);
     if (put.status === 410) return EXPIRED;
     if (!put.ok) {
       throw new Error(`Chunk ${index} failed on retry (${put.status})`);
@@ -331,7 +340,8 @@ async function commitWithRepair(
   sess: OpenSession,
   source: ChunkSource,
   key: CryptoKey,
-  signal: AbortSignal
+  signal: AbortSignal,
+  assertKeyCurrent: () => void
 ): Promise<{ kind: 'done'; attachment: UploadedAttachment } | PhaseOutcome> {
   for (let attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
     throwIfAborted(signal);
@@ -351,7 +361,8 @@ async function commitWithRepair(
       source,
       key,
       signal,
-      await missingIndicesFrom(res, sess.header.totalChunks)
+      await missingIndicesFrom(res, sess.header.totalChunks),
+      assertKeyCurrent
     );
     if (repaired.kind === 'expired') return EXPIRED;
   }
@@ -383,7 +394,7 @@ export async function uploadAttachmentChunked(
     try {
       const sent = await sendAllChunks(sess, source, key, signal, cb);
       if (sent.kind === 'ok') {
-        const committed = await commitWithRepair(sess, source, key, signal);
+        const committed = await commitWithRepair(sess, source, key, signal, cb.assertKeyCurrent);
         if (committed.kind === 'done') {
           // Committed: the session id is spent, so the unmount DELETE must not
           // chase it.

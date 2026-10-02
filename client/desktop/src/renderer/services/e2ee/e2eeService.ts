@@ -602,6 +602,19 @@ class E2EEService {
   }
 
   /**
+   * The epoch a current-key response serves is stamped on every ciphertext
+   * encrypted under that key, so it must be an issued epoch: a positive safe
+   * integer. Our server always sends one. Anything else is a malformed
+   * payload, refetched once like a bad wrap and never replaced with 1.
+   */
+  private validateServedEpoch(raw: unknown): number {
+    if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 1) {
+      throw new E2EEKeyUnavailableError('MALFORMED_PAYLOAD', false);
+    }
+    return raw;
+  }
+
+  /**
    * Parse a non-OK key-fetch response: update rate-limit state on 429 and
    * throw a typed `E2EEKeyUnavailableError` carrying the server's code+pending.
    * Shared by `fetchAndUnwrapChannelKey` and `getChannelKeyByVersion` so both
@@ -889,15 +902,16 @@ class E2EEService {
     const data = await safeJson<KeyResponseShape>(res);
     this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     const wrappedKey: string = data.key.wrapped_key;
-    const keyVersion: number = data.key.key_version || 1;
+    let keyVersion: number;
 
-    // Cache-poison defense: validate wrap shape before trusting the cache.
-    // Strict 512-byte check (RSA-OAEP-4096 output). On failure, refetch once
-    // and if the refetch is also malformed, surface MALFORMED_PAYLOAD as
-    // terminal — we cannot remediate a server that persistently serves
-    // corrupt data, but we MUST not loop forever.
+    // Cache-poison defense: validate the wrap shape (strict 512-byte check,
+    // RSA-OAEP-4096 output) and the served epoch before trusting the cache.
+    // On failure, refetch once and if the refetch is also malformed, surface
+    // MALFORMED_PAYLOAD as terminal — we cannot remediate a server that
+    // persistently serves corrupt data, but we MUST not loop forever.
     try {
       this.validateWrapShape(wrappedKey);
+      keyVersion = this.validateServedEpoch(data.key.key_version);
     } catch (err) {
       if (err instanceof E2EEKeyUnavailableError && err.code === 'MALFORMED_PAYLOAD') {
         const existing = this.channelKeyCache.get(channelId);
@@ -978,19 +992,6 @@ class E2EEService {
     if (!res.ok) {
       throw new Error(`requestRewrap failed: ${res.status}`);
     }
-  }
-
-  /**
-   * Encrypt a message for a channel.
-   * JIT: gets channel key, encrypts, key falls out of scope.
-   */
-  async encryptForChannel(channelId: string, plaintext: string): Promise<string> {
-    const operationGuard = this.createChannelOperationGuard(channelId);
-    const channelKey = await this.getChannelKey(channelId);
-    operationGuard.assertCurrent();
-    const ciphertext = await encryptMessage(plaintext, channelKey);
-    operationGuard.assertCurrent();
-    return ciphertext;
   }
 
   /**
@@ -1368,8 +1369,13 @@ class E2EEService {
   }
 
   /**
-   * Get the current (latest) key version for a channel from cache.
-   * Returns 1 if no key is cached yet.
+   * The key version cached for a channel: 1 when nothing is cached, and 0
+   * while a malformed-wrap refetch holds the slot.
+   *
+   * Never stamp ciphertext with this. The cache can change between choosing a
+   * key and reading this, so the two can name different epochs. Take the key
+   * and its version together from `encryptForChannelWithVersion` or
+   * `getChannelKeyMaterial`.
    */
   getCurrentKeyVersion(channelId: string): number {
     const cached = this.channelKeyCache.get(channelId);

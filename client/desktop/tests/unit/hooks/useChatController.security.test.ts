@@ -68,7 +68,6 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
   safeJson: (res: Response) => res.json(),
 }));
 
-const mockEncryptForChannel = vi.fn();
 const mockGetCurrentKeyVersion = vi.fn(() => 2);
 const mockEncryptForChannelWithVersion = vi.fn().mockResolvedValue({
   ciphertext: 'encrypted-edited',
@@ -77,7 +76,6 @@ const mockEncryptForChannelWithVersion = vi.fn().mockResolvedValue({
 
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
-    encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
     encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
     isInitialized: true,
