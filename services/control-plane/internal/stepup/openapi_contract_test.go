@@ -11,6 +11,7 @@ package stepup
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
@@ -172,4 +173,94 @@ func TestRefusalFlags_DeclaredByTheResponseSchemas(t *testing.T) {
 			assert.Truef(t, declared, "%s must reference a schema declaring %s", response, flag)
 		}
 	}
+}
+
+// TestStepUpRequirements_SchemaMatchesTheHandler: GET /mfa/step-up's documented
+// body must be exactly the fields requirementsResponse writes, with
+// default_method nullable (an account with no inline factor gets null, which a
+// validating client would otherwise reject) and no 404 documented, because a
+// 404 on this path is how a client learns the server predates it.
+func TestStepUpRequirements_SchemaMatchesTheHandler(t *testing.T) {
+	lines := openAPILines(t)
+	route := strings.Join(block(t, lines, 0, 2, "/mfa/step-up"), "\n")
+	require.Contains(t, route, "#/components/schemas/StepUpRequirements")
+	require.NotContains(t, route, "'404':")
+	// The shared authentication chain answers these before the handler runs,
+	// and the picker must tell a terminal refusal from a retryable outage.
+	for _, status := range []string{"'400':", "'403':", "'503':"} {
+		require.Contains(t, route, status, "the auth chain's %s must be documented", status)
+	}
+	require.Contains(t, route, "#/components/schemas/AccountDisabledError")
+
+	schema := component(t, lines, "schemas", "StepUpRequirements")
+	var documented []string
+	for _, line := range block(t, schema, 0, 6, "properties") {
+		if indentOf(line) == 8 {
+			documented = append(documented, strings.TrimSuffix(strings.TrimSpace(line), ":"))
+		}
+	}
+	var written []string
+	rt := reflect.TypeOf(requirementsResponse{})
+	for i := 0; i < rt.NumField(); i++ {
+		written = append(written, strings.Split(rt.Field(i).Tag.Get("json"), ",")[0])
+	}
+	assert.ElementsMatch(t, written, documented)
+
+	var required []string
+	for _, line := range block(t, schema, 0, 6, "required") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "- "); ok {
+			required = append(required, v)
+		}
+	}
+	assert.ElementsMatch(t, written, required, "every field is always present")
+
+	defaultMethod := strings.Join(block(t, schema, 0, 8, "default_method"), "\n")
+	assert.Contains(t, defaultMethod, "nullable: true")
+	assert.True(t, declaresBoolean(schema, "backup_code_available"))
+}
+
+// TestChallengeDefaultMethod_DocumentedOnEveryChallenge: the login, refresh
+// and SSO MFA challenges carry the advisory default_method (MFA picker spec
+// §2). Login and refresh share the MfaChallenge schema; the SSO session
+// response declares its challenge variant inline, so it can drift on its own
+// and is pinned separately (rev 3.3, C14).
+func TestChallengeDefaultMethod_DocumentedOnEveryChallenge(t *testing.T) {
+	lines := openAPILines(t)
+	for _, route := range []string{"/auth/login", "/auth/refresh"} {
+		assert.Contains(t, strings.Join(block(t, lines, 0, 2, route), "\n"),
+			"#/components/schemas/MfaChallenge", "%s must document its MFA challenge", route)
+	}
+	// Refresh's 403 is also a disabled account (auth/handlers.go, both rotation
+	// paths), which carries no challenge token; one schema for both would make
+	// a validator reject that response.
+	assert.Contains(t, strings.Join(block(t, lines, 0, 2, "/auth/refresh"), "\n"),
+		"#/components/schemas/AccountDisabledError", "/auth/refresh's 403 must admit the disabled-account body")
+
+	// Both declarations carry the exact enum the server can send: a member
+	// missing from either makes a validating client reject a valid challenge.
+	challenge := component(t, lines, "schemas", "MfaChallenge")
+	assert.ElementsMatch(t, []string{MethodTOTP, MethodWebAuthn}, enumValues(block(t, challenge, 0, 8, "default_method")),
+		"MfaChallenge default_method")
+
+	sso := block(t, lines, 0, 2, "/auth/sso/{provider}/session")
+	var ssoMethod []string
+	for i, line := range sso {
+		if strings.TrimSpace(line) == "default_method:" {
+			ssoMethod = block(t, sso, i, indentOf(line), "default_method")
+			break
+		}
+	}
+	require.NotEmpty(t, ssoMethod, "the SSO session response's MFA challenge must declare default_method")
+	assert.ElementsMatch(t, []string{MethodTOTP, MethodWebAuthn}, enumValues(ssoMethod), "SSO session default_method")
+}
+
+// enumValues returns the "- value" items of a property block: its enum.
+func enumValues(property []string) []string {
+	var values []string
+	for _, line := range property {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "- "); ok {
+			values = append(values, v)
+		}
+	}
+	return values
 }

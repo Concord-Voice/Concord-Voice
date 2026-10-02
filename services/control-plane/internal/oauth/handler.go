@@ -76,6 +76,10 @@ type AuthAdapter interface {
 	//     before calling handleMFAChallenge; the SSO path's only entry point is here, so
 	//     surfacing it on this method keeps behavior parallel.
 	IssueMFAChallenge(ctx context.Context, userID string) (challengeToken string, methods []string, recoveryOnlyMethods []string, webauthnOptions interface{}, mfaEnabled bool, err error)
+	// ChallengeDefaultMethod is the advisory default_method for an MFA
+	// challenge offering these methods, or "" to omit the field (MFA picker
+	// spec §2). It never fails a challenge; the adapter logs a failed read.
+	ChallengeDefaultMethod(ctx context.Context, userID string, offered []string) string
 	// VerifyPassword performs a constant-time password check against the user's
 	// stored Argon2id hash and returns the epoch it verified, used by the
 	// link-existing-account flow.
@@ -758,6 +762,9 @@ func (h *Handler) respondExistingSSO(c *gin.Context, info *UserInfo) {
 		}
 		if webauthnOptions != nil {
 			resp["webauthn_options"] = webauthnOptions
+		}
+		if method := h.deps.AuthHandler.ChallengeDefaultMethod(ctx, userID, methods); method != "" {
+			resp["default_method"] = method
 		}
 		c.JSON(http.StatusOK, resp)
 		return

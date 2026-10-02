@@ -381,35 +381,38 @@ paths:
               $ref: '#/components/schemas/LoginRequest'
       responses:
         '200':
-          description: Login successful
+          description: Signed in, or an MFA challenge to answer at /auth/mfa/verify when the account has a login-eligible MFA factor
           content:
             application/json:
               schema:
-                type: object
-                required:
-                - access_token
-                - refresh_token
-                - session_id
-                - remember_me
-                - user
-                - e2ee_keys
-                properties:
-                  access_token:
-                    type: string
-                  refresh_token:
-                    type: string
-                  session_id:
-                    type: string
-                    format: uuid
-                  expires_in:
-                    type: integer
-                    example: 900
-                  remember_me:
-                    type: boolean
-                  user:
-                    $ref: '#/components/schemas/User'
-                  e2ee_keys:
-                    $ref: '#/components/schemas/E2EEKeys'
+                oneOf:
+                  - type: object
+                    description: Signed in. No MFA was required.
+                    required:
+                    - access_token
+                    - refresh_token
+                    - session_id
+                    - remember_me
+                    - user
+                    - e2ee_keys
+                    properties:
+                      access_token:
+                        type: string
+                      refresh_token:
+                        type: string
+                      session_id:
+                        type: string
+                        format: uuid
+                      expires_in:
+                        type: integer
+                        example: 900
+                      remember_me:
+                        type: boolean
+                      user:
+                        $ref: '#/components/schemas/User'
+                      e2ee_keys:
+                        $ref: '#/components/schemas/E2EEKeys'
+                  - $ref: '#/components/schemas/MfaChallenge'
           headers:
             Set-Cookie:
               description: HttpOnly refresh token cookie
@@ -1144,6 +1147,17 @@ paths:
               description: New HttpOnly refresh token cookie (rotation)
               schema:
                 type: string
+        '403':
+          description: 'Either an MFA challenge instead of a rotation, or a disabled account (error_code: account_disabled,
+            when the account is disabled after the token lookup or during grace-period recovery). The challenge''s error is
+            suspicious_session_mfa (a same-IP refresh from a different machine) or mfa_upgrade_required (a session that predates
+            MFA enrolment); answer it at /auth/mfa/verify.'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/MfaChallenge'
+                - $ref: '#/components/schemas/AccountDisabledError'
         '401':
           description: Invalid or expired refresh token
           content:
@@ -1787,6 +1801,13 @@ paths:
                         type: string
                     webauthn_options:
                       type: object
+                    default_method:
+                      type: string
+                      enum:
+                      - totp
+                      - webauthn
+                      description: Advisory. The factor to preselect among methods (most recently used, then the
+                        strongest). Omitted when none applies or when the read fails.
                 - type: object
                   description: Verified email matches an existing account
                   properties:
@@ -10864,6 +10885,71 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: 'Failed to load MFA status: a factor or flag read failed (fail-closed, never reported as not enrolled)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /mfa/step-up:
+    get:
+      tags:
+      - MFA
+      summary: Get the caller's step-up factors
+      description: 'The inline MFA factors this account can verify for a step-up (policy P1: TOTP that is enabled
+        and confirmed, or any WebAuthn credential), the factor to offer first (the most recently used, then the
+        strongest), and whether a backup code is still spendable. Read-only and owner-only; the shared MFA
+        picker prefetches it before a step-up. The handler itself answers only 200, 401 and 500, and the shared
+        authentication chain adds 400, 403 and 503, so a 404 on this path means the server predates the route.
+        A 503 is retryable; a 403 is a terminal refusal.
+
+        Rate limit: 20 requests per minute (user-based).
+
+        '
+      operationId: getMfaStepUpRequirements
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: The caller's step-up factors. Sent with Cache-Control no-store.
+          headers:
+            Cache-Control:
+              description: Always no-store.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpRequirements'
+        '400':
+          description: Malformed global device headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: 'Missing or invalid JWT, or the user row no longer exists (never a 404 and never an empty 200)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Account disabled, email unverified, client too old, or client attestation rejected
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/AttestationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: 'A factor read failed (fail-closed, never reported as no factors)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: An authentication dependency or the client-attestation registry is unavailable (retryable)
           content:
             application/json:
               schema:
@@ -20113,6 +20199,77 @@ components:
         mfa_code:
           type: string
           description: Required when MFA is already active (TOTP, backup code, or inline WebAuthn token)
+    StepUpRequirements:
+      type: object
+      description: The caller's step-up factors (GET /mfa/step-up). Carries no timestamps, credential names or
+        counts.
+      required:
+      - methods
+      - default_method
+      - backup_code_available
+      properties:
+        methods:
+          type: array
+          description: The P1 set. Empty when the account has no inline factor; email and SMS never appear.
+          items:
+            type: string
+            enum:
+            - totp
+            - webauthn
+        default_method:
+          type: string
+          nullable: true
+          enum:
+          - totp
+          - webauthn
+          - null
+          description: A member of methods, or null when methods is empty. The most recently used factor, then
+            the strongest (webauthn).
+        backup_code_available:
+          type: boolean
+          description: True when TOTP is active and at least one backup code is unspent.
+    MfaChallenge:
+      type: object
+      description: An MFA challenge from login (200) or refresh (403). Answer it at /auth/mfa/verify with the token and one
+        of methods.
+      required:
+      - mfa_challenge_token
+      - methods
+      properties:
+        mfa_required:
+          type: boolean
+          description: Present and true on the login challenge.
+        error:
+          type: string
+          enum:
+          - suspicious_session_mfa
+          - mfa_upgrade_required
+          description: Present on a refresh challenge.
+        message:
+          type: string
+          description: Present on a refresh challenge.
+        mfa_challenge_token:
+          type: string
+        methods:
+          type: array
+          description: Login-eligible methods the client can answer with.
+          items:
+            type: string
+        recovery_only_methods:
+          type: array
+          description: Methods enabled on the account that cannot answer a login challenge.
+          items:
+            type: string
+        webauthn_options:
+          type: object
+          description: PublicKeyCredentialRequestOptions, present when webauthn is in methods.
+        default_method:
+          type: string
+          enum:
+          - totp
+          - webauthn
+          description: Advisory. The factor to preselect among methods (most recently used, then the strongest). Omitted
+            when none applies or when the read fails; it never decides whether a challenge is issued.
     MfaStatus:
       type: object
       properties:

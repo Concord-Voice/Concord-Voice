@@ -22,13 +22,25 @@ const ErrMsgSessionNoLongerValid = "Session no longer valid"
 // 401 handling applies unchanged.
 const ErrMsgAuthenticationRequired = "Authentication required"
 
-// inlineMFAMethodsSQL is policy P1's predicate: TOTP only when enabled AND
-// confirmed (a pending enrollment verifies nothing), WebAuthn when any
-// credential exists. Email and SMS are absent on purpose — no inline verifier
-// exists for them.
+// Policy P1's two factor predicates, shared by inlineMFAMethodsSQL and
+// inlineMFAFactorsSQL by compile-time concatenation (never Sprintf). TOTP
+// counts only when enabled AND confirmed (a pending enrollment verifies
+// nothing); WebAuthn counts when any credential exists. Email and SMS are
+// absent on purpose — no inline verifier exists for them.
+//
+// loadSubjectSQL keeps its own copy keyed on u.id; the P1 equivalence test
+// holds the readers to one answer.
+const (
+	p1TOTPActive  = `EXISTS (SELECT 1 FROM user_mfa_totp WHERE user_id = $1 AND enabled AND confirmed)`
+	p1WebAuthnAny = `EXISTS (SELECT 1 FROM user_mfa_webauthn WHERE user_id = $1)`
+)
+
+// inlineMFAMethodsSQL is P1 for any uuid: it has no FROM clause, so a deleted
+// user reads as (false, false). That is authorization-critical behaviour and is
+// pinned byte-for-byte by TestInlineMFAMethodsSQL_RenderedUnchanged.
 const inlineMFAMethodsSQL = `
-	SELECT EXISTS (SELECT 1 FROM user_mfa_totp WHERE user_id = $1 AND enabled AND confirmed),
-	       EXISTS (SELECT 1 FROM user_mfa_webauthn WHERE user_id = $1)`
+	SELECT ` + p1TOTPActive + `,
+	       ` + p1WebAuthnAny
 
 // loadSubjectSQL reads the password hash and the P1 predicate in ONE
 // statement, so the two halves of an unlocked Subject share a snapshot and a

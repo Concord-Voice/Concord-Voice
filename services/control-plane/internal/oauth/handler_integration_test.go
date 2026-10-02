@@ -265,6 +265,20 @@ type fakeAuthAdapter struct {
 	// translates to HTTP 423 Locked. Used by CompleteLink's
 	// 423-translation test path.
 	VerifyPasswordLocked bool
+	// DefaultMethod is what ChallengeDefaultMethod answers; DefaultMethodOffered
+	// records the methods it was asked about. DefaultMethodVia, when set, answers
+	// instead, so a test can run the production read-failure handling.
+	DefaultMethod        string
+	DefaultMethodOffered []string
+	DefaultMethodVia     *auth.Handler
+}
+
+func (f *fakeAuthAdapter) ChallengeDefaultMethod(ctx context.Context, userID string, offered []string) string {
+	f.DefaultMethodOffered = offered
+	if f.DefaultMethodVia != nil {
+		return f.DefaultMethodVia.ChallengeDefaultMethod(ctx, userID, offered)
+	}
+	return f.DefaultMethod
 }
 
 func (f *fakeAuthAdapter) IssueAccessAndRefresh(_ context.Context, userID string) (string, string, string, error) {

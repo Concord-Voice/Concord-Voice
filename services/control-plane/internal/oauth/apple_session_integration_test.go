@@ -8,7 +8,9 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,9 +24,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/oauth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 const appleSessionPath = "/api/v1/auth/sso/%s/session"
@@ -313,6 +317,74 @@ func TestAppleSession_ExistingSSO_RequiresMFA(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.NotEmpty(t, resp["mfa_challenge_token"], "untrusted existing-SSO must surface the MFA challenge")
 	assert.NotEmpty(t, resp["methods"])
+	_, present := resp["default_method"]
+	assert.False(t, present, "no default for this challenge: the field is omitted, not sent empty")
+}
+
+// The returning-SSO challenge carries the same advisory default_method as the
+// password login (MFA picker spec §2, C1), read within exactly the methods it
+// offers.
+func TestAppleSession_ExistingSSO_MFAChallengeCarriesDefaultMethod(t *testing.T) {
+	rig := newAppleSessionRig(t, false)
+	rig.Adapter.DefaultMethod = "totp"
+	userID := insertSSOTestUser(t, rig.DB, "applesession-default@example.com", "applesessiondefault")
+	_, err := rig.DB.Exec(
+		`INSERT INTO user_sso_identities (user_id, provider, provider_user_id, provider_email)
+		 VALUES ($1, 'apple', 'sub-default', $2)`, userID, "applesession-default@example.com")
+	require.NoError(t, err)
+
+	nonce := "nonce-default"
+	state := seedAppleSessionState(t, rig.Redis, "apple", nonce)
+	idToken := rig.JWKS.sign(t, appleSessionClaims(time.Now(), nonce,
+		map[string]any{"email": "applesession-default@example.com", "sub": "sub-default"}))
+
+	w := postAppleSession(rig, "apple", map[string]any{"id_token": idToken, "state": state})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "totp", resp["default_method"])
+	methods, ok := resp["methods"].([]any)
+	require.True(t, ok, "methods must decode as an array")
+	require.Len(t, rig.Adapter.DefaultMethodOffered, len(methods), "the default is read within exactly the offered methods")
+	for i, m := range methods {
+		assert.Equal(t, m, rig.Adapter.DefaultMethodOffered[i])
+	}
+}
+
+// A failed factors read omits default_method and still mints the challenge
+// (MFA picker spec §2, C1). The omitting is done by the production
+// *auth.Handler, so the adapter delegates to one whose reader fails.
+func TestAppleSession_ExistingSSO_DefaultMethodReadFailureStillChallenges(t *testing.T) {
+	rig := newAppleSessionRig(t, false)
+	var read bool
+	h := auth.NewHandler(nil, nil, logger.NewWithWriter(io.Discard), "", nil) // signs nothing here
+	h.SetDefaultMethodReader(func(context.Context, string, []string) (string, error) {
+		read = true
+		return "totp", errors.New("factors read failed")
+	})
+	rig.Adapter.DefaultMethodVia = h
+	userID := insertSSOTestUser(t, rig.DB, "applesession-readfail@example.com", "applesessionreadfail")
+	_, err := rig.DB.Exec(
+		`INSERT INTO user_sso_identities (user_id, provider, provider_user_id, provider_email)
+		 VALUES ($1, 'apple', 'sub-readfail', $2)`, userID, "applesession-readfail@example.com")
+	require.NoError(t, err)
+
+	nonce := "nonce-readfail"
+	state := seedAppleSessionState(t, rig.Redis, "apple", nonce)
+	idToken := rig.JWKS.sign(t, appleSessionClaims(time.Now(), nonce,
+		map[string]any{"email": "applesession-readfail@example.com", "sub": "sub-readfail"}))
+
+	w := postAppleSession(rig, "apple", map[string]any{"id_token": idToken, "state": state})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.True(t, read, "the default was read and failed")
+	assert.NotEmpty(t, resp["mfa_challenge_token"], "a failed advisory read must not cost the challenge")
+	assert.NotEmpty(t, resp["methods"])
+	_, present := resp["default_method"]
+	assert.False(t, present, "a failed read omits the field rather than send the reader's value")
 }
 
 func TestAppleSession_RealEmail_OffersAccountLink(t *testing.T) {

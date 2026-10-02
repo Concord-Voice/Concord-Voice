@@ -151,6 +151,7 @@ type Handler struct {
 	hub                       SessionDisconnector
 	presenceHistory           *presencehistory.Service
 	mfaChecker                MFAChecker
+	defaultMethodReader       DefaultMethodReader
 	emailSvc                  *email.Service
 	pending                   *PendingRepo
 	entCache                  *entitlements.Cache
@@ -311,6 +312,36 @@ func (h *Handler) SetEmailService(svc *email.Service) {
 // SetMFAChecker sets the MFA checker (called after both handlers are initialized to break circular init).
 func (h *Handler) SetMFAChecker(checker MFAChecker) {
 	h.mfaChecker = checker
+}
+
+// DefaultMethodReader returns the advisory default_method for an MFA challenge
+// that offers these methods, or "" for none. Production wires
+// stepup.DefaultMethodReader in router.go; internal/auth cannot import
+// internal/stepup, which imports this package (MFA picker spec §2).
+type DefaultMethodReader func(ctx context.Context, userID string, offered []string) (string, error)
+
+// SetDefaultMethodReader wires the challenges' default_method source. A nil
+// reader (the zero value, as in every test that builds a bare Handler) omits
+// the field.
+func (h *Handler) SetDefaultMethodReader(read DefaultMethodReader) {
+	h.defaultMethodReader = read
+}
+
+// ChallengeDefaultMethod is the advisory default_method for a login, refresh
+// or SSO challenge offering these methods, or "" to omit the field. It never
+// fails a challenge: like the recovery-only hint, a failed read is logged and
+// the field left off. The value itself is never logged, because it is derived
+// from how recently each factor was used.
+func (h *Handler) ChallengeDefaultMethod(ctx context.Context, userID string, offered []string) string {
+	if h.defaultMethodReader == nil {
+		return ""
+	}
+	method, err := h.defaultMethodReader(ctx, userID, offered)
+	if err != nil {
+		h.log.Error("Failed to read step-up factors", "error", err, "user_id", userID)
+		return ""
+	}
+	return method
 }
 
 // RegisterRequest represents registration payload
@@ -1173,6 +1204,9 @@ func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID
 	if webauthnOptions != nil {
 		resp["webauthn_options"] = webauthnOptions
 	}
+	if method := h.ChallengeDefaultMethod(ctx, userID, offered); method != "" {
+		resp["default_method"] = method
+	}
 	c.JSON(http.StatusOK, resp)
 	return true
 }
@@ -2014,6 +2048,9 @@ func (h *Handler) buildMFAChallengeResponse(ctx context.Context, errorCode, mess
 	}
 	if webauthnOptions != nil {
 		resp["webauthn_options"] = webauthnOptions
+	}
+	if method := h.ChallengeDefaultMethod(ctx, userID, offered); method != "" {
+		resp["default_method"] = method
 	}
 
 	return resp, nil

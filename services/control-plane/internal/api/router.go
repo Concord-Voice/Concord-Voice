@@ -995,6 +995,9 @@ func NewRouter(
 	authHandler.SetInitialDistributorChecker(rbacResolver.CanDistributeChannelKeyTx)
 	// Wire cross-references (breaks circular init dependency)
 	authHandler.SetMFAChecker(mfaHandler)
+	// The login, refresh and SSO challenges' advisory default_method (MFA picker
+	// spec §2). A setter, not an import: internal/stepup imports internal/auth.
+	authHandler.SetDefaultMethodReader(stepup.DefaultMethodReader(db))
 	mfaHandler.SetLoginCompleter(authHandler)
 	mfaHandler.SetEmailService(emailSvc)
 	// A committed factor change bumps the user's permission generation (#3453):
@@ -1778,6 +1781,15 @@ func NewRouter(
 				mfaRoutes.GET("/status",
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					mfaHandler.GetStatus,
+				)
+
+				// The step-up factor read the shared MFA picker prefetches
+				// (picker spec §2). Read-only and owner-only; the 20/min budget
+				// is a code constant, never an env var, and its bucket is this
+				// route's own.
+				mfaRoutes.GET("/step-up",
+					middleware.RateLimitByUser(redis, 20, 1*time.Minute),
+					stepup.RequirementsHandler(db, log),
 				)
 
 				// TOTP enrollment
