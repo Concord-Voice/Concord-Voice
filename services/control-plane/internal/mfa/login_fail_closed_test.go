@@ -483,6 +483,9 @@ func TestGetLoginMethodsNeverLeavesAnMFAAccountWithNoMethod(t *testing.T) {
 		{name: "restriction would leave nothing", methods: "{webauthn}", recoveryOnly: "{webauthn}", want: []string{"webauthn"}},
 		{name: "every method restricted", methods: "{webauthn,email}", recoveryOnly: "{email,webauthn}", want: []string{"webauthn", "email"}},
 		{name: "no restriction", methods: "{totp}", recoveryOnly: "{}", want: []string{"totp"}},
+		// Sign-in cannot answer SMS, so a remainder of SMS alone lapses the
+		// restriction like an empty one.
+		{name: "only SMS would remain", methods: "{totp,sms}", recoveryOnly: "{totp}", want: []string{"totp", "sms"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := NewHandler(fakeMFADB(t, &mfaEventDB{mfaMethods: tc.methods, recoveryOnly: tc.recoveryOnly}), nil, logger.New("test"), nil, "test", nil, "test")
@@ -511,6 +514,7 @@ func TestVerifyRefusesARecoveryOnlyMethodAtSignIn(t *testing.T) {
 		// would leave a challenge nothing can answer (see
 		// TestGetLoginMethodsNeverLeavesAnMFAAccountWithNoMethod).
 		{name: "restriction would leave nothing", methods: "{totp}", recoveryOnly: "{totp}", want: http.StatusOK},
+		{name: "only SMS would remain", methods: "{totp,sms}", recoveryOnly: "{totp}", want: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newVerifyFixture(t)

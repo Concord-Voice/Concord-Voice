@@ -441,7 +441,7 @@ func (h *Handler) GetEnabledMethods(ctx context.Context, userID string) ([]strin
 	return methods, nil
 }
 
-// GetLoginMethods returns methods eligible for login and sensitive ops — excludes recovery-only methods.
+// GetLoginMethods returns the methods eligible for sign-in — it excludes recovery-only methods.
 // Recovery-only methods are like a spare key: they can unlock the door (account recovery) but can't start the engine (login).
 func (h *Handler) GetLoginMethods(ctx context.Context, userID string) ([]string, error) {
 	var methods, recoveryOnly []string
@@ -1958,7 +1958,7 @@ func (h *Handler) Verify(c *gin.Context) {
 		return
 	}
 
-	verified, matchedMethod, responded := h.verifyByMethod(ctx, c, req, claims)
+	verified, matchedMethod, responded := h.verifyByMethod(ctx, c, req, claims, containsStr(restricted, "totp"))
 	if responded {
 		return // Early return already sent a response (e.g. bad request)
 	}
@@ -2000,7 +2000,7 @@ func (h *Handler) recoveryOnlyMethods(ctx context.Context, userID string) ([]str
 // password alone. Requiring the recovery-only factor is the safe reading.
 func effectiveRecoveryOnly(methods, recoveryOnly []string) []string {
 	for _, m := range methods {
-		if !containsStr(recoveryOnly, m) {
+		if !containsStr(recoveryOnly, m) && signInFactor(m) {
 			return recoveryOnly
 		}
 	}
@@ -2280,9 +2280,17 @@ func (h *Handler) parseChallengeToken(tokenStr string) (*ChallengeClaims, Challe
 // verifyByMethod dispatches verification to the appropriate method handler.
 // Returns (verified, matchedMethod, responded) — responded is true if an HTTP
 // response was already written.
-func (h *Handler) verifyByMethod(ctx context.Context, c *gin.Context, req verifyRequest, claims *ChallengeClaims) (bool, string, bool) {
+func (h *Handler) verifyByMethod(ctx context.Context, c *gin.Context, req verifyRequest, claims *ChallengeClaims, totpRestricted bool) (bool, string, bool) {
 	switch req.Method {
 	case "totp", "backup_code":
+		// Backup codes belong to TOTP, so a recovery-only TOTP restricts them
+		// too. Nothing is judged: judging spends a backup code or a TOTP step,
+		// and Verify's matched-name check cannot see a backup code, which
+		// matches as "backup_code". Verify refuses the unverified code exactly
+		// as a wrong one. An empty code still gets verifyTOTPOrBackup's 400.
+		if totpRestricted && req.Code != "" {
+			return false, "", false
+		}
 		return h.verifyTOTPOrBackup(ctx, c, req.Code, claims.UserID)
 	case "webauthn":
 		verified, responded := h.verifyWebAuthnChallenge(ctx, c, req.Assertion, claims)
@@ -2841,7 +2849,14 @@ func (h *Handler) buildWebAuthnUser(ctx context.Context, userID string) (*WebAut
 
 // ── Recovery-Only Methods ─────────────────────────────────────────────────────
 
-// countLoginEligible returns the number of enabled methods not in the recovery-only set.
+// signInFactor reports whether Verify can answer a sign-in challenge with m.
+// SMS is not one: it has no Verify branch, so a restriction that leaves SMS as
+// the only other method leaves nothing that can sign in.
+func signInFactor(m string) bool {
+	return m == "totp" || m == "webauthn" || m == "email"
+}
+
+// countLoginEligible returns the number of enabled sign-in factors not in the recovery-only set.
 func countLoginEligible(enabledMethods, recoveryOnlyMethods []string) int {
 	excluded := make(map[string]bool, len(recoveryOnlyMethods))
 	for _, r := range recoveryOnlyMethods {
@@ -2849,11 +2864,20 @@ func countLoginEligible(enabledMethods, recoveryOnlyMethods []string) int {
 	}
 	count := 0
 	for _, m := range enabledMethods {
-		if !excluded[m] {
+		if !excluded[m] && signInFactor(m) {
 			count++
 		}
 	}
 	return count
+}
+
+// strandsSignIn reports whether restricting these methods would take away the
+// account's last sign-in method. An account with none to begin with (SMS only,
+// possible only in development and test) has nothing to strand, so clearing or
+// setting its list is not refused (#3563 review).
+func strandsSignIn(enabledMethods, recoveryOnlyMethods []string) bool {
+	return countLoginEligible(enabledMethods, nil) > 0 &&
+		countLoginEligible(enabledMethods, recoveryOnlyMethods) == 0
 }
 
 // filterValidRecoveryOnly returns only those requested methods that are actually enabled.
@@ -2879,8 +2903,8 @@ func hasEmailOrSms(methods []string) bool {
 
 // SetRecoveryOnly updates which MFA methods are restricted to account recovery only.
 // Recovery-only methods can verify identity for recovery flows but are excluded from
-// login and sensitive-operation MFA challenges — like a spare key that unlocks the
-// door but doesn't start the engine.
+// sign-in MFA challenges — like a spare key that unlocks the door but doesn't start
+// the engine. Step-up does not consult the list: it runs behind a signed-in session.
 func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
@@ -2904,12 +2928,12 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 
 	enabledMethods, err := h.GetEnabledMethods(ctx, userID)
 	if err != nil {
-		h.log.Error("Failed to read MFA methods for recovery-only update", "error", err)
+		h.log.Error("Failed to read MFA methods for recovery-only update", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch MFA status"})
 		return
 	}
 
-	if countLoginEligible(enabledMethods, req.Methods) == 0 && len(enabledMethods) > 0 {
+	if strandsSignIn(enabledMethods, req.Methods) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one MFA method must remain eligible for login"})
 		return
 	}

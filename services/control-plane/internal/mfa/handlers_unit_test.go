@@ -41,10 +41,39 @@ func TestCountLoginEligible(t *testing.T) {
 		{"exclude all", []string{"email"}, []string{"email"}, 0},
 		{"exclude non-existent", []string{"totp"}, []string{"email"}, 1},
 		{"empty enabled", nil, nil, 0},
+		// SMS has no sign-in branch, so it leaves nothing that can sign in.
+		{"only sms would remain", []string{"totp", "sms"}, []string{"totp"}, 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, countLoginEligible(tc.enabled, tc.excluded))
+		})
+	}
+}
+
+// --- strandsSignIn ---
+
+func TestStrandsSignIn(t *testing.T) {
+	tests := []struct {
+		name       string
+		enabled    []string
+		restricted []string
+		want       bool
+	}{
+		{"restricting the only sign-in method", []string{"totp"}, []string{"totp"}, true},
+		{"restricting it leaves only sms", []string{"totp", "sms"}, []string{"totp"}, true},
+		{"another sign-in method remains", []string{"totp", "webauthn"}, []string{"totp"}, false},
+		{"clearing the list", []string{"totp"}, []string{}, false},
+		{"a method that is not enabled restricts nothing", []string{"totp"}, []string{"webauthn", "email"}, false},
+		// An SMS-only account has no sign-in method to strand, so neither
+		// request is refused; before #3563 review the clear was (Gitar).
+		{"sms only: clearing", []string{"sms"}, []string{}, false},
+		{"sms only: restricting sms", []string{"sms"}, []string{"sms"}, false},
+		{"no methods", nil, nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, strandsSignIn(tc.enabled, tc.restricted))
 		})
 	}
 }

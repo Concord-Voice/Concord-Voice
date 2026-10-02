@@ -10566,11 +10566,19 @@ paths:
       tags:
       - MFA
       summary: Set recovery-only MFA methods
-      description: 'Marks MFA methods as recovery-only (not usable for login). At least one
+      description: 'Marks MFA methods as recovery-only (not usable for sign-in). The list
 
-        enabled method must remain login-eligible. Listing email or SMS
+        governs sign-in only: a step-up still accepts every factor. A recovery-only
 
-        automatically enables hardened recovery mode.
+        TOTP also restricts its backup codes. A restriction must leave at least one
+
+        enabled sign-in method (TOTP, WebAuthn or email; SMS cannot answer a sign-in
+
+        challenge), unless the account has none, in which case the list can still be
+
+        set or cleared. Listing email or SMS automatically enables hardened recovery
+
+        mode.
 
         Rate limit: 5 requests per minute (user-based).
 

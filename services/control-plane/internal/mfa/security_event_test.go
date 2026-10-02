@@ -828,6 +828,10 @@ type mfaEventDB struct {
 	// mfaMethods is the user's mfa_methods, as a Postgres array literal; empty
 	// means several factors, so a restriction on one of them still applies.
 	mfaMethods string
+	// backupHashes and backupUsed are the user's backup_codes_hash and
+	// backup_codes_used, as Postgres array literals; empty means no codes.
+	backupHashes string
+	backupUsed   string
 	// deleteMatchesNothing makes every DELETE report zero rows.
 	deleteMatchesNothing bool
 	// statements logs every statement as "<conn> <sql>", plus "<conn> BEGIN"
@@ -860,6 +864,14 @@ func (s *mfaEventDB) mfaMethodsArray() string {
 		return "{totp,webauthn,email}"
 	}
 	return s.mfaMethods
+}
+
+// arrayOrEmpty returns a Postgres array literal, "{}" when unset.
+func arrayOrEmpty(literal string) string {
+	if literal == "" {
+		return "{}"
+	}
+	return literal
 }
 
 func (s *mfaEventDB) recoveryOnlyArray() string {
@@ -960,7 +972,7 @@ func (c mfaEventConn) QueryContext(_ context.Context, query string, _ []driver.N
 		time.Sleep(c.state.totpReadDelay)
 		return &mfaEventRows{values: []driver.Value{c.state.totpSecretEnc, c.state.totpSecretNonce, int64(c.state.totpKeyVersion), c.state.totpEnabled, c.state.totpConfirmed}}, nil
 	case strings.Contains(query, "backup_codes_hash"):
-		return &mfaEventRows{values: []driver.Value{[]byte("{}"), []byte("{}")}}, nil
+		return &mfaEventRows{values: []driver.Value{[]byte(arrayOrEmpty(c.state.backupHashes)), []byte(arrayOrEmpty(c.state.backupUsed))}}, nil
 	case strings.Contains(query, "COALESCE(display_name"):
 		return &mfaEventRows{values: []driver.Value{"email-fixture@example.test", "user-fixture", "User Fixture"}}, nil
 	case strings.Contains(query, "FROM user_mfa_webauthn") && !strings.Contains(query, "COUNT"):

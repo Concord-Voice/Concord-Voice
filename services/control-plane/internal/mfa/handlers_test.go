@@ -1269,11 +1269,88 @@ func TestSetRecoveryOnlyWithMFA(t *testing.T) {
 		"methods":  []string{"email"},
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	// Handler exercises the full flow: password+MFA verify, method validation,
-	// login-eligible check, DB update. May return 500 if recovery_only_methods
-	// column has a NOT NULL constraint and the Go slice is nil — that's a
-	// legitimate code path to cover regardless.
-	assert.Contains(t, []int{http.StatusOK, http.StatusInternalServerError}, w.Code)
+	// The full flow: password and MFA verify, method validation, the
+	// sign-in eligibility check and the write. It used to tolerate a 500 from
+	// binding a nil slice into the NOT NULL column; that is fixed, so only 200
+	// is correct (TestSetRecoveryOnlyClear pins the same).
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+// --- SetRecoveryOnly: sign-in factors only (#3563) ---
+
+// SMS cannot answer a sign-in challenge, so restricting TOTP on an account
+// that also has SMS would leave nothing that can sign in.
+func TestSetRecoveryOnlyRefusesLeavingOnlySMS(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "recovonlysms")
+	secret, _ := enrollTOTP(t, ts, user)
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_methods = '{totp,sms}' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+	code, _ := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{
+		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
+
+	w := ts.DoRequest("PUT", urlRecoveryOnly, map[string]interface{}{
+		"password": testPassword,
+		"mfa_code": code,
+		"methods":  []string{"totp"},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "At least one MFA method must remain eligible")
+}
+
+// An account with no sign-in method (SMS only, development and test) has
+// nothing to strand, so it can clear its list (#3563 review).
+func TestSetRecoveryOnlySMSOnlyAccountCanClear(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "recovonlysmsclear")
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_methods = '{sms}', recovery_only_methods = '{sms}' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PUT", urlRecoveryOnly, map[string]interface{}{
+		"password": testPassword,
+		"methods":  []string{},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var remaining int
+	require.NoError(t, ts.DB.QueryRow(`SELECT cardinality(recovery_only_methods) FROM users WHERE id = $1`, user.ID).Scan(&remaining))
+	assert.Zero(t, remaining)
+}
+
+// Recovery-only governs sign-in only: a step-up still takes the restricted
+// TOTP's codes, here the recovery-only change itself (#3563).
+func TestStepUpAcceptsARecoveryOnlyTOTPsCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		backup bool
+	}{
+		{name: "totp code"},
+		{name: "backup code", backup: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupTS(t)
+			user := ts.CreateTestUser(t, "stepuprecovonly")
+			secret, backupCodes := enrollTOTP(t, ts, user)
+			_, err := ts.DB.Exec(`UPDATE users SET mfa_methods = '{totp,email}', recovery_only_methods = '{totp}' WHERE id = $1`, user.ID)
+			require.NoError(t, err)
+			code, _ := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{
+				Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+			})
+			if tc.backup {
+				code = backupCodes[0].(string)
+			}
+
+			w := ts.DoRequest("PUT", urlRecoveryOnly, map[string]interface{}{
+				"password": testPassword,
+				"mfa_code": code,
+				"methods":  []string{},
+			}, testhelpers.AuthHeaders(user.AccessToken))
+
+			assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		})
+	}
 }
 
 // --- DeleteRecoveryKey (with password) ---

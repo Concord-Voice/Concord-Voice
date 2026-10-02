@@ -378,6 +378,7 @@ account can't provide, never your password twice.
 
 ### Security
 
+- **A backup code no longer signs you in past an authenticator app set to recovery only** ([#3563](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3563)) — backup codes belong to the authenticator app, so marking the app "recovery only" now covers its backup codes too; before, a backup code still signed you in. A refused code is not used up, and neither is the app's code for that moment.
 - **The control plane now treats an unset `ENVIRONMENT` as production** ([#3519](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3519)) — it used to fall back to development, which skipped the production safety checks and allowed development-only behaviour such as logging verification codes. The bundled deploy files and the self-host installer already set `ENVIRONMENT=production`, so they are unaffected. A custom deployment that never set it will now refuse to start until it does; local development sets `ENVIRONMENT=development`. `CONCORD_ENV=test`, which writes plaintext verification codes and relaxes the sign-in rate limits, is now refused under any `ENVIRONMENT` other than `development` or `test`, not only under `production`.
 - **Updated the voice server's connection library to close a published advisory** ([#3507](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3507)) —
   resolves GHSA-2GC4-CQFQ-P2GV, a denial-of-service flaw in the connection that carries voice and
