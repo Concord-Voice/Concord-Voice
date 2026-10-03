@@ -232,11 +232,17 @@ MEDIASOUP_LOG_LEVEL=warn
   `<lo>:<hi>` must EQUAL the TCP publication — wider is rejected, not just uncovered.
 
 - `NUM_WORKERS=4` is the code default and the value `docker-compose.yml` sets.
-  **Production uses `3`**, matching the media-plane's `cpus: '3'` limit in
-  `docker-compose.production.yml`. A mediasoup worker is a single-threaded C++
+  **Managed production uses `3` workers and `3` CPUs** in
+  `docker-compose.production.yml`. **Basic self-host uses `2` workers and `2` CPUs**:
+  `docker-compose.selfhost.yml` overrides both managed values. Change the pair
+  in the file for the deployment being configured; the self-host overlay takes
+  precedence over the production file. These are Compose literals, not env-file
+  settings. A mediasoup worker is a single-threaded C++
   subprocess pinned to one core, so a count above the CPU allocation
   oversubscribes the CFS quota and shows up as RTP jitter rather than a crash.
-  Nothing enforces agreement between the two values — change them together.
+  Change the worker count and CPU quota together. The fresh-host acceptance
+  runner checks the selected model against daemon CPU capacity; that check does
+  not establish performance or minimum-memory sufficiency.
 - The worker count is validated fail-closed at startup (#2178): a value that is
   not an integer in `[1, 32]` logs `FATAL:` and exits 1 instead of falling back
   to the default. Both bounds matter. `NUM_WORKERS=0` would otherwise build an
