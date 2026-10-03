@@ -530,13 +530,13 @@ No environment variables needed for development.
 
 ### Failover/Production Ports
 
-Staging and production deployments use these ports, with an nginx reverse proxy and database replication:
+Staging and production deployments use these ports, with an nginx reverse proxy and database replication. Coturn's base Compose mapping publishes TURN over TLS on port 5349; the failover overlay does not publish port 443 for coturn:
 
 | Port | Service | Notes |
 |------|---------|-------|
 | 8443 | Control Plane HTTPS | TLS termination via nginx |
 | 3443 | Media Plane HTTPS | TLS termination via nginx |
-| 443 | TURN over TLS | Bypasses restrictive firewalls (corporate, hotel WiFi) |
+| 5349 | TURN over TLS | Base coturn TLS listener |
 | 5433 | PostgreSQL replica | Read replica / hot standby failover |
 | 6380 | Redis Sentinel | Coordinates automatic primary failover |
 | 6222 | NATS cluster routing | Inter-node communication for multi-instance |

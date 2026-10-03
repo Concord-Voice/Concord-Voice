@@ -1432,7 +1432,7 @@ The `tools` compose profile gates the dev and test services (`pgadmin`, `redis-c
 
 - **Signaling:** TLS 1.2+/1.3 (HTTP/WebSocket) — the nginx/Cloudflare termination layer permits TLS 1.2 minimum, TLS 1.3 preferred.
 - **Media (two layers):** DTLS-SRTP at the WebRTC transport layer, which is structurally mandatory in the media plane with no plaintext RTP path. A second layer adds application-layer **E2EE frame encryption** above the SFU (see [Media E2EE](#media-e2ee-frame-encryption)). The SFU sees neither plaintext media nor frame keys.
-- **TURN:** coturn with TLS listeners (5349, and 443 alternate) for restrictive networks. Credentials are HMAC ephemeral.
+- **TURN:** coturn with a TLS listener on port 5349. Credentials are HMAC ephemeral.
 
 ### E2EE Key Flow
 
