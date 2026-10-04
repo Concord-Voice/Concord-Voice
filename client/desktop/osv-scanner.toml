@@ -27,3 +27,12 @@ group = "dev"
 vulnerability.ignore = true
 effectiveUntil = 2026-11-13
 reason = "GHSA-jmr9-qjv8-65gv and GHSA-7pqw-9j4j-h8q3 (symlink traversal / write): no fixed extract-zip. Dev-only, build-time via @electron-forge 7.11.2 -> @electron/packager 18.4.4 on integrity-checked Electron archives; the fix needs packager >= 20.3.0, which stable forge does not allow yet. Accepted in #2734."
+
+[[PackageOverrides]]
+name = "braces"
+version = "3.0.3"
+ecosystem = "npm"
+group = "dev"
+vulnerability.ignore = true
+effectiveUntil = 2026-11-13
+reason = "GHSA-vfj7-8cjw-p6xm (stack-exhaustion DoS): no fixed braces release. Dev-only, build-time via @electron-forge 7.11.2 -> fast-glob 3.3.3 -> micromatch 4.0.8; Forge uses a fixed internal glob and there is no first-party import or production path. Revisit with the existing Forge exception cohort or a reviewed Forge 8 migration; approved 2026-10-04 and tracked in #1975."
