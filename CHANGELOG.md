@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.48] — 2026-10-04
+
 Concord Voice now keeps screen sharing steady when a capture changes, cleans up
 cancelled audio work before it can surface later, records security outcomes
 without losing the observation that triggered them, pauses a voice stream
