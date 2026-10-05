@@ -1,6 +1,8 @@
 import React from 'react';
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { vi } from 'vitest';
+import { resetAllStores } from '../../../helpers/store-helpers';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 // ── Service mock ─────────────────────────────────────────────────────────────
 vi.mock('@/renderer/services/system/apiClient', () => ({
@@ -104,6 +106,7 @@ const defaultProps = {
 
 describe('MFATierSelector', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
   });
 
@@ -1152,6 +1155,13 @@ describe('MFATierSelector', () => {
     });
 
     it('keeps the unknown state on a non-2xx or failed read', async () => {
+      useUserStore.setState({
+        user: {
+          id: '11111111-2222-4333-8444-555555555555',
+          username: 'local',
+          email: 'local@example.test',
+        },
+      });
       vi.mocked(apiFetch).mockImplementation(async (path) => {
         if (path === '/api/v1/mfa/recovery-circle') throw new TypeError('Failed to fetch');
         return {

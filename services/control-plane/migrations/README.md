@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000162)
+## Existing Migrations (000001–000163)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -272,6 +272,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000160 | add_voice_pending_admissions | Add the channel pending-admission base table and expiry index |
 | 000161 | version_voice_pending_admissions | Add exact admission and socket identity columns to pending admissions |
 | 000162 | add_step_up_tokens | `step_up_tokens` — single-use, purpose-bound password and WebAuthn step-up tokens, stored as SHA-256 only and spent in the consumer's transaction (#3455, PR #3509) |
+| 000163 | trusted_device_recovery_v2 | `recovery_requests` — hash-only JTI and bound v2 offer/approval/completion context; drain ephemeral ceremonies and guard rollback while live v2 requests remain (#2550, #2621, #2622) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -351,6 +352,21 @@ not to a session. Every mint deletes the minting user's expired rows and keeps a
 most 16 live rows per user, oldest first; the hourly cleanup job sweeps expired
 rows globally. The down drops the table: every row is at most 60 seconds from
 expiry, so a rollback costs at most one re-prompt.
+
+Migration 000163 replaces trusted-device recovery's raw JTI column with a
+32-byte SHA-256 hash and adds bound v2 context, offer/completion timestamps and
+state/envelope constraints. Under an `ACCESS EXCLUSIVE` lock, it drains only the
+historical 15-minute `recovery_requests` ceremonies; users must start fresh
+requests. Accounts, trusted devices, Recovery Circle records and account keys
+are not deleted. The existing owner foreign key and user/status index remain.
+
+The down takes the same lock and refuses unexpired v2 `pending`, `offered` or
+`approved` requests. It drains terminal/expired ceremonies, then restores the
+empty prior schema without reconstructing raw JTIs or approval ciphertext.
+Schema rollback must preserve v1 refusal and never restore the old vulnerable
+approval binary. Stage schema/control plane before desktop rollout; older
+clients need update/restart and a fresh request. See the
+[trusted-recovery protocol and release checklist](../../../docs/design/trusted-device-recovery.md).
 
 ## Troubleshooting
 

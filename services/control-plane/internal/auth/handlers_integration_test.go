@@ -713,7 +713,7 @@ func TestPollDeviceRecoveryRequestNotFound(t *testing.T) {
 	ts := setupTS(t)
 
 	w := ts.DoRequest("GET", "/api/v1/auth/recovery/device-request/00000000-0000-0000-0000-000000000000", nil, nil)
-	assert.Contains(t, []int{http.StatusNotFound, http.StatusBadRequest}, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 // --- Social Recovery ---

@@ -958,6 +958,179 @@ export async function generateECDHKeyPair(): Promise<CryptoKeyPair> {
   );
 }
 
+/** Trusted-device recovery feeds ECDH bits into independently authenticated HKDF. */
+export async function generateDeviceRecoveryKeyPair(): Promise<CryptoKeyPair> {
+  return crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-384' }, false, ['deriveBits']);
+}
+
+/** Recovery uses the transcript hash as HKDF salt and independent purpose labels. */
+export interface DeviceRecoveryKeyMaterial {
+  readonly encryptionKey: CryptoKey;
+  readonly transcriptHash: string;
+  readonly fingerprint: string;
+}
+
+export function randomRecoveryNonce(): string {
+  return arrayBufferToBase64(crypto.getRandomValues(new Uint8Array(32)).buffer);
+}
+
+export async function sha256(data: Uint8Array<ArrayBuffer>): Promise<ArrayBuffer> {
+  return crypto.subtle.digest('SHA-256', data);
+}
+
+export async function deriveDeviceRecoveryKeyMaterial(
+  privateKey: CryptoKey,
+  peerPublicKey: CryptoKey,
+  transcript: Uint8Array<ArrayBuffer>,
+  assertCurrent: () => void = () => {}
+): Promise<DeviceRecoveryKeyMaterial> {
+  assertCurrent();
+  const hash = await sha256(transcript);
+  assertCurrent();
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: peerPublicKey },
+    privateKey,
+    384
+  );
+  try {
+    assertCurrent();
+    const material = await crypto.subtle.importKey('raw', sharedBits, 'HKDF', false, [
+      'deriveKey',
+      'deriveBits',
+    ]);
+    assertCurrent();
+    const encryptionKey = await crypto.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: hash,
+        info: new TextEncoder().encode('concord-trusted-device-recovery/v2/encryption'),
+      },
+      material,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+    assertCurrent();
+    const fingerprintBits = await crypto.subtle.deriveBits(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: hash,
+        info: new TextEncoder().encode('concord-trusted-device-recovery/v2/fingerprint'),
+      },
+      material,
+      128
+    );
+    try {
+      assertCurrent();
+      const hex = Array.from(new Uint8Array(fingerprintBits), (byte) =>
+        byte.toString(16).padStart(2, '0').toUpperCase()
+      ).join('');
+      return Object.freeze({
+        encryptionKey,
+        transcriptHash: arrayBufferToBase64(hash),
+        fingerprint: hex.match(/.{4}/g)?.join(' ') ?? '',
+      });
+    } finally {
+      new Uint8Array(fingerprintBits).fill(0);
+    }
+  } finally {
+    new Uint8Array(sharedBits).fill(0);
+  }
+}
+
+/** AES-GCM recovery envelope v2. Generic/social helpers below retain their format. */
+export async function encryptRecoveryEnvelope(
+  key: CryptoKey,
+  pkcs8: ArrayBuffer,
+  transcriptHash: ArrayBuffer
+): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: transcriptHash, tagLength: 128 },
+    key,
+    pkcs8
+  );
+  const envelope = new Uint8Array(13 + ciphertext.byteLength);
+  envelope[0] = 2;
+  envelope.set(iv, 1);
+  envelope.set(new Uint8Array(ciphertext), 13);
+  return arrayBufferToBase64(envelope.buffer);
+}
+
+export async function decryptRecoveryEnvelope(
+  key: CryptoKey,
+  envelope: ArrayBuffer,
+  transcriptHash: ArrayBuffer
+): Promise<ArrayBuffer> {
+  const bytes = new Uint8Array(envelope);
+  return crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: bytes.slice(1, 13), additionalData: transcriptHash, tagLength: 128 },
+    key,
+    bytes.slice(13)
+  );
+}
+
+/** The guard is checked before every sensitive primitive and its continuation. */
+export async function exportRecoveryAccountKey(
+  wrapped: string,
+  wrappingKey: CryptoKey,
+  assertCurrent: () => void
+): Promise<ArrayBuffer> {
+  const data = new Uint8Array(base64ToArrayBuffer(wrapped));
+  assertCurrent();
+  const privateKey = await crypto.subtle.unwrapKey(
+    'pkcs8',
+    data.slice(12),
+    wrappingKey,
+    { name: 'AES-GCM', iv: data.slice(0, 12) },
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    true,
+    ['decrypt']
+  );
+  assertCurrent();
+  const pkcs8 = await crypto.subtle.exportKey('pkcs8', privateKey);
+  try {
+    assertCurrent();
+    return pkcs8;
+  } catch (error) {
+    new Uint8Array(pkcs8).fill(0);
+    throw error;
+  }
+}
+
+export async function validateRecoveryAccountKey(pkcs8: ArrayBuffer): Promise<void> {
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    pkcs8,
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    false,
+    ['decrypt']
+  );
+  const algorithm = key.algorithm as RsaHashedKeyAlgorithm;
+  if (algorithm.modulusLength < 4096) throw new Error('Invalid recovered account key.');
+}
+
+export async function rewrapRecoveryAccountKey(
+  pkcs8: ArrayBuffer,
+  wrappingKey: CryptoKey,
+  assertCurrent: () => void
+): Promise<string> {
+  assertCurrent();
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    pkcs8,
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    true,
+    ['decrypt']
+  );
+  assertCurrent();
+  const result = await wrapPrivateKey(key, wrappingKey);
+  assertCurrent();
+  return arrayBufferToBase64(result);
+}
+
 export async function exportECDHPublicKey(key: CryptoKey): Promise<string> {
   const raw = await crypto.subtle.exportKey('raw', key);
   return arrayBufferToBase64(raw);

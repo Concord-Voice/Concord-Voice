@@ -1,9 +1,26 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
+import { http, HttpResponse } from 'msw';
+import { setupServer } from 'msw/node';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
-// Mock global fetch
-const mockFetch = vi.fn();
-vi.stubGlobal('fetch', mockFetch);
+// Queue API responses at the HTTP boundary; retain real fetch.
+const mockApiResponse = vi.fn();
+const server = setupServer(
+  http.all('*', async () => {
+    try {
+      const response = await mockApiResponse();
+      return HttpResponse.json(await response.json(), { status: response.ok ? 200 : 400 });
+    } catch (error) {
+      return HttpResponse.json(
+        { error: error instanceof Error ? error.message : 'Request failed' },
+        { status: 400 }
+      );
+    }
+  })
+);
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterAll(() => server.close());
 
 // Mock crypto utilities
 vi.mock('@/renderer/utils/crypto/crypto', () => ({
@@ -16,6 +33,8 @@ vi.mock('@/renderer/utils/crypto/crypto', () => ({
       // Minimal mock CryptoKey
     },
   }),
+  exportPublicKey: vi.fn().mockResolvedValue('mock-base64'),
+  rewrapRecoveryAccountKey: vi.fn().mockResolvedValue('mock-base64'),
   arrayBufferToBase64: vi.fn().mockReturnValue('mock-base64'),
   generateSalt: vi.fn().mockReturnValue(new Uint8Array(16)),
   deriveKeyArgon2id: vi.fn().mockResolvedValue({} as CryptoKey),
@@ -56,8 +75,9 @@ describe('AccountRecovery', () => {
   const onComplete = vi.fn();
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
-    mockFetch.mockReset();
+    mockApiResponse.mockReset();
   });
 
   // --- Step 1: Email ---
@@ -110,7 +130,7 @@ describe('AccountRecovery', () => {
   });
 
   it('sends recovery code and advances to verify step', async () => {
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -127,7 +147,7 @@ describe('AccountRecovery', () => {
   });
 
   it('shows error when send code fails', async () => {
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: false,
       json: async () => ({ error: 'Email not found' }),
     });
@@ -144,7 +164,7 @@ describe('AccountRecovery', () => {
   });
 
   it('shows generic error on network failure during code send', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
+    mockApiResponse.mockRejectedValueOnce(new Error('Network error'));
 
     render(<AccountRecovery onBack={onBack} onComplete={onComplete} />);
     fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
@@ -159,7 +179,7 @@ describe('AccountRecovery', () => {
 
   it('shows Sending... text during code send loading', async () => {
     // Make fetch hang
-    mockFetch.mockImplementation(() => new Promise(() => {}));
+    mockApiResponse.mockImplementation(() => new Promise(() => {}));
 
     render(<AccountRecovery onBack={onBack} onComplete={onComplete} />);
     fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
@@ -175,7 +195,7 @@ describe('AccountRecovery', () => {
   // --- Step 2: Verify Code ---
 
   async function advanceToVerifyStep() {
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -231,7 +251,7 @@ describe('AccountRecovery', () => {
   it('advances to recovery-key step when has_recovery_key is true', async () => {
     await advanceToVerifyStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         recovery_token: 'mock-token',
@@ -258,7 +278,7 @@ describe('AccountRecovery', () => {
   it('advances to reset-warning step when no recovery key', async () => {
     await advanceToVerifyStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         recovery_token: 'mock-token',
@@ -281,7 +301,7 @@ describe('AccountRecovery', () => {
   it('shows error when verify code fails', async () => {
     await advanceToVerifyStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: false,
       json: async () => ({ error: 'Invalid code' }),
     });
@@ -299,7 +319,7 @@ describe('AccountRecovery', () => {
   it('shows Verifying... text during code verification', async () => {
     await advanceToVerifyStep();
 
-    mockFetch.mockImplementation(() => new Promise(() => {}));
+    mockApiResponse.mockImplementation(() => new Promise(() => {}));
 
     fireEvent.change(screen.getByPlaceholderText('000000'), {
       target: { value: '123456' },
@@ -315,7 +335,7 @@ describe('AccountRecovery', () => {
 
   async function advanceToRecoveryKeyStep() {
     // Step 1 -> Step 2
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -329,7 +349,7 @@ describe('AccountRecovery', () => {
     });
 
     // Step 2 -> Step 3 (recovery-key)
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         recovery_token: 'mock-token',
@@ -434,7 +454,7 @@ describe('AccountRecovery', () => {
   // --- Step: Reset Warning ---
 
   async function advanceToResetWarningStep() {
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -447,7 +467,7 @@ describe('AccountRecovery', () => {
       expect(screen.getByPlaceholderText('000000')).toBeInTheDocument();
     });
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         recovery_token: 'mock-token',
@@ -538,7 +558,7 @@ describe('AccountRecovery', () => {
 
   async function advanceToNewPasswordStep() {
     // Step 1 -> 2
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -552,7 +572,7 @@ describe('AccountRecovery', () => {
     });
 
     // Step 2 -> recovery-key
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         recovery_token: 'mock-token',
@@ -631,7 +651,7 @@ describe('AccountRecovery', () => {
   it('shows success screen after password reset (recovery key path)', async () => {
     await advanceToNewPasswordStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -655,7 +675,7 @@ describe('AccountRecovery', () => {
   it('shows Sign In button on success screen', async () => {
     await advanceToNewPasswordStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -676,7 +696,7 @@ describe('AccountRecovery', () => {
   it('calls onComplete when Sign In is clicked on success screen', async () => {
     await advanceToNewPasswordStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -699,7 +719,7 @@ describe('AccountRecovery', () => {
   it('shows error when password reset API fails', async () => {
     await advanceToNewPasswordStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: false,
       json: async () => ({ error: 'Token expired' }),
     });
@@ -720,7 +740,7 @@ describe('AccountRecovery', () => {
   it('shows Resetting... text during password reset', async () => {
     await advanceToNewPasswordStep();
 
-    mockFetch.mockImplementation(() => new Promise(() => {}));
+    mockApiResponse.mockImplementation(() => new Promise(() => {}));
 
     fireEvent.change(screen.getByPlaceholderText('At least 12 characters'), {
       target: { value: 'MyNewPassword123!' },
@@ -739,7 +759,7 @@ describe('AccountRecovery', () => {
 
   async function advanceToNewPasswordViaReset() {
     // Step 1 -> 2
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -753,7 +773,7 @@ describe('AccountRecovery', () => {
     });
 
     // Step 2 -> reset-warning (no recovery key)
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         recovery_token: 'mock-token',
@@ -780,7 +800,7 @@ describe('AccountRecovery', () => {
   it('shows success after account reset (data loss path)', async () => {
     await advanceToNewPasswordViaReset();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
     });
@@ -801,7 +821,7 @@ describe('AccountRecovery', () => {
   it('shows error when account reset API fails', async () => {
     await advanceToNewPasswordViaReset();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: false,
       json: async () => ({ error: 'Account reset failed' }),
     });
@@ -821,45 +841,10 @@ describe('AccountRecovery', () => {
 
   // --- Device Waiting Step ---
 
-  it('shows device waiting step subtitle', async () => {
-    await advanceToRecoveryKeyStep();
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ request_id: '11111111-1111-1111-1111-111111111111' }),
-    });
-
-    fireEvent.click(screen.getByText('Recover from trusted device instead'));
-
-    await waitFor(() => {
-      expect(screen.getByText('Waiting for trusted device approval')).toBeInTheDocument();
-      expect(
-        screen.getByText('Waiting for approval from your trusted device...')
-      ).toBeInTheDocument();
-    });
-  });
-
-  it('shows "Try a different recovery method" in device waiting step', async () => {
-    await advanceToRecoveryKeyStep();
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ request_id: '11111111-1111-1111-1111-111111111111' }),
-    });
-
-    fireEvent.click(screen.getByText('Recover from trusted device instead'));
-
-    await waitFor(() => {
-      expect(screen.getByText('Try a different recovery method')).toBeInTheDocument();
-    });
-  });
-
-  // --- Social Waiting Step ---
-
   it('shows social waiting step subtitle', async () => {
     await advanceToRecoveryKeyStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 3 }),
     });
@@ -877,7 +862,7 @@ describe('AccountRecovery', () => {
   it('shows share progress in social waiting step', async () => {
     await advanceToRecoveryKeyStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 3 }),
     });
@@ -915,35 +900,10 @@ describe('AccountRecovery', () => {
   // strictly better UX than the poll-catch fallback above (which stays in
   // place as defense-in-depth).
 
-  it('rejects device recovery initiation immediately when server returns malformed request_id', async () => {
-    await advanceToRecoveryKeyStep();
-
-    // Server returns a malformed request_id on POST /device-request
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ request_id: 'not-a-uuid' }),
-    });
-    fireEvent.click(screen.getByText('Recover from trusted device instead'));
-
-    // User should see the error immediately — no "Waiting..." flash because
-    // upfront validation throws before step transitions to device-waiting.
-    await waitFor(() => {
-      expect(
-        screen.getByText('Server returned an invalid recovery request ID. Please try again.')
-      ).toBeInTheDocument();
-    });
-    // Step should remain at recovery-key
-    expect(
-      screen.getByText('Enter your recovery key to restore your encrypted data')
-    ).toBeInTheDocument();
-    // "Waiting..." screen should never have rendered
-    expect(screen.queryByText('Waiting for trusted device approval')).not.toBeInTheDocument();
-  });
-
   it('rejects social recovery initiation immediately when server returns malformed request_id', async () => {
     await advanceToRecoveryKeyStep();
 
-    mockFetch.mockResolvedValueOnce({
+    mockApiResponse.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ request_id: 'also-not-a-uuid', threshold_k: 3 }),
     });

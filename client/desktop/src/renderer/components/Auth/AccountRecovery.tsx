@@ -1,9 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   unwrapWithRecoveryKey,
   generateRegistrationKeys,
   arrayBufferToBase64,
   generateSalt,
+  exportPublicKey,
+  rewrapRecoveryAccountKey,
   deriveKeyArgon2id,
   generateECDHKeyPair,
   exportECDHPublicKey,
@@ -11,7 +13,21 @@ import {
   deriveSharedSecret,
   decryptWithSharedSecret,
 } from '../../utils/crypto/crypto';
-import { apiUrl } from '../../services/system/runtimeServerBase';
+import {
+  apiUrl,
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/system/runtimeServerBase';
+import {
+  RequesterDeviceRecoveryAttempt,
+  type DeviceRecoveryView,
+} from '../../services/system/deviceRecoveryService';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import DeviceRecoveryFingerprint from './DeviceRecoveryFingerprint';
 import { assertValidUUID, isValidUUID } from '../../utils/runtime/uuid';
 import LoadingSpinner from './LoadingSpinner';
 import './Login.css';
@@ -39,11 +55,15 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
   const [hasRecoveryKey, setHasRecoveryKey] = useState(false);
   const [hasTrustedDevices, setHasTrustedDevices] = useState(false);
   const [hasRecoveryCircle, setHasRecoveryCircle] = useState(false);
-  const [deviceRequestId, setDeviceRequestId] = useState('');
   const [socialRequestId, setSocialRequestId] = useState('');
   const [socialThreshold, setSocialThreshold] = useState(0);
   const [socialSharesReceived, setSocialSharesReceived] = useState(0);
   const [ecdhKeyPair, setEcdhKeyPair] = useState<CryptoKeyPair | null>(null);
+  const deviceAttemptRef = useRef<RequesterDeviceRecoveryAttempt | null>(null);
+  const deviceStartingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const plaintextRef = useRef<ArrayBuffer | null>(null);
+  const [deviceView, setDeviceView] = useState<DeviceRecoveryView | null>(null);
   const [recoveryData, setRecoveryData] = useState<{
     recovery_wrapped_private_key?: string;
     recovery_key_salt?: string;
@@ -58,6 +78,32 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState('');
+
+  const retainRecoveredPkcs8 = (bytes: ArrayBuffer | null) => {
+    if (!mountedRef.current) {
+      if (bytes) new Uint8Array(bytes).fill(0);
+      return;
+    }
+    if (plaintextRef.current && plaintextRef.current !== bytes)
+      new Uint8Array(plaintextRef.current).fill(0);
+    plaintextRef.current = bytes;
+    setRecoveredPkcs8(bytes);
+  };
+  const cancelDeviceRecovery = () => {
+    deviceAttemptRef.current?.dispose();
+    deviceAttemptRef.current = null;
+    setDeviceView(null);
+  };
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      deviceAttemptRef.current?.dispose();
+      deviceAttemptRef.current = null;
+      if (plaintextRef.current) new Uint8Array(plaintextRef.current).fill(0);
+      plaintextRef.current = null;
+    };
+  }, []);
 
   // Step 1: Send recovery code
   const handleSendCode = async () => {
@@ -128,7 +174,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         throw new Error('Recovery key material missing from server response');
       }
       const pkcs8Bytes = await unwrapWithRecoveryKey(wrappedKey, salt, recoveryKeyInput);
-      setRecoveredPkcs8(pkcs8Bytes);
+      retainRecoveredPkcs8(pkcs8Bytes);
       setStep('new-password');
     } catch {
       setError('Invalid recovery key. Please check and try again.');
@@ -137,90 +183,32 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     }
   };
 
-  // Step 3b: Initiate trusted device recovery
+  // A service-owned attempt pins local context, the offer, consent, and completion acknowledgement.
   const handleDeviceRecovery = async () => {
+    if (deviceStartingRef.current) return;
+    deviceStartingRef.current = true;
+    cancelDeviceRecovery();
     setLoading(true);
     setError('');
-    try {
-      const keyPair = await generateECDHKeyPair();
-      setEcdhKeyPair(keyPair);
-      const pubKeyBase64 = await exportECDHPublicKey(keyPair.publicKey);
-
-      const res = await fetch(apiUrl('/api/v1/auth/recovery/device-request'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recovery_token: recoveryToken,
-          ephemeral_public_key: pubKeyBase64,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to create recovery request');
-
-      // Upfront validation: if the server returns a malformed request_id,
-      // fail fast with a user-visible error instead of
-      // transitioning to device-waiting and discovering the problem 3s later
-      // in the poll loop. The poll-catch fallback (below) remains as
-      // defense-in-depth for any future path where a valid ID could become
-      // corrupted in React state.
-      if (!isValidUUID(data.request_id)) {
-        throw new Error('Server returned an invalid recovery request ID. Please try again.');
+    const attempt = new RequesterDeviceRecoveryAttempt(recoveryToken, (view) => {
+      if (!mountedRef.current || deviceAttemptRef.current !== attempt) return;
+      setDeviceView(view);
+      setError(view.error);
+      if (view.status === 'complete') {
+        retainRecoveredPkcs8(attempt.recoveredAccountKey());
+        setStep('new-password');
+      } else if (view.status === 'error') {
+        deviceAttemptRef.current = null;
+        retainRecoveredPkcs8(null);
+        setStep(hasRecoveryKey ? 'recovery-key' : 'reset-warning');
       }
-
-      setDeviceRequestId(data.request_id);
-      setStep('device-waiting');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to initiate device recovery');
-    } finally {
-      setLoading(false);
-    }
+    });
+    deviceAttemptRef.current = attempt;
+    setStep('device-waiting');
+    await attempt.start();
+    deviceStartingRef.current = false;
+    if (mountedRef.current) setLoading(false);
   };
-
-  // Poll for trusted device response (handler defined inside useEffect to capture current closure values)
-  useEffect(() => {
-    if (step !== 'device-waiting' || !deviceRequestId) return;
-
-    const pollDevice = async () => {
-      try {
-        const safeId = encodeURIComponent(assertValidUUID(deviceRequestId, 'deviceRequestId'));
-        const res = await fetch(apiUrl(`/api/v1/auth/recovery/device-request/${safeId}`), {
-          headers: { Authorization: `Bearer ${recoveryToken}` },
-        });
-        const data = await res.json();
-        if (!res.ok) return;
-
-        if (data.status === 'approved' && data.encrypted_payload && data.responder_public_key) {
-          // Decrypt the payload using ECDH
-          if (!ecdhKeyPair) {
-            throw new Error('device recovery: ECDH key pair was not generated before polling');
-          }
-          const responderKey = await importECDHPublicKey(data.responder_public_key);
-          const sharedKey = await deriveSharedSecret(ecdhKeyPair.privateKey, responderKey);
-          const pkcs8Bytes = await decryptWithSharedSecret(sharedKey, data.encrypted_payload);
-          setRecoveredPkcs8(pkcs8Bytes);
-          setStep('new-password');
-        } else if (data.status === 'rejected') {
-          setError('Recovery request was rejected by the trusted device.');
-          setStep('recovery-key');
-        } else if (data.status === 'expired') {
-          setError('Recovery request expired. Please try again.');
-          setStep('recovery-key');
-        }
-        // If still pending, do nothing (will poll again)
-      } catch {
-        // Ignore poll errors silently — the next poll tick retries. See
-        // [internal]rules/frontend.md re: idiomatic fetch-retry polling loops.
-        // Malformed request_ids are caught upstream at handleDeviceRecovery
-        // before setDeviceRequestId is ever called, so reaching this catch
-        // in practice means fetch failure.
-        // (The ECDH-invariant throw above is already gated by state-machine
-        //  preconditions; also handled by the silent retry.)
-      }
-    };
-
-    const interval = setInterval(pollDevice, 3000); // Poll every 3 seconds
-    return () => clearInterval(interval);
-  }, [step, deviceRequestId, recoveryToken, ecdhKeyPair]);
 
   // Step 3c: Initiate social recovery
   const handleSocialRecovery = async () => {
@@ -299,7 +287,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
 
           // Reconstruct PKCS8
           const reconstructed = combine(shares);
-          setRecoveredPkcs8(reconstructed.buffer as ArrayBuffer);
+          retainRecoveredPkcs8(reconstructed.buffer as ArrayBuffer);
           setStep('new-password');
         }
       } catch {
@@ -329,29 +317,32 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     setLoading(true);
     setError('');
     try {
+      const auth = captureAuthLifecycle();
+      const server = captureRuntimeServerSelection();
+      const keyEpoch = e2eeService.captureTeardownEpoch();
+      const currentAttempt = deviceAttemptRef.current;
+      const assertCurrent = () => {
+        if (
+          !mountedRef.current ||
+          !isSameAuthLifecycle(auth) ||
+          !runtimeServerSelectionIsCurrent(server) ||
+          e2eeService.wasTornDownSince(keyEpoch)
+        )
+          throw new Error('Account, server or keys changed. Restart recovery.');
+        currentAttempt?.assertCurrent();
+      };
+      assertCurrent();
       if (recoveredPkcs8) {
         // Recovery key path — same keypair
         const salt = generateSalt();
         const wrappingKey = await deriveKeyArgon2id(newPassword, salt);
-
-        // Import recovered PKCS8 as extractable CryptoKey for wrapping
-        const privateKeyToWrap = await crypto.subtle.importKey(
-          'pkcs8',
+        assertCurrent();
+        const wrappedPrivateKey = await rewrapRecoveryAccountKey(
           recoveredPkcs8,
-          { name: 'RSA-OAEP', hash: 'SHA-256' },
-          true, // extractable
-          ['decrypt']
+          wrappingKey,
+          assertCurrent
         );
-
-        // Wrap using wrapKey (which wrappingKey supports)
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const wrapped = await crypto.subtle.wrapKey('pkcs8', privateKeyToWrap, wrappingKey, {
-          name: 'AES-GCM',
-          iv,
-        });
-        const wrappedResult = new Uint8Array(12 + wrapped.byteLength);
-        wrappedResult.set(iv, 0);
-        wrappedResult.set(new Uint8Array(wrapped), 12);
+        assertCurrent();
 
         const res = await fetch(apiUrl('/api/v1/auth/recovery/reset-password'), {
           method: 'POST',
@@ -359,7 +350,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
           body: JSON.stringify({
             recovery_token: recoveryToken,
             new_password: newPassword,
-            wrapped_private_key: arrayBufferToBase64(wrappedResult.buffer),
+            wrapped_private_key: wrappedPrivateKey,
             key_derivation_salt: arrayBufferToBase64(salt.buffer as ArrayBuffer),
             key_derivation_alg: 'argon2id',
           }),
@@ -371,7 +362,10 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       } else {
         // Account reset path — new keypair, data loss
         const newKeys = await generateRegistrationKeys(newPassword);
+        assertCurrent();
 
+        const publicKey = await exportPublicKey(newKeys.publicKey);
+        assertCurrent();
         const res = await fetch(apiUrl('/api/v1/auth/recovery/reset-account'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -381,9 +375,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
             wrapped_private_key: newKeys.wrappedPrivateKey,
             key_derivation_salt: newKeys.keyDerivationSalt,
             key_derivation_alg: newKeys.keyDerivationAlg,
-            public_key: arrayBufferToBase64(
-              await crypto.subtle.exportKey('spki', newKeys.publicKey)
-            ),
+            public_key: publicKey,
             acknowledge_data_loss: true,
           }),
         });
@@ -393,6 +385,9 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         }
       }
 
+      assertCurrent();
+      retainRecoveredPkcs8(null);
+      cancelDeviceRecovery();
       setSuccess('Password reset successfully. Please sign in with your new password.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Reset failed');
@@ -400,6 +395,14 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       setLoading(false);
     }
   };
+
+  let deviceStatusMessage = 'Open Concord on your trusted device and review this request.';
+  if (deviceView?.status === 'approved-locked') {
+    deviceStatusMessage =
+      'Approval received. Your key remains locked until you confirm the fingerprint.';
+  } else if (deviceView?.status === 'completing') {
+    deviceStatusMessage = 'Validating the account key and acknowledging completion…';
+  }
 
   // Success screen
   if (success) {
@@ -543,7 +546,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 />
               </div>
               {error && (
-                <div className="form-error-banner">
+                <div className="form-error-banner" role="alert">
                   <span>{error}</span>
                 </div>
               )}
@@ -595,33 +598,48 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
           )}
 
           {step === 'device-waiting' && (
-            <>
-              <div style={{ textAlign: 'center', padding: '20px 0' }}>
-                <LoadingSpinner size="small" inline />
-                <p style={{ color: 'var(--text-secondary)', marginTop: 12 }}>
-                  Waiting for approval from your trusted device...
-                </p>
-                <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
-                  Open Concord on your trusted device and approve the recovery request.
-                </p>
-              </div>
-              {error && (
-                <div className="form-error-banner">
-                  <span>{error}</span>
-                </div>
+            <div className="device-recovery-ceremony">
+              <p role="status" aria-live="polite">
+                {deviceStatusMessage}
+              </p>
+              <p>
+                Compare all eight groups directly with your trusted device. Confirm only when every
+                character matches. Never send the fingerprint to support. Both devices must run an
+                updated version of Concord.
+              </p>
+              {deviceView?.fingerprint && (
+                <DeviceRecoveryFingerprint fingerprint={deviceView.fingerprint} />
               )}
-              <button
-                type="button"
-                className="mfa-choose-another"
-                onClick={() => {
-                  setStep(hasRecoveryKey ? 'recovery-key' : 'reset-warning');
-                  setError('');
-                }}
-                style={{ marginTop: 8 }}
-              >
-                Try a different recovery method
-              </button>
-            </>
+              {error && <p role="alert">{error}</p>}
+              <div className="device-recovery-actions">
+                <button
+                  type="button"
+                  className="login-submit-btn"
+                  disabled={
+                    !deviceView?.fingerprint ||
+                    deviceView.confirmed ||
+                    deviceView.status === 'completing'
+                  }
+                  onClick={() => {
+                    void deviceAttemptRef.current?.confirmMatch();
+                  }}
+                >
+                  {deviceView?.confirmed ? 'Fingerprints confirmed' : 'These fingerprints match'}
+                </button>
+                <button
+                  type="button"
+                  className="mfa-choose-another"
+                  onClick={() => {
+                    cancelDeviceRecovery();
+                    retainRecoveredPkcs8(null);
+                    setStep(hasRecoveryKey ? 'recovery-key' : 'reset-warning');
+                    setError('');
+                  }}
+                >
+                  Try a different recovery method
+                </button>
+              </div>
+            </div>
           )}
 
           {step === 'social-waiting' && (
@@ -686,7 +704,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 </span>
               </label>
               {error && (
-                <div className="form-error-banner">
+                <div className="form-error-banner" role="alert">
                   <span>{error}</span>
                 </div>
               )}
@@ -786,7 +804,16 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
             </>
           )}
 
-          <button type="button" className="login-back-btn" onClick={onBack} disabled={loading}>
+          <button
+            type="button"
+            className="login-back-btn"
+            onClick={() => {
+              cancelDeviceRecovery();
+              retainRecoveredPkcs8(null);
+              onBack();
+            }}
+            disabled={loading}
+          >
             &larr; Back to login
           </button>
         </div>

@@ -704,59 +704,72 @@ paths:
     post:
       tags:
       - Auth
-      summary: Create a trusted-device recovery request
-      description: 'Create a recovery request (15-minute expiry) that a trusted device can approve. Requires
-        a valid recovery token.
-
-        Rate limit: 3 requests per 15 minutes (IP-based).
-
-        '
+      summary: Create trusted-device recovery v2
       operationId: createDeviceRecoveryRequest
       security: []
+      description: All bodies are exact objects, at most 16 KiB. Reject unknown, duplicate, case-alias, null, wrong-type,
+        action-incompatible fields and trailing documents. Canonical padded standard base64 is required. P-384 keys
+        are on-curve 97-byte uncompressed points. v1 is always refused. Recovery-purpose token; immutable expiry min(database
+        creation + 15 minutes, verified JWT expiry). 3 per 15 minutes per IP.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RecoveryRequestCreate'
+              $ref: '#/components/schemas/DeviceRecoveryCreateBody'
       responses:
         '200':
-          description: Recovery request created
+          description: Owned v2 recovery state
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  request_id:
-                    type: string
-                    format: uuid
+                $ref: '#/components/schemas/DeviceRecoveryPending'
         '400':
-          description: Invalid body, no trusted devices configured, or malformed base64 ephemeral key
+          description: Invalid exact body or unsupported version. Update both devices and restart recovery.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '401':
-          description: Invalid or expired recovery token
+          description: Invalid or expired role authentication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Request missing or unowned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: State or transcript conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Full body exceeds 16 KiB
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Recovery dependency unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/device-request/{id}:
     get:
       tags:
       - Auth
-      summary: Poll a trusted-device recovery request
-      description: 'Poll request status. Recovery token is passed via `Authorization: Bearer` header or
-        the `recovery_token` query parameter.
-
-        Rate limit: 10 requests per 15 minutes (IP-based).
-
-        '
+      summary: Poll owned v2 recovery state
       operationId: pollDeviceRecoveryRequest
-      security: []
+      security:
+      - RecoveryBearerAuth: []
       parameters:
       - name: id
         in: path
@@ -764,51 +777,55 @@ paths:
         schema:
           type: string
           format: uuid
-        description: Recovery request UUID
-      - name: recovery_token
-        in: query
-        required: false
-        schema:
-          type: string
-        description: Recovery token (alternative to the Authorization Bearer header)
+        description: Canonical lowercase UUID
+      description: Recovery-purpose Bearer header only; query tokens refused. 60 per minute per IP. Poll every 3 seconds
+        without overlap; honor Retry-After. Expired ciphertext is erased and withheld. Terminals contain only request_id,
+        protocol_version, status, expires_at.
       responses:
         '200':
-          description: Current request status (`pending`, `approved`, `denied`, or `expired`)
+          description: Owned v2 recovery state
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                  encrypted_payload:
-                    type: string
-                    format: byte
-                    description: Present when status is approved
-                  responder_public_key:
-                    type: string
-                    format: byte
-                    description: Present when status is approved
+                $ref: '#/components/schemas/DeviceRecoveryRequest'
         '400':
-          description: Recovery token missing
+          description: Invalid exact body or unsupported version. Update both devices and restart recovery.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '401':
-          description: Invalid or expired recovery token
+          description: Invalid or expired role authentication
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Recovery request not found
+          description: Request missing or unowned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: State or transcript conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Full body exceeds 16 KiB
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Recovery dependency unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/reset-account:
     post:
       tags:
@@ -909,6 +926,78 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /auth/recovery/device-request/{id}/complete:
+    post:
+      tags:
+      - Auth
+      summary: Acknowledge confirmed client key import
+      operationId: completeDeviceRecoveryRequest
+      security:
+      - RecoveryBearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Canonical lowercase UUID
+      description: All bodies are exact objects, at most 16 KiB. Reject unknown, duplicate, case-alias, null, wrong-type,
+        action-incompatible fields and trailing documents. Canonical padded standard base64 is required. P-384 keys
+        are on-curve 97-byte uncompressed points. v1 is always refused. Requester recovery-purpose Bearer token must
+        match user, JTI hash and exact approved transcript. Clears ciphertext without consuming password-reset token.
+        5 per minute per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRecoveryCompleteBody'
+      responses:
+        '200':
+          description: Owned v2 recovery state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceRecoveryCompleteResult'
+        '400':
+          description: Invalid exact body or unsupported version. Update both devices and restart recovery.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or expired role authentication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Request missing or unowned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: State or transcript conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Full body exceeds 16 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Recovery dependency unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/social-request:
     post:
       tags:
@@ -10665,29 +10754,56 @@ paths:
     get:
       tags:
       - MFA
-      summary: List pending recovery requests
-      description: 'Returns pending, unexpired recovery requests targeting the
-
-        authenticated user''s account.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      summary: List owned pending/offered v2 recovery contexts
       operationId: mfaListRecoveryRequests
       security:
       - BearerAuth: []
+      description: Owned, unexpired pending/offered rows only; never ciphertext. 10 per minute per user.
       responses:
         '200':
-          description: Pending recovery requests
+          description: Owned v2 recovery state
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  requests:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/RecoveryRequestSummary'
+                $ref: '#/components/schemas/DeviceRecoveryList'
+        '400':
+          description: Invalid exact body or unsupported version. Update both devices and restart recovery.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or expired role authentication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Request missing or unowned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: State or transcript conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Full body exceeds 16 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Recovery dependency unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /mfa/recovery-requests/social:
     get:
       tags:
@@ -10788,16 +10904,7 @@ paths:
     post:
       tags:
       - MFA
-      summary: Approve or reject a recovery request
-      description: 'Responds to a pending recovery request for the authenticated user''s own
-
-        account. Approval requires base64 `encrypted_payload` and
-
-        `responder_public_key`.
-
-        Rate limit: 5 requests per minute (user-based).
-
-        '
+      summary: Offer, approve or reject owned recovery v2
       operationId: mfaRespondToRecoveryRequest
       security:
       - BearerAuth: []
@@ -10808,49 +10915,59 @@ paths:
         schema:
           type: string
           format: uuid
-        description: Recovery request UUID
+        description: Canonical lowercase UUID
+      description: All bodies are exact objects, at most 16 KiB. Reject unknown, duplicate, case-alias, null, wrong-type,
+        action-incompatible fields and trailing documents. Canonical padded standard base64 is required. P-384 keys
+        are on-curve 97-byte uncompressed points. v1 is always refused. Access credential epoch is fenced within users-before-request
+        transaction. Offer fixes key, nonce and transcript once. Approve carries only offered digest and v2 ciphertext.
+        Reject accepts pending/offered. Approval acknowledgement does not prove key receipt. 5 per minute per user.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required:
-              - action
-              properties:
-                action:
-                  type: string
-                  enum:
-                  - approve
-                  - reject
-                encrypted_payload:
-                  type: string
-                  description: Base64 — required for approve
-                responder_public_key:
-                  type: string
-                  description: Base64 — required for approve
+              $ref: '#/components/schemas/DeviceRecoveryRespondBody'
       responses:
         '200':
-          description: Response recorded
+          description: Owned v2 recovery state
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
+                $ref: '#/components/schemas/DeviceRecoveryResponseResult'
         '400':
-          description: Invalid action, missing/invalid base64 approval payloads, or request already responded
-            to
+          description: Invalid exact body or unsupported version. Update both devices and restart recovery.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '403':
-          description: Not authorized to respond to this request
+        '401':
+          description: Invalid or expired role authentication
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Recovery request not found or expired
+          description: Request missing or unowned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: State or transcript conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Full body exceeds 16 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Recovery dependency unavailable
           content:
             application/json:
               schema:
@@ -16766,6 +16883,11 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: JWT access token (15-minute expiry)
+    RecoveryBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Recovery-purpose JWT for the verified account and recovery JTI; access tokens are refused.
     CookieAuth:
       type: apiKey
       in: cookie
@@ -17152,6 +17274,508 @@ components:
           example:
             error: Verification failed
   schemas:
+    DeviceRecoveryContext:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - server_origin
+      - account_binding
+      - expires_at
+      - requester_nonce
+      - requester_public_key
+      - recovery_token_jti_hash
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        server_origin:
+          type: string
+          maxLength: 512
+          description: Canonical ASCII HTTP(S) selected-server origin; context only
+        account_binding:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        expires_at:
+          type: integer
+          format: int64
+          description: Fixed integer Unix milliseconds
+        requester_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        requester_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        recovery_token_jti_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+    DeviceRecoveryPending:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - server_origin
+      - account_binding
+      - expires_at
+      - requester_nonce
+      - requester_public_key
+      - recovery_token_jti_hash
+      - status
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        server_origin:
+          type: string
+          maxLength: 512
+          description: Canonical ASCII HTTP(S) selected-server origin; context only
+        account_binding:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        expires_at:
+          type: integer
+          format: int64
+          description: Fixed integer Unix milliseconds
+        requester_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        requester_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        recovery_token_jti_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        status:
+          type: string
+          enum:
+          - pending
+    DeviceRecoveryOffered:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - server_origin
+      - account_binding
+      - expires_at
+      - requester_nonce
+      - requester_public_key
+      - recovery_token_jti_hash
+      - responder_public_key
+      - responder_nonce
+      - transcript_hash
+      - status
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        server_origin:
+          type: string
+          maxLength: 512
+          description: Canonical ASCII HTTP(S) selected-server origin; context only
+        account_binding:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        expires_at:
+          type: integer
+          format: int64
+          description: Fixed integer Unix milliseconds
+        requester_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        requester_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        recovery_token_jti_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        responder_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        responder_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        transcript_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        status:
+          type: string
+          enum:
+          - offered
+    DeviceRecoveryApproved:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - server_origin
+      - account_binding
+      - expires_at
+      - requester_nonce
+      - requester_public_key
+      - recovery_token_jti_hash
+      - responder_public_key
+      - responder_nonce
+      - transcript_hash
+      - status
+      - encrypted_payload
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        server_origin:
+          type: string
+          maxLength: 512
+          description: Canonical ASCII HTTP(S) selected-server origin; context only
+        account_binding:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        expires_at:
+          type: integer
+          format: int64
+          description: Fixed integer Unix milliseconds
+        requester_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        requester_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        recovery_token_jti_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        responder_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        responder_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        transcript_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        status:
+          type: string
+          enum:
+          - approved
+        encrypted_payload:
+          type: string
+          format: byte
+          minLength: 40
+          maxLength: 10924
+          description: '30–8192 decoded bytes: 02 || 12-byte IV || ciphertext/128-bit tag. AES-256-GCM AAD is transcript
+            hash.'
+    DeviceRecoveryTerminal:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - status
+      - expires_at
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        status:
+          type: string
+          enum:
+          - rejected
+          - expired
+          - complete
+        expires_at:
+          type: integer
+          format: int64
+          description: Fixed integer Unix milliseconds
+    DeviceRecoveryRequest:
+      oneOf:
+      - $ref: '#/components/schemas/DeviceRecoveryPending'
+      - $ref: '#/components/schemas/DeviceRecoveryOffered'
+      - $ref: '#/components/schemas/DeviceRecoveryApproved'
+      - $ref: '#/components/schemas/DeviceRecoveryTerminal'
+    DeviceRecoveryCreateBody:
+      type: object
+      additionalProperties: false
+      required:
+      - protocol_version
+      - recovery_token
+      - server_origin
+      - account_binding
+      - requester_nonce
+      - requester_public_key
+      properties:
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        recovery_token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        server_origin:
+          type: string
+          maxLength: 512
+          description: Canonical ASCII HTTP(S) selected-server origin; context only
+        account_binding:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        requester_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        requester_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+    DeviceRecoveryOfferBody:
+      type: object
+      additionalProperties: false
+      required:
+      - action
+      - protocol_version
+      - responder_public_key
+      - responder_nonce
+      - transcript_hash
+      properties:
+        action:
+          type: string
+          enum:
+          - offer
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        responder_public_key:
+          type: string
+          format: byte
+          minLength: 132
+          maxLength: 132
+          description: Canonical base64; 97-byte on-curve uncompressed P-384 point
+        responder_nonce:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        transcript_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+    DeviceRecoveryApproveBody:
+      type: object
+      additionalProperties: false
+      required:
+      - action
+      - protocol_version
+      - transcript_hash
+      - encrypted_payload
+      properties:
+        action:
+          type: string
+          enum:
+          - approve
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        transcript_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+        encrypted_payload:
+          type: string
+          format: byte
+          minLength: 40
+          maxLength: 10924
+          description: '30–8192 decoded bytes: 02 || 12-byte IV || ciphertext/128-bit tag. AES-256-GCM AAD is transcript
+            hash.'
+    DeviceRecoveryRejectBody:
+      type: object
+      additionalProperties: false
+      required:
+      - action
+      - protocol_version
+      properties:
+        action:
+          type: string
+          enum:
+          - reject
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+    DeviceRecoveryRespondBody:
+      oneOf:
+      - $ref: '#/components/schemas/DeviceRecoveryOfferBody'
+      - $ref: '#/components/schemas/DeviceRecoveryApproveBody'
+      - $ref: '#/components/schemas/DeviceRecoveryRejectBody'
+    DeviceRecoveryCompleteBody:
+      type: object
+      additionalProperties: false
+      required:
+      - protocol_version
+      - transcript_hash
+      properties:
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        transcript_hash:
+          type: string
+          format: byte
+          minLength: 44
+          maxLength: 44
+          description: Canonical padded base64; exactly 32 decoded bytes
+    DeviceRecoveryResponseResult:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - status
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        status:
+          type: string
+          enum:
+          - offered
+          - approved
+          - rejected
+          - complete
+    DeviceRecoveryCompleteResult:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - protocol_version
+      - status
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        protocol_version:
+          type: integer
+          enum:
+          - 2
+        status:
+          type: string
+          enum:
+          - complete
+    DeviceRecoveryList:
+      type: object
+      additionalProperties: false
+      required:
+      - requests
+      properties:
+        requests:
+          type: array
+          items:
+            oneOf:
+            - $ref: '#/components/schemas/DeviceRecoveryPending'
+            - $ref: '#/components/schemas/DeviceRecoveryOffered'
     VoiceEnforcementHealthBootstrap:
       type: object
       description: Body-bound bootstrap proof for the exact media-process NATS subscriber.

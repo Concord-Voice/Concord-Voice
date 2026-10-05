@@ -489,9 +489,11 @@ function apiFetchRaw(
   apiBase: string,
   path: string,
   init: RequestInit | undefined,
-  headers: Headers
+  headers: Headers,
+  assertBeforeDispatch?: () => void
 ): Promise<Response> {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  assertBeforeDispatch?.();
   return fetch(`${apiBase}${normalizedPath}`, {
     ...init,
     headers,
@@ -645,7 +647,8 @@ async function handleReattestPath(
   init: RequestInit | undefined,
   response: Response,
   mid: string | null,
-  lifecycle: AuthLifecycleSnapshot
+  lifecycle: AuthLifecycleSnapshot,
+  assertBeforeDispatch?: () => void
 ): Promise<Response> {
   if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
   if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
@@ -673,7 +676,13 @@ async function handleReattestPath(
   ) {
     return response;
   }
-  const retryResponse = await apiFetchRaw(serverSelection.apiBase, path, init, retryHeaders);
+  const retryResponse = await apiFetchRaw(
+    serverSelection.apiBase,
+    path,
+    init,
+    retryHeaders,
+    assertBeforeDispatch
+  );
   if (retryResponse.status !== 403) return retryResponse;
 
   const retryBody = await parseAttestationBody(retryResponse);
@@ -778,14 +787,23 @@ async function handle403Attestation(
   init: RequestInit | undefined,
   response: Response,
   mid: string | null,
-  lifecycle: AuthLifecycleSnapshot
+  lifecycle: AuthLifecycleSnapshot,
+  assertBeforeDispatch?: () => void
 ): Promise<Response> {
   const body = await parseAttestationBody(response);
   if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
 
   if (body.code !== null && ATTESTATION_REATTEST_CODES.has(body.code)) {
     if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
-    return handleReattestPath(serverSelection, path, init, response, mid, lifecycle);
+    return handleReattestPath(
+      serverSelection,
+      path,
+      init,
+      response,
+      mid,
+      lifecycle,
+      assertBeforeDispatch
+    );
   }
 
   if (body.code !== null && isTerminalAttestationCode(body.code)) {
@@ -840,19 +858,31 @@ async function build401RetryHeaders(
   return headers;
 }
 
+interface Recovery401Options {
+  readonly serverSelection: RuntimeServerSelection;
+  readonly path: string;
+  readonly init: RequestInit | undefined;
+  readonly response: Response;
+  readonly mid: string | null;
+  readonly authoritative: boolean;
+  readonly lifecycle: AuthLifecycleSnapshot;
+  readonly assertBeforeDispatch?: () => void;
+}
+
 /**
  * Attempt to recover from a 401 response by refreshing the token and retrying.
  * Returns the retried response on success, or the original 401 on failure.
  */
-async function handle401Recovery(
-  serverSelection: RuntimeServerSelection,
-  path: string,
-  init: RequestInit | undefined,
-  response: Response,
-  mid: string | null,
-  authoritative: boolean,
-  lifecycle: AuthLifecycleSnapshot
-): Promise<Response> {
+async function handle401Recovery({
+  serverSelection,
+  path,
+  init,
+  response,
+  mid,
+  authoritative,
+  lifecycle,
+  assertBeforeDispatch,
+}: Recovery401Options): Promise<Response> {
   // The response and any recovery work belong to the auth lifecycle that
   // issued the original request. Never let a held 401 adopt a later account.
   if (lifecycle.accessToken === null) return response;
@@ -900,9 +930,23 @@ async function handle401Recovery(
     return response;
   }
   const refreshedLifecycle = captureAuthLifecycle();
-  const retryResponse = await apiFetchRaw(serverSelection.apiBase, path, init, retryHeaders);
+  const retryResponse = await apiFetchRaw(
+    serverSelection.apiBase,
+    path,
+    init,
+    retryHeaders,
+    assertBeforeDispatch
+  );
   if (retryResponse.status !== 403) return retryResponse;
-  return handle403Attestation(serverSelection, path, init, retryResponse, mid, refreshedLifecycle);
+  return handle403Attestation(
+    serverSelection,
+    path,
+    init,
+    retryResponse,
+    mid,
+    refreshedLifecycle,
+    assertBeforeDispatch
+  );
 }
 
 /**
@@ -917,11 +961,18 @@ async function handle401Recovery(
  *   admitted against that account and server, so it refuses to dispatch if
  *   either changed since the capture. Without one, the request is its own
  *   operation, admitted against the account and server current at the call.
+ * @param opts.assertBeforeDispatch Operation-owned synchronous guard run before
+ *   each actual fetch, including auth and attestation retries. Use it when
+ *   disposal, key epochs or deadlines must also fence publication after IPC.
  */
 export async function apiFetch(
   path: string,
   init?: RequestInit,
-  opts?: { authoritative?: boolean; context?: ApiRequestContext }
+  opts?: {
+    authoritative?: boolean;
+    context?: ApiRequestContext;
+    assertBeforeDispatch?: () => void;
+  }
 ): Promise<Response> {
   const serverSelection = opts?.context?.serverSelection ?? captureRuntimeServerSelection();
   const requestApiBase = serverSelection.apiBase;
@@ -983,7 +1034,13 @@ export async function apiFetch(
     headers.set('X-Session-ID', requestAuthLifecycle.sessionId);
   }
 
-  const response = await apiFetchRaw(requestApiBase, path, init, headers);
+  const response = await apiFetchRaw(
+    requestApiBase,
+    path,
+    init,
+    headers,
+    opts?.assertBeforeDispatch
+  );
 
   // The response belongs to the invocation-time origin. A server switch while
   // attestation or the request was in flight must never refresh/re-attest using
@@ -992,7 +1049,15 @@ export async function apiFetch(
 
   // Intercept 403 attestation failures before the 401 path.
   if (response.status === 403) {
-    return handle403Attestation(serverSelection, path, init, response, mid, requestAuthLifecycle);
+    return handle403Attestation(
+      serverSelection,
+      path,
+      init,
+      response,
+      mid,
+      requestAuthLifecycle,
+      opts?.assertBeforeDispatch
+    );
   }
 
   // If not 401, return as-is
@@ -1000,15 +1065,16 @@ export async function apiFetch(
     return response;
   }
 
-  return handle401Recovery(
+  return handle401Recovery({
     serverSelection,
     path,
     init,
     response,
     mid,
-    opts?.authoritative ?? true,
-    requestAuthLifecycle
-  );
+    authoritative: opts?.authoritative ?? true,
+    lifecycle: requestAuthLifecycle,
+    assertBeforeDispatch: opts?.assertBeforeDispatch,
+  });
 }
 
 /**

@@ -6,6 +6,21 @@ import RecoveryApprovalModal from '../Auth/RecoveryApprovalModal';
 import RecoveryCircle from './RecoveryCircle';
 import Modal from '../ui/Modal';
 import ErrorBanner, { FieldError } from './ErrorBanner';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+  onRuntimeServerSelectionChange,
+} from '../../services/system/runtimeServerBase';
+import {
+  listDeviceRecoveryRequests,
+  type ReviewableDeviceRecoveryRequest,
+} from '../../services/system/deviceRecoveryService';
 import { apiFetch } from '../../services/system/apiClient';
 import {
   isStepUpLocked,
@@ -442,14 +457,104 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
   const [trustedDevices, setTrustedDevices] = useState<
     Array<{ id: string; device_name: string; machine_id: string; designated_at: string }>
   >([]);
+  const userId = useUserStore((state) => state.user?.id);
+  const authGeneration = useAuthStore((state) => state.authGeneration);
+  const [serverGeneration, setServerGeneration] = useState(0);
   const [pendingRecoveryRequests, setPendingRecoveryRequests] = useState<
-    Array<{ id: string; ephemeral_public_key: string; created_at: string }>
+    ReviewableDeviceRecoveryRequest[]
   >([]);
-  const [activeRecoveryRequest, setActiveRecoveryRequest] = useState<{
-    id: string;
-    ephemeral_public_key: string;
-    created_at: string;
-  } | null>(null);
+  const [activeRecoveryRequest, setActiveRecoveryRequest] =
+    useState<ReviewableDeviceRecoveryRequest | null>(null);
+  const [recoveryRequestError, setRecoveryRequestError] = useState('');
+  const [recoveryRefresh, setRecoveryRefresh] = useState(0);
+  const recoveryRefreshGuardRef = useRef({ busy: false, retryAt: 0 });
+  const resolvedRecoveryRequestsRef = useRef(new Set<string>());
+  useEffect(
+    () => onRuntimeServerSelectionChange(() => setServerGeneration((generation) => generation + 1)),
+    []
+  );
+  useEffect(() => {
+    resolvedRecoveryRequestsRef.current.clear();
+    let current = true;
+    void Promise.resolve().then(() => {
+      if (current) {
+        setPendingRecoveryRequests([]);
+        setActiveRecoveryRequest(null);
+      }
+    });
+    return () => {
+      current = false;
+    };
+  }, [userId, authGeneration, serverGeneration]);
+  useEffect(() => {
+    let mounted = true;
+    let refreshing = false;
+    const refreshGuard = { busy: false, retryAt: 0 };
+    recoveryRefreshGuardRef.current = refreshGuard;
+    let timer: ReturnType<typeof setTimeout>;
+    const auth = captureAuthLifecycle();
+    const server = captureRuntimeServerSelection();
+    const assertCurrent = () => {
+      if (
+        !mounted ||
+        !isSameAuthLifecycle(auth) ||
+        !runtimeServerSelectionIsCurrent(server) ||
+        useUserStore.getState().user?.id !== userId
+      )
+        throw new Error('Recovery context changed.');
+    };
+
+    const refresh = async () => {
+      if (!userId || refreshing) return;
+      refreshing = true;
+      refreshGuard.busy = true;
+      let delay = 15_000;
+      try {
+        const requests = await listDeviceRecoveryRequests(userId, assertCurrent);
+        assertCurrent();
+        setPendingRecoveryRequests(
+          requests.filter((request) => !resolvedRecoveryRequestsRef.current.has(request.request_id))
+        );
+        setRecoveryRequestError('');
+      } catch (error) {
+        try {
+          assertCurrent();
+          setRecoveryRequestError(
+            error instanceof Error ? error.message : 'Recovery requests could not be refreshed.'
+          );
+          if (
+            error &&
+            typeof error === 'object' &&
+            'retryAfterMs' in error &&
+            typeof error.retryAfterMs === 'number'
+          )
+            delay = Math.max(delay, error.retryAfterMs);
+          refreshGuard.retryAt = Date.now() + delay;
+        } catch {
+          /* A stale list never replaces the current account's rows. */
+        }
+      } finally {
+        refreshing = false;
+        refreshGuard.busy = false;
+        if (mounted)
+          timer = setTimeout(() => {
+            void refresh();
+          }, delay);
+      }
+    };
+    void refresh();
+    return () => {
+      mounted = false;
+      clearTimeout(timer);
+    };
+  }, [userId, authGeneration, serverGeneration, recoveryRefresh]);
+
+  const closeRecoveryRequest = useCallback(() => setActiveRecoveryRequest(null), []);
+  const resolveRecoveryRequest = useCallback((requestId: string) => {
+    // Terminal acknowledgements must survive list reads begun before the write.
+    resolvedRecoveryRequestsRef.current.add(requestId);
+    setPendingRecoveryRequests((rows) => rows.filter((row) => row.request_id !== requestId));
+  }, []);
 
   useEffect(() => {
     // A non-2xx body is an error object, not the resource: reading it as one
@@ -468,10 +573,6 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
     });
 
     refreshCircleConfig();
-
-    readOkJson<{ requests?: unknown }>('/api/v1/mfa/recovery-requests').then((data) => {
-      if (data) setPendingRecoveryRequests(Array.isArray(data.requests) ? data.requests : []);
-    });
   }, [refreshCircleConfig]);
 
   // Backup email state
@@ -1011,6 +1112,18 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
             Designate This Device
           </button>
 
+          {recoveryRequestError && <p role="alert">{recoveryRequestError}</p>}
+          <button
+            className="btn btn-secondary"
+            style={{ minHeight: 44 }}
+            onClick={() => {
+              const guard = recoveryRefreshGuardRef.current;
+              if (!guard.busy && Date.now() >= guard.retryAt)
+                setRecoveryRefresh((generation) => generation + 1);
+            }}
+          >
+            Refresh recovery requests
+          </button>
           {/* Pending Recovery Requests */}
           {pendingRecoveryRequests.length > 0 && (
             <div style={{ marginTop: 16 }}>
@@ -1019,7 +1132,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
               </h5>
               {pendingRecoveryRequests.map((req) => (
                 <div
-                  key={req.id}
+                  key={req.request_id}
                   style={{
                     display: 'flex',
                     justifyContent: 'space-between',
@@ -1028,11 +1141,11 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                   }}
                 >
                   <span style={{ color: 'var(--text-secondary)', fontSize: 14 }}>
-                    Request from {new Date(req.created_at).toLocaleString()}
+                    Request expires {new Date(req.expires_at).toLocaleTimeString()}
                   </span>
                   <button
                     className="btn btn-secondary"
-                    style={{ fontSize: 12, padding: '4px 12px' }}
+                    style={{ fontSize: 12, padding: '4px 12px', minHeight: 44 }}
                     onClick={() => setActiveRecoveryRequest(req)}
                   >
                     Review
@@ -1099,16 +1212,10 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
       {/* Recovery Approval Modal */}
       {activeRecoveryRequest && (
         <RecoveryApprovalModal
-          requestId={activeRecoveryRequest.id}
-          requesterEphemeralKey={activeRecoveryRequest.ephemeral_public_key}
-          createdAt={activeRecoveryRequest.created_at}
-          onClose={() => {
-            setActiveRecoveryRequest(null);
-            // Remove from pending list after handling
-            setPendingRecoveryRequests((prev) =>
-              prev.filter((r) => r.id !== activeRecoveryRequest.id)
-            );
-          }}
+          key={activeRecoveryRequest.request_id}
+          request={activeRecoveryRequest}
+          onClose={closeRecoveryRequest}
+          onResolved={resolveRecoveryRequest}
         />
       )}
 

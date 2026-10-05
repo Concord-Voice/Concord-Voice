@@ -1397,8 +1397,12 @@ func NewRouter(
 				authHandler.CreateDeviceRecoveryRequest,
 			)
 			authRoutes.GET("/recovery/device-request/:id",
-				middleware.RateLimitByIP(redis, 10, 15*time.Minute),
+				middleware.RateLimitByIP(redis, 60, time.Minute),
 				authHandler.PollDeviceRecoveryRequest,
+			)
+			authRoutes.POST("/recovery/device-request/:id/complete",
+				middleware.RateLimitByIP(redis, 5, time.Minute),
+				authHandler.CompleteDeviceRecoveryRequest,
 			)
 
 			// Social recovery (unauthenticated — uses recovery token)

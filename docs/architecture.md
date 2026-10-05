@@ -621,7 +621,7 @@ erDiagram
 | Domain               | Tables (creating migration)                                                                                                                                                                                                                                                                                   |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Auth / registration  | `pending_registrations` (000058)                                                                                                                                                                                                                                                                              |
-| MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045)                                                        |
+| MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044; hash-only trusted-recovery v2 context and state in 000163); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045) |
 | Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087); `activity_settings_pending_cleanups` (000098, durable Rich Presence policy-cleanup evidence) |
 | Activity history    | `presence_history` (000087, category-neutral self-owned interval ledger)                                                                                                                                                                                                                                     |
 | Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133; 000140 adds `server_voice_terminal_outbox` for retrying stale-leave notifications through local Hub admission, 000141 adds its account-erasure index, 000142 admits six aggregate operations counters, and 000143 adds its recoverable delivery claim. DM block enforcement adds `dm_block_reconciliations` (000146), `dm_block_voice_ejections` (000147), and `credential_epoch_voice_ejections` (000151). Durable exact-session voice enforcement adds `voice_enforcement_sessions` and its rollout singleton (000154). |
@@ -1422,11 +1422,71 @@ The `tools` compose profile gates the dev and test services (`pgadmin`, `redis-c
 - **JWT access tokens** (15-minute TTL) + **refresh tokens** (30-day rolling) in HttpOnly cookies (`internal/auth/`).
 - **Refresh-token revocation ordering:** standalone bulk sweeps call `auth.RevokeAllRefreshTokens`, which locks the user row `FOR NO KEY UPDATE` in the revocation transaction. Destructive flows that already hold that lock retain their own atomic sweeps. Session mints take the same lock, so a sweep and mint have a total order. For “revoke all other sessions,” the helper locks an active bearer refresh row, falls back to the active refresh-cookie row, and fails without revoking if neither is active. When it preserves a bearer row, the sweep revokes a different refresh-cookie row.
 - **WebSocket auth:** single-use ticket (30s TTL, consumed on first use).
-- **MFA (implemented):** TOTP, WebAuthn, backup codes, recovery key, trusted devices, and social recovery circles (`internal/mfa/`).
+- **MFA (implemented):** TOTP, WebAuthn, backup codes, recovery key, trusted devices, and social recovery circles (`internal/mfa/`). [Trusted-device recovery v2](#trusted-device-recovery-v2) requires explicit fingerprint comparison on both devices and retains the original RSA account identity; hosted rollout remains unverified.
 - **SSO (implemented):** OAuth 2.0 / OIDC for Google and Apple (`internal/oauth/`. Auth-side integration in `internal/auth/oauth_adapter.go`). Provider-assertion `Callback` and new-user `CompleteRegistration` session mints are unbound because they have no earlier password authorization. Their `IssueAccessAndRefresh` transaction holds the users row `FOR NO KEY UPDATE` while it reads the durable credential epoch and inserts the refresh row. Password-authorized `CompleteLink` instead carries the epoch returned separately by `VerifyPassword` into `IssueAccessAndRefreshBound`, which runs `MatchEpoch` under the same lock and atomically inserts both the SSO identity and refresh row. An intervening credential reset therefore rolls back the identity link and refuses the session (#2458).
 - **RBAC:** `internal/rbac/` resolves effective permissions from `server_members` / `member_roles` joined to `roles` (a `permissions` BIGINT bitfield, `BIT_OR`-aggregated) plus channel/category overrides (`channel_permission_overrides` / `category_permission_overrides`), enforced by `RequireMembership` / `RequirePermission` middleware, cached in Redis, and audited to `audit_log`.
 - **Rate limiting:** Redis-based, per-IP and per-user (`internal/middleware/`).
 - **Client attestation:** server- and client-side. The client (`src/main/attestationService.ts` + `attestationSignals.ts`) collects device/build signals, POSTs them to get a short-lived `attestation_token` (cached until expiry), and presents it to gated routes. Failures surface via `attestationFailureStore`. The server (`internal/attestation/`) verifies tokens and gates authenticated routes when enabled (fail-closed on Redis error). Release provenance is recorded in `release_spas` / `release_binaries` (migration 000066).
+
+### Trusted-Device Recovery v2
+
+The requester captures recovery-token account/JTI context and the selected API
+origin. The responder uses its local signed-in account and origin. Both derive a
+128-bit fingerprint from non-exportable P-384 ECDH using HKDF-SHA256, displayed as
+eight groups of four uppercase hexadecimal characters. The canonical transcript
+binds the account UUID hash, origin, request UUID, expiry, both role nonces,
+recovery-JTI hash and explicitly labelled public keys. Separate HKDF labels derive
+the AES-256-GCM transport key and fingerprint; transcript SHA-256 is both HKDF
+salt and AES-GCM AAD. The envelope is `02 || 12-byte IV || ciphertext/tag` with a
+128-bit tag and no legacy fallback. Exact bytes and labels are in the
+[protocol guide](design/trusted-device-recovery.md).
+
+| State transition | Required boundary |
+| --- | --- |
+| `pending` → `offered` | Responder Review publishes ephemeral material only; key, nonce and server-computed transcript digest become immutable |
+| `offered` → `approved` | Explicit responder match for the current digest before account-key access/export; approval cannot replace offered context |
+| `approved` → `complete` | Explicit requester match before decrypt/import, then recovery-Bearer POST `/api/v1/auth/recovery/device-request/{id}/complete` with the exact digest |
+| `pending`/`offered` → `rejected` | Authenticated owner rejection; clear ciphertext |
+| Active state → `expired` | Deadline reached, including approved requests; clear/withhold ciphertext |
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> offered: ephemeral offer
+    offered --> approved: responder confirms match
+    approved --> complete: requester confirms and imports
+    pending --> rejected
+    offered --> rejected
+    pending --> expired
+    offered --> expired
+    approved --> expired
+```
+
+Server transactions lock the user before the request, guard responder credential
+epochs, check database time after locks and require exactly one CAS row matching
+owner, version and immutable context. Completion validates the recovery-purpose
+token and user/JTI hash without an access-token epoch guard; it does not consume
+the password-reset token. Lifetime is at most 15 minutes and never renewed.
+Terminal polls expose metadata only. Polling is non-overlapping every three
+seconds with a 60/minute/IP budget and `Retry-After` handling.
+
+Expiry, cancellation, unmount and account/server/E2EE changes clear confirmation
+and ephemeral/plaintext state. A responder that loses its local private offer
+cannot resume or reoffer; it must reject/restart. Approval acknowledgement means
+submission, not confirmed receipt. A lost approval response cannot be positively
+reconciled from the responder's pending/offered-only list; absence is not proof
+of approval, so show restart guidance without claiming success. Recovery-key,
+Recovery Circle and explicitly consented destructive-reset behavior remain
+unchanged.
+
+Migration 000163 drains only ephemeral `recovery_requests`; accounts, trusted
+devices, social-recovery records and account keys remain intact. Down refuses
+live `pending`/`offered`/`approved` v2 rows and restores the empty prior schema.
+Rollback must retain v1 refusal and never restore the vulnerable approval binary.
+The server accepts v2 only unconditionally. Stage schema/control plane before the
+desktop rollout; older clients must update/restart and begin fresh requests.
+Hosted build/schema identity, successful v2 recovery and deployed legacy refusal
+remain **UNVERIFIED** in the [release evidence record](security/reviews/2026-10-04-trusted-device-recovery-v2-rci.md).
 
 ### Transport & Media Security
 

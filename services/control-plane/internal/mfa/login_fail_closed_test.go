@@ -3,8 +3,10 @@ package mfa
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/devicerecovery"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
@@ -1147,74 +1150,70 @@ func TestWebAuthnCeremoniesReportAnUnreadableSessionAsAnOutage(t *testing.T) {
 // ── Recovery request responses ──────────────────────────────────────────────
 
 func TestRespondToRecoveryRequestAnswersAMalformedIDAsNotFound(t *testing.T) {
-	h, _ := scriptedHandler(t, &mfaEventDB{}, "test")
-	c, response := enrollRequest("/api/v1/auth/mfa/recovery/requests/not-a-uuid", `{"action":"approve"}`, "session-a")
+	userID := "11111111-2222-4333-8444-555555555555"
+	h, _ := scriptedHandler(t, &mfaEventDB{}, "test", scriptedAnswer{match: "SELECT id FROM users", values: []driver.Value{userID}}, scriptedAnswer{match: "SELECT credential_epoch", values: []driver.Value{nil}})
+	c, response := enrollRequest("/api/v1/mfa/recovery-requests/not-a-uuid/respond", `{"action":"reject","protocol_version":2}`, "session-a")
+	c.Set("user_id", userID)
 	c.Params = gin.Params{{Key: "id", Value: "not-a-uuid"}}
-
 	h.RespondToRecoveryRequest(c)
-
 	require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
-	require.Contains(t, response.Body.String(), "Recovery request not found")
 }
 
-// A generic read failure (not sql.ErrNoRows) on the ownership/status lookup
-// must answer 500, not 404 — a 404 here would tell a guesser their id was
-// simply wrong rather than that the server could not check it.
+// Recovery v2 fault cases use the complete immutable row and reach the actual
+// database read/write boundary. No dependency fault is disguised as a 404 or success.
+func recoveryResponseFault(t *testing.T, mode string, expected int) {
+	t.Helper()
+	userID := "11111111-2222-4333-8444-555555555555"
+	requestID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	now := time.Now().Truncate(time.Millisecond)
+	scalar := make([]byte, 48)
+	scalar[47] = 1
+	private, err := ecdh.P384().NewPrivateKey(scalar)
+	require.NoError(t, err)
+	public := private.PublicKey().Bytes()
+	nonce := devicerecovery.Hash("public-nonce")
+	ctx := devicerecovery.Context{RequestID: requestID, ProtocolVersion: 2, ServerOrigin: "https://recovery.example.test", AccountBinding: devicerecovery.AccountBinding(userID), ExpiresAt: now.Add(15 * time.Minute).UnixMilli(), RequesterNonce: devicerecovery.Encode(nonce), RequesterPublicKey: devicerecovery.Encode(public), RecoveryTokenJTIHash: devicerecovery.Encode(devicerecovery.Hash("public-jti"))}
+	offer := devicerecovery.Offer{ResponderPublicKey: devicerecovery.Encode(public), ResponderNonce: devicerecovery.Encode(nonce)}
+	_, digest, err := devicerecovery.Transcript(ctx, offer)
+	require.NoError(t, err)
+	binding, err := devicerecovery.Decode(ctx.AccountBinding, 32)
+	require.NoError(t, err)
+	read := scriptedAnswer{match: "FROM recovery_requests", values: []driver.Value{requestID, userID, int64(2), ctx.ServerOrigin, binding, now.Add(15 * time.Minute), nonce, public, devicerecovery.Hash("public-jti"), "offered", public, nonce, digest, nil, now, now, nil, nil}}
+	if mode == "read" {
+		read.err = errReadFailed
+	}
+	exec := scriptedExecAnswer{match: "UPDATE recovery_requests", rowsAffected: 1}
+	switch mode {
+	case "write":
+		exec.err = errReadFailed
+	case "affected":
+		exec.rowsAffectedErr = errReadFailed
+	case "zero":
+		exec.rowsAffected = 0
+	}
+	h, _ := scriptedHandlerFull(t, &mfaEventDB{}, "test", nil, []scriptedAnswer{{match: "SELECT id FROM users", values: []driver.Value{userID}}, {match: "SELECT credential_epoch", values: []driver.Value{nil}}, read, {match: "SELECT clock_timestamp()", values: []driver.Value{now}}}, []scriptedExecAnswer{exec})
+	payload := make([]byte, 30)
+	payload[0] = 2
+	body, err := json.Marshal(map[string]any{"action": "approve", "protocol_version": 2, "transcript_hash": devicerecovery.Encode(digest), "encrypted_payload": devicerecovery.Encode(payload)})
+	require.NoError(t, err)
+	c, response := enrollRequest("/api/v1/mfa/recovery-requests/"+requestID+"/respond", string(body), "session-a")
+	c.Set("user_id", userID)
+	c.Params = gin.Params{{Key: "id", Value: requestID}}
+	h.RespondToRecoveryRequest(c)
+	require.Equal(t, expected, response.Code, response.Body.String())
+	require.NotContains(t, response.Body.String(), errReadFailed.Error())
+}
 func TestRespondToRecoveryRequestFailsWhenItCannotReadTheRequest(t *testing.T) {
-	h, _ := scriptedHandler(t, &mfaEventDB{}, "test",
-		scriptedAnswer{match: "SELECT user_id, status FROM recovery_requests", err: errReadFailed})
-	c, response := enrollRequest("/api/v1/auth/mfa/recovery/requests/"+credentialFixtureID, `{"action":"approve","encrypted_payload":"AAAA","responder_public_key":"AAAA"}`, "session-a")
-	c.Params = gin.Params{{Key: "id", Value: credentialFixtureID}}
-
-	h.RespondToRecoveryRequest(c)
-
-	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	require.Contains(t, response.Body.String(), errMsgFailedRespondRecovery)
+	recoveryResponseFault(t, "read", 500)
 }
-
-// executeRecoveryResponse's write failing (approve branch) must answer 500
-// rather than silently claim the response landed.
 func TestRespondToRecoveryRequestFailsWhenTheApprovalWriteFails(t *testing.T) {
-	h, _ := scriptedHandler(t, &mfaEventDB{failFirstExec: true}, "test",
-		scriptedAnswer{match: "SELECT user_id, status FROM recovery_requests", values: []driver.Value{enrollUser, "pending"}})
-	c, response := enrollRequest("/api/v1/auth/mfa/recovery/requests/"+credentialFixtureID, `{"action":"approve","encrypted_payload":"AAAA","responder_public_key":"AAAA"}`, "session-a")
-	c.Params = gin.Params{{Key: "id", Value: credentialFixtureID}}
-
-	h.RespondToRecoveryRequest(c)
-
-	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	require.Contains(t, response.Body.String(), errMsgFailedRespondRecovery)
+	recoveryResponseFault(t, "write", 500)
 }
-
-// A write whose RowsAffected() itself cannot be read must answer 500, exactly
-// as a write that failed outright — the caller cannot tell the response
-// landed.
 func TestRespondToRecoveryRequestFailsWhenItCannotReadTheWriteResult(t *testing.T) {
-	h, _ := scriptedHandlerFull(t, &mfaEventDB{}, "test", nil,
-		[]scriptedAnswer{{match: "SELECT user_id, status FROM recovery_requests", values: []driver.Value{enrollUser, "pending"}}},
-		[]scriptedExecAnswer{{match: "status = 'rejected'", rowsAffectedErr: errReadFailed}})
-	c, response := enrollRequest("/api/v1/auth/mfa/recovery/requests/"+credentialFixtureID, `{"action":"reject"}`, "session-a")
-	c.Params = gin.Params{{Key: "id", Value: credentialFixtureID}}
-
-	h.RespondToRecoveryRequest(c)
-
-	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	require.Contains(t, response.Body.String(), errMsgFailedRespondRecovery)
+	recoveryResponseFault(t, "affected", 500)
 }
-
-// A concurrent response landing between the read and the write leaves this
-// write matching no row; the caller must be told to retry, not congratulated.
 func TestRespondToRecoveryRequestAnswersARaceAsAlreadyResponded(t *testing.T) {
-	h, _ := scriptedHandlerFull(t, &mfaEventDB{}, "test", nil,
-		[]scriptedAnswer{{match: "SELECT user_id, status FROM recovery_requests", values: []driver.Value{enrollUser, "pending"}}},
-		[]scriptedExecAnswer{{match: "status = 'rejected'", rowsAffected: 0}})
-	c, response := enrollRequest("/api/v1/auth/mfa/recovery/requests/"+credentialFixtureID, `{"action":"reject"}`, "session-a")
-	c.Params = gin.Params{{Key: "id", Value: credentialFixtureID}}
-
-	h.RespondToRecoveryRequest(c)
-
-	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-	require.Contains(t, response.Body.String(), "Request already responded to")
+	recoveryResponseFault(t, "zero", 409)
 }
 
 // ── Social recovery responses ───────────────────────────────────────────────

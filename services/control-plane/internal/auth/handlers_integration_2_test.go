@@ -1353,10 +1353,7 @@ func TestCreateDeviceRecoveryRequestMissingBody(t *testing.T) {
 func TestCreateDeviceRecoveryRequestInvalidToken(t *testing.T) {
 	ts := setupTS(t)
 
-	w := ts.DoRequest("POST", pathDeviceRequest, map[string]interface{}{
-		"recovery_token":       invalidToken,
-		"ephemeral_public_key": base64.StdEncoding.EncodeToString([]byte("test-ephemeral-key")),
-	}, nil)
+	w := ts.DoRequest("POST", pathDeviceRequest, deviceCreateV2(t, "11111111-2222-4333-8444-555555555555", invalidToken), nil)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
@@ -1380,7 +1377,7 @@ func TestPollDeviceRecoveryRequestMissingToken(t *testing.T) {
 
 	// No recovery_token query param and no Authorization header
 	w := ts.DoRequest("GET", pathDeviceRequest+pollSuffix, nil, nil)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestPollDeviceRecoveryRequestInvalidToken(t *testing.T) {

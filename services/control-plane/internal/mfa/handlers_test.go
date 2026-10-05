@@ -76,15 +76,14 @@ const (
 	redisEmailSMSEnabled = "mfa_emailsms_enabled:%s:email"
 
 	// Duplicated literals extracted for SonarQube S1192 compliance
-	testCredName         = "Test Key"
-	testZeroUUID         = "/00000000-0000-0000-0000-000000000000"
-	respondSuffix        = "/respond"
-	someIDRespond        = "/some-id/respond"
-	redisEmailSmsSetup   = "mfa_emailsms_setup:%s:email"
-	skipRecoveryReqTable = "recovery_requests table not available: %v" //nolint:gosec // skip message, not a credential
-	invalidBase64        = "not-valid-base64!!!"
-	testUpdatedName      = "Updated Name"
-	testBackupEmail      = "backup@example.com"
+	testCredName       = "Test Key"
+	testZeroUUID       = "/00000000-0000-0000-0000-000000000000"
+	respondSuffix      = "/respond"
+	someIDRespond      = "/some-id/respond"
+	redisEmailSmsSetup = "mfa_emailsms_setup:%s:email"
+	invalidBase64      = "not-valid-base64!!!"
+	testUpdatedName    = "Updated Name"
+	testBackupEmail    = "backup@example.com"
 )
 
 func setupTS(t *testing.T) *testhelpers.TestServer {
@@ -651,12 +650,8 @@ func TestListRecoveryRequestsEmpty(t *testing.T) {
 func TestRespondToRecoveryRequestNotFound(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "recreqresp")
-
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/nonexistent/respond", map[string]interface{}{
-		"action": "approve",
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusNotFound, w.Code)
+	w := ts.DoRequest("POST", urlRecoveryRequests+"/nonexistent/respond", map[string]any{"action": "reject", "protocol_version": 2}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, 404, w.Code, w.Body.String())
 }
 
 func TestRespondToRecoveryRequestBadAction(t *testing.T) {
@@ -1582,50 +1577,26 @@ func TestListTrustedDevicesAfterDesignate(t *testing.T) {
 
 func TestRespondToRecoveryRequestApprove(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqappr")
-
-	// Insert a fake recovery request — use UUID format for ID
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000001"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	encPayload := base64.StdEncoding.EncodeToString([]byte("encrypted-payload"))
-	respPubKey := base64.StdEncoding.EncodeToString([]byte("responder-public-key"))
-
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action":               "approve",
-		"encrypted_payload":    encPayload,
-		"responder_public_key": respPubKey,
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusOK, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	w := ts.DoRequest("POST", route, actionV2Map(offer), headers)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	w = ts.DoRequest("POST", route, actionV2Map(approve), headers)
+	require.Equal(t, 200, w.Code, w.Body.String())
 }
 
 func TestRespondToRecoveryRequestReject(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqrej")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000002"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action": "reject",
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusOK, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	_ = offer
+	_ = approve
+	w := ts.DoRequest("POST", route, map[string]any{"action": "reject", "protocol_version": 2}, headers)
+	require.Equal(t, 200, w.Code, w.Body.String())
 }
 
 // --- StoreRecoveryKey with prefs ---
@@ -2789,76 +2760,46 @@ func TestDesignateTrustedDeviceWrongPassword(t *testing.T) {
 
 func TestRespondToRecoveryRequestNotOwner(t *testing.T) {
 	ts := setupTS(t)
-	owner := ts.CreateTestUser(t, "recreqowner")
-	other := ts.CreateTestUser(t, "recreqother")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000010"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, owner.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	// Other user tries to respond
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action":               "approve",
-		"encrypted_payload":    base64.StdEncoding.EncodeToString([]byte("payload")),
-		"responder_public_key": base64.StdEncoding.EncodeToString([]byte("pubkey")),
-	}, testhelpers.AuthHeaders(other.AccessToken))
-
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	_ = offer
+	_ = approve
+	_ = headers
+	other := ts.CreateTestUser(t, "recoveryother")
+	w := ts.DoRequest("POST", route, map[string]any{"action": "reject", "protocol_version": 2}, testhelpers.AuthHeaders(other.AccessToken))
+	require.Equal(t, 404, w.Code, w.Body.String())
 }
 
 // --- RespondToRecoveryRequest: Already responded ---
 
 func TestRespondToRecoveryRequestAlreadyResponded(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqrespdone")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000011"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'approved', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action":               "approve",
-		"encrypted_payload":    base64.StdEncoding.EncodeToString([]byte("payload")),
-		"responder_public_key": base64.StdEncoding.EncodeToString([]byte("pubkey")),
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	w := ts.DoRequest("POST", route, actionV2Map(offer), headers)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	w = ts.DoRequest("POST", route, actionV2Map(approve), headers)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	w = ts.DoRequest("POST", route, actionV2Map(approve), headers)
+	require.Equal(t, 409, w.Code, w.Body.String())
 }
 
 // --- RespondToRecoveryRequest: Approve without payload ---
 
 func TestRespondToRecoveryRequestApproveWithoutPayload(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqnopay")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000012"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	// Approve without encrypted_payload
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action": "approve",
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	_ = offer
+	_ = approve
+	w := ts.DoRequest("POST", route, map[string]any{"action": "approve", "protocol_version": 2}, headers)
+	require.Equal(t, 400, w.Code, w.Body.String())
 }
 
 // --- MFA Verify: WebAuthn method with empty assertion ---
@@ -3837,48 +3778,26 @@ func TestDecodeCircleShares(t *testing.T) {
 
 func TestRespondToRecoveryRequestBadBase64Payload(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqb64pay")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000020"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action":               "approve",
-		"encrypted_payload":    invalidBase64,
-		"responder_public_key": base64.StdEncoding.EncodeToString([]byte("key")),
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	_ = offer
+	approve.EncryptedPayload = invalidBase64
+	w := ts.DoRequest("POST", route, actionV2Map(approve), headers)
+	require.Equal(t, 400, w.Code, w.Body.String())
 }
 
 func TestRespondToRecoveryRequestBadBase64PubKey(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqb64pk")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000021"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
-	w := ts.DoRequest("POST", urlRecoveryRequests+"/"+requestID+respondSuffix, map[string]interface{}{
-		"action":               "approve",
-		"encrypted_payload":    base64.StdEncoding.EncodeToString([]byte("payload")),
-		"responder_public_key": invalidBase64,
-	}, testhelpers.AuthHeaders(user.AccessToken))
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	user := ts.CreateTestUser(t, "recoveryv2")
+	r, offer, approve := recoveryV2Fixture(t, ts, user.ID)
+	route := urlRecoveryRequests + "/" + r.RequestID + respondSuffix
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	_ = approve
+	offer.ResponderPublicKey = invalidBase64
+	w := ts.DoRequest("POST", route, actionV2Map(offer), headers)
+	require.Equal(t, 400, w.Code, w.Body.String())
 }
 
 // --- RespondToRecoveryRequest: Missing body ---
@@ -3897,57 +3816,36 @@ func TestRespondToRecoveryRequestNoBody(t *testing.T) {
 
 func TestListRecoveryRequestsWithData(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqlist")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000030"
-	ephPubKey := []byte("ephemeral-pub-key")
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, ephemeral_public_key, created_at, expires_at)
-		VALUES ($1, $2, 'pending', $3, NOW(), NOW() + INTERVAL '15 minutes')
-	`, requestID, user.ID, ephPubKey)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
+	user := ts.CreateTestUser(t, "recoverylist")
+	r, _, _ := recoveryV2Fixture(t, ts, user.ID)
 	w := ts.DoRequest("GET", urlRecoveryRequests, nil, testhelpers.AuthHeaders(user.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-	var body map[string]interface{}
+	require.Equal(t, 200, w.Code, w.Body.String())
+	var body struct {
+		Requests []map[string]any `json:"requests"`
+	}
 	testhelpers.ParseJSON(t, w, &body)
-	requests := body["requests"].([]interface{})
-	assert.GreaterOrEqual(t, len(requests), 1)
-	req0 := requests[0].(map[string]interface{})
-	assert.Equal(t, requestID, req0["id"])
-	assert.Equal(t, "pending", req0["status"])
-	assert.NotEmpty(t, req0["ephemeral_public_key"])
+	require.Len(t, body.Requests, 1)
+	require.Equal(t, r.RequestID, body.Requests[0]["request_id"])
+	require.Equal(t, "pending", body.Requests[0]["status"])
+	require.NotEmpty(t, body.Requests[0]["requester_public_key"])
+	require.NotContains(t, body.Requests[0], "encrypted_payload")
 }
 
 // --- ListRecoveryRequests: Expired requests not shown ---
 
 func TestListRecoveryRequestsExpiredNotShown(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "recreqexpd")
-
-	ctx := context.Background()
-	requestID := "00000000-0000-0000-0000-000000000031"
-	_, err := ts.DB.ExecContext(ctx, `
-		INSERT INTO recovery_requests (id, user_id, status, created_at, expires_at)
-		VALUES ($1, $2, 'pending', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '30 minutes')
-	`, requestID, user.ID)
-	if err != nil {
-		t.Skipf(skipRecoveryReqTable, err)
-	}
-
+	user := ts.CreateTestUser(t, "recoveryexpired")
+	r, _, _ := recoveryV2Fixture(t, ts, user.ID)
+	_, err := ts.DB.Exec(`UPDATE recovery_requests SET created_at=clock_timestamp()-INTERVAL '2 minutes',expires_at=clock_timestamp()-INTERVAL '1 minute' WHERE id=$1`, r.RequestID)
+	require.NoError(t, err)
 	w := ts.DoRequest("GET", urlRecoveryRequests, nil, testhelpers.AuthHeaders(user.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	requests := body["requests"].([]interface{})
-	// Expired request should not be in results
-	for _, r := range requests {
-		req := r.(map[string]interface{})
-		assert.NotEqual(t, requestID, req["id"])
+	require.Equal(t, 200, w.Code, w.Body.String())
+	var body struct {
+		Requests []map[string]any `json:"requests"`
 	}
+	testhelpers.ParseJSON(t, w, &body)
+	require.Empty(t, body.Requests)
 }
 
 // --- WebAuthn: Inline verify begin with no credentials ---

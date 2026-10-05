@@ -1,149 +1,281 @@
-import React, { useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import Modal from '../ui/Modal';
+import DeviceRecoveryFingerprint from './DeviceRecoveryFingerprint';
 import {
-  generateECDHKeyPair,
-  exportECDHPublicKey,
-  importECDHPublicKey,
-  deriveSharedSecret,
-  encryptWithSharedSecret,
-  base64ToArrayBuffer,
-} from '../../utils/crypto/crypto';
+  ResponderDeviceRecoveryAttempt,
+  rejectDeviceRecoveryRequest,
+  type DeviceRecoveryView,
+  type ReviewableDeviceRecoveryRequest,
+} from '../../services/system/deviceRecoveryService';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/system/runtimeServerBase';
 import { e2eeService } from '../../services/e2ee/e2eeService';
-import { apiFetch } from '../../services/system/apiClient';
+import { useUserStore } from '../../stores/auth/userStore';
 
 interface RecoveryApprovalModalProps {
-  requestId: string;
-  requesterEphemeralKey: string; // base64 ECDH public key
-  createdAt: string;
-  onClose: () => void;
+  readonly request: ReviewableDeviceRecoveryRequest;
+  readonly onClose: () => void;
+  readonly onResolved?: (requestId: string) => void;
 }
-
-const RecoveryApprovalModal: React.FC<RecoveryApprovalModalProps> = ({
-  requestId,
-  requesterEphemeralKey,
-  createdAt,
-  onClose,
-}) => {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [completed, setCompleted] = useState(false);
-
-  const handleApprove = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      // 1. Generate our own ECDH keypair
-      const ecdhKeyPair = await generateECDHKeyPair();
-      const ourPublicKey = await exportECDHPublicKey(ecdhKeyPair.publicKey);
-
-      // 2. Import requester's public key and derive shared secret
-      const requesterKey = await importECDHPublicKey(requesterEphemeralKey);
-      const sharedKey = await deriveSharedSecret(ecdhKeyPair.privateKey, requesterKey);
-
-      // 3. Get the wrapped private key and wrapping key from e2eeService
-      const wrappingKey = e2eeService.getWrappingKey();
-      const wrappedPrivateKey = e2eeService.getWrappedPrivateKey();
-
-      if (!wrappingKey || !wrappedPrivateKey) {
-        throw new Error('E2EE keys not available. Please ensure you are logged in.');
-      }
-
-      // 4. Unwrap the password-wrapped private key to get raw PKCS8 bytes
-      //    (wrappingKey only supports wrapKey/unwrapKey, not decrypt)
-      const wrappedData = new Uint8Array(base64ToArrayBuffer(wrappedPrivateKey));
-      const iv = wrappedData.slice(0, 12);
-      const ciphertext = wrappedData.slice(12);
-      const privateKeyForExport = await crypto.subtle.unwrapKey(
-        'pkcs8',
-        ciphertext,
-        wrappingKey,
-        { name: 'AES-GCM', iv },
-        { name: 'RSA-OAEP', hash: 'SHA-256' },
-        true, // extractable so we can re-export
-        ['decrypt']
-      );
-      const rawPkcs8 = await crypto.subtle.exportKey('pkcs8', privateKeyForExport);
-
-      // 5. Encrypt the raw PKCS8 with the ECDH shared secret
-      const encryptedPayload = await encryptWithSharedSecret(sharedKey, rawPkcs8);
-
-      // 6. Send approval to server
-      const res = await apiFetch(`/api/v1/mfa/recovery-requests/${requestId}/respond`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'approve',
-          encrypted_payload: encryptedPayload,
-          responder_public_key: ourPublicKey,
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Failed to send approval');
-      }
-
-      setCompleted(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to approve recovery');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleReject = async () => {
-    setLoading(true);
-    try {
-      await apiFetch(`/api/v1/mfa/recovery-requests/${requestId}/respond`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'reject' }),
-      });
-      onClose();
-    } catch {
-      onClose();
-    }
-  };
-
-  if (completed) {
-    return (
-      <div className="mfa-modal-overlay">
-        <div className="mfa-modal">
-          <h3>Recovery Approved</h3>
-          <p>Your encrypted private key has been securely transferred to the recovering device.</p>
-          <div className="mfa-setup-actions">
-            <button className="btn btn-primary" onClick={onClose}>
-              Close
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mfa-modal-overlay">
-      <div className="mfa-modal">
-        <h3>Account Recovery Request</h3>
-        <p style={{ color: 'var(--text-secondary)', marginBottom: 16 }}>
-          A recovery request was created on {new Date(createdAt).toLocaleString()}. Approving will
-          securely transfer your private key to the recovering device via an encrypted channel.
-        </p>
-        {error && (
-          <div className="mfa-setup-error-banner">
-            <span>{error}</span>
-          </div>
-        )}
-        <div className="mfa-setup-actions">
-          <button className="btn btn-primary" onClick={handleApprove} disabled={loading}>
-            {loading ? 'Approving...' : 'Approve Recovery'}
-          </button>
-          <button className="btn btn-secondary" onClick={handleReject} disabled={loading}>
-            Reject
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+const initialView: DeviceRecoveryView = {
+  status: 'creating',
+  fingerprint: '',
+  confirmed: false,
+  error: '',
+  retryAt: 0,
 };
 
-export default RecoveryApprovalModal;
+// This bounded action deliberately outlives real unmount. Its caller owns the
+// returned cancellation when React replays setup or replaces the request.
+function deferUnmountRejection(reject: () => void): () => void {
+  const timer = setTimeout(reject, 0);
+  return () => clearTimeout(timer);
+}
+
+function submitUnmountRejection(
+  request: ReviewableDeviceRecoveryRequest,
+  assertContext: () => void
+): void {
+  void rejectDeviceRecoveryRequest(request, assertContext).catch(() => {
+    // Best-effort cleanup leaves the row unresolved without an acknowledgement.
+  });
+}
+
+export default function RecoveryApprovalModal({
+  request,
+  onClose,
+  onResolved,
+}: RecoveryApprovalModalProps) {
+  const [view, setView] = useState(initialView);
+  const [busy, setBusy] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const [rejectionRetryAt, setRejectionRetryAt] = useState(0);
+  const rejectionRetryRef = useRef(0);
+  const [rejectionError, setRejectionError] = useState('');
+  const attemptRef = useRef<ResponderDeviceRecoveryAttempt | null>(null);
+  const descriptionRef = useRef<HTMLParagraphElement>(null);
+  const descriptionId = useId();
+  const mountedRef = useRef(false);
+  const busyRef = useRef(false);
+  const rejectionStartedRef = useRef(false);
+  const settledRef = useRef(false);
+  const modalGuardRef = useRef<(() => void) | null>(null);
+  const detachedGuardRef = useRef<(() => void) | null>(null);
+  const unmountRejectionRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    // StrictMode replays cleanup/setup synchronously; a replacement request also
+    // retires the old cleanup's remote action before it can be dispatched.
+    if (unmountRejectionRef.current !== null) {
+      unmountRejectionRef.current();
+      unmountRejectionRef.current = null;
+    }
+    mountedRef.current = true;
+    const retryClock = setInterval(() => setNow(Date.now()), 1000);
+    const auth = captureAuthLifecycle();
+    const server = captureRuntimeServerSelection();
+    const epoch = e2eeService.captureTeardownEpoch();
+    const userId = useUserStore.getState().user?.id;
+    const assertContext = () => {
+      if (
+        !isSameAuthLifecycle(auth) ||
+        !runtimeServerSelectionIsCurrent(server) ||
+        e2eeService.wasTornDownSince(epoch) ||
+        useUserStore.getState().user?.id !== userId ||
+        Date.now() >= request.expires_at
+      )
+        throw new Error('Recovery changed or expired. Restart recovery.');
+    };
+    modalGuardRef.current = () => {
+      if (!mountedRef.current) throw new Error('Recovery comparison was closed.');
+      assertContext();
+    };
+    detachedGuardRef.current = assertContext;
+    const attempt = new ResponderDeviceRecoveryAttempt(request, (next) => {
+      if (next.status === 'submitted') settledRef.current = true;
+      if (mountedRef.current && attemptRef.current === attempt) setView(next);
+    });
+    attemptRef.current = attempt;
+    void attempt.start();
+    return () => {
+      mountedRef.current = false;
+      clearInterval(retryClock);
+      modalGuardRef.current = null;
+      detachedGuardRef.current = null;
+      attempt.dispose();
+      if (attemptRef.current === attempt) attemptRef.current = null;
+      if (
+        !settledRef.current &&
+        !rejectionStartedRef.current &&
+        Date.now() >= rejectionRetryRef.current
+      ) {
+        const cancel = deferUnmountRejection(() => {
+          if (unmountRejectionRef.current !== cancel || mountedRef.current) return;
+          unmountRejectionRef.current = null;
+          if (
+            settledRef.current ||
+            rejectionStartedRef.current ||
+            Date.now() < rejectionRetryRef.current
+          )
+            return;
+          rejectionStartedRef.current = true;
+          submitUnmountRejection(request, assertContext);
+        });
+        unmountRejectionRef.current = cancel;
+      }
+    };
+  }, [request]);
+
+  const close = useCallback(() => {
+    const guard = detachedGuardRef.current;
+    // Reject begins while this modal owns the context. A late acknowledgement cannot mutate a new session.
+    if (
+      !settledRef.current &&
+      !rejectionStartedRef.current &&
+      guard &&
+      Date.now() >= rejectionRetryRef.current
+    ) {
+      rejectionStartedRef.current = true;
+      void rejectDeviceRecoveryRequest(request, guard)
+        .then(() => {
+          guard();
+          onResolved?.(request.request_id);
+        })
+        .catch(() => {});
+    }
+    attemptRef.current?.dispose();
+    onClose();
+  }, [onClose, onResolved, request]);
+
+  const confirm = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    const attempt = attemptRef.current;
+    try {
+      if (attempt && (await attempt.confirmMatch()) && mountedRef.current)
+        onResolved?.(request.request_id);
+    } finally {
+      busyRef.current = false;
+      if (mountedRef.current) setBusy(false);
+    }
+  };
+  const reject = async () => {
+    if (busyRef.current || !modalGuardRef.current || Date.now() < rejectionRetryRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setRejectionError('');
+    rejectionStartedRef.current = true;
+    try {
+      await rejectDeviceRecoveryRequest(request, modalGuardRef.current);
+      if (mountedRef.current) {
+        settledRef.current = true;
+        attemptRef.current?.dispose();
+        onResolved?.(request.request_id);
+        setView({ ...initialView, status: 'rejected' });
+      }
+    } catch (error) {
+      rejectionStartedRef.current = false;
+      if (
+        error &&
+        typeof error === 'object' &&
+        'retryAfterMs' in error &&
+        typeof error.retryAfterMs === 'number'
+      ) {
+        rejectionRetryRef.current = Date.now() + error.retryAfterMs;
+        if (mountedRef.current) setRejectionRetryAt(rejectionRetryRef.current);
+      }
+      if (mountedRef.current)
+        setRejectionError(
+          error instanceof Error ? error.message : 'Rejection was not acknowledged. Retry.'
+        );
+    } finally {
+      busyRef.current = false;
+      if (mountedRef.current) setBusy(false);
+    }
+  };
+  const retry = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await attemptRef.current?.retryOffer();
+    } finally {
+      busyRef.current = false;
+      if (mountedRef.current) setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      isOpen
+      onClose={close}
+      title="Account Recovery Request"
+      initialFocusRef={descriptionRef}
+      describedById={descriptionId}
+    >
+      <div className="device-recovery-ceremony">
+        <p
+          ref={descriptionRef}
+          id={descriptionId}
+          tabIndex={-1}
+          className="device-recovery-description"
+        >
+          Compare all eight fingerprint groups with your recovering device directly. Confirm only
+          when every character matches. Never send the fingerprint to support or approve an
+          unexpected request. Both devices must run an updated version of Concord.
+        </p>
+        {view.fingerprint && <DeviceRecoveryFingerprint fingerprint={view.fingerprint} />}
+        <p role="status" aria-live="polite">
+          {view.status === 'creating' && 'Preparing the comparison. Account keys remain locked.'}
+          {view.status === 'offered' &&
+            'Ready to compare. Your account key remains locked until you confirm.'}
+          {view.status === 'submitted' &&
+            'Approval submitted. Confirm the fingerprint on the recovering device to continue.'}
+          {view.status === 'rejected' && 'Rejection acknowledged.'}
+        </p>
+        {(view.error || rejectionError) && <p role="alert">{rejectionError || view.error}</p>}
+        <div className="device-recovery-actions">
+          {view.status !== 'submitted' && view.status !== 'rejected' && (
+            <>
+              <button
+                className="btn btn-primary"
+                onClick={confirm}
+                disabled={
+                  busy || view.status !== 'offered' || !view.fingerprint || now < view.retryAt
+                }
+              >
+                {busy ? 'Submitting…' : 'These fingerprints match'}
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={reject}
+                disabled={busy || now < rejectionRetryAt}
+              >
+                Reject
+              </button>
+              {view.status === 'creating' && view.error && view.retryAt > 0 && (
+                <button
+                  className="btn btn-secondary"
+                  onClick={retry}
+                  disabled={busy || now < view.retryAt}
+                >
+                  Retry comparison
+                </button>
+              )}
+            </>
+          )}
+          <button className="btn btn-secondary" onClick={close}>
+            Close
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}

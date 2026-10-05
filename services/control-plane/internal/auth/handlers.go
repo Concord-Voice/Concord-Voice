@@ -23,6 +23,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/devicerecovery"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
@@ -45,8 +46,9 @@ type SessionDisconnector interface {
 
 // RecoveryClaims contains the user_id extracted from a validated recovery token.
 type RecoveryClaims struct {
-	UserID string
-	JTI    string
+	UserID    string
+	JTI       string
+	ExpiresAt time.Time // Verified JWT expiry; only the device ceremony uses this lifetime.
 }
 
 // MFAChecker checks if a user has MFA enabled and returns their methods.
@@ -3436,73 +3438,50 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 
 // ── Trusted Device Recovery Endpoints ───────────────────────────────────────
 
-// CreateDeviceRecoveryRequest initiates a trusted-device recovery request.
-// This is an unauthenticated endpoint — the caller must provide a valid recovery token.
+// CreateDeviceRecoveryRequest accepts only the complete v2 requester context.
 func (h *Handler) CreateDeviceRecoveryRequest(c *gin.Context) {
-	var req struct {
-		RecoveryToken      string `json:"recovery_token" binding:"required"`
-		EphemeralPublicKey string `json:"ephemeral_public_key" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "recovery_token and ephemeral_public_key are required"})
+	req, err := devicerecovery.ParseCreate(c)
+	if err != nil {
+		devicerecovery.WriteError(c, err)
 		return
 	}
+	claims := h.validateDeviceRecoveryToken(c, req.RecoveryToken)
+	if claims == nil {
+		return
+	}
+	row, err := devicerecovery.Create(c.Request.Context(), h.db, claims.UserID, claims.JTI, claims.ExpiresAt, req)
+	if err != nil {
+		devicerecovery.WriteError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row.Wire())
+}
 
-	// Validate recovery token
+// Device routes use Bearer recovery-purpose authentication only. They deliberately
+// do not consume reset tokens or apply access-token credential epochs.
+func (h *Handler) validateDeviceRecoveryToken(c *gin.Context, token string) *RecoveryClaims {
+	if token == "" || len(token) > 4096 {
+		devicerecovery.WriteError(c, devicerecovery.ErrUnauthorized)
+		return nil
+	}
 	if h.mfaChecker == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryNotConfigured})
-		return
+		devicerecovery.WriteError(c, errors.New("recovery unavailable"))
+		return nil
 	}
-	claims, err := h.mfaChecker.ValidateRecoveryToken(req.RecoveryToken)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryToken})
-		return
+	claims, err := h.mfaChecker.ValidateRecoveryToken(token)
+	if err != nil || claims == nil || !devicerecovery.CanonicalUUID(claims.UserID) || claims.JTI == "" || claims.ExpiresAt.IsZero() {
+		devicerecovery.WriteError(c, devicerecovery.ErrUnauthorized)
+		return nil
 	}
-
-	ctx := c.Request.Context()
-
-	// Check user has trusted devices
-	var deviceCount int
-	err = h.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM trusted_recovery_devices WHERE user_id = $1`, claims.UserID,
-	).Scan(&deviceCount)
-	if err != nil {
-		h.log.Error("Failed to check trusted devices", "error", err, "user_id", claims.UserID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateRecoveryRequest})
-		return
+	return claims
+}
+func (h *Handler) deviceBearerClaims(c *gin.Context) *RecoveryClaims {
+	header := c.GetHeader("Authorization")
+	if !strings.HasPrefix(header, bearerPrefix) {
+		devicerecovery.WriteError(c, devicerecovery.ErrUnauthorized)
+		return nil
 	}
-	if deviceCount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No trusted devices configured"})
-		return
-	}
-
-	// Base64-decode ephemeral public key
-	ephPubKey, err := base64.StdEncoding.DecodeString(req.EphemeralPublicKey)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ephemeral_public_key format (must be base64)"})
-		return
-	}
-
-	// Insert recovery request with 15-minute expiry
-	var requestID string
-	err = h.db.QueryRowContext(ctx, `
-		INSERT INTO recovery_requests (user_id, recovery_token_jti, ephemeral_public_key, expires_at)
-		VALUES ($1, $2, $3, NOW() + INTERVAL '15 minutes')
-		RETURNING id
-	`, claims.UserID, claims.JTI, ephPubKey).Scan(&requestID)
-	if err != nil {
-		h.log.Error(errFailedCreateRecoveryRequest, "error", err, "user_id", claims.UserID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateRecoveryRequest})
-		return
-	}
-
-	// NOTE: WebSocket notification to trusted device sessions is deferred.
-	// The auth handler's hub field is a SessionDisconnector interface which
-	// does not expose BroadcastToUser. The client polls via
-	// GET /recovery/device-request/:id as a fallback until the interface is extended.
-
-	h.log.Info("Device recovery request created", "user_id", claims.UserID, "request_id", requestID)
-	c.JSON(http.StatusOK, gin.H{"request_id": requestID})
+	return h.validateDeviceRecoveryToken(c, strings.TrimSpace(strings.TrimPrefix(header, bearerPrefix)))
 }
 
 // extractRecoveryTokenParam extracts a recovery token from the Authorization: Bearer header
@@ -3534,45 +3513,37 @@ func (h *Handler) validateRecoveryTokenParam(c *gin.Context) *RecoveryClaims {
 	return claims
 }
 
-// PollDeviceRecoveryRequest polls the status of a trusted-device recovery request.
-// This is an unauthenticated endpoint — the caller must provide a valid recovery token.
+// PollDeviceRecoveryRequest returns only owned immutable context or terminal metadata.
 func (h *Handler) PollDeviceRecoveryRequest(c *gin.Context) {
-	requestID := c.Param("id")
-
-	claims := h.validateRecoveryTokenParam(c)
+	claims := h.deviceBearerClaims(c)
 	if claims == nil {
 		return
 	}
-
-	// Fetch the recovery request (JTI-scoped to prevent cross-token access)
-	var status string
-	var encryptedPayload, responderPublicKey []byte
-	var expiresAt time.Time
-	err := h.db.QueryRowContext(c.Request.Context(), `
-		SELECT status, encrypted_payload, responder_public_key, expires_at
-		FROM recovery_requests
-		WHERE id = $1 AND user_id = $2 AND recovery_token_jti = $3
-	`, requestID, claims.UserID, claims.JTI).Scan(&status, &encryptedPayload, &responderPublicKey, &expiresAt)
+	row, err := devicerecovery.Poll(c.Request.Context(), h.db, claims.UserID, claims.JTI, c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recovery request not found"})
+		devicerecovery.WriteError(c, err)
 		return
 	}
+	c.JSON(http.StatusOK, row.Wire())
+}
 
-	// Check if expired
-	if time.Now().After(expiresAt) && status == "pending" {
-		c.JSON(http.StatusOK, gin.H{"status": "expired"})
+// CompleteDeviceRecoveryRequest acknowledges client import without spending the reset token.
+func (h *Handler) CompleteDeviceRecoveryRequest(c *gin.Context) {
+	req, err := devicerecovery.ParseComplete(c)
+	if err != nil {
+		devicerecovery.WriteError(c, err)
 		return
 	}
-
-	response := gin.H{"status": status}
-	if status == "approved" && encryptedPayload != nil {
-		response["encrypted_payload"] = base64.StdEncoding.EncodeToString(encryptedPayload)
+	claims := h.deviceBearerClaims(c)
+	if claims == nil {
+		return
 	}
-	if status == "approved" && responderPublicKey != nil {
-		response["responder_public_key"] = base64.StdEncoding.EncodeToString(responderPublicKey)
+	result, err := devicerecovery.Complete(c.Request.Context(), h.db, claims.UserID, claims.JTI, c.Param("id"), req)
+	if err != nil {
+		devicerecovery.WriteError(c, err)
+		return
 	}
-
-	c.JSON(http.StatusOK, response)
+	c.JSON(http.StatusOK, result)
 }
 
 // ── Social Recovery Request Endpoints ────────────────────────────────────────

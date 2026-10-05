@@ -1,0 +1,99 @@
+.device-recovery-fingerprint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+  min-inline-size: 0;
+  padding: 0;
+  border: 0;
+  font-family: inherit;
+  font-size: 1.125rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.device-recovery-fingerprint > span {
+  flex: 1 0 calc((100% - 24px) / 4);
+  min-width: max-content;
+  max-width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 4px;
+  text-align: center;
+  letter-spacing: 0.08em;
+}
+.device-recovery-ceremony {
+  color: var(--text-secondary);
+  font-family: inherit;
+}
+.device-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.device-recovery-actions button {
+  min-height: 44px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.device-recovery-actions button:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+.device-recovery-description:focus-visible {
+  outline: 2px solid var(--state-focused);
+}
+@media (max-width: 360px) {
+  .device-recovery-fingerprint > span {
+    flex-basis: calc((100% - 8px) / 2);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .device-recovery-ceremony *,
+  .device-recovery-fingerprint *,
+  .device-recovery-ceremony .device-recovery-actions button {
+    animation: none;
+    transition: none;
+  }
+}
+.modal-container:has(.device-recovery-ceremony) .modal-close {
+  min-width: 44px;
+  min-height: 44px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .modal-overlay:has(.device-recovery-ceremony),
+  .modal-container:has(.device-recovery-ceremony) {
+    animation: none;
+    transition: none;
+  }
+}
+.device-recovery-actions .btn {
+  padding: 10px 20px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.device-recovery-actions .btn-primary {
+  background: var(--brand-fill);
+  color: var(--on-brand);
+}
+.device-recovery-actions .btn-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+.device-recovery-actions .btn-secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.device-recovery-actions .btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

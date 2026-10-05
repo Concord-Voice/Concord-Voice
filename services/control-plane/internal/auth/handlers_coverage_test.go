@@ -689,7 +689,7 @@ func TestPollDeviceRecoveryWithQueryParam(t *testing.T) {
 	recoveryToken := getRecoveryToken2(t, ts, user)
 
 	w := ts.DoRequest("GET", pathDeviceReqPoll+uuid.New().String()+"?recovery_token="+recoveryToken, nil, nil)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 // ── Poll Social Recovery Request ───────────────────────────────────────────
@@ -743,11 +743,7 @@ func TestCreateDeviceRecoveryRequestWithTrustedDevice(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathDeviceReqCreate, map[string]interface{}{
-		"recovery_token":       recoveryToken,
-		"ephemeral_public_key": ephKey,
-	}, nil)
+	w := ts.DoRequest("POST", pathDeviceReqCreate, deviceCreateV2(t, user.ID, recoveryToken), nil)
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	var body map[string]interface{}
@@ -818,11 +814,7 @@ func TestPollDeviceRecoveryPendingStatus(t *testing.T) {
 	require.NoError(t, dbErr)
 
 	// Create a device recovery request
-	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathDeviceReqCreate, map[string]interface{}{
-		"recovery_token":       recoveryToken,
-		"ephemeral_public_key": ephKey,
-	}, nil)
+	w := ts.DoRequest("POST", pathDeviceReqCreate, deviceCreateV2(t, user.ID, recoveryToken), nil)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var createBody map[string]interface{}
@@ -966,11 +958,7 @@ func TestPollDeviceRecoveryExpired(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a device recovery request
-	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathDeviceReqCreate, map[string]interface{}{
-		"recovery_token":       recoveryToken,
-		"ephemeral_public_key": ephKey,
-	}, nil)
+	w := ts.DoRequest("POST", pathDeviceReqCreate, deviceCreateV2(t, user.ID, recoveryToken), nil)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var createBody map[string]interface{}
@@ -979,7 +967,7 @@ func TestPollDeviceRecoveryExpired(t *testing.T) {
 
 	// Manually expire the request
 	_, err = ts.DB.Exec(
-		`UPDATE recovery_requests SET expires_at = $1 WHERE id = $2`,
+		`UPDATE recovery_requests SET created_at = $1::timestamptz - INTERVAL '1 minute', expires_at = $1::timestamptz WHERE id = $2`,
 		time.Now().Add(-1*time.Hour), requestID,
 	)
 	require.NoError(t, err)
@@ -1695,23 +1683,16 @@ func TestPollDeviceRecoveryApproved(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a device recovery request
-	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathDeviceReqCreate, map[string]interface{}{
-		"recovery_token":       recoveryToken,
-		"ephemeral_public_key": ephKey,
-	}, nil)
+	w := ts.DoRequest("POST", pathDeviceReqCreate, deviceCreateV2(t, user.ID, recoveryToken), nil)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var createBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &createBody)
 	requestID := createBody["request_id"].(string)
 
-	// Manually set status to approved with payload
-	_, err = ts.DB.Exec(
-		`UPDATE recovery_requests SET status = 'approved', encrypted_payload = $1, responder_public_key = $2 WHERE id = $3`,
-		[]byte("encrypted-payload"), []byte("responder-pubkey"), requestID,
-	)
-	require.NoError(t, err)
+	digest, payload := deviceOfferV2(t, ts, user.ID, requestID)
+	w = ts.DoRequest("POST", "/api/v1/mfa/recovery-requests/"+requestID+"/respond", map[string]any{"action": "approve", "protocol_version": 2, "transcript_hash": digest, "encrypted_payload": payload}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	// Poll should return approved status with payload
 	headers := http.Header{}

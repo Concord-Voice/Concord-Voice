@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/devicerecovery"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
@@ -3655,7 +3656,10 @@ func (h *Handler) ValidateRecoveryToken(tokenString string) (*auth.RecoveryClaim
 	if err != nil {
 		return nil, err
 	}
-	return &auth.RecoveryClaims{UserID: claims.UserID, JTI: claims.ID}, nil
+	if claims.ExpiresAt == nil {
+		return nil, errors.New("recovery expiry missing")
+	}
+	return &auth.RecoveryClaims{UserID: claims.UserID, JTI: claims.ID, ExpiresAt: claims.ExpiresAt.Time}, nil
 }
 
 // ── Recovery Key Endpoints ──────────────────────────────────────────────────
@@ -4093,54 +4097,13 @@ func (h *Handler) RemoveTrustedDevice(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Trusted device removed"})
 }
 
-// ListRecoveryRequests returns pending recovery requests for the authenticated user.
+// ListRecoveryRequests returns owned pending/offered context without approval payloads.
 func (h *Handler) ListRecoveryRequests(c *gin.Context) {
-	userID := c.GetString("user_id")
-
-	rows, err := h.db.QueryContext(c.Request.Context(), `
-		SELECT id, status, ephemeral_public_key, created_at, expires_at
-		FROM recovery_requests
-		WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()
-		ORDER BY created_at DESC
-	`, userID)
+	requests, err := devicerecovery.List(c.Request.Context(), h.db, c.GetString("user_id"))
 	if err != nil {
-		h.log.Error(errMsgFailedListRecoveryReqs, "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedListRecoveryReqs})
+		devicerecovery.WriteError(c, err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	type recoveryRequest struct {
-		ID                 string    `json:"id"`
-		Status             string    `json:"status"`
-		EphemeralPublicKey string    `json:"ephemeral_public_key"`
-		CreatedAt          time.Time `json:"created_at"`
-		ExpiresAt          time.Time `json:"expires_at"`
-	}
-
-	requests := []recoveryRequest{}
-	var scanErr error
-	for rows.Next() {
-		var r recoveryRequest
-		var ephPubKey []byte
-		if err := rows.Scan(&r.ID, &r.Status, &ephPubKey, &r.CreatedAt, &r.ExpiresAt); err != nil {
-			h.log.Error("Failed to scan recovery request row", "user_id", userID, "error", err)
-			scanErr = err
-			break
-		}
-		r.EphemeralPublicKey = base64.StdEncoding.EncodeToString(ephPubKey)
-		requests = append(requests, r)
-	}
-	if scanErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedListRecoveryReqs})
-		return
-	}
-	if err := rows.Err(); err != nil {
-		h.log.Error("Error iterating recovery requests", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedListRecoveryReqs})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{"requests": requests})
 }
 
@@ -4162,118 +4125,19 @@ func DecodeApprovalPayloads(encPayloadB64, respPubKeyB64 string) ([]byte, []byte
 	return encPayload, respPubKey, "", 0
 }
 
-// executeRecoveryResponse answers a pending request and reports whether it was
-// still pending and unexpired. Both checks are part of the write, so two
-// concurrent answers cannot both land, the later one overwriting the first,
-// and a request that expired after the handler read it cannot be answered.
-func (h *Handler) executeRecoveryResponse(ctx context.Context, requestID, action string, encPayload, respPubKey []byte) (bool, error) {
-	var result sql.Result
-	var err error
-	if action == "approve" {
-		result, err = h.db.ExecContext(ctx, `
-			UPDATE recovery_requests
-			SET status = 'approved', encrypted_payload = $1, responder_public_key = $2, responded_at = NOW()
-			WHERE id = $3 AND status = 'pending' AND expires_at > NOW()
-		`, encPayload, respPubKey, requestID)
-	} else {
-		result, err = h.db.ExecContext(ctx, `
-			UPDATE recovery_requests
-			SET status = 'rejected', responded_at = NOW()
-			WHERE id = $1 AND status = 'pending' AND expires_at > NOW()
-		`, requestID)
-	}
-	if err != nil {
-		return false, fmt.Errorf("write recovery response: %w", err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("read recovery response result: %w", err)
-	}
-	return rows == 1, nil
-}
-
-// RespondToRecoveryRequest allows the authenticated user to approve or reject a recovery request.
+// RespondToRecoveryRequest fixes one offer, approves its exact digest, or rejects.
 func (h *Handler) RespondToRecoveryRequest(c *gin.Context) {
-	userID := c.GetString("user_id")
-	requestID := c.Param("id")
-
-	var req struct {
-		Action             string `json:"action" binding:"required"`
-		EncryptedPayload   string `json:"encrypted_payload"`
-		ResponderPublicKey string `json:"responder_public_key"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "action is required (approve or reject)"})
-		return
-	}
-
-	if req.Action != "approve" && req.Action != "reject" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be 'approve' or 'reject'"})
-		return
-	}
-
-	// An id that is not a UUID names no request. Refusing it here keeps the
-	// database's parse error out of the fault path below.
-	if _, err := uuid.Parse(requestID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recovery request not found"})
-		return
-	}
-
-	// Verify the request belongs to this user and is still pending
-	var requestUserID, status string
-	err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT user_id, status FROM recovery_requests WHERE id = $1 AND expires_at > NOW()`, requestID,
-	).Scan(&requestUserID, &status)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recovery request not found"})
-		return
-	}
+	req, err := devicerecovery.ParseRespond(c)
 	if err != nil {
-		h.log.Error("Failed to read recovery request", "user_id", userID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRespondRecovery})
+		devicerecovery.WriteError(c, err)
 		return
 	}
-
-	if requestUserID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized to respond to this request"})
-		return
-	}
-
-	if status != "pending" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Request already responded to"})
-		return
-	}
-
-	var encPayload, respPubKey []byte
-	if req.Action == "approve" {
-		var errMsg string
-		var httpStatus int
-		encPayload, respPubKey, errMsg, httpStatus = DecodeApprovalPayloads(req.EncryptedPayload, req.ResponderPublicKey)
-		if errMsg != "" {
-			c.JSON(httpStatus, gin.H{"error": errMsg})
-			return
-		}
-	}
-
-	ctx := c.Request.Context()
-	answered, err := h.executeRecoveryResponse(ctx, requestID, req.Action, encPayload, respPubKey)
+	result, err := devicerecovery.Respond(c.Request.Context(), h.db, c.GetString("user_id"), middleware.TokenCredentialEpoch(c), c.Param("id"), req)
 	if err != nil {
-		h.log.Error("Failed to respond to recovery request", "error", err, "user_id", userID, "request_id", requestID, "action", req.Action)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRespondRecovery})
+		devicerecovery.WriteError(c, err)
 		return
 	}
-	if !answered {
-		// Another response landed between the read above and this write.
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Request already responded to"})
-		return
-	}
-
-	statusWord := "approved"
-	if req.Action == "reject" {
-		statusWord = "rejected"
-	}
-	h.log.Info("Recovery request responded", "user_id", userID, "request_id", requestID, "action", req.Action)
-	c.JSON(http.StatusOK, gin.H{"message": "Recovery request " + statusWord})
+	c.JSON(http.StatusOK, result)
 }
 
 // ── Social Recovery Circle Endpoints ─────────────────────────────────────────
