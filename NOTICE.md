@@ -585,13 +585,12 @@ image even though the image's Go table above lists only linked Go modules.
 
 Versions here are resolved from `client/admin/package-lock.json` and are
 independent of the desktop client's lockfile: the two are bumped by separate
-Dependabot PRs and may drift apart at any time. They happen to agree on all four
-rows as of this regeneration, but that is a coincidence of timing and not a
-guarantee — do not read either table as covering the other.
+Dependabot PRs and may drift apart at any time. Do not read either table as
+covering the other.
 
 | Package | Version | License | Repository |
 |---|---|---|---|
-| lucide-react | 1.47.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.48.0 | ISC | https://github.com/lucide-icons/lucide |
 | react-dom | 19.3.0 | MIT | https://github.com/react/react |
 | react | 19.3.0 | MIT | https://github.com/react/react |
 | scheduler | 0.28.0 | MIT | https://github.com/react/react |
