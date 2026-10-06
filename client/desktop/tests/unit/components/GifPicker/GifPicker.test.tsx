@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { act, render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { openForeignModal } from '../../../helpers/foreignModal';
 import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
@@ -17,6 +17,8 @@ const recentMock = vi.fn();
 const categoriesMock = vi.fn();
 const getBySlugMock = vi.fn();
 const notifySharedMock = vi.fn();
+let gifIdentityRevision = 0;
+const gifIdentityListeners = new Set<() => void>();
 
 const sampleVideoGif = {
   slug: 'video-1',
@@ -37,6 +39,11 @@ const sampleImageGif = {
 };
 
 vi.mock('@/renderer/services/messaging/gifProvider', () => ({
+  getGifIdentityRevision: () => gifIdentityRevision,
+  subscribeGifIdentity: (listener: () => void) => {
+    gifIdentityListeners.add(listener);
+    return () => gifIdentityListeners.delete(listener);
+  },
   gifProvider: {
     name: 'KLIPY',
     searchPlaceholder: 'Search KLIPY',
@@ -74,8 +81,11 @@ describe('GifPicker', () => {
     categoriesMock.mockReset();
     getBySlugMock.mockReset();
     notifySharedMock.mockReset();
+    gifIdentityRevision = 0;
+    gifIdentityListeners.clear();
     // Enable personalization so the Recent tab is visible in these tests
     usePrivacyStore.setState((s) => ({
+      loaded: true,
       settings: { ...s.settings, sharePersonalizationWithGifProvider: true },
     }));
     // Default trending returns one GIF
@@ -93,6 +103,99 @@ describe('GifPicker', () => {
     expect(screen.getByText('Saved')).toBeInTheDocument();
     // Wait for the trending fetch to settle so React doesn't warn about unawaited state updates
     await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+  });
+
+  it('hides Recent until the personalization preference is confirmed', async () => {
+    usePrivacyStore.setState({ loaded: false });
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+
+    expect(screen.queryByText('Recent')).not.toBeInTheDocument();
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+  });
+
+  it('replaces an old-mode trending response when personalization is confirmed', async () => {
+    usePrivacyStore.setState({ loaded: false });
+    let finishOld!: (value: { items: (typeof sampleVideoGif)[]; hasMore: boolean }) => void;
+    trendingMock
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishOld = resolve;
+        })
+      )
+      .mockResolvedValueOnce({ items: [sampleImageGif], hasMore: false });
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalledTimes(1));
+
+    act(() =>
+      usePrivacyStore.setState((s) => ({
+        loaded: true,
+        settings: { ...s.settings, sharePersonalizationWithGifProvider: true },
+      }))
+    );
+    await waitFor(() => expect(trendingMock).toHaveBeenCalledTimes(2));
+    finishOld({ items: [sampleVideoGif], hasMore: false });
+
+    await waitFor(() => expect(document.querySelector('img[src$="g1.gif"]')).not.toBeNull());
+    expect(document.querySelector('video[src$="v1.mp4"]')).toBeNull();
+  });
+
+  it('refetches an open trending view when the saved GIF identity rotates', async () => {
+    trendingMock
+      .mockResolvedValueOnce({ items: [sampleVideoGif], hasMore: false })
+      .mockResolvedValueOnce({ items: [sampleImageGif], hasMore: false });
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    await waitFor(() => expect(document.querySelector('video[src$="v1.mp4"]')).not.toBeNull());
+
+    act(() => {
+      // Notifications before a completed rotation (and the first ID mint)
+      // leave the revision alone, so they must not duplicate the fetch.
+      for (const listener of gifIdentityListeners) listener();
+    });
+    expect(trendingMock).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      gifIdentityRevision += 1;
+      for (const listener of gifIdentityListeners) listener();
+    });
+
+    await waitFor(() => expect(trendingMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(document.querySelector('img[src$="g1.gif"]')).not.toBeNull());
+    expect(document.querySelector('video[src$="v1.mp4"]')).toBeNull();
+  });
+
+  it('leaves Recent and clears its items when the preference becomes unavailable', async () => {
+    trendingMock.mockResolvedValue({ items: [], hasMore: false });
+    recentMock.mockResolvedValue({ items: [sampleVideoGif], hasMore: false });
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    fireEvent.click(screen.getByText('Recent'));
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    const recentCalls = recentMock.mock.calls.length;
+
+    act(() => usePrivacyStore.setState({ loaded: false }));
+
+    expect(screen.queryByText('Recent')).not.toBeInTheDocument();
+    expect(document.querySelector('video')).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByText('Trending')).toHaveAttribute('aria-pressed', 'true')
+    );
+    expect(recentMock).toHaveBeenCalledTimes(recentCalls);
+  });
+
+  it('masks a search started from Recent while the privacy preference changes', async () => {
+    recentMock.mockResolvedValue({ items: [], hasMore: false });
+    searchMock
+      .mockResolvedValueOnce({ items: [sampleImageGif], hasMore: false })
+      .mockImplementationOnce(() => new Promise(() => {}));
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    fireEvent.click(screen.getByText('Recent'));
+    fireEvent.change(screen.getByPlaceholderText('Search KLIPY'), { target: { value: 'cat' } });
+    await waitFor(() => expect(document.querySelector('.gif-tile')).not.toBeNull());
+
+    act(() => usePrivacyStore.setState({ loaded: false }));
+
+    expect(document.querySelector('.gif-tile')).toBeNull();
+    expect(screen.queryByText('Recent')).not.toBeInTheDocument();
+    await waitFor(() => expect(searchMock).toHaveBeenCalledTimes(2));
   });
 
   it('renders the close button and search input with correct placeholder', async () => {
@@ -827,6 +930,7 @@ describe('GifPicker GifMedia — window-focus playback gating (#2369 T6)', () =>
     categoriesMock.mockReset();
     notifySharedMock.mockReset();
     usePrivacyStore.setState((s) => ({
+      loaded: true,
       settings: { ...s.settings, sharePersonalizationWithGifProvider: true },
     }));
     recentMock.mockResolvedValue({ items: [], hasMore: false });

@@ -10,6 +10,7 @@ import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { extractInviteCodes } from '@/renderer/utils/messaging/inviteUrl';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -841,7 +842,7 @@ describe('extractInviteCodes — friend links (#945)', () => {
 });
 
 describe('KLIPY personalization wiring (#1785)', () => {
-  it('applies the personalization preference eagerly when App is imported, with no GIF surface mounted', () => {
+  it('waits for the confirmed preference before enabling a stable GIF ID', () => {
     // App.tsx carries a side-effect `import './services/messaging/gifProvider'`. That
     // module owns the personalization wiring and applies the stored preference
     // on evaluation. Nothing here mounts GifPicker or GifEmbed — and that is
@@ -855,12 +856,13 @@ describe('KLIPY personalization wiring (#1785)', () => {
     // is the only importer left.
     expect(klipyPersonalizationCalls.length).toBeGreaterThan(0);
 
-    // Assert the VALUE, not merely that a call happened. privacyStore defaults
-    // sharePersonalizationWithGifProvider to `true` while klipyClient's class
-    // field defaults to `false` — that asymmetry IS the regression, so the
-    // wiring is only correct if `true` actually reaches the provider. A guard
-    // that checked call-count alone would still pass if the wiring fired with
-    // a hardcoded or wrongly-sourced value.
-    expect(klipyPersonalizationCalls).toContain(true);
+    // The stored preference has not been fetched yet. Its initial ON value is
+    // only a placeholder, so the provider must start without a stable ID.
+    expect(klipyPersonalizationCalls[0]).toBe(false);
+
+    act(() => {
+      usePrivacyStore.setState({ loaded: true });
+    });
+    expect(klipyPersonalizationCalls.at(-1)).toBe(true);
   });
 });

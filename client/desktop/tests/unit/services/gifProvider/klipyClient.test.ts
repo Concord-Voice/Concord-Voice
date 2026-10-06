@@ -318,6 +318,290 @@ describe('klipyClient', () => {
       );
       expect(idCalls).toHaveLength(1);
     });
+
+    it('publishes a lazily minted ID and each automatic temporary rotation', async () => {
+      const observed: Array<string | null> = [];
+      const unsubscribe = klipyClient.subscribeCustomerId(() => {
+        observed.push(klipyClient.getCurrentCustomerId());
+      });
+      klipyClient.setPersonalizationEnabled(true);
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ customer_id: 'stable-id' }));
+      await klipyClient.getCustomerID();
+      expect(observed).toContain('stable-id');
+      expect(klipyClient.getCustomerIdRevision()).toBe(0);
+
+      vi.useFakeTimers();
+      try {
+        klipyClient.setPersonalizationEnabled(false);
+        const firstTemporaryId = klipyClient.getCurrentCustomerId();
+        vi.advanceTimersByTime(30 * 60 * 1_000);
+        const nextTemporaryId = klipyClient.getCurrentCustomerId();
+        expect(nextTemporaryId).toBeTruthy();
+        expect(nextTemporaryId).not.toBe(firstTemporaryId);
+        expect(observed.at(-1)).toBe(nextTemporaryId);
+
+        apiFetchMock.mockResolvedValueOnce(jsonResponse({ data: [], has_more: false }));
+        await klipyClient.trending(1, 25);
+        expect(String(apiFetchMock.mock.lastCall?.[0])).toContain(`customer_id=${nextTemporaryId}`);
+      } finally {
+        vi.useRealTimers();
+        unsubscribe();
+      }
+    });
+
+    it.each([
+      ['trending', () => klipyClient.trending(1, 25)],
+      ['search', () => klipyClient.search('cats', 1, 25)],
+    ])('retries an off-mode %s read after its temporary ID rotates', async (_name, request) => {
+      klipyClient.setPersonalizationEnabled(false);
+      const previousId = await klipyClient.getCustomerID();
+      expect(previousId).toBeTruthy();
+      let release!: () => void;
+      let dispatched = false;
+      apiFetchMock
+        .mockImplementationOnce(
+          async (_path: string, _init: RequestInit, opts: { assertBeforeDispatch: () => void }) => {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            opts.assertBeforeDispatch();
+            dispatched = true;
+            return jsonResponse({ data: [], has_more: false });
+          }
+        )
+        .mockResolvedValueOnce(jsonResponse({ data: [], has_more: false }));
+
+      const pending = request();
+      await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(1));
+      const nextId = await klipyClient.rotateCustomerId();
+      expect(nextId).not.toBe(previousId);
+      release();
+
+      await expect(pending).resolves.toMatchObject({ data: [] });
+      expect(dispatched).toBe(false);
+      expect(apiFetchMock).toHaveBeenCalledTimes(2);
+      expect(String(apiFetchMock.mock.calls[0][0])).toContain(`customer_id=${previousId}`);
+      expect(String(apiFetchMock.mock.calls[1][0])).toContain(`customer_id=${nextId}`);
+    });
+
+    it('publishes a successful manual rotation after an initial mint failed', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ error: 'unavailable' }, 503));
+      await expect(klipyClient.getCustomerID()).resolves.toBeNull();
+      expect(klipyClient.getCustomerIdRevision()).toBe(0);
+
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ customer_id: 'new-id' }));
+      await expect(klipyClient.rotateCustomerId()).resolves.toBe('new-id');
+      expect(klipyClient.getCustomerIdRevision()).toBe(1);
+      expect(klipyClient.getCurrentCustomerId()).toBe('new-id');
+    });
+
+    it('keeps the working ID when manual rotation fails', async () => {
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      klipyClient.setPersonalizationEnabled(true);
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({}, 503));
+
+      await expect(klipyClient.rotateCustomerId()).rejects.toThrow('Could not rotate');
+      expect(klipyClient.getCustomerIdRevision()).toBe(0);
+      expect(klipyClient.getCurrentCustomerId()).toBe('working-id');
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBe('working-id');
+
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ data: [], has_more: false }));
+      await klipyClient.trending(1, 25);
+      expect(String(apiFetchMock.mock.lastCall?.[0])).toContain('customer_id=working-id');
+    });
+
+    it('parks personalized reads while rotation is pending, then uses the new ID', async () => {
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      klipyClient.setPersonalizationEnabled(true);
+      let finishRotation!: (response: Response) => void;
+      const pendingRotation = new Promise<Response>((resolve) => {
+        finishRotation = resolve;
+      });
+      apiFetchMock.mockReturnValueOnce(pendingRotation);
+      const rotation = klipyClient.rotateCustomerId();
+      expect(klipyClient.getCurrentCustomerId()).toBeNull();
+      expect(klipyClient.getCustomerIdRevision()).toBe(0);
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBe('working-id');
+
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ data: [], has_more: false }));
+      const pendingRead = klipyClient.trending(1, 25);
+      await Promise.resolve();
+      expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+      finishRotation(jsonResponse({ customer_id: 'new-id' }));
+      await expect(rotation).resolves.toBe('new-id');
+      await expect(pendingRead).resolves.toEqual({ data: [], has_more: false });
+      expect(klipyClient.getCurrentCustomerId()).toBe('new-id');
+      expect(klipyClient.getCustomerIdRevision()).toBe(1);
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBe('new-id');
+      expect(String(apiFetchMock.mock.lastCall?.[0])).toContain('customer_id=new-id');
+
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ data: [], has_more: false }));
+      await klipyClient.trending(2, 25);
+      expect(String(apiFetchMock.mock.lastCall?.[0])).toContain('customer_id=new-id');
+    });
+
+    it('keeps a successful rotation successful when one subscriber throws', async () => {
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      klipyClient.setPersonalizationEnabled(true);
+      const subscriber = vi.fn();
+      const unsubscribeFaulty = klipyClient.subscribeCustomerId(() => {
+        throw new Error('subscriber failed');
+      });
+      const unsubscribeHealthy = klipyClient.subscribeCustomerId(subscriber);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        apiFetchMock.mockResolvedValueOnce(jsonResponse({ customer_id: 'new-id' }));
+
+        await expect(klipyClient.rotateCustomerId()).resolves.toBe('new-id');
+        expect(klipyClient.getCurrentCustomerId()).toBe('new-id');
+        expect(localStorage.getItem('concord:klipy-customer-id')).toBe('new-id');
+        expect(subscriber).toHaveBeenCalledTimes(2);
+        expect(warn).toHaveBeenCalledWith('[gifProvider] customer-id subscriber failed');
+      } finally {
+        unsubscribeFaulty();
+        unsubscribeHealthy();
+        warn.mockRestore();
+      }
+    });
+
+    it('does not let an older mint overwrite a successful rotation', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      let finishOldMint!: (response: Response) => void;
+      apiFetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishOldMint = resolve;
+        })
+      );
+      const oldMint = klipyClient.getCustomerID();
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ customer_id: 'rotated-id' }));
+
+      await expect(klipyClient.rotateCustomerId()).resolves.toBe('rotated-id');
+      finishOldMint(jsonResponse({ customer_id: 'stale-id' }));
+      await expect(oldMint).resolves.toBeNull();
+      expect(klipyClient.getCurrentCustomerId()).toBe('rotated-id');
+    });
+
+    it('does not commit a rotation that finishes after opt-out', async () => {
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      klipyClient.setPersonalizationEnabled(true);
+      let finishRotation!: (response: Response) => void;
+      apiFetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishRotation = resolve;
+        })
+      );
+      const rotation = klipyClient.rotateCustomerId();
+
+      klipyClient.setPersonalizationEnabled(false);
+      finishRotation(jsonResponse({ customer_id: 'stale-id' }));
+      await expect(rotation).rejects.toThrow('Could not rotate');
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBe('working-id');
+
+      klipyClient.setPersonalizationEnabled(true);
+      expect(klipyClient.getCurrentCustomerId()).toBe('working-id');
+    });
+
+    it('does not commit a rotation from a previous server selection', async () => {
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      klipyClient.setPersonalizationEnabled(true);
+      let finishRotation!: (response: Response) => void;
+      apiFetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishRotation = resolve;
+        })
+      );
+      const rotation = klipyClient.rotateCustomerId();
+
+      setRuntimeServerBase('https://other.example');
+      finishRotation(jsonResponse({ customer_id: 'stale-id' }));
+      await expect(rotation).rejects.toThrow('Could not rotate');
+      expect(klipyClient.getCurrentCustomerId()).toBe('working-id');
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBe('working-id');
+    });
+
+    it('does not send a stale personalized search after opt-out', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      let finishMint!: (response: Response) => void;
+      apiFetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishMint = resolve;
+        })
+      );
+      const search = klipyClient.search('cats', 1, 25);
+      klipyClient.setPersonalizationEnabled(false);
+      finishMint(jsonResponse({ customer_id: 'old-mode-id' }));
+
+      await expect(search).rejects.toThrow('privacy setting or server changed');
+      expect(
+        apiFetchMock.mock.calls.every(([path]) => !String(path).includes('/gifs/search'))
+      ).toBe(true);
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBeNull();
+    });
+
+    it.each([
+      ['trending', () => klipyClient.trending(1, 25)],
+      ['search', () => klipyClient.search('cats', 1, 25)],
+      ['recent', () => klipyClient.recent(1, 25)],
+    ])(
+      'cancels %s before network dispatch if personalization is disabled during auth IPC',
+      async (_name, request) => {
+        localStorage.setItem('concord:klipy-customer-id', 'working-id');
+        klipyClient.setPersonalizationEnabled(true);
+        let release!: () => void;
+        let dispatched = false;
+        apiFetchMock.mockImplementationOnce(
+          async (_path: string, _init: RequestInit, opts: { assertBeforeDispatch: () => void }) => {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            opts.assertBeforeDispatch();
+            dispatched = true;
+            return jsonResponse({ data: [], has_more: false });
+          }
+        );
+
+        const pending = request();
+        await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(1));
+        expect(String(apiFetchMock.mock.calls[0][0])).toContain('working-id');
+        klipyClient.setPersonalizationEnabled(false);
+        release();
+
+        await expect(pending).rejects.toThrow();
+        expect(dispatched).toBe(false);
+      }
+    );
+
+    it('retries an item read once with the new temporary ID after opt-out during auth IPC', async () => {
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      klipyClient.setPersonalizationEnabled(true);
+      let release!: () => void;
+      let firstDispatched = false;
+      apiFetchMock
+        .mockImplementationOnce(
+          async (_path: string, _init: RequestInit, opts: { assertBeforeDispatch: () => void }) => {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            opts.assertBeforeDispatch();
+            firstDispatched = true;
+            return jsonResponse({ data: [] });
+          }
+        )
+        .mockResolvedValueOnce(jsonResponse({ data: [{ slug: 'cat-gif' }] }));
+
+      const pending = klipyClient.getBySlug('cat-gif');
+      await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(1));
+      klipyClient.setPersonalizationEnabled(false);
+      const temporaryId = klipyClient.getCurrentCustomerId();
+      release();
+
+      await expect(pending).resolves.toMatchObject({ slug: 'cat-gif' });
+      expect(firstDispatched).toBe(false);
+      expect(apiFetchMock).toHaveBeenCalledTimes(2);
+      expect(String(apiFetchMock.mock.calls[1][0])).toContain(`customer_id=${temporaryId}`);
+    });
   });
 
   describe('endpoint methods', () => {
@@ -471,6 +755,66 @@ describe('klipyClient', () => {
       const path = apiFetchMock.mock.calls[0][0] as string;
       expect(path).toContain('/gifs/share/good-slug');
       expect(path).toContain('customer_id=abc-123');
+    });
+
+    it('keeps a share in the saved Recent list when concurrent rotation fails', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      localStorage.setItem('concord:klipy-customer-id', 'working-id');
+      let finishRotation!: (response: Response) => void;
+      apiFetchMock
+        .mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              finishRotation = resolve;
+            })
+        )
+        .mockResolvedValueOnce(jsonResponse({ result: true }));
+
+      const rotation = klipyClient.rotateCustomerId();
+      const share = klipyClient.notifyShared('good-slug');
+      const rotationFailure = expect(rotation).rejects.toThrow('Could not rotate');
+      expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+      finishRotation(jsonResponse({ error: 'unavailable' }, 503));
+      await rotationFailure;
+      await expect(share).resolves.toBeUndefined();
+
+      expect(klipyClient.getCurrentCustomerId()).toBe('working-id');
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBe('working-id');
+      expect(apiFetchMock).toHaveBeenCalledTimes(2);
+      expect(String(apiFetchMock.mock.calls[1][0])).toContain(
+        '/gifs/share/good-slug?customer_id=working-id'
+      );
+    });
+
+    it('does not dispatch a personalized share after opt-out during auth IPC', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      localStorage.setItem('concord:klipy-customer-id', 'abc-123');
+      let release!: () => void;
+      let dispatched = false;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      apiFetchMock.mockImplementationOnce(
+        async (_path: string, _init: RequestInit, opts: { assertBeforeDispatch: () => void }) => {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          opts.assertBeforeDispatch();
+          dispatched = true;
+          return jsonResponse({ result: true });
+        }
+      );
+
+      try {
+        const pending = klipyClient.notifyShared('good-slug');
+        await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(1));
+        expect(String(apiFetchMock.mock.calls[0][0])).toContain('customer_id=abc-123');
+        klipyClient.setPersonalizationEnabled(false);
+        release();
+        await expect(pending).resolves.toBeUndefined();
+        expect(dispatched).toBe(false);
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it('OMITS customer_id when personalization is OFF', async () => {

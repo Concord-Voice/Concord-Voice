@@ -242,8 +242,18 @@ export class KlipyIdentityError extends Error {
   }
 }
 
+class KlipyIdentityChangedError extends Error {
+  constructor() {
+    super('GIF request canceled because the privacy setting or server changed.');
+    this.name = 'KlipyIdentityChangedError';
+  }
+}
+
 class KlipyClient {
   private personalizationEnabled = false;
+  private customerIdGeneration = 0;
+  private customerIdRevision = 0;
+  private readonly customerIdListeners = new Set<() => void>();
 
   // ── Personalization ON: stable UUID persisted to localStorage ──
   private cachedCustomerId: string | null = null;
@@ -253,19 +263,49 @@ class KlipyClient {
   private customerIdInFlight: Promise<string | null> | null = null;
   /** The server selection the in-flight request was started under. */
   private customerIdInFlightSelection: RuntimeServerSelection | null = null;
+  /** Keep reads behind a manual rotation until its replacement is ready. */
+  private rotationInFlight: {
+    promise: Promise<string | null>;
+    selection: RuntimeServerSelection;
+  } | null = null;
 
   // ── Personalization OFF: ephemeral UUID rotated every 30 minutes ──
   private ephemeralCustomerId: string | null = null;
   private ephemeralRotationTimer: ReturnType<typeof setTimeout> | null = null;
 
+  subscribeCustomerId(listener: () => void): () => void {
+    this.customerIdListeners.add(listener);
+    return () => this.customerIdListeners.delete(listener);
+  }
+
+  /** Changes after a successful manual rotation, including an initial mint retry. */
+  getCustomerIdRevision(): number {
+    return this.customerIdRevision;
+  }
+
+  private notifyCustomerIdChanged(): void {
+    for (const listener of this.customerIdListeners) {
+      try {
+        listener();
+      } catch {
+        // A failed UI subscriber must not turn a committed ID change into a
+        // failed rotation or prevent the remaining subscribers from updating.
+        console.warn('[gifProvider] customer-id subscriber failed');
+      }
+    }
+  }
+
   setPersonalizationEnabled(enabled: boolean): void {
     const changed = this.personalizationEnabled !== enabled;
     this.personalizationEnabled = enabled;
     if (changed) {
+      // A response started in the previous mode must not commit an ID there.
+      this.customerIdGeneration += 1;
       if (enabled) {
         // Switching ON: stop ephemeral rotation timer, clear ephemeral state.
         this._clearEphemeralTimer();
         this.ephemeralCustomerId = null;
+        this.notifyCustomerIdChanged();
       } else {
         // Switching OFF: clear persistent ID from memory (not localStorage — the
         // user may re-enable later and should get their previous stable ID back).
@@ -273,6 +313,7 @@ class KlipyClient {
         this.cachedCustomerId = null;
         this.customerIdInFlight = null;
         this.customerIdInFlightSelection = null;
+        this.rotationInFlight = null;
         this.customerIdFailureAt = null;
         this._refreshEphemeral();
       }
@@ -282,7 +323,14 @@ class KlipyClient {
   /** The current customer_id shown in settings UI (stable when on, ephemeral when off). */
   getCurrentCustomerId(): string | null {
     if (this.personalizationEnabled) {
-      return this.cachedCustomerId ?? localStorage.getItem(CUSTOMER_ID_STORAGE_KEY);
+      if (
+        this.rotationInFlight &&
+        runtimeServerSelectionIsCurrent(this.rotationInFlight.selection)
+      ) {
+        return null;
+      }
+      const id = this.cachedCustomerId ?? localStorage.getItem(CUSTOMER_ID_STORAGE_KEY);
+      return id && isValidCustomerId(id) ? id : null;
     }
     return this.ephemeralCustomerId;
   }
@@ -295,18 +343,32 @@ class KlipyClient {
    */
   async rotateCustomerId(): Promise<string> {
     if (this.personalizationEnabled) {
-      // Clear cached ID and force a fresh fetch from control-plane.
-      this.cachedCustomerId = null;
+      // Stop using the old ID immediately. Reads wait for the replacement;
+      // a failed rotation restores the saved ID without changing localStorage.
+      // Read the saved value directly: a second Rotate can start while the
+      // first has parked the public snapshot at null.
+      const previousId = this.cachedCustomerId ?? localStorage.getItem(CUSTOMER_ID_STORAGE_KEY);
+      const generation = ++this.customerIdGeneration;
       this.customerIdFailureAt = null;
       this.customerIdInFlight = null;
       this.customerIdInFlightSelection = null;
-      localStorage.removeItem(CUSTOMER_ID_STORAGE_KEY);
-      // Kick off the fetch immediately and return the new ID. The selection is
-      // captured here for the same reason _getStableId captures one: the guard
-      // inside _fetchStableId must be keyed to the server this rotation was
-      // requested on, not to whatever is current when it resolves.
-      const id = await this._fetchStableId(captureRuntimeServerSelection());
-      return id ?? crypto.randomUUID();
+      const selection = captureRuntimeServerSelection();
+      const pending = this._fetchStableId(selection, generation)
+        .then((id) => {
+          if (id && id !== previousId) this.customerIdRevision += 1;
+          return id;
+        })
+        .finally(() => {
+          if (this.rotationInFlight?.promise === pending) {
+            this.rotationInFlight = null;
+            this.notifyCustomerIdChanged();
+          }
+        });
+      this.rotationInFlight = { promise: pending, selection };
+      this.notifyCustomerIdChanged();
+      const id = await pending;
+      if (!id) throw new Error('Could not rotate the personalization ID.');
+      return id;
     } else {
       return this._refreshEphemeral();
     }
@@ -315,10 +377,13 @@ class KlipyClient {
   /** Reset all internal state. Used by tests; not called from production code. */
   _resetForTesting(): void {
     this.personalizationEnabled = false;
+    this.customerIdRevision = 0;
     this.cachedCustomerId = null;
     this.customerIdFailureAt = null;
     this.customerIdInFlight = null;
     this.customerIdInFlightSelection = null;
+    this.rotationInFlight = null;
+    this.customerIdGeneration += 1;
     this._clearEphemeralTimer();
     this.ephemeralCustomerId = null;
   }
@@ -333,6 +398,7 @@ class KlipyClient {
         this._refreshEphemeral();
       }
     }, EPHEMERAL_ROTATION_INTERVAL_MS);
+    this.notifyCustomerIdChanged();
     return id;
   }
 
@@ -352,8 +418,15 @@ class KlipyClient {
    * placeholder), never a logout. Genuine session expiry is still caught by the
    * next real Concord API call, which is authoritative.
    */
-  private async doFetch(path: string, init?: RequestInit): Promise<Response> {
-    return apiFetch(`${KLIPY_PROXY_BASE}${path}`, init, { authoritative: false });
+  private async doFetch(
+    path: string,
+    init?: RequestInit,
+    assertBeforeDispatch?: () => void
+  ): Promise<Response> {
+    return apiFetch(`${KLIPY_PROXY_BASE}${path}`, init, {
+      authoritative: false,
+      assertBeforeDispatch,
+    });
   }
 
   /** Append the customer_id query param. Always included (required by KLIPY).
@@ -383,8 +456,32 @@ class KlipyClient {
     return this.ephemeralCustomerId;
   }
 
+  /** Do not send an ID resolved under an older privacy choice or server. */
+  private async customerIdForRead(): Promise<{
+    id: string | null;
+    assertBeforeDispatch: () => void;
+  }> {
+    const selection = captureRuntimeServerSelection();
+    const generation = this.customerIdGeneration;
+    const id = await this.getCustomerID();
+    const assertBeforeDispatch = (): void => {
+      if (
+        !runtimeServerSelectionIsCurrent(selection) ||
+        generation !== this.customerIdGeneration ||
+        id !== this.getCurrentCustomerId()
+      ) {
+        throw new KlipyIdentityChangedError();
+      }
+    };
+    assertBeforeDispatch();
+    return { id, assertBeforeDispatch };
+  }
+
   /** Lazily fetch and cache the stable per-device customer_id from the control-plane. */
   private async _getStableId(): Promise<string | null> {
+    if (this.rotationInFlight && runtimeServerSelectionIsCurrent(this.rotationInFlight.selection)) {
+      return this.rotationInFlight.promise;
+    }
     if (this.cachedCustomerId) return this.cachedCustomerId;
 
     const stored = localStorage.getItem(CUSTOMER_ID_STORAGE_KEY);
@@ -393,6 +490,7 @@ class KlipyClient {
       // and fall through to mint a fresh id.
       console.warn('[gifProvider] customer-id: discarding an ill-formed stored id');
       localStorage.removeItem(CUSTOMER_ID_STORAGE_KEY);
+      this.notifyCustomerIdChanged();
     } else if (stored) {
       this.cachedCustomerId = stored;
       return stored;
@@ -421,7 +519,8 @@ class KlipyClient {
     }
 
     const selection = captureRuntimeServerSelection();
-    const pending = this._fetchStableId(selection).finally(() => {
+    const generation = this.customerIdGeneration;
+    const pending = this._fetchStableId(selection, generation).finally(() => {
       // Clear only OUR handle. A successor started under a newer selection
       // must not be torn down by its predecessor settling afterwards.
       if (this.customerIdInFlight === pending) {
@@ -434,7 +533,10 @@ class KlipyClient {
     return pending;
   }
 
-  private async _fetchStableId(selection: RuntimeServerSelection): Promise<string | null> {
+  private async _fetchStableId(
+    selection: RuntimeServerSelection,
+    generation: number
+  ): Promise<string | null> {
     // frontend.md: async provider flows MUST fence every continuation on the
     // runtime-server selection. Comparing the URL alone is not ABA-safe, which
     // is why the selection carries an epoch. It is passed in rather than
@@ -446,7 +548,11 @@ class KlipyClient {
     // recent() throws KlipyIdentityError there even though its endpoint is
     // healthy. Every failure write in this method goes through here.
     const markFailure = (): void => {
-      if (runtimeServerSelectionIsCurrent(selection)) {
+      if (
+        runtimeServerSelectionIsCurrent(selection) &&
+        generation === this.customerIdGeneration &&
+        this.personalizationEnabled
+      ) {
         this.customerIdFailureAt = Date.now();
       }
     };
@@ -466,16 +572,22 @@ class KlipyClient {
         return null;
       }
       if (id) {
-        if (!runtimeServerSelectionIsCurrent(selection)) {
+        if (
+          !runtimeServerSelectionIsCurrent(selection) ||
+          generation !== this.customerIdGeneration ||
+          !this.personalizationEnabled
+        ) {
           // The user selected a different runtime server while this request was
           // in flight. Caching and persisting now would carry the value minted
           // by the previous server into the new one's session — a state check
           // made BEFORE an await says nothing about the world after it.
           return null;
         }
+        localStorage.setItem(CUSTOMER_ID_STORAGE_KEY, id);
         this.cachedCustomerId = id;
         this.customerIdFailureAt = null;
-        localStorage.setItem(CUSTOMER_ID_STORAGE_KEY, id);
+        // A manual rotation publishes once when its pending fence is lifted.
+        if (!this.rotationInFlight) this.notifyCustomerIdChanged();
       } else {
         markFailure();
       }
@@ -486,8 +598,38 @@ class KlipyClient {
     }
   }
 
+  private async retryTemporaryReadAfterRollover<T>(read: () => Promise<T>): Promise<T> {
+    const startedOff = !this.personalizationEnabled;
+    const generation = this.customerIdGeneration;
+    const selection = captureRuntimeServerSelection();
+    try {
+      return await read();
+    } catch (err) {
+      // A temporary ID can rotate while auth IPC is pending. Retry once with
+      // the current ID, but never carry a read across a mode or server change.
+      if (
+        !(err instanceof KlipyIdentityChangedError) ||
+        !startedOff ||
+        this.personalizationEnabled ||
+        generation !== this.customerIdGeneration ||
+        !runtimeServerSelectionIsCurrent(selection)
+      ) {
+        throw err;
+      }
+      return read();
+    }
+  }
+
   async trending(page: number, perPage: number, locale?: string): Promise<KlipyListResponse> {
-    const customerId = await this.getCustomerID();
+    return this.retryTemporaryReadAfterRollover(() => this.trendingOnce(page, perPage, locale));
+  }
+
+  private async trendingOnce(
+    page: number,
+    perPage: number,
+    locale?: string
+  ): Promise<KlipyListResponse> {
+    const { id: customerId, assertBeforeDispatch } = await this.customerIdForRead();
     const params = this.withCustomerID(
       new URLSearchParams({
         page: String(page),
@@ -498,7 +640,11 @@ class KlipyClient {
     if (locale) params.set('locale', locale);
     params.set('format_filter', 'mp4,gif,webp');
 
-    const res = await this.doFetch(`/gifs/trending?${params.toString()}`);
+    const res = await this.doFetch(
+      `/gifs/trending?${params.toString()}`,
+      undefined,
+      assertBeforeDispatch
+    );
     if (!res.ok) throw new Error(`KLIPY trending failed: ${res.status}`);
     return (await res.json()) as KlipyListResponse;
   }
@@ -509,7 +655,16 @@ class KlipyClient {
     perPage: number,
     locale?: string
   ): Promise<KlipyListResponse> {
-    const customerId = await this.getCustomerID();
+    return this.retryTemporaryReadAfterRollover(() => this.searchOnce(q, page, perPage, locale));
+  }
+
+  private async searchOnce(
+    q: string,
+    page: number,
+    perPage: number,
+    locale?: string
+  ): Promise<KlipyListResponse> {
+    const { id: customerId, assertBeforeDispatch } = await this.customerIdForRead();
     const params = this.withCustomerID(
       new URLSearchParams({
         q,
@@ -521,7 +676,11 @@ class KlipyClient {
     if (locale) params.set('locale', locale);
     params.set('format_filter', 'mp4,gif,webp');
 
-    const res = await this.doFetch(`/gifs/search?${params.toString()}`);
+    const res = await this.doFetch(
+      `/gifs/search?${params.toString()}`,
+      undefined,
+      assertBeforeDispatch
+    );
     if (!res.ok) throw new Error(`KLIPY search failed: ${res.status}`);
     return (await res.json()) as KlipyListResponse;
   }
@@ -551,6 +710,8 @@ class KlipyClient {
       this.customerIdFailureAt = null;
     }
 
+    const selection = captureRuntimeServerSelection();
+    const generation = this.customerIdGeneration;
     const customerId = await this.getCustomerID();
     // Re-read the flag AFTER the await, as the original implementation did.
     // Opting out while /customer-id is in flight must not send the stable
@@ -558,9 +719,24 @@ class KlipyClient {
     if (!this.personalizationEnabled) {
       return { data: [], has_more: false };
     }
-    if (!customerId) {
+    if (
+      !customerId ||
+      !runtimeServerSelectionIsCurrent(selection) ||
+      generation !== this.customerIdGeneration ||
+      customerId !== this.getCurrentCustomerId()
+    ) {
       throw new KlipyIdentityError();
     }
+    const assertBeforeDispatch = (): void => {
+      if (
+        !this.personalizationEnabled ||
+        !runtimeServerSelectionIsCurrent(selection) ||
+        generation !== this.customerIdGeneration ||
+        customerId !== this.getCurrentCustomerId()
+      ) {
+        throw new KlipyIdentityError();
+      }
+    };
 
     const params = new URLSearchParams({
       page: String(page),
@@ -570,7 +746,9 @@ class KlipyClient {
     // this keeps a future edit that reintroduces an unvalidated id from
     // re-opening the path-interpolation class.
     const res = await this.doFetch(
-      `/gifs/recent/${encodeURIComponent(customerId)}?${params.toString()}`
+      `/gifs/recent/${encodeURIComponent(customerId)}?${params.toString()}`,
+      undefined,
+      assertBeforeDispatch
     );
     if (!res.ok) throw new Error(`KLIPY recent failed: ${res.status}`);
     return (await res.json()) as KlipyListResponse;
@@ -587,10 +765,32 @@ class KlipyClient {
   }
 
   async getBySlug(slug: string): Promise<KlipyGifItem | null> {
-    const customerId = await this.getCustomerID();
+    const selection = captureRuntimeServerSelection();
+    try {
+      return await this.getBySlugOnce(slug);
+    } catch (err) {
+      // A privacy-mode change or temporary-ID rollover can cancel a read
+      // before dispatch. Retry once with the current ID on the same server so
+      // visible embeds and saved GIFs do not become permanent load errors.
+      if (
+        !(err instanceof KlipyIdentityChangedError) ||
+        !runtimeServerSelectionIsCurrent(selection)
+      ) {
+        throw err;
+      }
+      return this.getBySlugOnce(slug);
+    }
+  }
+
+  private async getBySlugOnce(slug: string): Promise<KlipyGifItem | null> {
+    const { id: customerId, assertBeforeDispatch } = await this.customerIdForRead();
     const params = this.withCustomerID(new URLSearchParams({ slugs: slug }), customerId);
     params.set('format_filter', 'mp4,gif,webp');
-    const res = await this.doFetch(`/gifs/items?${params.toString()}`);
+    const res = await this.doFetch(
+      `/gifs/items?${params.toString()}`,
+      undefined,
+      assertBeforeDispatch
+    );
     if (!res.ok) return null;
     const data = (await res.json()) as KlipyListResponse;
     let items: KlipyGifItem[] = [];
@@ -632,27 +832,31 @@ class KlipyClient {
       // would create a PERSISTENT upstream write keyed to an id we promise is
       // ephemeral, where today only transient reads carry it. The Recent tab
       // is hidden in that mode, so the ledger entry has no user-visible
-      // purpose. Share still fires — just unattributed.
-      // DEFENSIVE AND UNVERIFIED BY TEST — see the note in klipyClient.test.ts.
-      // The recent() equivalent is falsified and covers the same class; this
-      // one could not be staged, because disabling personalization clears the
-      // in-flight handle and the continuation resolves null either way.
+      // purpose. A share begun with personalization off is unattributed.
       //
       // Re-read the flag AFTER the await. A check made before it does not hold
       // after it: the user can disable personalization while /customer-id is
       // still in flight, and attaching the resolved id then would create a
       // PERSISTENT upstream ledger entry keyed to a user who has just opted
-      // out. Share still fires — just unattributed.
+      // out. If the choice changes later during auth IPC, the dispatch guard
+      // cancels the stale request before it reaches the network.
       // Fence the whole continuation, not just the identifier. Rejecting a
       // stale id still leaves the SHARE itself — the slug, and the search term
       // in ctx.q — being POSTed to whichever server is current after the await.
       // A user who switches instances mid-share would hand the query they typed
       // on server A to server B.
       const selection = captureRuntimeServerSelection();
+      const generation = this.customerIdGeneration;
       let customerId: string | null = null;
       if (this.personalizationEnabled) {
         const resolved = await this.getCustomerID();
-        if (this.personalizationEnabled) customerId = resolved;
+        if (this.personalizationEnabled) {
+          // A newer rotation or an off/on transition invalidates this share.
+          if (generation !== this.customerIdGeneration) return;
+          // A failed manual rotation restores the saved ID. Use that still-active
+          // ID rather than writing an unattributed share outside its Recent list.
+          customerId = resolved ?? this.getCurrentCustomerId();
+        }
       }
       if (!runtimeServerSelectionIsCurrent(selection)) return;
 
@@ -665,7 +869,17 @@ class KlipyClient {
 
       const qs = params.toString();
       const path = qs ? `/gifs/share/${slug}?${qs}` : `/gifs/share/${slug}`;
-      const res = await this.doFetch(path, { method: 'POST' });
+      const res = await this.doFetch(path, { method: 'POST' }, () => {
+        if (
+          !runtimeServerSelectionIsCurrent(selection) ||
+          (customerId !== null &&
+            (!this.personalizationEnabled ||
+              generation !== this.customerIdGeneration ||
+              customerId !== this.getCurrentCustomerId()))
+        ) {
+          throw new Error('GIF share canceled because the privacy setting or server changed.');
+        }
+      });
 
       if (!res.ok) {
         // Never log the slug.

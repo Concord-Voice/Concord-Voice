@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import ToggleSwitch from './ToggleSwitch';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { klipyClient } from '../../services/messaging/gifProvider/klipyClient';
+import {
+  captureRuntimeServerSelection,
+  onRuntimeServerSelectionChange,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/system/runtimeServerBase';
+
+const subscribeCustomerId = (listener: () => void): (() => void) =>
+  klipyClient.subscribeCustomerId(listener);
+const getCustomerIdSnapshot = (): string | null => klipyClient.getCurrentCustomerId();
 
 function gifAutoLoadHint(enabled: boolean): string {
   return enabled
@@ -11,35 +20,109 @@ function gifAutoLoadHint(enabled: boolean): string {
 
 function gifPersonalizationHint(enabled: boolean): string {
   return enabled
-    ? 'Concord sends a stable per-device ID to KLIPY so the GIF picker can show you personalized recent and trending results. Concord derives that ID with a server-held secret, so KLIPY cannot connect it to your Concord account or to any personally identifiable information.'
-    : 'GIF picker results are not personalized. A rotating ephemeral ID is used so KLIPY cannot build a persistent profile. The Recent tab is hidden because it requires a stable ID to function.';
+    ? 'Concord uses the Personalization ID below to make a separate ID for KLIPY. KLIPY receives that ID with GIF browsing and shares. That links your GIF shares to your Recent list. KLIPY receives neither your Concord account ID nor the ID shown here.'
+    : 'GIF browsing uses a temporary ID that changes about every 30 minutes. Recent GIFs are unavailable. KLIPY can still connect requests made with the same temporary ID.';
 }
 
 function personalizationIdHint(enabled: boolean): string {
   return enabled
-    ? 'Your stable per-device personalization key. KLIPY never receives this value itself. Rotating it starts a fresh personalization history.'
-    : 'Ephemeral key — rotates automatically every 30 minutes. KLIPY never receives this value itself; rotating starts a fresh, unlinkable history immediately.';
+    ? 'This value helps make the ID KLIPY sees. Rotate it to start a new Recent list. Turning personalization off keeps this ID for when you turn it back on.'
+    : 'This temporary value changes about every 30 minutes. Rotate it to change it now. Your earlier Recent GIFs are unavailable while personalization is off.';
 }
+
+const ROTATION_BUTTON_COPY = {
+  idle: { title: 'Generate a new personalization ID', label: 'Rotate' },
+  pending: { title: 'Rotating personalization ID', label: 'Rotating…' },
+  done: { title: 'Rotate cooldown active', label: 'Rotated' },
+} as const;
 
 const ContentSafetyControls = () => {
   const privacySettings = usePrivacyStore((s) => s.settings);
+  const privacyLoaded = usePrivacyStore((s) => s.loaded);
+  const privacyError = usePrivacyStore((s) => s.error);
+  const fetchPrivacy = usePrivacyStore((s) => s.fetchPrivacy);
   const updatePrivacy = usePrivacyStore((s) => s.updatePrivacy);
-  const [displayedCustomerId, setDisplayedCustomerId] = useState<string | null>(null);
-  const [isRotatingId, setIsRotatingId] = useState(false);
+  const displayedCustomerId = useSyncExternalStore(subscribeCustomerId, getCustomerIdSnapshot);
+  const [rotationState, setRotationState] = useState<'idle' | 'pending' | 'done'>('idle');
+  const rotationButtonCopy = ROTATION_BUTTON_COPY[rotationState];
+  const [rotationError, setRotationError] = useState<string | null>(null);
+  const [idLoadFailed, setIdLoadFailed] = useState(false);
   const rotationCooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contextEpochRef = useRef(0);
+
+  const invalidateIdUi = useCallback(() => {
+    contextEpochRef.current += 1;
+    if (rotationCooldownRef.current !== null) {
+      clearTimeout(rotationCooldownRef.current);
+      rotationCooldownRef.current = null;
+    }
+    /* eslint-disable @eslint-react/set-state-in-effect -- a mode or server change must clear the prior rotation result */
+    setRotationState('idle');
+    setRotationError(null);
+    setIdLoadFailed(false);
+    /* eslint-enable @eslint-react/set-state-in-effect -- reset complete */
+  }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: refreshes displayedCustomerId when GIF provider personalization setting changes; not a render loop
-    setDisplayedCustomerId(klipyClient.getCurrentCustomerId());
-  }, [privacySettings.sharePersonalizationWithGifProvider]);
+    let active = true;
+    invalidateIdUi();
+    if (!privacyLoaded) {
+      // The pre-fetch ON value is a placeholder, not the account's preference.
+      klipyClient.setPersonalizationEnabled(false);
+      return;
+    }
+    klipyClient.setPersonalizationEnabled(privacySettings.sharePersonalizationWithGifProvider);
+    const loadId = (): void => {
+      const selection = captureRuntimeServerSelection();
+      const contextEpoch = contextEpochRef.current;
+      void klipyClient
+        .getCustomerID()
+        .then((id) => {
+          if (
+            active &&
+            contextEpoch === contextEpochRef.current &&
+            runtimeServerSelectionIsCurrent(selection) &&
+            !id
+          ) {
+            setIdLoadFailed(true);
+          }
+        })
+        .catch(() => {
+          if (
+            active &&
+            contextEpoch === contextEpochRef.current &&
+            runtimeServerSelectionIsCurrent(selection)
+          ) {
+            setIdLoadFailed(true);
+          }
+        });
+    };
+    loadId();
+    const unsubscribeServer = onRuntimeServerSelectionChange(() => {
+      invalidateIdUi();
+      loadId();
+    });
+    return () => {
+      active = false;
+      contextEpochRef.current += 1;
+      unsubscribeServer();
+    };
+  }, [invalidateIdUi, privacyLoaded, privacySettings.sharePersonalizationWithGifProvider]);
 
   const handleRotateCustomerId = useCallback(async () => {
-    setIsRotatingId(true);
+    const contextEpoch = ++contextEpochRef.current;
+    setRotationError(null);
+    setRotationState('pending');
     try {
-      const newId = await klipyClient.rotateCustomerId();
-      setDisplayedCustomerId(newId);
-    } finally {
-      rotationCooldownRef.current = setTimeout(() => setIsRotatingId(false), 3_000);
+      await klipyClient.rotateCustomerId();
+      if (contextEpoch !== contextEpochRef.current) return;
+      setIdLoadFailed(false);
+      setRotationState('done');
+      rotationCooldownRef.current = setTimeout(() => setRotationState('idle'), 3_000);
+    } catch {
+      if (contextEpoch !== contextEpochRef.current) return;
+      setRotationError('Could not rotate the Personalization ID. Please try again.');
+      setRotationState('idle');
     }
   }, []);
 
@@ -50,6 +133,26 @@ const ContentSafetyControls = () => {
       }
     };
   }, []);
+
+  if (!privacyLoaded) {
+    return (
+      <>
+        <h3 className="settings-subsection-title" style={{ marginTop: 20 }}>
+          Content Safety
+        </h3>
+        {privacyError ? (
+          <div role="alert" className="settings-row-hint">
+            Could not load privacy settings.{' '}
+            <button type="button" onClick={() => void fetchPrivacy()}>
+              Retry
+            </button>
+          </div>
+        ) : (
+          <output className="settings-row-hint">Loading privacy settings…</output>
+        )}
+      </>
+    );
+  }
 
   return (
     <>
@@ -97,7 +200,10 @@ const ContentSafetyControls = () => {
         </div>
         <ToggleSwitch
           checked={privacySettings.sharePersonalizationWithGifProvider}
-          onChange={(v) => updatePrivacy({ sharePersonalizationWithGifProvider: v })}
+          onChange={(v) => {
+            invalidateIdUi();
+            updatePrivacy({ sharePersonalizationWithGifProvider: v });
+          }}
         />
       </div>
 
@@ -112,15 +218,19 @@ const ContentSafetyControls = () => {
               {displayedCustomerId}
             </span>
           )}
+          {!displayedCustomerId && idLoadFailed && (
+            <span role="alert">Could not load the Personalization ID. Please try Rotate.</span>
+          )}
+          {rotationError && <span role="alert">{rotationError}</span>}
         </div>
         <button
           type="button"
           className="settings-rotate-id-btn"
           onClick={handleRotateCustomerId}
-          disabled={isRotatingId}
-          title={isRotatingId ? 'Rotate cooldown active' : 'Generate a new personalization ID'}
+          disabled={rotationState !== 'idle'}
+          title={rotationButtonCopy.title}
         >
-          {isRotatingId ? 'Rotated' : 'Rotate'}
+          {rotationButtonCopy.label}
         </button>
       </div>
     </>

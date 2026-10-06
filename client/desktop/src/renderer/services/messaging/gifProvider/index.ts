@@ -18,9 +18,13 @@
 
 import type { GifProvider } from './types';
 import { klipyProvider } from './klipyProvider';
+import { klipyClient } from './klipyClient';
 import { usePrivacyStore } from '../../../stores/ui/privacyStore';
 
 export const gifProvider: GifProvider = klipyProvider;
+export const subscribeGifIdentity = (listener: () => void): (() => void) =>
+  klipyClient.subscribeCustomerId(listener);
+export const getGifIdentityRevision = (): number => klipyClient.getCustomerIdRevision();
 export type {
   GifProvider,
   GifResolved,
@@ -32,10 +36,12 @@ export type {
 // Apply current settings immediately, then subscribe to future changes.
 // Note: KLIPY traffic is ALWAYS proxied through the control-plane now —
 // the legacy "Privacy Mode" toggle no longer has any effect on routing.
-const applySettings = (settings: ReturnType<typeof usePrivacyStore.getState>['settings']): void => {
-  gifProvider.setPersonalizationEnabled(settings.sharePersonalizationWithGifProvider);
+const applySettings = (state: ReturnType<typeof usePrivacyStore.getState>): void => {
+  // The initial ON value is only a placeholder until the server confirms the
+  // account's preference. Do not mint or send a stable ID from that placeholder.
+  gifProvider.setPersonalizationEnabled(
+    state.loaded && state.settings.sharePersonalizationWithGifProvider
+  );
 };
-applySettings(usePrivacyStore.getState().settings);
-usePrivacyStore.subscribe((state) => {
-  applySettings(state.settings);
-});
+applySettings(usePrivacyStore.getState());
+usePrivacyStore.subscribe(applySettings);

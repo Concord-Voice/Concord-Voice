@@ -1,6 +1,3 @@
-import { resetAllStores } from '../../../helpers/store-helpers';
-import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
-
 // Mock the underlying provider so we can verify the wiring without doing
 // any actual KLIPY work.
 const setPersonalizationEnabledMock = vi.fn();
@@ -23,7 +20,7 @@ vi.mock('@/renderer/services/messaging/gifProvider/klipyProvider', () => ({
 
 describe('gifProvider index', () => {
   beforeEach(() => {
-    resetAllStores();
+    vi.resetModules();
     setPersonalizationEnabledMock.mockReset();
   });
 
@@ -33,32 +30,46 @@ describe('gifProvider index', () => {
     expect(gifProvider.name).toBe('KLIPY');
   });
 
-  it('applies current privacy settings to the provider on import', async () => {
-    // Set non-default privacy values BEFORE the import to verify the
-    // applySettings call inside index.ts picks them up
+  it('does not enable personalization from the unconfirmed ON placeholder', async () => {
+    const { usePrivacyStore } = await import('@/renderer/stores/ui/privacyStore');
+    expect(usePrivacyStore.getState().loaded).toBe(false);
+    expect(usePrivacyStore.getState().settings.sharePersonalizationWithGifProvider).toBe(true);
+
+    await import('@/renderer/services/messaging/gifProvider');
+    expect(setPersonalizationEnabledMock).toHaveBeenLastCalledWith(false);
+  });
+
+  it('applies confirmed privacy settings to the provider on import', async () => {
+    const { usePrivacyStore } = await import('@/renderer/stores/ui/privacyStore');
     usePrivacyStore.setState({
+      loaded: true,
       settings: {
         ...usePrivacyStore.getState().settings,
-        sharePersonalizationWithGifProvider: false,
+        sharePersonalizationWithGifProvider: true,
       },
     });
-    // Re-import to trigger the module-level subscribe
-    vi.resetModules();
+
     await import('@/renderer/services/messaging/gifProvider');
-    expect(setPersonalizationEnabledMock).toHaveBeenCalledWith(false);
+    expect(setPersonalizationEnabledMock).toHaveBeenLastCalledWith(true);
   });
 
   it('forwards subsequent privacy store updates to the provider', async () => {
-    vi.resetModules();
+    const { usePrivacyStore } = await import('@/renderer/stores/ui/privacyStore');
     await import('@/renderer/services/messaging/gifProvider');
     setPersonalizationEnabledMock.mockClear();
-    // Trigger a store update
+
+    usePrivacyStore.setState({ loaded: true });
+    expect(setPersonalizationEnabledMock).toHaveBeenLastCalledWith(true);
+
     usePrivacyStore.setState({
       settings: {
         ...usePrivacyStore.getState().settings,
         sharePersonalizationWithGifProvider: false,
       },
     });
-    expect(setPersonalizationEnabledMock).toHaveBeenCalledWith(false);
+    expect(setPersonalizationEnabledMock).toHaveBeenLastCalledWith(false);
+
+    usePrivacyStore.setState({ loaded: false });
+    expect(setPersonalizationEnabledMock).toHaveBeenLastCalledWith(false);
   });
 });

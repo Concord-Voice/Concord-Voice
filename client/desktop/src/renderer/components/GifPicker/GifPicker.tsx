@@ -1,7 +1,17 @@
-import React, { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
+import React, {
+  useState,
+  useCallback,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useSyncExternalStore,
+} from 'react';
 import { Save, X, Search, AlertTriangle } from 'lucide-react';
 import {
   gifProvider,
+  getGifIdentityRevision,
+  subscribeGifIdentity,
   type GifResolved,
   type GifCategory,
   type GifCategoryPreview,
@@ -271,8 +281,9 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   // slug can contain one and two different lists cannot collide on one key.
   const savedSlugKey = useSavedGifsStore((s) => s.gifs.map((g) => g.slug).join('\u0000'));
   const sharePersonalization = usePrivacyStore(
-    (s) => s.settings.sharePersonalizationWithGifProvider
+    (s) => s.loaded && s.settings.sharePersonalizationWithGifProvider
   );
+  const gifIdentityRevision = useSyncExternalStore(subscribeGifIdentity, getGifIdentityRevision);
 
   // Match the runtime theme (light/dark) used by document.documentElement —
   // settings.theme can be "system", so resolve via the same media query the
@@ -364,6 +375,16 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   }, [searchTerm]);
 
   const isSearching = debouncedSearchTerm.length > 0;
+  const recentUnavailable = activeTab === 'recent' && !sharePersonalization;
+  const effectiveTab: Tab = recentUnavailable ? 'trending' : activeTab;
+
+  useEffect(() => {
+    if (recentUnavailable) {
+      forceRecentRef.current = false;
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- the Recent tab was removed by a privacy change
+      setActiveTab('trending');
+    }
+  }, [recentUnavailable]);
 
   // The saved list drives a fetch only while the Saved tab is the thing
   // rendering it. On any other tab, saving must not disturb what is on screen.
@@ -372,7 +393,10 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   // isSearching are separate entries in the dependency array below, so every
   // transition through the collision re-runs the effect regardless. Keep all
   // three deps together.
-  const savedFetchKey = activeTab === 'saved' && !isSearching ? savedSlugKey : '';
+  const savedFetchKey = effectiveTab === 'saved' && !isSearching ? savedSlugKey : '';
+  // Mode changes refetch every active view. A new saved ID also refreshes an
+  // already-open picker after Rotate without refetching on each off-mode tick.
+  const identityFetchKey = sharePersonalization ? gifIdentityRevision : 'off';
 
   // Fetch content based on active tab + search state
   useEffect(() => {
@@ -414,17 +438,17 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
       };
     }
 
-    if (activeTab === 'trending') {
+    if (effectiveTab === 'trending') {
       gifProvider
         .trending({ offset: 0, limit: PAGE_SIZE })
         .then((r) => finish(r.items))
         .catch(() => fail("Couldn't load trending GIFs."));
-    } else if (activeTab === 'recent') {
+    } else if (effectiveTab === 'recent') {
       gifProvider
         .recent({ offset: 0, limit: PAGE_SIZE, force: consumeForceRecent() })
         .then((r) => finish(r.items))
         .catch(() => fail("Couldn't load your recent GIFs."));
-    } else if (activeTab === 'categories') {
+    } else if (effectiveTab === 'categories') {
       gifProvider
         .categories({})
         .then((cats) => {
@@ -435,7 +459,7 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
           }
         })
         .catch(() => fail("Couldn't load categories."));
-    } else if (activeTab === 'saved') {
+    } else if (effectiveTab === 'saved') {
       // Read the array here rather than subscribing to it. getState() can be
       // NEWER than the savedFetchKey that scheduled this run — a write landing
       // between the render that computed the key and the effect flush does
@@ -468,7 +492,7 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
     return () => {
       cancelled = true;
     };
-  }, [activeTab, isSearching, debouncedSearchTerm, savedFetchKey, retryNonce]);
+  }, [effectiveTab, isSearching, debouncedSearchTerm, savedFetchKey, retryNonce, identityFetchKey]);
 
   const handleGifClick = useCallback(
     (gif: GifResolved) => {
@@ -566,8 +590,8 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
           {visibleTabs.map((tab) => (
             <button
               key={tab}
-              className={`gif-picker-tab ${activeTab === tab && !isSearching ? 'active' : ''}`}
-              aria-pressed={activeTab === tab && !isSearching}
+              className={`gif-picker-tab ${effectiveTab === tab && !isSearching ? 'active' : ''}`}
+              aria-pressed={effectiveTab === tab && !isSearching}
               onClick={() => {
                 setActiveTab(tab);
                 setSearchTerm('');
@@ -600,18 +624,18 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
 
       <div className="gif-picker-body">
         <PickerBody
-          loading={loading}
+          loading={recentUnavailable ? true : loading}
           error={error}
           isSearching={isSearching}
           debouncedSearchTerm={debouncedSearchTerm}
-          activeTab={activeTab}
-          items={items}
+          activeTab={effectiveTab}
+          items={recentUnavailable ? [] : items}
           categories={categories}
           onGifClick={handleGifClick}
           onCategoryClick={handleCategoryClick}
           onRetry={() => {
             // Only a retry ON the Recent tab may clear the identity backoff.
-            if (activeTab === 'recent' && !isSearching) forceRecentRef.current = true;
+            if (effectiveTab === 'recent' && !isSearching) forceRecentRef.current = true;
             setRetryNonce((n) => n + 1);
           }}
         />

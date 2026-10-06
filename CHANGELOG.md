@@ -18,6 +18,7 @@ also includes a patched source-map-js dependency.
 
 ### Changed
 
+- GIF personalization now uses the Personalization ID shown in Settings to derive the separate ID sent to KLIPY. When personalization is off, GIF browsing requests use a temporary ID that changes about every 30 minutes; sharing a GIF does not send that ID. Turning personalization back on resumes the saved Personalization ID unless you rotate it. The Recent tab is available only while personalization is on. After you click Rotate while personalization is on, requests using your saved ID wait for the new ID, which starts a new Recent list. An open GIF picker refreshes when the setting or saved ID changes.
 - Webcam speaker frames stay at a fixed size and show a steady accent highlight during voice calls. Avatar frames keep their speaking pulse ([#3595](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3595), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - Refreshed the desktop icon library to lucide-react 1.48.0 ([PR #3645](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3645)).
 

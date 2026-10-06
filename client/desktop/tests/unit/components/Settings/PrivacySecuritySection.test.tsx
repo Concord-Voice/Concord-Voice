@@ -3,6 +3,11 @@ import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
 import { vi } from 'vitest';
 
+const gifIdMock = vi.hoisted(() => ({
+  currentId: 'mock-customer-id-123' as string | null,
+  listeners: new Set<() => void>(),
+}));
+
 const mockApiFetch = vi.fn();
 // SSO-identities GET fixture for LinkedAccountsList (issue #270 / Task 20).
 // Defined before the vi.mock factory so the factory can capture it; the
@@ -148,8 +153,18 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 }));
 vi.mock('@/renderer/services/messaging/gifProvider/klipyClient', () => ({
   klipyClient: {
-    getCurrentCustomerId: vi.fn(() => 'mock-customer-id-123'),
-    rotateCustomerId: vi.fn(() => Promise.resolve('mock-rotated-id-456')),
+    getCurrentCustomerId: vi.fn(() => gifIdMock.currentId),
+    getCustomerID: vi.fn(() => Promise.resolve(gifIdMock.currentId)),
+    setPersonalizationEnabled: vi.fn(),
+    subscribeCustomerId: vi.fn((listener: () => void) => {
+      gifIdMock.listeners.add(listener);
+      return () => gifIdMock.listeners.delete(listener);
+    }),
+    rotateCustomerId: vi.fn(async () => {
+      gifIdMock.currentId = 'mock-rotated-id-456';
+      for (const listener of gifIdMock.listeners) listener();
+      return gifIdMock.currentId;
+    }),
   },
 }));
 vi.mock('@/renderer/components/Settings/MFATierSelector', () => ({
@@ -312,6 +327,8 @@ function drainOnceQueues(): void {
 
 describe('PrivacySecuritySection', () => {
   beforeEach(() => {
+    gifIdMock.currentId = 'mock-customer-id-123';
+    gifIdMock.listeners.clear();
     vi.clearAllMocks();
     drainOnceQueues();
     mockApiFetch
@@ -1321,6 +1338,7 @@ describe('PrivacySecuritySection', () => {
           searchableByPhone: false,
           allowEmbeddedContent: false,
         },
+        loaded: true,
         fetchPrivacy: mockFetchPrivacy,
         updatePrivacy: mockUpdatePrivacy,
       })
@@ -1422,14 +1440,15 @@ describe('PrivacySecuritySection', () => {
           loadGifsAutomatically: false,
           sharePersonalizationWithGifProvider: false,
         },
+        loaded: true,
         fetchPrivacy: mockFetchPrivacy,
         updatePrivacy: mockUpdatePrivacy,
       })
     );
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText(/Click to load/)).toBeInTheDocument());
-    expect(screen.getByText(/GIF picker results are not personalized/)).toBeInTheDocument();
-    expect(screen.getByText(/Ephemeral key — rotates automatically/)).toBeInTheDocument();
+    expect(screen.getByText(/GIF browsing uses a temporary ID/)).toBeInTheDocument();
+    expect(screen.getByText(/This temporary value changes/)).toBeInTheDocument();
   });
 
   // ── Mode change modal ──────────────────────────────────────────────────
@@ -1489,6 +1508,7 @@ describe('PrivacySecuritySection', () => {
           loadGifsAutomatically: true,
           sharePersonalizationWithGifProvider: true,
         },
+        loaded: true,
         fetchPrivacy: mockFetchPrivacy,
         updatePrivacy: mockUpdatePrivacy,
       })
@@ -1522,6 +1542,7 @@ describe('PrivacySecuritySection', () => {
           loadGifsAutomatically: true,
           sharePersonalizationWithGifProvider: true,
         },
+        loaded: true,
         fetchPrivacy: mockFetchPrivacy,
         updatePrivacy: mockUpdatePrivacy,
       })

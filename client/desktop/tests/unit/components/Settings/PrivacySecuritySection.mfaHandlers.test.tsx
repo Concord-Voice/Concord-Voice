@@ -114,6 +114,9 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 vi.mock('@/renderer/services/messaging/gifProvider/klipyClient', () => ({
   klipyClient: {
     getCurrentCustomerId: vi.fn(() => 'mock-customer-id-123'),
+    getCustomerID: vi.fn(() => Promise.resolve('mock-customer-id-123')),
+    setPersonalizationEnabled: vi.fn(),
+    subscribeCustomerId: vi.fn(() => () => {}),
     rotateCustomerId: vi.fn(() => Promise.resolve('mock-rotated-id-456')),
   },
 }));
