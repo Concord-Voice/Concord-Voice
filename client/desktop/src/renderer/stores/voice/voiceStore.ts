@@ -27,6 +27,8 @@ function loadPersistedSettings(): Partial<PersistedVoiceSettings> {
     const raw = localStorage.getItem(VOICE_SETTINGS_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Partial<PersistedVoiceSettings>;
+    if (parsed.audioInputDeviceId === 'default') parsed.audioInputDeviceId = '';
+    if (parsed.audioOutputDeviceId === 'default') parsed.audioOutputDeviceId = '';
     // Migrate old tier name → new tier name
     if ((parsed.qualityTier as string) === 'voice') parsed.qualityTier = 'low';
     // Every AUDIO_QUALITY_TIERS[qualityTier] lookup in Settings throws on a tier it does
@@ -465,6 +467,8 @@ interface VoiceState {
   setActiveSpeaker: (userId: string | null) => void;
   setAudioInputDevice: (deviceId: string) => void;
   setAudioOutputDevice: (deviceId: string) => void;
+  joinError: string | null;
+  setJoinError: (error: string | null) => void;
   setVideoDevice: (deviceId: string) => void;
   setQualityTier: (tier: AudioQualityTier) => void;
   setEffectiveQualityTier: (tier: AudioQualityTier) => void;
@@ -611,6 +615,7 @@ const initialState = {
   activeChannelName: null as string | null,
   activeServerId: null as string | null,
   connectionState: 'disconnected' as VoiceConnectionState,
+  joinError: null as string | null,
   isMuted: false,
   isDeafened: false,
   isVideoOn: false,
@@ -762,6 +767,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),
   setActiveSpeaker: (activeSpeakerId) => set({ activeSpeakerId }),
   setAudioInputDevice: (audioInputDeviceId) => {
+    if (audioInputDeviceId === 'default') audioInputDeviceId = '';
     set({ audioInputDeviceId });
     const s = useVoiceStore.getState();
     savePersistedSettings({
@@ -772,6 +778,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
     });
   },
   setAudioOutputDevice: (audioOutputDeviceId) => {
+    if (audioOutputDeviceId === 'default') audioOutputDeviceId = '';
     set({ audioOutputDeviceId });
     const s = useVoiceStore.getState();
     savePersistedSettings({
@@ -801,6 +808,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       qualityTier,
     });
   },
+  setJoinError: (joinError) => set({ joinError }),
   setEffectiveQualityTier: (effectiveQualityTier) => set({ effectiveQualityTier }),
   setDecoderHealth: (decoderHealth) => set({ decoderHealth }),
   setPacketLoss: (percent, warningThreshold = 3) => {

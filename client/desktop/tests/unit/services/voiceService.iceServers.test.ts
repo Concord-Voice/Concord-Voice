@@ -418,7 +418,13 @@ function makeSendTransportWithEvents(stats: Map<string, unknown>) {
     id: 'send-1',
     closed: false,
     close: vi.fn(),
-    produce: vi.fn().mockResolvedValue({ id: 'prod-mic', close: vi.fn(), on: vi.fn() }),
+    produce: vi.fn().mockResolvedValue({
+      id: 'prod-mic',
+      close: vi.fn(),
+      pause: vi.fn(),
+      resume: vi.fn(),
+      on: vi.fn(),
+    }),
     on: vi.fn((event: string, cb: (...a: unknown[]) => void) => {
       (handlers[event] ??= []).push(cb);
     }),

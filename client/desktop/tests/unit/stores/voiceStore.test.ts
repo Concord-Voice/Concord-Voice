@@ -49,6 +49,7 @@ describe('voiceStore', () => {
     it('reset clears voice state', () => {
       useVoiceStore.getState().setActiveChannel('voice-1', 'General', 'server-1');
       useVoiceStore.getState().addParticipant(mockParticipant);
+      useVoiceStore.getState().setJoinError('Choose another microphone and try again.');
 
       useVoiceStore.getState().reset();
 
@@ -56,6 +57,7 @@ describe('voiceStore', () => {
       expect(state.activeChannelId).toBeNull();
       expect(Object.keys(state.participants)).toHaveLength(0);
       expect(state.connectionState).toBe('disconnected');
+      expect(state.joinError).toBeNull();
     });
   });
 
@@ -141,6 +143,50 @@ describe('voiceStore', () => {
     it('sets video device', () => {
       useVoiceStore.getState().setVideoDevice('cam-1');
       expect(useVoiceStore.getState().videoDeviceId).toBe('cam-1');
+    });
+
+    it.each([
+      {
+        kind: 'input',
+        setDevice: 'setAudioInputDevice' as const,
+        field: 'audioInputDeviceId' as const,
+      },
+      {
+        kind: 'output',
+        setDevice: 'setAudioOutputDevice' as const,
+        field: 'audioOutputDeviceId' as const,
+      },
+    ])('normalizes the literal default alias from the $kind setter', ({ setDevice, field }) => {
+      useVoiceStore.setState({
+        audioInputDeviceId: 'mic-usb',
+        audioOutputDeviceId: 'speaker-usb',
+        videoDeviceId: 'camera-usb',
+        qualityTier: 'hifi',
+      });
+
+      useVoiceStore.getState()[setDevice]('default');
+
+      const state = useVoiceStore.getState();
+      const persisted = JSON.parse(localStorage.getItem('concord:voice-settings') ?? '{}');
+      expect(state[field]).toBe('');
+      expect(persisted[field]).toBe('');
+      expect(persisted.videoDeviceId).toBe('camera-usb');
+      expect(persisted.qualityTier).toBe('hifi');
+      expect(
+        persisted[field === 'audioInputDeviceId' ? 'audioOutputDeviceId' : 'audioInputDeviceId']
+      ).toBe(field === 'audioInputDeviceId' ? 'speaker-usb' : 'mic-usb');
+    });
+
+    it('preserves communications device choices when audio setters persist selection', () => {
+      useVoiceStore.getState().setAudioInputDevice('communications');
+      useVoiceStore.getState().setAudioOutputDevice('communications');
+
+      const state = useVoiceStore.getState();
+      const persisted = JSON.parse(localStorage.getItem('concord:voice-settings') ?? '{}');
+      expect(state.audioInputDeviceId).toBe('communications');
+      expect(state.audioOutputDeviceId).toBe('communications');
+      expect(persisted.audioInputDeviceId).toBe('communications');
+      expect(persisted.audioOutputDeviceId).toBe('communications');
     });
   });
 

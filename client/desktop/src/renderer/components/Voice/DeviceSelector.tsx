@@ -48,7 +48,11 @@ const DeviceSelector: React.FC<DeviceSelectorProps> = ({ kind }) => {
     const enumerate = async () => {
       try {
         const allDevices = await navigator.mediaDevices.enumerateDevices();
-        setDevices(allDevices.filter((d) => d.kind === kind));
+        setDevices(
+          allDevices.filter(
+            (d) => d.kind === kind && !(kind !== 'videoinput' && d.deviceId === 'default')
+          )
+        );
       } catch {
         // Permission denied or not available
       }

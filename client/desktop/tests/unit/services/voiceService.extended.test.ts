@@ -2448,19 +2448,6 @@ describe('VoiceService Extended', () => {
   // ===== produceVideo with pre-acquired stream =====
 
   describe('produceAudio', () => {
-    it('uses pre-acquired stream', async () => {
-      const { sendTransport } = await joinVoiceChannel();
-      const svc = voiceService as any;
-      const preStream = createMockMediaStream([{ kind: 'audio', id: 'pre-mic' }]);
-      const newProducer = createMockProducer('new-mic', 'mic');
-      sendTransport.produce.mockResolvedValue(newProducer);
-
-      // Close existing mic first
-      await svc.closeProducer('mic');
-      await svc.produceAudio(undefined, preStream);
-      expect(sendTransport.produce).toHaveBeenCalled();
-    });
-
     it('uses the selected microphone when no explicit deviceId is passed', async () => {
       const { sendTransport } = await joinVoiceChannel();
       const svc = voiceService as any;
@@ -2480,24 +2467,6 @@ describe('VoiceService Extended', () => {
           deviceId: { exact: 'mic-selected' },
         }),
       });
-    });
-
-    it('stops pre-acquired stream when deviceId changes', async () => {
-      const { sendTransport } = await joinVoiceChannel();
-      const svc = voiceService as any;
-      const preStream = createMockMediaStream([{ kind: 'audio' }]);
-      const newStream = createMockMediaStream([{ kind: 'audio', id: 'device-mic' }]);
-      mockGetUserMedia.mockResolvedValue(newStream);
-      const newProducer = createMockProducer('new-mic', 'mic');
-      sendTransport.produce.mockResolvedValue(newProducer);
-
-      await svc.closeProducer('mic');
-      await svc.produceAudio('specific-device-id', preStream);
-
-      // Pre-acquired stream tracks should be stopped
-      for (const t of preStream.getTracks()) {
-        expect(t.stop).toHaveBeenCalled();
-      }
     });
 
     it('noop without transport', async () => {
@@ -2624,6 +2593,7 @@ describe('VoiceService Extended', () => {
 
     it('exitSoloBandwidthSaving does not resume mic when muted', async () => {
       const { micProducer } = await joinVoiceChannel();
+      micProducer.resume.mockClear();
       const svc = voiceService as any;
       svc.producers.set('mic', micProducer);
       micProducer.paused = true;
@@ -3415,27 +3385,6 @@ describe('VoiceService Extended', () => {
       svc.applyDegradationPreference(producer);
       // Should not throw (catch block handles it)
       expect(producer.rtpSender.setParameters).toHaveBeenCalled();
-    });
-  });
-
-  // ===== acquireMicStream =====
-
-  describe('acquireMicStream', () => {
-    it('returns stream on success', async () => {
-      await joinVoiceChannel();
-      const svc = voiceService as any;
-      const stream = createMockMediaStream([{ kind: 'audio' }]);
-      mockGetUserMedia.mockResolvedValue(stream);
-      const result = await svc.acquireMicStream();
-      expect(result).toBe(stream);
-    });
-
-    it('returns null on failure', async () => {
-      await joinVoiceChannel();
-      const svc = voiceService as any;
-      mockGetUserMedia.mockRejectedValue(new Error('denied'));
-      const result = await svc.acquireMicStream();
-      expect(result).toBeNull();
     });
   });
 

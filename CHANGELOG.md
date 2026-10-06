@@ -7,7 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 Trusted-device recovery now asks you to compare a fingerprint on both devices
-before transferring your account key.
+before transferring your account key. Voice joins now capture the selected
+microphone once and explain how to recover when capture fails. The desktop
+also includes a patched source-map-js dependency.
+
+### Fixed
+
+- **Voice joins capture the selected microphone once** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — server and direct-message calls capture the selected input after room and encryption setup. If capture finishes after a join has ended, or encrypted publication fails, Concord stops the track. A capture error now gives you useful next steps; the device may be unavailable or in use, so choose another microphone or close the app using it. Microphone permission errors point you to system settings. Audio setting changes preserve your mute, including when you press Mute during a microphone update, and changing an input or audio setting can retry a failed microphone update during a call. Speaking feedback keeps working after switching or rebuilding the microphone, including while alone in a call.
+- **Audio menus now show one Default option** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — it follows your operating system's default device, while named microphones and speakers remain selectable.
 
 ### Changed
 
@@ -17,7 +24,7 @@ before transferring your account key.
 ### Security
 
 - Updated Vite to 8.3.3 for desktop and admin development builds, closing three development-server advisories: [file disclosure](https://github.com/vitejs/vite/security/advisories/GHSA-rq7h-c2jc-7f22), [Wasm-query file disclosure](https://github.com/vitejs/vite/security/advisories/GHSA-vfpm-58rq-9qcg), and [cross-origin script execution](https://github.com/vitejs/vite/security/advisories/GHSA-9jrq-w75r-8gcw).
-- Updated the desktop development dependency `source-map-js` to 1.2.2 to address malformed source-map denial of service ([CVE-2026-93749](https://github.com/advisories/GHSA-68fv-2mgg-jv7q), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
+- **Patched the desktop `source-map-js` dependency** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — updated from 1.2.1 to 1.2.2 to address malformed source-map denial of service ([CVE-2026-93749](https://github.com/advisories/GHSA-68fv-2mgg-jv7q), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - Updated the desktop development dependency `shell-quote` to 1.12.0 to address shell command injection in comment-bearing argument lists ([CVE-2026-102422](https://github.com/advisories/GHSA-pqg4-j6r4-53mv), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - **Media server dependency security update** ([#3620](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3620)) — updated the library that interprets forwarded client addresses to its patched release, and patched `source-map-js` and Vite in media development tooling. No configuration change is needed.
 
@@ -482,6 +489,7 @@ account can't provide, never your password twice.
 Concord Voice now gives you clearer control over screen sharing, voice calls, and Rich Presence. Activity details show what is shared and who may receive it.
 
 ### Added
+
 - **Changing the message timer now leaves a note in the conversation** ([#1351](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1351)) — when
   someone sets, changes or turns off how long messages last, a line appears in the conversation
   saying who did it and what they chose, the same way a call leaves a record. It arrives straight

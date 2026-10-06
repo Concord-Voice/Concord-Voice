@@ -36,7 +36,7 @@ import { voiceService } from '../voiceService';
  * file importing back into its own host singleton.
  */
 function sanitizeErrForLog(err: unknown): string {
-  const raw = err instanceof Error ? err.message : 'non-Error thrown';
+  const raw = err instanceof Error ? err.message || err.name : 'non-Error thrown';
   return raw.replace(/[\x00-\x1F\x7F]/g, '').slice(0, 200);
 }
 

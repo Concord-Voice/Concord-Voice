@@ -3,7 +3,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // voiceStore reads its persisted settings once, at module load, so each case
 // seeds storage and then imports a fresh copy of the module.
 async function stateWithPersistedTier(tier: unknown) {
-  localStorage.setItem('concord:voice-settings', JSON.stringify({ qualityTier: tier }));
+  return stateWithPersistedSettings({ qualityTier: tier });
+}
+
+async function stateWithPersistedSettings(settings: Record<string, unknown>) {
+  localStorage.setItem('concord:voice-settings', JSON.stringify(settings));
   vi.resetModules();
   const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
   return useVoiceStore.getState();
@@ -31,5 +35,29 @@ describe('voiceStore persisted quality tier', () => {
 
   it("still migrates the legacy 'voice' tier to low", async () => {
     expect((await stateWithPersistedTier('voice')).qualityTier).toBe('low');
+  });
+
+  it('normalizes persisted audio default aliases while preserving physical choices', async () => {
+    const state = await stateWithPersistedSettings({
+      audioInputDeviceId: 'default',
+      audioOutputDeviceId: 'default',
+      videoDeviceId: 'camera-usb',
+      qualityTier: 'hifi',
+    });
+
+    expect(state.audioInputDeviceId).toBe('');
+    expect(state.audioOutputDeviceId).toBe('');
+    expect(state.videoDeviceId).toBe('camera-usb');
+    expect(state.qualityTier).toBe('hifi');
+  });
+
+  it('keeps concrete persisted audio device IDs', async () => {
+    const state = await stateWithPersistedSettings({
+      audioInputDeviceId: 'mic-usb',
+      audioOutputDeviceId: 'speaker-usb',
+    });
+
+    expect(state.audioInputDeviceId).toBe('mic-usb');
+    expect(state.audioOutputDeviceId).toBe('speaker-usb');
   });
 });

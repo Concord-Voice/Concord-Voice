@@ -15,6 +15,7 @@ import ForceUpdateOverlay from './components/ui/ForceUpdateOverlay';
 import UpdateBanner from './components/ui/UpdateBanner';
 import { UpdateSecurityBanner } from './components/Updates/UpdateSecurityBanner';
 import MediaPolicyDialog from './components/Voice/MediaPolicyDialog';
+import VoiceJoinErrorNotice from './components/Voice/VoiceJoinErrorNotice';
 import { IncomingCallBanner } from './components/Voice/IncomingCallBanner';
 import { OutgoingCallModal } from './components/Voice/OutgoingCallModal';
 import { AudioOutputs } from './components/Voice/ParticipantGrid';
@@ -659,6 +660,7 @@ function App() {
           <UpdateSecurityBanner />
           {/* #2153: outlives the voice UI teardown an eviction causes. */}
           <MediaPolicyDialog />
+          {!isPipWindow && <VoiceJoinErrorNotice />}
           <UpdateBanner />
           {/* DM voice call ring UI (#1209). IncomingCallBanner: corner banner
               for callee. OutgoingCallModal: bottom-right non-modal prompt for

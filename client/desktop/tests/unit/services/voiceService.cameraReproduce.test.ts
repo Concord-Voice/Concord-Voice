@@ -134,9 +134,10 @@ Object.defineProperty(globalThis, 'RTCRtpSender', {
 if ('RTCRtpScriptTransform' in globalThis) {
   delete (globalThis as Record<string, unknown>)['RTCRtpScriptTransform'];
 }
+const mockGetUserMedia = vi.fn();
 Object.defineProperty(navigator, 'mediaDevices', {
   value: {
-    getUserMedia: vi.fn(),
+    getUserMedia: mockGetUserMedia,
     getDisplayMedia: vi.fn(),
     enumerateDevices: vi.fn().mockResolvedValue([]),
   },
@@ -350,6 +351,7 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    mockGetUserMedia.mockResolvedValue(new MockMediaStream([makeAudioTrack()]));
     nextProducerId = 0;
     produceWithRtpSender = true;
     produceWithRtpParameters = true;
@@ -387,8 +389,8 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
 
     const micTrack = makeAudioTrack('pre-publish-mic');
     const micStream = new MockMediaStream([micTrack]);
-    svc.resolveAudioStream = vi.fn().mockResolvedValue(micStream);
-    await svc.produceAudio(undefined, micStream);
+    mockGetUserMedia.mockResolvedValue(micStream);
+    await svc.produceAudio();
 
     const expectedSources = [
       'camera',
@@ -413,9 +415,9 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
 
     const micTrack = makeAudioTrack('fail-closed-pre-publish-mic');
     const micStream = new MockMediaStream([micTrack]);
-    svc.resolveAudioStream = vi.fn().mockResolvedValue(micStream);
+    mockGetUserMedia.mockResolvedValue(micStream);
 
-    await expect(svc.produceAudio(undefined, micStream)).rejects.toThrow(/encrypt transform/);
+    await expect(svc.produceAudio()).rejects.toThrow(/encrypt transform/);
     expect(publishedSources).toEqual([]);
     expect(micTrack.readyState).toBe('ended');
     expect(svc.localMicStream).toBeNull();

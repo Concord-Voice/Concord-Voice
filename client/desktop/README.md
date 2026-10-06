@@ -172,6 +172,8 @@ without the value produces an inert Google SSO (empty secret), not a failure.
 ### Phase 1C: Voice & Media ✅
 
 - WebRTC voice channels via mediasoup SFU
+- Audio **Default** follows your operating system's default input or output device; choosing a named device keeps that device selected. If Concord cannot open the selected microphone, choose another input or close the app using it, then try again. For permission failures, check microphone access in system settings. Concord does not silently switch microphones.
+- Audio setting changes preserve your mute, including when you press Mute during a microphone update. Changing an input or audio setting can retry a failed microphone update during a call. Speaking feedback keeps working after switching or rebuilding the microphone, including while alone in a call.
 - Video and screen sharing UI
 - DM system with conversations and voice calls
 - Friend codes and privacy controls

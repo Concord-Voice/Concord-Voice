@@ -890,6 +890,12 @@ class VoiceService {
     camera: Promise.resolve(),
     screen: Promise.resolve(),
   };
+  private micReproduceQueue: Promise<void> = Promise.resolve();
+  private micReproduceGeneration = 0;
+  private micReproducesPending = 0;
+  // A failed queued swap has no mapped producer; retain its mic intent until explicit teardown.
+  private micReproduceArmed = false;
+  private micCaptureGeneration = 0;
   // Invalidates queued/in-flight swaps when their owning media session is torn
   // down. Queue reset lets a successor call start immediately; generation checks
   // keep continuations already attached to an old tail from touching it (#2187).
@@ -1719,7 +1725,7 @@ class VoiceService {
 
     // Audio settings subscription
     this.liveAudioUnsub = useAudioSettingsStore.subscribe((state, prev) => {
-      if (!this.producers.get('mic') || !this.sendTransport) return;
+      if (!this.sendTransport) return;
 
       // --- Instant: setParameters (DSCP priority) ---
       if (state.audioPriority !== prev.audioPriority) {
@@ -1750,7 +1756,12 @@ class VoiceService {
         'adaptivePtime',
       ] as const;
       if (codecOptionFields.some((f) => state[f] !== prev[f])) {
-        this.liveReproduceAudio();
+        void this.liveReproduceAudio().catch((err) =>
+          console.warn(
+            '[audio-settings] Microphone re-produce failed:',
+            this.microphoneCaptureErrorName(err)
+          )
+        );
       }
     });
 
@@ -1963,15 +1974,19 @@ class VoiceService {
 
   // --- replaceTrack: re-acquire media with new constraints, swap on existing producer ---
 
-  private shouldResumeMicAfterTrackReplacement(producerId: string): boolean {
+  private shouldRunMicVAD(producerId: string): boolean {
     if (this.shouldKeepProducerSuspendedForTest(producerId)) return false;
 
     const store = useVoiceStore.getState();
-    if (store.isMuted || store.isDeafened || store.isSoloBandwidthSaving) return false;
+    if (store.isMuted || store.isDeafened) return false;
 
     const localUserId = useUserStore.getState().user?.id;
     const localParticipant = localUserId ? store.participants[localUserId] : undefined;
     return localParticipant?.serverMuted !== true && localParticipant?.serverDeafened !== true;
+  }
+
+  private shouldResumeMicAfterTrackReplacement(producerId: string): boolean {
+    return !useVoiceStore.getState().isSoloBandwidthSaving && this.shouldRunMicVAD(producerId);
   }
 
   private stopMediaStream(stream: MediaStream | null): void {
@@ -1991,6 +2006,7 @@ class VoiceService {
   ): MediaStreamTrack {
     this.stopNoiseGate();
     this.stopInputVolume();
+    this.stopLocalVAD();
     this.stopMediaStream(this.localMicStream);
     this.localMicStream = stream;
 
@@ -2001,13 +2017,40 @@ class VoiceService {
     return this.applyInputVolume(track, adv.inputVolume);
   }
 
+  private microphoneCaptureConstraints(
+    adv: ReturnType<typeof useAudioSettingsStore.getState>,
+    selectedDeviceId: string | null | undefined
+  ): MediaStreamConstraints {
+    const useProcessing = !adv.musicMode;
+    return {
+      audio: {
+        deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+        echoCancellation: useProcessing && adv.echoCancellation,
+        noiseSuppression: useProcessing && adv.noiseCancellation,
+        autoGainControl: useProcessing && adv.autoGainControl,
+        sampleRate: 48000,
+        channelCount: 2,
+      },
+    };
+  }
+
   private async liveReplaceAudioTrack(): Promise<void> {
     const producer = this.producers.get('mic');
-    if (!producer) return;
+    if (!producer) {
+      // A pending re-production already reads the latest settings and retries
+      // drift. A later change may recover its failed, now-idle mic intent.
+      if (this.micReproducesPending > 0) return;
+      await this.liveReproduceAudio().catch((err) =>
+        console.warn(
+          '[audio-settings] Microphone recovery failed:',
+          this.microphoneCaptureErrorName(err)
+        )
+      );
+      return;
+    }
 
     const replaceSeq = ++this.liveAudioTrackReplaceSeq;
     const adv = useAudioSettingsStore.getState();
-    const useProcessing = !adv.musicMode;
     const selectedDeviceId = useVoiceStore.getState().audioInputDeviceId;
 
     // Briefly mute to hide transition
@@ -2015,21 +2058,26 @@ class VoiceService {
 
     try {
       // Re-acquire mic with new constraints
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
-          echoCancellation: useProcessing && adv.echoCancellation,
-          noiseSuppression: useProcessing && adv.noiseCancellation,
-          autoGainControl: useProcessing && adv.autoGainControl,
-          sampleRate: 48000,
-          channelCount: 2,
-        },
-      });
+      const stream = await navigator.mediaDevices.getUserMedia(
+        this.microphoneCaptureConstraints(adv, selectedDeviceId)
+      );
 
       if (this.isStaleAudioTrackReplacement(replaceSeq, stream)) return;
+      if (this.producers.get('mic') !== producer) {
+        this.stopMediaStream(stream);
+        return;
+      }
 
       // Swap track on existing producer (no SDP renegotiation)
       await producer.replaceTrack({ track: this.swapLiveMicStream(stream, adv) });
+      if (
+        replaceSeq === this.liveAudioTrackReplaceSeq &&
+        this.producers.get('mic') === producer &&
+        this.localMicStream === stream &&
+        this.shouldRunMicVAD(producer.id)
+      ) {
+        this.startLocalVAD(stream);
+      }
     } catch (err) {
       if (replaceSeq === this.liveAudioTrackReplaceSeq) {
         console.warn('liveReplaceAudioTrack failed:', errorMessage(err));
@@ -2133,10 +2181,62 @@ class VoiceService {
 
   // --- Re-produce: close + re-create producer with new codec options ---
 
-  private async liveReproduceAudio(): Promise<void> {
-    if (!this.producers.get('mic') || !this.sendTransport) return;
-    await this.closeProducer('mic');
-    await this.produceAudio();
+  private liveReproduceAudio(): Promise<void> {
+    const transport = this.sendTransport;
+    if (!transport) return Promise.resolve();
+    const generation = this.micReproduceGeneration;
+    if (this.producers.has('mic')) this.micReproduceArmed = true;
+    if (!this.micReproduceArmed) return Promise.resolve();
+    this.micReproducesPending++;
+    const reproduce = this.micReproduceQueue
+      .catch(() => undefined)
+      .then(async () => {
+        if (
+          generation !== this.micReproduceGeneration ||
+          this.sendTransport !== transport ||
+          transport.closed ||
+          !this.micReproduceArmed
+        )
+          return;
+
+        if (this.producers.has('mic')) {
+          await this.closeProducer('mic', { preserveMicReproduceToken: true });
+        }
+        if (
+          generation !== this.micReproduceGeneration ||
+          this.sendTransport !== transport ||
+          transport.closed
+        )
+          return;
+        await this.produceAudio();
+      })
+      .finally(() => {
+        if (generation === this.micReproduceGeneration) this.micReproducesPending--;
+      });
+    this.micReproduceQueue = reproduce.catch(() => undefined);
+    return reproduce;
+  }
+
+  private isCurrentMicCapture(
+    generation: number,
+    transport: mediasoupTypes.Transport,
+    stream?: MediaStream
+  ): boolean {
+    return (
+      generation === this.micCaptureGeneration &&
+      this.sendTransport === transport &&
+      !transport.closed &&
+      (stream === undefined || this.localMicStream === stream)
+    );
+  }
+
+  private invalidateMicReproduces(resetQueue = false): void {
+    this.micReproduceGeneration++;
+    this.micReproduceArmed = false;
+    this.micReproducesPending = 0;
+    this.micCaptureGeneration++;
+    this.liveAudioTrackReplaceSeq++;
+    if (resetQueue) this.micReproduceQueue = Promise.resolve();
   }
 
   private async liveReproduceCamera(): Promise<void> {
@@ -3135,12 +3235,23 @@ class VoiceService {
     throw new Error('Voice join response missing channel info');
   }
 
+  private shouldRecoverInitialJoinFailure(
+    shouldRecoverJoinFailure: boolean,
+    connectingStarted: boolean
+  ): boolean {
+    if (!shouldRecoverJoinFailure) return false;
+    if (!connectingStarted) return true;
+    const state = useVoiceStore.getState().connectionState;
+    return state === 'connecting' || (state === 'reconnecting' && !this.resumeInFlight);
+  }
+
   /** Authorize and join a voice channel */
   async joinChannel(
     channelId: string,
     joinType: 'channel' | 'dm' = 'channel',
     opts?: { internalRebuild?: boolean }
   ): Promise<void> {
+    useVoiceStore.getState().setJoinError(null);
     // A user joining anything supersedes a pending legacy-fallback rebuild.
     // The rebuild's own join runs after its intent check, so clearing here is
     // harmless for it and decisive against a racing user join.
@@ -3148,6 +3259,7 @@ class VoiceService {
     if (this.joinInFlight) throw new Error('Another voice call is already in progress');
     this.joinInFlight = true;
     let shouldRecoverJoinFailure = false;
+    let connectingStarted = false;
     try {
       const store = useVoiceStore.getState();
       const directDMJoiningState = this.claimDMJoinOwnership(channelId, joinType, store);
@@ -3157,6 +3269,7 @@ class VoiceService {
       await this.leaveActiveChannelBeforeJoin(store, callStateToPreserve);
 
       store.setConnectionState('connecting');
+      connectingStarted = true;
 
       // Step 1: Authorize via control plane (uses apiFetch for automatic token refresh)
       const joinData = await this.authorizeVoiceJoin(channelId, joinType, ringId);
@@ -3181,17 +3294,6 @@ class VoiceService {
         notificationSoundService.playLoop('call-outgoing');
 
       this.resolveQualityTier(store, channel.audio_quality_tier ?? undefined);
-
-      // Pre-acquire mic stream in parallel with socket connection + room join.
-      // getUserMedia can take 500ms+ (device enumeration, permission prompt).
-      // Starting it now overlaps that latency with the network handshake below.
-      // Skip it entirely for a listen-only join (Speak not granted): the
-      // media-plane produce() gate would reject the mic publish anyway, and
-      // starting getUserMedia would pop an unnecessary permission prompt and
-      // block the join behind slow device acquisition for a user who is not
-      // allowed to speak. establishMediaSession then takes its listen-only
-      // branch with a null mic promise (releasePreAcquiredMic(null) no-ops).
-      const micPromise = this.joinPermitsSpeak(joinData) ? this.acquireMicStream() : null;
 
       // Step 2: Connect Socket.IO to media plane
       // Fail fast when unauthenticated; the socket's auth callback below
@@ -3249,7 +3351,7 @@ class VoiceService {
       // Steps 3–9: join room → load device → transports → E2EE →
       // participants → mic producer → existing consumers. Shared with
       // resumeAfterReconnect (#1790) via establishMediaSession.
-      await this.establishMediaSession(store, channel.id, joinData, micPromise);
+      await this.establishMediaSession(store, channel.id, joinData);
 
       store.setConnectionState('connected');
       notificationSoundService.stopAllLoops();
@@ -3264,7 +3366,11 @@ class VoiceService {
       this.startDecoderBudgetProfiling();
       this.startAvSyncSampling();
     } catch (err) {
-      if (shouldRecoverJoinFailure) await this.handleJoinFailure(err);
+      // A completed leave owns disconnected; a reconnecting initial join still
+      // owns its failure until resumeAfterReconnect claims the rebuild.
+      if (this.shouldRecoverInitialJoinFailure(shouldRecoverJoinFailure, connectingStarted)) {
+        await this.handleJoinFailure(err);
+      }
       throw err;
     } finally {
       this.joinInFlight = false;
@@ -3287,8 +3393,59 @@ class VoiceService {
    * log volume. Used by handleJoinFailure and its cleanup-error sibling.
    */
   private sanitizeErrForLog(err: unknown): string {
-    const raw = err instanceof Error ? err.message : 'non-Error thrown';
+    const raw = err instanceof Error ? err.message || err.name : 'non-Error thrown';
     return raw.replace(/[\x00-\x1F\x7F]/g, '').slice(0, 200);
+  }
+
+  private microphoneCaptureErrorName(err: unknown): string {
+    if (typeof err !== 'object' || err === null || !('name' in err)) return 'UnknownError';
+    const capture = err as { name?: unknown; captureErrorName?: unknown };
+    const name =
+      capture.name === 'microphone_capture_failed' ? capture.captureErrorName : capture.name;
+    if (typeof name !== 'string') return 'UnknownError';
+    const sanitizedName = name.replace(/[\x00-\x1F\x7F]/g, '').slice(0, 200);
+    switch (sanitizedName) {
+      case 'NotReadableError':
+      case 'AbortError':
+      case 'NotFoundError':
+      case 'OverconstrainedError':
+      case 'NotAllowedError':
+      case 'SecurityError':
+      case 'TypeError':
+        return sanitizedName;
+      default:
+        return 'UnknownError';
+    }
+  }
+
+  private tagMicrophoneCaptureError(err: unknown): Error {
+    const captureErrorName = this.microphoneCaptureErrorName(err);
+    const tagged = new Error(captureErrorName);
+    tagged.name = 'microphone_capture_failed';
+    Object.assign(tagged, { code: 'microphone_capture_failed', captureErrorName });
+    return tagged;
+  }
+
+  private microphoneJoinGuidance(err: unknown): string | null {
+    if (
+      !(err instanceof Error) ||
+      (err as Error & { code?: string }).code !== 'microphone_capture_failed'
+    ) {
+      return null;
+    }
+    const name = (err as Error & { captureErrorName?: string }).captureErrorName;
+    switch (name) {
+      case 'NotReadableError':
+      case 'AbortError':
+        return 'Couldn’t start the selected microphone. It may be unavailable or in use by another app. Choose another mic or close the app using it, then try again.';
+      case 'NotFoundError':
+      case 'OverconstrainedError':
+        return 'The selected microphone isn’t available. Choose another microphone, then try again.';
+      case 'NotAllowedError':
+        return 'Concord can’t access the microphone. Check microphone permission in your system settings, then try again.';
+      default:
+        return 'Couldn’t start the microphone. Check that it’s connected and available, then try again.';
+    }
   }
 
   /**
@@ -3342,6 +3499,8 @@ class VoiceService {
     // reset() restores the default 'disconnected' connectionState.
     store.reset();
     store.setConnectionState('error');
+    const microphoneGuidance = this.microphoneJoinGuidance(err);
+    if (microphoneGuidance) store.setJoinError(microphoneGuidance);
     // #2153 §1d: a join refused during a policer cooldown opens the app-level dialog.
     // Set AFTER reset() — reset preserves the field, but ordering it last means the
     // interrupt does not depend on that preservation to survive this path.
@@ -3459,16 +3618,11 @@ class VoiceService {
    * build the full client-side media session — device load, transports,
    * E2EE, participants, mic producer, existing consumers. Shared by
    * joinChannel (initial join) and resumeAfterReconnect (#1790).
-   *
-   * micStreamPromise is awaited only immediately before produceAudio so a
-   * pre-acquired getUserMedia (joinChannel's latency overlap) keeps running
-   * in parallel with the room join and transport creation.
    */
   private async establishMediaSession(
     store: ReturnType<typeof useVoiceStore.getState>,
     channelId: string,
-    joinData: JoinResponse,
-    micStreamPromise: Promise<MediaStream | null> | null
+    joinData: JoinResponse
   ): Promise<void> {
     // Both entry paths funnel through here with a freshly authorized joinData:
     // joinChannel (initial join) and resumeAfterReconnect. Setting it here is
@@ -3522,19 +3676,14 @@ class VoiceService {
     // Apply enforcement flags after participants are populated
     this.applyEnforcementToParticipant(store, joinData);
 
-    // Produce audio (using the pre-acquired mic stream when provided) — unless
-    // the server denies Speak. A listen-only member (ViewVoiceChannels|JoinVoice
+    // Produce audio unless the server denies Speak. A listen-only member (ViewVoiceChannels|JoinVoice
     // without Speak, e.g. a listen-only role or channel override) is admitted by
     // AuthorizeJoin, but the media-plane produce() gate would reject the mic
     // publish and handleJoinFailure would tear the whole session down. Skip
     // auto-produce and join with mic off so the stock client can listen.
     if (this.joinPermitsSpeak(joinData)) {
-      const preAcquiredStream = micStreamPromise ? await micStreamPromise : null;
-      await this.produceAudio(undefined, preAcquiredStream);
+      await this.produceAudio();
     } else {
-      // Release any pre-acquired mic so no capture device stays open (no stray
-      // mic light), and reflect the mic-off state in the UI.
-      await this.releasePreAcquiredMic(micStreamPromise);
       store.setMuted(true);
     }
     this.setupLiveSubscriptions();
@@ -3606,7 +3755,7 @@ class VoiceService {
 
       // Steps 3–9 (as in joinChannel): join-room → device → transports →
       // E2EE → participants → mic producer → existing consumers.
-      await this.establishMediaSession(store, channelId, joinData, null);
+      await this.establishMediaSession(store, channelId, joinData);
 
       // Stale-context guard: a leaveChannel() racing the awaits above has
       // already torn the call down (socket nulled, store reset) — don't
@@ -3615,12 +3764,10 @@ class VoiceService {
         return;
       }
 
-      // Re-apply the user's pre-drop self-mute/deafen: establishMediaSession
-      // builds an UNMUTED mic producer and RESUMED consumers, so without this
-      // a muted user would silently transmit after recovery (Gitar finding,
-      // PR #2029). Server-mute/deafen is separately re-applied server-side at
-      // re-join; this covers the client-side self state. Deafen also implies
-      // self-mute (toggleDeafen), so the mic branch covers both.
+      // Re-check self-mute/deafen after the rebuild awaits. Mic adoption applies
+      // the current pause policy before transmission, while resumed consumers
+      // still need deafen restored here. Server-mute/deafen is separately
+      // re-applied server-side at re-join.
       const postResume = useVoiceStore.getState();
       const mic = this.producers.get('mic');
       if (postResume.isMuted && mic && !mic.paused) {
@@ -3662,6 +3809,8 @@ class VoiceService {
   /** Stop local streams, close producers/consumers/transports. */
   private cleanupMediaAndTransports(): void {
     this.invalidateVideoReproduces();
+    this.invalidateMicReproduces(true);
+    this.cleanupMicState();
     for (const stream of [this.localMicStream, this.localCameraStream, this.localScreenStream]) {
       if (stream) for (const t of stream.getTracks()) t.stop();
     }
@@ -3798,168 +3947,194 @@ class VoiceService {
     return hasPermission(bits, SPEAK);
   }
 
-  /**
-   * Stop any pre-acquired mic stream (from acquireMicStream's latency overlap)
-   * that a listen-only join will not produce, so the capture device is released
-   * and no mic indicator lingers. Safe when the promise is null or resolved null.
-   */
-  private async releasePreAcquiredMic(
-    micStreamPromise: Promise<MediaStream | null> | null
-  ): Promise<void> {
-    if (!micStreamPromise) return;
-    const stream = await micStreamPromise;
-    stream?.getTracks().forEach((track) => track.stop());
+  private microphoneSettingsChanged(
+    adv: ReturnType<typeof useAudioSettingsStore.getState>,
+    selectedDeviceId: string | undefined,
+    explicitDeviceId?: string
+  ): boolean {
+    const current = useAudioSettingsStore.getState();
+    const currentDeviceId =
+      explicitDeviceId ?? useVoiceStore.getState().audioInputDeviceId ?? undefined;
+    return (
+      selectedDeviceId !== currentDeviceId ||
+      adv.musicMode !== current.musicMode ||
+      adv.echoCancellation !== current.echoCancellation ||
+      adv.noiseCancellation !== current.noiseCancellation ||
+      adv.autoGainControl !== current.autoGainControl ||
+      adv.noiseGateMode !== current.noiseGateMode ||
+      adv.noiseGateLevel !== current.noiseGateLevel
+    );
   }
 
-  /**
-   * Pre-acquire the mic stream so getUserMedia latency overlaps with
-   * socket connection, room join, and transport creation.
-   */
-  private async acquireMicStream(): Promise<MediaStream | null> {
-    try {
-      // JIT permission check (#197): request mic access on macOS before getUserMedia.
-      // On macOS, the plist patch (scripts/patch-electron-plist.sh) ensures the
-      // helper process has NSMicrophoneUsageDescription, so getUserMedia can safely
-      // trigger the native TCC prompt. We only block if explicitly denied/restricted.
-      const micStatus = await ensureOsPermissionShared('microphone');
-      if (micStatus === 'denied' || micStatus === 'restricted') {
-        console.warn(`[VoiceService] Mic permission ${micStatus}, skipping getUserMedia`);
-        return null;
-      }
+  private requireCurrentMicCapture(
+    captureGeneration: number,
+    sendTransport: mediasoupTypes.Transport,
+    stream?: MediaStream
+  ): void {
+    if (this.isCurrentMicCapture(captureGeneration, sendTransport)) return;
+    this.stopMediaStream(stream ?? null);
+    throw new Error('Voice transport closed before microphone publication');
+  }
 
+  private async acquireCurrentMicrophone(
+    captureGeneration: number,
+    sendTransport: mediasoupTypes.Transport,
+    explicitDeviceId?: string
+  ): Promise<{
+    stream: MediaStream;
+    adv: ReturnType<typeof useAudioSettingsStore.getState>;
+    selectedDeviceId: string | undefined;
+  }> {
+    // Codec re-production removes the old producer before acquiring its
+    // replacement, so live settings handlers may have no producer to update.
+    // Only a capture matching the latest selected input and constraints may win.
+    for (;;) {
+      this.requireCurrentMicCapture(captureGeneration, sendTransport);
       const adv = useAudioSettingsStore.getState();
-      const useProcessing = !adv.musicMode;
-      return await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: useProcessing && adv.echoCancellation,
-          noiseSuppression: useProcessing && adv.noiseCancellation,
-          autoGainControl: useProcessing && adv.autoGainControl,
-          sampleRate: 48000,
-          channelCount: 2,
-        },
-      });
+      const selectedDeviceId =
+        explicitDeviceId ?? useVoiceStore.getState().audioInputDeviceId ?? undefined;
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(
+          this.microphoneCaptureConstraints(adv, selectedDeviceId)
+        );
+      } catch (err) {
+        if (
+          this.isCurrentMicCapture(captureGeneration, sendTransport) &&
+          this.microphoneSettingsChanged(adv, selectedDeviceId, explicitDeviceId)
+        ) {
+          continue;
+        }
+        throw this.tagMicrophoneCaptureError(err);
+      }
+      this.requireCurrentMicCapture(captureGeneration, sendTransport, stream);
+      if (this.microphoneSettingsChanged(adv, selectedDeviceId, explicitDeviceId)) {
+        this.stopMediaStream(stream);
+        continue;
+      }
+      return { stream, adv, selectedDeviceId };
+    }
+  }
+
+  private async awaitMicrophonePermission(
+    captureGeneration: number,
+    sendTransport: mediasoupTypes.Transport
+  ): Promise<void> {
+    try {
+      await this.ensureOsPermission('microphone');
     } catch (err) {
-      console.warn(
-        '[VoiceService] Pre-acquire mic failed, will retry in produceAudio:',
-        errorMessage(err)
-      );
-      return null;
+      throw this.tagMicrophoneCaptureError(err);
     }
+    this.requireCurrentMicCapture(captureGeneration, sendTransport);
   }
 
-  /**
-   * Resolve the audio stream: use pre-acquired if available and device unchanged,
-   * otherwise acquire fresh via getUserMedia.
-   */
-  private async resolveAudioStream(
-    deviceId: string | undefined,
-    preAcquiredStream: MediaStream | null | undefined,
-    musicMode: boolean,
-    audioSettings: {
-      echoCancellation: boolean;
-      noiseCancellation: boolean;
-      autoGainControl: boolean;
-    }
-  ): Promise<MediaStream> {
-    if (preAcquiredStream && !deviceId) return preAcquiredStream;
-
-    // Stop any pre-acquired stream we're not using (device changed)
-    if (preAcquiredStream) {
-      for (const t of preAcquiredStream.getTracks()) t.stop();
-    }
-
-    await this.ensureOsPermission('microphone');
-
-    const useProcessing = !musicMode;
-    return navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
-        echoCancellation: useProcessing && audioSettings.echoCancellation,
-        noiseSuppression: useProcessing && audioSettings.noiseCancellation,
-        autoGainControl: useProcessing && audioSettings.autoGainControl,
-        sampleRate: 48000,
-        channelCount: 2,
-      },
-    });
-  }
-
-  async produceAudio(deviceId?: string, preAcquiredStream?: MediaStream | null): Promise<void> {
-    if (!this.sendTransport || !this.device) return;
-
-    const adv = useAudioSettingsStore.getState();
-    const selectedDeviceId = deviceId ?? useVoiceStore.getState().audioInputDeviceId ?? undefined;
-    this.localMicStream = await this.resolveAudioStream(
-      selectedDeviceId,
-      preAcquiredStream,
-      adv.musicMode,
-      adv
-    );
-    let track = this.localMicStream.getAudioTracks()[0];
-
-    // Apply noise gate in manual mode
-    if (adv.noiseGateMode === 'manual') {
-      track = this.applyNoiseGate(this.localMicStream, adv.noiseGateLevel);
-    }
-
-    // Apply input volume control (GainNode)
-    track = this.applyInputVolume(track, adv.inputVolume);
-
-    const tier = useVoiceStore.getState().effectiveQualityTier;
-    const tierConfig = AUDIO_QUALITY_TIERS[tier];
-    const { effectiveFec, effectiveDtx, effectiveStereo, effectiveFrameSize } = resolveOpusSettings(
-      adv,
-      tierConfig
-    );
-    const audioPrioParams = buildPriorityParams(adv.audioPriority);
-
-    const producer = await this.produceEncrypted(this.sendTransport, {
-      track,
-      encodings: [
-        {
-          maxBitrate: tierConfig.maxBitrate,
-          adaptivePtime: adv.adaptivePtime || undefined,
-          ...audioPrioParams,
-        },
-      ],
-      codecOptions: {
-        opusStereo: effectiveStereo,
-        opusDtx: effectiveDtx,
-        opusFec: effectiveFec,
-        opusNack: adv.opusNack,
-        opusMaxAverageBitrate: tierConfig.maxBitrate,
-        opusMaxPlaybackRate: 48000,
-        opusPtime: effectiveFrameSize,
-      },
-      appData: { source: 'mic' },
-    });
-
+  private adoptMicProducer(producer: mediasoupTypes.Producer, stream: MediaStream): void {
     this.producers.set('mic', producer);
 
     if (this.testSuspensionDepth > 0) {
-      producer.pause();
-      this.socket?.emit('pause-producer', { producerId: producer.id });
       this.testSuspendedProducerIds.add(producer.id);
       this.testRestoreEligibleProducerIds.add(producer.id);
     }
 
-    // Start client-side VAD for instant speaking indicator
-    if (!this.shouldKeepProducerSuspendedForTest(producer.id)) {
-      this.startLocalVAD(this.localMicStream);
+    // The outbound track was disabled before transport.produce. Only current
+    // policy may enable it; muted and test-suspended producers stay paused.
+    if (this.shouldResumeMicAfterTrackReplacement(producer.id)) {
+      producer.resume();
+    } else {
+      producer.pause();
+      this.socket?.emit('pause-producer', { producerId: producer.id });
     }
+    if (this.shouldRunMicVAD(producer.id)) this.startLocalVAD(stream);
 
     // Start packet loss monitor for dynamic FEC
     this.startPacketLossMonitor();
 
     producer.on('transportclose', () => {
+      if (this.producers.get('mic') !== producer || this.localMicStream !== stream) return;
       this.producers.delete('mic');
-      this.stopLocalVAD();
-      this.stopNoiseGate();
-      this.stopInputVolume();
-      if (this.localMicStream) {
-        for (const t of this.localMicStream.getTracks()) t.stop();
-        this.localMicStream = null;
-      }
+      this.cleanupMicState();
     });
+  }
+
+  async produceAudio(deviceId?: string): Promise<void> {
+    const sendTransport = this.sendTransport;
+    if (!sendTransport || sendTransport.closed || !this.device) return;
+    const captureGeneration = ++this.micCaptureGeneration;
+
+    await this.awaitMicrophonePermission(captureGeneration, sendTransport);
+    for (;;) {
+      const { stream, adv, selectedDeviceId } = await this.acquireCurrentMicrophone(
+        captureGeneration,
+        sendTransport,
+        deviceId
+      );
+      if (this.localMicStream && this.localMicStream !== stream) this.cleanupMicState();
+      this.localMicStream = stream;
+      try {
+        let track = stream.getAudioTracks()[0];
+
+        // Apply noise gate in manual mode
+        if (adv.noiseGateMode === 'manual') {
+          track = this.applyNoiseGate(stream, adv.noiseGateLevel);
+        }
+
+        // Apply input volume control (GainNode)
+        track = this.applyInputVolume(track, adv.inputVolume);
+        // Keep every candidate silent until it passes publication ownership
+        // checks and the current mute policy at adoption.
+        track.enabled = false;
+
+        const tier = useVoiceStore.getState().effectiveQualityTier;
+        const tierConfig = AUDIO_QUALITY_TIERS[tier];
+        const { effectiveFec, effectiveDtx, effectiveStereo, effectiveFrameSize } =
+          resolveOpusSettings(adv, tierConfig);
+        const audioPrioParams = buildPriorityParams(adv.audioPriority);
+
+        const producer = await this.produceEncrypted(
+          sendTransport,
+          {
+            track,
+            encodings: [
+              {
+                maxBitrate: tierConfig.maxBitrate,
+                adaptivePtime: adv.adaptivePtime || undefined,
+                ...audioPrioParams,
+              },
+            ],
+            codecOptions: {
+              opusStereo: effectiveStereo,
+              opusDtx: effectiveDtx,
+              opusFec: effectiveFec,
+              opusNack: adv.opusNack,
+              opusMaxAverageBitrate: tierConfig.maxBitrate,
+              opusMaxPlaybackRate: 48000,
+              opusPtime: effectiveFrameSize,
+            },
+            appData: { source: 'mic' },
+          },
+          stream
+        );
+
+        if (!this.isCurrentMicCapture(captureGeneration, sendTransport, stream)) {
+          producer.close();
+          throw new Error('Microphone publication belongs to an obsolete voice session');
+        }
+
+        if (this.microphoneSettingsChanged(adv, selectedDeviceId, deviceId)) {
+          producer.close();
+          this.cleanupMicState(stream);
+          await this.emitAsync<{ success: true }>('close-producer', { producerId: producer.id });
+          await this.drainSendTransportQueue(sendTransport);
+          continue;
+        }
+
+        this.adoptMicProducer(producer, stream);
+        return;
+      } catch (err) {
+        this.cleanupMicState(stream);
+        throw err;
+      }
+    }
   }
 
   /**
@@ -4658,7 +4833,7 @@ class VoiceService {
      * `switchScreenSourceQueued` holds a good stream at the moment it decides to
      * close and re-produce, and acquiring a SECOND one there can fail -- leaving the
      * user sharing nothing, which is precisely what the acquire-first ordering exists
-     * to prevent. Mirrors `produceAudio`'s `preAcquiredStream` parameter.
+     * to prevent. This preserves the acquired stream through screen producer setup.
      */
     preAcquired?: ScreenCaptureResult | null
   ): Promise<void> {
@@ -5230,7 +5405,28 @@ class VoiceService {
   async toggleMute(): Promise<void> {
     const store = useVoiceStore.getState();
     const producer = this.producers.get('mic');
-    if (!producer) return;
+    if (!producer) {
+      const transport = this.sendTransport;
+      if (
+        !this.micReproduceArmed ||
+        !transport ||
+        transport.closed ||
+        !store.activeChannelId ||
+        store.mediaPolicyPaused.mic !== undefined
+      )
+        return;
+
+      // A codec replacement can have no mapped producer while pending or after
+      // a recoverable failure. Keep the latest mute intent for adoption, where
+      // the outgoing track stays disabled until current policy permits a resume.
+      if (store.isMuted && (!this.canUnmuteMic(store) || store.isDeafened)) return;
+      const muted = !store.isMuted;
+      store.setMuted(muted);
+      this.applyOptimisticMute(store, muted);
+      notificationSoundService.play(muted ? 'mute' : 'unmute');
+      if (muted) this.stopLocalVAD();
+      return;
+    }
     // #2153: a policed mic can only come back through a rejoin. resume-producer carries no
     // ack, so the server's refusal would be invisible — this is the second guard behind
     // the locked MediaButton, and it also covers the PiP controls' toggle-mute action.
@@ -7086,31 +7282,53 @@ class VoiceService {
   /** Close a specific producer by source */
   async closeProducer(
     source: string,
-    options?: { preserveScreenAudioOutcome?: boolean; preserveVideoReproduceToken?: boolean }
+    options?: {
+      preserveScreenAudioOutcome?: boolean;
+      preserveVideoReproduceToken?: boolean;
+      preserveMicReproduceToken?: boolean;
+    }
   ): Promise<void> {
     if ((source === 'camera' || source === 'screen') && !options?.preserveVideoReproduceToken) {
       this.cancelVideoReproduce(source);
     }
     const producer = this.producers.get(source);
+    const socket = this.socket;
+    const transport = this.sendTransport;
+
+    if (source === 'mic') {
+      if (options?.preserveMicReproduceToken) {
+        this.micCaptureGeneration++;
+        this.liveAudioTrackReplaceSeq++;
+      } else {
+        this.invalidateMicReproduces();
+      }
+      // Release the exact mic before draining: a successor can capture while
+      // stopSending waits, and this close must never stop or delete its stream.
+      if (producer && this.producers.get(source) === producer) this.producers.delete(source);
+      this.cleanupMicState();
+    }
 
     if (producer) {
       producer.close();
-      await this.drainSendTransportQueue();
-      this.producers.delete(source);
+      await this.drainSendTransportQueue(transport);
+      if (source !== 'mic') this.producers.delete(source);
       // #2153 A1 (a): a local close retires the latch without waiting for the echo.
       useVoiceStore.getState().clearMediaPolicyPausedByProducer(producer.id);
-      this.socket?.emit('close-producer', { producerId: producer.id });
+      socket?.emit('close-producer', { producerId: producer.id });
     }
 
     // Always clean up local tracks and reset state, even if no producer exists.
-    if (source === 'mic') this.cleanupMicState();
-    else if (source === 'camera') this.cleanupCameraState();
+    if (source === 'camera') this.cleanupCameraState();
     else if (source === 'screen')
       await this.cleanupScreenState(undefined, options?.preserveScreenAudioOutcome);
     else if (source === 'screen-audio') this.cleanupScreenAudioState();
   }
 
-  private cleanupMicState(): void {
+  private cleanupMicState(stream?: MediaStream): void {
+    if (stream && this.localMicStream !== stream) {
+      this.stopMediaStream(stream);
+      return;
+    }
     this.stopLocalVAD();
     this.stopNoiseGate();
     this.stopInputVolume();
@@ -7229,11 +7447,7 @@ class VoiceService {
   async setQualityTier(tier: AudioQualityTier): Promise<void> {
     useVoiceStore.getState().setQualityTier(tier);
     // Re-produce mic with new codec options if we have an active producer
-    const producer = this.producers.get('mic');
-    if (producer && this.sendTransport) {
-      await this.closeProducer('mic');
-      await this.produceAudio();
-    }
+    await this.liveReproduceAudio();
   }
 
   // ─── Transport Setup ───────────────────────────────────────────────
@@ -9726,7 +9940,8 @@ class VoiceService {
    */
   private produceEncrypted(
     transport: mediasoupTypes.Transport,
-    options: mediasoupTypes.ProducerOptions
+    options: mediasoupTypes.ProducerOptions,
+    micStream?: MediaStream
   ): Promise<mediasoupTypes.Producer> {
     const source = typeof options.appData?.source === 'string' ? options.appData.source : undefined;
     const codecFamily =
@@ -9736,7 +9951,7 @@ class VoiceService {
       ...options,
       onRtpSender: (sender) => {
         try {
-          this.applyEncryptTransform(sender, codecFamily, source);
+          this.applyEncryptTransform(sender, codecFamily, source, micStream);
         } catch (err) {
           // mediasoup invokes this before createOffer(), but does not roll back the
           // just-created transceiver when the callback throws. Detach the track and
@@ -9761,12 +9976,13 @@ class VoiceService {
   private applyEncryptTransform(
     sender: RTCRtpSender,
     codecFamily?: CodecFamily,
-    source?: string
+    source?: string,
+    micStream?: MediaStream
   ): void {
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
     if (currentTransformPath() === 'script-transform') {
       if (!this.e2eeWorker) {
-        this.failClosedEncryptTransform(source, 'E2EE Worker is not initialized');
+        this.failClosedEncryptTransform(source, 'E2EE Worker is not initialized', micStream);
       }
       try {
         const options: E2EETransformOptions = { role: 'encrypt', codecFamily };
@@ -9774,18 +9990,18 @@ class VoiceService {
         console.debug('E2EE: encrypt transform applied (RTCRtpScriptTransform)');
       } catch (err) {
         console.error('E2EE: RTCRtpScriptTransform failed on sender:', errorMessage(err));
-        this.failClosedEncryptTransform(source, 'RTCRtpScriptTransform failed');
+        this.failClosedEncryptTransform(source, 'RTCRtpScriptTransform failed', micStream);
       }
       return;
     }
 
     if (currentTransformPath() === 'unavailable') {
-      this.failClosedEncryptTransform(source, 'encoded transform API unavailable');
+      this.failClosedEncryptTransform(source, 'encoded transform API unavailable', micStream);
     }
 
     // Legacy path: createEncodedStreams (Chromium 86-130)
     if (!this.mediaEncryption) {
-      this.failClosedEncryptTransform(source, 'media encryption is not initialized');
+      this.failClosedEncryptTransform(source, 'media encryption is not initialized', micStream);
     }
     const encryption = this.mediaEncryption;
     const legacySender = sender as RtpSenderWithEncodedStreams;
@@ -9831,20 +10047,29 @@ class VoiceService {
         console.debug('E2EE: encrypt transform applied (createEncodedStreams)');
       } catch (err) {
         console.error('E2EE: createEncodedStreams failed on sender:', errorMessage(err));
-        this.failClosedEncryptTransform(source, 'createEncodedStreams failed');
+        this.failClosedEncryptTransform(source, 'createEncodedStreams failed', micStream);
       }
     } else {
       console.warn('E2EE: no Insertable Streams API available — frames will not be encrypted');
-      this.failClosedEncryptTransform(source, 'Insertable Streams API unavailable');
+      this.failClosedEncryptTransform(source, 'Insertable Streams API unavailable', micStream);
     }
   }
 
-  private failClosedEncryptTransform(source: string | undefined, reason: string): never {
+  private failClosedEncryptTransform(
+    source: string | undefined,
+    reason: string,
+    micStream?: MediaStream
+  ): never {
     // Pre-publication failures have no Producer to close. Always tear down the
     // owning capture stream so fail-closed E2EE cannot leave hardware active.
     if (source === 'camera') this.cleanupCameraState();
-    else if (source === 'mic') this.cleanupMicState();
-    else if (source === 'screen' || source === 'screen-audio')
+    else if (source === 'mic') {
+      if (micStream && this.localMicStream !== micStream) this.stopMediaStream(micStream);
+      else {
+        this.invalidateMicReproduces();
+        this.cleanupMicState();
+      }
+    } else if (source === 'screen' || source === 'screen-audio')
       // cleanupScreenState is async (awaits the transport queue drain); this path
       // is intentionally fire-and-forget because failClosed throws synchronously
       // below. Attach a catch so a failing async teardown logs (PII-safe) instead
@@ -10335,6 +10560,8 @@ class VoiceService {
     this.bypassProbes.clear(); // same stale-probe reasoning as cleanupTimersAndE2EE
     this.teardownSharedE2EEState();
     this.invalidateVideoReproduces();
+    this.invalidateMicReproduces(true);
+    this.cleanupMicState();
     // Clear solo bandwidth saving state
     if (this.soloNotificationTimer) {
       clearTimeout(this.soloNotificationTimer);

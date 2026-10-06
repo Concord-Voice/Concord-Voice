@@ -1,5 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
+import { deferred } from '../../helpers/deferred';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,7 @@ const mockAnalyser = {
   connect: vi.fn(),
   disconnect: vi.fn(),
 };
+const mockVadInputStreams: MediaStream[] = [];
 
 const processedAudioTrack = {
   id: 'processed-track',
@@ -192,12 +194,16 @@ const processedAudioTrack = {
 };
 
 class MockAudioContext {
+  private isVadContext = false;
   state = 'running';
   currentTime = 0;
   sampleRate = 48000;
-  createMediaStreamSource = vi.fn().mockReturnValue({
-    connect: vi.fn(),
-    disconnect: vi.fn(),
+  constructor(options?: AudioContextOptions) {
+    this.isVadContext = options === undefined;
+  }
+  createMediaStreamSource = vi.fn().mockImplementation((stream: MediaStream) => {
+    if (this.isVadContext) mockVadInputStreams.push(stream);
+    return { connect: vi.fn(), disconnect: vi.fn() };
   });
   createAnalyser = vi.fn().mockReturnValue(mockAnalyser);
   createGain = vi.fn().mockReturnValue(mockGainNode);
@@ -486,6 +492,7 @@ async function joinVoiceChannel(
 describe('VoiceService', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockVadInputStreams.length = 0;
     vi.useFakeTimers({ shouldAdvanceTime: true });
     resetAllStores();
     // resetAllStores() does not cover videoSettingsStore; reset the fields these voice
@@ -630,6 +637,270 @@ describe('VoiceService', () => {
   // ===== joinChannel =====
 
   describe('joinChannel', () => {
+    describe('microphone capture join regressions', () => {
+      beforeEach(() => {
+        useVoiceStore.setState({ joinError: null } as Parameters<typeof useVoiceStore.setState>[0]);
+      });
+
+      it.each(['channel', 'dm'] as const)(
+        'captures once from the selected input when joining a %s call',
+        async (joinType) => {
+          useVoiceStore.getState().setAudioInputDevice('mic-selected');
+          const selectedStream = createMockMediaStream([{ kind: 'audio', id: 'mic-selected' }]);
+          const joining = joinVoiceChannel(undefined, joinType);
+          mockGetUserMedia.mockResolvedValue(selectedStream);
+
+          const { sendTransport } = await joining;
+
+          expect(mockGetUserMedia).toHaveBeenCalledOnce();
+          expect(mockGetUserMedia).toHaveBeenCalledWith(
+            expect.objectContaining({
+              audio: expect.objectContaining({ deviceId: { exact: 'mic-selected' } }),
+            })
+          );
+          expect(selectedStream.getAudioTracks).toHaveBeenCalled();
+          expect(sendTransport.produce).toHaveBeenCalledOnce();
+          expect(useVoiceStore.getState().connectionState).toBe('connected');
+        }
+      );
+
+      it.each(['channel', 'dm'] as const)(
+        'does not acquire the microphone before %s room admission',
+        async (joinType) => {
+          const joining = joinVoiceChannel(undefined, joinType);
+          setupEmitResponses({ 'join-room': { error: 'Room admission rejected' } });
+
+          await expect(joining).rejects.toThrow('Room admission rejected');
+
+          expect(mockSocket.emit).toHaveBeenCalledWith(
+            'join-room',
+            expect.any(Object),
+            expect.any(Function)
+          );
+          expect(mockGetUserMedia).not.toHaveBeenCalled();
+          expect(useVoiceStore.getState().connectionState).toBe('error');
+          expect(useVoiceStore.getState().activeChannelId).toBeNull();
+        }
+      );
+
+      it.each([
+        {
+          joinType: 'channel' as const,
+          errorName: 'NotReadableError',
+          guidance:
+            'Couldn’t start the selected microphone. It may be unavailable or in use by another app. Choose another mic or close the app using it, then try again.',
+        },
+        {
+          joinType: 'dm' as const,
+          errorName: 'NotReadableError',
+          guidance:
+            'Couldn’t start the selected microphone. It may be unavailable or in use by another app. Choose another mic or close the app using it, then try again.',
+        },
+        {
+          joinType: 'channel' as const,
+          errorName: 'NotAllowedError',
+          guidance:
+            'Concord can’t access the microphone. Check microphone permission in your system settings, then try again.',
+        },
+        {
+          joinType: 'dm' as const,
+          errorName: 'NotAllowedError',
+          guidance:
+            'Concord can’t access the microphone. Check microphone permission in your system settings, then try again.',
+        },
+        {
+          joinType: 'channel' as const,
+          errorName: 'NotFoundError',
+          guidance:
+            'The selected microphone isn’t available. Choose another microphone, then try again.',
+        },
+        {
+          joinType: 'channel' as const,
+          errorName: 'OverconstrainedError',
+          guidance:
+            'The selected microphone isn’t available. Choose another microphone, then try again.',
+        },
+        {
+          joinType: 'channel' as const,
+          errorName: 'AbortError',
+          guidance:
+            'Couldn’t start the selected microphone. It may be unavailable or in use by another app. Choose another mic or close the app using it, then try again.',
+        },
+      ])(
+        'surfaces the fixed microphone guidance and platform error name for $errorName in $joinType',
+        async ({ joinType, errorName, guidance }) => {
+          // Use the runtime's genuine DOMException. Some browser realms do not make it
+          // `instanceof Error`; the service should classify it without depending on that.
+          const captureError = new DOMException('', errorName);
+          expect(captureError.name).toBe(errorName);
+          expect(captureError.message).toBe('');
+          const joining = joinVoiceChannel(undefined, joinType);
+          mockGetUserMedia.mockRejectedValue(captureError);
+          const logError = vi.spyOn(console, 'error').mockImplementation(() => {});
+          const logWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+          try {
+            const rejection = await joining.then(
+              () => null,
+              (error: unknown) => error
+            );
+            expect(rejection).not.toBeNull();
+
+            const joinError = (useVoiceStore.getState() as unknown as { joinError?: string | null })
+              .joinError;
+            expect(joinError).toEqual(expect.any(String));
+            expect(joinError).toBe(guidance);
+            const diagnostics = [...logError.mock.calls, ...logWarn.mock.calls]
+              .flat()
+              .filter((part): part is string => typeof part === 'string')
+              .join(' ');
+            expect(diagnostics).toContain(errorName);
+          } finally {
+            logError.mockRestore();
+            logWarn.mockRestore();
+          }
+        }
+      );
+
+      it('uses generic fixed guidance and excludes hostile capture text from diagnostics', async () => {
+        const hostileMessage = 'private platform detail should not be logged';
+        const captureError = new Error(hostileMessage);
+        captureError.name = 'UnknownCaptureError';
+        const joining = joinVoiceChannel();
+        mockGetUserMedia.mockRejectedValue(captureError);
+        const logError = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          const rejection = await joining.then(
+            () => null,
+            (error: unknown) => error
+          );
+          expect(rejection).not.toBeNull();
+          expect(
+            (useVoiceStore.getState() as unknown as { joinError?: string | null }).joinError
+          ).toBe(
+            'Couldn’t start the microphone. Check that it’s connected and available, then try again.'
+          );
+          const diagnostics = logError.mock.calls.flat().join(' ');
+          expect(diagnostics).not.toContain(hostileMessage);
+        } finally {
+          logError.mockRestore();
+        }
+      });
+
+      it('does not give microphone advice for a room admission error', async () => {
+        const joining = joinVoiceChannel();
+        setupEmitResponses({ 'join-room': { error: 'Room admission rejected' } });
+
+        await expect(joining).rejects.toThrow('Room admission rejected');
+
+        const joinError = (useVoiceStore.getState() as unknown as { joinError?: string | null })
+          .joinError;
+        expect(joinError ?? null).toBeNull();
+      });
+
+      it('clears stale microphone join guidance after a successful join', async () => {
+        useVoiceStore.setState({ joinError: 'Previous microphone failure' } as Parameters<
+          typeof useVoiceStore.setState
+        >[0]);
+
+        await joinVoiceChannel();
+
+        const joinError = (useVoiceStore.getState() as unknown as { joinError?: string | null })
+          .joinError;
+        expect(joinError ?? null).toBeNull();
+      });
+
+      it('stops capture without microphone advice when encrypted publishing rejects', async () => {
+        const defaultStream = createMockMediaStream([{ kind: 'audio', id: 'mic-default' }]);
+        const selectedStream = createMockMediaStream([{ kind: 'audio', id: 'mic-selected' }]);
+        useVoiceStore.getState().setAudioInputDevice('mic-selected');
+
+        const joining = joinVoiceChannel();
+        mockGetUserMedia.mockImplementation(
+          (constraints: { audio?: { deviceId?: { exact?: string } } }) =>
+            Promise.resolve(constraints.audio?.deviceId?.exact ? selectedStream : defaultStream)
+        );
+        let sendTransport: ReturnType<typeof makeSendTransport> | undefined;
+        mockCreateSendTransport.mockImplementation(() => {
+          sendTransport = makeSendTransport();
+          sendTransport.produce.mockRejectedValue(new Error('transport encryption publish failed'));
+          return sendTransport;
+        });
+
+        await expect(joining).rejects.toThrow('transport encryption publish failed');
+
+        expect(sendTransport?.produce).toHaveBeenCalledOnce();
+        expect(selectedStream.getTracks()[0].stop).toHaveBeenCalled();
+        const joinError = (useVoiceStore.getState() as unknown as { joinError?: string | null })
+          .joinError;
+        expect(joinError ?? null).toBeNull();
+      });
+
+      it('stops a capture that resolves after emergency cleanup and never produces on the closed transport', async () => {
+        const { sendTransport } = await joinVoiceChannel();
+        sendTransport.produce.mockClear();
+        mockGetUserMedia.mockClear();
+        const pendingCapture = deferred<MediaStream>();
+        const obsoleteStream = createMockMediaStream([
+          { kind: 'audio', id: 'mic-resolved-after-cleanup' },
+        ]);
+        mockGetUserMedia.mockReturnValue(pendingCapture.promise);
+
+        const producing = voiceService.produceAudio('mic-selected');
+        await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledOnce());
+        voiceService.emergencyCleanup();
+        expect(sendTransport.close).toHaveBeenCalled();
+
+        pendingCapture.resolve(obsoleteStream as unknown as MediaStream);
+        await producing.catch(() => undefined);
+
+        expect(obsoleteStream.getTracks()[0].stop).toHaveBeenCalledOnce();
+        expect(sendTransport.produce).not.toHaveBeenCalled();
+      });
+
+      it('closes and does not adopt a producer that resolves after emergency cleanup', async () => {
+        const stream = createMockMediaStream([{ kind: 'audio', id: 'mic-late-publish' }]);
+        const { sendTransport } = await joinVoiceChannel();
+        sendTransport.produce.mockClear();
+        mockGetUserMedia.mockResolvedValue(stream);
+
+        const lateProducer = createMockProducer('prod-late-mic', 'mic');
+        const pendingProducer = deferred<ReturnType<typeof createMockProducer>>();
+        sendTransport.produce.mockReturnValue(pendingProducer.promise);
+
+        const publishing = voiceService.produceAudio();
+        await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledOnce());
+        voiceService.emergencyCleanup();
+        pendingProducer.resolve(lateProducer);
+
+        await expect(publishing).rejects.toThrow(/obsolete voice session/i);
+        expect(lateProducer.close).toHaveBeenCalledOnce();
+        await voiceService.emergencyCleanup();
+        expect(lateProducer.close).toHaveBeenCalledOnce();
+      });
+
+      it('ignores a stale producer close callback after a successor call owns the microphone', async () => {
+        const firstStream = createMockMediaStream([{ kind: 'audio', id: 'mic-first-call' }]);
+        mockGetUserMedia.mockResolvedValue(firstStream);
+        const first = await joinVoiceChannel();
+        const closeHandlers = first.micProducer.on.mock.calls
+          .filter(([event]) => event === 'transportclose')
+          .map(([, handler]) => handler);
+        expect(closeHandlers).toHaveLength(1);
+        const staleTransportClose = closeHandlers[0] as () => void;
+
+        await voiceService.leaveChannel();
+
+        const successorStream = createMockMediaStream([{ kind: 'audio', id: 'mic-successor' }]);
+        mockGetUserMedia.mockResolvedValue(successorStream);
+        const successor = await joinVoiceChannel();
+        staleTransportClose();
+
+        expect(successorStream.getTracks()[0].stop).not.toHaveBeenCalled();
+        await voiceService.toggleMute();
+        expect(successor.micProducer.pause).toHaveBeenCalledOnce();
+      });
+    });
+
     it('transitions connecting -> connected', async () => {
       await joinVoiceChannel();
       expect(useVoiceStore.getState().connectionState).toBe('connected');
@@ -1109,7 +1380,7 @@ describe('VoiceService', () => {
       // joinChannel's catch.
       mockGetUserMedia.mockRejectedValue(new DOMException('Permission denied', 'NotAllowedError'));
 
-      await expect(voiceService.joinChannel('ch')).rejects.toThrow('Permission denied');
+      await expect(voiceService.joinChannel('ch')).rejects.toThrow();
 
       const state = useVoiceStore.getState();
       // setActiveChannel writes three fields (id/name/server). Assert all
@@ -1121,6 +1392,7 @@ describe('VoiceService', () => {
       expect(state.activeChannelName).toBeNull();
       expect(state.activeServerId).toBeNull();
       expect(state.connectionState).toBe('error');
+      expect(state.joinError).toMatch(/permission/i);
     });
 
     // Regression for the defense-in-depth branch added in handleJoinFailure:
@@ -1152,13 +1424,14 @@ describe('VoiceService', () => {
         throw new Error('mock cleanup teardown failure');
       });
 
-      await expect(voiceService.joinChannel('ch')).rejects.toThrow('Permission denied');
+      await expect(voiceService.joinChannel('ch')).rejects.toThrow();
 
       const state = useVoiceStore.getState();
       expect(state.activeChannelId).toBeNull();
       expect(state.activeChannelName).toBeNull();
       expect(state.activeServerId).toBeNull();
       expect(state.connectionState).toBe('error');
+      expect(state.joinError).toMatch(/permission/i);
     });
 
     it('sets participants with video state', async () => {
@@ -1261,6 +1534,87 @@ describe('VoiceService', () => {
   });
 
   // ===== Network-change recovery (#1790) =====
+
+  describe('initial join after media socket disconnect', () => {
+    it.each(['native permission', 'microphone capture'] as const)(
+      'tears down an initial join when %s fails after the socket starts reconnecting',
+      async (stage) => {
+        const permissionStore = await import('@/renderer/stores/voice/osPermissionStore');
+        const permission =
+          deferred<Awaited<ReturnType<typeof permissionStore.ensureOsPermission>>>();
+        const capture = deferred<MediaStream>();
+        const ensurePermission = vi.mocked(permissionStore.ensureOsPermission);
+        const joining = joinVoiceChannel();
+        let sendTransport: ReturnType<typeof makeSendTransport> | undefined;
+        let recvTransport: ReturnType<typeof makeRecvTransport> | undefined;
+
+        if (stage === 'native permission') {
+          ensurePermission.mockImplementation(() => permission.promise);
+        } else {
+          mockGetUserMedia.mockReset().mockReturnValue(capture.promise);
+        }
+
+        try {
+          await vi.waitFor(() =>
+            expect(
+              stage === 'native permission'
+                ? ensurePermission.mock.calls.length
+                : mockGetUserMedia.mock.calls.length
+            ).toBeGreaterThan(0)
+          );
+          sendTransport = mockCreateSendTransport.mock.results.at(-1)?.value;
+          recvTransport = mockCreateRecvTransport.mock.results.at(-1)?.value;
+
+          socketListeners['disconnect']?.forEach((listener) => listener('transport close'));
+          expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
+
+          if (stage === 'native permission')
+            permission.reject(new DOMException('', 'NotAllowedError'));
+          else capture.reject(new DOMException('', 'NotReadableError'));
+          await expect(joining).rejects.toThrow();
+
+          expect(
+            useVoiceStore.getState().connectionState,
+            'a failed initial join must not leave a reconnecting ghost session'
+          ).toBe('error');
+          expect(useVoiceStore.getState().activeChannelId).toBeNull();
+          expect(sendTransport?.close).toHaveBeenCalled();
+          expect(recvTransport?.close).toHaveBeenCalled();
+          expect(mockSocket.disconnect).toHaveBeenCalled();
+          expect((voiceService as any).sendTransport).toBeNull();
+          expect((voiceService as any).recvTransportAudio).toBeNull();
+        } finally {
+          permission.resolve('granted');
+          capture.resolve(createMockMediaStream() as unknown as MediaStream);
+          await joining.catch(() => undefined);
+          ensurePermission.mockResolvedValue('granted');
+          voiceService.emergencyCleanup();
+        }
+      }
+    );
+
+    it('keeps a voluntary leave disconnected when pending microphone capture later fails', async () => {
+      const capture = deferred<MediaStream>();
+      const joining = joinVoiceChannel();
+      mockGetUserMedia.mockReset().mockReturnValue(capture.promise);
+
+      try {
+        await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledOnce());
+        await voiceService.leaveChannel();
+        capture.reject(new DOMException('', 'NotReadableError'));
+        await expect(joining).rejects.toThrow();
+
+        expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+        expect(useVoiceStore.getState().activeChannelId).toBeNull();
+        expect((voiceService as any).sendTransport).toBeNull();
+        expect(mockSocket.disconnect).toHaveBeenCalled();
+      } finally {
+        capture.resolve(createMockMediaStream() as unknown as MediaStream);
+        await joining.catch(() => undefined);
+        voiceService.emergencyCleanup();
+      }
+    });
+  });
 
   describe('network-change recovery (#1790)', () => {
     it('re-establishes the media session after a transient disconnect + socket reconnect', async () => {
@@ -1790,6 +2144,7 @@ describe('VoiceService', () => {
 
     it('skips non-paused producer', async () => {
       const { micProducer } = await joinVoiceChannel();
+      micProducer.resume.mockClear();
       micProducer.paused = false;
       voiceService.resumeLocalProducer('mic');
       expect(micProducer.resume).not.toHaveBeenCalled();
@@ -2643,6 +2998,47 @@ describe('VoiceService', () => {
   // ===== OS permission =====
 
   describe('OS permission', () => {
+    it('does not reconnect the store when microphone permission resolves after leaving an initial join', async () => {
+      const permissionStore = await import('@/renderer/stores/voice/osPermissionStore');
+      const permission = deferred<Awaited<ReturnType<typeof permissionStore.ensureOsPermission>>>();
+      const ensurePermission = vi.mocked(permissionStore.ensureOsPermission);
+      ensurePermission.mockImplementation(() => permission.promise);
+      let joining: Promise<void> | undefined;
+
+      try {
+        joining = joinVoiceChannel();
+        await vi.waitFor(() => expect(ensurePermission).toHaveBeenCalledWith('microphone'));
+        await voiceService.leaveChannel();
+        expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+        expect(useVoiceStore.getState().activeChannelId).toBeNull();
+
+        permission.resolve('granted');
+        await joining.catch(() => undefined);
+
+        expect(
+          useVoiceStore.getState().connectionState,
+          'a completed leave must not be overwritten by the stale initial join'
+        ).toBe('disconnected');
+        expect(useVoiceStore.getState().activeChannelId).toBeNull();
+        expect(mockGetUserMedia).not.toHaveBeenCalled();
+        const recvTransport = mockCreateRecvTransport.mock.results.at(-1)?.value;
+        expect(recvTransport.consume).not.toHaveBeenCalled();
+        expect((voiceService as any).liveAudioUnsub).toBeNull();
+      } finally {
+        permission.resolve('granted');
+        await joining?.catch(() => undefined);
+        ensurePermission.mockResolvedValue('granted');
+        voiceService.emergencyCleanup();
+      }
+    });
+
+    it('still joins when OS microphone permission is already granted', async () => {
+      const permissionStore = await import('@/renderer/stores/voice/osPermissionStore');
+      vi.mocked(permissionStore.ensureOsPermission).mockResolvedValue('granted');
+      await joinVoiceChannel();
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+    });
+
     it('throws for denied mic', async () => {
       const m = await import('@/renderer/stores/voice/osPermissionStore');
       vi.mocked(m.ensureOsPermission).mockResolvedValue('denied');
@@ -2717,6 +3113,42 @@ describe('VoiceService', () => {
       expect(participant?.isSpeaking).toBe(true);
     });
 
+    it('keeps local speaking feedback attached to a successful replacement capture', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReplaceAudioTrack = svc.liveReplaceAudioTrack.bind(voiceService);
+      const replacements: Promise<void>[] = [];
+      svc.liveReplaceAudioTrack = () => {
+        const replacement = liveReplaceAudioTrack();
+        replacements.push(replacement);
+        return replacement;
+      };
+      const replacementStream = createMockMediaStream([
+        { kind: 'audio', id: 'replacement-vad-input' },
+      ]);
+      mockGetUserMedia.mockReset().mockResolvedValue(replacementStream as unknown as MediaStream);
+      mockAnalyser.getByteFrequencyData.mockImplementation((arr: Uint8Array) => {
+        const vadInput = mockVadInputStreams.at(-1);
+        const inputId = vadInput?.getAudioTracks()[0]?.id;
+        arr.fill(inputId === 'replacement-vad-input' ? 50 : 0);
+      });
+
+      try {
+        useVoiceStore.getState().setAudioInputDevice('replacement-device');
+        await Promise.all(replacements);
+
+        // The replacement published on the existing producer and remains unpaused.
+        expect(micProducer.replaceTrack).toHaveBeenCalledOnce();
+        expect(micProducer.paused).toBe(false);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(useVoiceStore.getState().participants['user-1']?.isSpeaking).toBe(true);
+      } finally {
+        delete svc.liveReplaceAudioTrack;
+        mockAnalyser.getByteFrequencyData.mockReset();
+        voiceService.emergencyCleanup();
+      }
+    });
+
     it('debounces silence before clearing isSpeaking', async () => {
       await joinVoiceChannel();
       setupAuth();
@@ -2773,8 +3205,9 @@ describe('VoiceService', () => {
     it('applies gain node for volume control', async () => {
       useAudioSettingsStore.setState({ inputVolume: 50 });
       await joinVoiceChannel();
-      // GainNode should have been created and connected
-      expect(mockGainNode.gain.setTargetAtTime).toHaveBeenCalled();
+      // Capture initializes the native gain value; setTargetAtTime is only used
+      // for later live setting changes.
+      expect(mockGainNode.gain.value).toBeCloseTo(0.5);
     });
 
     it('100% volume results in gain of 1', async () => {
@@ -4147,6 +4580,54 @@ describe('VoiceService', () => {
       expect(useVoiceStore.getState().isSoloBandwidthSaving).toBe(false);
     });
 
+    it('restarts local speaking feedback when solo mode resumes a replacement mic', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const joinHandler = socketListeners['user-joined']?.[0];
+      const leaveHandler = socketListeners['user-left']?.[0];
+      joinHandler?.({ userId: 'user-2', username: 'other', displayName: 'Other' });
+      await vi.advanceTimersByTimeAsync(0);
+      leaveHandler?.({ userId: 'user-2' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(useVoiceStore.getState().isSoloBandwidthSaving).toBe(true);
+
+      const successorProducer = createMockProducer('prod-mic-solo-replacement', 'mic');
+      let outgoingTrack: MediaStreamTrack | undefined;
+      successorProducer.pause.mockImplementation(() => {
+        successorProducer.paused = true;
+        if (outgoingTrack) outgoingTrack.enabled = false;
+      });
+      successorProducer.resume.mockImplementation(() => {
+        successorProducer.paused = false;
+        if (outgoingTrack) outgoingTrack.enabled = true;
+      });
+      sendTransport.produce.mockClear().mockImplementation(async (options) => {
+        outgoingTrack = options.track as MediaStreamTrack;
+        successorProducer.paused = !outgoingTrack.enabled;
+        options.onRtpSender?.(successorProducer.rtpSender as RTCRtpSender);
+        return successorProducer;
+      });
+      useAudioSettingsStore.setState({ opusNack: true });
+      await vi.waitFor(() => expect(svcProducer()).toBe(successorProducer));
+
+      expect(successorProducer.paused).toBe(true);
+      expect(outgoingTrack?.enabled).toBe(false);
+      mockAnalyser.getByteFrequencyData.mockImplementation((arr: Uint8Array) => arr.fill(50));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(useVoiceStore.getState().participants['user-1']?.isSpeaking).toBe(true);
+
+      joinHandler?.({ userId: 'user-3', username: 'third', displayName: 'Third' });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(useVoiceStore.getState().isSoloBandwidthSaving).toBe(false);
+      expect(successorProducer.paused).toBe(false);
+      expect(outgoingTrack?.enabled).toBe(true);
+      expect(useVoiceStore.getState().participants['user-1']?.isSpeaking).toBe(true);
+
+      function svcProducer() {
+        return (voiceService as any).producers.get('mic');
+      }
+    });
+
     it('shows notification after 60s alone', async () => {
       await joinVoiceChannel();
 
@@ -4807,6 +5288,1049 @@ describe('VoiceService', () => {
   // ===== Live Settings Subscriptions =====
 
   describe('live settings subscriptions', () => {
+    it('logs the safe native category for a codec-triggered microphone capture failure', async () => {
+      await joinVoiceChannel();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        mockGetUserMedia.mockRejectedValueOnce(
+          new DOMException('test diagnostic detail', 'NotReadableError')
+        );
+        useAudioSettingsStore.setState({ musicMode: true });
+
+        await vi.waitFor(() =>
+          expect(warn).toHaveBeenCalledWith(
+            '[audio-settings] Microphone re-produce failed:',
+            expect.any(String)
+          )
+        );
+        expect(warn).toHaveBeenCalledWith(
+          '[audio-settings] Microphone re-produce failed:',
+          'NotReadableError'
+        );
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('test diagnostic detail');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('stops the superseded raw mic capture when overlapping codec changes reject the later publish', async () => {
+      useAudioSettingsStore.setState({ advancedMode: true });
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      // The subscription detaches this promise; consume the expected publication
+      // rejection so the test pins raw-track cleanup directly.
+      const reproductions: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+      try {
+        const firstRawTrack = createMockMediaStream([
+          { kind: 'audio', id: 'raw-first' },
+        ]).getAudioTracks()[0];
+        const secondRawTrack = createMockMediaStream([
+          { kind: 'audio', id: 'raw-second' },
+        ]).getAudioTracks()[0];
+        const firstStream = createMockMediaStream([{ kind: 'audio', id: 'raw-first' }]);
+        const secondStream = createMockMediaStream([{ kind: 'audio', id: 'raw-second' }]);
+        firstStream.getAudioTracks.mockReturnValue([firstRawTrack]);
+        firstStream.getTracks.mockReturnValue([firstRawTrack]);
+        secondStream.getAudioTracks.mockReturnValue([secondRawTrack]);
+        secondStream.getTracks.mockReturnValue([secondRawTrack]);
+
+        let releaseDrain!: () => void;
+        const drainGate = new Promise<void>((resolve) => {
+          releaseDrain = resolve;
+        });
+        svc.drainSendTransportQueue = vi.fn(async () => drainGate);
+        const firstCapture = deferred<MediaStream>();
+        const secondCapture = deferred<MediaStream>();
+        let captureCount = 0;
+        mockGetUserMedia.mockReset();
+        mockGetUserMedia.mockImplementation(() => {
+          const capture = [firstCapture, secondCapture][captureCount];
+          if (!capture) throw new Error('Unexpected additional microphone capture');
+          captureCount += 1;
+          return capture.promise;
+        });
+
+        const firstReplacement = createMockProducer('prod-mic-first-replacement', 'mic');
+        sendTransport.produce.mockClear();
+        sendTransport.produce.mockResolvedValueOnce(firstReplacement);
+        sendTransport.produce.mockRejectedValueOnce(new Error('duplicate microphone producer'));
+
+        // These are the production codec-option subscription triggers. Both start
+        // closeProducer while its transport drain is still pending.
+        useAudioSettingsStore.setState({ musicMode: true });
+        useAudioSettingsStore.setState({ frameSize: 20 });
+        await vi.waitFor(() => expect(svc.drainSendTransportQueue).toHaveBeenCalled());
+        releaseDrain();
+        await vi.waitFor(() => expect(captureCount).toBeGreaterThanOrEqual(1));
+
+        firstCapture.resolve(firstStream as unknown as MediaStream);
+        await vi.waitFor(() =>
+          expect(
+            firstRawTrack.stop.mock.calls.length > 0 ||
+              svc.producers.get('mic') === firstReplacement
+          ).toBe(true)
+        );
+        secondCapture.resolve(secondStream as unknown as MediaStream);
+        await Promise.all(reproductions);
+
+        // The producer owns the processed destination track. Closing it does not
+        // stop the distinct raw getUserMedia track that feeds AudioContext.
+        await voiceService.closeProducer('mic');
+        expect(captureCount).toBeGreaterThan(0);
+        expect(
+          firstRawTrack.stop,
+          'first acquired raw mic track should be stopped'
+        ).toHaveBeenCalled();
+        if (captureCount > 1) {
+          expect(
+            secondRawTrack.stop,
+            'second acquired raw mic track should be stopped'
+          ).toHaveBeenCalled();
+        }
+        expect(svc.producers.has('mic')).toBe(false);
+      } finally {
+        delete svc.liveReproduceAudio;
+        delete svc.drainSendTransportQueue;
+      }
+    });
+
+    it('applies the latest codec option changed during microphone capture', async () => {
+      useAudioSettingsStore.setState({ advancedMode: true, frameSize: 10 });
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+
+      const firstRawTrack = createMockMediaStream([
+        { kind: 'audio', id: 'codec-first-raw' },
+      ]).getAudioTracks()[0];
+      const latestRawTrack = createMockMediaStream([
+        { kind: 'audio', id: 'codec-latest-raw' },
+      ]).getAudioTracks()[0];
+      const firstStream = createMockMediaStream([{ kind: 'audio', id: 'codec-first-raw' }]);
+      const latestStream = createMockMediaStream([{ kind: 'audio', id: 'codec-latest-raw' }]);
+      firstStream.getAudioTracks.mockReturnValue([firstRawTrack]);
+      firstStream.getTracks.mockReturnValue([firstRawTrack]);
+      latestStream.getAudioTracks.mockReturnValue([latestRawTrack]);
+      latestStream.getTracks.mockReturnValue([latestRawTrack]);
+      const firstCapture = deferred<MediaStream>();
+      const latestCapture = deferred<MediaStream>();
+      let captureCount = 0;
+      mockGetUserMedia.mockReset().mockImplementation(() => {
+        const captureIndex = captureCount++;
+        const capture = captureIndex === 0 ? firstCapture : latestCapture;
+        if (captureIndex > 1) throw new Error('Unexpected additional microphone capture');
+        if (captureIndex === 1) latestCapture.resolve(latestStream as unknown as MediaStream);
+        return capture.promise;
+      });
+
+      const firstReplacement = createMockProducer('prod-mic-codec-first', 'mic');
+      const latestReplacement = createMockProducer('prod-mic-codec-latest', 'mic');
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockImplementation(async (options) =>
+        options.codecOptions?.opusPtime === 20 ? latestReplacement : firstReplacement
+      );
+
+      try {
+        useAudioSettingsStore.setState({ musicMode: true });
+        await vi.waitFor(() => expect(captureCount).toBe(1));
+        useAudioSettingsStore.setState({ advancedMode: true, frameSize: 20 });
+        firstCapture.resolve(firstStream as unknown as MediaStream);
+        await Promise.all(reproductions);
+
+        const calls = sendTransport.produce.mock.calls;
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.at(-1)?.[0].codecOptions?.opusPtime).toBe(20);
+        expect(svc.producers.get('mic')).toBe(latestReplacement);
+        await voiceService.closeProducer('mic');
+        expect(captureCount).toBeGreaterThan(0);
+        expect(firstRawTrack.stop).toHaveBeenCalled();
+        if (captureCount > 1) expect(latestRawTrack.stop).toHaveBeenCalled();
+      } finally {
+        delete svc.liveReproduceAudio;
+      }
+    });
+
+    it('keeps a queued codec update when the first replacement microphone capture rejects', async () => {
+      useAudioSettingsStore.setState({ advancedMode: true, frameSize: 10 });
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+
+      const staleCapture = deferred<MediaStream>();
+      const latestStream = createMockMediaStream([{ kind: 'audio', id: 'queued-capture-latest' }]);
+      const latestRawTrack = latestStream.getTracks()[0];
+      let captureCount = 0;
+      mockGetUserMedia.mockReset().mockImplementation(() => {
+        captureCount += 1;
+        if (captureCount === 1) return staleCapture.promise;
+        if (captureCount === 2) return Promise.resolve(latestStream as unknown as MediaStream);
+        throw new Error('Unexpected additional microphone capture');
+      });
+      const successorProducer = createMockProducer('prod-mic-after-capture-failure', 'mic');
+      sendTransport.produce.mockClear().mockImplementation(async (options) => {
+        options.onRtpSender?.(successorProducer.rtpSender as RTCRtpSender);
+        return successorProducer;
+      });
+
+      try {
+        useAudioSettingsStore.setState({ opusNack: true });
+        await vi.waitFor(() => expect(captureCount).toBe(1));
+        expect(svc.producers.has('mic')).toBe(false);
+
+        useAudioSettingsStore.setState({ frameSize: 20 });
+        expect(reproductions).toHaveLength(2);
+        staleCapture.reject(new DOMException('', 'NotReadableError'));
+        await Promise.all(reproductions);
+
+        expect(captureCount).toBe(2);
+        expect(sendTransport.produce).toHaveBeenCalledOnce();
+        expect(sendTransport.produce.mock.calls[0]?.[0].codecOptions?.opusPtime).toBe(20);
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+        await voiceService.closeProducer('mic');
+        expect(latestRawTrack.stop).toHaveBeenCalled();
+      } finally {
+        staleCapture.resolve(createMockMediaStream() as unknown as MediaStream);
+        await Promise.all(reproductions);
+        delete svc.liveReproduceAudio;
+        voiceService.emergencyCleanup();
+      }
+    });
+
+    it('keeps a queued codec update when the first replacement publication rejects', async () => {
+      useAudioSettingsStore.setState({ advancedMode: true, frameSize: 10 });
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+
+      const staleStream = createMockMediaStream([{ kind: 'audio', id: 'queued-publish-stale' }]);
+      const staleRawTrack = staleStream.getTracks()[0];
+      const latestStream = createMockMediaStream([{ kind: 'audio', id: 'queued-publish-latest' }]);
+      const latestRawTrack = latestStream.getTracks()[0];
+      let captureCount = 0;
+      mockGetUserMedia.mockReset().mockImplementation(() => {
+        captureCount += 1;
+        if (captureCount === 1) return Promise.resolve(staleStream as unknown as MediaStream);
+        if (captureCount === 2) return Promise.resolve(latestStream as unknown as MediaStream);
+        throw new Error('Unexpected additional microphone capture');
+      });
+      const stalePublication = deferred<ReturnType<typeof createMockProducer>>();
+      const successorProducer = createMockProducer('prod-mic-after-publish-failure', 'mic');
+      sendTransport.produce.mockClear().mockImplementation(async (options) => {
+        options.onRtpSender?.(
+          (captureCount === 1 ? createMockProducer('prod-mic-stale', 'mic') : successorProducer)
+            .rtpSender as RTCRtpSender
+        );
+        if (sendTransport.produce.mock.calls.length === 1) return stalePublication.promise;
+        return successorProducer;
+      });
+
+      try {
+        useAudioSettingsStore.setState({ opusNack: true });
+        await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledOnce());
+
+        useAudioSettingsStore.setState({ frameSize: 20 });
+        expect(reproductions).toHaveLength(2);
+        stalePublication.reject(new Error('first encrypted microphone publication failed'));
+        await Promise.all(reproductions);
+
+        expect(captureCount).toBe(2);
+        expect(sendTransport.produce).toHaveBeenCalledTimes(2);
+        expect(sendTransport.produce.mock.calls.at(-1)?.[0].codecOptions?.opusPtime).toBe(20);
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+        expect(staleRawTrack.stop).toHaveBeenCalled();
+        await voiceService.closeProducer('mic');
+        expect(latestRawTrack.stop).toHaveBeenCalled();
+      } finally {
+        stalePublication.reject(new Error('first encrypted microphone publication failed'));
+        await Promise.all(reproductions);
+        delete svc.liveReproduceAudio;
+        voiceService.emergencyCleanup();
+      }
+    });
+
+    it('retains replacement intent for a later codec update after a swap failure settles', async () => {
+      useAudioSettingsStore.setState({ advancedMode: true, frameSize: 10 });
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+
+      const failedCapture = deferred<MediaStream>();
+      const latestStream = createMockMediaStream([{ kind: 'audio', id: 'later-retry-raw' }]);
+      const latestRawTrack = latestStream.getTracks()[0];
+      let captureCount = 0;
+      mockGetUserMedia.mockReset().mockImplementation(() => {
+        captureCount += 1;
+        if (captureCount === 1) return failedCapture.promise;
+        if (captureCount === 2) return Promise.resolve(latestStream as unknown as MediaStream);
+        throw new Error('Unexpected additional microphone capture');
+      });
+      const successorProducer = createMockProducer('prod-mic-later-retry', 'mic');
+      sendTransport.produce.mockClear().mockImplementation(async (options) => {
+        options.onRtpSender?.(successorProducer.rtpSender as RTCRtpSender);
+        return successorProducer;
+      });
+
+      try {
+        useAudioSettingsStore.setState({ opusNack: true });
+        await vi.waitFor(() => expect(captureCount).toBe(1));
+        failedCapture.reject(new DOMException('', 'NotReadableError'));
+        await Promise.all(reproductions);
+        expect(svc.producers.has('mic')).toBe(false);
+
+        useAudioSettingsStore.setState({ frameSize: 20 });
+        await vi.waitFor(() => expect(captureCount).toBe(2));
+        await Promise.all(reproductions);
+
+        expect(sendTransport.produce).toHaveBeenCalledOnce();
+        expect(sendTransport.produce.mock.calls[0]?.[0].codecOptions?.opusPtime).toBe(20);
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+        await voiceService.closeProducer('mic');
+        expect(latestRawTrack.stop).toHaveBeenCalled();
+      } finally {
+        failedCapture.resolve(createMockMediaStream() as unknown as MediaStream);
+        await Promise.all(reproductions);
+        delete svc.liveReproduceAudio;
+        voiceService.emergencyCleanup();
+      }
+    });
+
+    it.each(['leave', 'explicit close'] as const)(
+      'does not run a queued replacement after %s cancels microphone intent',
+      async (cancellation) => {
+        useAudioSettingsStore.setState({ advancedMode: true, frameSize: 10 });
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+        const reproductions: Promise<void>[] = [];
+        svc.liveReproduceAudio = () => {
+          const reproduction = liveReproduceAudio().catch(() => undefined);
+          reproductions.push(reproduction);
+          return reproduction;
+        };
+
+        const pendingCapture = deferred<MediaStream>();
+        let captureCount = 0;
+        mockGetUserMedia.mockReset().mockImplementation(() => {
+          captureCount += 1;
+          return pendingCapture.promise;
+        });
+        sendTransport.produce.mockClear();
+
+        try {
+          useAudioSettingsStore.setState({ opusNack: true });
+          await vi.waitFor(() => expect(captureCount).toBe(1));
+          useAudioSettingsStore.setState({ frameSize: 20 });
+          expect(reproductions).toHaveLength(2);
+
+          if (cancellation === 'leave') await voiceService.leaveChannel();
+          else await voiceService.closeProducer('mic');
+          pendingCapture.reject(new DOMException('', 'NotReadableError'));
+          await Promise.all(reproductions);
+
+          useVoiceStore.getState().setAudioInputDevice('mic-after-cancel');
+          useAudioSettingsStore.getState().setEchoCancellation(false);
+          await Promise.all(reproductions);
+          await Promise.resolve();
+
+          expect(captureCount).toBe(1);
+          expect(sendTransport.produce).not.toHaveBeenCalled();
+          expect(svc.producers.has('mic')).toBe(false);
+          if (cancellation === 'leave') {
+            expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+          }
+        } finally {
+          pendingCapture.resolve(createMockMediaStream() as unknown as MediaStream);
+          await Promise.all(reproductions);
+          delete svc.liveReproduceAudio;
+          voiceService.emergencyCleanup();
+        }
+      }
+    );
+
+    it('does not capture on a codec setting change when initial join has no mic producer', async () => {
+      await joinVoiceChannel(undefined, 'channel', { permissions: '0' });
+      expect((voiceService as any).producers.has('mic')).toBe(false);
+
+      useAudioSettingsStore.setState({ opusNack: true });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      useVoiceStore.getState().setAudioInputDevice('listen-only-device');
+      useAudioSettingsStore.getState().setEchoCancellation(false);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockGetUserMedia).not.toHaveBeenCalled();
+      expect((voiceService as any).producers.has('mic')).toBe(false);
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+    });
+
+    it.each([
+      { initiallyMuted: true, mutedAtAdoption: true },
+      { initiallyMuted: false, mutedAtAdoption: false },
+      { initiallyMuted: false, mutedAtAdoption: true },
+      { initiallyMuted: true, mutedAtAdoption: false },
+    ])(
+      'applies current mute policy across a codec replacement (initial=$initiallyMuted, adoption=$mutedAtAdoption)',
+      async ({ initiallyMuted, mutedAtAdoption }) => {
+        processedAudioTrack.enabled = true;
+        const { sendTransport, micProducer } = await joinVoiceChannel();
+        if (initiallyMuted) await voiceService.toggleMute();
+        expect(useVoiceStore.getState().isMuted).toBe(initiallyMuted);
+
+        const svc = voiceService as any;
+        const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+        const reproductions: Promise<void>[] = [];
+        svc.liveReproduceAudio = () => {
+          const reproduction = liveReproduceAudio().catch(() => undefined);
+          reproductions.push(reproduction);
+          return reproduction;
+        };
+
+        const successorProducer = createMockProducer(
+          initiallyMuted ? 'prod-mic-muted-successor' : 'prod-mic-unmuted-successor',
+          'mic'
+        );
+        successorProducer.pause.mockImplementation(() => {
+          successorProducer.paused = true;
+          if (outgoingTrack) outgoingTrack.enabled = false;
+        });
+        successorProducer.resume.mockImplementation(() => {
+          successorProducer.paused = false;
+          if (outgoingTrack) outgoingTrack.enabled = true;
+        });
+        const pendingPublication = deferred<ReturnType<typeof createMockProducer>>();
+        let enabledAtProduce: boolean | undefined;
+        let outgoingTrack: MediaStreamTrack | undefined;
+        sendTransport.produce.mockClear().mockImplementation(async (options) => {
+          outgoingTrack = options.track as MediaStreamTrack | undefined;
+          enabledAtProduce = outgoingTrack?.enabled;
+          successorProducer.paused = !enabledAtProduce;
+          options.onRtpSender?.(successorProducer.rtpSender as RTCRtpSender);
+          return pendingPublication.promise;
+        });
+
+        try {
+          useAudioSettingsStore.setState({ opusNack: true });
+          await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledOnce());
+
+          if (initiallyMuted) {
+            expect
+              .soft(
+                enabledAtProduce,
+                'a self-muted replacement track must be disabled before transport publication'
+              )
+              .toBe(false);
+          }
+
+          if (mutedAtAdoption !== initiallyMuted) {
+            useVoiceStore.getState().setMuted(mutedAtAdoption);
+          }
+
+          pendingPublication.resolve(successorProducer);
+          await Promise.all(reproductions);
+
+          if (initiallyMuted) {
+            expect(micProducer.pause).toHaveBeenCalled();
+          }
+          expect(svc.producers.get('mic')).toBe(successorProducer);
+          expect(useVoiceStore.getState().isMuted).toBe(mutedAtAdoption);
+          if (mutedAtAdoption) {
+            expect.soft(outgoingTrack?.enabled).toBe(false);
+            expect.soft(successorProducer.paused).toBe(true);
+            expect.soft(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+              producerId: successorProducer.id,
+            });
+          } else {
+            expect(outgoingTrack?.enabled).toBe(true);
+            expect(successorProducer.paused).toBe(false);
+          }
+        } finally {
+          pendingPublication.resolve(successorProducer);
+          await Promise.all(reproductions);
+          delete svc.liveReproduceAudio;
+          voiceService.emergencyCleanup();
+          processedAudioTrack.enabled = true;
+        }
+      }
+    );
+
+    it('remembers a mute pressed while codec replacement is publishing', async () => {
+      processedAudioTrack.enabled = true;
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+
+      const successorProducer = createMockProducer('prod-mic-muted-during-publication', 'mic');
+      const pendingPublication = deferred<ReturnType<typeof createMockProducer>>();
+      let outgoingTrack: MediaStreamTrack | undefined;
+      successorProducer.pause.mockImplementation(() => {
+        successorProducer.paused = true;
+        if (outgoingTrack) outgoingTrack.enabled = false;
+      });
+      successorProducer.resume.mockImplementation(() => {
+        successorProducer.paused = false;
+        if (outgoingTrack) outgoingTrack.enabled = true;
+      });
+      mockGetUserMedia.mockResolvedValue(
+        createMockMediaStream([
+          { kind: 'audio', id: 'pending-mute-replacement' },
+        ]) as unknown as MediaStream
+      );
+      sendTransport.produce.mockClear().mockImplementation(async (options) => {
+        outgoingTrack = options.track as MediaStreamTrack;
+        successorProducer.paused = !outgoingTrack.enabled;
+        options.onRtpSender?.(successorProducer.rtpSender as RTCRtpSender);
+        return pendingPublication.promise;
+      });
+
+      try {
+        useAudioSettingsStore.setState({ opusNack: true });
+        await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledOnce());
+        expect(svc.producers.has('mic')).toBe(false);
+
+        await voiceService.toggleMute();
+        const muteStateAfterUserAction = useVoiceStore.getState().isMuted;
+
+        pendingPublication.resolve(successorProducer);
+        await Promise.all(reproductions);
+
+        expect(muteStateAfterUserAction).toBe(true);
+        expect(useVoiceStore.getState().isMuted).toBe(true);
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+        expect(outgoingTrack?.enabled).toBe(false);
+        expect(successorProducer.paused).toBe(true);
+        expect(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+          producerId: successorProducer.id,
+        });
+      } finally {
+        pendingPublication.resolve(successorProducer);
+        await Promise.all(reproductions);
+        delete svc.liveReproduceAudio;
+        voiceService.emergencyCleanup();
+        processedAudioTrack.enabled = true;
+      }
+    });
+
+    it('keeps mute intent through a settled codec failure and later device recovery', async () => {
+      processedAudioTrack.enabled = true;
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const liveReplaceAudioTrack = svc.liveReplaceAudioTrack.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      const replacements: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+      svc.liveReplaceAudioTrack = () => {
+        const replacement = liveReplaceAudioTrack();
+        replacements.push(replacement);
+        return replacement;
+      };
+
+      const failedStream = createMockMediaStream([{ kind: 'audio', id: 'failed-codec-raw' }]);
+      const recoveryStream = createMockMediaStream([{ kind: 'audio', id: 'recovery-device-raw' }]);
+      const captureConstraints: MediaTrackConstraints[] = [];
+      let captureCount = 0;
+      mockGetUserMedia.mockReset().mockImplementation((constraints: MediaStreamConstraints) => {
+        captureConstraints.push(constraints.audio as MediaTrackConstraints);
+        captureCount += 1;
+        return Promise.resolve(
+          (captureCount === 1 ? failedStream : recoveryStream) as unknown as MediaStream
+        );
+      });
+
+      const recoveryProducer = createMockProducer('prod-mic-after-settled-failure', 'mic');
+      const publishedTracks: MediaStreamTrack[] = [];
+      let produceCount = 0;
+      recoveryProducer.pause.mockImplementation(() => {
+        recoveryProducer.paused = true;
+        const publishedTrack = publishedTracks.at(-1);
+        if (publishedTrack) publishedTrack.enabled = false;
+      });
+      recoveryProducer.resume.mockImplementation(() => {
+        recoveryProducer.paused = false;
+        const publishedTrack = publishedTracks.at(-1);
+        if (publishedTrack) publishedTrack.enabled = true;
+      });
+      sendTransport.produce.mockClear().mockImplementation(async (options) => {
+        produceCount += 1;
+        if (produceCount === 1) {
+          throw new Error('simulated codec replacement publication failure');
+        }
+        const publishedTrack = options.track as MediaStreamTrack;
+        publishedTracks.push(publishedTrack);
+        recoveryProducer.paused = !publishedTrack.enabled;
+        options.onRtpSender?.(recoveryProducer.rtpSender as RTCRtpSender);
+        return recoveryProducer;
+      });
+
+      try {
+        useAudioSettingsStore.setState({ opusNack: true });
+        await vi.waitFor(() => expect(captureCount).toBe(1));
+        await Promise.all(reproductions);
+        expect(svc.producers.has('mic')).toBe(false);
+
+        await voiceService.toggleMute();
+        const muteStateAfterUserAction = useVoiceStore.getState().isMuted;
+
+        useVoiceStore.getState().setAudioInputDevice('mic-after-failure');
+        await Promise.all(replacements);
+        await Promise.all(reproductions);
+
+        expect(captureCount).toBe(2);
+        expect(captureConstraints[1].deviceId).toEqual({ exact: 'mic-after-failure' });
+        expect(sendTransport.produce).toHaveBeenCalledTimes(2);
+        expect(svc.producers.get('mic')).toBe(recoveryProducer);
+        expect(muteStateAfterUserAction).toBe(true);
+        expect(useVoiceStore.getState().isMuted).toBe(true);
+        expect(publishedTracks.at(-1)?.enabled).toBe(false);
+        expect(recoveryProducer.paused).toBe(true);
+        expect(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+          producerId: recoveryProducer.id,
+        });
+      } finally {
+        await Promise.all(reproductions);
+        await Promise.all(replacements);
+        delete svc.liveReproduceAudio;
+        delete svc.liveReplaceAudioTrack;
+        voiceService.emergencyCleanup();
+        processedAudioTrack.enabled = true;
+      }
+    });
+
+    const latestMicSettingCases = [
+      {
+        name: 'device selection changed during capture',
+        phase: 'capture',
+        change: () => useVoiceStore.getState().setAudioInputDevice('mic-current'),
+        isLatest: (audio: any) => audio.deviceId?.exact === 'mic-current',
+      },
+      {
+        name: 'echo-cancellation constraint changed during capture',
+        phase: 'capture',
+        change: () => useAudioSettingsStore.setState({ echoCancellation: false }),
+        isLatest: (audio: any) => audio.echoCancellation === false,
+      },
+      {
+        name: 'device selection changed during publication',
+        phase: 'publication',
+        change: () => useVoiceStore.getState().setAudioInputDevice('mic-current'),
+        isLatest: (audio: any) => audio.deviceId?.exact === 'mic-current',
+      },
+    ] as const;
+
+    it.each(latestMicSettingCases)(
+      'uses the latest microphone setting after $name',
+      async ({ phase, change, isLatest }) => {
+        useVoiceStore.getState().setAudioInputDevice('mic-before');
+        const { sendTransport } = await joinVoiceChannel();
+        expect(mockGetUserMedia.mock.calls[0]?.[0]).toMatchObject({
+          audio: { deviceId: { exact: 'mic-before' } },
+        });
+
+        const svc = voiceService as any;
+        const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+        const liveReplaceAudioTrack = svc.liveReplaceAudioTrack.bind(voiceService);
+        const reproductions: Promise<void>[] = [];
+        const replacements: Promise<void>[] = [];
+        svc.liveReproduceAudio = () => {
+          const reproduction = liveReproduceAudio().catch(() => undefined);
+          reproductions.push(reproduction);
+          return reproduction;
+        };
+        svc.liveReplaceAudioTrack = () => {
+          const replacement = liveReplaceAudioTrack();
+          replacements.push(replacement);
+          return replacement;
+        };
+
+        const oldCapture = deferred<MediaStream>();
+        const oldStream = createMockMediaStream([{ kind: 'audio', id: 'mic-before-raw' }]);
+        const latestStream = createMockMediaStream([{ kind: 'audio', id: 'mic-current-raw' }]);
+        const captureAudioOptions: MediaTrackConstraints[] = [];
+        const acquiredStreams: MediaStream[] = [oldStream as unknown as MediaStream];
+        mockGetUserMedia.mockReset().mockImplementation((constraints: MediaStreamConstraints) => {
+          const audio = constraints.audio as MediaTrackConstraints;
+          captureAudioOptions.push(audio);
+          if (captureAudioOptions.length === 1) return oldCapture.promise;
+          const stream = isLatest(audio) ? latestStream : oldStream;
+          acquiredStreams.push(stream as unknown as MediaStream);
+          return Promise.resolve(stream as unknown as MediaStream);
+        });
+        const staleProducer = createMockProducer('prod-mic-stale-device', 'mic');
+        const successorProducer = createMockProducer('prod-mic-current-device', 'mic');
+        const pendingPublication = deferred<ReturnType<typeof createMockProducer>>();
+        let publicationCount = 0;
+        sendTransport.produce.mockClear().mockImplementation(() => {
+          publicationCount += 1;
+          if (phase === 'publication' && publicationCount === 1) {
+            return pendingPublication.promise;
+          }
+          return Promise.resolve(publicationCount === 1 ? staleProducer : successorProducer);
+        });
+
+        try {
+          useAudioSettingsStore.setState({ opusNack: true });
+          await vi.waitFor(() => expect(captureAudioOptions).toHaveLength(1));
+          expect(isLatest(captureAudioOptions[0])).toBe(false);
+          expect(svc.producers.has('mic')).toBe(false);
+
+          if (phase === 'publication') {
+            oldCapture.resolve(oldStream as unknown as MediaStream);
+            await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledOnce());
+            expect(svc.producers.has('mic')).toBe(false);
+          }
+          change();
+          if (phase === 'capture') oldCapture.resolve(oldStream as unknown as MediaStream);
+          else pendingPublication.resolve(staleProducer);
+
+          await Promise.all(reproductions);
+          await Promise.all(replacements);
+
+          expect(captureAudioOptions.some(isLatest)).toBe(true);
+          expect(svc.localMicStream).toBe(latestStream);
+          if (phase === 'publication') {
+            expect(staleProducer.close).toHaveBeenCalled();
+            expect(svc.producers.get('mic')).toBe(successorProducer);
+          } else {
+            expect(svc.producers.get('mic')).toBeDefined();
+          }
+          await voiceService.closeProducer('mic');
+          for (const stream of acquiredStreams) {
+            expect(stream.getTracks()[0].stop).toHaveBeenCalled();
+          }
+        } finally {
+          oldCapture.resolve(oldStream as unknown as MediaStream);
+          pendingPublication.resolve(staleProducer);
+          await Promise.all(reproductions);
+          await Promise.all(replacements);
+          delete svc.liveReproduceAudio;
+          delete svc.liveReplaceAudioTrack;
+          voiceService.emergencyCleanup();
+        }
+      }
+    );
+
+    it('retries with the newly selected device when the stale microphone capture rejects', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      const liveReplaceAudioTrack = svc.liveReplaceAudioTrack.bind(voiceService);
+      const reproductions: Promise<void>[] = [];
+      const replacements: Promise<void>[] = [];
+      svc.liveReproduceAudio = () => {
+        const reproduction = liveReproduceAudio().catch(() => undefined);
+        reproductions.push(reproduction);
+        return reproduction;
+      };
+      svc.liveReplaceAudioTrack = () => {
+        const replacement = liveReplaceAudioTrack();
+        replacements.push(replacement);
+        return replacement;
+      };
+
+      const staleCapture = deferred<MediaStream>();
+      const latestStream = createMockMediaStream([{ kind: 'audio', id: 'latest-device-raw' }]);
+      const captureConstraints: MediaTrackConstraints[] = [];
+      let captureCount = 0;
+      mockGetUserMedia.mockReset().mockImplementation((constraints: MediaStreamConstraints) => {
+        captureConstraints.push(constraints.audio as MediaTrackConstraints);
+        captureCount += 1;
+        if (captureCount === 1) return staleCapture.promise;
+        if (captureCount === 2) return Promise.resolve(latestStream as unknown as MediaStream);
+        throw new Error('Unexpected additional microphone capture');
+      });
+      const successorProducer = createMockProducer('prod-mic-after-device-change', 'mic');
+      sendTransport.produce.mockClear().mockResolvedValue(successorProducer);
+
+      try {
+        useAudioSettingsStore.setState({ opusNack: true });
+        await vi.waitFor(() => expect(captureCount).toBe(1));
+        expect(svc.producers.has('mic')).toBe(false);
+
+        useVoiceStore.getState().setAudioInputDevice('mic-after-reject');
+        staleCapture.reject(new DOMException('', 'NotReadableError'));
+        await Promise.all(reproductions);
+        await Promise.all(replacements);
+
+        expect(captureCount).toBe(2);
+        expect(captureConstraints[1].deviceId).toEqual({ exact: 'mic-after-reject' });
+        expect(sendTransport.produce).toHaveBeenCalledOnce();
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+        await voiceService.closeProducer('mic');
+        expect(latestStream.getTracks()[0].stop).toHaveBeenCalled();
+      } finally {
+        staleCapture.reject(new DOMException('', 'NotReadableError'));
+        await Promise.all(reproductions);
+        await Promise.all(replacements);
+        delete svc.liveReproduceAudio;
+        delete svc.liveReplaceAudioTrack;
+        voiceService.emergencyCleanup();
+      }
+    });
+
+    it.each([
+      { failure: 'capture' as const, latest: 'device' as const },
+      { failure: 'publication' as const, latest: 'constraint' as const },
+    ])(
+      'recovers a failed replacement after a later $latest change ($failure failure)',
+      async ({ failure, latest }) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+        const liveReplaceAudioTrack = svc.liveReplaceAudioTrack.bind(voiceService);
+        const reproductions: Promise<void>[] = [];
+        const replacements: Promise<void>[] = [];
+        svc.liveReproduceAudio = () => {
+          const reproduction = liveReproduceAudio().catch(() => undefined);
+          reproductions.push(reproduction);
+          return reproduction;
+        };
+        svc.liveReplaceAudioTrack = () => {
+          const replacement = liveReplaceAudioTrack();
+          replacements.push(replacement);
+          return replacement;
+        };
+
+        const firstStream = createMockMediaStream([{ kind: 'audio', id: 'failed-attempt-raw' }]);
+        const successorStream = createMockMediaStream([{ kind: 'audio', id: 'recovery-raw' }]);
+        const captureAudioOptions: MediaTrackConstraints[] = [];
+        let captureCount = 0;
+        mockGetUserMedia.mockReset().mockImplementation((constraints: MediaStreamConstraints) => {
+          captureCount += 1;
+          captureAudioOptions.push(constraints.audio as MediaTrackConstraints);
+          if (captureCount === 1 && failure === 'capture') {
+            return Promise.reject(new DOMException('', 'NotReadableError'));
+          }
+          return Promise.resolve(
+            (captureCount === 1 ? firstStream : successorStream) as unknown as MediaStream
+          );
+        });
+        const recoveryProducer = createMockProducer('prod-mic-after-later-setting', 'mic');
+        let produceCount = 0;
+        sendTransport.produce.mockClear().mockImplementation(() => {
+          produceCount += 1;
+          if (failure === 'publication' && produceCount === 1) {
+            return Promise.reject(new Error('simulated microphone publication failure'));
+          }
+          return Promise.resolve(recoveryProducer);
+        });
+
+        try {
+          useAudioSettingsStore.setState({ opusNack: true });
+          await vi.waitFor(() => expect(captureCount).toBe(1));
+          await Promise.all(reproductions);
+          if (failure === 'publication') {
+            expect(sendTransport.produce).toHaveBeenCalledOnce();
+          } else {
+            expect(sendTransport.produce).not.toHaveBeenCalled();
+          }
+          expect(svc.producers.has('mic')).toBe(false);
+
+          if (latest === 'device') {
+            useVoiceStore.getState().setAudioInputDevice('mic-recovery-later');
+          } else {
+            useAudioSettingsStore.getState().setEchoCancellation(false);
+          }
+          await Promise.all(replacements);
+          await Promise.all(reproductions);
+
+          expect(captureCount).toBe(2);
+          expect(captureAudioOptions[1]).toMatchObject(
+            latest === 'device'
+              ? { deviceId: { exact: 'mic-recovery-later' } }
+              : { echoCancellation: false }
+          );
+          expect(sendTransport.produce).toHaveBeenCalledTimes(failure === 'publication' ? 2 : 1);
+          expect(svc.producers.get('mic')).toBe(recoveryProducer);
+          expect(svc.localMicStream).toBe(successorStream);
+        } finally {
+          await Promise.all(reproductions);
+          await Promise.all(replacements);
+          delete svc.liveReproduceAudio;
+          delete svc.liveReplaceAudioTrack;
+          voiceService.emergencyCleanup();
+        }
+      }
+    );
+
+    it.each([
+      { result: 'success' as const, ack: { success: true as const } },
+      { result: 'error' as const, ack: { error: 'server could not retire old producer' } },
+    ])(
+      'retires a stale published microphone before retrying after settings drift ($result ack)',
+      async ({ ack, result }) => {
+        useVoiceStore.getState().setAudioInputDevice('mic-before-publication');
+        const { sendTransport, micProducer } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+        const reproductions: Promise<void>[] = [];
+        svc.liveReproduceAudio = () => {
+          const reproduction = liveReproduceAudio().catch(() => undefined);
+          reproductions.push(reproduction);
+          return reproduction;
+        };
+
+        const originalEmit = mockSocket.emit.getMockImplementation();
+        type CloseAck = (response: { success: true } | { error: string }) => void;
+        const closeEvents: Array<{ producerId: string; ack?: CloseAck }> = [];
+        let serverMicSlot: string | null = micProducer.id;
+        const staleProducer = createMockProducer('prod-mic-stale-publication', 'mic');
+        const successorProducer = createMockProducer('prod-mic-successor', 'mic');
+        const pendingPublication = deferred<ReturnType<typeof createMockProducer>>();
+        const captureConstraints: MediaTrackConstraints[] = [];
+        let publicationCount = 0;
+        mockGetUserMedia.mockReset().mockImplementation((constraints: MediaStreamConstraints) => {
+          captureConstraints.push(constraints.audio as MediaTrackConstraints);
+          return Promise.resolve(createMockMediaStream() as unknown as MediaStream);
+        });
+
+        mockSocket.emit.mockImplementation((event: string, data?: unknown, callback?: unknown) => {
+          if (event === 'close-producer') {
+            const producerId = (data as { producerId: string }).producerId;
+            const closeAck = typeof callback === 'function' ? (callback as CloseAck) : undefined;
+            closeEvents.push({ producerId, ack: closeAck });
+            if (producerId === micProducer.id) {
+              // The pre-capture codec close uses the existing ordered, fire-and-forget event.
+              serverMicSlot = null;
+            }
+            return;
+          }
+          originalEmit?.(event, data, callback);
+        });
+        sendTransport.produce.mockClear().mockImplementation(async (options: any) => {
+          if (serverMicSlot !== null)
+            throw new Error('A microphone producer already occupies the server slot');
+          publicationCount += 1;
+          if (publicationCount === 1) {
+            options.onRtpSender?.(staleProducer.rtpSender as RTCRtpSender);
+            serverMicSlot = staleProducer.id;
+            return pendingPublication.promise;
+          }
+          options.onRtpSender?.(successorProducer.rtpSender as RTCRtpSender);
+          serverMicSlot = successorProducer.id;
+          return successorProducer;
+        });
+
+        let staleCloseSettled = false;
+        const settleStaleClose = (response: { success: true } | { error: string }) => {
+          const closeAck = closeEvents.find((event) => event.producerId === staleProducer.id)?.ack;
+          if (staleCloseSettled || !closeAck) return;
+          staleCloseSettled = true;
+          if ('success' in response) serverMicSlot = null;
+          closeAck(response);
+        };
+
+        try {
+          useAudioSettingsStore.setState({ opusNack: true });
+          await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledOnce());
+          expect(serverMicSlot).toBe(staleProducer.id);
+          expect(captureConstraints[0].deviceId).toEqual({ exact: 'mic-before-publication' });
+
+          useVoiceStore.getState().setAudioInputDevice('mic-current-after-publication');
+          pendingPublication.resolve(staleProducer);
+          await vi.waitFor(() => {
+            expect(
+              closeEvents.some((event) => event.producerId === staleProducer.id) ||
+                sendTransport.produce.mock.calls.length > 1
+            ).toBe(true);
+          });
+
+          const staleClose = closeEvents.find((event) => event.producerId === staleProducer.id);
+          expect(
+            staleClose,
+            'a published stale mic must be retired on the server before the successor is produced'
+          ).toBeDefined();
+          expect(staleClose?.ack).toEqual(expect.any(Function));
+          expect(staleProducer.close).toHaveBeenCalled();
+          expect(sendTransport.produce).toHaveBeenCalledOnce();
+          expect(serverMicSlot).toBe(staleProducer.id);
+
+          settleStaleClose(ack);
+          await Promise.all(reproductions);
+          if (result === 'success') {
+            expect(sendTransport.produce).toHaveBeenCalledTimes(2);
+            expect(serverMicSlot).toBe(successorProducer.id);
+            expect(svc.producers.get('mic')).toBe(successorProducer);
+            expect(captureConstraints.at(-1)?.deviceId).toEqual({
+              exact: 'mic-current-after-publication',
+            });
+          } else {
+            expect(sendTransport.produce).toHaveBeenCalledOnce();
+            expect(serverMicSlot).toBe(staleProducer.id);
+            expect(svc.producers.has('mic')).toBe(false);
+          }
+        } finally {
+          pendingPublication.resolve(staleProducer);
+          settleStaleClose({ success: true });
+          await Promise.all(reproductions);
+          delete svc.liveReproduceAudio;
+          voiceService.emergencyCleanup();
+        }
+      }
+    );
+
+    it('stops a codec-triggered raw capture that resolves after leaving', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const liveReproduceAudio = svc.liveReproduceAudio.bind(voiceService);
+      svc.liveReproduceAudio = () => liveReproduceAudio().catch(() => undefined);
+      try {
+        const pendingCapture = deferred<MediaStream>();
+        const rawStream = createMockMediaStream([{ kind: 'audio', id: 'raw-after-leave' }]);
+        mockGetUserMedia.mockReset().mockReturnValue(pendingCapture.promise);
+
+        useAudioSettingsStore.setState({ musicMode: true });
+        await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledOnce());
+        voiceService.emergencyCleanup();
+        pendingCapture.resolve(rawStream as unknown as MediaStream);
+        await vi.waitFor(() => expect(rawStream.getTracks()[0].stop).toHaveBeenCalled());
+      } finally {
+        delete svc.liveReproduceAudio;
+      }
+    });
+
     it('updates audio priority via setParameters', async () => {
       const { micProducer } = await joinVoiceChannel();
 
@@ -4907,6 +6431,92 @@ describe('VoiceService', () => {
   // ===== closeProducer =====
 
   describe('closeProducer extended', () => {
+    it('does not let a drained old mic close stop the successor call capture', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = svc.producers.get('mic');
+      const successorStream = createMockMediaStream([{ kind: 'audio', id: 'successor-raw' }]);
+      const successorRawTrack = successorStream.getAudioTracks()[0];
+      let releaseDrain!: () => void;
+      const drainGate = new Promise<void>((resolve) => {
+        releaseDrain = resolve;
+      });
+      svc.drainSendTransportQueue = vi.fn(async () => drainGate);
+
+      try {
+        const oldClose = voiceService.closeProducer('mic');
+        await vi.waitFor(() => expect(svc.drainSendTransportQueue).toHaveBeenCalledOnce());
+
+        voiceService.emergencyCleanup();
+        mockGetUserMedia.mockReset().mockResolvedValueOnce(successorStream);
+        const { micProducer: successorProducer } = await joinVoiceChannel();
+
+        releaseDrain();
+        await oldClose;
+
+        expect(oldProducer.close).toHaveBeenCalled();
+        expect(
+          successorRawTrack.stop,
+          'an old closeProducer drain must preserve the successor raw mic track'
+        ).not.toHaveBeenCalled();
+        expect(svc.localMicStream).toBe(successorStream);
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+      } finally {
+        releaseDrain();
+        delete svc.drainSendTransportQueue;
+      }
+    });
+
+    it('keeps a delayed old mic transform failure from cleaning the successor call', async () => {
+      const { sendTransport: oldTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldRawStream = createMockMediaStream([{ kind: 'audio', id: 'old-raw' }]);
+      const successorStream = createMockMediaStream([{ kind: 'audio', id: 'successor-raw' }]);
+      const successorRawTrack = successorStream.getAudioTracks()[0];
+      const oldPublication = deferred<ReturnType<typeof createMockProducer>>();
+      oldPublication.promise.catch(() => undefined);
+      let oldProduceOptions: Record<string, unknown> | undefined;
+      mockGetUserMedia
+        .mockReset()
+        .mockResolvedValueOnce(oldRawStream)
+        .mockResolvedValueOnce(successorStream);
+      oldTransport.produce.mockImplementationOnce((options: Record<string, unknown>) => {
+        oldProduceOptions = options;
+        return oldPublication.promise;
+      });
+
+      let oldProduction!: Promise<void>;
+      try {
+        oldProduction = svc.produceAudio();
+        await vi.waitFor(() => expect(oldProduceOptions).toBeDefined());
+        expect(svc.localMicStream).toBe(oldRawStream);
+
+        voiceService.emergencyCleanup();
+        const { micProducer: successorProducer } = await joinVoiceChannel();
+        const sender = {
+          createEncodedStreams: vi.fn(() => {
+            throw new Error('delayed transform attachment failure');
+          }),
+          replaceTrack: vi.fn().mockResolvedValue(undefined),
+          transform: null,
+        };
+        const attachTransform = oldProduceOptions?.onRtpSender as (value: unknown) => void;
+
+        expect(() => attachTransform(sender)).toThrow('failed to attach encrypt transform');
+        expect(sender.replaceTrack).toHaveBeenCalledWith(null);
+        expect(oldTransport.close).toHaveBeenCalled();
+
+        oldPublication.reject(new Error('old publication rejected after cleanup'));
+        await expect(oldProduction).rejects.toThrow('old publication rejected after cleanup');
+        expect(successorRawTrack.stop).not.toHaveBeenCalled();
+        expect(svc.localMicStream).toBe(successorStream);
+        expect(svc.producers.get('mic')).toBe(successorProducer);
+      } finally {
+        oldPublication.reject(new Error('test cleanup'));
+        await oldProduction?.catch(() => undefined);
+      }
+    });
+
     it('closes screen with paired screen-audio', async () => {
       await joinVoiceChannel();
 

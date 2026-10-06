@@ -175,6 +175,7 @@ describe('App', () => {
     usePendingRegistrationStore.getState().clearPending();
     useE2EEStore.getState().reset();
     useVoiceStore.getState().reset();
+    useVoiceStore.setState({ joinError: null } as Parameters<typeof useVoiceStore.setState>[0]);
     useVideoSettingsStore.setState({ hdrEncoding: false, systemHdr: false });
     __resetRestoreSessionCalledForTesting();
     Object.assign(globalThis.electron ?? {}, {
@@ -227,6 +228,40 @@ describe('App', () => {
   it('renders auth flow on root path', () => {
     render(<App />);
     expect(screen.getByTestId('auth-flow')).toBeInTheDocument();
+  });
+
+  it('shows a microphone join alert in the primary window', () => {
+    useVoiceStore.setState({
+      joinError: 'Could not start the selected microphone. Choose another mic and try again.',
+    } as Parameters<typeof useVoiceStore.setState>[0]);
+
+    render(<App />);
+    expect(screen.getByRole('alert')).toHaveTextContent(/microphone/i);
+    act(() => screen.getByRole('button', { name: /dismiss/i }).click());
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect((useVoiceStore.getState() as unknown as { joinError?: string | null }).joinError).toBe(
+      null
+    );
+  });
+
+  it('does not show a microphone join alert when there is no join error', () => {
+    render(<App />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByTestId('auth-flow')).toBeInTheDocument();
+  });
+
+  it('does not show the microphone join alert in a PiP window', () => {
+    useVoiceStore.setState({ joinError: 'Choose another microphone and retry.' } as Parameters<
+      typeof useVoiceStore.setState
+    >[0]);
+    const originalHash = window.location.hash;
+    window.location.hash = '#/pip/pip-test';
+    try {
+      render(<App />);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    } finally {
+      window.location.hash = originalHash;
+    }
   });
 
   it('renders app container with correct class', () => {

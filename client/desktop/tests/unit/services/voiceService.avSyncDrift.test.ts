@@ -161,7 +161,7 @@ class MockAudioContext {
     disconnect: vi.fn(),
   });
   createMediaStreamDestination = vi.fn().mockReturnValue({
-    stream: { getAudioTracks: vi.fn().mockReturnValue([]) },
+    stream: { getAudioTracks: vi.fn().mockReturnValue([{ enabled: true, stop: vi.fn() }]) },
   });
   close = vi.fn().mockResolvedValue(undefined);
 }
