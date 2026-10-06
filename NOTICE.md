@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-09-30
+**Generated:** 2026-10-06
 **MinIO distribution addendum updated:** 2026-09-27
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -531,7 +531,7 @@ bundle (services/media-plane):
 | one-time | 1.0.0 | MIT | https://github.com/3rd-Eden/one-time |
 | parseurl | 1.3.3 | MIT | https://github.com/pillarjs/parseurl |
 | path-to-regexp | 8.4.0 | MIT | https://github.com/pillarjs/path-to-regexp |
-| proxy-addr | 2.0.7 | MIT | https://github.com/jshttp/proxy-addr |
+| proxy-addr | 2.0.8 | MIT | https://github.com/jshttp/proxy-addr |
 | qs | 6.16.0 | BSD-3-Clause | https://github.com/ljharb/qs |
 | range-parser | 1.2.1 | MIT | https://github.com/jshttp/range-parser |
 | raw-body | 3.0.2 | MIT | https://github.com/stream-utils/raw-body |
