@@ -320,7 +320,9 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   );
 
   const scaleStyle =
-    magnificationScale === 1 ? undefined : { transform: `scale(${magnificationScale})`, zIndex: 2 };
+    hasVideo || magnificationScale === 1
+      ? undefined
+      : { transform: `scale(${magnificationScale})`, zIndex: 2 };
 
   // Voice channel/server context for the participant menu's move/disconnect
   // actions. Both come from the active call (voiceStore), not props.
@@ -378,7 +380,7 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   return (
     <div
       ref={tileRef}
-      className={`participant-tile${hasVideo ? ' participant-tile--video' : ''}${compact ? ' participant-tile--compact' : ''}${activeSpeaker ? ' participant-tile--active-speaker' : ''}${dimmed ? ' participant-tile--inactive' : ''}`}
+      className={`participant-tile${hasVideo ? ' participant-tile--video' : ''}${compact ? ' participant-tile--compact' : ''}${activeSpeaker || (hasVideo && participant.isSpeaking) ? ' participant-tile--active-speaker' : ''}${dimmed ? ' participant-tile--inactive' : ''}`}
       {...scopeProps}
       style={{ ...scopeProps.style, ...scaleStyle }}
       onContextMenu={handleContextMenu}

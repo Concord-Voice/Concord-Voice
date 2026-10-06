@@ -21,9 +21,9 @@
 
 /* ─── Active-speaker dominance (#1040) ─────────────────────────── */
 
-/* Speaking tile — accent glow. Scale is owned by JS magnification
-   (useVoiceMagnification), NOT here, so we never double-apply a transform. The
-   glow uses the user-scoped --accent-primary, so it matches the speaker's color. */
+/* Speaking tile — accent glow. Avatar scale is owned by JS magnification
+   (useVoiceMagnification); rendered webcam video stays at a fixed size (#3595).
+   The glow uses the user-scoped --accent-primary to match the speaker's color. */
 .participant-tile--active-speaker {
   box-shadow: 0 0 24px color-mix(in srgb, var(--accent-primary) 30%, transparent);
   z-index: 2;

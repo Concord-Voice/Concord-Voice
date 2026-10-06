@@ -9,7 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Trusted-device recovery now asks you to compare a fingerprint on both devices
 before transferring your account key.
 
+### Changed
+
+- Webcam speaker frames stay at a fixed size and show a steady accent highlight during voice calls. Avatar frames keep their speaking pulse ([#3595](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3595), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
+
 ### Security
+
+- Updated the desktop development dependency `source-map-js` to 1.2.2 to address malformed source-map denial of service ([CVE-2026-93749](https://github.com/advisories/GHSA-68fv-2mgg-jv7q), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
+- Updated the desktop development dependency `shell-quote` to 1.12.0 to address shell command injection in comment-bearing argument lists ([CVE-2026-102422](https://github.com/advisories/GHSA-pqg4-j6r4-53mv), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 
 - **Trusted-device recovery requires matching fingerprints on both devices** ([#3582](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3582)) — compare all eight groups and confirm the match on each device before your account key can be transferred and opened. Recovery keeps your original account key and message access. Updated servers refuse the old recovery protocol, so update and restart both devices and begin a fresh request. The server update clears pending recovery requests; it does not remove accounts, trusted devices, recovery circles or account keys.
 

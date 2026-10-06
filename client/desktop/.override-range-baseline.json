@@ -65,7 +65,7 @@
       "consumer": "node_modules/concurrently",
       "dep": "shell-quote",
       "range": "1.9.0",
-      "resolved": "1.10.0"
+      "resolved": "1.12.0"
     },
     {
       "consumer": "node_modules/dir-compare",

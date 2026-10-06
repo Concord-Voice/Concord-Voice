@@ -153,6 +153,161 @@ describe('ParticipantTile', () => {
     expect(container.querySelector('.participant-tile__video')).not.toBeInTheDocument();
   });
 
+  it.each([
+    { isLocal: false, compact: true },
+    { isLocal: true, compact: true },
+    { isLocal: true, compact: false },
+  ])(
+    'keeps a speaking webcam steady and highlighted (local=$isLocal, compact=$compact)',
+    ({ isLocal, compact }) => {
+      const stream = { id: 'speaker-stream', active: true } as unknown as MediaStream;
+      vi.spyOn(HTMLVideoElement.prototype, 'play').mockResolvedValue(undefined);
+      const { container } = render(
+        <ParticipantTile
+          participant={makeParticipant({ isVideoOn: true, isSpeaking: true, videoStream: stream })}
+          isLocal={isLocal}
+          compact={compact}
+          magnificationScale={1.12}
+        />
+      );
+
+      const tile = container.querySelector('.participant-tile');
+      expect(tile).toHaveClass('participant-tile--active-speaker');
+      expect(tile).toHaveClass('participant-tile--video');
+      expect(tile?.querySelector('.participant-tile__video')).toBeInTheDocument();
+      expect(tile?.getAttribute('style') ?? '').not.toContain('scale(');
+      if (compact) expect(tile).toHaveClass('participant-tile--compact');
+      else expect(tile).not.toHaveClass('participant-tile--compact');
+    }
+  );
+
+  it('does not highlight or scale a silent webcam and preserves its node and stream across speech flips', () => {
+    const stream = { id: 'stable-stream', active: true } as unknown as MediaStream;
+    const play = vi.spyOn(HTMLVideoElement.prototype, 'play').mockResolvedValue(undefined);
+    const { container, rerender } = render(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: true, isSpeaking: false, videoStream: stream })}
+        magnificationScale={1.12}
+      />
+    );
+    const tile = container.querySelector('.participant-tile');
+    const video = container.querySelector('.participant-tile__video') as HTMLVideoElement;
+    expect(tile?.getAttribute('style') ?? '').not.toContain('scale(');
+    expect(tile).not.toHaveClass('participant-tile--active-speaker');
+    expect(video.srcObject).toBe(stream);
+
+    rerender(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: true, isSpeaking: true, videoStream: stream })}
+        magnificationScale={1.12}
+      />
+    );
+    expect(container.querySelector('.participant-tile__video')).toBe(video);
+    expect(video.srcObject).toBe(stream);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.participant-tile')?.getAttribute('style') ?? '').not.toContain(
+      'scale('
+    );
+
+    rerender(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: true, isSpeaking: false, videoStream: stream })}
+        magnificationScale={1.12}
+      />
+    );
+    expect(container.querySelector('.participant-tile__video')).toBe(video);
+    expect(video.srcObject).toBe(stream);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.participant-tile')?.getAttribute('style') ?? '').not.toContain(
+      'scale('
+    );
+    expect(container.querySelector('.participant-tile')).not.toHaveClass(
+      'participant-tile--active-speaker'
+    );
+  });
+
+  it('switches between webcam and avatar treatment while speaking', () => {
+    const stream = { id: 'toggle-stream', active: true } as unknown as MediaStream;
+    vi.spyOn(HTMLVideoElement.prototype, 'play').mockResolvedValue(undefined);
+    const { container, rerender } = render(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: true, isSpeaking: true, videoStream: stream })}
+        magnificationScale={1.12}
+      />
+    );
+    let tile = container.querySelector('.participant-tile');
+    expect(tile?.getAttribute('style') ?? '').not.toContain('scale(');
+    expect(tile).toHaveClass('participant-tile--active-speaker');
+
+    rerender(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: false, isSpeaking: true, videoStream: stream })}
+        magnificationScale={1.12}
+      />
+    );
+    tile = container.querySelector('.participant-tile');
+    expect(container.querySelector('.participant-tile__video')).not.toBeInTheDocument();
+    expect(tile).not.toHaveClass('participant-tile--active-speaker');
+    expect(tile?.getAttribute('style')).toContain('scale(1.12)');
+
+    rerender(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: true, isSpeaking: true, videoStream: stream })}
+        magnificationScale={1.12}
+      />
+    );
+    tile = container.querySelector('.participant-tile');
+    expect(container.querySelector('.participant-tile__video')).toBeInTheDocument();
+    expect(tile).toHaveClass('participant-tile--active-speaker');
+    expect(tile?.getAttribute('style') ?? '').not.toContain('scale(');
+  });
+
+  it('keeps paused and missing-stream avatars scaled without implicit highlight', () => {
+    const stream = { id: 'fallback-stream', active: true } as unknown as MediaStream;
+    const { container, rerender } = render(
+      <ParticipantTile
+        participant={makeParticipant({
+          isVideoOn: true,
+          isCameraPaused: true,
+          isSpeaking: true,
+          videoStream: stream,
+        })}
+        magnificationScale={1.12}
+      />
+    );
+    let tile = container.querySelector('.participant-tile');
+    expect(container.querySelector('.participant-tile__video')).not.toBeInTheDocument();
+    expect(tile).not.toHaveClass('participant-tile--active-speaker');
+    expect(tile?.getAttribute('style')).toContain('scale(1.12)');
+
+    rerender(
+      <ParticipantTile
+        participant={makeParticipant({ isVideoOn: true, isSpeaking: true })}
+        magnificationScale={1.12}
+      />
+    );
+    tile = container.querySelector('.participant-tile');
+    expect(container.querySelector('.participant-tile__video')).not.toBeInTheDocument();
+    expect(tile).not.toHaveClass('participant-tile--active-speaker');
+    expect(tile?.getAttribute('style')).toContain('scale(1.12)');
+
+    rerender(
+      <ParticipantTile
+        participant={makeParticipant({
+          isVideoOn: true,
+          isCameraPaused: true,
+          isSpeaking: true,
+          videoStream: stream,
+        })}
+        activeSpeaker
+        magnificationScale={1.12}
+      />
+    );
+    tile = container.querySelector('.participant-tile');
+    expect(tile).toHaveClass('participant-tile--active-speaker');
+    expect(tile?.getAttribute('style')).toContain('scale(1.12)');
+  });
+
   // ===== Server enforcement indicators =====
 
   it('shows server-muted indicator with title', () => {
