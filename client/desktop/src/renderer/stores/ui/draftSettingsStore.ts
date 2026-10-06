@@ -18,7 +18,7 @@ import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../voice/voiceStore'
 export type DraftableAudioSettings = Omit<AudioSettings, 'advancedMode'>;
 export type DraftableVideoSettings = Omit<
   VideoSettings,
-  'videoAdvancedMode' | 'codecCapabilities' | 'gpuInfo' | 'systemHdr'
+  'videoAdvancedMode' | 'codecCapabilities' | 'gpuInfo' | 'systemHdr' | 'webrtcHwByMime'
 >;
 export type DraftableTTSSettings = TTSSettings;
 export type DraftableAppearanceSettings = AppearanceSettings;
@@ -64,6 +64,7 @@ const VIDEO_DRAFTABLE_KEYS: (keyof DraftableVideoSettings)[] = [
   'scalabilityMode',
   'hardwareAcceleration',
   'hdrEncoding',
+  'prioritizeHdrCodecs',
   'supportSvc',
   'supportSimulcast',
   'autoTuneInScreenShares',
@@ -182,13 +183,8 @@ function restoreAppearanceFromSnapshot(snapshot: SettingsSnapshot): void {
 }
 
 /** Push draft entries to a real store via setter functions. */
-function pushDraftsToStore(
-  store: Record<string, unknown>,
-  drafts: Record<string, unknown>,
-  skipKeys?: Set<string>
-): void {
+function pushDraftsToStore(store: Record<string, unknown>, drafts: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(drafts)) {
-    if (skipKeys?.has(key)) continue;
     callSetter(store, key, value);
   }
 }
@@ -564,12 +560,13 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
       drafts.audio as Record<string, unknown>
     );
 
-    // Video — push to real store (except hardwareAcceleration IPC handled below)
-    pushDraftsToStore(
-      useVideoSettingsStore.getState() as unknown as Record<string, unknown>,
-      drafts.video as Record<string, unknown>,
-      new Set(['hardwareAcceleration'])
-    );
+    // Video setters only assign their fields. Apply every drafted video value in one
+    // Zustand update so a live call sees one codec-plan transition and re-produces
+    // camera and screen at most once when several controls changed together.
+    // Hardware acceleration still uses the relaunch IPC below.
+    const videoDrafts = { ...drafts.video };
+    delete videoDrafts.hardwareAcceleration;
+    if (Object.keys(videoDrafts).length > 0) useVideoSettingsStore.setState(videoDrafts);
 
     // TTS — push to real store
     pushDraftsToStore(

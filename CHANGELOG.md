@@ -30,6 +30,10 @@ also includes a patched source-map-js dependency.
 
 - **Trusted-device recovery requires matching fingerprints on both devices** ([#3582](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3582)) — compare all eight groups and confirm the match on each device before your account key can be transferred and opened. Recovery keeps your original account key and message access. Updated servers refuse the old recovery protocol, so update and restart both devices and begin a fresh request. The server update clears pending recovery requests; it does not remove accounts, trusted devices, recovery circles or account keys.
 
+### Changed
+
+- **HDR codec controls are separate** — Enable HDR allows supported HDR-capable codecs. Prioritize HDR Codecs prefers an HDR codec over hardware acceleration when both are available. If a codec check finishes after your camera or screen share starts, Concord Voice updates the active stream's codec choice. Neither setting guarantees HDR capture or display.
+
 ## [0.2.48] — 2026-10-04
 
 Concord Voice now keeps screen sharing steady when a capture changes, cleans up

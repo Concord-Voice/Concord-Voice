@@ -14,6 +14,7 @@ const defaultVideoSettings: Record<string, unknown> = {
   degradationPreference: 'balanced',
   hardwareAcceleration: true,
   hdrEncoding: false,
+  prioritizeHdrCodecs: false,
   autoTuneInScreenShares: false,
 };
 
@@ -418,9 +419,10 @@ describe('VideoConfigSection', () => {
       expect(screen.getByText('Codec & Hardware')).toBeInTheDocument();
     });
 
-    it('renders HDR encoding toggle', () => {
+    it('renders separate HDR capability and priority toggles', () => {
       renderComponent();
-      expect(screen.getByText('Enable HDR Encoding')).toBeInTheDocument();
+      expect(screen.getByText('Enable HDR')).toBeInTheDocument();
+      expect(screen.getByText('Prioritize HDR Codecs')).toBeInTheDocument();
     });
 
     it('renders Hardware Acceleration toggle', () => {
@@ -465,41 +467,34 @@ describe('VideoConfigSection', () => {
     });
   });
 
-  // ─── 7. HDR encoding branches ─────────────────────────────────────────────
+  // ─── 7. HDR codec controls ────────────────────────────────────────────────
 
-  describe('HDR encoding', () => {
-    it('shows no HDR display message when systemHdr is false', () => {
+  describe('HDR codec controls', () => {
+    it('allows HDR codec targets without treating display color metadata as proof of HDR', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: false });
       renderComponent();
-      expect(screen.getByText(/No HDR display detected/)).toBeInTheDocument();
+      expect(screen.getByRole('checkbox', { name: 'Enable HDR' })).toBeEnabled();
     });
 
-    it('disables toggle when systemHdr is false', () => {
-      mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: false });
+    it('disables priority until HDR codecs are enabled', () => {
+      mockVideoSettingsStore({ videoAdvancedMode: true });
       renderComponent();
-      const checkboxes = screen.getAllByRole('checkbox');
-      // HDR toggle is the first toggle in advanced mode
-      const hdrToggle = checkboxes.find((cb) =>
-        cb.closest('.settings-row')?.textContent?.includes('HDR')
-      );
-      expect(hdrToggle).toBeDisabled();
+      expect(screen.getByRole('checkbox', { name: 'Prioritize HDR Codecs' })).toBeDisabled();
     });
 
-    it('shows enabled message when systemHdr=true and hdrEncoding=true', () => {
+    it('describes enabled HDR as codec eligibility rather than guaranteed HDR output', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: true });
       mockDraftSettings({ hdrEncoding: true });
       renderComponent();
-      expect(screen.getByText(/AV1 HDR is a 10-bit target/)).toBeInTheDocument();
-      expect(
-        screen.getAllByText(/active outbound WebRTC stats are authoritative/)
-      ).not.toHaveLength(0);
+      expect(screen.getByText(/does not guarantee HDR capture or output/)).toBeInTheDocument();
+      expect(screen.getByRole('checkbox', { name: 'Prioritize HDR Codecs' })).toBeEnabled();
     });
 
-    it('shows disabled message when systemHdr=true and hdrEncoding=false', () => {
+    it('describes disabled HDR as excluding eligible codec targets', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: true });
       mockDraftSettings({ hdrEncoding: false });
       renderComponent();
-      expect(screen.getByText(/prefers SDR codec profiles/)).toBeInTheDocument();
+      expect(screen.getByText(/HDR-capable codec targets are excluded/)).toBeInTheDocument();
     });
   });
 
@@ -1211,6 +1206,20 @@ describe('VideoConfigSection', () => {
   // ─── 17. Codec grid with preferred codec and hwActive logic ───────────────
 
   describe('codec grid hwActive logic', () => {
+    it('ranks HDR first within a backend even when cross-backend HDR priority is off', () => {
+      mockVideoSettingsStore({ videoAdvancedMode: true, codecCapabilities: sampleCodecsWithHdr });
+      mockDraftSettings({ hdrEncoding: true, prioritizeHdrCodecs: false });
+      renderComponent();
+
+      const softwareColumn = screen.getByText('Software').closest('.settings-codec-column');
+      const names = Array.from(softwareColumn?.querySelectorAll('.settings-codec-item') ?? []).map(
+        (item) => item.textContent ?? ''
+      );
+      expect(names.findIndex((name) => name.includes('Profile 2'))).toBeLessThan(
+        names.findIndex((name) => name.includes('Profile 0'))
+      );
+    });
+
     it('activates HW column when user picks a codec present in HW codecs', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
@@ -1427,7 +1436,7 @@ describe('VideoConfigSection', () => {
       expect(labels).toContain('H.264 (High 5.2 — Best H.264 quality) — Hardware');
     });
 
-    it('describes AV1 HDR as a target and names outbound stats as authoritative', () => {
+    it('does not promise HDR capture or output from an eligible codec target', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
         codecCapabilities: av1Targets,
@@ -1437,7 +1446,7 @@ describe('VideoConfigSection', () => {
 
       renderComponent();
 
-      expect(screen.getByText(/AV1 HDR is a 10-bit target/)).toBeInTheDocument();
+      expect(screen.getByText(/does not guarantee HDR capture or output/)).toBeInTheDocument();
       expect(
         screen.getAllByText(/active outbound WebRTC stats are authoritative/)
       ).not.toHaveLength(0);
@@ -1451,16 +1460,19 @@ describe('VideoConfigSection', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: true });
     });
 
-    it('calls setDraftVideoSetting for HDR encoding toggle', () => {
+    it('stages HDR codec eligibility independently of priority', () => {
       mockDraftSettings({ hdrEncoding: false });
       renderComponent();
-      const checkboxes = screen.getAllByRole('checkbox');
-      const hdrToggle = checkboxes.find((cb) =>
-        cb.closest('.settings-row')?.textContent?.includes('HDR')
-      );
-      expect(hdrToggle).toBeTruthy();
-      fireEvent.click(hdrToggle!);
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Enable HDR' }));
       expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('hdrEncoding', true);
+    });
+
+    it('stages HDR priority independently of codec eligibility', () => {
+      mockDraftSettings({ hdrEncoding: true, prioritizeHdrCodecs: false });
+      renderComponent();
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Prioritize HDR Codecs' }));
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('prioritizeHdrCodecs', true);
+      expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith('hdrEncoding', false);
     });
 
     it('calls setDraftVideoSetting for Hardware Acceleration toggle', () => {

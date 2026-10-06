@@ -14,6 +14,7 @@ const defaultVideoSettings: Record<string, unknown> = {
   degradationPreference: 'balanced',
   hardwareAcceleration: true,
   hdrEncoding: false,
+  prioritizeHdrCodecs: false,
 };
 
 const { mockSetDraftVideoSetting } = vi.hoisted(() => ({

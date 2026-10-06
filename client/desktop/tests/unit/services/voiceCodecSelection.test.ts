@@ -53,26 +53,43 @@ function makeLookup(opts: {
 
 describe('buildCodecCascade', () => {
   it('enumerates the full HDR-first hardware/software Auto order', () => {
-    expect(buildCodecCandidates(true, true).map(({ key, backend }) => `${key}@${backend}`)).toEqual(
-      [
-        'video/AV1:hdr@hardware',
-        'video/VP9:2@hardware',
-        'video/AV1:hdr@software',
-        'video/VP9:2@software',
-        'video/AV1:sdr@hardware',
-        'video/VP9:0@hardware',
-        'video/H264:640034@hardware',
-        'video/H264:4d0032@hardware',
-        'video/H264:42e01f@hardware',
-        'video/VP8@hardware',
-        'video/AV1:sdr@software',
-        'video/VP9:0@software',
-        'video/H264:640034@software',
-        'video/H264:4d0032@software',
-        'video/H264:42e01f@software',
-        'video/VP8@software',
-      ]
+    expect(
+      buildCodecCandidates(true, true, true).map(({ key, backend }) => `${key}@${backend}`)
+    ).toEqual([
+      'video/AV1:hdr@hardware',
+      'video/VP9:2@hardware',
+      'video/AV1:hdr@software',
+      'video/VP9:2@software',
+      'video/AV1:sdr@hardware',
+      'video/VP9:0@hardware',
+      'video/H264:640034@hardware',
+      'video/H264:4d0032@hardware',
+      'video/H264:42e01f@hardware',
+      'video/VP8@hardware',
+      'video/AV1:sdr@software',
+      'video/VP9:0@software',
+      'video/H264:640034@software',
+      'video/H264:4d0032@software',
+      'video/H264:42e01f@software',
+      'video/VP8@software',
+    ]);
+  });
+
+  it('keeps SDR hardware ahead of HDR software when HDR is enabled without priority', () => {
+    const keys = buildCodecCandidates(true, true, false).map(
+      ({ key, backend }) => `${key}@${backend}`
     );
+    expect(keys.indexOf('video/AV1:sdr@hardware')).toBeLessThan(
+      keys.indexOf('video/AV1:hdr@software')
+    );
+    expect(keys).toContain('video/VP9:2@hardware');
+    expect(keys).toContain('video/VP9:2@software');
+  });
+
+  it('does not admit HDR candidates when the capability switch is off', () => {
+    expect(
+      buildCodecCandidates(false, true, true).every(({ colorTarget }) => colorTarget === 'sdr')
+    ).toBe(true);
   });
 
   it('returns the canonical SDR order', () => {
@@ -242,6 +259,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: true,
       hdrEncoding: true,
+      prioritizeHdrCodecs: true,
       isInCodecFloor: () => true,
       isHwAccelerated: () => true,
       findSendCodec: (key: string) => (key.toLowerCase() === 'video/av1:hdr' ? av1Hdr : undefined),
@@ -269,6 +287,7 @@ describe('selectCodecFromCascade', () => {
         preferred: null,
         hwAccel: true,
         hdrEncoding: true,
+        prioritizeHdrCodecs: true,
         isInCodecFloor: () => true,
         isHwAccelerated: (key) => hardware.includes(key.toLowerCase()),
         findSendCodec: (key) => available[key.toLowerCase()],
@@ -289,6 +308,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: true,
+      prioritizeHdrCodecs: true,
       isInCodecFloor: () => true,
       isHwAccelerated: (key) => {
         hardwareChecks.push(key);
@@ -313,6 +333,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/AV1:sdr',
       hwAccel: true,
       hdrEncoding: true,
+      prioritizeHdrCodecs: true,
       isInCodecFloor: () => true,
       isHwAccelerated: (key) => key.toLowerCase() === 'video/av1:hdr',
       findSendCodec: (key) => available[key.toLowerCase()],
@@ -333,6 +354,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/VP8',
       hwAccel: false,
       hdrEncoding: true,
+      prioritizeHdrCodecs: true,
       isInCodecFloor: (key) => key.toLowerCase().startsWith('video/av1:'),
       isHwAccelerated: () => false,
       findSendCodec: (key) => available[key.toLowerCase()],
@@ -353,6 +375,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/H264',
       hwAccel: true,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       isInCodecFloor: () => true,
       isHwAccelerated: (key) =>
         key.toLowerCase() === 'video/av1:sdr' || key.toLowerCase() === 'video/h264:4d0032',
@@ -372,6 +395,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/VP9',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(vp9);
@@ -388,6 +412,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/VP9',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(av1);
@@ -404,6 +429,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: true,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(h264);
@@ -421,6 +447,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: true,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(vp9);
@@ -436,6 +463,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: true,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(av1);
@@ -451,6 +479,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(vp8);
@@ -462,6 +491,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBeUndefined();
@@ -478,6 +508,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(av1);
@@ -493,6 +524,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: true,
+      prioritizeHdrCodecs: true,
       ...lookup,
     });
     expect(result).toBe(vp9_2);
@@ -509,12 +541,33 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: true,
       hdrEncoding: true,
+      prioritizeHdrCodecs: true,
       isInCodecFloor: () => true,
       isHwAccelerated: (key) => key.toLowerCase() === 'video/vp9:0',
       findSendCodec: (key) => available[key.toLowerCase()],
     });
 
     expect(result).toBe(vp9Profile2);
+  });
+
+  it('selects SDR hardware before HDR software when HDR priority is off', () => {
+    const hdr = fakeCodec('video/VP9-hdr');
+    const sdr = fakeCodec('video/VP9-sdr');
+    const result = selectCodecFromCascade({
+      preferred: null,
+      hwAccel: true,
+      hdrEncoding: true,
+      prioritizeHdrCodecs: false,
+      isInCodecFloor: () => true,
+      isHwAccelerated: (key) => key.toLowerCase() === 'video/vp9:0',
+      findSendCodec: (key) =>
+        key.toLowerCase() === 'video/vp9:2'
+          ? hdr
+          : key.toLowerCase() === 'video/vp9:0'
+            ? sdr
+            : undefined,
+    });
+    expect(result).toBe(sdr);
   });
 
   it('never honors a manual HEVC preference while HEVC is disabled', () => {
@@ -527,6 +580,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/HEVC',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(vp8);
@@ -542,6 +596,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/H264:42001f',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(vp8);
@@ -557,6 +612,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/H264:64001f',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(localHigh);
@@ -572,6 +628,7 @@ describe('selectCodecFromCascade', () => {
       preferred: 'video/VP9:2',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(vp8);
@@ -592,6 +649,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
       isEligible: (key) => !key.startsWith('video/AV1') && !key.startsWith('video/VP9'),
     });
@@ -605,6 +663,7 @@ describe('selectCodecFromCascade', () => {
       preferred: null,
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(av1);
@@ -617,6 +676,7 @@ describe('selectCodecFromCascade', () => {
       preferred: '',
       hwAccel: false,
       hdrEncoding: false,
+      prioritizeHdrCodecs: false,
       ...lookup,
     });
     expect(result).toBe(av1);

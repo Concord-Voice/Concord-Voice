@@ -691,7 +691,8 @@ describe('VoiceAudioSection', () => {
     render(<VoiceAudioSection />);
     expect(screen.queryByText('Hardware Acceleration')).not.toBeInTheDocument();
     expect(screen.queryByText('Congestion Priority')).not.toBeInTheDocument();
-    expect(screen.queryByText('Enable HDR Encoding')).not.toBeInTheDocument();
+    expect(screen.queryByText('Enable HDR')).not.toBeInTheDocument();
+    expect(screen.queryByText('Prioritize HDR Codecs')).not.toBeInTheDocument();
     expect(screen.queryByText('Codec & Hardware')).not.toBeInTheDocument();
   });
 
@@ -710,7 +711,8 @@ describe('VoiceAudioSection', () => {
     );
     render(<VoiceAudioSection />);
     expect(screen.getByText('Hardware Acceleration')).toBeInTheDocument();
-    expect(screen.getByText('Enable HDR Encoding')).toBeInTheDocument();
+    expect(screen.getByText('Enable HDR')).toBeInTheDocument();
+    expect(screen.getByText('Prioritize HDR Codecs')).toBeInTheDocument();
     expect(screen.getByText('Congestion Priority')).toBeInTheDocument();
     expect(screen.getByText('Video Codec')).toBeInTheDocument();
     expect(screen.getByText('Codec & Hardware')).toBeInTheDocument();

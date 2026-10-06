@@ -70,6 +70,7 @@ import {
   h264ProfileClass,
   h264ProfilesCompatible,
   isCodecKeyInFloor,
+  selectCodecCandidate,
   selectCodecFromCascade,
   type CodecLookup,
 } from './voiceCodecSelection';
@@ -1476,8 +1477,7 @@ class VoiceService {
    * affirm only the unqualified MIME; qualified AV1/VP9/H.264 targets still require an
    * affirmative exact WebCodecs probe.
    */
-  private isHwAccelerated(key: string): boolean {
-    const store = useVideoSettingsStore.getState();
+  private isHwAccelerated(key: string, store = useVideoSettingsStore.getState()): boolean {
     const [mime, requestedProfile] = key.toLowerCase().split(':');
     const learned = store.webrtcHwByMime[mime];
     if (learned === false) return false;
@@ -1591,12 +1591,44 @@ class VoiceService {
    * the selected codec publishes layered or single-stream encodings.
    */
   /** Build a CodecLookup bound to this VoiceService instance. */
-  private codecLookup(): CodecLookup {
+  private codecLookup(store = useVideoSettingsStore.getState()): CodecLookup {
     return {
       isInCodecFloor: (key: string) => this.isInCodecFloor(key),
-      isHwAccelerated: (key: string) => this.isHwAccelerated(key),
+      isHwAccelerated: (key: string) => this.isHwAccelerated(key, store),
+      isEligible: (key, backend) => this.isCodecBackendEligible(key, backend, store),
       findSendCodec: (key: string) => this.findSendCodec(key),
     };
+  }
+
+  /** HDR targets need an affirmative probe for their exact profile and backend.
+   * RTP AV1 alone cannot distinguish the 10-bit app target from SDR. */
+  private isCodecBackendEligible(
+    key: string,
+    backend: 'hardware' | 'software',
+    store = useVideoSettingsStore.getState()
+  ): boolean {
+    const normalized = key.toLowerCase();
+    if (normalized !== 'video/av1:hdr' && normalized !== 'video/vp9:2') return true;
+    return store.codecCapabilities.some(
+      (capability) =>
+        this.capabilityMatchesCodecKey(capability, key) &&
+        (backend === 'hardware' ? capability.hwAvailable === true : capability.swAvailable === true)
+    );
+  }
+
+  /** Compare the selected codec target, including HDR and its encoding backend.
+   *  AV1 SDR and HDR share an RTP MIME, so comparing producer MIME is insufficient. */
+  private selectedCodecPlanKey(
+    store: ReturnType<typeof useVideoSettingsStore.getState>
+  ): string | null {
+    const selected = selectCodecCandidate({
+      preferred: store.preferredVideoCodec,
+      hwAccel: store.hardwareAcceleration,
+      hdrEncoding: store.hdrEncoding,
+      prioritizeHdrCodecs: store.prioritizeHdrCodecs,
+      ...this.codecLookup(store),
+    });
+    return selected ? `${selected.candidate.key}:${selected.candidate.backend}` : null;
   }
 
   private pickCameraCodec(): {
@@ -1611,6 +1643,7 @@ class VoiceService {
       preferred: vs.preferredVideoCodec,
       hwAccel: vs.hardwareAcceleration,
       hdrEncoding: vs.hdrEncoding,
+      prioritizeHdrCodecs: vs.prioritizeHdrCodecs,
       ...this.codecLookup(),
     });
 
@@ -1638,6 +1671,7 @@ class VoiceService {
       preferred: vs.preferredVideoCodec,
       hwAccel: vs.hardwareAcceleration,
       hdrEncoding: vs.hdrEncoding,
+      prioritizeHdrCodecs: vs.prioritizeHdrCodecs,
       ...this.codecLookup(),
     });
   }
@@ -1813,9 +1847,14 @@ class VoiceService {
     // codec MIME, so reProduceIfBetterCodec early-returns — reproduce explicitly.
     // liveReproduceCamera rides the existing stopTracks:false (#1902) + fail-closed
     // capture-stop (CWE-212) path; do NOT call sendTransport.produce directly.
+    // The codec probe can finish after capture starts; its backend result can
+    // change the selected codec without a settings toggle.
     const codecPlanChanged =
       state.preferredVideoCodec !== prev.preferredVideoCodec ||
-      state.hdrEncoding !== prev.hdrEncoding;
+      state.hdrEncoding !== prev.hdrEncoding ||
+      state.prioritizeHdrCodecs !== prev.prioritizeHdrCodecs ||
+      (state.codecCapabilities !== prev.codecCapabilities &&
+        this.selectedCodecPlanKey(state) !== this.selectedCodecPlanKey(prev));
     const layeringChanged =
       state.supportSvc !== prev.supportSvc || state.supportSimulcast !== prev.supportSimulcast;
     if (codecPlanChanged || layeringChanged) {
@@ -1850,7 +1889,10 @@ class VoiceService {
     // fail-closed capture-stop (CWE-212) path.
     const codecPlanChanged =
       state.preferredVideoCodec !== prev.preferredVideoCodec ||
-      state.hdrEncoding !== prev.hdrEncoding;
+      state.hdrEncoding !== prev.hdrEncoding ||
+      state.prioritizeHdrCodecs !== prev.prioritizeHdrCodecs ||
+      (state.codecCapabilities !== prev.codecCapabilities &&
+        this.selectedCodecPlanKey(state) !== this.selectedCodecPlanKey(prev));
     const svcChanged = state.supportSvc !== prev.supportSvc;
     const simulcastChanged = state.supportSimulcast !== prev.supportSimulcast;
     if (codecPlanChanged) {

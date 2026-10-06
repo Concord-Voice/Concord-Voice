@@ -3,8 +3,8 @@
  * cognitive complexity. Pure functions — no VoiceService `this` dependency.
  *
  * Canonical codec order shared by runtime selection and Settings prediction.
- * HDR targets lead SDR targets even when that crosses the hardware/software
- * boundary.
+ * HDR targets cross the hardware/software boundary only when the user chooses
+ * to prioritize HDR codecs.
  */
 
 import type { types as mediasoupTypes } from 'mediasoup-client';
@@ -23,7 +23,7 @@ export interface CodecCascadeEntry {
 export interface CodecLookup<T = mediasoupTypes.RtpCodecCapability> {
   isInCodecFloor: (key: string) => boolean;
   isHwAccelerated: (key: string) => boolean;
-  isEligible?: (key: string) => boolean;
+  isEligible?: (key: string, backend: CodecBackendTarget) => boolean;
   findSendCodec: (key: string) => T | undefined;
 }
 
@@ -31,6 +31,7 @@ export interface CodecCascadeConfig<T = mediasoupTypes.RtpCodecCapability> exten
   preferred: string | null;
   hwAccel: boolean;
   hdrEncoding: boolean;
+  prioritizeHdrCodecs: boolean;
 }
 
 export type CodecBackendTarget = 'hardware' | 'software';
@@ -224,7 +225,8 @@ function findCodecInEntry<T>(
   for (const mime of entry.mimes) {
     if (requireHw && !lookup.isHwAccelerated(mime)) continue;
     if (!lookup.isInCodecFloor(mime)) continue;
-    if (lookup.isEligible && !lookup.isEligible(mime)) continue;
+    if (lookup.isEligible && !lookup.isEligible(mime, requireHw ? 'hardware' : 'software'))
+      continue;
     const codec = lookup.findSendCodec(mime);
     if (codec) return codec;
   }
@@ -256,16 +258,19 @@ function candidates(
   return keys.map((key) => ({ key, backend, colorTarget }));
 }
 
-/** Exact Auto policy. Hardware candidates are absent when acceleration is off. */
-export function buildCodecCandidates(hdrEncoding: boolean, hwAccel: boolean): CodecCandidate[] {
-  const result: CodecCandidate[] = [];
-  if (hdrEncoding) {
-    if (hwAccel) result.push(...candidates(HDR_CODEC_KEYS, 'hardware', 'hdr'));
-    result.push(...candidates(HDR_CODEC_KEYS, 'software', 'hdr'));
-  }
-  if (hwAccel) result.push(...candidates(SDR_CODEC_KEYS, 'hardware', 'sdr'));
-  result.push(...candidates(SDR_CODEC_KEYS, 'software', 'sdr'));
-  return result;
+/** Exact Auto policy. The HDR priority switch changes only cross-backend order. */
+export function buildCodecCandidates(
+  hdrEncoding: boolean,
+  hwAccel: boolean,
+  prioritizeHdrCodecs: boolean
+): CodecCandidate[] {
+  const hdrHardware = hdrEncoding && hwAccel ? candidates(HDR_CODEC_KEYS, 'hardware', 'hdr') : [];
+  const hdrSoftware = hdrEncoding ? candidates(HDR_CODEC_KEYS, 'software', 'hdr') : [];
+  const sdrHardware = hwAccel ? candidates(SDR_CODEC_KEYS, 'hardware', 'sdr') : [];
+  const sdrSoftware = candidates(SDR_CODEC_KEYS, 'software', 'sdr');
+  return prioritizeHdrCodecs
+    ? [...hdrHardware, ...hdrSoftware, ...sdrHardware, ...sdrSoftware]
+    : [...hdrHardware, ...sdrHardware, ...hdrSoftware, ...sdrSoftware];
 }
 
 /** Normalize legacy family-only preferences without changing their stored type. */
@@ -303,7 +308,7 @@ function findCandidate<T>(
 ): SelectedCodecCandidate<T> | undefined {
   if (candidate.backend === 'hardware' && !lookup.isHwAccelerated(candidate.key)) return undefined;
   if (!lookup.isInCodecFloor(candidate.key)) return undefined;
-  if (lookup.isEligible && !lookup.isEligible(candidate.key)) return undefined;
+  if (lookup.isEligible && !lookup.isEligible(candidate.key, candidate.backend)) return undefined;
   const codec = lookup.findSendCodec(candidate.key);
   return codec ? { codec, candidate } : undefined;
 }
@@ -344,14 +349,14 @@ function findPreferredCandidate<T>(
 export function selectCodecCandidate<T = mediasoupTypes.RtpCodecCapability>(
   config: CodecCascadeConfig<T>
 ): SelectedCodecCandidate<T> | undefined {
-  const { preferred, hwAccel, hdrEncoding, ...lookup } = config;
+  const { preferred, hwAccel, hdrEncoding, prioritizeHdrCodecs, ...lookup } = config;
 
   if (preferred) {
     const selected = findPreferredCandidate(preferred, hwAccel, hdrEncoding, lookup);
     if (selected) return selected;
   }
 
-  for (const candidate of buildCodecCandidates(hdrEncoding, hwAccel)) {
+  for (const candidate of buildCodecCandidates(hdrEncoding, hwAccel, prioritizeHdrCodecs)) {
     const selected = findCandidate(candidate, lookup);
     if (selected) return selected;
   }

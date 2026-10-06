@@ -309,6 +309,7 @@ function resolveCodecTarget(args: {
   preferred: string | null;
   hardwareAcceleration: boolean;
   hdrEncoding: boolean;
+  prioritizeHdrCodecs: boolean;
   codecFloor: string[] | null;
   webrtcHwByMime: Record<string, boolean>;
 }): SelectedCodecCandidate<CodecCapability> | undefined {
@@ -338,6 +339,7 @@ function resolveCodecTarget(args: {
     preferred,
     hwAccel: args.hardwareAcceleration,
     hdrEncoding: args.hdrEncoding,
+    prioritizeHdrCodecs: args.prioritizeHdrCodecs,
     isInCodecFloor: (key) => isCodecKeyInFloor(key, args.codecFloor),
     isHwAccelerated: (key) => matching(key).some(hasUsableHardwareTarget),
     findSendCodec: find,
@@ -568,15 +570,18 @@ function codecSelectorValue(key: string, backend: 'hardware' | 'software'): stri
 
 function buildCodecSelectorOptions(
   capabilities: CodecCapability[],
-  hdrEncoding: boolean
+  hdrEncoding: boolean,
+  prioritizeHdrCodecs: boolean
 ): SelectOption[] {
   const supported = capabilities.filter((capability) =>
     isRouterSupportedCodecProfile(capability.mimeType, capability.profileId)
   );
-  const active = buildCodecCandidates(hdrEncoding, true);
+  const active = buildCodecCandidates(hdrEncoding, true, prioritizeHdrCodecs);
   const disabledHdr = hdrEncoding
     ? []
-    : buildCodecCandidates(true, true).filter((candidate) => candidate.colorTarget === 'hdr');
+    : buildCodecCandidates(true, true, false).filter(
+        (candidate) => candidate.colorTarget === 'hdr'
+      );
   const seen = new Set<string>();
   const options: SelectOption[] = [];
 
@@ -732,7 +737,6 @@ const VideoConfigSection: React.FC = () => {
   const codecCapabilities = useVideoSettingsStore((s) => s.codecCapabilities);
   const gpuInfo = useVideoSettingsStore((s) => s.gpuInfo);
   const videoAdvancedMode = useVideoSettingsStore((s) => s.videoAdvancedMode);
-  const systemHdr = useVideoSettingsStore((s) => s.systemHdr);
   const webrtcHwByMime = useVideoSettingsStore((s) => s.webrtcHwByMime);
   const appliedHardwareAcceleration = useVideoSettingsStore((s) => s.hardwareAcceleration);
 
@@ -748,6 +752,7 @@ const VideoConfigSection: React.FC = () => {
   const degradationPreference = useDraftVideoSetting('degradationPreference');
   const hardwareAcceleration = useDraftVideoSetting('hardwareAcceleration');
   const hdrEncoding = useDraftVideoSetting('hdrEncoding');
+  const prioritizeHdrCodecs = useDraftVideoSetting('prioritizeHdrCodecs');
   const supportSvc = useDraftVideoSetting('supportSvc');
   const supportSimulcast = useDraftVideoSetting('supportSimulcast');
   const autoTuneInScreenShares = useDraftVideoSetting('autoTuneInScreenShares');
@@ -808,6 +813,7 @@ const VideoConfigSection: React.FC = () => {
         preferred: preferredVideoCodec,
         hardwareAcceleration,
         hdrEncoding,
+        prioritizeHdrCodecs,
         codecFloor,
         webrtcHwByMime: webrtcHwByMime ?? {},
       }),
@@ -816,6 +822,7 @@ const VideoConfigSection: React.FC = () => {
       preferredVideoCodec,
       hardwareAcceleration,
       hdrEncoding,
+      prioritizeHdrCodecs,
       codecFloor,
       webrtcHwByMime,
     ]
@@ -1341,6 +1348,9 @@ const VideoConfigSection: React.FC = () => {
                 H265: 'HEVC (H.265)',
                 HEVC: 'HEVC (H.265)',
               };
+              // These lists are separate backend columns. HDR eligibility decides
+              // the order within each column; priority only orders the columns'
+              // candidates against one another in Auto selection.
               const sortByPriority = (a: CodecCapability, b: CodecCapability) =>
                 codecPriority(codecKey(a), hdrEncoding) - codecPriority(codecKey(b), hdrEncoding);
               const humanProfile = (c: CodecCapability) =>
@@ -1477,21 +1487,33 @@ const VideoConfigSection: React.FC = () => {
 
           <div className="settings-row">
             <div className="settings-row-info">
-              <span className="settings-row-label">Enable HDR Encoding</span>
+              <span className="settings-row-label">Enable HDR</span>
               <span className="settings-row-hint">
-                {(() => {
-                  if (!systemHdr)
-                    return 'No HDR display detected. Connect an HDR-capable display to enable.';
-                  if (hdrEncoding)
-                    return 'Enabled. AV1 HDR is a 10-bit target, not proof of encoded bit depth; active outbound WebRTC stats are authoritative for the negotiated codec and hardware path.';
-                  return 'Disabled. Concord prefers SDR codec profiles and will not select VP9 Profile 2.';
-                })()}
+                {hdrEncoding
+                  ? 'HDR-capable codec targets can be selected when available. This does not guarantee HDR capture or output.'
+                  : 'HDR-capable codec targets are excluded from selection.'}
               </span>
             </div>
             <ToggleSwitch
+              label="Enable HDR"
               checked={hdrEncoding}
               onChange={(v) => setDraftVideoSetting('hdrEncoding', v)}
-              disabled={!systemHdr}
+            />
+          </div>
+
+          <div className="settings-row">
+            <div className="settings-row-info">
+              <span className="settings-row-label">Prioritize HDR Codecs</span>
+              <span className="settings-row-hint">
+                In Auto, choose HDR software encoding ahead of SDR hardware encoding when both are
+                available. With this off, hardware encoding keeps priority.
+              </span>
+            </div>
+            <ToggleSwitch
+              label="Prioritize HDR Codecs"
+              checked={prioritizeHdrCodecs}
+              onChange={(v) => setDraftVideoSetting('prioritizeHdrCodecs', v)}
+              disabled={!hdrEncoding}
             />
           </div>
 
@@ -1542,7 +1564,11 @@ const VideoConfigSection: React.FC = () => {
                     className="settings-select"
                     options={[
                       { value: '', label: 'Auto' },
-                      ...buildCodecSelectorOptions(codecCapabilities, hdrEncoding),
+                      ...buildCodecSelectorOptions(
+                        codecCapabilities,
+                        hdrEncoding,
+                        prioritizeHdrCodecs
+                      ),
                     ]}
                     value={preferredSelectorValue}
                     onChange={(value) => {

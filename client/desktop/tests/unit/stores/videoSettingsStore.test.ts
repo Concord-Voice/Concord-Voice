@@ -48,8 +48,18 @@ describe('videoSettingsStore', () => {
   });
 
   it('sets codec capabilities', () => {
-    useVideoSettingsStore.getState().setCodecCapabilities({ vp9: true, h264: true });
-    expect(useVideoSettingsStore.getState().codecCapabilities).toEqual({ vp9: true, h264: true });
+    const caps = [
+      {
+        mimeType: 'video/VP9',
+        supported: true,
+        profileId: '2',
+        profileLabel: 'HDR',
+        isHdr: true,
+        swAvailable: true,
+      },
+    ];
+    useVideoSettingsStore.getState().setCodecCapabilities(caps);
+    expect(useVideoSettingsStore.getState().codecCapabilities).toEqual(caps);
   });
 
   it('sets GPU info', () => {

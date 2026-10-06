@@ -23,6 +23,7 @@ describe('videoSettingsStore — extended coverage', () => {
     expect(s.scalabilityMode).toBe('auto');
     expect(s.hardwareAcceleration).toBe(true);
     expect(s.hdrEncoding).toBe(false);
+    expect(s.prioritizeHdrCodecs).toBe(false);
     expect(s.systemHdr).toBe(false);
     expect(s.codecCapabilities).toEqual([]);
     expect(s.gpuInfo).toBeNull();
@@ -121,12 +122,93 @@ describe('videoSettingsStore — extended coverage', () => {
     });
   });
 
+  describe('setPrioritizeHdrCodecs', () => {
+    it('changes codec ranking without changing HDR eligibility', () => {
+      useVideoSettingsStore.getState().setPrioritizeHdrCodecs(true);
+      expect(useVideoSettingsStore.getState().prioritizeHdrCodecs).toBe(true);
+      expect(useVideoSettingsStore.getState().hdrEncoding).toBe(false);
+    });
+  });
+
+  describe('legacy HDR preference migration', () => {
+    it('keeps both HDR eligibility and priority enabled for a previously enabled setting', async () => {
+      localStorage.setItem(
+        'concord:video-settings',
+        JSON.stringify({ state: { hdrEncoding: true, cameraPreset: '720p30' }, version: 0 })
+      );
+      await useVideoSettingsStore.persist.rehydrate();
+      expect(useVideoSettingsStore.getState()).toMatchObject({
+        hdrEncoding: true,
+        prioritizeHdrCodecs: true,
+        cameraPreset: '720p30',
+      });
+    });
+
+    it('leaves both switches off for a previously disabled setting', async () => {
+      localStorage.setItem(
+        'concord:video-settings',
+        JSON.stringify({ state: { hdrEncoding: false }, version: 0 })
+      );
+      await useVideoSettingsStore.persist.rehydrate();
+      expect(useVideoSettingsStore.getState()).toMatchObject({
+        hdrEncoding: false,
+        prioritizeHdrCodecs: false,
+      });
+    });
+  });
+
   describe('persistence', () => {
-    it('excludes systemHdr from persisted state', () => {
-      useVideoSettingsStore.setState({ systemHdr: true });
+    it('does not persist runtime codec, GPU, or HDR observations', () => {
+      useVideoSettingsStore.setState({
+        systemHdr: true,
+        codecCapabilities: [
+          {
+            mimeType: 'video/AV1',
+            supported: true,
+            profileId: 'hdr',
+            profileLabel: 'HDR',
+            isHdr: true,
+            hwAvailable: true,
+          },
+        ],
+        gpuInfo: { vendor: 'old GPU', device: 'old device', encodeProfiles: ['video/AV1'] },
+      });
       const stored = JSON.parse(localStorage.getItem('concord:video-settings') || '{}');
-      // systemHdr should not be in persisted state (partialize excludes it)
       expect(stored.state?.systemHdr).toBeUndefined();
+      expect(stored.state?.codecCapabilities).toBeUndefined();
+      expect(stored.state?.gpuInfo).toBeUndefined();
+      expect(stored.version).toBe(2);
+    });
+
+    it('discards stale codec probes when migrating a saved version 1 preference', async () => {
+      localStorage.setItem(
+        'concord:video-settings',
+        JSON.stringify({
+          version: 1,
+          state: {
+            hdrEncoding: true,
+            prioritizeHdrCodecs: true,
+            codecCapabilities: [
+              {
+                mimeType: 'video/AV1',
+                profileId: 'hdr',
+                hwAvailable: true,
+                supported: true,
+                isHdr: true,
+              },
+            ],
+            gpuInfo: { vendor: 'old GPU', device: 'old device', encodeProfiles: ['video/AV1'] },
+          },
+        })
+      );
+
+      await useVideoSettingsStore.persist.rehydrate();
+      expect(useVideoSettingsStore.getState()).toMatchObject({
+        hdrEncoding: true,
+        prioritizeHdrCodecs: true,
+        codecCapabilities: [],
+        gpuInfo: null,
+      });
     });
   });
 

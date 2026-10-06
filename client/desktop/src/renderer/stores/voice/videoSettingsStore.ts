@@ -129,10 +129,12 @@ export interface VideoSettings {
   hardwareAcceleration: boolean;
 
   // HDR
-  hdrEncoding: boolean; // Prefer AV1 HDR / VP9 P2 targets. Availability is display-gated.
+  hdrEncoding: boolean; // Admit HDR-capable AV1 / VP9 P2 targets to codec selection.
+  prioritizeHdrCodecs: boolean; // Let HDR software targets outrank SDR hardware targets.
   systemHdr: boolean; // Whether any connected display supports HDR (non-persisted, runtime)
 
-  // Cached capabilities (non-persisted in practice, but ok to persist for fast initial render)
+  // Current-session probes only. A previous GPU/driver/WebRTC build cannot
+  // affirm eligibility for an HDR encoder in this session.
   codecCapabilities: CodecCapability[];
   gpuInfo: GpuInfo | null;
   // Runtime-observed WebRTC hardware-encode signal (RTCOutboundRtpStreamStats
@@ -162,6 +164,7 @@ interface VideoSettingsState extends VideoSettings {
   setAutoTuneInScreenShares: (enabled: boolean) => void;
   setHardwareAcceleration: (enabled: boolean) => void;
   setHdrEncoding: (enabled: boolean) => void;
+  setPrioritizeHdrCodecs: (enabled: boolean) => void;
   setVideoAdvancedMode: (enabled: boolean) => void;
   setCodecCapabilities: (caps: CodecCapability[]) => void;
   setGpuInfo: (info: GpuInfo | null) => void;
@@ -187,6 +190,7 @@ const defaults: VideoSettings = {
   autoTuneInScreenShares: false,
   hardwareAcceleration: true,
   hdrEncoding: false,
+  prioritizeHdrCodecs: false,
   systemHdr: false,
   codecCapabilities: [],
   gpuInfo: null,
@@ -217,6 +221,7 @@ export const useVideoSettingsStore = wrapStore(
         setAutoTuneInScreenShares: (autoTuneInScreenShares) => set({ autoTuneInScreenShares }),
         setHardwareAcceleration: (hardwareAcceleration) => set({ hardwareAcceleration }),
         setHdrEncoding: (hdrEncoding) => set({ hdrEncoding }),
+        setPrioritizeHdrCodecs: (prioritizeHdrCodecs) => set({ prioritizeHdrCodecs }),
         setCodecCapabilities: (codecCapabilities) => set({ codecCapabilities }),
         setGpuInfo: (gpuInfo) => set({ gpuInfo }),
         setWebrtcHwForMime: (mime, hw) =>
@@ -224,9 +229,32 @@ export const useVideoSettingsStore = wrapStore(
       }),
       {
         name: 'concord:video-settings',
+        version: 2,
+        migrate: (persisted, version) => {
+          if (typeof persisted !== 'object' || persisted === null || Array.isArray(persisted)) {
+            return {} as VideoSettingsState;
+          }
+          // Persist's merge supplies the actions and any absent defaults after migration.
+          const {
+            codecCapabilities: _codecCapabilities,
+            gpuInfo: _gpuInfo,
+            systemHdr: _systemHdr,
+            webrtcHwByMime: _webrtcHwByMime,
+            ...state
+          } = persisted as Partial<VideoSettingsState>;
+          return (
+            version < 1 ? { ...state, prioritizeHdrCodecs: state.hdrEncoding === true } : state
+          ) as VideoSettingsState;
+        },
         partialize: (state) => {
           // Exclude runtime-only fields from persistence
-          const { systemHdr: _, webrtcHwByMime: __, ...rest } = state;
+          const {
+            systemHdr: _,
+            codecCapabilities: __,
+            gpuInfo: ___,
+            webrtcHwByMime: ____,
+            ...rest
+          } = state;
           return rest;
         },
       }
