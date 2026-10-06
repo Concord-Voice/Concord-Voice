@@ -35,6 +35,21 @@ function rejectWithContractError(promise: Promise<unknown>) {
 }
 
 describe("api", () => {
+  it("fails closed on an unmatched request", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(
+      fetch(`${base}/admin/api/v1/__unhandled__`),
+    ).rejects.toMatchObject({
+      cause: {
+        name: "InternalError",
+        message: expect.stringContaining(
+          'Cannot bypass a request when using the "error" strategy for the "onUnhandledFrame" option.',
+        ),
+      },
+    });
+  });
+
   it("uses fixed same-origin requests and validates metric responses", async () => {
     const seen: Request[] = [];
     server.use(
@@ -134,10 +149,9 @@ describe("api", () => {
         bodies.push(await request.json());
         return json({ status: "enrolled" });
       }),
-      http.post(`${base}/admin/api/v1/auth/logout`, ({ request }) => {
-        bodies.push(request.body);
-        return json({ status: "logged out" });
-      }),
+      http.post(`${base}/admin/api/v1/auth/logout`, () =>
+        json({ status: "logged out" }),
+      ),
     );
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
@@ -160,6 +174,7 @@ describe("api", () => {
         return headers.get("content-type") === "application/json";
       }),
     ).toBe(true);
+    expect(fetchSpy.mock.calls[4]?.[1]?.body).toBeUndefined();
     expect(bodies).toEqual([
       { username: "operator", password: "correct horse" }, // pragma: allowlist secret
       { handle: "login-handle", assertion: { id: "cred" } },
@@ -169,7 +184,6 @@ describe("api", () => {
         attestation: { id: "cred" },
         credential_name: "primary key",
       },
-      null,
     ]);
   });
 

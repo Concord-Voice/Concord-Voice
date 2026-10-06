@@ -24,7 +24,7 @@ if (!navigator.credentials) {
 }
 
 beforeAll(() => {
-  server.listen({ onUnhandledRequest: "error" });
+  server.listen({ onUnhandledFrame: "error" });
 });
 
 afterEach(() => {
