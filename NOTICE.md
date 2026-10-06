@@ -13,7 +13,7 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 399 third-party software components across its four
+Concord Voice distributes 398 third-party software components across its four
 CVSL application artifact families:
 
 - **59** Go modules linked into the control-plane runtime binaries. The image
@@ -22,7 +22,7 @@ CVSL application artifact families:
   is the union of what all three link. The image also carries the admin portal
   bundle below, so it is not Go-only.
 - **188** npm packages in the desktop client production bundle (plus Electron and its bundled components)
-- **148** npm packages in the media-plane production bundle
+- **147** npm packages in the media-plane production bundle
 - **4** npm packages in the admin portal production bundle (`client/admin`),
   compiled by the `admin-ui-builder` stage and copied into the control-plane
   runtime image at `/admin-ui` (`services/control-plane/Dockerfile:8,66`)
@@ -37,7 +37,7 @@ Application-dependency license distribution:
 
 | License family | Share | Compatible with CVSL 1.0 + AGPL-3.0 |
 |---|---|---|
-| MIT | 82.5% (329) | ✓ |
+| MIT | 82.4% (328) | ✓ |
 | ISC | 6.3% (25) | ✓ |
 | Apache-2.0 | 4.5% (18) | ✓ |
 | BSD-3-Clause | 3.8% (15) | ✓ |
@@ -48,9 +48,9 @@ Application-dependency license distribution:
 | MPL-2.0 (build-time only) | not in the count above | ✓ |
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | not in the count above | ✓ (attribution required) |
 
-Shares are exact counts over the 399 components tabulated below, not estimates.
+Shares are exact counts over the 398 components tabulated below, not estimates.
 The final two rows cover build-time and build-data dependencies, which are not
-part of that 399 and therefore carry no share of it; see
+part of that 398 and therefore carry no share of it; see
 [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 for their treatment.
 
@@ -58,7 +58,7 @@ No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the four
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 399-component count.
+recorded separately below; it is not part of the 398-component count.
 
 ## License Texts
 
@@ -435,13 +435,12 @@ bundle (services/media-plane):
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/node | 26.6.2 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/node | 26.6.3 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/triple-beam | 1.3.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |
 | accepts | 2.0.0 | MIT | https://github.com/jshttp/accepts |
 | async | 3.2.6 | MIT | https://github.com/caolan/async |
-| base64id | 2.0.0 | MIT | https://github.com/faeldt/base64id |
 | body-parser | 2.3.0 | MIT | https://github.com/expressjs/body-parser |
 | buffer-equal-constant-time | 1.0.1 | BSD-3-Clause | https://github.com/goinstant/buffer-equal-constant-time |
 | bytes | 3.1.2 | MIT | https://github.com/visionmedia/bytes.js |
@@ -551,7 +550,7 @@ bundle (services/media-plane):
 | side-channel | 1.1.1 | MIT | https://github.com/ljharb/side-channel |
 | socket.io-adapter | 2.5.7 | MIT | https://github.com/socketio/socket.io |
 | socket.io-parser | 4.2.7 | MIT | https://github.com/socketio/socket.io |
-| socket.io | 4.8.3 | MIT | https://github.com/socketio/socket.io |
+| socket.io | 4.8.4 | MIT | https://github.com/socketio/socket.io |
 | stack-trace | 0.0.10 | MIT | https://github.com/felixge/node-stack-trace |
 | statuses | 2.0.2 | MIT | https://github.com/jshttp/statuses |
 | string_decoder | 1.3.0 | MIT | https://github.com/nodejs/string_decoder |
