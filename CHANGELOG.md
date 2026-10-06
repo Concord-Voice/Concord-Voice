@@ -15,6 +15,7 @@ before transferring your account key.
 
 ### Security
 
+- Updated Vite to 8.3.3 for desktop and admin development builds, closing three development-server advisories: [file disclosure](https://github.com/vitejs/vite/security/advisories/GHSA-rq7h-c2jc-7f22), [Wasm-query file disclosure](https://github.com/vitejs/vite/security/advisories/GHSA-vfpm-58rq-9qcg), and [cross-origin script execution](https://github.com/vitejs/vite/security/advisories/GHSA-9jrq-w75r-8gcw).
 - Updated the desktop development dependency `source-map-js` to 1.2.2 to address malformed source-map denial of service ([CVE-2026-93749](https://github.com/advisories/GHSA-68fv-2mgg-jv7q), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - Updated the desktop development dependency `shell-quote` to 1.12.0 to address shell command injection in comment-bearing argument lists ([CVE-2026-102422](https://github.com/advisories/GHSA-pqg4-j6r4-53mv), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - **Media server dependency security update** ([#3620](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3620)) — updated the library that interprets forwarded client addresses to its patched release, and patched `source-map-js` and Vite in media development tooling. No configuration change is needed.
