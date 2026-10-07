@@ -486,7 +486,11 @@ function makeRecvTransport(id = 'recv-1') {
   return { id, closed: false, close: vi.fn(), consume: vi.fn(), on: vi.fn() };
 }
 
-async function joinVoiceChannel(co?: Record<string, unknown>, top?: Record<string, unknown>) {
+async function joinVoiceChannel(
+  co?: Record<string, unknown>,
+  top?: Record<string, unknown>,
+  roomJoined?: Record<string, unknown>
+) {
   setupAuth();
   mockApiFetch.mockResolvedValueOnce({
     ok: true,
@@ -500,7 +504,7 @@ async function joinVoiceChannel(co?: Record<string, unknown>, top?: Record<strin
   mockCreateRecvTransport.mockReturnValue(recvTransport);
 
   setupEmitResponses({
-    'join-room': makeRoomJoined(),
+    'join-room': makeRoomJoined(roomJoined),
     'create-transport': makeTransportOpts(),
     produce: { id: 'prod-mic' },
     'resume-consumer': undefined,
@@ -536,6 +540,11 @@ describe('VoiceService Extended', () => {
     vi.clearAllMocks();
     vi.useFakeTimers({ shouldAdvanceTime: true });
     resetAllStores();
+    useVideoSettingsStore.setState({
+      cameraPreset: 'system',
+      cameraBitrate: 0,
+      screenShareBitrate: 0,
+    });
     mockSocket.connected = false;
     for (const k of Object.keys(socketListeners)) delete socketListeners[k];
     for (const k of Object.keys(socketOnceListeners)) delete socketOnceListeners[k];
@@ -1271,6 +1280,539 @@ describe('VoiceService Extended', () => {
       } finally {
         warn.mockRestore();
       }
+    });
+  });
+
+  describe('video producer bitrate ceilings', () => {
+    const premiumMedia = {
+      tier: 'premium',
+      camera_max_bitrate_bps: 6_000_000,
+      screen_max_bitrate_bps: 20_000_000,
+    };
+    const premiumAck = { cameraMaxBitrateBps: 6_000_000, screenMaxBitrateBps: 20_000_000 };
+    const premiumEntitlement: Entitlement = {
+      ...FREE_ENTITLEMENT,
+      tier: 'premium',
+      cameraMaxBitrate: 6_000_000,
+      streamMaxBitrate: 20_000_000,
+      streamMaxHeight: -1,
+      streamMaxFps: -1,
+      streamMaxPixelRate: -1,
+    };
+
+    it('hands the camera encoder the lower manual cap, not just a start hint', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVideoSettingsStore.setState({ cameraPreset: '1080p60', cameraBitrate: 1_200_000 });
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video' }]));
+      sendTransport.produce.mockResolvedValue(createMockProducer('camera-capped', 'camera'));
+
+      await voiceService.produceVideo();
+
+      const call = sendTransport.produce.mock.calls.find(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'camera'
+      )?.[0];
+      expect(call).toBeDefined();
+      expect(
+        call.encodings.reduce((sum: number, enc: { maxBitrate: number }) => sum + enc.maxBitrate, 0)
+      ).toBe(1_200_000);
+      expect(call.codecOptions.videoGoogleStartBitrate).toBeLessThan(1_200);
+    });
+
+    it('keeps an automatic camera within the free camera entitlement', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVideoSettingsStore.setState({ cameraPreset: '1080p60', cameraBitrate: 0 });
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video' }]));
+      sendTransport.produce.mockResolvedValue(createMockProducer('camera-free', 'camera'));
+
+      await voiceService.produceVideo();
+
+      const call = sendTransport.produce.mock.calls.find(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'camera'
+      )?.[0];
+      expect(call).toBeDefined();
+      expect(
+        call.encodings.reduce((sum: number, enc: { maxBitrate: number }) => sum + enc.maxBitrate, 0)
+      ).toBe(FREE_ENTITLEMENT.cameraMaxBitrate);
+    });
+
+    it('hands the screen encoder an aggregate cap no higher than the free stream entitlement', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVideoSettingsStore.setState({ screenShareBitrate: 20_000_000 });
+      mockGetDisplayMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video' }]));
+      sendTransport.produce.mockResolvedValue(createMockProducer('screen-free', 'screen'));
+
+      await voiceService.produceScreen();
+
+      const call = sendTransport.produce.mock.calls.find(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'screen'
+      )?.[0];
+      expect(call).toBeDefined();
+      expect(
+        call.encodings.reduce((sum: number, enc: { maxBitrate: number }) => sum + enc.maxBitrate, 0)
+      ).toBe(FREE_ENTITLEMENT.streamMaxBitrate);
+    });
+
+    it('caps an automatic high-motion share at the premium stream ceiling', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumEntitlement);
+      await joinVoiceChannel(undefined, { media_entitlements: premiumMedia }, premiumAck);
+      useVideoSettingsStore.setState({
+        screenResolution: '4K',
+        screenFrameRate: 120,
+        screenShareBitrate: 0,
+      });
+      const plan = (voiceService as any).pickScreenCodec();
+      expect(plan.effectiveBitrate).toBe(20_000_000);
+      expect(
+        plan.encodings.reduce((sum: number, enc: { maxBitrate: number }) => sum + enc.maxBitrate, 0)
+      ).toBe(20_000_000);
+    });
+
+    it('applies a changed manual camera cap to the active sender', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({ cameraPreset: '720p60', cameraBitrate: 0 });
+      const producer = createMockProducer('camera-live-manual', 'camera');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: [{ maxBitrate: 2_500_000 }],
+      });
+      svc.producers.set('camera', producer);
+
+      useVideoSettingsStore.setState({ cameraBitrate: 1_100_000 });
+
+      expect(producer.rtpSender.setParameters).toHaveBeenCalledTimes(1);
+      expect(producer.rtpSender.setParameters.mock.calls[0][0].encodings[0].maxBitrate).toBe(
+        1_100_000
+      );
+    });
+
+    it('lowers an active camera and screen when the entitlement drops', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumEntitlement);
+      await joinVoiceChannel(undefined, { media_entitlements: premiumMedia }, premiumAck);
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({
+        cameraPreset: '1080p60',
+        cameraBitrate: 0,
+        screenShareBitrate: 12_000_000,
+      });
+      const cameraProducer = createMockProducer('camera-live', 'camera');
+      const screenProducer = createMockProducer('screen-live', 'screen');
+      cameraProducer.rtpSender.getParameters.mockReturnValue({
+        encodings: [{ maxBitrate: 5_000_000 }],
+      });
+      screenProducer.rtpSender.getParameters.mockReturnValue({
+        encodings: [
+          { rid: 'r0', maxBitrate: 200_000 },
+          { rid: 'r1', maxBitrate: 600_000 },
+          { rid: 'r2', maxBitrate: 11_200_000 },
+        ],
+      });
+      svc.producers.set('camera', cameraProducer);
+      svc.producers.set('screen', screenProducer);
+
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+
+      const cameraParams = cameraProducer.rtpSender.setParameters.mock.calls[0]?.[0];
+      const screenParams = screenProducer.rtpSender.setParameters.mock.calls[0]?.[0];
+      expect(cameraParams.encodings[0].maxBitrate).toBe(FREE_ENTITLEMENT.cameraMaxBitrate);
+      expect(
+        screenParams.encodings.reduce(
+          (sum: number, enc: { maxBitrate: number }) => sum + enc.maxBitrate,
+          0
+        )
+      ).toBe(FREE_ENTITLEMENT.streamMaxBitrate);
+    });
+
+    it('stops an active camera if the browser rejects a tighter entitlement cap', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumEntitlement);
+      await joinVoiceChannel(undefined, { media_entitlements: premiumMedia }, premiumAck);
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({ cameraPreset: '1080p60', cameraBitrate: 0 });
+      const producer = createMockProducer('camera-downgrade-failed', 'camera');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: [{ maxBitrate: 5_000_000 }],
+      });
+      producer.rtpSender.setParameters.mockRejectedValueOnce(new Error('sender rejected cap'));
+      svc.producers.set('camera', producer);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+        await vi.waitFor(() => expect(producer.close).toHaveBeenCalledTimes(1));
+        expect(svc.producers.has('camera')).toBe(false);
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining('Camera bitrate update failed'),
+          'sender rejected cap'
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('keeps active Free senders at the admitted cap after a Premium store upgrade', async () => {
+      // The control-plane join says Premium, but the later SFU authorization
+      // admitted Free. The ack is the authoritative session cap.
+      await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumMedia },
+        {
+          cameraMaxBitrateBps: FREE_ENTITLEMENT.cameraMaxBitrate,
+          screenMaxBitrateBps: FREE_ENTITLEMENT.streamMaxBitrate,
+        }
+      );
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({
+        cameraPreset: '1080p60',
+        cameraBitrate: 0,
+        screenShareBitrate: 12_000_000,
+      });
+      const cameraProducer = createMockProducer('camera-free-session', 'camera');
+      const screenProducer = createMockProducer('screen-free-session', 'screen');
+      cameraProducer.rtpSender.getParameters.mockReturnValue({
+        encodings: [{ maxBitrate: FREE_ENTITLEMENT.cameraMaxBitrate }],
+      });
+      screenProducer.rtpSender.getParameters.mockReturnValue({
+        encodings: [{ maxBitrate: FREE_ENTITLEMENT.streamMaxBitrate }],
+      });
+      svc.producers.set('camera', cameraProducer);
+      svc.producers.set('screen', screenProducer);
+
+      useSubscriptionStore.getState().setEntitlement(premiumEntitlement);
+
+      expect(
+        svc
+          .pickCameraCodec()
+          .encodings.reduce((sum: number, enc: { maxBitrate: number }) => sum + enc.maxBitrate, 0)
+      ).toBe(FREE_ENTITLEMENT.cameraMaxBitrate);
+      expect(svc.pickScreenCodec().effectiveBitrate).toBe(FREE_ENTITLEMENT.streamMaxBitrate);
+      expect(cameraProducer.rtpSender.setParameters.mock.calls[0][0].encodings[0].maxBitrate).toBe(
+        FREE_ENTITLEMENT.cameraMaxBitrate
+      );
+      expect(screenProducer.rtpSender.setParameters.mock.calls[0][0].encodings[0].maxBitrate).toBe(
+        FREE_ENTITLEMENT.streamMaxBitrate
+      );
+    });
+
+    it('discards a camera produced while its entitlement was downgraded in flight', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumEntitlement);
+      const { sendTransport } = await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumMedia },
+        premiumAck
+      );
+      useVideoSettingsStore.setState({ cameraPreset: '1080p60', cameraBitrate: 0 });
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video' }]));
+      const pending = deferred<ReturnType<typeof createMockProducer>>();
+      sendTransport.produce.mockReturnValueOnce(pending.promise);
+
+      const starting = voiceService.produceVideo();
+      await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(2));
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      const camera = createMockProducer('late-camera', 'camera');
+      pending.resolve(camera);
+      await starting;
+
+      expect(camera.close).toHaveBeenCalledTimes(1);
+      expect((voiceService as any).producers.has('camera')).toBe(false);
+    });
+  });
+
+  describe('admitted audio quality in an active call', () => {
+    const premiumAudio: Entitlement = {
+      ...FREE_ENTITLEMENT,
+      tier: 'premium',
+      allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+      minPtimeMs: 10,
+    };
+    const premiumJoin = {
+      tier: 'premium',
+      allowed_audio_tiers: premiumAudio.allowedAudioTiers,
+      min_ptime_ms: 10,
+    };
+
+    it('limits mic and screen audio to the SFU Free admission after a store upgrade', async () => {
+      useVoiceStore.getState().setQualityTier('studio');
+      const { sendTransport, micProducer } = await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumJoin },
+        {
+          allowedAudioTiers: FREE_ENTITLEMENT.allowedAudioTiers,
+          minPtimeMs: 20,
+        }
+      );
+      const initialMic = sendTransport.produce.mock.calls.find(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'mic'
+      )?.[0];
+      expect(initialMic.encodings[0].maxBitrate).toBe(96_000);
+      expect(initialMic.codecOptions.opusPtime).toBe(20);
+
+      useSubscriptionStore.getState().setEntitlement(premiumAudio);
+      expect(micProducer.close).not.toHaveBeenCalled();
+
+      const svc = voiceService as any;
+      svc.localScreenStream = createMockMediaStream([{ kind: 'audio' }]);
+      svc.producers.set('screen-audio', createMockProducer('old-screen-audio', 'screen-audio'));
+      sendTransport.produce.mockResolvedValue(
+        createMockProducer('new-screen-audio', 'screen-audio')
+      );
+      await svc.reProduceScreenAudio();
+      const screenCall = sendTransport.produce.mock.calls.findLast(
+        ([options]: [{ appData?: { source?: string } }]) =>
+          options.appData?.source === 'screen-audio'
+      )?.[0];
+      expect(screenCall.encodings[0].maxBitrate).toBe(96_000);
+      expect(screenCall.codecOptions.opusPtime).toBe(20);
+    });
+
+    it('re-produces active mic and screen audio at Free bitrate and ptime on downgrade', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumAudio);
+      useVoiceStore.getState().setQualityTier('studio');
+      const { sendTransport, micProducer } = await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumJoin },
+        { allowedAudioTiers: premiumAudio.allowedAudioTiers, minPtimeMs: 10 }
+      );
+      const svc = voiceService as any;
+      const oldScreenAudio = createMockProducer('old-screen-audio', 'screen-audio');
+      svc.localScreenStream = createMockMediaStream([{ kind: 'audio' }]);
+      svc.producers.set('screen-audio', oldScreenAudio);
+      sendTransport.produce.mockImplementation(async (options: { appData: { source: string } }) =>
+        createMockProducer(`new-${options.appData.source}`, options.appData.source)
+      );
+
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      await vi.waitFor(() => expect(micProducer.close).toHaveBeenCalledTimes(1));
+      expect(oldScreenAudio.close).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => {
+        const calls = sendTransport.produce.mock.calls.filter(
+          ([options]: [{ appData?: { source?: string } }]) =>
+            options.appData?.source === 'mic' || options.appData?.source === 'screen-audio'
+        );
+        expect(calls.length).toBeGreaterThanOrEqual(3);
+      });
+      const newMic = sendTransport.produce.mock.calls.findLast(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'mic'
+      )?.[0];
+      const newScreen = sendTransport.produce.mock.calls.findLast(
+        ([options]: [{ appData?: { source?: string } }]) =>
+          options.appData?.source === 'screen-audio'
+      )?.[0];
+      expect(newMic.encodings[0].maxBitrate).toBe(96_000);
+      expect(newMic.codecOptions.opusPtime).toBe(20);
+      expect(newScreen.encodings[0].maxBitrate).toBe(96_000);
+      expect(newScreen.codecOptions.opusPtime).toBe(20);
+    });
+
+    it('finishes an entitlement audio swap before a queued Share sound Off', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumAudio);
+      const { sendTransport } = await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumJoin },
+        { allowedAudioTiers: premiumAudio.allowedAudioTiers, minPtimeMs: 10 }
+      );
+      await voiceService.closeProducer('mic');
+      const svc = voiceService as any;
+      const oldAudio = createMockProducer('old-screen-audio', 'screen-audio');
+      const replacement = createMockProducer('new-screen-audio', 'screen-audio');
+      const produceGate = deferred<ReturnType<typeof createMockProducer>>();
+      svc.localScreenStream = createMockMediaStream([{ kind: 'audio', id: 'share-audio' }]);
+      svc.producers.set('screen', createMockProducer('screen-video', 'screen'));
+      svc.producers.set('screen-audio', oldAudio);
+      useVoiceStore.getState().setScreenAudioOn(true);
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockReturnValue(produceGate.promise);
+
+      try {
+        useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+        await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+        const turnOff = svc.setScreenAudioEnabled(false);
+
+        // The Off operation cannot retire an empty slot while the entitlement
+        // swap's replacement is still in flight.
+        expect(oldAudio.close).toHaveBeenCalledTimes(1);
+        expect(svc.producers.has('screen-audio')).toBe(false);
+        produceGate.resolve(replacement);
+        await turnOff;
+
+        expect(replacement.close).toHaveBeenCalledTimes(1);
+        expect(svc.producers.has('screen-audio')).toBe(false);
+        expect(useVoiceStore.getState().isScreenAudioOn).toBe(false);
+      } finally {
+        produceGate.resolve(replacement);
+      }
+    });
+
+    it('keeps an admitted fixed channel Studio standard for a Free member', async () => {
+      useVoiceStore.getState().setQualityTier('studio');
+      const { sendTransport } = await joinVoiceChannel(
+        { audio_quality_tier: 'studio' },
+        {
+          media_entitlements: {
+            ...premiumJoin,
+            tier: 'free',
+            channel_audio_uplift: true,
+          },
+        },
+        { allowedAudioTiers: premiumAudio.allowedAudioTiers, minPtimeMs: 10 }
+      );
+      const micCall = sendTransport.produce.mock.calls.find(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'mic'
+      )?.[0];
+      expect(micCall.encodings[0].maxBitrate).toBe(510_000);
+      expect(micCall.codecOptions.opusPtime).toBe(10);
+    });
+
+    it('produces mic at the A2 channel standard enabled after the earlier REST join', async () => {
+      useVoiceStore.getState().setQualityTier('studio');
+      const { sendTransport } = await joinVoiceChannel(
+        { audio_quality_tier: null },
+        { media_entitlements: { tier: 'free' } },
+        {
+          allowedAudioTiers: premiumAudio.allowedAudioTiers,
+          minPtimeMs: 10,
+          channelAudioUpliftTier: 'high',
+        }
+      );
+
+      const micCall = sendTransport.produce.mock.calls.find(
+        ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'mic'
+      )?.[0];
+      expect(micCall.encodings[0].maxBitrate).toBe(192_000);
+      expect(micCall.codecOptions.opusPtime).toBe(10);
+    });
+
+    it('retires and retries a mic produced while its audio policy was downgraded in flight', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumAudio);
+      const { sendTransport } = await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumJoin },
+        { allowedAudioTiers: premiumAudio.allowedAudioTiers, minPtimeMs: 10 }
+      );
+      await voiceService.closeProducer('mic');
+      const staleStream = createMockMediaStream([{ kind: 'audio', id: 'mic-stale-cap' }]);
+      const recoveredStream = createMockMediaStream([{ kind: 'audio', id: 'mic-recovered-cap' }]);
+      mockGetUserMedia
+        .mockReset()
+        .mockResolvedValueOnce(staleStream)
+        .mockResolvedValueOnce(recoveredStream);
+      const pending = deferred<ReturnType<typeof createMockProducer>>();
+      const recoveredMic = createMockProducer('recovered-mic', 'mic');
+      sendTransport.produce.mockReturnValueOnce(pending.promise);
+      sendTransport.produce.mockResolvedValueOnce(recoveredMic);
+
+      const starting = voiceService.produceAudio();
+      await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(2));
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      const mic = createMockProducer('late-mic', 'mic');
+      pending.resolve(mic);
+      await starting;
+
+      expect(mic.close).toHaveBeenCalledTimes(1);
+      expect(staleStream.getTracks()[0].stop).toHaveBeenCalled();
+      expect(sendTransport.produce).toHaveBeenCalledTimes(3);
+      const retriedOptions = sendTransport.produce.mock.calls.at(-1)?.[0];
+      expect(retriedOptions.encodings[0].maxBitrate).toBe(96_000);
+      expect(retriedOptions.codecOptions.opusPtime).toBeGreaterThanOrEqual(20);
+      expect((voiceService as any).producers.get('mic')).toBe(recoveredMic);
+      expect(recoveredStream.getTracks()[0].stop).not.toHaveBeenCalled();
+    });
+
+    it('serializes rapid entitlement and codec updates and keeps mute intent during a mic drain', async () => {
+      useSubscriptionStore.getState().setEntitlement(premiumAudio);
+      useVoiceStore.getState().setQualityTier('studio');
+      const { sendTransport, micProducer } = await joinVoiceChannel(
+        undefined,
+        { media_entitlements: premiumJoin },
+        { allowedAudioTiers: premiumAudio.allowedAudioTiers, minPtimeMs: 10 }
+      );
+      const svc = voiceService as any;
+      const drainGate = deferred();
+      let drainCount = 0;
+      sendTransport._awaitQueue.push.mockImplementation(async (run: () => Promise<void>) => {
+        if (++drainCount === 1) await drainGate.promise;
+        await run();
+      });
+      const produceGate = deferred();
+      const successors: ReturnType<typeof createMockProducer>[] = [];
+      let inFlight = 0;
+      let maximumInFlight = 0;
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockImplementation(async () => {
+        inFlight++;
+        maximumInFlight = Math.max(maximumInFlight, inFlight);
+        if (successors.length === 0) await produceGate.promise;
+        const successor = createMockProducer(`mic-successor-${successors.length}`, 'mic');
+        successors.push(successor);
+        inFlight--;
+        return successor;
+      });
+      const reproduce = svc.liveReproduceAudio.bind(svc);
+      const reproductions: Promise<void>[] = [];
+      const reproduceSpy = vi.spyOn(svc, 'liveReproduceAudio').mockImplementation(() => {
+        const pending: Promise<void> = reproduce();
+        reproductions.push(pending);
+        return pending;
+      });
+
+      try {
+        useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+        useAudioSettingsStore.setState({ advancedMode: true, frameSize: 40, adaptivePtime: false });
+        expect(reproduceSpy).toHaveBeenCalledTimes(2);
+        await vi.waitFor(() => expect(micProducer.close).toHaveBeenCalledTimes(1));
+        expect(sendTransport.produce).not.toHaveBeenCalled();
+        await svc.toggleMute();
+        expect(useVoiceStore.getState().isMuted).toBe(true);
+
+        drainGate.resolve();
+        await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sendTransport.produce).toHaveBeenCalledTimes(1);
+
+        produceGate.resolve();
+        await Promise.all(reproductions);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(maximumInFlight).toBe(1);
+        const live = successors.filter((producer) => producer.close.mock.calls.length === 0);
+        expect(live).toHaveLength(1);
+        expect(svc.producers.get('mic')).toBe(live[0]);
+        expect(live[0].pause).toHaveBeenCalled();
+        const finalOptions = sendTransport.produce.mock.calls.at(-1)?.[0];
+        expect(finalOptions.encodings[0].maxBitrate).toBe(96_000);
+        expect(finalOptions.codecOptions.opusPtime).toBe(40);
+      } finally {
+        drainGate.resolve();
+        produceGate.resolve();
+        reproduceSpy.mockRestore();
+      }
+    });
+
+    it('does not publish a queued mic after the media session is torn down', async () => {
+      const { sendTransport, micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const drainGate = deferred();
+      let drainCount = 0;
+      sendTransport._awaitQueue.push.mockImplementation(async (run: () => Promise<void>) => {
+        drainCount++;
+        await drainGate.promise;
+        await run();
+      });
+      sendTransport.produce.mockClear();
+      const reproduce = svc.liveReproduceAudio.bind(svc);
+      let reproduction: Promise<void> | null = null;
+      const reproduceSpy = vi.spyOn(svc, 'liveReproduceAudio').mockImplementation(() => {
+        reproduction = reproduce();
+        return reproduction;
+      });
+      useAudioSettingsStore.setState({ frameSize: 40 });
+      await vi.waitFor(() => expect(drainCount).toBe(1));
+      expect(micProducer.close).toHaveBeenCalledTimes(1);
+      expect(sendTransport.produce).not.toHaveBeenCalled();
+
+      voiceService.emergencyCleanup();
+      drainGate.resolve();
+      await reproduction;
+      expect(sendTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.has('mic')).toBe(false);
+      reproduceSpy.mockRestore();
     });
   });
 

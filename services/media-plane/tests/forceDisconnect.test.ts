@@ -29,7 +29,15 @@ const POLICED: ForceDisconnectOptions = { reason: 'media_policy', retryAfterSec:
 
 /** Builds a fake RoomManager surface. */
 function makeRoomManager(
-  participant: { socketId: string; admissionId?: string; callId?: string } | undefined,
+  participant:
+    | {
+        socketId: string;
+        admissionId?: string;
+        callId?: string;
+        sendTransport?: { id: string };
+        producers?: Map<string, { producer: { closed: boolean } }>;
+      }
+    | undefined,
   provisionalSocketId?: string,
   roomCallId?: string,
   provisionalCallId?: string
@@ -451,6 +459,67 @@ describe('handleForceDisconnect reasons (#2153)', () => {
     ]);
     expect(disconnect).toHaveBeenCalledWith(true);
     expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+  });
+
+  it('closes only the exact unmeterable send transport without an abuse cooldown', async () => {
+    const { rm, getParticipant, leaveRoomIfSocketOwned } = makeRoomManager({
+      socketId: SOCKET_ID,
+      sendTransport: { id: 'send-current' },
+      producers: new Map([['mic', { producer: { closed: false } }]]),
+    });
+    const { io, emit, disconnect } = makeIO(SOCKET_ID);
+    const securityEmit = vi.fn();
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, securityEmit, {
+      reason: 'stats_unavailable',
+      sendTransportId: 'send-old',
+    });
+    expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, securityEmit, {
+      reason: 'stats_unavailable',
+      sendTransportId: 'send-current',
+    });
+    expect(getParticipant).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(emit).toHaveBeenCalledWith('force-disconnect', {
+      channelId: CHANNEL_ID,
+      reason: 'stats_unavailable',
+    });
+    expect(disconnect).toHaveBeenCalledWith(true);
+    expect(securityEmit).toHaveBeenCalledWith({
+      eventType: 'security_control',
+      outcome: 'degraded',
+      severity: 'high',
+      reasonCode: 'dependency_unavailable',
+      routeTemplate: 'socket.force_disconnect',
+    });
+    expect(vi.mocked(logger.info).mock.calls).toStrictEqual([
+      [
+        'Media policer closed session after persistent stats failures',
+        { reason: 'stats_unavailable' },
+      ],
+    ]);
+  });
+
+  it('keeps a listen-only session when stats are unavailable but no producer forwards', async () => {
+    const { rm, leaveRoomIfSocketOwned } = makeRoomManager({
+      socketId: SOCKET_ID,
+      sendTransport: { id: 'send-current' },
+      producers: new Map(),
+    });
+    const { io, emit, disconnect } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+      reason: 'stats_unavailable',
+      sendTransportId: 'send-current',
+    });
+
+    expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
   });
 
   it('keeps the access-revoked payload free of retryAfterSec', async () => {

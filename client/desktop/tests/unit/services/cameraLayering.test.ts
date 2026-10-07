@@ -5,6 +5,7 @@ import {
   castingKindForCodec,
   firstEligibleLayeringKey,
   resolveCameraScalabilityMode,
+  simulcastLadderBitrates,
   type CameraLayeringPriority,
   type CastingEligibility,
 } from '../../../src/renderer/services/voice/cameraLayering';
@@ -81,10 +82,13 @@ describe('buildCameraEncodingPlan', () => {
     // rejects those per-sender fields on any encoding after index 0. See the `per-sender RTP
     // encoding parameters (libwebrtc contract)` suite below, which owns that rule.
     expect(plan.encodings).toEqual([
-      { rid: 'q', scaleResolutionDownBy: 4, maxBitrate: 250_000, ...priority },
-      { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 800_000 },
-      { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 2_500_000 },
+      { rid: 'q', scaleResolutionDownBy: 4, maxBitrate: 176_056, ...priority },
+      { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 563_380 },
+      { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 1_760_564 },
     ]);
+    expect(plan.encodings.reduce((sum, encoding) => sum + (encoding.maxBitrate ?? 0), 0)).toBe(
+      2_500_000
+    );
   });
 
   it('uses VP8 as simulcast fallback', () => {
@@ -97,7 +101,10 @@ describe('buildCameraEncodingPlan', () => {
     });
     expect(plan.kind).toBe('simulcast');
     expect(plan.encodings.map((e) => e.rid)).toEqual(['q', 'h', 'f']);
-    expect(plan.encodings[2].maxBitrate).toBe(900_000);
+    expect(plan.encodings[2].maxBitrate).toBe(613_637);
+    expect(plan.encodings.reduce((sum, encoding) => sum + (encoding.maxBitrate ?? 0), 0)).toBe(
+      900_000
+    );
   });
 
   it('returns single-layer fallback for an unsupported codec', () => {
@@ -111,6 +118,18 @@ describe('buildCameraEncodingPlan', () => {
     expect(plan.kind).toBe('single');
     expect(plan.encodings).toEqual([{ maxBitrate: 1_500_000, ...priority }]);
   });
+});
+
+describe('simulcast aggregate bitrate budget', () => {
+  it.each([500_000, 900_000, 2_500_000, 5_000_000])(
+    'splits %i bps without exceeding the producer ceiling',
+    (budget) => {
+      const ladder = simulcastLadderBitrates(budget);
+      expect(ladder.q + ladder.h + ladder.f).toBe(budget);
+      expect(ladder.q).toBeLessThan(ladder.h);
+      expect(ladder.h).toBeLessThan(ladder.f);
+    }
+  );
 });
 
 const planBase = { maxBitrate: 1_000_000, scalabilityMode: 'auto' as const, priority };

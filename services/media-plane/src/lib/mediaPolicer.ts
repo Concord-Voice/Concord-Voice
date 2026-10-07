@@ -1,11 +1,12 @@
 /**
- * Hard media-rate policer (#2153) — the PURE half.
+ * Observed media-rate policer (#2153) — the PURE half.
  *
  * RoomManager reads cumulative RTP counters from mediasoup and hands them here
  * as plain numbers; this module turns them into verdicts. It has no runtime
- * mediasoup import and no input type carries `rtpParameters` or fmtp, so it
- * structurally cannot depend on anything the client DECLARES. That is the
- * point: CV-CAN-018 (the bitrate cap is a BWE advisory) and CV-CAN-020 (the
+ * mediasoup import and no input type carries `rtpParameters` or fmtp. The
+ * source label is still client-declared; observed bytes and admitted caps are
+ * authoritative. That distinction matters for CV-CAN-018 (the bitrate cap is
+ * a BWE advisory) and CV-CAN-020 (the
  * audio tier gate reads optional fmtp) both trusted the client.
  *
  * Every limit is derived from server-authoritative Participant caps, read live
@@ -18,9 +19,10 @@
 import type { MediaSource } from './roomManager.js';
 
 // ---------------------------------------------------------------------------
-// Constants, fixed by the T0 measurement (spec §9). The evidence and the reason for
-// each value: [internal]reports/2026-09-23-2153-media-policer-t0.md. Each τ is
-// hard-capped at TAU_HARD_CAP.
+// Audio and aggregate constants were fixed by the T0 measurement (spec §9):
+// [internal]reports/2026-09-23-2153-media-policer-t0.md. The video
+// source constants below are new policy choices without a loaded-room measurement.
+// Each τ is hard-capped at TAU_HARD_CAP.
 // ---------------------------------------------------------------------------
 
 /** Tick period. */
@@ -37,11 +39,26 @@ export const PER_PACKET_OVERHEAD_BYTES = 72;
 export const TAU_AUDIO = 1.25;
 export const TAU_PPS = 1.5;
 export const TAU_AGGREGATE = 1.5;
+/** Encoded-video target: only bounded RTP and per-frame E2EE overhead is credited. */
+export const VIDEO_RTP_HEADER_BYTES = 28;
+export const VIDEO_E2EE_BYTES_PER_FRAME = 38;
+/** Conservative frame/packet bounds for overhead credit, not a video fps entitlement. */
+export const VIDEO_MAX_CREDIT_FPS = 240;
+export const VIDEO_MIN_CREDIT_PAYLOAD_BYTES = 512;
+/** A small measurement margin after bounded RTP/E2EE overhead is removed. */
+export const VIDEO_MEASUREMENT_MARGIN = 1.05;
+/** A whole sample at twice the entitlement is an immediate abuse guard. */
+export const VIDEO_GROSS_RATIO = 2;
+export const VIDEO_SUSTAINED_MS = 10_000;
+export const VIDEO_CUMULATIVE_MS = 15_000;
+export const VIDEO_LOOKBACK_MS = 60_000;
+export const VIDEO_COOLDOWN_STEPS_MS = [300_000, 600_000, 1_800_000, 3_600_000] as const;
+export const VIDEO_ESCALATION_RESET_MS = 86_400_000;
 /** No τ may exceed this; raising one past it is a design change, not a tuning change. */
 export const TAU_HARD_CAP = 1.5;
 /** Seconds of sustained excess a bucket may bank before it trips. */
 export const TRIP_BUDGET_S = 10;
-/** Consecutive failed ticks for one participant before the process reports degraded. */
+/** Consecutive failed ticks before degraded health and exact-session fail-closed teardown. */
 export const FAILURE_STREAK_K = 3;
 export const COOLDOWN_MS = 900_000;
 export const STRIKE_WINDOW_MS = 3_600_000;
@@ -55,7 +72,18 @@ export const MEDIA_POLICER_CONSTANTS = Object.freeze({
   TAU_AUDIO,
   TAU_PPS,
   TAU_AGGREGATE,
+  VIDEO_RTP_HEADER_BYTES,
+  VIDEO_E2EE_BYTES_PER_FRAME,
+  VIDEO_MAX_CREDIT_FPS,
+  VIDEO_MIN_CREDIT_PAYLOAD_BYTES,
   TRIP_BUDGET_S,
+  VIDEO_MEASUREMENT_MARGIN,
+  VIDEO_GROSS_RATIO,
+  VIDEO_SUSTAINED_MS,
+  VIDEO_CUMULATIVE_MS,
+  VIDEO_LOOKBACK_MS,
+  VIDEO_COOLDOWN_STEPS_MS,
+  VIDEO_ESCALATION_RESET_MS,
   FAILURE_STREAK_K,
   COOLDOWN_MS,
   STRIKE_WINDOW_MS,
@@ -68,6 +96,8 @@ export const MEDIA_POLICER_CONSTANTS = Object.freeze({
 const FAIL_CLOSED_AUDIO_CEILING_BPS = 96_000;
 const FAIL_CLOSED_MIN_PTIME_MS = 20;
 const FAIL_CLOSED_MAX_MANUAL_BITRATE_BPS = 5_000_000;
+const FAIL_CLOSED_CAMERA_BITRATE_BPS = 2_500_000;
+const FAIL_CLOSED_SCREEN_BITRATE_BPS = 5_000_000;
 
 // ---------------------------------------------------------------------------
 // Limits and verdict vocabulary
@@ -79,6 +109,8 @@ export interface ParticipantCaps {
   readonly audioCeilingBps: number;
   readonly minPtimeMs: number;
   readonly maxManualBitrateBps: number;
+  readonly cameraMaxBitrateBps: number;
+  readonly screenMaxBitrateBps: number;
 }
 
 export interface PolicerLimits {
@@ -86,12 +118,17 @@ export interface PolicerLimits {
   readonly audioBps: number;
   /** Per audio slot, packets per second. Enforces minPtimeMs without reading fmtp. */
   readonly audioPps: number;
-  /** Per send transport, RTP-layer bits per second after SRTP decryption (excludes IP/UDP headers and the SRTP tag). */
+  /** Coarse simultaneous-source RTP/RTX envelope per send transport, not an encoder entitlement. */
   readonly aggregateBps: number;
+  /** Encoded-video server guard for each declared slot. Source labels are untrusted. */
+  readonly cameraBps: number;
+  readonly screenBps: number;
 }
 
 export type PolicedSlot = 'mic' | 'screen-audio';
-export type PolicerCheck = 'audio_bytes' | 'audio_pps' | 'aggregate';
+export type VideoSlot = 'camera' | 'screen';
+export type PolicerCheck =
+  'audio_bytes' | 'audio_pps' | 'camera_bytes' | 'screen_bytes' | 'aggregate';
 export type RatioBucket = '1-1.5x' | '1.5-2x' | '2-4x' | '>=4x';
 
 export interface PolicerTrip {
@@ -116,12 +153,43 @@ export function deriveLimits(caps: ParticipantCaps): PolicerLimits {
   const ceiling = positiveFinite(caps.audioCeilingBps, FAIL_CLOSED_AUDIO_CEILING_BPS);
   const ptimeMs = positiveFinite(caps.minPtimeMs, FAIL_CLOSED_MIN_PTIME_MS);
   const aggregate = positiveFinite(caps.maxManualBitrateBps, FAIL_CLOSED_MAX_MANUAL_BITRATE_BPS);
+  const camera = positiveFinite(caps.cameraMaxBitrateBps, FAIL_CLOSED_CAMERA_BITRATE_BPS);
+  const screen = positiveFinite(caps.screenMaxBitrateBps, FAIL_CLOSED_SCREEN_BITRATE_BPS);
   const nominalPps = 1000 / ptimeMs;
+  const audioBps =
+    (ceiling * FEC_HEADROOM + nominalPps * PER_PACKET_OVERHEAD_BYTES * 8) * TAU_AUDIO;
+  // Camera/screen labels come from the client and cannot establish the physical
+  // capture source. The stock client applies its camera/screen plan settings;
+  // the server gives either declared slot the highest authorized video ceiling
+  // so relabelling a producer cannot change the enforcement boundary.
+  const videoBps = Math.min(Math.max(camera, screen), aggregate);
+  const cameraBps = videoBps;
+  const screenBps = videoBps;
+  // MaxManualBitrateBps is the MAX single source, not a combined quota. A
+  // participant may legally publish camera, screen, mic, and screen audio at
+  // once. Include each source's bounded wire overhead before applying the
+  // existing T0 aggregate tolerance for RTX/worker accounting differences.
+  // Video buckets are the source-agnostic server guard; this is a coarse
+  // detector for transport bytes (including RTX/unknown SSRC) they cannot attribute.
+  const simultaneousSourcesBps =
+    videoWireAllowanceBps(cameraBps) + videoWireAllowanceBps(screenBps) + 2 * audioBps;
   return {
-    audioBps: (ceiling * FEC_HEADROOM + nominalPps * PER_PACKET_OVERHEAD_BYTES * 8) * TAU_AUDIO,
+    audioBps,
     audioPps: nominalPps * TAU_PPS,
-    aggregateBps: aggregate * TAU_AGGREGATE,
+    aggregateBps: Math.max(aggregate, simultaneousSourcesBps) * TAU_AGGREGATE,
+    cameraBps,
+    screenBps,
   };
+}
+
+/** Upper RTP/E2EE wire rate compatible with one encoded-video source cap. */
+function videoWireAllowanceBps(encodedCapBps: number): number {
+  const creditPps = Math.ceil(encodedCapBps / (8 * VIDEO_MIN_CREDIT_PAYLOAD_BYTES));
+  return (
+    encodedCapBps +
+    creditPps * VIDEO_RTP_HEADER_BYTES * 8 +
+    VIDEO_MAX_CREDIT_FPS * VIDEO_E2EE_BYTES_PER_FRAME * 8
+  );
 }
 
 /** Coarse ratio of the tripping interval's rate to its limit. Never a rate series (C8). */
@@ -140,15 +208,25 @@ export function slotFor(source: MediaSource): PolicedSlot {
   return source === 'screen-audio' ? 'screen-audio' : 'mic';
 }
 
+/** Unknown video source is metered in the camera slot; both slots share one server ceiling. */
+export function videoSlotFor(source: MediaSource): VideoSlot {
+  return source === 'screen' ? 'screen' : 'camera';
+}
+
 const KEY_SEPARATOR = '\u0000';
 
 /** Slot buckets outlive producer churn and same-room rejoin: the key has no producer id. */
-export function slotKey(roomId: string, userId: string, slot: PolicedSlot): string {
+export function slotKey(roomId: string, userId: string, slot: PolicedSlot | VideoSlot): string {
   return [roomId, userId, slot].join(KEY_SEPARATOR);
 }
 
 function participantKey(roomId: string, userId: string): string {
   return [roomId, userId].join(KEY_SEPARATOR);
+}
+
+/** A stats failure streak belongs to one admitted send transport, not its successor. */
+function failedSessionKey(failure: FailedParticipant): string {
+  return [failure.roomId, failure.userId, failure.sendTransportId].join(KEY_SEPARATOR);
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +247,12 @@ interface LedgerEntry {
   cooldownUntilMs: number;
 }
 
+interface VideoLedgerEntry {
+  violations: number;
+  lastViolationAtMs: number;
+  cooldownUntilMs: number;
+}
+
 /**
  * userId → strikes and cooldown, in process memory. SINGLE-NODE ASSUMPTION:
  * lost on every media-plane recreate (deploy, healthwatch restart). A second
@@ -177,6 +261,7 @@ interface LedgerEntry {
  */
 export class MediaPolicyLedger {
   private readonly entries = new Map<string, LedgerEntry>();
+  private readonly videoEntries = new Map<string, VideoLedgerEntry>();
   private readonly cooldownMs: number;
   private readonly strikeWindowMs: number;
 
@@ -218,12 +303,42 @@ export class MediaPolicyLedger {
     return Math.ceil(this.cooldownRemainingMs(userId, nowMs) / 1000);
   }
 
+  /** One event per user, even if multiple video checks trip on the same tick. */
+  armVideoCooldown(userId: string, nowMs: number): number {
+    const entry = this.videoEntries.get(userId);
+    if (entry && entry.cooldownUntilMs > nowMs) return this.videoRetryAfterSec(userId, nowMs);
+    const violations =
+      entry && nowMs - entry.lastViolationAtMs < VIDEO_ESCALATION_RESET_MS
+        ? entry.violations + 1
+        : 1;
+    const step =
+      VIDEO_COOLDOWN_STEPS_MS[Math.min(violations - 1, VIDEO_COOLDOWN_STEPS_MS.length - 1)];
+    this.videoEntries.set(userId, {
+      violations,
+      lastViolationAtMs: nowMs,
+      cooldownUntilMs: nowMs + step,
+    });
+    return Math.ceil(step / 1000);
+  }
+
+  videoRetryAfterSec(userId: string, nowMs: number): number {
+    const entry = this.videoEntries.get(userId);
+    return entry ? Math.ceil(Math.max(0, entry.cooldownUntilMs - nowMs) / 1000) : 0;
+  }
+
   /** Deletes an entry only once its cooldown has ended AND its last strike left the window. */
   prune(nowMs: number): void {
     for (const [userId, entry] of this.entries) {
       if (entry.cooldownUntilMs <= nowMs && nowMs - entry.lastStrikeAtMs > this.strikeWindowMs) {
         this.entries.delete(userId);
       }
+    }
+    for (const [userId, entry] of this.videoEntries) {
+      if (
+        entry.cooldownUntilMs <= nowMs &&
+        nowMs - entry.lastViolationAtMs >= VIDEO_ESCALATION_RESET_MS
+      )
+        this.videoEntries.delete(userId);
     }
   }
 
@@ -334,7 +449,7 @@ export interface ObserveResult {
   readonly stalled: readonly StalledParticipant[];
 }
 
-/** Last counters of an audio producer the client closed (RoomManager.closeProducerFromClient). */
+/** Last counters of a producer closed after a final sample. */
 export interface FinalProducerSample {
   readonly roomId: string;
   readonly userId: string;
@@ -370,6 +485,40 @@ export interface SlotBucketState {
   limits: PolicerLimits;
 }
 
+export interface VideoBucketState {
+  readonly roomId: string;
+  readonly userId: string;
+  readonly slot: VideoSlot;
+  lastEvalAtMs: number;
+  pendingBits: number;
+  pendingPkts: number;
+  limitBps: number;
+}
+
+interface VideoWindowSample {
+  readonly endAtMs: number;
+  readonly durationMs: number;
+}
+
+export interface VideoWindowState {
+  readonly userId: string;
+  samples: VideoWindowSample[];
+  streakMs: number;
+  lastMeasuredAtMs: number;
+}
+
+interface VideoInterval {
+  readonly roomId: string;
+  readonly userId: string;
+  readonly slot: VideoSlot;
+  readonly durationMs: number;
+  readonly exceeded: boolean;
+  readonly gross: boolean;
+  readonly ratioBucket: RatioBucket;
+  readonly producerId: string | null;
+  readonly ratio: number;
+}
+
 export interface AggregateBucketState {
   lastEvalAtMs: number;
   debtBits: number;
@@ -379,6 +528,8 @@ export interface AggregateBucketState {
 
 export interface PolicerStateSnapshot {
   readonly slots: ReadonlyMap<string, SlotBucketState>;
+  readonly videoSlots: ReadonlyMap<string, VideoBucketState>;
+  readonly videoWindows: ReadonlyMap<string, VideoWindowState>;
   readonly aggregates: ReadonlyMap<string, AggregateBucketState>;
   readonly baselines: ReadonlyMap<string, ReadonlyMap<number, Readonly<StreamBase>>>;
   readonly failStreaks: ReadonlyMap<string, number>;
@@ -391,6 +542,7 @@ interface LiveSets {
 }
 
 const POLICED_SLOTS: readonly PolicedSlot[] = ['mic', 'screen-audio'];
+const VIDEO_SLOTS: readonly VideoSlot[] = ['camera', 'screen'];
 const NO_DELTA: Delta = { bytes: 0, pkts: 0 };
 
 /** A counter below its baseline means the stream was recreated: count it from zero. */
@@ -463,12 +615,66 @@ function newSlotBucket(
   };
 }
 
+function newVideoBucket(
+  roomId: string,
+  userId: string,
+  slot: VideoSlot,
+  lastEvalAtMs: number,
+  limitBps: number
+): VideoBucketState {
+  return {
+    roomId,
+    userId,
+    slot,
+    lastEvalAtMs,
+    pendingBits: 0,
+    pendingPkts: 0,
+    limitBps,
+  };
+}
+
+function settleVideoSlot(
+  bucket: VideoBucketState,
+  bits: number,
+  pkts: number,
+  nowMs: number
+): Pick<VideoInterval, 'durationMs' | 'exceeded' | 'gross' | 'ratioBucket' | 'ratio'> {
+  const dtS = Math.max(0, nowMs - bucket.lastEvalAtMs) / 1000;
+  const intervalBits = bits + bucket.pendingBits;
+  const intervalPkts = pkts + bucket.pendingPkts;
+  // Producer byteCount includes RTP headers and the E2EE frame envelope while
+  // the entitlement is an ENCODER target. Credit only observed packet headers,
+  // bounded by a packet rate derived from the entitlement; a sender cannot buy
+  // unlimited credit by flooding tiny packets. Frame boundaries are not in the
+  // stats, so give at most 240 encrypted-frame envelopes per second.
+  const creditPps = Math.ceil(bucket.limitBps / (8 * VIDEO_MIN_CREDIT_PAYLOAD_BYTES));
+  const creditedPackets = Math.min(intervalPkts, creditPps * dtS);
+  const overheadBits =
+    creditedPackets * VIDEO_RTP_HEADER_BYTES * 8 +
+    VIDEO_MAX_CREDIT_FPS * VIDEO_E2EE_BYTES_PER_FRAME * 8 * dtS;
+  const encodedBits = Math.max(0, intervalBits - overheadBits);
+  bucket.pendingBits = 0;
+  bucket.pendingPkts = 0;
+  bucket.lastEvalAtMs = nowMs;
+  const ratio = rate(encodedBits, dtS) / bucket.limitBps;
+  return {
+    durationMs: Math.min(POLICER_INTERVAL_MS, dtS * 1000),
+    exceeded: dtS > 0 && ratio > VIDEO_MEASUREMENT_MARGIN,
+    gross:
+      dtS > 0 &&
+      ratio >= VIDEO_GROSS_RATIO &&
+      encodedBits - bucket.limitBps * dtS >= bucket.limitBps,
+    ratioBucket: ratioBucketFor(ratio),
+    ratio,
+  };
+}
+
 /**
  * Sum the non-latched producers' deltas. The offender is the largest non-zero
  * one by bytes, and `pktOffender` the largest by packets: an `audio_pps` trip
  * names the producer that sent the packets, not a byte-heavier sibling. A slot
- * can briefly hold two producers while a client-closed one takes its final
- * read beside its replacement (F8).
+ * can briefly hold two producers while one takes its final read beside its
+ * replacement (F8).
  */
 function sumUnlatched(
   producers: readonly ProducerReading[],
@@ -545,12 +751,15 @@ function settleSlot(
  *   latched ones do not.
  * - Aggregate buckets, keyed by send-transport id, bound the transport's
  *   producer-attributed RTP+RTX traffic, minus the latched producers' bytes.
- * - A failed read is a no-op for that participant: no baseline moves, no debt
- *   drains, no strike. Enforcement is delayed, not bypassed.
+ * - A failed read is a no-op for that participant's rate accounting: no baseline
+ *   moves, no debt drains, no strike. The tick closes its exact send session
+ *   after FAILURE_STREAK_K consecutive failed reads.
  */
 export class MediaPolicer {
   private readonly baselines = new Map<string, Map<number, StreamBase>>();
   private readonly slots = new Map<string, SlotBucketState>();
+  private readonly videoSlots = new Map<string, VideoBucketState>();
+  private readonly videoWindows = new Map<string, VideoWindowState>();
   private readonly aggregates = new Map<string, AggregateBucketState>();
   private failStreaks = new Map<string, number>();
   private degraded = false;
@@ -570,31 +779,71 @@ export class MediaPolicer {
     }
 
     const trips: PolicerTrip[] = [];
+    const videoIntervals: VideoInterval[] = [];
     const evaluatedSlots = new Set<string>();
     for (const reading of readings) {
       for (const p of reading.producers) live.producers.add(p.producerId);
       live.transports.add(reading.sendTransportId);
       if (failedKeys.has(participantKey(reading.roomId, reading.userId))) continue;
-      trips.push(...this.evaluateParticipant(reading, input.nowMs, evaluatedSlots));
+      trips.push(...this.evaluateParticipant(reading, input.nowMs, evaluatedSlots, videoIntervals));
     }
     trips.push(...this.drainUnreadSlots(input.nowMs, evaluatedSlots, failedKeys));
-    this.prune(live);
+    this.drainUnreadVideoSlots(input.nowMs, evaluatedSlots, failedKeys, videoIntervals);
+    this.evaluateVideoIntervals(videoIntervals, input.nowMs, trips);
+    this.prune(live, input.nowMs);
     const { transition, stalled } = this.updateFailStreaks(failed);
     return { trips, degradedTransition: transition, stalled };
   }
 
+  private evaluateVideoIntervals(
+    videoIntervals: readonly VideoInterval[],
+    nowMs: number,
+    trips: PolicerTrip[]
+  ): void {
+    const byUser = new Map<string, VideoInterval[]>();
+    for (const interval of videoIntervals) {
+      const key = interval.userId;
+      const group = byUser.get(key);
+      if (group) group.push(interval);
+      else byUser.set(key, [interval]);
+    }
+    for (const [key, intervals] of byUser) {
+      const trip = this.evaluateVideoWindow(key, intervals, nowMs);
+      if (trip) trips.push(trip);
+    }
+  }
+
   /**
-   * Final sample for a client-closed audio producer: the delta since its
-   * stored baseline becomes pending bits on its slot, and the baseline is
+   * Final sample for a client-closed or superseded producer: the delta since its
+   * stored baseline becomes pending bits on its audio or video slot, and the baseline is
    * dropped. This is what makes close-and-re-produce churn visible: a producer
    * that lives between two ticks is never in any reading.
    */
   recordFinal(sample: FinalProducerSample): void {
     const prior = this.baselines.get(sample.producerId);
     this.baselines.delete(sample.producerId);
-    if (sample.kind !== 'audio' || sample.streams === null) return;
+    if (sample.streams === null) return;
     if (!hasWellFormedStreams(sample.streams)) return;
     const delta = sumStreamDeltas(sample.streams, prior);
+    if (sample.kind === 'video') {
+      const slot = videoSlotFor(sample.source);
+      const key = slotKey(sample.roomId, sample.userId, slot);
+      let bucket = this.videoSlots.get(key);
+      if (!bucket) {
+        const limits = deriveLimits(sample.caps);
+        bucket = newVideoBucket(
+          sample.roomId,
+          sample.userId,
+          slot,
+          sample.createdAtMs,
+          slot === 'camera' ? limits.cameraBps : limits.screenBps
+        );
+        this.videoSlots.set(key, bucket);
+      }
+      bucket.pendingBits += delta.bytes * 8;
+      bucket.pendingPkts += delta.pkts;
+      return;
+    }
     const key = slotKey(sample.roomId, sample.userId, slotFor(sample.source));
     let bucket = this.slots.get(key);
     if (!bucket) {
@@ -614,6 +863,10 @@ export class MediaPolicer {
   snapshot(): PolicerStateSnapshot {
     return {
       slots: new Map([...this.slots].map(([k, b]) => [k, { ...b, limits: { ...b.limits } }])),
+      videoSlots: new Map([...this.videoSlots].map(([k, b]) => [k, { ...b }])),
+      videoWindows: new Map(
+        [...this.videoWindows].map(([k, w]) => [k, { ...w, samples: [...w.samples] }])
+      ),
       aggregates: new Map([...this.aggregates].map(([k, b]) => [k, { ...b }])),
       baselines: new Map(
         [...this.baselines].map(([id, streams]) => [
@@ -629,7 +882,8 @@ export class MediaPolicer {
   private evaluateParticipant(
     reading: ParticipantReading,
     nowMs: number,
-    evaluatedSlots: Set<string>
+    evaluatedSlots: Set<string>,
+    videoIntervals: VideoInterval[]
   ): PolicerTrip[] {
     const limits = deriveLimits(reading.caps);
     const deltas = this.advanceBaselines(reading.producers);
@@ -642,6 +896,15 @@ export class MediaPolicer {
       );
       const trip = this.evaluateSlot(key, reading, inSlot, deltas, limits, nowMs);
       if (trip) trips.push(trip);
+    }
+    for (const slot of VIDEO_SLOTS) {
+      const key = slotKey(reading.roomId, reading.userId, slot);
+      evaluatedSlots.add(key);
+      const inSlot = reading.producers.filter(
+        (p) => p.kind === 'video' && videoSlotFor(p.source) === slot
+      );
+      const interval = this.evaluateVideoSlot(key, reading, inSlot, deltas, limits, slot, nowMs);
+      if (interval) videoIntervals.push(interval);
     }
     const aggregateTrip = this.evaluateAggregate(reading, deltas, limits, nowMs);
     if (aggregateTrip) trips.push(aggregateTrip);
@@ -691,6 +954,92 @@ export class MediaPolicer {
     if (!verdict) return null;
     const producerId = verdict.check === 'audio_pps' ? pktOffender : offender;
     return { roomId: reading.roomId, userId: reading.userId, ...verdict, producerId };
+  }
+
+  /** One bucket per participant/source sums every producer and every simulcast SSRC. */
+  private evaluateVideoSlot(
+    key: string,
+    reading: ParticipantReading,
+    inSlot: readonly ProducerReading[],
+    deltas: ReadonlyMap<string, Delta>,
+    limits: PolicerLimits,
+    slot: VideoSlot,
+    nowMs: number
+  ): VideoInterval | null {
+    let bucket = this.videoSlots.get(key);
+    if (!bucket) {
+      if (inSlot.length === 0) return null;
+      bucket = newVideoBucket(
+        reading.roomId,
+        reading.userId,
+        slot,
+        Math.min(...inSlot.map((p) => p.createdAtMs)),
+        slot === 'camera' ? limits.cameraBps : limits.screenBps
+      );
+      this.videoSlots.set(key, bucket);
+    }
+    bucket.limitBps = slot === 'camera' ? limits.cameraBps : limits.screenBps;
+    const { bits, pkts, offender } = sumUnlatched(inSlot, deltas);
+    const sample = settleVideoSlot(bucket, bits, pkts, nowMs);
+    if (inSlot.length === 0) this.videoSlots.delete(key);
+    return {
+      roomId: reading.roomId,
+      userId: reading.userId,
+      slot,
+      producerId: offender,
+      ...sample,
+    };
+  }
+
+  private evaluateVideoWindow(
+    key: string,
+    intervals: readonly VideoInterval[],
+    nowMs: number
+  ): PolicerTrip | null {
+    const [first] = intervals;
+    if (!first) return null;
+    let window = this.videoWindows.get(key);
+    if (!window) {
+      window = { userId: first.userId, samples: [], streakMs: 0, lastMeasuredAtMs: 0 };
+      this.videoWindows.set(key, window);
+    }
+    const lookbackStart = nowMs - VIDEO_LOOKBACK_MS;
+    window.samples = window.samples.filter((sample) => sample.endAtMs > lookbackStart);
+    const worst = intervals
+      .filter((interval) => interval.exceeded)
+      .sort((a, b) => b.ratio - a.ratio)[0];
+    const durationMs = Math.max(
+      0,
+      ...intervals.filter((interval) => interval.exceeded).map((interval) => interval.durationMs)
+    );
+    if (worst) {
+      const contiguous = nowMs - window.lastMeasuredAtMs <= POLICER_INTERVAL_MS * 1.5;
+      window.streakMs = (contiguous ? window.streakMs : 0) + durationMs;
+      window.samples.push({ endAtMs: nowMs, durationMs });
+    } else {
+      window.streakMs = 0;
+    }
+    window.lastMeasuredAtMs = nowMs;
+    const cumulativeMs = window.samples.reduce(
+      (sum, sample) => sum + Math.min(sample.durationMs, sample.endAtMs - lookbackStart),
+      0
+    );
+    if (
+      !worst ||
+      (!intervals.some((interval) => interval.gross) &&
+        window.streakMs < VIDEO_SUSTAINED_MS &&
+        cumulativeMs < VIDEO_CUMULATIVE_MS)
+    )
+      return null;
+    window.samples = [];
+    window.streakMs = 0;
+    return {
+      roomId: worst.roomId,
+      userId: first.userId,
+      check: worst.slot === 'camera' ? 'camera_bytes' : 'screen_bytes',
+      ratioBucket: worst.ratioBucket,
+      producerId: worst.producerId,
+    };
   }
 
   private evaluateAggregate(
@@ -762,12 +1111,31 @@ export class MediaPolicer {
     return trips;
   }
 
-  private prune(live: LiveSets): void {
+  private drainUnreadVideoSlots(
+    nowMs: number,
+    evaluatedSlots: ReadonlySet<string>,
+    failedKeys: ReadonlySet<string>,
+    videoIntervals: VideoInterval[]
+  ): void {
+    for (const [key, bucket] of this.videoSlots) {
+      if (evaluatedSlots.has(key)) continue;
+      const { roomId, userId } = bucket;
+      if (failedKeys.has(participantKey(roomId, userId))) continue;
+      const sample = settleVideoSlot(bucket, 0, 0, nowMs);
+      this.videoSlots.delete(key);
+      videoIntervals.push({ roomId, userId, slot: bucket.slot, producerId: null, ...sample });
+    }
+  }
+
+  private prune(live: LiveSets, nowMs: number): void {
     for (const id of this.baselines.keys()) {
       if (!live.producers.has(id)) this.baselines.delete(id);
     }
     for (const id of this.aggregates.keys()) {
       if (!live.transports.has(id)) this.aggregates.delete(id);
+    }
+    for (const [key, window] of this.videoWindows) {
+      if (window.lastMeasuredAtMs < nowMs - VIDEO_LOOKBACK_MS) this.videoWindows.delete(key);
     }
   }
 
@@ -778,7 +1146,10 @@ export class MediaPolicer {
     const next = new Map<string, number>();
     const stalled: StalledParticipant[] = [];
     for (const f of failed) {
-      const key = participantKey(f.roomId, f.userId);
+      // A listen-only participant has no publish path to leave unmetered.
+      // Starting a mic later must begin its own three-failure window.
+      if (f.producerIds.length === 0) continue;
+      const key = failedSessionKey(f);
       if (next.has(key)) continue;
       const streak = (this.failStreaks.get(key) ?? 0) + 1;
       next.set(key, streak);

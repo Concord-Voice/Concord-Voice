@@ -244,7 +244,11 @@ export interface ChannelAccessResult {
   userTier: string;
   allowedAudioTiers: string[];
   minPtimeMs: number;
+  /** Fixed channel tier from this authorization snapshot, after the server ceiling. */
+  channelAudioUpliftTier?: string | null;
   maxManualBitrateBps: number;
+  cameraMaxBitrateBps: number;
+  screenMaxBitrateBps: number;
   /** Server-validated DM call instance ID; undefined only for server channels. */
   callId?: string;
   /** Server-validated ring that originated the DM call, when one exists. */
@@ -387,11 +391,15 @@ export const FREE_MEDIA_ENTITLEMENT: {
   allowedAudioTiers: string[];
   minPtimeMs: number;
   maxManualBitrateBps: number;
+  cameraMaxBitrateBps: number;
+  screenMaxBitrateBps: number;
 } = {
   tier: 'free',
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
   minPtimeMs: 20,
   maxManualBitrateBps: 5_000_000,
+  cameraMaxBitrateBps: 2_500_000,
+  screenMaxBitrateBps: 5_000_000,
 };
 
 /**
@@ -405,10 +413,25 @@ interface MediaEntitlementsWire {
   allowed_audio_tiers?: unknown;
   min_ptime_ms?: unknown;
   max_manual_bitrate_bps?: unknown;
+  camera_max_bitrate_bps?: unknown;
+  screen_max_bitrate_bps?: unknown;
   channel_audio_uplift?: unknown;
 }
 
 const CHANNEL_AUDIO_UPLIFT_MIN_PTIME_MS = 10;
+const CHANNEL_AUDIO_TIERS: ReadonlySet<string> = new Set([
+  'minimum',
+  'low',
+  'moderate',
+  'standard',
+  'high',
+  'hifi',
+  'studio',
+]);
+
+function positiveFiniteOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 /**
  * Parse the control-plane `media_entitlements` object into the typed
@@ -421,14 +444,20 @@ function parseMediaEntitlements(raw: unknown): {
   userTier: string;
   allowedAudioTiers: string[];
   minPtimeMs: number;
+  channelAudioUplift: boolean;
   maxManualBitrateBps: number;
+  cameraMaxBitrateBps: number;
+  screenMaxBitrateBps: number;
 } {
   if (typeof raw !== 'object' || raw === null) {
     return {
       userTier: FREE_MEDIA_ENTITLEMENT.tier,
       allowedAudioTiers: [...FREE_MEDIA_ENTITLEMENT.allowedAudioTiers],
       minPtimeMs: FREE_MEDIA_ENTITLEMENT.minPtimeMs,
+      channelAudioUplift: false,
       maxManualBitrateBps: FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps,
+      cameraMaxBitrateBps: FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps,
+      screenMaxBitrateBps: FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps,
     };
   }
 
@@ -445,17 +474,19 @@ function parseMediaEntitlements(raw: unknown): {
       : [...FREE_MEDIA_ENTITLEMENT.allowedAudioTiers];
 
   // Numeric caps must be finite positive numbers; otherwise floor.
-  const minPtimeMs =
-    typeof me.min_ptime_ms === 'number' && Number.isFinite(me.min_ptime_ms) && me.min_ptime_ms > 0
-      ? me.min_ptime_ms
-      : FREE_MEDIA_ENTITLEMENT.minPtimeMs;
-
-  const maxManualBitrateBps =
-    typeof me.max_manual_bitrate_bps === 'number' &&
-    Number.isFinite(me.max_manual_bitrate_bps) &&
-    me.max_manual_bitrate_bps > 0
-      ? me.max_manual_bitrate_bps
-      : FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps;
+  const minPtimeMs = positiveFiniteOr(me.min_ptime_ms, FREE_MEDIA_ENTITLEMENT.minPtimeMs);
+  const maxManualBitrateBps = positiveFiniteOr(
+    me.max_manual_bitrate_bps,
+    FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps
+  );
+  const cameraMaxBitrateBps = positiveFiniteOr(
+    me.camera_max_bitrate_bps,
+    FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps
+  );
+  const screenMaxBitrateBps = positiveFiniteOr(
+    me.screen_max_bitrate_bps,
+    FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps
+  );
 
   const channelAudioUplift = me.channel_audio_uplift === true;
 
@@ -470,7 +501,7 @@ function parseMediaEntitlements(raw: unknown): {
   // tier string — fail-closed) is clamped to the free floor, so a free tier
   // can never carry a premium cap. Clamp DIRECTION matters — minPtime floors
   // UP (lower ptime is the premium lever), the others floor DOWN/to the free
-  // set. Premium values flow through untouched only when the tier is premium.
+  // set. Premium tier values still obey the aggregate send cap.
   // A fixed channel audio standard (#179) is the narrow exception: the
   // control-plane marks channel_audio_uplift=true when it has bounded the grant
   // by the server tier, so only the audio tier list and ptime floor may widen.
@@ -483,14 +514,33 @@ function parseMediaEntitlements(raw: unknown): {
       minPtimeMs: channelAudioUplift
         ? Math.max(minPtimeMs, CHANNEL_AUDIO_UPLIFT_MIN_PTIME_MS)
         : Math.max(minPtimeMs, FREE_MEDIA_ENTITLEMENT.minPtimeMs),
+      channelAudioUplift,
       maxManualBitrateBps: Math.min(
         maxManualBitrateBps,
         FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps
       ),
+      cameraMaxBitrateBps: Math.min(
+        cameraMaxBitrateBps,
+        FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps,
+        maxManualBitrateBps
+      ),
+      screenMaxBitrateBps: Math.min(
+        screenMaxBitrateBps,
+        FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps,
+        maxManualBitrateBps
+      ),
     };
   }
 
-  return { userTier, allowedAudioTiers, minPtimeMs, maxManualBitrateBps };
+  return {
+    userTier,
+    allowedAudioTiers,
+    minPtimeMs,
+    channelAudioUplift,
+    maxManualBitrateBps,
+    cameraMaxBitrateBps: Math.min(cameraMaxBitrateBps, maxManualBitrateBps),
+    screenMaxBitrateBps: Math.min(screenMaxBitrateBps, maxManualBitrateBps),
+  };
 }
 
 /**
@@ -530,6 +580,7 @@ interface ChannelJoinAuthorizationResponse {
     id: string;
     server_id: string;
     name: string;
+    audio_quality_tier?: unknown;
   };
   media_entitlements?: unknown;
   room_owner_tier?: unknown;
@@ -648,6 +699,8 @@ function deniedChannelAccess(channelId: string, error: string): ChannelAccessRes
     allowedAudioTiers: [...FREE_MEDIA_ENTITLEMENT.allowedAudioTiers],
     minPtimeMs: FREE_MEDIA_ENTITLEMENT.minPtimeMs,
     maxManualBitrateBps: FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps,
+    cameraMaxBitrateBps: FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps,
+    screenMaxBitrateBps: FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps,
     error,
   };
 }
@@ -811,6 +864,8 @@ function dmChannelAccessResult(
     allowedAudioTiers: ent.allowedAudioTiers,
     minPtimeMs: ent.minPtimeMs,
     maxManualBitrateBps: ent.maxManualBitrateBps,
+    cameraMaxBitrateBps: ent.cameraMaxBitrateBps,
+    screenMaxBitrateBps: ent.screenMaxBitrateBps,
     callId: nonEmptyResponseString(response.call_id),
     callRingId: nonEmptyResponseString(response.call_ring_id),
     callCallerUserId: nonEmptyResponseString(response.call_caller_user_id),
@@ -831,6 +886,26 @@ function serverChannelAccessResult(
   const identity = parseAuthoritativeIdentity(response);
   const permissions = parsePermissionBitfield(response.permissions) ?? 0n;
   const authorizationRevision = parsePermissionBitfield(response.authorization_revision);
+  const requestedUpliftTier = response.channel.audio_quality_tier;
+  // The control plane clamps a stale channel row above a Groundspeed server's
+  // audio ceiling to Standard before granting the media entitlement. Mirror
+  // that final grant in the ack, not the raw channel setting.
+  const knownUpliftTier =
+    typeof requestedUpliftTier === 'string' && CHANNEL_AUDIO_TIERS.has(requestedUpliftTier)
+      ? requestedUpliftTier
+      : null;
+  const effectiveUpliftTier =
+    knownUpliftTier &&
+    response.room_owner_tier !== 'premium' &&
+    !FREE_MEDIA_ENTITLEMENT.allowedAudioTiers.includes(knownUpliftTier)
+      ? 'standard'
+      : knownUpliftTier;
+  const channelAudioUpliftTier =
+    ent.channelAudioUplift &&
+    effectiveUpliftTier &&
+    ent.allowedAudioTiers.includes(effectiveUpliftTier)
+      ? effectiveUpliftTier
+      : null;
   if (
     requiresAdmissionRevision &&
     (authorizationRevision === undefined || authorizationRevision <= 0n)
@@ -846,6 +921,8 @@ function serverChannelAccessResult(
       allowedAudioTiers: ent.allowedAudioTiers,
       minPtimeMs: ent.minPtimeMs,
       maxManualBitrateBps: ent.maxManualBitrateBps,
+      cameraMaxBitrateBps: ent.cameraMaxBitrateBps,
+      screenMaxBitrateBps: ent.screenMaxBitrateBps,
       error: 'Invalid channel authorization revision',
     };
   }
@@ -859,7 +936,10 @@ function serverChannelAccessResult(
     userTier: ent.userTier,
     allowedAudioTiers: ent.allowedAudioTiers,
     minPtimeMs: ent.minPtimeMs,
+    channelAudioUpliftTier,
     maxManualBitrateBps: ent.maxManualBitrateBps,
+    cameraMaxBitrateBps: ent.cameraMaxBitrateBps,
+    screenMaxBitrateBps: ent.screenMaxBitrateBps,
     roomOwnerTier: response.room_owner_tier === 'premium' ? 'premium' : 'free',
     ...identity,
     permissions,

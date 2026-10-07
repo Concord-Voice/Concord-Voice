@@ -437,12 +437,20 @@ export type ForceDisconnectOptions =
       readonly retryAfterSec: number;
       readonly socketId?: string;
       readonly admissionId?: string;
+    }
+  | {
+      readonly reason: 'stats_unavailable';
+      /** Exact failed send transport; a reconnect must never be evicted by an old sample. */
+      readonly sendTransportId: string;
+      readonly socketId?: never;
+      readonly admissionId?: never;
     };
 
 /** The `force-disconnect` payload the evicted socket receives. */
 export type ForceDisconnectPayload =
   | { channelId: string; reason: 'access_revoked' }
-  | { channelId: string; reason: 'media_policy'; retryAfterSec: number };
+  | { channelId: string; reason: 'media_policy'; retryAfterSec: number }
+  | { channelId: string; reason: 'stats_unavailable' };
 
 interface ResolvedReason {
   payload: ForceDisconnectPayload;
@@ -484,6 +492,19 @@ function resolveReason(channelId: string, options: ForceDisconnectOptions): Reso
         logMessage: 'Media policer evicted participant',
         logDetail: { retryAfterSec: options.retryAfterSec },
       };
+    case 'stats_unavailable':
+      return {
+        payload: { channelId, reason: 'stats_unavailable' },
+        event: {
+          eventType: 'security_control',
+          outcome: 'degraded',
+          severity: 'high',
+          reasonCode: 'dependency_unavailable',
+          routeTemplate: 'socket.force_disconnect',
+        },
+        logMessage: 'Media policer closed session after persistent stats failures',
+        logDetail: {},
+      };
     default:
       return unhandledReason(options);
   }
@@ -522,6 +543,18 @@ function sessionsForCall(
 ) {
   const participant = roomManager.getParticipant(channelId, userId);
   const provisional = roomManager.getProvisionalParticipant(channelId, userId);
+  if (options.reason === 'stats_unavailable') {
+    const hasForwardedMedia = [...(participant?.producers.values() ?? [])].some(
+      (entry) => !entry.producer.closed
+    );
+    return {
+      participant:
+        participant?.sendTransport?.id === options.sendTransportId && hasForwardedMedia
+          ? participant
+          : undefined,
+      provisional: undefined,
+    };
+  }
   const callId = options.reason === 'access_revoked' ? options.callId : undefined;
   if (callId === undefined) return { participant, provisional };
 
@@ -624,7 +657,13 @@ export async function handleForceDisconnect(
     }
   }
 
-  logger.info(resolved.logMessage, { channelId, userId, ...resolved.logDetail });
+  if (options.reason === 'stats_unavailable') {
+    // Policer operational logs are aggregate-only. The security event above
+    // records the reason without adding room/user/transport identifiers.
+    logger.info(resolved.logMessage, { reason: options.reason });
+  } else {
+    logger.info(resolved.logMessage, { channelId, userId, ...resolved.logDetail });
+  }
 }
 
 // createDMBlockDisconnectAckHandler acknowledges only after the existing,

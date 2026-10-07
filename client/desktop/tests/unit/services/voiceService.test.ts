@@ -307,6 +307,7 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useUpdateStatusStore } from '@/renderer/stores/ui/updateStatusStore';
+import { FREE_ENTITLEMENT, useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2704,7 +2705,21 @@ describe('VoiceService', () => {
 
     it('stereo from tier when null', async () => {
       useAudioSettingsStore.setState({ advancedMode: true, stereoOverride: null });
-      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.getState().setQualityTier('hifi');
+      const premiumTiers = ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'];
+      useSubscriptionStore.getState().setEntitlement({
+        ...FREE_ENTITLEMENT,
+        tier: 'premium',
+        allowedAudioTiers: premiumTiers,
+        minPtimeMs: 10,
+      });
+      const { sendTransport } = await joinVoiceChannel(undefined, 'channel', {
+        media_entitlements: {
+          tier: 'premium',
+          allowed_audio_tiers: premiumTiers,
+          min_ptime_ms: 10,
+        },
+      });
       const mc = sendTransport.produce.mock.calls.filter(
         (c: any) => c[0].appData?.source === 'mic'
       );
@@ -6822,15 +6837,17 @@ describe('VoiceService', () => {
       expect(svc.producers.get('screen-audio').close).not.toHaveBeenCalled();
     });
 
-    it('returns early when audio track is not live', async () => {
+    it('closes stale screen audio when its track is not live', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      svc.producers.set('screen-audio', createMockProducer('prod-sa', 'screen-audio'));
+      const staleProducer = createMockProducer('prod-sa', 'screen-audio');
+      svc.producers.set('screen-audio', staleProducer);
       svc.localScreenStream = createMockMediaStream([{ kind: 'audio', id: 'sa-1' }]);
       // Override readyState to 'ended'
       svc.localScreenStream.getAudioTracks()[0].readyState = 'ended';
       await svc.reProduceScreenAudio();
-      expect(svc.producers.get('screen-audio').close).not.toHaveBeenCalled();
+      expect(staleProducer.close).toHaveBeenCalledTimes(1);
+      expect(svc.producers.has('screen-audio')).toBe(false);
     });
 
     it('re-produces screen audio with new producer', async () => {

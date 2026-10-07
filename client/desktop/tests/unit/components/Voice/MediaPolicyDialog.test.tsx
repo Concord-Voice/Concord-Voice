@@ -40,6 +40,21 @@ describe('MediaPolicyDialog (#2153 handoff §1c/§1d)', () => {
     expect(screen.getByText(/^Try again after/)).toBeInTheDocument();
   });
 
+  it('video-only disablement explains the limit and offers ordered recovery steps', () => {
+    useVoiceStore.setState({
+      mediaPolicyInterrupt: { reason: 'video_disabled', source: 'screen', rejoinAt: AT },
+    });
+    render(<MediaPolicyDialog />);
+
+    expect(screen.getByRole('dialog', { name: 'Video turned off for now' })).toBeInTheDocument();
+    expect(screen.getByText(/We turned off your video/)).toBeInTheDocument();
+    expect(screen.getByText(/You can still use voice/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText('If this keeps happening'));
+    expect(screen.getByText('Check for a Concord Voice update.')).toBeInTheDocument();
+    expect(screen.getByText('Restart the app.')).toBeInTheDocument();
+    expect(screen.getByText('Reboot your device.')).toBeInTheDocument();
+  });
+
   it.each([
     ['evicted', 'You can join voice again later.'],
     ['cooldown', 'Try again later.'],

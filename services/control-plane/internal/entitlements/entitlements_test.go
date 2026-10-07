@@ -81,6 +81,17 @@ func TestMediaFor_ManualBitrateIsStreamCeiling(t *testing.T) {
 	assert.Equal(t, 20_000_000, entitlements.MediaFor(entitlements.TierPremium).MaxManualBitrateBps)
 }
 
+func TestMediaFor_SeparateVideoCeilingsFollowAuthoritativeEntitlements(t *testing.T) {
+	for _, tier := range []string{entitlements.TierFree, entitlements.TierPremium, "unknown"} {
+		got := entitlements.MediaFor(tier)
+		want := entitlements.For(tier)
+		assert.Equal(t, want.CameraMaxBitrate, got.CameraMaxBitrateBps)
+		assert.Equal(t, want.StreamMaxBitrate, got.ScreenMaxBitrateBps)
+	}
+	assert.Equal(t, 2_500_000, entitlements.MediaFor(entitlements.TierFree).CameraMaxBitrateBps)
+	assert.Equal(t, 6_000_000, entitlements.MediaFor(entitlements.TierPremium).CameraMaxBitrateBps)
+}
+
 func TestFor_ReturnsDefensiveSliceCopy(t *testing.T) {
 	e := entitlements.For(entitlements.TierFree)
 	e.AllowedAudioTiers[0] = "MUTATED"

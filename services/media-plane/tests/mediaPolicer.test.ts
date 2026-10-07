@@ -15,11 +15,23 @@ import {
   TAU_HARD_CAP,
   TAU_PPS,
   TRIP_BUDGET_S,
+  VIDEO_COOLDOWN_STEPS_MS,
+  VIDEO_CUMULATIVE_MS,
+  VIDEO_ESCALATION_RESET_MS,
+  VIDEO_GROSS_RATIO,
+  VIDEO_LOOKBACK_MS,
+  VIDEO_MEASUREMENT_MARGIN,
+  VIDEO_SUSTAINED_MS,
+  VIDEO_E2EE_BYTES_PER_FRAME,
+  VIDEO_MAX_CREDIT_FPS,
+  VIDEO_MIN_CREDIT_PAYLOAD_BYTES,
+  VIDEO_RTP_HEADER_BYTES,
   decideVerdicts,
   deriveLimits,
   ratioBucketFor,
   slotFor,
   slotKey,
+  videoSlotFor,
   type ObserveResult,
   type ParticipantCaps,
   type ParticipantReading,
@@ -37,13 +49,17 @@ const FREE_CAPS: ParticipantCaps = {
   audioCeilingBps: 96_000,
   minPtimeMs: 20,
   maxManualBitrateBps: 5_000_000,
+  cameraMaxBitrateBps: 2_500_000,
+  screenMaxBitrateBps: 5_000_000,
 };
 const PREMIUM_STUDIO_CAPS: ParticipantCaps = {
   audioCeilingBps: 510_000,
   minPtimeMs: 10,
   maxManualBitrateBps: 10_000_000,
+  cameraMaxBitrateBps: 6_000_000,
+  screenMaxBitrateBps: 10_000_000,
 };
-/** Free: 216 kbps and 75 pps per audio slot, 7.5 Mbps per send transport. */
+/** Free: 216 kbps and 75 pps per audio slot; the aggregate covers concurrent media. */
 const FREE = deriveLimits(FREE_CAPS);
 
 describe('media policer limits', () => {
@@ -51,7 +67,9 @@ describe('media policer limits', () => {
     expect(deriveLimits(FREE_CAPS)).toEqual({
       audioBps: 216_000,
       audioPps: 75,
-      aggregateBps: 7_500_000,
+      aggregateBps: 16_687_392,
+      cameraBps: 5_000_000,
+      screenBps: 5_000_000,
     });
   });
 
@@ -59,14 +77,22 @@ describe('media policer limits', () => {
     expect(deriveLimits(PREMIUM_STUDIO_CAPS)).toEqual({
       audioBps: 1_028_250,
       audioPps: 150,
-      aggregateBps: 15_000_000,
+      aggregateBps: 34_944_654,
+      cameraBps: 10_000_000,
+      screenBps: 10_000_000,
     });
   });
 
   it('fails closed to the free floor when a cap is zero, negative or not finite', () => {
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(
-        deriveLimits({ audioCeilingBps: bad, minPtimeMs: bad, maxManualBitrateBps: bad })
+        deriveLimits({
+          audioCeilingBps: bad,
+          minPtimeMs: bad,
+          maxManualBitrateBps: bad,
+          cameraMaxBitrateBps: bad,
+          screenMaxBitrateBps: bad,
+        })
       ).toEqual(FREE);
     }
   });
@@ -88,6 +114,9 @@ describe('media policer limits', () => {
     expect(slotFor('camera')).toBe('mic');
     expect(slotFor('screen')).toBe('mic');
     expect(slotKey(ROOM, USER, 'mic')).not.toBe(slotKey(ROOM, USER, 'screen-audio'));
+    expect(videoSlotFor('camera')).toBe('camera');
+    expect(videoSlotFor('screen')).toBe('screen');
+    expect(videoSlotFor('mic')).toBe('camera');
   });
 
   it('keeps every tau under the hard cap and the read timeout inside the tick', () => {
@@ -111,6 +140,17 @@ describe('media policer limits', () => {
       TAU_PPS,
       TAU_AGGREGATE,
       TRIP_BUDGET_S,
+      VIDEO_COOLDOWN_STEPS_MS,
+      VIDEO_CUMULATIVE_MS,
+      VIDEO_ESCALATION_RESET_MS,
+      VIDEO_GROSS_RATIO,
+      VIDEO_LOOKBACK_MS,
+      VIDEO_MEASUREMENT_MARGIN,
+      VIDEO_SUSTAINED_MS,
+      VIDEO_E2EE_BYTES_PER_FRAME,
+      VIDEO_MAX_CREDIT_FPS,
+      VIDEO_MIN_CREDIT_PAYLOAD_BYTES,
+      VIDEO_RTP_HEADER_BYTES,
       FAILURE_STREAK_K,
       COOLDOWN_MS,
       STRIKE_WINDOW_MS,
@@ -123,6 +163,37 @@ function trip(check: PolicerTrip['check'], producerId: string | null, userId = U
 }
 
 describe('MediaPolicyLedger', () => {
+  it('escalates distinct video violations and leaves the voice cooldown untouched', () => {
+    const ledger = new MediaPolicyLedger();
+    let now = T0;
+    for (const duration of VIDEO_COOLDOWN_STEPS_MS) {
+      expect(ledger.armVideoCooldown(USER, now)).toBe(duration / 1000);
+      expect(ledger.videoRetryAfterSec(USER, now)).toBe(duration / 1000);
+      expect(ledger.retryAfterSec(USER, now)).toBe(0);
+      expect(ledger.armVideoCooldown(USER, now + 1_000)).toBe(duration / 1000 - 1);
+      now += duration + 1;
+    }
+    expect(ledger.armVideoCooldown(USER, now)).toBe(3_600);
+    expect(ledger.videoRetryAfterSec(USER, now + 3_600_000)).toBe(0);
+  });
+
+  it('resets the video ladder after a full violation-free day', () => {
+    const ledger = new MediaPolicyLedger();
+    expect(ledger.armVideoCooldown(USER, T0)).toBe(300);
+    expect(ledger.armVideoCooldown(USER, T0 + VIDEO_ESCALATION_RESET_MS)).toBe(300);
+    ledger.prune(T0 + 2 * VIDEO_ESCALATION_RESET_MS);
+    expect(ledger.armVideoCooldown(USER, T0 + 2 * VIDEO_ESCALATION_RESET_MS)).toBe(300);
+  });
+
+  it('moves the 24-hour escalation window to the latest violation', () => {
+    const ledger = new MediaPolicyLedger();
+    expect(ledger.armVideoCooldown(USER, T0)).toBe(300);
+    expect(ledger.armVideoCooldown(USER, T0 + VIDEO_ESCALATION_RESET_MS - 1_000)).toBe(600);
+    expect(ledger.armVideoCooldown(USER, T0 + 2 * VIDEO_ESCALATION_RESET_MS - 2_000)).toBe(1_800);
+    expect(ledger.armVideoCooldown(USER, T0 + 3 * VIDEO_ESCALATION_RESET_MS - 3_000)).toBe(3_600);
+    expect(ledger.armVideoCooldown(USER, T0 + 4 * VIDEO_ESCALATION_RESET_MS - 4_000)).toBe(3_600);
+    expect(ledger.armVideoCooldown(USER, T0 + 5 * VIDEO_ESCALATION_RESET_MS - 4_000)).toBe(300);
+  });
   it('pauses on a first strike and evicts on a second inside the strike window', () => {
     const ledger = new MediaPolicyLedger();
     expect(ledger.strike(USER, T0)).toBe('pause');
@@ -698,6 +769,44 @@ describe('MediaPolicer — failed reads', () => {
     expect(sim.tick().degradedTransition).toBeNull();
   });
 
+  it('starts a fresh failure streak when a send transport is replaced', () => {
+    const policer = new MediaPolicer();
+    const failed = (sendTransportId: string) => ({
+      roomId: ROOM,
+      userId: USER,
+      sendTransportId,
+      producerIds: ['mic-1'],
+    });
+    const observeFailure = (sendTransportId: string) =>
+      policer.observe({ nowMs: T0, readings: [], failed: [failed(sendTransportId)] });
+
+    expect(observeFailure('send-old').stalled).toEqual([]);
+    expect(observeFailure('send-old').stalled).toEqual([]);
+    expect(observeFailure('send-new').stalled).toEqual([]);
+    expect(observeFailure('send-new').stalled).toEqual([]);
+    expect(observeFailure('send-new').stalled).toEqual([
+      { roomId: ROOM, userId: USER, streak: FAILURE_STREAK_K },
+    ]);
+  });
+
+  it('does not count listen-only stats failures toward a later mic session', () => {
+    const policer = new MediaPolicer();
+    const failed = (producerIds: string[]) =>
+      policer.observe({
+        nowMs: T0,
+        readings: [],
+        failed: [{ roomId: ROOM, userId: USER, sendTransportId: TRANSPORT, producerIds }],
+      });
+    for (let i = 0; i < FAILURE_STREAK_K + 1; i++) {
+      expect(failed([]).stalled).toEqual([]);
+    }
+    expect(failed(['mic-1']).stalled).toEqual([]);
+    expect(failed(['mic-1']).stalled).toEqual([]);
+    expect(failed(['mic-1']).stalled).toEqual([
+      { roomId: ROOM, userId: USER, streak: FAILURE_STREAK_K },
+    ]);
+  });
+
   it('treats a reading with a non-finite counter as failed rather than trusting it', () => {
     const sim = new Sim();
     sim.add('mic-1', 'audio', 'mic');
@@ -787,8 +896,175 @@ describe('MediaPolicer — lifecycle', () => {
   });
 });
 
+describe('MediaPolicer — video source ceilings', () => {
+  it('allows a free camera up to the 5 Mbps server guard while the stock client targets 2.5 Mbps', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    expect(sim.drive(120_000, [{ id: 'camera-1', bps: 4_500_000 }])).toEqual([]);
+  });
+
+  it('stops a free camera above the 5 Mbps server guard while below the aggregate cap', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    const trips = sim.drive(25_000, [{ id: 'camera-1', bps: 6_500_000 }]);
+    expect(trips[0]).toMatchObject({
+      atMs: 10_000,
+      trip: { check: 'camera_bytes', producerId: 'camera-1' },
+    });
+    expect(trips.some(({ trip }) => trip.check === 'aggregate')).toBe(false);
+  });
+
+  it('stops a free screen above its cap while allowing one within its cap', () => {
+    const compliant = new Sim();
+    compliant.add('screen-1', 'video', 'screen');
+    expect(compliant.drive(120_000, [{ id: 'screen-1', bps: 5_000_000 }])).toEqual([]);
+
+    const excessive = new Sim();
+    excessive.add('screen-1', 'video', 'screen');
+    const trips = excessive.drive(35_000, [{ id: 'screen-1', bps: 6_500_000 }]);
+    expect(trips[0]).toMatchObject({
+      atMs: 10_000,
+      trip: { check: 'screen_bytes', producerId: 'screen-1' },
+    });
+    expect(trips.some(({ trip }) => trip.check === 'aggregate')).toBe(false);
+  });
+
+  it('sums all simulcast layers before applying the camera ceiling', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera', { ssrcs: [11, 12, 13] });
+    const trips = sim.drive(25_000, [
+      { id: 'camera-1', layer: 0, bps: 2_000_000 },
+      { id: 'camera-1', layer: 1, bps: 2_000_000 },
+      { id: 'camera-1', layer: 2, bps: 2_000_000 },
+    ]);
+    expect(trips[0]?.trip).toMatchObject({ check: 'camera_bytes', producerId: 'camera-1' });
+  });
+
+  it('keeps over-limit video time through client close and re-produce', () => {
+    const sim = new Sim();
+    for (let i = 0; i < 2; i++) {
+      const id = `camera-${i}`;
+      sim.add(id, 'video', 'camera', { ssrcs: [i + 1] });
+      sim.advance(5_000, [{ id, bps: 5_800_000 }]);
+      sim.closeFromClient(id);
+      const trips = sim.tick().trips;
+      if (i === 0) expect(trips).toEqual([]);
+      else expect(trips).toMatchObject([{ check: 'camera_bytes', producerId: null }]);
+    }
+  });
+
+  it('counts three separated violating samples in the last minute, without an adjacent pair', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    const tickAt = (bps: number) => {
+      sim.advance(5_000, [{ id: 'camera-1', bps }]);
+      return sim.tick().trips;
+    };
+    expect(tickAt(5_800_000)).toEqual([]);
+    expect(tickAt(5_000_000)).toEqual([]);
+    expect(tickAt(5_800_000)).toEqual([]);
+    expect(tickAt(5_000_000)).toEqual([]);
+    expect(tickAt(5_800_000)).toMatchObject([{ check: 'camera_bytes' }]);
+  });
+
+  it('expires the first burst after the rolling minute, then counts a new third burst', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    const tickAt = (bps: number) => {
+      sim.advance(5_000, [{ id: 'camera-1', bps }]);
+      return sim.tick().trips;
+    };
+    expect(tickAt(5_800_000)).toEqual([]);
+    for (let i = 0; i < 12; i++) expect(tickAt(5_000_000)).toEqual([]);
+    expect(tickAt(5_800_000)).toEqual([]);
+    expect(tickAt(5_000_000)).toEqual([]);
+    expect(tickAt(5_800_000)).toEqual([]);
+    expect(tickAt(5_000_000)).toEqual([]);
+    expect(tickAt(5_800_000)).toMatchObject([{ check: 'camera_bytes' }]);
+  });
+
+  it('carries the cumulative count across declared camera and screen sources', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    sim.add('screen-1', 'video', 'screen');
+    const tickAt = (camera: number, screen: number) => {
+      sim.advance(5_000, [
+        { id: 'camera-1', bps: camera },
+        { id: 'screen-1', bps: screen },
+      ]);
+      return sim.tick().trips;
+    };
+    expect(tickAt(5_800_000, 5_000_000)).toEqual([]);
+    expect(tickAt(5_000_000, 5_000_000)).toEqual([]);
+    expect(tickAt(5_000_000, 5_800_000)).toEqual([]);
+    expect(tickAt(5_000_000, 5_000_000)).toEqual([]);
+    expect(tickAt(5_800_000, 5_000_000)).toMatchObject([{ check: 'camera_bytes' }]);
+  });
+
+  it('stops a gross one-sample flood without waiting for 10 seconds', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    expect(sim.drive(5_000, [{ id: 'camera-1', bps: 10_500_000 }])).toMatchObject([
+      { atMs: 5_000, trip: { check: 'camera_bytes' } },
+    ]);
+  });
+
+  it('credits bounded RTP headers and encrypted-frame bytes, without a percentage uplift', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    const pps = 300;
+    const accountedOverhead =
+      pps * VIDEO_RTP_HEADER_BYTES * 8 + VIDEO_MAX_CREDIT_FPS * VIDEO_E2EE_BYTES_PER_FRAME * 8;
+    expect(
+      sim.drive(60_000, [{ id: 'camera-1', bps: FREE.cameraBps + accountedOverhead, pps }])
+    ).toEqual([]);
+
+    const excess = new Sim();
+    excess.add('camera-1', 'video', 'camera');
+    const trips = excess.drive(60_000, [
+      { id: 'camera-1', bps: FREE.cameraBps + accountedOverhead + 500_000, pps },
+    ]);
+    expect(trips[0]?.trip).toMatchObject({ check: 'camera_bytes', producerId: 'camera-1' });
+  });
+
+  it('caps header credit when a patched sender floods small packets', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    const trips = sim.drive(30_000, [{ id: 'camera-1', bps: 6_000_000, pps: 10_000 }]);
+    expect(trips[0]?.trip).toMatchObject({ check: 'camera_bytes', producerId: 'camera-1' });
+  });
+
+  it('uses the same source-agnostic premium video guard for camera and screen', () => {
+    const sim = new Sim(PREMIUM_STUDIO_CAPS);
+    sim.add('camera-1', 'video', 'camera');
+    sim.add('screen-1', 'video', 'screen');
+    expect(
+      sim.drive(120_000, [
+        { id: 'camera-1', bps: 5_500_000 },
+        { id: 'screen-1', bps: 9_000_000 },
+      ])
+    ).toEqual([]);
+  });
+});
+
 describe('MediaPolicer — aggregate', () => {
   const compliantMic: Flow = { id: 'mic-1', bps: 0.8 * FREE.audioBps, pps: STOCK_MIC_PPS };
+
+  it('allows concurrent camera, screen, mic, and screen audio within their independent caps', () => {
+    const sim = new Sim();
+    sim.add('camera-1', 'video', 'camera');
+    sim.add('screen-1', 'video', 'screen');
+    sim.add('mic-1', 'audio', 'mic');
+    sim.add('screen-audio-1', 'audio', 'screen-audio');
+    expect(
+      sim.drive(120_000, [
+        { id: 'camera-1', bps: FREE.cameraBps },
+        { id: 'screen-1', bps: FREE.screenBps },
+        compliantMic,
+        { id: 'screen-audio-1', bps: 0.8 * FREE.audioBps, pps: STOCK_MIC_PPS },
+      ])
+    ).toEqual([]);
+  });
 
   it('does not cascade an 8 Mbps latched producer into the aggregate', () => {
     const sim = new Sim();
@@ -818,11 +1094,10 @@ describe('MediaPolicer — aggregate', () => {
     sim.add('screen-1', 'video', 'screen');
     const trips = sim.drive(60_000, [
       compliantMic,
-      { id: 'cam-1', bps: 6_000_000 },
+      { id: 'cam-1', bps: 18_500_000 },
       { id: 'screen-1', bps: 4_800_000 },
     ]);
-    expect(trips[0]).toEqual({
-      atMs: 25_000,
+    expect(trips.find(({ trip }) => trip.check === 'aggregate')).toMatchObject({
       trip: {
         roomId: ROOM,
         userId: USER,
@@ -831,7 +1106,7 @@ describe('MediaPolicer — aggregate', () => {
         producerId: 'cam-1',
       },
     });
-    expect(trips.map((t) => t.atMs)).toEqual([25_000, 50_000]);
+    expect(trips.filter(({ trip }) => trip.check === 'aggregate')).toHaveLength(2);
   });
 
   it('gives no headroom for repaired RTX inflating a latched producer', () => {
@@ -843,10 +1118,9 @@ describe('MediaPolicer — aggregate', () => {
       compliantMic,
       { id: 'cam-1', bps: 1_200_000 },
       { id: 'cam-1', bps: 2_400_000, rtx: true },
-      { id: 'screen-1', bps: 9_600_000 },
+      { id: 'screen-1', bps: 22_000_000 },
     ]);
-    expect(trips[0]).toMatchObject({
-      atMs: 35_000,
+    expect(trips.find(({ trip }) => trip.check === 'aggregate')).toMatchObject({
       trip: { check: 'aggregate', producerId: 'screen-1' },
     });
   });
@@ -855,20 +1129,21 @@ describe('MediaPolicer — aggregate', () => {
     const sim = new Sim();
     sim.add('cam-1', 'video', 'camera', { policed: true });
     sim.add('screen-1', 'video', 'screen');
-    sim.drive(15_000, [{ id: 'screen-1', bps: 10_800_000 }]);
+    const aboveAggregate = FREE.aggregateBps + 3_300_000;
+    sim.drive(30_000, [{ id: 'screen-1', bps: aboveAggregate }]);
     const aggregateDebt = () => sim.policer.snapshot().aggregates.get(TRANSPORT)?.debtBits;
-    expect(aggregateDebt()).toBeCloseTo(49_500_000);
+    expect(aggregateDebt()).toBeCloseTo(99_000_000);
 
     sim.inflate('cam-1', 15_000_000); // +120 Mbit the transport never received
-    sim.drive(5_000, [{ id: 'screen-1', bps: 10_800_000 }]);
-    expect(aggregateDebt()).toBeCloseTo(12_000_000); // 49.5 + 0 − 37.5
+    sim.drive(5_000, [{ id: 'screen-1', bps: aboveAggregate }]);
+    expect(aggregateDebt()).toBeCloseTo(99_000_000 - FREE.aggregateBps * 5); // no false credit
   });
 
   it('records a strike with nothing to pause when no live producer carried the bytes', () => {
     const sim = new Sim();
     let trips: PolicerTrip[] = [];
     for (let i = 0; i < 6 && trips.length === 0; i++) {
-      sim.rtpBytes += (10_800_000 * POLICER_INTERVAL_MS) / 8000;
+      sim.rtpBytes += ((FREE.aggregateBps + 6_000_000) * POLICER_INTERVAL_MS) / 8000;
       sim.advance(POLICER_INTERVAL_MS);
       trips = [...sim.tick().trips];
     }

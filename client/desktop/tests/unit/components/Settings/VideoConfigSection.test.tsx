@@ -950,14 +950,16 @@ describe('VideoConfigSection', () => {
     it('shows enabled hint and estimated bitrate when screenShareBitrate=0', () => {
       mockDraftSettings({ screenShareBitrate: 0 });
       renderComponent();
-      expect(screen.getByText(/Enabled\. Concord Voice adjusts bitrate/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Enabled\. Picks a bitrate from your resolution/)
+      ).toBeInTheDocument();
       expect(screen.getByText(/Estimated Bitrate/)).toBeInTheDocument();
     });
 
     it('shows disabled hint with fixed Mbps when screenShareBitrate is non-zero', () => {
       mockDraftSettings({ screenShareBitrate: 5_000_000 });
       renderComponent();
-      expect(screen.getByText(/Disabled\. Using a fixed 5\.0 Mbps/)).toBeInTheDocument();
+      expect(screen.getByText(/Disabled\. Limits your share to 5\.0 Mbps/)).toBeInTheDocument();
     });
 
     it('shows bitrate slider when bitrate is non-zero', () => {

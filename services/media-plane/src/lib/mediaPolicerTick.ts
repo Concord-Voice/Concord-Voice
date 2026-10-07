@@ -8,9 +8,10 @@
  * Ordering is the whole contract:
  *  - Everything between settling the sample and the last latch is ONE
  *    synchronous block. The identity fence is checked against the objects the
- *    settle captured, and an eviction's cooldown is set by ledger.strike()
- *    inside decideVerdicts(), so no join or produce can slip in between the
- *    verdict and its enforcement.
+ *    settle captured. The audio eviction cooldown is set by ledger.strike()
+ *    inside decideVerdicts(), and a video cooldown is armed before its current
+ *    producers are latched, so no join or produce can slip between a verdict
+ *    and its enforcement.
  *  - Evict verdicts latch too (spec R5): a latched producer's resume is
  *    refused while handleForceDisconnect tears the session down.
  *  - Pauses run before evictions, and every unit of work — each pauseLatched
@@ -41,16 +42,22 @@ import {
   type MediaPolicer,
   type MediaPolicyLedger,
   type ObserveResult,
+  type PolicerObservation,
   type PolicerTrip,
   type StalledParticipant,
   type UserVerdict,
 } from './mediaPolicer.js';
-import type { MediaPolicyNoticePayload, ProducerStateChangePayload } from './mediaPolicyWire.js';
+import type {
+  MediaPolicyNoticePayload,
+  ProducerStateChangePayload,
+  VideoBandwidthDisabledPayload,
+} from './mediaPolicyWire.js';
 import type {
   LatchedProducer,
   PolicedProducerRef,
   ProducerIngressSample,
   RoomManager,
+  SettledIngressSample,
 } from './roomManager.js';
 import type { EmitSecurityEvent, SecurityEventInput } from './securityEvent.js';
 
@@ -58,7 +65,9 @@ export interface MediaPolicerRoomManager extends ForceDisconnectRoomManager {
   collectProducerIngressSample: RoomManager['collectProducerIngressSample'];
   settleIngressSample: RoomManager['settleIngressSample'];
   latchPolicedProducer: RoomManager['latchPolicedProducer'];
+  latchUserVideoProducers: RoomManager['latchUserVideoProducers'];
   pausePolicedProducer: RoomManager['pausePolicedProducer'];
+  closePolicedVideoProducer: RoomManager['closePolicedVideoProducer'];
 }
 
 /** Verified: socket.io `Server` is assignable to this. */
@@ -109,9 +118,23 @@ interface LatchedTrip {
   readonly producer: LatchedProducer;
 }
 
+interface VideoVerdict {
+  readonly userId: string;
+  readonly trips: readonly PolicerTrip[];
+  readonly retryAfterSec: number;
+}
+
+type VideoNoticeContext = Pick<VideoBandwidthDisabledPayload, 'producerId' | 'source'>;
+
 interface Decision {
   readonly verdicts: readonly UserVerdict[];
+  readonly videoVerdicts: readonly VideoVerdict[];
   readonly latched: ReadonlyMap<string, LatchedTrip>;
+  readonly stalledTransports: readonly {
+    roomId: string;
+    userId: string;
+    sendTransportId: string;
+  }[];
 }
 
 function errorMessage(error: unknown): string {
@@ -120,7 +143,7 @@ function errorMessage(error: unknown): string {
 
 /** Which unit of isolated work failed, for a distinct log message per stage. */
 interface IsolationContext {
-  readonly stage: 'pause' | 'evict' | 'evict-latch-pause';
+  readonly stage: 'pause' | 'evict' | 'evict-latch-pause' | 'video-close' | 'stats-fail-closed';
   readonly userId: string;
   readonly roomIds: readonly string[];
   readonly producerIds?: readonly string[];
@@ -144,7 +167,7 @@ async function applyIsolated(apply: () => Promise<void>, context: IsolationConte
   }
 }
 
-function stalledKey(s: StalledParticipant): string {
+function stalledKey(s: Pick<StalledParticipant, 'roomId' | 'userId'>): string {
   return `${s.roomId}\u0000${s.userId}`;
 }
 
@@ -154,6 +177,125 @@ function stalledSetsDiffer(a: ReadonlySet<string>, b: ReadonlySet<string>): bool
     if (!b.has(key)) return true;
   }
   return false;
+}
+
+function stalledTransportsFor(
+  observation: PolicerObservation,
+  stalled: readonly StalledParticipant[]
+): Decision['stalledTransports'] {
+  // The policer counts both explicit failed reads and malformed successful
+  // readings. Keep the exact transport ID from either shape: a reconnect
+  // must never be evicted for its predecessor's three failed samples.
+  const observedTransports = new Map<string, string>();
+  for (const failed of observation.failed) {
+    if (failed.producerIds.length > 0) {
+      observedTransports.set(stalledKey(failed), failed.sendTransportId);
+    }
+  }
+  for (const reading of observation.readings) {
+    if (reading.producers.length > 0) {
+      observedTransports.set(stalledKey(reading), reading.sendTransportId);
+    }
+  }
+  return stalled.flatMap(({ roomId, userId }) => {
+    const sendTransportId = observedTransports.get(stalledKey({ roomId, userId }));
+    return sendTransportId ? [{ roomId, userId, sendTransportId }] : [];
+  });
+}
+
+function isVideoTrip(trip: PolicerTrip, refs: SettledIngressSample['refs']): boolean {
+  if (trip.check === 'camera_bytes' || trip.check === 'screen_bytes') return true;
+  return trip.check === 'aggregate' && refs.get(trip.producerId ?? '')?.entry.kind === 'video';
+}
+
+function splitPolicyTrips(
+  trips: readonly PolicerTrip[],
+  refs: SettledIngressSample['refs']
+): { audioTrips: PolicerTrip[]; videoTrips: PolicerTrip[] } {
+  const audioTrips: PolicerTrip[] = [];
+  const videoTrips: PolicerTrip[] = [];
+  for (const trip of trips) {
+    (isVideoTrip(trip, refs) ? videoTrips : audioTrips).push(trip);
+  }
+  return { audioTrips, videoTrips };
+}
+
+function armVideoVerdicts(
+  trips: readonly PolicerTrip[],
+  ledger: MediaPolicyLedger,
+  nowMs: number
+): VideoVerdict[] {
+  const byUser = new Map<string, PolicerTrip[]>();
+  for (const trip of trips) {
+    const group = byUser.get(trip.userId);
+    if (group) group.push(trip);
+    else byUser.set(trip.userId, [trip]);
+  }
+  return [...byUser].map(([userId, userTrips]) => ({
+    userId,
+    trips: userTrips,
+    retryAfterSec: ledger.armVideoCooldown(userId, nowMs),
+  }));
+}
+
+function latchVideoProducers(
+  verdicts: readonly VideoVerdict[],
+  roomManager: MediaPolicerRoomManager,
+  latched: Map<string, LatchedTrip>
+): void {
+  for (const verdict of verdicts) {
+    // The stats read may predate a new producer, so walk current room state
+    // synchronously after arming the gate, not only the sampled refs.
+    for (const { ref, producer } of roomManager.latchUserVideoProducers(verdict.userId)) {
+      const trip =
+        verdict.trips.find((candidate) => candidate.producerId === ref.producerId) ??
+        verdict.trips[0];
+      latched.set(ref.producerId, { trip, ref, producer });
+    }
+  }
+}
+
+/** All latches happen synchronously after the ledger arms each cooldown. */
+function latchPolicyProducers(
+  verdicts: readonly UserVerdict[],
+  videoVerdicts: readonly VideoVerdict[],
+  refs: SettledIngressSample['refs'],
+  roomManager: MediaPolicerRoomManager
+): ReadonlyMap<string, LatchedTrip> {
+  const latched = new Map<string, LatchedTrip>();
+  for (const verdict of verdicts) {
+    for (const trip of verdict.trips) {
+      // A slot trip and the aggregate can name the same producer: latch once.
+      if (trip.producerId === null || latched.has(trip.producerId)) continue;
+      const ref = refs.get(trip.producerId);
+      const producer = ref ? roomManager.latchPolicedProducer(ref) : null;
+      if (ref && producer) latched.set(trip.producerId, { trip, ref, producer });
+    }
+  }
+  latchVideoProducers(videoVerdicts, roomManager, latched);
+  return latched;
+}
+
+function videoNoticeContexts(
+  verdict: VideoVerdict,
+  latched: ReadonlyMap<string, LatchedTrip>
+): Map<string, VideoNoticeContext> {
+  const noticeByRoom = new Map<string, VideoNoticeContext>();
+  for (const hit of latched.values()) {
+    if (hit.ref.userId !== verdict.userId || hit.producer.kind !== 'video') continue;
+    noticeByRoom.set(hit.ref.roomId, {
+      producerId: hit.ref.producerId,
+      source: hit.producer.source === 'screen' ? 'screen' : 'camera',
+    });
+  }
+  for (const trip of verdict.trips) {
+    if (noticeByRoom.has(trip.roomId)) continue;
+    noticeByRoom.set(trip.roomId, {
+      producerId: trip.producerId,
+      source: trip.check === 'screen_bytes' ? 'screen' : 'camera',
+    });
+  }
+  return noticeByRoom;
 }
 
 export function createMediaPolicerTick(ports: MediaPolicerTickPorts): MediaPolicerTick {
@@ -180,7 +322,7 @@ export function createMediaPolicerTick(ports: MediaPolicerTickPorts): MediaPolic
   function reportStatsTransition(result: ObserveResult): void {
     if (result.degradedTransition === 'degraded') {
       observe(STATS_DEGRADED_EVENT);
-      logger.warn('Media policer stats degraded', { stalled: result.stalled });
+      logger.warn('Media policer stats degraded', { stalledSessions: result.stalled.length });
       lastStalledKeys = new Set(result.stalled.map(stalledKey));
     } else if (result.degradedTransition === 'restored') {
       observe(STATS_RESTORED_EVENT);
@@ -191,7 +333,7 @@ export function createMediaPolicerTick(ports: MediaPolicerTickPorts): MediaPolic
       // (a participant joined or left it), not on every tick it holds steady.
       const nextKeys = new Set(result.stalled.map(stalledKey));
       if (stalledSetsDiffer(lastStalledKeys, nextKeys)) {
-        logger.warn('Media policer stats degraded', { stalled: result.stalled });
+        logger.warn('Media policer stats degraded', { stalledSessions: result.stalled.length });
         lastStalledKeys = nextKeys;
       }
     }
@@ -203,19 +345,72 @@ export function createMediaPolicerTick(ports: MediaPolicerTickPorts): MediaPolic
     const settled = roomManager.settleIngressSample(sample, now);
     const result = policer.observe(settled.observation);
     reportStatsTransition(result);
-    // One ledger.strike() per user; an 'evict' sets cooldownUntil right here.
-    const verdicts = decideVerdicts(result.trips, ledger, now);
-    const latched = new Map<string, LatchedTrip>();
-    for (const verdict of verdicts) {
-      for (const trip of verdict.trips) {
-        // A slot trip and the aggregate can name the same producer: latch once.
-        if (trip.producerId === null || latched.has(trip.producerId)) continue;
-        const ref = settled.refs.get(trip.producerId);
-        const producer = ref ? roomManager.latchPolicedProducer(ref) : null;
-        if (ref && producer) latched.set(trip.producerId, { trip, ref, producer });
+    const stalledTransports = stalledTransportsFor(settled.observation, result.stalled);
+    const { audioTrips, videoTrips } = splitPolicyTrips(result.trips, settled.refs);
+    // Audio retains its existing pause/second-strike voice policy.
+    const verdicts = decideVerdicts(audioTrips, ledger, now);
+    const videoVerdicts = armVideoVerdicts(videoTrips, ledger, now);
+    const latched = latchPolicyProducers(verdicts, videoVerdicts, settled.refs, roomManager);
+    return { verdicts, videoVerdicts, latched, stalledTransports };
+  }
+
+  async function applyVideo(
+    verdict: Decision['videoVerdicts'][number],
+    latched: ReadonlyMap<string, LatchedTrip>
+  ): Promise<void> {
+    for (const hit of latched.values()) {
+      if (hit.ref.userId !== verdict.userId || hit.producer.kind !== 'video') continue;
+      await applyIsolated(
+        async () => {
+          const outcome = await roomManager.closePolicedVideoProducer(hit.ref);
+          if (outcome === 'gone') return;
+          observe(PAUSE_EVENT);
+          logger.warn('Media policer disabled video producer', {
+            userId: hit.ref.userId,
+            roomId: hit.ref.roomId,
+            producerId: hit.ref.producerId,
+            check: hit.trip.check,
+            ratioBucket: hit.trip.ratioBucket,
+            outcome,
+            retryAfterSec: verdict.retryAfterSec,
+          });
+        },
+        {
+          stage: 'video-close',
+          userId: verdict.userId,
+          roomIds: [hit.ref.roomId],
+          producerIds: [hit.ref.producerId],
+        }
+      );
+    }
+    for (const [roomId, context] of videoNoticeContexts(verdict, latched)) {
+      const participant = roomManager.getParticipant(roomId, verdict.userId);
+      if (!participant) continue;
+      const notice: VideoBandwidthDisabledPayload = {
+        roomId,
+        producerId: context.producerId,
+        source: context.source,
+        retryAfterSec: verdict.retryAfterSec,
+      };
+      try {
+        io.sockets.sockets.get(participant.socketId)?.emit('video-bandwidth-disabled', notice);
+      } catch (error) {
+        logger.warn('Media policer video notice failed', {
+          userId: verdict.userId,
+          roomId,
+          error: errorMessage(error),
+        });
       }
     }
-    return { verdicts, latched };
+  }
+
+  async function closeUnmeteredSession(
+    session: Decision['stalledTransports'][number]
+  ): Promise<void> {
+    await handleForceDisconnect(roomManager, io, session.roomId, session.userId, ports.emit, {
+      reason: 'stats_unavailable',
+      sendTransportId: session.sendTransportId,
+    });
   }
 
   async function pauseLatched({ trip, ref, producer }: LatchedTrip): Promise<void> {
@@ -354,10 +549,20 @@ export function createMediaPolicerTick(ports: MediaPolicerTickPorts): MediaPolic
     running = true;
     try {
       const sample = await roomManager.collectProducerIngressSample();
-      const { verdicts, latched } = decide(sample);
+      const { verdicts, videoVerdicts, latched, stalledTransports } = decide(sample);
+      // Close unmeterable sessions before awaits for ordinary rate verdicts.
+      // Repeated failed ticks retry a failed close; a fresh transport is fenced.
+      for (const session of stalledTransports) {
+        await applyIsolated(() => closeUnmeteredSession(session), {
+          stage: 'stats-fail-closed',
+          userId: session.userId,
+          roomIds: [session.roomId],
+        });
+      }
       for (const verdict of verdicts) {
         if (verdict.action === 'pause') await applyPause(verdict, latched);
       }
+      for (const verdict of videoVerdicts) await applyVideo(verdict, latched);
       for (const verdict of verdicts) {
         if (verdict.action === 'evict') await applyEvict(verdict, latched);
       }

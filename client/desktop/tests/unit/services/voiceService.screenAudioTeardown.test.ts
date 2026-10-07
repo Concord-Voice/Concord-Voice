@@ -88,6 +88,7 @@ describe('voiceService screen-audio teardown choke point (#3195 section 6c)', ()
 
     svc = voiceService as any;
     svc.producers.clear();
+    svc.audioCapsForSession = null;
     svc.consumers = new Map();
     svc.consumerMeta = new Map();
     svc.pendingScreenAudioProducers = new Map();
@@ -374,6 +375,11 @@ describe('voiceService screen-audio teardown choke point (#3195 section 6c)', ()
         allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
       },
     });
+    svc.audioCapsForSession = {
+      allowedTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+      minPtimeMs: 10,
+      channelUpliftTier: null,
+    };
     delete svc.produceScreenAudioFromStream;
     svc.produceEncrypted = vi.fn().mockResolvedValue(producerStub('screen-audio-1'));
 
@@ -391,6 +397,11 @@ describe('voiceService screen-audio teardown choke point (#3195 section 6c)', ()
     [['bogus'], 96_000],
     [['bogus', 'high'], 192_000],
   ])('#2153 T0: allowed tiers %j cap screen audio at %i', async (tiers, expected) => {
+    svc.audioCapsForSession = {
+      allowedTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+      minPtimeMs: 10,
+      channelUpliftTier: null,
+    };
     useSubscriptionStore.setState({
       entitlement: { ...useSubscriptionStore.getState().entitlement, allowedAudioTiers: tiers },
     });

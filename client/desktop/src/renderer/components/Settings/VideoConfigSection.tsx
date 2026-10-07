@@ -1169,8 +1169,8 @@ const VideoConfigSection: React.FC = () => {
           <span className="settings-row-label">Automatic Camera Bitrate</span>
           <span className="settings-row-hint">
             {cameraBitrate === 0
-              ? 'Enabled. Concord Voice adjusts your camera bitrate based on resolution, frame rate, and codec.'
-              : `Disabled. Using a fixed ${(cameraBitrate / 1_000_000).toFixed(1)} Mbps camera cap.`}
+              ? "Enabled. Uses your camera quality preset, within your plan's bitrate cap."
+              : `Disabled. Limits your camera to ${(cameraBitrate / 1_000_000).toFixed(1)} Mbps or the lower preset and plan cap.`}
           </span>
         </div>
         <ToggleSwitch
@@ -1760,8 +1760,8 @@ const VideoConfigSection: React.FC = () => {
               <span className="settings-row-label">Automatic Bitrate</span>
               <span className="settings-row-hint">
                 {screenShareBitrate === 0
-                  ? 'Enabled. Concord Voice adjusts bitrate based on your resolution, frame rate, and codec.'
-                  : `Disabled. Using a fixed ${(screenShareBitrate / 1_000_000).toFixed(1)} Mbps cap. Recommended ~${(clampedRecommended / 1_000_000).toFixed(1)} Mbps for current settings.`}
+                  ? 'Enabled. Picks a bitrate from your resolution, frame rate, and codec when the share starts, within your plan cap.'
+                  : `Disabled. Limits your share to ${(screenShareBitrate / 1_000_000).toFixed(1)} Mbps or your lower plan cap. Recommended ~${(clampedRecommended / 1_000_000).toFixed(1)} Mbps for current settings.`}
               </span>
               {screenShareBitrate === 0 && (
                 <span className="settings-estimated-bitrate">

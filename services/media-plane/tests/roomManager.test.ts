@@ -45,6 +45,7 @@ vi.mock('@/config/index.js', () => ({
 
 import {
   RoomManager,
+  VideoPolicyCooldownError,
   resolveVideoPublisherCap,
   ABSOLUTE_VIDEO_PUBLISHER_CEILING,
   resolveRoomCapTier,
@@ -79,8 +80,10 @@ import { config as mockedConfig } from '@/config/index.js';
 import { MediaPolicyCooldownError, type PolicedProducerRef } from '../src/lib/roomManager.js';
 import {
   COOLDOWN_MS,
+  MediaPolicer,
   MediaPolicyLedger,
   POLICER_READ_TIMEOUT_MS,
+  slotKey,
 } from '../src/lib/mediaPolicer.js';
 
 // ---------------------------------------------------------------------------
@@ -2094,6 +2097,8 @@ describe('RoomManager', () => {
           allowedAudioTiers: ['minimum', 'studio'],
           minPtimeMs: 10,
           maxManualBitrateBps: 10_000_000,
+          cameraMaxBitrateBps: 6_000_000,
+          screenMaxBitrateBps: 10_000_000,
         },
       });
       const oldTransport = createMockTransport();
@@ -2130,6 +2135,8 @@ describe('RoomManager', () => {
           allowedAudioTiers: ['minimum', 'standard'],
           minPtimeMs: 20,
           maxManualBitrateBps: 5_000_000,
+          cameraMaxBitrateBps: 2_500_000,
+          screenMaxBitrateBps: 5_000_000,
         },
         ownerTier: 'free',
         permissions: 0n,
@@ -2148,7 +2155,19 @@ describe('RoomManager', () => {
       expect(oldTransport.close).not.toHaveBeenCalled();
       expect(oldProducer.close).not.toHaveBeenCalled();
 
-      manager.promoteChannelParticipant(roomId, 'u-1', 'sock-1', promotion, () => undefined);
+      const admitted = manager.promoteChannelParticipant(
+        roomId,
+        'u-1',
+        'sock-1',
+        promotion,
+        () => undefined
+      );
+      expect(admitted).toMatchObject({
+        cameraMaxBitrateBps: 2_500_000,
+        screenMaxBitrateBps: 5_000_000,
+        allowedAudioTiers: ['minimum', 'standard'],
+        minPtimeMs: 20,
+      });
       expect(manager.getRoom(roomId)?.ownerTier).toBe('free');
       expect(resolveScreenProducerCap(manager.getRoom(roomId)!)).toBe(1);
       expect(manager.getParticipant(roomId, 'u-1')).toMatchObject({
@@ -2571,10 +2590,9 @@ describe('RoomManager', () => {
       );
     });
 
-    // ── Per-user tier bitrate cap (#1300) ─────────────────────────────────
+    // ── Per-user send-transport bitrate advisory (#1300, #2153) ──────────
 
-    it('caps the SEND transport with the FREE tier maxManualBitrateBps (5 Mbps)', async () => {
-      // u-free joins with the free entitlement (5_000_000 bps).
+    it('allows the FREE camera, screen, mic, and screen-audio budgets together', async () => {
       await joinRoomWithSupportedCrypto(
         manager,
         'room-1',
@@ -2587,6 +2605,8 @@ describe('RoomManager', () => {
           allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
           minPtimeMs: 20,
           maxManualBitrateBps: 5_000_000,
+          cameraMaxBitrateBps: 2_500_000,
+          screenMaxBitrateBps: 5_000_000,
         }
       );
       const transport = createMockTransport();
@@ -2594,12 +2614,14 @@ describe('RoomManager', () => {
 
       await manager.createTransport('room-1', 'u-free', 'send');
 
-      // The producing (send) transport is capped at the user's tier ceiling,
-      // NOT the global ~50 Mbps default.
-      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(5_000_000);
+      // The server gives both declared video slots a 5 Mbps guard because the
+      // capture source is untrusted; the stock client still targets 2.5 Mbps
+      // camera + 5 Mbps screen. Add two 96 kbps audio slots, bounded wire
+      // overhead, and the aggregate tolerance to the send-transport advisory.
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(16_687_392);
     });
 
-    it('caps the SEND transport with the PREMIUM tier maxManualBitrateBps (10 Mbps)', async () => {
+    it('uses the admitted PREMIUM source caps for the simultaneous-source advisory', async () => {
       await joinRoomWithSupportedCrypto(
         manager,
         'room-1',
@@ -2612,6 +2634,8 @@ describe('RoomManager', () => {
           allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
           minPtimeMs: 10,
           maxManualBitrateBps: 10_000_000,
+          cameraMaxBitrateBps: 6_000_000,
+          screenMaxBitrateBps: 10_000_000,
         }
       );
       const transport = createMockTransport();
@@ -2619,7 +2643,10 @@ describe('RoomManager', () => {
 
       await manager.createTransport('room-1', 'u-prem', 'send');
 
-      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(10_000_000);
+      // The premium server guard is 10 Mbps for either declared video source;
+      // the stock client retains 6 Mbps camera + 10 Mbps screen. Include two
+      // 510 kbps audio slots, bounded wire allowance, and aggregate tolerance.
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(34_944_654);
     });
 
     it('does NOT apply the per-user cap to the RECV transport (keeps the global default)', async () => {
@@ -2642,43 +2669,58 @@ describe('RoomManager', () => {
 
       await manager.createTransport('room-1', 'u-free', 'recv');
 
-      // recv carries media TO the peer — the global maxIncomingBitrate (50 Mbps
-      // from the config mock), never the per-user send cap.
+      // recv carries media TO the peer; its incoming advisory remains global.
       expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(50_000_000);
-      expect(transport.setMaxIncomingBitrate).not.toHaveBeenCalledWith(5_000_000);
+      expect(transport.setMaxIncomingBitrate).not.toHaveBeenCalledWith(16_687_392);
     });
 
-    it('defaults to the FREE floor send cap when no entitlement is supplied (pre-#1300 caller)', async () => {
+    it('defaults to the FREE simultaneous-source advisory without an entitlement', async () => {
       // The default beforeEach join (u-1) passed no entitlement → free floor.
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
 
       await manager.createTransport('room-1', 'u-1', 'send');
 
-      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(5_000_000);
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(16_687_392);
     });
 
-    it('logs a PII-safe warning and PROCEEDS (does not fail the join) when setMaxIncomingBitrate rejects (#1300 fail-open)', async () => {
-      // A WebRtcTransport always supports setMaxIncomingBitrate, so a rejection
-      // is a transient worker error, not a capability gap. The security control
-      // fails OPEN (transport left uncapped) — but observably: a PII-safe warn
-      // is logged (ids + direction only) and the join still succeeds.
+    it('refuses and closes a send transport when its bitrate cap cannot be installed', async () => {
       const warnSpy = vi.mocked(logger.warn);
       warnSpy.mockClear();
       const transport = createMockTransport();
       transport.setMaxIncomingBitrate.mockRejectedValueOnce(new Error('worker IPC error'));
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
 
-      const info = await manager.createTransport('room-1', 'u-1', 'send');
-      expect(info).toBeDefined(); // join not blocked by the flaky cap call
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).rejects.toThrow(
+        'Send transport bitrate cap unavailable'
+      );
+      expect(transport.close).toHaveBeenCalledTimes(1);
+      expect(manager.getParticipant('room-1', 'u-1')?.sendTransport).toBeNull();
 
-      const call = warnSpy.mock.calls.find((c) => String(c[0]).includes('fail-open'));
+      const call = warnSpy.mock.calls.find((c) =>
+        String(c[0]).includes('setMaxIncomingBitrate failed')
+      );
       expect(call).toBeDefined();
       const meta = call![1] as Record<string, unknown>;
       expect(meta.userId).toBe('u-1');
       expect(meta.direction).toBe('send');
       // No identity/display fields leaked.
       expect(JSON.stringify(meta)).not.toMatch(/displayName|avatarUrl|username/);
+    });
+
+    it('refuses an invalid send cap instead of admitting an uncapped transport', async () => {
+      const participant = manager.getParticipant('room-1', 'u-1');
+      expect(participant).toBeDefined();
+      participant!.maxManualBitrateBps = 0;
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).rejects.toThrow(
+        'Send transport bitrate cap unavailable'
+      );
+      expect(transport.setMaxIncomingBitrate).not.toHaveBeenCalled();
+      expect(transport.close).toHaveBeenCalledTimes(1);
+      expect(participant!.sendTransport).toBeNull();
     });
   });
 
@@ -8625,6 +8667,8 @@ const POLICER_FREE_CAPS = {
   audioCeilingBps: 96_000,
   minPtimeMs: 20,
   maxManualBitrateBps: 5_000_000,
+  cameraMaxBitrateBps: 2_500_000,
+  screenMaxBitrateBps: 5_000_000,
 };
 const MIC_STATS = [
   { type: 'inbound-rtp', ssrc: 1111, byteCount: 4_000, packetCount: 50, bitrate: 6_400 },
@@ -9109,6 +9153,20 @@ describe('RoomManager #2153 — latch, policed pause and latch-aware resume', ()
     expect(h.manager.latchPolicedProducer(ref)).toBeNull();
   });
 
+  it('latches every current video producer but leaves the microphone unlatched', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const camera = await producePoliced(h, transport, 'camera');
+    const screen = await producePoliced(h, transport, 'screen');
+
+    const latched = h.manager.latchUserVideoProducers(POLICER_USER);
+
+    expect(latched.map(({ ref }) => ref.producerId)).toEqual([camera.id, screen.id]);
+    expect(latched.every(({ ref }) => ref.entry.policed)).toBe(true);
+    expect(policerEntry(h, mic.id)?.policed).toBe(false);
+    expect(h.manager.latchUserVideoProducers(POLICER_USER)).toEqual([]);
+  });
+
   it('refuses to latch a replaced participant, a replaced entry, or a closed producer', async () => {
     const transport = await joinWithSendTransport(h);
     const mic = await producePoliced(h, transport, 'mic');
@@ -9363,6 +9421,49 @@ describe('RoomManager #2153 — latch, policed pause and latch-aware resume', ()
       reason: 'rejected',
     });
   });
+
+  it('closes the exact latched video producer and preserves the microphone', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const camera = await producePoliced(h, transport, 'camera');
+    const ref = policedRef(h, camera.id);
+    h.manager.latchPolicedProducer(ref);
+
+    await expect(h.manager.closePolicedVideoProducer(ref)).resolves.toBe('closed');
+
+    expect(camera.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, camera.id)).toBeUndefined();
+    expect(policerEntry(h, mic.id)).toBeDefined();
+    expect(mic.close).not.toHaveBeenCalled();
+  });
+
+  it('closes paired screen audio when a policed screen share is disabled', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const screen = await producePoliced(h, transport, 'screen');
+    const screenAudio = await producePoliced(h, transport, 'screen-audio');
+    const ref = policedRef(h, screen.id);
+    h.manager.latchPolicedProducer(ref);
+
+    await expect(h.manager.closePolicedVideoProducer(ref)).resolves.toBe('closed');
+
+    expect(screenAudio.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, screenAudio.id)).toBeUndefined();
+    expect(policerEntry(h, mic.id)).toBeDefined();
+  });
+
+  it('pauses video when its exact close fails, preventing continued forwarding', async () => {
+    const transport = await joinWithSendTransport(h);
+    const camera = await producePoliced(h, transport, 'camera');
+    const ref = policedRef(h, camera.id);
+    h.manager.latchPolicedProducer(ref);
+    vi.spyOn(h.manager, 'closeProducer').mockRejectedValueOnce(new Error('worker close failed'));
+
+    await expect(h.manager.closePolicedVideoProducer(ref)).resolves.toBe('paused');
+
+    expect(camera.pause).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, camera.id)?.policed).toBe(true);
+  });
 });
 
 describe('RoomManager #2153 — media-policy cooldown gate', () => {
@@ -9382,6 +9483,91 @@ describe('RoomManager #2153 — media-policy cooldown gate', () => {
     expect(ledger.strike(userId, h.clock.now)).toBe('pause');
     expect(ledger.strike(userId, h.clock.now)).toBe('evict');
   }
+
+  it('keeps voice available while refusing video and its paired screen audio during cooldown', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.manager.setMediaPolicyGate(ledger);
+    expect(ledger.armVideoCooldown(POLICER_USER, h.clock.now)).toBe(300);
+
+    const produceVideo = (source: 'camera' | 'screen') =>
+      h.manager.produce(
+        POLICER_ROOM,
+        POLICER_USER,
+        transport.id,
+        'video',
+        createRtpParameters() as any,
+        source
+      );
+    await expect(produceVideo('camera')).rejects.toBeInstanceOf(VideoPolicyCooldownError);
+    await expect(produceVideo('screen')).rejects.toMatchObject({
+      code: 'video_policy_cooldown',
+      retryAfterSec: 300,
+    });
+    await expect(
+      h.manager.produce(
+        POLICER_ROOM,
+        POLICER_USER,
+        transport.id,
+        'audio',
+        createRtpParameters() as any,
+        'screen-audio'
+      )
+    ).rejects.toBeInstanceOf(VideoPolicyCooldownError);
+    expect(transport.produce).not.toHaveBeenCalled();
+    const mic = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, mic.id)).toBeDefined();
+  });
+
+  it('rejects a video produce whose cooldown arms during the worker await', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.manager.setMediaPolicyGate(ledger);
+    const deferredProduce = policerDeferred<ReturnType<typeof createMockProducer>>();
+    const camera = createMockProducer({ kind: 'video' });
+    transport.produce.mockImplementationOnce(() => deferredProduce.promise);
+    const call = h.manager.produce(
+      POLICER_ROOM,
+      POLICER_USER,
+      transport.id,
+      'video',
+      createRtpParameters() as any,
+      'camera'
+    );
+
+    await flushPolicerMicrotasks();
+    ledger.armVideoCooldown(POLICER_USER, h.clock.now);
+    deferredProduce.resolve(camera);
+
+    await expect(call).rejects.toBeInstanceOf(VideoPolicyCooldownError);
+    expect(camera.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, camera.id)).toBeUndefined();
+    const mic = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, mic.id)).toBeDefined();
+  });
+
+  it('rejects paired screen audio if the video cooldown arms during its worker await', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.manager.setMediaPolicyGate(ledger);
+    await producePoliced(h, transport, 'screen');
+    const deferredProduce = policerDeferred<ReturnType<typeof createMockProducer>>();
+    const screenAudio = createMockProducer({ kind: 'audio' });
+    transport.produce.mockImplementationOnce(() => deferredProduce.promise);
+    const call = h.manager.produce(
+      POLICER_ROOM,
+      POLICER_USER,
+      transport.id,
+      'audio',
+      createRtpParameters() as any,
+      'screen-audio'
+    );
+
+    await flushPolicerMicrotasks();
+    ledger.armVideoCooldown(POLICER_USER, h.clock.now);
+    deferredProduce.resolve(screenAudio);
+
+    await expect(call).rejects.toBeInstanceOf(VideoPolicyCooldownError);
+    expect(screenAudio.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, screenAudio.id)).toBeUndefined();
+  });
 
   it('refuses produce during a cooldown before touching the transport', async () => {
     const transport = await joinWithSendTransport(h);
@@ -9741,6 +9927,26 @@ describe('RoomManager #2153 — closeProducerFromClient final sample', () => {
     expect(mic.close).toHaveBeenCalledTimes(1);
   });
 
+  it('closes video after a fulfilled but malformed final stats response', async () => {
+    const transport = await joinWithSendTransport(h);
+    const camera = await producePoliced(h, transport, 'camera', {
+      getStats: vi.fn(() => Promise.resolve(null as unknown as typeof MIC_STATS)),
+    });
+
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, camera.id)
+    ).resolves.toBe('camera');
+    expect(finalizer).toHaveBeenCalledWith(
+      expect.objectContaining({ producerId: camera.id, kind: 'video', streams: null })
+    );
+    expect(logger.debug).toHaveBeenCalledWith('Media policer final read failed', {
+      producerId: camera.id,
+      reason: 'malformed',
+    });
+    expect(camera.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, camera.id)).toBeUndefined();
+  });
+
   it('bounds the final read by POLICER_READ_TIMEOUT_MS', async () => {
     const transport = await joinWithSendTransport(h);
     const mic = await producePoliced(h, transport, 'mic', {
@@ -9755,13 +9961,17 @@ describe('RoomManager #2153 — closeProducerFromClient final sample', () => {
     expect(finalizer).toHaveBeenCalledWith(expect.objectContaining({ streams: null }));
   });
 
-  it('closes video, latched audio, and any producer with no finalizer set without a read', async () => {
+  it('final-reads video but closes latched or unwatched producers without a read', async () => {
     const transport = await joinWithSendTransport(h);
     const camera = await producePoliced(h, transport, 'camera');
     await expect(
       h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, camera.id)
     ).resolves.toBe('camera');
-    expect(camera.getStats).not.toHaveBeenCalled();
+    expect(camera.getStats).toHaveBeenCalledTimes(1);
+    expect(finalizer).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'video', source: 'camera', producerId: camera.id })
+    );
+    finalizer.mockClear();
 
     const latched = await producePoliced(h, transport, 'mic');
     h.manager.latchPolicedProducer(policedRef(h, latched.id));
@@ -9835,12 +10045,9 @@ describe('RoomManager #2153 — closeProducerFromClient final sample', () => {
     await expect(closing).resolves.toBe('mic');
   });
 
-  // #2153 F9: `closeProducerFromClient` routes its final read through the same
-  // outstanding-read guard (`guardedIngressRead`) a tick uses, so the two can
-  // never both dispatch a `getStats()` to the same producer. Here the TICK's
-  // read is already outstanding when the close starts, so the close's own
-  // read is the one skipped.
-  it('F9: issues no second getStats call when a tick read of the same producer is already outstanding', async () => {
+  // #2153 F9: the close reuses the tick's bounded result. A second worker read
+  // would pile up IPC; dropping both results would let close churn hide bytes.
+  it('F9: reuses an outstanding tick read for the final sample without a second getStats call', async () => {
     const transport = await joinWithSendTransport(h);
     const reading = policerDeferred<typeof MIC_STATS>();
     const mic = await producePoliced(h, transport, 'mic', {
@@ -9857,7 +10064,155 @@ describe('RoomManager #2153 — closeProducerFromClient final sample', () => {
     await expect(closing).resolves.toBe('mic');
     expect(mic.getStats).toHaveBeenCalledTimes(1);
     expect(mic.close).toHaveBeenCalledTimes(1);
-    expect(finalizer).toHaveBeenCalledWith(expect.objectContaining({ streams: null }));
+    expect(finalizer).toHaveBeenCalledWith(
+      expect.objectContaining({ streams: [{ ssrc: 1111, byteCount: 4_000, packetCount: 50 }] })
+    );
+  });
+
+  it('charges camera bytes when close races a tick read and the tick drops the closed producer', async () => {
+    const policer = new MediaPolicer();
+    h.manager.setIngressFinalizer((sample) => {
+      finalizer(sample);
+      policer.recordFinal(sample);
+    });
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof CAMERA_STATS>();
+    const camera = await producePoliced(h, transport, 'camera', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const collecting = h.manager.collectProducerIngressSample();
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, camera.id);
+    expect(camera.getStats).toHaveBeenCalledTimes(1);
+    reading.resolve([
+      { type: 'inbound-rtp', ssrc: 2221, byteCount: 2_000_000, packetCount: 500, rid: 'l' },
+    ]);
+    const sample = await collecting;
+    await expect(closing).resolves.toBe('camera');
+
+    const settled = h.manager.settleIngressSample(sample, 11_000);
+    expect(settled.observation.readings[0]?.producers).toEqual([]);
+    expect(
+      policer.snapshot().videoSlots.get(slotKey(POLICER_ROOM, POLICER_USER, 'camera'))?.pendingBits
+    ).toBe(16_000_000);
+    expect(policer.observe(settled.observation).trips).toEqual(
+      expect.arrayContaining([expect.objectContaining({ check: 'camera_bytes' })])
+    );
+    expect(camera.getStats).toHaveBeenCalledTimes(1);
+  });
+
+  it('charges cameras replaced between ticks before announcing their removal', async () => {
+    const policer = new MediaPolicer();
+    h.manager.setIngressFinalizer((sample) => {
+      finalizer(sample);
+      policer.recordFinal(sample);
+    });
+    const transport = await joinWithSendTransport(h);
+    const events: string[] = [];
+    h.manager.onEvent((event) => {
+      if (event.type === 'producer-removed') events.push(`closed:${event.producerId}`);
+    });
+    const produceFastCamera = (id: string) =>
+      producePoliced(h, transport, 'camera', {
+        id,
+        getStats: vi.fn(() =>
+          Promise.resolve([
+            { type: 'inbound-rtp', ssrc: 2221, byteCount: 600_000, packetCount: 500 },
+          ])
+        ),
+      });
+
+    const first = await produceFastCamera('camera-first');
+    h.clock.now = 11_000;
+    const second = await produceFastCamera('camera-second');
+    events.push(`announced:${second.id}`);
+    await h.manager.supersedeOlderCameraProducers(POLICER_ROOM, POLICER_USER, second.id, 'camera');
+    h.clock.now = 12_000;
+    const third = await produceFastCamera('camera-third');
+    events.push(`announced:${third.id}`);
+    await h.manager.supersedeOlderCameraProducers(POLICER_ROOM, POLICER_USER, third.id, 'camera');
+
+    expect(events).toEqual([
+      'announced:camera-second',
+      'closed:camera-first',
+      'announced:camera-third',
+      'closed:camera-second',
+    ]);
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(second.close).toHaveBeenCalledTimes(1);
+    expect(third.close).not.toHaveBeenCalled();
+    expect([...h.manager.getParticipant(POLICER_ROOM, POLICER_USER)!.producers.keys()]).toEqual([
+      third.id,
+    ]);
+    expect(finalizer.mock.calls.map(([sample]) => sample.producerId)).toEqual([
+      first.id,
+      second.id,
+    ]);
+    expect(
+      policer.snapshot().videoSlots.get(slotKey(POLICER_ROOM, POLICER_USER, 'camera'))?.pendingBits
+    ).toBe(9_600_000);
+    // The replacement bytes are measured, while one short interval stays below
+    // the new 10-second sustained / 15-second cumulative video threshold.
+    expect(policer.observe({ nowMs: 12_000, readings: [], failed: [] }).trips).toEqual([]);
+    expect(policer.snapshot().videoWindows.size).toBe(1);
+  });
+
+  it('counts a camera awaiting replacement stats against the overlap limit', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof CAMERA_STATS>();
+    const first = await producePoliced(h, transport, 'camera', {
+      id: 'camera-first',
+      getStats: vi.fn(() => reading.promise),
+    });
+    const second = await producePoliced(h, transport, 'camera', { id: 'camera-second' });
+
+    const superseding = h.manager.supersedeOlderCameraProducers(
+      POLICER_ROOM,
+      POLICER_USER,
+      second.id,
+      'camera'
+    );
+    expect(first.getStats).toHaveBeenCalledTimes(1);
+    expect(first.close).not.toHaveBeenCalled();
+    await expect(producePoliced(h, transport, 'camera', { id: 'camera-third' })).rejects.toThrow(
+      `Participant camera producer limit reached (max ${MAX_PARTICIPANT_CAMERA_PRODUCERS})`
+    );
+
+    reading.resolve(CAMERA_STATS);
+    await superseding;
+    expect(finalizer).toHaveBeenCalledWith(
+      expect.objectContaining({ producerId: first.id, kind: 'video', source: 'camera' })
+    );
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(second.close).not.toHaveBeenCalled();
+  });
+
+  it('keeps a directly closing camera counted until its final stats read finishes', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof CAMERA_STATS>();
+    const first = await producePoliced(h, transport, 'camera', {
+      id: 'camera-first',
+      getStats: vi.fn(() => reading.promise),
+    });
+    const second = await producePoliced(h, transport, 'camera', { id: 'camera-second' });
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, first.id);
+    expect(first.getStats).toHaveBeenCalledTimes(1);
+    expect(first.close).not.toHaveBeenCalled();
+    expect(policerEntry(h, first.id)?.closing).not.toBe(true);
+    await expect(producePoliced(h, transport, 'camera', { id: 'camera-third' })).rejects.toThrow(
+      `Participant camera producer limit reached (max ${MAX_PARTICIPANT_CAMERA_PRODUCERS})`
+    );
+
+    reading.resolve(CAMERA_STATS);
+    await expect(closing).resolves.toBe('camera');
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(second.close).not.toHaveBeenCalled();
+    expect(finalizer).toHaveBeenCalledWith(
+      expect.objectContaining({ producerId: first.id, kind: 'video', source: 'camera' })
+    );
+    const third = await producePoliced(h, transport, 'camera', { id: 'camera-third' });
+    expect(policerEntry(h, third.id)).toBeDefined();
   });
 
   // #2153 F8b: the mirror of F9 — the CLOSE's read is the one outstanding when

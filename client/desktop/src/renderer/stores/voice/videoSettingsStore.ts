@@ -102,7 +102,7 @@ export interface VideoSettings {
 
   // Camera
   cameraPreset: string; // Key into VIDEO_QUALITY_PRESETS
-  cameraBitrate: number; // bps, 0 = auto (codec/preset-dependent). Gated on the camera axis (#1602).
+  cameraBitrate: number; // bps, 0 = preset cap; always bounded by the camera entitlement (#1602).
   preferredVideoCodec: string | null; // codec/app target, e.g. "video/av1:hdr" or "video/h264:640034"
   cameraPriority: VideoPriority; // DSCP priority for camera traffic
 
@@ -112,7 +112,7 @@ export interface VideoSettings {
   screenContentType: ScreenContentType;
   screenStreamAudio: boolean; // persisted default for ScreenShareOptions.streamAudio
   screenSharePriority: VideoPriority; // DSCP priority for screen share traffic
-  screenShareBitrate: number; // bps, 0 = auto (codec-dependent)
+  screenShareBitrate: number; // bps, 0 = resolution/fps/codec estimate; bounded by stream entitlement
 
   // Encoding behavior
   degradationPreference: DegradationPreference; // How to handle congestion: drop fps or resolution

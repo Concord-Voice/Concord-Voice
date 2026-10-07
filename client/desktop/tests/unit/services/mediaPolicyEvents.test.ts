@@ -5,6 +5,7 @@ import {
   formatRejoinTime,
   parseForceDisconnect,
   parseMediaPolicyNotice,
+  parseVideoBandwidthDisabled,
   parseProducerStateChange,
   parseRetryAfterSec,
   rejoinAtFrom,
@@ -34,6 +35,32 @@ describe('parseMediaPolicyNotice (closed enums, spec A2 / R9)', () => {
     ['null', null],
   ])('rejects %s', (_name, payload) => {
     expect(parseMediaPolicyNotice(payload)).toBeNull();
+  });
+});
+
+describe('parseVideoBandwidthDisabled', () => {
+  const valid = {
+    roomId: 'room-1',
+    producerId: 'camera-1',
+    source: 'camera',
+    retryAfterSec: 300,
+  };
+
+  it('accepts a video-only cooldown notice, including a closed producer with no live id', () => {
+    expect(parseVideoBandwidthDisabled(valid)).toEqual(valid);
+    expect(parseVideoBandwidthDisabled({ ...valid, producerId: null })).toEqual({
+      ...valid,
+      producerId: null,
+    });
+  });
+
+  it.each([
+    { ...valid, source: 'mic' },
+    { ...valid, retryAfterSec: 0 },
+    { ...valid, retryAfterSec: '300' },
+    { ...valid, roomId: '' },
+  ])('rejects a malformed video-only notice', (payload) => {
+    expect(parseVideoBandwidthDisabled(payload)).toBeNull();
   });
 });
 
@@ -114,6 +141,12 @@ describe('parseForceDisconnect', () => {
       reason: 'access_revoked',
       retryAfterSec: null,
     });
+  });
+
+  it('accepts stats_unavailable without treating it as a media-policy cooldown', () => {
+    expect(
+      parseForceDisconnect({ channelId: 'ch', reason: 'stats_unavailable', retryAfterSec: 900 })
+    ).toEqual({ channelId: 'ch', reason: 'stats_unavailable', retryAfterSec: null });
   });
 
   it.each([

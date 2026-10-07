@@ -9,6 +9,7 @@ import { MediasoupService } from './lib/mediasoup.js';
 import {
   CryptoVersionMismatchError,
   MediaPolicyCooldownError,
+  VideoPolicyCooldownError,
   parseMediaFrameCryptoVersion,
   RoomManager,
 } from './lib/roomManager.js';
@@ -22,7 +23,15 @@ import { emitCameraLayeringGate } from './lib/layeringGateBroadcast.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import { MediaPolicer, MediaPolicyLedger } from './lib/mediaPolicer.js';
 import { createMediaPolicerTick } from './lib/mediaPolicerTick.js';
-import { MEDIA_POLICY_PAUSED_RESUME_ACK, mediaPolicyCooldownAck } from './lib/mediaPolicyWire.js';
+import {
+  requireCompatibleVideoPublishProfile,
+  VideoClientUpdateRequiredError,
+} from './lib/videoPublishProfile.js';
+import {
+  MEDIA_POLICY_PAUSED_RESUME_ACK,
+  mediaPolicyCooldownAck,
+  videoPolicyCooldownAck,
+} from './lib/mediaPolicyWire.js';
 import {
   createAuthMiddleware,
   parsePermissionBitfield,
@@ -678,6 +687,8 @@ function registerJoinRoomHandler(
                     allowedAudioTiers: access.allowedAudioTiers,
                     minPtimeMs: access.minPtimeMs,
                     maxManualBitrateBps: access.maxManualBitrateBps,
+                    cameraMaxBitrateBps: access.cameraMaxBitrateBps,
+                    screenMaxBitrateBps: access.screenMaxBitrateBps,
                   },
                   mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
                   // Room kind selects the cap strategy; owner tier is absent for DMs.
@@ -734,6 +745,8 @@ function registerJoinRoomHandler(
                     allowedAudioTiers: access.allowedAudioTiers,
                     minPtimeMs: access.minPtimeMs,
                     maxManualBitrateBps: access.maxManualBitrateBps,
+                    cameraMaxBitrateBps: access.cameraMaxBitrateBps,
+                    screenMaxBitrateBps: access.screenMaxBitrateBps,
                   },
                   serverMuted: access.serverMuted,
                   serverDeafened: access.serverDeafened,
@@ -749,6 +762,8 @@ function registerJoinRoomHandler(
                   allowedAudioTiers: access.allowedAudioTiers,
                   minPtimeMs: access.minPtimeMs,
                   maxManualBitrateBps: access.maxManualBitrateBps,
+                  cameraMaxBitrateBps: access.cameraMaxBitrateBps,
+                  screenMaxBitrateBps: access.screenMaxBitrateBps,
                 },
                 ownerTier: access.roomOwnerTier ?? 'free',
                 permissions: access.permissions ?? 0n,
@@ -878,6 +893,14 @@ function registerJoinRoomHandler(
             channelName: access.channelName,
             e2eeEpoch: result.e2eeEpoch,
             cameraSpatialCap: result.cameraSpatialCap,
+            cameraMaxBitrateBps: result.cameraMaxBitrateBps,
+            screenMaxBitrateBps: result.screenMaxBitrateBps,
+            allowedAudioTiers: result.allowedAudioTiers,
+            minPtimeMs: result.minPtimeMs,
+            // This is the A2 channel standard that granted the admitted audio
+            // caps above. Null explicitly clears a standard seen by an earlier
+            // desktop REST join when the channel changed before promotion.
+            channelAudioUpliftTier: access.channelAudioUpliftTier ?? null,
           };
 
           logger.info('Room join response', {
@@ -1539,7 +1562,8 @@ async function main() {
     );
 
     // ── produce ──────────────────────────────────────────────────────
-    // Client sends: { transportId, kind, rtpParameters, appData: { source } }
+    // Client sends: { transportId, kind, rtpParameters,
+    //   appData: { source, videoBitrateProfileVersion? } }
     withRateLimit(
       socket,
       'produce',
@@ -1551,6 +1575,10 @@ async function main() {
           }
 
           const source: MediaSource = appData?.source || 'mic';
+          // Older desktop video simulcast encodings can exceed today's aggregate
+          // cap. Refuse those clients before a producer exists; audio and receiving
+          // remain available. This marker is only a rollout compatibility check.
+          requireCompatibleVideoPublishProfile(kind, appData);
           const producerInfo = await roomManager.produce(
             roomId,
             data.userId,
@@ -1592,9 +1620,14 @@ async function main() {
 
           callback({ id: producerInfo.producerId });
         } catch (error) {
+          if (error instanceof VideoClientUpdateRequiredError) {
+            return callback({ error: error.message, code: error.code });
+          }
           const message = error instanceof Error ? error.message : 'Failed to produce';
           // #2153: a cooldown refusal is already logged (warn) where RoomManager decided it.
-          if (!(error instanceof MediaPolicyCooldownError)) {
+          if (!(
+            error instanceof MediaPolicyCooldownError || error instanceof VideoPolicyCooldownError
+          )) {
             logger.error('Error producing', {
               error: message,
               userId: data.userId,
@@ -1602,11 +1635,10 @@ async function main() {
           }
           // Surface limit errors to client (e.g. "Video participant limit reached (max 25)"),
           // and a media-policy cooldown with its retry-after (#2153).
-          callback(
-            error instanceof MediaPolicyCooldownError
-              ? mediaPolicyCooldownAck(error)
-              : { error: message }
-          );
+          if (error instanceof MediaPolicyCooldownError) callback(mediaPolicyCooldownAck(error));
+          else if (error instanceof VideoPolicyCooldownError)
+            callback(videoPolicyCooldownAck(error));
+          else callback({ error: message });
         }
       }
     );

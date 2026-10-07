@@ -3,7 +3,11 @@
  * only: no IPC contract, OpenAPI or control-plane change. The renderer's zod
  * mirror lives in `client/desktop/src/renderer/services/voice/mediaPolicyEvents.ts`.
  */
-import type { MediaPolicyCooldownError, MediaSource } from './roomManager.js';
+import type {
+  MediaPolicyCooldownError,
+  MediaSource,
+  VideoPolicyCooldownError,
+} from './roomManager.js';
 
 /** `producer-paused` / `producer-resumed`, at every emit site. */
 export interface ProducerStateChangePayload {
@@ -28,6 +32,20 @@ export interface MediaPolicyCooldownAck {
   retryAfterSec: number;
 }
 
+export interface VideoPolicyCooldownAck {
+  error: 'Video publishing is temporarily disabled';
+  code: 'video_policy_cooldown';
+  retryAfterSec: number;
+}
+
+/** Owner-only notice after the exact video producer is disabled. */
+export interface VideoBandwidthDisabledPayload {
+  roomId: string;
+  producerId: string | null;
+  source: 'camera' | 'screen';
+  retryAfterSec: number;
+}
+
 /** The `resume-producer` ack while the producer is latched. */
 export interface MediaPolicyPausedResumeAck {
   error: 'media_policy_paused';
@@ -43,6 +61,14 @@ export function mediaPolicyCooldownAck(error: MediaPolicyCooldownError): MediaPo
   return {
     error: 'Media policy cooldown',
     code: 'media_policy_cooldown',
+    retryAfterSec: error.retryAfterSec,
+  };
+}
+
+export function videoPolicyCooldownAck(error: VideoPolicyCooldownError): VideoPolicyCooldownAck {
+  return {
+    error: 'Video publishing is temporarily disabled',
+    code: 'video_policy_cooldown',
     retryAfterSec: error.retryAfterSec,
   };
 }

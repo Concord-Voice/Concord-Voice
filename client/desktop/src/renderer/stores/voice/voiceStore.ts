@@ -217,7 +217,13 @@ export interface ActiveScreenShare {
 }
 
 /** #2153 eviction/cooldown dialog state. `rejoinAt` is an absolute ms instant, or null when unknown. */
-export type MediaPolicyInterrupt = { reason: 'evicted' | 'cooldown'; rejoinAt: number | null };
+export type MediaPolicyInterrupt =
+  | { reason: 'evicted' | 'cooldown'; rejoinAt: number | null }
+  | {
+      reason: 'video_disabled' | 'video_cooldown';
+      rejoinAt: number | null;
+      source?: 'camera' | 'screen';
+    };
 
 // ---------------------------------------------------------------------------
 // Channel voice members (sidebar display — who's in each voice channel)

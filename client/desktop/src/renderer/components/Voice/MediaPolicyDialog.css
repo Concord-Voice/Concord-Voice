@@ -16,6 +16,23 @@
   margin: 0;
 }
 
+.media-policy-dialog__body p {
+  margin: 0;
+}
+
+.media-policy-dialog__help {
+  margin-top: 10px;
+}
+
+.media-policy-dialog__help summary {
+  cursor: pointer;
+}
+
+.media-policy-dialog__help ol {
+  padding-left: 20px;
+  margin: 8px 0 0;
+}
+
 .media-policy-dialog__actions {
   display: flex;
   justify-content: flex-end;

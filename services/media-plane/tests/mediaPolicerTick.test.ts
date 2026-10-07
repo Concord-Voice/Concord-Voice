@@ -58,24 +58,32 @@ function trip(overrides: Partial<PolicerTrip> = {}): PolicerTrip {
 }
 
 /** A captured ref. The entry is a bare latch flag: the fakes never touch mediasoup. */
-function refFor(producerId: string, userId = USER, roomId = ROOM): PolicedProducerRef {
+function refFor(
+  producerId: string,
+  userId = USER,
+  roomId = ROOM,
+  kind: 'audio' | 'video' = 'audio',
+  source: 'mic' | 'camera' | 'screen' = 'mic'
+): PolicedProducerRef {
   return {
     roomId,
     userId,
     producerId,
     participant: { socketId: userId === USER ? SOCKET : SOCKET_2 },
-    entry: { policed: false },
+    entry: { policed: false, kind, source },
   } as unknown as PolicedProducerRef;
 }
 
 interface HarnessOptions {
   trips?: readonly PolicerTrip[];
   refs?: readonly PolicedProducerRef[];
+  currentVideoRefs?: readonly PolicedProducerRef[];
   observe?: (observation: PolicerObservation) => ObserveResult;
   policer?: MediaPolicer;
   observation?: PolicerObservation;
   pauseOutcome?: PolicedPauseOutcome;
   fenceMisses?: boolean;
+  sendTransportId?: string;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -94,12 +102,28 @@ function makeHarness(options: HarnessOptions = {}) {
     // The real fence refuses an already-latched entry; the fake keeps that rule.
     if (options.fenceMisses || ref.entry.policed) return null;
     ref.entry.policed = true;
-    return { kind: 'audio', source: 'mic', socketId: ref.userId === USER ? SOCKET : SOCKET_2 };
+    return {
+      kind: ref.entry.kind,
+      source: ref.entry.source,
+      socketId: ref.userId === USER ? SOCKET : SOCKET_2,
+    };
   });
+  const latchUserVideoProducers = vi.fn((userId: string) =>
+    (options.currentVideoRefs ?? options.refs ?? [])
+      .filter((ref) => ref.userId === userId && ref.entry.kind === 'video')
+      .flatMap((ref) => {
+        const producer = latchPolicedProducer(ref);
+        return producer ? [{ ref, producer }] : [];
+      })
+  );
   const pausePolicedProducer = vi.fn(async (ref: PolicedProducerRef) => {
     order.push(`pause:${ref.producerId}`);
     policedAtPause.push(ref.entry.policed);
     return options.pauseOutcome ?? 'paused';
+  });
+  const closePolicedVideoProducer = vi.fn(async (ref: PolicedProducerRef) => {
+    order.push(`close-video:${ref.producerId}`);
+    return 'closed' as const;
   });
   const sockets: Record<string, Record<string, string>> = {
     [ROOM]: { [USER]: SOCKET, [USER_2]: SOCKET_2 },
@@ -107,14 +131,22 @@ function makeHarness(options: HarnessOptions = {}) {
   };
   const getParticipant = vi.fn((roomId: string, userId: string) => {
     const socketId = sockets[roomId]?.[userId];
-    return socketId ? { socketId } : undefined;
+    return socketId
+      ? {
+          socketId,
+          sendTransport: { id: options.sendTransportId ?? 'send-current' },
+          producers: new Map([['mic', { producer: { closed: false } }]]),
+        }
+      : undefined;
   });
   const leaveRoomIfSocketOwned = vi.fn(async () => true);
   const roomManager = {
     collectProducerIngressSample,
     settleIngressSample,
     latchPolicedProducer,
+    latchUserVideoProducers,
     pausePolicedProducer,
+    closePolicedVideoProducer,
     getParticipant,
     getProvisionalParticipant: vi.fn(() => undefined),
     leaveRoomIfSocketOwned,
@@ -163,7 +195,9 @@ function makeHarness(options: HarnessOptions = {}) {
     collectProducerIngressSample,
     settleIngressSample,
     latchPolicedProducer,
+    latchUserVideoProducers,
     pausePolicedProducer,
+    closePolicedVideoProducer,
     getParticipant,
     leaveRoomIfSocketOwned,
     to,
@@ -255,6 +289,90 @@ describe('media policer tick lifecycle', () => {
 });
 
 describe('media policer tick ordering (#2153 latch-before-await)', () => {
+  it('arms video cooldown before close, closes video only, and tells its owner', async () => {
+    const camera = refFor('camera-1', USER, ROOM, 'video', 'camera');
+    const h = makeHarness({
+      trips: [trip({ check: 'camera_bytes', producerId: camera.producerId })],
+      refs: [camera],
+    });
+    h.closePolicedVideoProducer.mockImplementationOnce(async (ref: PolicedProducerRef) => {
+      expect(ref.entry.policed).toBe(true);
+      expect(h.ledger.videoRetryAfterSec(USER, NOW)).toBe(300);
+      expect(h.ledger.retryAfterSec(USER, NOW)).toBe(0);
+      return 'closed';
+    });
+
+    await h.tick.runOnce();
+
+    expect(h.leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(h.pausePolicedProducer).not.toHaveBeenCalled();
+    expect(h.ownerEmit.mock.calls).toStrictEqual([
+      [
+        'video-bandwidth-disabled',
+        { roomId: ROOM, producerId: camera.producerId, source: 'camera', retryAfterSec: 300 },
+      ],
+    ]);
+  });
+
+  it('closes a second video source on the same user-wide cooldown', async () => {
+    const camera = refFor('camera-1', USER, ROOM, 'video', 'camera');
+    const screen = refFor('screen-1', USER, ROOM, 'video', 'screen');
+    const h = makeHarness({
+      trips: [trip({ check: 'camera_bytes', producerId: camera.producerId })],
+      refs: [camera, screen],
+    });
+
+    await h.tick.runOnce();
+
+    expect(h.closePolicedVideoProducer.mock.calls.map(([ref]) => ref.producerId)).toEqual([
+      camera.producerId,
+      screen.producerId,
+    ]);
+    expect(h.ledger.videoRetryAfterSec(USER, NOW)).toBe(300);
+  });
+
+  it('latches video created during the stats read and notifies every affected room', async () => {
+    const camera = refFor('camera-1', USER, ROOM, 'video', 'camera');
+    const lateScreen = refFor('screen-late', USER, ROOM_2, 'video', 'screen');
+    const h = makeHarness({
+      trips: [trip({ check: 'camera_bytes', producerId: camera.producerId })],
+      refs: [camera],
+      currentVideoRefs: [camera, lateScreen],
+    });
+
+    await h.tick.runOnce();
+
+    expect(h.closePolicedVideoProducer.mock.calls.map(([ref]) => ref.producerId)).toEqual([
+      camera.producerId,
+      lateScreen.producerId,
+    ]);
+    expect(h.ownerEmit2).toHaveBeenCalledWith('video-bandwidth-disabled', {
+      roomId: ROOM_2,
+      producerId: lateScreen.producerId,
+      source: 'screen',
+      retryAfterSec: 300,
+    });
+  });
+
+  it('routes a video-attributed aggregate trip to video policy, leaving voice joined', async () => {
+    const screen = refFor('screen-1', USER, ROOM, 'video', 'screen');
+    const h = makeHarness({
+      trips: [trip({ check: 'aggregate', producerId: screen.producerId })],
+      refs: [screen],
+    });
+
+    await h.tick.runOnce();
+
+    expect(h.closePolicedVideoProducer).toHaveBeenCalledTimes(1);
+    expect(h.leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(h.ownerEmit.mock.calls).toStrictEqual([
+      [
+        'video-bandwidth-disabled',
+        { roomId: ROOM, producerId: screen.producerId, source: 'screen', retryAfterSec: 300 },
+      ],
+    ]);
+  });
+
   it('sets the cooldown and every latch before the first await', async () => {
     const h = makeHarness({
       trips: [trip(), trip({ userId: USER_2, producerId: MIC_2 })],
@@ -732,9 +850,104 @@ describe('media policer tick outcomes', () => {
       ],
     ]);
     expect(vi.mocked(logger.warn).mock.calls).toStrictEqual([
-      ['Media policer stats degraded', { stalled }],
+      ['Media policer stats degraded', { stalledSessions: 1 }],
     ]);
     expect(vi.mocked(logger.info).mock.calls).toStrictEqual([['Media policer stats restored']]);
+  });
+
+  it('closes only the failed session after three consecutive unmeterable ticks', async () => {
+    const observation: PolicerObservation = {
+      nowMs: NOW,
+      readings: [],
+      failed: [
+        {
+          roomId: ROOM,
+          userId: USER,
+          sendTransportId: 'send-current',
+          producerIds: [MIC],
+        },
+      ],
+    };
+    const h = makeHarness({ policer: new MediaPolicer(), observation });
+
+    await h.tick.runOnce();
+    await h.tick.runOnce();
+    expect(h.leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(h.ownerEmit).not.toHaveBeenCalledWith('force-disconnect', expect.anything());
+
+    await h.tick.runOnce();
+    expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledTimes(1);
+    expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledWith(ROOM, USER, SOCKET);
+    expect(h.ownerEmit).toHaveBeenCalledWith('force-disconnect', {
+      channelId: ROOM,
+      reason: 'stats_unavailable',
+    });
+    expect(h.securityEmit).toHaveBeenCalledWith({
+      eventType: 'security_control',
+      outcome: 'degraded',
+      severity: 'high',
+      reasonCode: 'dependency_unavailable',
+      routeTemplate: 'socket.force_disconnect',
+    });
+  });
+
+  it('never evicts a successor transport for an old failed stats sample', async () => {
+    const observation: PolicerObservation = {
+      nowMs: NOW,
+      readings: [],
+      failed: [
+        {
+          roomId: ROOM,
+          userId: USER,
+          sendTransportId: 'send-old',
+          producerIds: [MIC],
+        },
+      ],
+    };
+    const h = makeHarness({
+      policer: new MediaPolicer(),
+      observation,
+      sendTransportId: 'send-new',
+    });
+    await h.tick.runOnce();
+    await h.tick.runOnce();
+    await h.tick.runOnce();
+
+    expect(h.leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(h.ownerEmit).not.toHaveBeenCalledWith('force-disconnect', expect.anything());
+  });
+
+  it('retries exact-session teardown on the next failed tick when the first close fails', async () => {
+    const observation: PolicerObservation = {
+      nowMs: NOW,
+      readings: [],
+      failed: [
+        {
+          roomId: ROOM,
+          userId: USER,
+          sendTransportId: 'send-current',
+          producerIds: [MIC],
+        },
+      ],
+    };
+    const h = makeHarness({ policer: new MediaPolicer(), observation });
+    h.leaveRoomIfSocketOwned.mockRejectedValueOnce(new Error('teardown failed'));
+
+    await h.tick.runOnce();
+    await h.tick.runOnce();
+    await h.tick.runOnce();
+    expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+      'Media policer stats-fail-closed failed',
+      expect.objectContaining({ error: 'teardown failed' })
+    );
+
+    await h.tick.runOnce();
+    expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledTimes(2);
+    expect(h.ownerEmit).toHaveBeenCalledWith('force-disconnect', {
+      channelId: ROOM,
+      reason: 'stats_unavailable',
+    });
   });
 
   it('logs again when the stalled set changes while already degraded (F11)', async () => {
@@ -755,8 +968,8 @@ describe('media policer tick outcomes', () => {
     await h.tick.runOnce();
 
     expect(vi.mocked(logger.warn).mock.calls).toStrictEqual([
-      ['Media policer stats degraded', { stalled: stalledA }],
-      ['Media policer stats degraded', { stalled: stalledB }],
+      ['Media policer stats degraded', { stalledSessions: 1 }],
+      ['Media policer stats degraded', { stalledSessions: 2 }],
     ]);
   });
 });
@@ -771,6 +984,8 @@ describe('media policer tick logs (C8)', () => {
       audioCeilingBps: 96_000,
       minPtimeMs: 20,
       maxManualBitrateBps: 5_000_000,
+      cameraMaxBitrateBps: 2_500_000,
+      screenMaxBitrateBps: 5_000_000,
     };
     const BYTES = 1_000_003; // ~1.6 Mbps over 5 s against a 216 kbps free limit
     const observation: PolicerObservation = {

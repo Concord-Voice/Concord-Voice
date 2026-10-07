@@ -18,6 +18,20 @@ export const MediaPolicyNoticeSchema = z.object({
 });
 export type MediaPolicyNotice = z.infer<typeof MediaPolicyNoticeSchema>;
 
+const VideoBandwidthDisabledSchema = z.object({
+  roomId: z.string().min(1),
+  producerId: z.string().min(1).nullable(),
+  source: z.enum(['camera', 'screen']),
+  retryAfterSec: z.unknown(),
+});
+
+export interface VideoBandwidthDisabledEvent {
+  roomId: string;
+  producerId: string | null;
+  source: 'camera' | 'screen';
+  retryAfterSec: number;
+}
+
 /** Unknown kind/source degrade to absent (verified on zod 4.6.5), so the legacy-mute fallback still runs. */
 export const ProducerStateChangeSchema = z.object({
   producerId: z.string().min(1),
@@ -38,19 +52,26 @@ export function parseRetryAfterSec(value: unknown): number | null {
 
 export const ForceDisconnectSchema = z.object({
   channelId: z.string().min(1),
-  reason: z.enum(['access_revoked', 'media_policy']),
+  reason: z.enum(['access_revoked', 'media_policy', 'stats_unavailable']),
   retryAfterSec: z.unknown().optional(),
 });
 
 export interface ForceDisconnectEvent {
   channelId: string;
-  reason: 'access_revoked' | 'media_policy';
+  reason: 'access_revoked' | 'media_policy' | 'stats_unavailable';
   retryAfterSec: number | null;
 }
 
 export function parseMediaPolicyNotice(payload: unknown): MediaPolicyNotice | null {
   const result = MediaPolicyNoticeSchema.safeParse(payload);
   return result.success ? result.data : null;
+}
+
+export function parseVideoBandwidthDisabled(payload: unknown): VideoBandwidthDisabledEvent | null {
+  const parsed = VideoBandwidthDisabledSchema.safeParse(payload);
+  if (!parsed.success) return null;
+  const retryAfterSec = parseRetryAfterSec(parsed.data.retryAfterSec);
+  return retryAfterSec === null ? null : { ...parsed.data, retryAfterSec };
 }
 
 export function parseProducerStateChange(payload: unknown): ProducerStateChange | null {

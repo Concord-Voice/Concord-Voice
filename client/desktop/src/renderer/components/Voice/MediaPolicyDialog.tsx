@@ -27,25 +27,63 @@ const MediaPolicyDialog: React.FC = () => {
   if (!interrupt) return null;
 
   const evicted = interrupt.reason === 'evicted';
+  const videoDisabled = interrupt.reason === 'video_disabled';
+  const videoCooldown = interrupt.reason === 'video_cooldown';
+  const video = videoDisabled || videoCooldown;
   const when = interrupt.rejoinAt === null ? null : <RejoinTime rejoinAt={interrupt.rejoinAt} />;
 
   let body: React.ReactNode;
-  if (evicted) {
+  if (video) {
     body = (
-      <>
+      <div className="media-policy-dialog__body">
+        <p>
+          {videoDisabled
+            ? 'We turned off your video because its stream exceeded the bandwidth limit for your plan. This helps keep video fair for everyone.'
+            : 'Video is temporarily disabled after a stream exceeded your plan’s bandwidth limit.'}{' '}
+          {when ? <>You can try video again after {when}.</> : 'You can try video again later.'} You
+          can still use voice.
+        </p>
+        <details className="media-policy-dialog__help">
+          <summary>If this keeps happening</summary>
+          <ol>
+            <li>Check for a Concord Voice update.</li>
+            <li>Restart the app.</li>
+            <li>
+              If you use a camera, check its driver. For hardware encoding, check graphics and
+              chipset drivers. For software encoding, check operating system updates.
+            </li>
+            <li>Reboot your device.</li>
+          </ol>
+        </details>
+      </div>
+    );
+  } else if (evicted) {
+    body = (
+      <p className="media-policy-dialog__body">
         Your connection kept sending more data than this call allows, so you were removed.{' '}
         {when ? <>You can join voice again after {when}.</> : 'You can join voice again later.'}
-      </>
+      </p>
     );
   } else {
-    body = when ? <>Try again after {when}.</> : 'Try again later.';
+    body = (
+      <p className="media-policy-dialog__body">
+        {when ? <>Try again after {when}.</> : 'Try again later.'}
+      </p>
+    );
+  }
+
+  let title = 'You can’t join voice yet';
+  if (video) {
+    title = 'Video turned off for now';
+  } else if (evicted) {
+    title = 'Removed from voice';
   }
 
   return (
     <Modal
       isOpen
       onClose={dismiss}
-      title={evicted ? 'Removed from voice' : 'You can’t join voice yet'}
+      title={title}
       width="small"
       initialFocusRef={closeRef}
       describedById={bodyId}
@@ -53,9 +91,9 @@ const MediaPolicyDialog: React.FC = () => {
       <div className="media-policy-dialog">
         {/* --danger on the glyph ONLY, never label text (fails as text in 9/30 combos). */}
         <AlertOctagon size={20} aria-hidden="true" className="media-policy-dialog__glyph" />
-        <p id={bodyId} className="media-policy-dialog__body">
+        <div id={bodyId} className="media-policy-dialog__content">
           {body}
-        </p>
+        </div>
       </div>
       <div className="media-policy-dialog__actions">
         <button

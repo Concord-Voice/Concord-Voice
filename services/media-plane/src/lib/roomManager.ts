@@ -27,6 +27,7 @@ import {
 import { computeScreenLayeringGate, type StoredScreenLayerDemand } from './screenLayerGovernor.js';
 import type { EmitSecurityEvent, SecurityReasonCode } from './securityEvent.js';
 import {
+  deriveLimits,
   POLICER_READ_TIMEOUT_MS,
   type FailedParticipant,
   type FinalProducerSample,
@@ -57,6 +58,8 @@ export interface MediaEntitlement {
   allowedAudioTiers: string[];
   minPtimeMs: number;
   maxManualBitrateBps: number;
+  cameraMaxBitrateBps: number;
+  screenMaxBitrateBps: number;
 }
 
 // Voice publish-permission bits (CV-CAN-007), mirroring the control-plane
@@ -207,13 +210,12 @@ export interface ProducerEntry {
   /** Shared monotonic clock at `participant.producers.set`: the policer's zero baseline. */
   createdAtMs: number;
   /**
-   * #2153 F8. Set synchronously, before `closeProducerFromClient`'s bounded
-   * (~1s) final-stats await, on an unlatched audio producer taking a final
-   * sample. `reserveParticipantProducerSlot` skips a closing entry when
-   * counting live producers for the same source, so an immediate re-produce
-   * (e.g. a screen-audio swap) is not refused by a slot this entry is about
-   * to vacate. Never cleared — the entry is deleted with its producer at the
-   * end of the same close.
+   * #2153 F8. Set synchronously for a client-closed AUDIO producer, before the
+   * bounded (~1s) final-stats await. `reserveParticipantProducerSlot` skips it
+   * so an immediate mic or screen-audio re-produce can use the departing slot.
+   * Video stays counted until actual close: freeing a still-live camera or
+   * screen slot would admit another video producer during the stats read.
+   * Never cleared — the entry is deleted with its producer at close.
    */
   closing?: boolean;
 }
@@ -307,6 +309,9 @@ export interface Participant {
   tier: string;
   /** Aggregate send-bitrate ceiling (bps) applied to this peer's PRODUCING transport. */
   maxManualBitrateBps: number;
+  /** Per-camera and per-screen observed RTP ceilings, from the join authority. */
+  cameraMaxBitrateBps: number;
+  screenMaxBitrateBps: number;
   /** Audio quality tiers this user may produce at (highest entry sets the opus bitrate ceiling). */
   allowedAudioTiers: string[];
   /** Minimum opus ptime (ms) this user may produce at (free 20, premium 10). */
@@ -400,6 +405,8 @@ export const FREE_MEDIA_ENTITLEMENT: Readonly<MediaEntitlement> = {
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
   minPtimeMs: 20,
   maxManualBitrateBps: 5_000_000,
+  cameraMaxBitrateBps: 2_500_000,
+  screenMaxBitrateBps: 5_000_000,
 };
 
 export interface Room {
@@ -511,6 +518,12 @@ export interface JoinRoomResult {
    * client keeps its own fallback chain rather than being handed a guess.
    */
   cameraSpatialCap?: LayerValue;
+  /** Bitrate ceilings actually admitted after the final join authorization. */
+  cameraMaxBitrateBps?: number;
+  screenMaxBitrateBps?: number;
+  /** Audio tier and packetization floor actually admitted for this media session. */
+  allowedAudioTiers?: string[];
+  minPtimeMs?: number;
 }
 
 /** Absolute per-room camera-producer ceiling — hard upper bound, not tier-tunable. */
@@ -739,6 +752,15 @@ export class MediaPolicyCooldownError extends Error {
   constructor(public readonly retryAfterSec: number) {
     super('Media policy cooldown');
     this.name = 'MediaPolicyCooldownError';
+  }
+}
+
+/** A video publication was refused while the user's video-only cooldown is active. */
+export class VideoPolicyCooldownError extends Error {
+  readonly code = 'video_policy_cooldown' as const;
+  constructor(public readonly retryAfterSec: number) {
+    super('Video publishing is temporarily disabled');
+    this.name = 'VideoPolicyCooldownError';
   }
 }
 
@@ -1247,6 +1269,8 @@ function applyDMParticipantPromotion(
   participant.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
   participant.minPtimeMs = promotion.entitlement.minPtimeMs;
   participant.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
+  participant.cameraMaxBitrateBps = promotion.entitlement.cameraMaxBitrateBps;
+  participant.screenMaxBitrateBps = promotion.entitlement.screenMaxBitrateBps;
   const promotionRevision = promotion.authorizationRevision ?? participant.authorizationRevision;
   const promotionRevisionForComparison = promotionRevision ?? 0n;
   // A moderation snapshot received while this candidate was staged is newer
@@ -1277,6 +1301,8 @@ function applyChannelParticipantPromotion(
   participant.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
   participant.minPtimeMs = promotion.entitlement.minPtimeMs;
   participant.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
+  participant.cameraMaxBitrateBps = promotion.entitlement.cameraMaxBitrateBps;
+  participant.screenMaxBitrateBps = promotion.entitlement.screenMaxBitrateBps;
 
   const promotionRevision = promotion.authorizationRevision ?? participant.authorizationRevision;
   const promotionRevisionForComparison = promotionRevision ?? 0n;
@@ -1350,17 +1376,39 @@ function joinRoomResult(
     existingProducers: existingProducerInfo(room, joiningUserId),
     participants: participantInfo(room),
     e2eeEpoch: room.e2eeEpoch,
-    ...cameraSpatialCapField(room, joiningUserId),
+    ...admittedMediaCapsField(room, joiningUserId),
   };
 }
 
-/** The admitted cap for the joining participant, or nothing when unresolvable. */
-function cameraSpatialCapField(
+/** The admitted caps for the joining participant, or nothing when unresolvable. */
+function admittedMediaCapsField(
   room: Room,
   joiningUserId: string
-): { cameraSpatialCap?: LayerValue } {
+): Pick<
+  JoinRoomResult,
+  | 'cameraSpatialCap'
+  | 'cameraMaxBitrateBps'
+  | 'screenMaxBitrateBps'
+  | 'allowedAudioTiers'
+  | 'minPtimeMs'
+> {
   const participant = room.participants.get(joiningUserId);
-  return participant ? { cameraSpatialCap: cameraSpatialCapForParticipant(participant) } : {};
+  if (!participant) return {};
+  const validCap = (cap: number): boolean => Number.isSafeInteger(cap) && cap > 0;
+  return {
+    cameraSpatialCap: cameraSpatialCapForParticipant(participant),
+    ...(validCap(participant.cameraMaxBitrateBps)
+      ? { cameraMaxBitrateBps: participant.cameraMaxBitrateBps }
+      : {}),
+    ...(validCap(participant.screenMaxBitrateBps)
+      ? { screenMaxBitrateBps: participant.screenMaxBitrateBps }
+      : {}),
+    ...(participant.allowedAudioTiers.length > 0 &&
+    participant.allowedAudioTiers.every((tier) => typeof tier === 'string' && tier.length > 0)
+      ? { allowedAudioTiers: [...participant.allowedAudioTiers] }
+      : {}),
+    ...(validCap(participant.minPtimeMs) ? { minPtimeMs: participant.minPtimeMs } : {}),
+  };
 }
 
 /** Keep an A1-authorized DM socket local until exact A2 promotion. */
@@ -1418,11 +1466,11 @@ export class RoomManager {
   private emitSecurityEvent: EmitSecurityEvent | undefined;
   /** #2153: one monotonic clock shared by the stamps, the cooldown gate and the policer tick. */
   private monotonicNow: () => number = () => performance.now();
-  /** #2153: objects with a policer `getStats()` still pending; a wedged worker is read once, not per tick. */
-  private readonly ingressReadsOutstanding = new WeakSet<object>();
+  /** #2153: one bounded result per outstanding worker read; a close can reuse its tick sample. */
+  private readonly ingressReadsOutstanding = new WeakMap<object, Promise<BoundedRead<unknown>>>();
   /** #2153: the policer's strike/cooldown ledger; `undefined` refuses nothing. */
   private mediaPolicyGate: MediaPolicyLedger | undefined;
-  /** #2153: receives the final sample of a client-closed audio producer. */
+  /** #2153: receives the final sample of a closed unlatched producer. */
   private ingressFinalizer: IngressFinalizer | undefined;
 
   constructor(
@@ -1456,7 +1504,7 @@ export class RoomManager {
     this.mediaPolicyGate = ledger;
   }
 
-  /** Inject the policer's final-sample sink (#2153); unset, a client close takes no final sample. */
+  /** Inject the policer's final-sample sink (#2153); unset, closes take no final sample. */
   setIngressFinalizer(finalizer: IngressFinalizer | undefined): void {
     this.ingressFinalizer = finalizer;
   }
@@ -1480,6 +1528,22 @@ export class RoomManager {
       return 0;
     }
     return this.mediaPolicyGate.retryAfterSec(userId, this.monotonicNow());
+  }
+
+  private videoCooldownRetryAfterSec(userId: string): number {
+    return this.mediaPolicyGate?.videoRetryAfterSec(userId, this.monotonicNow()) ?? 0;
+  }
+
+  private refuseDuringVideoCooldown(roomId: string, userId: string): void {
+    const retryAfterSec = this.videoCooldownRetryAfterSec(userId);
+    if (retryAfterSec <= 0) return;
+    this.securityDeny('structural_limit_exceeded', 'socket.produce');
+    logger.warn('Media policer refused video produce during cooldown', {
+      roomId,
+      userId,
+      retryAfterSec,
+    });
+    throw new VideoPolicyCooldownError(retryAfterSec);
   }
 
   /**
@@ -1883,6 +1947,8 @@ export class RoomManager {
       pendingProducerSources: new Map(),
       tier: ent.tier,
       maxManualBitrateBps: ent.maxManualBitrateBps,
+      cameraMaxBitrateBps: ent.cameraMaxBitrateBps,
+      screenMaxBitrateBps: ent.screenMaxBitrateBps,
       allowedAudioTiers: [...ent.allowedAudioTiers],
       minPtimeMs: ent.minPtimeMs,
       permissions,
@@ -2514,56 +2580,88 @@ export class RoomManager {
       throw err;
     }
 
-    // Per-user tier gating (#1300): `setMaxIncomingBitrate` caps the aggregate
-    // bitrate the SFU will ACCEPT from this transport — i.e. it caps what the
-    // peer can SEND. The producing direction is the `send` transport (the peer
-    // calls produce() on it — see produce() below), so for `send` we apply the
-    // joining user's tier ceiling `participant.maxManualBitrateBps` (free
-    // 5_000_000, premium 10_000_000), replacing the global ~50 Mbps default.
-    // The `recv` transport carries media TO the peer (the SFU never produces on
-    // it), so its incoming cap is irrelevant to send-side abuse — it keeps the
-    // existing global default. This is the workhorse server-authoritative lever
-    // (spec §1): it bounds aggregate cost/abuse. It is NOT a pixel/fps limit —
-    // a patched client can still encode low-quality 4K inside the envelope.
+    // The send transport may carry camera, screen, mic, and screen audio at
+    // once. `maxManualBitrateBps` is a single-source ceiling, so using it as a
+    // transport-wide REMB advisory would throttle a legitimate Free user's
+    // concurrent sources. Reuse the policer's simultaneous-source envelope:
+    // it includes bounded RTP/E2EE overhead, audio FEC headroom, and the T0
+    // aggregate tolerance. Individual producer limits remain the entitlement
+    // boundary. The recv transport keeps the global incoming advisory because
+    // it carries no client uploads.
     //
-    // Honest scope: this is a BWE/congestion-control ADVISORY, not a hard RTP
-    // policer. The SFU advertises the cap via REMB / transport-cc and a
-    // COOPERATIVE client (stock browser / Electron WebRTC) honours it and
-    // throttles its encoder. A patched client that ignores congestion-control
-    // feedback can still send above the cap and the SFU will forward what
-    // arrives — so this bounds real-world / cooperative cost, it does not
-    // hard-stop a deliberately misbehaving peer. The hard policer is #2153
-    // (`lib/mediaPolicer.ts` + `collectProducerIngressSample`): it meters the
-    // bytes that actually arrive and PAUSES a producer over its limit, so it
-    // stops forwarding, not ingress — closing this transport only stops the
-    // mediasoup worker from ACCEPTING the packets, not the packets arriving
-    // over the network; a still-connected client keeps sending until it
-    // itself stops. It reads `participant.maxManualBitrateBps` directly, so this
-    // advisory's fail-open on a `setMaxIncomingBitrate` worker error
-    // (CV-CAN-018) stays fail-open here and the policer does not inherit it.
-    const incomingBitrateCap =
-      direction === 'send'
-        ? participant.maxManualBitrateBps
-        : config.mediasoup.webRtcTransport.maxIncomingBitrate;
-    await this.applyIncomingBitrateCap(transport, incomingBitrateCap, {
-      roomId,
-      userId,
-      direction,
-    });
+    // This is a BWE/congestion-control advisory, not a hard RTP policer. A
+    // patched client can ignore REMB; the observed-ingress policer (#2153)
+    // enforces the producer limits separately. If the advisory cannot be
+    // installed, refuse the send transport before admission.
+    const incomingBitrateCap = this.incomingBitrateCapForParticipant(participant, direction);
+    try {
+      await this.applyIncomingBitrateCap(transport, incomingBitrateCap, {
+        roomId,
+        userId,
+        direction,
+      });
+    } catch (error) {
+      transport.close();
+      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+      throw error;
+    }
 
     // The participant may have left — or reconnected onto a FRESH Participant
     // object — while the router call was in flight. Storing here would attach
     // the transport to a detached object that nothing ever closes and that the
     // recv cap cannot see. Close the orphan and fail closed (#2032).
-    if (room.participants.get(userId) !== participant) {
-      this.counterHooks.onIceTerminalWithoutConnect?.();
-      if (!transport.closed) transport.close();
-      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
-      throw new Error('Participant left during transport creation');
-    }
+    this.assertTransportParticipantCurrent(room, participant, userId, transport, direction);
 
     this.commitTransportToParticipant(participant, transport, direction);
 
+    this.attachTransportDiagnostics(transport, roomId, userId, direction);
+
+    logger.debug('Transport created', {
+      transportId: transport.id,
+      roomId,
+      userId,
+      direction,
+    });
+
+    return {
+      id: transport.id,
+      iceParameters: transport.iceParameters,
+      iceCandidates: transport.iceCandidates,
+      dtlsParameters: transport.dtlsParameters,
+    };
+  }
+
+  private incomingBitrateCapForParticipant(
+    participant: Participant,
+    direction: 'send' | 'recv'
+  ): number {
+    if (direction === 'recv') return config.mediasoup.webRtcTransport.maxIncomingBitrate;
+    if (!Number.isFinite(participant.maxManualBitrateBps) || participant.maxManualBitrateBps <= 0) {
+      return 0;
+    }
+    return Math.ceil(deriveLimits(RoomManager.participantCaps(participant)).aggregateBps);
+  }
+
+  private assertTransportParticipantCurrent(
+    room: Room,
+    participant: Participant,
+    userId: string,
+    transport: WebRtcTransport,
+    direction: 'send' | 'recv'
+  ): void {
+    if (room.participants.get(userId) === participant) return;
+    this.counterHooks.onIceTerminalWithoutConnect?.();
+    if (!transport.closed) transport.close();
+    if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+    throw new Error('Participant left during transport creation');
+  }
+
+  private attachTransportDiagnostics(
+    transport: WebRtcTransport,
+    roomId: string,
+    userId: string,
+    direction: 'send' | 'recv'
+  ): void {
     // Log ICE/DTLS state transitions for diagnostics
     const iceLogLevel: Record<string, string> = {
       completed: 'info',
@@ -2630,20 +2728,6 @@ export class RoomManager {
         userId,
       });
     });
-
-    logger.debug('Transport created', {
-      transportId: transport.id,
-      roomId,
-      userId,
-      direction,
-    });
-
-    return {
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-    };
   }
 
   /** Connect a transport's DTLS */
@@ -2791,6 +2875,9 @@ export class RoomManager {
       throw new Error('Participant not found');
     }
     this.refuseDuringMediaPolicyCooldown(roomId, userId, 'socket.produce');
+    if (kind === 'video' || source === 'screen-audio') {
+      this.refuseDuringVideoCooldown(roomId, userId);
+    }
 
     if (participant.sendTransport?.id !== transportId) {
       throw new Error('Send transport not found or mismatch');
@@ -2871,8 +2958,8 @@ export class RoomManager {
       'socket.produce'
     );
 
-    // Enforce per-room concurrent-producer caps (#1542 tier-resolved: camera
-    // free 8 / premium 25; screen free 1 / premium 3). TOCTOU-safe (#1539): the
+    // Enforce per-room concurrent-producer caps (#1542 tier-resolved; separate
+    // camera/screen limits, with room-kind-specific ownership). TOCTOU-safe (#1539): the
     // check + slot reservation run synchronously with no intervening await, so
     // concurrent invocations observe each other's reservations. The reservation
     // is released once the producer is recorded or if produce() fails.
@@ -2932,24 +3019,17 @@ export class RoomManager {
     // re-check below: a client that keeps produces perpetually in flight must
     // not ride one out through its own cooldown. Unwind the fresh producer
     // rather than publishing it.
-    const cooldownRetryAfterSec = this.cooldownRetryAfterSec(userId);
-    if (cooldownRetryAfterSec > 0) {
-      this.discardUnpublishedProducer(
-        producer,
-        room,
-        participant,
-        source,
-        producerCap,
-        participantSlotReserved
-      );
-      this.securityDeny('structural_limit_exceeded', 'socket.produce');
-      logger.warn('Media policer refused produce during cooldown', {
-        roomId,
-        userId,
-        retryAfterSec: cooldownRetryAfterSec,
-      });
-      throw new MediaPolicyCooldownError(cooldownRetryAfterSec);
-    }
+    this.refuseUnpublishedProducerDuringCooldown({
+      roomId,
+      userId,
+      room,
+      participant,
+      producer,
+      kind,
+      source,
+      producerCap,
+      participantSlotReserved,
+    });
 
     participant.producers.set(producer.id, {
       producer,
@@ -3010,6 +3090,76 @@ export class RoomManager {
     return info;
   }
 
+  private refuseUnpublishedProducerDuringCooldown({
+    roomId,
+    userId,
+    room,
+    participant,
+    producer,
+    kind,
+    source,
+    producerCap,
+    participantSlotReserved,
+  }: {
+    roomId: string;
+    userId: string;
+    room: Room;
+    participant: Participant;
+    producer: Producer;
+    kind: MediaKind;
+    source: MediaSource;
+    producerCap: number | null;
+    participantSlotReserved: boolean;
+  }): void {
+    const cooldownRetryAfterSec = this.cooldownRetryAfterSec(userId);
+    if (cooldownRetryAfterSec > 0) {
+      this.discardUnpublishedProducer(
+        producer,
+        room,
+        participant,
+        source,
+        producerCap,
+        participantSlotReserved
+      );
+      this.securityDeny('structural_limit_exceeded', 'socket.produce');
+      logger.warn('Media policer refused produce during cooldown', {
+        roomId,
+        userId,
+        retryAfterSec: cooldownRetryAfterSec,
+      });
+      throw new MediaPolicyCooldownError(cooldownRetryAfterSec);
+    }
+    if (kind === 'video' || source === 'screen-audio') {
+      const videoRetryAfterSec = this.videoCooldownRetryAfterSec(userId);
+      if (videoRetryAfterSec > 0) {
+        this.discardUnpublishedProducer(
+          producer,
+          room,
+          participant,
+          source,
+          producerCap,
+          participantSlotReserved
+        );
+        this.securityDeny('structural_limit_exceeded', 'socket.produce');
+        throw new VideoPolicyCooldownError(videoRetryAfterSec);
+      }
+    }
+  }
+
+  private static olderCameraProducersBefore(
+    participant: Participant,
+    keepProducerId: string
+  ): { older: string[]; keepEntry: ProducerEntry } | null {
+    // The map is insertion-ordered. If the replacement is absent, do not
+    // close any camera; a concurrent close may already have removed it.
+    const older: string[] = [];
+    for (const [producerId, entry] of participant.producers) {
+      if (producerId === keepProducerId) return { older, keepEntry: entry };
+      if (entry.source === 'camera') older.push(producerId);
+    }
+    return null;
+  }
+
   /**
    * Camera replace-in-place: close the participant's cameras older than
    * `keepProducerId`, so the steady state is ONE camera per participant.
@@ -3035,11 +3185,10 @@ export class RoomManager {
    * server-muted user. So the eviction moves later rather than the announcement
    * moving earlier.
    *
-   * Routed through `closeProducer` rather than a bare `producer.close()` so the
-   * eviction takes the SAME path as a client-initiated close: map removal, mic
-   * bookkeeping, camera layering-gate recompute, and the removal event. A bare
-   * close would strand every other participant consuming a producer that is dead
-   * with no signal that it died.
+   * Routed through the final-sample close path so the old camera's bytes are
+   * charged before it leaves the map. That path ends in `closeProducer`, which
+   * removes the map entry and emits the removal event after the replacement
+   * announcement. A bare producer close would strand its consumers.
    */
   async supersedeOlderCameraProducers(
     roomId: string,
@@ -3056,40 +3205,29 @@ export class RoomManager {
     const participant = this.rooms.get(roomId)?.participants.get(userId);
     if (!participant) return;
 
-    // Walk only as far as the replacement. `participant.producers` is
-    // insertion-ordered, so everything BEFORE `keepProducerId` is older and
-    // everything after it is newer — a concurrent produce that will run its own
-    // eviction and must not be closed by this one.
-    //
-    // Closing every OTHER camera instead of every OLDER one annihilates a
-    // concurrent pair: `produce` handlers on one socket are not serialized
-    // (withRateLimit meters, it does not queue) and there is an await between
-    // recording a producer and evicting, so both can record before either
-    // evicts. A then closes B and B closes A, leaving the participant with zero
-    // cameras. Order-bounded eviction makes the survivor deterministic — the
-    // newest wins — and is what this method's name always claimed it did.
-    // (Gitar review, PR #2824.)
-    const older: string[] = [];
-    for (const [producerId, info] of participant.producers) {
-      if (producerId === keepProducerId) {
-        // Reaching the replacement is the ONLY path that evicts. Structuring it
-        // this way rather than as a `found` flag means the safe outcome is the
-        // fall-through: if the replacement is no longer in the map at all —
-        // a concurrent `close-producer` for it landed during the await above —
-        // this returns having closed nothing, instead of walking the whole map
-        // and closing every camera the participant still has.
-        for (const supersededId of older) {
-          await this.closeProducer(roomId, userId, supersededId);
-          logger.info('Camera producer superseded by replacement', {
-            roomId,
-            userId,
-            supersededProducerId: supersededId,
-            replacementProducerId: keepProducerId,
-          });
-        }
+    // Close only cameras inserted before this replacement, never a newer
+    // concurrent produce. A missing replacement closes nothing (#2824).
+    const replacement = RoomManager.olderCameraProducersBefore(participant, keepProducerId);
+    if (!replacement) return;
+
+    for (const supersededId of replacement.older) {
+      // A final stats read awaits the worker. Do not let this stale replacement
+      // sweep act on a reconnected participant or a removed replacement.
+      if (
+        this.rooms.get(roomId)?.participants.get(userId) !== participant ||
+        participant.producers.get(keepProducerId) !== replacement.keepEntry
+      ) {
         return;
       }
-      if (info.source === 'camera') older.push(producerId);
+      const closed = await this.closeProducerWithFinalSample(roomId, userId, supersededId, false);
+      if (closed !== null) {
+        logger.info('Camera producer superseded by replacement', {
+          roomId,
+          userId,
+          supersededProducerId: supersededId,
+          replacementProducerId: keepProducerId,
+        });
+      }
     }
   }
 
@@ -3128,10 +3266,22 @@ export class RoomManager {
   ): Promise<'resumed' | 'media_policy_paused'> {
     const entry = this.findProducer(roomId, userId, producerId);
     if (!entry) throw new Error('Producer not found');
-    if (entry.policed) return 'media_policy_paused';
+    if (
+      entry.policed ||
+      ((entry.kind === 'video' || entry.source === 'screen-audio') &&
+        this.videoCooldownRetryAfterSec(userId) > 0)
+    ) {
+      return 'media_policy_paused';
+    }
 
     await entry.producer.resume();
-    if (entry.policed) return 'media_policy_paused';
+    if (
+      entry.policed ||
+      ((entry.kind === 'video' || entry.source === 'screen-audio') &&
+        this.videoCooldownRetryAfterSec(userId) > 0)
+    ) {
+      return 'media_policy_paused';
+    }
     logger.debug('Producer resumed', { producerId, roomId, userId });
     return 'resumed';
   }
@@ -3241,8 +3391,9 @@ export class RoomManager {
    * read. After every read settles:
    * - a failed read on a now-closed transport drops the participant (departed);
    * - a failed read on a now-closed producer drops that producer (departed);
-   * - any other failure marks the whole participant `failed`, so the policer
-   *   no-ops its group for this tick: enforcement is delayed, never bypassed.
+   * - any other failure marks the whole participant `failed`, so rate accounting
+   *   no-ops its group for this tick. The tick force-closes its exact send session
+   *   after three consecutive failures instead of forwarding unmetered forever.
    */
   async collectProducerIngressSample(): Promise<ProducerIngressSample> {
     const captures: IngressCapture[] = [];
@@ -3407,16 +3558,25 @@ export class RoomManager {
     }
   }
 
-  /** One bounded read, skipped (as a failure) while the same object's previous read is outstanding. */
-  private guardedIngressRead<T>(target: { getStats(): Promise<T> }): Promise<BoundedRead<T>> {
-    if (this.ingressReadsOutstanding.has(target)) return Promise.resolve(READ_FAILED);
-    this.ingressReadsOutstanding.add(target);
+  /** One bounded worker read. Only final close may reuse a tick's outstanding producer result. */
+  private guardedIngressRead<T>(
+    target: { getStats(): Promise<T> },
+    reuseOutstanding = false
+  ): Promise<BoundedRead<T>> {
+    const existing = this.ingressReadsOutstanding.get(target);
+    if (existing) {
+      return reuseOutstanding
+        ? (existing as Promise<BoundedRead<T>>)
+        : Promise.resolve(READ_FAILED);
+    }
     const pending = startStatsRead(target);
+    const bounded = boundedRead(pending);
+    this.ingressReadsOutstanding.set(target, bounded);
     const release = (): void => {
       this.ingressReadsOutstanding.delete(target);
     };
     void pending.then(release, release);
-    return boundedRead(pending);
+    return bounded;
   }
 
   /** The Participant's live caps, exactly as the policer derives limits from them. */
@@ -3425,6 +3585,8 @@ export class RoomManager {
       audioCeilingBps: RoomManager.resolveAllowedOpusBitrateCeiling(participant.allowedAudioTiers),
       minPtimeMs: participant.minPtimeMs,
       maxManualBitrateBps: participant.maxManualBitrateBps,
+      cameraMaxBitrateBps: participant.cameraMaxBitrateBps,
+      screenMaxBitrateBps: participant.screenMaxBitrateBps,
     };
   }
 
@@ -3440,6 +3602,29 @@ export class RoomManager {
     if (!this.isPolicedRefCurrent(ref) || ref.entry.policed) return null;
     ref.entry.policed = true;
     return { kind: ref.entry.kind, source: ref.entry.source, socketId: ref.participant.socketId };
+  }
+
+  /**
+   * Latch every current video producer for a user after a video cooldown is
+   * armed. The stats walk can predate a producer created during its awaits;
+   * using only its refs would leave that producer forwarding for the cooldown.
+   * This walk and its latches are synchronous with the cooldown decision.
+   */
+  latchUserVideoProducers(
+    userId: string
+  ): { ref: PolicedProducerRef; producer: LatchedProducer }[] {
+    const latched: { ref: PolicedProducerRef; producer: LatchedProducer }[] = [];
+    for (const [roomId, room] of this.rooms) {
+      const participant = room.participants.get(userId);
+      if (!participant) continue;
+      for (const [producerId, entry] of participant.producers) {
+        if (entry.kind !== 'video') continue;
+        const ref = { roomId, userId, producerId, participant, entry };
+        const producer = this.latchPolicedProducer(ref);
+        if (producer) latched.push({ ref, producer });
+      }
+    }
+    return latched;
   }
 
   /**
@@ -3496,6 +3681,50 @@ export class RoomManager {
     }
   }
 
+  /** Close only the exact latched video producer; a reconnect's successor is untouched. */
+  async closePolicedVideoProducer(ref: PolicedProducerRef): Promise<PolicedPauseOutcome> {
+    if (!this.isPolicedRefCurrent(ref) || !ref.entry.policed || ref.entry.kind !== 'video') {
+      return 'gone';
+    }
+    let outcome: PolicedPauseOutcome;
+    try {
+      await this.closeProducer(ref.roomId, ref.userId, ref.producerId);
+      outcome = 'closed';
+    } catch (error) {
+      logger.error('Media policer video close failed; pausing producer', {
+        roomId: ref.roomId,
+        userId: ref.userId,
+        producerId: ref.producerId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      outcome = ref.entry.producer.closed ? 'closed' : await this.pausePolicedProducer(ref);
+    }
+    if (ref.entry.source === 'screen' && outcome !== 'gone') {
+      await this.closeScreenAudioForVideoPolicy(ref);
+    }
+    return outcome;
+  }
+
+  private async closeScreenAudioForVideoPolicy(ref: PolicedProducerRef): Promise<void> {
+    const participant = this.rooms.get(ref.roomId)?.participants.get(ref.userId);
+    if (participant !== ref.participant) return;
+    const audioIds = [...participant.producers.entries()]
+      .filter(([, entry]) => entry.source === 'screen-audio')
+      .map(([id]) => id);
+    for (const id of audioIds) {
+      try {
+        await this.closeProducer(ref.roomId, ref.userId, id);
+      } catch (error) {
+        logger.error('Media policer paired screen audio close failed', {
+          roomId: ref.roomId,
+          userId: ref.userId,
+          producerId: id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   /** The #2153 identity fence without the `!policed` term. */
   private isPolicedRefCurrent(ref: PolicedProducerRef): boolean {
     return (
@@ -3505,61 +3734,76 @@ export class RoomManager {
     );
   }
 
+  /** The `close-producer` handler's close (#2153 spec §5.6). */
+  closeProducerFromClient(
+    roomId: string,
+    userId: string,
+    producerId: string
+  ): Promise<MediaSource | null> {
+    return this.closeProducerWithFinalSample(roomId, userId, producerId, true);
+  }
+
   /**
-   * The `close-producer` handler's close (#2153 spec §5.6). For an unlatched
-   * AUDIO producer, while a finalizer is set, it takes one bounded final
-   * `getStats()` first, so close-and-re-produce churn cannot hide the bytes a
-   * producer sent since the last tick. Every other close delegates to
-   * `closeProducer` unchanged, and no other caller takes a final sample.
+   * For a client close or camera supersession, take one bounded final
+   * `getStats()` before closing an unlatched producer, so churn cannot hide
+   * bytes sent since the last tick. Without a finalizer, delegate to
+   * `closeProducer` unchanged.
    *
    * After the read, the entry is re-found: if the participant or the entry is
    * no longer the one read, the close already happened elsewhere and this
    * returns `null`. Otherwise the finalizer and `closeProducer` run in ONE
    * synchronous continuation. `closeProducer` has no await before it deletes
-   * the entry, so no tick can observe the entry between the two. Worker
-   * replies arrive in order, so the final Δ and a tick's Δ never overlap.
+   * the entry, so no tick can observe the entry between the two. If a tick
+   * already started this producer's read, the finalizer reuses its bounded
+   * result. The tick either accounts it first (then final Δ is zero) or drops
+   * the closed entry (then the finalizer accounts it).
    *
-   * A failed or timed-out read is tolerated (`streams: null`). A latch that
+   * A failed, timed-out, or malformed read is tolerated (`streams: null`). A latch that
    * landed during the read skips the finalizer, because latched bytes are
    * excluded from slot attribution. A throwing finalizer is logged and never
    * keeps the producer open.
    *
-   * #2153 F8: `entry.closing` is set synchronously, before the bounded final
-   * read below, so `reserveParticipantProducerSlot` does not count this entry
-   * against its own source for the whole ~1s read window — otherwise an
-   * immediate re-produce on the same source (a screen-audio swap) would be
-   * refused by a slot this entry is already vacating. The entry stays in tick
-   * samples while it closes (see `captureIngressParticipant`).
+   * #2153 F8: a client close releases only an AUDIO slot while the final read
+   * is pending, so an immediate mic or screen-audio re-produce can proceed.
+   * Still-live video counts toward the camera/screen limit until actual close,
+   * including during camera supersession. Every entry stays in tick samples.
    *
-   * #2153 F9: the read goes through `guardedIngressRead`, so a close that lands
-   * while a tick's read of this producer is outstanding gets `streams: null`.
-   * The bytes since the last tick then go unmetered, once, bounded by one
-   * interval; `settleIngressSample` drops that tick's reading of the closed
-   * entry, so nothing is counted twice.
+   * #2153 F9: a close during a tick read reuses its result. A read that
+   * actually fails or times out still produces `streams: null`; the tick's
+   * failure streak handles repeated stats failures for the send session.
    */
-  async closeProducerFromClient(
+  private async closeProducerWithFinalSample(
     roomId: string,
     userId: string,
-    producerId: string
+    producerId: string,
+    releaseSlotDuringRead: boolean
   ): Promise<MediaSource | null> {
     const participant = this.rooms.get(roomId)?.participants.get(userId);
     const entry = participant?.producers.get(producerId);
-    if (!participant || entry?.kind !== 'audio' || entry.policed || !this.ingressFinalizer) {
+    if (!participant || !entry || entry.policed || !this.ingressFinalizer) {
       return this.closeProducer(roomId, userId, producerId);
     }
 
-    entry.closing = true;
-    // #2153 F9: route through the same outstanding-read guard the policer
-    // tick uses, so a concurrent tick reading this exact producer and this
-    // final read cannot both dispatch a getStats() to the same object.
-    const read = await this.guardedIngressRead(entry.producer);
+    if (releaseSlotDuringRead && entry.kind === 'audio') entry.closing = true;
+    // Reuse an outstanding tick read so closing cannot erase its bytes when
+    // settleIngressSample later drops this now-closed producer.
+    const read = await this.guardedIngressRead(entry.producer, true);
     if (
       this.rooms.get(roomId)?.participants.get(userId) !== participant ||
       participant.producers.get(producerId) !== entry
     ) {
       return null;
     }
-    if (!read.ok) {
+    let streams: StreamCounter[] | null = null;
+    if (read.ok) {
+      try {
+        streams = toStreamCounters(read.value);
+      } catch {
+        // A fulfilled worker response can still be malformed. A conversion
+        // error must never strand the entry with `closing=true` before close.
+        logger.debug('Media policer final read failed', { producerId, reason: 'malformed' });
+      }
+    } else {
       // #2153 F11: name the cause rather than silently treating a skipped or
       // outstanding read the same as a genuine worker timeout/rejection.
       logger.debug('Media policer final read failed', { producerId, reason: read.reason });
@@ -3573,7 +3817,7 @@ export class RoomManager {
         source: entry.source,
         createdAtMs: entry.createdAtMs,
         caps: RoomManager.participantCaps(participant),
-        streams: read.ok ? toStreamCounters(read.value) : null,
+        streams,
       });
     }
     return this.closeProducer(roomId, userId, producerId);
@@ -4854,10 +5098,10 @@ export class RoomManager {
 
     let live = 0;
     for (const [, info] of participant.producers) {
-      // #2153 F8: a `closing` entry is already vacating this slot inside
-      // `closeProducerFromClient`'s bounded final read; counting it against
-      // the SAME source would refuse an immediate re-produce (e.g. a
-      // screen-audio swap) for the ~1s the old entry is still present.
+      // #2153 F8: only client-closed audio entries get `closing`, allowing an
+      // immediate mic/screen-audio swap. A video producer remains counted while
+      // its final stats are read, or a direct close could exceed the camera or
+      // screen limit before that producer actually stops forwarding.
       if (info.source === source && !info.producer.closed && !info.closing) live += 1;
     }
     const pending = participant.pendingProducerSources.get(source) ?? 0;
@@ -4884,48 +5128,35 @@ export class RoomManager {
   }
 
   /**
-   * Reserve a receive-transport slot (#2032 / VULN-009). Same shape as
-   * `reserveParticipantProducerSlot`: synchronous check-and-reserve with no
-   * intervening await, committed count DERIVED from the authoritative
-   * `recvTransports` map so only the pending delta needs a release path.
-   *
-   * The live count PRUNES already-closed entries in the same synchronous pass.
-   * A transport torn down by ICE/DTLS failure emits no `routerclose` (that fires
-   * only when the ROUTER closes), so its map entry survives its own death —
-   * without this prune those corpses would hold the cap for the rest of the
-   * session and a legitimate PiP reopen would be refused. Check and cleanup are
-   * deliberately one code path: a separate sweep could drift out of step.
-   */
-  /**
-   * Apply the per-direction incoming-bitrate cap, failing OPEN on a worker
-   * error (#1300). Extracted from `createTransport` so that method stays under
-   * the cognitive-complexity budget; the fail-open rationale is unchanged.
+   * Apply the per-direction incoming-bitrate advisory. A send transport fails
+   * closed when the worker rejects the cap; receive transports retain the
+   * earlier best-effort behavior because they do not carry client uploads.
    *
    * WebRtcTransport ALWAYS supports setMaxIncomingBitrate (unlike Plain/Pipe
-   * transports, which we never create here), so a failure is a transient worker
-   * error, not a capability gap. We do NOT fail the join closed — a legitimate
-   * peer should not be blocked by a flaky worker call — but the fail-open IS
-   * observable: the transport is left at the mediasoup default (effectively
-   * uncapped), so the per-user bitrate cap silently does not apply for this
-   * session. Logged PII-safe (ids + direction only — never identity/display
-   * fields or the err object, per observability.md #1/#2).
+   * transports, which we never create here), so a failure is a worker fault,
+   * not a capability gap. Logged PII-safe (ids + direction only — never
+   * identity/display fields or the raw worker error).
    */
   private async applyIncomingBitrateCap(
     transport: WebRtcTransport,
     cap: number | undefined,
     ctx: { roomId: string; userId: string; direction: 'send' | 'recv' }
   ): Promise<void> {
-    if (!cap) return;
+    if (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0) {
+      if (ctx.direction === 'send') throw new Error('Send transport bitrate cap unavailable');
+      return;
+    }
     try {
       await transport.setMaxIncomingBitrate(cap);
-    } catch (err) {
-      logger.warn('setMaxIncomingBitrate failed — send transport left uncapped (#1300 fail-open)', {
+    } catch {
+      logger.warn('setMaxIncomingBitrate failed', {
         roomId: ctx.roomId,
         userId: ctx.userId,
         direction: ctx.direction,
         transportId: transport.id,
-        error: err instanceof Error ? err.message : 'unknown',
+        failureClass: 'worker_rejected',
       });
+      if (ctx.direction === 'send') throw new Error('Send transport bitrate cap unavailable');
     }
   }
 
@@ -5031,6 +5262,19 @@ export class RoomManager {
     return undefined;
   }
 
+  /**
+   * Reserve a receive-transport slot (#2032 / VULN-009). Same shape as
+   * `reserveParticipantProducerSlot`: synchronous check-and-reserve with no
+   * intervening await, committed count DERIVED from the authoritative
+   * `recvTransports` map so only the pending delta needs a release path.
+   *
+   * The live count PRUNES already-closed entries in the same synchronous pass.
+   * A transport torn down by ICE/DTLS failure emits no `routerclose` (that fires
+   * only when the ROUTER closes), so its map entry survives its own death —
+   * without this prune those corpses would hold the cap for the rest of the
+   * session and a legitimate PiP reopen would be refused. Check and cleanup are
+   * deliberately one code path: a separate sweep could drift out of step.
+   */
   private reserveRecvTransportSlot(participant: Participant): void {
     for (const [id, transport] of participant.recvTransports) {
       if (transport.closed) participant.recvTransports.delete(id);

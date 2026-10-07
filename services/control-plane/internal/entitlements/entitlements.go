@@ -162,12 +162,13 @@ func For(tier string) Entitlement {
 
 // MediaEntitlements is the server-authoritative media-entitlement
 // payload the join-authorize responses carry to the media-plane (#1300). The
-// media-plane parses these caps to enforce send bitrate and the audio
-// tier/ptime floor at the produce boundary; video resolution/fps stay
-// client-enforced with the bitrate cap as the backstop (the SFU does NOT enforce
-// pixel dimensions). Tier and max manual bitrate stay per-user; fixed channel
-// audio standards may widen AllowedAudioTiers/MinPtimeMs only, marked by
-// ChannelAudioUplift. The room-owner-scoped caps (MaxWebcamPublishers etc.) are
+// media-plane parses these caps to set the send bitrate advisory, enforce the
+// audio tier/ptime floor at the produce boundary, and police observed camera
+// and screen rates separately. Video resolution/fps stay client-enforced (the
+// SFU does NOT enforce pixel dimensions). Tier and max manual bitrate stay
+// per-user; fixed channel audio standards may widen only
+// AllowedAudioTiers/MinPtimeMs, marked by ChannelAudioUplift. The
+// room-owner-scoped caps (MaxWebcamPublishers etc.) are
 // intentionally NOT carried here — #1542 shipped them via the separate
 // room_owner_tier join-authorize field (channels) and Participant.tier (DMs);
 // see ADR-0029.
@@ -176,6 +177,8 @@ type MediaEntitlements struct {
 	AllowedAudioTiers   []string `json:"allowed_audio_tiers"`
 	MinPtimeMs          int      `json:"min_ptime_ms"`
 	MaxManualBitrateBps int      `json:"max_manual_bitrate_bps"`
+	CameraMaxBitrateBps int      `json:"camera_max_bitrate_bps"`
+	ScreenMaxBitrateBps int      `json:"screen_max_bitrate_bps"`
 	ChannelAudioUplift  bool     `json:"channel_audio_uplift,omitempty"`
 }
 
@@ -190,6 +193,8 @@ func MediaFor(tier string) MediaEntitlements {
 		AllowedAudioTiers:   e.AllowedAudioTiers,
 		MinPtimeMs:          e.MinPtimeMs,
 		MaxManualBitrateBps: e.MaxManualBitrateBps,
+		CameraMaxBitrateBps: e.CameraMaxBitrate,
+		ScreenMaxBitrateBps: e.StreamMaxBitrate,
 	}
 }
 

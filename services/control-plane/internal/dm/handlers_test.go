@@ -5861,6 +5861,8 @@ func assertDMMediaEntitlements(t *testing.T, body map[string]interface{}, tier s
 	assert.Equal(t, want.Tier, me["tier"], "tier")
 	assert.EqualValues(t, want.MinPtimeMs, me["min_ptime_ms"], "min_ptime_ms")
 	assert.EqualValues(t, want.MaxManualBitrateBps, me["max_manual_bitrate_bps"], "max_manual_bitrate_bps")
+	assert.EqualValues(t, want.CameraMaxBitrateBps, me["camera_max_bitrate_bps"], "camera_max_bitrate_bps")
+	assert.EqualValues(t, want.ScreenMaxBitrateBps, me["screen_max_bitrate_bps"], "screen_max_bitrate_bps")
 
 	rawTiers, ok := me["allowed_audio_tiers"].([]interface{})
 	require.True(t, ok, "allowed_audio_tiers is an array")

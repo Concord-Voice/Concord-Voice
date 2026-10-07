@@ -713,6 +713,8 @@ describe('validateChannelAccess', () => {
     allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
     min_ptime_ms: 10,
     max_manual_bitrate_bps: 10_000_000,
+    camera_max_bitrate_bps: 6_000_000,
+    screen_max_bitrate_bps: 10_000_000,
   };
 
   const freeEntitlements = {
@@ -720,6 +722,8 @@ describe('validateChannelAccess', () => {
     allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard'],
     min_ptime_ms: 20,
     max_manual_bitrate_bps: 5_000_000,
+    camera_max_bitrate_bps: 2_500_000,
+    screen_max_bitrate_bps: 5_000_000,
   };
 
   it('parses free media_entitlements from the server-channel join response', async () => {
@@ -741,6 +745,8 @@ describe('validateChannelAccess', () => {
     expect(result.allowedAudioTiers).toEqual(['minimum', 'low', 'moderate', 'standard']);
     expect(result.minPtimeMs).toBe(20);
     expect(result.maxManualBitrateBps).toBe(5_000_000);
+    expect(result.cameraMaxBitrateBps).toBe(2_500_000);
+    expect(result.screenMaxBitrateBps).toBe(5_000_000);
   });
 
   it('parses premium media_entitlements from the server-channel join response', async () => {
@@ -762,6 +768,8 @@ describe('validateChannelAccess', () => {
     expect(result.allowedAudioTiers).toContain('studio');
     expect(result.minPtimeMs).toBe(10);
     expect(result.maxManualBitrateBps).toBe(10_000_000);
+    expect(result.cameraMaxBitrateBps).toBe(6_000_000);
+    expect(result.screenMaxBitrateBps).toBe(10_000_000);
   });
 
   // This parse path went LIVE with the #1542 review reconciliation: the DM
@@ -811,6 +819,8 @@ describe('validateChannelAccess', () => {
     expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
     expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs);
     expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+    expect(result.cameraMaxBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps);
+    expect(result.screenMaxBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps);
   });
 
   it('fails closed to the free floor when media_entitlements is MALFORMED (wrong types)', async () => {
@@ -827,6 +837,8 @@ describe('validateChannelAccess', () => {
             allowed_audio_tiers: 'not-an-array', // wrong type
             min_ptime_ms: 'fast', // wrong type
             max_manual_bitrate_bps: -1, // out of range
+            camera_max_bitrate_bps: 'unlimited',
+            screen_max_bitrate_bps: -1,
           },
         }),
     });
@@ -839,6 +851,8 @@ describe('validateChannelAccess', () => {
     expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
     expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs);
     expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+    expect(result.cameraMaxBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps);
+    expect(result.screenMaxBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps);
   });
 
   it('floors only the malformed FIELDS, keeping valid ones (no all-or-nothing)', async () => {
@@ -893,6 +907,8 @@ describe('validateChannelAccess', () => {
             ],
             min_ptime_ms: 10, // premium-shaped (lower) → must clamp UP to 20
             max_manual_bitrate_bps: 10_000_000, // premium-shaped → must clamp DOWN to 5M
+            camera_max_bitrate_bps: 6_000_000,
+            screen_max_bitrate_bps: 20_000_000,
           },
         }),
     });
@@ -903,6 +919,8 @@ describe('validateChannelAccess', () => {
     expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
     expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs); // 20, not 10
     expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps); // 5M, not 10M
+    expect(result.cameraMaxBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.cameraMaxBitrateBps);
+    expect(result.screenMaxBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.screenMaxBitrateBps);
   });
 
   it('allows server-authoritative channel audio uplift for free users without raising manual bitrate', async () => {
@@ -913,7 +931,8 @@ describe('validateChannelAccess', () => {
           allowed: true,
           server_muted: false,
           server_deafened: false,
-          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          channel: { id: 'ch-1', server_id: 's', name: 'n', audio_quality_tier: 'studio' },
+          room_owner_tier: 'premium',
           media_entitlements: {
             tier: 'free',
             channel_audio_uplift: true,
@@ -937,7 +956,33 @@ describe('validateChannelAccess', () => {
     expect(result.userTier).toBe('free');
     expect(result.allowedAudioTiers).toContain('studio');
     expect(result.minPtimeMs).toBe(10);
+    expect(result.channelAudioUpliftTier).toBe('studio');
     expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+  });
+
+  it('reports the effective channel standard after a Groundspeed server ceiling', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n', audio_quality_tier: 'studio' },
+          room_owner_tier: 'free',
+          media_entitlements: {
+            tier: 'free',
+            channel_audio_uplift: true,
+            allowed_audio_tiers: FREE_MEDIA_ENTITLEMENT.allowedAudioTiers,
+            min_ptime_ms: 20,
+          },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.channelAudioUpliftTier).toBe('standard');
+    expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
   });
 
   it('denial paths carry the free-floor media entitlement (never escalate on denial)', async () => {

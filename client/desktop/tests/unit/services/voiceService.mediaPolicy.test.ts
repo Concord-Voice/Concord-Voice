@@ -77,6 +77,42 @@ describe('voiceService media-policy wiring (#2153)', () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  it('shows a video-only interrupt and stops local video without changing voice state', async () => {
+    useVoiceStore.setState({ activeChannelId: 'ch-1', connectionState: 'connected' });
+    const closeProducer = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
+    handler('video-bandwidth-disabled')({
+      roomId: 'ch-1',
+      producerId: 'camera-1',
+      source: 'camera',
+      retryAfterSec: 300,
+    });
+    expect(useVoiceStore.getState().mediaPolicyInterrupt).toEqual({
+      reason: 'video_disabled',
+      source: 'camera',
+      rejoinAt: 1_300_000,
+    });
+    expect(useVoiceStore.getState().connectionState).toBe('connected');
+    await Promise.resolve();
+    expect(closeProducer.mock.calls).toEqual([['camera'], ['screen']]);
+  });
+
+  it('ignores a video notice for another room or with an invalid retry', () => {
+    useVoiceStore.setState({ activeChannelId: 'ch-1' });
+    handler('video-bandwidth-disabled')({
+      roomId: 'ch-2',
+      producerId: 'camera-1',
+      source: 'camera',
+      retryAfterSec: 300,
+    });
+    handler('video-bandwidth-disabled')({
+      roomId: 'ch-1',
+      producerId: 'camera-1',
+      source: 'camera',
+      retryAfterSec: '300',
+    });
+    expect(useVoiceStore.getState().mediaPolicyInterrupt).toBeNull();
+  });
+
   // ── §1b peers: kind-aware producer-paused ────────────────────────────────
   it.each([
     ['mic', { kind: 'audio', source: 'mic' }, { isMuted: true, isCameraPaused: undefined }],
@@ -414,6 +450,27 @@ describe('voiceService media-policy wiring (#2153)', () => {
       code: 'media_policy_cooldown',
       retryAfterSec: 600,
     });
+  });
+
+  it('explains a refused video retry without leaving the voice call', async () => {
+    useVoiceStore.setState({ activeChannelId: 'ch-1', connectionState: 'connected' });
+    socket.emit.mockImplementation((_event: string, _data: unknown, ack: (r: unknown) => void) =>
+      ack({
+        error: 'Video publishing is temporarily disabled',
+        code: 'video_policy_cooldown',
+        retryAfterSec: 600,
+      })
+    );
+
+    await expect(svc.emitAsync('produce', {})).rejects.toMatchObject({
+      code: 'video_policy_cooldown',
+      retryAfterSec: 600,
+    });
+    expect(useVoiceStore.getState().mediaPolicyInterrupt).toEqual({
+      reason: 'video_cooldown',
+      rejoinAt: 1_600_000,
+    });
+    expect(useVoiceStore.getState().connectionState).toBe('connected');
   });
 
   it.each([

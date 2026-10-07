@@ -73,17 +73,18 @@ function midBitrate(maxBitrate: number): number {
 }
 
 /**
- * Per-RID caps for a 3-layer simulcast ladder seeded from ONE user-facing ceiling.
- *
- * The ceiling is the `f`-layer cap; `q` and `h` are derived from it. Exported because
- * the live-update path (`voiceService.liveUpdateScreenBitrate`) must produce the same
- * ladder a fresh produce would — #2208 shipped a flat cap that wrote the `f` value to
- * every layer, which raised the aggregate ceiling ~2.5x and, on a LOWERED setting,
- * raised `q` and `h` above what produce-time gives them. Both paths call this, so the
- * ratios cannot drift apart again.
+ * Split a total producer budget among three simulcast encodings. RTP senders may
+ * transmit all three at once, so the sum of their maxBitrate values must stay at
+ * or below the manual/preset/entitlement ceiling. Fresh publication and live
+ * updates use the same allocation.
  */
 export function simulcastLadderBitrates(maxBitrate: number): Record<'q' | 'h' | 'f', number> {
-  return { q: lowBitrate(maxBitrate), h: midBitrate(maxBitrate), f: maxBitrate };
+  const qWeight = Math.min(maxBitrate, lowBitrate(maxBitrate));
+  const hWeight = Math.min(maxBitrate, midBitrate(maxBitrate));
+  const totalWeight = qWeight + hWeight + maxBitrate;
+  const q = Math.floor((maxBitrate * qWeight) / totalWeight);
+  const h = Math.floor((maxBitrate * hWeight) / totalWeight);
+  return { q, h, f: maxBitrate - q - h };
 }
 
 export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): CameraEncodingPlan {

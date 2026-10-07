@@ -104,11 +104,20 @@ import {
 } from './avSyncDriftDetector';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan, simulcastLadderBitrates } from './cameraLayering';
+import { resolveSessionVideoBitrateCaps, type VideoBitrateCaps } from './videoBitrateCaps';
+import {
+  capAudioPtime,
+  capAudioTier,
+  effectiveAudioCaps,
+  resolveSessionAudioCaps,
+  type SessionAudioCaps,
+} from './audioSessionCaps';
 import { calculateFecBitrate as computeFecBitrate } from './fecHeadroom';
 import {
   MEDIA_POLICY_SOURCES,
   parseForceDisconnect,
   parseMediaPolicyNotice,
+  parseVideoBandwidthDisabled,
   parseProducerStateChange,
   parseRetryAfterSec,
   rejoinAtFrom,
@@ -159,6 +168,19 @@ const AV_SYNC_OBSERVATION_COUNT_CEILING = 1_000;
 // only errors, warnings, and key lifecycle events are logged.
 const E2EE_VERBOSE = false;
 const MAX_REMOTE_VIDEO_DEVICE_PIXEL_RATIO = 8;
+
+// Keep this protocol version aligned with the SFU's videoPublishProfile gate.
+// It marks desktop video encodings that cap the sum of simulcast layers; the
+// SFU's observed-byte policer still enforces the actual entitlement.
+const VIDEO_BITRATE_PROFILE_VERSION = 1 as const;
+type VideoPublishAppData = {
+  source: 'camera' | 'screen';
+  videoBitrateProfileVersion: typeof VIDEO_BITRATE_PROFILE_VERSION;
+};
+
+function videoPublishAppData(source: VideoPublishAppData['source']): VideoPublishAppData {
+  return { source, videoBitrateProfileVersion: VIDEO_BITRATE_PROFILE_VERSION };
+}
 
 // Overall budget for the media-plane Socket.IO connect during a voice join (#2176).
 // waitForConnect() rides through transient connect_errors (letting Socket.IO's
@@ -427,25 +449,28 @@ if (E2EE_VERBOSE) {
 // ---------------------------------------------------------------------------
 
 /**
- * Codec options for screen audio, capped at the highest tier the user may produce (#2153 T0).
+ * Codec options for screen audio, capped by the current SFU admission and live grant (#2153 T0).
  * The mic's stats loop rewrites its maxBitrate every 5 s; nothing does that for screen audio,
  * which ran at ~537 kbps uncapped and tripped the media policer on stock settings. The ceiling
  * mirrors the media plane's resolveAllowedOpusBitrateCeiling: max over the allowed tiers, and
  * `standard` when none is recognised. maxBitrate binds the encoder; opusMaxAverageBitrate
  * only states the same figure in the SDP.
  */
-function screenAudioProduceOptions(): {
+function screenAudioProduceOptions(
+  maxBitrate: number,
+  minPtimeMs: number
+): {
   encodings: mediasoupTypes.RtpEncodingParameters[];
   codecOptions: mediasoupTypes.ProducerCodecOptions;
 } {
-  let ceiling = 0;
-  for (const tier of useSubscriptionStore.getState().entitlement.allowedAudioTiers) {
-    ceiling = Math.max(ceiling, AUDIO_QUALITY_TIERS[tier as AudioQualityTier]?.maxBitrate ?? 0);
-  }
-  if (ceiling === 0) ceiling = AUDIO_QUALITY_TIERS.standard.maxBitrate;
   return {
-    encodings: [{ maxBitrate: ceiling }],
-    codecOptions: { opusStereo: true, opusDtx: false, opusMaxAverageBitrate: ceiling },
+    encodings: [{ maxBitrate }],
+    codecOptions: {
+      opusStereo: true,
+      opusDtx: false,
+      opusMaxAverageBitrate: maxBitrate,
+      opusPtime: capAudioPtime(20, minPtimeMs),
+    },
   };
 }
 
@@ -656,6 +681,13 @@ interface RoomJoinedResponse {
    *  Absent on a media plane predating the field -- the client then keeps its
    *  own fallback chain rather than being handed a guess. */
   cameraSpatialCap?: unknown;
+  /** Actual video bitrate ceilings admitted by the SFU for this session. */
+  cameraMaxBitrateBps?: unknown;
+  screenMaxBitrateBps?: unknown;
+  allowedAudioTiers?: unknown;
+  minPtimeMs?: unknown;
+  /** Final channel standard admitted by the SFU; null means Personal mode. */
+  channelAudioUpliftTier?: unknown;
   mediaFrameCryptoVersion?: number;
   existingProducers: Array<{
     producerId: string;
@@ -786,6 +818,8 @@ class VoiceService {
    * is consulted only before one is established.
    */
   private cameraSpatialCapForSession: 0 | 1 | 2 | null = null;
+  private videoBitrateCapsForSession: VideoBitrateCaps | null = null;
+  private audioCapsForSession: SessionAudioCaps | null = null;
 
   // Local producers: source → Producer
   private readonly producers: Map<string, mediasoupTypes.Producer> = new Map();
@@ -936,6 +970,7 @@ class VoiceService {
   // Live settings subscriptions (apply changes during active calls)
   private liveAudioUnsub: (() => void) | null = null;
   private liveVideoUnsub: (() => void) | null = null;
+  private liveEntitlementUnsub: (() => void) | null = null;
   private liveVoiceUnsub: (() => void) | null = null;
   private liveAudioTrackReplaceSeq = 0;
 
@@ -1307,7 +1342,11 @@ class VoiceService {
         useVoiceStore.getState().setPacketLoss(lossPercent, adv.packetLossWarningThreshold);
 
         if (micProducer.rtpSender) {
-          const tier = useVoiceStore.getState().effectiveQualityTier;
+          const audioCaps = this.currentAudioCaps();
+          const tier = capAudioTier(
+            useVoiceStore.getState().effectiveQualityTier,
+            audioCaps.maxBitrate
+          );
           const tierConfig = AUDIO_QUALITY_TIERS[tier];
           const effectiveHeadroom = adv.advancedMode
             ? adv.inlineFec && adv.fecHeadroom
@@ -1317,7 +1356,7 @@ class VoiceService {
           if (params.encodings?.[0]) {
             params.encodings[0].maxBitrate = VoiceService.calculateFecBitrate(
               lossPercent,
-              tierConfig.maxBitrate,
+              Math.min(tierConfig.maxBitrate, audioCaps.maxBitrate),
               effectiveHeadroom
             );
             micProducer.rtpSender.setParameters(params).catch(() => {});
@@ -1579,6 +1618,41 @@ class VoiceService {
     return Math.max(100, Math.min(10_000, Math.round((targetBps * 0.5) / 1000)));
   }
 
+  private cameraBitrateBudget(
+    entitlementCap = useSubscriptionStore.getState().entitlement.cameraMaxBitrate
+  ): number {
+    const vs = useVideoSettingsStore.getState();
+    const preset = VIDEO_QUALITY_PRESETS[vs.cameraPreset] || VIDEO_QUALITY_PRESETS['system'];
+    return Math.min(
+      preset.maxBitrate,
+      vs.cameraBitrate > 0 ? vs.cameraBitrate : Infinity,
+      entitlementCap,
+      this.videoBitrateCapsForSession?.camera ?? Infinity
+    );
+  }
+
+  private currentAudioCaps(): ReturnType<typeof effectiveAudioCaps> {
+    return effectiveAudioCaps(
+      this.audioCapsForSession,
+      useSubscriptionStore.getState().entitlement
+    );
+  }
+
+  private screenBitrateBudget(requested: number): number {
+    const manual = useVideoSettingsStore.getState().screenShareBitrate;
+    return Math.min(
+      requested,
+      manual > 0 ? manual : Infinity,
+      useSubscriptionStore.getState().entitlement.streamMaxBitrate,
+      this.videoBitrateCapsForSession?.screen ?? Infinity
+    );
+  }
+
+  private audioPublicationExceedsCurrentCaps(bitrate: number, ptimeMs: number): boolean {
+    const caps = this.currentAudioCaps();
+    return bitrate > caps.maxBitrate || ptimeMs < caps.minPtimeMs;
+  }
+
   private cameraStartBitrate(encodings: mediasoupTypes.RtpEncodingParameters[]): number {
     let maxBitrate = 0;
     for (const encoding of encodings) {
@@ -1588,11 +1662,7 @@ class VoiceService {
       }
     }
     const target = maxBitrate || 2_500_000;
-    // User manual camera-bitrate cap (#1602): 0 = auto (no override). When set, it
-    // lowers the encoder start-bitrate hint only — the SFU is advisory for video
-    // bitrate (media-plane.md), so this never fights simulcast/SVC layer bitrates.
-    const userCap = useVideoSettingsStore.getState().cameraBitrate;
-    return userCap > 0 ? Math.min(target, userCap) : target;
+    return target;
   }
 
   /**
@@ -1649,8 +1719,8 @@ class VoiceService {
     encodings: mediasoupTypes.RtpEncodingParameters[];
   } {
     const vs = useVideoSettingsStore.getState();
-    const preset = VIDEO_QUALITY_PRESETS[vs.cameraPreset] || VIDEO_QUALITY_PRESETS['720p30'];
     const prio = vs.cameraPriority;
+    const budget = this.cameraBitrateBudget();
 
     const codec = selectCodecFromCascade({
       preferred: vs.preferredVideoCodec,
@@ -1664,13 +1734,13 @@ class VoiceService {
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
 
     if (!this.cameraLayeringEnabled) {
-      return { codec, encodings: [{ ...base, maxBitrate: preset.maxBitrate }] };
+      return { codec, encodings: [{ ...base, maxBitrate: budget }] };
     }
 
     const layeringCodec = this.pickLayeringCodec();
     const plan = buildCameraEncodingPlan({
       codec: layeringCodec,
-      maxBitrate: preset.maxBitrate,
+      maxBitrate: budget,
       scalabilityMode: vs.scalabilityMode,
       priority: base,
       eligibility: { svc: vs.supportSvc, simulcast: vs.supportSimulcast },
@@ -1717,10 +1787,11 @@ class VoiceService {
 
     const layeringCodec = this.pickLayeringCodec();
 
-    // Derive the auto bitrate from the codec actually published. Layering toggles
-    // may collapse its encoding plan, but do not replace the codec. A non-zero user
-    // override is honored verbatim and never re-derived.
-    const bitrate = userBitrate || this.calculateScreenBitrate(layeringCodec?.mimeType ?? null);
+    // Manual and automatic values are both bounded by the current entitlement.
+    // The RTP encoding plan treats this as the aggregate simulcast budget.
+    const bitrate = this.screenBitrateBudget(
+      userBitrate || this.calculateScreenBitrate(layeringCodec?.mimeType ?? null)
+    );
 
     const plan = buildCameraEncodingPlan({
       codec: layeringCodec,
@@ -1817,6 +1888,42 @@ class VoiceService {
       this.handleVideoSettingsChange(state, prev);
     });
 
+    this.liveEntitlementUnsub = useSubscriptionStore.subscribe((state, prev) => {
+      if (state.entitlement.cameraMaxBitrate !== prev.entitlement.cameraMaxBitrate) {
+        const cameraProducer = this.producers.get('camera');
+        if (cameraProducer) {
+          this.liveUpdateCameraBitrate(
+            cameraProducer,
+            this.cameraBitrateBudget(state.entitlement.cameraMaxBitrate) <
+              this.cameraBitrateBudget(prev.entitlement.cameraMaxBitrate)
+          );
+        }
+      }
+      if (state.entitlement.streamMaxBitrate !== prev.entitlement.streamMaxBitrate) {
+        const screenProducer = this.producers.get('screen');
+        if (screenProducer) {
+          this.liveUpdateScreenBitrate(
+            screenProducer,
+            useVideoSettingsStore.getState().screenShareBitrate,
+            Math.min(
+              state.entitlement.streamMaxBitrate,
+              this.videoBitrateCapsForSession?.screen ?? Infinity
+            ) <
+              Math.min(
+                prev.entitlement.streamMaxBitrate,
+                this.videoBitrateCapsForSession?.screen ?? Infinity
+              )
+          );
+        }
+      }
+      if (
+        state.entitlement.allowedAudioTiers !== prev.entitlement.allowedAudioTiers ||
+        state.entitlement.minPtimeMs !== prev.entitlement.minPtimeMs
+      ) {
+        this.handleAudioEntitlementChange(prev.entitlement);
+      }
+    });
+
     this.liveVoiceUnsub = useVoiceStore.subscribe((state, prev) => {
       if (state.audioInputDeviceId !== prev.audioInputDeviceId) {
         this.liveReplaceAudioTrack();
@@ -1852,9 +1959,12 @@ class VoiceService {
       this.liveUpdateVideoPriority(cameraProducer, state.cameraPriority);
     }
     if (state.cameraPreset !== prev.cameraPreset) {
+      this.liveUpdateCameraBitrate(cameraProducer);
       void this.liveReplaceCameraTrack().catch((err) =>
         console.warn('[video-settings] Camera track replacement failed:', errorMessage(err))
       );
+    } else if (state.cameraBitrate !== prev.cameraBitrate) {
+      this.liveUpdateCameraBitrate(cameraProducer);
     }
     // SVC/Simulcast casting toggles (#1921): a shape-only change does not alter the
     // codec MIME, so reProduceIfBetterCodec early-returns — reproduce explicitly.
@@ -1924,8 +2034,88 @@ class VoiceService {
     this.liveAudioUnsub = null;
     this.liveVideoUnsub?.();
     this.liveVideoUnsub = null;
+    this.liveEntitlementUnsub?.();
+    this.liveEntitlementUnsub = null;
     this.liveVoiceUnsub?.();
     this.liveVoiceUnsub = null;
+  }
+
+  private handleAudioEntitlementChange(
+    previous: ReturnType<typeof useSubscriptionStore.getState>['entitlement']
+  ): void {
+    const before = effectiveAudioCaps(this.audioCapsForSession, previous);
+    const after = this.currentAudioCaps();
+    const mic = this.producers.get('mic');
+    const desiredTier = useVoiceStore.getState().effectiveQualityTier;
+    const tierChanged =
+      capAudioTier(desiredTier, before.maxBitrate) !== capAudioTier(desiredTier, after.maxBitrate);
+    if (
+      (mic || this.micReproduceArmed) &&
+      (tierChanged || before.minPtimeMs !== after.minPtimeMs)
+    ) {
+      // Re-produce renegotiates Opus's declared bitrate/ptime under the current
+      // policy. The mic queue serializes this with codec-setting changes.
+      void this.liveReproduceAudio().catch((err) =>
+        console.warn(
+          '[audio-settings] Mic re-produce after entitlement change failed:',
+          errorMessage(err)
+        )
+      );
+    } else if (mic && before.maxBitrate !== after.maxBitrate) {
+      this.liveUpdateAudioBitrate(
+        mic,
+        Math.min(
+          AUDIO_QUALITY_TIERS[capAudioTier(desiredTier, after.maxBitrate)].maxBitrate,
+          after.maxBitrate
+        ),
+        before.maxBitrate > after.maxBitrate,
+        'mic'
+      );
+    }
+    if (before.minPtimeMs !== after.minPtimeMs) {
+      // Share-sound toggles and screen codec swaps use this queue too. A direct
+      // re-produce could publish a successor after a queued Off had retired the
+      // old producer. Check for live audio when the queued operation runs so an
+      // in-flight On is covered as well.
+      void this.enqueueVideoReproduce('screen', (token) => this.reProduceScreenAudio(token)).catch(
+        (err) =>
+          console.warn(
+            '[audio-settings] Screen audio re-produce after entitlement change failed:',
+            errorMessage(err)
+          )
+      );
+    } else if (before.maxBitrate !== after.maxBitrate) {
+      const screenAudio = this.producers.get('screen-audio');
+      if (!screenAudio) return;
+      this.liveUpdateAudioBitrate(
+        screenAudio,
+        after.maxBitrate,
+        before.maxBitrate > after.maxBitrate,
+        'screen-audio'
+      );
+    }
+  }
+
+  private liveUpdateAudioBitrate(
+    producer: mediasoupTypes.Producer,
+    maxBitrate: number,
+    tightening: boolean,
+    source: 'mic' | 'screen-audio'
+  ): void {
+    try {
+      const sender = producer.rtpSender;
+      if (!sender) throw new Error('RTP sender unavailable');
+      const params = sender.getParameters();
+      if (!params.encodings?.length) throw new Error('RTP encodings unavailable');
+      for (const encoding of params.encodings) encoding.maxBitrate = maxBitrate;
+      void sender.setParameters(params).catch((err: unknown) => {
+        console.warn('[audio-settings] Audio bitrate update failed:', errorMessage(err));
+        if (tightening && this.producers.get(source) === producer) void this.closeProducer(source);
+      });
+    } catch (err) {
+      console.warn('[audio-settings] Audio bitrate update failed:', errorMessage(err));
+      if (tightening && this.producers.get(source) === producer) void this.closeProducer(source);
+    }
   }
 
   // --- Instant update helpers (setParameters, no track change) ---
@@ -1978,27 +2168,58 @@ class VoiceService {
     }
   }
 
-  private liveUpdateScreenBitrate(producer: mediasoupTypes.Producer, bitrate: number): void {
-    if (!producer?.rtpSender) return;
+  private liveUpdateCameraBitrate(
+    producer: mediasoupTypes.Producer,
+    mustApplyLowerCap = false
+  ): void {
+    this.liveUpdateVideoBitrate(producer, this.cameraBitrateBudget(), 'camera', mustApplyLowerCap);
+  }
+
+  private liveUpdateScreenBitrate(
+    producer: mediasoupTypes.Producer,
+    bitrate: number,
+    mustApplyLowerCap = false
+  ): void {
+    // Infer the codec the way produce-time does (pickScreenCodec passes the
+    // layering codec explicitly), then apply the entitlement ceiling.
+    const requested =
+      bitrate > 0
+        ? bitrate
+        : this.calculateScreenBitrate(this.pickLayeringCodec()?.mimeType ?? null);
+    this.liveUpdateVideoBitrate(
+      producer,
+      this.screenBitrateBudget(requested),
+      'screen',
+      mustApplyLowerCap
+    );
+  }
+
+  private liveUpdateVideoBitrate(
+    producer: mediasoupTypes.Producer,
+    budget: number,
+    source: 'camera' | 'screen',
+    mustApplyLowerCap: boolean
+  ): void {
+    if (!producer?.rtpSender) {
+      if (mustApplyLowerCap) this.stopVideoProducerAfterFailedCap(producer, source);
+      return;
+    }
+    let tightening = mustApplyLowerCap;
     try {
       const params = producer.rtpSender.getParameters();
-      if (!params.encodings?.length) return;
-      // When bitrate is 0 (auto), recalculate from current screen settings
-      // Infer the codec the way produce-time does (pickScreenCodec passes the layering
-      // codec explicitly). A bare call falls back to activeScreenCodec ?? preferred,
-      // which flips the bits-per-pixel constant when those disagree.
-      const effectiveBitrate =
-        bitrate > 0
-          ? bitrate
-          : this.calculateScreenBitrate(this.pickLayeringCodec()?.mimeType ?? null);
-      // Screen simulcast (#2185) publishes q/h/f, and EVERY layer moves — writing only
-      // encodings[0] left h and f on their prior caps (#2208). The setting is the
-      // f-layer ceiling, not a per-layer value: q and h are derived from it by the same
-      // helper produceScreen seeds the plan with, so a live update and a fresh produce
-      // land on identical caps. A flat cap here would raise the aggregate ceiling ~2.5x
-      // and, on a LOWERED setting, push q and h above what produce-time gives them.
-      // One setParameters transaction; order, rid, scaling and activity flags untouched.
-      const ladder = simulcastLadderBitrates(effectiveBitrate);
+      if (!params.encodings?.length) {
+        if (mustApplyLowerCap) this.stopVideoProducerAfterFailedCap(producer, source);
+        return;
+      }
+      const priorBudget = params.encodings.reduce((total, enc) => {
+        const cap = enc.maxBitrate;
+        return total + (typeof cap === 'number' && Number.isFinite(cap) ? cap : Infinity);
+      }, 0);
+      tightening ||= priorBudget > budget;
+      // Every encoding can send at once. Split the total budget rather than giving
+      // each encoding its own full ceiling. One setParameters transaction preserves
+      // the sender's order, rid, scaling, and activity flags.
+      const ladder = simulcastLadderBitrates(budget);
       // Key by INDEX, never by rid — the reverse of what this block said until #3348, and
       // the rid form made the whole #2208 fix inert. Our 'q'/'h'/'f' never reaches the
       // sender: `Transport.produce()` rebuilds each encoding through an allow-list that
@@ -2009,22 +2230,45 @@ class VoiceService {
       // the aggregate-ceiling defect #2208 exists to close. MEASURED on Chromium 152.
       // Index is sound because the handler's forEach preserves encoding order, so position
       // IS the layer; that is the same property the per-sender encodings[0] write relies on.
-      const byIndex = [ladder.q, ladder.h, ladder.f];
-      const layered = params.encodings.length === byIndex.length;
+      const count = params.encodings.length;
+      const byIndex =
+        count === 3
+          ? [ladder.q, ladder.h, ladder.f]
+          : Array.from({ length: count }, (_, i) =>
+              i === count - 1
+                ? budget - Math.floor(budget / count) * (count - 1)
+                : Math.floor(budget / count)
+            );
       params.encodings.forEach((enc, i) => {
-        // A single-encoding sender (SVC, or the layering gate off) is the f-equivalent and
-        // takes the ceiling verbatim, exactly as before.
-        enc.maxBitrate = layered ? byIndex[i] : effectiveBitrate;
+        enc.maxBitrate = byIndex[i];
       });
       producer.rtpSender.setParameters(params).catch((err: unknown) => {
         // Never swallow this. A rejection (stale transactionId after an intervening
         // renegotiation, or a per-encoding validation failure) leaves the slider moved
         // and the wire unchanged — the same silent divergence #2208 exists to close.
-        console.warn('[video-settings] Screen bitrate update failed:', errorMessage(err));
+        console.warn(
+          `[video-settings] ${source === 'camera' ? 'Camera' : 'Screen'} bitrate update failed:`,
+          errorMessage(err)
+        );
+        if (tightening) this.stopVideoProducerAfterFailedCap(producer, source);
       });
-    } catch {
-      /* rtpSender may not be available */
+    } catch (err) {
+      console.warn(
+        `[video-settings] ${source === 'camera' ? 'Camera' : 'Screen'} bitrate update failed:`,
+        errorMessage(err)
+      );
+      if (tightening) this.stopVideoProducerAfterFailedCap(producer, source);
     }
+  }
+
+  private stopVideoProducerAfterFailedCap(
+    producer: mediasoupTypes.Producer,
+    source: 'camera' | 'screen'
+  ): void {
+    if (this.producers.get(source) !== producer) return;
+    void this.closeProducer(source).catch((err) =>
+      console.warn('[video-settings] Could not stop uncapped video producer:', errorMessage(err))
+    );
   }
 
   // --- replaceTrack: re-acquire media with new constraints, swap on existing producer ---
@@ -2393,9 +2637,14 @@ class VoiceService {
 
       let codec: mediasoupTypes.RtpCodecCapability;
       let newProducer: mediasoupTypes.Producer;
+      let publishedBitrate = 0;
       try {
         const selection = this.pickCameraCodec();
         codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+        publishedBitrate = selection.encodings.reduce(
+          (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
+          0
+        );
         const cameraBitrate = this.cameraStartBitrate(selection.encodings);
         newProducer = await this.produceEncrypted(transport, {
           track,
@@ -2403,7 +2652,7 @@ class VoiceService {
           codec,
           codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
           stopTracks: false,
-          appData: { source: 'camera' },
+          appData: videoPublishAppData('camera'),
         });
       } catch (err) {
         if (
@@ -2426,7 +2675,12 @@ class VoiceService {
         return;
       }
 
-      this.commitCameraProducer(newProducer, stream, token, transport, socket, codec);
+      if (publishedBitrate > this.cameraBitrateBudget()) {
+        this.discardProducedProducer(newProducer, socket);
+        this.cleanupCameraState();
+        return;
+      }
+      if (!this.commitCameraProducer(newProducer, stream, token, transport, socket, codec)) return;
       const selectedCodecKey = this.codecKeyFromParameters(codec);
       const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
       console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
@@ -2605,9 +2859,11 @@ class VoiceService {
   } | null> {
     let codec: mediasoupTypes.RtpCodecCapability;
     let producer: mediasoupTypes.Producer;
+    let publishedBitrate = 0;
     try {
       const selection = this.pickScreenCodec();
       codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
+      publishedBitrate = selection.effectiveBitrate;
       producer = await this.produceEncrypted(transport, {
         track,
         encodings: selection.encodings,
@@ -2616,7 +2872,7 @@ class VoiceService {
           videoGoogleStartBitrate: this.computeStartBitrate(selection.effectiveBitrate),
         },
         stopTracks: false,
-        appData: { source: 'screen' },
+        appData: videoPublishAppData('screen'),
       });
     } catch (err) {
       if (
@@ -2635,7 +2891,8 @@ class VoiceService {
     if (
       !this.isCurrentVideoReproduce(token, transport) ||
       this.localScreenStream !== stream ||
-      this.producers.has('screen')
+      this.producers.has('screen') ||
+      publishedBitrate > this.screenBitrateBudget(publishedBitrate)
     ) {
       this.discardProducedProducer(producer, socket);
       return null;
@@ -2661,7 +2918,10 @@ class VoiceService {
     }
 
     const audioTrack = stream.getAudioTracks()[0];
-    if (audioTrack?.readyState !== 'live') return;
+    if (audioTrack?.readyState !== 'live') {
+      await this.closeProducer('screen-audio');
+      return;
+    }
 
     const oldAudioId = oldAudioProducer.id;
     oldAudioProducer.close();
@@ -2677,16 +2937,22 @@ class VoiceService {
     this.socket?.emit('close-producer', { producerId: oldAudioId });
 
     try {
+      const audioCaps = this.currentAudioCaps();
+      const options = screenAudioProduceOptions(audioCaps.maxBitrate, audioCaps.minPtimeMs);
       const newAudioProducer = await this.produceEncrypted(transport, {
         track: audioTrack,
-        ...screenAudioProduceOptions(),
+        ...options,
         stopTracks: false,
         appData: { source: 'screen-audio' },
       });
       if (
         !this.isCurrentVideoReproduce(token, transport) ||
         this.localScreenStream !== stream ||
-        this.producers.has('screen-audio')
+        this.producers.has('screen-audio') ||
+        this.audioPublicationExceedsCurrentCaps(
+          audioCaps.maxBitrate,
+          options.codecOptions.opusPtime as number
+        )
       ) {
         this.discardProducedProducer(newAudioProducer, socket);
         return;
@@ -3699,6 +3965,15 @@ class VoiceService {
       joinMediaEntitlements: joinData.media_entitlements,
       subscription: useSubscriptionStore.getState(),
     });
+    this.videoBitrateCapsForSession = resolveSessionVideoBitrateCaps(
+      roomJoined,
+      joinData.media_entitlements
+    );
+    this.audioCapsForSession = resolveSessionAudioCaps(
+      roomJoined,
+      joinData.media_entitlements,
+      joinData.channel?.audio_quality_tier
+    );
 
     // Load device with router capabilities
     this.device = new Device();
@@ -3915,6 +4190,8 @@ class VoiceService {
     // Credentials must not outlive the transports they were minted for (#3104).
     this.iceServers = null;
     this.cameraSpatialCapForSession = null;
+    this.videoBitrateCapsForSession = null;
+    this.audioCapsForSession = null;
   }
 
   /** Tear down already-invalidated shared E2EE state synchronously. */
@@ -4128,10 +4405,16 @@ class VoiceService {
         // checks and the current mute policy at adoption.
         track.enabled = false;
 
-        const tier = useVoiceStore.getState().effectiveQualityTier;
+        const audioCaps = this.currentAudioCaps();
+        const tier = capAudioTier(
+          useVoiceStore.getState().effectiveQualityTier,
+          audioCaps.maxBitrate
+        );
         const tierConfig = AUDIO_QUALITY_TIERS[tier];
         const { effectiveFec, effectiveDtx, effectiveStereo, effectiveFrameSize } =
           resolveOpusSettings(adv, tierConfig);
+        const maxBitrate = Math.min(tierConfig.maxBitrate, audioCaps.maxBitrate);
+        const publishedPtime = capAudioPtime(effectiveFrameSize, audioCaps.minPtimeMs);
         const audioPrioParams = buildPriorityParams(adv.audioPriority);
 
         const producer = await this.produceEncrypted(
@@ -4140,7 +4423,7 @@ class VoiceService {
             track,
             encodings: [
               {
-                maxBitrate: tierConfig.maxBitrate,
+                maxBitrate,
                 adaptivePtime: adv.adaptivePtime || undefined,
                 ...audioPrioParams,
               },
@@ -4150,9 +4433,9 @@ class VoiceService {
               opusDtx: effectiveDtx,
               opusFec: effectiveFec,
               opusNack: adv.opusNack,
-              opusMaxAverageBitrate: tierConfig.maxBitrate,
+              opusMaxAverageBitrate: maxBitrate,
               opusMaxPlaybackRate: 48000,
-              opusPtime: effectiveFrameSize,
+              opusPtime: publishedPtime,
             },
             appData: { source: 'mic' },
           },
@@ -4164,7 +4447,10 @@ class VoiceService {
           throw new Error('Microphone publication belongs to an obsolete voice session');
         }
 
-        if (this.microphoneSettingsChanged(adv, selectedDeviceId, deviceId)) {
+        if (
+          this.microphoneSettingsChanged(adv, selectedDeviceId, deviceId) ||
+          this.audioPublicationExceedsCurrentCaps(maxBitrate, publishedPtime)
+        ) {
           producer.close();
           this.cleanupMicState(stream);
           await this.emitAsync<{ success: true }>('close-producer', { producerId: producer.id });
@@ -4324,6 +4610,10 @@ class VoiceService {
       const selection = this.pickCameraCodec();
       const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
       const { encodings } = selection;
+      const publishedBitrate = encodings.reduce(
+        (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
+        0
+      );
       const cameraBitrate = this.cameraStartBitrate(encodings);
 
       const producer = await this.produceEncrypted(transport, {
@@ -4335,9 +4625,19 @@ class VoiceService {
         // re-produces (fastReproduceCamera). stopTracks:false keeps producer.close()
         // from stopping it; every teardown path stops localCameraStream explicitly.
         stopTracks: false,
-        appData: { source: 'camera' },
+        appData: videoPublishAppData('camera'),
       });
-      if (!this.commitCameraProducer(producer, acquiredStream, token, transport, socket, codec)) {
+      if (
+        !this.commitCameraProducer(
+          producer,
+          acquiredStream,
+          token,
+          transport,
+          socket,
+          codec,
+          publishedBitrate
+        )
+      ) {
         return;
       }
     } catch (err) {
@@ -4362,12 +4662,14 @@ class VoiceService {
     token: VideoReproduceToken,
     transport: mediasoupTypes.Transport,
     socket: Socket | null,
-    codec?: mediasoupTypes.RtpCodecCapability
+    codec?: mediasoupTypes.RtpCodecCapability,
+    publishedBitrate = 0
   ): boolean {
     if (
       !this.isCurrentVideoReproduce(token, transport) ||
       this.localCameraStream !== stream ||
-      this.producers.has('camera')
+      this.producers.has('camera') ||
+      publishedBitrate > this.cameraBitrateBudget()
     ) {
       this.discardProducedProducer(producer, socket);
       this.stopMediaStream(stream);
@@ -4793,9 +5095,11 @@ class VoiceService {
     }
 
     try {
+      const audioCaps = this.currentAudioCaps();
+      const options = screenAudioProduceOptions(audioCaps.maxBitrate, audioCaps.minPtimeMs);
       const audioProducer = await this.produceEncrypted(this.sendTransport, {
         track: audioTrack,
-        ...screenAudioProduceOptions(),
+        ...options,
         // Track owned by localScreenStream and reused across re-produces
         // (reProduceScreenAudio); stopTracks:false keeps close() from stopping it.
         stopTracks: false,
@@ -4813,6 +5117,10 @@ class VoiceService {
         this.localScreenStream !== stream ||
         !this.producers.get('screen') ||
         this.producers.has('screen-audio') ||
+        this.audioPublicationExceedsCurrentCaps(
+          audioCaps.maxBitrate,
+          options.codecOptions.opusPtime as number
+        ) ||
         // Releasing a bridge stops its track, and the OS can end a desktop track, so an
         // ended track here means the audio this produce was for is already gone.
         audioTrack.readyState !== 'live'
@@ -5004,10 +5312,14 @@ class VoiceService {
         // Track owned by localScreenStream and reused across codec re-produces
         // (fastReproduceScreen); stopTracks:false keeps close() from stopping it.
         stopTracks: false,
-        appData: { source: 'screen' },
+        appData: videoPublishAppData('screen'),
       });
 
-      if (!isCurrent() || this.producers.has('screen')) {
+      if (
+        !isCurrent() ||
+        this.producers.has('screen') ||
+        screenBitrate > this.screenBitrateBudget(screenBitrate)
+      ) {
         this.discardProducedProducer(producer, socket);
         stopStreamTracks(stream);
         return;
@@ -5188,6 +5500,29 @@ class VoiceService {
     this.stopLocalVAD();
     store.setMuted(true);
     this.applyOptimisticMute(store, true);
+  }
+
+  private handleVideoBandwidthDisabled(payload: unknown): void {
+    const notice = parseVideoBandwidthDisabled(payload);
+    if (!notice) {
+      console.warn('[media-policy] rejected malformed video-bandwidth-disabled');
+      return;
+    }
+    const store = useVoiceStore.getState();
+    if (store.activeChannelId !== notice.roomId) return;
+    store.setMediaPolicyInterrupt({
+      reason: 'video_disabled',
+      source: notice.source,
+      rejoinAt: rejoinAtFrom(notice.retryAfterSec, Date.now()),
+    });
+    // The server closes the exact producers. Stop capture locally as well,
+    // including a producer whose server-side close fell back to pause.
+    void (async () => {
+      await this.closeProducer('camera');
+      await this.closeProducer('screen');
+    })().catch((error) =>
+      console.warn('[media-policy] video capture cleanup failed:', errorMessage(error))
+    );
   }
 
   /** force-disconnect → the eviction dialog. Only media_policy has anything to explain. */
@@ -8505,6 +8840,10 @@ class VoiceService {
       this.handleMediaPolicyNotice(payload)
     );
 
+    this.socket.on('video-bandwidth-disabled', (payload: unknown) =>
+      this.handleVideoBandwidthDisabled(payload)
+    );
+
     this.socket.on('force-disconnect', (payload: unknown) =>
       this.handleForceDisconnectEvent(payload)
     );
@@ -10701,6 +11040,12 @@ class VoiceService {
             // (0, 86400] validation the force-disconnect payload does.
             const retryAfterSec = parseRetryAfterSec(response.retryAfterSec);
             if (retryAfterSec !== null) err.retryAfterSec = retryAfterSec;
+            if (err.code === 'video_policy_cooldown') {
+              useVoiceStore.getState().setMediaPolicyInterrupt({
+                reason: 'video_cooldown',
+                rejoinAt: rejoinAtFrom(retryAfterSec, Date.now()),
+              });
+            }
             reject(err);
           } else {
             resolve(response);
@@ -10778,6 +11123,8 @@ class VoiceService {
     // Duplicated deliberately: cleanup() does not call cleanupMediaAndTransports() (#3104).
     this.iceServers = null;
     this.cameraSpatialCapForSession = null;
+    this.videoBitrateCapsForSession = null;
+    this.audioCapsForSession = null;
 
     // Stop local VAD, noise gate, input volume, and live subscriptions
     this.stopLocalVAD();
