@@ -162,7 +162,14 @@ const AudioConfigSection: React.FC = () => {
   const inputVolume = useDraftAudioSetting('inputVolume');
   const outputVolume = useDraftAudioSetting('outputVolume');
   const localIsTesting = useVoiceStore((s) => s.localIsTesting);
-  const { isTesting, dbfsLevel, error: micTestError, startTest, stopTest } = useMicTest();
+  const {
+    isTesting,
+    dbfsLevel,
+    inputOverloaded,
+    error: micTestError,
+    startTest,
+    stopTest,
+  } = useMicTest();
   const {
     isTesting: isOutputTesting,
     error: outputTestError,
@@ -218,14 +225,15 @@ const AudioConfigSection: React.FC = () => {
             {micTestError && <span className="settings-mic-test-error">{micTestError}</span>}
           </div>
           <p className="settings-row-hint">
-            Microphone Test uses applied settings until you select Apply.
+            Microphone Test uses applied settings until you select Apply. Its meter shows sample
+            peaks before the noise gate, so it still responds while the gate is closed.
           </p>
           {isTesting && (
             <div className="settings-mic-meter-container">
               <div className="settings-mic-meter-track">
                 <div
                   className="settings-mic-meter-fill"
-                  style={{ width: `${Math.max(0, ((dbfsLevel + 80) / 80) * 100)}%` }}
+                  style={{ width: `${Math.min(100, Math.max(0, ((dbfsLevel + 80) / 80) * 100))}%` }}
                 />
               </div>
               <div className="settings-mic-meter-ticks">
@@ -235,6 +243,12 @@ const AudioConfigSection: React.FC = () => {
                 <span>-20</span>
                 <span>0 dBFS</span>
               </div>
+              {inputOverloaded && (
+                <p className="settings-mic-test-error" role="alert">
+                  Input reached or exceeded 0 dBFS before the noise gate. This may indicate
+                  clipping; check your microphone level and upstream audio settings.
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -470,7 +484,7 @@ const AudioConfigSection: React.FC = () => {
               musicMode,
               autoGainControl,
               'Locked by Music Mode. Automatic gain control is forced off to prevent dynamic compression of your audio signal.',
-              'Enabled. Automatically normalizes your microphone volume \u2014 making quiet speech louder and loud speech softer. Positive Microphone Level values are treated as unity; a retained 0% stays silent. The independent mute control still applies.',
+              'Enabled. Requests automatic microphone leveling and limits outgoing sample peaks to −6 dBFS. As a starting point, aim for speech peaks around −18 to −12 dBFS; repeated peaks above −12 dBFS may indicate a high input level. This cannot repair clipping at the microphone. Positive saved Microphone Level values use unity; 0% stays silent.',
               'Disabled. Your microphone level is not automatically adjusted. Adjust it with Microphone Level below.'
             )}
           </span>
@@ -520,7 +534,7 @@ const AudioConfigSection: React.FC = () => {
           <span className="settings-row-label">Input Noise Gate</span>
           <span className="settings-row-hint">
             {noiseGateMode === 'manual'
-              ? `Enabled. Input below ${noiseGateLevel} dBFS is muted with a hard cutoff. Sounds above this threshold pass through unaffected.`
+              ? `Enabled. Input below ${noiseGateLevel} dBFS is attenuated. The threshold controls when the gate opens, not microphone loudness.`
               : 'Disabled. No hard cutoff is applied to your input. Relies on noise cancellation and auto gain control if those are enabled.'}
           </span>
         </div>

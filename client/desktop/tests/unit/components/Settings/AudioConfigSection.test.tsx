@@ -11,7 +11,12 @@ const mockStopMicTest = vi.fn();
 const mockPlayTestTone = vi.fn();
 const mockStopOutputTest = vi.fn();
 let mockLocalIsTesting = false;
-let micTestState = { isTesting: false, dbfsLevel: -Infinity, error: null as string | null };
+let micTestState = {
+  isTesting: false,
+  dbfsLevel: -Infinity,
+  inputOverloaded: false,
+  error: null as string | null,
+};
 let outputTestState = { isTesting: false, error: null as string | null };
 
 const defaultAudioSettings: Record<string, unknown> = {
@@ -257,7 +262,12 @@ describe('AudioConfigSection', () => {
   beforeEach(async () => {
     resetAllStores();
     vi.clearAllMocks();
-    micTestState = { isTesting: false, dbfsLevel: -Infinity, error: null };
+    micTestState = {
+      isTesting: false,
+      dbfsLevel: -Infinity,
+      inputOverloaded: false,
+      error: null,
+    };
     outputTestState = { isTesting: false, error: null };
     mockLocalIsTesting = false;
 
@@ -347,13 +357,32 @@ describe('AudioConfigSection', () => {
     });
 
     it('retains active and error feedback for microphone and speaker tests', () => {
-      micTestState = { isTesting: true, dbfsLevel: -24, error: 'Microphone unavailable' };
+      micTestState = {
+        isTesting: true,
+        dbfsLevel: -24,
+        inputOverloaded: false,
+        error: 'Microphone unavailable',
+      };
       outputTestState = { isTesting: true, error: 'Audio output unavailable' };
       render(<AudioConfigSection />);
       expect(screen.getByRole('button', { name: 'Stop Testing' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Playing...' })).toBeDisabled();
       expect(screen.getByText('Microphone unavailable')).toBeInTheDocument();
       expect(screen.getByText('Audio output unavailable')).toBeInTheDocument();
+    });
+
+    it('announces when the microphone input reaches full scale before peak limiting', () => {
+      micTestState = {
+        isTesting: true,
+        dbfsLevel: -24,
+        inputOverloaded: true,
+        error: null,
+      };
+      render(<AudioConfigSection />);
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Input reached or exceeded 0 dBFS before the noise gate.'
+      );
+      expect(screen.getByRole('alert')).toHaveTextContent('This may indicate clipping');
     });
 
     it('keeps both audio tests disabled while another local test is active', () => {
@@ -381,7 +410,7 @@ describe('AudioConfigSection', () => {
       render(<AudioConfigSection />);
 
       expect(
-        screen.getByText('Microphone Test uses applied settings until you select Apply.')
+        screen.getByText(/Microphone Test uses applied settings until you select Apply/)
       ).toBeInTheDocument();
     });
 
@@ -392,7 +421,7 @@ describe('AudioConfigSection', () => {
 
       expect(screen.queryByRole('slider', { name: 'Microphone Level' })).not.toBeInTheDocument();
       expect(
-        screen.getByText('Microphone Test uses applied settings until you select Apply.')
+        screen.getByText(/Microphone Test uses applied settings until you select Apply/)
       ).toBeInTheDocument();
     });
   });
@@ -791,9 +820,7 @@ describe('AudioConfigSection', () => {
   it('shows correct hint for manual noise gate', async () => {
     await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -50 });
     render(<AudioConfigSection />);
-    expect(
-      screen.getByText(/Input below -50 dBFS is muted with a hard cutoff/)
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Input below -50 dBFS is attenuated/)).toBeInTheDocument();
   });
 
   it('shows correct hint for auto noise gate', () => {

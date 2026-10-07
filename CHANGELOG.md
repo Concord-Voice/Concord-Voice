@@ -10,7 +10,9 @@ Trusted-device recovery asks you to compare a fingerprint on both devices
 before transferring your account key. Voice joins capture the selected
 microphone once and explain how to recover if capture fails. Audio and video
 device controls now sit with their settings, with app-only microphone level
-adjustment when automatic gain is off. The desktop also includes a patched
+adjustment when automatic gain is off. Calls and Microphone Test share
+microphone processing, with a sample-peak ceiling while automatic gain is on.
+The desktop also includes a patched
 source-map-js dependency. Local camera previews stay
 visible during producer swaps, and a remote tile returns when its replacement
 attaches. A remote close can briefly clear the tile if it arrives first. Brief
@@ -29,6 +31,7 @@ the rest of the session.
 
 ### Changed
 
+- **AGC now limits microphone sample peaks** ([#3638](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3638)) — calls and Microphone Test use the same microphone processing path. When automatic gain control is active, Concord Voice limits samples leaving its microphone processor to −6 dBFS, with about 4 ms of lookahead and 100 ms recovery. This does not repair clipping already present in the source or measure acoustic loudness. The Off and fixed-threshold noise-gate choices remain available; the fixed gate now measures float samples in the processor.
 - GIF personalization now uses the Personalization ID shown in Settings to derive the separate ID sent to KLIPY. When personalization is off, GIF browsing requests use a temporary ID that changes about every 30 minutes; sharing a GIF does not send that ID. Turning personalization back on resumes the saved Personalization ID unless you rotate it. The Recent tab is available only while personalization is on. After you click Rotate while personalization is on, requests using your saved ID wait for the new ID, which starts a new Recent list. An open GIF picker refreshes when the setting or saved ID changes.
 - **Audio and video device controls now sit with their settings** ([#3635](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3635)) — Input and Output selectors, microphone and speaker tests, and output level start Audio Configuration; Camera selection, test, and preview start Video Configuration, removing the separate Device Configuration section. Device choices, including Default, apply immediately; processing and Microphone Level use Apply/Revert. The app-only Microphone Level defaults to 100%, spans 0–200% by 1%, and appears when effective automatic gain control (AGC) is off, including Music Mode; its saved value persists while hidden. While AGC manages the microphone, positive saved levels are ignored and app gain stays at unity; saved 0% remains silent. The saved level applies again when AGC is off or Music Mode is on. Microphone Test uses applied settings. Section close and call conflicts stop tests; mic-input changes replace active test capture, while output/camera changes stop theirs. Level is applied before the saved gate; a non-unity level changes gate activation without recalibration, so apply and retest it.
 - Webcam speaker frames stay at a fixed size and show a steady accent highlight during voice calls. Avatar frames keep their speaking pulse ([#3595](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3595), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).

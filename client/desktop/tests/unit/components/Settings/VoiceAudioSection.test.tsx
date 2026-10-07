@@ -819,7 +819,9 @@ describe('VoiceAudioSection', () => {
 
   it('renders auto gain control hint text', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getByText(/Automatically normalizes your microphone volume/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/automatic microphone leveling and limits outgoing sample peaks to −6 dBFS/)
+    ).toBeInTheDocument();
   });
 
   // ===== Screen share section =====

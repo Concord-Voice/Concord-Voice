@@ -93,6 +93,7 @@ export default defineConfig(() => {
         reporter: ['text', 'html', 'lcov'],
         include: [
           'src/renderer/**/*.{ts,tsx}',
+          'src/renderer/services/voice/micProcessor.worklet.js',
           'src/shared/**/*.{ts,tsx}',
           // #920 §5.5, §5.7 added typed constants + build-time generators that
           // SonarCloud QG measures as new code. Without these globs, SonarCloud

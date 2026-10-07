@@ -34,6 +34,7 @@ import {
   useAudioSettingsStore,
   type AudioPriority,
 } from '../../stores/audio/audioSettingsStore';
+import { createMicProcessor, type MicProcessorHandle } from './micProcessor';
 import {
   useVideoSettingsStore,
   VIDEO_QUALITY_PRESETS,
@@ -752,6 +753,28 @@ interface WebrtcHwObservation {
 // VoiceService singleton
 // ---------------------------------------------------------------------------
 
+type MicGraph = {
+  stream: MediaStream;
+  context: AudioContext;
+  gain: GainNode;
+  processor: MicProcessorHandle;
+  track: MediaStreamTrack;
+  failed: boolean;
+  settings: ReturnType<typeof useAudioSettingsStore.getState>;
+  selectedDeviceId: string | undefined;
+};
+
+type MicCapture = {
+  stream: MediaStream;
+  adv: ReturnType<typeof useAudioSettingsStore.getState>;
+  selectedDeviceId: string | undefined;
+};
+
+const MIC_PROCESSING_FAILED_ERROR =
+  'Microphone processing failed. Retry your microphone or rejoin the call.';
+const MIC_PROCESSING_STOPPED_ERROR =
+  'Microphone processing stopped. Retry your microphone or rejoin the call.';
+
 class VoiceService {
   private socket: Socket | null = null;
   private device: Device | null = null;
@@ -958,14 +981,10 @@ class VoiceService {
   private vadTimer: ReturnType<typeof setInterval> | null = null;
   private vadSpeaking = false;
 
-  // Noise gate (Web Audio API)
-  private noiseGateCtx: AudioContext | null = null;
-  private noiseGateTimer: ReturnType<typeof setInterval> | null = null;
-
-  // Input volume (Web Audio API GainNode)
-  private inputVolumeCtx: AudioContext | null = null;
-  private inputVolumeGain: GainNode | null = null;
+  // The capture owner keeps exactly one gain → processor → destination graph.
+  private micGraph: MicGraph | null = null;
   private inputVolumeUnsub: (() => void) | null = null;
+  private micReplaceTrackQueue: Promise<void> = Promise.resolve();
 
   // Live settings subscriptions (apply changes during active calls)
   private liveAudioUnsub: (() => void) | null = null;
@@ -1072,118 +1091,99 @@ class VoiceService {
     }
   }
 
-  // ─── Noise Gate ──────────────────────────────────────────────────
-
-  /**
-   * Apply a noise gate to the mic stream using Web Audio API. Callers apply
-   * manual microphone level before this stage, so the byte-domain gate sees the
-   * processed signal; its AnalyserNode measurement remains quantized to 8-bit samples.
-   * Returns a new MediaStreamTrack from a MediaStreamDestination node.
-   * Audio below the threshold (dBFS) is silenced via a GainNode.
-   */
-  private applyNoiseGate(micStream: MediaStream, thresholdDbfs: number): MediaStreamTrack {
-    this.stopNoiseGate();
-
-    const ctx = new AudioContext({ sampleRate: 48000 });
-    this.noiseGateCtx = ctx;
-
-    const source = ctx.createMediaStreamSource(micStream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    const gain = ctx.createGain();
-    const destination = ctx.createMediaStreamDestination();
-
-    source.connect(analyser);
-    analyser.connect(gain);
-    gain.connect(destination);
-
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    // Convert dBFS threshold to a 0–255 byte level (AnalyserNode getByteTimeDomainData range)
-    // dBFS -80 → ~0, -20 → ~200. Formula: 128 * 10^(dBFS/20) maps to amplitude offset from 128.
-    const thresholdAmplitude = 128 * Math.pow(10, thresholdDbfs / 20);
-
-    this.noiseGateTimer = setInterval(() => {
-      analyser.getByteTimeDomainData(dataArray);
-      // Peak amplitude offset from silence (128)
-      let peak = 0;
-      for (const sample of dataArray) {
-        const offset = Math.abs(sample - 128);
-        if (offset > peak) peak = offset;
-      }
-
-      const isOpen = peak >= thresholdAmplitude;
-      const target = isOpen ? 1 : 0;
-      gain.gain.setTargetAtTime(target, ctx.currentTime, 0.015);
-    }, 20); // 50 Hz poll for responsive gating
-
-    return destination.stream.getAudioTracks()[0];
+  private async createMicGraph(
+    stream: MediaStream,
+    adv: ReturnType<typeof useAudioSettingsStore.getState>,
+    selectedDeviceId: string | undefined
+  ): Promise<MicGraph> {
+    let context: AudioContext;
+    try {
+      context = new AudioContext({ sampleRate: 48000 });
+    } catch (error) {
+      this.stopMediaStream(stream);
+      throw error;
+    }
+    let processor: MicProcessorHandle | null = null;
+    let graph: MicGraph | null = null;
+    let failed = false;
+    try {
+      processor = await createMicProcessor(
+        context,
+        {
+          protectAgcPeaks: !adv.musicMode && adv.autoGainControl,
+          gate:
+            adv.noiseGateMode === 'manual'
+              ? { kind: 'fixed', thresholdDbfs: adv.noiseGateLevel }
+              : { kind: 'off' },
+        },
+        () => {},
+        () => {
+          failed = true;
+          if (graph) graph.failed = true;
+          if (graph && this.micGraph === graph) this.handleMicProcessorError(graph);
+        }
+      );
+      const source = context.createMediaStreamSource(stream);
+      const gain = context.createGain();
+      const destination = context.createMediaStreamDestination();
+      gain.gain.value = effectiveMicLevelPercent(useAudioSettingsStore.getState()) / 100;
+      source.connect(gain);
+      gain.connect(processor.node);
+      processor.node.connect(destination);
+      const track = destination.stream.getAudioTracks()[0];
+      if (!track) throw new Error('Microphone processor produced no audio track');
+      graph = { stream, context, gain, processor, track, failed, settings: adv, selectedDeviceId };
+      return graph;
+    } catch (error) {
+      processor?.close();
+      if (context.state !== 'closed') void context.close().catch(() => {});
+      this.stopMediaStream(stream);
+      throw error;
+    }
   }
 
-  /** Stop noise gate and clean up audio nodes */
-  private stopNoiseGate(): void {
-    if (this.noiseGateTimer) {
-      clearInterval(this.noiseGateTimer);
-      this.noiseGateTimer = null;
-    }
-    if (this.noiseGateCtx?.state !== 'closed') {
-      this.noiseGateCtx?.close().catch(() => {});
-    }
-    this.noiseGateCtx = null;
+  private disposeMicGraph(graph: MicGraph): void {
+    graph.track.stop();
+    graph.processor.close();
+    if (graph.context.state !== 'closed') void graph.context.close().catch(() => {});
+    this.stopMediaStream(graph.stream);
   }
 
-  // ─── Input Volume ───────────────────────────────────────────────
+  private handleMicProcessorError(graph: MicGraph): void {
+    if (this.micGraph !== graph) return;
+    const producer = this.producers.get('mic');
+    producer?.pause();
+    if (producer) this.socket?.emit('pause-producer', { producerId: producer.id });
+    useVoiceStore.getState().setJoinError(MIC_PROCESSING_STOPPED_ERROR);
+    this.cleanupMicState(graph.stream);
+  }
 
-  /**
-   * Apply input volume via a GainNode. Returns a processed MediaStreamTrack.
-   * Stores references so the gain can be updated in real-time from the settings store.
-   */
-  private applyInputVolume(track: MediaStreamTrack, volumePercent: number): MediaStreamTrack {
-    this.stopInputVolume();
+  private clearMicProcessingError(): void {
+    const store = useVoiceStore.getState();
+    if (
+      store.joinError === MIC_PROCESSING_FAILED_ERROR ||
+      store.joinError === MIC_PROCESSING_STOPPED_ERROR
+    ) {
+      store.setJoinError(null);
+    }
+  }
 
-    const ctx = new AudioContext({ sampleRate: 48000 });
-    this.inputVolumeCtx = ctx;
-
-    const source = ctx.createMediaStreamSource(new MediaStream([track]));
-    const gain = ctx.createGain();
-    const destination = ctx.createMediaStreamDestination();
-
-    gain.gain.value = volumePercent / 100;
-    source.connect(gain);
-    gain.connect(destination);
-
-    this.inputVolumeGain = gain;
-
-    // Subscribe to effective committed levels. Positive stored manual levels
-    // leave unity gain in place while AGC is effective; zero remains silent.
+  private watchMicLevel(): void {
+    this.inputVolumeUnsub?.();
     this.inputVolumeUnsub = useAudioSettingsStore.subscribe((state, prevState) => {
+      const graph = this.micGraph;
       if (
-        effectiveMicLevelPercent(state) !== effectiveMicLevelPercent(prevState) &&
-        this.inputVolumeGain &&
-        this.inputVolumeCtx &&
-        this.inputVolumeCtx.state !== 'closed'
+        graph &&
+        graph.context.state !== 'closed' &&
+        effectiveMicLevelPercent(state) !== effectiveMicLevelPercent(prevState)
       ) {
-        this.inputVolumeGain.gain.setTargetAtTime(
+        graph.gain.gain.setTargetAtTime(
           effectiveMicLevelPercent(state) / 100,
-          this.inputVolumeCtx.currentTime,
+          graph.context.currentTime,
           0.01
         );
       }
     });
-
-    return destination.stream.getAudioTracks()[0];
-  }
-
-  /** Stop input volume processing and clean up */
-  private stopInputVolume(): void {
-    if (this.inputVolumeUnsub) {
-      this.inputVolumeUnsub();
-      this.inputVolumeUnsub = null;
-    }
-    if (this.inputVolumeCtx?.state !== 'closed') {
-      this.inputVolumeCtx?.close().catch(() => {});
-    }
-    this.inputVolumeCtx = null;
-    this.inputVolumeGain = null;
   }
 
   // ─── Packet loss monitor ─────────────────────────────────────────
@@ -1874,6 +1874,9 @@ class VoiceService {
         'adaptivePtime',
       ] as const;
       if (codecOptionFields.some((f) => state[f] !== prev[f])) {
+        if (state.musicMode !== prev.musicMode && !state.musicMode && state.autoGainControl) {
+          this.producers.get('mic')?.pause();
+        }
         void this.liveReproduceAudio().catch((err) =>
           console.warn(
             '[audio-settings] Microphone re-produce failed:',
@@ -2285,7 +2288,21 @@ class VoiceService {
   }
 
   private shouldResumeMicAfterTrackReplacement(producerId: string): boolean {
-    return !useVoiceStore.getState().isSoloBandwidthSaving && this.shouldRunMicVAD(producerId);
+    return (
+      !useVoiceStore.getState().isSoloBandwidthSaving &&
+      !this.isMediaPolicyLatched(producerId) &&
+      this.shouldRunMicVAD(producerId)
+    );
+  }
+
+  private hasLiveMicGraph(producer: mediasoupTypes.Producer): boolean {
+    const graph = this.micGraph;
+    return (
+      this.producers.get('mic') === producer &&
+      graph !== null &&
+      !graph.failed &&
+      graph.track.readyState === 'live'
+    );
   }
 
   private stopMediaStream(stream: MediaStream | null): void {
@@ -2297,26 +2314,6 @@ class VoiceService {
     if (replaceSeq === this.liveAudioTrackReplaceSeq) return false;
     this.stopMediaStream(stream);
     return true;
-  }
-
-  private swapLiveMicStream(
-    stream: MediaStream,
-    adv: ReturnType<typeof useAudioSettingsStore.getState>
-  ): MediaStreamTrack {
-    this.stopNoiseGate();
-    this.stopInputVolume();
-    this.stopLocalVAD();
-    this.stopMediaStream(this.localMicStream);
-    this.localMicStream = stream;
-
-    let track = this.applyInputVolume(
-      stream.getAudioTracks()[0],
-      effectiveMicLevelPercent(useAudioSettingsStore.getState())
-    );
-    if (adv.noiseGateMode === 'manual') {
-      track = this.applyNoiseGate(new MediaStream([track]), adv.noiseGateLevel);
-    }
-    return track;
   }
 
   private microphoneCaptureConstraints(
@@ -2336,61 +2333,204 @@ class VoiceService {
     };
   }
 
-  private async liveReplaceAudioTrack(): Promise<void> {
+  private liveReplaceAudioTrack(): Promise<void> {
+    const replaceSeq = ++this.liveAudioTrackReplaceSeq;
+    this.producers.get('mic')?.pause();
+    const replacement = this.micReplaceTrackQueue
+      .catch(() => {})
+      .then(() => this.liveReplaceAudioTrackQueued(replaceSeq));
+    this.micReplaceTrackQueue = replacement.catch(() => {});
+    return replacement;
+  }
+
+  private async recoverMissingMicProducer(): Promise<void> {
+    // A pending re-production already reads the latest settings and retries
+    // drift. A later change may recover its failed, now-idle mic intent.
+    if (this.micReproducesPending > 0) return;
+    await this.liveReproduceAudio().catch((err) =>
+      console.warn(
+        '[audio-settings] Microphone recovery failed:',
+        this.microphoneCaptureErrorName(err)
+      )
+    );
+  }
+
+  private isCurrentMicReplacement(
+    replaceSeq: number,
+    producer: mediasoupTypes.Producer,
+    oldGraph: MicGraph | null,
+    adv: ReturnType<typeof useAudioSettingsStore.getState>,
+    selectedDeviceId: string | undefined,
+    graph?: MicGraph
+  ): boolean {
+    return (
+      replaceSeq === this.liveAudioTrackReplaceSeq &&
+      this.producers.get('mic') === producer &&
+      (this.micGraph === oldGraph || (oldGraph?.failed === true && this.micGraph === null)) &&
+      !graph?.failed &&
+      !this.microphoneSettingsChanged(adv, selectedDeviceId)
+    );
+  }
+
+  private async captureReplacementMicGraph(
+    replaceSeq: number,
+    producer: mediasoupTypes.Producer,
+    oldGraph: MicGraph | null,
+    adv: ReturnType<typeof useAudioSettingsStore.getState>,
+    selectedDeviceId: string | undefined
+  ): Promise<MicGraph | null> {
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(
+        this.microphoneCaptureConstraints(adv, selectedDeviceId)
+      );
+    } catch (err) {
+      throw this.tagMicrophoneCaptureError(err);
+    }
+    if (this.isStaleAudioTrackReplacement(replaceSeq, stream)) return null;
+    if (!this.isCurrentMicReplacement(replaceSeq, producer, oldGraph, adv, selectedDeviceId)) {
+      this.stopMediaStream(stream);
+      return null;
+    }
+    const graph = await this.createMicGraph(stream, adv, selectedDeviceId);
+    if (
+      !this.isCurrentMicReplacement(replaceSeq, producer, oldGraph, adv, selectedDeviceId, graph)
+    ) {
+      this.disposeMicGraph(graph);
+      return null;
+    }
+    return graph;
+  }
+
+  private adoptReplacementMicGraph(
+    graph: MicGraph,
+    oldGraph: MicGraph | null,
+    oldStream: MediaStream | null,
+    producer: mediasoupTypes.Producer
+  ): void {
+    this.stopLocalVAD();
+    this.localMicStream = graph.stream;
+    this.micGraph = graph;
+    this.watchMicLevel();
+    if (oldGraph) this.disposeMicGraph(oldGraph);
+    else this.stopMediaStream(oldStream);
+    if (this.shouldRunMicVAD(producer.id)) this.startLocalVAD(graph.stream);
+    this.clearMicProcessingError();
+  }
+
+  private async recoverFailedMicReplacement(
+    err: unknown,
+    replaceSeq: number,
+    producer: mediasoupTypes.Producer,
+    oldGraph: MicGraph | null,
+    producerTrackSafe: boolean
+  ): Promise<boolean> {
+    if (!producerTrackSafe && oldGraph && this.micGraph === oldGraph) {
+      try {
+        await producer.replaceTrack({ track: oldGraph.track });
+        producerTrackSafe = true;
+      } catch {
+        // Keep a producer paused if its active track cannot be restored.
+      }
+    }
+    if (
+      !producerTrackSafe &&
+      this.producers.get('mic') === producer &&
+      this.micGraph === oldGraph
+    ) {
+      this.cleanupMicState(oldGraph?.stream);
+    }
+    if (replaceSeq === this.liveAudioTrackReplaceSeq) {
+      console.warn('liveReplaceAudioTrack failed:', errorMessage(err));
+      useVoiceStore
+        .getState()
+        .setJoinError(this.microphoneJoinGuidance(err) ?? MIC_PROCESSING_FAILED_ERROR);
+    }
+    return producerTrackSafe;
+  }
+
+  private resumeMicAfterReplacement(
+    replaceSeq: number,
+    producer: mediasoupTypes.Producer,
+    producerTrackSafe: boolean
+  ): void {
+    const graph = this.micGraph;
+    const currentSettings = useAudioSettingsStore.getState();
+    const needsPeakProtection = !currentSettings.musicMode && currentSettings.autoGainControl;
+    if (
+      replaceSeq === this.liveAudioTrackReplaceSeq &&
+      producerTrackSafe &&
+      graph !== null &&
+      this.hasLiveMicGraph(producer) &&
+      (!needsPeakProtection || (!graph.settings.musicMode && graph.settings.autoGainControl)) &&
+      this.shouldResumeMicAfterTrackReplacement(producer.id)
+    ) {
+      graph.track.enabled = true;
+      producer.resume();
+      this.socket?.emit('resume-producer', { producerId: producer.id });
+    }
+  }
+
+  private async liveReplaceAudioTrackQueued(replaceSeq: number): Promise<void> {
+    if (replaceSeq !== this.liveAudioTrackReplaceSeq) return;
     const producer = this.producers.get('mic');
     if (!producer) {
-      // A pending re-production already reads the latest settings and retries
-      // drift. A later change may recover its failed, now-idle mic intent.
-      if (this.micReproducesPending > 0) return;
-      await this.liveReproduceAudio().catch((err) =>
-        console.warn(
-          '[audio-settings] Microphone recovery failed:',
-          this.microphoneCaptureErrorName(err)
-        )
-      );
+      await this.recoverMissingMicProducer();
       return;
     }
 
-    const replaceSeq = ++this.liveAudioTrackReplaceSeq;
     const adv = useAudioSettingsStore.getState();
     const selectedDeviceId = useVoiceStore.getState().audioInputDeviceId;
+    const oldGraph = this.micGraph;
+    const oldStream = this.localMicStream;
 
-    // Briefly mute to hide transition
-    producer.pause();
-
+    // The entry point paused the producer before this queued async work began.
+    let candidate: MicGraph | null = null;
+    let producerTrackSafe = true;
     try {
-      // Re-acquire mic with new constraints
-      const stream = await navigator.mediaDevices.getUserMedia(
-        this.microphoneCaptureConstraints(adv, selectedDeviceId)
+      candidate = await this.captureReplacementMicGraph(
+        replaceSeq,
+        producer,
+        oldGraph,
+        adv,
+        selectedDeviceId ?? undefined
       );
-
-      if (this.isStaleAudioTrackReplacement(replaceSeq, stream)) return;
-      if (this.producers.get('mic') !== producer) {
-        this.stopMediaStream(stream);
+      if (!candidate) return;
+      const graph = candidate;
+      graph.gain.gain.value = effectiveMicLevelPercent(useAudioSettingsStore.getState()) / 100;
+      graph.track.enabled = false;
+      producerTrackSafe = false;
+      await producer.replaceTrack({ track: graph.track });
+      if (
+        !this.isCurrentMicReplacement(
+          replaceSeq,
+          producer,
+          oldGraph,
+          adv,
+          selectedDeviceId ?? undefined,
+          graph
+        )
+      ) {
+        if (oldGraph && this.micGraph === oldGraph) {
+          await producer.replaceTrack({ track: oldGraph.track });
+          producerTrackSafe = true;
+        }
         return;
       }
-
-      // Swap track on existing producer (no SDP renegotiation)
-      await producer.replaceTrack({ track: this.swapLiveMicStream(stream, adv) });
-      if (
-        replaceSeq === this.liveAudioTrackReplaceSeq &&
-        this.producers.get('mic') === producer &&
-        this.localMicStream === stream &&
-        this.shouldRunMicVAD(producer.id)
-      ) {
-        this.startLocalVAD(stream);
-      }
+      graph.gain.gain.value = effectiveMicLevelPercent(useAudioSettingsStore.getState()) / 100;
+      producerTrackSafe = true;
+      this.adoptReplacementMicGraph(graph, oldGraph, oldStream, producer);
     } catch (err) {
-      if (replaceSeq === this.liveAudioTrackReplaceSeq) {
-        console.warn('liveReplaceAudioTrack failed:', errorMessage(err));
-      }
+      producerTrackSafe = await this.recoverFailedMicReplacement(
+        err,
+        replaceSeq,
+        producer,
+        oldGraph,
+        producerTrackSafe
+      );
     } finally {
-      if (
-        replaceSeq === this.liveAudioTrackReplaceSeq &&
-        this.shouldResumeMicAfterTrackReplacement(producer.id)
-      ) {
-        producer.resume();
-      }
+      if (candidate && this.micGraph !== candidate) this.disposeMicGraph(candidate);
+      this.resumeMicAfterReplacement(replaceSeq, producer, producerTrackSafe);
     }
   }
 
@@ -2538,6 +2678,7 @@ class VoiceService {
     this.micReproducesPending = 0;
     this.micCaptureGeneration++;
     this.liveAudioTrackReplaceSeq++;
+    this.micReplaceTrackQueue = Promise.resolve();
     if (resetQueue) this.micReproduceQueue = Promise.resolve();
   }
 
@@ -3739,7 +3880,19 @@ class VoiceService {
     return tagged;
   }
 
+  private microphoneProcessingFailure(): Error {
+    const error = new Error('Microphone processing failed');
+    Object.assign(error, { code: 'microphone_processing_failed' });
+    return error;
+  }
+
   private microphoneJoinGuidance(err: unknown): string | null {
+    if (
+      err instanceof Error &&
+      (err as Error & { code?: string }).code === 'microphone_processing_failed'
+    ) {
+      return MIC_PROCESSING_FAILED_ERROR;
+    }
     if (
       !(err instanceof Error) ||
       (err as Error & { code?: string }).code !== 'microphone_capture_failed'
@@ -4300,11 +4453,7 @@ class VoiceService {
     captureGeneration: number,
     sendTransport: mediasoupTypes.Transport,
     explicitDeviceId?: string
-  ): Promise<{
-    stream: MediaStream;
-    adv: ReturnType<typeof useAudioSettingsStore.getState>;
-    selectedDeviceId: string | undefined;
-  }> {
+  ): Promise<MicCapture> {
     // Codec re-production removes the old producer before acquiring its
     // replacement, so live settings handlers may have no producer to update.
     // Only a capture matching the latest selected input and constraints may win.
@@ -4383,88 +4532,143 @@ class VoiceService {
 
     await this.awaitMicrophonePermission(captureGeneration, sendTransport);
     for (;;) {
-      const { stream, adv, selectedDeviceId } = await this.acquireCurrentMicrophone(
+      const capture = await this.acquireCurrentMicrophone(
         captureGeneration,
         sendTransport,
         deviceId
       );
-      if (this.localMicStream && this.localMicStream !== stream) this.cleanupMicState();
-      this.localMicStream = stream;
-      try {
-        let track = this.applyInputVolume(
-          stream.getAudioTracks()[0],
-          effectiveMicLevelPercent(useAudioSettingsStore.getState())
-        );
-
-        // Manual gain is pre-gate; the existing AnalyserNode gate still measures
-        // its input with quantized 8-bit samples.
-        if (adv.noiseGateMode === 'manual') {
-          track = this.applyNoiseGate(new MediaStream([track]), adv.noiseGateLevel);
-        }
-        // Keep every candidate silent until it passes publication ownership
-        // checks and the current mute policy at adoption.
-        track.enabled = false;
-
-        const audioCaps = this.currentAudioCaps();
-        const tier = capAudioTier(
-          useVoiceStore.getState().effectiveQualityTier,
-          audioCaps.maxBitrate
-        );
-        const tierConfig = AUDIO_QUALITY_TIERS[tier];
-        const { effectiveFec, effectiveDtx, effectiveStereo, effectiveFrameSize } =
-          resolveOpusSettings(adv, tierConfig);
-        const maxBitrate = Math.min(tierConfig.maxBitrate, audioCaps.maxBitrate);
-        const publishedPtime = capAudioPtime(effectiveFrameSize, audioCaps.minPtimeMs);
-        const audioPrioParams = buildPriorityParams(adv.audioPriority);
-
-        const producer = await this.produceEncrypted(
-          sendTransport,
-          {
-            track,
-            encodings: [
-              {
-                maxBitrate,
-                adaptivePtime: adv.adaptivePtime || undefined,
-                ...audioPrioParams,
-              },
-            ],
-            codecOptions: {
-              opusStereo: effectiveStereo,
-              opusDtx: effectiveDtx,
-              opusFec: effectiveFec,
-              opusNack: adv.opusNack,
-              opusMaxAverageBitrate: maxBitrate,
-              opusMaxPlaybackRate: 48000,
-              opusPtime: publishedPtime,
-            },
-            appData: { source: 'mic' },
-          },
-          stream
-        );
-
-        if (!this.isCurrentMicCapture(captureGeneration, sendTransport, stream)) {
-          producer.close();
-          throw new Error('Microphone publication belongs to an obsolete voice session');
-        }
-
-        if (
-          this.microphoneSettingsChanged(adv, selectedDeviceId, deviceId) ||
-          this.audioPublicationExceedsCurrentCaps(maxBitrate, publishedPtime)
-        ) {
-          producer.close();
-          this.cleanupMicState(stream);
-          await this.emitAsync<{ success: true }>('close-producer', { producerId: producer.id });
-          await this.drainSendTransportQueue(sendTransport);
-          continue;
-        }
-
-        this.adoptMicProducer(producer, stream);
+      if (await this.produceAudioCapture(capture, captureGeneration, sendTransport, deviceId))
         return;
-      } catch (err) {
-        this.cleanupMicState(stream);
-        throw err;
-      }
     }
+  }
+
+  private async produceAudioCapture(
+    { stream, adv, selectedDeviceId }: MicCapture,
+    captureGeneration: number,
+    sendTransport: mediasoupTypes.Transport,
+    deviceId?: string
+  ): Promise<boolean> {
+    let graph: MicGraph | null = null;
+    try {
+      try {
+        graph = await this.createMicGraph(stream, adv, selectedDeviceId);
+      } catch (error) {
+        if (this.isCurrentMicCapture(captureGeneration, sendTransport)) {
+          useVoiceStore.getState().setJoinError(MIC_PROCESSING_FAILED_ERROR);
+          throw this.microphoneProcessingFailure();
+        }
+        throw error;
+      }
+      this.requireCurrentMicCapture(captureGeneration, sendTransport, stream);
+      if (graph.failed) {
+        useVoiceStore.getState().setJoinError(MIC_PROCESSING_FAILED_ERROR);
+        throw this.microphoneProcessingFailure();
+      }
+      if (this.microphoneSettingsChanged(adv, selectedDeviceId, deviceId)) {
+        this.disposeMicGraph(graph);
+        return false;
+      }
+      // Keep every candidate silent until it passes publication ownership
+      // checks and the current mute policy at adoption.
+      graph.track.enabled = false;
+      return await this.publishMicGraph(
+        graph,
+        { stream, adv, selectedDeviceId },
+        captureGeneration,
+        sendTransport,
+        deviceId
+      );
+    } catch (err) {
+      if (graph && this.micGraph !== graph) this.disposeMicGraph(graph);
+      else this.cleanupMicState(stream);
+      throw err;
+    }
+  }
+
+  private async publishMicGraph(
+    graph: MicGraph,
+    { stream, adv, selectedDeviceId }: MicCapture,
+    captureGeneration: number,
+    sendTransport: mediasoupTypes.Transport,
+    deviceId?: string
+  ): Promise<boolean> {
+    const audioCaps = this.currentAudioCaps();
+    const tier = capAudioTier(useVoiceStore.getState().effectiveQualityTier, audioCaps.maxBitrate);
+    const tierConfig = AUDIO_QUALITY_TIERS[tier];
+    const { effectiveFec, effectiveDtx, effectiveStereo, effectiveFrameSize } = resolveOpusSettings(
+      adv,
+      tierConfig
+    );
+    const maxBitrate = Math.min(tierConfig.maxBitrate, audioCaps.maxBitrate);
+    const publishedPtime = capAudioPtime(effectiveFrameSize, audioCaps.minPtimeMs);
+    const audioPrioParams = buildPriorityParams(adv.audioPriority);
+
+    const producer = await this.produceEncrypted(
+      sendTransport,
+      {
+        track: graph.track,
+        // A stale settings swap may restore this track after replaceTrack succeeds.
+        // The graph owns both output and capture tracks through that rollback.
+        stopTracks: false,
+        encodings: [
+          {
+            maxBitrate,
+            adaptivePtime: adv.adaptivePtime || undefined,
+            ...audioPrioParams,
+          },
+        ],
+        codecOptions: {
+          opusStereo: effectiveStereo,
+          opusDtx: effectiveDtx,
+          opusFec: effectiveFec,
+          opusNack: adv.opusNack,
+          opusMaxAverageBitrate: maxBitrate,
+          opusMaxPlaybackRate: 48000,
+          opusPtime: publishedPtime,
+        },
+        appData: { source: 'mic' },
+      },
+      stream
+    );
+
+    if (!this.isCurrentMicCapture(captureGeneration, sendTransport)) {
+      producer.close();
+      throw new Error('Microphone publication belongs to an obsolete voice session');
+    }
+    if (graph.failed) {
+      producer.close();
+      useVoiceStore.getState().setJoinError(MIC_PROCESSING_STOPPED_ERROR);
+      try {
+        await this.emitAsync<{ success: true }>('close-producer', { producerId: producer.id });
+      } catch {
+        console.warn('Could not confirm failed microphone producer cleanup on the media server');
+      } finally {
+        await this.drainSendTransportQueue(sendTransport);
+      }
+      throw this.microphoneProcessingFailure();
+    }
+
+    if (
+      this.microphoneSettingsChanged(adv, selectedDeviceId, deviceId) ||
+      this.audioPublicationExceedsCurrentCaps(maxBitrate, publishedPtime)
+    ) {
+      producer.close();
+      this.disposeMicGraph(graph);
+      await this.emitAsync<{ success: true }>('close-producer', { producerId: producer.id });
+      await this.drainSendTransportQueue(sendTransport);
+      return false;
+    }
+
+    const oldGraph = this.micGraph;
+    const oldStream = this.localMicStream;
+    this.micGraph = graph;
+    this.localMicStream = stream;
+    this.watchMicLevel();
+    if (oldGraph) this.disposeMicGraph(oldGraph);
+    else if (oldStream && oldStream !== stream) this.stopMediaStream(oldStream);
+    this.adoptMicProducer(producer, stream);
+    this.clearMicProcessingError();
+    return true;
   }
 
   /**
@@ -5661,6 +5865,7 @@ class VoiceService {
     if (this.isMediaPolicyLatched(producer.id)) return; // #2153: never resume a policed producer
     if (policy.keepProducersPaused) return;
     if (source === 'mic' && policy.keepMicPaused) return;
+    if (source === 'mic' && !this.hasLiveMicGraph(producer)) return;
 
     producer.resume();
     this.socket?.emit('resume-producer', { producerId: producer.id });
@@ -5739,7 +5944,7 @@ class VoiceService {
     store: ReturnType<typeof useVoiceStore.getState>,
     producer: mediasoupTypes.Producer
   ): Promise<void> {
-    if (!this.canUnmuteMic(store)) return;
+    if (!this.canUnmuteMic(store) || !this.hasLiveMicGraph(producer)) return;
 
     const keepSuspended = this.shouldKeepProducerSuspendedForTest(producer.id);
     if (!keepSuspended) {
@@ -5772,7 +5977,7 @@ class VoiceService {
     try {
       if (wasMuted) {
         await producer.pause();
-      } else {
+      } else if (this.hasLiveMicGraph(producer)) {
         await producer.resume();
       }
     } catch {
@@ -6615,6 +6820,7 @@ class VoiceService {
   resumeLocalProducer(source: string): void {
     const producer = this.producers.get(source);
     if (!producer?.paused || this.isMediaPolicyLatched(producer.id)) return; // #2153
+    if (source === 'mic' && !this.hasLiveMicGraph(producer)) return;
     producer.resume();
     this.socket?.emit('resume-producer', { producerId: producer.id });
   }
@@ -6674,6 +6880,7 @@ class VoiceService {
     // Respect current mute state — don't resume mic if user is muted
     for (const [source, producer] of this.producers) {
       if (source === 'mic' && store.isMuted) continue; // stay paused if intentionally muted
+      if (source === 'mic' && !this.hasLiveMicGraph(producer)) continue;
       if (producer.paused && !this.isMediaPolicyLatched(producer.id)) {
         producer.resume();
         this.socket?.emit('resume-producer', { producerId: producer.id });
@@ -7691,6 +7898,7 @@ class VoiceService {
       if (options?.preserveMicReproduceToken) {
         this.micCaptureGeneration++;
         this.liveAudioTrackReplaceSeq++;
+        this.micReplaceTrackQueue = Promise.resolve();
       } else {
         this.invalidateMicReproduces();
       }
@@ -7722,8 +7930,11 @@ class VoiceService {
       return;
     }
     this.stopLocalVAD();
-    this.stopNoiseGate();
-    this.stopInputVolume();
+    this.inputVolumeUnsub?.();
+    this.inputVolumeUnsub = null;
+    const graph = this.micGraph;
+    this.micGraph = null;
+    if (graph) this.disposeMicGraph(graph);
     if (this.localMicStream) {
       for (const t of this.localMicStream.getTracks()) t.stop();
       this.localMicStream = null;
@@ -11126,10 +11337,8 @@ class VoiceService {
     this.videoBitrateCapsForSession = null;
     this.audioCapsForSession = null;
 
-    // Stop local VAD, noise gate, input volume, and live subscriptions
+    // Stop local VAD and live subscriptions; cleanupMicState retired the graph.
     this.stopLocalVAD();
-    this.stopNoiseGate();
-    this.stopInputVolume();
     this.teardownLiveSubscriptions();
 
     // Stop packet loss monitor

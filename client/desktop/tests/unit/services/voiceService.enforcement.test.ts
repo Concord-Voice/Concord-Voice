@@ -327,6 +327,7 @@ describe('VoiceService enforcement guards', () => {
     // Clear internal maps
     svc.producers.clear();
     svc.consumers.clear();
+    svc.micGraph = null;
     // Clear socket listeners collected during import
     for (const key of Object.keys(socketListeners)) {
       delete socketListeners[key];
@@ -363,6 +364,7 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
+      svc.micGraph = { failed: false, track: { readyState: 'live' } };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();
@@ -378,6 +380,7 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
+      svc.micGraph = { failed: false, track: { readyState: 'live' } };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();
@@ -394,6 +397,7 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
+      svc.micGraph = { failed: false, track: { readyState: 'live' } };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();
@@ -409,6 +413,7 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
+      svc.micGraph = { failed: false, track: { readyState: 'live' } };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();

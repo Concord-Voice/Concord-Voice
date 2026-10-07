@@ -193,6 +193,7 @@ class MockAudioContext {
   state = 'running';
   currentTime = 0;
   sampleRate = 48000;
+  audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) };
   createMediaStreamSource = vi.fn().mockReturnValue({
     connect: vi.fn(),
     disconnect: vi.fn(),
@@ -207,8 +208,28 @@ class MockAudioContext {
   close = vi.fn().mockResolvedValue(undefined);
 }
 
+class MockAudioWorkletNode {
+  static instances: MockAudioWorkletNode[] = [];
+  port = { postMessage: vi.fn(), close: vi.fn(), onmessage: null };
+  connect = vi.fn();
+  disconnect = vi.fn();
+  addEventListener = vi.fn();
+  constructor(
+    readonly context: MockAudioContext,
+    readonly name: string,
+    readonly options: AudioWorkletNodeOptions
+  ) {
+    MockAudioWorkletNode.instances.push(this);
+  }
+}
+
 Object.defineProperty(globalThis, 'AudioContext', {
   value: MockAudioContext,
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(globalThis, 'AudioWorkletNode', {
+  value: MockAudioWorkletNode,
   writable: true,
   configurable: true,
 });
@@ -538,6 +559,7 @@ function triggerIoEvent(event: string, ...args: unknown[]) {
 describe('VoiceService Extended', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    MockAudioWorkletNode.instances.length = 0;
     vi.useFakeTimers({ shouldAdvanceTime: true });
     resetAllStores();
     useVideoSettingsStore.setState({
@@ -621,42 +643,24 @@ describe('VoiceService Extended', () => {
     });
   });
 
-  // ===== stopNoiseGate =====
+  // ===== microphone graph cleanup =====
 
-  describe('stopNoiseGate', () => {
-    it('handles already closed context', async () => {
+  describe('microphone graph cleanup', () => {
+    it('closes the protected processor graph and owned capture together', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      svc.noiseGateCtx = { state: 'closed', close: vi.fn() };
-      svc.noiseGateTimer = null;
-      svc.stopNoiseGate();
-      expect(svc.noiseGateCtx).toBeNull();
-    });
-  });
+      const graph = svc.micGraph;
+      const processor = MockAudioWorkletNode.instances.at(-1);
+      expect(graph).toBeDefined();
+      expect(processor).toBeDefined();
 
-  // ===== stopInputVolume =====
+      svc.cleanupMicState();
 
-  describe('stopInputVolume', () => {
-    it('unsubscribes and closes context', async () => {
-      await joinVoiceChannel();
-      const svc = voiceService as any;
-      const unsubSpy = vi.fn();
-      const closeCtx = vi.fn().mockResolvedValue(undefined);
-      svc.inputVolumeUnsub = unsubSpy;
-      svc.inputVolumeCtx = { state: 'running', close: closeCtx };
-      svc.stopInputVolume();
-      expect(unsubSpy).toHaveBeenCalled();
-      expect(closeCtx).toHaveBeenCalled();
-      expect(svc.inputVolumeCtx).toBeNull();
-      expect(svc.inputVolumeGain).toBeNull();
-    });
-
-    it('handles already closed context', async () => {
-      const svc = voiceService as any;
-      svc.inputVolumeCtx = { state: 'closed', close: vi.fn() };
-      svc.inputVolumeUnsub = null;
-      svc.stopInputVolume();
-      expect(svc.inputVolumeCtx).toBeNull();
+      expect(graph.track.stop).toHaveBeenCalledOnce();
+      expect(processor?.port.postMessage).toHaveBeenCalledWith({ type: 'close' });
+      expect(processor?.port.close).toHaveBeenCalledOnce();
+      expect(graph.context.close).toHaveBeenCalledOnce();
+      expect(svc.micGraph).toBeNull();
     });
   });
 
@@ -752,29 +756,25 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
       svc.teardownLiveSubscriptions();
       svc.producers.set('mic', micProducer);
-      vi.spyOn(svc, 'applyInputVolume').mockImplementation((track) => track);
 
-      const firstStream = createMockMediaStream([{ kind: 'audio', id: 'mic-old' }]);
-      const secondStream = createMockMediaStream([{ kind: 'audio', id: 'mic-new' }]);
-      const firstCapture = deferred<unknown>();
-      const secondCapture = deferred<unknown>();
-      mockGetUserMedia
-        .mockImplementationOnce(() => firstCapture.promise)
-        .mockImplementationOnce(() => secondCapture.promise);
+      const latestStream = createMockMediaStream([{ kind: 'audio', id: 'mic-new' }]);
+      mockGetUserMedia.mockResolvedValue(latestStream);
+      const capturesBeforeReplacement = mockGetUserMedia.mock.calls.length;
 
       useVoiceStore.setState({ audioInputDeviceId: 'mic-old' });
       const firstReplacement = svc.liveReplaceAudioTrack();
       useVoiceStore.setState({ audioInputDeviceId: 'mic-new' });
       const secondReplacement = svc.liveReplaceAudioTrack();
 
-      secondCapture.resolve(secondStream);
-      await secondReplacement;
-      firstCapture.resolve(firstStream);
-      await firstReplacement;
+      await Promise.all([firstReplacement, secondReplacement]);
 
-      expect(svc.localMicStream).toBe(secondStream);
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(capturesBeforeReplacement + 1);
+      expect(mockGetUserMedia).toHaveBeenCalledWith({
+        audio: expect.objectContaining({ deviceId: { exact: 'mic-new' } }),
+      });
+      expect(svc.localMicStream).toBe(latestStream);
       expect(micProducer.replaceTrack).toHaveBeenLastCalledWith({
-        track: secondStream.getAudioTracks()[0],
+        track: svc.micGraph.track,
       });
     });
 

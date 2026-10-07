@@ -194,10 +194,19 @@ const processedAudioTrack = {
 };
 
 class MockAudioContext {
+  static failNextWorkletModule = false;
   private isVadContext = false;
   state = 'running';
   currentTime = 0;
   sampleRate = 48000;
+  audioWorklet = {
+    addModule: vi.fn(async () => {
+      if (MockAudioContext.failNextWorkletModule) {
+        MockAudioContext.failNextWorkletModule = false;
+        throw new Error('worklet module load failed');
+      }
+    }),
+  };
   constructor(options?: AudioContextOptions) {
     this.isVadContext = options === undefined;
   }
@@ -214,6 +223,27 @@ class MockAudioContext {
   });
   close = vi.fn().mockResolvedValue(undefined);
 }
+
+class MockAudioWorkletNode {
+  static instances: MockAudioWorkletNode[] = [];
+  port = { postMessage: vi.fn(), close: vi.fn(), onmessage: null };
+  connect = vi.fn();
+  disconnect = vi.fn();
+  addEventListener = vi.fn();
+  constructor(
+    readonly context: MockAudioContext,
+    readonly name: string,
+    readonly options: AudioWorkletNodeOptions
+  ) {
+    MockAudioWorkletNode.instances.push(this);
+  }
+}
+
+Object.defineProperty(globalThis, 'AudioWorkletNode', {
+  value: MockAudioWorkletNode,
+  writable: true,
+  configurable: true,
+});
 
 Object.defineProperty(globalThis, 'AudioContext', {
   value: MockAudioContext,
@@ -493,6 +523,8 @@ async function joinVoiceChannel(
 describe('VoiceService', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    MockAudioContext.failNextWorkletModule = false;
+    MockAudioWorkletNode.instances.length = 0;
     mockVadInputStreams.length = 0;
     vi.useFakeTimers({ shouldAdvanceTime: true });
     resetAllStores();
@@ -659,7 +691,6 @@ describe('VoiceService', () => {
               audio: expect.objectContaining({ deviceId: { exact: 'mic-selected' } }),
             })
           );
-          expect(selectedStream.getAudioTracks).toHaveBeenCalled();
           expect(sendTransport.produce).toHaveBeenCalledOnce();
           expect(useVoiceStore.getState().connectionState).toBe('connected');
         }
@@ -808,6 +839,24 @@ describe('VoiceService', () => {
         const joinError = (useVoiceStore.getState() as unknown as { joinError?: string | null })
           .joinError;
         expect(joinError ?? null).toBeNull();
+      });
+
+      it('preserves fixed retry guidance after an initial worklet module failure resets join state', async () => {
+        MockAudioContext.failNextWorkletModule = true;
+        const logError = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const logWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+          await expect(joinVoiceChannel()).rejects.toThrow('Microphone processing failed');
+
+          expect(useVoiceStore.getState().connectionState).toBe('error');
+          expect(useVoiceStore.getState().joinError).toBe(
+            'Microphone processing failed. Retry your microphone or rejoin the call.'
+          );
+          expect(MockAudioWorkletNode.instances).toHaveLength(0);
+        } finally {
+          logError.mockRestore();
+          logWarn.mockRestore();
+        }
       });
 
       it('stops capture without microphone advice when encrypted publishing rejects', async () => {
@@ -3201,8 +3250,9 @@ describe('VoiceService', () => {
     it('applies noise gate in manual mode', async () => {
       useAudioSettingsStore.setState({ noiseGateMode: 'manual', noiseGateLevel: -40 });
       await joinVoiceChannel();
-      // Noise gate creates AudioContext, source, analyser, gain, destination
-      expect(MockAudioContext.prototype.createMediaStreamSource || true).toBeTruthy();
+      expect(MockAudioWorkletNode.instances.at(-1)?.options.processorOptions).toMatchObject({
+        gate: { kind: 'fixed', thresholdDbfs: -40 },
+      });
     });
 
     it('returns processed track from destination', async () => {
@@ -6563,7 +6613,10 @@ describe('VoiceService', () => {
       try {
         oldProduction = svc.produceAudio();
         await vi.waitFor(() => expect(oldProduceOptions).toBeDefined());
-        expect(svc.localMicStream).toBe(oldRawStream);
+        expect(
+          svc.localMicStream,
+          'an uncommitted candidate must not replace the active microphone stream before publication'
+        ).not.toBe(oldRawStream);
 
         voiceService.emergencyCleanup();
         const { micProducer: successorProducer } = await joinVoiceChannel();

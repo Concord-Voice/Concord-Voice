@@ -6,10 +6,12 @@ import {
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { ensureOsPermission } from '../../stores/voice/osPermissionStore';
 import { voiceService } from '../../services/voice/voiceService';
+import { createMicProcessor, type MicProcessorHandle } from '../../services/voice/micProcessor';
 
 interface UseMicTestReturn {
   isTesting: boolean;
   dbfsLevel: number;
+  inputOverloaded: boolean;
   error: string | null;
   startTest: () => Promise<void>;
   stopTest: () => void;
@@ -48,6 +50,9 @@ function getMicAccessErrorMessage(err: unknown): string {
   if (err instanceof DOMException && err.name === 'NotAllowedError') {
     return 'Microphone access denied';
   }
+  if (err instanceof Error && err.message === 'Microphone processing failed') {
+    return 'Microphone processing failed. Retry Test.';
+  }
   return 'Failed to access microphone';
 }
 
@@ -66,22 +71,14 @@ function buildMicConstraints(
   };
 }
 
-function getBytePeak(dataArray: Uint8Array): number {
-  let peak = 0;
-  for (const sample of dataArray) {
-    const offset = Math.abs(sample - 128);
-    if (offset > peak) peak = offset;
-  }
-  return peak;
-}
-
-function getFloatPeak(dataArray: Float32Array): number {
-  let peak = 0;
-  for (const sample of dataArray) {
-    const abs = Math.abs(sample);
-    if (abs > peak) peak = abs;
-  }
-  return peak;
+function buildMicProcessorOptions(adv: MicTestAudioSettings, useProcessing: boolean) {
+  return {
+    protectAgcPeaks: useProcessing && adv.autoGainControl,
+    gate:
+      adv.noiseGateMode === 'manual'
+        ? { kind: 'fixed' as const, thresholdDbfs: adv.noiseGateLevel }
+        : { kind: 'off' as const },
+  };
 }
 
 function shouldRestartForSettings(
@@ -106,13 +103,14 @@ function shouldRestartForDevices(state: MicTestVoiceState, prev: MicTestVoiceSta
 
 /**
  * Microphone test hook — captures mic, runs it through the same processing chain
- * as a real voice call (noise cancellation, echo cancellation, AGC, noise gate,
- * input volume), plays back through the selected output device, and provides a
- * live dBFS meter reading.
+ * as a real voice call (browser processing, one microphone level, peak protection,
+ * noise gate), plays back through the selected output device, and reads its
+ * pre-gate float peak reports.
  */
 export function useMicTest(): UseMicTestReturn {
   const [isTesting, setIsTesting] = useState(false);
   const [dbfsLevel, setDbfsLevel] = useState(-Infinity);
+  const [inputOverloaded, setInputOverloaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Refs for audio resources (not state — avoids re-renders)
@@ -120,14 +118,9 @@ export function useMicTest(): UseMicTestReturn {
   const micStreamRef = useRef<MediaStream | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const noiseGateGainRef = useRef<GainNode | null>(null);
-  const noiseGateAnalyserRef = useRef<AnalyserNode | null>(null);
-  const meterAnalyserRef = useRef<AnalyserNode | null>(null);
-  const noiseGateTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const meterRafRef = useRef<number | null>(null);
+  const processorRef = useRef<MicProcessorHandle | null>(null);
   const settingsUnsubRef = useRef<(() => void) | null>(null);
   const deviceUnsubRef = useRef<(() => void) | null>(null);
-  const noiseGateThresholdRef = useRef(-50);
   const isRestartingRef = useRef(false);
   const isTestingRef = useRef(false);
   const callSuspensionRef = useRef(false);
@@ -155,17 +148,8 @@ export function useMicTest(): UseMicTestReturn {
       }
       isRestartingRef.current = false;
 
-      // Stop meter polling
-      if (meterRafRef.current != null) {
-        cancelAnimationFrame(meterRafRef.current);
-        meterRafRef.current = null;
-      }
-
-      // Stop noise gate polling
-      if (noiseGateTimerRef.current != null) {
-        clearInterval(noiseGateTimerRef.current);
-        noiseGateTimerRef.current = null;
-      }
+      processorRef.current?.close();
+      processorRef.current = null;
 
       // Stop audio playback
       if (audioElementRef.current) {
@@ -193,12 +177,10 @@ export function useMicTest(): UseMicTestReturn {
 
       // Clear node refs
       gainNodeRef.current = null;
-      noiseGateGainRef.current = null;
-      noiseGateAnalyserRef.current = null;
-      meterAnalyserRef.current = null;
 
       setIsTesting(false);
       setDbfsLevel(-Infinity);
+      setInputOverloaded(false);
       setError(null);
     },
     [releaseCallTestSuspension]
@@ -234,34 +216,6 @@ export function useMicTest(): UseMicTestReturn {
     return ctx;
   }, []);
 
-  const connectNoiseGate = useCallback(
-    (ctx: AudioContext, currentNode: AudioNode, adv: MicTestAudioSettings): AudioNode => {
-      if (adv.noiseGateMode !== 'manual') return currentNode;
-
-      const gateAnalyser = ctx.createAnalyser();
-      gateAnalyser.fftSize = 256;
-      const gateGain = ctx.createGain();
-      noiseGateAnalyserRef.current = gateAnalyser;
-      noiseGateGainRef.current = gateGain;
-      noiseGateThresholdRef.current = adv.noiseGateLevel;
-
-      currentNode.connect(gateAnalyser);
-      gateAnalyser.connect(gateGain);
-
-      const dataArray = new Uint8Array(gateAnalyser.frequencyBinCount);
-      noiseGateTimerRef.current = setInterval(() => {
-        if (!noiseGateAnalyserRef.current) return;
-        noiseGateAnalyserRef.current.getByteTimeDomainData(dataArray);
-        const thresholdAmplitude = 128 * Math.pow(10, noiseGateThresholdRef.current / 20);
-        const isOpen = getBytePeak(dataArray) >= thresholdAmplitude;
-        gateGain.gain.setTargetAtTime(isOpen ? 1 : 0, ctx.currentTime, 0.015);
-      }, 20);
-
-      return gateGain;
-    },
-    []
-  );
-
   const connectInputVolume = useCallback(
     (ctx: AudioContext, currentNode: AudioNode, adv: MicTestAudioSettings): AudioNode => {
       const volumeGain = ctx.createGain();
@@ -273,24 +227,15 @@ export function useMicTest(): UseMicTestReturn {
     []
   );
 
-  const connectMeter = useCallback((ctx: AudioContext, currentNode: AudioNode): AnalyserNode => {
-    const meterAnalyser = ctx.createAnalyser();
-    meterAnalyser.fftSize = 2048;
-    meterAnalyser.smoothingTimeConstant = 0.4;
-    meterAnalyserRef.current = meterAnalyser;
-    currentNode.connect(meterAnalyser);
-    return meterAnalyser;
-  }, []);
-
   const createLoopbackAudio = useCallback(
     async (
       ctx: AudioContext,
-      meterAnalyser: AnalyserNode,
+      processedNode: AudioNode,
       outputDeviceId: string | null,
       generation: number
     ): Promise<boolean> => {
       const destination = ctx.createMediaStreamDestination();
-      meterAnalyser.connect(destination);
+      processedNode.connect(destination);
 
       const audioEl = new Audio();
       audioEl.srcObject = destination.stream;
@@ -319,32 +264,17 @@ export function useMicTest(): UseMicTestReturn {
     []
   );
 
-  const startMeterPolling = useCallback(
-    (meterAnalyser: AnalyserNode) => {
-      const meterData = new Float32Array(meterAnalyser.fftSize);
-      const pollMeter = () => {
-        if (!meterAnalyserRef.current) return;
-        meterAnalyserRef.current.getFloatTimeDomainData(meterData);
-        const peak = getFloatPeak(meterData);
-        const dbfs = peak > 0 ? Math.max(-80, 20 * Math.log10(peak)) : -80;
-        setDbfsLevel(dbfs);
-        meterRafRef.current = requestAnimationFrame(pollMeter);
-      };
-      meterRafRef.current = requestAnimationFrame(pollMeter);
-    },
-    [setDbfsLevel]
-  );
-
   const scheduleRestart = useCallback(() => {
+    const restartActiveTest = isTestingRef.current;
     const restartPendingTest = pendingRef.current && !isTestingRef.current;
-    if (restartPendingTest) {
+    if (restartActiveTest || restartPendingTest) {
       stopTest({ keepCallSuspension: callSuspensionRef.current });
     }
     if (isRestartingRef.current) return;
     isRestartingRef.current = true;
     restartTimeoutRef.current = setTimeout(async () => {
       restartTimeoutRef.current = null;
-      if (isTestingRef.current || restartPendingTest) {
+      if (restartActiveTest || restartPendingTest) {
         await startTestRef.current();
       }
       isRestartingRef.current = false;
@@ -367,7 +297,9 @@ export function useMicTest(): UseMicTestReturn {
       }
 
       if (state.noiseGateLevel !== prev.noiseGateLevel) {
-        noiseGateThresholdRef.current = state.noiseGateLevel;
+        if (state.noiseGateMode === 'manual') {
+          processorRef.current?.setGate({ kind: 'fixed', thresholdDbfs: state.noiseGateLevel });
+        }
       }
     },
     []
@@ -416,14 +348,36 @@ export function useMicTest(): UseMicTestReturn {
         return false;
       }
       if (generation !== generationRef.current) return false;
+      const processor = await createMicProcessor(
+        ctx,
+        buildMicProcessorOptions(adv, useProcessing),
+        (window) => {
+          if (generation !== generationRef.current || !window.valid) return;
+          if (window.overloaded) setInputOverloaded(true);
+          setDbfsLevel(window.peak > 0 ? Math.max(-80, 20 * Math.log10(window.peak)) : -80);
+        },
+        () => {
+          if (generation !== generationRef.current) return;
+          stopTest();
+          setError('Microphone processing failed. Retry Test.');
+        }
+      );
+      if (generation !== generationRef.current) {
+        processor.close();
+        return false;
+      }
+      processorRef.current = processor;
       const source = ctx.createMediaStreamSource(stream);
-      const volumeNode = connectInputVolume(ctx, source, adv);
-      const gatedNode = connectNoiseGate(ctx, volumeNode, adv);
-      const meterAnalyser = connectMeter(ctx, gatedNode);
+      const volumeNode = connectInputVolume(ctx, source, useAudioSettingsStore.getState());
+      volumeNode.connect(processor.node);
+      const current = useAudioSettingsStore.getState();
+      if (current.noiseGateMode === 'manual') {
+        processor.setGate({ kind: 'fixed', thresholdDbfs: current.noiseGateLevel });
+      }
 
       const loopbackReady = await createLoopbackAudio(
         ctx,
-        meterAnalyser,
+        processor.node,
         voiceState.audioOutputDeviceId,
         generation
       );
@@ -439,17 +393,10 @@ export function useMicTest(): UseMicTestReturn {
         }
         return false;
       }
-      startMeterPolling(meterAnalyser);
+      processor.setWindowReporting(true);
       return true;
     },
-    [
-      connectInputVolume,
-      connectMeter,
-      connectNoiseGate,
-      createLoopbackAudio,
-      createRunningAudioContext,
-      startMeterPolling,
-    ]
+    [connectInputVolume, createLoopbackAudio, createRunningAudioContext, stopTest]
   );
 
   const startTest = useCallback(async () => {
@@ -488,7 +435,10 @@ export function useMicTest(): UseMicTestReturn {
       }
       if (generation !== generationRef.current) return;
       ensureCallSuspensionForTest(inVoiceCall);
-      if (!(await startMicPipeline(adv, voiceState, useProcessing, generation))) return;
+      if (!(await startMicPipeline(adv, voiceState, useProcessing, generation))) {
+        if (generation === generationRef.current) stopTest();
+        return;
+      }
       if (generation !== generationRef.current) return;
 
       pendingRef.current = false;
@@ -517,5 +467,5 @@ export function useMicTest(): UseMicTestReturn {
     };
   }, [stopTest]);
 
-  return { isTesting, dbfsLevel, error, startTest, stopTest };
+  return { isTesting, dbfsLevel, inputOverloaded, error, startTest, stopTest };
 }

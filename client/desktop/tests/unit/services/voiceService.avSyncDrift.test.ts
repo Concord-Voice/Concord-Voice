@@ -145,6 +145,7 @@ class MockAudioContext {
   state = 'running';
   currentTime = 0;
   sampleRate = 48000;
+  audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) };
   createMediaStreamSource = vi.fn().mockReturnValue({ connect: vi.fn(), disconnect: vi.fn() });
   createAnalyser = vi.fn().mockReturnValue({
     fftSize: 0,
@@ -167,6 +168,23 @@ class MockAudioContext {
 }
 Object.defineProperty(globalThis, 'AudioContext', {
   value: MockAudioContext,
+  writable: true,
+  configurable: true,
+});
+
+class MockAudioWorkletNode {
+  port = { postMessage: vi.fn(), close: vi.fn(), onmessage: null };
+  connect = vi.fn();
+  disconnect = vi.fn();
+  addEventListener = vi.fn();
+  constructor(
+    readonly context: MockAudioContext,
+    readonly name: string,
+    readonly options: AudioWorkletNodeOptions
+  ) {}
+}
+Object.defineProperty(globalThis, 'AudioWorkletNode', {
+  value: MockAudioWorkletNode,
   writable: true,
   configurable: true,
 });

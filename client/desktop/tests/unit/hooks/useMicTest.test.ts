@@ -96,6 +96,10 @@ import { voiceService } from '@/renderer/services/voice/voiceService';
 const mockTrackStop = vi.fn();
 const mockGetUserMedia = vi.fn();
 let mockAudioContext: ReturnType<typeof createMockAudioPipeline>;
+let nextModuleGate: Promise<void> | null = null;
+let nextNodeConstructionFailure = false;
+let nextAudioContextState: AudioContextState = 'running';
+let nextAudioContextResume: (() => Promise<void>) | null = null;
 let mockDestinationTrackStop: ReturnType<typeof vi.fn>;
 let mockLoopbackSetSinkId: ReturnType<typeof vi.fn>;
 let mockLoopbackAudioElement: {
@@ -104,8 +108,48 @@ let mockLoopbackAudioElement: {
   play: ReturnType<typeof vi.fn>;
   pause: ReturnType<typeof vi.fn>;
 } | null;
+const mockProcessorNodes: Array<{
+  context: Record<string, unknown>;
+  name: string;
+  options: unknown;
+  instance: MockAudioWorkletNode;
+}> = [];
+class MockAudioWorkletNode {
+  port = {
+    onmessage: null as ((event: MessageEvent<unknown>) => void) | null,
+    postMessage: vi.fn(),
+    close: vi.fn(),
+  };
+  disconnect = vi.fn();
+  addEventListener = vi.fn();
+  connect: ReturnType<typeof vi.fn>;
+  constructor(
+    readonly context: Record<string, unknown>,
+    readonly name: string,
+    readonly options: unknown
+  ) {
+    if (nextNodeConstructionFailure) {
+      nextNodeConstructionFailure = false;
+      throw new Error('node construction failed');
+    }
+    mockProcessorNodes.push({ context, name, options, instance: this });
+    this.connect = vi.fn((to: Record<string, unknown>) => {
+      (
+        context._connections as Array<{
+          from: Record<string, unknown>;
+          to: Record<string, unknown>;
+        }>
+      ).push({
+        from: this as unknown as Record<string, unknown>,
+        to,
+      });
+    });
+  }
+}
 
 function createMockAudioPipeline() {
+  const contextState = nextAudioContextState;
+  const resumeAudioContext = nextAudioContextResume;
   const connections: Array<{ from: Record<string, unknown>; to: Record<string, unknown> }> = [];
   const gainNodes: Record<string, unknown>[] = [];
   // Each node needs its own connect mock that returns itself (for chaining)
@@ -123,10 +167,18 @@ function createMockAudioPipeline() {
   const destNode = { stream: destStream };
 
   const mockCtx = {
-    state: 'running',
+    state: contextState,
     currentTime: 0,
+    sampleRate: 48000,
+    audioWorklet: {
+      addModule: vi.fn(async () => {
+        const gate = nextModuleGate;
+        nextModuleGate = null;
+        if (gate) await gate;
+      }),
+    },
     close: vi.fn().mockResolvedValue(undefined),
-    resume: vi.fn().mockResolvedValue(undefined),
+    resume: vi.fn(() => resumeAudioContext?.() ?? Promise.resolve()),
     createMediaStreamSource: vi.fn(() => sourceNode),
     createGain: vi.fn(() => {
       // Return a fresh gain node each time (volume gain vs noise gate gain)
@@ -154,6 +206,10 @@ function createMockAudioPipeline() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  nextModuleGate = null;
+  nextNodeConstructionFailure = false;
+  nextAudioContextState = 'running';
+  nextAudioContextResume = null;
   vi.mocked(useVoiceStore.getState).mockImplementation(() =>
     (useVoiceStore as any)._getCanonicalState()
   );
@@ -170,11 +226,15 @@ beforeEach(() => {
 
   // Mock AudioContext constructor — must use a class/function form for `new`
   mockDestinationTrackStop = vi.fn();
-  const mockCtx = createMockAudioPipeline();
-  mockAudioContext = mockCtx;
+  mockAudioContext = createMockAudioPipeline();
+  mockProcessorNodes.length = 0;
   (globalThis as any).AudioContext = function MockAudioContext() {
-    return mockCtx;
+    mockAudioContext = createMockAudioPipeline();
+    nextAudioContextState = 'running';
+    nextAudioContextResume = null;
+    return mockAudioContext;
   };
+  (globalThis as any).AudioWorkletNode = MockAudioWorkletNode;
 
   // Mock getUserMedia
   mockGetUserMedia.mockResolvedValue({
@@ -223,34 +283,48 @@ describe('useMicTest', () => {
       _gainNodes: Record<string, unknown>[];
       _sourceNode: Record<string, unknown>;
     };
-    const gateAnalyser = mockAudioContext.createAnalyser.mock.results[0]?.value;
-    const gateGain = graph._connections.find(({ from }) => from === gateAnalyser)?.to;
-    const levelGains = graph._gainNodes.filter((gainNode) => gainNode !== gateGain);
+    const levelGains = graph._gainNodes;
     expect(
       levelGains,
       'the graph must contain exactly one manual microphone-level GainNode'
     ).toHaveLength(1);
     if (levelGains.length !== 1) return null;
-    return { graph, levelGain: levelGains[0], gateAnalyser, gateGain };
+    return { graph, levelGain: levelGains[0] };
   };
 
   const expectManualGainBeforeGate = () => {
     const graphBits = findManualLevelGain();
     if (!graphBits) return null;
-    const { graph, levelGain, gateAnalyser, gateGain } = graphBits;
+    const { graph, levelGain } = graphBits;
     const sourceGains = graph._connections
       .filter(({ from, to }) => from === graph._sourceNode && graph._gainNodes.includes(to))
       .map(({ to }) => to);
-    expect(graph._gainNodes, 'manual level and gate must each own one GainNode').toHaveLength(2);
+    expect(graph._gainNodes, 'the only GainNode must be before the protector').toHaveLength(1);
     expect(
       sourceGains,
-      'the raw microphone source must enter the manual level GainNode before the gate'
+      'the raw microphone source must enter the manual level GainNode before the protector'
     ).toEqual([levelGain]);
-    expect(graph._connections).toContainEqual({ from: levelGain, to: gateAnalyser });
-    expect(gateGain, 'the gate analyser must feed its gate GainNode').toBeDefined();
-    expect(graph._connections).toContainEqual({
-      from: gateGain,
-      to: mockAudioContext.createAnalyser.mock.results[1]?.value,
+    const processor = mockProcessorNodes.find(({ context }) => context === mockAudioContext);
+    expect(processor?.name).toBe('concord-mic-processor');
+    const processorNode = graph._connections.find(({ from, to }) => from === levelGain)?.to;
+    expect(processorNode).toBeDefined();
+    expect(graph._connections.some(({ from }) => from === processorNode)).toBe(true);
+    expect(
+      graph._connections.some(
+        ({ from, to }) => from === processorNode && graph._gainNodes.includes(to)
+      ),
+      'the test graph must not boost audio after the peak protector'
+    ).toBe(false);
+    expect(
+      (processor?.options as { processorOptions?: unknown } | undefined)?.processorOptions
+    ).toMatchObject({
+      protectAgcPeaks:
+        (useAudioSettingsStore as any).getState().autoGainControl &&
+        !(useAudioSettingsStore as any).getState().musicMode,
+      gate:
+        (useAudioSettingsStore as any).getState().noiseGateMode === 'manual'
+          ? { kind: 'fixed' }
+          : { kind: 'off' },
     });
     return levelGain;
   };
@@ -268,7 +342,7 @@ describe('useMicTest', () => {
   });
 
   describe('startTest', () => {
-    it('#3635 keeps one microphone-level GainNode before the manual gate and uses unity when AGC is effective', async () => {
+    it('#3638 keeps one microphone-level GainNode before the protector and uses unity when AGC is effective', async () => {
       (useAudioSettingsStore as any).setState({
         autoGainControl: true,
         musicMode: false,
@@ -282,8 +356,79 @@ describe('useMicTest', () => {
       expectManualGainBeforeGate();
     });
 
+    it('#3638 reports pre-gate dBFS from validated processor windows', async () => {
+      const result = await startMicPipeline();
+      const processor = mockProcessorNodes.at(-1)?.instance;
+      expect(processor?.port.onmessage).toBeTypeOf('function');
+
+      act(() => {
+        processor?.port.onmessage?.({
+          data: { peak: 0.25, frames: 960, valid: true, overloaded: false },
+        } as MessageEvent<unknown>);
+      });
+
+      expect(result.current.dbfsLevel).toBeCloseTo(20 * Math.log10(0.25));
+      expect(mockAudioContext.createAnalyser).not.toHaveBeenCalled();
+    });
+
+    it('#3638 keeps the pre-limiter overload warning visible until Test stops', async () => {
+      const result = await startMicPipeline();
+      const processor = mockProcessorNodes.at(-1)?.instance;
+      const report = (overloaded: boolean) =>
+        processor?.port.onmessage?.({
+          data: { peak: 0.25, frames: 960, valid: true, overloaded },
+        } as MessageEvent<unknown>);
+
+      act(() => report(true));
+      expect(result.current.inputOverloaded).toBe(true);
+
+      act(() => report(false));
+      expect(result.current.inputOverloaded).toBe(true);
+
+      act(() => result.current.stopTest());
+      expect(result.current.inputOverloaded).toBe(false);
+    });
+
+    it('#3638 closes the processor and capture when Test stops', async () => {
+      const result = await startMicPipeline();
+      const processor = mockProcessorNodes.at(-1)?.instance;
+
+      act(() => result.current.stopTest());
+
+      expect(processor?.port.postMessage).toHaveBeenCalledWith({ type: 'close' });
+      expect(processor?.port.close).toHaveBeenCalledOnce();
+      expect(processor?.disconnect).toHaveBeenCalledOnce();
+      expect(mockTrackStop).toHaveBeenCalledOnce();
+      expect(result.current.isTesting).toBe(false);
+    });
+
+    it('#3638 disposes a delayed processor candidate when Test is stopped during module loading', async () => {
+      let resolveModule!: () => void;
+      const moduleReady = new Promise<void>((resolve) => {
+        resolveModule = resolve;
+      });
+      nextModuleGate = moduleReady;
+      const { result } = renderHook(() => useMicTest());
+      let starting!: Promise<void>;
+      act(() => {
+        starting = result.current.startTest();
+      });
+      await waitFor(() => expect(mockAudioContext.audioWorklet.addModule).toHaveBeenCalled());
+      const candidateContext = mockAudioContext;
+
+      act(() => result.current.stopTest());
+      resolveModule();
+      await act(async () => starting);
+
+      expect(result.current.isTesting).toBe(false);
+      expect(candidateContext.close).toHaveBeenCalledOnce();
+      expect(mockTrackStop).toHaveBeenCalledOnce();
+      expect(mockProcessorNodes.at(-1)?.instance.disconnect).toHaveBeenCalledOnce();
+      expect(mockLoopbackAudioElement).toBeNull();
+    });
+
     it.each([{ inputVolume: 0 }, { inputVolume: 100 }, { inputVolume: 200 }])(
-      '#3635 applies saved manual microphone level $inputVolume% before the gate when AGC is off',
+      '#3638 applies saved manual microphone level $inputVolume% before the processor when AGC is off',
       async ({ inputVolume }) => {
         (useAudioSettingsStore as any).setState({
           autoGainControl: false,
@@ -351,7 +496,7 @@ describe('useMicTest', () => {
         null,
       ],
     ])(
-      '#3635 committed %s updates the active Test GainNode to the effective level',
+      '#3638 committed %s updates the active Test graph to the effective level',
       async (_label, initialSettings, update, effectivePercent) => {
         (useAudioSettingsStore as any).setState({
           ...initialSettings,
@@ -361,11 +506,32 @@ describe('useMicTest', () => {
         await startMicPipeline();
         const levelGain = findManualLevelGain()?.levelGain;
         const gainParam = levelGain?.gain as
-          { setTargetAtTime: ReturnType<typeof vi.fn> } | undefined;
+          { value: number; setTargetAtTime: ReturnType<typeof vi.fn> } | undefined;
+        const previousProcessor = mockProcessorNodes.at(-1);
+        const oldProcessorCount = mockProcessorNodes.length;
         act(() => (useAudioSettingsStore as any).setState(update));
-        if (effectivePercent == null) {
+        const changesEffectiveAgc =
+          Object.hasOwn(update as object, 'autoGainControl') ||
+          Object.hasOwn(update as object, 'musicMode');
+        if (changesEffectiveAgc) {
           expect(
-            (levelGain?.gain as { value: number } | undefined)?.value,
+            previousProcessor?.instance.port.close,
+            'an AGC or Music Mode transition must synchronously retire the prior Test graph'
+          ).toHaveBeenCalledOnce();
+          await waitFor(() => expect(mockProcessorNodes.length).toBeGreaterThan(oldProcessorCount));
+          const settings = (useAudioSettingsStore as any).getState();
+          expect(
+            (mockProcessorNodes.at(-1)?.options as { processorOptions?: unknown })?.processorOptions
+          ).toMatchObject({
+            protectAgcPeaks: settings.autoGainControl && !settings.musicMode,
+            gate: { kind: 'fixed', thresholdDbfs: -50 },
+          });
+          expect((findManualLevelGain()?.levelGain.gain as { value: number }).value).toBe(
+            (effectivePercent as number) / 100
+          );
+        } else if (effectivePercent == null) {
+          expect(
+            gainParam?.value,
             'positive saved manual levels must retain unity Test gain while AGC is effective'
           ).toBe(1);
           expect(
@@ -375,7 +541,7 @@ describe('useMicTest', () => {
         } else {
           expect(
             gainParam?.setTargetAtTime,
-            'committed AGC, Music Mode, and manual-level changes must update the active Test graph'
+            'committed manual-level changes must update the active Test graph'
           ).toHaveBeenCalledWith(effectivePercent / 100, 0, 0.01);
         }
       }
@@ -604,8 +770,8 @@ describe('useMicTest', () => {
       const pendingResume = new Promise<void>((resolve) => {
         resolveResume = resolve;
       });
-      mockAudioContext.state = 'suspended';
-      mockAudioContext.resume = vi.fn().mockReturnValue(pendingResume);
+      nextAudioContextState = 'suspended';
+      nextAudioContextResume = () => pendingResume;
       const { result } = renderHook(() => useMicTest());
       let start!: Promise<void>;
       act(() => {
@@ -632,8 +798,8 @@ describe('useMicTest', () => {
       const pendingResume = new Promise<void>((resolve) => {
         resolveResume = resolve;
       });
-      mockAudioContext.state = 'suspended';
-      mockAudioContext.resume = vi.fn().mockReturnValue(pendingResume);
+      nextAudioContextState = 'suspended';
+      nextAudioContextResume = () => pendingResume;
       const { result } = renderHook(() => useMicTest());
       let start!: Promise<void>;
       act(() => {
@@ -918,16 +1084,6 @@ describe('useMicTest', () => {
       vi.useRealTimers();
     });
 
-    it('starts meter polling via requestAnimationFrame', async () => {
-      const { result } = renderHook(() => useMicTest());
-
-      await act(async () => {
-        await result.current.startTest();
-      });
-
-      expect(globalThis.requestAnimationFrame).toHaveBeenCalled();
-    });
-
     it('handles getUserMedia NotAllowedError', async () => {
       const domErr = new DOMException('Permission denied', 'NotAllowedError');
       mockGetUserMedia.mockRejectedValueOnce(domErr);
@@ -954,6 +1110,29 @@ describe('useMicTest', () => {
       expect(result.current.isTesting).toBe(false);
       expect(result.current.error).toBe('Failed to access microphone');
     });
+
+    it.each(['module load', 'node construction'] as const)(
+      'reports %s failure as microphone processing failure after successful capture',
+      async (failure) => {
+        if (failure === 'module load') {
+          nextModuleGate = Promise.resolve().then(() => {
+            throw new Error('module load failed');
+          });
+        } else {
+          nextNodeConstructionFailure = true;
+        }
+
+        const { result } = renderHook(() => useMicTest());
+        await act(async () => {
+          await result.current.startTest();
+        });
+
+        expect(mockGetUserMedia).toHaveBeenCalledOnce();
+        expect(result.current.isTesting).toBe(false);
+        expect(result.current.error).toBe('Microphone processing failed. Retry Test.');
+        expect(mockTrackStop).toHaveBeenCalledOnce();
+      }
+    );
   });
 
   describe('stopTest', () => {
@@ -973,7 +1152,7 @@ describe('useMicTest', () => {
       expect(result.current.isTesting).toBe(false);
       expect(result.current.dbfsLevel).toBe(-Infinity);
       expect(result.current.error).toBeNull();
-      expect(cancelAnimationFrame).toHaveBeenCalled();
+      expect(mockProcessorNodes.at(-1)?.instance.port.close).toHaveBeenCalledOnce();
     });
 
     it('stops mic stream tracks', async () => {

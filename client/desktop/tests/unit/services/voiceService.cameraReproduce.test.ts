@@ -101,6 +101,37 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 }));
 
 // --- browser APIs ---
+class MockAudioContext {
+  state = 'running';
+  currentTime = 0;
+  sampleRate = 48000;
+  audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) };
+  createMediaStreamSource = vi.fn().mockReturnValue({ connect: vi.fn(), disconnect: vi.fn() });
+  createGain = vi
+    .fn()
+    .mockReturnValue({ gain: { value: 1, setTargetAtTime: vi.fn() }, connect: vi.fn() });
+  createMediaStreamDestination = vi.fn(() => ({
+    stream: { getAudioTracks: () => [makeAudioTrack('protected-mic')] },
+  }));
+  close = vi.fn().mockResolvedValue(undefined);
+}
+class MockAudioWorkletNode {
+  port = { postMessage: vi.fn(), close: vi.fn(), onmessage: null };
+  connect = vi.fn();
+  disconnect = vi.fn();
+  addEventListener = vi.fn();
+  constructor() {}
+}
+Object.defineProperty(globalThis, 'AudioContext', {
+  value: MockAudioContext,
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(globalThis, 'AudioWorkletNode', {
+  value: MockAudioWorkletNode,
+  writable: true,
+  configurable: true,
+});
 class MockMediaStream {
   private _tracks: any[];
   constructor(tracks?: any[]) {
@@ -370,8 +401,6 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     svc.mediaEncryption = { encryptFrame: vi.fn().mockResolvedValue(undefined) };
     svc.startPacketLossMonitor = vi.fn();
     svc.startLocalVAD = vi.fn();
-    svc.applyNoiseGate = vi.fn((stream: MockMediaStream) => stream.getAudioTracks()[0]);
-    svc.applyInputVolume = vi.fn((track: unknown) => track);
 
     const cameraTrack = makeVideoTrack('pre-publish-camera');
     svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([cameraTrack]));
@@ -411,7 +440,6 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     requirePrePublishTransform = true;
     pendingSenderSupportsTransform = false;
     svc.mediaEncryption = { encryptFrame: vi.fn().mockResolvedValue(undefined) };
-    svc.applyInputVolume = vi.fn((track: unknown) => track);
 
     const micTrack = makeAudioTrack('fail-closed-pre-publish-mic');
     const micStream = new MockMediaStream([micTrack]);
