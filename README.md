@@ -38,8 +38,8 @@ For the high-level system design, see **[docs/architecture.md](./docs/architectu
 
 ### Prerequisites
 
-- **Node.js** 24+
-- **Go** 1.26+
+- **Node.js** 24.15.0+ (the highest `engines.node` floor across the Node workspaces)
+- **Go** 1.26.8 (the supported toolchain, recorded in `services/control-plane/go.mod`)
 - **Python 3** + **pre-commit** (`pip install pre-commit`)
 - **Docker** & **Docker Compose**
 

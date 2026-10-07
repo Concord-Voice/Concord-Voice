@@ -47,8 +47,8 @@ Media Plane (Node.js + mediasoup) ← Voice Routing
 
 Install these first:
 
-- **Node.js 24+** - [Download](https://nodejs.org/)
-- **Go 1.26.6+** - [Download](https://go.dev/dl/) (the `go` directive in `services/control-plane/go.mod`)
+- **Node.js 24.15.0+** - [Download](https://nodejs.org/) (the highest `engines.node` floor across the Node workspaces)
+- **Go 1.26.8** - [Download](https://go.dev/dl/) (the `go` directive in `services/control-plane/go.mod`, aligned with CI and both Docker builders)
 - **Docker Desktop** - [Download](https://www.docker.com/products/docker-desktop/)
 - **Git** - [Download](https://git-scm.com/)
 - **Python 3** - [Download](https://www.python.org/downloads/) (for `pre-commit` hooks framework and mediasoup build)
@@ -57,8 +57,8 @@ Install these first:
 ### Verify Installation
 
 ```bash
-node --version    # Should be v24.x or higher
-go version        # Should be go1.26.6 or higher
+node --version    # Should be v24.15.0 or higher
+go version        # Should be go1.26.8
 docker --version  # Should be 20.x or higher
 lsof -v           # Used for safe local-process cleanup
 ```

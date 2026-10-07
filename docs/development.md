@@ -21,7 +21,9 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
   `client/admin` need **Node.js >= 24.15.0**, and `services/media-plane` needs
   **>= 24.11.0**. Node 26 is included. Each workspace's `package.json` `engines`
   field is authoritative. Go-only work does not require Node.js
-- **Go** 1.26.6+ (the floor is `services/control-plane/go.mod`)
+- **Go** 1.26.8 (the supported toolchain, recorded in `services/control-plane/go.mod`)
+  Select this exact release with `GOTOOLCHAIN=go1.26.8` if a newer Go is installed;
+  CI and both Docker builders use the same version
 - **Docker** and **Docker Compose**
 - **Git**
 - **Python 3** (for `pre-commit` hooks framework and mediasoup build)

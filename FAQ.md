@@ -418,8 +418,8 @@ See [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) for detailed instructio
 
 **Required:**
 
-- **Node.js** 20+
-- **Go** 1.26.2+
+- **Node.js** 24.15.0+ (the highest `engines.node` floor across the Node workspaces)
+- **Go** 1.26.8 (the supported toolchain, recorded in `services/control-plane/go.mod`)
 - **Docker** & **Docker Compose**
 - **Git**
 

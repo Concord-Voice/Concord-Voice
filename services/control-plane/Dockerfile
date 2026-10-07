@@ -15,14 +15,12 @@ COPY --from=admin_ui . .
 RUN npm run build && test -f dist/index.html
 
 # Go build stage
-# Patch-pinned to 1.26.6 (not the floating 1.26-alpine tag) so the SHIPPED
-# binary is compiled with the Go stdlib CVE fixes (GO-2026-5037/5038/5039
-# plus GO-2026-5856/GO-2026-4970, and the 1.26.6 set: GO-2026-5026/5972/6088/
-# 6089/6090/6091/6218 across net/http, crypto/tls, html/template, encoding/xml,
-# encoding/asn1 and net/url), deterministically, not reliant on Docker Hub
-# tag-float + a GOTOOLCHAIN build-time download. Keep in lockstep with
-# services/control-plane/go.mod's `go` directive.
-FROM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
+# Pin the patch tag and reviewed digest to go.mod's `toolchain` directive
+# (or its `go` directive when no toolchain is declared). The builder supplies
+# the shipped stdlib directly, without a GOTOOLCHAIN build-time download.
+# The `go` directive separately controls the module's compatibility defaults.
+# scripts/check-go-toolchain.py enforces alignment with Dockerfile.ops-agent.
+FROM golang:1.26.8-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS builder
 
 WORKDIR /app
 
