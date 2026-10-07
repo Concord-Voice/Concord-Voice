@@ -324,7 +324,7 @@ bundle (client/desktop):
 | mdast-util-to-hast | 13.2.1 | MIT | https://github.com/syntax-tree/mdast-util-to-hast |
 | mdast-util-to-markdown | 2.1.2 | MIT | https://github.com/syntax-tree/mdast-util-to-markdown |
 | mdast-util-to-string | 4.0.0 | MIT | https://github.com/syntax-tree/mdast-util-to-string |
-| mediasoup-client | 3.23.2 | ISC | https://github.com/versatica/mediasoup-client |
+| mediasoup-client | 3.24.1 | ISC | https://github.com/versatica/mediasoup-client |
 | micromark-core-commonmark | 2.0.3 | MIT | https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark |
 | micromark-extension-gfm-autolink-literal | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-autolink-literal |
 | micromark-extension-gfm-footnote | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-footnote |
@@ -381,7 +381,7 @@ bundle (client/desktop):
 | sdp-transform | 3.0.0 | MIT | https://github.com/clux/sdp-transform |
 | semver | 7.7.4 | ISC | https://github.com/npm/node-semver |
 | set-blocking | 2.0.0 | ISC | https://github.com/yargs/set-blocking |
-| socket.io-client | 4.8.3 | MIT | https://github.com/socketio/socket.io |
+| socket.io-client | 4.8.4 | MIT | https://github.com/socketio/socket.io |
 | socket.io-parser | 4.2.7 | MIT | https://github.com/socketio/socket.io |
 | space-separated-tokens | 2.0.2 | MIT | https://github.com/wooorm/space-separated-tokens |
 | string-width | 4.2.3 | MIT | https://github.com/sindresorhus/string-width |
