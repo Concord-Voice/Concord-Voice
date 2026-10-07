@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -27,13 +28,17 @@ type fakePurger struct {
 	gotServerID, gotActor, gotTarget, gotReason string
 	gotCtxErr                                   error // ctx.Err() observed at call time
 	gotDeadline                                 time.Time
+	gotProvenance                               messages.PurgeProvenance
 	retCount                                    int
 	retStatus                                   messages.PurgeStatus
 	retErr                                      error
 }
 
-func (f *fakePurger) PurgeUserServerMessages(ctx context.Context, serverID, actorID, target, reason string) (int, messages.PurgeStatus, error) {
+func (f *fakePurger) PurgeUserServerMessages(
+	ctx context.Context, serverID, actorID, target, reason string, provenance messages.PurgeProvenance,
+) (int, messages.PurgeStatus, error) {
 	f.called = true
+	f.gotProvenance = provenance
 	f.gotServerID, f.gotActor, f.gotTarget, f.gotReason = serverID, actorID, target, reason
 	f.gotCtxErr = ctx.Err()
 	f.gotDeadline, _ = ctx.Deadline()
@@ -56,7 +61,7 @@ func testHandlerWithRedis(t *testing.T, p serverMessagePurger) (*Handler, *minir
 
 func TestApplyPurgeOnModeration_Completed(t *testing.T) {
 	fp := &fakePurger{retCount: 3, retStatus: messages.PurgeCompleted}
-	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
+	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.True(t, fp.called)
 	assert.Equal(t, "srv", fp.gotServerID)
 	assert.Equal(t, "mod", fp.gotActor)
@@ -65,20 +70,43 @@ func TestApplyPurgeOnModeration_Completed(t *testing.T) {
 	assert.Equal(t, purgeOutcome{Requested: true, Status: messages.PurgeCompleted, PurgedCount: 3}, out)
 }
 
+// TestApplyPurgeOnModeration_PassesTheGateProvenance pins the provenance the
+// purge engine receives (#3454 A-3.7): purgeProvenance of the committed ban or
+// removal's gate outcome, passed through unchanged. Confirmed covers a
+// verified factor and a valid grace; unconfirmed is a server that did not
+// enforce. Neither may become PurgeExempt, which the per-batch enforcement
+// recheck never refuses.
+func TestApplyPurgeOnModeration_PassesTheGateProvenance(t *testing.T) {
+	cases := []struct {
+		outcome mfaenforce.Outcome
+		want    messages.PurgeProvenance
+	}{
+		{mfaenforce.Verified, messages.PurgeConfirmed},
+		{mfaenforce.GraceCovered, messages.PurgeConfirmed},
+		{mfaenforce.Unconfirmed, messages.PurgeUnconfirmed},
+	}
+	for _, tc := range cases {
+		fp := &fakePurger{retStatus: messages.PurgeCompleted}
+		testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban",
+			purgeProvenance(tc.outcome))
+		assert.Equal(t, tc.want, fp.gotProvenance, "outcome %d", tc.outcome)
+	}
+}
+
 func TestApplyPurgeOnModeration_SkippedUnauthorized(t *testing.T) {
 	fp := &fakePurger{retStatus: messages.PurgeSkippedUnauthorized}
-	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "kick")
+	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "kick", messages.PurgeUnconfirmed)
 	assert.Equal(t, purgeOutcome{Requested: true, Status: messages.PurgeSkippedUnauthorized}, out)
 }
 
 func TestApplyPurgeOnModeration_Failed(t *testing.T) {
 	fp := &fakePurger{retCount: 3, retStatus: messages.PurgeFailed, retErr: errors.New("boom")}
-	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
+	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.Equal(t, purgeOutcome{Requested: true, Status: messages.PurgeFailed, PurgedCount: 3}, out)
 }
 
 func TestApplyPurgeOnModeration_NilPurger(t *testing.T) {
-	out := testHandlerWithPurger(nil).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
+	out := testHandlerWithPurger(nil).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.Equal(t, purgeOutcome{Requested: true, Status: messages.PurgeFailed}, out)
 }
 
@@ -121,7 +149,7 @@ func TestApplyPurgeOnModeration_DetachesFromRequestContext(t *testing.T) {
 	fp := &fakePurger{retStatus: messages.PurgeCompleted, retCount: 1}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // simulate the client having already disconnected
-	out := testHandlerWithPurger(fp).applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban")
+	out := testHandlerWithPurger(fp).applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.True(t, fp.called, "purge still runs despite a cancelled request context")
 	assert.NoError(t, fp.gotCtxErr, "purger receives a cancellation-detached context")
 	assert.Equal(t, messages.PurgeCompleted, out.Status)
@@ -133,7 +161,7 @@ func TestApplyPurgeOnModeration_PreservesCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
-	testHandlerWithPurger(fp).applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban")
+	testHandlerWithPurger(fp).applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	require.True(t, fp.called)
 	require.WithinDuration(t, deadline, fp.gotDeadline, 20*time.Millisecond)
 }
@@ -145,11 +173,11 @@ func TestApplyPurgeOnModeration_RateLimitExhausted(t *testing.T) {
 	h, _ := testHandlerWithRedis(t, fp)
 	// First purgeModerationRateLimit calls are allowed; the next is denied.
 	for i := 0; i < purgeModerationRateLimit; i++ {
-		out := h.applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
+		out := h.applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 		require.Equal(t, messages.PurgeCompleted, out.Status, "call %d should be allowed", i+1)
 	}
 	fp.called = false
-	out := h.applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
+	out := h.applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.Equal(t, messages.PurgeSkippedRateLimited, out.Status, "over-budget call is skipped")
 	assert.False(t, fp.called, "engine is NOT invoked when rate-limited")
 }
@@ -160,7 +188,7 @@ func TestApplyPurgeOnModeration_RateLimitBackendErrorFailsClosed(t *testing.T) {
 	fp := &fakePurger{retStatus: messages.PurgeCompleted, retCount: 1}
 	h, mr := testHandlerWithRedis(t, fp)
 	mr.Close() // Redis outage
-	out := h.applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
+	out := h.applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.Equal(t, messages.PurgeSkippedRateLimited, out.Status, "backend error fails closed")
 	assert.False(t, fp.called, "engine is NOT invoked on a Redis backend error")
 }
@@ -174,7 +202,7 @@ func TestApplyPurgeOnModeration_RateLimitGateSurvivesDisconnect(t *testing.T) {
 	h, _ := testHandlerWithRedis(t, fp)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // client already disconnected when applyPurgeOnModeration runs
-	out := h.applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban")
+	out := h.applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban", messages.PurgeUnconfirmed)
 	assert.Equal(t, messages.PurgeCompleted, out.Status, "purge runs; NOT skipped_rate_limited")
 	assert.True(t, fp.called, "engine invoked despite the cancelled request context")
 	assert.NoError(t, fp.gotCtxErr, "purger receives a cancellation-detached context")

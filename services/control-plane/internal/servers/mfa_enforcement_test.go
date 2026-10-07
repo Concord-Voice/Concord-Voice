@@ -692,6 +692,35 @@ func TestMFAEnforcement_BackupCodeSurvivesAFailedCommit(t *testing.T) {
 	assert.False(t, readMFAFlag(t, env, f.serverID))
 }
 
+// A rollback that itself fails is joined onto the route's error, so the 500's
+// log line carries it rather than reporting the injected failure alone. The
+// transaction's backend is terminated inside the gate, so the deferred
+// ROLLBACK meets a dead connection. Kills: the rollback's result discarded.
+func TestMFAEnforcement_FailedRollbackIsLogged(t *testing.T) {
+	env := setupMFAEnforcementEnv(t)
+	f := newMFAFixture(t, env, "mfarb", false)
+	enrollMFATOTP(t, env, f.owner.ID)
+	gateErr := errors.New("injected gate failure")
+
+	servers.SetMFAEnforcementGateForTest(t, func(ctx context.Context, tx *sql.Tx, _, _ string,
+		_ stepup.Lock, _ mfaenforce.ServerLock, _ string) (mfaenforce.Gate, error) {
+		var pid int
+		require.NoError(t, tx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid))
+		var gone bool
+		require.NoError(t, env.ts.DB.QueryRowContext(ctx, `SELECT pg_terminate_backend($1, 5000)`, pid).Scan(&gone))
+		require.True(t, gone, "the backend must have exited before the gate returns")
+		return mfaenforce.Gate{}, gateErr
+	})
+	env.logs.Reset()
+	w := putMFA(env, f.owner, f.serverID, bodyOn())
+	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	assert.JSONEq(t, mfaErrorBody("Failed to update MFA enforcement"), w.Body.String())
+	logs := env.logs.String()
+	assert.Contains(t, logs, gateErr.Error(), "the route's own error is still logged")
+	assert.Contains(t, logs, "roll back", "the failed rollback is logged with it")
+	assert.False(t, readMFAFlag(t, env, f.serverID))
+}
+
 // ---------------------------------------------------------------------------
 // Nightwatch: every 403 refusal is the one fallback
 // ---------------------------------------------------------------------------
@@ -807,9 +836,12 @@ func TestMFAEnforcement_ValueAppearsInNoServerPayload(t *testing.T) {
 		}
 	}
 
+	// Each edit carries the actor's backup code: on an enforcing server
+	// UpdateServer is a gated dangerous action (#3454).
 	for name, u := range map[string]testhelpers.TestUser{"owner": f.owner, "admin": f.admin} {
 		requireNoFlagInBody(t, ts.DoRequest(http.MethodPatch, "/api/v1/servers/"+f.serverID,
-			map[string]any{"name": "E2 renamed " + name}, testhelpers.AuthHeaders(u.AccessToken)), name+" UpdateServer")
+			map[string]any{"name": "E2 renamed " + name, "mfa_code": mfaBackupCode},
+			testhelpers.AuthHeaders(u.AccessToken)), name+" UpdateServer")
 	}
 
 	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))

@@ -5,7 +5,7 @@ package mfa
 // seeded key, so these tests do not depend on how a token is stored.
 //
 // Levels: the fourteen MFA-settings consumers are driven at the HANDLER; the
-// thirteen consumers outside this package are driven through the entry point each
+// twenty-eight consumers outside this package are driven through the entry point each
 // calls with the real verifier (stepup.VerifyMFAFactor/Tx, mfaenforce.ConfirmTx,
 // or VerifyCode/VerifyCodeTx directly), because their handlers live in packages
 // this one cannot import.
@@ -191,10 +191,25 @@ func TestInlinePurpose_EveryOtherConsumerPurpose(t *testing.T) {
 		{stepup.PurposeDMPurge, "stepup.VerifyMFAFactor (dm.verifyPurgeStepUp)", factor},
 		{stepup.PurposeDMClear, "stepup.VerifyMFAFactorTx (dm.verifyClearStepUp)", factorTx},
 		{stepup.PurposeServerMFAEnforcementOff, "mfaenforce.ConfirmTx (servers toggle OFF)", confirm},
-		{stepup.PurposeMessageDelete, "mfaenforce.ConfirmTx (messages channel delete, via RequireConfirmationTx)", confirm},
+		{stepup.PurposeMessageDelete, "mfaenforce.ConfirmTx (messages channel delete soft-lock, via admitDeleteTx's confirmServerRuleTx)", confirm},
 		{stepup.PurposeDMMessageDelete, "stepup.VerifyMFAFactorTx (dm message delete, via the Clear seam)", factorTx},
-		{stepup.PurposeChannelPurge, "mfaenforce.ConfirmTx (messages channel self-purge soft-lock, via RequireConfirmationTx)", confirm},
-		{stepup.PurposeServerPurge, "mfaenforce.ConfirmTx (messages server self-purge soft-lock, via RequireConfirmationTx)", confirm},
+		{stepup.PurposeChannelPurge, "mfaenforce.ConfirmTx (messages channel purge: self-purge soft-lock and the D1 gate, via admitDeleteTx's confirmServerRuleTx)", confirm},
+		{stepup.PurposeServerPurge, "mfaenforce.ConfirmTx (messages server purge: self-purge soft-lock and the D1 gate, via admitDeleteTx's confirmServerRuleTx)", confirm},
+		// #3454's dangerous-action gates: every one reaches the verifier
+		// through mfaenforce.Require, which calls ConfirmTx under the gate.
+		{stepup.PurposeServerUpdate, "mfaenforce.ConfirmTx (servers.UpdateServer, via mfaenforce.Require)", confirm},
+		{stepup.PurposeServerDelete, "mfaenforce.ConfirmTx (servers.DeleteServer, via mfaenforce.Require)", confirm},
+		{stepup.PurposeServerIconUpload, "mfaenforce.ConfirmTx (media server icon upload, via mfaenforce.Require)", confirm},
+		{stepup.PurposeServerBannerUpload, "mfaenforce.ConfirmTx (media server banner upload, via mfaenforce.Require)", confirm},
+		{stepup.PurposeChannelDelete, "mfaenforce.ConfirmTx (channels.DeleteChannel, via mfaenforce.Require)", confirm},
+		{stepup.PurposeChannelExpirationShorten, "mfaenforce.ConfirmTx (channels expiration shorten, via mfaenforce.Require)", confirm},
+		{stepup.PurposeMemberBan, "mfaenforce.ConfirmTx (members ban, via mfaenforce.Require)", confirm},
+		{stepup.PurposeMemberKickPurge, "mfaenforce.ConfirmTx (members kick with purge, via mfaenforce.Require)", confirm},
+		{stepup.PurposeRoleCreate, "mfaenforce.ConfirmTx (rbac.CreateRole, via mfaenforce.Require)", confirm},
+		{stepup.PurposeRoleUpdate, "mfaenforce.ConfirmTx (rbac.UpdateRole, via mfaenforce.Require)", confirm},
+		{stepup.PurposeRoleDelete, "mfaenforce.ConfirmTx (rbac.DeleteRole, via mfaenforce.Require)", confirm},
+		{stepup.PurposeChannelOverrideUpsert, "mfaenforce.ConfirmTx (rbac channel override upsert, via mfaenforce.Require)", confirm},
+		{stepup.PurposeCategoryOverrideUpsert, "mfaenforce.ConfirmTx (rbac category override upsert, via mfaenforce.Require)", confirm},
 	} {
 		t.Run(string(c.purpose), func(t *testing.T) {
 			userID := iuCreateUser(t, db, iuPassword)
@@ -217,7 +232,7 @@ func TestInlinePurpose_EveryOtherConsumerPurpose(t *testing.T) {
 // route passing another route's purpose: that is pinned at the handler, as in
 // internal/users/key_reset_inline_purpose_test.go.
 func TestInlinePurpose_TablesCoverTheClosedSet(t *testing.T) {
-	require.Len(t, stepup.Purposes(), 14+15)
+	require.Len(t, stepup.Purposes(), 14+28)
 }
 
 func TestInlinePurpose_VerifyCodeRefusesAnInvalidPurpose(t *testing.T) {

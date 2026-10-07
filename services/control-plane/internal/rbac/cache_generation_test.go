@@ -10,11 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -371,15 +373,18 @@ func TestResolver_BumpRetriesThenFallsBack(t *testing.T) {
 		assert.NotEqual(t, before, after)
 	})
 
-	t.Run("user: both bumps fail, fallback deletes the user's entries", func(t *testing.T) {
+	t.Run("user: both bumps fail, fallback deletes the user's generation and entries", func(t *testing.T) {
 		ts := testhelpers.SetupTestServer(t)
 		plant(t, ts)
 		hook := &failingRedis{failSets: 2}
 		require.NoError(t, hookedResolver(t, ts, hook).BumpUserPermissionGeneration(ctx, "u-fb"))
 		assert.Equal(t, 2, hook.setAttempts)
 		assert.Positive(t, hook.scans)
+		assert.Zero(t, stored(t, ts, userGenKey("u-fb")), "the fallback must delete the generation graces are stamped with")
 		assert.Zero(t, stored(t, ts, userEntries...), "the fallback must delete every entry of the user")
 		assert.Equal(t, int64(1), stored(t, ts, "perm:s-fb1:u-bystander"), "and nobody else's")
+		assert.Equal(t, int64(2), stored(t, ts, userGenKey("u-bystander"), serverGenKey("s-fb1")),
+			"nor any other generation")
 	})
 
 	t.Run("user: bump and fallback fail, error returned", func(t *testing.T) {
@@ -391,14 +396,16 @@ func TestResolver_BumpRetriesThenFallsBack(t *testing.T) {
 		assert.Equal(t, 2, hook.setAttempts)
 	})
 
-	t.Run("server: both bumps fail, fallback deletes the server's entries", func(t *testing.T) {
+	t.Run("server: both bumps fail, fallback deletes the server's generation and entries", func(t *testing.T) {
 		ts := testhelpers.SetupTestServer(t)
 		plant(t, ts)
 		hook := &failingRedis{failSets: 2}
 		require.NoError(t, hookedResolver(t, ts, hook).BumpServerPermissionGeneration(ctx, "s-fb1"))
 		assert.Equal(t, 2, hook.setAttempts)
+		assert.Zero(t, stored(t, ts, serverGenKey("s-fb1")), "the fallback must delete the generation graces are stamped with")
 		assert.Zero(t, stored(t, ts, "perm:s-fb1:u-fb", "perm:s-fb1:u-bystander"))
 		assert.Equal(t, int64(1), stored(t, ts, "perm:s-fb2:u-fb:c-fb"), "another server is untouched")
+		assert.Equal(t, int64(2), stored(t, ts, serverGenKey("s-fb2"), userGenKey("u-fb")), "and so are other generations")
 	})
 
 	t.Run("server: bump and fallback fail, error returned", func(t *testing.T) {
@@ -426,4 +433,46 @@ func TestResolver_BumpWithoutCacheIsANoOp(t *testing.T) {
 	r := rbac.NewResolver(nil, nil, nil)
 	assert.NoError(t, r.BumpUserPermissionGeneration(context.Background(), "u"))
 	assert.NoError(t, r.BumpServerPermissionGeneration(context.Background(), "s"))
+}
+
+// A step-up grace taken before an MFA change must not survive a bump that fell
+// back (Codex review of #3454). The grace is stamped with both permission
+// generations, so a fallback that deleted only the cached entries left it
+// matching for its whole window: a factor replaced, or enforcement turned off
+// and on again, without the fresh confirmation the bump exists to force.
+// Kills: either fallback restored to deleting only the entries
+// (InvalidateUser or InvalidateServer).
+func TestResolver_BumpFallbackVoidsStepUpGraces(t *testing.T) {
+	ctx := context.Background()
+	enrolled := stepup.Subject{MFAEnabled: true, MFAMethods: []string{"totp"}}
+	for _, tc := range []struct {
+		name string
+		bump func(r *rbac.Resolver, userID, serverID string) error
+	}{
+		{"user generation", func(r *rbac.Resolver, userID, _ string) error {
+			return r.BumpUserPermissionGeneration(ctx, userID)
+		}},
+		{"server generation", func(r *rbac.Resolver, _, serverID string) error {
+			return r.BumpServerPermissionGeneration(ctx, serverID)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := testhelpers.SetupTestServer(t)
+			userID, serverID := uuid.New(), uuid.New()
+			testhelpers.PublishPermissionCache(t, ts.Redis, serverID.String(), userID.String(), "", rbac.PermKick)
+			store := stepup.NewGraceStore(ts.Redis)
+			actor := stepup.GraceActor{UserID: userID, SessionID: uuid.NewString(), Epoch: "epoch-1"}
+			scope := stepup.DangerousActionGraceScope(serverID, int64(rbac.PermManageChannels))
+			covered := func() bool {
+				return store.Read(ctx, actor, scope).Covers(stepup.PurposeChannelDelete, stepup.GraceServerRule, enrolled)
+			}
+			require.NoError(t, store.Grant(ctx, store.Read(ctx, actor, scope), stepup.GraceStrengthMFA))
+			require.True(t, covered(), "the grace covers before the change")
+
+			hook := &failingRedis{failSets: 2}
+			require.NoError(t, tc.bump(hookedResolver(t, ts, hook), userID.String(), serverID.String()))
+			require.Equal(t, 2, hook.setAttempts, "both bumps failed, so the fallback ran")
+			assert.False(t, covered(), "a grace stamped before the change must not cover after the fallback")
+		})
+	}
 }

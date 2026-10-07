@@ -82,6 +82,9 @@ type softLockHarness struct {
 	actor    string
 	peer     string
 	epoch    string
+	// sid, when set, is the access token's session claim, which a step-up
+	// grace is keyed on (#3454).
+	sid string
 }
 
 // newSoftLockHarness wires a DM handler to a real database and its own
@@ -116,7 +119,11 @@ func (hs *softLockHarness) deleteAs(t *testing.T, userID, messageID, body string
 	router := gin.New()
 	router.DELETE(softLockDeleteRoute, func(c *gin.Context) {
 		c.Set("user_id", userID)
-		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": hs.epoch})
+		claims := jwt.MapClaims{"cred_epoch": hs.epoch}
+		if hs.sid != "" {
+			claims["sid"] = hs.sid
+		}
+		c.Set(middleware.JWTClaimsContextKey, claims)
 		hs.handler.DeleteMessage(c)
 	})
 	w := httptest.NewRecorder()

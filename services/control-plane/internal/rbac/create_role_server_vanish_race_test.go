@@ -8,12 +8,14 @@ package rbac_test
 // can only mean "no servers row" — the actor is no longer a member, which is
 // the 403 CreateRole already gives a non-member.
 //
-// Nothing in CreateRole's transaction holds the servers row: the visibility
-// advisory lock, the credential-epoch FOR SHARE on the actor's users row, and
-// the resolver's unlocked reads all leave DeleteServer and the owner's erasure
-// free to commit in between.
+// Since #3454 CreateRole's dangerous-action gate holds the servers row FOR
+// SHARE from just after the credential-epoch guard until commit, so the window
+// these tests open moved: a server deleted, or an owner erased, before the
+// gate's servers read is refused by the gate as a non-member, and one deleted
+// after it queues behind the transaction instead of vanishing under it.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -41,6 +43,9 @@ const (
 // epochGuardFragment is credepoch.GuardTx's read of the actor's users row.
 const epochGuardFragment = `SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`
 
+// createRoleGateFragment is unique to mfaenforce.LockGateTx's servers read.
+const createRoleGateFragment = `enforce_mfa_dangerous_actions, current_setting('transaction_isolation')`
+
 func classifyCreateRole(code int, body string) string {
 	switch {
 	case code >= 200 && code < 300:
@@ -53,13 +58,16 @@ func classifyCreateRole(code int, body string) string {
 	return fmt.Sprintf("unexpected %d %s", code, body)
 }
 
-// TestCreateRole_ServerVanishingBeforePositionSnapshot_IsADenial pins the
-// oracle: a server deleted before CreateRole's position snapshot denies the
-// actor as a non-member (403), while a real fault at that read stays a 500.
-func TestCreateRole_ServerVanishingBeforePositionSnapshot_IsADenial(t *testing.T) {
+// TestCreateRole_ServerVanishingBeforeTheGate_IsADenial pins the oracle: a
+// server deleted before CreateRole's gate locks it denies the actor as a
+// non-member (403), while a real fault at that read stays a 500. Before #3454
+// this window was the position snapshot, which the gate now precedes.
+// Kills: lockRoleGateTx answering ErrServerNotFound with anything but
+// ErrNotMember.
+func TestCreateRole_ServerVanishingBeforeTheGate_IsADenial(t *testing.T) {
 	hook, hookedDB := stmthook.Open(t)
 	ts := testhelpers.SetupTestServerWithRouterDB(t, hookedDB)
-	sequence := []string{createRoleSnapshotFragment}
+	sequence := []string{createRoleGateFragment}
 
 	for _, sc := range stmthook.Scenarios() {
 		t.Run(sc.Name, func(t *testing.T) {
@@ -76,32 +84,32 @@ func TestCreateRole_ServerVanishingBeforePositionSnapshot_IsADenial(t *testing.T
 
 			stmthook.RequireInterleaved(t, ts.DB, hook, sc, len(sequence), serverID)
 			assert.Equal(t, sc.Want, classifyCreateRole(w.Code, w.Body.String()),
-				"CreateRole, with the server deleted before its position snapshot, must deny rather than report a fault; "+
+				"CreateRole, with the server deleted before its gate, must deny rather than report a fault; "+
 					"a real fault at that read must still be reported")
 		})
 	}
 }
 
 // TestCreateRole_ServerVanishingBeforeInsert_IsADenial is the snapshot repro's
-// second window: the server survives the position snapshot and is deleted
-// before the INSERT, which then fails roles.server_id's foreign key (23503).
-// That is the same fact the snapshot path answers with a 403, so it gets the
-// same answer; a 23503 on any other constraint, and any other error, stays 500.
+// second window: between the position snapshot and the INSERT. A violation of
+// roles.server_id's foreign key (23503) there is the same fact the gate
+// answers with a 403, so it gets the same answer; a 23503 on any other
+// constraint, and any other error, stays 500.
 //
-// Only the OWNER reaches this window. A non-owner's slot shifts every role at
-// or above theirs (`UPDATE roles SET position = position + 1 …`), and those row
-// locks make a server delete's cascade into roles wait for this transaction —
-// measured: the interleaved DELETE times out with 55P03. And the owner's own
-// erasure cannot land here either, because GuardTx holds the owner's users row
-// FOR SHARE. What remains is the owner's server being deleted by another of the
-// owner's requests (DeleteServer) between the snapshot and the INSERT.
+// No deletion can open this window any more. Before #3454 only the owner's
+// server being deleted by another of the owner's requests reached it (a
+// non-owner's position shift, and GuardTx's FOR SHARE on the owner's own row,
+// already closed the rest); now the gate's servers FOR SHARE makes that
+// DELETE queue as well, which TestCreateRole_ServerDeleteQueuesBehindTheGate
+// pins. The deletion scenarios are skipped here, and the FK arm stays a
+// backstop the controls below still classify.
 func TestCreateRole_ServerVanishingBeforeInsert_IsADenial(t *testing.T) {
 	hook, hookedDB := stmthook.Open(t)
 	ts := testhelpers.SetupTestServerWithRouterDB(t, hookedDB)
 	sequence := []string{createRoleSnapshotFragment, createRoleInsertFragment}
 
 	for _, sc := range stmthook.FKScenarios(roleServerFK) {
-		if sc.DeleteOwner {
+		if sc.DeleteSQL != "" {
 			continue // unreachable in this window; see above
 		}
 		t.Run(sc.Name, func(t *testing.T) {
@@ -118,6 +126,43 @@ func TestCreateRole_ServerVanishingBeforeInsert_IsADenial(t *testing.T) {
 					"any other error at that INSERT must still be reported")
 		})
 	}
+}
+
+// TestCreateRole_ServerDeleteQueuesBehindTheGate: a DELETE of the server in
+// the old snapshot-to-INSERT window now waits on the gate's servers FOR SHARE
+// (55P03 under a 100ms lock_timeout) instead of committing, and the create it
+// raced succeeds against a server that still exists.
+// Kills: the gate's servers lock dropped or weakened to FOR KEY SHARE (the
+// DELETE commits and the create fails its foreign key).
+func TestCreateRole_ServerDeleteQueuesBehindTheGate(t *testing.T) {
+	hook, hookedDB := stmthook.Open(t)
+	ts := testhelpers.SetupTestServerWithRouterDB(t, hookedDB)
+	owner := ts.CreateTestUser(t, "crqo"+uuid.NewString()[:8])
+	serverID := ts.CreateTestServer(t, owner.ID, "Queued role delete server")
+	hook.Arm([]string{createRoleSnapshotFragment, createRoleInsertFragment}, func() error {
+		tx, err := ts.DB.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.Exec(`SET LOCAL lock_timeout = '100ms'`); err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DELETE FROM servers WHERE id = $1`, serverID)
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "55P03" {
+			return nil
+		}
+		return fmt.Errorf("the DELETE did not queue behind the gate: %v", err)
+	}, nil)
+
+	w := ts.DoRequest(http.MethodPost, "/api/v1/servers/"+serverID+"/roles",
+		map[string]any{"name": "fresh", "permissions": "0"}, testhelpers.AuthHeaders(owner.AccessToken))
+
+	seen, betweenErr := hook.Report()
+	require.Equal(t, 2, seen, "the hook must fire at the INSERT")
+	require.NoError(t, betweenErr)
+	assert.Equal(t, stmthook.Allowed, classifyCreateRole(w.Code, w.Body.String()))
 }
 
 // Codex on #3508: the vanished-server answers above come after

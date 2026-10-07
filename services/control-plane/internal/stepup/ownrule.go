@@ -44,6 +44,18 @@ func VerifyOwnRuleTx(
 	return spendPasswordTokenTx(ctx, tx, userID, route, in.StepUpToken, subj)
 }
 
+// OwnRuleGraceStrength is the grace strength a VerifyOwnRuleTx that returned
+// nil for subj earned (#3454 A-9): mfa when the account has an inline factor,
+// because only VerifyMFAFactorTx can pass it, and password otherwise, because
+// only a spent password step-up token can. It mirrors VerifyOwnRuleTx's one
+// branch, so the two cannot disagree about which factor verified.
+func OwnRuleGraceStrength(subj Subject) GraceStrength {
+	if subj.MFAEnabled {
+		return GraceStrengthMFA
+	}
+	return GraceStrengthPassword
+}
+
 // spendPasswordTokenTx is VerifyOwnRuleTx's password arm, for an account with
 // no inline MFA. In order, mirroring VerifyPasswordFactor:
 //

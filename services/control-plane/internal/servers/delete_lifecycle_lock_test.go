@@ -43,7 +43,7 @@ func startServerDelete(
 		}
 		outcome := serverDeleteOutcome{}
 		err = h.deleteServerWithActivePlans(
-			ctx, tx, serverID.String(), ownerID.String(), preflight, &outcome,
+			ctx, tx, serverID.String(), ownerID.String(), preflight, serverDeleteConfirm{}, &outcome,
 		)
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 			err = errors.Join(err, rollbackErr)
@@ -279,7 +279,7 @@ func TestDeleteServerKeepsVoiceEvidenceAfterChannelTypeChanges(t *testing.T) {
 	require.NoError(t, err)
 	outcome := serverDeleteOutcome{}
 	require.NoError(t, h.deleteServerWithActivePlans(
-		context.Background(), tx, serverID.String(), owner.String(), preflight, &outcome,
+		context.Background(), tx, serverID.String(), owner.String(), preflight, serverDeleteConfirm{}, &outcome,
 	))
 	require.True(t, outcome.committed)
 	require.Len(t, rail.plans, 1)
@@ -305,7 +305,7 @@ func TestDeleteServerPreservesVoiceEvidenceAfterChannelDeletion(t *testing.T) {
 	require.NoError(t, err)
 	outcome := serverDeleteOutcome{}
 	require.NoError(t, h.deleteServerWithActivePlans(
-		context.Background(), tx, serverID.String(), owner.String(), preflight, &outcome,
+		context.Background(), tx, serverID.String(), owner.String(), preflight, serverDeleteConfirm{}, &outcome,
 	))
 	require.True(t, outcome.committed)
 	require.Len(t, rail.plans, 1)
@@ -442,7 +442,7 @@ func TestDeleteServerWithActivePlansFailsClosedBeforeDelete(t *testing.T) {
 			require.NoError(t, beginErr)
 			outcome := serverDeleteOutcome{}
 			deleteErr := (&Handler{db: db, activePlans: tc.rail}).deleteServerWithActivePlans(
-				context.Background(), tx, tc.serverID.String(), tc.userID.String(), tc.preflight, &outcome)
+				context.Background(), tx, tc.serverID.String(), tc.userID.String(), tc.preflight, serverDeleteConfirm{}, &outcome)
 			require.ErrorIs(t, deleteErr, tc.want)
 			require.False(t, outcome.committed)
 			require.NoError(t, tx.Rollback())

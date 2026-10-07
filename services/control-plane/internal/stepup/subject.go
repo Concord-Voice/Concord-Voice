@@ -219,3 +219,9 @@ func verificationFailed(cause error) *Error {
 		Cause:  cause,
 	}
 }
+
+// VerificationFailed is the 500 a fault in a step-up read or verification
+// earns: the shared ErrMsgVerificationFailed body, with the fault as Cause
+// for the caller to log. Packages outside stepup use it instead of building
+// that body themselves (rbac.EnrollmentDenial, #3454).
+func VerificationFailed(cause error) *Error { return verificationFailed(cause) }

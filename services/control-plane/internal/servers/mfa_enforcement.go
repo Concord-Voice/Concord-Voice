@@ -63,12 +63,12 @@ const (
 	errMsgMFAEnforcementFetchFailed = "Failed to fetch MFA enforcement"
 )
 
-// The failure classes this route logs. mfa_gate_lock is the design's (§7); a
-// 500 carries mfa_enforcement_internal plus the wrapped cause, whose prefix
-// names the stage. Neither carries anything that differs between enrolled and
-// unenrolled actors (I7).
+// The failure classes this route logs beside the gate's own, which
+// mfaenforce.WriteError logs (mfa_gate_lock for a lock conflict). A 500 the
+// gate did not produce carries mfa_enforcement_internal plus the wrapped
+// cause, whose prefix names the stage. None carries anything that differs
+// between enrolled and unenrolled actors (I7).
 const (
-	failureClassMFAGateLock   = "mfa_gate_lock"
 	failureClassMFAPermBump   = "perm_generation_bump"
 	failureClassMFAEnforceErr = "mfa_enforcement_internal"
 )
@@ -303,7 +303,13 @@ func (h *Handler) applyMFAEnforcement(
 	if err != nil {
 		return false, fmt.Errorf("begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }() // a no-op after a successful commit
+	defer func() {
+		// A no-op after a commit (sql.ErrTxDone); any other rollback failure is
+		// joined onto err, never discarded, so the 500's log line carries it.
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			err = errors.Join(err, fmt.Errorf("roll back: %w", rbErr))
+		}
+	}()
 
 	if _, err := tx.ExecContext(ctx, mfaEnforcementLockTimeout); err != nil {
 		return false, fmt.Errorf("set lock timeout: %w", err)
@@ -358,39 +364,22 @@ func (h *Handler) confirmMFAEnforcementRequest(
 	return mfaenforce.ConfirmTx(ctx, tx, subj, h.mfaVerifier, userID, stepup.PurposeServerMFAEnforcementOff, code)
 }
 
-// respondMFAEnforcementError maps a PUT error, in the order mfaenforce's
-// package comment prescribes: a lock conflict first (it can arrive wrapped in
-// a *stepup.Error), then a step-up refusal, then the not-found and forbidden
-// sentinels, then 500. 4xx outcomes are not logged; nothing logged carries the
-// actor's enrollment, the server's setting, or any part of the code (I7).
+// respondMFAEnforcementError maps a PUT error: the forbidden sentinel, then
+// the gate's errors through mfaenforce.WriteError (a lock conflict first,
+// since one can arrive inside a *stepup.Error, then a step-up refusal, then a
+// vanished server's 404), then this route's own 500. 4xx outcomes are not
+// logged; nothing logged carries the actor's enrollment, the server's
+// setting, or any part of the code (I7).
 func (h *Handler) respondMFAEnforcementError(c *gin.Context, err error) {
-	var stepErr *stepup.Error
-	isStepErr := errors.As(err, &stepErr)
-	if mfaenforce.IsLockConflict(err) {
-		cause := err
-		if isStepErr && stepErr.Cause != nil {
-			cause = stepErr.Cause // a users-row timeout arrives inside a *stepup.Error
-		}
-		h.log.Warn(errMsgMFAEnforcementFailed, "failure_class", failureClassMFAGateLock, "error", cause)
-		mfaenforce.WriteBusy(c)
-		return
-	}
-	if isStepErr {
-		if stepErr.Cause != nil {
-			h.log.Error(errMsgMFAEnforcementFailed, "failure_class", failureClassMFAEnforceErr, "error", stepErr.Cause)
-		}
-		stepErr.Write(c)
-		return
-	}
-	switch {
-	case errors.Is(err, mfaenforce.ErrServerNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
-	case errors.Is(err, errMFAEnforcementForbidden):
+	if errors.Is(err, errMFAEnforcementForbidden) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgMFAEnforcementForbidden})
-	default:
-		h.log.Error(errMsgMFAEnforcementFailed, "failure_class", failureClassMFAEnforceErr, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAEnforcementFailed})
+		return
 	}
+	if h.respondGateError(c, err) {
+		return
+	}
+	h.log.Error(errMsgMFAEnforcementFailed, "failure_class", failureClassMFAEnforceErr, "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAEnforcementFailed})
 }
 
 // bumpMFAEnforcementGeneration bumps the server's permission generation so the

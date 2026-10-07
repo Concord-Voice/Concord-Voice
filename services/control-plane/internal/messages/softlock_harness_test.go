@@ -121,8 +121,15 @@ func buildSoftLockHarness(t *testing.T, ts *testhelpers.TestServer, db *sql.DB, 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", c.GetHeader("X-Test-User"))
+		claims := jwt.MapClaims{}
 		if epoch := c.GetHeader("X-Test-Epoch"); epoch != "" {
-			c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": epoch})
+			claims["cred_epoch"] = epoch
+		}
+		if sid := c.GetHeader("X-Test-Session"); sid != "" {
+			claims["sid"] = sid // the access token's session, which a step-up grace is keyed on (#3454)
+		}
+		if len(claims) > 0 {
+			c.Set(middleware.JWTClaimsContextKey, claims)
 		}
 		c.Next()
 	})
@@ -134,10 +141,11 @@ func buildSoftLockHarness(t *testing.T, ts *testhelpers.TestServer, db *sql.DB, 
 }
 
 // request is one call through the harness router. body is JSON-encoded when
-// non-nil; epoch, when set, is the token's cred_epoch claim.
+// non-nil; epoch, when set, is the token's cred_epoch claim, and session its
+// sid claim.
 type request struct {
-	method, path, userID, epoch string
-	body                        any
+	method, path, userID, epoch, session string
+	body                                 any
 }
 
 func (s *softLockHarness) do(t *testing.T, r request) *httptest.ResponseRecorder {
@@ -155,6 +163,9 @@ func (s *softLockHarness) do(t *testing.T, r request) *httptest.ResponseRecorder
 	req.Header.Set("X-Test-User", r.userID)
 	if r.epoch != "" {
 		req.Header.Set("X-Test-Epoch", r.epoch)
+	}
+	if r.session != "" {
+		req.Header.Set("X-Test-Session", r.session)
 	}
 	w := httptest.NewRecorder()
 	s.router.ServeHTTP(w, req)

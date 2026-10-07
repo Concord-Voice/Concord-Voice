@@ -105,20 +105,23 @@ func (h *Handler) deleteDMMessageUnconfirmed(c *gin.Context, t dmMessageDeleteTa
 
 // confirmDMMessageDelete is the DM message delete's ONE confirmation helper
 // (D-3): everything from the budget charge to the post-commit reset runs from
-// here, so #3454's grace retrofit is local to this function. The charge and
-// the reset are split into chargeDMDeleteBudget and settleDMDeleteConfirmation
-// only to keep this function readable; each has this one caller.
+// here, so #3454's grace retrofit is local to this function. The charge, the
+// in-transaction confirmation and the settlement are split into
+// chargeDMDeleteBudget, confirmDMDeleteTx and settleDMDeleteConfirmation only
+// to keep this function readable; each has this one caller.
 //
-// A DM delete is author-only, so only the own rule governs it (D-1): the
-// account's inline MFA when it has any, otherwise a password step-up token
-// minted for this purpose (#3509), through the seam DM Clear uses
-// (stepup.VerifyOwnRuleTx).
+// A DM delete is author-only, so only the own rule governs it (D-1): a grace
+// the own rule accepts (#3454 A-9, A-10), otherwise the account's inline MFA
+// when it has any, otherwise a password step-up token minted for this purpose
+// (#3509), through the seam DM Clear uses (stepup.VerifyOwnRuleTx).
 //
 // Budget (X4): charged before BeginTx whenever the body carries either factor,
 // because only then is there a credential to guess with; cleared only after a
-// verified confirmation commits, when the soft-lock is reset too. Both
-// post-commit writes are best-effort: a failure leaves a counter high, which
-// fails toward more limiting.
+// verified confirmation commits, when the soft-lock is reset too and a
+// delete-scope grace is granted. The grace is read here too, before BeginTx
+// (A-9), and only on this over-threshold path, which already called Redis.
+// Every post-commit write is best-effort: a failure leaves a counter high, or
+// grants no grace, which fails toward more limiting.
 func (h *Handler) confirmDMMessageDelete(
 	c *gin.Context, t dmMessageDeleteTarget, in stepup.Input, verdict stepup.SoftLockVerdict,
 ) (dmDeletedMessage, bool) {
@@ -127,10 +130,12 @@ func (h *Handler) confirmDMMessageDelete(
 	if !h.chargeDMDeleteBudget(c, budget, t.userID, in) {
 		return dmDeletedMessage{}, false
 	}
+	grace := stepup.NewGraceStore(h.redis).Read(ctx,
+		stepup.GraceActorFromContext(c, t.actorUUID), stepup.DeleteGraceScope(stepup.DMDeleteScope()))
 
-	var confirmed bool
-	deleted, err := h.deleteDMMessageTx(ctx, t, func(ctx context.Context, tx *sql.Tx) error {
-		// Re-initialised per attempt: DeleteOne retries once on
+	var confirmation dmDeleteConfirmation
+	deleted, err := h.deleteDMMessageTx(ctx, t, func(ctx context.Context, tx *sql.Tx) (err error) {
+		// Overwritten on every attempt: DeleteOne retries once on
 		// dmblock.ErrMembershipChanged in a fresh transaction. Only
 		// dmblock.PrepareConversationTx returns that error, and it runs before
 		// this fence, so an attempt that is retried never reached the verifier
@@ -138,35 +143,53 @@ func (h *Handler) confirmDMMessageDelete(
 		// on the retry: a TOTP step, a backup code and a step-up token (WebAuthn
 		// or password) are all spent on this transaction, so the first
 		// attempt's rollback restored them (#3509).
-		confirmed = false
-		// LockSubjectTx replaces the ordinary path's credepoch.GuardTx: the same
-		// users FOR SHARE lock and epoch fence, plus the P1 factor set read
-		// after it. It runs after the conversation lock, where #3141's order
-		// puts the credential guard. That is the placement contract's one
-		// exception, not a breach of it: PrepareConversationTx already holds
-		// the actor's users row FOR SHARE (the actor is in its sorted
-		// users-first prefix), so taking it again adds no lock-order edge, and
-		// the factor set it reads cannot change while that lock is held.
-		subject, stepErr := stepup.LockSubjectTx(ctx, tx, t.userID, stepup.LockForShare, t.tokenEpoch)
-		if stepErr != nil {
-			return stepErr
-		}
-		if verifyErr := stepup.VerifyOwnRuleTx(ctx, tx, h.mfaVerifier, t.userID,
-			stepup.OwnRuleRoute{Purpose: stepup.PurposeDMMessageDelete, Copy: dmMessageDeleteStepUpCopy},
-			in, subject); verifyErr != nil {
-			return verifyErr
-		}
-		confirmed = true
-		return nil
+		confirmation, err = h.confirmDMDeleteTx(ctx, tx, t, in, grace)
+		return err
 	})
 	if err != nil {
 		h.writeDMMessageDeleteError(c, err, verdict.RetryAfter)
 		return dmDeletedMessage{}, false
 	}
-	if confirmed {
-		h.settleDMDeleteConfirmation(ctx, budget, t)
-	}
+	h.settleDMDeleteConfirmation(ctx, budget, t, grace, confirmation)
 	return deleted, true
+}
+
+// dmDeleteConfirmation is confirmDMDeleteTx's outcome. strength is the grace
+// a Verified outcome earned and is meaningless for the other two.
+type dmDeleteConfirmation struct {
+	outcome  mfaenforce.Outcome
+	strength stepup.GraceStrength
+}
+
+// confirmDMDeleteTx is the delete transaction's fence past the soft-lock. It
+// returns Verified or GraceCovered, or an error; never Unconfirmed with a nil
+// error, because the own rule always applies to a member who reached it.
+//
+// LockSubjectTx replaces the ordinary path's credepoch.GuardTx: the same users
+// FOR SHARE lock and epoch fence, plus the P1 factor set read after it. It
+// runs after the conversation lock, where #3141's order puts the credential
+// guard. That is the placement contract's one exception, not a breach of it:
+// PrepareConversationTx already holds the actor's users row FOR SHARE (the
+// actor is in its sorted users-first prefix), so taking it again adds no
+// lock-order edge, and the factor set it reads cannot change while that lock
+// is held. The grace is judged against that locked subject, so a password
+// grace stops covering the moment the account has an inline factor.
+func (h *Handler) confirmDMDeleteTx(
+	ctx context.Context, tx *sql.Tx, t dmMessageDeleteTarget, in stepup.Input, grace stepup.GraceRead,
+) (dmDeleteConfirmation, error) {
+	subject, stepErr := stepup.LockSubjectTx(ctx, tx, t.userID, stepup.LockForShare, t.tokenEpoch)
+	if stepErr != nil {
+		return dmDeleteConfirmation{}, stepErr
+	}
+	if grace.Covers(stepup.PurposeDMMessageDelete, stepup.GraceOwnRule, subject) {
+		return dmDeleteConfirmation{outcome: mfaenforce.GraceCovered}, nil
+	}
+	if verifyErr := stepup.VerifyOwnRuleTx(ctx, tx, h.mfaVerifier, t.userID,
+		stepup.OwnRuleRoute{Purpose: stepup.PurposeDMMessageDelete, Copy: dmMessageDeleteStepUpCopy},
+		in, subject); verifyErr != nil {
+		return dmDeleteConfirmation{}, verifyErr
+	}
+	return dmDeleteConfirmation{outcome: mfaenforce.Verified, strength: stepup.OwnRuleGraceStrength(subject)}, nil
 }
 
 // chargeDMDeleteBudget charges the step-up budget when the body carries either
@@ -188,19 +211,34 @@ func (h *Handler) chargeDMDeleteBudget(c *gin.Context, budget stepup.Budget, use
 	return false
 }
 
-// settleDMDeleteConfirmation resets the soft-lock and clears the budget after a
-// verified confirmation has committed. Both writes are best-effort, and run on
-// stepup.SettleContext so a client that hangs up after the commit cannot
-// cancel them (review of #3509).
-func (h *Handler) settleDMDeleteConfirmation(ctx context.Context, budget stepup.Budget, t dmMessageDeleteTarget) {
+// settleDMDeleteConfirmation runs a committed confirmation's writes (A-10):
+// Verified or GraceCovered resets the soft-lock; Verified alone also clears
+// the budget and grants a delete-scope grace of the strength it earned, so a
+// grace-covered delete never slides its grace. Every write is best-effort and
+// runs on stepup.SettleContext, so a client that hangs up after the commit
+// cannot cancel them (review of #3509). No line here tells a grace-covered
+// delete from a verified one (observability principle 7).
+func (h *Handler) settleDMDeleteConfirmation(
+	ctx context.Context, budget stepup.Budget, t dmMessageDeleteTarget, grace stepup.GraceRead, r dmDeleteConfirmation,
+) {
+	if !r.outcome.Confirmed() {
+		return
+	}
 	ctx, cancel := stepup.SettleContext(ctx)
 	defer cancel()
 	if resetErr := stepup.NewDeleteSoftLock(h.redis).Reset(ctx, t.actorUUID, stepup.DMDeleteScope()); resetErr != nil {
 		h.log.Warn("Could not reset the delete soft-lock", "failure_class", failureClassSoftLockReset, "error", resetErr)
 	}
+	if r.outcome != mfaenforce.Verified {
+		return
+	}
 	if clearErr := budget.Clear(ctx, t.userID); clearErr != nil {
 		h.log.Warn("Could not clear the delete soft-lock step-up budget",
 			"failure_class", failureClassSoftLockClear, "error", clearErr)
+	}
+	if grantErr := stepup.NewGraceStore(h.redis).Grant(ctx, grace, r.strength); grantErr != nil {
+		h.log.Warn("Could not record the delete soft-lock step-up grace",
+			"failure_class", stepup.FailureClassGraceGrant, "error", grantErr)
 	}
 }
 

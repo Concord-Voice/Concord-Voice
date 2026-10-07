@@ -656,21 +656,23 @@ func requirePermissionInvalidatorWired(log *logger.Logger, h *mfa.Handler) {
 }
 
 // requireServersMFAVerifierWired fatal-exits when the servers handler lacks a
-// dependency of the MFA-enforcement toggle's OFF confirmation (#3453).
+// dependency of the MFA-enforcement toggle's OFF confirmation (#3453) or of
+// the dangerous-action gates on UpdateServer and DeleteServer (#3454).
 //
 // Both fail CLOSED, which is the safe direction but a silent one: with no
-// verifier every OFF is a 500, and with no Redis client the step-up attempt
-// budget answers every OFF that carries a code with a 503, so an owner could
-// turn enforcement on and never off again. Boot is where that should surface.
+// verifier every OFF, and every server edit or deletion on an enforcing
+// server, is a 500; with no Redis client the step-up attempt budget answers
+// each of them that carries a code with a 503, so an owner could turn
+// enforcement on and never off again. Boot is where that should surface.
 // It interrogates the HANDLER, never the values the router holds, for the
 // reason requirePermissionInvalidatorWired gives. Extracted from NewRouter,
 // which sits at the go:S3776 limit.
 func requireServersMFAVerifierWired(log *logger.Logger, h *servers.Handler) {
 	if h == nil || !h.HasMFAVerifier() {
-		log.Fatal("servers handler has no MFA verifier: turning MFA enforcement off would fail for every server")
+		log.Fatal("servers handler has no MFA verifier: turning MFA enforcement off, and editing or deleting an enforcing server, would fail for every server")
 	}
 	if !h.HasRedis() {
-		log.Fatal("servers handler has no Redis client: the MFA enforcement step-up budget would deny every request")
+		log.Fatal("servers handler has no Redis client: the step-up attempt budget would deny every MFA enforcement change and every gated server edit or deletion")
 	}
 }
 
@@ -712,6 +714,7 @@ func requireMessageDeleteGuardWired(log *logger.Logger, messagesH *messages.Hand
 func wireMediaHandler(
 	handler *media.Handler,
 	redis *redis.Client,
+	mfaVerifier stepup.MFATxCodeVerifier,
 	cfg *config.Config,
 	log *logger.Logger,
 	opsCounters *opsmetrics.Counters,
@@ -722,6 +725,9 @@ func wireMediaHandler(
 	// rather than passed to NewHandler so the constructor signature stays
 	// put; every session route answers 503 when this is nil.
 	handler.SetSessionRedis(redis)
+	// #3454: the dangerous-action gate on server icon and banner uploads, which
+	// charges its step-up budget on the session client above.
+	handler.SetMFAVerifier(mfaVerifier)
 	// Shared-disk occupancy gate for attachment writes (#2759 unit A1).
 	// selfHosted comes from the existing InstanceType seam rather than a
 	// new flag: self-hosted/dev/air-gapped deployments only ever warn,
@@ -1023,9 +1029,14 @@ func NewRouter(
 	requireServersMFAVerifierWired(log, serversHandler)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
 	channelsHandler.SetAuthorityHandler(rbacHandler)
+	channelsHandler.SetMFAVerifier(mfaHandler)
 	voiceEnforcementSessionHandler := newVoiceEnforcementSessionHandler(db, cfg.JWTSecret, natsClient)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
 	membersHandler.SetAuthorityHandler(rbacHandler)
+	membersHandler.SetMFAVerifier(mfaHandler)
+	// #3454: the dangerous-action gates on roles and overrides. Checked with
+	// channels, members and media by requireDangerousActionGatesWired below.
+	rbacHandler.SetMFAVerifier(mfaHandler)
 	// A kick/leave/ban deletes membership but leaves any voice participant on its
 	// join-time snapshot — recheck evicts them from the room (CV-CAN-007 P1).
 	membersHandler.SetVoiceEnforcer(voicePermEnforcer)
@@ -1171,9 +1182,10 @@ func NewRouter(
 	var mediaHandler *media.Handler
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
-		wireMediaHandler(mediaHandler, redis, cfg, log, opsCounters, dependencies)
+		wireMediaHandler(mediaHandler, redis, mfaHandler, cfg, log, opsCounters, dependencies)
 		serversHandler.SetMediaStore(store)
 	}
+	requireDangerousActionGatesWired(log, channelsHandler, membersHandler, rbacHandler, mediaHandler)
 	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins,
 		credFence, middleware.SecurityHeaderSet(cfg.Environment, cfg.HSTSHeaderValue))
 	wsHandler.SetMinimumClientVersion(cfg.ClientMinVersion)
@@ -1191,6 +1203,10 @@ func NewRouter(
 	// cannot complete -- and the client believes it, because a capability is
 	// the only evidence it has.
 	serverCapabilitiesHandler.SetChunkedAttachmentUpload(mediaHandler != nil && redis != nil)
+	// #3454: the same predicate the boot guard above enforced, so the
+	// capability can never advertise a gate the guard would not have admitted.
+	serverCapabilitiesHandler.SetMFAEnforcedDangerousActions(
+		dangerousActionGateGap(channelsHandler, membersHandler, rbacHandler, mediaHandler) == "")
 	updatesHandler := updates.NewHandler(cfg, log)
 	privacyHandler, accountService := buildPrivacyHandler(
 		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient)

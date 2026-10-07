@@ -108,3 +108,13 @@ func TestVerifyOwnRuleTx_PasswordAccountWithoutAPasswordUsesTheRouteCopy(t *test
 	require.Equal(t, testCopy.CredentialRequired, err.Body["error"])
 	require.Equal(t, true, err.Body["password_required"], "a code does not substitute for the password")
 }
+
+// TestOwnRuleGraceStrength_FollowsTheFactorTheOwnRuleAccepts pins the strength
+// a verified own-rule confirmation grants (#3454 A-9): mfa for an account with
+// an inline factor, password for one without. Kills a constant strength, which
+// would let a password grace survive an MFA enrolment or deny an MFA grace the
+// server rule.
+func TestOwnRuleGraceStrength_FollowsTheFactorTheOwnRuleAccepts(t *testing.T) {
+	require.Equal(t, GraceStrengthMFA, OwnRuleGraceStrength(Subject{MFAEnabled: true, MFAMethods: []string{"totp"}}))
+	require.Equal(t, GraceStrengthPassword, OwnRuleGraceStrength(Subject{PasswordHash: "unused"}))
+}

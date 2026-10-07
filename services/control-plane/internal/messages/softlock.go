@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 )
 
@@ -30,20 +31,35 @@ import (
 // Governing rule. Over the threshold, the strictest applicable rule confirms:
 // the server rule (inline MFA only) when the server enforces, otherwise the
 // own rule (MFA when the account has an inline factor, otherwise a password
-// step-up token: the password itself reaches only the mint endpoint, #3509). confirmSoftLockTx is the one place that choice is made, for
-// every route in this package; #3454 retrofits its grace check there.
+// step-up token: the password itself reaches only the mint endpoint, #3509).
+// admitDeleteTx is the one place that choice is made, for every route in this
+// package, and on a purge it is also where the D1 gate (#3454 A-3) confirms:
+// one lock, one decision, at most one verification for both.
+//
+// Grace (#3454 D-2, A-9, A-10). A committed, verified confirmation grants a
+// 10-minute delete-scope grace for the actor's session, stamped with the
+// strength it was earned with; a later trip in the same session and scope is
+// confirmed by that grace, with no prompt and no verifier call, when the
+// governing rule accepts its strength (stepup.GraceRead.Covers). The grace is
+// read before the transaction opens, only over the threshold, and judged under
+// the locks the confirmation takes. A grace-covered confirmation resets the
+// counters but neither clears the budget nor grants, so the window never
+// slides.
 //
 // Invariant: over the threshold, a delete commits only if a factor verified
-// in the same transaction, or no rule applies to the actor any more under the
-// locks that transaction took. Breaking it takes a branch that answers
-// "confirmed" without a verified factor, or one that proceeds unverified while
-// a rule still applies — the in-flight OFF flip below is where the second is
-// easy to write.
+// in the same transaction, a grace the governing rule accepts — judged under
+// that transaction's locks — covered it, or no rule applies to the actor any
+// more under those locks. Breaking it takes a branch that answers "confirmed"
+// without either, or one that proceeds unverified while a rule still applies —
+// the in-flight OFF flip below is where the second is easy to write — or a
+// grace judged against a rule other than the one the locked re-read chose.
 //
 // Logging (C7). Only population members reach the lines in this file, so none
 // of them carries user_id, a scope, server_id, the enforcement flag, MFA
 // methods, the governing rule or which rule put the actor in the population.
-// Each carries a fixed failure_class and the error, nothing else.
+// Each carries a fixed failure_class and the error, nothing else, and no line
+// or field tells a grace-covered confirmation from a verified one
+// (observability principle 7).
 
 // The fixed failure classes of the soft-lock's own log lines.
 const (
@@ -68,7 +84,7 @@ type softLockGate struct {
 	// enforcing is servers.enforce_mfa_dangerous_actions as read WITHOUT a lock
 	// (the role_guard precedent). It decides population membership only; the
 	// confirmation chooses its rule from the servers-row lock's re-read (see
-	// confirmSoftLockTx).
+	// deleteAdmission.rule).
 	enforcing bool
 	// ownRule is true when the actor is the author of what is being deleted
 	// and their require_auth_before_purge is on (a missing row is on).
@@ -76,6 +92,17 @@ type softLockGate struct {
 	purpose stepup.Purpose
 	input   stepup.Input
 	epoch   string
+	// grace is the delete-scope grace read before the transaction, over the
+	// threshold only (armSoftLockConfirmation). The zero value covers nothing,
+	// so every other path is prompted as before.
+	grace stepup.GraceRead
+}
+
+// softLockResult is one confirmation's outcome. strength is the grace a
+// Verified outcome earned and is meaningless for the other two.
+type softLockResult struct {
+	outcome  mfaenforce.Outcome
+	strength stepup.GraceStrength
 }
 
 // inPopulation reports whether the soft-lock counts this action at all.
@@ -100,60 +127,181 @@ func (g softLockGate) hasFactor() bool {
 }
 
 // confirmSoftLockTx runs the governing rule's confirmation inside tx and
-// reports whether a factor verified. It must be the transaction's first
-// statement: it locks the actor's users row first (stepup.LockSubjectTx
-// placement contract) and then the servers row, whichever rule applies, so the
-// order is users → servers → the factor write → the caller's own locks. On
-// the channel delete those are #3142's authority locks (channels, then
-// server_members, then the message), all children of servers; their
-// credential-epoch guard re-takes the users row this already holds, which
-// adds no lock-order edge.
-//
-// The rule is chosen from the flag as re-read under the servers-row lock,
-// never from the unlocked read, so a flip in either direction is observed.
-// Turned ON in flight, the server rule governs even for an actor the own rule
-// brought here, and a password no longer passes. Turned OFF in flight, the own
-// rule governs if it applies, reusing the subject the gate already locked; only
-// when no rule applies any more does the action proceed unverified, and then
-// confirmed is false, so the caller neither resets the counters nor clears the
-// budget. That arm needs both reads: an actor the unlocked read did not put in
-// the population is never waved through here, but asked for the own rule's
-// factor, so a caller that confirms outside the population is refused.
-//
-// The error is a *stepup.Error (a refusal, a 401, or a 500 with Cause),
-// mfaenforce.ErrServerNotFound, or a wrapped database error; classify it with
+// reports its outcome: Verified when a factor verified, GraceCovered when the
+// pre-read grace covered it under that rule, Unconfirmed when no rule applies
+// any more. It is the composed admission (admitDeleteTx) with nothing but the
+// soft-lock to confirm, which is what the single-message delete has, and like
+// it must be the transaction's first statement. The error is classified with
 // respondSoftLockError.
-func (h *Handler) confirmSoftLockTx(ctx context.Context, tx *sql.Tx, g softLockGate) (bool, error) {
-	gate, err := lockSoftLockGateTx(ctx, tx, g)
-	if err != nil {
-		return false, err
-	}
-	if gate.Enforcing {
-		return h.confirmServerRuleTx(ctx, tx, g, gate.Subject)
-	}
-	if g.enforcing && !g.ownRule {
-		return false, nil // turned OFF in flight, and no rule applies to this actor
-	}
-	return h.verifyOwnRuleTx(ctx, tx, g, gate.Subject)
+func (h *Handler) confirmSoftLockTx(ctx context.Context, tx *sql.Tx, g softLockGate) (softLockResult, error) {
+	return h.admitDeleteTx(ctx, tx, &deleteAdmission{gate: g, mode: confirmOverThreshold})
 }
 
-// recheckSoftLockTx admits an action the unlocked read put OUTSIDE the
-// population, and like confirmSoftLockTx must be the transaction's first
-// statement. That read is unlocked, so the flag is re-read under the same
-// users → servers locks: still not enforcing, nothing applies and the action
-// proceeds unverified (confirmed false); turned ON in flight, the server rule
-// governs exactly as in confirmSoftLockTx, so a request without a verified
-// inline factor is refused. The own rule is not re-read: an owner can turn
-// enforcement on for someone else, but nobody else can turn on this actor's
-// own setting. Without this re-read the action would carry neither a
-// confirmation nor a count, and the flip would wave it through (review of
-// #3509).
-func (h *Handler) recheckSoftLockTx(ctx context.Context, tx *sql.Tx, g softLockGate) (bool, error) {
-	gate, err := lockSoftLockGateTx(ctx, tx, g)
-	if err != nil || !gate.Enforcing {
-		return false, err
+// confirmMode is what the soft-lock asks of an admission.
+type confirmMode int
+
+const (
+	// confirmNone: nothing. The soft-lock counted the action under the
+	// threshold, or never counted it.
+	confirmNone confirmMode = iota
+	// confirmOverThreshold: the action is over the threshold, so the governing
+	// rule must confirm it.
+	confirmOverThreshold
+	// confirmRecheck: the unlocked read put the actor OUTSIDE the population,
+	// so the admission confirms only if the server turned enforcement on in
+	// flight. Without it the action would carry neither a confirmation nor a
+	// count, and the flip would wave it through (review of #3509).
+	confirmRecheck
+)
+
+// confirmRule is the rule an admission confirms under (A-3.3).
+type confirmRule int
+
+const (
+	// ruleNone admits the action unverified (Unconfirmed).
+	ruleNone confirmRule = iota
+	// ruleServer is the server rule: inline MFA only.
+	ruleServer
+	// ruleOwn is the own rule: MFA when the account has an inline factor,
+	// otherwise a password step-up token.
+	ruleOwn
+)
+
+// deleteAdmission is one delete's or purge's composed admission (#3454 A-3):
+// the soft-lock's ask and, on a purge, the D1 gate over the plan's specs
+// whose author is not the actor. admitDeleteTx admits it under ONE lock and
+// ONE confirmation decision, so a request that both rules apply to verifies
+// once: a second ConfirmTx would be refused by acceptTOTPStep as a replay,
+// and a token can be spent only once.
+//
+// Invariant: the admission commits only if no rule applies under its locks,
+// or every rule that applies is confirmed by one verified factor or by every
+// applicable grace — and on an enforcing server only after the D1 specs'
+// authority was re-checked under those same locks (I7). Breaking it takes a
+// confirmation before that check, a second confirmation, a grace for one
+// scope standing in for another's, or provenance recorded as confirmed for a
+// D1 spec the server rule did not confirm.
+type deleteAdmission struct {
+	// gate is the actor's soft-lock gate: who, where, the purpose, the
+	// request's factor and epoch, the unlocked population read, and the
+	// delete-scope grace (read over the threshold only).
+	gate softLockGate
+	mode confirmMode
+	// d1 is the purge plan's D1 specs, empty when it has none (A-3.1).
+	d1 []purge.DeleteSpec
+	// d1Grace is the dangerous-action grace for purgeDangerousBit, read before
+	// the transaction (A-9). It is judged only when d1 is non-empty.
+	d1Grace stepup.GraceRead
+	// authorize is the plan's per-spec authority check (selfPurge.authorize),
+	// run over d1 before any confirmation.
+	authorize func(context.Context, *sql.Tx, purge.DeleteSpec) error
+
+	// The purge route's answers to a refusal.
+	retryAfter          time.Duration
+	notFound, forbidden string
+
+	// result, enforcing and err are what the admission found. They count only
+	// if its transaction committed; see settleSelfPurge.
+	result softLockResult
+	// enforcing is the flag as read under the servers-row lock.
+	enforcing bool
+	// err is the admission's own error, which refuseSelfPurge answers.
+	err error
+}
+
+// admitDeleteTx is the composed admission, the one helper every soft-locked
+// confirmation and every purge's Plan.Admit runs (A-3.1). It must be the
+// transaction's first statement: it takes LockGateTx(users FOR SHARE, servers
+// FOR SHARE) once (lockSoftLockGateTx), re-reads the enforcement flag under
+// it, and decides by A-3.3's table (rule). When a rule applies and the plan
+// has D1 specs, it first runs the plan's authority check over each of them
+// (I7, A-3.2), so an actor who lost their authority is refused as the batch
+// would refuse them and never sees mfa_required; that check's channels and
+// server_members locks are children of servers, and the order is users →
+// servers → those → the factor write → the audit row. On a server that does
+// not enforce and with no soft-lock confirmation to make, nothing is checked
+// or confirmed and the admission is what it was before #3454.
+//
+// The error is a *stepup.Error (a refusal, a 401, or a 500 with Cause),
+// mfaenforce.ErrServerNotFound, the authority check's refusal, or a wrapped
+// database error.
+func (h *Handler) admitDeleteTx(ctx context.Context, tx *sql.Tx, a *deleteAdmission) (softLockResult, error) {
+	gate, err := lockSoftLockGateTx(ctx, tx, a.gate)
+	if err != nil {
+		return softLockResult{}, err
 	}
-	return h.confirmServerRuleTx(ctx, tx, g, gate.Subject)
+	a.enforcing = gate.Enforcing
+	rule := a.rule(gate.Enforcing)
+	if rule == ruleNone {
+		return softLockResult{}, nil
+	}
+	for _, ds := range a.d1 {
+		if err := a.authorize(ctx, tx, ds); err != nil {
+			return softLockResult{}, err
+		}
+	}
+	if rule == ruleServer {
+		return h.confirmServerRuleTx(ctx, tx, a.gate, gate.Subject, a.graceCovers(gate.Subject))
+	}
+	return h.verifyOwnRuleTx(ctx, tx, a.gate, gate.Subject)
+}
+
+// rule is A-3.3's decision table, on the flag as re-read under the
+// servers-row lock (enforcing), never on the unlocked read, so a flip in
+// either direction is observed:
+//
+//   - enforcing, with a D1 spec or a soft-lock ask: the server rule, once.
+//     Turned ON in flight, it governs even for an actor the own rule brought
+//     here, and a password no longer passes.
+//   - not enforcing and over the threshold: the own rule, exactly as before
+//     #3454. Turned OFF in flight it governs if it applies; when no rule
+//     applies any more the action proceeds unverified. That arm needs both
+//     reads: an actor the unlocked read did not put in the population is
+//     never waved through here, but asked for the own rule's factor, so a
+//     caller that confirms outside the population is refused. D1 does not
+//     fire.
+//   - otherwise: unverified.
+func (a *deleteAdmission) rule(enforcing bool) confirmRule {
+	switch {
+	case enforcing && (len(a.d1) > 0 || a.mode != confirmNone):
+		return ruleServer
+	case enforcing || a.mode != confirmOverThreshold:
+		return ruleNone
+	case a.gate.enforcing && !a.gate.ownRule:
+		return ruleNone // turned OFF in flight, and no rule applies to this actor
+	default:
+		return ruleOwn
+	}
+}
+
+// graceCovers reports whether the pre-read graces confirm the server rule for
+// every reason it applies: the D1 specs' dangerous-action grace, and the
+// delete-scope grace when the soft-lock asked. Each covers only its own
+// scope, so a purge both apply to needs both. A recheck read no grace (the
+// population check that sent it made no Redis call), so it is always
+// prompted. Called only under ruleServer, where at least one reason applies.
+func (a *deleteAdmission) graceCovers(subj stepup.Subject) bool {
+	p := a.gate.purpose
+	d1 := len(a.d1) == 0 || a.d1Grace.Covers(p, stepup.GraceServerRule, subj)
+	softLock := a.mode == confirmNone || a.gate.grace.Covers(p, stepup.GraceServerRule, subj)
+	return d1 && softLock
+}
+
+// d1Provenance is the provenance the plan's D1 specs carry once the
+// admission committed (A-3.6): confirmed when it confirmed the server rule, by
+// a factor or by grace; unconfirmed when the server did not enforce.
+func (a *deleteAdmission) d1Provenance() PurgeProvenance {
+	if a.enforcing && a.result.outcome.Confirmed() {
+		return PurgeConfirmed
+	}
+	return PurgeUnconfirmed
+}
+
+// softLockCharged reports whether the soft-lock charged this request's
+// factor to the budget (armSoftLockConfirmation): over the threshold, with a
+// factor present.
+func (a *deleteAdmission) softLockCharged() bool {
+	return a.mode == confirmOverThreshold && a.gate.hasFactor()
 }
 
 // lockSoftLockGateTx takes the soft-lock's locks — the actor's users row,
@@ -164,42 +312,77 @@ func lockSoftLockGateTx(ctx context.Context, tx *sql.Tx, g softLockGate) (mfaenf
 		stepup.LockForShare, mfaenforce.ServerForShare, g.epoch)
 }
 
-// confirmServerRuleTx confirms under the server rule: an inline MFA factor,
-// whatever the account's own setting. ConfirmTx rather than
-// RequireConfirmationTx: the latter's nil also means "not enforcing", and the
-// callers must tell the two apart.
-func (h *Handler) confirmServerRuleTx(ctx context.Context, tx *sql.Tx, g softLockGate, subj stepup.Subject) (bool, error) {
-	if e := mfaenforce.ConfirmTx(ctx, tx, subj, h.mfaVerifier, g.userID, g.purpose, g.input.MFACode); e != nil {
-		return false, e
+// confirmServerRuleTx confirms under the server rule: covered, when the
+// pre-read graces cover it (A-10; graceCovers judges them against the
+// subject read under the lock), otherwise an inline MFA factor, whatever the
+// account's own setting. ConfirmTx rather than RequireConfirmationTx: the
+// latter's nil also means "not enforcing", and the callers must tell the two
+// apart. mfaenforce.Require is not used for the same reason: it answers
+// Unconfirmed for a gate that does not enforce, and this helper must prompt
+// whenever it is reached.
+func (h *Handler) confirmServerRuleTx(ctx context.Context, tx *sql.Tx, g softLockGate, subj stepup.Subject, covered bool) (softLockResult, error) {
+	if covered {
+		return softLockResult{outcome: mfaenforce.GraceCovered}, nil
 	}
-	return true, nil
+	if e := mfaenforce.ConfirmTx(ctx, tx, subj, h.mfaVerifier, g.userID, g.purpose, g.input.MFACode); e != nil {
+		return softLockResult{}, e
+	}
+	return softLockResult{outcome: mfaenforce.Verified, strength: stepup.GraceStrengthMFA}, nil
 }
 
 // verifyOwnRuleTx confirms under the own rule (stepup.VerifyOwnRuleTx, the DM
-// Clear seam): the inline MFA code when the account has a factor, otherwise a
-// password step-up token minted for this route's purpose (#3509).
-func (h *Handler) verifyOwnRuleTx(ctx context.Context, tx *sql.Tx, g softLockGate, subj stepup.Subject) (bool, error) {
+// Clear seam): a grace the own rule accepts (A-9: mfa, or password while the
+// account has no inline factor), otherwise the inline MFA code when the
+// account has a factor, otherwise a password step-up token minted for this
+// route's purpose (#3509).
+func (h *Handler) verifyOwnRuleTx(ctx context.Context, tx *sql.Tx, g softLockGate, subj stepup.Subject) (softLockResult, error) {
+	if g.grace.Covers(g.purpose, stepup.GraceOwnRule, subj) {
+		return softLockResult{outcome: mfaenforce.GraceCovered}, nil
+	}
 	route := stepup.OwnRuleRoute{Purpose: g.purpose, Copy: softLockStepUpCopy}
 	if e := stepup.VerifyOwnRuleTx(ctx, tx, h.mfaVerifier, g.userID, route, g.input, subj); e != nil {
-		return false, e
+		return softLockResult{}, e
 	}
-	return true, nil
+	return softLockResult{outcome: mfaenforce.Verified, strength: stepup.OwnRuleGraceStrength(subj)}, nil
 }
 
 // chargeMessageDelete is the single-message delete's soft-lock charge: nothing
 // outside the population (no Redis call); one attempt counted inside it; and,
-// over the threshold, the budget charged before the delete transaction opens.
-// verdict.Over tells the caller to confirm. On a refusal it has written the
-// 503 or 429 and returns false.
-func (h *Handler) chargeMessageDelete(ctx context.Context, c *gin.Context, g softLockGate) (stepup.SoftLockVerdict, bool) {
+// over the threshold, the budget charged and the grace read into g before the
+// delete transaction opens (armSoftLockConfirmation). verdict.Over tells the
+// caller to confirm. On a refusal it has written the 503 or 429 and returns
+// false.
+func (h *Handler) chargeMessageDelete(ctx context.Context, c *gin.Context, g *softLockGate) (stepup.SoftLockVerdict, bool) {
 	if !g.inPopulation() {
 		return stepup.SoftLockVerdict{}, true
 	}
-	verdict, ok := h.chargeSoftLock(ctx, c, g, 1)
+	verdict, ok := h.chargeSoftLock(ctx, c, *g, 1)
 	if !ok || !verdict.Over {
 		return verdict, ok
 	}
-	return verdict, h.consumeSoftLockBudget(ctx, c, g)
+	return verdict, h.armSoftLockConfirmation(ctx, c, g)
+}
+
+// armSoftLockConfirmation is the over-threshold path's pre-transaction Redis
+// work, shared by the channel delete and both self-purges: the budget charge
+// (consumeSoftLockBudget), then the delete-scope grace read into g.grace. Both
+// run before BeginTx, because no Redis call may sit inside the confirming
+// transaction (A-9), and only here, where the soft-lock has already called
+// Redis, so a request under the threshold or outside the population costs no
+// extra round trip (A-10). The read never fails the request: any Redis error
+// reads as no grace, so the actor is prompted. On a budget refusal it has
+// written the 429 or 503 and returns false.
+func (h *Handler) armSoftLockConfirmation(ctx context.Context, c *gin.Context, g *softLockGate) bool {
+	if !h.consumeSoftLockBudget(ctx, c, *g) {
+		return false
+	}
+	// chargeSoftLock has already parsed the same inputs, so this cannot fail;
+	// if it did, the zero read prompts.
+	if uid, scope, err := g.scope(); err == nil {
+		g.grace = stepup.NewGraceStore(h.redis).Read(ctx,
+			stepup.GraceActorFromContext(c, uid), stepup.DeleteGraceScope(scope))
+	}
+	return true
 }
 
 // chargeSoftLock records n authorized delete attempts on the server scope and
@@ -235,15 +418,75 @@ func (h *Handler) consumeSoftLockBudget(ctx context.Context, c *gin.Context, g s
 	if !g.hasFactor() {
 		return true
 	}
-	if e := stepup.NewBudget(h.redis, stepup.MFASettingsBudgetPrefix).Consume(ctx, g.userID); e != nil {
-		if e.Cause != nil {
-			h.log.Error("Delete soft-lock step-up budget unavailable",
-				"failure_class", failureClassSoftLockBudget, "error", e.Cause)
-		}
-		e.Write(c)
-		return false
+	return h.admitStepUpCharge(c, stepup.NewBudget(h.redis, stepup.MFASettingsBudgetPrefix).Consume(ctx, g.userID))
+}
+
+// admitStepUpCharge answers a budget charge's outcome e: nil admits; a 429 or
+// 503 is written, the 503 logging its Cause, and returns false. A purge's D1
+// charge (armD1Purge) is answered here too, on the same budget, so the line
+// it logs cannot tell which rule charged the request.
+func (h *Handler) admitStepUpCharge(c *gin.Context, e *stepup.Error) bool {
+	if e == nil {
+		return true
 	}
-	return true
+	if e.Cause != nil {
+		h.log.Error("Delete soft-lock step-up budget unavailable",
+			"failure_class", failureClassSoftLockBudget, "error", e.Cause)
+	}
+	e.Write(c)
+	return false
+}
+
+// settleSoftLock runs the single-message delete's post-commit writes: its
+// admission had the soft-lock alone to confirm (settleAdmission).
+func (h *Handler) settleSoftLock(ctx context.Context, g softLockGate, r softLockResult, succeeded bool) {
+	h.settleAdmission(ctx, &deleteAdmission{gate: g, mode: confirmOverThreshold, result: r}, succeeded)
+}
+
+// settleAdmission runs an admission's post-commit writes (A-10, A-3.5). Call
+// it only once the transaction that produced a.result COMMITTED; succeeded is
+// whether the action itself succeeded. A confirmed (verified or grace-covered)
+// soft-lock ask resets the counters once the action succeeded. A Verified
+// outcome clears the budget once, and grants each grace it earned: the
+// delete-scope one, of the strength it earned, when the soft-lock asked, and
+// the D1 specs' mfa one when the server rule confirmed them. Unconfirmed
+// settles nothing, and a grace-covered confirmation neither clears the budget
+// nor grants, so a grace never slides.
+func (h *Handler) settleAdmission(ctx context.Context, a *deleteAdmission, succeeded bool) {
+	r := a.result
+	if succeeded && r.outcome.Confirmed() && a.mode != confirmNone {
+		h.resetSoftLock(ctx, a.gate)
+	}
+	if r.outcome != mfaenforce.Verified {
+		return
+	}
+	h.clearSoftLockBudget(ctx, a.gate)
+	var stamped stepup.GraceRead
+	if a.mode != confirmNone {
+		stamped = h.grantGrace(ctx, a.gate.grace, r.strength)
+	}
+	if len(a.d1) > 0 && a.enforcing {
+		// The soft-lock grant may have just seeded the generations both reads
+		// found absent; without adopting them this grant's SET NX would find
+		// them and refuse (stepup.GraceStore.GrantRead).
+		h.grantGrace(ctx, a.d1Grace.AdoptGenerations(stamped), stepup.GraceStrengthMFA)
+	}
+}
+
+// grantGrace records a verified confirmation as a grace of strength, stamped
+// with what read found before the transaction, and returns the read it
+// stamped (zero when it granted nothing). Best-effort, and on
+// stepup.SettleContext, like clearSoftLockBudget: a failure only prompts
+// sooner. Every grace it grants logs the same line, which names no scope.
+func (h *Handler) grantGrace(ctx context.Context, read stepup.GraceRead, strength stepup.GraceStrength) stepup.GraceRead {
+	ctx, cancel := stepup.SettleContext(ctx)
+	defer cancel()
+	stamped, err := stepup.NewGraceStore(h.redis).GrantRead(ctx, read, strength)
+	if err != nil {
+		h.log.Warn("Could not record the delete soft-lock step-up grace",
+			"failure_class", stepup.FailureClassGraceGrant, "error", err)
+	}
+	return stamped
 }
 
 // clearSoftLockBudget clears the budget after a verified confirmation has
@@ -259,8 +502,8 @@ func (h *Handler) clearSoftLockBudget(ctx context.Context, g softLockGate) {
 	}
 }
 
-// resetSoftLock clears both tiers after a verified confirmation's action
-// succeeded. Best-effort, and on stepup.SettleContext, like
+// resetSoftLock clears both tiers after a confirmed (verified or
+// grace-covered) action succeeded. Best-effort, and on stepup.SettleContext, like
 // clearSoftLockBudget; a failure leaves the member prompted again sooner,
 // never later.
 func (h *Handler) resetSoftLock(ctx context.Context, g softLockGate) {

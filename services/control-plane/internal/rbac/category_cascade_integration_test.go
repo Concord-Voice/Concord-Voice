@@ -46,7 +46,7 @@ func TestCategoryOverrideTransactionsFenceFinalAdmission(t *testing.T) {
 				_, _, err := env.handler.upsertCategoryOverrideWithAuthority(
 					context.Background(), categoryAuthorityRequest{
 						serverID: env.serverID, categoryID: categoryID, userID: env.serverOwnerID,
-					}, req, &state,
+					}, req, roleGateConfirm{}, &state,
 				)
 				return err
 			},

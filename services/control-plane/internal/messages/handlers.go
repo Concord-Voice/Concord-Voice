@@ -961,6 +961,30 @@ func (h *Handler) authorizeMessageUpdate(c *gin.Context, messageID, userID strin
 	return channelID, true
 }
 
+// lockOwnMessageForEditTx locks the message FOR SHARE in channelID and checks
+// that userID wrote it. On failure it writes the HTTP response and returns
+// false: 404 when the message is gone from that channel, 403 when someone
+// else wrote it, 500 when the read fails.
+func (h *Handler) lockOwnMessageForEditTx(c *gin.Context, tx *sql.Tx, messageID, channelID, userID string) bool {
+	var authorID string
+	err := tx.QueryRowContext(c.Request.Context(),
+		`SELECT user_id FROM messages WHERE id = $1 AND channel_id = $2 FOR SHARE`, messageID, channelID,
+	).Scan(&authorID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return false
+	case err != nil:
+		h.log.Error("Failed to lock message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return false
+	case authorID != userID:
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
+		return false
+	}
+	return true
+}
+
 // updateMessageCiphertext serializes the epoch check and ciphertext update.
 // On failure it writes the HTTP response and returns false.
 func (h *Handler) updateMessageCiphertext(
@@ -990,20 +1014,7 @@ func (h *Handler) updateMessageCiphertext(
 		return models.Message{}, false
 	}
 	channelID := lockedChannelID
-	var authorID string
-	if err = tx.QueryRowContext(c.Request.Context(),
-		`SELECT user_id FROM messages WHERE id = $1 AND channel_id = $2 FOR SHARE`, messageID, channelID,
-	).Scan(&authorID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		} else {
-			h.log.Error("Failed to lock message update", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
-		}
-		return models.Message{}, false
-	}
-	if authorID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
+	if !h.lockOwnMessageForEditTx(c, tx, messageID, channelID, userID) {
 		return models.Message{}, false
 	}
 	if !h.enforceChannelEpoch(c, tx, channelID, req.KeyVersion) {
@@ -1127,9 +1138,11 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 // re-authorizes under #3142's locks (authorizeMessageDeleteTx). Under the
 // threshold, or outside the population, that is all it does, and any step-up
 // the body carried is ignored. Over it, the budget is charged when a factor
-// is present, confirmSoftLockTx confirms as the transaction's first
-// statement, and a verified, committed delete resets the counters and clears
-// the budget.
+// is present and the delete-scope grace is read, confirmSoftLockTx confirms
+// (by that grace or a factor) as the transaction's first statement, and a
+// committed delete settles (settleSoftLock): a verified one resets the
+// counters, clears the budget and grants grace, a grace-covered one only
+// resets the counters.
 func (h *Handler) DeleteMessage(c *gin.Context) {
 	userID := c.GetString("user_id")
 	messageID := c.Param("id")
@@ -1156,22 +1169,15 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	gate := softLockGate{
-		userID:    userID,
-		serverID:  preflight.serverID,
-		enforcing: preflight.enforcing,
-		ownRule:   preflight.authorID == userID && preflight.actorOwnRule,
-		purpose:   stepup.PurposeMessageDelete,
-		input:     input,
-		epoch:     middleware.TokenCredentialEpoch(c),
-	}
-	verdict, ok := h.chargeMessageDelete(ctx, c, gate)
+	gate := preflight.softLockGate(userID, input, middleware.TokenCredentialEpoch(c))
+	verdict, ok := h.chargeMessageDelete(ctx, c, &gate)
 	if !ok {
 		return
 	}
 	h.runBeforeSoftLockConfirmHook()
 
-	var confirmed, responseWritten bool
+	var confirmation softLockResult
+	var responseWritten bool
 	locked := preflight
 	err := h.purgeEngine.DeleteOne(ctx, messageID, purge.DeleteSpec{
 		MessagesTable:    "messages",
@@ -1187,7 +1193,7 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 				// TOTP or backup code re-verifies after the rollback, while a
 				// WebAuthn token was already spent, so the retry fails closed as
 				// Invalid MFA code.
-				if confirmed, err = h.confirmSoftLockTx(ctx, tx, gate); err != nil {
+				if confirmation, err = h.confirmSoftLockTx(ctx, tx, gate); err != nil {
 					return err
 				}
 			}
@@ -1205,10 +1211,7 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		h.respondSoftLockError(c, err, verdict.RetryAfter, errMsgMessageNotFound, errMsgFailedDeleteMessage)
 		return
 	}
-	if confirmed {
-		h.resetSoftLock(ctx, gate)
-		h.clearSoftLockBudget(ctx, gate)
-	}
+	h.settleSoftLock(ctx, gate, confirmation, true)
 
 	h.log.Info("Message deleted", "message_id", messageID, "deleted_by", userID, "author", locked.authorID)
 
@@ -1269,6 +1272,20 @@ type messageDeletePreflight struct {
 	// actorOwnRule is the ACTOR's require_auth_before_purge, a missing row
 	// reading TRUE. It governs only when the actor is also the author.
 	actorOwnRule bool
+}
+
+// softLockGate is the delete's soft-lock state for actor userID. The own rule
+// applies only when the actor is also the author.
+func (p messageDeletePreflight) softLockGate(userID string, input stepup.Input, epoch string) softLockGate {
+	return softLockGate{
+		userID:    userID,
+		serverID:  p.serverID,
+		enforcing: p.enforcing,
+		ownRule:   p.authorID == userID && p.actorOwnRule,
+		purpose:   stepup.PurposeMessageDelete,
+		input:     input,
+		epoch:     epoch,
+	}
 }
 
 // deleteTargetQuery joins servers for the enforcement flag and reads the

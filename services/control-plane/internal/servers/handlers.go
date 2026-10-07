@@ -17,10 +17,13 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -105,6 +108,12 @@ type UpdateServerRequest struct {
 	IconURL              json.RawMessage `json:"icon_url"`
 	BannerURL            json.RawMessage `json:"banner_url"`
 	AllowEmbeddedContent *bool           `json:"allow_embedded_content,omitempty"` // Server-level embed policy
+	// MFACode confirms the edit on a server that enforces MFA on dangerous
+	// actions (#3454 A-6). A client sends it only on a retry after a 403
+	// carrying mfa_required. A plain field, not stepup.Fields: this is not an
+	// own-rule route, so current_password is not refused here and
+	// step_up_token is never read.
+	MFACode string `json:"mfa_code" binding:"max=256"`
 }
 
 // readListServersMFAMask resolves the caller's MFA mask for ListServers'
@@ -534,7 +543,8 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 	serverID := c.Param("id")
 
 	// Validate server ID
-	if _, err := uuid.Parse(serverID); err != nil {
+	serverUUID, err := uuid.Parse(serverID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
 		return
 	}
@@ -545,7 +555,9 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 		return
 	}
 
-	// Check permission to manage server
+	// Check permission to manage server. This pooled check answers a member
+	// without the bit before any row lock is taken; the gate transaction
+	// re-checks under its locks (#3454, updateServerGated).
 	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermManageServer)
 	if err != nil {
 		h.log.Error("Failed to check permissions", "error", err)
@@ -553,7 +565,7 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 		return
 	}
 	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		h.respondUpdateServerError(c, manageServerDenial(c.Request.Context(), h.db, serverID, userID))
 		return
 	}
 
@@ -594,19 +606,9 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 	updateQuery := fmt.Sprintf("UPDATE servers SET %s WHERE id = $%d RETURNING name, icon_url, banner_url, owner_id, allow_embedded_content, created_at, updated_at", //nolint:gosec // setClauses are hardcoded column names, argIdx is an integer — no injection risk // nosemgrep:concord-go-sql-sprintf
 		strings.Join(setClauses, ", "), argIdx)
 
-	var server models.Server
-	server.ID = serverID
-	// nosemgrep: go.net.sql.go-vanillasql-format-string-sqli-taint-med-conf.go-vanillasql-format-string-sqli-taint-med-conf,go.net.sql.go-vanillasql-format-string-sqli-taint.go-vanillasql-format-string-sqli-taint
-	err = h.db.QueryRow(updateQuery, args...).Scan( //nolint:gosec // updateQuery composed by buildUpdateClauses: hardcoded column names + integer argIdx via fmt.Sprintf; user values flow only through args... as parameterized $N placeholders. See matching nosemgrep on the fmt.Sprintf above.
-		&server.Name, &server.IconURL, &server.BannerURL, &server.OwnerID, &server.AllowEmbeddedContent, &server.CreatedAt, &server.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to update server", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdate})
+	server, err := h.updateServerGated(c, serverID, serverUUID, userID, req.MFACode, updateQuery, args)
+	if err != nil {
+		h.respondUpdateServerError(c, err)
 		return
 	}
 
@@ -621,18 +623,16 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 	server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), server.ID)
 
 	// Broadcast update to server subscribers so members see changes in real time
-	if serverUUID, parseErr := uuid.Parse(serverID); parseErr == nil {
-		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
-			Type: "server_updated",
-			Data: map[string]interface{}{
-				"server_id":              serverID,
-				"name":                   server.Name,
-				"icon_url":               server.IconURL,
-				"banner_url":             server.BannerURL,
-				"allow_embedded_content": server.AllowEmbeddedContent,
-			},
-		})
-	}
+	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+		Type: "server_updated",
+		Data: map[string]interface{}{
+			"server_id":              serverID,
+			"name":                   server.Name,
+			"icon_url":               server.IconURL,
+			"banner_url":             server.BannerURL,
+			"allow_embedded_content": server.AllowEmbeddedContent,
+		},
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"server": server,
@@ -720,22 +720,19 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 		return
 	}
 
+	// DeleteServer bound no body before #3454, so the confirmation arrives
+	// through the optional step-up reader (A-6): an empty body is no code.
+	// Only mfa_code is read; a D1 gate never accepts a step_up_token.
+	stepUp, e := stepup.ReadOptionalStepUp(c)
+	if e != nil {
+		e.Write(c)
+		return
+	}
+
 	ctx := c.Request.Context()
 	candidates, err := h.preflightServerVoiceCandidates(ctx, serverID, userID)
-	switch {
-	case errors.Is(err, errServerDeleteNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
-		return
-	case errors.Is(err, errServerDeleteNotOwner):
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can delete the server"})
-		return
-	case errors.Is(err, errServerVoiceCandidateConflict):
-		h.log.Warn(errMsgFailedDelete, "failure_class", serverVoiceCandidateFailureClass(err))
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgServerActivityChanged})
-		return
-	case err != nil:
-		h.log.Error(errMsgFailedDelete, "failure_class", "preflight")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+	if err != nil {
+		h.respondServerDeleteError(c, err, "preflight")
 		return
 	}
 	if h.activePlans == nil {
@@ -743,20 +740,30 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
 		return
 	}
+	// The budget is charged before the gated transaction (A-9), and only when
+	// the request carries a code. servers.delete is always fresh (D-2): no
+	// grace is read for it, and none is granted after it.
+	budget := stepup.DangerousActionBudget(h.redis)
+	if e := stepup.Charge(ctx, budget, userID, stepUp.MFACode); e != nil {
+		mfaenforce.WriteError(c, h.log, e, nil)
+		return
+	}
+	confirm := serverDeleteConfirm{tokenEpoch: middleware.TokenCredentialEpoch(c), mfaCode: stepUp.MFACode}
 
 	// C3 Server Voice captures exact durable plans. C2 Custom Status remains the
 	// bounded member-audience disconnect below, after the gated bracket closes.
 	// The destructive lock order is gates -> fence -> Server Voice advisories ->
-	// users -> server -> channels.
+	// users (the candidates and the actor, sorted) -> server -> channels.
 	var outcome serverDeleteOutcome
 	err = h.activePlans.WithGatedRevocationTx(ctx, candidateSubjectIDs(candidates), func() func() {
 		return h.hub.BeginAudienceRevocation()
 	}, func(tx *sql.Tx) error {
 		return h.deleteServerWithActivePlans(
-			ctx, tx, serverID, userID, candidates, &outcome,
+			ctx, tx, serverID, userID, candidates, confirm, &outcome,
 		)
 	})
 	if outcome.committed {
+		mfaenforce.Settle(ctx, h.log, outcome.confirmation, budget, stepup.GraceStore{}, stepup.GraceRead{}, userID)
 		h.reconcileServerDeleteAudience(ctx, outcome.affected, outcome.oversized)
 		h.log.Info("Server deleted", "server_id", serverID, "user_id", userID)
 		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
@@ -772,25 +779,32 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Server deleted; presence cleanup is pending"})
 			return
 		}
-		if errors.Is(err, errServerDeleteNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
-			return
-		}
-		if errors.Is(err, errServerDeleteNotOwner) {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can delete the server"})
-			return
-		}
-		if errors.Is(err, errServerVoiceCandidateConflict) {
-			h.log.Warn(errMsgFailedDelete, "failure_class", serverVoiceCandidateFailureClass(err))
-			c.JSON(http.StatusConflict, gin.H{"error": errMsgServerActivityChanged})
-			return
-		}
-		h.log.Error(errMsgFailedDelete, "failure_class", serverDeleteTransactionFailureClass(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+		h.respondServerDeleteError(c, err, serverDeleteTransactionFailureClass(err))
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Server deleted successfully"})
+}
+
+// respondServerDeleteError answers a refused or failed deletion: the route's
+// own sentinels first, then the gate's refusals (#3454), then a 500 logged
+// with failureClass, which names the stage that failed.
+func (h *Handler) respondServerDeleteError(c *gin.Context, err error, failureClass string) {
+	switch {
+	case errors.Is(err, errServerDeleteNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
+	case errors.Is(err, errServerDeleteNotOwner):
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can delete the server"})
+	case errors.Is(err, errServerVoiceCandidateConflict):
+		h.log.Warn(errMsgFailedDelete, "failure_class", serverVoiceCandidateFailureClass(err))
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgServerActivityChanged})
+	default:
+		if h.respondGateError(c, err) {
+			return
+		}
+		h.log.Error(errMsgFailedDelete, "failure_class", failureClass)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+	}
 }
 
 const maxServerVoiceCandidates = 16
@@ -836,6 +850,16 @@ type serverDeleteOutcome struct {
 	committed bool
 	affected  []uuid.UUID
 	oversized bool
+	// confirmation is the dangerous-action gate's verdict (#3454), settled
+	// after a commit.
+	confirmation mfaenforce.Outcome
+}
+
+// serverDeleteConfirm is what the deletion's dangerous-action gate confirms
+// with (#3454): the session's cred_epoch claim and the request's mfa_code.
+type serverDeleteConfirm struct {
+	tokenEpoch string
+	mfaCode    string
 }
 
 func (h *Handler) preflightServerVoiceCandidates(ctx context.Context, serverID, userID string) (candidates []serverVoiceCandidate, returnErr error) {
@@ -877,6 +901,7 @@ func (h *Handler) deleteServerWithActivePlans(
 	tx *sql.Tx,
 	serverID, userID string,
 	preflight []serverVoiceCandidate,
+	confirm serverDeleteConfirm,
 	outcome *serverDeleteOutcome,
 ) error {
 	for _, candidate := range preflight {
@@ -884,20 +909,12 @@ func (h *Handler) deleteServerWithActivePlans(
 			return fmt.Errorf("lock server voice lifecycle: %w", err)
 		}
 	}
-	survivingUsers, err := lockServerVoiceCandidateUsers(ctx, tx, preflight)
+	survivingUsers, err := lockServerDeleteUsers(ctx, tx, preflight, userID)
 	if err != nil {
 		return err
 	}
-
-	var ownerID string
-	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errServerDeleteNotFound
-		}
-		return fmt.Errorf("lock server deletion: %w", err)
-	}
-	if ownerID != userID {
-		return errServerDeleteNotOwner
+	if outcome.confirmation, err = h.gateServerDeleteTx(ctx, tx, serverID, userID, confirm); err != nil {
+		return err
 	}
 	channelParents, err := lockServerVoiceChannelParents(ctx, tx, serverID)
 	if err != nil {
@@ -1001,15 +1018,26 @@ func candidateSubjectIDs(candidates []serverVoiceCandidate) []uuid.UUID {
 	return subjects
 }
 
-func lockServerVoiceCandidateUsers(
+// lockServerDeleteUsers locks, FOR NO KEY UPDATE and in one id-ordered
+// statement, every preflight candidate's users row and the actor's, and
+// returns the ids whose rows still exist.
+//
+// The actor is in the set, not locked separately by the gate (#3454): two
+// owners deleting servers in which each is the other's voice candidate would
+// otherwise each hold one row and wait for the other's. One sorted statement
+// takes every row in the same global order. The gate then re-takes the
+// actor's row at the same strength, which adds no edge.
+func lockServerDeleteUsers(
 	ctx context.Context,
 	tx *sql.Tx,
 	candidates []serverVoiceCandidate,
+	actorID string,
 ) (surviving map[uuid.UUID]struct{}, returnErr error) {
-	if len(candidates) == 0 {
-		return nil, nil
+	actor, err := uuid.Parse(actorID)
+	if err != nil {
+		return nil, fmt.Errorf("parse server delete actor: %w", err)
 	}
-	ids := candidateSubjectIDs(candidates)
+	ids := append(candidateSubjectIDs(candidates), actor)
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE`, pq.Array(ids))
 	if err != nil {

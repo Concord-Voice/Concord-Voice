@@ -33,8 +33,13 @@ const (
 	// pooledOwnerRead is the preflight owner read (UpdateMember's inline read
 	// and getServerOwnerID). Nothing earlier on these routes sends this text.
 	pooledOwnerRead = `SELECT owner_id FROM servers WHERE id = $1`
-	// txOwnerLock is the moderation transactions' server lock.
+	// txOwnerLock is the removal transaction's server lock when the kick
+	// purges nothing.
 	txOwnerLock = `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`
+	// txGateLock is the server lock a ban and a purging kick take through the
+	// dangerous-action gate (#3454 A-8), in txOwnerLock's place. Only the
+	// gate's statements read the isolation level beside the flag.
+	txGateLock = `enforce_mfa_dangerous_actions, current_setting('transaction_isolation')`
 	// updateRoleWrite and timeoutWrite are UpdateMember's and TimeoutMember's
 	// final writes, after every read above. Codex on #3508: a server deleted
 	// after the owner read and before these left RETURNING with no row, and its
@@ -219,7 +224,13 @@ func moderationSites() []moderationSite {
 			faultBody: `{"error":"Failed to ban member"}`,
 		},
 		{
-			name: "BanMember transaction (handlers.go:1702)", sequence: []string{txOwnerLock},
+			name: "RemoveMember purging transaction (gate lock)", sequence: []string{txGateLock},
+			method: http.MethodDelete, path: member, body: map[string]bool{"purge_messages": true},
+			denyStatus: http.StatusNotFound, denyBody: bodyUserNotMember,
+			faultBody: `{"error":"Failed to remove member"}`,
+		},
+		{
+			name: "BanMember transaction (gate lock)", sequence: []string{txGateLock},
 			method:     http.MethodPost,
 			path:       ban,
 			denyStatus: http.StatusForbidden, denyBody: bodyInsufficient,

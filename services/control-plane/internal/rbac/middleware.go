@@ -6,6 +6,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 )
 
 // RequireMembership is middleware that checks if the authenticated user is a member of the server
@@ -85,6 +87,16 @@ func RequirePermission(resolver *Resolver, perm Permission, channelIDParam strin
 		}
 
 		if !hasPerm {
+			// RS5 (#3454 §14.1): a denial the MFA mask caused is answered with
+			// mfa_enrollment_required. For a permission the mask never
+			// withholds, EnrollmentDenial returns before any statement, so
+			// only the ManageRoles routes pay its reads, on the pool as the
+			// denial was decided.
+			if e := EnrollmentDenial(c.Request.Context(), resolver.db, serverID, channelID, userID, perm); e != nil {
+				mfaenforce.WriteError(c, resolver.log, e, nil)
+				c.Abort()
+				return
+			}
 			c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermissions})
 			c.Abort()
 			return

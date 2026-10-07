@@ -9,6 +9,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 )
 
 // Guard sentinels (#2721). Call sites map these through mapGuardError to the
@@ -308,8 +310,11 @@ func (h *Handler) preCheckRoleMutation(
 	// escalation check in UpdateRole/AssignRole anyway — so evaluating it here
 	// would manufacture a false denial. CreateRole has no pre-check at all, which
 	// is what preserves its deliberate absence of an owner bypass.
-	if res.IsOwner || mode == confersNothing {
+	if mode == confersNothing {
 		return nil
+	}
+	if res.IsOwner {
+		return h.preCheckOwnerConferral(ctx, serverID, actorID, roleID, mode, res)
 	}
 
 	// MFA mask (#3453). MaskFor issues no query when EnforceMFADangerousActions
@@ -335,6 +340,34 @@ func (h *Handler) preCheckRoleMutation(
 		return errEscalationDenied
 	}
 	return nil
+}
+
+// preCheckOwnerConferral is RS4's pooled pre-check (#3454 §6), the owner's
+// counterpart of the masked escalation half above: the verdict must equal the
+// authoritative guard's, or the mismatched pre-check reopens F3 for exactly
+// this case. So it counts the same conferral, the role's bitfield plus its
+// override allows. Only an assignment on an enforcing server reads anything,
+// through the same MaskFor and under the same fail-open rule as the non-owner
+// half: it can only ever save work, because unenrolledOwnerConferral
+// re-decides in the transaction.
+func (h *Handler) preCheckOwnerConferral(
+	ctx context.Context, serverID, actorID, roleID string, mode conferredMode, res roleGuardResult,
+) error {
+	if mode != confersTargetRole || !res.EnforceMFADangerousActions {
+		return nil
+	}
+	mask, err := MaskFor(ctx, h.db, actorID, true)
+	if err != nil || mask.Enrolled {
+		//nolint:nilerr // deliberate: a P1 read fault falls through to the
+		// authoritative guard, matching the fail-open rule above.
+		return nil
+	}
+	allows, err := roleOverrideAllows(ctx, h.db, serverID, roleID)
+	if err != nil {
+		//nolint:nilerr // deliberate: same fail-open rule as MaskFor above.
+		return nil
+	}
+	return maskedOwnerConferral(res.Permissions | allows)
 }
 
 // roleGuardRequest is one guard evaluation's inputs.
@@ -410,6 +443,14 @@ func (h *Handler) evaluateRoleGuard(
 	// through UpdateRole (#2869). Owners may delegate PermAdministrator by
 	// decision, so this bypass is intended; CreateRole's refusal is the defect,
 	// tracked as #3407. Do not cite CreateRole as containment.
+	//
+	// RS4 (#3454 §6) narrows the bypass for AssignRole only. Its route
+	// permission, ManageRolesAssign, is not masked (D6), so an unenrolled owner
+	// of an enforcing server would otherwise confer through it every bit the
+	// mask withholds from that owner everywhere else.
+	if res.IsOwner && mode == confersTargetRole && res.EnforceMFADangerousActions {
+		return res, unenrolledOwnerConferral(ctx, q, req, res.Permissions)
+	}
 	if mode == confersNothing || res.IsOwner {
 		return res, nil
 	}
@@ -490,6 +531,11 @@ func (h *Handler) mapGuardError(c *gin.Context, err error, hierarchyMsg, failure
 	switch {
 	case err == nil:
 		return false
+	case isRoleGateError(err):
+		// First: a gate, RS4 or RS5 refusal carries its own status and body
+		// (#3454 §7), and a lock conflict on the gate's own lock is its 503,
+		// which the guard-lock-timeout arm below would answer with a 500.
+		mfaenforce.WriteError(c, h.log, err, nil)
 	case errors.Is(err, errRoleGone), err == sql.ErrNoRows: //nolint:errorlint // see below
 		// BARE sql.ErrNoRows only, deliberately — NOT errors.Is.
 		// resolveServerPermissions wraps a vanished `servers` row as

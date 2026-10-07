@@ -34,6 +34,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -272,6 +273,9 @@ type Handler struct {
 	// tier1UploadCommit is a package-test seam for definite versus ambiguous
 	// profile-upload metadata commits. Production uses tx.Commit.
 	tier1UploadCommit func(*sql.Tx) error
+	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
+	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
+	mfaVerifier stepup.MFATxCodeVerifier
 }
 
 // SetOpsCounter enables aggregate successful-upload counting.
@@ -995,6 +999,10 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 	if !ok {
 		return
 	}
+	mfaCode, ok := readServerImageMFACode(c, purpose)
+	if !ok {
+		return
+	}
 	if !enforceTier1UploadLimit(c, h, purpose, serverID, header.Size, maxSize) {
 		return
 	}
@@ -1034,7 +1042,26 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		h.respondTier1Upload(c, purpose, userID, storageKey, fileID, header.Size, processed)
 		return
 	}
-	storageKey := tier1StorageKey(purpose, userID, serverID, conversationID)
+	if isServerImagePurpose(purpose) {
+		h.storeServerImage(c, serverImageUpload{
+			userID: userID, serverID: serverID, purpose: purpose, code: mfaCode,
+			store: store, processed: processed, originalSize: header.Size,
+		})
+		return
+	}
+	if purpose == purposeDMIcon {
+		h.storeDMIcon(c, store, userID, conversationID, header.Size, processed)
+		return
+	}
+	h.storeUniqueKeyTier1Image(c, store, userID, purpose, tier1StorageKey(purpose, userID, serverID, conversationID), header.Size, processed)
+}
+
+// storeUniqueKeyTier1Image stores a Tier-1 image whose key is fresh for every
+// upload (a feedback screenshot, #1747), records it and answers. Unlike the
+// fixed-key purposes above, a failed record leaves an object nothing points
+// at, so it is deleted: #3454 C4's "never delete after a failed record" holds
+// only because a fixed key's write has already replaced the live image.
+func (h *Handler) storeUniqueKeyTier1Image(c *gin.Context, store ObjectStore, userID, purpose, storageKey string, originalSize int64, processed *ProcessedImage) {
 	reader := bytes.NewReader(processed.Data)
 	if err := store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
 		h.log.Error("Failed to store processed image", "error", err, "user_id", userID, "purpose", purpose)
@@ -1042,20 +1069,43 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		return
 	}
 
-	fileID, err = insertTier1Record(c.Request.Context(), h, c, nil, userID, storageKey, processed)
+	fileID, err := insertTier1Record(c.Request.Context(), h, c, userID, storageKey, processed)
 	if err != nil {
 		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
 			h.log.Error("Failed to delete orphaned media object", "error", delErr, "storage_key", storageKey)
 		}
 		return // response already sent
 	}
-	if purpose == purposeDMIcon {
-		if err := updateDMIconURL(h, c, conversationID); err != nil {
-			return
-		}
+
+	h.respondTier1Upload(c, purpose, userID, storageKey, fileID, originalSize, processed)
+}
+
+// storeDMIcon puts a group DM icon at its fixed key, records it, and points
+// the conversation at it.
+//
+// There is no compensating DeleteObject when the record fails. The key is
+// fixed (dm-icons/<conversation>), so the object just written replaced the
+// live icon at that key, and deleting it afterwards would leave
+// dm_conversations.icon_url pointing at nothing (#3454 C4). A failed record
+// leaves the new image in place, which the next upload overwrites.
+func (h *Handler) storeDMIcon(c *gin.Context, store ObjectStore, userID, conversationID string, originalSize int64, processed *ProcessedImage) {
+	storageKey := tier1StorageKey(purposeDMIcon, userID, "", conversationID)
+	reader := bytes.NewReader(processed.Data)
+	if err := store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
+		h.log.Error("Failed to store processed image", "error", err, "user_id", userID, "purpose", purposeDMIcon)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return
 	}
 
-	h.respondTier1Upload(c, purpose, userID, storageKey, fileID, header.Size, processed)
+	fileID, err := insertTier1Record(c.Request.Context(), h, c, userID, storageKey, processed)
+	if err != nil {
+		return // response already sent
+	}
+	if err := updateDMIconURL(h, c, conversationID); err != nil {
+		return
+	}
+
+	h.respondTier1Upload(c, purposeDMIcon, userID, storageKey, fileID, originalSize, processed)
 }
 
 func (h *Handler) respondTier1Upload(c *gin.Context, purpose, userID, storageKey, fileID string, originalSize int64, processed *ProcessedImage) {
@@ -1080,7 +1130,7 @@ func (h *Handler) respondTier1Upload(c *gin.Context, purpose, userID, storageKey
 
 func enforceTier1UploadLimit(c *gin.Context, h *Handler, purpose, serverID string, fileSize, defaultMaxSize int64) bool {
 	maxSize := defaultMaxSize
-	if purpose == purposeServerIcon || purpose == purposeServerBanner {
+	if isServerImagePurpose(purpose) {
 		ent := entitlements.ForServer(h.serverTier(c.Request.Context(), serverID))
 		if purpose == purposeServerIcon {
 			maxSize = ent.MaxServerIconBytes
@@ -1125,7 +1175,7 @@ func parseMultipartFile(c *gin.Context, maxSize int64) (multipart.File, *multipa
 }
 
 func validateTier1Context(c *gin.Context, h *Handler, userID, purpose string) (serverID, conversationID string, ok bool) {
-	if purpose == purposeServerIcon || purpose == purposeServerBanner {
+	if isServerImagePurpose(purpose) {
 		serverID = c.PostForm("server_id")
 		if serverID == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "server_id is required"})
@@ -1587,24 +1637,32 @@ func (h *Handler) insertProfileTier1Record(ctx context.Context, c *gin.Context, 
 	return fileID, nil
 }
 
-func insertTier1Record(ctx context.Context, h *Handler, c *gin.Context, tx *sql.Tx, userID, storageKey string, processed *ProcessedImage) (string, error) {
-	fileID := uuid.New().String()
+// insertTier1RecordQuery upserts the media_files row for a tier-1 key. The
+// ON CONFLICT rebinds a re-upload of a fixed key to its latest uploader.
+const insertTier1RecordQuery = `
+	INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, created_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+	ON CONFLICT (storage_key) WHERE deleted_at IS NULL
+	DO UPDATE SET uploader_id = EXCLUDED.uploader_id, file_size = EXCLUDED.file_size, mime_type = EXCLUDED.mime_type, updated_at = NOW()
+	RETURNING id
+`
 
-	insertQuery := `
-		INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-		ON CONFLICT (storage_key) WHERE deleted_at IS NULL
-		DO UPDATE SET uploader_id = EXCLUDED.uploader_id, file_size = EXCLUDED.file_size, mime_type = EXCLUDED.mime_type, updated_at = NOW()
-		RETURNING id
-	`
-	var err error
-	if tx != nil {
-		err = tx.QueryRowContext(ctx, insertQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
-			processed.ContentType, len(processed.Data), storageKey).Scan(&fileID)
-	} else {
-		err = h.db.QueryRowContext(ctx, insertQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
-			processed.ContentType, len(processed.Data), storageKey).Scan(&fileID)
+// insertTier1Row upserts the media_files row for storageKey on q (the pool, or
+// a transaction) and returns its id. It writes no response and no log: its
+// callers answer the failure in their own terms.
+func insertTier1Row(ctx context.Context, q RowQuerier, userID, storageKey string, processed *ProcessedImage) (string, error) {
+	fileID := uuid.New().String()
+	if err := q.QueryRowContext(ctx, insertTier1RecordQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
+		processed.ContentType, len(processed.Data), storageKey).Scan(&fileID); err != nil {
+		return "", err
 	}
+	return fileID, nil
+}
+
+// insertTier1Record is insertTier1Row on the pool, answering a failure with
+// the 500 itself.
+func insertTier1Record(ctx context.Context, h *Handler, c *gin.Context, userID, storageKey string, processed *ProcessedImage) (string, error) {
+	fileID, err := insertTier1Row(ctx, h.db, userID, storageKey, processed)
 	if err != nil {
 		h.log.Error(errMsgFailedRecordMediaMetadata, "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRecordMediaMetadata})
@@ -2214,7 +2272,7 @@ func (h *Handler) userCanManageServer(c *gin.Context, userID, serverID string) b
 		return false
 	}
 	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+		h.respondServerImageError(c, manageServerDenial(c.Request.Context(), h.db, serverID, userID))
 		return false
 	}
 	return true

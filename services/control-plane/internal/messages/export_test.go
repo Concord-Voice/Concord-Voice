@@ -24,5 +24,6 @@ func (h *Handler) ConfirmOutsidePopulationForTest(ctx context.Context, userID, s
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	return h.confirmSoftLockTx(ctx, tx, softLockGate{userID: userID, serverID: serverID, purpose: stepup.PurposeMessageDelete})
+	res, err := h.confirmSoftLockTx(ctx, tx, softLockGate{userID: userID, serverID: serverID, purpose: stepup.PurposeMessageDelete})
+	return res.outcome.Confirmed(), err
 }

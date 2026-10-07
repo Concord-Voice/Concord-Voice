@@ -104,7 +104,11 @@ func authorityWriters() []authorityWriter {
 			// parent-lock error fell to its 500 default.
 			name: "DeleteRole",
 			request: func(f authorityFixture) (gin.Params, any) {
-				return gin.Params{{Key: "id", Value: f.serverID}, {Key: "role_id", Value: f.doomedRoleID}}, nil
+				// An empty object, not nil: invokeStaleRBACMutation marshals nil to
+				// a literal null, which DeleteRole's optional step-up body reader
+				// refuses with 400 since #3454 (A-6). {} carries no code, which is
+				// what this case always sent.
+				return gin.Params{{Key: "id", Value: f.serverID}, {Key: "role_id", Value: f.doomedRoleID}}, map[string]any{}
 			},
 			call:      func(h *rbac.Handler, c *gin.Context) { h.DeleteRole(c) },
 			faultBody: `{"error":"Failed to delete role"}`,

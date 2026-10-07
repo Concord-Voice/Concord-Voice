@@ -2241,11 +2241,12 @@ paths:
       tags:
       - ChannelGroups
       summary: Create or update a category permission override
-      description: 'Upsert an SBAC permission override for a user or role on a category
+      description: >-
+        Upsert an SBAC permission override for a user or role on a category
 
         (keyed on category + target type + target ID). Requires the Manage
 
-        Channels permission. Allow bits must be a subset of the caller''s own
+        Channels permission. Allow bits must be a subset of the caller's own
 
         effective permissions unless the caller has Administrator (deny bits
 
@@ -2255,7 +2256,18 @@ paths:
 
         Rate limit: 10 requests per minute (user-based).
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Writing a category permission override is a dangerous
+        action. On a server that enforces MFA on dangerous actions, writing one needs an inline MFA
+        confirmation. The first request is refused with a 403 `mfa_required` (with `methods`);
+        repeat the same request with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline
+        token minted for this route's purpose). `mfa_code` is required only when the server enforces
+        and the action is dangerous, and it is charged against the step-up attempt budget (5 per 15
+        minutes, shared with the MFA settings routes) even on a server that does not enforce, so
+        send it only on a retry after that 403. The budget fails closed: if its Redis store is
+        unreachable the request is refused with a 503 `step_up_budget_unavailable` and nothing is
+        checked, verified or changed. A code on a request that is not gated is ignored. A request
+        that carries no code on a server that does not enforce is answered exactly as before.
       operationId: upsertCategoryOverride
       security:
       - BearerAuth: []
@@ -2290,12 +2302,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions (Manage Channels required), or the allow bits include
-            permissions the caller does not hold
+          description: >-
+            Insufficient permissions (Manage Channels required), or the allow bits include permissions
+            the caller does not hold. On a server that enforces MFA on dangerous actions the same status
+            also carries the gate's refusals (#3454): `mfa_required: true` with `methods` when no
+            `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or wrong-purpose code, and
+            `mfa_enrollment_required: true` when the actor has no inline MFA factor. None of them
+            carries `delete_rate_limited` or `Retry-After`, because waiting does not lift a refusal.
+            Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '404':
           description: Category not found
           content:
@@ -2303,7 +2323,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
   /categories/{id}/overrides/{override_id}:
     delete:
       tags:
@@ -2513,15 +2537,33 @@ paths:
       tags:
       - Channels
       summary: Delete a channel
-      description: 'Permanently delete a channel. Requires owner or admin role.
+      description: >-
+        Permanently delete a channel. Requires owner or admin role.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Deleting a channel is a dangerous action. On a server
+        that enforces MFA on dangerous actions, deleting it needs an inline MFA confirmation. The
+        first request is refused with a 403 `mfa_required` (with `methods`); repeat the same request
+        with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this
+        route's purpose). `mfa_code` is required only when the server enforces and the action is
+        dangerous, and it is charged against the step-up attempt budget (5 per 15 minutes, shared
+        with the MFA settings routes) even on a server that does not enforce, so send it only on a
+        retry after that 403. The budget fails closed: if its Redis store is unreachable the request
+        is refused with a 503 `step_up_budget_unavailable` and nothing is checked, verified or
+        changed. A code on a request that is not gated is ignored. A request that carries no code on
+        a server that does not enforce is answered exactly as before.
       security:
       - BearerAuth: []
       parameters:
       - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousActionStepUpRequest'
       responses:
         '200':
           description: Channel deleted
@@ -2536,7 +2578,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions
+          description: >-
+            Insufficient permissions. On a server that enforces MFA on dangerous actions the same status
+            also carries the gate's refusals (#3454): `mfa_required: true` with `methods` when no
+            `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or wrong-purpose code, and
+            `mfa_enrollment_required: true` when the actor has no inline MFA factor. None of them
+            carries `delete_rate_limited` or `Retry-After`, because waiting does not lift a refusal.
+            Nothing was changed. Route on the body flag, never the message text.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
+        '400':
+          description: >-
+            Invalid channel ID. A request body the server cannot read: larger than 4 KiB, not a JSON
+            object (a literal `null` included), trailing data after the object, a non-string field, an
+            `mfa_code` over 256 characters, or any `current_password` field. The body is `Invalid
+            request body`.
           content:
             application/json:
               schema:
@@ -2546,12 +2612,31 @@ paths:
       tags:
       - Channels
       summary: Update channel message expiration
-      description: 'Set, clear, or resume the shared message-expiration policy for a text channel.
-        `set` is valid only for text channels; `clear` and `resume` are also valid when a channel has
-        been retyped as non-text. Requires `Manage Channels`. The complete JSON document is limited to
-        1 KiB. Each request performs at most five 5,000-row backfill batches; remaining work stays
+      description: >-
+        Set, clear, or resume the shared message-expiration policy for a text channel. `set` is
+        valid only for text channels; `clear` and `resume` are also valid when a channel has been
+        retyped as non-text. Requires `Manage Channels`. The complete JSON document is limited to 1
+        KiB. Each request performs at most five 5,000-row backfill batches; remaining work stays
         resumable. The endpoint stamps and backfills expiry metadata; the separate startup preflight
-        and five-minute worker remove eligible messages.'
+        and five-minute worker remove eligible messages.
+
+
+        **Dangerous-action MFA gate (#3454).** Only a request that SHORTENS retention is dangerous:
+        a `set` with a finite window when no window was in force, with a window shorter than the
+        current one, or with `retroactive: apply` at any window, because `apply` stamps an expiry
+        on every message an earlier `new_only` policy kept. Clearing the policy, lengthening it for
+        new messages only (`new_only`) and resuming a backfill are ungated, and
+        `mfa_code` is ignored there (but still charged). On a server that enforces MFA on dangerous
+        actions, shortening retention needs an inline MFA confirmation. The first request is refused
+        with a 403 `mfa_required` (with `methods`); repeat the same request with `mfa_code` (a TOTP
+        code, a backup code, or a WebAuthn inline token minted for this route's purpose). `mfa_code`
+        is required only when the server enforces and the action is dangerous, and it is charged
+        against the step-up attempt budget (5 per 15 minutes, shared with the MFA settings routes)
+        even on a server that does not enforce, so send it only on a retry after that 403. The
+        budget fails closed: if its Redis store is unreachable the request is refused with a 503
+        `step_up_budget_unavailable` and nothing is checked, verified or changed. A code on a
+        request that is not gated is ignored. A request that carries no code on a server that does
+        not enforce is answered exactly as before.
       operationId: updateChannelExpiration
       security:
       - BearerAuth: []
@@ -2562,7 +2647,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ExpirationRequest'
+              $ref: '#/components/schemas/ChannelExpirationRequest'
       responses:
         '200':
           description: Current channel expiration policy
@@ -2583,11 +2668,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Visible channel member lacks channel-management permission
+          description: >-
+            Visible channel member lacks channel-management permission. On a server that enforces MFA on
+            dangerous actions the same status also carries the gate's refusals (#3454): `mfa_required:
+            true` with `methods` when no `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed
+            or wrong-purpose code, and `mfa_enrollment_required: true` when the actor has no inline MFA
+            factor. None of them carries `delete_rate_limited` or `Retry-After`, because waiting does
+            not lift a refusal. Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '404':
           description: Channel or caller membership/authorization context not found
           content:
@@ -2603,7 +2696,10 @@ paths:
                 - $ref: '#/components/schemas/Error'
                 - $ref: '#/components/schemas/ExpirationPolicy'
         '500':
-          description: Database error before the policy change was accepted
+          description: >-
+            Database error before the policy change was accepted. The gate's own failures are
+            `Verification failed` (a verifier or token-store fault) and `Internal server error`; nothing
+            was changed.
           content:
             application/json:
               schema:
@@ -2615,13 +2711,29 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
         '503':
-          description: A bounded backfill may leave a durable marker, or any Start commit error may return a candidate ExpirationPolicy that was not persisted, including new_only and leave_pending. Re-fetch the chat policy; resume only when the fetched policy has backfill_pending true at the matching revision.
+          description: >-
+            A bounded backfill may leave a durable marker, or a Start commit error other than a
+            deadlock or lock timeout may return a candidate ExpirationPolicy that was not persisted,
+            including new_only and leave_pending. Re-fetch the chat policy; resume only when the
+            fetched policy has backfill_pending true at the matching revision. The gate adds two more
+            503s: the step-up attempt budget's store is unreachable (`step_up_budget_unavailable:
+            true`), or a deadlock or lock timeout hit the transaction, including at commit
+            (`lock_conflict: true`, with `Retry-After: 1`). Nothing was changed for either.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying a lock conflict (1). Absent on the other bodies.
+              schema:
+                type: integer
+                example: 1
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ExpirationPolicy'
+                anyOf:
+                - $ref: '#/components/schemas/ExpirationPolicy'
+                - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+                - $ref: '#/components/schemas/LockConflictError'
   /channels/{id}/keys:
     get:
       tags:
@@ -2759,8 +2871,9 @@ paths:
       tags:
       - Messages
       summary: Purge messages in a channel
-      description: 'Bulk-delete messages in a channel, scoped by a recent-ward time
-        range and an optional target author (#1352). Irreversible.
+      description: >-
+        Bulk-delete messages in a channel, scoped by a recent-ward time range and an optional target
+        author (#1352). Irreversible.
 
 
         Authorization: `Manage All Messages` permits purging any/all authors. An actor
@@ -2769,25 +2882,35 @@ paths:
         nothing deleted and no audit row.
 
 
-        Deletion is batched internally; the batch size is not a cap on how many
-        messages are removed. Every purge writes a privacy-safe audit row (counts and
-        context only, never content) and broadcasts `channel_purged`.
+        Deletion is batched internally; the batch size is not a cap on how many messages are
+        removed. Every purge writes a privacy-safe audit row (counts and context only, never
+        content) and broadcasts `channel_purged`.
 
 
-        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
-        allows).
+        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than allows).
 
 
-        Delete-rate soft-lock (#3455): a purge whose resolved author scope is the
-        actor (an actor with only `Manage Own Messages`, or an explicit
-        `target_user_id` equal to the actor) counts the messages it will delete,
-        up to 101, against the same counters as single deletes. Over the
-        threshold the request is refused with a 403 carrying
-        `delete_rate_limited: true` before any batch runs, and nothing is purged
-        or audited. Repeat the request with `mfa_code`, or with a
-        `step_up_token` from `POST /auth/step-up/password` when the refusal
-        asked for a password; a body carrying `current_password` is a 400.
-        A purge of other authors'' messages is never counted.'
+        Delete-rate soft-lock (#3455): a purge whose resolved author scope is the actor (an actor
+        with only `Manage Own Messages`, or an explicit `target_user_id` equal to the actor) counts
+        the messages it will delete, up to 101, against the same counters as single deletes. Over
+        the threshold the request is refused with a 403 carrying `delete_rate_limited: true` before
+        any batch runs, and nothing is purged or audited. Repeat the request with `mfa_code`, or
+        with a `step_up_token` from `POST /auth/step-up/password` when the refusal asked for a
+        password; a body carrying `current_password` is a 400. A purge of other authors' messages is
+        never counted.
+
+
+        **Dangerous-action MFA gate (#3454).** A purge that deletes any other author's messages, or
+        every author's, is a dangerous action. On a server that enforces MFA on dangerous actions it
+        needs `mfa_code`, verified in the same admission as the delete-rate soft-lock's own
+        confirmation, so one code satisfies both. Its refusals are the plain gate bodies (403
+        `mfa_required`, `Invalid MFA code` or `mfa_enrollment_required`) with no
+        `delete_rate_limited` flag and no `Retry-After`, because waiting does not lift them, and the
+        429, 503 and 500 below carry the gate's budget, outage, lock-conflict and
+        verification-failure bodies. `mfa_code` is charged against the step-up attempt budget even
+        on a server that does not enforce, so send it only on a retry after a 403 `mfa_required`.
+        The budget fails closed: an unreachable Redis store is a 503 `step_up_budget_unavailable`. A
+        purge of the actor's own messages is not gated by this rule.
       operationId: purgeChannelMessages
       security:
       - BearerAuth: []
@@ -2828,7 +2951,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: Purge failed or timed out
+          description: >-
+            Purge failed or timed out. The dangerous-action gate's own failures are `Verification
+            failed` (a verifier or token-store fault) and `Internal server error`; nothing was purged.
           content:
             application/json:
               schema:
@@ -2984,11 +3109,12 @@ paths:
       tags:
       - Channels
       summary: Create or update a channel permission override
-      description: 'Upsert an SBAC permission override for a user or role on a channel
+      description: >-
+        Upsert an SBAC permission override for a user or role on a channel
 
         (keyed on channel + target type + target ID). Requires the Manage
 
-        Channels permission. Allow bits must be a subset of the caller''s own
+        Channels permission. Allow bits must be a subset of the caller's own
 
         effective permissions unless the caller has Administrator (deny bits
 
@@ -2996,7 +3122,18 @@ paths:
 
         Rate limit: 10 requests per minute (user-based).
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Writing a channel permission override is a dangerous
+        action. On a server that enforces MFA on dangerous actions, writing one needs an inline MFA
+        confirmation. The first request is refused with a 403 `mfa_required` (with `methods`);
+        repeat the same request with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline
+        token minted for this route's purpose). `mfa_code` is required only when the server enforces
+        and the action is dangerous, and it is charged against the step-up attempt budget (5 per 15
+        minutes, shared with the MFA settings routes) even on a server that does not enforce, so
+        send it only on a retry after that 403. The budget fails closed: if its Redis store is
+        unreachable the request is refused with a 503 `step_up_budget_unavailable` and nothing is
+        checked, verified or changed. A code on a request that is not gated is ignored. A request
+        that carries no code on a server that does not enforce is answered exactly as before.
       operationId: upsertChannelOverride
       security:
       - BearerAuth: []
@@ -3025,12 +3162,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions (Manage Channels required), or the allow bits include
-            permissions the caller does not hold
+          description: >-
+            Insufficient permissions (Manage Channels required), or the allow bits include permissions
+            the caller does not hold. On a server that enforces MFA on dangerous actions the same status
+            also carries the gate's refusals (#3454): `mfa_required: true` with `methods` when no
+            `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or wrong-purpose code, and
+            `mfa_enrollment_required: true` when the actor has no inline MFA factor. None of them
+            carries `delete_rate_limited` or `Retry-After`, because waiting does not lift a refusal.
+            Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '404':
           description: Channel not found
           content:
@@ -3038,7 +3183,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
   /channels/{id}/overrides/{override_id}:
     delete:
       tags:
@@ -3738,6 +3887,7 @@ paths:
                     - maxMembersPerServer
                     - entitlementMode
                     - chunkedAttachmentUpload
+                    - mfaEnforcedDangerousActions
                     properties:
                       voiceTiersSupported:
                         type: boolean
@@ -3765,6 +3915,15 @@ paths:
                           Clients MUST fail closed to the single-shot
                           /media/upload/attachment path on anything but an
                           explicit true.
+                      mfaEnforcedDangerousActions:
+                        type: boolean
+                        description: >-
+                          Whether this deployment enforces a server's "Enforce MFA On Dangerous Actions"
+                          setting (#3454): when true, a server that turns it on gates the dangerous
+                          actions behind an inline MFA confirmation (`mfa_code`). Always present, never
+                          omitted. False means this server predates the gates or cannot run them, so
+                          turning the setting on would protect nothing. Clients MUST read anything but an
+                          explicit true as false, and must not offer to turn enforcement on.
                       activityHistorySupported:
                         type: boolean
                         description: >-
@@ -8988,13 +9147,26 @@ paths:
       - Media
       summary: Upload a server banner image
       operationId: mediaUploadServerBanner
-      description: 'Tier 1 authenticated upload. Requires the manage_server permission on the target server.
+      description: >-
+        Tier 1 authenticated upload. Requires the manage_server permission on the target server.
 
-        Image is resized to fit 1500x500 and re-encoded; max raw upload 5 MiB for Groundspeed servers or 8 MiB for Mach servers.
+        Image is resized to fit 1500x500 and re-encoded; max raw upload 5 MiB for Groundspeed
+        servers or 8 MiB for Mach servers.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Replacing the server banner is a dangerous action. On
+        a server that enforces MFA on dangerous actions, uploading it needs an inline MFA
+        confirmation. The first request is refused with a 403 `mfa_required` (with `methods`);
+        repeat the same request with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline
+        token minted for this route's purpose). `mfa_code` is required only when the server enforces
+        and the action is dangerous, and it is charged against the step-up attempt budget (5 per 15
+        minutes, shared with the MFA settings routes) even on a server that does not enforce, so
+        send it only on a retry after that 403. The budget fails closed: if its Redis store is
+        unreachable the request is refused with a 503 `step_up_budget_unavailable` and nothing is
+        checked, verified or changed. A code on a request that is not gated is ignored. A request
+        that carries no code on a server that does not enforce is answered exactly as before.
       security:
       - BearerAuth: []
       requestBody:
@@ -9015,6 +9187,8 @@ paths:
                   type: string
                   format: uuid
                   description: Target server UUID
+                mfa_code:
+                  $ref: '#/components/schemas/DangerousActionMFACode'
       responses:
         '201':
           description: Image processed and stored
@@ -9029,11 +9203,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Caller lacks the manage_server permission
+          description: >-
+            Caller lacks the manage_server permission. On a server that enforces MFA on dangerous
+            actions the same status also carries the gate's refusals (#3454): `mfa_required: true` with
+            `methods` when no `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or
+            wrong-purpose code, and `mfa_enrollment_required: true` when the actor has no inline MFA
+            factor. None of them carries `delete_rate_limited` or `Retry-After`, because waiting does
+            not lift a refusal. Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '413':
           description: File exceeds the maximum upload size
           content:
@@ -9041,26 +9223,53 @@ paths:
               schema:
                 $ref: '#/components/schemas/MediaFileTooLargeError'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
         '503':
-          description: Media storage not configured
+          description: >-
+            Media storage not configured. The gate adds two more 503s: the step-up attempt budget's
+            store is unreachable (`step_up_budget_unavailable: true`), or a row-lock conflict hit the
+            confirmation (`lock_conflict: true`, with `Retry-After: 1`). Nothing was changed for either.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying a lock conflict (1). Absent on the other bodies.
+              schema:
+                type: integer
+                example: 1
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+                - $ref: '#/components/schemas/LockConflictError'
+        '500':
+          $ref: '#/components/responses/ServerImageUploadFailed'
   /media/upload/server-icon:
     post:
       tags:
       - Media
       summary: Upload a server icon image
       operationId: mediaUploadServerIcon
-      description: 'Tier 1 authenticated upload. Requires the manage_server permission on the target server.
+      description: >-
+        Tier 1 authenticated upload. Requires the manage_server permission on the target server.
 
-        Image is resized to fit 512x512 and re-encoded; max raw upload 5 MiB for Groundspeed servers or 8 MiB for Mach servers.
+        Image is resized to fit 512x512 and re-encoded; max raw upload 5 MiB for Groundspeed servers
+        or 8 MiB for Mach servers.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Replacing the server icon is a dangerous action. On a
+        server that enforces MFA on dangerous actions, uploading it needs an inline MFA
+        confirmation. The first request is refused with a 403 `mfa_required` (with `methods`);
+        repeat the same request with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline
+        token minted for this route's purpose). `mfa_code` is required only when the server enforces
+        and the action is dangerous, and it is charged against the step-up attempt budget (5 per 15
+        minutes, shared with the MFA settings routes) even on a server that does not enforce, so
+        send it only on a retry after that 403. The budget fails closed: if its Redis store is
+        unreachable the request is refused with a 503 `step_up_budget_unavailable` and nothing is
+        checked, verified or changed. A code on a request that is not gated is ignored. A request
+        that carries no code on a server that does not enforce is answered exactly as before.
       security:
       - BearerAuth: []
       requestBody:
@@ -9081,6 +9290,8 @@ paths:
                   type: string
                   format: uuid
                   description: Target server UUID
+                mfa_code:
+                  $ref: '#/components/schemas/DangerousActionMFACode'
       responses:
         '201':
           description: Image processed and stored
@@ -9095,11 +9306,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Caller lacks the manage_server permission
+          description: >-
+            Caller lacks the manage_server permission. On a server that enforces MFA on dangerous
+            actions the same status also carries the gate's refusals (#3454): `mfa_required: true` with
+            `methods` when no `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or
+            wrong-purpose code, and `mfa_enrollment_required: true` when the actor has no inline MFA
+            factor. None of them carries `delete_rate_limited` or `Retry-After`, because waiting does
+            not lift a refusal. Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '413':
           description: File exceeds the maximum upload size
           content:
@@ -9107,13 +9326,27 @@ paths:
               schema:
                 $ref: '#/components/schemas/MediaFileTooLargeError'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
         '503':
-          description: Media storage not configured
+          description: >-
+            Media storage not configured. The gate adds two more 503s: the step-up attempt budget's
+            store is unreachable (`step_up_budget_unavailable: true`), or a row-lock conflict hit the
+            confirmation (`lock_conflict: true`, with `Retry-After: 1`). Nothing was changed for either.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying a lock conflict (1). Absent on the other bodies.
+              schema:
+                type: integer
+                example: 1
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+                - $ref: '#/components/schemas/LockConflictError'
+        '500':
+          $ref: '#/components/responses/ServerImageUploadFailed'
   /media/{file_id}:
     delete:
       tags:
@@ -11744,6 +11977,19 @@ paths:
                   - messages.channel_purge
                   - messages.server_purge
                   - servers.mfa_enforcement_disable
+                  - channels.delete
+                  - servers.update
+                  - media.server_icon_upload
+                  - media.server_banner_upload
+                  - members.ban
+                  - members.kick_purge
+                  - roles.delete
+                  - roles.create
+                  - roles.update
+                  - channels.expiration_shorten
+                  - servers.delete
+                  - overrides.channel_upsert
+                  - overrides.category_upsert
       responses:
         '200':
           description: WebAuthn assertion options (CredentialAssertion)
@@ -12157,36 +12403,46 @@ paths:
       tags:
       - Messages
       summary: Purge messages across a server
-      description: 'Bulk-delete messages across every channel of a server, scoped by
-        a recent-ward time range and an optional target author (#1352). Irreversible.
+      description: >-
+        Bulk-delete messages across every channel of a server, scoped by a recent-ward time range
+        and an optional target author (#1352). Irreversible.
 
 
-        Authorization is re-resolved PER CHANNEL: channels where the actor lacks
-        `Manage All Messages` (or is denied it by a channel permission override) are
-        skipped rather than purged, and an actor holding only `Manage Own Messages` in
-        a channel purges only their own messages there. If the server has no channels,
-        an actor authorized at server scope receives 200 with a zero-count audit row;
-        otherwise, if no channel is purgeable the request returns 403 with nothing
-        deleted and no audit row.
+        Authorization is re-resolved PER CHANNEL: channels where the actor lacks `Manage All
+        Messages` (or is denied it by a channel permission override) are skipped rather than purged,
+        and an actor holding only `Manage Own Messages` in a channel purges only their own messages
+        there. If the server has no channels, an actor authorized at server scope receives 200 with
+        a zero-count audit row; otherwise, if no channel is purgeable the request returns 403 with
+        nothing deleted and no audit row.
 
 
         Emits one `channel_purged` event per affected channel.
 
 
-        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
-        allows).
+        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than allows).
 
 
-        Delete-rate soft-lock (#3455): the messages the actor authored in the
-        channels this purge covers are counted, up to 101, against the same
-        counters as single deletes, when the purge deletes the actor''s own
-        messages. Over the threshold the request is refused with a 403 carrying
-        `delete_rate_limited: true` before any batch runs, and nothing is purged
-        or audited. Repeat the request with `mfa_code`, or with a
-        `step_up_token` from `POST /auth/step-up/password` when the refusal
-        asked for a password; a body carrying `current_password` is a 400.
-        A purge of other authors'' messages is never counted, and neither is the
-        purge a ban or kick can trigger.'
+        Delete-rate soft-lock (#3455): the messages the actor authored in the channels this purge
+        covers are counted, up to 101, against the same counters as single deletes, when the purge
+        deletes the actor's own messages. Over the threshold the request is refused with a 403
+        carrying `delete_rate_limited: true` before any batch runs, and nothing is purged or
+        audited. Repeat the request with `mfa_code`, or with a `step_up_token` from `POST
+        /auth/step-up/password` when the refusal asked for a password; a body carrying
+        `current_password` is a 400. A purge of other authors' messages is never counted, and
+        neither is the purge a ban or kick can trigger.
+
+
+        **Dangerous-action MFA gate (#3454).** A purge that deletes any other author's messages, or
+        every author's, is a dangerous action. On a server that enforces MFA on dangerous actions it
+        needs `mfa_code`, verified in the same admission as the delete-rate soft-lock's own
+        confirmation, so one code satisfies both. Its refusals are the plain gate bodies (403
+        `mfa_required`, `Invalid MFA code` or `mfa_enrollment_required`) with no
+        `delete_rate_limited` flag and no `Retry-After`, because waiting does not lift them, and the
+        429, 503 and 500 below carry the gate's budget, outage, lock-conflict and
+        verification-failure bodies. `mfa_code` is charged against the step-up attempt budget even
+        on a server that does not enforce, so send it only on a retry after a 403 `mfa_required`.
+        The budget fails closed: an unreachable Redis store is a 503 `step_up_budget_unavailable`. A
+        purge of the actor's own messages is not gated by this rule.
       operationId: purgeServerMessages
       security:
       - BearerAuth: []
@@ -12227,7 +12483,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: Purge failed or timed out
+          description: >-
+            Purge failed or timed out. The dangerous-action gate's own failures are `Verification
+            failed` (a verifier or token-store fault) and `Internal server error`; nothing was purged.
           content:
             application/json:
               schema:
@@ -12282,11 +12540,23 @@ paths:
       tags:
       - Servers
       summary: Update a server
-      description: 'Update server name and icon. Requires owner or admin role.
+      description: >-
+        Update server name and icon. Requires owner or admin role.
 
         Rate limit: 10 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Updating a server is a dangerous action. On a server
+        that enforces MFA on dangerous actions, updating it needs an inline MFA confirmation. The
+        first request is refused with a 403 `mfa_required` (with `methods`); repeat the same request
+        with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this
+        route's purpose). `mfa_code` is required only when the server enforces and the action is
+        dangerous, and it is charged against the step-up attempt budget (5 per 15 minutes, shared
+        with the MFA settings routes) even on a server that does not enforce, so send it only on a
+        retry after that 403. The budget fails closed: if its Redis store is unreachable the request
+        is refused with a 503 `step_up_budget_unavailable` and nothing is checked, verified or
+        changed. A code on a request that is not gated is ignored. A request that carries no code on
+        a server that does not enforce is answered exactly as before.
       security:
       - BearerAuth: []
       parameters:
@@ -12310,24 +12580,72 @@ paths:
                   role:
                     type: string
         '403':
-          description: Insufficient permissions
+          description: >-
+            Insufficient permissions. On a server that enforces MFA on dangerous actions the same status
+            also carries the gate's refusals (#3454): `mfa_required: true` with `methods` when no
+            `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or wrong-purpose code, and
+            `mfa_enrollment_required: true` when the actor has no inline MFA factor. None of them
+            carries `delete_rate_limited` or `Retry-After`, because waiting does not lift a refusal.
+            Nothing was changed. Route on the body flag, never the message text.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
+        '400':
+          description: >-
+            Invalid server ID, an unreadable or invalid request body (including an `mfa_code` over
+            256 characters), or an invalid `icon_url`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            Server not found: the server was deleted while the request waited for the gate's lock
+            (#3454, #3508).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
     delete:
       tags:
       - Servers
       summary: Delete a server
-      description: 'Permanently delete a server. Owner only.
+      description: >-
+        Permanently delete a server. Owner only.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Deleting a server is a dangerous action. On a server
+        that enforces MFA on dangerous actions, deleting it needs an inline MFA confirmation. The
+        first request is refused with a 403 `mfa_required` (with `methods`); repeat the same request
+        with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this
+        route's purpose). `mfa_code` is required only when the server enforces and the action is
+        dangerous, and it is charged against the step-up attempt budget (5 per 15 minutes, shared
+        with the MFA settings routes) even on a server that does not enforce, so send it only on a
+        retry after that 403. The budget fails closed: if its Redis store is unreachable the request
+        is refused with a 503 `step_up_budget_unavailable` and nothing is checked, verified or
+        changed. A code on a request that is not gated is ignored. A request that carries no code on
+        a server that does not enforce is answered exactly as before.
       security:
       - BearerAuth: []
       parameters:
       - $ref: '#/components/parameters/ServerId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousActionStepUpRequest'
       responses:
         '200':
           description: Server deleted
@@ -12336,11 +12654,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
         '403':
-          description: Only the server owner can delete
+          description: >-
+            Only the server owner can delete. On a server that enforces MFA on dangerous actions the
+            same status also carries the gate's refusals (#3454): `mfa_required: true` with `methods`
+            when no `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or wrong-purpose code,
+            and `mfa_enrollment_required: true` when the actor has no inline MFA factor. None of them
+            carries `delete_rate_limited` or `Retry-After`, because waiting does not lift a refusal.
+            Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '409':
           description: Server activity changed before deletion committed; retry the deletion
           content:
@@ -12348,7 +12674,42 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          description: Server deletion committed, but presence cleanup is pending; do not retry the deletion
+          description: >-
+            Server deletion committed, but presence cleanup is pending; do not retry the deletion. The
+            gate adds two more 503s: the step-up attempt budget's store is unreachable
+            (`step_up_budget_unavailable: true`), or a row-lock conflict hit the confirmation
+            (`lock_conflict: true`, with `Retry-After: 1`). Nothing was changed for either.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying a lock conflict (1). Absent on the other bodies.
+              schema:
+                type: integer
+                example: 1
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+                - $ref: '#/components/schemas/LockConflictError'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '400':
+          description: >-
+            Invalid server ID. A request body the server cannot read: larger than 4 KiB, not a JSON
+            object (a literal `null` included), trailing data after the object, a non-string field, an
+            `mfa_code` over 256 characters, or any `current_password` field. The body is `Invalid
+            request body`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            Server not found, including a server deleted while the request waited for the gate's
+            lock (#3454, #3508).
           content:
             application/json:
               schema:
@@ -12538,15 +12899,26 @@ paths:
       tags:
       - Members
       summary: Ban a member
-      description: 'Ban a user from the server: removes membership, roles, channel keys, and prevents
-        rejoin.
+      description: >-
+        Ban a user from the server: removes membership, roles, channel keys, and prevents rejoin.
 
-        Requires the Ban Members permission; subject to role-hierarchy checks. Cannot ban the owner or
-        yourself.
+        Requires the Ban Members permission; subject to role-hierarchy checks. Cannot ban the owner
+        or yourself.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Banning a member is a dangerous action. On a server
+        that enforces MFA on dangerous actions, banning needs an inline MFA confirmation. The first
+        request is refused with a 403 `mfa_required` (with `methods`); repeat the same request with
+        `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this route's
+        purpose). `mfa_code` is required only when the server enforces and the action is dangerous,
+        and it is charged against the step-up attempt budget (5 per 15 minutes, shared with the MFA
+        settings routes) even on a server that does not enforce, so send it only on a retry after
+        that 403. The budget fails closed: if its Redis store is unreachable the request is refused
+        with a 503 `step_up_budget_unavailable` and nothing is checked, verified or changed. A code
+        on a request that is not gated is ignored. A request that carries no code on a server that
+        does not enforce is answered exactly as before.
       operationId: banServerMember
       security:
       - BearerAuth: []
@@ -12589,12 +12961,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions, target is the owner, or target has equal/higher role
-            position
+          description: >-
+            Insufficient permissions, target is the owner, or target has equal/higher role position. On
+            a server that enforces MFA on dangerous actions the same status also carries the gate's
+            refusals (#3454): `mfa_required: true` with `methods` when no `mfa_code` was sent, `Invalid
+            MFA code` for a wrong, replayed or wrong-purpose code, and `mfa_enrollment_required: true`
+            when the actor has no inline MFA factor. None of them carries `delete_rate_limited` or
+            `Retry-After`, because waiting does not lift a refusal. Nothing was changed. Route on the
+            body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/ModerationFailed'
+        '503':
+          $ref: '#/components/responses/ModerationUnavailable'
     delete:
       tags:
       - Members
@@ -13111,7 +13497,8 @@ paths:
       tags:
       - Members
       summary: Remove a member
-      description: 'Remove a member from the server (kick) or leave the server (self).
+      description: >-
+        Remove a member from the server (kick) or leave the server (self).
 
         Owner/admin can kick members; any member can leave.
 
@@ -13119,7 +13506,20 @@ paths:
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Only a moderator removal that sets `purge_messages`
+        is dangerous. A plain kick, and a member leaving, are ungated: `mfa_code` is ignored there,
+        neither verified nor charged. On a server that enforces MFA on dangerous actions, a kick that
+        purges the removed member's messages needs an inline MFA confirmation. The first request is
+        refused with a 403 `mfa_required` (with `methods`); repeat the same request with `mfa_code`
+        (a TOTP code, a backup code, or a WebAuthn inline token minted for this route's purpose).
+        `mfa_code` is required only when the server enforces and the action is dangerous, and it is
+        charged against the step-up attempt budget (5 per 15 minutes, shared with the MFA settings
+        routes) even on a server that does not enforce, so send it only on a retry after that 403.
+        The budget fails closed: if its Redis store is unreachable the request is refused with a 503
+        `step_up_budget_unavailable` and nothing is checked, verified or changed. A code on a
+        request that is not gated is ignored. A request that carries no code on a server that does
+        not enforce is answered exactly as before.
       security:
       - BearerAuth: []
       parameters:
@@ -13156,17 +13556,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions or owner cannot leave
+          description: >-
+            Insufficient permissions or owner cannot leave. On a server that enforces MFA on dangerous
+            actions the same status also carries the gate's refusals (#3454): `mfa_required: true` with
+            `methods` when no `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or
+            wrong-purpose code, and `mfa_enrollment_required: true` when the actor has no inline MFA
+            factor. None of them carries `delete_rate_limited` or `Retry-After`, because waiting does
+            not lift a refusal. Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '409':
           description: Channel key cleanup exceeds 500 recipients; resolve access changes in batches of 500 or fewer
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/ModerationFailed'
+        '503':
+          $ref: '#/components/responses/ModerationUnavailable'
   /servers/{id}/members/{user_id}/roles:
     post:
       tags:
@@ -13656,6 +14070,15 @@ paths:
                       The caller's effective permission bitfield, decimal encoded.
                       A string rather than an integer because the bitfield reaches bit 62 and JSON numbers lose precision above 2^53.
                     example: '484687360'
+                  mfa_restricted:
+                    type: boolean
+                    enum:
+                    - true
+                    description: >-
+                      Present, and true, only while the server's MFA enforcement withholds a server-scope
+                      permission from the caller (#3454): the dangerous bits are masked out of `permissions`
+                      because the caller has no inline MFA factor. Absent for every other caller, so the body
+                      is unchanged for them. It names no permission and no reason beyond the mask.
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
@@ -13736,13 +14159,28 @@ paths:
       tags:
       - Servers
       summary: Create a role
-      description: 'Create a new role. A role created by a non-owner is placed strictly below the highest role that actor holds, and existing roles at or above that position shift up by one; a role created by the server owner is placed above all existing roles. Requires the Manage Roles permission;
+      description: >-
+        Create a new role. A role created by a non-owner is placed strictly below the highest role
+        that actor holds, and existing roles at or above that position shift up by one; a role
+        created by the server owner is placed above all existing roles. Requires the Manage Roles
+        permission;
 
-        granted permissions must be a subset of the actor''s own.
+        granted permissions must be a subset of the actor's own.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Creating a role is a dangerous action. On a server
+        that enforces MFA on dangerous actions, creating one needs an inline MFA confirmation. The
+        first request is refused with a 403 `mfa_required` (with `methods`); repeat the same request
+        with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this
+        route's purpose). `mfa_code` is required only when the server enforces and the action is
+        dangerous, and it is charged against the step-up attempt budget (5 per 15 minutes, shared
+        with the MFA settings routes) even on a server that does not enforce, so send it only on a
+        retry after that 403. The budget fails closed: if its Redis store is unreachable the request
+        is refused with a 503 `step_up_budget_unavailable` and nothing is checked, verified or
+        changed. A code on a request that is not gated is ignored. A request that carries no code on
+        a server that does not enforce is answered exactly as before.
       operationId: createServerRole
       security:
       - BearerAuth: []
@@ -13772,19 +14210,32 @@ paths:
                 $ref: '#/components/schemas/Error'
         '403':
           description: >-
-            Insufficient permissions, an attempt to grant permissions the actor lacks,
-            or no available role position below the actor's own highest role (returned
-            when that role sits at position 0 or 1, since position 0 is the default role's).
+            Insufficient permissions, an attempt to grant permissions the actor lacks, or no available
+            role position below the actor's own highest role (returned when that role sits at position 0
+            or 1, since position 0 is the default role's). On a server that enforces MFA on dangerous
+            actions the same status also carries the gate's refusals (#3454): `mfa_required: true` with
+            `methods` when no `mfa_code` was sent, `Invalid MFA code` for a wrong, replayed or
+            wrong-purpose code, and `mfa_enrollment_required: true` when the actor has no inline MFA
+            factor. None of them carries `delete_rate_limited` or `Retry-After`, because waiting does
+            not lift a refusal. Nothing was changed. Route on the body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '409':
           description: A role with that name already exists in this server
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
   /servers/{id}/roles/reorder:
     patch:
       tags:
@@ -13848,14 +14299,26 @@ paths:
       tags:
       - Servers
       summary: Update a role
-      description: 'Update role name, color, emoji, permissions, or display flags. Requires the Manage
-        Roles
+      description: >-
+        Update role name, color, emoji, permissions, or display flags. Requires the Manage Roles
 
-        permission; managed roles cannot be modified, hierarchy and permission-escalation checks apply.
+        permission; managed roles cannot be modified, hierarchy and permission-escalation checks
+        apply.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Updating a role is a dangerous action. On a server
+        that enforces MFA on dangerous actions, updating one needs an inline MFA confirmation. The
+        first request is refused with a 403 `mfa_required` (with `methods`); repeat the same request
+        with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this
+        route's purpose). `mfa_code` is required only when the server enforces and the action is
+        dangerous, and it is charged against the step-up attempt budget (5 per 15 minutes, shared
+        with the MFA settings routes) even on a server that does not enforce, so send it only on a
+        retry after that 403. The budget fails closed: if its Redis store is unreachable the request
+        is refused with a 503 `step_up_budget_unavailable` and nothing is checked, verified or
+        changed. A code on a request that is not gated is ignored. A request that carries no code on
+        a server that does not enforce is answered exactly as before.
       operationId: updateServerRole
       security:
       - BearerAuth: []
@@ -13890,28 +14353,55 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions, managed role, hierarchy violation, or permission escalation
+          description: >-
+            Insufficient permissions, managed role, hierarchy violation, or permission escalation. On a
+            server that enforces MFA on dangerous actions the same status also carries the gate's
+            refusals (#3454): `mfa_required: true` with `methods` when no `mfa_code` was sent, `Invalid
+            MFA code` for a wrong, replayed or wrong-purpose code, and `mfa_enrollment_required: true`
+            when the actor has no inline MFA factor. None of them carries `delete_rate_limited` or
+            `Retry-After`, because waiting does not lift a refusal. Nothing was changed. Route on the
+            body flag, never the message text.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '404':
           description: Role not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
     delete:
       tags:
       - Servers
       summary: Delete a role
-      description: 'Delete a role (cascades member assignments). Requires the Manage Roles permission;
+      description: >-
+        Delete a role (cascades member assignments). Requires the Manage Roles permission;
 
         managed and default roles cannot be deleted, hierarchy checks apply for non-owners.
 
         Rate limit: 5 requests per minute.
 
-        '
+
+        **Dangerous-action MFA gate (#3454).** Deleting a role is a dangerous action. On a server
+        that enforces MFA on dangerous actions, deleting one needs an inline MFA confirmation. The
+        first request is refused with a 403 `mfa_required` (with `methods`); repeat the same request
+        with `mfa_code` (a TOTP code, a backup code, or a WebAuthn inline token minted for this
+        route's purpose). `mfa_code` is required only when the server enforces and the action is
+        dangerous, and it is charged against the step-up attempt budget (5 per 15 minutes, shared
+        with the MFA settings routes) even on a server that does not enforce, so send it only on a
+        retry after that 403. The budget fails closed: if its Redis store is unreachable the request
+        is refused with a 503 `step_up_budget_unavailable` and nothing is checked, verified or
+        changed. A code on a request that is not gated is ignored. A request that carries no code on
+        a server that does not enforce is answered exactly as before.
       operationId: deleteServerRole
       security:
       - BearerAuth: []
@@ -13923,6 +14413,12 @@ paths:
         schema:
           type: string
           format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousActionStepUpRequest'
       responses:
         '200':
           description: Role deleted
@@ -13931,19 +14427,42 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
         '400':
-          $ref: '#/components/responses/BadRequest'
-        '403':
-          description: Insufficient permissions, managed/default role, or hierarchy violation
+          description: >-
+            Invalid server or role ID. A request body the server cannot read: larger than 4 KiB, not a
+            JSON object (a literal `null` included), trailing data after the object, a non-string field,
+            an `mfa_code` over 256 characters, or any `current_password` field. The body is `Invalid
+            request body`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: >-
+            Insufficient permissions, managed/default role, or hierarchy violation. On a server that
+            enforces MFA on dangerous actions the same status also carries the gate's refusals (#3454):
+            `mfa_required: true` with `methods` when no `mfa_code` was sent, `Invalid MFA code` for a
+            wrong, replayed or wrong-purpose code, and `mfa_enrollment_required: true` when the actor
+            has no inline MFA factor. None of them carries `delete_rate_limited` or `Retry-After`,
+            because waiting does not lift a refusal. Nothing was changed. Route on the body flag, never
+            the message text.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/Error'
         '404':
           description: Role not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateOrStepUpBudgetLimited'
+        '500':
+          $ref: '#/components/responses/DangerousActionGateFailed'
+        '503':
+          $ref: '#/components/responses/DangerousActionUnavailable'
   /servers/{id}/transfer-ownership:
     post:
       tags:
@@ -17054,6 +17573,189 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    RateOrStepUpBudgetLimited:
+      description: >-
+        Two different 429s share this status; tell them apart by the body flag,
+        never by the message text. The route limiter's body is `RateLimitError`
+        (`error: Rate limit exceeded`) with the usual rate-limit headers. The
+        step-up attempt budget's body is `error: Too many verification
+        attempts` with `step_up_budget_exhausted: true` (#3454): the actor
+        sent too many `mfa_code` values (5 per 15 minutes, shared with the MFA
+        settings routes and the delete-rate soft-lock). The budget is charged
+        by any request that carries a code, including one sent to a server
+        that does not enforce MFA on dangerous actions. Nothing was changed.
+      headers:
+        Retry-After:
+          description: Seconds until the limit resets, when the limiter supplies it
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/RateLimitError'
+            - $ref: '#/components/schemas/StepUpBudgetExhaustedError'
+          examples:
+            routeLimiter:
+              summary: Route limiter
+              value:
+                error: Rate limit exceeded
+                message: Rate limit reached. Try again in 41 seconds.
+                retry_after: 41
+            budgetExhausted:
+              summary: Step-up attempt budget spent
+              value:
+                error: Too many verification attempts
+                step_up_budget_exhausted: true
+    DangerousActionUnavailable:
+      description: >-
+        The dangerous-action MFA gate could not evaluate the request (#3454).
+        Nothing was checked, verified or changed. Two bodies share this status;
+        tell them apart by the flag. The step-up attempt budget's Redis store
+        is unreachable (`step_up_budget_unavailable: true`): the budget fails
+        closed, so the request is refused rather than allowed through
+        unmetered, and a server that does not enforce MFA refuses a request
+        that carries a code the same way. A row-lock conflict (PostgreSQL
+        40P01 or 55P03) hit the confirmation (`lock_conflict: true`, with
+        `Retry-After: 1`). Retry shortly.
+      headers:
+        Retry-After:
+          description: 1 for a lock conflict. Absent on the budget-unavailable body.
+          schema:
+            type: integer
+            example: 1
+      content:
+        application/json:
+          schema:
+            anyOf:
+            - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+            - $ref: '#/components/schemas/LockConflictError'
+          examples:
+            budgetUnavailable:
+              summary: Step-up attempt budget unavailable
+              value:
+                error: Verification is temporarily unavailable. Try again in a few minutes.
+                step_up_budget_unavailable: true
+            lockConflict:
+              summary: Row-lock conflict
+              value:
+                error: The server is busy. Try again.
+                lock_conflict: true
+    DangerousActionGateFailed:
+      description: >-
+        The dangerous-action MFA gate failed server-side (#3454), never because
+        a credential was rejected. A verifier or token-store fault answers
+        `Verification failed`; any other gate failure answers `Internal server
+        error`. Nothing was changed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            verificationFailed:
+              summary: Verifier or token-store fault
+              value:
+                error: Verification failed
+            gateFailed:
+              summary: Unclassified gate failure
+              value:
+                error: Internal server error
+    ModerationFailed:
+      description: >-
+        The ban or removal failed server-side. The route's own body (`Failed to
+        ban member` or `Failed to remove member`) means its transaction failed.
+        When the COMMIT itself could not be confirmed, the change may have
+        landed; the server reconciles the member's access either way, so re-read
+        the member list before retrying. On a ban, or a kick that purges, the
+        dangerous-action gate can also fail server-side (#3454): `Verification
+        failed` for a verifier or token-store fault, `Internal server error` for
+        any other gate failure. Nothing was changed for those two.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            banFailed:
+              summary: The ban transaction failed
+              value:
+                error: Failed to ban member
+            verificationFailed:
+              summary: Verifier or token-store fault
+              value:
+                error: Verification failed
+    ModerationUnavailable:
+      description: >-
+        Five bodies share this status. The first four changed nothing; the fifth
+        is a change that was SAVED. (1) The step-up attempt budget's store is
+        unreachable (`step_up_budget_unavailable: true`), on a ban or a kick
+        that purges that carries `mfa_code` (#3454). (2) A deadlock or lock
+        timeout hit a ban or a kick that purges (`lock_conflict: true`, with
+        `Retry-After: 1`); a plain kick keeps its 500. (3) A presence operation
+        is still pending for this server: the route's own message (`Failed to
+        ban member` or `Failed to remove member`) with `Retry-After` in seconds.
+        (4) A stale presence probe: the route's own message with
+        `Retry-After: 1`. Retry these four after the delay. (5) The ban or
+        removal COMMITTED, but delivering it to connected clients is taking
+        longer than usual: `Your change was saved. Updating everyone who can see
+        it is taking longer than usual.`, with the `purge` outcome when a purge
+        ran. Do not retry it: the member is already banned or removed.
+      headers:
+        Retry-After:
+          description: >-
+            Seconds to wait: 1 for a lock conflict or a stale probe, the pending
+            operation's remaining time for a pending presence operation. Absent
+            on the budget-unavailable and the saved-change bodies.
+          schema:
+            type: integer
+            example: 1
+      content:
+        application/json:
+          schema:
+            anyOf:
+            - $ref: '#/components/schemas/StepUpBudgetUnavailableError'
+            - $ref: '#/components/schemas/LockConflictError'
+            - type: object
+              required: [error]
+              properties:
+                error:
+                  type: string
+                purge:
+                  $ref: '#/components/schemas/PurgeOutcome'
+          examples:
+            lockConflict:
+              summary: Row-lock conflict on a gated moderation transaction
+              value:
+                error: The server is busy. Try again.
+                lock_conflict: true
+            saved:
+              summary: The change committed; delivery is slow
+              value:
+                error: Your change was saved. Updating everyone who can see it is taking longer than usual.
+    ServerImageUploadFailed:
+      description: >-
+        The server icon or banner upload failed server-side. Read the body.
+        `Failed to record media metadata` means the image was stored but its
+        media record, or the transaction, failed. The image key is fixed per
+        server, so the NEW image has already replaced the live one and the
+        existing URL serves it; the old image is not restored (#3454 C4).
+        Upload again to record it. `Failed to store image` means the object
+        store refused the write, and `Failed to verify permissions` that the
+        permission check failed; nothing was changed for either. `Verification
+        failed` or `Internal server error` means the dangerous-action gate
+        failed server-side (#3454); nothing was changed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            metadataFailed:
+              summary: Stored, but the record failed; the new image is live
+              value:
+                error: Failed to record media metadata
+            storeFailed:
+              summary: The object store refused the write
+              value:
+                error: Failed to store image
     StepUpAttemptsExhausted:
       description: >-
         Too many step-up verification attempts for this user (5 per 15
@@ -17115,27 +17817,32 @@ components:
         The delete was refused. Two families share this status.
 
 
-        The route's own refusals are unchanged and are always evaluated first:
-        insufficient permission, not the message author, no longer a member or
-        participant, a timed-out member (`code: member_timed_out`), a DM whose
-        membership changed or is blocked (`dm_unavailable`), or, for a purge,
-        no purgeable channel. A delete transaction re-checks these under lock
+        The route's own refusals are unchanged and are always evaluated first: insufficient
+        permission, not the message author, no longer a member or participant, a timed-out member
+        (`code: member_timed_out`), a DM whose membership changed or is blocked (`dm_unavailable`),
+        or, for a purge, no purgeable channel. A delete transaction re-checks these under lock
         (#3141, #3142). They carry no `delete_rate_limited` flag.
 
 
-        The delete-rate soft-lock's refusals (#3455) all carry
-        `delete_rate_limited: true` and a `Retry-After` header: whole seconds
-        until the window that tripped rolls over, at least 1. The flag is set
-        on these five variants and on no other 403. A client tells them apart
-        by their body flag: `mfa_required` with `methods` (a subset of `totp`
-        and `webauthn`) asks for `mfa_code`; `password_required` asks for a
-        `step_up_token` from `POST /auth/step-up/password` (#3509), and also
-        carries `step_up_token_invalid` when the token sent matched nothing;
-        `Invalid MFA code` reports a wrong or replayed code; `mfa_enrollment_required` reports that the
-        actor has no inline MFA method to confirm with, which no retry with a
-        code can fix, so the client can only wait out `Retry-After`.
-        `mfa_enrollment_required` occurs only where a server enforces MFA on
-        dangerous actions. `Invalid MFA code` is byte-exact.
+        The delete-rate soft-lock's refusals (#3455) all carry `delete_rate_limited: true` and a
+        `Retry-After` header: whole seconds until the window that tripped rolls over, at least 1.
+        The flag is set on these five variants and on no other 403. A client tells them apart by
+        their body flag: `mfa_required` with `methods` (a subset of `totp` and `webauthn`) asks for
+        `mfa_code`; `password_required` asks for a `step_up_token` from `POST
+        /auth/step-up/password` (#3509), and also carries `step_up_token_invalid` when the token
+        sent matched nothing; `Invalid MFA code` reports a wrong or replayed code;
+        `mfa_enrollment_required` reports that the actor has no inline MFA method to confirm with,
+        which no retry with a code can fix, so the client can only wait out `Retry-After`.
+        `mfa_enrollment_required` occurs only where a server enforces MFA on dangerous actions.
+        `Invalid MFA code` is byte-exact.
+
+
+        The two purge routes add the dangerous-action MFA gate's refusals (#3454): on a server that
+        enforces MFA on dangerous actions, a purge that deletes another author's messages answers
+        `mfa_required` with `methods`, `Invalid MFA code` or `mfa_enrollment_required` (the same
+        three bodies as above) with NO `delete_rate_limited` flag and NO `Retry-After`, because
+        waiting does not lift them. Only a purge with no such spec keeps the soft-lock's decoration
+        above.
       headers:
         Retry-After:
           description: >-
@@ -18711,6 +19418,8 @@ components:
           type: string
           nullable: true
           description: Data URL or null to remove
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     ExpirationRequest:
       oneOf:
       - $ref: '#/components/schemas/SetExpirationRequest'
@@ -18764,6 +19473,70 @@ components:
           format: int64
           minimum: 0
           description: Exact pending policy revision to resume.
+    ChannelExpirationRequest:
+      oneOf:
+      - $ref: '#/components/schemas/ChannelSetExpirationRequest'
+      - $ref: '#/components/schemas/ChannelClearExpirationRequest'
+      - $ref: '#/components/schemas/ChannelResumeExpirationRequest'
+      discriminator:
+        propertyName: mode
+        mapping:
+          set: '#/components/schemas/ChannelSetExpirationRequest'
+          clear: '#/components/schemas/ChannelClearExpirationRequest'
+          resume: '#/components/schemas/ChannelResumeExpirationRequest'
+      description: >-
+        The channel expiration PATCH body: ExpirationRequest plus an optional `mfa_code` on every
+        mode (#3454). Only a shortening `set` on a server that enforces MFA on dangerous actions
+        needs the code; on `clear` and `resume` it is never needed, but a code that is sent is
+        still charged against the step-up budget (C6). The DM expiration route keeps the closed
+        ExpirationRequest and refuses `mfa_code` with a 400.
+    ChannelSetExpirationRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, window_seconds, retroactive]
+      properties:
+        mode:
+          type: string
+          enum: [set]
+        window_seconds:
+          type: integer
+          enum: [3600, 86400, 604800, 2592000]
+          description: Expiration window in seconds (1 hour, 1 day, 7 days, or 30 days).
+        retroactive:
+          type: string
+          enum: [apply, new_only]
+          description: Apply the window to eligible existing messages, or stamp only new messages.
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
+    ChannelClearExpirationRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, retroactive]
+      properties:
+        mode:
+          type: string
+          enum: [clear]
+        retroactive:
+          type: string
+          enum: [clear_pending, leave_pending]
+          description: Clear eligible future expiry stamps, or leave existing stamps unchanged.
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
+    ChannelResumeExpirationRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, revision]
+      properties:
+        mode:
+          type: string
+          enum: [resume]
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Exact pending policy revision to resume.
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     ExpirationPolicy:
       type: object
       required: [window_seconds, updated_at, revision, backfill_pending]
@@ -18854,9 +19627,12 @@ components:
           type: string
           maxLength: 256
           description: >-
-            Confirms a self-purge that tripped the delete-rate soft-lock (#3455).
-            Read only when the request would delete the actor's own messages
-            past the threshold; ignored otherwise. Counted in characters.
+            An authenticator code, backup code or WebAuthn inline token for this route's purpose
+            (`messages.channel_purge` or `messages.server_purge`). It confirms a self-purge that
+            tripped the delete-rate soft-lock (#3455), and, on a server that enforces MFA on
+            dangerous actions, a purge that can remove other authors' messages (#3454). One code
+            confirms both when both apply. It is charged against the step-up budget whenever it is
+            sent (C6). Counted in characters.
         step_up_token:
           type: string
           maxLength: 256
@@ -18866,7 +19642,8 @@ components:
             account has no inline MFA method: the single-use token
             `POST /auth/step-up/password` minted for `messages.channel_purge` or
             `messages.server_purge`. Ignored otherwise. A body that carries
-            `current_password` at all is a 400 (#3509).
+            `current_password` at all is a 400 (#3509). It never satisfies the
+            dangerous-action MFA gate (#3454), which reads only `mfa_code`.
     PurgeDMMessagesRequest:
       type: object
       description: Bulk message-purge parameters for DM/group contexts, including the
@@ -20143,6 +20920,69 @@ components:
             type: string
             enum:
             - account_locked
+    DangerousActionMFACode:
+      type: string
+      maxLength: 256
+      description: >-
+        An inline MFA confirmation for a dangerous action (#3454): a TOTP code,
+        a backup code, or a WebAuthn inline assertion token minted for the
+        route's purpose. Counted in characters; more than 256 is a 400.
+        Required only when the server enforces MFA on dangerous actions and
+        the action is dangerous. It is charged against the step-up attempt
+        budget even on a server that does not enforce, so send it only on a
+        retry after a 403 `mfa_required`. A `step_up_token` is never read on
+        these routes and never satisfies the gate.
+    DangerousActionStepUpRequest:
+      type: object
+      description: >-
+        Optional body of a dangerous-action DELETE route (#3454): delete
+        channel, delete role and delete server. Send it only on a retry after a
+        403 `mfa_required`; a request on a server that does not enforce takes
+        no body. An empty body means no code. The whole body may not exceed 4
+        KiB and must be one JSON object: a literal `null`, an array, trailing
+        data, a non-string field and any `current_password` field are each a
+        400 `Invalid request body`. Unknown fields are ignored and no
+        `Content-Type` is required.
+      properties:
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
+    DangerousActionMFAForbiddenError:
+      description: >-
+        The dangerous-action MFA gate's 403 (#3454), on a server that enforces
+        MFA on dangerous actions. Exactly one variant is sent. `mfa_required: true`
+        with `methods` (a subset of `totp` and `webauthn`) asks for `mfa_code`.
+        `Invalid MFA code` is byte-exact and covers a wrong code, a replayed
+        code, a token minted for another purpose, and a password token.
+        `mfa_enrollment_required: true` says the actor has no inline MFA factor
+        (TOTP enabled and confirmed, or WebAuthn), so no retry with a code can
+        succeed. None carries `delete_rate_limited`, `password_required` or
+        `step_up_unavailable`, and none sets `Retry-After`. Route on the flag,
+        never the message text.
+      allOf:
+      - $ref: '#/components/schemas/Error'
+      - type: object
+        properties:
+          mfa_required:
+            type: boolean
+            enum:
+            - true
+          methods:
+            type: array
+            items:
+              type: string
+              enum:
+              - totp
+              - webauthn
+            description: Present with `mfa_required`.
+          mfa_enrollment_required:
+            type: boolean
+            enum:
+            - true
+        example:
+          error: MFA verification required
+          mfa_required: true
+          methods:
+          - totp
     StepUpBudgetExhaustedError:
       description: >-
         The step-up attempt budget's 429 (`internal/stepup`, 5 attempts per 15
@@ -20670,6 +21510,8 @@ components:
             `null`, `"null"`, `"-0"` or an omitted field is read as 0, and leading
             zeros are accepted, so this request field carries no digits-only pattern.
           example: '1024'
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     ChannelOverride:
       type: object
       properties:
@@ -21303,6 +22145,8 @@ components:
           type: boolean
         display_separately:
           type: boolean
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     UpdateRoleRequest:
       type: object
       description: All fields optional; at least one must be provided
@@ -21327,6 +22171,8 @@ components:
           type: boolean
         display_separately:
           type: boolean
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     ReorderRolesRequest:
       type: object
       required:
@@ -21363,6 +22209,8 @@ components:
           description: >-
             When true and the actor holds Manage All Messages, additionally purge the banned
             user's server-wide messages. Additive — the ban succeeds regardless of purge outcome.
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     RemoveMemberRequest:
       type: object
       description: Optional body for the kick (DELETE member) endpoint.
@@ -21374,6 +22222,8 @@ components:
             When true, the actor holds Manage All Messages, and this is a moderator removal
             (not a self-leave), additionally purge the removed user's server-wide messages.
             Additive — the removal succeeds regardless of purge outcome.
+        mfa_code:
+          $ref: '#/components/schemas/DangerousActionMFACode'
     PurgeOutcome:
       type: object
       description: >-

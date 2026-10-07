@@ -615,8 +615,12 @@ func lockCounterparts() []lockCounterpart {
 			name:     "DeleteServer",
 			fragment: `DELETE FROM servers WHERE id = $1`,
 			do: func(_ *testing.T, env *mfaEnv, f lockFixture) *httptest.ResponseRecorder {
-				return env.ts.DoRequest(http.MethodDelete, "/api/v1/servers/"+f.serverID, nil,
-					testhelpers.AuthHeaders(f.owner.AccessToken))
+				// The deletion is gated on an enforcing server (#3454), and
+				// either order can leave the server enforcing when it runs,
+				// so the owner always sends a code; a server that does not
+				// enforce ignores it.
+				return env.ts.DoRequest(http.MethodDelete, "/api/v1/servers/"+f.serverID,
+					map[string]any{"mfa_code": mfaBackupCode}, testhelpers.AuthHeaders(f.owner.AccessToken))
 			},
 			wantCode:        http.StatusOK,
 			putOutcomes:     []string{putOK, putServerGone, putNotAMember},

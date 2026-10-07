@@ -312,21 +312,51 @@ func (r *Resolver) applyBatchedChannelOverrides(
 
 	for rows.Next() {
 		var channelID string
-		var roleAllow, roleDeny, userAllow, userDeny int64
-		if err := rows.Scan(&channelID, &roleAllow, &roleDeny, &userAllow, &userDeny); err != nil {
+		var o channelOverrides
+		if err := rows.Scan(&channelID, &o.roleAllow, &o.roleDeny, &o.userAllow, &o.userDeny); err != nil {
 			return fmt.Errorf("scan channel override row: %w", err)
 		}
-		perms := basePerms
-		perms |= Permission(roleAllow)
-		perms &^= Permission(roleDeny)
-		perms |= Permission(userAllow)
-		perms &^= Permission(userDeny)
-		permsByChannel[channelID] = perms
+		permsByChannel[channelID] = o.apply(basePerms)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate channel override rows: %w", err)
 	}
 	return nil
+}
+
+// channelOverrides is one member's SBAC aggregate for one channel: the four
+// columns sbacChannelOverrideColumns selects.
+type channelOverrides struct {
+	roleAllow, roleDeny, userAllow, userDeny Permission
+}
+
+// apply is the SBAC layer over a RAW base: role allow, role deny, user allow,
+// user deny, in that order, so a user deny is final. It knows nothing of the
+// Administrator or owner bypasses; the caller decides those first.
+func (o channelOverrides) apply(base Permission) Permission {
+	perms := base | o.roleAllow
+	perms &^= o.roleDeny
+	perms |= o.userAllow
+	return perms &^ o.userDeny
+}
+
+// readChannelOverrides reads one channel's overrides for userID on q through
+// batchChannelOverrideQuery itself, so a single-row caller shares the batched
+// resolver's predicate (#2869's server qualification included) instead of
+// copying it. The query groups by channel, so a channel with no matching
+// override returns no row, which is no override.
+func readChannelOverrides(ctx context.Context, q rowQuerier, serverID, userID, channelID string) (channelOverrides, error) {
+	var o channelOverrides
+	var groupedChannelID string
+	err := q.QueryRowContext(ctx, batchChannelOverrideQuery, pq.Array([]string{channelID}), serverID, userID).
+		Scan(&groupedChannelID, &o.roleAllow, &o.roleDeny, &o.userAllow, &o.userDeny)
+	if errors.Is(err, sql.ErrNoRows) {
+		return channelOverrides{}, nil
+	}
+	if err != nil {
+		return channelOverrides{}, fmt.Errorf("failed to resolve channel overrides: %w", err)
+	}
+	return o, nil
 }
 
 // computeEffectivePermissions implements the two-layer permission resolution model:
@@ -366,6 +396,11 @@ func (r *Resolver) resolveServerPermissionsFresh(ctx context.Context, serverID, 
 	return r.resolveServerPermissions(ctx, r.db, serverID, userID)
 }
 
+// serverOwnerQuery reads the server's owner and its MFA-enforcement flag. The
+// flag rides this read so a server that does not enforce costs no extra
+// statement (#3453); EnrollmentDenial reuses it for the same pair.
+const serverOwnerQuery = `SELECT owner_id, enforce_mfa_dangerous_actions FROM servers WHERE id = $1`
+
 // resolveServerPermissions returns the member's RAW server-scope permissions,
 // whether they own the server, and the MFA mask their entry point applies at
 // its exit. It never masks: the caller's bypass decisions read the raw value.
@@ -387,8 +422,7 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 	// Server owner bypasses RBAC and SBAC.
 	var ownerID string
 	var enforcing bool
-	ownerQuery := `SELECT owner_id, enforce_mfa_dangerous_actions FROM servers WHERE id = $1`
-	if err := db.QueryRowContext(ctx, ownerQuery, serverID).Scan(&ownerID, &enforcing); err != nil {
+	if err := db.QueryRowContext(ctx, serverOwnerQuery, serverID).Scan(&ownerID, &enforcing); err != nil {
 		return 0, false, MFAMask{}, ownerReadError(err)
 	}
 	mask, err := MaskFor(ctx, db, userID, enforcing)
@@ -543,21 +577,21 @@ func (r *Resolver) applyChannelOverrides(ctx context.Context, channelID, userID 
 	}
 	defer rows.Close() //nolint:errcheck
 
-	var userAllow, userDeny, roleAllow, roleDeny Permission
+	var o channelOverrides
 
 	for rows.Next() {
 		var targetType string
-		var allow, deny int64
+		var allow, deny Permission
 		if err := rows.Scan(&targetType, &allow, &deny); err != nil {
 			return 0, err
 		}
 
 		if targetType == "user" {
-			userAllow |= Permission(allow)
-			userDeny |= Permission(deny)
+			o.userAllow |= allow
+			o.userDeny |= deny
 		} else {
-			roleAllow |= Permission(allow)
-			roleDeny |= Permission(deny)
+			o.roleAllow |= allow
+			o.roleDeny |= deny
 		}
 	}
 
@@ -566,13 +600,7 @@ func (r *Resolver) applyChannelOverrides(ctx context.Context, channelID, userID 
 	}
 
 	// Apply overrides in order: base → role allow → role deny → user allow → user deny
-	finalPerms := basePerms
-	finalPerms |= roleAllow // Add role-allowed permissions
-	finalPerms &^= roleDeny // Remove role-denied permissions
-	finalPerms |= userAllow // Add user-allowed permissions
-	finalPerms &^= userDeny // Remove user-denied permissions (final authority)
-
-	return finalPerms, nil
+	return o.apply(basePerms), nil
 }
 
 // InvalidateChannel clears cached permission entries for every user in a channel.
@@ -594,15 +622,19 @@ func (r *Resolver) InvalidateUser(ctx context.Context, serverID, userID string) 
 // the commit lets a compute that reads the pre-commit state publish under the
 // new generation.
 //
-// It retries the bump once, then falls back to deleting the user's entries.
-// It returns an error only when all three fail; the caller logs it. The
-// fallback leaves a residual the bump does not (spec RS2): a compute already
-// in flight can still publish under the unchanged generation.
+// It retries the bump once, then falls back to deleting the user's generation
+// and entries (DropUserGeneration). It returns an error only when all three
+// fail; the caller logs it. The fallback must delete the generation, not only
+// the entries: a step-up grace is stamped with the generation, so leaving it
+// would let a grace taken before the change keep matching (Codex review of
+// #3454). With the generation gone, a compute already in flight cannot publish
+// a value anything will serve either, which narrows #3453's RS2 to a bump and
+// fallback that both fail, or a Redis crash that loses the write.
 func (r *Resolver) BumpUserPermissionGeneration(ctx context.Context, userID string) error {
 	if r.cache == nil {
 		return nil // nothing is cached, so nothing can be stale
 	}
-	return bumpWithFallback(ctx, userID, r.cache.BumpUser, r.cache.InvalidateUser)
+	return bumpWithFallback(ctx, userID, r.cache.BumpUser, r.cache.DropUserGeneration)
 }
 
 // BumpServerPermissionGeneration makes every cached permission on serverID
@@ -613,7 +645,7 @@ func (r *Resolver) BumpServerPermissionGeneration(ctx context.Context, serverID 
 	if r.cache == nil {
 		return nil // nothing is cached, so nothing can be stale
 	}
-	return bumpWithFallback(ctx, serverID, r.cache.BumpServer, r.cache.InvalidateServer)
+	return bumpWithFallback(ctx, serverID, r.cache.BumpServer, r.cache.DropServerGeneration)
 }
 
 // permissionBumpTimeout bounds one bump with its retry and fallback.

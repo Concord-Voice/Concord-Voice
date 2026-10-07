@@ -25,6 +25,9 @@ type Handler struct {
 	// Set by the router to mirror the exact condition under which the chunked
 	// upload session routes are registered. See SetChunkedAttachmentUpload.
 	chunkedAttachmentUpload bool
+	// Set by the router from the dangerous-action boot guard's own predicate.
+	// See SetMFAEnforcedDangerousActions.
+	mfaEnforcedDangerousActions bool
 }
 
 // NewHandler creates a capabilities handler. No logger: the handler is a pure
@@ -49,6 +52,20 @@ func NewHandler(cfg *config.Config) *Handler {
 // take it at its word.
 func (h *Handler) SetChunkedAttachmentUpload(v bool) {
 	h.chunkedAttachmentUpload = v
+}
+
+// SetMFAEnforcedDangerousActions records whether this deployment gates the
+// dangerous actions behind inline MFA on a server that enforces it (#3454).
+// The router passes the same predicate its boot guard enforces, so the value
+// is true on any deployment that booted. A setter for the reason
+// SetChunkedAttachmentUpload gives.
+//
+// The zero value is FALSE, and that is the load-bearing part (C5). A client
+// reads this bit before offering to turn enforcement ON (#3456, X16): a server
+// that predates the gates, or one that cannot run them, must not let an owner
+// believe the toggle protects anything, so it says nothing it has not proved.
+func (h *Handler) SetMFAEnforcedDangerousActions(v bool) {
+	h.mfaEnforcedDangerousActions = v
 }
 
 // ServerInfo identifies the server and its deployment type.
@@ -84,6 +101,11 @@ type FeaturesInfo struct {
 	// Omitted when the routes are not reachable, so clients cannot mistake a
 	// format capability for route availability.
 	AttachmentEnvelopeVersions []int `json:"attachmentEnvelopeVersions,omitempty"`
+	// Whether a server's "Enforce MFA On Dangerous Actions" setting actually
+	// gates the dangerous actions (#3454). NOT omitempty, for the reason
+	// ChunkedAttachmentUpload gives: a server without the gates says false
+	// rather than leaving the client to infer it from a missing key.
+	MFAEnforcedDangerousActions bool `json:"mfaEnforcedDangerousActions"`
 }
 
 // Response is the payload for GET /api/v1/server/capabilities. The schema is
@@ -147,12 +169,13 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			SAMLEnabled:               false,
 		},
 		Features: FeaturesInfo{
-			VoiceTiersSupported:      instanceType == config.InstanceTypeSaaS,
-			E2EEEnforcedEverywhere:   true,
-			MaxMembersPerServer:      maxMembersPerServer,
-			EntitlementMode:          entitlementMode,
-			ActivityHistorySupported: activityHistorySupported(h.cfg),
-			ChunkedAttachmentUpload:  h.chunkedAttachmentUpload,
+			VoiceTiersSupported:         instanceType == config.InstanceTypeSaaS,
+			E2EEEnforcedEverywhere:      true,
+			MaxMembersPerServer:         maxMembersPerServer,
+			EntitlementMode:             entitlementMode,
+			ActivityHistorySupported:    activityHistorySupported(h.cfg),
+			ChunkedAttachmentUpload:     h.chunkedAttachmentUpload,
+			MFAEnforcedDangerousActions: h.mfaEnforcedDangerousActions,
 		},
 		PolicyVersion: policyVersion,
 	}

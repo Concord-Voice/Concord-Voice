@@ -228,7 +228,7 @@ func TestTask4AssemblySecurityEventInjection(t *testing.T) {
 		recorder := &eventRecorder{}
 		cfg := &config.Config{InstanceType: "saas", AdminConsoleEnabled: true, AdminWebAuthnRPID: "admin.example.org", AdminWebAuthnRPOrigins: []string{"https://admin.example.org"}, AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"}}
 		mediaHandler := media.NewHandler(nil, nil, log, cfg, nil, nil)
-		wireMediaHandler(mediaHandler, nil, cfg, log, nil, RouterDependencies{SecurityEvents: recorder})
+		wireMediaHandler(mediaHandler, nil, nil, cfg, log, nil, RouterDependencies{SecurityEvents: recorder})
 		require.Equal(t, reflect.ValueOf(recorder).Pointer(), nestedEmitterPointer(t, mediaHandler, "diskWatermark", "events"))
 		hub := newHubWithSecurityEvents(nil, nil, nil, recorder)
 		require.Equal(t, reflect.ValueOf(recorder).Pointer(), nestedEmitterPointer(t, hub, "securityEvents"))

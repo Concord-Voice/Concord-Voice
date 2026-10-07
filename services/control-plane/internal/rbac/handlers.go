@@ -12,7 +12,9 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -93,6 +95,11 @@ func (h *Handler) resolveManageChannelsTx(ctx context.Context, tx *sql.Tx, serve
 
 // requireRoleMutationPermissionTx makes the route permission authoritative at
 // the write transaction. The route middleware remains only the cached fast path.
+//
+// A denial the MFA mask caused is answered with RS5's mfa_enrollment_required
+// (#3454 §14.1), read on tx, the querier the denial came from. For a
+// permission the mask never withholds (ManageRolesAssign) EnrollmentDenial
+// returns before any statement, so AssignRole and UnassignRole pay nothing.
 func (h *Handler) requireRoleMutationPermissionTx(
 	ctx context.Context, tx *sql.Tx, serverID, actorID string, permission Permission,
 ) error {
@@ -101,6 +108,9 @@ func (h *Handler) requireRoleMutationPermissionTx(
 		return fmt.Errorf("resolve current actor permissions: %w", err)
 	}
 	if !actorPerms.Has(permission) {
+		if e := EnrollmentDenial(ctx, tx, serverID, "", actorID, permission); e != nil {
+			return e
+		}
 		return errRolePermissionDenied
 	}
 	return nil
@@ -202,6 +212,11 @@ func (h *Handler) syncedChannelsForCategoryTx(ctx context.Context, tx *sql.Tx, c
 // withStableSyncedCategoryAuthority binds category fan-out to one exact child
 // set. A preflight/locked mismatch retries the entire capture once; a second
 // mismatch is retryable rather than risking a capture/write scope divergence.
+//
+// I-RETRY (#3454): errCategorySyncSetChanged is returned only before write
+// runs. Nothing that runs after write starts may return it, because a
+// dangerous-action gate lives inside write: a sentinel after the gate would
+// re-run the gate on the retry and ask the actor's factor twice.
 func (h *Handler) withStableSyncedCategoryAuthority(
 	ctx context.Context,
 	serverID, categoryID string,
@@ -330,6 +345,15 @@ type Handler struct {
 	// syncedCategoryPreflight is a test seam that makes the preflight/lock
 	// membership race deterministic. Production leaves it nil.
 	syncedCategoryPreflight func()
+	// channelKeyAuthorityPreflight is the same seam for
+	// withServerChannelKeyAuthorityMutation: it runs after each attempt's
+	// preflight read and before the visibility lock, so a test can change the
+	// channel set in between and force the wrapper's retry (#3454 §14.9).
+	// Production leaves it nil.
+	channelKeyAuthorityPreflight func()
+	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
+	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
+	mfaVerifier stepup.MFATxCodeVerifier
 }
 
 // NewHandler creates a new RBAC handler
@@ -412,6 +436,11 @@ type CreateRoleRequest struct {
 	Permissions       int64   `json:"permissions,string" binding:"gte=0"` // bit 63 is not a permission (#2869)
 	Mentionable       bool    `json:"mentionable"`
 	DisplaySeparately bool    `json:"display_separately"`
+	// MFACode confirms a role that confers a dangerous grant on a server that
+	// enforces MFA on dangerous actions (#3454 A-6). Not stepup.Fields: this is
+	// not an own-rule route, so it neither refuses current_password nor
+	// accepts a step_up_token.
+	MFACode string `json:"mfa_code" binding:"max=256"`
 }
 
 // UpdateRoleRequest represents a request to update an existing role
@@ -422,6 +451,10 @@ type UpdateRoleRequest struct {
 	Permissions       *int64  `json:"permissions,string,omitempty" binding:"omitempty,gte=0"` // #2869: the owner bypass writes this unmasked
 	Mentionable       *bool   `json:"mentionable,omitempty"`
 	DisplaySeparately *bool   `json:"display_separately,omitempty"`
+	// MFACode confirms a permissions write that newly confers a dangerous
+	// grant on an enforcing server (#3454 A-6). It is read only when
+	// Permissions is present; see CreateRoleRequest.MFACode.
+	MFACode string `json:"mfa_code" binding:"max=256"`
 }
 
 // ReorderRolesRequest represents a request to reorder roles (changes position values).
@@ -600,8 +633,11 @@ func validateHexColor(c *gin.Context, color *string) bool {
 	return true
 }
 
-// resolveNewRolePosition returns the position a newly created role should take,
-// making room for it inside tx when the actor is not the server owner.
+// resolveNewRolePosition returns the position a newly created role should take
+// and whether shiftRolesForNewRole must make room for it there, which it must
+// when the actor is not the server owner. It only reads: the shift is a write,
+// and CreateRole's dangerous-action gate must run between this hierarchy
+// verdict and any write (#3454 I7), so the two halves are separate calls.
 //
 // Non-owners get a slot strictly below their own highest role. CreateRole
 // previously used a server-wide MAX(position)+1, which placed every created role
@@ -624,9 +660,7 @@ func validateHexColor(c *gin.Context, color *string) bool {
 // The owner check is identity on servers.owner_id, matching checkRoleOwnerAndHierarchy
 // and AssignRole — never PermAdministrator.
 //
-// Returns (position, true) on success. On failure it has already written the
-// response and returns (0, false); the caller must return immediately.
-// Returns the position, and whether other roles were SHIFTED to make room --
+// Returns the position, and whether other roles will be SHIFTED to make room --
 // the caller must tell clients when they were, since a shift moves roles the
 // role_created broadcast does not name.
 func (h *Handler) resolveNewRolePosition(ctx context.Context, tx *sql.Tx, serverID, userID string) (int, bool, error) {
@@ -653,11 +687,12 @@ func (h *Handler) resolveNewRolePosition(ctx context.Context, tx *sql.Tx, server
 		return 0, false, fmt.Errorf("create role: resolve position snapshot: %w", err)
 	}
 	// servers.owner_id is NOT NULL, so a NULL here means the scalar subquery
-	// found no servers row: the server was deleted after this transaction's
-	// permission resolve, since nothing in it holds the servers row. The actor
-	// is not a member of a server that no longer exists — ErrNotMember, which
-	// mapGuardError renders as the 403 it gives any non-member. A Scan error
-	// above is unchanged and stays a fault.
+	// found no servers row. Since #3454 the caller's gate holds the servers row
+	// FOR SHARE from before this read until commit, so this is a backstop: a
+	// server deleted before the gate is refused by the gate itself, with the
+	// same answer. The actor is not a member of a server that no longer exists
+	// — ErrNotMember, which mapGuardError renders as the 403 it gives any
+	// non-member. A Scan error above is unchanged and stays a fault.
 	if !ownerID.Valid {
 		return 0, false, ErrNotMember
 	}
@@ -695,32 +730,37 @@ func (h *Handler) resolveNewRolePosition(ctx context.Context, tx *sql.Tx, server
 	if actorMaxPosition < 1 {
 		return 0, false, fmt.Errorf("create role: no legal position below %d: %w", actorMaxPosition, errHierarchyDenied)
 	}
+	return actorMaxPosition, true, nil
+}
 
-	// SHIFT rather than clamp. A clamp to actorMaxPosition-1 always returns that
-	// one value -- the actor's roles are a subset of the server's, so
-	// MAX(position)+1 is never the smaller operand -- and every role an actor
-	// created would collide on it, in an axis with no unique constraint.
-	// Searching for a free slot below the actor does not help either, because
-	// applyRolePositions repacks densely as len-i-1 on every reorder, so a server
-	// reordered even once has no gaps. Raising everything at or above the actor
-	// by one is the only approach yielding a distinct position in a dense server.
-	// Relative order is preserved and no authority relationship changes.
-	//
-	// This makes CreateRole a MULTI-ROW roles.position writer, which is only safe
-	// because the caller takes LockServerVisibilityCapture as its first statement
-	// and applyRolePositions now does the same (#2861) -- the two families are
-	// totally ordered and cannot interleave. Before #2856 this shift was an
-	// escalation primitive: it let an actor raise their own ceiling between a
-	// guard's two unsynchronized reads. roleGuardQuery closed that by making the
-	// ceiling structurally unable to be newer than the target.
+// shiftRolesForNewRole makes room at position for a role a non-owner creates:
+// everything at or above it moves up by one.
+//
+// SHIFT rather than clamp. A clamp to actorMaxPosition-1 always returns that
+// one value -- the actor's roles are a subset of the server's, so
+// MAX(position)+1 is never the smaller operand -- and every role an actor
+// created would collide on it, in an axis with no unique constraint.
+// Searching for a free slot below the actor does not help either, because
+// applyRolePositions repacks densely as len-i-1 on every reorder, so a server
+// reordered even once has no gaps. Raising everything at or above the actor
+// by one is the only approach yielding a distinct position in a dense server.
+// Relative order is preserved and no authority relationship changes.
+//
+// This makes CreateRole a MULTI-ROW roles.position writer, which is only safe
+// because the caller takes LockServerVisibilityCapture as its first statement
+// and applyRolePositions now does the same (#2861) -- the two families are
+// totally ordered and cannot interleave. Before #2856 this shift was an
+// escalation primitive: it let an actor raise their own ceiling between a
+// guard's two unsynchronized reads. roleGuardQuery closed that by making the
+// ceiling structurally unable to be newer than the target.
+func shiftRolesForNewRole(ctx context.Context, tx *sql.Tx, serverID string, position int) error {
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE roles SET position = position + 1, updated_at = NOW() WHERE server_id = $1 AND position >= $2`,
-		serverID, actorMaxPosition,
+		serverID, position,
 	); err != nil {
-		return 0, false, fmt.Errorf("create role: shift role positions: %w", err)
+		return fmt.Errorf("create role: shift role positions: %w", err)
 	}
-
-	return actorMaxPosition, true, nil
+	return nil
 }
 
 // CreateRole creates a new role in a server
@@ -751,99 +791,23 @@ func (h *Handler) CreateRole(c *gin.Context) {
 		return
 	}
 
-	roleID := uuid.New().String()
+	// roles.create is always fresh (D-2): the charge reads no grace.
+	confirm, ok := h.chargeRoleGate(c, serverID, userID, stepup.PurposeRoleCreate, req.MFACode)
+	if !ok {
+		return
+	}
 
-	query := `
-		INSERT INTO roles (id, server_id, name, color, emoji, position, permissions, mentionable, display_separately)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		RETURNING created_at, updated_at
-	`
-
-	var role Role
-	role.ID = roleID
-	role.ServerID = serverID
-	role.Name = req.Name
-	role.Color = req.Color
-	role.Emoji = req.Emoji
-	role.Permissions = req.Permissions
-	role.Mentionable = req.Mentionable
-	role.DisplaySeparately = req.DisplaySeparately
-
-	// Set inside the transaction below; read after it commits.
-	shifted := false
-
-	// CreateRole deliberately does NOT use withAuthorityCapture: a memberless new
-	// role changes nobody's Rich Presence visibility, so there is no pre-mutation
-	// audience to capture. It uses the same lighter seam the category-override
-	// paths already use — BeginTx -> LockServerVisibilityCapture -> work -> Commit
-	// — so it joins the per-server advisory total order without adding a fifth
-	// transaction pattern (#2721).
-	err := func() (err error) {
-		ctx := c.Request.Context()
-		tx, txErr := h.db.BeginTx(ctx, nil)
-		if txErr != nil {
-			return fmt.Errorf("begin create role transaction: %w", txErr)
-		}
-		// See discardOutcome: a failed discard is a fault, never the denial.
-		defer func() { err = discardOutcome(tx.Rollback(), "create role", err) }()
-
-		// FIRST statement, and the only advisory key this transaction takes.
-		if lockErr := LockServerVisibilityCapture(ctx, tx, serverID); lockErr != nil {
-			return fmt.Errorf("lock server for create role: %w", lockErr)
-		}
-		if guardErr := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
-			return roleGuardError(ctx, tx, serverID, guardErr)
-		}
-		if toErr := applyGuardLockTimeout(ctx, tx); toErr != nil {
-			return toErr
-		}
-
-		// Cache-free and in-transaction. There is no owner bypass here, so an
-		// owner is bounded by OwnerPermissions, which EXCLUDES bit 62: an owner
-		// cannot CREATE a role carrying PermAdministrator. That does not keep bit
-		// 62 out of a server - UpdateRole's owner bypass writes it - and owners
-		// may delegate it by decision; letting CreateRole confer exactly that bit
-		// for the owner is #3407.
-		actorPerms, permErr := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
-		if permErr != nil {
-			// %w, not %v: errors.Is unwraps, so ErrNotMember stays matchable and
-			// mapGuardError still renders its 403 rather than the default 500.
-			return fmt.Errorf("create role: resolve actor permissions: %w", permErr)
-		}
-		// The route decorator's HasPermission is cache-first with a 5-minute TTL,
-		// and CreateRole has no hierarchy check to fail closed behind it — so a
-		// fully-demoted actor riding a stale entry could still mint a
-		// permissions=0 role, complete with a role_created audit entry and
-		// broadcast attributed to someone who no longer holds ManageRoles. The
-		// other four handlers are covered by the ceiling dropping to 0. This is
-		// one comparison on a value already resolved above; it costs no query.
-		if actorPerms&PermManageRoles == 0 {
-			return errEscalationDenied
-		}
-		if Permission(req.Permissions)&^actorPerms != 0 {
-			return errEscalationDenied
-		}
-
-		// Non-owners get a slot strictly below their own highest role, shifting
-		// everything at or above them up by one to make room (#2359). The owner
-		// is unclamped at MAX(position)+1. This is the replacement #2856 shaped
-		// this transaction to hold.
-		position, didShift, posErr := h.resolveNewRolePosition(ctx, tx, serverID, userID)
-		if posErr != nil {
-			return posErr
-		}
-		role.Position = position
-		shifted = didShift
-
-		if insErr := tx.QueryRowContext(ctx,
-			query, roleID, serverID, req.Name, req.Color, req.Emoji,
-			role.Position, req.Permissions, req.Mentionable, req.DisplaySeparately,
-		).Scan(&role.CreatedAt, &role.UpdatedAt); insErr != nil {
-			return roleInsertError(insErr)
-		}
-		return tx.Commit()
-	}()
-
+	role := Role{
+		ID:                uuid.New().String(),
+		ServerID:          serverID,
+		Name:              req.Name,
+		Color:             req.Color,
+		Emoji:             req.Emoji,
+		Permissions:       req.Permissions,
+		Mentionable:       req.Mentionable,
+		DisplaySeparately: req.DisplaySeparately,
+	}
+	shifted, outcome, err := h.createRoleTx(c.Request.Context(), userID, req, confirm, &role)
 	if err != nil {
 		var pqErr *pq.Error
 		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
@@ -859,20 +823,133 @@ func (h *Handler) CreateRole(c *gin.Context) {
 		h.mapGuardError(c, err, errMsgNoLegalRolePosition, errMsgFailedCreateRole)
 		return
 	}
+	h.settleRoleGate(c.Request.Context(), outcome, confirm, userID)
 
-	h.announceRoleCreated(c, serverID, userID, roleID, req, role, shifted)
+	h.announceRoleCreated(c, serverID, userID, role.ID, req, role, shifted)
 	c.JSON(http.StatusCreated, gin.H{"role": role})
+}
+
+// createRoleTx is CreateRole's transaction. It fills role's position and
+// timestamps, and reports whether other roles were shifted to make room and
+// what the dangerous-action gate decided.
+//
+// CreateRole deliberately does NOT use withAuthorityCapture: a memberless new
+// role changes nobody's Rich Presence visibility, so there is no pre-mutation
+// audience to capture. It uses the same lighter seam the category-override
+// paths already use — BeginTx -> LockServerVisibilityCapture -> work -> Commit
+// — so it joins the per-server advisory total order without adding a fifth
+// transaction pattern (#2721).
+//
+// The gate (#3454 A-8) follows GuardTx and the lock timeout: users FOR SHARE,
+// which GuardTx already holds, then servers FOR SHARE, which covers the FK
+// KEY SHARE the INSERT takes with no upgrade. The gate fires only when the new
+// role confers a dangerous grant (prior 0), and runs after the permission,
+// escalation and hierarchy verdicts and before the position shift, the first
+// write.
+func (h *Handler) createRoleTx(
+	ctx context.Context, userID string, req CreateRoleRequest, confirm roleGateConfirm, role *Role,
+) (shifted bool, outcome mfaenforce.Outcome, err error) {
+	serverID := role.ServerID
+	tx, txErr := h.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		return false, outcome, fmt.Errorf("begin create role transaction: %w", txErr)
+	}
+	// See discardOutcome: a failed discard is a fault, never the denial.
+	defer func() { err = discardOutcome(tx.Rollback(), "create role", err) }()
+
+	// FIRST statement, and the only advisory key this transaction takes.
+	if lockErr := LockServerVisibilityCapture(ctx, tx, serverID); lockErr != nil {
+		return false, outcome, fmt.Errorf("lock server for create role: %w", lockErr)
+	}
+	if guardErr := credepoch.GuardTx(ctx, tx, userID, confirm.tokenEpoch); guardErr != nil {
+		return false, outcome, roleGuardError(ctx, tx, serverID, guardErr)
+	}
+	if toErr := applyGuardLockTimeout(ctx, tx); toErr != nil {
+		return false, outcome, toErr
+	}
+	g, gateErr := lockRoleGateTx(ctx, tx, serverID, userID, stepup.LockForShare, mfaenforce.ServerForShare, confirm)
+	if gateErr != nil {
+		return false, outcome, gateErr
+	}
+	if authErr := h.authorizeCreateRoleTx(ctx, tx, serverID, userID, req.Permissions); authErr != nil {
+		return false, outcome, authErr
+	}
+
+	// Non-owners get a slot strictly below their own highest role, shifting
+	// everything at or above them up by one to make room (#2359). The owner
+	// is unclamped at MAX(position)+1. This is the replacement #2856 shaped
+	// this transaction to hold.
+	position, shift, posErr := h.resolveNewRolePosition(ctx, tx, serverID, userID)
+	if posErr != nil {
+		return false, outcome, posErr
+	}
+	if outcome, err = h.requireRoleGate(ctx, tx, g, userID, confirm, grantsDangerous(0, req.Permissions)); err != nil {
+		return false, outcome, err
+	}
+	if shift {
+		if shiftErr := shiftRolesForNewRole(ctx, tx, serverID, position); shiftErr != nil {
+			return false, outcome, shiftErr
+		}
+	}
+	role.Position = position
+
+	if insErr := tx.QueryRowContext(ctx, `
+		INSERT INTO roles (id, server_id, name, color, emoji, position, permissions, mentionable, display_separately)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING created_at, updated_at`,
+		role.ID, serverID, req.Name, req.Color, req.Emoji,
+		role.Position, req.Permissions, req.Mentionable, req.DisplaySeparately,
+	).Scan(&role.CreatedAt, &role.UpdatedAt); insErr != nil {
+		return false, outcome, roleInsertError(insErr)
+	}
+	return shift, outcome, roleCommitError(tx.Commit())
+}
+
+// authorizeCreateRoleTx is CreateRole's permission and escalation verdict, in
+// the transaction and cache-free. There is no owner bypass here, so an owner is
+// bounded by OwnerPermissions, which EXCLUDES bit 62: an owner cannot CREATE a
+// role carrying PermAdministrator. That does not keep bit 62 out of a server -
+// UpdateRole's owner bypass writes it - and owners may delegate it by decision;
+// letting CreateRole confer exactly that bit for the owner is #3407.
+//
+// A ManageRoles denial the MFA mask caused is answered with RS5's
+// mfa_enrollment_required (#3454 §14.1), read on tx. The escalation denial
+// needs no RS5: an actor the mask binds has already lost ManageRoles itself,
+// so only an actor the mask does not bind reaches it.
+func (h *Handler) authorizeCreateRoleTx(ctx context.Context, tx *sql.Tx, serverID, userID string, requested int64) error {
+	actorPerms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
+	if err != nil {
+		// %w, not %v: errors.Is unwraps, so ErrNotMember stays matchable and
+		// mapGuardError still renders its 403 rather than the default 500.
+		return fmt.Errorf("create role: resolve actor permissions: %w", err)
+	}
+	// The route decorator's HasPermission is cache-first with a 5-minute TTL,
+	// and CreateRole has no hierarchy check to fail closed behind it — so a
+	// fully-demoted actor riding a stale entry could still mint a
+	// permissions=0 role, complete with a role_created audit entry and
+	// broadcast attributed to someone who no longer holds ManageRoles. The
+	// other four handlers are covered by the ceiling dropping to 0. This is
+	// one comparison on a value already resolved above; it costs no query.
+	if actorPerms&PermManageRoles == 0 {
+		if e := EnrollmentDenial(ctx, tx, serverID, "", userID, PermManageRoles); e != nil {
+			return e
+		}
+		return errEscalationDenied
+	}
+	if Permission(requested)&^actorPerms != 0 {
+		return errEscalationDenied
+	}
+	return nil
 }
 
 // roleServerFKConstraint is roles.server_id's foreign key to servers(id).
 const roleServerFKConstraint = "roles_server_id_fkey"
 
-// roleInsertError classifies CreateRole's INSERT failure. The server can be
-// deleted after the position snapshot just as before it: for the owner nothing
-// in the transaction holds the servers row (a non-owner's position shift locks
-// the roles rows a server delete must cascade through, so that delete waits).
-// A violation of roles.server_id's FK is the same fact the snapshot answers with
-// ErrNotMember, so it gets the same 403. Everything else is wrapped with %w, not
+// roleInsertError classifies CreateRole's INSERT failure. Since #3454 the
+// gate holds the servers row FOR SHARE from before the position snapshot to
+// commit, so a server delete waits for this transaction and the FK arm below
+// is a backstop. A violation of roles.server_id's FK is the same fact the
+// snapshot answers with ErrNotMember, so it gets the same 403. Everything else is wrapped with %w, not
 // %v: errors.As unwraps, so the call site's errors.As(err, &pqErr) still sees
 // the 23505 and renders the 409.
 func roleInsertError(err error) error {
@@ -953,9 +1030,12 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		return // Response already written
 	}
 
-	guardMode, guardRequested := confersNothing, int64(0)
+	// gateCode stays empty unless the request writes permissions: only that
+	// write can confer a dangerous grant, so nothing else is charged or gated
+	// (I-UNGATED).
+	guardMode, guardRequested, gateCode := confersNothing, int64(0), ""
 	if req.Permissions != nil {
-		guardMode, guardRequested = confersRequested, *req.Permissions
+		guardMode, guardRequested, gateCode = confersRequested, *req.Permissions, req.MFACode
 	}
 
 	// Cheap, non-authoritative hierarchy denial BEFORE the transaction, so a
@@ -979,6 +1059,11 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 	query := "UPDATE roles SET " + strings.Join(updates, ", ") +
 		", updated_at = NOW() WHERE id = $1 AND server_id = $2 RETURNING id, server_id, name, color, emoji, position, permissions, is_default, is_managed, mentionable, display_separately, created_at, updated_at"
 
+	// roles.update is always fresh (D-2): the charge reads no grace.
+	confirm, ok := h.chargeRoleGate(c, serverID, userID, stepup.PurposeRoleUpdate, gateCode)
+	if !ok {
+		return
+	}
 	txRequest := roleUpdateTxRequest{
 		serverID:        serverID,
 		userID:          userID,
@@ -986,27 +1071,21 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		roleID:          roleID,
 		guardMode:       guardMode,
 		guardRequested:  guardRequested,
+		confirm:         confirm,
 	}
-	var role Role
+	var (
+		role    Role
+		outcome mfaenforce.Outcome
+	)
 	// nil channelIDs = server scope: every voice channel with active senders.
 	// nil onlyUserID = the full candidate set (a role edit can change any
 	// member's visibility).
 	writeRole := func(ctx context.Context, tx *sql.Tx) error {
-		updated, err := h.updateRoleTx(ctx, tx, txRequest, query, args)
-		role = updated
+		updated, gated, err := h.updateRoleTx(ctx, tx, txRequest, query, args)
+		role, outcome = updated, gated
 		return err
 	}
-	var (
-		plan     PresenceRecheckPlan
-		mutation ChannelAuthorityMutation
-		err      error
-	)
-	if req.Permissions != nil {
-		mutation, err = h.withServerChannelKeyAuthorityMutation(c.Request.Context(), serverID, userID, middleware.TokenCredentialEpoch(c), nil, writeRole)
-		plan = mutation.Plan
-	} else {
-		plan, err = h.withAuthorityCapture(c.Request.Context(), serverID, nil, nil, writeRole, userID)
-	}
+	plan, mutation, err := h.runRoleUpdate(c.Request.Context(), txRequest, writeRole)
 	if errors.Is(err, ErrChannelAuthorityChannelLimit) {
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgChannelKeyCleanupLimit})
 		return
@@ -1020,19 +1099,43 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		return
 	}
 
-	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(c.Request.Context(), serverID))
-	if req.Permissions != nil {
-		h.CompleteChannelAuthorityMutationWithRotations(c.Request.Context(), serverID, mutation.ChannelIDs, plan, mutation.Rotations, mutation.DeniedByChannel)
-	} else {
-		h.recheckVoiceServer(serverID)
-		h.presenceExecute(plan)
-		h.revalidateServerSubscribers(serverID)
-	}
+	h.settleRoleGate(c.Request.Context(), outcome, confirm, userID)
+	h.completeRoleUpdate(c.Request.Context(), serverID, req.Permissions != nil, plan, mutation)
 	h.auditRoleUpdate(c, serverID, userID, roleID, req)
 	h.broadcastRoleUpdated(serverID, roleID, role)
 
 	h.log.Info("Role updated", "role_id", roleID, "server_id", serverID)
 	c.JSON(http.StatusOK, gin.H{"role": role})
+}
+
+// runRoleUpdate runs UpdateRole's write in the transaction its shape needs. A
+// permissions write can change effective VIEW on every channel, so it goes
+// through the channel-key coordinator; any other edit only needs the capture.
+func (h *Handler) runRoleUpdate(
+	ctx context.Context, req roleUpdateTxRequest, write func(context.Context, *sql.Tx) error,
+) (PresenceRecheckPlan, ChannelAuthorityMutation, error) {
+	if req.guardMode == confersRequested {
+		mutation, err := h.withServerChannelKeyAuthorityMutation(ctx, req.serverID, req.userID, req.credentialEpoch, nil, write)
+		return mutation.Plan, mutation, err
+	}
+	plan, err := h.withAuthorityCapture(ctx, req.serverID, nil, nil, write, req.userID)
+	return plan, ChannelAuthorityMutation{}, err
+}
+
+// completeRoleUpdate runs a committed role update's side effects. A
+// permissions write went through the channel-key coordinator and completes its
+// rotations; any other edit changed no key authority and only rechecks.
+func (h *Handler) completeRoleUpdate(
+	ctx context.Context, serverID string, wrotePermissions bool, plan PresenceRecheckPlan, mutation ChannelAuthorityMutation,
+) {
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(ctx, serverID))
+	if wrotePermissions {
+		h.CompleteChannelAuthorityMutationWithRotations(ctx, serverID, mutation.ChannelIDs, plan, mutation.Rotations, mutation.DeniedByChannel)
+		return
+	}
+	h.recheckVoiceServer(serverID)
+	h.presenceExecute(plan)
+	h.revalidateServerSubscribers(serverID)
 }
 
 type roleUpdateTxRequest struct {
@@ -1042,23 +1145,41 @@ type roleUpdateTxRequest struct {
 	roleID          string
 	guardMode       conferredMode
 	guardRequested  int64
+	confirm         roleGateConfirm
 }
 
+// updateRoleTx is UpdateRole's write callback. When the request writes
+// permissions (confersRequested) it runs inside
+// withServerChannelKeyAuthorityMutation's write, after that wrapper's
+// retry sentinel can fire (I-RETRY), and takes the dangerous-action gate
+// (#3454 §4): LockGateTx at NO KEY UPDATE and FOR UPDATE, both already held
+// by the wrapper, so the gate adds no edge; then the permission and hierarchy
+// verdicts; then the prior bitfield; then Require when the write newly confers
+// a dangerous grant. Any other edit takes no new lock (I-UNGATED).
 func (h *Handler) updateRoleTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	req roleUpdateTxRequest,
 	query string,
 	args []interface{},
-) (Role, error) {
+) (Role, mfaenforce.Outcome, error) {
 	if err := credepoch.GuardTx(ctx, tx, req.userID, req.credentialEpoch); err != nil {
-		return Role{}, err
+		return Role{}, mfaenforce.Unconfirmed, err
 	}
 	if err := applyGuardLockTimeout(ctx, tx); err != nil {
-		return Role{}, err
+		return Role{}, mfaenforce.Unconfirmed, err
+	}
+	gated := req.guardMode == confersRequested
+	var g mfaenforce.Gate
+	if gated {
+		var err error
+		if g, err = lockRoleGateTx(ctx, tx, req.serverID, req.userID,
+			stepup.LockForNoKeyUpdate, mfaenforce.ServerForUpdate, req.confirm); err != nil {
+			return Role{}, mfaenforce.Unconfirmed, err
+		}
 	}
 	if err := h.requireRoleMutationPermissionTx(ctx, tx, req.serverID, req.userID, PermManageRoles); err != nil {
-		return Role{}, err
+		return Role{}, mfaenforce.Unconfirmed, err
 	}
 	// Authoritative guard: same transaction, same snapshot, one row lock.
 	// Must stay below capturePresenceVisibility, which runs before this callback.
@@ -1066,10 +1187,16 @@ func (h *Handler) updateRoleTx(
 		ctx, tx, req.serverID, req.userID, req.roleID, req.guardMode, req.guardRequested,
 	)
 	if err != nil {
-		return Role{}, err
+		return Role{}, mfaenforce.Unconfirmed, err
 	}
 	if err := rejectRoleFlags(result, "Cannot modify managed roles", ""); err != nil {
-		return Role{}, err
+		return Role{}, mfaenforce.Unconfirmed, err
+	}
+	outcome := mfaenforce.Unconfirmed
+	if gated {
+		if outcome, err = h.requireRoleUpdateGate(ctx, tx, g, req); err != nil {
+			return Role{}, outcome, err
+		}
 	}
 	var role Role
 	err = tx.QueryRowContext(ctx, query, args...).Scan(
@@ -1077,7 +1204,38 @@ func (h *Handler) updateRoleTx(
 		&role.Position, &role.Permissions, &role.IsDefault, &role.IsManaged,
 		&role.Mentionable, &role.DisplaySeparately, &role.CreatedAt, &role.UpdatedAt,
 	)
-	return role, err
+	return role, outcome, err
+}
+
+// requireRoleUpdateGate reads the role's prior bitfield and runs the gate when
+// the requested one newly confers a dangerous grant: (new &^ prior) & D ≠ 0.
+// The prior read re-reads the latest committed version under READ COMMITTED;
+// a row missing or deleted since the guard read it is prior 0, which can only
+// over-gate (#3454 §4).
+//
+// It locks FOR NO KEY UPDATE, the lock the UPDATE that follows takes anyway,
+// so it adds no lock strength. Plain FOR UPDATE would be stronger than the
+// write needs and would also conflict with FOR KEY SHARE, the lock a foreign
+// key takes on this row (a member_roles INSERT, such as a join's default-role
+// assignment): a deadlock shape against the servers FOR UPDATE this
+// transaction already holds.
+//
+// The guard already holds this row FOR SHARE, so this read upgrades it. That
+// is safe only because every other SHARE holder on a role row (the assign,
+// unassign and reorder guards) first takes LockServerVisibilityCapture, and
+// this transaction holds it and servers FOR UPDATE: no second holder can be
+// waiting to make the same upgrade.
+func (h *Handler) requireRoleUpdateGate(
+	ctx context.Context, tx *sql.Tx, g mfaenforce.Gate, req roleUpdateTxRequest,
+) (mfaenforce.Outcome, error) {
+	var prior int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT permissions FROM roles WHERE id = $1 AND server_id = $2 FOR NO KEY UPDATE`, req.roleID, req.serverID,
+	).Scan(&prior)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return mfaenforce.Unconfirmed, fmt.Errorf("update role: read prior permissions: %w", err)
+	}
+	return h.requireRoleGate(ctx, tx, g, req.userID, req.confirm, grantsDangerous(prior, req.guardRequested))
 }
 
 // validateRoleModifiable checks that the role exists, belongs to the server, and is not managed.
@@ -1246,6 +1404,15 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 		return
 	}
 
+	// DeleteRole bound no body before #3454, so the confirmation arrives
+	// through the optional step-up reader (A-6): an empty body is no code.
+	// Only mfa_code is read; a D1 gate never accepts a step_up_token.
+	stepUp, e := stepup.ReadOptionalStepUp(c)
+	if e != nil {
+		e.Write(c)
+		return
+	}
+
 	// Cheap pre-check only: rejects managed/default roles without paying
 	// PrepareCapture's cost. NOT authoritative — the position it returns is
 	// deliberately discarded; the in-transaction guard re-reads it (#2721).
@@ -1256,30 +1423,19 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 		h.mapGuardError(c, preErr, "Cannot delete a role at or above your own position", errMsgFailedDeleteRole)
 		return
 	}
+	confirm, ok := h.chargeRoleGate(c, serverID, userID, stepup.PurposeRoleDelete, stepUp.MFACode)
+	if !ok {
+		return
+	}
 
 	// Delete role (CASCADE will remove member_roles entries)
 	// nil channelIDs = server scope; nil onlyUserID = the full candidate set.
-	mutation, err := h.withServerChannelKeyAuthorityMutation(c.Request.Context(), serverID, userID, middleware.TokenCredentialEpoch(c), nil,
+	var outcome mfaenforce.Outcome
+	mutation, err := h.withServerChannelKeyAuthorityMutation(c.Request.Context(), serverID, userID, confirm.tokenEpoch, nil,
 		func(ctx context.Context, tx *sql.Tx) error {
-			if lockErr := applyGuardLockTimeout(ctx, tx); lockErr != nil {
-				return lockErr
-			}
-			if permissionErr := h.requireRoleMutationPermissionTx(ctx, tx, serverID, userID, PermManageRoles); permissionErr != nil {
-				return permissionErr
-			}
-			// confersNothing: a delete grants no bits.
-			res, guardErr := h.authorizeRoleMutationTx(
-				ctx, tx, serverID, userID, roleID, confersNothing, 0,
-			)
-			if guardErr != nil {
-				return guardErr
-			}
-			if flagErr := rejectRoleFlags(res,
-				"Cannot delete managed roles", "Cannot delete default roles"); flagErr != nil {
-				return flagErr
-			}
-			return execRequiringRow(ctx, tx,
-				`DELETE FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID)
+			var deleteErr error
+			outcome, deleteErr = h.deleteRoleTx(ctx, tx, serverID, userID, roleID, confirm)
+			return deleteErr
 		},
 	)
 	if errors.Is(err, ErrChannelAuthorityChannelLimit) {
@@ -1294,6 +1450,7 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 		"Cannot delete a role at or above your own position", errMsgFailedDeleteRole) {
 		return
 	}
+	h.settleRoleGate(c.Request.Context(), outcome, confirm, userID)
 	// Invalidate cache
 	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(c.Request.Context(), serverID))
 	h.CompleteChannelAuthorityMutationWithRotations(c.Request.Context(), serverID, mutation.ChannelIDs, mutation.Plan, mutation.Rotations, mutation.DeniedByChannel)
@@ -1315,6 +1472,42 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 
 	h.log.Info("Role deleted", "role_id", roleID, "server_id", serverID)
 	c.JSON(http.StatusOK, gin.H{"message": "Role deleted"})
+}
+
+// deleteRoleTx is DeleteRole's write callback, run inside
+// withServerChannelKeyAuthorityMutation's write after that wrapper's retry
+// sentinel can fire (I-RETRY). The dangerous-action gate (#3454 §4) re-takes
+// the actor's users row at NO KEY UPDATE and the servers row FOR UPDATE, both
+// already held by the wrapper, so it adds no edge; it follows the wrapper's
+// GuardTx and runs before the permission and hierarchy verdicts, and every
+// deletion fires it.
+func (h *Handler) deleteRoleTx(
+	ctx context.Context, tx *sql.Tx, serverID, userID, roleID string, confirm roleGateConfirm,
+) (mfaenforce.Outcome, error) {
+	if err := applyGuardLockTimeout(ctx, tx); err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	g, err := lockRoleGateTx(ctx, tx, serverID, userID, stepup.LockForNoKeyUpdate, mfaenforce.ServerForUpdate, confirm)
+	if err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	if err := h.requireRoleMutationPermissionTx(ctx, tx, serverID, userID, PermManageRoles); err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	// confersNothing: a delete grants no bits.
+	res, err := h.authorizeRoleMutationTx(ctx, tx, serverID, userID, roleID, confersNothing, 0)
+	if err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	if err := rejectRoleFlags(res, "Cannot delete managed roles", "Cannot delete default roles"); err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	outcome, err := h.requireRoleGate(ctx, tx, g, userID, confirm, true)
+	if err != nil {
+		return outcome, err
+	}
+	return outcome, execRequiringRow(ctx, tx,
+		`DELETE FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID)
 }
 
 // reorderVerdict is the outcome of one evaluation of the ReorderRoles guards.
@@ -2007,6 +2200,18 @@ func (h *Handler) unassignRoleTx(ctx context.Context, tx *sql.Tx, serverID, acto
 	)
 }
 
+// myServerPermissionsResponse is GET /servers/:id/permissions' body.
+type myServerPermissionsResponse struct {
+	// #3406: a decimal string, like every RBAC bitfield on the wire; a
+	// float64 reader loses the low bits once bit 62 is set.
+	Permissions string `json:"permissions"`
+	// MFARestricted is present, and true, only while the server's MFA
+	// enforcement withholds a server-scope permission from the caller (#3454
+	// X7, X18; see Resolver.ServerPermissionsWithMFARestriction). omitempty is the contract: every
+	// other caller receives the body it received before #3454.
+	MFARestricted bool `json:"mfa_restricted,omitempty"`
+}
+
 // GetMyServerPermissions returns the effective permissions bitfield for the authenticated user
 func (h *Handler) GetMyServerPermissions(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -2017,16 +2222,19 @@ func (h *Handler) GetMyServerPermissions(c *gin.Context) {
 		return
 	}
 
-	perms, err := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, "")
+	// Uncached: mfa_restricted needs the raw value the cache does not hold,
+	// and one fresh read answers both fields consistently.
+	perms, restricted, err := h.resolver.ServerPermissionsWithMFARestriction(c.Request.Context(), serverID, userID)
 	if err != nil {
 		h.log.Error("Failed to get permissions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchPermissions})
 		return
 	}
 
-	// #3406: a decimal string, like every RBAC bitfield on the wire; a
-	// float64 reader loses the low bits once bit 62 is set.
-	c.JSON(http.StatusOK, gin.H{"permissions": strconv.FormatInt(int64(perms), 10)})
+	c.JSON(http.StatusOK, myServerPermissionsResponse{
+		Permissions:   strconv.FormatInt(int64(perms), 10),
+		MFARestricted: restricted,
+	})
 }
 
 // GetAuditLog returns paginated audit log entries for a server
@@ -2087,6 +2295,9 @@ type UpsertOverrideRequest struct {
 	// so gte=0 keeps refusing a negative bitfield (#2869).
 	Allow int64 `json:"allow,string" binding:"gte=0"` // #2869: administrators skip the allow subset check
 	Deny  int64 `json:"deny,string" binding:"gte=0"`  // #2869: deny is never subset-checked
+	// MFACode confirms an override whose allow newly confers a dangerous grant
+	// on an enforcing server (#3454 A-6); see CreateRoleRequest.MFACode.
+	MFACode string `json:"mfa_code" binding:"max=256"`
 }
 
 // ListChannelOverrides returns all permission overrides for a channel
@@ -2166,6 +2377,10 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// overrides.channel_upsert is always fresh (D-2): the charge reads no grace.
+	if req.confirm, ok = h.chargeRoleGate(c, req.serverID, req.userID, stepup.PurposeChannelOverrideUpsert, req.request.MFACode); !ok {
+		return
+	}
 	state := channelOverrideWriteState{override: ChannelOverride{
 		ID: uuid.New().String(), ChannelID: req.channelID, TargetType: req.request.TargetType,
 		TargetID: req.request.TargetID, Allow: req.request.Allow, Deny: req.request.Deny,
@@ -2187,6 +2402,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 		h.respondChannelOverrideWriteError(c, req.serverID, req.channelID, state, err)
 		return
 	}
+	h.settleRoleGate(c.Request.Context(), state.gateOutcome, req.confirm, req.userID)
 	h.completeChannelOverrideWrite(c.Request.Context(), req, plan, state)
 	h.auditChannelOverrideWrite(c.Request.Context(), req, state)
 	c.JSON(http.StatusOK, gin.H{"override": state.override})
@@ -2215,6 +2431,7 @@ type channelOverrideRequest struct {
 	channelID       string
 	serverID        string
 	request         UpsertOverrideRequest
+	confirm         roleGateConfirm
 }
 
 func (h *Handler) loadAuthorizedChannelOverride(c *gin.Context) (channelOverrideRequest, bool) {
@@ -2227,7 +2444,7 @@ func (h *Handler) loadAuthorizedChannelOverride(c *gin.Context) (channelOverride
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
 		return channelOverrideRequest{}, false
 	}
-	if !h.loadChannelOverrideServer(c, &req) || !h.authorizeChannelOverride(c, req) {
+	if !h.loadChannelOverrideServer(c, &req) || !h.authorizeOverrideUpsert(c, req.serverID, req.userID, req.request) {
 		return channelOverrideRequest{}, false
 	}
 	return req, true
@@ -2247,30 +2464,6 @@ func (h *Handler) loadChannelOverrideServer(c *gin.Context, req *channelOverride
 	return true
 }
 
-func (h *Handler) authorizeChannelOverride(c *gin.Context, req channelOverrideRequest) bool {
-	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), req.serverID, req.userID, "", PermManageChannels)
-	if err != nil {
-		h.log.Error(errMsgFailedCheckPermissions, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPermissions})
-		return false
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermissions})
-		return false
-	}
-	actorPerms, err := h.resolver.GetEffectivePermissions(c.Request.Context(), req.serverID, req.userID, "")
-	if err != nil {
-		h.log.Error(errMsgFailedGetActorPerms, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPermissions})
-		return false
-	}
-	if !actorPerms.Has(PermAdministrator) && Permission(req.request.Allow)&^actorPerms != 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgCannotGrantPerms})
-		return false
-	}
-	return true
-}
-
 func (h *Handler) respondCredentialEpochError(c *gin.Context, err error) bool {
 	if !errors.Is(err, credepoch.ErrEpochMismatch) && !errors.Is(err, credepoch.ErrBlocked) {
 		return false
@@ -2281,6 +2474,9 @@ func (h *Handler) respondCredentialEpochError(c *gin.Context, err error) bool {
 
 func (h *Handler) respondChannelOverrideWriteError(c *gin.Context, serverID, channelID string, state channelOverrideWriteState, err error) {
 	switch {
+	case isRoleGateError(err):
+		// First: a gate or RS5 refusal carries its own status and body (#3454 §7).
+		mfaenforce.WriteError(c, h.log, err, nil)
 	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthenticationRequired})
 	case errors.Is(err, errManageChannelsDenied), errors.Is(err, ErrNotMember):
@@ -2343,8 +2539,15 @@ type channelOverrideWriteState struct {
 	ordinaryDeniedByChannel  map[string][]string
 	revocationReady          bool
 	supersessionReady        bool
+	// gateOutcome is what the dangerous-action gate decided, for
+	// settleRoleGate after the commit.
+	gateOutcome mfaenforce.Outcome
 }
 
+// upsertChannelOverrideTx is UpsertChannelOverride's write inside
+// withAuthorityCapture. The gate (#3454 §4, A-8) runs in
+// authorizeOverrideUpsertTx; then the channel lock, the temporary-grant lock,
+// the prior allow and Require, all before the first write.
 func (h *Handler) upsertChannelOverrideTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -2352,15 +2555,9 @@ func (h *Handler) upsertChannelOverrideTx(
 	query string,
 	state *channelOverrideWriteState,
 ) error {
-	if err := credepoch.GuardTx(ctx, tx, req.userID, req.credentialEpoch); err != nil {
-		return err
-	}
-	actorPerms, err := h.resolveManageChannelsTx(ctx, tx, req.serverID, req.userID)
+	g, err := h.authorizeOverrideUpsertTx(ctx, tx, req.serverID, req.userID, req.credentialEpoch, req.request.Allow, req.confirm)
 	if err != nil {
 		return err
-	}
-	if !actorPerms.Has(PermAdministrator) && Permission(req.request.Allow)&^actorPerms != 0 {
-		return errEscalationDenied
 	}
 	if err := lockChannelOverrideAuthority(ctx, tx, req.channelID, req.serverID); err != nil {
 		return err
@@ -2370,6 +2567,15 @@ func (h *Handler) upsertChannelOverrideTx(
 		return err
 	}
 	state.supersededTemporaryGrant = superseded
+	// After the temporary-grant lock: that one is FOR UPDATE on the same row,
+	// so the prior read's NO KEY UPDATE never upgrades a lock this transaction
+	// holds.
+	if state.gateOutcome, err = h.requireOverrideGate(ctx, tx, g, overrideGateInput{
+		priorQuery: channelOverridePriorAllowQuery, parentID: req.channelID, req: req.request,
+		actorID: req.userID, confirm: req.confirm,
+	}); err != nil {
+		return err
+	}
 	writeOverride := func() error {
 		err := tx.QueryRowContext(ctx, query,
 			state.override.ID, req.channelID, req.request.TargetType, req.request.TargetID, req.request.Allow, req.request.Deny, req.serverID,
@@ -2602,6 +2808,9 @@ type categoryOverrideWriteState struct {
 	isInsert        bool
 	rotations       []keyrotation.Rotation
 	deniedByChannel map[string][]string
+	// gateOutcome is what the dangerous-action gate decided on the attempt
+	// that reached write, for settleRoleGate after the commit.
+	gateOutcome mfaenforce.Outcome
 }
 
 type categoryAuthorityRequest struct {
@@ -2622,60 +2831,41 @@ func newCategoryOverrideWriteState(categoryID string, req UpsertOverrideRequest)
 	}}
 }
 
-func (h *Handler) authorizeCategoryOverride(c *gin.Context, serverID, userID string, req UpsertOverrideRequest) bool {
-	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", PermManageChannels)
-	if err != nil {
-		h.log.Error(errMsgFailedCheckPermissions, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPermissions})
-		return false
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermissions})
-		return false
-	}
-	actorPerms, err := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, "")
-	if err != nil {
-		h.log.Error(errMsgFailedGetActorPerms, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPermissions})
-		return false
-	}
-	if !actorPerms.Has(PermAdministrator) && Permission(req.Allow)&^actorPerms != 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgCannotGrantPerms})
-		return false
-	}
-	return true
-}
-
+// upsertCategoryOverrideWithAuthority runs the category upsert in the
+// synced-category wrapper. The gate lives inside write (I-RETRY): the
+// wrapper's retry sentinel returns before write runs, so a forced retry
+// reaches the gate once, on the attempt that writes.
 func (h *Handler) upsertCategoryOverrideWithAuthority(
 	ctx context.Context,
 	authority categoryAuthorityRequest,
 	req UpsertOverrideRequest,
+	confirm roleGateConfirm,
 	state *categoryOverrideWriteState,
 ) (PresenceRecheckPlan, []string, error) {
 	return h.withStableSyncedCategoryAuthority(ctx, authority.serverID, authority.categoryID,
 		func(ctx context.Context, tx *sql.Tx, lockedChannelIDs []string) error {
-			return h.upsertCategoryOverrideTx(ctx, tx, authority, req, lockedChannelIDs, state)
+			return h.upsertCategoryOverrideTx(ctx, tx, authority, req, confirm, lockedChannelIDs, state)
 		}, authority.userID,
 	)
 }
 
+// upsertCategoryOverrideTx is the category upsert's write: the gate and the
+// route's verdicts (authorizeOverrideUpsertTx), the temporary-grant check,
+// then the prior allow, the sync copy's conferral on the locked children, and
+// one Require over both, all before the first write. A refusal therefore
+// writes neither the category row nor any child row.
 func (h *Handler) upsertCategoryOverrideTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	authority categoryAuthorityRequest,
 	req UpsertOverrideRequest,
+	confirm roleGateConfirm,
 	lockedChannelIDs []string,
 	state *categoryOverrideWriteState,
 ) error {
-	if err := credepoch.GuardTx(ctx, tx, authority.userID, authority.credentialEpoch); err != nil {
-		return err
-	}
-	actorPerms, err := h.resolveManageChannelsTx(ctx, tx, authority.serverID, authority.userID)
+	g, err := h.authorizeOverrideUpsertTx(ctx, tx, authority.serverID, authority.userID, authority.credentialEpoch, req.Allow, confirm)
 	if err != nil {
 		return err
-	}
-	if !actorPerms.Has(PermAdministrator) && Permission(req.Allow)&^actorPerms != 0 {
-		return errEscalationDenied
 	}
 	conflict, err := hasTemporaryMoveGrantForChannelsTx(ctx, tx, lockedChannelIDs, "", "")
 	if err != nil {
@@ -2683,6 +2873,12 @@ func (h *Handler) upsertCategoryOverrideTx(
 	}
 	if conflict {
 		return errTemporaryChannelOverrideManaged
+	}
+	if state.gateOutcome, err = h.requireOverrideGate(ctx, tx, g, overrideGateInput{
+		priorQuery: categoryOverridePriorAllowQuery, parentID: authority.categoryID, req: req,
+		actorID: authority.userID, confirm: confirm, syncedChildIDs: lockedChannelIDs,
+	}); err != nil {
+		return err
 	}
 	state.rotations, state.deniedByChannel, err = h.FencePostStateLossTx(
 		ctx, tx, authority.serverID, authority.userID, lockedChannelIDs,
@@ -2719,6 +2915,9 @@ func (h *Handler) respondCategoryOverrideWriteError(
 	channelIDs []string,
 ) {
 	switch {
+	case isRoleGateError(err):
+		// First: a gate or RS5 refusal carries its own status and body (#3454 §7).
+		mfaenforce.WriteError(c, h.log, err, nil)
 	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthenticationRequired})
 	case errors.Is(err, errManageChannelsDenied), errors.Is(err, ErrNotMember):
@@ -2914,7 +3113,13 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 		return
 	}
 
-	if !h.authorizeCategoryOverride(c, serverID, userID, req) {
+	if !h.authorizeOverrideUpsert(c, serverID, userID, req) {
+		return
+	}
+	// overrides.category_upsert is always fresh (D-2): the charge reads no
+	// grace. It runs once per request, outside the wrapper's retry loop.
+	confirm, ok := h.chargeRoleGate(c, serverID, userID, stepup.PurposeCategoryOverrideUpsert, req.MFACode)
+	if !ok {
 		return
 	}
 
@@ -2926,12 +3131,13 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 		credentialEpoch: tokenEpoch,
 	}
 	plan, channelIDs, err := h.upsertCategoryOverrideWithAuthority(
-		c.Request.Context(), authority, req, &state,
+		c.Request.Context(), authority, req, confirm, &state,
 	)
 	if err != nil {
 		h.respondCategoryOverrideWriteError(c, err, serverID, channelIDs)
 		return
 	}
+	h.settleRoleGate(c.Request.Context(), state.gateOutcome, confirm, userID)
 	h.CompleteChannelAuthorityMutationWithRotations(c.Request.Context(), serverID, channelIDs, plan, state.rotations, state.deniedByChannel)
 
 	// Audit log — xmax=0 means INSERT (new row), otherwise UPDATE (conflict)

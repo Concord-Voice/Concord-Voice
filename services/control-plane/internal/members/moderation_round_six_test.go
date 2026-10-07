@@ -71,10 +71,12 @@ func TestBanMember_PreemptiveFailedDiscard_IsAFault(t *testing.T) {
 			var between func() error
 			if terminate {
 				// The ban transaction's last statement before the server lock is the
-				// credential-epoch guard.
-				between = stmthook.TerminateIdleBackend(ts.DB, `SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`, &terminated)
+				// gate's enrollment read (#3454: LockGateTx follows the
+				// credential-epoch guard and reads the actor's factors before it
+				// locks the servers row).
+				between = stmthook.TerminateIdleBackend(ts.DB, `FROM user_mfa_webauthn WHERE user_id = $1`, &terminated)
 			}
-			hook.Arm([]string{txOwnerLock}, between, sql.ErrNoRows)
+			hook.Arm([]string{txGateLock}, between, sql.ErrNoRows)
 
 			w := ts.DoRequest(http.MethodPost, "/api/v1/servers/"+f.serverID+"/bans/"+outsider.ID, nil,
 				testhelpers.AuthHeaders(f.actor.AccessToken))

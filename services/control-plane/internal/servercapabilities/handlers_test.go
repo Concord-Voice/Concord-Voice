@@ -337,6 +337,53 @@ func TestGetCapabilities_AttachmentEnvelopeVersions_ReaderFloor(t *testing.T) {
 	}
 }
 
+// The MFA-enforced dangerous-actions capability (#3454, C5). A client offers to
+// turn enforcement ON only when this is true (X16), so a handler nobody wired
+// must say false, and say it explicitly.
+func TestGetCapabilities_MFAEnforcedDangerousActions_DefaultsFalse(t *testing.T) {
+	w, c := newTestContext()
+	servercapabilities.NewHandler(&config.Config{InstanceType: "saas"}).GetCapabilities(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	features, ok := body["features"].(map[string]any)
+	require.True(t, ok, "features object missing")
+	got, present := features["mfaEnforcedDangerousActions"]
+	require.True(t, present, "capability key absent; the client reads it by this exact name")
+	assert.Equal(t, false, got)
+}
+
+func TestGetCapabilities_MFAEnforcedDangerousActions_ReflectsWiring(t *testing.T) {
+	h := servercapabilities.NewHandler(&config.Config{InstanceType: "saas"})
+	h.SetMFAEnforcedDangerousActions(true)
+
+	w, c := newTestContext()
+	h.GetCapabilities(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	features, ok := body["features"].(map[string]any)
+	require.True(t, ok, "features object missing")
+	assert.Equal(t, true, features["mfaEnforcedDangerousActions"])
+}
+
+// Through the real router: a deployment that booted has passed the
+// dangerous-action boot guard, so it advertises the gates.
+// Kills: the router never calling the setter.
+func TestServerCapabilitiesEndpoint_MFAEnforcedDangerousActionsWired(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	w := ts.DoRequest("GET", "/api/v1/server/capabilities", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Features map[string]any `json:"features"`
+	}
+	testhelpers.ParseJSON(t, w, &resp)
+	assert.Equal(t, true, resp.Features["mfaEnforcedDangerousActions"])
+}
+
 // An enabled raw flag must not advertise hosted SSO on a self-hosted deployment.
 func TestGetCapabilities_OAuthDeploymentPolicy(t *testing.T) {
 	modes := []struct {

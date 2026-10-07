@@ -550,6 +550,14 @@ var errChannelAuthorityMutationNoop = errors.New("channel authority mutation noo
 // caller DML, fresh VIEW filtering, purge, and the one successor epoch per
 // channel. The callback performs only the role/member write after the exact
 // channel set is locked and before reconciliation.
+//
+// I-RETRY (#3454): errChannelAuthoritySetChanged is returned only before write
+// runs (runServerChannelKeyAuthorityWrite's set comparison). Nothing that runs
+// after write starts may return it, because the role gates live inside write:
+// a sentinel after the gate would re-run the gate on the retry and ask the
+// actor's factor twice. Since every factor is spent on this transaction a
+// rollback restores it (A-1), so a breach costs a second verification, not a
+// refusal; the forced-retry test pins the single verification.
 func (h *Handler) withServerChannelKeyAuthorityMutation(
 	ctx context.Context,
 	serverID, actorID, tokenEpoch string,
@@ -560,6 +568,9 @@ func (h *Handler) withServerChannelKeyAuthorityMutation(
 		preflight, err := h.serverChannelAuthorityTarget(ctx, serverID)
 		if err != nil {
 			return ChannelAuthorityMutation{}, err
+		}
+		if h.channelKeyAuthorityPreflight != nil {
+			h.channelKeyAuthorityPreflight()
 		}
 		result := ChannelAuthorityMutation{ChannelIDs: preflight.all}
 		principalIDs := []string{actorID}

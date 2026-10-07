@@ -75,6 +75,31 @@ func NewBudget(rdb *redis.Client, prefix string) Budget {
 // the clear cannot disagree about it.
 func (b Budget) Key(userID string) string { return b.prefix + userID }
 
+// DangerousActionBudget is the budget every dangerous-action gate charges
+// (#3454): the shared MFASettingsBudgetPrefix one, because a D1 gate verifies
+// the same factor the MFA-settings routes and the enforcement toggle do, and a
+// budget per route would hand a stolen session five more guesses per route.
+func DangerousActionBudget(rdb *redis.Client) Budget {
+	return NewBudget(rdb, MFASettingsBudgetPrefix)
+}
+
+// Charge is a dangerous-action gate's budget charge: one attempt when the
+// request carries an MFA code, and nothing when it does not, since a request
+// with no code guesses nothing. Only mfaCode counts: a D1 gate never accepts a
+// password or a step_up_token, so neither is a guess against it.
+//
+// Run it BEFORE BeginTx (see Budget), and whatever the server's setting: the
+// setting is read under the gate's lock, and deciding to charge from an
+// unlocked read of it would fail open (#3454 C6). Its refusals are Consume's:
+// the 429 flagged step_up_budget_exhausted, and the 503 flagged
+// step_up_budget_unavailable with Cause set.
+func Charge(ctx context.Context, b Budget, userID, mfaCode string) *Error {
+	if mfaCode == "" {
+		return nil
+	}
+	return b.Consume(ctx, userID)
+}
+
 // Consume charges one attempt. It returns nil when the attempt is admitted,
 // a 429 when the budget is exhausted, and a 503 — with Cause set, for the
 // caller to log — when the budget cannot be evaluated at all.

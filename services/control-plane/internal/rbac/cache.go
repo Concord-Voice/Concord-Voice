@@ -2,14 +2,14 @@ package rbac
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/permgen"
 )
 
 // PermissionCache provides Redis-backed caching for computed permissions
@@ -63,14 +63,6 @@ const (
 	// bare integer, so neither binary can serve the other's entries during a
 	// rolling deploy.
 	permValueVersion = "2"
-
-	// permGenerationTTL bounds how long an idle subject's generation lives.
-	permGenerationTTL = 24 * time.Hour
-
-	// permGenerationBytes is 64 bits, encoded as 16 hex characters. Only two
-	// consecutive generations of one subject need to differ, so wider values
-	// would spend memory on every perm:* value for nothing (spec L3).
-	permGenerationBytes = 8
 )
 
 // GenTags are the generations a value is tagged with. An empty field means the
@@ -97,53 +89,9 @@ func NewPermissionCache(redisClient *redis.Client) *PermissionCache {
 // If channelID is empty, caches server-level permissions only
 func (c *PermissionCache) cacheKey(serverID, userID, channelID string) string {
 	if channelID == "" {
-		return fmt.Sprintf("perm:%s:%s", cacheID(serverID), cacheID(userID))
+		return fmt.Sprintf("perm:%s:%s", permgen.CanonicalID(serverID), permgen.CanonicalID(userID))
 	}
-	return fmt.Sprintf("perm:%s:%s:%s", cacheID(serverID), cacheID(userID), cacheID(channelID))
-}
-
-func userGenerationKey(userID string) string { return "permgen:u:" + cacheID(userID) }
-
-func serverGenerationKey(serverID string) string { return "permgen:s:" + cacheID(serverID) }
-
-// cacheID is the form an id takes inside every key this cache builds. A uuid,
-// in any spelling PostgreSQL resolves to the same row (either case, braces,
-// hyphens anywhere or nowhere), becomes its canonical lowercase 8-4-4-4-12
-// form; anything else is used as given.
-//
-// Keys must follow the database's equality, not the request's spelling. Before
-// this, the key was the RAW path parameter, so a member who read through
-// /servers/<UPPERCASE-ID>/... got an entry tagged with a server generation that
-// a canonical bump never reaches, and after an enforcement flip kept reading
-// and using the dangerous bits through that spelling until the TTL (#3453
-// red-team; the canonical-only invalidation patterns had the same hole for
-// role and override changes). Folding a string PostgreSQL would reject merges
-// nothing a database read ever accepted, so it can never join two rows.
-func cacheID(s string) string {
-	var hex [32]byte
-	n := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
-		case c >= 'A' && c <= 'F':
-			c += 'a' - 'A'
-		case c == '-', c == '{', c == '}':
-			continue
-		default:
-			return s
-		}
-		if n == len(hex) {
-			return s
-		}
-		hex[n] = c
-		n++
-	}
-	if n != len(hex) {
-		return s
-	}
-	h := string(hex[:])
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+	return fmt.Sprintf("perm:%s:%s:%s", permgen.CanonicalID(serverID), permgen.CanonicalID(userID), permgen.CanonicalID(channelID))
 }
 
 // Get retrieves cached permissions with one MGET of the value and both
@@ -153,7 +101,7 @@ func cacheID(s string) string {
 // must hand to Set so the compute is tagged with what was current before it.
 func (c *PermissionCache) Get(ctx context.Context, serverID, userID, channelID string) (Permission, bool, GenTags) {
 	vals, err := c.redis.MGet(ctx,
-		c.cacheKey(serverID, userID, channelID), userGenerationKey(userID), serverGenerationKey(serverID),
+		c.cacheKey(serverID, userID, channelID), permgen.UserKey(userID), permgen.ServerKey(serverID),
 	).Result()
 	if err != nil || len(vals) != 3 {
 		return 0, false, GenTags{}
@@ -170,7 +118,7 @@ func (c *PermissionCache) Get(ctx context.Context, serverID, userID, channelID s
 // without calling Get first (ResolveEffectivePermissionsFresh). It must run
 // BEFORE that compute. A Redis error yields empty tags, so Set seeds and skips.
 func (c *PermissionCache) Generations(ctx context.Context, serverID, userID string) GenTags {
-	vals, err := c.redis.MGet(ctx, userGenerationKey(userID), serverGenerationKey(serverID)).Result()
+	vals, err := c.redis.MGet(ctx, permgen.UserKey(userID), permgen.ServerKey(serverID)).Result()
 	if err != nil || len(vals) != 2 {
 		return GenTags{}
 	}
@@ -190,8 +138,8 @@ func (c *PermissionCache) Set(ctx context.Context, serverID, userID, channelID s
 	}, "|")
 	_, err := c.redis.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.Set(ctx, c.cacheKey(serverID, userID, channelID), value, c.ttl)
-		pipe.Expire(ctx, userGenerationKey(userID), permGenerationTTL)
-		pipe.Expire(ctx, serverGenerationKey(serverID), permGenerationTTL)
+		pipe.Expire(ctx, permgen.UserKey(userID), permgen.TTL)
+		pipe.Expire(ctx, permgen.ServerKey(serverID), permgen.TTL)
 		return nil
 	})
 	return err
@@ -202,18 +150,18 @@ func (c *PermissionCache) Set(ctx context.Context, serverID, userID, channelID s
 func (c *PermissionCache) seedGenerations(ctx context.Context, serverID, userID string, tags GenTags) error {
 	var absent []string
 	if tags.User == "" {
-		absent = append(absent, userGenerationKey(userID))
+		absent = append(absent, permgen.UserKey(userID))
 	}
 	if tags.Server == "" {
-		absent = append(absent, serverGenerationKey(serverID))
+		absent = append(absent, permgen.ServerKey(serverID))
 	}
 	_, err := c.redis.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for _, key := range absent {
-			gen, err := newGeneration()
+			gen, err := permgen.New()
 			if err != nil {
 				return err
 			}
-			pipe.SetNX(ctx, key, gen, permGenerationTTL)
+			pipe.SetNX(ctx, key, gen, permgen.TTL)
 		}
 		return nil
 	})
@@ -223,29 +171,59 @@ func (c *PermissionCache) seedGenerations(ctx context.Context, serverID, userID 
 // BumpUser replaces the user's generation, so every entry tagged with the old
 // one misses. Call it after the commit that changed the user's inputs.
 func (c *PermissionCache) BumpUser(ctx context.Context, userID string) error {
-	return c.bump(ctx, userGenerationKey(userID))
+	return c.bump(ctx, permgen.UserKey(userID))
 }
 
 // BumpServer replaces the server's generation, so every entry tagged with the
 // old one misses. Call it after the commit that changed the server's inputs.
 func (c *PermissionCache) BumpServer(ctx context.Context, serverID string) error {
-	return c.bump(ctx, serverGenerationKey(serverID))
+	return c.bump(ctx, permgen.ServerKey(serverID))
 }
 
 func (c *PermissionCache) bump(ctx context.Context, key string) error {
-	gen, err := newGeneration()
+	gen, err := permgen.New()
 	if err != nil {
 		return err
 	}
-	return c.redis.Set(ctx, key, gen, permGenerationTTL).Err()
+	return c.redis.Set(ctx, key, gen, permgen.TTL).Err()
+}
+
+// DropUserGeneration is BumpUser's fallback. It deletes the user's generation
+// key, then every cached value for userID (InvalidateUser).
+//
+// Deleting the generation is what invalidates. A cache read with a missing
+// generation is a miss, and Set reseeds a fresh one with SET NX; a step-up
+// grace read with one is not covered (stepup.GraceRead.gensComplete). So
+// nothing tagged or stamped before the drop can match again, including a value
+// a compute already in flight publishes afterwards. Deleting only the values,
+// as the fallback once did, left in place the generation every grace is
+// stamped against: a grace taken before an MFA factor change outlived it
+// (Codex review of #3454). The values are deleted too so they stop holding
+// memory; if that half fails they are already unreadable, and the error is
+// still returned for the caller to log.
+func (c *PermissionCache) DropUserGeneration(ctx context.Context, userID string) error {
+	if err := c.redis.Unlink(ctx, permgen.UserKey(userID)).Err(); err != nil {
+		return err
+	}
+	return c.InvalidateUser(ctx, userID)
+}
+
+// DropServerGeneration is BumpServer's fallback, DropUserGeneration's
+// counterpart for the server generation and every value cached on serverID.
+func (c *PermissionCache) DropServerGeneration(ctx context.Context, serverID string) error {
+	if err := c.redis.Unlink(ctx, permgen.ServerKey(serverID)).Err(); err != nil {
+		return err
+	}
+	return c.InvalidateServer(ctx, serverID)
 }
 
 // InvalidateUser deletes every cached value for userID across all servers:
-// perm:*:{userID} and perm:*:{userID}:*. It is the fallback for a failed
-// BumpUser. A pattern can over-match only keys whose ids collide, which costs
-// a recompute and nothing else.
+// perm:*:{userID} and perm:*:{userID}:*. DropUserGeneration, the fallback for a
+// failed BumpUser, runs it after deleting the generation. A pattern can
+// over-match only keys whose ids collide, which costs a recompute and nothing
+// else.
 func (c *PermissionCache) InvalidateUser(ctx context.Context, userID string) error {
-	userID = cacheID(userID)
+	userID = permgen.CanonicalID(userID)
 	return c.scanAndUnlink(ctx, "perm:*:"+userID, "perm:*:"+userID+":*")
 }
 
@@ -266,14 +244,6 @@ func (c *PermissionCache) scanAndUnlink(ctx context.Context, patterns ...string)
 		return c.redis.Unlink(ctx, keys...).Err()
 	}
 	return nil
-}
-
-func newGeneration() (string, error) {
-	var b [permGenerationBytes]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generate permission generation: %w", err)
-	}
-	return hex.EncodeToString(b[:]), nil
 }
 
 // parseCachedValue accepts exactly "2|<int64>|<ugen>|<sgen>". A bare integer
@@ -302,7 +272,7 @@ func (c *PermissionCache) Invalidate(ctx context.Context, serverID, userID strin
 	serverKey := c.cacheKey(serverID, userID, "")
 
 	// SCAN for channel-level keys: perm:{serverID}:{userID}:{channelID}
-	pattern := fmt.Sprintf("perm:%s:%s:*", cacheID(serverID), cacheID(userID))
+	pattern := fmt.Sprintf("perm:%s:%s:*", permgen.CanonicalID(serverID), permgen.CanonicalID(userID))
 	keys := []string{serverKey}
 	iter := c.redis.Scan(ctx, 0, pattern, 100).Iterator()
 	for iter.Next(ctx) {
@@ -321,10 +291,10 @@ func (c *PermissionCache) Invalidate(ctx context.Context, serverID, userID strin
 
 // InvalidateServer removes all cached permissions for a server (called after role/permission changes)
 func (c *PermissionCache) InvalidateServer(ctx context.Context, serverID string) error {
-	return c.scanAndUnlink(ctx, fmt.Sprintf("perm:%s:*", cacheID(serverID)))
+	return c.scanAndUnlink(ctx, fmt.Sprintf("perm:%s:*", permgen.CanonicalID(serverID)))
 }
 
 // InvalidateChannel removes cached permissions for a channel (called after channel permission overrides change)
 func (c *PermissionCache) InvalidateChannel(ctx context.Context, serverID, channelID string) error {
-	return c.scanAndUnlink(ctx, fmt.Sprintf("perm:%s:*:%s", cacheID(serverID), cacheID(channelID)))
+	return c.scanAndUnlink(ctx, fmt.Sprintf("perm:%s:*:%s", permgen.CanonicalID(serverID), permgen.CanonicalID(channelID)))
 }

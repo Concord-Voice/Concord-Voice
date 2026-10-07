@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 )
 
@@ -28,7 +29,9 @@ const (
 // serverMessagePurger is the narrow capability the moderation handlers need from the
 // messages handler: purge one user's server-wide messages. Satisfied by *messages.Handler.
 type serverMessagePurger interface {
-	PurgeUserServerMessages(ctx context.Context, serverID, actorID, target, reason string) (int, messages.PurgeStatus, error)
+	PurgeUserServerMessages(
+		ctx context.Context, serverID, actorID, target, reason string, provenance messages.PurgeProvenance,
+	) (int, messages.PurgeStatus, error)
 }
 
 // SetServerMessagePurger wires the purge capability post-construction. The router builds the
@@ -63,13 +66,27 @@ type purgeOutcome struct {
 	PurgedCount int                  `json:"purged_count"`
 }
 
+// purgeProvenance is the provenance a moderation purge carries (#3454 A-3.7),
+// from the dangerous-action gate of the ban or removal that COMMITTED:
+// confirmed when it verified a factor or found a valid grace, unconfirmed when
+// the server did not enforce. The purge's per-batch recheck refuses an
+// unconfirmed batch on a server that enforces by then.
+func purgeProvenance(o mfaenforce.Outcome) messages.PurgeProvenance {
+	if o.Confirmed() {
+		return messages.PurgeConfirmed
+	}
+	return messages.PurgeUnconfirmed
+}
+
 // applyPurgeOnModeration runs the best-effort purge of target's server messages and returns the
 // response fragment. It NEVER returns an error and never affects the caller — the ban/kick has
 // already committed (the additive contract). A denied purge -> skipped_unauthorized; a rate-limit
 // deny / Redis outage -> skipped_rate_limited; any failure (including a nil/unwired purger) ->
 // failed. All non-completed paths are logged PII-safe (never message content or usernames,
-// per observability.md #1/#2).
-func (h *Handler) applyPurgeOnModeration(ctx context.Context, serverID, actorID, targetUserID, reason string) purgeOutcome {
+// per observability.md #1/#2). provenance is purgeProvenance of the committed ban or removal.
+func (h *Handler) applyPurgeOnModeration(
+	ctx context.Context, serverID, actorID, targetUserID, reason string, provenance messages.PurgeProvenance,
+) purgeOutcome {
 	if h.purger == nil {
 		h.log.Error("purge-on-moderation: no purger wired", "server_id", serverID, "reason", reason)
 		return purgeOutcome{Requested: true, Status: messages.PurgeFailed}
@@ -113,7 +130,7 @@ func (h *Handler) applyPurgeOnModeration(ctx context.Context, serverID, actorID,
 		}
 	}
 
-	count, status, err := h.purger.PurgeUserServerMessages(pctx, serverID, actorID, targetUserID, reason)
+	count, status, err := h.purger.PurgeUserServerMessages(pctx, serverID, actorID, targetUserID, reason, provenance)
 	// Treat the returned status as authoritative alongside err (#1353 review, CodeRabbit):
 	// a PurgeFailed status must resolve to failed even on a nil error, never logged as completed.
 	if err != nil || status == messages.PurgeFailed {

@@ -14,6 +14,13 @@ func SetSyncedCategoryPreflightForTest(h *Handler, observe func()) {
 	h.syncedCategoryPreflight = observe
 }
 
+// SetChannelKeyAuthorityPreflightForTest runs observe after each attempt's
+// preflight read in withServerChannelKeyAuthorityMutation, before the
+// visibility lock, so a test can change the channel set and force the retry.
+func SetChannelKeyAuthorityPreflightForTest(h *Handler, observe func()) {
+	h.channelKeyAuthorityPreflight = observe
+}
+
 // SetAfterComputeForTest installs a hook that runs immediately after a
 // cache-publishing compute returns (HasPermission, GetEffectivePermissions,
 // ResolveEffectivePermissionsFresh), before its cache.Set (#3453 I-3).

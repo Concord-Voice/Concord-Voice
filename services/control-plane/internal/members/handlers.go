@@ -14,12 +14,14 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -87,6 +89,9 @@ type Handler struct {
 	// snapshots serves the additive (hydrate) direction, outside the
 	// presencecapture contract. nil means no hydrate.
 	snapshots *presence.ActivitySnapshotService
+	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
+	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
+	mfaVerifier stepup.MFATxCodeVerifier
 }
 
 type memberAuthorityCoordinator interface {
@@ -606,6 +611,7 @@ func (h *Handler) classifyMutationOutcome(
 func (h *Handler) classifyModerationTxError(
 	c *gin.Context, err error, ownerMessage, hierarchyMessage, logMessage, userMessage string, logArgs ...any,
 ) (*presencehook.Failure, bool) {
+	var stepErr *stepup.Error
 	switch {
 	case errors.Is(err, errRemoveCurrentOwner), errors.Is(err, errBanCurrentOwner):
 		c.JSON(http.StatusForbidden, gin.H{"error": ownerMessage})
@@ -615,6 +621,11 @@ func (h *Handler) classifyModerationTxError(
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 	case errors.Is(err, errModerationHierarchyDenied):
 		c.JSON(http.StatusForbidden, gin.H{"error": hierarchyMessage})
+	case errors.As(err, &stepErr):
+		// The dangerous-action gate's refusals and RS5's (#3454), after the
+		// route's own sentinels. Each transaction already mapped the gate's
+		// ErrServerNotFound to its own vanished-server sentinel above.
+		mfaenforce.WriteError(c, h.log, stepErr, nil)
 	default:
 		return h.classifyMutationOutcome(c, err, logMessage, userMessage, logArgs...)
 	}
@@ -787,6 +798,11 @@ func (h *Handler) authorizeModerationTx(
 		return fmt.Errorf("resolve current moderator permissions: %w", err)
 	}
 	if !perms.Has(permission) {
+		// RS5 (#3454): a denial the MFA mask caused names enrollment instead.
+		// It reads on this transaction, after the denial (I7).
+		if e := rbac.EnrollmentDenial(ctx, tx, serverID, "", actorID, permission); e != nil {
+			return e
+		}
 		return errModerationPermissionDenied
 	}
 	if err := h.resolver.CheckHierarchyTx(ctx, tx, serverID, actorID, targetUserID); err != nil {
@@ -1249,34 +1265,53 @@ func removalCurrentOwnerMessage(isSelfRemoval bool) string {
 	return "Cannot remove the server owner"
 }
 
-func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserID, ownerID string) (*removalAuth, int, string) {
-	isSelfRemoval := userID == targetUserID
-
-	if isSelfRemoval {
-		if userID == ownerID {
-			return nil, http.StatusForbidden, "Server owner cannot leave. Delete the server or transfer ownership first."
-		}
-		return &removalAuth{isSelfRemoval: true}, 0, ""
+// authorizeRemoval writes RemoveMember's refusal and returns nil unless the
+// actor may remove the target: a member other than the owner leaving, or a
+// moderator holding PermKick who outranks a target that is not the owner.
+func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserID string) *removalAuth {
+	ctx := c.Request.Context()
+	ownerID, err := h.getServerOwnerID(ctx, serverID)
+	if errors.Is(err, errServerGone) {
+		// Deleted since the target check: the target is no longer a member.
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return nil
+	}
+	if err != nil {
+		h.log.Error(errMsgFailedGetServerOwner, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
+		return nil
 	}
 
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermKick)
+	if userID == targetUserID {
+		if userID == ownerID {
+			c.JSON(http.StatusForbidden, gin.H{"error": removalCurrentOwnerMessage(true)})
+			return nil
+		}
+		return &removalAuth{isSelfRemoval: true}
+	}
+
+	hasPerm, permErr := h.resolver.HasPermission(ctx, serverID, userID, "", rbac.PermKick)
 	if permErr != nil {
 		h.log.Error(errMsgFailedCheckPerms, "error", permErr)
-		return nil, http.StatusInternalServerError, errMsgFailedRemoveMember
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
+		return nil
 	}
 	if !hasPerm {
-		status, msg := h.refusalUnlessServerGone(c.Request.Context(), serverID, removalVanished, http.StatusForbidden, errMsgInsufficientPerms, nil)
-		return nil, status, msg
+		status, msg := h.refusalUnlessServerGone(ctx, serverID, removalVanished, http.StatusForbidden, errMsgInsufficientPerms, nil)
+		h.writeModerationDenial(c, serverID, userID, rbac.PermKick, status, msg)
+		return nil
 	}
 	if targetUserID == ownerID {
-		return nil, http.StatusForbidden, "Cannot remove the server owner"
+		c.JSON(http.StatusForbidden, gin.H{"error": removalCurrentOwnerMessage(false)})
+		return nil
 	}
-	if err := h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID); err != nil {
-		status, msg := h.hierarchyRefusal(c.Request.Context(), serverID, removalVanished, "Cannot remove a member with equal or higher role position", err)
-		return nil, status, msg
+	if err := h.resolver.CheckHierarchy(ctx, serverID, userID, targetUserID); err != nil {
+		status, msg := h.hierarchyRefusal(ctx, serverID, removalVanished, "Cannot remove a member with equal or higher role position", err)
+		c.JSON(status, gin.H{"error": msg})
+		return nil
 	}
 
-	return &removalAuth{isSelfRemoval: false}, 0, ""
+	return &removalAuth{isSelfRemoval: false}
 }
 
 // execRemovalTx removes the member inside a HOOKED transaction. It no longer
@@ -1297,10 +1332,29 @@ type memberAuthorityFence struct {
 	channelIDs      []string
 	rotations       []keyrotation.Rotation
 	deniedByChannel map[string][]string
+	// gateOutcome is the dangerous-action gate's verdict (#3454). It means
+	// something only once the transaction has COMMITTED: settle the gate and
+	// derive a purge's provenance from it then, never on an error.
+	gateOutcome mfaenforce.Outcome
 }
 
-func (h *Handler) execRemovalFenceTx(ctx context.Context, serverID, targetUserID, actorID, credentialEpoch string) (memberAuthorityFence, error) {
+// removalFenceRequest is execRemovalFenceTx's input, mirroring banFenceRequest.
+type removalFenceRequest struct {
+	serverID        string
+	targetUserID    string
+	actorID         string
+	credentialEpoch string
+	// purge marks a kick that purges the target's messages: purge_messages on
+	// someone else. It is the only removal the dangerous-action gate covers
+	// (#3454); every other removal stays byte-identical, with no new lock
+	// (I-UNGATED).
+	purge   bool
+	confirm moderationConfirm
+}
+
+func (h *Handler) execRemovalFenceTx(ctx context.Context, req removalFenceRequest) (memberAuthorityFence, error) {
 	var fence memberAuthorityFence
+	serverID, targetUserID, actorID := req.serverID, req.targetUserID, req.actorID
 	spec := presencehook.Spec{
 		Family:      presencecapture.FamilyMemberRemove,
 		Posture:     presencecapture.FailClosedBlockWrite,
@@ -1308,7 +1362,7 @@ func (h *Handler) execRemovalFenceTx(ctx context.Context, serverID, targetUserID
 	}
 
 	err := presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
-		if err := h.prepareRemovalFenceTx(ctx, tx, serverID, targetUserID, actorID, credentialEpoch, &fence); err != nil {
+		if err := h.prepareRemovalFenceTx(ctx, tx, req, &fence); err != nil {
 			return err
 		}
 		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
@@ -1345,41 +1399,71 @@ func (h *Handler) execRemovalFenceTx(ctx context.Context, serverID, targetUserID
 // Reversing that order lets concurrent authority mutations form a cycle while
 // one waits for visibility and the other waits for a moderation user row.
 func (h *Handler) prepareRemovalFenceTx(
-	ctx context.Context, tx *sql.Tx, serverID, targetUserID, actorID, credentialEpoch string, fence *memberAuthorityFence,
+	ctx context.Context, tx *sql.Tx, req removalFenceRequest, fence *memberAuthorityFence,
 ) error {
-	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, req.serverID); err != nil {
 		return fmt.Errorf("lock member removal server: %w", err)
 	}
-	if err := lockModerationUsersTx(ctx, tx, actorID, targetUserID); err != nil {
+	if err := lockModerationUsersTx(ctx, tx, req.actorID, req.targetUserID); err != nil {
 		return err
 	}
 	// Take the sorted stronger pair before GuardTx's actor FOR SHARE read so
 	// concurrent cross-target removals cannot form a lock-upgrade cycle.
-	if err := credepoch.GuardTx(ctx, tx, actorID, credentialEpoch); err != nil {
+	if err := credepoch.GuardTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
 		return err
 	}
 
 	// Revalidate mutable server facts after all authoritative locks are held.
-	// None of them holds the servers row, so a server deleted since the
-	// preflight arrives here with no row: the target is no longer a member,
-	// which is this transaction's own answer for a vanished membership. Only
-	// sql.ErrNoRows is reclassified; any other error stays a fault.
-	var ownerID string
-	err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return errModerationTargetGone
-	}
+	gate, err := lockRemovalServerTx(ctx, tx, req)
 	if err != nil {
-		return fmt.Errorf("query current server owner for member removal: %w", err)
+		return err
 	}
-	if ownerID == targetUserID {
+	if gate.OwnerID == req.targetUserID {
 		return errRemoveCurrentOwner
 	}
-	if actorID != targetUserID && actorID != ownerID {
-		if err := h.authorizeModerationTx(ctx, tx, serverID, actorID, targetUserID, rbac.PermKick); err != nil {
+	if req.actorID != req.targetUserID && req.actorID != gate.OwnerID {
+		if err := h.authorizeModerationTx(ctx, tx, req.serverID, req.actorID, req.targetUserID, rbac.PermKick); err != nil {
 			return err
 		}
 	}
+	if req.purge {
+		if fence.gateOutcome, err = h.requireModerationGate(ctx, tx, gate, req.actorID, stepup.PurposeMemberKickPurge, req.confirm); err != nil {
+			return err
+		}
+	}
+	return h.lockRemovalAuthorityTx(ctx, tx, req.serverID, req.targetUserID, fence)
+}
+
+// lockRemovalServerTx locks the servers row and reads its owner, after every
+// users lock. A purging kick takes it through the dangerous-action gate
+// (#3454 A-8, see lockModerationGateTx), which also reads the flag and the
+// actor's subject. Every other removal keeps the plain owner lock,
+// byte-identical (I-UNGATED), and gets a Gate carrying the owner alone.
+//
+// None of the earlier locks holds the servers row, so a server deleted since
+// the preflight arrives here with no row: the target is no longer a member,
+// which is this transaction's own answer for a vanished membership (#3508).
+// Only a missing row is reclassified; any other error stays a fault.
+func lockRemovalServerTx(ctx context.Context, tx *sql.Tx, req removalFenceRequest) (mfaenforce.Gate, error) {
+	if req.purge {
+		return lockModerationGateTx(ctx, tx, req.serverID, req.actorID, req.credentialEpoch, errModerationTargetGone)
+	}
+	var g mfaenforce.Gate
+	err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, req.serverID).Scan(&g.OwnerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return g, errModerationTargetGone
+	}
+	if err != nil {
+		return g, fmt.Errorf("query current server owner for member removal: %w", err)
+	}
+	return g, nil
+}
+
+// lockRemovalAuthorityTx locks the server's authority channels and then
+// revalidates, under that lock, that the target is still a member.
+func (h *Handler) lockRemovalAuthorityTx(
+	ctx context.Context, tx *sql.Tx, serverID, targetUserID string, fence *memberAuthorityFence,
+) error {
 	if h.authority == nil {
 		return errors.New("member authority coordinator unavailable")
 	}
@@ -1403,7 +1487,7 @@ func (h *Handler) prepareRemovalFenceTx(
 // execRemovalTx preserves the package-private test seam while the HTTP path
 // consumes the confirmed fence result for post-commit delivery.
 func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID, actorID string) error {
-	_, err := h.execRemovalFenceTx(ctx, serverID, targetUserID, actorID, "")
+	_, err := h.execRemovalFenceTx(ctx, removalFenceRequest{serverID: serverID, targetUserID: targetUserID, actorID: actorID})
 	return err
 }
 
@@ -1419,6 +1503,11 @@ func (h *Handler) invalidateMemberPermissions(serverID, userID, action string) {
 // An empty body binds to the zero value, so existing bodyless callers are unaffected.
 type RemoveMemberRequest struct {
 	PurgeMessages bool `json:"purge_messages"`
+	// MFACode confirms a kick that purges on a server enforcing MFA on
+	// dangerous actions (#3454 A-6). A plain field, never stepup.Fields: this
+	// is not an own-rule route, so it neither refuses current_password nor
+	// reads a step_up_token.
+	MFACode string `json:"mfa_code" binding:"max=256"`
 }
 
 // bindOptionalBody binds an OPTIONAL JSON request body. An empty body is fine (fields stay at
@@ -1443,7 +1532,7 @@ func credentialFenceRejected(c *gin.Context, err error) bool {
 }
 
 func (h *Handler) classifyRemovalFenceError(
-	c *gin.Context, err error, fence memberAuthorityFence, serverID string, selfRemoval bool,
+	c *gin.Context, err error, fence memberAuthorityFence, serverID string, selfRemoval, gated bool,
 ) (*presencehook.Failure, bool) {
 	if credentialFenceRejected(c, err) {
 		return nil, true
@@ -1455,10 +1544,32 @@ func (h *Handler) classifyRemovalFenceError(
 	if !errors.Is(err, presencecapture.ErrPostCommitDelivery) && !isAmbiguousMemberCommit(err) && len(fence.channelIDs) > 0 {
 		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, fence.channelIDs)
 	}
+	if gated && h.writeGatedLockConflict(c, err) {
+		return nil, true
+	}
 	return h.classifyModerationTxError(
 		c, err, removalCurrentOwnerMessage(selfRemoval),
 		"Cannot remove a member with equal or higher role position", "Failed to remove member", errMsgFailedRemoveMember,
 	)
+}
+
+// writeGatedLockConflict answers a deadlock or lock timeout in a GATED
+// moderation transaction, a ban or a kick that purges, with the gate's
+// retryable 503 lock_conflict and Retry-After: 1 (#3454 A-12.3). Before this
+// it fell through to the presence classifier's generic 500, so a client could
+// not retry it the way it retries the same conflict on every other gated route
+// (Codex review of #3454). Only the caller knows whether its transaction was
+// gated: a plain kick keeps its 500 byte-identical (I-UNGATED). A lock
+// conflict matches none of the route's own sentinels, so answering it before
+// them changes no other answer. A durable or ambiguous commit is never
+// answered here: something may have changed.
+func (h *Handler) writeGatedLockConflict(c *gin.Context, err error) bool {
+	if !mfaenforce.IsLockConflict(err) ||
+		errors.Is(err, presencecapture.ErrPostCommitDelivery) || isAmbiguousMemberCommit(err) {
+		return false
+	}
+	mfaenforce.WriteError(c, h.log, err, nil)
+	return true
 }
 
 func isAmbiguousMemberCommit(err error) bool {
@@ -1534,6 +1645,39 @@ func (h *Handler) requireRemovalParties(c *gin.Context, serverID, userID, target
 	return true
 }
 
+// removalFenceRequest builds RemoveMember's transaction input. A kick that
+// purges is the one removal the dangerous-action gate covers (#3454), so only
+// it runs the gate's pre-transaction half; that writes the charge's refusal
+// and returns false.
+func (h *Handler) removalFenceRequest(
+	c *gin.Context, serverID, targetUserID, actorID string, body RemoveMemberRequest, selfRemoval bool,
+) (removalFenceRequest, bool) {
+	req := removalFenceRequest{
+		serverID:        serverID,
+		targetUserID:    targetUserID,
+		actorID:         actorID,
+		credentialEpoch: middleware.TokenCredentialEpoch(c),
+		purge:           body.PurgeMessages && !selfRemoval,
+	}
+	if !req.purge {
+		return req, true
+	}
+	var ok bool
+	req.confirm, ok = h.chargeModerationGate(c, serverID, actorID, body.MFACode, rbac.PermKick)
+	return req, ok
+}
+
+// auditMemberRemoval records a committed removal. Best-effort: the member is
+// already removed, so a failed write is logged and changes no response.
+func (h *Handler) auditMemberRemoval(ctx context.Context, serverID, actorID, targetUserID, auditAction string) {
+	if h.audit == nil {
+		return
+	}
+	if err := h.audit.Log(ctx, serverID, &actorID, auditAction, "member", &targetUserID, nil); err != nil {
+		h.log.Warn("Member removal audit write failed", "error", err)
+	}
+}
+
 // RemoveMember removes a member from a server (kick or leave)
 func (h *Handler) RemoveMember(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -1557,21 +1701,12 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	ownerID, err := h.getServerOwnerID(c.Request.Context(), serverID)
-	if errors.Is(err, errServerGone) {
-		// Deleted since the target check above: the target is no longer a member.
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
-		return
-	}
-	if err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
-		return
-	}
-
-	auth, status, errMsg := h.authorizeRemoval(c, serverID, userID, targetUserID, ownerID)
+	auth := h.authorizeRemoval(c, serverID, userID, targetUserID)
 	if auth == nil {
-		c.JSON(status, gin.H{"error": errMsg})
+		return
+	}
+	fenceReq, ok := h.removalFenceRequest(c, serverID, targetUserID, userID, req, auth.isSelfRemoval)
+	if !ok {
 		return
 	}
 
@@ -1579,7 +1714,7 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// delivery failed. The de-authorization sequence still runs; the 503 is
 	// written after it.
 	var deliveryFailure *presencehook.Failure
-	fence, removalErr := h.execRemovalFenceTx(c.Request.Context(), serverID, targetUserID, userID, middleware.TokenCredentialEpoch(c))
+	fence, removalErr := h.execRemovalFenceTx(c.Request.Context(), fenceReq)
 	if removalErr != nil {
 		// presencehook wraps commit acknowledgement failures, so they do not
 		// retain rbac's ambiguity sentinel. Any non-delivery error after this
@@ -1600,22 +1735,20 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 			h.reconcileAmbiguousMemberDeauthorization(serverID, targetUserID, fence, "removed")
 		}
 		var handled bool
-		deliveryFailure, handled = h.classifyRemovalFenceError(c, removalErr, fence, serverID, auth.isSelfRemoval)
+		deliveryFailure, handled = h.classifyRemovalFenceError(c, removalErr, fence, serverID, auth.isSelfRemoval, fenceReq.purge)
 		if handled {
 			return
 		}
 	}
+	// Committed, so the gate settles now (a no-op unless it verified).
+	h.settleModerationGate(c.Request.Context(), fence.gateOutcome, fenceReq.confirm, userID)
 	action := "removed"
 	auditAction := "member_removed"
 	if auth.isSelfRemoval {
 		action = "left"
 		auditAction = "member_left"
 	}
-	if h.audit != nil {
-		if err := h.audit.Log(c.Request.Context(), serverID, &userID, auditAction, "member", &targetUserID, nil); err != nil {
-			h.log.Warn("Member removal audit write failed", "error", err)
-		}
-	}
+	h.auditMemberRemoval(c.Request.Context(), serverID, userID, targetUserID, auditAction)
 
 	memberRemoved := websocket.OutgoingMessage{
 		Type: "member_removed",
@@ -1647,8 +1780,8 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	resp := gin.H{"message": "Member " + action + " successfully"}
 	// #1353: additive purge applies ONLY to a moderator removal, never a self-leave
 	// (no moderation intent — a user leaving must not bulk-wipe their own history).
-	if req.PurgeMessages && !auth.isSelfRemoval {
-		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "kick")
+	if fenceReq.purge {
+		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "kick", purgeProvenance(fence.gateOutcome))
 	}
 
 	// The member is removed and fully de-authorized by this point; only presence
@@ -1677,6 +1810,10 @@ func (h *Handler) classifyBanFenceError(
 	if !errors.Is(err, presencecapture.ErrPostCommitDelivery) && !isAmbiguousMemberCommit(err) && len(fence.channelIDs) > 0 {
 		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, fence.channelIDs)
 	}
+	// A ban is always a gated transaction.
+	if h.writeGatedLockConflict(c, err) {
+		return nil, true
+	}
 	return h.classifyModerationTxError(
 		c, err, "Cannot ban the server owner",
 		"Cannot ban a member with equal or higher role position", "Failed to ban member", errMsgFailedBanMember,
@@ -1688,6 +1825,9 @@ func (h *Handler) classifyBanFenceError(
 type BanRequest struct {
 	Reason        string `json:"reason"`
 	PurgeMessages bool   `json:"purge_messages"` // #1353 additive purge-on-ban (optional; default false)
+	// MFACode confirms the ban on a server enforcing MFA on dangerous actions
+	// (#3454 A-6). A plain field, never stepup.Fields, as on RemoveMemberRequest.
+	MFACode string `json:"mfa_code" binding:"max=256"`
 }
 
 // BannedMember represents a banned user
@@ -1710,6 +1850,9 @@ type banFenceRequest struct {
 	credentialEpoch string
 	reason          *string
 	probedMember    bool
+	// confirm is the dangerous-action gate's input. A ban always runs the gate
+	// (#3454): it is what locks the servers row.
+	confirm moderationConfirm
 }
 
 // execBanTx bans the member inside a HOOKED transaction, on the same contract as
@@ -1736,17 +1879,7 @@ type banFenceRequest struct {
 // FOR UPDATE row locks with no stripe held: the lock-order invariant violated
 // in the one direction it forbids, and invisible to every behavioural test
 // because the response and the durable state come out byte-identical.
-func (h *Handler) execBanFenceTx(
-	ctx context.Context, serverID, targetUserID, actorID, credentialEpoch string, reason *string, probedMember bool,
-) (memberAuthorityFence, error) {
-	req := banFenceRequest{
-		serverID:        serverID,
-		targetUserID:    targetUserID,
-		actorID:         actorID,
-		credentialEpoch: credentialEpoch,
-		reason:          reason,
-		probedMember:    probedMember,
-	}
+func (h *Handler) execBanFenceTx(ctx context.Context, req banFenceRequest) (memberAuthorityFence, error) {
 	var fence memberAuthorityFence
 	// Capture and gate decisions are separate: an unwired replica still skips
 	// capture for a known non-member, while only a wired skipped gate can prove a
@@ -1792,7 +1925,7 @@ func (h *Handler) banPresenceGate(probedMember bool) (presencecapture.GraphPrese
 func (h *Handler) prepareBanFenceTx(
 	ctx context.Context, tx *sql.Tx, req banFenceRequest, skipGateForProbe bool, fence *memberAuthorityFence,
 ) (bool, error) {
-	ownerID, err := lockBanActorAndServerTx(ctx, tx, req)
+	gate, err := lockBanActorAndServerTx(ctx, tx, req)
 	if err != nil {
 		return false, err
 	}
@@ -1803,30 +1936,33 @@ func (h *Handler) prepareBanFenceTx(
 	if err := validateBanProbe(isMember, skipGateForProbe); err != nil {
 		return false, err
 	}
-	if req.actorID != ownerID {
+	if req.actorID != gate.OwnerID {
 		if err := h.authorizeModerationTx(ctx, tx, req.serverID, req.actorID, req.targetUserID, rbac.PermBan); err != nil {
 			return false, err
 		}
 	}
+	if fence.gateOutcome, err = h.requireModerationGate(ctx, tx, gate, req.actorID, stepup.PurposeMemberBan, req.confirm); err != nil {
+		return false, err
+	}
 	return h.lockBanAuthorityTx(ctx, tx, req, isMember, fence)
 }
 
-func lockBanActorAndServerTx(ctx context.Context, tx *sql.Tx, req banFenceRequest) (string, error) {
+func lockBanActorAndServerTx(ctx context.Context, tx *sql.Tx, req banFenceRequest) (mfaenforce.Gate, error) {
 	// The visibility serializer is the first shared lock for every moderation
 	// write. Once it is held, match DeleteServer's users-before-server order so
 	// a live-voice server delete cannot form a users <-> servers lock cycle.
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, req.serverID); err != nil {
-		return "", fmt.Errorf("lock member ban server: %w", err)
+		return mfaenforce.Gate{}, fmt.Errorf("lock member ban server: %w", err)
 	}
 	if err := lockModerationUsersTx(ctx, tx, req.actorID, req.targetUserID); err != nil {
-		return "", banUsersLockError(ctx, tx, req.serverID, err)
+		return mfaenforce.Gate{}, banUsersLockError(ctx, tx, req.serverID, err)
 	}
 	// The stronger, sorted user-pair lock prevents GuardTx's actor FOR SHARE
 	// read from creating a lock-upgrade cycle before the target is locked.
 	if err := credepoch.GuardTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
-		return "", err
+		return mfaenforce.Gate{}, err
 	}
-	return lockBanServerOwnerTx(ctx, tx, req.serverID, req.targetUserID)
+	return lockBanServerOwnerTx(ctx, tx, req)
 }
 
 func validateBanProbe(isMember, skipGateForProbe bool) error {
@@ -1890,24 +2026,23 @@ func banUsersLockError(ctx context.Context, tx *sql.Tx, serverID string, err err
 	return err
 }
 
-func lockBanServerOwnerTx(ctx context.Context, tx *sql.Tx, serverID, targetUserID string) (string, error) {
-	// Nothing locked before this holds the servers row, so a server deleted
-	// since the preflight arrives here with no row. The moderator is no longer
-	// a member of it: errModerationPermissionDenied, the ban preflight's own
-	// answer (a pre-emptive ban's target need not be a member, so the target's
-	// membership says nothing). Only sql.ErrNoRows is reclassified.
-	var ownerID string
-	err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", errModerationPermissionDenied
-	}
+// lockBanServerOwnerTx locks the servers row through the dangerous-action gate
+// (#3454 A-8, see lockModerationGateTx) and refuses a ban of the current owner.
+//
+// Nothing locked before this holds the servers row, so a server deleted since
+// the preflight arrives here with no row. The moderator is no longer a member
+// of it: errModerationPermissionDenied, the ban preflight's own answer (a
+// pre-emptive ban's target need not be a member, so the target's membership
+// says nothing). Only a missing row is reclassified.
+func lockBanServerOwnerTx(ctx context.Context, tx *sql.Tx, req banFenceRequest) (mfaenforce.Gate, error) {
+	g, err := lockModerationGateTx(ctx, tx, req.serverID, req.actorID, req.credentialEpoch, errModerationPermissionDenied)
 	if err != nil {
-		return "", fmt.Errorf("query current server owner for member ban: %w", err)
+		return g, err
 	}
-	if ownerID == targetUserID {
-		return "", errBanCurrentOwner
+	if g.OwnerID == req.targetUserID {
+		return g, errBanCurrentOwner
 	}
-	return ownerID, nil
+	return g, nil
 }
 
 func banTargetMembershipTx(ctx context.Context, tx *sql.Tx, serverID, targetUserID, operation string) (bool, error) {
@@ -1974,7 +2109,9 @@ func (h *Handler) writeBanTx(
 func (h *Handler) execBanTx(
 	ctx context.Context, serverID, targetUserID, actorID string, reason *string, probedMember bool,
 ) error {
-	_, err := h.execBanFenceTx(ctx, serverID, targetUserID, actorID, "", reason, probedMember)
+	_, err := h.execBanFenceTx(ctx, banFenceRequest{
+		serverID: serverID, targetUserID: targetUserID, actorID: actorID, reason: reason, probedMember: probedMember,
+	})
 	return err
 }
 
@@ -1988,7 +2125,7 @@ func (h *Handler) authorizeBan(c *gin.Context, serverID, userID, targetUserID st
 		return false
 	}
 	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		h.writeModerationDenial(c, serverID, userID, rbac.PermBan, http.StatusForbidden, errMsgInsufficientPerms)
 		return false
 	}
 
@@ -2021,6 +2158,34 @@ func (h *Handler) authorizeBan(c *gin.Context, serverID, userID, targetUserID st
 	return true
 }
 
+// banFenceRequest builds BanMember's transaction input, after its preflight.
+// It runs the ban gate's pre-transaction half (#3454), which writes the
+// charge's refusal and returns false.
+func (h *Handler) banFenceRequest(
+	c *gin.Context, serverID, targetUserID, actorID string, body BanRequest,
+) (banFenceRequest, bool) {
+	confirm, ok := h.chargeModerationGate(c, serverID, actorID, body.MFACode, rbac.PermBan)
+	if !ok {
+		return banFenceRequest{}, false
+	}
+	req := banFenceRequest{
+		serverID:        serverID,
+		targetUserID:    targetUserID,
+		actorID:         actorID,
+		credentialEpoch: middleware.TokenCredentialEpoch(c),
+		confirm:         confirm,
+	}
+	if body.Reason != "" {
+		req.reason = &body.Reason
+	}
+	// Probe-then-gate (#2854 stage C). A probe ERROR yields true, which is the
+	// fail-OPEN direction here: it takes the gate and captures, i.e. today's
+	// behaviour.
+	probedMember, probeErr := h.checkMembership(c.Request.Context(), serverID, targetUserID)
+	req.probedMember = probedMember || probeErr != nil
+	return req, true
+}
+
 // BanMember bans a member from a server (removes + prevents rejoin)
 func (h *Handler) BanMember(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -2039,24 +2204,15 @@ func (h *Handler) BanMember(c *gin.Context) {
 	if !bindOptionalBody(c, &req) { // #1353 optional body; empty OK, malformed rejected
 		return
 	}
-
-	var reason *string
-	if req.Reason != "" {
-		reason = &req.Reason
+	fenceReq, ok := h.banFenceRequest(c, serverID, targetUserID, userID, req)
+	if !ok {
+		return
 	}
 
 	// banDeliveryFailure is non-nil only for a DURABLE ban whose presence delivery
 	// failed. As in RemoveMember, the de-authorization sequence still runs.
 	var banDeliveryFailure *presencehook.Failure
-	// Probe-then-gate (#2854 stage C). A probe ERROR yields true, which is the
-	// fail-OPEN direction here: it takes the gate and captures, i.e. today's
-	// behaviour.
-	probedMember, probeErr := h.checkMembership(c.Request.Context(), serverID, targetUserID)
-	if probeErr != nil {
-		probedMember = true
-	}
-
-	fence, banErr := h.execBanFenceTx(c.Request.Context(), serverID, targetUserID, userID, middleware.TokenCredentialEpoch(c), reason, probedMember)
+	fence, banErr := h.execBanFenceTx(c.Request.Context(), fenceReq)
 	if banErr != nil {
 		// Same split as RemoveMember: a post-commit delivery failure means the
 		// member IS banned, so it must not be reported as a 500 that implies
@@ -2073,6 +2229,8 @@ func (h *Handler) BanMember(c *gin.Context) {
 			return
 		}
 	}
+	// Committed, so the gate settles now (a no-op unless it verified).
+	h.settleModerationGate(c.Request.Context(), fence.gateOutcome, fenceReq.confirm, userID)
 	if h.audit != nil {
 		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "member_banned", "member", &targetUserID, //nolint:errcheck
 			map[string]interface{}{"reason": req.Reason})
@@ -2114,7 +2272,7 @@ func (h *Handler) BanMember(c *gin.Context) {
 	// #1353: additive purge — runs AFTER the ban has committed; a denied/failed purge
 	// never affects the ban (best-effort, surfaced via the purge object only).
 	if req.PurgeMessages {
-		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "ban")
+		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "ban", purgeProvenance(fence.gateOutcome))
 	}
 
 	// Banned and fully de-authorized by this point; only presence delivery

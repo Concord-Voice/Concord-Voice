@@ -18,9 +18,11 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/e2eekeys"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -129,6 +131,9 @@ type Handler struct {
 	redis       *redis.Client
 	serverTiers entitlements.ServerTierResolver
 	authority   *rbac.Handler
+	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
+	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
+	mfaVerifier stepup.MFATxCodeVerifier
 }
 
 // SetAuthorityHandler wires the RBAC authority coordinator used only for
@@ -412,12 +417,19 @@ func bindStrictJSONBody(c *gin.Context, target any, maxBytes int64) bool {
 }
 
 func (h *Handler) respondCreateChannelGuardError(c *gin.Context, guardErr error) {
+	h.respondChannelGuardError(c, guardErr, errMsgFailedCreateChannel)
+}
+
+// respondChannelGuardError answers a credepoch.GuardTx failure: a stale or
+// blocked credential epoch is a 401, and anything else is the calling route's
+// own 500, failMsg.
+func (h *Handler) respondChannelGuardError(c *gin.Context, guardErr error, failMsg string) {
 	if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
 		return
 	}
 	h.log.Error("credential-epoch guard read failed", "error", guardErr)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+	c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
 }
 
 type createChannelResult struct {
@@ -1709,6 +1721,14 @@ func (h *Handler) DeleteChannel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelID})
 		return
 	}
+	// DeleteChannel bound no body before #3454, so the gate's confirmation
+	// arrives through the optional step-up reader (A-6): an empty body is no
+	// code. Only mfa_code is read; a D1 gate never accepts a step_up_token.
+	stepUp, e := stepup.ReadOptionalStepUp(c)
+	if e != nil {
+		e.Write(c)
+		return
+	}
 
 	// Get channel's server ID
 	var serverID string
@@ -1723,14 +1743,16 @@ func (h *Handler) DeleteChannel(c *gin.Context) {
 	}
 
 	// Check permission to manage channels
-	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermManageChannels)
+	ctx := c.Request.Context()
+	hasPerm, err := h.resolver.HasPermission(ctx, serverID, userID, "", rbac.PermManageChannels)
 	if err != nil {
 		h.log.Error(logMsgFailedCheckPermissions, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteChannel})
 		return
 	}
 	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		// RS5 on the pool, where the denial came from: no transaction is open.
+		h.respondDeleteChannelError(c, serverID, channelID, manageChannelsDenial(ctx, h.db, serverID, "", userID))
 		return
 	}
 
@@ -1739,7 +1761,7 @@ func (h *Handler) DeleteChannel(c *gin.Context) {
 		return
 	}
 	var preflightVoice bool
-	if err := h.db.QueryRowContext(c.Request.Context(), `SELECT type = 'voice' FROM channels WHERE id = $1`, channelID).Scan(&preflightVoice); err != nil {
+	if err := h.db.QueryRowContext(ctx, `SELECT type = 'voice' FROM channels WHERE id = $1`, channelID).Scan(&preflightVoice); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		} else {
@@ -1751,38 +1773,58 @@ func (h *Handler) DeleteChannel(c *gin.Context) {
 	if preflightVoice {
 		voiceIDs = []string{channelID}
 	}
-	plan, err := h.authority.RunChannelAuthorityMutation(c.Request.Context(), serverID, voiceIDs,
+	confirm, ok := h.chargeChannelGate(c, serverID, userID, stepUp.MFACode, true)
+	if !ok {
+		return
+	}
+	tokenEpoch := middleware.TokenCredentialEpoch(c)
+	var outcome mfaenforce.Outcome
+	in := deleteChannelInput{
+		serverID: serverID, userID: userID, tokenEpoch: tokenEpoch, channelID: channelID,
+		preflightVoice: preflightVoice, confirm: confirm,
+	}
+	plan, err := h.authority.RunChannelAuthorityMutation(ctx, serverID, voiceIDs,
 		func(ctx context.Context, tx *sql.Tx) error {
-			return h.deleteChannelTx(ctx, tx, serverID, userID, middleware.TokenCredentialEpoch(c), channelID, preflightVoice)
+			var writeErr error
+			outcome, writeErr = h.deleteChannelTx(ctx, tx, in)
+			return writeErr
 		}, userID,
 	)
-	if errors.Is(err, errChannelAuthoritySetChanged) {
-		c.JSON(http.StatusConflict, gin.H{"error": errChannelAuthorityRetry})
-		return
-	}
-	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
-		return
-	}
-	if errors.Is(err, rbac.ErrNotMember) || errors.Is(err, errManageChannelsDenied) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return
-	}
-	if rbac.IsAmbiguousAuthorityCommit(err) {
-		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, []string{channelID})
-	}
 	if err != nil {
-		h.log.Error("Failed to delete channel", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteChannel})
+		h.respondDeleteChannelError(c, serverID, channelID, err)
 		return
 	}
-	h.authority.CompleteChannelAuthorityMutation(c.Request.Context(), serverID, []string{channelID}, plan)
+	h.settleChannelGate(ctx, outcome, confirm, userID)
+	h.authority.CompleteChannelAuthorityMutation(ctx, serverID, []string{channelID}, plan)
 
 	h.log.Info("Channel deleted", "channel_id", channelID, "user_id", userID)
 
 	h.broadcastChannelDeleted(serverID, channelID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Channel deleted successfully"})
+}
+
+// respondDeleteChannelError answers a refused or failed deletion. An
+// ambiguous commit is failed closed first, whatever is answered. Then the
+// route's own sentinels, then the gate's refusals (#3454), then the route's
+// own 500.
+func (h *Handler) respondDeleteChannelError(c *gin.Context, serverID, channelID string, err error) {
+	if rbac.IsAmbiguousAuthorityCommit(err) {
+		h.authority.FailClosedChannelAuthorityMutation(c.Request.Context(), serverID, []string{channelID})
+	}
+	switch {
+	case errors.Is(err, errChannelAuthoritySetChanged):
+		c.JSON(http.StatusConflict, gin.H{"error": errChannelAuthorityRetry})
+	case errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked):
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+	case errors.Is(err, rbac.ErrNotMember) || errors.Is(err, errManageChannelsDenied):
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+	case mfaenforce.IsGateError(err):
+		mfaenforce.WriteError(c, h.log, err, writeDeleteChannelServerGone)
+	default:
+		h.log.Error("Failed to delete channel", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteChannel})
+	}
 }
 
 func (h *Handler) broadcastChannelDeleted(serverID, channelID string) {
@@ -1799,21 +1841,66 @@ func (h *Handler) broadcastChannelDeleted(serverID, channelID string) {
 	})
 }
 
-func (h *Handler) deleteChannelTx(ctx context.Context, tx *sql.Tx, serverID, userID, tokenEpoch, channelID string, preflightVoice bool) error {
-	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
-		return err
+// deleteChannelInput is DeleteChannel's request scalars, bundled so
+// deleteChannelTx stays under the parameter ceiling: the route's identifiers,
+// the token's credential epoch, whether the preflight saw a voice channel (the
+// locked re-read must agree), and the gate's confirmation.
+type deleteChannelInput struct {
+	serverID, userID, tokenEpoch, channelID string
+	preflightVoice                          bool
+	confirm                                 channelGateConfirm
+}
+
+// deleteChannelTx is DeleteChannel's write inside withAuthorityCapture, which
+// has already taken the advisory lock, the actor's users row FOR NO KEY UPDATE
+// and the servers row FOR UPDATE. The dangerous-action gate (#3454 A-7) goes
+// right after GuardTx and re-takes both rows at the strength the capture
+// holds, so it adds no lock edge; the channel lock, the membership read and
+// the ManageChannels check (I7) follow, then Require, then the DELETE.
+//
+// I-RETRY: RunChannelAuthorityMutation runs this exactly once and never
+// retries. errChannelAuthoritySetChanged is the route's terminal 409, and
+// every return of it below precedes Require, so nothing after the gate starts
+// verifying may return it. A rollback restores any factor Require spent
+// (A-1), so a client's own retry after a 409 re-verifies rather than finding
+// its code consumed.
+func (h *Handler) deleteChannelTx(ctx context.Context, tx *sql.Tx, in deleteChannelInput) (mfaenforce.Outcome, error) {
+	if err := credepoch.GuardTx(ctx, tx, in.userID, in.tokenEpoch); err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	g, err := mfaenforce.LockGateTx(ctx, tx, in.serverID, in.userID,
+		stepup.LockForNoKeyUpdate, mfaenforce.ServerForUpdate, in.tokenEpoch)
+	if err != nil {
+		return mfaenforce.Unconfirmed, err
 	}
 	var lockedServerID string
 	var lockedVoice bool
-	if err := tx.QueryRowContext(ctx, `SELECT server_id, type = 'voice' FROM channels WHERE id = $1 FOR UPDATE`, channelID).Scan(&lockedServerID, &lockedVoice); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT server_id, type = 'voice' FROM channels WHERE id = $1 FOR UPDATE`, in.channelID).Scan(&lockedServerID, &lockedVoice); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return errChannelAuthoritySetChanged
+			return mfaenforce.Unconfirmed, errChannelAuthoritySetChanged
 		}
-		return err
+		return mfaenforce.Unconfirmed, err
 	}
-	if lockedServerID != serverID || lockedVoice != preflightVoice {
-		return errChannelAuthoritySetChanged
+	if lockedServerID != in.serverID || lockedVoice != in.preflightVoice {
+		return mfaenforce.Unconfirmed, errChannelAuthoritySetChanged
 	}
+	if err := h.authorizeDeleteChannelTx(ctx, tx, in.serverID, in.userID); err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	outcome, err := h.requireChannelGate(ctx, tx, g, in.userID, stepup.PurposeChannelDelete, in.confirm, true)
+	if err != nil {
+		return mfaenforce.Unconfirmed, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = $1 AND server_id = $2`, in.channelID, in.serverID); err != nil {
+		return mfaenforce.Unconfirmed, fmt.Errorf("delete channel: %w", err)
+	}
+	return outcome, nil
+}
+
+// authorizeDeleteChannelTx is DeleteChannel's ManageChannels check under the
+// capture's locks, at server scope like the pooled check it re-verifies. A
+// member who lost the bit since that check gets manageChannelsDenial on tx.
+func (h *Handler) authorizeDeleteChannelTx(ctx context.Context, tx *sql.Tx, serverID, userID string) error {
 	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`, serverID, userID).Scan(new(string)); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return rbac.ErrNotMember
@@ -1825,10 +1912,7 @@ func (h *Handler) deleteChannelTx(ctx context.Context, tx *sql.Tx, serverID, use
 		return err
 	}
 	if !perms.Has(rbac.PermManageChannels) {
-		return errManageChannelsDenied
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = $1 AND server_id = $2`, channelID, serverID); err != nil {
-		return fmt.Errorf("delete channel: %w", err)
+		return manageChannelsDenial(ctx, tx, serverID, "", userID)
 	}
 	return nil
 }

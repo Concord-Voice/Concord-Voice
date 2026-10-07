@@ -72,6 +72,24 @@ const (
 
 	// internal/servers, through mfaenforce.ConfirmTx.
 	PurposeServerMFAEnforcementOff Purpose = "servers.mfa_enforcement_disable"
+
+	// The dangerous-action gates (#3454), through mfaenforce.Require: one per
+	// D1 route. A D1 channel or server purge reuses PurposeChannelPurge and
+	// PurposeServerPurge, because it is the same route and the same request as
+	// the self-purge, and one verification must not run under two purposes.
+	PurposeChannelDelete            Purpose = "channels.delete"
+	PurposeServerUpdate             Purpose = "servers.update"
+	PurposeServerIconUpload         Purpose = "media.server_icon_upload"
+	PurposeServerBannerUpload       Purpose = "media.server_banner_upload"
+	PurposeMemberBan                Purpose = "members.ban"
+	PurposeMemberKickPurge          Purpose = "members.kick_purge"
+	PurposeRoleDelete               Purpose = "roles.delete"
+	PurposeRoleCreate               Purpose = "roles.create"
+	PurposeRoleUpdate               Purpose = "roles.update"
+	PurposeChannelExpirationShorten Purpose = "channels.expiration_shorten"
+	PurposeServerDelete             Purpose = "servers.delete"
+	PurposeChannelOverrideUpsert    Purpose = "overrides.channel_upsert"
+	PurposeCategoryOverrideUpsert   Purpose = "overrides.category_upsert"
 )
 
 // allPurposes is the closed set Valid checks. A constant missing from it can
@@ -107,6 +125,19 @@ var allPurposes = [...]Purpose{
 	PurposeChannelPurge,
 	PurposeServerPurge,
 	PurposeServerMFAEnforcementOff,
+	PurposeChannelDelete,
+	PurposeServerUpdate,
+	PurposeServerIconUpload,
+	PurposeServerBannerUpload,
+	PurposeMemberBan,
+	PurposeMemberKickPurge,
+	PurposeRoleDelete,
+	PurposeRoleCreate,
+	PurposeRoleUpdate,
+	PurposeChannelExpirationShorten,
+	PurposeServerDelete,
+	PurposeChannelOverrideUpsert,
+	PurposeCategoryOverrideUpsert,
 }
 
 // ownRulePurposes are the routes stepup.VerifyOwnRuleTx guards: the only
@@ -122,6 +153,46 @@ var ownRulePurposes = [...]Purpose{
 	PurposeMessageDelete,
 	PurposeChannelPurge,
 	PurposeServerPurge,
+}
+
+// graceEligiblePurposes are the routes a step-up grace may cover (#3454 D-2,
+// A-5): within GraceTTL of a verified confirmation, the same session repeats
+// an action of the same kind without a code. Each is also in allPurposes.
+//
+// Two families qualify. The D1 gates whose action is reversible or bounded,
+// keyed by the dangerous bit the route requires; and the delete-rate
+// soft-lock's four routes, keyed by the soft-lock scope, which A-10 retrofits
+// (the two purge purposes serve both families). A purpose outside this list
+// is always fresh: GraceRead.Covers refuses it whatever the stored grace
+// says. Deleting a server, turning MFA enforcement off, and the grant gate on
+// role create/update and both override upserts are deliberately absent: each
+// either cannot be undone or hands out the authority the gate protects.
+// TestGraceEligiblePurposes_ClosedSet pins the list.
+var graceEligiblePurposes = [...]Purpose{
+	PurposeMessageDelete,
+	PurposeDMMessageDelete,
+	PurposeChannelPurge,
+	PurposeServerPurge,
+	PurposeChannelDelete,
+	PurposeServerUpdate,
+	PurposeServerIconUpload,
+	PurposeServerBannerUpload,
+	PurposeMemberBan,
+	PurposeMemberKickPurge,
+	PurposeRoleDelete,
+	PurposeChannelExpirationShorten,
+}
+
+// GraceEligible reports whether a step-up grace may cover p (see
+// graceEligiblePurposes).
+func (p Purpose) GraceEligible() bool {
+	return slices.Contains(graceEligiblePurposes[:], p)
+}
+
+// GraceEligiblePurposes returns a copy of the grace-eligible set, in
+// declaration order.
+func GraceEligiblePurposes() []Purpose {
+	return slices.Clone(graceEligiblePurposes[:])
 }
 
 // OwnRule reports whether p is one of the own-rule purposes a password

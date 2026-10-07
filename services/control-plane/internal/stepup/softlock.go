@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -122,10 +124,17 @@ func NewDeleteSoftLock(rdb *redis.Client) DeleteSoftLock {
 // serverID comes from the DB row read for that request. Neither key holds a
 // message id or any message content.
 func (l DeleteSoftLock) Key(userID uuid.UUID, s SoftLockScope) string {
+	return "stepup:delete_softlock:" + userID.String() + ":" + s.segment()
+}
+
+// segment is how every key spells a scope: "dm", or "server:<serverID>".
+// Key and deleteGraceScope both use it, so a soft-lock counter and its grace
+// cannot disagree about which population they name.
+func (s SoftLockScope) segment() string {
 	if s.kind == softLockScopeServer {
-		return fmt.Sprintf("stepup:delete_softlock:%s:server:%s", userID, s.serverID)
+		return "server:" + s.serverID.String()
 	}
-	return fmt.Sprintf("stepup:delete_softlock:%s:dm", userID)
+	return "dm"
 }
 
 // DayKey is the one place the sustained-tier key is spelled. Unlike Key, it
@@ -134,6 +143,44 @@ func (l DeleteSoftLock) Key(userID uuid.UUID, s SoftLockScope) string {
 // many DMs or servers must still trip this tier.
 func (l DeleteSoftLock) DayKey(userID uuid.UUID) string {
 	return fmt.Sprintf("stepup:delete_softlock:%s:day", userID)
+}
+
+// graceKey is the one place a step-up grace key (#3454 D-2, A-10) is spelled:
+// stepup:grace:<uid>:<sid>:<tail>. The tail is GraceScope's, built only by the
+// two constructors below, so the key shapes are exactly
+// stepup:grace:<uid>:<sid>:<serverID>:<bit> for a dangerous-action gate and
+// stepup:grace:<uid>:<sid>:<segment>:delete for the soft-lock. They cannot
+// collide: a D1 tail ends in a decimal bit index, a soft-lock tail in
+// "delete". sid is a canonical uuid by the time it reaches here (GraceStore.Read).
+func graceKey(userID, sessionID uuid.UUID, s GraceScope) string {
+	return "stepup:grace:" + userID.String() + ":" + sessionID.String() + ":" + s.tail
+}
+
+// DangerousActionGraceScope is the grace a D1 gate on serverID honours and
+// grants: one per dangerous permission bit, so a confirmation for one kind of
+// action never covers another. bit must be exactly one positive permission
+// bit; anything else yields the zero scope, which reads as no grace and grants
+// nothing (fail closed).
+func DangerousActionGraceScope(serverID uuid.UUID, bit int64) GraceScope {
+	if bit <= 0 || bit&(bit-1) != 0 {
+		return GraceScope{}
+	}
+	return GraceScope{
+		tail:      serverID.String() + ":" + strconv.Itoa(bits.TrailingZeros64(uint64(bit))),
+		serverID:  serverID,
+		hasServer: true,
+	}
+}
+
+// DeleteGraceScope is the grace the delete-rate soft-lock in scope s honours
+// and grants. A server scope is stamped with the server's permission
+// generation; a DM scope has no server and is stamped with the user's alone.
+func DeleteGraceScope(s SoftLockScope) GraceScope {
+	return GraceScope{
+		tail:      s.segment() + ":delete",
+		serverID:  s.serverID,
+		hasServer: s.kind == softLockScopeServer,
+	}
 }
 
 // Hit is HitN with n=1: it records one authorized delete attempt.

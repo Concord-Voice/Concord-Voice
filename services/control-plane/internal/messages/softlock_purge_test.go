@@ -128,6 +128,11 @@ func TestSelfPurge_ChannelPurpose(t *testing.T) {
 // author, or of all authors, is never counted — even on an enforcing server,
 // even when the all-authors purge sweeps up the moderator's own messages.
 //
+// On an enforcing server both purges are D1 dangerous actions (#3454 A-3), so
+// each carries mfa_code. That confirmation writes the dangerous-action budget
+// and grace keys, which are not the soft-lock's; the assertion is therefore
+// that no soft-lock counter key exists, not that Redis is empty.
+//
 // Mutant killed: counting every spec regardless of its resolved author (keys
 // appear, and 20 messages trip the refusal).
 func TestSelfPurge_OtherAuthorsNeverCount(t *testing.T) {
@@ -136,17 +141,21 @@ func TestSelfPurge_OtherAuthorsNeverCount(t *testing.T) {
 	s.enroll(t, w.owner.ID)
 	s.seed(t, w.channelID, w.author, 20)
 
-	other := s.purgeServer(t, w.owner.ID, w.serverID, map[string]any{"range": "all", "target_user_id": w.author.ID})
+	other := s.purgeServer(t, w.owner.ID, w.serverID, map[string]any{
+		"range": "all", "target_user_id": w.author.ID, "mfa_code": softLockValidCode,
+	})
 	require.Equal(t, http.StatusOK, other.Code, other.Body.String())
 	assert.Zero(t, s.countBy(t, w.author.ID))
 
 	s.seed(t, w.channelID, w.author, 20)
 	s.seed(t, w.channelID, w.owner, 20)
-	all := s.purgeChannel(t, w.owner.ID, w.channelID, map[string]any{"range": "all"})
+	all := s.purgeChannel(t, w.owner.ID, w.channelID, map[string]any{"range": "all", "mfa_code": softLockValidCode})
 	require.Equal(t, http.StatusOK, all.Code, all.Body.String())
 	assert.Zero(t, s.countBy(t, w.owner.ID))
 
-	assert.Empty(t, s.mr.Keys())
+	for _, k := range s.mr.Keys() {
+		assert.False(t, strings.HasPrefix(k, "stepup:delete_softlock:"), "soft-lock counter key %q", k)
+	}
 }
 
 // TestSelfPurge_ModerationPathNeverCounts: the ban/kick purge
@@ -161,7 +170,7 @@ func TestSelfPurge_ModerationPathNeverCounts(t *testing.T) {
 	s.enroll(t, w.owner.ID)
 	s.seed(t, w.channelID, w.owner, 20)
 
-	deleted, status, err := s.handler.PurgeUserServerMessages(context.Background(), w.serverID, w.owner.ID, w.owner.ID, "ban")
+	deleted, status, err := s.handler.PurgeUserServerMessages(context.Background(), w.serverID, w.owner.ID, w.owner.ID, "ban", messages.PurgeExempt)
 	require.NoError(t, err)
 	assert.Equal(t, messages.PurgeCompleted, status)
 	assert.Equal(t, 20, deleted)
