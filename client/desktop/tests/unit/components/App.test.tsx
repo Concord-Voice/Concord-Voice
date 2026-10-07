@@ -231,27 +231,29 @@ describe('App', () => {
     expect(screen.getByTestId('auth-flow')).toBeInTheDocument();
   });
 
-  it('shows a microphone join alert in the primary window', () => {
+  it('shows a microphone join dialog in the primary window', () => {
     useVoiceStore.setState({
       joinError: 'Could not start the selected microphone. Choose another mic and try again.',
     } as Parameters<typeof useVoiceStore.setState>[0]);
 
     render(<App />);
-    expect(screen.getByRole('alert')).toHaveTextContent(/microphone/i);
+    expect(screen.getByRole('dialog', { name: 'Unable to join voice' })).toHaveTextContent(
+      /microphone/i
+    );
     act(() => screen.getByRole('button', { name: /dismiss/i }).click());
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Unable to join voice' })).not.toBeInTheDocument();
     expect((useVoiceStore.getState() as unknown as { joinError?: string | null }).joinError).toBe(
       null
     );
   });
 
-  it('does not show a microphone join alert when there is no join error', () => {
+  it('does not show a microphone join dialog when there is no join error', () => {
     render(<App />);
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Unable to join voice' })).not.toBeInTheDocument();
     expect(screen.getByTestId('auth-flow')).toBeInTheDocument();
   });
 
-  it('does not show the microphone join alert in a PiP window', () => {
+  it('does not show the microphone join dialog in a PiP window', () => {
     useVoiceStore.setState({ joinError: 'Choose another microphone and retry.' } as Parameters<
       typeof useVoiceStore.setState
     >[0]);
@@ -259,7 +261,9 @@ describe('App', () => {
     window.location.hash = '#/pip/pip-test';
     try {
       render(<App />);
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('dialog', { name: 'Unable to join voice' })
+      ).not.toBeInTheDocument();
     } finally {
       window.location.hash = originalHash;
     }
