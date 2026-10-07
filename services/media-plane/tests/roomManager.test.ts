@@ -59,6 +59,7 @@ import {
   SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
   parseMediaFrameCryptoVersion,
   SCREEN_GATE_OFF_DEBOUNCE_MS,
+  CAMERA_GATE_OFF_DEBOUNCE_MS,
   FREE_MEDIA_ENTITLEMENT,
   MAX_RECV_TRANSPORTS_PER_PARTICIPANT,
   KEYFRAME_REQUEST_DELAY_MS,
@@ -5379,37 +5380,94 @@ describe('RoomManager', () => {
     });
 
     it('keeps gate on at one useful consumer, then disables when no useful demand remains', async () => {
-      const handler = vi.fn();
-      manager.onEvent(handler);
-      await addCameraConsumer('u-1', 'c1');
-      const participant = manager.getParticipant('room-1', 'u-1')!;
-      const consumer2 = createMockConsumer({
-        id: 'c2',
-        kind: 'video',
-        appData: { source: 'camera' },
-      });
-      participant.consumers.set('c2', consumer2 as any);
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        await addCameraConsumer('u-1', 'c1');
+        const participant = manager.getParticipant('room-1', 'u-1')!;
+        participant.consumers.set(
+          'c2',
+          createMockConsumer({ id: 'c2', kind: 'video', appData: { source: 'camera' } }) as any
+        );
+        await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+        await manager.setPreferredLayers(
+          'room-1',
+          'u-1',
+          validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+        );
 
-      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredLayers(
-        'room-1',
-        'u-1',
-        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
-      );
+        expect(manager.closeConsumer('room-1', 'u-1', 'c1')).toBe(true);
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+        expect(manager.closeConsumer('room-1', 'u-1', 'c2')).toBe(true);
 
-      expect(manager.closeConsumer('room-1', 'u-1', 'c1')).toBe(true);
+        // Re-consuming during producer replacement restores live demand before
+        // the pending OFF; the room gate must not flap and trigger another publish.
+        participant.consumers.set(
+          'c3',
+          createMockConsumer({ id: 'c3', kind: 'video', appData: { source: 'camera' } }) as any
+        );
+        await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c3'));
+        await vi.advanceTimersByTimeAsync(CAMERA_GATE_OFF_DEBOUNCE_MS);
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+        expect(gateEvents(handler)).toEqual([
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
+        ]);
 
-      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
-      expect(gateEvents(handler)).toEqual([
-        { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
-      ]);
+        expect(manager.closeConsumer('room-1', 'u-1', 'c3')).toBe(true);
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+        await vi.advanceTimersByTimeAsync(CAMERA_GATE_OFF_DEBOUNCE_MS);
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+        expect(gateEvents(handler)).toEqual([
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: false },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
 
-      expect(manager.closeConsumer('room-1', 'u-1', 'c2')).toBe(true);
+    it('clears a pending camera gate OFF when replacing a stale room with the same ID', async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        await addCameraConsumer('u-1', 'c1');
+        const participant = manager.getParticipant('room-1', 'u-1')!;
+        participant.consumers.set(
+          'c2',
+          createMockConsumer({ id: 'c2', kind: 'video', appData: { source: 'camera' } }) as any
+        );
+        await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+        await manager.setPreferredLayers(
+          'room-1',
+          'u-1',
+          validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+        );
+        const staleRoom = manager.getRoom('room-1')!;
+        expect(manager.closeConsumer('room-1', 'u-1', 'c1')).toBe(true);
+        expect(manager.closeConsumer('room-1', 'u-1', 'c2')).toBe(true);
+        expect(staleRoom.cameraGateOffTimer).toBeDefined();
 
-      expect(gateEvents(handler)).toEqual([
-        { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
-        { type: 'camera-layering-gate', roomId: 'room-1', enabled: false },
-      ]);
+        mockRouter.closed = true;
+        const replacementRouter = createMockRouter();
+        mockMediasoup.getOrCreateRouter.mockResolvedValueOnce(replacementRouter);
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+          username: 'bob',
+        });
+        const replacementRoom = manager.getRoom('room-1')!;
+
+        expect(replacementRoom).not.toBe(staleRoom);
+        expect(replacementRoom.router).toBe(replacementRouter);
+        expect(staleRoom.cameraGateOffTimer).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(CAMERA_GATE_OFF_DEBOUNCE_MS);
+        expect(replacementRoom.cameraLayeringGateEnabled).toBe(false);
+        expect(gateEvents(handler)).toEqual([
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('keeps fallback simulcast gate disabled with only two camera producers', async () => {
@@ -5652,35 +5710,40 @@ describe('RoomManager', () => {
     });
 
     it('keeps fallback simulcast gate on at two producers, then disables below hysteresis floor', async () => {
-      const handler = vi.fn();
-      manager.onEvent(handler);
-      const fallbackCodecs = ['video/H264', 'video/VP8'];
-      await addCameraProducer('u-1', 'p1', fallbackCodecs);
-      await addCameraProducer('u-2', 'p2', fallbackCodecs);
-      await addCameraProducer('u-3', 'p3', fallbackCodecs);
-      await addCameraConsumer('u-1', 'c1');
-      await addCameraConsumer('u-1', 'c2');
-      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredLayers(
-        'room-1',
-        'u-1',
-        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
-      );
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        const fallbackCodecs = ['video/H264', 'video/VP8'];
+        await addCameraProducer('u-1', 'p1', fallbackCodecs);
+        await addCameraProducer('u-2', 'p2', fallbackCodecs);
+        await addCameraProducer('u-3', 'p3', fallbackCodecs);
+        await addCameraConsumer('u-1', 'c1');
+        await addCameraConsumer('u-1', 'c2');
+        await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+        await manager.setPreferredLayers(
+          'room-1',
+          'u-1',
+          validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+        );
 
-      await manager.closeProducer('room-1', 'u-3', 'p3');
+        await manager.closeProducer('room-1', 'u-3', 'p3');
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+        expect(gateEvents(handler)).toEqual([
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
+        ]);
 
-      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
-      expect(gateEvents(handler)).toEqual([
-        { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
-      ]);
-
-      await manager.closeProducer('room-1', 'u-2', 'p2');
-
-      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
-      expect(gateEvents(handler)).toEqual([
-        { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
-        { type: 'camera-layering-gate', roomId: 'room-1', enabled: false },
-      ]);
+        await manager.closeProducer('room-1', 'u-2', 'p2');
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+        await vi.advanceTimersByTimeAsync(CAMERA_GATE_OFF_DEBOUNCE_MS);
+        expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+        expect(gateEvents(handler)).toEqual([
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
+          { type: 'camera-layering-gate', roomId: 'room-1', enabled: false },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('enables SVC-capable gate with two camera producers', async () => {

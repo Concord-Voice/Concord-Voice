@@ -803,6 +803,11 @@ class VoiceService {
     string,
     { source: string; producerUserId: string; producerId: string }
   > = new Map();
+  private readonly pendingConsumes = new Set<{
+    producerId: string;
+    userId?: string;
+    cancelled: boolean;
+  }>();
   // Local media streams
   private localMicStream: MediaStream | null = null;
   /** Single-flight guard for initial channel/DM joins. */
@@ -810,6 +815,7 @@ class VoiceService {
   /** Single-flight guard for #1790 network-change media-session resume. */
   private resumeInFlight = false;
   private localCameraStream: MediaStream | null = null;
+  private cameraReplacementProducerId: string | null = null;
   private localScreenStream: MediaStream | null = null;
 
   // The source id behind localScreenStream. Needed because re-enabling audio on a
@@ -2381,68 +2387,54 @@ class VoiceService {
       return;
     }
     this.producers.delete('camera');
-    this.socket?.emit('close-producer', { producerId: producer.id });
-
-    let codec: mediasoupTypes.RtpCodecCapability;
-    let newProducer: mediasoupTypes.Producer;
+    this.cameraReplacementProducerId = producer.id;
     try {
-      const selection = this.pickCameraCodec();
-      codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
-      const cameraBitrate = this.cameraStartBitrate(selection.encodings);
-      newProducer = await this.produceEncrypted(transport, {
-        track,
-        encodings: selection.encodings,
-        codec,
-        codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
-        stopTracks: false,
-        appData: { source: 'camera' },
-      });
-    } catch (err) {
+      this.socket?.emit('close-producer', { producerId: producer.id });
+
+      let codec: mediasoupTypes.RtpCodecCapability;
+      let newProducer: mediasoupTypes.Producer;
+      try {
+        const selection = this.pickCameraCodec();
+        codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+        const cameraBitrate = this.cameraStartBitrate(selection.encodings);
+        newProducer = await this.produceEncrypted(transport, {
+          track,
+          encodings: selection.encodings,
+          codec,
+          codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
+          stopTracks: false,
+          appData: { source: 'camera' },
+        });
+      } catch (err) {
+        if (
+          this.isCurrentVideoReproduce(token, transport) &&
+          this.localCameraStream === stream &&
+          !this.producers.has('camera')
+        ) {
+          this.cleanupCameraState();
+          this.setVideoReproduceError('camera');
+        }
+        throw err;
+      }
+
       if (
-        this.isCurrentVideoReproduce(token, transport) &&
-        this.localCameraStream === stream &&
-        !this.producers.has('camera')
+        !this.isCurrentVideoReproduce(token, transport) ||
+        this.localCameraStream !== stream ||
+        this.producers.has('camera')
       ) {
-        this.cleanupCameraState();
-        this.setVideoReproduceError('camera');
+        this.discardProducedProducer(newProducer, socket);
+        return;
       }
-      throw err;
-    }
 
-    if (
-      !this.isCurrentVideoReproduce(token, transport) ||
-      this.localCameraStream !== stream ||
-      this.producers.has('camera')
-    ) {
-      this.discardProducedProducer(newProducer, socket);
-      return;
-    }
-
-    this.applyDegradationPreference(newProducer);
-    this.producers.set('camera', newProducer);
-
-    newProducer.on('transportclose', () => {
-      if (this.producers.get('camera') !== newProducer) return;
-      this.producers.delete('camera');
-      if (this.localCameraStream) {
-        for (const t of this.localCameraStream.getTracks()) t.stop();
-        this.localCameraStream = null;
+      this.commitCameraProducer(newProducer, stream, token, transport, socket, codec);
+      const selectedCodecKey = this.codecKeyFromParameters(codec);
+      const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
+      console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
+    } finally {
+      if (this.cameraReplacementProducerId === producer.id) {
+        this.cameraReplacementProducerId = null;
       }
-      const s = useVoiceStore.getState();
-      s.setActiveCameraCodec(null);
-      s.setVideoOn(false);
-      const uid = useUserStore.getState().user?.id;
-      if (uid) s.updateParticipant(uid, { videoStream: undefined, isVideoOn: false });
-    });
-
-    useVoiceStore
-      .getState()
-      .setActiveCameraCodec(
-        this.getProducerCodecMimeType('camera') ?? this.codecKeyFromParameters(codec)
-      );
-    const selectedCodecKey = this.codecKeyFromParameters(codec);
-    const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
-    console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
+    }
   }
 
   /**
@@ -2813,6 +2805,7 @@ class VoiceService {
   private invalidateVideoReproduces(): void {
     this.videoReproduceSessionActive = false;
     this.videoReproduceGeneration++;
+    this.tuneInsInFlight.clear();
     this.cancelVideoReproduce('camera');
     this.cancelVideoReproduce('screen');
     // A successor media session uses different transports, so it must not wait
@@ -3076,7 +3069,9 @@ class VoiceService {
     existingProducers: RoomJoinedResponse['existingProducers']
   ): Promise<void> {
     const store = useVoiceStore.getState();
+    const sessionGeneration = this.videoReproduceGeneration;
     for (const producer of existingProducers) {
+      if (sessionGeneration !== this.videoReproduceGeneration) return;
       if (producer.source === 'screen') {
         const participant = store.participants[producer.userId];
         store.addAvailableScreenShare({
@@ -3787,10 +3782,6 @@ class VoiceService {
       // torn down above, and producer-closed events missed during the drop
       // could never prune these maps).
       store.resetScreenShareConsumption();
-      // A consume that never settled (socket died mid-flight) would strand its
-      // producerId in the in-flight guard forever; remote producer ids survive
-      // OUR reconnect, so clear the guard with the rest of the tune state.
-      this.tuneInsInFlight.clear();
       // Local camera/screen producers did not survive the network change;
       // reflect that honestly instead of showing a dead camera as live.
       store.setVideoOn(false);
@@ -6302,6 +6293,8 @@ class VoiceService {
    */
   private checkSoloBandwidthSaving(): void {
     const store = useVoiceStore.getState();
+    const localUserId = useUserStore.getState().user?.id;
+    if (!localUserId || !store.participants[localUserId]) return;
     const participantCount = Object.keys(store.participants).length;
     const wasSolo = store.isSoloBandwidthSaving;
 
@@ -6360,6 +6353,7 @@ class VoiceService {
     // awaits below must not land on a store that leaveChannel()/reconnect has
     // reset out from under us (see the stale-context guard before store.tuneIn).
     const startChannelId = store.activeChannelId;
+    const sessionGeneration = this.videoReproduceGeneration;
 
     // Idempotency + in-flight guard (#2088): the ShareTunePill, the Tune In
     // Everywhere control, and the
@@ -6395,10 +6389,14 @@ class VoiceService {
       if (this.mediaEncryption && startChannelId) {
         await this.addDecryptKeyForUser(startChannelId, userId);
       }
+      if (sessionGeneration !== this.videoReproduceGeneration) return;
 
       // Remove from available list and consume the producer
       store.removeAvailableScreenShare(producerId);
       await this.consumeProducer(producerId, userId, 'video');
+      // consumeProducer owns cleanup of stale-session consumers. Do not scan
+      // shared maps here: a reconnect may have installed this producer anew.
+      if (sessionGeneration !== this.videoReproduceGeneration) return;
 
       // Find the consumer that was just created for this producer
       let consumerId = '';
@@ -6436,7 +6434,9 @@ class VoiceService {
         await this.consumeProducer(audioProducerId, userId, 'audio');
       }
     } finally {
-      this.tuneInsInFlight.delete(producerId);
+      if (sessionGeneration === this.videoReproduceGeneration) {
+        this.tuneInsInFlight.delete(producerId);
+      }
     }
   }
 
@@ -6555,16 +6555,20 @@ class VoiceService {
    *  to close its side. Client-initiated closes ONLY — server-initiated close
    *  paths (producer-closed / consumer-closed / transportclose) must NOT emit
    *  back at the server. No-ops for unknown ids and the local-screen sentinel. */
-  private closeConsumerAndNotify(consumerId: string): void {
+  private closeConsumerAndNotify(consumerId: string, socket: Socket | null = this.socket): void {
     const consumer = this.consumers.get(consumerId);
     if (!consumer) return;
-    consumer.close();
+    if (!consumer.closed) consumer.close();
     this.consumers.delete(consumerId);
     this.decoderBudgetSampler.deleteConsumer(consumerId);
     this.consumerMeta.delete(consumerId);
     this.lastPreferredLayerKeyByConsumer.delete(consumerId);
     this.pauseCoordinator.clearConsumer(consumerId);
-    this.socket?.emit('close-consumer', { consumerId });
+    this.testSuspendedConsumerIds.delete(consumerId);
+    this.testRestoreEligibleConsumerIds.delete(consumerId);
+    this.testServerPausedConsumerIds.delete(consumerId);
+    this.serverResumeOnUndeafenConsumerIds.delete(consumerId);
+    socket?.emit('close-consumer', { consumerId });
   }
 
   /**
@@ -7814,6 +7818,8 @@ class VoiceService {
     senderUserId?: string,
     kind?: mediasoupTypes.MediaKind
   ): Promise<void> {
+    const sessionGeneration = this.videoReproduceGeneration;
+    const socket = this.socket;
     // Validate kind for E2EE transport routing (all channels are always E2EE)
     if (kind && kind !== 'audio' && kind !== 'video') {
       console.warn('[consume] skipped — invalid kind for E2EE routing', { producerId, kind });
@@ -7825,31 +7831,59 @@ class VoiceService {
         producerId,
       });
     }
+    const token = { producerId, userId: senderUserId, cancelled: false };
+    this.pendingConsumes.add(token);
+    let queued: Promise<void>;
     if (kind) {
       // Route to per-transport queues so audio/video negotiate in parallel
       if (kind === 'audio') {
         this.consumeQueueAudio = this.consumeQueueAudio
-          .then(() => this.consumeProducerImpl(producerId, senderUserId, kind))
+          .then(() =>
+            this.consumeProducerImpl(
+              producerId,
+              senderUserId,
+              kind,
+              sessionGeneration,
+              socket,
+              token
+            )
+          )
           .catch((err) => {
             console.error('Audio consume queue error:', errorMessage(err));
           });
-        await this.consumeQueueAudio;
+        queued = this.consumeQueueAudio;
       } else {
         this.consumeQueueVideo = this.consumeQueueVideo
-          .then(() => this.consumeProducerImpl(producerId, senderUserId, kind))
+          .then(() =>
+            this.consumeProducerImpl(
+              producerId,
+              senderUserId,
+              kind,
+              sessionGeneration,
+              socket,
+              token
+            )
+          )
           .catch((err) => {
             console.error('Video consume queue error:', errorMessage(err));
           });
-        await this.consumeQueueVideo;
+        queued = this.consumeQueueVideo;
       }
     } else {
       // kind unknown: fall back to audio queue
       this.consumeQueueAudio = this.consumeQueueAudio
-        .then(() => this.consumeProducerImpl(producerId, senderUserId, kind))
+        .then(() =>
+          this.consumeProducerImpl(producerId, senderUserId, kind, sessionGeneration, socket, token)
+        )
         .catch((err) => {
           console.error('Consume queue error:', errorMessage(err));
         });
-      await this.consumeQueueAudio;
+      queued = this.consumeQueueAudio;
+    }
+    try {
+      await queued;
+    } finally {
+      this.pendingConsumes.delete(token);
     }
   }
 
@@ -7930,9 +7964,13 @@ class VoiceService {
 
   private async consumeProducerImpl(
     producerId: string,
-    senderUserId?: string,
-    kind?: mediasoupTypes.MediaKind
+    senderUserId: string | undefined,
+    kind: mediasoupTypes.MediaKind | undefined,
+    sessionGeneration: number,
+    socket: Socket | null,
+    token: { cancelled: boolean }
   ): Promise<void> {
+    if (this.isConsumeCancelled(sessionGeneration, token)) return;
     if (!this.device) {
       console.warn('[consume] skipped — no device', { producerId });
       return;
@@ -7942,22 +7980,10 @@ class VoiceService {
       // For E2EE, tell the server which recv transport to use for this consumer.
       // Guard: ensure recv transport exists before server call to prevent
       // to avoid leaking server-side consumers that the client can't attach.
-      const transportId = kind ? this.getRecvTransportId(kind) : undefined;
-      if (kind && !transportId) {
-        console.warn('[consume] skipped — recv transport not ready for kind', {
-          producerId,
-          kind,
-        });
-        return;
-      }
-
-      console.debug('[consume] requesting', { producerId, senderUserId, kind, transportId });
-      const result = await this.emitAsync<ConsumeResponse>('consume', {
-        producerId,
-        ...(transportId && { transportId }),
-      });
-      if (!result || 'error' in result) {
-        console.warn('[consume] server returned error or empty result', { producerId, result });
+      const result = await this.requestConsume(producerId, senderUserId, kind);
+      if (!result) return;
+      if (this.isConsumeCancelled(sessionGeneration, token)) {
+        socket?.emit('close-consumer', { consumerId: result.id });
         return;
       }
 
@@ -7977,109 +8003,158 @@ class VoiceService {
         });
         return;
       }
-
-      // Chromium ≥149 (encoded-transform V2 line) ignores a receive transform
-      // attached after the receiver is live: zero frames enter it and
-      // ciphertext reaches the decoder (2026-08-21 incident, PR #2865). The
-      // transform therefore attaches AT RECEIVER CREATION via onRtpReceiver —
-      // after setRemoteDescription, before createAnswer — mirroring the
-      // sender-side onRtpSender hook, which works on the same engines.
-      // applyDecryptTransform stays as the verifier: it detects the
-      // creation-time attachment, schedules the bypass probe, and remains the
-      // fail-closed late-attach path for the legacy pipeline.
-      const consumer = await recvTransport.consume({
-        id: result.id,
-        producerId: result.producerId,
-        kind: result.kind,
-        rtpParameters: result.rtpParameters,
-        ...this.creationAttachConsumeOption(result, senderUserId),
-      });
-
-      this.consumers.set(consumer.id, consumer);
-      this.consumerMeta.set(consumer.id, {
-        source: result.source,
-        producerUserId: result.producerUserId,
-        producerId: result.producerId,
-      });
-
-      console.debug('[consume] consumer created', {
-        consumerId: consumer.id,
-        kind: consumer.kind,
-        trackState: consumer.track.readyState,
-        trackEnabled: consumer.track.enabled,
-        paused: consumer.paused,
-      });
-
-      // Apply E2EE decrypt transform (all channels are always encrypted)
-      const producerUserId = senderUserId || result.producerUserId;
-      try {
-        await this.ensureE2EEForConsumer(consumer, producerUserId);
-      } catch (err) {
-        this.closeConsumerAfterDecryptTransformFailure(consumer, errorMessage(err));
-        return;
-      }
-
-      // Attach stream to participant
-      this.routeConsumerToStore(consumer, result);
-
-      // Clean up on close
-      consumer.on('transportclose', () => {
-        console.debug('[consume] transport closed for consumer', consumer.id);
-        this.consumers.delete(consumer.id);
-        this.decoderBudgetSampler.deleteConsumer(consumer.id);
-        this.consumerMeta.delete(consumer.id);
-        this.lastPreferredLayerKeyByConsumer.delete(consumer.id);
-        this.pauseCoordinator.clearConsumer(consumer.id);
-        this.testSuspendedConsumerIds.delete(consumer.id);
-        this.testRestoreEligibleConsumerIds.delete(consumer.id);
-        this.testServerPausedConsumerIds.delete(consumer.id);
-        this.serverResumeOnUndeafenConsumerIds.delete(consumer.id);
-      });
-
-      if (this.testSuspensionDepth > 0 && consumer.kind === 'audio') {
-        if (!consumer.paused) consumer.pause();
-        this.testSuspendedConsumerIds.add(consumer.id);
-        this.testRestoreEligibleConsumerIds.add(consumer.id);
-        this.testServerPausedConsumerIds.add(consumer.id);
-        console.debug('[consume] consumer held during test suspension', {
-          consumerId: consumer.id,
-        });
-      } else if (this.startsPausedByScreenMute(result.source, result.producerUserId)) {
-        // A screen-audio consumer the viewer has already muted is created paused
-        // on the server. Unconditionally resuming it here only to re-pause it in
-        // applyInitialConsumerPauseReasons() below would open a resume→pause
-        // window where the SFU forwards audio for a stream the viewer explicitly
-        // muted — wasted bandwidth plus a brief audible blip on reconnect / stream
-        // restart. Detect that persisted mute intent up front and skip the resume,
-        // leaving the consumer server-paused for the coordinator to own (#2162).
-        console.debug('[consume] consumer left server-paused (persisted screenshare mute)', {
-          consumerId: consumer.id,
-        });
-      } else {
-        // Resume the consumer (was created paused on server)
-        await this.emitAsync('resume-consumer', { consumerId: consumer.id });
-        console.debug('[consume] consumer resumed', { consumerId: consumer.id });
-      }
-
-      // #1541: apply pending visibility intent AFTER the resume emit above. An
-      // initially-hidden tile's pause-consumer must run after the unconditional
-      // resume that starts the server-paused consumer — otherwise the resume
-      // clobbers the pause and the off-screen tile keeps forwarding (Gitar review).
-      // #1541 + #2162: re-apply per-source initial pause intent AFTER the
-      // unconditional resume above (else the resume clobbers an initially-hidden
-      // camera tile or a muted screenshare). Dispatched by source in a helper to
-      // keep consume()'s cognitive complexity within budget.
-      this.applyInitialConsumerPauseReasons(consumer.id, result.source, result.producerUserId);
-
-      // #1924: a screen REPRODUCE / codec-swap keeps the render surface mounted (same
-      // userId/tileId), so the reporter's IntersectionObserver never re-fires — but the
-      // underlying screen consumer was just swapped for a fresh one seeded at spatial
-      // layer 0. Re-emit the stored render-state demand so the NEW consumer inherits the
-      // viewer's real size/visibility instead of stranding on layer 0.
-      this.reemitScreenDemandOnConsume(result.source, result.producerUserId);
+      const consumer = await this.createAndRegisterConsumer(
+        recvTransport,
+        result,
+        senderUserId,
+        sessionGeneration,
+        socket,
+        token
+      );
+      if (!consumer) return;
+      await this.finishConsumerSetup(
+        consumer,
+        result,
+        senderUserId,
+        sessionGeneration,
+        socket,
+        token
+      );
     } catch (err) {
       console.error('[consume] Failed to consume producer:', producerId, errorMessage(err));
     }
+  }
+
+  private isConsumeCancelled(sessionGeneration: number, token: { cancelled: boolean }): boolean {
+    return sessionGeneration !== this.videoReproduceGeneration || token.cancelled;
+  }
+
+  private async requestConsume(
+    producerId: string,
+    senderUserId: string | undefined,
+    kind: mediasoupTypes.MediaKind | undefined
+  ): Promise<ConsumeResponse | null> {
+    const transportId = kind ? this.getRecvTransportId(kind) : undefined;
+    if (kind && !transportId) {
+      console.warn('[consume] skipped — recv transport not ready for kind', { producerId, kind });
+      return null;
+    }
+    console.debug('[consume] requesting', { producerId, senderUserId, kind, transportId });
+    const result = await this.emitAsync<ConsumeResponse>('consume', {
+      producerId,
+      ...(transportId && { transportId }),
+    });
+    if (!result || 'error' in result) {
+      console.warn('[consume] server returned error or empty result', { producerId, result });
+      return null;
+    }
+    return result;
+  }
+
+  private async createAndRegisterConsumer(
+    recvTransport: mediasoupTypes.Transport,
+    result: ConsumeResponse,
+    senderUserId: string | undefined,
+    sessionGeneration: number,
+    socket: Socket | null,
+    token: { cancelled: boolean }
+  ): Promise<mediasoupTypes.Consumer | null> {
+    // Chromium ≥149 ignores a receive transform attached after the receiver is live, so
+    // creationAttachConsumeOption attaches it before createAnswer. applyDecryptTransform
+    // remains the verifier and fail-closed late-attach path for the legacy pipeline.
+    const consumer = await recvTransport.consume({
+      id: result.id,
+      producerId: result.producerId,
+      kind: result.kind,
+      rtpParameters: result.rtpParameters,
+      ...this.creationAttachConsumeOption(result, senderUserId),
+    });
+    if (this.isConsumeCancelled(sessionGeneration, token)) {
+      if (!consumer.closed) consumer.close();
+      socket?.emit('close-consumer', { consumerId: consumer.id });
+      return null;
+    }
+    this.consumers.set(consumer.id, consumer);
+    this.consumerMeta.set(consumer.id, {
+      source: result.source,
+      producerUserId: result.producerUserId,
+      producerId: result.producerId,
+    });
+    // Register teardown before E2EE setup yields so transport close cannot leave stale state.
+    consumer.on('transportclose', () => {
+      console.debug('[consume] transport closed for consumer', consumer.id);
+      this.removeConsumerState(consumer.id);
+    });
+    console.debug('[consume] consumer created', {
+      consumerId: consumer.id,
+      kind: consumer.kind,
+      trackState: consumer.track.readyState,
+      trackEnabled: consumer.track.enabled,
+      paused: consumer.paused,
+    });
+    return consumer;
+  }
+
+  private removeConsumerState(consumerId: string): void {
+    this.consumers.delete(consumerId);
+    this.decoderBudgetSampler.deleteConsumer(consumerId);
+    this.consumerMeta.delete(consumerId);
+    this.lastPreferredLayerKeyByConsumer.delete(consumerId);
+    this.pauseCoordinator.clearConsumer(consumerId);
+    this.testSuspendedConsumerIds.delete(consumerId);
+    this.testRestoreEligibleConsumerIds.delete(consumerId);
+    this.testServerPausedConsumerIds.delete(consumerId);
+    this.serverResumeOnUndeafenConsumerIds.delete(consumerId);
+  }
+
+  private async finishConsumerSetup(
+    consumer: mediasoupTypes.Consumer,
+    result: ConsumeResponse,
+    senderUserId: string | undefined,
+    sessionGeneration: number,
+    socket: Socket | null,
+    token: { cancelled: boolean }
+  ): Promise<void> {
+    const producerUserId = senderUserId || result.producerUserId;
+    try {
+      await this.ensureE2EEForConsumer(consumer, producerUserId);
+    } catch (err) {
+      if (consumer.closed || this.consumers.get(consumer.id) !== consumer) return;
+      if (this.isConsumeCancelled(sessionGeneration, token)) {
+        this.closeConsumerAndNotify(consumer.id, socket);
+      } else {
+        this.closeConsumerAfterDecryptTransformFailure(consumer, errorMessage(err));
+      }
+      return;
+    }
+    if (this.isConsumeCancelled(sessionGeneration, token)) {
+      this.closeConsumerAndNotify(consumer.id, socket);
+      return;
+    }
+    if (consumer.closed || this.consumers.get(consumer.id) !== consumer) return;
+    this.routeConsumerToStore(consumer, result);
+
+    if (this.testSuspensionDepth > 0 && consumer.kind === 'audio') {
+      consumer.pause();
+      this.testSuspendedConsumerIds.add(consumer.id);
+      this.testRestoreEligibleConsumerIds.add(consumer.id);
+      this.testServerPausedConsumerIds.add(consumer.id);
+      console.debug('[consume] consumer held during test suspension', { consumerId: consumer.id });
+    } else if (this.startsPausedByScreenMute(result.source, result.producerUserId)) {
+      console.debug('[consume] consumer left server-paused (persisted screenshare mute)', {
+        consumerId: consumer.id,
+      });
+    } else {
+      await this.emitAsync('resume-consumer', { consumerId: consumer.id });
+      console.debug('[consume] consumer resumed', { consumerId: consumer.id });
+    }
+    if (this.isConsumeCancelled(sessionGeneration, token)) {
+      this.closeConsumerAndNotify(consumer.id, socket);
+      return;
+    }
+    if (consumer.closed || this.consumers.get(consumer.id) !== consumer) return;
+    this.applyInitialConsumerPauseReasons(consumer.id, result.source, result.producerUserId);
+    this.reemitScreenDemandOnConsume(result.source, result.producerUserId);
   }
 
   /**
@@ -8253,6 +8328,22 @@ class VoiceService {
     }
   }
 
+  private attachedCameraProducerId(userId: string, excludingProducerId?: string): string | null {
+    const track = useVoiceStore.getState().participants[userId]?.videoStream?.getVideoTracks()[0];
+    if (!track) return null;
+    for (const [consumerId, meta] of this.consumerMeta) {
+      if (
+        meta.source === 'camera' &&
+        meta.producerUserId === userId &&
+        meta.producerId !== excludingProducerId &&
+        this.consumers.get(consumerId)?.track === track
+      ) {
+        return meta.producerId;
+      }
+    }
+    return null;
+  }
+
   /** Handle a new-producer socket event — dispatches opt-in, E2EE, slot enforcement. */
   private async handleNewProducer(event: {
     producerId: string;
@@ -8263,12 +8354,12 @@ class VoiceService {
   }): Promise<void> {
     const { producerId, userId, kind, source, requiresOptIn } = event;
     const store = useVoiceStore.getState();
+    const sessionGeneration = this.videoReproduceGeneration;
 
     if (requiresOptIn && source === 'screen') {
       await this.handleOptInScreenAnnounce(producerId, userId, store);
       return;
     }
-
     if (requiresOptIn && source === 'screen-audio') {
       this.pendingScreenAudioProducers.set(userId, producerId);
       if (this.isUserScreenTunedIn(userId, store)) {
@@ -8283,23 +8374,118 @@ class VoiceService {
         await this.addDecryptKeyForUser(channelId, userId);
       }
     }
+    if (sessionGeneration !== this.videoReproduceGeneration) return;
 
-    if (source === 'camera') {
-      const videoOnCount = Object.values(store.participants).filter((p) => p.isVideoOn).length;
-      if (videoOnCount >= store.maxVideoSlots) {
-        console.warn(
-          `[new-producer] Video slot limit reached (${store.maxVideoSlots}), skipping camera consume for ${userId}`
-        );
-        store.updateParticipant(userId, { isVideoOn: true });
-        return;
-      }
-    }
+    if (!this.canConsumeCameraProducer(source, userId, producerId)) return;
 
     await this.consumeProducer(producerId, userId, kind as mediasoupTypes.MediaKind);
-    if (source === 'camera') store.updateParticipant(userId, { isVideoOn: true });
-    if (source === 'screen') store.updateParticipant(userId, { isScreenSharing: true });
-
+    if (sessionGeneration !== this.videoReproduceGeneration) return;
+    if (source === 'camera') {
+      if (this.attachedCameraProducerId(userId) !== producerId) return;
+      store.updateParticipant(userId, { isVideoOn: true });
+    }
     this.onProducerAdded?.(producerId, userId, source);
+  }
+
+  private canConsumeCameraProducer(source: string, userId: string, producerId: string): boolean {
+    if (source !== 'camera') return true;
+    const store = useVoiceStore.getState();
+    const videoOnCount = Object.values(store.participants).filter((p) => p.isVideoOn).length;
+    if (
+      videoOnCount < store.maxVideoSlots ||
+      this.attachedCameraProducerId(userId, producerId) !== null
+    ) {
+      return true;
+    }
+    console.warn(
+      `[new-producer] Video slot limit reached (${store.maxVideoSlots}), skipping camera consume for ${userId}`
+    );
+    store.updateParticipant(userId, { isVideoOn: true });
+    return false;
+  }
+
+  private handleProducerClosed(producerId: string, userId: string, source: string): void {
+    for (const token of this.pendingConsumes) {
+      if (token.producerId === producerId) token.cancelled = true;
+    }
+    const store = useVoiceStore.getState();
+    // Self-echo clears an owner latch; producer IDs are unique to this client.
+    store.clearMediaPolicyPausedByProducer(producerId);
+    this.cleanupServerClosedLocalProducer(producerId, source);
+    this.closeConsumerForProducer(producerId);
+    if (source === 'camera') {
+      this.clearClosedCamera(userId, producerId, store);
+    } else if (source === 'screen') {
+      this.handleScreenProducerClosed(producerId, userId, store);
+    } else if (source === 'screen-audio') {
+      store.updateParticipant(userId, { screenAudioStream: undefined });
+      this.pendingScreenAudioProducers.delete(userId);
+    }
+    this.onProducerClosed?.(producerId, userId);
+  }
+
+  private cleanupServerClosedLocalProducer(producerId: string, source: string): void {
+    if (
+      !['mic', 'camera', 'screen', 'screen-audio'].includes(source) ||
+      this.producers.get(source)?.id !== producerId
+    ) {
+      return;
+    }
+    // Local paths delete the producer before emitting close-producer, so a still-held
+    // producer here identifies a server-initiated close that must also stop local capture.
+    const cleanup =
+      source === 'screen-audio' ? this.setScreenAudioEnabled(false) : this.closeProducer(source);
+    void cleanup.catch((err) =>
+      console.warn(
+        '[media-policy] server-initiated producer close cleanup failed:',
+        errorMessage(err)
+      )
+    );
+    if (source === 'mic') {
+      const store = useVoiceStore.getState();
+      store.setMuted(true);
+      this.applyOptimisticMute(store, true);
+    }
+  }
+
+  private closeConsumerForProducer(producerId: string): void {
+    for (const [consumerId, consumer] of this.consumers) {
+      if (consumer.producerId !== producerId) continue;
+      consumer.close();
+      this.consumers.delete(consumerId);
+      this.decoderBudgetSampler.deleteConsumer(consumerId);
+      this.consumerMeta.delete(consumerId);
+      this.lastPreferredLayerKeyByConsumer.delete(consumerId);
+      this.pauseCoordinator.clearConsumer(consumerId);
+      break;
+    }
+  }
+
+  private clearClosedCamera(
+    userId: string,
+    producerId: string,
+    store: ReturnType<typeof useVoiceStore.getState>
+  ): void {
+    const currentCamera = this.producers.get('camera');
+    const localUserId = useUserStore.getState().user?.id;
+    const hasLocalReplacement =
+      userId === localUserId && currentCamera && currentCamera.id !== producerId;
+    const isLocalSwapInFlight =
+      userId === localUserId &&
+      this.cameraReplacementProducerId === producerId &&
+      this.localCameraStream?.getVideoTracks()[0]?.readyState === 'live';
+    if (
+      hasLocalReplacement ||
+      isLocalSwapInFlight ||
+      this.attachedCameraProducerId(userId, producerId) !== null
+    ) {
+      return;
+    }
+    store.updateParticipant(userId, {
+      isVideoOn: false,
+      videoStream: undefined,
+      isCameraPaused: false,
+    });
   }
 
   private setupSocketListeners(): void {
@@ -8339,94 +8525,9 @@ class VoiceService {
       }
     );
 
-    this.socket.on('producer-closed', ({ producerId, userId, source }) => {
-      // #2153 A1 (b): the self-echo clears an owner latch. Unconditional on userId —
-      // mediaPolicyPaused only ever holds this client's producerIds, and they are unique.
-      useVoiceStore.getState().clearMediaPolicyPausedByProducer(producerId);
-
-      // F6: when the server's pause of a policed producer fails, it closes the
-      // producer outright and the owner receives ONLY this self-echo. Nothing else
-      // stops the local side: the SFU closes exactly one producer (no screen /
-      // screen-audio pairing), and a client-side Producer outlives its server twin,
-      // so the device kept capturing and the closed producer kept sending RTP until
-      // the user left. That held for all four sources — screen and screen-audio were
-      // left out when mic and camera were fixed (#3394 PR 2 review). Mirror the
-      // permissions-changed handler's ownership check: a producer this client STILL
-      // HOLDS locally (this.producers keeps this client's own producers only, keyed
-      // by source) means this client did NOT initiate the close — every local path
-      // deletes the map entry before it emits `close-producer`, so a locally-initiated
-      // close's own echo always misses here and stays a no-op. Each source runs the
-      // teardown a user stop runs. Screen-audio takes the Share-sound OFF path rather
-      // than closeProducer: that retires the producer (so RTP stops), clears Share
-      // sound and reaps the capture host, but keeps the captured track, so turning
-      // Share sound back on reuses it instead of re-capturing and replacing the video
-      // every viewer is watching (see setScreenAudioEnabledQueued).
-      if (
-        (source === 'mic' ||
-          source === 'camera' ||
-          source === 'screen' ||
-          source === 'screen-audio') &&
-        this.producers.get(source)?.id === producerId
-      ) {
-        const serverCloseCleanup =
-          source === 'screen-audio'
-            ? this.setScreenAudioEnabled(false)
-            : this.closeProducer(source);
-        void serverCloseCleanup.catch((err) =>
-          console.warn(
-            '[media-policy] server-initiated producer close cleanup failed:',
-            errorMessage(err)
-          )
-        );
-        if (source === 'mic') {
-          // closeProducer('mic') stops capture but never touches mute state (same gap
-          // the permissions-changed handler below already covers) — without this the
-          // toolbar kept reading "unmuted" over a producer the server had closed.
-          const store = useVoiceStore.getState();
-          store.setMuted(true);
-          this.applyOptimisticMute(store, true);
-        }
-      }
-
-      // Find and close the corresponding consumer
-      for (const [consumerId, consumer] of this.consumers) {
-        if (consumer.producerId === producerId) {
-          consumer.close();
-          this.consumers.delete(consumerId);
-          this.decoderBudgetSampler.deleteConsumer(consumerId);
-          this.consumerMeta.delete(consumerId);
-          this.lastPreferredLayerKeyByConsumer.delete(consumerId);
-          this.pauseCoordinator.clearConsumer(consumerId);
-          break;
-        }
-      }
-
-      const store = useVoiceStore.getState();
-      if (source === 'camera')
-        store.updateParticipant(userId, {
-          isVideoOn: false,
-          videoStream: undefined,
-          isCameraPaused: false, // #2153: a re-produced camera must not inherit the pause
-        });
-      else if (source === 'screen') {
-        this.handleScreenProducerClosed(producerId, userId, store);
-      } else if (source === 'screen-audio') {
-        store.updateParticipant(userId, { screenAudioStream: undefined });
-        this.pendingScreenAudioProducers.delete(userId);
-        // Teardown rail 2 is the F6 branch above: a server close of a screen-audio
-        // producer this client still holds runs the Share-sound OFF path, which reaps
-        // the capture host. It is GATED ON OWNERSHIP, never on the echo alone.
-        // Every local path that drops the producer reaps the host itself, and each one
-        // emits `close-producer` whose echo lands here. Ungated, that echo undid them:
-        // #3394 PR 2's M5 check measured the interrupt handler writing `interrupted`
-        // and a teardown here overwriting it with `off` 7 ms later, so the notice never
-        // showed; and a re-produce or source switch retires the OLD producer id while a
-        // new capture is live, which the echo would then stop.
-      }
-
-      // Notify PiP proxy so open PiP windows can close their consumers
-      this.onProducerClosed?.(producerId, userId);
-    });
+    this.socket.on('producer-closed', ({ producerId, userId, source }) =>
+      this.handleProducerClosed(producerId, userId, source)
+    );
 
     // permissions-changed (CV-CAN-007 P1): the control plane revoked this peer's
     // mid-session voice permissions and the media plane already closed the listed
@@ -9739,6 +9840,9 @@ class VoiceService {
   }
 
   private async handleUserLeft({ userId, e2eeEpoch }: UserLeftEvent): Promise<void> {
+    for (const token of this.pendingConsumes) {
+      if (token.userId === userId) token.cancelled = true;
+    }
     useVoiceStore.getState().removeParticipant(userId);
     this.checkSoloBandwidthSaving();
     await this.rotateE2EEAfterUserLeft(e2eeEpoch);

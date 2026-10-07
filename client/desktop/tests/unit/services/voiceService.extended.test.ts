@@ -2950,7 +2950,16 @@ describe('VoiceService Extended', () => {
       });
       const updateSpy = vi.spyOn(store, 'updateParticipant');
 
-      await svc.consumeProducerImpl('p-audio', 'user-2', 'audio');
+      await svc.consumeProducerImpl(
+        'p-audio',
+        'user-2',
+        'audio',
+        svc.videoReproduceGeneration,
+        mockSocket,
+        {
+          cancelled: false,
+        }
+      );
 
       expect(consumer.close).toHaveBeenCalled();
       expect(svc.consumers.has('c-no-transform')).toBe(false);
@@ -3164,7 +3173,16 @@ describe('VoiceService Extended', () => {
       // emitAsync rejects when response has 'error', so consumeProducerImpl
       // hits its catch block which calls console.error
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-      await svc.consumeProducerImpl('unknown-prod');
+      await svc.consumeProducerImpl(
+        'unknown-prod',
+        undefined,
+        undefined,
+        svc.videoReproduceGeneration,
+        mockSocket,
+        {
+          cancelled: false,
+        }
+      );
       expect(errorSpy).toHaveBeenCalled();
       errorSpy.mockRestore();
     });
@@ -3187,7 +3205,16 @@ describe('VoiceService Extended', () => {
       });
 
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      await svc.consumeProducerImpl('p1');
+      await svc.consumeProducerImpl(
+        'p1',
+        undefined,
+        undefined,
+        svc.videoReproduceGeneration,
+        mockSocket,
+        {
+          cancelled: false,
+        }
+      );
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('no recvTransport'),
         expect.any(Object)

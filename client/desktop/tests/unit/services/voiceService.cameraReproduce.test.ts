@@ -648,6 +648,8 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
       const track = makeVideoTrack(`${source}-reproduce-reject-track`);
 
       if (source === 'camera') {
+        useUserStore.setState({ user: { id: 'local-user', username: 'me' } } as never);
+        useVoiceStore.getState().upsertParticipant('local-user', { username: 'me' });
         svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([track]));
         await svc.produceVideo();
       } else {
@@ -670,6 +672,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
       const state = useVoiceStore.getState();
       expect(source === 'camera' ? state.activeCameraCodec : state.activeScreenCodec).toBeNull();
       expect(source === 'camera' ? state.isVideoOn : state.isScreenSharing).toBe(false);
+      if (source === 'camera') {
+        expect(state.participants['local-user'].videoStream).toBeUndefined();
+        expect(svc.cameraReplacementProducerId).toBeNull();
+      }
     }
   );
 
@@ -739,6 +745,539 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     expect(reproduced.id).not.toBe(original.id);
     expect(camTrack.readyState, 'reused camera track must stay live').toBe('live');
   });
+
+  it('keeps the local camera preview across early and late old-producer close echoes', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    useUserStore.setState({ user: { id: 'local-user', username: 'me' } } as never);
+    useVoiceStore.getState().upsertParticipant('local-user', { username: 'me' });
+
+    const camTrack = makeVideoTrack('preview-track');
+    const camStream = new MockMediaStream([camTrack]);
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(camStream);
+    await svc.produceVideo();
+    const original = svc.producers.get('camera');
+    const onProducerClosed = getSocketHandler(svc, 'producer-closed');
+    const closeEcho = () =>
+      onProducerClosed({ producerId: original.id, userId: 'local-user', source: 'camera' });
+
+    const produce = svc.sendTransport.produce;
+    svc.sendTransport.produce = vi.fn(async (options: unknown) => {
+      closeEcho(); // Echo arrives while the replacement is still publishing.
+      expect(useVoiceStore.getState().participants['local-user']).toMatchObject({
+        isVideoOn: true,
+        videoStream: camStream,
+      });
+      return produce(options);
+    });
+    await svc.fastReproduceCamera();
+
+    const replacement = svc.producers.get('camera');
+    expect(replacement.id).not.toBe(original.id);
+    expect(useVoiceStore.getState().participants['local-user']).toMatchObject({
+      isVideoOn: true,
+      videoStream: camStream,
+    });
+
+    closeEcho(); // Echo arrives after the replacement was committed.
+    expect(useVoiceStore.getState().participants['local-user']).toMatchObject({
+      isVideoOn: true,
+      videoStream: camStream,
+    });
+    expect(camTrack.readyState).toBe('live');
+  });
+
+  it('replaces a remote camera at the video slot limit without clearing its new stream', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    svc.consumers = new Map();
+    svc.consumerMeta = new Map();
+    useUserStore.setState({ user: { id: 'local-user', username: 'me' } } as never);
+    useVoiceStore.setState({ maxVideoSlots: 1 });
+
+    const oldTrack = makeVideoTrack('peer-old');
+    const newTrack = makeVideoTrack('peer-new');
+    const oldStream = new MockMediaStream([oldTrack]);
+    const newStream = new MockMediaStream([newTrack]);
+    useVoiceStore.getState().upsertParticipant('peer-user', {
+      username: 'peer',
+      isVideoOn: true,
+      videoStream: oldStream as MediaStream,
+    });
+    const oldConsumer = { producerId: 'peer-camera-old', track: oldTrack, close: vi.fn() };
+    svc.consumers.set('old-consumer', oldConsumer);
+    svc.consumerMeta.set('old-consumer', {
+      source: 'camera',
+      producerUserId: 'peer-user',
+      producerId: 'peer-camera-old',
+    });
+
+    const consume = vi.fn(async (producerId: string) => {
+      const newConsumer = { producerId, track: newTrack, close: vi.fn() };
+      svc.consumers.set('new-consumer', newConsumer);
+      svc.consumerMeta.set('new-consumer', {
+        source: 'camera',
+        producerUserId: 'peer-user',
+        producerId,
+      });
+      useVoiceStore.getState().updateParticipant('peer-user', {
+        videoStream: newStream as MediaStream,
+        isVideoOn: true,
+      });
+    });
+    svc.consumeProducer = consume;
+    try {
+      await svc.handleNewProducer({
+        producerId: 'peer-camera-new',
+        userId: 'peer-user',
+        kind: 'video',
+        source: 'camera',
+      });
+      expect(consume).toHaveBeenCalledWith('peer-camera-new', 'peer-user', 'video');
+
+      const onProducerClosed = getSocketHandler(svc, 'producer-closed');
+      onProducerClosed({
+        producerId: 'peer-camera-old',
+        userId: 'peer-user',
+        source: 'camera',
+      });
+      expect(oldConsumer.close).toHaveBeenCalledOnce();
+      expect(useVoiceStore.getState().participants['peer-user']).toMatchObject({
+        isVideoOn: true,
+        videoStream: newStream,
+      });
+
+      useVoiceStore.getState().upsertParticipant('another-user', { username: 'another' });
+      await svc.handleNewProducer({
+        producerId: 'another-camera',
+        userId: 'another-user',
+        kind: 'video',
+        source: 'camera',
+      });
+      expect(consume).toHaveBeenCalledTimes(1);
+    } finally {
+      delete svc.consumeProducer;
+    }
+  });
+
+  it('uses the live camera slot count after decrypt-key setup yields to old close', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    svc.consumers = new Map();
+    svc.consumerMeta = new Map();
+    svc.mediaEncryption = {};
+    useVoiceStore.setState({ maxVideoSlots: 1, activeChannelId: 'channel-1' });
+
+    const oldTrack = makeVideoTrack('key-wait-old');
+    const newTrack = makeVideoTrack('key-wait-new');
+    const newStream = new MockMediaStream([newTrack]);
+    useVoiceStore.getState().upsertParticipant('peer-user', {
+      username: 'peer',
+      isVideoOn: true,
+      videoStream: new MockMediaStream([oldTrack]) as MediaStream,
+    });
+    svc.consumers.set('old-consumer', {
+      producerId: 'peer-camera-old',
+      track: oldTrack,
+      close: vi.fn(),
+    });
+    svc.consumerMeta.set('old-consumer', {
+      source: 'camera',
+      producerUserId: 'peer-user',
+      producerId: 'peer-camera-old',
+    });
+
+    let releaseKey: () => void = () => {};
+    svc.addDecryptKeyForUser = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseKey = resolve;
+        })
+    );
+    const consume = vi.fn(async (producerId: string) => {
+      svc.consumers.set('new-consumer', { producerId, track: newTrack, close: vi.fn() });
+      svc.consumerMeta.set('new-consumer', {
+        source: 'camera',
+        producerUserId: 'peer-user',
+        producerId,
+      });
+      useVoiceStore.getState().updateParticipant('peer-user', {
+        isVideoOn: true,
+        videoStream: newStream as MediaStream,
+      });
+    });
+    svc.consumeProducer = consume;
+    try {
+      const announce = svc.handleNewProducer({
+        producerId: 'peer-camera-new',
+        userId: 'peer-user',
+        kind: 'video',
+        source: 'camera',
+      });
+      expect(svc.addDecryptKeyForUser).toHaveBeenCalledOnce();
+      getSocketHandler(
+        svc,
+        'producer-closed'
+      )({
+        producerId: 'peer-camera-old',
+        userId: 'peer-user',
+        source: 'camera',
+      });
+      expect(useVoiceStore.getState().participants['peer-user']).toMatchObject({
+        isVideoOn: false,
+        videoStream: undefined,
+      });
+
+      releaseKey();
+      await announce;
+      expect(consume).toHaveBeenCalledWith('peer-camera-new', 'peer-user', 'video');
+      expect(useVoiceStore.getState().participants['peer-user']).toMatchObject({
+        isVideoOn: true,
+        videoStream: newStream,
+      });
+    } finally {
+      releaseKey();
+      delete svc.consumeProducer;
+      delete svc.addDecryptKeyForUser;
+    }
+  });
+
+  it('retires a real camera consumer whose E2EE setup finishes after session reset', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    svc.consumers = new Map();
+    svc.consumerMeta = new Map();
+    svc.consumeQueueVideo = Promise.resolve();
+    useVoiceStore.getState().upsertParticipant('peer-user', { username: 'peer' });
+
+    const track = makeVideoTrack('stale-consume');
+    const consumer = {
+      id: 'stale-consumer',
+      producerId: 'peer-camera',
+      kind: 'video',
+      track,
+      paused: true,
+      closed: false,
+      close: vi.fn(function (this: { closed: boolean }) {
+        this.closed = true;
+      }),
+      on: vi.fn(),
+    };
+    svc.recvTransportVideo = {
+      id: 'recv-video',
+      consume: vi.fn().mockResolvedValue(consumer),
+    };
+    svc.emitAsync = vi.fn().mockResolvedValue({
+      id: consumer.id,
+      producerId: consumer.producerId,
+      kind: 'video',
+      rtpParameters: {},
+      source: 'camera',
+      producerUserId: 'peer-user',
+    });
+    svc.creationAttachConsumeOption = vi.fn().mockReturnValue({});
+    let releaseE2EE: () => void = () => {};
+    svc.ensureE2EEForConsumer = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseE2EE = resolve;
+        })
+    );
+    const oldSocket = svc.socket;
+    const successorSocket = { emit: vi.fn() };
+    try {
+      const consuming = svc.consumeProducer('peer-camera', 'peer-user', 'video');
+      await vi.waitFor(() => expect(svc.ensureE2EEForConsumer).toHaveBeenCalledOnce());
+      expect(svc.consumers.get(consumer.id)).toBe(consumer);
+
+      svc.invalidateVideoReproduces();
+      useVoiceStore.getState().setParticipants([]);
+      svc.socket = successorSocket;
+      releaseE2EE();
+      await consuming;
+
+      expect(useVoiceStore.getState().participants['peer-user']).toBeUndefined();
+      expect(consumer.close).toHaveBeenCalledOnce();
+      expect(svc.consumers.has(consumer.id)).toBe(false);
+      expect(svc.consumerMeta.has(consumer.id)).toBe(false);
+      expect(oldSocket.emit).toHaveBeenCalledWith('close-consumer', { consumerId: consumer.id });
+      expect(successorSocket.emit).not.toHaveBeenCalledWith('close-consumer', {
+        consumerId: consumer.id,
+      });
+      expect(svc.emitAsync).not.toHaveBeenCalledWith('resume-consumer', {
+        consumerId: consumer.id,
+      });
+    } finally {
+      releaseE2EE();
+      svc.socket = oldSocket;
+      delete svc.emitAsync;
+      delete svc.ensureE2EEForConsumer;
+      delete svc.creationAttachConsumeOption;
+    }
+  });
+
+  it('does not route a camera consumer closed while E2EE setup is pending', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    svc.consumers = new Map();
+    svc.consumerMeta = new Map();
+    svc.consumeQueueVideo = Promise.resolve();
+    useVoiceStore.getState().upsertParticipant('peer-user', { username: 'peer' });
+
+    const consumer = {
+      id: 'closed-consumer',
+      producerId: 'peer-camera',
+      kind: 'video',
+      track: makeVideoTrack('closed-track'),
+      paused: true,
+      closed: false,
+      close: vi.fn(function (this: { closed: boolean }) {
+        this.closed = true;
+      }),
+      on: vi.fn(),
+    };
+    svc.recvTransportVideo = { id: 'recv-video', consume: vi.fn().mockResolvedValue(consumer) };
+    svc.emitAsync = vi.fn().mockResolvedValue({
+      id: consumer.id,
+      producerId: consumer.producerId,
+      kind: 'video',
+      rtpParameters: {},
+      source: 'camera',
+      producerUserId: 'peer-user',
+    });
+    svc.creationAttachConsumeOption = vi.fn().mockReturnValue({});
+    let releaseE2EE: () => void = () => {};
+    svc.ensureE2EEForConsumer = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseE2EE = resolve;
+        })
+    );
+    try {
+      const consuming = svc.consumeProducer('peer-camera', 'peer-user', 'video');
+      await vi.waitFor(() => expect(svc.ensureE2EEForConsumer).toHaveBeenCalledOnce());
+      expect(svc.consumers.get(consumer.id)).toBe(consumer);
+
+      getSocketHandler(
+        svc,
+        'producer-closed'
+      )({
+        producerId: 'peer-camera',
+        userId: 'peer-user',
+        source: 'camera',
+      });
+      expect(consumer.close).toHaveBeenCalledOnce();
+      expect(svc.consumers.has(consumer.id)).toBe(false);
+
+      releaseE2EE();
+      await consuming;
+      expect(useVoiceStore.getState().participants['peer-user']).toMatchObject({
+        isVideoOn: false,
+        videoStream: undefined,
+      });
+      expect(svc.emitAsync).not.toHaveBeenCalledWith('resume-consumer', {
+        consumerId: consumer.id,
+      });
+    } finally {
+      releaseE2EE();
+      delete svc.emitAsync;
+      delete svc.ensureE2EEForConsumer;
+      delete svc.creationAttachConsumeOption;
+    }
+  });
+
+  it.each([
+    { closeProducer: true, leaveUser: false },
+    { closeProducer: false, leaveUser: true },
+    { closeProducer: true, leaveUser: true },
+  ])(
+    'cancels a camera consume still negotiating after close: $closeProducer, leave: $leaveUser',
+    async ({ closeProducer, leaveUser }) => {
+      const svc = voiceService as any;
+      resetService(svc);
+      svc.consumers = new Map();
+      svc.consumerMeta = new Map();
+      svc.consumeQueueVideo = Promise.resolve();
+      useVoiceStore.getState().upsertParticipant('peer-user', {
+        username: 'peer',
+        isVideoOn: true,
+      });
+
+      const consumer = {
+        id: 'late-consumer',
+        producerId: 'peer-camera',
+        kind: 'video',
+        track: makeVideoTrack('late-track'),
+        closed: false,
+        close: vi.fn(function (this: { closed: boolean }) {
+          this.closed = true;
+        }),
+        on: vi.fn(),
+      };
+      let releaseTransport: (value: typeof consumer) => void = () => {};
+      const pendingTransport = new Promise<typeof consumer>((resolve) => {
+        releaseTransport = resolve;
+      });
+      const consumeTransport = vi.fn(() => pendingTransport);
+      svc.recvTransportVideo = { id: 'recv-video', consume: consumeTransport };
+      svc.emitAsync = vi.fn().mockResolvedValue({
+        id: consumer.id,
+        producerId: consumer.producerId,
+        kind: 'video',
+        rtpParameters: {},
+        source: 'camera',
+        producerUserId: 'peer-user',
+      });
+      svc.creationAttachConsumeOption = vi.fn().mockReturnValue({});
+      svc.ensureE2EEForConsumer = vi.fn().mockResolvedValue(undefined);
+      try {
+        const consuming = svc.consumeProducer('peer-camera', 'peer-user', 'video');
+        await vi.waitFor(() => expect(consumeTransport).toHaveBeenCalledOnce());
+        if (closeProducer) {
+          getSocketHandler(
+            svc,
+            'producer-closed'
+          )({
+            producerId: 'peer-camera',
+            userId: 'peer-user',
+            source: 'camera',
+          });
+        }
+        if (leaveUser) await svc.handleUserLeft({ userId: 'peer-user' });
+
+        releaseTransport(consumer);
+        await consuming;
+        if (leaveUser) {
+          expect(useVoiceStore.getState().participants['peer-user']).toBeUndefined();
+        } else {
+          expect(useVoiceStore.getState().participants['peer-user']).toMatchObject({
+            isVideoOn: false,
+            videoStream: undefined,
+          });
+        }
+        expect(consumer.close).toHaveBeenCalledOnce();
+        expect(svc.consumers.has(consumer.id)).toBe(false);
+        expect(svc.consumerMeta.has(consumer.id)).toBe(false);
+        expect(mockSocket.emit).toHaveBeenCalledWith('close-consumer', {
+          consumerId: consumer.id,
+        });
+        expect(svc.ensureE2EEForConsumer).not.toHaveBeenCalled();
+      } finally {
+        releaseTransport(consumer);
+        delete svc.emitAsync;
+        delete svc.creationAttachConsumeOption;
+        delete svc.ensureE2EEForConsumer;
+      }
+    }
+  );
+
+  it('does not mark an uncaptured legacy screen as sharing after consume fails', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    useVoiceStore.getState().upsertParticipant('peer-user', { username: 'peer' });
+    svc.consumeProducer = vi.fn().mockResolvedValue(undefined);
+    try {
+      await svc.handleNewProducer({
+        producerId: 'peer-screen',
+        userId: 'peer-user',
+        kind: 'video',
+        source: 'screen',
+        requiresOptIn: false,
+      });
+      expect(svc.consumeProducer).toHaveBeenCalledWith('peer-screen', 'peer-user', 'video');
+      expect(useVoiceStore.getState().participants['peer-user'].isScreenSharing).toBe(false);
+    } finally {
+      delete svc.consumeProducer;
+    }
+  });
+
+  it.each([
+    { closeBeforeAnnouncement: true, attaches: true },
+    { closeBeforeAnnouncement: false, attaches: true },
+    { closeBeforeAnnouncement: true, attaches: false },
+    { closeBeforeAnnouncement: false, attaches: false },
+  ])(
+    'handles old camera close before replacement attach (before announcement: $closeBeforeAnnouncement, attaches: $attaches)',
+    async ({ closeBeforeAnnouncement, attaches }) => {
+      const svc = voiceService as any;
+      resetService(svc);
+      svc.consumers = new Map();
+      svc.consumerMeta = new Map();
+      useVoiceStore.setState({ maxVideoSlots: 1 });
+
+      const oldTrack = makeVideoTrack('peer-old');
+      const newTrack = makeVideoTrack('peer-new');
+      const newStream = new MockMediaStream([newTrack]);
+      useVoiceStore.getState().upsertParticipant('peer-user', {
+        username: 'peer',
+        isVideoOn: true,
+        videoStream: new MockMediaStream([oldTrack]) as MediaStream,
+      });
+      const oldConsumer = { producerId: 'peer-camera-old', track: oldTrack, close: vi.fn() };
+      svc.consumers.set('old-consumer', oldConsumer);
+      svc.consumerMeta.set('old-consumer', {
+        source: 'camera',
+        producerUserId: 'peer-user',
+        producerId: 'peer-camera-old',
+      });
+
+      let releaseConsume: () => void = () => {};
+      const pendingConsume = new Promise<void>((resolve) => {
+        releaseConsume = resolve;
+      });
+      const consume = vi.fn(async (producerId: string) => {
+        await pendingConsume;
+        if (!attaches) return;
+        svc.consumers.set('new-consumer', { producerId, track: newTrack, close: vi.fn() });
+        svc.consumerMeta.set('new-consumer', {
+          source: 'camera',
+          producerUserId: 'peer-user',
+          producerId,
+        });
+        useVoiceStore.getState().updateParticipant('peer-user', {
+          isVideoOn: true,
+          videoStream: newStream as MediaStream,
+        });
+      });
+      svc.consumeProducer = consume;
+      try {
+        const closeOld = () =>
+          getSocketHandler(
+            svc,
+            'producer-closed'
+          )({
+            producerId: 'peer-camera-old',
+            userId: 'peer-user',
+            source: 'camera',
+          });
+        if (closeBeforeAnnouncement) closeOld();
+        const announce = svc.handleNewProducer({
+          producerId: 'peer-camera-new',
+          userId: 'peer-user',
+          kind: 'video',
+          source: 'camera',
+        });
+        await vi.waitFor(() => expect(consume).toHaveBeenCalledOnce());
+        if (!closeBeforeAnnouncement) closeOld();
+        expect(oldConsumer.close).toHaveBeenCalledOnce();
+        expect(useVoiceStore.getState().participants['peer-user']).toMatchObject({
+          isVideoOn: false,
+          videoStream: undefined,
+        });
+
+        releaseConsume();
+        await announce;
+        expect(useVoiceStore.getState().participants['peer-user']).toMatchObject(
+          attaches
+            ? { isVideoOn: true, videoStream: newStream }
+            : { isVideoOn: false, videoStream: undefined }
+        );
+      } finally {
+        releaseConsume();
+        delete svc.consumeProducer;
+      }
+    }
+  );
 
   it('codec-floor screen re-produce keeps the screen alive (reused track survives close)', async () => {
     const svc = voiceService as any;

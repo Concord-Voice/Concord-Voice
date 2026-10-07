@@ -445,6 +445,8 @@ export interface Room {
   cameraLayerDemands: Map<string, StoredCameraLayerDemand>;
   /** Current room-level camera layering gate state. */
   cameraLayeringGateEnabled: boolean;
+  /** Pending room-level camera gate-OFF debounce timer. */
+  cameraGateOffTimer?: ReturnType<typeof setTimeout>;
   /** Receiver-driven screen layer demand, keyed by consumerId (#1924). Values
    *  carry the owning viewer userId (so the gate counts DISTINCT viewers, not
    *  consumer entries — a single client can own multiple screen consumers of one
@@ -690,6 +692,9 @@ export const KEYFRAME_REQUEST_DELAY_MS = 1_000;
  * (or a re-added heterogeneous viewer pair) cancels the pending OFF immediately.
  */
 export const SCREEN_GATE_OFF_DEBOUNCE_MS = 1500;
+
+/** Absorb the brief consumer gap when camera producers are reproduced. */
+export const CAMERA_GATE_OFF_DEBOUNCE_MS = 1500;
 
 /** Keep a completed DM call ID closed long enough to reject delayed join retries. */
 const DM_CALL_ID_TOMBSTONE_MS = 60_000;
@@ -1585,6 +1590,10 @@ export class RoomManager {
         logger.warn('Room has closed router, discarding stale room', {
           roomId,
         });
+        if (room.cameraGateOffTimer) {
+          clearTimeout(room.cameraGateOffTimer);
+          room.cameraGateOffTimer = undefined;
+        }
         this.rooms.delete(roomId);
       } else {
         if (
@@ -1743,6 +1752,10 @@ export class RoomManager {
       clearTimeout(timer);
     }
     room.screenGateOffTimers.clear();
+    if (room.cameraGateOffTimer) {
+      clearTimeout(room.cameraGateOffTimer);
+      room.cameraGateOffTimer = undefined;
+    }
 
     // Close AudioLevelObserver
     if (room.audioLevelObserver && !room.audioLevelObserver.closed) {
@@ -5071,19 +5084,38 @@ export class RoomManager {
   }
 
   private recomputeCameraLayeringGate(room: Room): void {
-    const enabled = computeCameraLayeringGate({
-      codecKind: this.cameraLayeringCodecKind(room),
-      cameraProducerCount: this.countProducersBySource(room, 'camera'),
-      demands: Array.from(room.cameraLayerDemands.values()),
-      previouslyEnabled: room.cameraLayeringGateEnabled,
-    });
-    if (enabled === room.cameraLayeringGateEnabled) return;
-    room.cameraLayeringGateEnabled = enabled;
-    // Counted HERE rather than at the emit subscriber: this is the one place a
-    // transition is decided, and the snapshot emitted to a joining participant
-    // (#3275) is deliberately not a flip.
-    this.counterHooks.onCameraLayeringGateFlip?.();
-    this.emitEvent({ type: 'camera-layering-gate', roomId: room.id, enabled });
+    const enabled = (): boolean =>
+      computeCameraLayeringGate({
+        codecKind: this.cameraLayeringCodecKind(room),
+        cameraProducerCount: this.countProducersBySource(room, 'camera'),
+        demands: Array.from(room.cameraLayerDemands.values()),
+        previouslyEnabled: room.cameraLayeringGateEnabled,
+      });
+    const next = enabled();
+
+    if (next) {
+      if (room.cameraGateOffTimer) {
+        clearTimeout(room.cameraGateOffTimer);
+        room.cameraGateOffTimer = undefined;
+      }
+      if (room.cameraLayeringGateEnabled) return;
+      room.cameraLayeringGateEnabled = true;
+      this.counterHooks.onCameraLayeringGateFlip?.();
+      this.emitEvent({ type: 'camera-layering-gate', roomId: room.id, enabled: true });
+      return;
+    }
+
+    if (!room.cameraLayeringGateEnabled || room.cameraGateOffTimer) return;
+    // Consumer demand briefly disappears while a camera producer is replaced.
+    // Keep the gate on through that gap, then make the OFF decision from live state.
+    room.cameraGateOffTimer = setTimeout(() => {
+      room.cameraGateOffTimer = undefined;
+      if (this.rooms.get(room.id) !== room) return;
+      if (enabled() || !room.cameraLayeringGateEnabled) return;
+      room.cameraLayeringGateEnabled = false;
+      this.counterHooks.onCameraLayeringGateFlip?.();
+      this.emitEvent({ type: 'camera-layering-gate', roomId: room.id, enabled: false });
+    }, CAMERA_GATE_OFF_DEBOUNCE_MS);
   }
 
   private maxCameraSpatialLayerForParticipant(participant: Participant): LayerValue {

@@ -779,11 +779,17 @@ Room broadcasts include `participant-testing-changed` and `camera-layering-gate`
 
 `join-room` participant summaries carry `isTesting`, so clients can render in-call device tests. The peer-facing `user-joined` event carries identity, epoch, and optional authoritative `isDeafened` / `isTesting` values. Desktop merges only present booleans, so a no-leave reconnect clears stale flags without clobbering legacy or consume-race media state.
 
+The desktop waits for its own participant entry before applying solo-bandwidth roster counts, so an early peer `user-joined` event cannot pause local media while the initial roster is still arriving.
+
 `request-keyframe` lets a receiver ask the SFU for a fresh video keyframe from a target sender, after E2EE epoch recovery. The media plane validates room membership and applies a 5s per-sender cooldown. It then calls mediasoup `consumer.requestKeyFrame()` (PLI/FIR).
 
 `set-preferred-layers` carries receiver render demand for owned camera or screen video consumers: `consumerId`, desired layers, visibility, CSS size, device pixel ratio, and role, focus, and pressure flags. The media plane verifies ownership, video kind, and server-set source. It applies the camera entitlement cap only to camera demand. It calls mediasoup `consumer.setPreferredLayers()` only for simulcast and SVC consumers.
 
 Camera demand drives the room camera gate. Non-SVC screen demand drives the per-sharer screen gate. SVC screen demand applies without entering gate state.
+
+The camera gate turns ON immediately and delays OFF for 1.5 seconds, rechecking live room demand so a brief producer-replacement gap does not disable layered camera publishing. The desktop preserves local camera preview during an in-flight replacement and lets an attached remote camera reuse that same user's video slot. A remote tile can clear briefly if its old producer closes before the replacement attaches.
+
+Receive consumers are scoped to the active media-session generation. Once a consume is queued, producer closure or peer departure cancels the matching operation before it can attach a track to the roster; stale results are closed through the requesting socket. Transport-close cleanup is registered before E2EE setup so a closed consumer cannot later attach its track. A new-producer event still awaiting decrypt-key setup has not queued its consume yet.
 
 The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `server_deafened`. Voice quality tiers apply client-side through producer `codecOptions`, not through a Socket.IO event.
 `close-recv-transport` validates a non-empty transport ID, derives ownership from authenticated socket state, and closes only the caller's mapped receive transport. Retries and non-owned IDs receive an acknowledgement that reveals no resource existence.

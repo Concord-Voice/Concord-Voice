@@ -4548,6 +4548,63 @@ describe('VoiceService', () => {
   // ===== Solo Bandwidth Saving =====
 
   describe('solo bandwidth saving', () => {
+    it('does not treat an early peer join as solo before the authoritative roster arrives', async () => {
+      setupAuth();
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      mockSocket.connected = true;
+
+      const sendTransport = makeSendTransport();
+      mockCreateSendTransport.mockReturnValue(sendTransport);
+      mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+
+      let acknowledgeRoomJoined: ((response: unknown) => void) | undefined;
+      setupEmitResponses({
+        'join-room': undefined,
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic' },
+        'resume-consumer': undefined,
+        'close-producer': undefined,
+        'pause-producer': undefined,
+        'resume-producer': undefined,
+      });
+      mockSocket.emit.mockImplementation(
+        (event: string, _data: unknown, callback?: (response: unknown) => void) => {
+          if (event === 'join-room') acknowledgeRoomJoined = callback;
+          else if (callback) {
+            const responses: Record<string, unknown> = {
+              'create-transport': makeTransportOpts(),
+              produce: { id: 'prod-mic' },
+            };
+            callback(responses[event]);
+          }
+        }
+      );
+
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+      const micProducer = createMockProducer('prod-mic', 'mic');
+      sendTransport.produce.mockResolvedValue(micProducer);
+
+      const joining = voiceService.joinChannel('channel-1', 'channel');
+      await vi.waitFor(() => expect(acknowledgeRoomJoined).toBeTypeOf('function'));
+      expect(Object.keys(useVoiceStore.getState().participants)).toHaveLength(0);
+
+      socketListeners['user-joined']?.[0]?.({
+        userId: 'user-2',
+        username: 'other',
+        displayName: 'Other',
+      });
+      expect(useVoiceStore.getState().isSoloBandwidthSaving).toBe(false);
+
+      acknowledgeRoomJoined?.(makeRoomJoined());
+      await joining;
+
+      expect(micProducer.pause).not.toHaveBeenCalled();
+      expect(micProducer.paused).toBe(false);
+    });
+
     it('enters solo mode when last other user leaves', async () => {
       await joinVoiceChannel();
 
@@ -7594,6 +7651,69 @@ describe('tune-in hardening (#2088 review fixes)', () => {
     await Promise.all([first, second]);
 
     expect(consume).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not close a successor screen consumer when an old same-channel consume settles', async () => {
+    const svc = voiceService as any;
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+    const oldConsume = deferred();
+    const newConsume = deferred();
+    const successor = createMockConsumer('cons-new-session', 'video', 'shared-producer');
+    const consume = vi.spyOn(svc, 'consumeProducer');
+    consume.mockClear();
+    consume.mockImplementationOnce(async () => {
+      await oldConsume.promise;
+    });
+    consume.mockImplementationOnce(async () => {
+      await newConsume.promise;
+      svc.consumers.set(successor.id, successor);
+    });
+
+    const oldTune = voiceService.tuneInToScreenShare('shared-producer', 'user-2');
+    await vi.waitFor(() => expect(consume).toHaveBeenCalledTimes(1));
+    svc.invalidateVideoReproduces();
+    useVoiceStore.getState().resetScreenShareConsumption();
+    const newTune = voiceService.tuneInToScreenShare('shared-producer', 'user-2');
+    await vi.waitFor(() => expect(consume).toHaveBeenCalledTimes(2));
+    newConsume.resolve();
+    await newTune;
+    oldConsume.resolve();
+    await oldTune;
+
+    expect(successor.close).not.toHaveBeenCalled();
+    expect(svc.consumers.get(successor.id)).toBe(successor);
+    expect(useVoiceStore.getState().tunedInScreenShares['shared-producer']).toBe(successor.id);
+    consume.mockRestore();
+  });
+
+  it('does not release a successor tune-in reservation from an old finally', async () => {
+    const svc = voiceService as any;
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+    const oldConsume = deferred();
+    const newConsume = deferred();
+    const consume = vi.spyOn(svc, 'consumeProducer').mockImplementation(async () => {});
+    consume.mockClear();
+    consume.mockImplementationOnce(async () => {
+      await oldConsume.promise;
+    });
+    consume.mockImplementationOnce(async () => {
+      await newConsume.promise;
+    });
+
+    const oldTune = voiceService.tuneInToScreenShare('shared-producer', 'user-2');
+    await vi.waitFor(() => expect(consume).toHaveBeenCalledTimes(1));
+    svc.invalidateVideoReproduces();
+    useVoiceStore.getState().resetScreenShareConsumption();
+    const newTune = voiceService.tuneInToScreenShare('shared-producer', 'user-2');
+    await vi.waitFor(() => expect(consume).toHaveBeenCalledTimes(2));
+    oldConsume.resolve();
+    await oldTune;
+
+    await voiceService.tuneInToScreenShare('shared-producer', 'user-2');
+    expect(consume).toHaveBeenCalledTimes(2);
+    newConsume.resolve();
+    await newTune;
+    consume.mockRestore();
   });
 
   it('producer-closed (server-initiated) performs local-only cleanup — no close-consumer emit', () => {

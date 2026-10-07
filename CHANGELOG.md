@@ -11,12 +11,18 @@ before transferring your account key. Voice joins capture the selected
 microphone once and explain how to recover if capture fails. Audio and video
 device controls now sit with their settings, with app-only microphone level
 adjustment when automatic gain is off. The desktop also includes a patched
-source-map-js dependency.
+source-map-js dependency. Local camera previews stay
+visible during producer swaps, and a remote tile returns when its replacement
+attaches. A remote close can briefly clear the tile if it arrives first. Brief
+receiver gaps no longer turn off layered camera publishing for the whole room.
+Late media from an earlier voice session is closed before it can attach after a
+rejoin.
 
 ### Fixed
 
 - **Voice joins capture the selected microphone once** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — server and direct-message calls capture the selected input after room and encryption setup. If capture finishes after a join has ended, or encrypted publication fails, Concord stops the track. A capture error now gives you useful next steps; the device may be unavailable or in use, so choose another microphone or close the app using it. Microphone permission errors point you to system settings. Audio setting changes preserve your mute, including when you press Mute during a microphone update, and changing an input or audio setting can retry a failed microphone update during a call. Speaking feedback keeps working after switching or rebuilding the microphone, including while alone in a call.
 - **Audio menus now show one Default option** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — it follows your operating system's default device, while named microphones and speakers remain selectable.
+- **Camera replacements and call cleanup preserve the right video** ([PR #3650](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3650)) — local previews survive swaps, and remote video turns on only after its replacement consumer attaches. A remote tile can briefly disappear if its old producer closes first; room-level debounce keeps that gap from disabling layered camera publishing. Queued camera loads are canceled when their producer closes or their owner leaves before the stream attaches. Late media from an earlier voice session is closed before it can attach after a rejoin.
 
 ### Changed
 
