@@ -9,7 +9,7 @@ import PhoneIcon from '@/renderer/components/Auth/icons/PhoneIcon';
 
 describe('getAvailableCategories', () => {
   it('maps webauthn to webauthn category', () => {
-    expect(getAvailableCategories(['webauthn'])).toEqual(['webauthn', 'backup']);
+    expect(getAvailableCategories(['webauthn'])).toEqual(['webauthn']);
   });
 
   it('maps totp to totp category', () => {
@@ -19,7 +19,6 @@ describe('getAvailableCategories', () => {
   it('maps email and sms to email-sms category', () => {
     const result = getAvailableCategories(['email', 'sms']);
     expect(result).toContain('email-sms');
-    expect(result).toContain('backup');
   });
 
   it('deduplicates email-sms from email and sms', () => {
@@ -32,8 +31,12 @@ describe('getAvailableCategories', () => {
     expect(result).toEqual(['webauthn', 'totp', 'email-sms', 'backup']);
   });
 
-  it('always includes backup when at least one MFA method exists', () => {
+  // Backup codes belong to the authenticator app (picker spec C16, C50).
+  it('offers backup codes only when totp is listed', () => {
     expect(getAvailableCategories(['totp'])).toContain('backup');
+    expect(getAvailableCategories(['webauthn'])).not.toContain('backup');
+    expect(getAvailableCategories(['email', 'sms'])).not.toContain('backup');
+    expect(getAvailableCategories(['webauthn', 'email'])).toEqual(['webauthn', 'email-sms']);
   });
 
   it('returns empty array when no methods provided', () => {
@@ -53,6 +56,23 @@ describe('getAvailableCategories', () => {
   it('excludes multiple methods', () => {
     const result = getAvailableCategories(['totp', 'webauthn', 'email'], ['email', 'webauthn']);
     expect(result).toEqual(['totp', 'backup']);
+  });
+
+  // A sign-in challenge leaves a recovery-only TOTP out of `methods`, so its
+  // backup codes go with it (#3563)...
+  it('offers no backup codes when a sign-in challenge omits a recovery-only totp', () => {
+    expect(getAvailableCategories(['email'], ['totp'])).toEqual(['email-sms']);
+  });
+
+  // ...while a step-up list still names it, and step-up accepts its backup codes.
+  it('keeps backup codes when totp is listed but excluded', () => {
+    expect(getAvailableCategories(['totp', 'email'], ['totp'])).toEqual(['email-sms', 'backup']);
+  });
+
+  // Excluding every listed factor would hide the app code step-up accepts.
+  it('keeps totp when every listed method is excluded', () => {
+    expect(getAvailableCategories(['totp'], ['totp'])).toEqual(['totp', 'backup']);
+    expect(getDefaultMethod(['totp'], ['totp'])).toBe('totp');
   });
 });
 

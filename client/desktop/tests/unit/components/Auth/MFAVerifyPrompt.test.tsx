@@ -149,6 +149,47 @@ describe('MFAVerifyPrompt', () => {
     expect(screen.queryByText(/email/i)).not.toBeInTheDocument();
   });
 
+  // Recovery-only governs sign-in only (#3563): step-up still takes a
+  // recovery-only TOTP's backup codes, so the prompt keeps offering them.
+  it('keeps backup codes when TOTP is recovery-only', () => {
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn', 'totp']}
+        recoveryOnlyMethods={['totp']}
+        onVerify={onVerify}
+      />
+    );
+    expect(screen.getByText('Use a backup code instead')).toBeInTheDocument();
+  });
+
+  // Step-up accepts a recovery-only TOTP, so when it is the only factor listed
+  // the prompt still asks for the app's 6-digit code, not only a backup code.
+  it('keeps the authenticator app when a recovery-only TOTP is the only factor', () => {
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['totp']}
+        recoveryOnlyMethods={['totp']}
+        onVerify={onVerify}
+      />
+    );
+    expect(screen.getAllByRole('textbox')).toHaveLength(6);
+    expect(screen.getByText('Use a backup code instead')).toBeInTheDocument();
+  });
+
+  // Backup codes belong to the authenticator app (picker spec C16).
+  it('offers no backup codes without an authenticator app', () => {
+    render(
+      <MFAVerifyPrompt
+        purpose="mfa_settings.totp_setup"
+        methods={['webauthn']}
+        onVerify={onVerify}
+      />
+    );
+    expect(screen.queryByText('Use a backup code instead')).not.toBeInTheDocument();
+  });
+
   it('does not show backup switch when excludeBackupCodes and in webauthn mode', () => {
     render(
       <MFAVerifyPrompt

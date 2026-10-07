@@ -80,7 +80,15 @@ function methodToCategory(method: string): MFAMethodCategory | null {
 }
 
 /** Given available server methods, returns available categories in priority order.
- *  excludeMethods: optional list of raw method strings to exclude (e.g. recovery-only methods) */
+ *  excludeMethods: optional list of raw method strings to exclude (e.g. recovery-only methods).
+ *
+ *  Backup codes belong to the authenticator app: the server tries one only while
+ *  TOTP is set up, and refuses them at sign-in while TOTP is recovery-only
+ *  (#3563). So they are offered only when `methods` names `totp` (picker spec
+ *  C16, C50). A sign-in challenge leaves a recovery-only TOTP out of `methods`,
+ *  which takes its backup codes with it; a step-up list still names it, so
+ *  excluding `totp` there keeps the backup codes. Step-up accepts a
+ *  recovery-only TOTP too, so when excluding leaves nothing, `totp` stays. */
 export function getAvailableCategories(
   methods: string[],
   excludeMethods?: string[]
@@ -92,8 +100,10 @@ export function getAvailableCategories(
     const cat = methodToCategory(m);
     if (cat) categories.add(cat);
   }
-  // Always allow backup codes if any MFA method is available
-  if (categories.size > 0) categories.add('backup');
+  if (methods.includes('totp')) {
+    if (categories.size === 0) categories.add('totp');
+    categories.add('backup');
+  }
   return PRIORITY.filter((p) => categories.has(p));
 }
 

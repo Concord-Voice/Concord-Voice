@@ -123,8 +123,13 @@ vi.mock('@/renderer/components/Auth/WebAuthnPrompt', () => ({
   ),
 }));
 
-vi.mock('@/renderer/components/Auth/MFAMethodPicker', () => {
+vi.mock('@/renderer/components/Auth/MFAMethodPicker', async () => {
   const React = require('react');
+  // The category rules are the real ones: which methods a sign-in challenge
+  // offers is what these tests check (#3563). Only the picker UI is a stand-in.
+  const actual = await vi.importActual<typeof import('@/renderer/components/Auth/MFAMethodPicker')>(
+    '@/renderer/components/Auth/MFAMethodPicker'
+  );
   const component = ({
     onSelect,
     onCancel,
@@ -152,20 +157,8 @@ vi.mock('@/renderer/components/Auth/MFAMethodPicker', () => {
 
   return {
     default: component,
-    getDefaultMethod: (methods: string[]) => {
-      if (methods.includes('webauthn')) return 'webauthn';
-      if (methods.includes('totp')) return 'totp';
-      if (methods.includes('email') || methods.includes('sms')) return 'email-sms';
-      return 'totp';
-    },
-    getAvailableCategories: (methods: string[]) => {
-      const cats: string[] = [];
-      if (methods.includes('webauthn')) cats.push('webauthn');
-      if (methods.includes('totp')) cats.push('totp');
-      if (methods.includes('email') || methods.includes('sms')) cats.push('email-sms');
-      if (cats.length > 0) cats.push('backup');
-      return cats;
-    },
+    getDefaultMethod: actual.getDefaultMethod,
+    getAvailableCategories: actual.getAvailableCategories,
   };
 });
 
@@ -328,6 +321,30 @@ describe('MFAChallengeModal', () => {
     useMFAChallengeStore.setState({
       challengeToken: 'test-token',
       methods: ['totp', 'webauthn'],
+      recoveryOnlyMethods: [],
+    });
+
+    render(<MFAChallengeModal />);
+    expect(screen.getByText('Choose another form of verification')).toBeInTheDocument();
+  });
+
+  // #3563: a recovery-only TOTP is left out of the challenge's methods, and its
+  // backup codes go with it, so with email left there is no other form.
+  it('offers no other form when a recovery-only TOTP leaves only email', () => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'test-token',
+      methods: ['email'],
+      recoveryOnlyMethods: ['totp'],
+    });
+
+    render(<MFAChallengeModal />);
+    expect(screen.queryByText('Choose another form of verification')).not.toBeInTheDocument();
+  });
+
+  it('offers backup codes as another form when TOTP is listed', () => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'test-token',
+      methods: ['totp', 'email'],
       recoveryOnlyMethods: [],
     });
 
