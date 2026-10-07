@@ -200,7 +200,6 @@ const NAV_SUBSECTIONS: Record<string, NavSubsection[]> = {
     { id: 'quiet-hours', label: 'Quiet Hours' },
   ],
   voice: [
-    { id: 'device-config', label: 'Device Configuration' },
     { id: 'audio-config', label: 'Audio Configuration' },
     { id: 'video-screen', label: 'Video Configuration' },
   ],

@@ -5,6 +5,7 @@ interface CollapsibleSectionProps {
   title: string;
   children: React.ReactNode;
   defaultOpen?: boolean;
+  onCollapse?: () => void;
 }
 
 const CollapsibleSection: React.FC<CollapsibleSectionProps> = ({
@@ -12,9 +13,17 @@ const CollapsibleSection: React.FC<CollapsibleSectionProps> = ({
   title,
   children,
   defaultOpen = false,
+  onCollapse,
 }) => {
   return (
-    <details className="settings-section settings-collapsible" id={id} open={defaultOpen}>
+    <details
+      className="settings-section settings-collapsible"
+      id={id}
+      open={defaultOpen}
+      onToggle={(event) => {
+        if (event.target === event.currentTarget && !event.currentTarget.open) onCollapse?.();
+      }}
+    >
       <summary className="settings-collapsible-header">
         <h2 className="settings-section-title">{title}</h2>
         <svg

@@ -29,7 +29,11 @@ import {
   type MediaPolicyInterrupt,
   type VoiceParticipant,
 } from '../../stores/voice/voiceStore';
-import { useAudioSettingsStore, type AudioPriority } from '../../stores/audio/audioSettingsStore';
+import {
+  effectiveMicLevelPercent,
+  useAudioSettingsStore,
+  type AudioPriority,
+} from '../../stores/audio/audioSettingsStore';
 import {
   useVideoSettingsStore,
   VIDEO_QUALITY_PRESETS,
@@ -1030,7 +1034,9 @@ class VoiceService {
   // ─── Noise Gate ──────────────────────────────────────────────────
 
   /**
-   * Apply a noise gate to the mic stream using Web Audio API.
+   * Apply a noise gate to the mic stream using Web Audio API. Callers apply
+   * manual microphone level before this stage, so the byte-domain gate sees the
+   * processed signal; its AnalyserNode measurement remains quantized to 8-bit samples.
    * Returns a new MediaStreamTrack from a MediaStreamDestination node.
    * Audio below the threshold (dBFS) is silenced via a GainNode.
    */
@@ -1106,16 +1112,17 @@ class VoiceService {
 
     this.inputVolumeGain = gain;
 
-    // Subscribe to real-time volume changes from the settings store
+    // Subscribe to effective committed levels. Positive stored manual levels
+    // leave unity gain in place while AGC is effective; zero remains silent.
     this.inputVolumeUnsub = useAudioSettingsStore.subscribe((state, prevState) => {
       if (
-        state.inputVolume !== prevState.inputVolume &&
+        effectiveMicLevelPercent(state) !== effectiveMicLevelPercent(prevState) &&
         this.inputVolumeGain &&
         this.inputVolumeCtx &&
         this.inputVolumeCtx.state !== 'closed'
       ) {
         this.inputVolumeGain.gain.setTargetAtTime(
-          state.inputVolume / 100,
+          effectiveMicLevelPercent(state) / 100,
           this.inputVolumeCtx.currentTime,
           0.01
         );
@@ -2052,11 +2059,14 @@ class VoiceService {
     this.stopMediaStream(this.localMicStream);
     this.localMicStream = stream;
 
-    let track = stream.getAudioTracks()[0];
+    let track = this.applyInputVolume(
+      stream.getAudioTracks()[0],
+      effectiveMicLevelPercent(useAudioSettingsStore.getState())
+    );
     if (adv.noiseGateMode === 'manual') {
-      track = this.applyNoiseGate(stream, adv.noiseGateLevel);
+      track = this.applyNoiseGate(new MediaStream([track]), adv.noiseGateLevel);
     }
-    return this.applyInputVolume(track, adv.inputVolume);
+    return track;
   }
 
   private microphoneCaptureConstraints(
@@ -4113,15 +4123,16 @@ class VoiceService {
       if (this.localMicStream && this.localMicStream !== stream) this.cleanupMicState();
       this.localMicStream = stream;
       try {
-        let track = stream.getAudioTracks()[0];
+        let track = this.applyInputVolume(
+          stream.getAudioTracks()[0],
+          effectiveMicLevelPercent(useAudioSettingsStore.getState())
+        );
 
-        // Apply noise gate in manual mode
+        // Manual gain is pre-gate; the existing AnalyserNode gate still measures
+        // its input with quantized 8-bit samples.
         if (adv.noiseGateMode === 'manual') {
-          track = this.applyNoiseGate(stream, adv.noiseGateLevel);
+          track = this.applyNoiseGate(new MediaStream([track]), adv.noiseGateLevel);
         }
-
-        // Apply input volume control (GainNode)
-        track = this.applyInputVolume(track, adv.inputVolume);
         // Keep every candidate silent until it passes publication ownership
         // checks and the current mute policy at adoption.
         track.enabled = false;

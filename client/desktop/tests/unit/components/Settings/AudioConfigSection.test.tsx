@@ -6,6 +6,13 @@ import React from 'react';
 const mockSetQualityTier = vi.fn();
 const mockSetAdvancedMode = vi.fn();
 const mockStashAndSwap = vi.fn();
+const mockStartMicTest = vi.fn();
+const mockStopMicTest = vi.fn();
+const mockPlayTestTone = vi.fn();
+const mockStopOutputTest = vi.fn();
+let mockLocalIsTesting = false;
+let micTestState = { isTesting: false, dbfsLevel: -Infinity, error: null as string | null };
+let outputTestState = { isTesting: false, error: null as string | null };
 
 const defaultAudioSettings: Record<string, unknown> = {
   noiseCancellation: true,
@@ -16,81 +23,114 @@ const defaultAudioSettings: Record<string, unknown> = {
   quietBoost: false,
   quietBoostThreshold: -38,
   musicMode: false,
+  inputVolume: 100,
+  outputVolume: 100,
 };
 
-vi.mock('@/renderer/stores/voice/voiceStore', () => ({
-  useVoiceStore: vi.fn((selector) =>
-    selector({
-      qualityTier: 'standard' as const,
-      setQualityTier: mockSetQualityTier,
-    })
-  ),
-  AUDIO_QUALITY_TIERS: {
-    minimum: {
-      label: 'Minimum',
-      maxBitrate: 16000,
-      opusDtx: true,
-      opusFec: true,
-      preferredFrameSize: 60,
-      premium: false,
+vi.mock('@/renderer/stores/voice/voiceStore', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/stores/voice/voiceStore')>();
+  return {
+    useVoiceStore: Object.assign(
+      vi.fn((selector) =>
+        selector({
+          ...actual.useVoiceStore.getState(),
+          localIsTesting: mockLocalIsTesting,
+          qualityTier: 'standard' as const,
+          setQualityTier: mockSetQualityTier,
+        })
+      ),
+      actual.useVoiceStore
+    ),
+    AUDIO_QUALITY_TIERS: {
+      minimum: {
+        label: 'Minimum',
+        maxBitrate: 16000,
+        opusDtx: true,
+        opusFec: true,
+        preferredFrameSize: 60,
+        premium: false,
+      },
+      low: {
+        label: 'Low',
+        maxBitrate: 32000,
+        opusDtx: true,
+        opusFec: true,
+        preferredFrameSize: 40,
+        premium: false,
+      },
+      moderate: {
+        label: 'Moderate',
+        maxBitrate: 64000,
+        opusDtx: true,
+        opusFec: true,
+        preferredFrameSize: 20,
+        premium: false,
+      },
+      standard: {
+        label: 'Standard',
+        maxBitrate: 96000,
+        opusDtx: true,
+        opusFec: true,
+        preferredFrameSize: 20,
+        premium: false,
+      },
+      high: {
+        label: 'High',
+        maxBitrate: 192000,
+        opusDtx: false,
+        opusFec: true,
+        preferredFrameSize: 10,
+        premium: false,
+      },
+      hifi: {
+        label: 'Hi-Fi',
+        maxBitrate: 256000,
+        opusDtx: false,
+        opusFec: false,
+        preferredFrameSize: 10,
+        premium: true,
+      },
+      studio: {
+        label: 'Studio',
+        maxBitrate: 510000,
+        opusDtx: false,
+        opusFec: false,
+        preferredFrameSize: 10,
+        premium: true,
+      },
     },
-    low: {
-      label: 'Low',
-      maxBitrate: 32000,
-      opusDtx: true,
-      opusFec: true,
-      preferredFrameSize: 40,
-      premium: false,
-    },
-    moderate: {
-      label: 'Moderate',
-      maxBitrate: 64000,
-      opusDtx: true,
-      opusFec: true,
-      preferredFrameSize: 20,
-      premium: false,
-    },
-    standard: {
-      label: 'Standard',
-      maxBitrate: 96000,
-      opusDtx: true,
-      opusFec: true,
-      preferredFrameSize: 20,
-      premium: false,
-    },
-    high: {
-      label: 'High',
-      maxBitrate: 192000,
-      opusDtx: false,
-      opusFec: true,
-      preferredFrameSize: 10,
-      premium: false,
-    },
-    hifi: {
-      label: 'Hi-Fi',
-      maxBitrate: 256000,
-      opusDtx: false,
-      opusFec: false,
-      preferredFrameSize: 10,
-      premium: true,
-    },
-    studio: {
-      label: 'Studio',
-      maxBitrate: 510000,
-      opusDtx: false,
-      opusFec: false,
-      preferredFrameSize: 10,
-      premium: true,
-    },
-  },
-}));
+  };
+});
 
-vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
-  useAudioSettingsStore: Object.assign(
-    vi.fn((s) => s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
-    { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })) }
-  ),
-}));
+vi.mock('@/renderer/stores/audio/audioSettingsStore', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@/renderer/stores/audio/audioSettingsStore')>();
+  return {
+    useAudioSettingsStore: Object.assign(
+      vi.fn((s) =>
+        s({
+          advancedMode: false,
+          inputVolume: 100,
+          noiseCancellation: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          noiseGateMode: 'auto',
+          noiseGateLevel: -50,
+          musicMode: false,
+          setAdvancedMode: mockSetAdvancedMode,
+        })
+      ),
+      actual.useAudioSettingsStore,
+      {
+        getState: vi.fn(() => ({
+          ...actual.useAudioSettingsStore.getState(),
+          advancedMode: false,
+          setAdvancedMode: mockSetAdvancedMode,
+        })),
+      }
+    ),
+  };
+});
 
 vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn((key: string) => defaultAudioSettings[key] ?? false),
@@ -98,6 +138,47 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   batchSetAudioDrafts: vi.fn(),
   useStashAndSwapAudioMode: vi.fn(() => mockStashAndSwap),
 }));
+
+vi.mock('@/renderer/hooks/device/useMicTest', () => ({
+  useMicTest: () => ({ ...micTestState, startTest: mockStartMicTest, stopTest: mockStopMicTest }),
+}));
+vi.mock('@/renderer/hooks/device/useOutputTest', () => ({
+  useOutputTest: () => ({
+    ...outputTestState,
+    playTestTone: mockPlayTestTone,
+    stopTest: mockStopOutputTest,
+  }),
+}));
+vi.mock('@/renderer/components/Voice/DeviceSelector', async () => {
+  const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
+  return {
+    default: ({ kind }: { kind: string }) => {
+      const label = kind === 'audioinput' ? 'Microphone' : 'Speaker';
+      const deviceId = useVoiceStore(
+        (state: Record<string, unknown>) =>
+          state[kind === 'audioinput' ? 'audioInputDeviceId' : 'audioOutputDeviceId']
+      );
+      const setDevice = useVoiceStore(
+        (state: Record<string, unknown>) =>
+          state[kind === 'audioinput' ? 'setAudioInputDevice' : 'setAudioOutputDevice']
+      ) as (value: string) => void;
+      return (
+        <label>
+          {label}
+          <select
+            aria-label={label}
+            value={(deviceId as string | null) ?? ''}
+            onChange={(event) => setDevice(event.currentTarget.value)}
+          >
+            <option value="">Default</option>
+            <option value="mic-1">USB Microphone</option>
+            <option value="speaker-1">USB Speaker</option>
+          </select>
+        </label>
+      );
+    },
+  };
+});
 
 vi.mock('@/renderer/components/Settings/AudioOpusSection', () => ({
   default: ({ qualityTier }: { qualityTier: string }) => (
@@ -110,6 +191,7 @@ vi.mock('@/renderer/components/Settings/AudioOpusSection', () => ({
 // ─── Component import (AFTER mocks) ────────────────────────────────────────
 
 import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import AudioConfigSection from '@/renderer/components/Settings/AudioConfigSection';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -121,6 +203,31 @@ async function overrideDraftSettings(overrides: Record<string, unknown>) {
   (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
     (key: string) => merged[key] ?? false
   );
+}
+
+async function overrideCommittedSettings(overrides: Record<string, unknown>) {
+  const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
+  const committed = {
+    inputVolume: 100,
+    noiseCancellation: true,
+    echoCancellation: true,
+    autoGainControl: true,
+    noiseGateMode: 'auto',
+    noiseGateLevel: -50,
+    musicMode: false,
+    ...overrides,
+  };
+  (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+    (selector: (state: Record<string, unknown>) => unknown) =>
+      selector({ ...committed, advancedMode: false, setAdvancedMode: mockSetAdvancedMode })
+  );
+  (
+    useAudioSettingsStore as unknown as { getState: ReturnType<typeof vi.fn> }
+  ).getState.mockReturnValue({
+    ...committed,
+    advancedMode: false,
+    setAdvancedMode: mockSetAdvancedMode,
+  });
 }
 
 /** Switch the audioSettingsStore mock to advanced mode. */
@@ -148,19 +255,38 @@ async function overrideTier(tier: string) {
 
 describe('AudioConfigSection', () => {
   beforeEach(async () => {
+    resetAllStores();
     vi.clearAllMocks();
+    micTestState = { isTesting: false, dbfsLevel: -Infinity, error: null };
+    outputTestState = { isTesting: false, error: null };
+    mockLocalIsTesting = false;
 
     // Re-apply default mock implementations (clearAllMocks wipes mockImplementation)
     const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
     (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (s: (state: Record<string, unknown>) => unknown) =>
-        s({ qualityTier: 'standard', setQualityTier: mockSetQualityTier })
+        s({
+          ...useVoiceStore.getState(),
+          qualityTier: 'standard',
+          localIsTesting: mockLocalIsTesting,
+          setQualityTier: mockSetQualityTier,
+        })
     );
 
     const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
     (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (s: (state: Record<string, unknown>) => unknown) =>
-        s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })
+        s({
+          advancedMode: false,
+          inputVolume: 100,
+          noiseCancellation: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          noiseGateMode: 'auto',
+          noiseGateLevel: -50,
+          musicMode: false,
+          setAdvancedMode: mockSetAdvancedMode,
+        })
     );
     (
       useAudioSettingsStore as unknown as { getState: ReturnType<typeof vi.fn> }
@@ -172,6 +298,103 @@ describe('AudioConfigSection', () => {
       (key: string) => defaultAudioSettings[key] ?? false
     );
     (useStashAndSwapAudioMode as ReturnType<typeof vi.fn>).mockReturnValue(mockStashAndSwap);
+  });
+
+  describe('moved audio device controls', () => {
+    it('renders microphone and speaker selectors with Default options', () => {
+      render(<AudioConfigSection />);
+      expect(screen.getByRole('combobox', { name: 'Microphone' })).toHaveTextContent('Default');
+      expect(screen.getByRole('combobox', { name: 'Speaker' })).toHaveTextContent('Default');
+    });
+
+    it('applies microphone and speaker choices immediately while settings are being edited', async () => {
+      await overrideDraftSettings({ noiseCancellation: false });
+      render(<AudioConfigSection />);
+      fireEvent.change(screen.getByRole('combobox', { name: 'Microphone' }), {
+        target: { value: 'mic-1' },
+      });
+      fireEvent.change(screen.getByRole('combobox', { name: 'Speaker' }), {
+        target: { value: 'speaker-1' },
+      });
+
+      const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
+      expect(useVoiceStore.getState().audioInputDeviceId).toBe('mic-1');
+      expect(useVoiceStore.getState().audioOutputDeviceId).toBe('speaker-1');
+    });
+
+    it('places device and test controls before the Basic and Advanced mode fieldset', () => {
+      render(<AudioConfigSection />);
+      const fieldset = screen.getByRole('group', { name: 'Audio settings mode' });
+      for (const control of [
+        screen.getByRole('combobox', { name: 'Microphone' }),
+        screen.getByRole('combobox', { name: 'Speaker' }),
+        ...screen.getAllByRole('button', { name: /^Test$/ }),
+      ]) {
+        expect(
+          control.compareDocumentPosition(fieldset) & Node.DOCUMENT_POSITION_FOLLOWING
+        ).toBeTruthy();
+      }
+    });
+
+    it('starts microphone and speaker tests from their controls', () => {
+      render(<AudioConfigSection />);
+      const tests = screen.getAllByRole('button', { name: /^Test$/ });
+      expect(tests).toHaveLength(2);
+      fireEvent.click(tests[0]);
+      fireEvent.click(tests[1]);
+      expect(mockStartMicTest).toHaveBeenCalledTimes(1);
+      expect(mockPlayTestTone).toHaveBeenCalledTimes(1);
+    });
+
+    it('retains active and error feedback for microphone and speaker tests', () => {
+      micTestState = { isTesting: true, dbfsLevel: -24, error: 'Microphone unavailable' };
+      outputTestState = { isTesting: true, error: 'Audio output unavailable' };
+      render(<AudioConfigSection />);
+      expect(screen.getByRole('button', { name: 'Stop Testing' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Playing...' })).toBeDisabled();
+      expect(screen.getByText('Microphone unavailable')).toBeInTheDocument();
+      expect(screen.getByText('Audio output unavailable')).toBeInTheDocument();
+    });
+
+    it('keeps both audio tests disabled while another local test is active', () => {
+      mockLocalIsTesting = true;
+      render(<AudioConfigSection />);
+      const tests = screen.getAllByRole('button', { name: /^Test$/ });
+      expect(tests[0]).toBeDisabled();
+      expect(tests[1]).toBeDisabled();
+    });
+  });
+
+  describe('microphone test pending settings notice', () => {
+    it.each([
+      ['noise cancellation', { noiseCancellation: false }, {}],
+      ['echo cancellation', { echoCancellation: false }, {}],
+      ['noise gate mode', { noiseGateMode: 'manual' }, {}],
+      [
+        'noise gate threshold',
+        { noiseGateMode: 'manual', noiseGateLevel: -40 },
+        { noiseGateMode: 'manual' },
+      ],
+    ])('shows when the %s draft differs from applied settings', async (_field, change, applied) => {
+      await overrideCommittedSettings({ autoGainControl: false, ...applied });
+      await overrideDraftSettings({ autoGainControl: false, ...change });
+      render(<AudioConfigSection />);
+
+      expect(
+        screen.getByText('Microphone Test uses applied settings until you select Apply.')
+      ).toBeInTheDocument();
+    });
+
+    it('keeps the notice visible when a draft enables AGC and hides Microphone Level', async () => {
+      await overrideCommittedSettings({ autoGainControl: false });
+      await overrideDraftSettings({ autoGainControl: true });
+      render(<AudioConfigSection />);
+
+      expect(screen.queryByRole('slider', { name: 'Microphone Level' })).not.toBeInTheDocument();
+      expect(
+        screen.getByText('Microphone Test uses applied settings until you select Apply.')
+      ).toBeInTheDocument();
+    });
   });
 
   // ===== 1. Basic mode rendering =====

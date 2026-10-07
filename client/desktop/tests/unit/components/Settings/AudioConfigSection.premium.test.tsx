@@ -50,6 +50,33 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   batchSetAudioDrafts: vi.fn(),
   useStashAndSwapAudioMode: vi.fn(() => mockStashAndSwap),
 }));
+vi.mock('@/renderer/hooks/device/useMicTest', () => ({
+  useMicTest: () => ({
+    isTesting: false,
+    dbfsLevel: -Infinity,
+    error: null,
+    startTest: vi.fn(),
+    stopTest: vi.fn(),
+  }),
+}));
+vi.mock('@/renderer/hooks/device/useOutputTest', () => ({
+  useOutputTest: () => ({
+    isTesting: false,
+    error: null,
+    playTestTone: vi.fn(),
+    stopTest: vi.fn(),
+  }),
+}));
+vi.mock('@/renderer/components/Voice/DeviceSelector', () => ({
+  default: ({ kind }: { kind: string }) => (
+    <label>
+      {kind}
+      <select aria-label={kind}>
+        <option>Default</option>
+      </select>
+    </label>
+  ),
+}));
 
 vi.mock('@/renderer/components/Settings/AudioOpusSection', () => ({
   default: () => <div data-testid="audio-opus-section" />,

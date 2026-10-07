@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import {
   useVideoSettingsStore,
@@ -49,6 +49,8 @@ import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
 import CodecProfilesModal from './CodecProfilesModal';
+import DeviceSelector from '../Voice/DeviceSelector';
+import { useCameraTest } from '../../hooks/device/useCameraTest';
 
 // ─── GPU Vendor Icon ────────────────────────────────────────────────────────
 
@@ -733,6 +735,23 @@ const VideoConfigSection: React.FC = () => {
   const activeCameraCodec = useVoiceStore((s) => s.activeCameraCodec);
   const activeScreenCodec = useVoiceStore((s) => s.activeScreenCodec);
   const codecFloor = useVoiceStore((s) => s.codecFloor);
+  const connectionState = useVoiceStore((s) => s.connectionState);
+  const {
+    isTesting,
+    error: cameraTestError,
+    stream: cameraStream,
+    toggleTest,
+    stopTest,
+  } = useCameraTest();
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const video = cameraVideoRef.current;
+    if (video) video.srcObject = cameraStream;
+    return () => {
+      if (video) video.srcObject = null;
+    };
+  }, [cameraStream]);
 
   const codecCapabilities = useVideoSettingsStore((s) => s.codecCapabilities);
   const gpuInfo = useVideoSettingsStore((s) => s.gpuInfo);
@@ -1048,7 +1067,46 @@ const VideoConfigSection: React.FC = () => {
   const initialCameraBitrate = cameraLimit.bitrate;
 
   return (
-    <CollapsibleSection id="section-video-screen" title="Video Configuration">
+    <CollapsibleSection id="section-video-screen" title="Video Configuration" onCollapse={stopTest}>
+      {/* ── Camera ── */}
+      <h3 className="settings-subsection-title">Camera</h3>
+
+      <div className="settings-device-row">
+        <DeviceSelector kind="videoinput" />
+      </div>
+      <div className="settings-camera-test-row">
+        <button
+          className={`settings-camera-test-btn${isTesting ? ' testing' : ''}`}
+          onClick={toggleTest}
+          disabled={
+            connectionState === 'connected' ||
+            connectionState === 'connecting' ||
+            connectionState === 'reconnecting'
+          }
+          title={
+            connectionState === 'connected' ||
+            connectionState === 'connecting' ||
+            connectionState === 'reconnecting'
+              ? 'Unavailable during a voice call'
+              : undefined
+          }
+        >
+          {isTesting ? 'Stop Preview' : 'Test'}
+        </button>
+        {cameraTestError && <span className="settings-camera-test-error">{cameraTestError}</span>}
+      </div>
+      {isTesting && (
+        <div className="settings-camera-preview">
+          <video
+            ref={cameraVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className="settings-camera-preview-video"
+          />
+        </div>
+      )}
+
       {/* Native radios, same as the audio toggle; a distinct `name` keeps the two
           groups independent when both render on one page. */}
       <fieldset className="settings-mode-toggle">
@@ -1074,9 +1132,6 @@ const VideoConfigSection: React.FC = () => {
           {'Advanced Settings'}
         </label>
       </fieldset>
-
-      {/* ── Camera ── */}
-      <h3 className="settings-subsection-title">Camera</h3>
 
       <div className="settings-row">
         <div className="settings-row-info">

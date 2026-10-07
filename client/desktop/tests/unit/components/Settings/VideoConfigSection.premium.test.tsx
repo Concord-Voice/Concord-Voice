@@ -64,6 +64,25 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftVideoSetting: vi.fn((key: string) => defaultVideoSettings[key] ?? false),
   setDraftVideoSetting: mockSetDraftVideoSetting,
 }));
+vi.mock('@/renderer/hooks/device/useCameraTest', () => ({
+  useCameraTest: () => ({
+    isTesting: false,
+    error: null,
+    stream: null,
+    toggleTest: vi.fn(),
+    stopTest: vi.fn(),
+  }),
+}));
+vi.mock('@/renderer/components/Voice/DeviceSelector', () => ({
+  default: ({ kind }: { kind: string }) => (
+    <label>
+      {kind}
+      <select aria-label={kind}>
+        <option>Default</option>
+      </select>
+    </label>
+  ),
+}));
 
 vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   codecKey: vi.fn(() => 'video/vp8/default'),

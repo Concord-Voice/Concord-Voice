@@ -69,6 +69,24 @@ export interface AudioSettings {
   packetLossWarningThreshold: number; // percent, triggers UI warning
 }
 
+const DEFAULT_INPUT_VOLUME = 100;
+
+function normalizeInputVolume(inputVolume: unknown): number {
+  if (typeof inputVolume !== 'number' || !Number.isFinite(inputVolume)) {
+    return DEFAULT_INPUT_VOLUME;
+  }
+  return Math.max(0, Math.min(200, inputVolume));
+}
+
+export function effectiveMicLevelPercent(
+  settings: Pick<AudioSettings, 'musicMode' | 'autoGainControl' | 'inputVolume'>
+): number {
+  const inputVolume = normalizeInputVolume(settings.inputVolume);
+  if (inputVolume > 0 && !settings.musicMode && settings.autoGainControl)
+    return DEFAULT_INPUT_VOLUME;
+  return inputVolume;
+}
+
 interface AudioSettingsState extends AudioSettings {
   setAdvancedMode: (enabled: boolean) => void;
   setNoiseCancellation: (enabled: boolean) => void;
@@ -115,7 +133,7 @@ const defaults: AudioSettings = {
   opusNack: false,
   adaptivePtime: false,
   audioPriority: 'medium',
-  inputVolume: 100,
+  inputVolume: DEFAULT_INPUT_VOLUME,
   outputVolume: 100,
   perParticipantVolume: {},
   previousParticipantVolume: {},
@@ -148,8 +166,7 @@ export const useAudioSettingsStore = wrapStore(
         setOpusNack: (opusNack) => set({ opusNack }),
         setAdaptivePtime: (adaptivePtime) => set({ adaptivePtime }),
         setAudioPriority: (audioPriority) => set({ audioPriority }),
-        setInputVolume: (inputVolume) =>
-          set({ inputVolume: Math.max(0, Math.min(200, inputVolume)) }),
+        setInputVolume: (inputVolume) => set({ inputVolume: normalizeInputVolume(inputVolume) }),
         setOutputVolume: (outputVolume) =>
           set({ outputVolume: Math.max(0, Math.min(200, outputVolume)) }),
         setParticipantVolume: (userId, volume) =>
@@ -213,6 +230,20 @@ export const useAudioSettingsStore = wrapStore(
       {
         name: 'concord:audio-advanced',
         version: 2,
+        merge: (persistedState, currentState) => {
+          const persisted =
+            typeof persistedState === 'object' && persistedState !== null
+              ? (persistedState as Partial<AudioSettingsState>)
+              : {};
+          const inputVolume = Object.hasOwn(persisted, 'inputVolume')
+            ? persisted.inputVolume
+            : currentState.inputVolume;
+          return {
+            ...currentState,
+            ...persisted,
+            inputVolume: normalizeInputVolume(inputVolume),
+          };
+        },
         migrate: (persistedState: unknown, version: number) => {
           const state = persistedState as Record<string, unknown>;
           if (version === 0) {

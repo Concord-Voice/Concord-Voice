@@ -3203,21 +3203,23 @@ describe('VoiceService', () => {
 
   describe('input volume', () => {
     it('applies gain node for volume control', async () => {
-      useAudioSettingsStore.setState({ inputVolume: 50 });
+      useAudioSettingsStore.setState({ autoGainControl: false, inputVolume: 50 });
       await joinVoiceChannel();
-      // Capture initializes the native gain value; setTargetAtTime is only used
-      // for later live setting changes.
+      // Capture initializes the gain directly; subsequent committed changes use a smooth ramp.
       expect(mockGainNode.gain.value).toBeCloseTo(0.5);
+      useAudioSettingsStore.getState().setInputVolume(75);
+      expect(mockGainNode.gain.setTargetAtTime).toHaveBeenCalledWith(
+        0.75,
+        expect.any(Number),
+        0.01
+      );
     });
 
     it('100% volume results in gain of 1', async () => {
-      useAudioSettingsStore.setState({ inputVolume: 100 });
+      useAudioSettingsStore.setState({ autoGainControl: false, inputVolume: 100 });
       await joinVoiceChannel();
-      // At 100%, gain = 100/100 = 1.0
-      const calls = mockGainNode.gain.setTargetAtTime.mock.calls;
-      if (calls.length > 0) {
-        expect(calls[0][0]).toBeCloseTo(1.0, 1);
-      }
+      // Initial gain is assigned directly; no smoothing write is required at startup.
+      expect(mockGainNode.gain.value).toBe(1);
     });
   });
 

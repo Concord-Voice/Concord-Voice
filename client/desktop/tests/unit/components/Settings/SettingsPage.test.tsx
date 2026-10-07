@@ -5,6 +5,74 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { vi } from 'vitest';
+
+const mockStopMicTest = vi.fn();
+const mockStopOutputTest = vi.fn();
+const mockStopCameraTest = vi.fn();
+let mockMicTestActive = false;
+let mockOutputTestActive = false;
+let mockCameraTestActive = false;
+
+vi.mock('@/renderer/hooks/device/useMicTest', async () => {
+  const { useEffect } = await import('react');
+  return {
+    useMicTest: vi.fn(() => {
+      useEffect(
+        () => () => {
+          if (mockMicTestActive) mockStopMicTest();
+        },
+        []
+      );
+      return {
+        isTesting: mockMicTestActive,
+        dbfsLevel: -40,
+        error: null,
+        startTest: vi.fn(),
+        stopTest: mockStopMicTest,
+      };
+    }),
+  };
+});
+vi.mock('@/renderer/hooks/device/useOutputTest', async () => {
+  const { useEffect } = await import('react');
+  return {
+    useOutputTest: vi.fn(() => {
+      useEffect(
+        () => () => {
+          if (mockOutputTestActive) mockStopOutputTest();
+        },
+        []
+      );
+      return {
+        isTesting: mockOutputTestActive,
+        error: null,
+        playTestTone: vi.fn(),
+        stopTest: mockStopOutputTest,
+      };
+    }),
+  };
+});
+vi.mock('@/renderer/hooks/device/useCameraTest', async () => {
+  const { useEffect } = await import('react');
+  return {
+    useCameraTest: vi.fn(() => {
+      useEffect(
+        () => () => {
+          if (mockCameraTestActive) mockStopCameraTest();
+        },
+        []
+      );
+      return {
+        isTesting: mockCameraTestActive,
+        stream: null,
+        error: null,
+        toggleTest: vi.fn(),
+        stopTest: mockStopCameraTest,
+      };
+    }),
+  };
+});
 
 // Mock apiFetch for session fetching
 vi.mock('@/renderer/services/system/apiClient', () => ({
@@ -30,6 +98,9 @@ describe('SettingsPage', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    mockMicTestActive = false;
+    mockOutputTestActive = false;
+    mockCameraTestActive = false;
     useAuthStore.getState().setAccessToken('mock-token');
     useUserStore.setState({ user: mockUser });
     useSettingsStore.setState({
@@ -272,12 +343,33 @@ describe('SettingsPage', () => {
     });
     render(<SettingsPage />);
     fireEvent.click(screen.getByText('Audio & Video'));
-    const deviceEls = screen.getAllByText('Device Configuration');
-    expect(deviceEls.length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryAllByText('Device Configuration')).toHaveLength(0);
+    expect(document.querySelector('#section-device-config')).toBeNull();
     const audioEls = screen.getAllByText('Audio Configuration');
     expect(audioEls.length).toBeGreaterThanOrEqual(1);
     const videoEls = screen.getAllByText('Video Configuration');
     expect(videoEls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('stops active device tests when leaving Audio & Video settings', () => {
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {
+        enumerateDevices: vi.fn().mockResolvedValue([]),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+      configurable: true,
+    });
+    mockMicTestActive = true;
+    mockOutputTestActive = true;
+    mockCameraTestActive = true;
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText('Audio & Video'));
+    expect(screen.getAllByText('Audio Configuration')).toHaveLength(2);
+    fireEvent.click(screen.getByText('Appearance'));
+    expect(mockStopMicTest).toHaveBeenCalledOnce();
+    expect(mockStopOutputTest).toHaveBeenCalledOnce();
+    expect(mockStopCameraTest).toHaveBeenCalledOnce();
   });
 
   it('active nav item has both left and right accent borders', () => {

@@ -14,6 +14,9 @@ import {
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useGateActivation } from '../../hooks/ui/useGateActivation';
 import PremiumChip from '../common/PremiumChip';
+import DeviceSelector from '../Voice/DeviceSelector';
+import { useMicTest } from '../../hooks/device/useMicTest';
+import { useOutputTest } from '../../hooks/device/useOutputTest';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import AudioOpusSection from './AudioOpusSection';
@@ -155,7 +158,17 @@ const AudioConfigSection: React.FC = () => {
   const quietBoost = useDraftAudioSetting('quietBoost');
   const quietBoostThreshold = useDraftAudioSetting('quietBoostThreshold');
   const musicMode = useDraftAudioSetting('musicMode');
-
+  const processingRowClassName = musicMode ? 'settings-row settings-row-disabled' : 'settings-row';
+  const inputVolume = useDraftAudioSetting('inputVolume');
+  const outputVolume = useDraftAudioSetting('outputVolume');
+  const localIsTesting = useVoiceStore((s) => s.localIsTesting);
+  const { isTesting, dbfsLevel, error: micTestError, startTest, stopTest } = useMicTest();
+  const {
+    isTesting: isOutputTesting,
+    error: outputTestError,
+    playTestTone,
+    stopTest: stopOutputTest,
+  } = useOutputTest();
   const tierIndex = TIER_ORDER.indexOf(qualityTier);
 
   const handleTierSlider = useCallback(
@@ -179,7 +192,103 @@ const AudioConfigSection: React.FC = () => {
   );
 
   return (
-    <CollapsibleSection id="section-audio-config" title="Audio Configuration">
+    <CollapsibleSection
+      id="section-audio-config"
+      title="Audio Configuration"
+      onCollapse={() => {
+        stopTest();
+        stopOutputTest();
+      }}
+    >
+      <div className="settings-audio-devices">
+        <div className="settings-audio-device-group">
+          <h3 className="settings-subsection-title">Input</h3>
+          <div className="settings-device-row">
+            <DeviceSelector kind="audioinput" />
+          </div>
+          <div className="settings-mic-test-row">
+            <button
+              className={`settings-mic-test-btn${isTesting ? ' testing' : ''}`}
+              onClick={isTesting ? stopTest : startTest}
+              disabled={localIsTesting && !isTesting}
+              title={localIsTesting && !isTesting ? 'Another audio test is running' : undefined}
+            >
+              {isTesting ? 'Stop Testing' : 'Test'}
+            </button>
+            {micTestError && <span className="settings-mic-test-error">{micTestError}</span>}
+          </div>
+          <p className="settings-row-hint">
+            Microphone Test uses applied settings until you select Apply.
+          </p>
+          {isTesting && (
+            <div className="settings-mic-meter-container">
+              <div className="settings-mic-meter-track">
+                <div
+                  className="settings-mic-meter-fill"
+                  style={{ width: `${Math.max(0, ((dbfsLevel + 80) / 80) * 100)}%` }}
+                />
+              </div>
+              <div className="settings-mic-meter-ticks">
+                <span>-80</span>
+                <span>-60</span>
+                <span>-40</span>
+                <span>-20</span>
+                <span>0 dBFS</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="settings-audio-device-group">
+          <h3 className="settings-subsection-title">Output</h3>
+          <div className="settings-device-row">
+            <DeviceSelector kind="audiooutput" />
+          </div>
+          <div className="settings-volume-row">
+            <div className="settings-row-info">
+              <span className="settings-volume-label">Output Volume</span>
+              <span className="settings-row-hint">
+                Scales all incoming audio from muted (left) to 2x boost (right). Values above 100%
+                may introduce clipping.
+              </span>
+            </div>
+            <div className="settings-slider-wrapper">
+              <span className="settings-slider-value">{outputVolume}%</span>
+              <input
+                type="range"
+                className="settings-volume-slider"
+                min={0}
+                max={200}
+                step={1}
+                value={outputVolume}
+                aria-label="Output Volume"
+                onChange={(event) =>
+                  setDraftAudioSetting('outputVolume', Number(event.currentTarget.value))
+                }
+              />
+            </div>
+          </div>
+          <div className="settings-output-test-row">
+            <button
+              className={`settings-output-test-btn${isOutputTesting ? ' testing' : ''}`}
+              onClick={playTestTone}
+              disabled={isOutputTesting || (localIsTesting && !isOutputTesting)}
+              title={
+                localIsTesting && !isOutputTesting ? 'Another audio test is running' : undefined
+              }
+            >
+              {isOutputTesting ? 'Playing...' : 'Test'}
+            </button>
+            {outputTestError && (
+              <span className="settings-output-test-error">{outputTestError}</span>
+            )}
+          </div>
+        </div>
+      </div>
+      <p className="settings-section-description">
+        Device selections apply immediately. Processing changes apply when you select Apply.
+      </p>
+
       {/* ── Mode Toggle ── native radios: this persists a setting, it does not
           switch views, so a tablist would announce a tabpanel that isn't there. */}
       <fieldset className="settings-mode-toggle">
@@ -309,7 +418,7 @@ const AudioConfigSection: React.FC = () => {
       {/* ── Processing ── */}
       <h3 className="settings-subsection-title">Processing</h3>
 
-      <div className={`settings-row ${musicMode ? 'settings-row-disabled' : ''}`}>
+      <div className={processingRowClassName}>
         <div className="settings-row-info">
           <span className="settings-row-label">Noise Cancellation</span>
           <span className="settings-row-hint">
@@ -331,7 +440,7 @@ const AudioConfigSection: React.FC = () => {
         />
       </div>
 
-      <div className={`settings-row ${musicMode ? 'settings-row-disabled' : ''}`}>
+      <div className={processingRowClassName}>
         <div className="settings-row-info">
           <span className="settings-row-label">Echo Cancellation</span>
           <span className="settings-row-hint">
@@ -353,7 +462,7 @@ const AudioConfigSection: React.FC = () => {
         />
       </div>
 
-      <div className={`settings-row ${musicMode ? 'settings-row-disabled' : ''}`}>
+      <div className={processingRowClassName}>
         <div className="settings-row-info">
           <span className="settings-row-label">Auto Gain Control</span>
           <span className="settings-row-hint">
@@ -361,8 +470,8 @@ const AudioConfigSection: React.FC = () => {
               musicMode,
               autoGainControl,
               'Locked by Music Mode. Automatic gain control is forced off to prevent dynamic compression of your audio signal.',
-              'Enabled. Automatically normalizes your microphone volume \u2014 making quiet speech louder and loud speech softer.',
-              'Disabled. Your microphone level is not automatically adjusted. Manual volume control via the input slider is recommended.'
+              'Enabled. Automatically normalizes your microphone volume \u2014 making quiet speech louder and loud speech softer. Positive Microphone Level values are treated as unity; a retained 0% stays silent. The independent mute control still applies.',
+              'Disabled. Your microphone level is not automatically adjusted. Adjust it with Microphone Level below.'
             )}
           </span>
         </div>
@@ -374,6 +483,37 @@ const AudioConfigSection: React.FC = () => {
           disabled={musicMode}
         />
       </div>
+
+      {(musicMode || !autoGainControl) && (
+        <div className="settings-volume-row settings-row-child">
+          <div className="settings-row-info">
+            <label className="settings-volume-label" htmlFor="settings-microphone-level">
+              Microphone Level
+            </label>
+            <span className="settings-row-hint">
+              100% is unity gain; 0% is silence and 200% is 2x. Boosting can amplify noise and clip
+              audio. After changing the level from 100%, retest the noise gate at its saved
+              threshold; the threshold is not adjusted automatically.
+            </span>
+          </div>
+          <div className="settings-slider-wrapper">
+            <span className="settings-slider-value">{inputVolume}%</span>
+            <input
+              id="settings-microphone-level"
+              type="range"
+              className="settings-volume-slider"
+              min={0}
+              max={200}
+              step={1}
+              value={inputVolume}
+              aria-label="Microphone Level"
+              onChange={(event) =>
+                setDraftAudioSetting('inputVolume', Number(event.currentTarget.value))
+              }
+            />
+          </div>
+        </div>
+      )}
 
       <div className="settings-row">
         <div className="settings-row-info">

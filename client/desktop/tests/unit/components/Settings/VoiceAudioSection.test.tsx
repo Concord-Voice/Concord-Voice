@@ -1,16 +1,29 @@
 import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import { vi } from 'vitest';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 const mockSetQualityTier = vi.fn();
+let mockConnectionState = 'disconnected';
+let mockLocalIsTesting = false;
 vi.mock('@/renderer/stores/voice/voiceStore', () => ({
-  useVoiceStore: vi.fn((selector) =>
-    selector({
-      qualityTier: 'standard' as const,
-      setQualityTier: mockSetQualityTier,
-      activeCameraCodec: null,
-      activeScreenCodec: null,
-      connectionState: 'disconnected',
-    })
+  useVoiceStore: Object.assign(
+    vi.fn((selector) =>
+      selector({
+        qualityTier: 'standard' as const,
+        setQualityTier: mockSetQualityTier,
+        activeCameraCodec: null,
+        activeScreenCodec: null,
+        connectionState: mockConnectionState,
+        localIsTesting: mockLocalIsTesting,
+        audioInputDeviceId: null,
+        audioOutputDeviceId: null,
+        videoDeviceId: null,
+        setAudioInputDevice: vi.fn(),
+        setAudioOutputDevice: vi.fn(),
+        setVideoDevice: vi.fn(),
+      })
+    ),
+    { getState: vi.fn(() => ({ reset: vi.fn() })), setState: vi.fn() }
   ),
   AUDIO_QUALITY_TIERS: {
     minimum: {
@@ -130,6 +143,23 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
 }));
 const mockStartTest = vi.fn();
 const mockStopTest = vi.fn();
+const mockPlayOutputTest = vi.fn().mockResolvedValue(undefined);
+const mockStopOutputTest = vi.fn();
+const mockToggleCameraTest = vi.fn().mockResolvedValue(undefined);
+const mockStopCameraTest = vi.fn();
+let outputTestState = {
+  isTesting: false,
+  error: null as string | null,
+  playTestTone: mockPlayOutputTest,
+  stopTest: mockStopOutputTest,
+};
+let cameraTestState = {
+  isTesting: false,
+  error: null as string | null,
+  stream: null as MediaStream | null,
+  toggleTest: mockToggleCameraTest,
+  stopTest: mockStopCameraTest,
+};
 vi.mock('@/renderer/hooks/device/useMicTest', () => ({
   useMicTest: vi.fn(() => ({
     isTesting: false,
@@ -139,10 +169,11 @@ vi.mock('@/renderer/hooks/device/useMicTest', () => ({
     stopTest: mockStopTest,
   })),
 }));
-vi.mock('@/renderer/components/Voice/DeviceSelector', () => ({
-  default: ({ kind }: { kind: string }) => (
-    <div data-testid={`device-selector-${kind}`}>DeviceSelector</div>
-  ),
+vi.mock('@/renderer/hooks/device/useOutputTest', () => ({
+  useOutputTest: vi.fn(() => outputTestState),
+}));
+vi.mock('@/renderer/hooks/device/useCameraTest', () => ({
+  useCameraTest: vi.fn(() => cameraTestState),
 }));
 vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   codecKey: vi.fn(),
@@ -156,14 +187,17 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
     onChange,
     disabled,
     className,
+    id,
   }: {
     options: { value: string; label: string }[];
     value: string;
     onChange: (v: string) => void;
     disabled?: boolean;
     className?: string;
+    id?: string;
   }) => (
     <select
+      id={id}
       data-testid="custom-select"
       className={className}
       value={value}
@@ -203,23 +237,83 @@ function setAudioAdvancedMode(advancedMode: boolean) {
 
 describe('VoiceAudioSection', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
-    // clearAllMocks keeps implementations, so an override in one test would leak into
-    // every later one. mockReset() restores each mock's vi.fn(impl) factory default.
-    for (const mock of [
-      useAudioSettingsStore,
-      useVideoSettingsStore,
-      useVoiceStore,
-      useDraftAudioSetting,
-      useMicTest,
-    ]) {
-      (mock as unknown as ReturnType<typeof vi.fn>).mockReset();
-    }
+    outputTestState = {
+      isTesting: false,
+      error: null,
+      playTestTone: mockPlayOutputTest,
+      stopTest: mockStopOutputTest,
+    };
+    cameraTestState = {
+      isTesting: false,
+      error: null,
+      stream: null,
+      toggleTest: mockToggleCameraTest,
+      stopTest: mockStopCameraTest,
+    };
+    mockConnectionState = 'disconnected';
+    mockLocalIsTesting = false;
+    (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (s: (state: Record<string, unknown>) => unknown) =>
+        s({ advancedMode: false, setAdvancedMode: vi.fn() })
+    );
+    (useVideoSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (s: (state: Record<string, unknown>) => unknown) =>
+        s({ codecCapabilities: [], gpuInfo: null, videoAdvancedMode: false, systemHdr: false })
+    );
+    (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (s: (state: Record<string, unknown>) => unknown) =>
+        s({
+          qualityTier: 'standard',
+          setQualityTier: mockSetQualityTier,
+          activeCameraCodec: null,
+          activeScreenCodec: null,
+          connectionState: mockConnectionState,
+          localIsTesting: mockLocalIsTesting,
+          audioInputDeviceId: null,
+          audioOutputDeviceId: null,
+          videoDeviceId: null,
+          setAudioInputDevice: vi.fn(),
+          setAudioOutputDevice: vi.fn(),
+          setVideoDevice: vi.fn(),
+        })
+    );
+    (useDraftAudioSetting as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (key: string) =>
+        ({
+          stereoOverride: null,
+          noiseCancellation: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          noiseGateMode: 'auto',
+          noiseGateLevel: -50,
+          inputVolume: 100,
+          outputVolume: 100,
+          quietBoost: false,
+          quietBoostThreshold: -38,
+          musicMode: false,
+          frameSize: 0,
+          silenceDetection: true,
+          inlineFec: true,
+          fecHeadroom: true,
+          opusNack: false,
+          adaptivePtime: true,
+          audioPriority: 'medium',
+        })[key] ?? false
+    );
+    (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
+      isTesting: false,
+      dbfsLevel: -80,
+      error: null,
+      startTest: mockStartTest,
+      stopTest: mockStopTest,
+    });
   });
 
-  it('renders device configuration section', () => {
+  it('removes the separate device configuration section', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getByText('Device Configuration')).toBeInTheDocument();
+    expect(screen.queryByText('Device Configuration')).not.toBeInTheDocument();
   });
   it('renders audio configuration section', () => {
     render(<VoiceAudioSection />);
@@ -234,32 +328,209 @@ describe('VoiceAudioSection', () => {
     expect(screen.getAllByText('Input').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Output').length).toBeGreaterThanOrEqual(1);
   });
-  it('renders device selectors', () => {
+  it.each([
+    ['Basic', false],
+    ['Advanced', true],
+  ])('keeps device selectors in Audio and Video Configuration in %s mode', (_mode, advanced) => {
+    if (advanced) setAudioAdvancedMode(true);
     render(<VoiceAudioSection />);
-    expect(screen.getByTestId('device-selector-audioinput')).toBeInTheDocument();
-    expect(screen.getByTestId('device-selector-audiooutput')).toBeInTheDocument();
-    expect(screen.getByTestId('device-selector-videoinput')).toBeInTheDocument();
+    const audio = screen.getByText('Audio Configuration').closest('details')!;
+    const video = screen.getByText('Video Configuration').closest('details')!;
+    expect(within(audio).getByRole('combobox', { name: 'Microphone' })).toHaveValue('');
+    expect(within(audio).getByRole('combobox', { name: 'Speaker' })).toHaveValue('');
+    expect(within(video).getByRole('combobox', { name: 'Camera' })).toHaveValue('');
+    for (const selector of [
+      within(audio).getByRole('combobox', { name: 'Microphone' }),
+      within(audio).getByRole('combobox', { name: 'Speaker' }),
+      within(video).getByRole('combobox', { name: 'Camera' }),
+    ]) {
+      expect(within(selector).getByRole('option', { name: 'Default' })).toBeInTheDocument();
+    }
+    const microphone = within(audio).getByRole('combobox', { name: 'Microphone' });
+    const speaker = within(audio).getByRole('combobox', { name: 'Speaker' });
+    expect(microphone.closest('.settings-audio-devices')).not.toBeNull();
+    expect(microphone.closest('.settings-audio-devices')).toBe(
+      speaker.closest('.settings-audio-devices')
+    );
+    const agc = within(audio).getByText('Auto Gain Control');
+    expect(microphone.compareDocumentPosition(agc) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const camera = within(video).getByRole('combobox', { name: 'Camera' });
+    const cameraPreset = within(video).getByText('Camera Preset');
+    expect(
+      camera.compareDocumentPosition(cameraPreset) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
   });
-  it('renders input volume label', () => {
+
+  it('keeps all three device tests available in their configuration sections', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getByText('Input Volume')).toBeInTheDocument();
+    const audio = screen.getByText('Audio Configuration').closest('details')!;
+    const video = screen.getByText('Video Configuration').closest('details')!;
+    const inputGroup = within(audio)
+      .getByRole('heading', { name: 'Input' })
+      .closest('.settings-audio-device-group')!;
+    const outputGroup = within(audio)
+      .getByRole('heading', { name: 'Output' })
+      .closest('.settings-audio-device-group')!;
+    expect(within(inputGroup).getByRole('button', { name: /^Test$/ })).toBeInTheDocument();
+    expect(within(outputGroup).getByRole('button', { name: /^Test$/ })).toBeInTheDocument();
+    expect(within(outputGroup).getByText('Output Volume')).toBeInTheDocument();
+    expect(within(video).getByRole('button', { name: /^Test$/ })).toBeInTheDocument();
+  });
+
+  it('routes each Test button to its owning device test', () => {
+    render(<VoiceAudioSection />);
+    const audio = screen.getByText('Audio Configuration').closest('details')!;
+    const video = screen.getByText('Video Configuration').closest('details')!;
+    const inputGroup = within(audio)
+      .getByRole('heading', { name: 'Input' })
+      .closest('.settings-audio-device-group')!;
+    const outputGroup = within(audio)
+      .getByRole('heading', { name: 'Output' })
+      .closest('.settings-audio-device-group')!;
+    fireEvent.click(within(inputGroup).getByRole('button', { name: /^Test$/ }));
+    fireEvent.click(within(outputGroup).getByRole('button', { name: /^Test$/ }));
+    fireEvent.click(within(video).getByRole('button', { name: /^Test$/ }));
+    expect(mockStartTest).toHaveBeenCalledOnce();
+    expect(mockPlayOutputTest).toHaveBeenCalledOnce();
+    expect(mockToggleCameraTest).toHaveBeenCalledOnce();
+  });
+
+  it('keeps microphone and speaker tests available during a call', () => {
+    mockConnectionState = 'connected';
+    render(<VoiceAudioSection />);
+    const audio = screen.getByText('Audio Configuration').closest('details')!;
+    const video = screen.getByText('Video Configuration').closest('details')!;
+    const inputGroup = within(audio)
+      .getByRole('heading', { name: 'Input' })
+      .closest('.settings-audio-device-group')!;
+    const outputGroup = within(audio)
+      .getByRole('heading', { name: 'Output' })
+      .closest('.settings-audio-device-group')!;
+    expect(within(inputGroup).getByRole('button', { name: /^Test$/ })).not.toBeDisabled();
+    expect(within(outputGroup).getByRole('button', { name: /^Test$/ })).not.toBeDisabled();
+    expect(within(video).getByRole('button', { name: /^Test$/ })).toBeDisabled();
+  });
+
+  it('keeps microphone and speaker tests disabled while another test owns audio', () => {
+    mockConnectionState = 'disconnected';
+    mockLocalIsTesting = true;
+    render(<VoiceAudioSection />);
+    const audio = screen.getByText('Audio Configuration').closest('details')!;
+    const video = screen.getByText('Video Configuration').closest('details')!;
+    const inputGroup = within(audio)
+      .getByRole('heading', { name: 'Input' })
+      .closest('.settings-audio-device-group')!;
+    const outputGroup = within(audio)
+      .getByRole('heading', { name: 'Output' })
+      .closest('.settings-audio-device-group')!;
+    expect(within(inputGroup).getByRole('button', { name: /^Test$/ })).toBeDisabled();
+    expect(within(outputGroup).getByRole('button', { name: /^Test$/ })).toBeDisabled();
+    expect(within(video).getByRole('button', { name: /^Test$/ })).not.toBeDisabled();
+  });
+
+  it('retains output test status and camera preview while active', () => {
+    const stream = { getTracks: () => [] } as unknown as MediaStream;
+    outputTestState = { ...outputTestState, isTesting: true };
+    cameraTestState = { ...cameraTestState, isTesting: true, stream };
+    render(<VoiceAudioSection />);
+    expect(screen.getByRole('button', { name: /Playing/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Stop Preview/ })).toBeInTheDocument();
+    expect(document.querySelector('video')).toBeInTheDocument();
+  });
+
+  it('keeps output and camera failure guidance visible', () => {
+    outputTestState = { ...outputTestState, error: 'Failed to play test tone' };
+    cameraTestState = { ...cameraTestState, error: 'Camera access denied' };
+    render(<VoiceAudioSection />);
+    expect(screen.getByText('Failed to play test tone')).toBeInTheDocument();
+    expect(screen.getByText('Camera access denied')).toBeInTheDocument();
+  });
+
+  it('does not start device capture when configuration sections mount', () => {
+    render(<VoiceAudioSection />);
+    expect(mockStartTest).not.toHaveBeenCalled();
+    expect(mockPlayOutputTest).not.toHaveBeenCalled();
+    expect(mockToggleCameraTest).not.toHaveBeenCalled();
+  });
+
+  it('stops audio device tests when Audio Configuration closes', () => {
+    render(<VoiceAudioSection />);
+    const audio = screen.getByText('Audio Configuration').closest('details')!;
+    audio.open = true;
+    fireEvent(audio, new Event('toggle'));
+    audio.open = false;
+    fireEvent(audio, new Event('toggle'));
+    expect(mockStopTest).toHaveBeenCalledOnce();
+    expect(mockStopOutputTest).toHaveBeenCalledOnce();
+  });
+
+  it('stops the camera preview when Video Configuration closes', () => {
+    render(<VoiceAudioSection />);
+    const video = screen.getByText('Video Configuration').closest('details')!;
+    video.open = true;
+    fireEvent(video, new Event('toggle'));
+    video.open = false;
+    fireEvent(video, new Event('toggle'));
+    expect(mockStopCameraTest).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['AGC disabled', { autoGainControl: false, musicMode: false }],
+    ['Music Mode enabled', { autoGainControl: true, musicMode: true }],
+  ])('shows one labeled Microphone Level range when %s', async (_case, overrides) => {
+    const { useDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
+    const values = {
+      autoGainControl: true,
+      musicMode: false,
+      inputVolume: 100,
+      ...overrides,
+    };
+    (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
+      (key: string) => values[key as keyof typeof values] ?? false
+    );
+    render(<VoiceAudioSection />);
+    const level = screen.getByRole('slider', { name: 'Microphone Level' });
+    expect(screen.getAllByRole('slider', { name: 'Microphone Level' })).toHaveLength(1);
+    expect(level).toHaveAttribute('min', '0');
+    expect(level).toHaveAttribute('max', '200');
+    expect(level).toHaveAttribute('step', '1');
+    expect(level).toHaveValue('100');
+    expect(screen.getByText('100%')).toBeInTheDocument();
+    const agcRow = screen.getByText('Auto Gain Control').closest('.settings-row');
+    expect(agcRow?.nextElementSibling).toBe(level.closest('.settings-volume-row'));
+  });
+
+  it('drafts Microphone Level changes in app percentage points', async () => {
+    const { useDraftAudioSetting, setDraftAudioSetting } =
+      await import('@/renderer/hooks/ui/useDraftSettings');
+    (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
+      (key: string) =>
+        ({ autoGainControl: false, musicMode: false, inputVolume: 100 })[key] ?? false
+    );
+    render(<VoiceAudioSection />);
+    fireEvent.change(screen.getByRole('slider', { name: 'Microphone Level' }), {
+      target: { value: '200' },
+    });
+    expect(setDraftAudioSetting).toHaveBeenCalledWith('inputVolume', 200);
+  });
+
+  it('hides Microphone Level while AGC is effective', async () => {
+    const { useDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
+    (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
+      (key: string) => ({ autoGainControl: true, musicMode: false, inputVolume: 100 })[key] ?? false
+    );
+    render(<VoiceAudioSection />);
+    expect(screen.queryByRole('slider', { name: 'Microphone Level' })).not.toBeInTheDocument();
   });
   it('renders output volume label', () => {
     render(<VoiceAudioSection />);
     expect(screen.getByText('Output Volume')).toBeInTheDocument();
   });
-  it('calls setDraftAudioSetting on input volume change', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
-    render(<VoiceAudioSection />);
-    fireEvent.change(document.querySelectorAll('.settings-volume-slider')[0], {
-      target: { value: '150' },
-    });
-    expect(setDraftAudioSetting).toHaveBeenCalledWith('inputVolume', 150);
-  });
   it('calls setDraftAudioSetting on output volume change', async () => {
     const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<VoiceAudioSection />);
-    fireEvent.change(document.querySelectorAll('.settings-volume-slider')[1], {
+    const outputRow = screen.getByText('Output Volume').closest('.settings-volume-row')!;
+    fireEvent.change(within(outputRow as HTMLElement).getByRole('slider'), {
       target: { value: '80' },
     });
     expect(setDraftAudioSetting).toHaveBeenCalledWith('outputVolume', 80);
@@ -508,13 +779,8 @@ describe('VoiceAudioSection', () => {
 
   it('renders volume percentages', () => {
     render(<VoiceAudioSection />);
-    // Both input and output volume are 100%
-    expect(screen.getAllByText('100%').length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('renders Input Volume hint text', () => {
-    render(<VoiceAudioSection />);
-    expect(screen.getByText(/Scales your microphone level/)).toBeInTheDocument();
+    expect(screen.getByText('Output Volume')).toBeInTheDocument();
+    expect(screen.getByText(/Scales all incoming audio/)).toBeInTheDocument();
   });
 
   it('renders Output Volume hint text', () => {
@@ -526,13 +792,13 @@ describe('VoiceAudioSection', () => {
 
   it('renders Camera subsection title', () => {
     render(<VoiceAudioSection />);
-    // 'Camera' appears in both Device Configuration and Video Configuration
+    // Camera also labels its selector.
     expect(screen.getAllByText('Camera').length).toBeGreaterThanOrEqual(1);
   });
 
   it('renders video input device selector', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getByTestId('device-selector-videoinput')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Camera' })).toBeInTheDocument();
   });
 
   // ===== Processing hints =====

@@ -6,6 +6,7 @@ interface UseOutputTestReturn {
   isTesting: boolean;
   error: string | null;
   playTestTone: () => Promise<void>;
+  stopTest: () => void;
 }
 
 /**
@@ -25,8 +26,16 @@ export function useOutputTest(): UseOutputTestReturn {
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const callSuspensionRef = useRef(false);
+  const generationRef = useRef(0);
+
+  const closeOwnedAudioContext = useCallback(async (ctx: AudioContext) => {
+    if (audioContextRef.current !== ctx) return;
+    audioContextRef.current = null;
+    if (ctx.state !== 'closed') await ctx.close().catch(() => {});
+  }, []);
 
   const cleanup = useCallback(() => {
+    generationRef.current++;
     if (callSuspensionRef.current) {
       voiceService.endTestSuspension();
       voiceService.setLocalTestingStatus(false);
@@ -38,6 +47,10 @@ export function useOutputTest(): UseOutputTestReturn {
     }
     if (audioElementRef.current) {
       audioElementRef.current.pause();
+      const source = audioElementRef.current.srcObject;
+      if (source && 'getTracks' in source) {
+        for (const track of source.getTracks()) track.stop();
+      }
       audioElementRef.current.srcObject = null;
       audioElementRef.current = null;
     }
@@ -51,6 +64,7 @@ export function useOutputTest(): UseOutputTestReturn {
   const playTestTone = useCallback(async () => {
     // Idempotent: stop any existing tone before starting
     cleanup();
+    const generation = ++generationRef.current;
     setError(null);
 
     try {
@@ -65,13 +79,17 @@ export function useOutputTest(): UseOutputTestReturn {
       }
       if (inVoiceCall) {
         voiceService.beginTestSuspension();
-        voiceService.setLocalTestingStatus(true);
         callSuspensionRef.current = true;
+        voiceService.setLocalTestingStatus(true);
       }
 
       const ctx = new AudioContext({ sampleRate: 48000 });
       audioContextRef.current = ctx;
       if (ctx.state === 'suspended') await ctx.resume();
+      if (generation !== generationRef.current) {
+        await closeOwnedAudioContext(ctx);
+        return;
+      }
 
       const destination = ctx.createMediaStreamDestination();
 
@@ -107,8 +125,15 @@ export function useOutputTest(): UseOutputTestReturn {
         } catch {
           // setSinkId rejected — fall back to default sink
         }
+        if (generation !== generationRef.current) return;
       }
       await audioEl.play();
+      if (generation !== generationRef.current) {
+        audioEl.pause();
+        audioEl.srcObject = null;
+        await closeOwnedAudioContext(ctx);
+        return;
+      }
 
       setIsTesting(true);
       timeoutRef.current = setTimeout(
@@ -117,18 +142,27 @@ export function useOutputTest(): UseOutputTestReturn {
         },
         duration * 1000 + 50
       );
-    } catch (err) {
+    } catch {
+      if (generation !== generationRef.current) return;
       cleanup();
-      const msg = err instanceof Error ? err.message : 'Failed to play test tone';
-      setError(msg);
+      setError('Failed to play test tone');
     }
-  }, [cleanup]);
+  }, [cleanup, closeOwnedAudioContext]);
 
   useEffect(() => {
+    const unsubscribe = useVoiceStore.subscribe((state, prev) => {
+      const deviceChanged = state.audioOutputDeviceId !== prev.audioOutputDeviceId;
+      const wasInCall = ['connected', 'connecting', 'reconnecting'].includes(prev.connectionState);
+      const isInCall = ['connected', 'connecting', 'reconnecting'].includes(state.connectionState);
+      const callConflict = state.localIsTesting && !callSuspensionRef.current;
+      const callStarted = !wasInCall && isInCall && !callSuspensionRef.current;
+      if (deviceChanged || callConflict || callStarted) cleanup();
+    });
     return () => {
+      unsubscribe();
       cleanup();
     };
   }, [cleanup]);
 
-  return { isTesting, error, playTestTone };
+  return { isTesting, error, playTestTone, stopTest: cleanup };
 }

@@ -24,14 +24,27 @@ const { mockSetVideoAdvancedMode, mockSetDraftVideoSetting } = vi.hoisted(() => 
   mockSetVideoAdvancedMode: vi.fn(),
   mockSetDraftVideoSetting: vi.fn(),
 }));
+const { cameraTestState, mockToggleCameraTest, mockStopCameraTest } = vi.hoisted(() => ({
+  cameraTestState: {
+    current: { isTesting: false, error: null as string | null, stream: null as MediaStream | null },
+  },
+  mockToggleCameraTest: vi.fn(),
+  mockStopCameraTest: vi.fn(),
+}));
 
 // ─── Mocks (MUST be before component imports) ───────────────────────────────
 
-vi.mock('@/renderer/stores/voice/voiceStore', () => ({
-  useVoiceStore: vi.fn((s: (state: Record<string, unknown>) => unknown) =>
-    s({ activeCameraCodec: null, activeScreenCodec: null })
-  ),
-}));
+vi.mock('@/renderer/stores/voice/voiceStore', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/stores/voice/voiceStore')>();
+  return {
+    useVoiceStore: Object.assign(
+      vi.fn((s: (state: Record<string, unknown>) => unknown) =>
+        s({ ...actual.useVoiceStore.getState(), activeCameraCodec: null, activeScreenCodec: null })
+      ),
+      actual.useVoiceStore
+    ),
+  };
+});
 
 vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   useVideoSettingsStore: Object.assign(
@@ -56,6 +69,23 @@ vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
 vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftVideoSetting: vi.fn((key: string) => defaultVideoSettings[key] ?? false),
   setDraftVideoSetting: mockSetDraftVideoSetting,
+}));
+vi.mock('@/renderer/hooks/device/useCameraTest', () => ({
+  useCameraTest: () => ({
+    ...cameraTestState.current,
+    toggleTest: mockToggleCameraTest,
+    stopTest: mockStopCameraTest,
+  }),
+}));
+vi.mock('@/renderer/components/Voice/DeviceSelector', () => ({
+  default: ({ kind }: { kind: string }) => (
+    <label>
+      Camera
+      <select aria-label={kind === 'videoinput' ? 'Camera' : kind}>
+        <option>Default</option>
+      </select>
+    </label>
+  ),
 }));
 
 // These existing tests exercise device-derived resolution/fps/bitrate behaviour,
@@ -126,6 +156,7 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
 
 // ─── Component imports (AFTER mocks) ────────────────────────────────────────
 import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSection';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
@@ -246,7 +277,9 @@ function getCodecSelect(): HTMLSelectElement {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
+  resetAllStores();
   vi.clearAllMocks();
+  cameraTestState.current = { isTesting: false, error: null, stream: null };
   globalThis.electron = {
     getDisplayInfo: vi.fn().mockResolvedValue([]),
   } as unknown as typeof globalThis.electron;
@@ -267,13 +300,74 @@ beforeEach(() => {
   );
   (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
     (s: (state: Record<string, unknown>) => unknown) =>
-      s({ activeCameraCodec: null, activeScreenCodec: null })
+      s({ ...useVoiceStore.getState(), activeCameraCodec: null, activeScreenCodec: null })
   );
 });
 
 // ─── 1. Basic mode rendering ────────────────────────────────────────────────
 
 describe('VideoConfigSection', () => {
+  describe('moved camera controls', () => {
+    it('renders the camera selector with its Default option', () => {
+      renderComponent();
+      expect(screen.getByRole('combobox', { name: 'Camera' })).toHaveTextContent('Default');
+    });
+
+    it('places camera selection and preview before the Basic and Advanced mode fieldset', () => {
+      const { rerender } = renderComponent();
+      const fieldset = screen.getByRole('group', { name: 'Video settings mode' });
+      const camera = screen.getByRole('combobox', { name: 'Camera' });
+      expect(
+        camera.compareDocumentPosition(fieldset) & Node.DOCUMENT_POSITION_FOLLOWING
+      ).toBeTruthy();
+      expect(
+        screen.getByRole('button', { name: /^Test$/ }).compareDocumentPosition(fieldset) &
+          Node.DOCUMENT_POSITION_FOLLOWING
+      ).toBeTruthy();
+
+      fireEvent.click(screen.getByRole('button', { name: /^Test$/ }));
+      cameraTestState.current = {
+        isTesting: true,
+        error: null,
+        stream: { getTracks: () => [] } as unknown as MediaStream,
+      };
+      rerender(<VideoConfigSection />);
+      const preview = document.querySelector('video');
+      expect(preview).toBeInTheDocument();
+      expect(
+        preview!.compareDocumentPosition(fieldset) & Node.DOCUMENT_POSITION_FOLLOWING
+      ).toBeTruthy();
+    });
+
+    it('starts the camera test and retains the active preview control', () => {
+      const { rerender } = renderComponent();
+      fireEvent.click(screen.getByRole('button', { name: /^Test$/ }));
+      expect(mockToggleCameraTest).toHaveBeenCalledTimes(1);
+
+      cameraTestState.current = {
+        isTesting: true,
+        error: null,
+        stream: { getTracks: () => [] } as unknown as MediaStream,
+      };
+      rerender(<VideoConfigSection />);
+      expect(screen.getByRole('button', { name: 'Stop Preview' })).toBeInTheDocument();
+      expect(document.querySelector('video')).toBeInTheDocument();
+    });
+
+    it('retains camera test errors and disables testing during a call', () => {
+      cameraTestState.current.error = 'Camera access denied';
+      const { rerender } = renderComponent();
+      expect(screen.getByText('Camera access denied')).toBeInTheDocument();
+
+      (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        (selector: (state: Record<string, unknown>) => unknown) =>
+          selector({ ...useVoiceStore.getState(), connectionState: 'connected' })
+      );
+      rerender(<VideoConfigSection />);
+      expect(screen.getByRole('button', { name: /^Test$/ })).toBeDisabled();
+    });
+  });
+
   describe('basic mode', () => {
     it('renders Camera Preset section with system default hint', () => {
       renderComponent();

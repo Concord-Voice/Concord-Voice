@@ -1,4 +1,7 @@
-import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import {
+  effectiveMicLevelPercent,
+  useAudioSettingsStore,
+} from '@/renderer/stores/audio/audioSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {
@@ -32,6 +35,99 @@ beforeEach(() => {
 });
 
 describe('audioSettingsStore', () => {
+  describe('effective microphone level', () => {
+    it.each([100, 200])(
+      'uses unity while AGC is on with positive saved level %i',
+      (inputVolume) => {
+        expect(
+          effectiveMicLevelPercent({ musicMode: false, autoGainControl: true, inputVolume })
+        ).toBe(100);
+      }
+    );
+
+    it('preserves a persisted zero as silence while AGC is on', async () => {
+      localStorage.setItem(
+        'concord:audio-advanced',
+        JSON.stringify({
+          state: { inputVolume: 0, autoGainControl: true, musicMode: false },
+          version: 2,
+        })
+      );
+
+      await useAudioSettingsStore.persist.rehydrate();
+
+      expect(useAudioSettingsStore.getState().inputVolume).toBe(0);
+      expect(effectiveMicLevelPercent(useAudioSettingsStore.getState())).toBe(0);
+    });
+
+    it.each([0, 100, 200])('uses saved level %i while AGC is off', (inputVolume) => {
+      expect(
+        effectiveMicLevelPercent({ musicMode: false, autoGainControl: false, inputVolume })
+      ).toBe(inputVolume);
+    });
+
+    it('uses the retained manual level in Music Mode even when AGC is stored on', () => {
+      expect(
+        effectiveMicLevelPercent({ musicMode: true, autoGainControl: true, inputVolume: 200 })
+      ).toBe(200);
+    });
+
+    it.each([
+      [-1, 0],
+      [201, 200],
+      [Number.NaN, 100],
+      [Number.POSITIVE_INFINITY, 100],
+      [Number.NEGATIVE_INFINITY, 100],
+      ['150' as unknown as number, 100],
+    ])('normalizes invalid or out-of-range manual level %s to %i', (inputVolume, expected) => {
+      expect(
+        effectiveMicLevelPercent({ musicMode: true, autoGainControl: false, inputVolume })
+      ).toBe(expected);
+    });
+  });
+
+  describe('persisted microphone level hydration', () => {
+    it.each([
+      ['non-finite NaN', Number.NaN],
+      ['positive infinity', Number.POSITIVE_INFINITY],
+      ['negative infinity', Number.NEGATIVE_INFINITY],
+      ['non-numeric text', 'loud'],
+    ])(
+      'normalizes %s without discarding other same-version settings',
+      async (_label, inputVolume) => {
+        localStorage.setItem(
+          'concord:audio-advanced',
+          JSON.stringify({
+            state: { inputVolume, advancedMode: true, noiseCancellation: false },
+            version: 2,
+          })
+        );
+
+        await useAudioSettingsStore.persist.rehydrate();
+
+        const state = useAudioSettingsStore.getState();
+        expect(state.inputVolume).toBe(100);
+        expect(state.advancedMode).toBe(true);
+        expect(state.noiseCancellation).toBe(false);
+      }
+    );
+
+    it('clamps finite persisted manual levels without changing the stored value under AGC', async () => {
+      localStorage.setItem(
+        'concord:audio-advanced',
+        JSON.stringify({
+          state: { inputVolume: 250, autoGainControl: true, musicMode: false },
+          version: 2,
+        })
+      );
+
+      await useAudioSettingsStore.persist.rehydrate();
+
+      expect(useAudioSettingsStore.getState().inputVolume).toBe(200);
+      expect(effectiveMicLevelPercent(useAudioSettingsStore.getState())).toBe(100);
+    });
+  });
+
   it('has correct defaults', () => {
     const s = useAudioSettingsStore.getState();
     expect(s.advancedMode).toBe(false);
