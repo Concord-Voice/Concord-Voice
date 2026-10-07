@@ -4,7 +4,11 @@ import {
   AUDIO_QUALITY_TIERS,
   type AudioQualityTier,
 } from '../../stores/voice/voiceStore';
-import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
+import {
+  effectiveNoiseGateMode,
+  useAudioSettingsStore,
+  type NoiseGateMode,
+} from '../../stores/audio/audioSettingsStore';
 import {
   useDraftAudioSetting,
   setDraftAudioSetting,
@@ -59,17 +63,12 @@ function processingHint(
   return enabled ? enabledText : disabledText;
 }
 
-/** Describe the noise gate threshold level for the hint text. */
-function gateThresholdHint(level: number): string {
-  if (level >= -25)
-    return `${level} dBFS \u2014 Gates everything except loud, close-mic speech. Only passes through someone talking directly into a microphone.`;
-  if (level >= -35)
-    return `${level} dBFS \u2014 Gates background noise and quiet sounds. Passes through normal conversational speaking volume.`;
-  if (level >= -50)
-    return `${level} dBFS \u2014 Gates ambient room noise. Passes through most intentional speech, including softer voices.`;
-  if (level >= -65)
-    return `${level} dBFS \u2014 Gates only faint background hum. Most sounds above a quiet whisper will pass through.`;
-  return `${level} dBFS \u2014 Gates only near-total silence. Virtually everything audible passes through unaffected.`;
+function setProcessingToggle(
+  key: 'noiseCancellation' | 'echoCancellation' | 'autoGainControl',
+  enabled: boolean,
+  musicMode: boolean
+): void {
+  if (!musicMode) setDraftAudioSetting(key, enabled);
 }
 
 /** Describe the quiet boost threshold level for the hint text. */
@@ -85,47 +84,327 @@ function boostThresholdHint(level: number): string {
   return `${level} dBFS \u2014 Boosts only barely-audible participants. Like catching a faint whisper from across a quiet room.`;
 }
 
-// ─── Component ───────────────────────────────────────────────────────────────
+function noiseGateHint(mode: NoiseGateMode): string {
+  switch (mode) {
+    case 'dynamic':
+      return 'Dynamic learns from microphone levels during a call or Test. When levels overlap, it favors letting sound through.';
+    case 'manualCalibrate':
+      return 'Manual Calibrate uses the fixed dBFS threshold below to decide when the gate opens.';
+    case 'autoCalibrate':
+      return 'Off leaves the gate open.';
+    case 'off':
+      return 'Off leaves the gate open.';
+  }
+}
 
-const AudioConfigSection: React.FC = () => {
-  const qualityTier = useVoiceStore((s) => s.qualityTier);
-  const setQualityTier = useVoiceStore((s) => s.setQualityTier);
+function dynamicGateStatusMessage(
+  error: string | null,
+  status: ReturnType<typeof useVoiceStore.getState>['dynamicGateStatus']
+): string {
+  if (error) return error;
+  if (status?.state === 'adjusted') {
+    return 'Adjusted — Dynamic can change this threshold as levels change.';
+  }
+  if (status?.state === 'uncertain') {
+    return 'Uncertain — microphone levels are too close to separate reliably, so the gate stays permissive. Try moving the microphone closer.';
+  }
+  return 'Learning — speak normally while the gate samples microphone levels.';
+}
 
-  const advancedMode = useAudioSettingsStore((s) => s.advancedMode);
+interface QualityTierLabelsProps {
+  tierIndex: number;
+  isTierLocked: (tier: AudioQualityTier) => boolean;
+  selectTierGated: (tier: AudioQualityTier) => void;
+}
 
-  const stashAndSwapAudioMode = useStashAndSwapAudioMode();
+const QualityTierLabels: React.FC<QualityTierLabelsProps> = ({
+  tierIndex,
+  isTierLocked,
+  selectTierGated,
+}) => (
+  <div className="settings-tier-labels">
+    {TIER_ORDER.map((tier, i) => {
+      const config = AUDIO_QUALITY_TIERS[tier];
+      const locked = isTierLocked(tier);
+      return (
+        <button
+          type="button"
+          key={tier}
+          className={`settings-tier-label ${tierIndex === i ? 'active' : ''} ${locked ? 'settings-tier-label-locked' : ''}`}
+          aria-pressed={tierIndex === i}
+          {...(locked ? { 'aria-disabled': 'true' } : {})}
+          onClick={() => selectTierGated(tier)}
+        >
+          {config.label}
+          {locked && (
+            <span className="settings-tier-lock-glyph" aria-label="Premium feature" role="img">
+              {'\u{1F512}'}
+            </span>
+          )}
+        </button>
+      );
+    })}
+  </div>
+);
 
-  // L1 (#1301): the quality slider stays live across the free tiers; premium
-  // tiers (those NOT in `allowedAudioTiers`) render a 🔒 tick and snap back to
-  // the highest free tier when selected, surfacing a chip popover — no
-  // mid-action modal. The slider is fully keyboard-operable within the free
-  // range (we don't cap `max`; we intercept the value on change).
-  const allowedAudioTiers = useEntitlement((e) => e.allowedAudioTiers);
+interface AudioDeviceSettingsProps {
+  localIsTesting: boolean;
+  micTest: ReturnType<typeof useMicTest>;
+  outputTest: ReturnType<typeof useOutputTest>;
+  outputVolume: number;
+}
+
+const AudioDeviceSettings: React.FC<AudioDeviceSettingsProps> = ({
+  localIsTesting,
+  micTest,
+  outputTest,
+  outputVolume,
+}) => (
+  <div className="settings-audio-devices">
+    <div className="settings-audio-device-group">
+      <h3 className="settings-subsection-title">Input</h3>
+      <div className="settings-device-row">
+        <DeviceSelector kind="audioinput" />
+      </div>
+      <div className="settings-mic-test-row">
+        <button
+          className={`settings-mic-test-btn${micTest.isTesting ? ' testing' : ''}`}
+          onClick={micTest.isTesting ? micTest.stopTest : micTest.startTest}
+          disabled={localIsTesting && !micTest.isTesting}
+          title={localIsTesting && !micTest.isTesting ? 'Another audio test is running' : undefined}
+        >
+          {micTest.isTesting ? 'Stop Testing' : 'Test'}
+        </button>
+        {micTest.error && <span className="settings-mic-test-error">{micTest.error}</span>}
+      </div>
+      <p className="settings-row-hint">
+        Microphone Test uses applied settings until you select Apply. Its meter shows sample peaks
+        before the noise gate, so it still responds while the gate is closed.
+      </p>
+      {micTest.isTesting && (
+        <div className="settings-mic-meter-container">
+          <div className="settings-mic-meter-track">
+            <div
+              className="settings-mic-meter-fill"
+              style={{
+                width: `${Math.min(100, Math.max(0, ((micTest.dbfsLevel + 80) / 80) * 100))}%`,
+              }}
+            />
+          </div>
+          <div className="settings-mic-meter-ticks">
+            <span>-80</span>
+            <span>-60</span>
+            <span>-40</span>
+            <span>-20</span>
+            <span>0 dBFS</span>
+          </div>
+          {micTest.inputOverloaded && (
+            <p className="settings-mic-test-error" role="alert">
+              Input reached or exceeded 0 dBFS before the noise gate. This may indicate clipping;
+              check your microphone level and upstream audio settings.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+
+    <div className="settings-audio-device-group">
+      <h3 className="settings-subsection-title">Output</h3>
+      <div className="settings-device-row">
+        <DeviceSelector kind="audiooutput" />
+      </div>
+      <div className="settings-volume-row">
+        <div className="settings-row-info">
+          <span className="settings-volume-label">Output Volume</span>
+          <span className="settings-row-hint">
+            Scales all incoming audio from muted (left) to 2x boost (right). Values above 100% may
+            introduce clipping.
+          </span>
+        </div>
+        <div className="settings-slider-wrapper">
+          <span className="settings-slider-value">{outputVolume}%</span>
+          <input
+            type="range"
+            className="settings-volume-slider"
+            min={0}
+            max={200}
+            step={1}
+            value={outputVolume}
+            aria-label="Output Volume"
+            onChange={(event) =>
+              setDraftAudioSetting('outputVolume', Number(event.currentTarget.value))
+            }
+          />
+        </div>
+      </div>
+      <div className="settings-output-test-row">
+        <button
+          className={`settings-output-test-btn${outputTest.isTesting ? ' testing' : ''}`}
+          onClick={outputTest.playTestTone}
+          disabled={outputTest.isTesting || (localIsTesting && !outputTest.isTesting)}
+          title={
+            localIsTesting && !outputTest.isTesting ? 'Another audio test is running' : undefined
+          }
+        >
+          {outputTest.isTesting ? 'Playing...' : 'Test'}
+        </button>
+        {outputTest.error && <span className="settings-output-test-error">{outputTest.error}</span>}
+      </div>
+    </div>
+  </div>
+);
+
+interface NoiseGateSettingsProps {
+  appliedGateMode: NoiseGateMode;
+  appliedAgc: boolean;
+  appliedMusicMode: boolean;
+  autoGainControl: boolean;
+  noiseGateMode: NoiseGateMode;
+  noiseGateLevel: number;
+  musicMode: boolean;
+  isTesting: boolean;
+  activeGateStatus: ReturnType<typeof useVoiceStore.getState>['dynamicGateStatus'];
+  gateError: string | null;
+}
+
+const NoiseGateSettings: React.FC<NoiseGateSettingsProps> = ({
+  appliedGateMode,
+  appliedAgc,
+  appliedMusicMode,
+  autoGainControl,
+  noiseGateMode,
+  noiseGateLevel,
+  musicMode,
+  isTesting,
+  activeGateStatus,
+  gateError,
+}) => {
+  const effectiveAgc = !musicMode && autoGainControl;
+  const appliedDynamic =
+    effectiveNoiseGateMode({
+      noiseGateMode: appliedGateMode,
+      autoGainControl: appliedAgc,
+      musicMode: appliedMusicMode,
+    }) === 'dynamic';
+  const pendingGateChange =
+    noiseGateMode !== appliedGateMode ||
+    autoGainControl !== appliedAgc ||
+    musicMode !== appliedMusicMode;
+
+  return (
+    <>
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <label className="settings-row-label" htmlFor="settings-noise-gate-mode">
+            Noise Gate
+          </label>
+          <span className="settings-row-hint">
+            {noiseGateHint(noiseGateMode)}
+            {musicMode && ' Music Mode disables Auto Gain Control.'}
+          </span>
+        </div>
+        <select
+          id="settings-noise-gate-mode"
+          className="settings-select"
+          value={noiseGateMode}
+          onChange={(event) =>
+            setDraftAudioSetting('noiseGateMode', event.currentTarget.value as NoiseGateMode)
+          }
+        >
+          <option value="dynamic">Dynamic</option>
+          {!effectiveAgc && <option value="manualCalibrate">Manual Calibrate</option>}
+          <option value="off">Off</option>
+        </select>
+      </div>
+
+      {pendingGateChange && (
+        <p className="settings-row-hint">
+          {noiseGateMode === 'dynamic' && appliedGateMode === 'manualCalibrate' && effectiveAgc
+            ? 'Switching to Dynamic takes effect when you select Apply.'
+            : 'Noise Gate changes take effect when you select Apply.'}
+        </p>
+      )}
+
+      {appliedDynamic && (isTesting || activeGateStatus || gateError) ? (
+        <div className="settings-row-hint">
+          <span role="status" aria-live="polite">
+            {dynamicGateStatusMessage(gateError, activeGateStatus)}
+          </span>
+          {!gateError && activeGateStatus?.state === 'adjusted' && (
+            <span>
+              {' '}
+              Current threshold: {String(activeGateStatus.thresholdDbfs).replace('-', '−')} dBFS.
+            </span>
+          )}
+        </div>
+      ) : (
+        appliedDynamic &&
+        noiseGateMode === 'dynamic' && (
+          <p className="settings-row-hint">The gate learns during a call or microphone Test</p>
+        )
+      )}
+
+      {noiseGateMode === 'manualCalibrate' && (
+        <div className="settings-row settings-row-child">
+          <div className="settings-row-info">
+            <label className="settings-row-label" htmlFor="settings-noise-gate-threshold">
+              Gate Threshold
+            </label>
+            <span className="settings-row-hint">Set the threshold yourself.</span>
+          </div>
+          <div className="settings-slider-wrapper">
+            <span className="settings-slider-value">{noiseGateLevel} dBFS</span>
+            <input
+              id="settings-noise-gate-threshold"
+              type="range"
+              className="settings-slider"
+              min={-80}
+              max={-20}
+              value={noiseGateLevel}
+              onChange={(event) =>
+                setDraftAudioSetting('noiseGateLevel', Number(event.currentTarget.value))
+              }
+            />
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
+interface AudioQualitySettingsProps {
+  qualityTier: AudioQualityTier;
+  setQualityTier: (tier: AudioQualityTier) => void;
+  advancedMode: boolean;
+}
+
+const AudioQualitySettings: React.FC<AudioQualitySettingsProps> = ({
+  qualityTier,
+  setQualityTier,
+  advancedMode,
+}) => {
+  const allowedAudioTiers = useEntitlement((entitlement) => entitlement.allowedAudioTiers);
   const audioTierGate = useGateActivation('audio-tier');
   const [tierLockHinted, setTierLockHinted] = useState(false);
+  const tierIndex = TIER_ORDER.indexOf(qualityTier);
 
   const isTierLocked = useCallback(
     (tier: AudioQualityTier): boolean =>
       AUDIO_QUALITY_TIERS[tier]?.premium === true && !allowedAudioTiers.includes(tier),
     [allowedAudioTiers]
   );
-
-  /** Highest free tier the snap-back lands on — the last allowed tier in
-   *  display order (falls back to 'standard' if the floor list is unexpected). */
   const highestFreeTier: AudioQualityTier =
-    [...TIER_ORDER].reverse().find((t) => allowedAudioTiers.includes(t)) ?? 'standard';
+    [...TIER_ORDER].reverse().find((tier) => allowedAudioTiers.includes(tier)) ?? 'standard';
 
-  /** Apply a tier selection, batching its drafts in basic mode (the existing
-   *  side effect). Shared by the slider + label paths. */
   const applyTier = useCallback(
     (tier: AudioQualityTier) => {
       setQualityTier(tier);
       if (!useAudioSettingsStore.getState().advancedMode) {
-        const tc = AUDIO_QUALITY_TIERS[tier];
+        const config = AUDIO_QUALITY_TIERS[tier];
         batchSetAudioDrafts({
-          silenceDetection: tc.opusDtx,
-          inlineFec: tc.opusFec,
-          fecHeadroom: tc.opusFec,
+          silenceDetection: config.opusDtx,
+          inlineFec: config.opusFec,
+          fecHeadroom: config.opusFec,
           frameSize: 0,
           stereoOverride: null,
         });
@@ -133,9 +412,6 @@ const AudioConfigSection: React.FC = () => {
     },
     [setQualityTier]
   );
-
-  /** Resolve a tier selection through the L1 gate: a locked tier snaps back to
-   *  the highest free tier and reveals the chip; a free tier passes through. */
   const selectTierGated = useCallback(
     (tier: AudioQualityTier) => {
       if (isTierLocked(tier)) {
@@ -148,237 +424,35 @@ const AudioConfigSection: React.FC = () => {
     },
     [isTierLocked, applyTier, highestFreeTier]
   );
-
-  // Audio processing settings (drafted)
-  const noiseCancellation = useDraftAudioSetting('noiseCancellation');
-  const echoCancellation = useDraftAudioSetting('echoCancellation');
-  const autoGainControl = useDraftAudioSetting('autoGainControl');
-  const noiseGateMode = useDraftAudioSetting('noiseGateMode');
-  const noiseGateLevel = useDraftAudioSetting('noiseGateLevel');
-  const quietBoost = useDraftAudioSetting('quietBoost');
-  const quietBoostThreshold = useDraftAudioSetting('quietBoostThreshold');
-  const musicMode = useDraftAudioSetting('musicMode');
-  const processingRowClassName = musicMode ? 'settings-row settings-row-disabled' : 'settings-row';
-  const inputVolume = useDraftAudioSetting('inputVolume');
-  const outputVolume = useDraftAudioSetting('outputVolume');
-  const localIsTesting = useVoiceStore((s) => s.localIsTesting);
-  const {
-    isTesting,
-    dbfsLevel,
-    inputOverloaded,
-    error: micTestError,
-    startTest,
-    stopTest,
-  } = useMicTest();
-  const {
-    isTesting: isOutputTesting,
-    error: outputTestError,
-    playTestTone,
-    stopTest: stopOutputTest,
-  } = useOutputTest();
-  const tierIndex = TIER_ORDER.indexOf(qualityTier);
-
   const handleTierSlider = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const idx = Number(e.target.value);
-      if (idx >= 0 && idx < TIER_ORDER.length) {
-        // L1: a drag/keyboard move onto a locked premium tier snaps back to the
-        // highest free tier and reveals the chip; free tiers pass through.
-        selectTierGated(TIER_ORDER[idx]);
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const index = Number(event.target.value);
+      if (index >= 0 && index < TIER_ORDER.length) {
+        selectTierGated(TIER_ORDER[index]);
       }
     },
     [selectTierGated]
   );
 
-  const handleAdvancedToggle = useCallback(
-    (enabled: boolean) => {
-      useAudioSettingsStore.getState().setAdvancedMode(enabled); // immediate — UI toggle
-      stashAndSwapAudioMode(enabled, qualityTier);
-    },
-    [qualityTier, stashAndSwapAudioMode]
-  );
-
   return (
-    <CollapsibleSection
-      id="section-audio-config"
-      title="Audio Configuration"
-      onCollapse={() => {
-        stopTest();
-        stopOutputTest();
-      }}
-    >
-      <div className="settings-audio-devices">
-        <div className="settings-audio-device-group">
-          <h3 className="settings-subsection-title">Input</h3>
-          <div className="settings-device-row">
-            <DeviceSelector kind="audioinput" />
-          </div>
-          <div className="settings-mic-test-row">
-            <button
-              className={`settings-mic-test-btn${isTesting ? ' testing' : ''}`}
-              onClick={isTesting ? stopTest : startTest}
-              disabled={localIsTesting && !isTesting}
-              title={localIsTesting && !isTesting ? 'Another audio test is running' : undefined}
-            >
-              {isTesting ? 'Stop Testing' : 'Test'}
-            </button>
-            {micTestError && <span className="settings-mic-test-error">{micTestError}</span>}
-          </div>
-          <p className="settings-row-hint">
-            Microphone Test uses applied settings until you select Apply. Its meter shows sample
-            peaks before the noise gate, so it still responds while the gate is closed.
-          </p>
-          {isTesting && (
-            <div className="settings-mic-meter-container">
-              <div className="settings-mic-meter-track">
-                <div
-                  className="settings-mic-meter-fill"
-                  style={{ width: `${Math.min(100, Math.max(0, ((dbfsLevel + 80) / 80) * 100))}%` }}
-                />
-              </div>
-              <div className="settings-mic-meter-ticks">
-                <span>-80</span>
-                <span>-60</span>
-                <span>-40</span>
-                <span>-20</span>
-                <span>0 dBFS</span>
-              </div>
-              {inputOverloaded && (
-                <p className="settings-mic-test-error" role="alert">
-                  Input reached or exceeded 0 dBFS before the noise gate. This may indicate
-                  clipping; check your microphone level and upstream audio settings.
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="settings-audio-device-group">
-          <h3 className="settings-subsection-title">Output</h3>
-          <div className="settings-device-row">
-            <DeviceSelector kind="audiooutput" />
-          </div>
-          <div className="settings-volume-row">
-            <div className="settings-row-info">
-              <span className="settings-volume-label">Output Volume</span>
-              <span className="settings-row-hint">
-                Scales all incoming audio from muted (left) to 2x boost (right). Values above 100%
-                may introduce clipping.
-              </span>
-            </div>
-            <div className="settings-slider-wrapper">
-              <span className="settings-slider-value">{outputVolume}%</span>
-              <input
-                type="range"
-                className="settings-volume-slider"
-                min={0}
-                max={200}
-                step={1}
-                value={outputVolume}
-                aria-label="Output Volume"
-                onChange={(event) =>
-                  setDraftAudioSetting('outputVolume', Number(event.currentTarget.value))
-                }
-              />
-            </div>
-          </div>
-          <div className="settings-output-test-row">
-            <button
-              className={`settings-output-test-btn${isOutputTesting ? ' testing' : ''}`}
-              onClick={playTestTone}
-              disabled={isOutputTesting || (localIsTesting && !isOutputTesting)}
-              title={
-                localIsTesting && !isOutputTesting ? 'Another audio test is running' : undefined
-              }
-            >
-              {isOutputTesting ? 'Playing...' : 'Test'}
-            </button>
-            {outputTestError && (
-              <span className="settings-output-test-error">{outputTestError}</span>
-            )}
-          </div>
-        </div>
-      </div>
-      <p className="settings-section-description">
-        Device selections apply immediately. Processing changes apply when you select Apply.
-      </p>
-
-      {/* ── Mode Toggle ── native radios: this persists a setting, it does not
-          switch views, so a tablist would announce a tabpanel that isn't there. */}
-      <fieldset className="settings-mode-toggle">
-        <legend className="settings-mode-legend">Audio settings mode</legend>
-        <label className="settings-mode-pill">
-          <input
-            type="radio"
-            name="audio-settings-mode"
-            className="settings-mode-radio"
-            checked={!advancedMode}
-            onChange={() => handleAdvancedToggle(false)}
-          />
-          {'Basic Settings'}
-        </label>
-        <label className="settings-mode-pill">
-          <input
-            type="radio"
-            name="audio-settings-mode"
-            className="settings-mode-radio"
-            checked={advancedMode}
-            onChange={() => handleAdvancedToggle(true)}
-          />
-          {'Advanced Settings'}
-        </label>
-      </fieldset>
-
-      {advancedMode && (
-        <p className="settings-mode-notice">
-          These settings override the quality tier presets. Switching back to Basic will save your
-          advanced configuration but apply your last Basic settings instead.
-        </p>
-      )}
-
-      {/* ── Quality ── */}
+    <>
       <h3 className="settings-subsection-title">Quality</h3>
       <p className="settings-section-description">
         Higher quality uses more bandwidth. Premium tiers require a subscription.
       </p>
 
       <div className="settings-tier-slider-container">
-        <div className="settings-tier-labels">
-          {TIER_ORDER.map((tier, i) => {
-            const config = AUDIO_QUALITY_TIERS[tier];
-            const locked = isTierLocked(tier);
-            // Native buttons with aria-pressed: a shortcut onto the slider.
-            return (
-              <button
-                type="button"
-                key={tier}
-                className={`settings-tier-label ${tierIndex === i ? 'active' : ''} ${locked ? 'settings-tier-label-locked' : ''}`}
-                aria-pressed={tierIndex === i}
-                // O1: locked tiers stay focusable + aria-disabled (never
-                // `disabled`/`pointer-events:none`); selecting one snaps back.
-                {...(locked ? { 'aria-disabled': 'true' } : {})}
-                onClick={() => selectTierGated(tier)}
-              >
-                {config.label}
-                {locked && (
-                  <span
-                    className="settings-tier-lock-glyph"
-                    aria-label="Premium feature"
-                    role="img"
-                  >
-                    {'\u{1F512}'}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
+        <QualityTierLabels
+          tierIndex={tierIndex}
+          isTierLocked={isTierLocked}
+          selectTierGated={selectTierGated}
+        />
         <div className="settings-tier-track">
           <div className="settings-tier-ticks">
-            {TIER_ORDER.map((tier, i) => (
+            {TIER_ORDER.map((tier, index) => (
               <span
                 key={tier}
-                className={`settings-tier-tick ${tierIndex === i ? 'active' : ''}`}
+                className={`settings-tier-tick ${tierIndex === index ? 'active' : ''}`}
               />
             ))}
           </div>
@@ -428,6 +502,111 @@ const AudioConfigSection: React.FC = () => {
           </output>
         )}
       </div>
+    </>
+  );
+};
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+const AudioConfigSection: React.FC = () => {
+  const qualityTier = useVoiceStore((s) => s.qualityTier);
+  const setQualityTier = useVoiceStore((s) => s.setQualityTier);
+
+  const advancedMode = useAudioSettingsStore((s) => s.advancedMode);
+  const appliedGateMode = useAudioSettingsStore((s) => s.noiseGateMode);
+  const appliedAgc = useAudioSettingsStore((s) => s.autoGainControl);
+  const appliedMusicMode = useAudioSettingsStore((s) => s.musicMode);
+  const liveGateStatus = useVoiceStore((s) => s.dynamicGateStatus);
+  const liveGateError = useVoiceStore((s) =>
+    s.joinError?.startsWith('Microphone processing ') ? s.joinError : null
+  );
+
+  const stashAndSwapAudioMode = useStashAndSwapAudioMode();
+
+  // Audio processing settings (drafted)
+  const noiseCancellation = useDraftAudioSetting('noiseCancellation');
+  const echoCancellation = useDraftAudioSetting('echoCancellation');
+  const autoGainControl = useDraftAudioSetting('autoGainControl');
+  const noiseGateMode = useDraftAudioSetting('noiseGateMode');
+  const noiseGateLevel = useDraftAudioSetting('noiseGateLevel');
+  const quietBoost = useDraftAudioSetting('quietBoost');
+  const quietBoostThreshold = useDraftAudioSetting('quietBoostThreshold');
+  const musicMode = useDraftAudioSetting('musicMode');
+  const processingRowClassName = musicMode ? 'settings-row settings-row-disabled' : 'settings-row';
+  const inputVolume = useDraftAudioSetting('inputVolume');
+  const outputVolume = useDraftAudioSetting('outputVolume');
+  const localIsTesting = useVoiceStore((s) => s.localIsTesting);
+  const micTest = useMicTest();
+  const outputTest = useOutputTest();
+  const testGateError = micTest.error
+    ? `${micTest.error}. Check your microphone and try again.`
+    : null;
+  const gateError = !micTest.isTesting && liveGateError ? liveGateError : testGateError;
+  const handleAdvancedToggle = useCallback(
+    (enabled: boolean) => {
+      useAudioSettingsStore.getState().setAdvancedMode(enabled); // immediate — UI toggle
+      stashAndSwapAudioMode(enabled, qualityTier);
+    },
+    [qualityTier, stashAndSwapAudioMode]
+  );
+
+  return (
+    <CollapsibleSection
+      id="section-audio-config"
+      title="Audio Configuration"
+      onCollapse={() => {
+        micTest.stopTest();
+        outputTest.stopTest();
+      }}
+    >
+      <AudioDeviceSettings
+        localIsTesting={localIsTesting}
+        micTest={micTest}
+        outputTest={outputTest}
+        outputVolume={outputVolume}
+      />
+      <p className="settings-section-description">
+        Device selections apply immediately. Processing changes apply when you select Apply.
+      </p>
+
+      {/* ── Mode Toggle ── native radios: this persists a setting, it does not
+          switch views, so a tablist would announce a tabpanel that isn't there. */}
+      <fieldset className="settings-mode-toggle">
+        <legend className="settings-mode-legend">Audio settings mode</legend>
+        <label className="settings-mode-pill">
+          <input
+            type="radio"
+            name="audio-settings-mode"
+            className="settings-mode-radio"
+            checked={!advancedMode}
+            onChange={() => handleAdvancedToggle(false)}
+          />
+          {'Basic Settings'}
+        </label>
+        <label className="settings-mode-pill">
+          <input
+            type="radio"
+            name="audio-settings-mode"
+            className="settings-mode-radio"
+            checked={advancedMode}
+            onChange={() => handleAdvancedToggle(true)}
+          />
+          {'Advanced Settings'}
+        </label>
+      </fieldset>
+
+      {advancedMode && (
+        <p className="settings-mode-notice">
+          These settings override the quality tier presets. Switching back to Basic will save your
+          advanced configuration but apply your last Basic settings instead.
+        </p>
+      )}
+
+      <AudioQualitySettings
+        qualityTier={qualityTier}
+        setQualityTier={setQualityTier}
+        advancedMode={advancedMode}
+      />
 
       {/* ── Processing ── */}
       <h3 className="settings-subsection-title">Processing</h3>
@@ -447,9 +626,7 @@ const AudioConfigSection: React.FC = () => {
         </div>
         <ToggleSwitch
           checked={!musicMode && noiseCancellation}
-          onChange={(v) => {
-            if (!musicMode) setDraftAudioSetting('noiseCancellation', v);
-          }}
+          onChange={(v) => setProcessingToggle('noiseCancellation', v, musicMode)}
           disabled={musicMode}
         />
       </div>
@@ -469,9 +646,7 @@ const AudioConfigSection: React.FC = () => {
         </div>
         <ToggleSwitch
           checked={!musicMode && echoCancellation}
-          onChange={(v) => {
-            if (!musicMode) setDraftAudioSetting('echoCancellation', v);
-          }}
+          onChange={(v) => setProcessingToggle('echoCancellation', v, musicMode)}
           disabled={musicMode}
         />
       </div>
@@ -491,9 +666,7 @@ const AudioConfigSection: React.FC = () => {
         </div>
         <ToggleSwitch
           checked={!musicMode && autoGainControl}
-          onChange={(v) => {
-            if (!musicMode) setDraftAudioSetting('autoGainControl', v);
-          }}
+          onChange={(v) => setProcessingToggle('autoGainControl', v, musicMode)}
           disabled={musicMode}
         />
       </div>
@@ -529,40 +702,18 @@ const AudioConfigSection: React.FC = () => {
         </div>
       )}
 
-      <div className="settings-row">
-        <div className="settings-row-info">
-          <span className="settings-row-label">Input Noise Gate</span>
-          <span className="settings-row-hint">
-            {noiseGateMode === 'manual'
-              ? `Enabled. Input below ${noiseGateLevel} dBFS is attenuated. The threshold controls when the gate opens, not microphone loudness.`
-              : 'Disabled. No hard cutoff is applied to your input. Relies on noise cancellation and auto gain control if those are enabled.'}
-          </span>
-        </div>
-        <ToggleSwitch
-          checked={noiseGateMode === 'manual'}
-          onChange={(v) => setDraftAudioSetting('noiseGateMode', v ? 'manual' : 'auto')}
-        />
-      </div>
-
-      {noiseGateMode === 'manual' && (
-        <div className="settings-row settings-row-child">
-          <div className="settings-row-info">
-            <span className="settings-row-label">Gate Threshold</span>
-            <span className="settings-row-hint">{gateThresholdHint(noiseGateLevel)}</span>
-          </div>
-          <div className="settings-slider-wrapper">
-            <span className="settings-slider-value">{noiseGateLevel} dBFS</span>
-            <input
-              type="range"
-              className="settings-slider"
-              min={-80}
-              max={-20}
-              value={noiseGateLevel}
-              onChange={(e) => setDraftAudioSetting('noiseGateLevel', Number(e.target.value))}
-            />
-          </div>
-        </div>
-      )}
+      <NoiseGateSettings
+        appliedGateMode={appliedGateMode}
+        appliedAgc={appliedAgc}
+        appliedMusicMode={appliedMusicMode}
+        autoGainControl={autoGainControl}
+        noiseGateMode={noiseGateMode}
+        noiseGateLevel={noiseGateLevel}
+        musicMode={musicMode}
+        isTesting={micTest.isTesting}
+        activeGateStatus={micTest.isTesting ? micTest.dynamicGateStatus : liveGateStatus}
+        gateError={gateError}
+      />
 
       <div className="settings-row">
         <div className="settings-row-info">

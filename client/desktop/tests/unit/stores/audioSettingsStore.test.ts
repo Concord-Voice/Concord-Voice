@@ -1,5 +1,6 @@
 import {
   effectiveMicLevelPercent,
+  effectiveNoiseGateMode,
   useAudioSettingsStore,
 } from '@/renderer/stores/audio/audioSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -12,7 +13,7 @@ beforeEach(() => {
     noiseCancellation: true,
     echoCancellation: true,
     autoGainControl: true,
-    noiseGateMode: 'auto',
+    noiseGateMode: 'dynamic',
     noiseGateLevel: -50,
     musicMode: false,
     frameSize: 0,
@@ -129,12 +130,12 @@ describe('audioSettingsStore', () => {
   });
 
   it('has correct defaults', () => {
-    const s = useAudioSettingsStore.getState();
+    const s = useAudioSettingsStore.getInitialState();
     expect(s.advancedMode).toBe(false);
     expect(s.noiseCancellation).toBe(true);
     expect(s.echoCancellation).toBe(true);
     expect(s.autoGainControl).toBe(true);
-    expect(s.noiseGateMode).toBe('auto');
+    expect(s.noiseGateMode).toBe('dynamic');
     expect(s.inputVolume).toBe(100);
     expect(s.outputVolume).toBe(100);
   });
@@ -160,8 +161,103 @@ describe('audioSettingsStore', () => {
   });
 
   it('sets noise gate mode', () => {
-    useAudioSettingsStore.getState().setNoiseGateMode('manual');
-    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('manual');
+    useAudioSettingsStore.getState().setAutoGainControl(false);
+    useAudioSettingsStore.getState().setNoiseGateMode('manualCalibrate');
+    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('manualCalibrate');
+  });
+
+  it('normalizes direct mode choices against effective AGC', () => {
+    useAudioSettingsStore.getState().setAutoGainControl(true);
+    useAudioSettingsStore.getState().setNoiseGateMode('manualCalibrate');
+    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('dynamic');
+
+    useAudioSettingsStore.getState().setNoiseGateMode('off');
+    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('off');
+
+    useAudioSettingsStore.getState().setMusicMode(true);
+    useAudioSettingsStore.getState().setNoiseGateMode('off');
+    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('off');
+    useAudioSettingsStore.getState().setNoiseGateMode('manualCalibrate');
+    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('manualCalibrate');
+  });
+
+  it.each([
+    [{ musicMode: false, autoGainControl: true, noiseGateMode: 'manualCalibrate' }, 'dynamic'],
+    [
+      { musicMode: true, autoGainControl: true, noiseGateMode: 'manualCalibrate' },
+      'manualCalibrate',
+    ],
+    [{ musicMode: false, autoGainControl: false, noiseGateMode: 'off' }, 'off'],
+  ] as const)('resolves effective gate mode for %j', (settings, expected) => {
+    expect(effectiveNoiseGateMode(settings)).toBe(expected);
+  });
+
+  it('updates capture settings atomically for subscribers', () => {
+    const listener = vi.fn();
+    const unsubscribe = useAudioSettingsStore.subscribe(listener);
+    useAudioSettingsStore.getState().setCaptureGateSettings({
+      autoGainControl: false,
+      musicMode: true,
+      noiseGateMode: 'manualCalibrate',
+      noiseGateLevel: -42,
+    });
+    unsubscribe();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(useAudioSettingsStore.getState()).toMatchObject({
+      autoGainControl: false,
+      musicMode: true,
+      noiseGateMode: 'manualCalibrate',
+      noiseGateLevel: -42,
+    });
+  });
+
+  describe('noise gate persisted hydration', () => {
+    it.each([
+      [0, 'auto', false, 'off'],
+      [1, 'auto', false, 'off'],
+      [2, 'auto', false, 'off'],
+      [2, 'manual', false, 'manualCalibrate'],
+      [2, 'manual', true, 'dynamic'],
+    ] as const)(
+      'migrates v%i legacy %s with AGC=%s to %s',
+      async (version, mode, agc, expected) => {
+        localStorage.setItem(
+          'concord:audio-advanced',
+          JSON.stringify({
+            state: {
+              noiseGateMode: mode,
+              autoGainControl: agc,
+              musicMode: false,
+              noiseGateLevel: -61,
+              inputVolume: 0,
+            },
+            version,
+          })
+        );
+        await useAudioSettingsStore.persist.rehydrate();
+        expect(useAudioSettingsStore.getState().noiseGateMode).toBe(expected);
+        expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-61);
+        expect(useAudioSettingsStore.getState().inputVolume).toBe(0);
+      }
+    );
+
+    it.each([
+      ['invalid mode', { noiseGateMode: 'auto' }],
+      ['null mode', { noiseGateMode: null }],
+      ['unavailable auto calibration', { noiseGateMode: 'autoCalibrate' }],
+      ['invalid threshold', { noiseGateLevel: Number.POSITIVE_INFINITY }],
+      ['invalid AGC boolean', { autoGainControl: 'yes' }],
+      ['invalid Music Mode boolean', { musicMode: 1 }],
+    ])('sanitizes %s in a v3 snapshot', async (_label, state) => {
+      localStorage.setItem('concord:audio-advanced', JSON.stringify({ state, version: 3 }));
+      await useAudioSettingsStore.persist.rehydrate();
+      const hydrated = useAudioSettingsStore.getState();
+      if ('noiseGateMode' in state) expect(hydrated.noiseGateMode).toBe('off');
+      if ('noiseGateLevel' in state) expect(hydrated.noiseGateLevel).toBe(-50);
+      if ('autoGainControl' in state) expect(hydrated.autoGainControl).toBe(true);
+      if ('musicMode' in state) expect(hydrated.musicMode).toBe(false);
+    });
   });
 
   it('sets noise gate level', () => {

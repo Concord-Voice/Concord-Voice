@@ -380,6 +380,52 @@ describe('draftSettingsStore', () => {
       useDraftSettingsStore.getState().setAudioDraft('inputVolume', 50);
       expect(useDraftSettingsStore.getState().drafts.audio.inputVolume).toBeUndefined();
     });
+
+    it('shows Dynamic when AGC is enabled from a Manual Calibrate draft and retains the threshold', () => {
+      useAudioSettingsStore.setState({
+        autoGainControl: false,
+        musicMode: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -43,
+      });
+      useDraftSettingsStore.getState().initialize();
+
+      useDraftSettingsStore.getState().setAudioDraft('autoGainControl', true);
+
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('dynamic');
+      expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-43);
+    });
+
+    it('keeps explicit Off when effective AGC turns on', () => {
+      useAudioSettingsStore.setState({
+        autoGainControl: false,
+        musicMode: false,
+        noiseGateMode: 'off',
+      });
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setAudioDraft('autoGainControl', true);
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBeUndefined();
+      expect(useDraftSettingsStore.getState().drafts.audio.autoGainControl).toBe(true);
+    });
+
+    it('switches Manual Calibrate to Dynamic when Music Mode turns off with saved AGC on', () => {
+      useAudioSettingsStore.setState({
+        autoGainControl: true,
+        musicMode: true,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -47,
+      });
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setAudioDraft('musicMode', false);
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('dynamic');
+      expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-47);
+    });
+
+    it('normalizes unavailable Auto Calibrate to Off', () => {
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setAudioDraft('noiseGateMode', 'autoCalibrate');
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('off');
+    });
   });
 
   describe('setVideoDraft', () => {
@@ -563,6 +609,30 @@ describe('draftSettingsStore', () => {
       expect(useAudioSettingsStore.getState().inputVolume).toBe(42);
     });
 
+    it('applies gate settings with one atomic audio-store notification', () => {
+      useAudioSettingsStore.setState({
+        autoGainControl: false,
+        musicMode: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -50,
+      });
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setAudioDraft('autoGainControl', true);
+      useDraftSettingsStore.getState().setAudioDraft('noiseGateLevel', -46);
+      const listener = vi.fn();
+      const unsubscribe = useAudioSettingsStore.subscribe(listener);
+
+      useDraftSettingsStore.getState().apply();
+      unsubscribe();
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(useAudioSettingsStore.getState()).toMatchObject({
+        autoGainControl: true,
+        noiseGateMode: 'dynamic',
+        noiseGateLevel: -46,
+      });
+    });
+
     it('pushes TTS drafts to the real TTS store', () => {
       useDraftSettingsStore.getState().initialize();
       useDraftSettingsStore.getState().setTtsDraft('ttsEnabled', true);
@@ -647,6 +717,27 @@ describe('draftSettingsStore', () => {
       useDraftSettingsStore.getState().initialize();
       useDraftSettingsStore.getState().revert();
       expect(useDraftSettingsStore.getState().snapshot).not.toBeNull();
+    });
+
+    it('restores Manual Calibrate draft after the AGC transition is reverted', () => {
+      useAudioSettingsStore.setState({
+        autoGainControl: false,
+        musicMode: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -44,
+      });
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setAudioDraft('autoGainControl', true);
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('dynamic');
+
+      useDraftSettingsStore.getState().revert();
+
+      expect(useAudioSettingsStore.getState()).toMatchObject({
+        autoGainControl: false,
+        musicMode: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -44,
+      });
     });
 
     // Regression: every settable appearance key must be restored to its

@@ -10,7 +10,7 @@ type TestProcessor = {
 
 type ProcessorOptions = {
   protectAgcPeaks: boolean;
-  gate: { kind: 'off' } | { kind: 'fixed'; thresholdDbfs: number };
+  gate: { kind: 'off' } | { kind: 'fixed'; thresholdDbfs: number } | { kind: 'dynamic' };
 };
 
 let Registered: new (options: { processorOptions: unknown }) => TestProcessor;
@@ -49,6 +49,303 @@ function render(processor: TestProcessor, channels: number[][]): number[][] {
 }
 
 describe('microphone peak worklet', () => {
+  it('passes soft speech unchanged while Dynamic is learning', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const softWord = Array(960).fill(0.002);
+    expect(Math.max(...render(processor, [softWord])[0])).toBeCloseTo(0.002, 5);
+  });
+
+  it('learns a conservative threshold that closes on ambient and opens for speech', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 65; window++) render(processor, [Array(960).fill(0.003)]);
+
+    const statuses = processor.port.postMessage.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message?.type === 'dynamicGateStatus');
+    const adjusted = statuses.filter((message) => message.state === 'adjusted');
+    expect(adjusted.length).toBeGreaterThan(0);
+    expect(adjusted.every((message) => Number.isFinite(message.thresholdDbfs))).toBe(true);
+    expect(adjusted.every((message) => message.thresholdDbfs <= -20)).toBe(true);
+    expect(adjusted.every((message) => message.thresholdDbfs <= 20 * Math.log10(0.08) - 9)).toBe(
+      true
+    );
+
+    let quietOutput: number[] = [];
+    for (let window = 0; window < 12; window++) {
+      quietOutput = render(processor, [Array(960).fill(0.003)])[0];
+    }
+    expect(Math.max(...quietOutput)).toBeLessThan(0.003 * 0.5);
+    expect(Math.min(...render(processor, [Array(960).fill(0.08)])[0])).toBeCloseTo(0.08, 5);
+  });
+
+  it('keeps one isolated background utterance in permissive learning', () => {
+    for (const [ambientWindows, elevatedWindows] of [
+      [200, 40],
+      [150, 50],
+    ]) {
+      const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+      for (let window = 0; window < ambientWindows; window++) {
+        render(processor, [Array(960).fill(0.003)]);
+      }
+      for (let window = 0; window < elevatedWindows; window++) {
+        render(processor, [Array(960).fill(0.08)]);
+      }
+      for (let window = 0; window < 100; window++) render(processor, [Array(960).fill(0.003)]);
+
+      expect(processor.port.postMessage.mock.calls.map(([message]) => message)).not.toContainEqual(
+        expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+      );
+      expect(Math.max(...render(processor, [Array(960).fill(0.003)])[0])).toBeCloseTo(0.003, 5);
+    }
+  });
+
+  it('learns from recurring short phrases below 20% of recent windows', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 200; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 40; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 100; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 40; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 80; window++) render(processor, [Array(960).fill(0.003)]);
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+    expect(Math.max(...render(processor, [Array(960).fill(0.08)])[0])).toBeCloseTo(0.08, 5);
+  });
+
+  it('does not mistake a brief elevated transient for a spoken phrase', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 200; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 5; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 300; window++) render(processor, [Array(960).fill(0.003)]);
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).not.toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+  });
+
+  it('learns an onset despite ordinary 2–3 dB level jitter', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const block = (dbfs: number) => Array(960).fill(10 ** (dbfs / 20));
+    for (let window = 0; window < 120; window++) {
+      render(processor, [block(window % 2 === 0 ? -51 : -49)]);
+    }
+    for (let window = 0; window < 120; window++) {
+      render(processor, [block(window % 2 === 0 ? -25 : -22)]);
+    }
+    for (let window = 0; window < 65; window++) {
+      render(processor, [block(window % 2 === 0 ? -51 : -49)]);
+    }
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+  });
+
+  it('retains a supported threshold long enough to reach the slow steady-state model cadence', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const ambient = Array(960).fill(0.003);
+    const voice = Array(960).fill(0.08);
+    for (let window = 0; window < 120; window++) render(processor, [ambient]);
+    for (let window = 0; window < 120; window++) render(processor, [voice]);
+    for (let window = 0; window < 65; window++) render(processor, [ambient]);
+    // Keep both recent level regimes without another long low-to-high onset.
+    for (let window = 0; window < 1800; window++) {
+      render(processor, [window % 2 === 0 ? ambient : voice]);
+    }
+
+    const statuses = processor.port.postMessage.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message?.type === 'dynamicGateStatus');
+    expect(statuses.at(-1)?.state).toBe('adjusted');
+    expect(
+      (processor as TestProcessor & { dynamicConfidentWindows: number }).dynamicConfidentWindows
+    ).toBeGreaterThanOrEqual(1500);
+    for (let window = 0; window < 10; window++) render(processor, [ambient]);
+    const quietWord = render(processor, [Array(960).fill(0.002)])[0];
+    expect(quietWord[0]).toBeGreaterThan(0.002 * 0.24);
+  });
+
+  it('releases a stale threshold within three seconds of sustained low-level input', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const ambient = Array(960).fill(0.003);
+    const voice = Array(960).fill(0.08);
+    for (let window = 0; window < 120; window++) render(processor, [ambient]);
+    for (let window = 0; window < 120; window++) render(processor, [voice]);
+    for (let window = 0; window < 65; window++) render(processor, [ambient]);
+    for (let window = 0; window < 1800; window++) {
+      render(processor, [window % 2 === 0 ? ambient : voice]);
+    }
+
+    let suppressed = false;
+    let restoredAt: number | null = null;
+    for (let window = 0; window < 200; window++) {
+      const output = render(processor, [ambient])[0];
+      if (Math.max(...output) < 0.003 * 0.5) suppressed = true;
+      if (suppressed && Math.max(...output) >= 0.003 * 0.95) {
+        restoredAt = window;
+        break;
+      }
+    }
+    expect(suppressed).toBe(true);
+    expect(restoredAt).not.toBeNull();
+    expect(restoredAt!).toBeLessThan(200);
+  });
+
+  it.each([
+    ['silence only', () => Array(960).fill(0)],
+    ['speech only', () => Array(960).fill(0.01)],
+    ['overlapping ambient and voice', (index: number) => Array(960).fill(index % 2 ? 0.01 : 0.012)],
+    ['background voice', (index: number) => Array(960).fill(index % 2 ? 0.01 : 0.02)],
+  ])('keeps Dynamic permissive for %s', (_label, makeBlock) => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const softSpeech = Array(960).fill(0.002);
+    for (let index = 0; index < 240; index++) render(processor, [makeBlock(index)]);
+
+    expect(Math.max(...render(processor, [softSpeech])[0])).toBeCloseTo(0.002, 5);
+  });
+
+  it('does not learn from a single sustained rise without a return to baseline', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.08)]);
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).not.toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+    expect(Math.max(...render(processor, [Array(960).fill(0.002)])[0])).toBeCloseTo(0.002, 5);
+  });
+
+  it('replaces a transient onset candidate when later speech returns to baseline', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.003)]);
+    render(processor, [Array(960).fill(0.2)]);
+    for (let window = 0; window < 10; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 65; window++) render(processor, [Array(960).fill(0.003)]);
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+  });
+
+  it('keeps one stable regime in Learning instead of claiming overlap', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 200; window++) render(processor, [Array(960).fill(0.01)]);
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual({
+      type: 'dynamicGateStatus',
+      state: 'learning',
+      thresholdDbfs: null,
+    });
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).not.toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'uncertain' })
+    );
+  });
+
+  it('reports Uncertain when distinct levels remain too close to separate safely', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 200; window++) {
+      render(processor, [Array(960).fill(window % 2 === 0 ? 0.01 : 0.02)]);
+    }
+
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual({
+      type: 'dynamicGateStatus',
+      state: 'uncertain',
+      thresholdDbfs: null,
+    });
+  });
+
+  it('forgets a learned threshold after invalid input', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 65; window++) render(processor, [Array(960).fill(0.003)]);
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+
+    render(processor, [[Number.NaN, ...Array(959).fill(0.003)]]);
+    expect(Math.max(...render(processor, [Array(960).fill(0.002)])[0])).toBeCloseTo(0.002, 5);
+  });
+
+  it('forgets a learned threshold when the live graph resets Dynamic', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 65; window++) render(processor, [Array(960).fill(0.003)]);
+    expect(processor.port.postMessage.mock.calls.map(([message]) => message)).toContainEqual(
+      expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+    );
+
+    processor.port.onmessage?.({ data: { type: 'setGate', gate: { kind: 'dynamic' } } });
+    expect(Math.max(...render(processor, [Array(960).fill(0.002)])[0])).toBeCloseTo(0.002, 5);
+  });
+
+  it('keeps quiet speech onset and tail audible after a stronger syllable', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 120; window++) render(processor, [Array(960).fill(0.08)]);
+    for (let window = 0; window < 65; window++) render(processor, [Array(960).fill(0.003)]);
+    for (let window = 0; window < 10; window++) render(processor, [Array(960).fill(0.003)]);
+
+    const word = [...Array(160).fill(0.006), ...Array(640).fill(0.08), ...Array(160).fill(0.006)];
+    const output = render(processor, [word])[0];
+    expect(output[0]).toBeCloseTo(0.006, 5);
+    expect(output[480]).toBeCloseTo(0.08, 5);
+    expect(output[959]).toBeCloseTo(0.006, 5);
+  });
+
+  it('restarts Dynamic learning when the channel shape changes', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let index = 0; index < 120; index++) render(processor, [Array(960).fill(0.003)]);
+    for (let index = 0; index < 120; index++) render(processor, [Array(960).fill(0.08)]);
+    for (let index = 0; index < 65; index++) render(processor, [Array(960).fill(0.003)]);
+    render(processor, [Array(960).fill(0.003), Array(960).fill(0.003)]);
+
+    expect(
+      Math.max(...render(processor, [Array(960).fill(0.002), Array(960).fill(0.002)])[0])
+    ).toBeCloseTo(0.002, 5);
+  });
+
+  it('abandons a Dynamic candidate after a fan-level shift and passes a knock onset', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    for (let index = 0; index < 120; index++) render(processor, [Array(960).fill(0.003)]);
+    for (let index = 0; index < 120; index++) render(processor, [Array(960).fill(0.08)]);
+    for (let index = 0; index < 65; index++) render(processor, [Array(960).fill(0.003)]);
+    for (let index = 0; index < 240; index++) render(processor, [Array(960).fill(0.025)]);
+    const knock = Array(960).fill(0);
+    knock[0] = 0.7;
+
+    expect(render(processor, [knock])[0][0]).toBeGreaterThan(0);
+    expect(Math.max(...render(processor, [Array(960).fill(0.002)])[0])).toBeGreaterThanOrEqual(
+      0.0005
+    );
+  });
+
+  it('keeps Dynamic status bounded to one post per second and peak protection capped at -6 dBFS', () => {
+    const processor = createProcessor({ protectAgcPeaks: true, gate: { kind: 'dynamic' } });
+    const loud = Array(960).fill(0.9);
+    for (let index = 0; index < 600; index++) render(processor, [loud]);
+
+    const statuses = processor.port.postMessage.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message?.type === 'dynamicGateStatus');
+    expect(statuses.length).toBeLessThanOrEqual(13);
+    expect(
+      statuses.every((message) =>
+        message.state === 'learning' || message.state === 'uncertain'
+          ? message.thresholdDbfs === null
+          : Number.isFinite(message.thresholdDbfs)
+      )
+    ).toBe(true);
+    expect(Math.max(...render(processor, [loud])[0].map(Math.abs))).toBeLessThanOrEqual(
+      10 ** (-6 / 20)
+    );
+  });
+
   it('emits an above-full-scale impulse while keeping every Float32 output sample below -6 dBFS', () => {
     const processor = createProcessor();
     const impulse = Array(256).fill(0);

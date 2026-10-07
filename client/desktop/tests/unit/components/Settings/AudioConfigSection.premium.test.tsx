@@ -38,6 +38,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
 }));
 
 vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
+  effectiveNoiseGateMode: vi.fn(() => 'dynamic'),
   useAudioSettingsStore: Object.assign(
     vi.fn((s) => s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
     { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })) }

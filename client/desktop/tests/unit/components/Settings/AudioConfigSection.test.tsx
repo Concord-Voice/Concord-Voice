@@ -11,11 +11,13 @@ const mockStopMicTest = vi.fn();
 const mockPlayTestTone = vi.fn();
 const mockStopOutputTest = vi.fn();
 let mockLocalIsTesting = false;
+let mockCallState: { kind: string } = { kind: 'idle' };
 let micTestState = {
   isTesting: false,
   dbfsLevel: -Infinity,
   inputOverloaded: false,
   error: null as string | null,
+  dynamicGateStatus: null as null | { state: string; thresholdDbfs?: number; error?: string },
 };
 let outputTestState = { isTesting: false, error: null as string | null };
 
@@ -23,7 +25,7 @@ const defaultAudioSettings: Record<string, unknown> = {
   noiseCancellation: true,
   echoCancellation: true,
   autoGainControl: true,
-  noiseGateMode: 'auto',
+  noiseGateMode: 'dynamic',
   noiseGateLevel: -50,
   quietBoost: false,
   quietBoostThreshold: -38,
@@ -40,6 +42,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', async (importOriginal) => {
         selector({
           ...actual.useVoiceStore.getState(),
           localIsTesting: mockLocalIsTesting,
+          callState: mockCallState,
           qualityTier: 'standard' as const,
           setQualityTier: mockSetQualityTier,
         })
@@ -111,6 +114,7 @@ vi.mock('@/renderer/stores/audio/audioSettingsStore', async (importOriginal) => 
   const actual =
     await importOriginal<typeof import('@/renderer/stores/audio/audioSettingsStore')>();
   return {
+    effectiveNoiseGateMode: actual.effectiveNoiseGateMode,
     useAudioSettingsStore: Object.assign(
       vi.fn((s) =>
         s({
@@ -119,7 +123,7 @@ vi.mock('@/renderer/stores/audio/audioSettingsStore', async (importOriginal) => 
           noiseCancellation: true,
           echoCancellation: true,
           autoGainControl: true,
-          noiseGateMode: 'auto',
+          noiseGateMode: 'dynamic',
           noiseGateLevel: -50,
           musicMode: false,
           setAdvancedMode: mockSetAdvancedMode,
@@ -217,7 +221,7 @@ async function overrideCommittedSettings(overrides: Record<string, unknown>) {
     noiseCancellation: true,
     echoCancellation: true,
     autoGainControl: true,
-    noiseGateMode: 'auto',
+    noiseGateMode: 'dynamic',
     noiseGateLevel: -50,
     musicMode: false,
     ...overrides,
@@ -267,9 +271,11 @@ describe('AudioConfigSection', () => {
       dbfsLevel: -Infinity,
       inputOverloaded: false,
       error: null,
+      dynamicGateStatus: null,
     };
     outputTestState = { isTesting: false, error: null };
     mockLocalIsTesting = false;
+    mockCallState = { kind: 'idle' };
 
     // Re-apply default mock implementations (clearAllMocks wipes mockImplementation)
     const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
@@ -279,6 +285,7 @@ describe('AudioConfigSection', () => {
           ...useVoiceStore.getState(),
           qualityTier: 'standard',
           localIsTesting: mockLocalIsTesting,
+          callState: mockCallState,
           setQualityTier: mockSetQualityTier,
         })
     );
@@ -292,7 +299,7 @@ describe('AudioConfigSection', () => {
           noiseCancellation: true,
           echoCancellation: true,
           autoGainControl: true,
-          noiseGateMode: 'auto',
+          noiseGateMode: 'dynamic',
           noiseGateLevel: -50,
           musicMode: false,
           setAdvancedMode: mockSetAdvancedMode,
@@ -462,7 +469,7 @@ describe('AudioConfigSection', () => {
     expect(screen.getByText('Noise Cancellation')).toBeInTheDocument();
     expect(screen.getByText('Echo Cancellation')).toBeInTheDocument();
     expect(screen.getByText('Auto Gain Control')).toBeInTheDocument();
-    expect(screen.getByText('Input Noise Gate')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Noise Gate' })).toBeInTheDocument();
     expect(screen.getByText('Boost Quiet Users')).toBeInTheDocument();
   });
 
@@ -803,84 +810,164 @@ describe('AudioConfigSection', () => {
     }
   });
 
-  // ===== 10. Noise gate: manual vs auto =====
+  // ===== 10. Dynamic noise gate modes and status =====
 
-  it('shows gate threshold slider when noiseGateMode is manual', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -50 });
+  it('offers Dynamic and Off when AGC is effective', () => {
     render(<AudioConfigSection />);
-    expect(screen.getByText('Gate Threshold')).toBeInTheDocument();
-    expect(screen.getByText('-50 dBFS')).toBeInTheDocument();
+    const select = screen.getByRole('combobox', { name: 'Noise Gate' });
+    expect(select).toHaveValue('dynamic');
+    expect(within(select).getByRole('option', { name: 'Dynamic' })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: 'Off' })).toBeInTheDocument();
+    expect(
+      within(select).queryByRole('option', { name: 'Manual Calibrate' })
+    ).not.toBeInTheDocument();
   });
 
-  it('hides gate threshold slider when noiseGateMode is auto', () => {
-    render(<AudioConfigSection />);
-    expect(screen.queryByText('Gate Threshold')).not.toBeInTheDocument();
-  });
-
-  it('shows correct hint for manual noise gate', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -50 });
-    render(<AudioConfigSection />);
-    expect(screen.getByText(/Input below -50 dBFS is attenuated/)).toBeInTheDocument();
-  });
-
-  it('shows correct hint for auto noise gate', () => {
-    render(<AudioConfigSection />);
-    expect(screen.getByText(/No hard cutoff is applied to your input/)).toBeInTheDocument();
-  });
-
-  it('calls setDraftAudioSetting to toggle noise gate mode', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
-    render(<AudioConfigSection />);
-    // The noise gate toggle is the 4th checkbox (after noise, echo, agc)
-    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-    fireEvent.click(checkboxes[3]);
-    expect(setDraftAudioSetting).toHaveBeenCalledWith('noiseGateMode', 'manual');
-  });
-
-  it('calls setDraftAudioSetting when gate threshold slider changes', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -50 });
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
-    render(<AudioConfigSection />);
-    const sliders = document.querySelectorAll('.settings-slider');
-    expect(sliders.length).toBeGreaterThanOrEqual(1);
-    fireEvent.change(sliders[0], { target: { value: '-35' } });
-    expect(setDraftAudioSetting).toHaveBeenCalledWith('noiseGateLevel', -35);
-  });
-
-  // ===== 11. gateThresholdHint() — all 5 branches =====
-
-  it('gate hint: >= -25 (loud close-mic)', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -20 });
+  it('offers Manual Calibrate when AGC is ineffective and retains the fixed threshold control', async () => {
+    await overrideDraftSettings({
+      autoGainControl: false,
+      noiseGateMode: 'manualCalibrate',
+      noiseGateLevel: -50,
+    });
     render(<AudioConfigSection />);
     expect(
-      screen.getByText(/-20 dBFS.*Gates everything except loud, close-mic speech/)
+      within(screen.getByRole('combobox', { name: 'Noise Gate' })).getByRole('option', {
+        name: 'Manual Calibrate',
+      })
+    ).toBeInTheDocument();
+    expect(screen.getByRole('slider', { name: 'Gate Threshold' })).toHaveValue('-50');
+    expect(screen.getByText('Set the threshold yourself.')).toBeInTheDocument();
+  });
+
+  it('offers Manual Calibrate when Music Mode disables effective AGC', async () => {
+    await overrideDraftSettings({ musicMode: true, autoGainControl: true });
+    render(<AudioConfigSection />);
+    expect(
+      within(screen.getByRole('combobox', { name: 'Noise Gate' })).getByRole('option', {
+        name: 'Manual Calibrate',
+      })
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Music Mode disables Auto Gain Control/)).toBeInTheDocument();
+  });
+
+  it('preserves legacy Off and provides a keyboard-focusable labeled native select', async () => {
+    await overrideDraftSettings({ noiseGateMode: 'off' });
+    render(<AudioConfigSection />);
+    const select = screen.getByRole('combobox', { name: 'Noise Gate' });
+    expect(select).toHaveValue('off');
+    select.focus();
+    expect(select).toHaveFocus();
+  });
+
+  it('reports an AGC draft switch to Dynamic until Apply', async () => {
+    await overrideCommittedSettings({ autoGainControl: false, noiseGateMode: 'manualCalibrate' });
+    await overrideDraftSettings({ autoGainControl: true, noiseGateMode: 'dynamic' });
+    render(<AudioConfigSection />);
+    expect(
+      screen.getByText(/Switching to Dynamic takes effect when you select Apply/)
     ).toBeInTheDocument();
   });
 
-  it('gate hint: >= -35 (background noise)', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -30 });
+  it('does not claim Dynamic is learning before an Off-to-Dynamic draft is applied', async () => {
+    await overrideCommittedSettings({ noiseGateMode: 'off' });
+    await overrideDraftSettings({ noiseGateMode: 'dynamic' });
     render(<AudioConfigSection />);
     expect(
-      screen.getByText(/-30 dBFS.*Gates background noise and quiet sounds/)
+      screen.getByText(/Noise Gate changes take effect when you select Apply/)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('The gate learns during a call or microphone Test')
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows idle guidance when no call or microphone Test owns Dynamic', () => {
+    render(<AudioConfigSection />);
+    expect(
+      screen.getByText('The gate learns during a call or microphone Test')
     ).toBeInTheDocument();
   });
 
-  it('gate hint: >= -50 (ambient room noise)', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -45 });
+  it.each([
+    ['Learning', { state: 'learning' }],
+    ['Adjusted', { state: 'adjusted', thresholdDbfs: -42 }],
+    ['Uncertain', { state: 'uncertain' }],
+  ])('announces dynamic gate %s status politely', (label, status) => {
+    micTestState = { ...micTestState, isTesting: true, dynamicGateStatus: status };
     render(<AudioConfigSection />);
-    expect(screen.getByText(/-45 dBFS.*Gates ambient room noise/)).toBeInTheDocument();
+    const announcement = screen.getByRole('status');
+    expect(announcement).toHaveAttribute('aria-live', 'polite');
+    expect(announcement).toHaveTextContent(label);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    if (label === 'Adjusted') {
+      expect(announcement).not.toHaveTextContent(/dBFS/);
+      expect(screen.getByText(/Current threshold: −42 dBFS/)).toBeInTheDocument();
+    }
+    if (label === 'Uncertain')
+      expect(announcement).toHaveTextContent(/moving the microphone closer/);
   });
 
-  it('gate hint: >= -65 (faint background hum)', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -60 });
+  it('shows retry guidance when microphone learning fails', () => {
+    micTestState = { ...micTestState, isTesting: true, error: 'Microphone unavailable' };
     render(<AudioConfigSection />);
-    expect(screen.getByText(/-60 dBFS.*Gates only faint background hum/)).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(/Microphone unavailable.*try again/i);
   });
 
-  it('gate hint: < -65 (near-total silence)', async () => {
-    await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -70 });
+  it('keeps microphone Test failures visible after the Test stops', () => {
+    micTestState = { ...micTestState, error: 'Microphone unavailable' };
     render(<AudioConfigSection />);
-    expect(screen.getByText(/-70 dBFS.*Gates only near-total silence/)).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(/Microphone unavailable.*try again/i);
+  });
+
+  it('shows the live processor failure when Dynamic learning stops during a call', async () => {
+    const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
+    useVoiceStore.setState({
+      joinError: 'Microphone processing stopped. Retry your microphone or rejoin the call.',
+      dynamicGateStatus: null,
+    });
+    mockCallState = { kind: 'in-call' };
+
+    render(<AudioConfigSection />);
+
+    expect(screen.getByRole('status')).toHaveTextContent(/Microphone processing stopped/i);
+    expect(screen.queryByText('The gate learns during a call or microphone Test')).toBeNull();
+  });
+
+  it('prefers a current live processor failure over an earlier microphone Test error', async () => {
+    const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
+    micTestState = { ...micTestState, error: 'Earlier Test failure' };
+    useVoiceStore.setState({
+      joinError: 'Microphone processing stopped. Retry your microphone or rejoin the call.',
+      dynamicGateStatus: null,
+    });
+    mockCallState = { kind: 'in-call' };
+
+    render(<AudioConfigSection />);
+
+    expect(screen.getByRole('status')).toHaveTextContent(/Microphone processing stopped/i);
+    expect(screen.getByRole('status')).not.toHaveTextContent(/Earlier Test failure/i);
+  });
+
+  it('keeps status changes in one polite announcement region', () => {
+    micTestState = {
+      ...micTestState,
+      isTesting: true,
+      dynamicGateStatus: { state: 'adjusted', thresholdDbfs: -42 },
+    };
+    render(<AudioConfigSection />);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
+  });
+
+  it('does not acquire another microphone when Settings opens during an active call', () => {
+    mockCallState = { kind: 'in-call' };
+    const getUserMedia = vi.fn();
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia },
+    });
+    render(<AudioConfigSection />);
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(mockStartMicTest).not.toHaveBeenCalled();
   });
 
   // ===== 12. Quiet boost: on/off =====
@@ -917,9 +1004,9 @@ describe('AudioConfigSection', () => {
   it('calls setDraftAudioSetting when quiet boost toggle is clicked', async () => {
     const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
-    // Quiet boost toggle is the 5th checkbox (noise, echo, agc, gate, boost)
+    // Quiet boost follows noise cancellation, echo cancellation, and AGC.
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-    fireEvent.click(checkboxes[4]);
+    fireEvent.click(checkboxes[3]);
     expect(setDraftAudioSetting).toHaveBeenCalledWith('quietBoost', true);
   });
 

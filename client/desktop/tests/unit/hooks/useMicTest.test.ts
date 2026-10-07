@@ -91,6 +91,7 @@ import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStor
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useMicTest } from '@/renderer/hooks/device/useMicTest';
 import { voiceService } from '@/renderer/services/voice/voiceService';
+import { gateForAudioSettings } from '@/renderer/services/voice/micProcessor';
 
 // Build a comprehensive mock audio pipeline
 const mockTrackStop = vi.fn();
@@ -121,7 +122,13 @@ class MockAudioWorkletNode {
     close: vi.fn(),
   };
   disconnect = vi.fn();
-  addEventListener = vi.fn();
+  addEventListener = vi.fn((event: string, listener: EventListener) => {
+    if (event === 'processorerror') this.processorError = listener;
+  });
+  processorError: EventListener | undefined;
+  fail() {
+    this.processorError?.(new Event('processorerror'));
+  }
   connect: ReturnType<typeof vi.fn>;
   constructor(
     readonly context: Record<string, unknown>,
@@ -321,10 +328,7 @@ describe('useMicTest', () => {
       protectAgcPeaks:
         (useAudioSettingsStore as any).getState().autoGainControl &&
         !(useAudioSettingsStore as any).getState().musicMode,
-      gate:
-        (useAudioSettingsStore as any).getState().noiseGateMode === 'manual'
-          ? { kind: 'fixed' }
-          : { kind: 'off' },
+      gate: gateForAudioSettings((useAudioSettingsStore as any).getState()),
     });
     return levelGain;
   };
@@ -336,17 +340,195 @@ describe('useMicTest', () => {
       expect(result.current.isTesting).toBe(false);
       expect(result.current.dbfsLevel).toBe(-Infinity);
       expect(result.current.error).toBeNull();
+      expect(result.current.dynamicGateStatus).toBeNull();
       expect(typeof result.current.startTest).toBe('function');
       expect(typeof result.current.stopTest).toBe('function');
     });
   });
 
   describe('startTest', () => {
+    it.each([
+      [
+        'Dynamic with AGC',
+        { autoGainControl: true, musicMode: false, noiseGateMode: 'dynamic' },
+        { kind: 'dynamic' },
+      ],
+      [
+        'Dynamic in Music Mode',
+        { autoGainControl: true, musicMode: true, noiseGateMode: 'dynamic' },
+        { kind: 'dynamic' },
+      ],
+      [
+        'Manual Calibrate in Music Mode',
+        { autoGainControl: true, musicMode: true, noiseGateMode: 'manualCalibrate' },
+        { kind: 'fixed', thresholdDbfs: -50 },
+      ],
+      [
+        'Off with AGC',
+        { autoGainControl: true, musicMode: false, noiseGateMode: 'off' },
+        { kind: 'off' },
+      ],
+    ] as const)('uses the effective gate for %s', async (_label, settings, expectedGate) => {
+      (useAudioSettingsStore as any).setState(settings);
+      await startMicPipeline();
+      const options = mockProcessorNodes.at(-1)?.options as {
+        processorOptions?: { protectAgcPeaks: boolean; gate: unknown };
+      };
+
+      expect(options.processorOptions).toMatchObject({
+        protectAgcPeaks: settings.autoGainControl && !settings.musicMode,
+        gate: expectedGate,
+      });
+      expect(mockGetUserMedia).toHaveBeenCalledOnce();
+    });
+
+    it('delivers only current-generation Dynamic status and clears it on Stop', async () => {
+      (useAudioSettingsStore as any).setState({ noiseGateMode: 'dynamic' });
+      const result = await startMicPipeline();
+      const processor = mockProcessorNodes.at(-1)?.instance;
+      const status = (state: string, thresholdDbfs: number | null) =>
+        processor?.port.onmessage?.({
+          data: { type: 'dynamicGateStatus', state, thresholdDbfs },
+        } as MessageEvent<unknown>);
+
+      act(() => status('learning', null));
+      expect(result.current.dynamicGateStatus).toEqual({
+        type: 'dynamicGateStatus',
+        state: 'learning',
+        thresholdDbfs: null,
+      });
+
+      act(() => result.current.stopTest());
+      act(() => status('adjusted', -45));
+      expect(result.current.dynamicGateStatus).toBeNull();
+    });
+
+    it('clears Dynamic status when the active Test graph is superseded', async () => {
+      (useAudioSettingsStore as any).setState({ noiseGateMode: 'dynamic' });
+      const result = await startMicPipeline();
+      const oldProcessor = mockProcessorNodes.at(-1)?.instance;
+      act(() => {
+        oldProcessor?.port.onmessage?.({
+          data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -45 },
+        } as MessageEvent<unknown>);
+      });
+      expect(result.current.dynamicGateStatus?.state).toBe('adjusted');
+
+      act(() => (useAudioSettingsStore as any).setState({ noiseGateMode: 'off' }));
+      await waitFor(() => expect(mockProcessorNodes.length).toBeGreaterThan(1));
+      act(() => {
+        oldProcessor?.port.onmessage?.({
+          data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -40 },
+        } as MessageEvent<unknown>);
+      });
+
+      expect(result.current.dynamicGateStatus).toBeNull();
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(2);
+    });
+
+    it('clears Dynamic status and reports retry guidance after processorerror', async () => {
+      (useAudioSettingsStore as any).setState({ noiseGateMode: 'dynamic' });
+      const result = await startMicPipeline();
+      const processor = mockProcessorNodes.at(-1)?.instance;
+      act(() => {
+        processor?.port.onmessage?.({
+          data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -45 },
+        } as MessageEvent<unknown>);
+      });
+      expect(result.current.dynamicGateStatus?.state).toBe('adjusted');
+
+      act(() => processor?.fail());
+
+      expect(result.current.dynamicGateStatus).toBeNull();
+      expect(result.current.error).toBe('Microphone processing failed. Retry Test.');
+      expect(result.current.isTesting).toBe(false);
+    });
+
+    it('closes the processor and fences late Dynamic status after unmount', async () => {
+      (useAudioSettingsStore as any).setState({ noiseGateMode: 'dynamic' });
+      const { result, unmount } = renderHook(() => useMicTest());
+      await act(async () => result.current.startTest());
+      const processor = mockProcessorNodes.at(-1)?.instance;
+      unmount();
+
+      expect(processor?.port.postMessage).toHaveBeenCalledWith({ type: 'close' });
+      expect(() =>
+        processor?.port.onmessage?.({
+          data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -45 },
+        } as MessageEvent<unknown>)
+      ).not.toThrow();
+    });
+
+    it('retires pending capture after applied settings change and rebuilds once from current settings', async () => {
+      (useAudioSettingsStore as any).setState({
+        autoGainControl: true,
+        musicMode: false,
+        noiseCancellation: true,
+        echoCancellation: true,
+        noiseGateMode: 'dynamic',
+        inputVolume: 100,
+      });
+      (useVoiceStore as any).setState({ audioInputDeviceId: 'mic-before-change' });
+      let resolveInitialCapture!: (stream: MediaStream) => void;
+      const initialCapture = new Promise<MediaStream>((resolve) => {
+        resolveInitialCapture = resolve;
+      });
+      const initialTrackStop = vi.fn();
+      const captureConstraints: MediaTrackConstraints[] = [];
+      mockGetUserMedia.mockImplementation((constraints: MediaStreamConstraints) => {
+        captureConstraints.push(constraints.audio as MediaTrackConstraints);
+        return captureConstraints.length === 1
+          ? initialCapture
+          : Promise.resolve({ getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream);
+      });
+
+      const { result } = renderHook(() => useMicTest());
+      let starting!: Promise<void>;
+      act(() => {
+        starting = result.current.startTest();
+      });
+      await waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledOnce());
+
+      act(() => {
+        (useAudioSettingsStore as any).setState({
+          autoGainControl: false,
+          noiseCancellation: false,
+          echoCancellation: false,
+          noiseGateMode: 'manualCalibrate',
+          noiseGateLevel: -60,
+          inputVolume: 0,
+        });
+        (useVoiceStore as any).setState({ audioInputDeviceId: 'mic-after-change' });
+      });
+      await act(async () => {
+        resolveInitialCapture({
+          getTracks: () => [{ stop: initialTrackStop }],
+        } as unknown as MediaStream);
+        await starting;
+      });
+      await waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(result.current.isTesting).toBe(true));
+
+      expect(captureConstraints[1]).toMatchObject({
+        deviceId: { exact: 'mic-after-change' },
+        autoGainControl: false,
+        noiseSuppression: false,
+        echoCancellation: false,
+      });
+      expect(initialTrackStop).toHaveBeenCalledOnce();
+      expect(
+        (mockProcessorNodes.at(-1)?.options as { processorOptions: { gate: unknown } })
+          .processorOptions.gate
+      ).toEqual({ kind: 'fixed', thresholdDbfs: -60 });
+      expect((findManualLevelGain()?.levelGain.gain as { value: number }).value).toBe(0);
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(2);
+    });
+
     it('#3638 keeps one microphone-level GainNode before the protector and uses unity when AGC is effective', async () => {
       (useAudioSettingsStore as any).setState({
         autoGainControl: true,
         musicMode: false,
-        noiseGateMode: 'manual',
+        noiseGateMode: 'manualCalibrate',
         inputVolume: 200,
       });
       await startMicPipeline();
@@ -433,7 +615,7 @@ describe('useMicTest', () => {
         (useAudioSettingsStore as any).setState({
           autoGainControl: false,
           musicMode: false,
-          noiseGateMode: 'manual',
+          noiseGateMode: 'manualCalibrate',
           inputVolume,
         });
         await startMicPipeline();
@@ -448,7 +630,7 @@ describe('useMicTest', () => {
       (useAudioSettingsStore as any).setState({
         autoGainControl: true,
         musicMode: true,
-        noiseGateMode: 'manual',
+        noiseGateMode: 'manualCalibrate',
         inputVolume: 200,
       });
       await startMicPipeline();
@@ -500,7 +682,7 @@ describe('useMicTest', () => {
       async (_label, initialSettings, update, effectivePercent) => {
         (useAudioSettingsStore as any).setState({
           ...initialSettings,
-          noiseGateMode: 'manual',
+          noiseGateMode: 'manualCalibrate',
           inputVolume: 200,
         });
         await startMicPipeline();
@@ -524,7 +706,7 @@ describe('useMicTest', () => {
             (mockProcessorNodes.at(-1)?.options as { processorOptions?: unknown })?.processorOptions
           ).toMatchObject({
             protectAgcPeaks: settings.autoGainControl && !settings.musicMode,
-            gate: { kind: 'fixed', thresholdDbfs: -50 },
+            gate: gateForAudioSettings(settings),
           });
           expect((findManualLevelGain()?.levelGain.gain as { value: number }).value).toBe(
             (effectivePercent as number) / 100
@@ -1197,7 +1379,7 @@ describe('useMicTest', () => {
 
   describe('noise gate', () => {
     it('creates noise gate nodes in manual mode', async () => {
-      (useAudioSettingsStore as any).setState({ noiseGateMode: 'manual' });
+      (useAudioSettingsStore as any).setState({ noiseGateMode: 'manualCalibrate' });
 
       const { result } = renderHook(() => useMicTest());
 

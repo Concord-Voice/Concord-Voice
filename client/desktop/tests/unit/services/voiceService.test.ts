@@ -3248,7 +3248,11 @@ describe('VoiceService', () => {
 
   describe('noise gate', () => {
     it('applies noise gate in manual mode', async () => {
-      useAudioSettingsStore.setState({ noiseGateMode: 'manual', noiseGateLevel: -40 });
+      useAudioSettingsStore.setState({
+        autoGainControl: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -40,
+      });
       await joinVoiceChannel();
       expect(MockAudioWorkletNode.instances.at(-1)?.options.processorOptions).toMatchObject({
         gate: { kind: 'fixed', thresholdDbfs: -40 },
@@ -3256,7 +3260,11 @@ describe('VoiceService', () => {
     });
 
     it('returns processed track from destination', async () => {
-      useAudioSettingsStore.setState({ noiseGateMode: 'manual', noiseGateLevel: -40 });
+      useAudioSettingsStore.setState({
+        autoGainControl: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -40,
+      });
       const { sendTransport } = await joinVoiceChannel();
       // The producer should have been called with a track
       const produceCall = sendTransport.produce.mock.calls[0]?.[0];

@@ -34,7 +34,12 @@ import {
   useAudioSettingsStore,
   type AudioPriority,
 } from '../../stores/audio/audioSettingsStore';
-import { createMicProcessor, type MicProcessorHandle } from './micProcessor';
+import {
+  createMicProcessor,
+  gateForAudioSettings,
+  type DynamicGateStatus,
+  type MicProcessorHandle,
+} from './micProcessor';
 import {
   useVideoSettingsStore,
   VIDEO_QUALITY_PRESETS,
@@ -760,6 +765,7 @@ type MicGraph = {
   processor: MicProcessorHandle;
   track: MediaStreamTrack;
   failed: boolean;
+  statusPaused: boolean;
   settings: ReturnType<typeof useAudioSettingsStore.getState>;
   selectedDeviceId: string | undefined;
 };
@@ -1111,16 +1117,18 @@ class VoiceService {
         context,
         {
           protectAgcPeaks: !adv.musicMode && adv.autoGainControl,
-          gate:
-            adv.noiseGateMode === 'manual'
-              ? { kind: 'fixed', thresholdDbfs: adv.noiseGateLevel }
-              : { kind: 'off' },
+          gate: gateForAudioSettings(adv),
         },
         () => {},
         () => {
           failed = true;
           if (graph) graph.failed = true;
           if (graph && this.micGraph === graph) this.handleMicProcessorError(graph);
+        },
+        (status: DynamicGateStatus) => {
+          if (graph && this.micGraph === graph && !graph.failed && !graph.statusPaused) {
+            useVoiceStore.getState().setDynamicGateStatus(status);
+          }
         }
       );
       const source = context.createMediaStreamSource(stream);
@@ -1132,7 +1140,17 @@ class VoiceService {
       processor.node.connect(destination);
       const track = destination.stream.getAudioTracks()[0];
       if (!track) throw new Error('Microphone processor produced no audio track');
-      graph = { stream, context, gain, processor, track, failed, settings: adv, selectedDeviceId };
+      graph = {
+        stream,
+        context,
+        gain,
+        processor,
+        track,
+        failed,
+        statusPaused: false,
+        settings: adv,
+        selectedDeviceId,
+      };
       return graph;
     } catch (error) {
       processor?.close();
@@ -1182,6 +1200,10 @@ class VoiceService {
           graph.context.currentTime,
           0.01
         );
+        if (gateForAudioSettings(graph.settings).kind === 'dynamic') {
+          graph.processor.setGate({ kind: 'dynamic' });
+          useVoiceStore.getState().setDynamicGateStatus(null);
+        }
       }
     });
   }
@@ -2339,6 +2361,8 @@ class VoiceService {
   private liveReplaceAudioTrack(): Promise<void> {
     const replaceSeq = ++this.liveAudioTrackReplaceSeq;
     this.producers.get('mic')?.pause();
+    if (this.micGraph) this.micGraph.statusPaused = true;
+    useVoiceStore.getState().setDynamicGateStatus(null);
     const replacement = this.micReplaceTrackQueue
       .catch(() => {})
       .then(() => this.liveReplaceAudioTrackQueued(replaceSeq));
@@ -2411,6 +2435,7 @@ class VoiceService {
     oldStream: MediaStream | null,
     producer: mediasoupTypes.Producer
   ): void {
+    useVoiceStore.getState().setDynamicGateStatus(null);
     this.stopLocalVAD();
     this.localMicStream = graph.stream;
     this.micGraph = graph;
@@ -2458,6 +2483,17 @@ class VoiceService {
     producerTrackSafe: boolean
   ): void {
     const graph = this.micGraph;
+    if (
+      replaceSeq === this.liveAudioTrackReplaceSeq &&
+      producerTrackSafe &&
+      graph &&
+      this.hasLiveMicGraph(producer) &&
+      gateForAudioSettings(graph.settings).kind === 'dynamic' &&
+      gateForAudioSettings(currentSettings).kind === 'dynamic' &&
+      (!needsPeakProtection || (!graph.settings.musicMode && graph.settings.autoGainControl))
+    ) {
+      graph.statusPaused = false;
+    }
     if (
       replaceSeq === this.liveAudioTrackReplaceSeq &&
       producerTrackSafe &&
@@ -4661,6 +4697,7 @@ class VoiceService {
 
     const oldGraph = this.micGraph;
     const oldStream = this.localMicStream;
+    useVoiceStore.getState().setDynamicGateStatus(null);
     this.micGraph = graph;
     this.localMicStream = stream;
     this.watchMicLevel();
@@ -7934,6 +7971,7 @@ class VoiceService {
     this.inputVolumeUnsub = null;
     const graph = this.micGraph;
     this.micGraph = null;
+    useVoiceStore.getState().setDynamicGateStatus(null);
     if (graph) this.disposeMicGraph(graph);
     if (this.localMicStream) {
       for (const t of this.localMicStream.getTracks()) t.stop();

@@ -1,5 +1,6 @@
 import { createStore } from '../../utils/runtime/createStore';
 import type { CallState } from '../../services/voice/voiceService/callStateMachine';
+import type { DynamicGateStatus } from '../../services/voice/micProcessor';
 // Type-only, so nothing from the main process is pulled into the renderer bundle --
 // the same layering the `CredentialOwner` imports from `main/ipcContract` already use.
 // The degrade reasons are AUTHORED in the host because the host is what produces them;
@@ -340,6 +341,7 @@ interface VoiceState {
    */
   screenAudio: ScreenAudioState;
   localIsTesting: boolean;
+  dynamicGateStatus: DynamicGateStatus | null;
 
   // Participants (keyed by userId)
   participants: Record<string, VoiceParticipant>;
@@ -470,6 +472,7 @@ interface VoiceState {
    */
   setScreenAudioState: (next: ScreenAudioState) => void;
   setLocalIsTesting: (testing: boolean) => void;
+  setDynamicGateStatus: (status: DynamicGateStatus | null) => void;
   setActiveSpeaker: (userId: string | null) => void;
   setAudioInputDevice: (deviceId: string) => void;
   setAudioOutputDevice: (deviceId: string) => void;
@@ -631,6 +634,7 @@ const initialState = {
   machineScreenAudioCapable: null as boolean | null,
   screenAudio: { mode: 'off', overrun: 0 } as ScreenAudioState,
   localIsTesting: false,
+  dynamicGateStatus: null as DynamicGateStatus | null,
   participants: {} as Record<string, VoiceParticipant>,
   screenShareMuted: {} as Record<string, boolean>,
   mediaPolicyPaused: {} as Partial<Record<MediaPolicySource, string>>,
@@ -771,6 +775,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setMachineScreenAudioCapable: (machineScreenAudioCapable) => set({ machineScreenAudioCapable }),
   setScreenAudioState: (screenAudio) => set({ screenAudio }),
   setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),
+  setDynamicGateStatus: (dynamicGateStatus) => set({ dynamicGateStatus }),
   setActiveSpeaker: (activeSpeakerId) => set({ activeSpeakerId }),
   setAudioInputDevice: (audioInputDeviceId) => {
     if (audioInputDeviceId === 'default') audioInputDeviceId = '';

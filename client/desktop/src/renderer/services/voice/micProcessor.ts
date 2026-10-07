@@ -1,6 +1,25 @@
 import processorUrl from './micProcessor.worklet.js?url&no-inline';
+import { effectiveNoiseGateMode, type AudioSettings } from '../../stores/audio/audioSettingsStore';
 
-export type GateRuntime = { kind: 'off' } | { kind: 'fixed'; thresholdDbfs: number };
+export type GateRuntime =
+  { kind: 'off' } | { kind: 'fixed'; thresholdDbfs: number } | { kind: 'dynamic' };
+
+export type DynamicGateStatus = {
+  type: 'dynamicGateStatus';
+  state: 'learning' | 'adjusted' | 'uncertain';
+  thresholdDbfs: number | null;
+};
+
+export function gateForAudioSettings(
+  settings: Pick<
+    AudioSettings,
+    'musicMode' | 'autoGainControl' | 'noiseGateMode' | 'noiseGateLevel'
+  >
+): GateRuntime {
+  const mode = effectiveNoiseGateMode(settings);
+  if (mode === 'manualCalibrate') return { kind: 'fixed', thresholdDbfs: settings.noiseGateLevel };
+  return mode === 'off' ? { kind: 'off' } : { kind: 'dynamic' };
+}
 
 export type PeakWindow = {
   peak: number;
@@ -25,7 +44,8 @@ export async function createMicProcessor(
   context: AudioContext,
   initial: MicProcessorInitial,
   onWindow: (window: PeakWindow) => void,
-  onProcessorError: () => void
+  onProcessorError: () => void,
+  onGateStatus?: (status: DynamicGateStatus) => void
 ): Promise<MicProcessorHandle> {
   validateInitial(initial);
   if (!Number.isFinite(context.sampleRate) || context.sampleRate <= 0) {
@@ -79,8 +99,9 @@ export async function createMicProcessor(
     });
     node = createdNode;
     node.port.onmessage = ({ data }: MessageEvent<unknown>) => {
-      if (closed || failed || !isPeakWindow(data, reportFrames)) return;
-      onWindow(data);
+      if (closed || failed) return;
+      if (isPeakWindow(data, reportFrames)) onWindow(data);
+      else if (isDynamicGateStatus(data)) onGateStatus?.(data);
     };
     node.addEventListener('processorerror', () => {
       notifyError();
@@ -119,6 +140,7 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 function validateGate(value: unknown): asserts value is GateRuntime {
   if (!isRecord(value)) throw new TypeError('Invalid microphone gate');
   if (value.kind === 'off' && hasExactKeys(value, ['kind'])) return;
+  if (value.kind === 'dynamic' && hasExactKeys(value, ['kind'])) return;
   if (
     value.kind === 'fixed' &&
     hasExactKeys(value, ['kind', 'thresholdDbfs']) &&
@@ -130,6 +152,23 @@ function validateGate(value: unknown): asserts value is GateRuntime {
     return;
   }
   throw new TypeError('Invalid microphone gate');
+}
+
+function isDynamicGateStatus(value: unknown): value is DynamicGateStatus {
+  if (!isRecord(value) || !hasExactKeys(value, ['type', 'state', 'thresholdDbfs'])) {
+    return false;
+  }
+  if (value.type !== 'dynamicGateStatus') return false;
+  if (value.state === 'learning' || value.state === 'uncertain') {
+    return value.thresholdDbfs === null;
+  }
+  return (
+    value.state === 'adjusted' &&
+    typeof value.thresholdDbfs === 'number' &&
+    Number.isFinite(value.thresholdDbfs) &&
+    value.thresholdDbfs >= -80 &&
+    value.thresholdDbfs <= -20
+  );
 }
 
 function validateInitial(value: unknown): asserts value is MicProcessorInitial {

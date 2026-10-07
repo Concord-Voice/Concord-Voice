@@ -85,6 +85,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   },
 }));
 vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
+  effectiveNoiseGateMode: vi.fn(() => 'dynamic'),
   useAudioSettingsStore: Object.assign(
     vi.fn((s) => s({ advancedMode: false, setAdvancedMode: vi.fn() })),
     { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: vi.fn() })) }
@@ -233,6 +234,10 @@ function setAudioAdvancedMode(advancedMode: boolean) {
     (s: (state: Record<string, unknown>) => unknown) =>
       s({ advancedMode, setAdvancedMode: vi.fn() })
   );
+}
+
+function openAudioConfiguration() {
+  fireEvent.click(screen.getByText('Audio Configuration'));
 }
 
 describe('VoiceAudioSection', () => {
@@ -614,10 +619,11 @@ describe('VoiceAudioSection', () => {
   });
   it('renders processing toggles', () => {
     render(<VoiceAudioSection />);
+    openAudioConfiguration();
     expect(screen.getByText('Noise Cancellation')).toBeInTheDocument();
     expect(screen.getByText('Echo Cancellation')).toBeInTheDocument();
     expect(screen.getByText('Auto Gain Control')).toBeInTheDocument();
-    expect(screen.getByText('Input Noise Gate')).toBeInTheDocument();
+    expect(screen.getByText('Noise Gate')).toBeInTheDocument();
     expect(screen.getByText('Boost Quiet Users')).toBeInTheDocument();
   });
   it('renders an audio and a video mode radio group', () => {
@@ -707,7 +713,8 @@ describe('VoiceAudioSection', () => {
 
   it('renders noise gate setting', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getByText('Input Noise Gate')).toBeInTheDocument();
+    openAudioConfiguration();
+    expect(screen.getByText('Noise Gate')).toBeInTheDocument();
   });
 
   // ===== GPU vendor icon =====
@@ -890,8 +897,8 @@ describe('VoiceAudioSection', () => {
           stereoOverride: null,
           noiseCancellation: true,
           echoCancellation: true,
-          autoGainControl: true,
-          noiseGateMode: 'manual',
+          autoGainControl: false,
+          noiseGateMode: 'manualCalibrate',
           noiseGateLevel: -50,
           inputVolume: 100,
           outputVolume: 100,
@@ -908,6 +915,7 @@ describe('VoiceAudioSection', () => {
         })[key] ?? false
     );
     render(<VoiceAudioSection />);
+    openAudioConfiguration();
     expect(screen.getByText('Gate Threshold')).toBeInTheDocument();
     expect(screen.getByText('-50 dBFS')).toBeInTheDocument();
   });

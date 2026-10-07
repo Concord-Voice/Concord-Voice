@@ -6,12 +6,18 @@ import {
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { ensureOsPermission } from '../../stores/voice/osPermissionStore';
 import { voiceService } from '../../services/voice/voiceService';
-import { createMicProcessor, type MicProcessorHandle } from '../../services/voice/micProcessor';
+import {
+  createMicProcessor,
+  gateForAudioSettings,
+  type DynamicGateStatus,
+  type MicProcessorHandle,
+} from '../../services/voice/micProcessor';
 
 interface UseMicTestReturn {
   isTesting: boolean;
   dbfsLevel: number;
   inputOverloaded: boolean;
+  dynamicGateStatus: DynamicGateStatus | null;
   error: string | null;
   startTest: () => Promise<void>;
   stopTest: () => void;
@@ -74,10 +80,7 @@ function buildMicConstraints(
 function buildMicProcessorOptions(adv: MicTestAudioSettings, useProcessing: boolean) {
   return {
     protectAgcPeaks: useProcessing && adv.autoGainControl,
-    gate:
-      adv.noiseGateMode === 'manual'
-        ? { kind: 'fixed' as const, thresholdDbfs: adv.noiseGateLevel }
-        : { kind: 'off' as const },
+    gate: gateForAudioSettings(adv),
   };
 }
 
@@ -90,7 +93,8 @@ function shouldRestartForSettings(
     state.echoCancellation !== prev.echoCancellation ||
     state.autoGainControl !== prev.autoGainControl ||
     state.noiseGateMode !== prev.noiseGateMode ||
-    state.musicMode !== prev.musicMode
+    state.musicMode !== prev.musicMode ||
+    state.inputVolume !== prev.inputVolume
   );
 }
 
@@ -111,6 +115,7 @@ export function useMicTest(): UseMicTestReturn {
   const [isTesting, setIsTesting] = useState(false);
   const [dbfsLevel, setDbfsLevel] = useState(-Infinity);
   const [inputOverloaded, setInputOverloaded] = useState(false);
+  const [dynamicGateStatus, setDynamicGateStatus] = useState<DynamicGateStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Refs for audio resources (not state — avoids re-renders)
@@ -181,6 +186,7 @@ export function useMicTest(): UseMicTestReturn {
       setIsTesting(false);
       setDbfsLevel(-Infinity);
       setInputOverloaded(false);
+      setDynamicGateStatus(null);
       setError(null);
     },
     [releaseCallTestSuspension]
@@ -297,9 +303,7 @@ export function useMicTest(): UseMicTestReturn {
       }
 
       if (state.noiseGateLevel !== prev.noiseGateLevel) {
-        if (state.noiseGateMode === 'manual') {
-          processorRef.current?.setGate({ kind: 'fixed', thresholdDbfs: state.noiseGateLevel });
-        }
+        processorRef.current?.setGate(gateForAudioSettings(state));
       }
     },
     []
@@ -360,6 +364,9 @@ export function useMicTest(): UseMicTestReturn {
           if (generation !== generationRef.current) return;
           stopTest();
           setError('Microphone processing failed. Retry Test.');
+        },
+        (status) => {
+          if (generation === generationRef.current) setDynamicGateStatus(status);
         }
       );
       if (generation !== generationRef.current) {
@@ -371,9 +378,7 @@ export function useMicTest(): UseMicTestReturn {
       const volumeNode = connectInputVolume(ctx, source, useAudioSettingsStore.getState());
       volumeNode.connect(processor.node);
       const current = useAudioSettingsStore.getState();
-      if (current.noiseGateMode === 'manual') {
-        processor.setGate({ kind: 'fixed', thresholdDbfs: current.noiseGateLevel });
-      }
+      processor.setGate(gateForAudioSettings(current));
 
       const loopbackReady = await createLoopbackAudio(
         ctx,
@@ -467,5 +472,13 @@ export function useMicTest(): UseMicTestReturn {
     };
   }, [stopTest]);
 
-  return { isTesting, dbfsLevel, inputOverloaded, error, startTest, stopTest };
+  return {
+    isTesting,
+    dbfsLevel,
+    inputOverloaded,
+    dynamicGateStatus,
+    error,
+    startTest,
+    stopTest,
+  };
 }

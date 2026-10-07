@@ -8,6 +8,7 @@ import { wrapStore } from '../../utils/runtime/createStore';
 // ---------------------------------------------------------------------------
 
 export type AudioPriority = 'off' | 'low' | 'medium' | 'high';
+export type NoiseGateMode = 'dynamic' | 'autoCalibrate' | 'manualCalibrate' | 'off';
 
 export interface AudioSettings {
   // Basic/Advanced mode toggle
@@ -17,8 +18,8 @@ export interface AudioSettings {
   noiseCancellation: boolean;
   echoCancellation: boolean;
   autoGainControl: boolean;
-  noiseGateMode: 'auto' | 'manual'; // Auto = no gate (AGC handles it), Manual = expose slider
-  noiseGateLevel: number; // dBFS, range -80 to -20 (only used in manual mode)
+  noiseGateMode: NoiseGateMode;
+  noiseGateLevel: number; // dBFS, range -80 to -20 (used in Manual Calibrate)
 
   // Opus advanced
   musicMode: boolean; // Disables audio processing (echo cancel, noise suppression, AGC) for music fidelity
@@ -70,12 +71,78 @@ export interface AudioSettings {
 }
 
 const DEFAULT_INPUT_VOLUME = 100;
+const DEFAULT_NOISE_GATE_LEVEL = -50;
+
+type CaptureGateSettings = Pick<
+  AudioSettings,
+  'autoGainControl' | 'musicMode' | 'noiseGateMode' | 'noiseGateLevel'
+>;
+
+function normalizeNoiseGateLevel(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(-80, Math.min(-20, value))
+    : DEFAULT_NOISE_GATE_LEVEL;
+}
+
+function normalizeNoiseGateMode(
+  value: unknown,
+  autoGainControl: boolean,
+  musicMode: boolean
+): Exclude<NoiseGateMode, 'autoCalibrate'> {
+  if (value === 'off' || value === 'autoCalibrate') return 'off';
+  if (value === 'dynamic') return 'dynamic';
+  if (value === 'manualCalibrate') return !musicMode && autoGainControl ? 'dynamic' : value;
+  return 'off';
+}
+
+export function effectiveNoiseGateMode(
+  settings: Pick<AudioSettings, 'musicMode' | 'autoGainControl' | 'noiseGateMode'>
+): 'off' | 'dynamic' | 'manualCalibrate' {
+  return normalizeNoiseGateMode(
+    settings.noiseGateMode,
+    settings.autoGainControl === true,
+    settings.musicMode === true
+  );
+}
 
 function normalizeInputVolume(inputVolume: unknown): number {
   if (typeof inputVolume !== 'number' || !Number.isFinite(inputVolume)) {
     return DEFAULT_INPUT_VOLUME;
   }
   return Math.max(0, Math.min(200, inputVolume));
+}
+
+function migrateVersionZero(state: Record<string, unknown>): void {
+  // v0→v1: Rename fecMode → autoFecMode, add advancedMode + stereoOverride
+  if (state.fecMode) {
+    state.autoFecMode = state.fecMode === 'auto' ? 'default' : 'manual';
+    delete state.fecMode;
+  }
+  if (typeof state.fecManualPercent === 'number' && state.fecManualPercent > 40) {
+    state.fecManualPercent = 40;
+  }
+  if (state.advancedMode === undefined) state.advancedMode = false;
+  if (state.stereoOverride === undefined) state.stereoOverride = null;
+}
+
+function migrateVersionOne(state: Record<string, unknown>): void {
+  // v1→v2: autoFecMode + fecManualPercent → inlineFec + fecHeadroom
+  const mode = state.autoFecMode as string | undefined;
+  state.inlineFec = mode !== 'off';
+  state.fecHeadroom = mode !== 'off' && mode !== 'manual';
+  delete state.autoFecMode;
+  delete state.fecManualPercent;
+}
+
+function migrateLegacyNoiseGate(state: Record<string, unknown>): void {
+  if (state.noiseGateMode === 'auto') {
+    state.noiseGateMode = 'off';
+    return;
+  }
+  if (state.noiseGateMode !== 'manual') return;
+
+  state.noiseGateMode =
+    state.autoGainControl !== false && state.musicMode !== true ? 'dynamic' : 'manualCalibrate';
 }
 
 export function effectiveMicLevelPercent(
@@ -92,8 +159,9 @@ interface AudioSettingsState extends AudioSettings {
   setNoiseCancellation: (enabled: boolean) => void;
   setEchoCancellation: (enabled: boolean) => void;
   setAutoGainControl: (enabled: boolean) => void;
-  setNoiseGateMode: (mode: 'auto' | 'manual') => void;
+  setNoiseGateMode: (mode: NoiseGateMode) => void;
   setNoiseGateLevel: (level: number) => void;
+  setCaptureGateSettings: (patch: Partial<CaptureGateSettings>) => void;
   setMusicMode: (enabled: boolean) => void;
   setFrameSize: (size: 0 | 10 | 20 | 40 | 60) => void;
   setSilenceDetection: (enabled: boolean) => void;
@@ -122,8 +190,8 @@ const defaults: AudioSettings = {
   noiseCancellation: true,
   echoCancellation: true,
   autoGainControl: true,
-  noiseGateMode: 'auto',
-  noiseGateLevel: -50,
+  noiseGateMode: 'dynamic',
+  noiseGateLevel: DEFAULT_NOISE_GATE_LEVEL,
   musicMode: false,
   frameSize: 0, // Default — resolved at runtime to tier's preferredFrameSize
   silenceDetection: false,
@@ -147,17 +215,36 @@ const defaults: AudioSettings = {
 export const useAudioSettingsStore = wrapStore(
   create<AudioSettingsState>()(
     persist(
-      (set) => ({
+      (set, get) => ({
         ...defaults,
 
         setAdvancedMode: (advancedMode) => set({ advancedMode }),
         setNoiseCancellation: (noiseCancellation) => set({ noiseCancellation }),
         setEchoCancellation: (echoCancellation) => set({ echoCancellation }),
-        setAutoGainControl: (autoGainControl) => set({ autoGainControl }),
-        setNoiseGateMode: (noiseGateMode) => set({ noiseGateMode }),
-        setNoiseGateLevel: (noiseGateLevel) =>
-          set({ noiseGateLevel: Math.max(-80, Math.min(-20, noiseGateLevel)) }),
-        setMusicMode: (musicMode) => set({ musicMode }),
+        setCaptureGateSettings: (patch) =>
+          set((state) => {
+            const autoGainControl =
+              typeof patch.autoGainControl === 'boolean'
+                ? patch.autoGainControl
+                : state.autoGainControl;
+            const musicMode =
+              typeof patch.musicMode === 'boolean' ? patch.musicMode : state.musicMode;
+            const noiseGateMode = normalizeNoiseGateMode(
+              patch.noiseGateMode ?? state.noiseGateMode,
+              autoGainControl,
+              musicMode
+            );
+            return {
+              autoGainControl,
+              musicMode,
+              noiseGateMode,
+              noiseGateLevel: normalizeNoiseGateLevel(patch.noiseGateLevel ?? state.noiseGateLevel),
+            };
+          }),
+        setAutoGainControl: (autoGainControl) => get().setCaptureGateSettings({ autoGainControl }),
+        setNoiseGateMode: (noiseGateMode) => get().setCaptureGateSettings({ noiseGateMode }),
+        setNoiseGateLevel: (noiseGateLevel) => get().setCaptureGateSettings({ noiseGateLevel }),
+        setMusicMode: (musicMode) => get().setCaptureGateSettings({ musicMode }),
         setFrameSize: (frameSize) => set({ frameSize }),
         setSilenceDetection: (silenceDetection) => set({ silenceDetection }),
         setStereoOverride: (stereoOverride) => set({ stereoOverride }),
@@ -229,7 +316,7 @@ export const useAudioSettingsStore = wrapStore(
       }),
       {
         name: 'concord:audio-advanced',
-        version: 2,
+        version: 3,
         merge: (persistedState, currentState) => {
           const persisted =
             typeof persistedState === 'object' && persistedState !== null
@@ -238,34 +325,38 @@ export const useAudioSettingsStore = wrapStore(
           const inputVolume = Object.hasOwn(persisted, 'inputVolume')
             ? persisted.inputVolume
             : currentState.inputVolume;
+          const autoGainControl =
+            typeof persisted.autoGainControl === 'boolean'
+              ? persisted.autoGainControl
+              : defaults.autoGainControl;
+          const musicMode =
+            typeof persisted.musicMode === 'boolean' ? persisted.musicMode : defaults.musicMode;
           return {
             ...currentState,
             ...persisted,
             inputVolume: normalizeInputVolume(inputVolume),
+            autoGainControl,
+            musicMode,
+            noiseGateMode: normalizeNoiseGateMode(
+              Object.hasOwn(persisted, 'noiseGateMode')
+                ? persisted.noiseGateMode
+                : currentState.noiseGateMode,
+              autoGainControl,
+              musicMode
+            ),
+            noiseGateLevel: normalizeNoiseGateLevel(
+              persisted.noiseGateLevel ?? currentState.noiseGateLevel
+            ),
           };
         },
         migrate: (persistedState: unknown, version: number) => {
-          const state = persistedState as Record<string, unknown>;
-          if (version === 0) {
-            // v0→v1: Rename fecMode → autoFecMode, add advancedMode + stereoOverride
-            if (state.fecMode) {
-              state.autoFecMode = state.fecMode === 'auto' ? 'default' : 'manual';
-              delete state.fecMode;
-            }
-            if (typeof state.fecManualPercent === 'number' && state.fecManualPercent > 40) {
-              state.fecManualPercent = 40;
-            }
-            if (state.advancedMode === undefined) state.advancedMode = false;
-            if (state.stereoOverride === undefined) state.stereoOverride = null;
-          }
-          if (version <= 1) {
-            // v1→v2: autoFecMode + fecManualPercent → inlineFec + fecHeadroom
-            const mode = state.autoFecMode as string | undefined;
-            state.inlineFec = mode !== 'off';
-            state.fecHeadroom = mode !== 'off' && mode !== 'manual';
-            delete state.autoFecMode;
-            delete state.fecManualPercent;
-          }
+          const state =
+            typeof persistedState === 'object' && persistedState !== null
+              ? { ...(persistedState as Record<string, unknown>) }
+              : ({} as Record<string, unknown>);
+          if (version === 0) migrateVersionZero(state);
+          if (version <= 1) migrateVersionOne(state);
+          if (version <= 2) migrateLegacyNoiseGate(state);
           return state as unknown as AudioSettingsState;
         },
       }

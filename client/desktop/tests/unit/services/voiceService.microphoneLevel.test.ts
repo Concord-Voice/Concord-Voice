@@ -249,7 +249,8 @@ describe('voiceService microphone processing graph (#3635)', () => {
     service.startPacketLossMonitor = vi.fn();
     service.clearMediaPolicyPausedByProducer = vi.fn();
     useVoiceStore.setState({ audioInputDeviceId: 'selected-mic' });
-    useAudioSettingsStore.getState().setNoiseGateMode('manual');
+    useAudioSettingsStore.getState().setAutoGainControl(false);
+    useAudioSettingsStore.getState().setNoiseGateMode('manualCalibrate');
     useAudioSettingsStore.getState().setNoiseGateLevel(-50);
     Object.defineProperty(globalThis, 'AudioContext', {
       configurable: true,
@@ -334,9 +335,15 @@ describe('voiceService microphone processing graph (#3635)', () => {
     const processor = AudioWorkletNodeMock.created.find((node) => node.context === graph.context);
     expect(processor?.name).toBe('concord-mic-processor');
     const settings = useAudioSettingsStore.getState();
+    const expectedGate =
+      settings.noiseGateMode === 'manualCalibrate'
+        ? { kind: 'fixed', thresholdDbfs: settings.noiseGateLevel }
+        : settings.noiseGateMode === 'dynamic'
+          ? { kind: 'dynamic' }
+          : { kind: 'off' };
     expect(processor?.options.processorOptions).toMatchObject({
       protectAgcPeaks: settings.autoGainControl && !settings.musicMode,
-      gate: settings.noiseGateMode === 'manual' ? { kind: 'fixed' } : { kind: 'off' },
+      gate: expectedGate,
     });
     expect(finalTrack, 'the outbound producer must use the protected graph track').toBe(
       graph.outputTrack
@@ -409,6 +416,181 @@ describe('voiceService microphone processing graph (#3635)', () => {
     expect(service.sendTransport.produce).toHaveBeenCalledWith(
       expect.objectContaining({ track: producedTracks[0] })
     );
+  });
+
+  it.each([
+    {
+      name: 'Dynamic with AGC',
+      mode: 'dynamic',
+      agc: true,
+      music: false,
+      gate: { kind: 'dynamic' },
+      protection: true,
+    },
+    {
+      name: 'Off with AGC',
+      mode: 'off',
+      agc: true,
+      music: false,
+      gate: { kind: 'off' },
+      protection: true,
+    },
+    {
+      name: 'Manual without AGC',
+      mode: 'manualCalibrate',
+      agc: false,
+      music: false,
+      gate: { kind: 'fixed', thresholdDbfs: -37 },
+      protection: false,
+    },
+    {
+      name: 'Manual in Music Mode',
+      mode: 'manualCalibrate',
+      agc: true,
+      music: true,
+      gate: { kind: 'fixed', thresholdDbfs: -37 },
+      protection: false,
+    },
+  ] as const)(
+    'builds the selected live gate policy: $name',
+    async ({ mode, agc, music, gate, protection }) => {
+      useAudioSettingsStore.getState().setCaptureGateSettings({
+        autoGainControl: agc,
+        musicMode: music,
+        noiseGateMode: mode,
+        noiseGateLevel: -37,
+      });
+      await service.produceAudio();
+      const processor = AudioWorkletNodeMock.created[0];
+      expect(processor.options.processorOptions).toMatchObject({
+        gate,
+        protectAgcPeaks: protection,
+      });
+      expect(producedTracks[0]).toBe(graphs[0].outputTrack);
+    }
+  );
+
+  it('uses the applied gate mode after permission resolves', async () => {
+    let resolveCapture!: (stream: StreamMock) => void;
+    const pending = new Promise<StreamMock>((resolve) => {
+      resolveCapture = resolve;
+    });
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn(() => pending) },
+    });
+    const starting = service.produceAudio();
+    await vi.waitFor(() => expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalled());
+    useAudioSettingsStore.getState().setCaptureGateSettings({
+      autoGainControl: true,
+      musicMode: false,
+      noiseGateMode: 'off',
+      noiseGateLevel: -37,
+    });
+    const raw = new TrackMock();
+    captured.push(raw);
+    resolveCapture(new StreamMock([raw]));
+    await starting;
+
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audio: expect.objectContaining({ deviceId: { exact: 'selected-mic' } }),
+      })
+    );
+    expect(AudioWorkletNodeMock.created[0].options.processorOptions).toMatchObject({
+      gate: { kind: 'off' },
+      protectAgcPeaks: true,
+    });
+    expect(producedTracks[0]).toBe(graphs[0].outputTrack);
+  });
+
+  it('fences dynamic gate status to the current graph and clears it on processor failure', async () => {
+    await service.produceAudio();
+    const oldProcessor = AudioWorkletNodeMock.created[0];
+    oldProcessor.port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: null },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus?.state).toBe('learning');
+
+    useVoiceStore.setState({ audioInputDeviceId: 'replacement-mic' });
+    await service.liveReproduceAudio();
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
+    oldProcessor.port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -48 },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
+
+    AudioWorkletNodeMock.created.at(-1)?.port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: null },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus?.state).toBe('learning');
+    AudioWorkletNodeMock.created.at(-1)?.dispatch('processorerror');
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
+  });
+
+  it('hides old Dynamic status while replacement capture is pending and restores it after rollback', async () => {
+    useAudioSettingsStore.getState().setNoiseGateMode('dynamic');
+    await service.produceAudio();
+    const oldProcessor = AudioWorkletNodeMock.created[0];
+    oldProcessor.port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -48 },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus?.state).toBe('adjusted');
+
+    let rejectCapture!: (error: Error) => void;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockImplementationOnce(
+      () =>
+        new Promise<MediaStream>((_resolve, reject) => {
+          rejectCapture = reject;
+        })
+    );
+    useVoiceStore.setState({ audioInputDeviceId: 'replacement-mic' });
+    const replacement = service.liveReplaceAudioTrack();
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
+    await vi.waitFor(() => expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2));
+    oldProcessor.port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -48 },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
+
+    rejectCapture(new Error('capture failed'));
+    await replacement;
+    expect(producer.resume).toHaveBeenCalled();
+    oldProcessor.port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: null },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus?.state).toBe('learning');
+  });
+
+  it('replaces the active microphone with the latest gate mode', async () => {
+    useAudioSettingsStore.getState().setCaptureGateSettings({ noiseGateMode: 'off' });
+    service.localMicStream = new StreamMock([new TrackMock()]);
+    service.producers.set('mic', producer);
+    await service.produceAudio();
+    useAudioSettingsStore.getState().setCaptureGateSettings({
+      noiseGateMode: 'manualCalibrate',
+      noiseGateLevel: -36,
+      autoGainControl: false,
+    });
+    await service.liveReplaceAudioTrack();
+
+    expect(AudioWorkletNodeMock.created.at(-1)?.options.processorOptions).toMatchObject({
+      gate: { kind: 'fixed', thresholdDbfs: -36 },
+      protectAgcPeaks: false,
+    });
+    expect(producer.replaceTrack).toHaveBeenCalledWith({ track: graphs.at(-1)?.outputTrack });
+  });
+
+  it('clears accepted Dynamic status when the microphone producer closes', async () => {
+    await service.produceAudio();
+    AudioWorkletNodeMock.created[0].port.onmessage?.({
+      data: { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: null },
+    } as MessageEvent);
+    expect(useVoiceStore.getState().dynamicGateStatus?.state).toBe('learning');
+
+    await service.closeProducer('mic');
+
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
   });
 
   it('reaches the outbound producer after selected-device capture and one protected graph', async () => {
@@ -928,6 +1110,27 @@ describe('voiceService microphone processing graph (#3635)', () => {
       agcOnTargets.every((value) => value === 1),
       'stored manual level changes must leave the live gain at unity while AGC is effective'
     ).toBe(true);
+  });
+
+  it('restarts live Dynamic learning after an effective microphone level change', async () => {
+    useAudioSettingsStore.getState().setAutoGainControl(false);
+    useAudioSettingsStore.getState().setNoiseGateMode('dynamic');
+    useAudioSettingsStore.getState().setInputVolume(100);
+    await service.produceAudio();
+    const processor = AudioWorkletNodeMock.created.at(-1)!;
+    useVoiceStore.getState().setDynamicGateStatus({
+      type: 'dynamicGateStatus',
+      state: 'adjusted',
+      thresholdDbfs: -45,
+    });
+
+    useAudioSettingsStore.getState().setInputVolume(180);
+
+    expect(processor.port.postMessage).toHaveBeenCalledWith({
+      type: 'setGate',
+      gate: { kind: 'dynamic' },
+    });
+    expect(useVoiceStore.getState().dynamicGateStatus).toBeNull();
   });
 
   it('applies the saved manual level when committed AGC changes from on to off', async () => {

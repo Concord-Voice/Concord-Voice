@@ -4,7 +4,7 @@ vi.mock('@/renderer/services/voice/micProcessor.worklet.js?url&no-inline', () =>
   default: '/assets/micProcessor.worklet.js',
 }));
 
-import { createMicProcessor } from '@/renderer/services/voice/micProcessor';
+import { createMicProcessor, gateForAudioSettings } from '@/renderer/services/voice/micProcessor';
 
 type WorkletMessage = { data: unknown };
 type MockPort = {
@@ -68,6 +68,116 @@ beforeEach(() => {
 });
 
 describe('createMicProcessor', () => {
+  it.each([
+    [
+      { musicMode: false, autoGainControl: true, noiseGateMode: 'dynamic', noiseGateLevel: -45 },
+      { kind: 'dynamic' },
+    ],
+    [
+      {
+        musicMode: false,
+        autoGainControl: true,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -45,
+      },
+      { kind: 'dynamic' },
+    ],
+    [
+      {
+        musicMode: true,
+        autoGainControl: true,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -45,
+      },
+      { kind: 'fixed', thresholdDbfs: -45 },
+    ],
+    [
+      {
+        musicMode: false,
+        autoGainControl: false,
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -60,
+      },
+      { kind: 'fixed', thresholdDbfs: -60 },
+    ],
+    [
+      { musicMode: false, autoGainControl: true, noiseGateMode: 'off', noiseGateLevel: -45 },
+      { kind: 'off' },
+    ],
+  ] as const)('resolves effective gate policy for %o', (settings, expected) => {
+    expect(gateForAudioSettings(settings)).toEqual(expected);
+  });
+
+  it('accepts Dynamic as an initial and runtime gate command', async () => {
+    const { setGate } = await createMicProcessor(
+      context,
+      { protectAgcPeaks: false, gate: { kind: 'dynamic' } },
+      vi.fn(),
+      vi.fn()
+    );
+
+    setGate({ kind: 'dynamic' });
+    expect(constructed[0].port.postMessage).toHaveBeenCalledWith({
+      type: 'setGate',
+      gate: { kind: 'dynamic' },
+    });
+  });
+
+  it('delivers a valid Dynamic status through the optional callback and preserves peak reports', async () => {
+    const onWindow = vi.fn();
+    const onGateStatus = vi.fn();
+    await createMicProcessor(context, initial, onWindow, vi.fn(), onGateStatus);
+    constructed[0].emit({
+      type: 'dynamicGateStatus',
+      state: 'adjusted',
+      thresholdDbfs: -42,
+    });
+    constructed[0].emit({ peak: 0.02, frames: 960, valid: true, overloaded: false });
+
+    expect(onGateStatus).toHaveBeenCalledWith({
+      type: 'dynamicGateStatus',
+      state: 'adjusted',
+      thresholdDbfs: -42,
+    });
+    expect(onWindow).toHaveBeenCalledWith({
+      peak: 0.02,
+      frames: 960,
+      valid: true,
+      overloaded: false,
+    });
+  });
+
+  it.each([
+    { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: null },
+    { type: 'dynamicGateStatus', state: 'uncertain', thresholdDbfs: null },
+    { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -80 },
+    { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -20 },
+  ])('accepts supported Dynamic status: %o', async (status) => {
+    const onGateStatus = vi.fn();
+    await createMicProcessor(context, initial, vi.fn(), vi.fn(), onGateStatus);
+    constructed[0].emit(status);
+    expect(onGateStatus).toHaveBeenCalledWith(status);
+  });
+
+  it.each([
+    { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: null },
+    { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: -40 },
+    { type: 'dynamicGateStatus', state: 'uncertain', thresholdDbfs: -40 },
+    { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -80.01 },
+    { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: -19.99 },
+    { type: 'dynamicGateStatus', state: 'adjusted', thresholdDbfs: Number.NaN },
+    { type: 'dynamicGateStatus', state: 'guess', thresholdDbfs: null },
+    { type: 'dynamicGateStatus', state: 'learning', thresholdDbfs: null, extra: true },
+  ])('ignores malformed Dynamic status: %o', async (status) => {
+    const onGateStatus = vi.fn();
+    const onWindow = vi.fn();
+    await createMicProcessor(context, initial, onWindow, vi.fn(), onGateStatus);
+    constructed[0].emit(status);
+
+    expect(onGateStatus).not.toHaveBeenCalled();
+    expect(onWindow).not.toHaveBeenCalled();
+  });
+
   it('waits for the module before constructing or returning a node', async () => {
     const moduleLoad = deferred<void>();
     addModule.mockReturnValue(moduleLoad.promise);

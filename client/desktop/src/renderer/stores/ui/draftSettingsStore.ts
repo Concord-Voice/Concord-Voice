@@ -6,7 +6,11 @@ import {
   type CustomColors,
 } from './settingsStore';
 import { setSyncSuppressed } from './colorSyncSuppression';
-import { useAudioSettingsStore, type AudioSettings } from '../audio/audioSettingsStore';
+import {
+  effectiveNoiseGateMode,
+  useAudioSettingsStore,
+  type AudioSettings,
+} from '../audio/audioSettingsStore';
 import { useVideoSettingsStore, type VideoSettings } from '../voice/videoSettingsStore';
 import { useTTSSettingsStore, type TTSSettings } from '../audio/ttsSettingsStore';
 import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../voice/voiceStore';
@@ -401,6 +405,14 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
         (newDrafts as Record<string, unknown>)[key as string] = value;
       }
 
+      const candidate = { ...state.snapshot.audio, ...newDrafts };
+      const nextMode = effectiveNoiseGateMode(candidate);
+      if (nextMode === state.snapshot.audio.noiseGateMode) {
+        delete newDrafts.noiseGateMode;
+      } else {
+        newDrafts.noiseGateMode = nextMode;
+      }
+
       return { drafts: { ...state.drafts, audio: newDrafts } };
     }),
 
@@ -554,10 +566,26 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
       syncColorSchemeToServer();
     }
 
-    // Audio — push to real store
+    // Publish the capture policy in one store update so a live graph never sees
+    // a temporary AGC/gate combination while Apply walks the other audio keys.
+    const { autoGainControl, musicMode, noiseGateMode, noiseGateLevel, ...otherAudioDrafts } =
+      drafts.audio;
+    if (
+      'autoGainControl' in drafts.audio ||
+      'musicMode' in drafts.audio ||
+      'noiseGateMode' in drafts.audio ||
+      'noiseGateLevel' in drafts.audio
+    ) {
+      useAudioSettingsStore.getState().setCaptureGateSettings({
+        autoGainControl,
+        musicMode,
+        noiseGateMode,
+        noiseGateLevel,
+      });
+    }
     pushDraftsToStore(
       useAudioSettingsStore.getState() as unknown as Record<string, unknown>,
-      drafts.audio as Record<string, unknown>
+      otherAudioDrafts as Record<string, unknown>
     );
 
     // Video setters only assign their fields. Apply every drafted video value in one
