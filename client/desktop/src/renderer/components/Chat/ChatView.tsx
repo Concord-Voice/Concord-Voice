@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Eraser, Timer } from 'lucide-react';
 import MessageList, { type MessageListHandle } from './MessageList';
 import { expirationClause, expirationControlLabel } from './MessageExpirationIndicator';
@@ -16,6 +16,7 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useReadMarker } from '../../hooks/messaging/useReadMarker';
+import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
 import { apiFetch } from '../../services/system/apiClient';
 import { useServerStore } from '../../stores/chat/serverStore';
@@ -63,6 +64,10 @@ const ChatView: React.FC = () => {
   // Active channel info
   const activeChannel = channels.find((c) => c.id === activeChannelId);
   const currentUserId = user?.id || '';
+  // #1959: this panel's id ties its rows, its composer and the delete-refusal flow together,
+  // so focus and an open edit never cross into another panel showing messages.
+  const surfaceId = useId();
+  const editLastMessage = useEditLastMessage(messages, currentUserId, surfaceId);
   const headerHover = useHoverIntent();
   const expirationScope =
     activeChannelId && activeChannel?.type === 'text'
@@ -283,7 +288,7 @@ const ChatView: React.FC = () => {
   }
 
   return (
-    <div className="chat-view">
+    <div className="chat-view" data-chat-surface={surfaceId}>
       <div className="chat-header">
         {activeChannel?.emoji ? (
           <span className="chat-header-emoji">{activeChannel.emoji}</span>
@@ -379,6 +384,7 @@ const ChatView: React.FC = () => {
 
       <div className="chat-messages">
         <MessageList
+          surfaceId={surfaceId}
           ref={messageListRef}
           key={activeChannelId}
           messages={messages}
@@ -414,6 +420,7 @@ const ChatView: React.FC = () => {
           channelId={activeChannelId || undefined}
           replyingTo={replyingTo}
           onCancelReply={cancelReply}
+          onEditLastMessage={editLastMessage}
           expirationClause={expirationClause(expiration.policy, expiration.policyState)}
         />
       </div>
@@ -468,6 +475,7 @@ const ChatView: React.FC = () => {
       )}
 
       <DeleteRefusalModal
+        surfaceId={surfaceId}
         refusal={deleteRefusal}
         onConfirm={confirmDelete}
         onDismiss={dismissDeleteRefusal}

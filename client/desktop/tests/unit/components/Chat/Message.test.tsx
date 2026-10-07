@@ -12,6 +12,7 @@ import {
   mockReplyMessage,
   mockPinnedMessage,
   mockMessageWithAttachments,
+  mockAttachment,
 } from '../../../mocks/fixtures';
 
 // Mock AttachmentDisplay to avoid fetch/decrypt complexity.
@@ -55,12 +56,16 @@ describe('Message', () => {
   });
 
   it('renders message content', () => {
-    render(<Message message={mockMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-1" showAvatar={true} />
+    );
     expect(screen.getByText('Hello, world!')).toBeInTheDocument();
   });
 
   it('renders display name when showAvatar is true', () => {
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     // display_name takes priority over username
     expect(screen.getByText('Test User')).toBeInTheDocument();
   });
@@ -68,6 +73,7 @@ describe('Message', () => {
   it('falls back to username when no display_name', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, display_name: undefined as unknown as string }}
         currentUserId="user-2"
         showAvatar={true}
@@ -77,7 +83,14 @@ describe('Message', () => {
   });
 
   it('shows pending status indicator', () => {
-    render(<Message message={mockPendingMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message
+        surfaceId="s1"
+        message={mockPendingMessage}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
     // Pending message should have visual indicator
     const msgEl = document.querySelector('.message');
     expect(msgEl).toBeInTheDocument();
@@ -86,6 +99,7 @@ describe('Message', () => {
   it('renders message with failed status', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, status: 'failed', error: 'Network error' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -98,13 +112,16 @@ describe('Message', () => {
   });
 
   it('does not show edit/delete buttons for other users messages', () => {
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     expect(screen.queryByLabelText(/edit/i)).not.toBeInTheDocument();
   });
 
   it('shows decryption failure message', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, decryptFailed: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -116,6 +133,7 @@ describe('Message', () => {
   it('shows pending keys message', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, pendingKeys: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -125,7 +143,9 @@ describe('Message', () => {
   });
 
   it('renders avatar initial from display name', () => {
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     // "T" for "Test User" display_name
     expect(screen.getByText('T')).toBeInTheDocument();
   });
@@ -133,6 +153,7 @@ describe('Message', () => {
   it('renders avatar image when avatar_url provided', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, avatar_url: 'https://example.com/avatar.png' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -144,20 +165,22 @@ describe('Message', () => {
 
   it('applies own-message class for own messages', () => {
     const { container } = render(
-      <Message message={mockMessage} currentUserId="user-1" showAvatar={true} />
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-1" showAvatar={true} />
     );
     expect(container.querySelector('.own-message')).toBeInTheDocument();
   });
 
   it('applies grouped style when showAvatar is false', () => {
     const { container } = render(
-      <Message message={mockMessage} currentUserId="user-2" showAvatar={false} />
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={false} />
     );
     expect(container.querySelector('.message-grouped')).toBeInTheDocument();
   });
 
   it('shows context menu on right-click', () => {
-    render(<Message message={mockMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-1" showAvatar={true} />
+    );
     const messageEl = document.querySelector('.message');
     fireEvent.contextMenu(messageEl!);
     // Context menu should render
@@ -166,7 +189,9 @@ describe('Message', () => {
 
   it('renders other user message correctly', () => {
     useMemberStore.getState().addMember(mockMember2);
-    render(<Message message={mockMessage2} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage2} currentUserId="user-1" showAvatar={true} />
+    );
     expect(screen.getByText('Hi there!')).toBeInTheDocument();
     expect(screen.getByText('Test User 2')).toBeInTheDocument();
   });
@@ -176,7 +201,13 @@ describe('Message', () => {
   it('enters edit mode via options menu', async () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     // Click the options trigger button
     const optionsTrigger = screen.getByLabelText('Message options');
@@ -192,7 +223,13 @@ describe('Message', () => {
   it('submits edit on Enter key', async () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -205,7 +242,13 @@ describe('Message', () => {
   it('cancels edit on Escape key', () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -220,7 +263,13 @@ describe('Message', () => {
   it('cancels edit via Cancel button', () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -231,7 +280,13 @@ describe('Message', () => {
   it('does not submit edit when content is unchanged', () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -244,7 +299,13 @@ describe('Message', () => {
   it('does not submit edit when content is empty', () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -257,7 +318,13 @@ describe('Message', () => {
   it('Save button is disabled when content is unchanged', () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -268,7 +335,13 @@ describe('Message', () => {
   it('Save button is enabled after content change', () => {
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Edit'));
@@ -283,7 +356,13 @@ describe('Message', () => {
   it('shows delete modal from options menu', () => {
     const onDelete = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onDelete={onDelete} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onDelete={onDelete}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     fireEvent.click(screen.getByText('Delete'));
@@ -294,7 +373,13 @@ describe('Message', () => {
   it('shift+click on Delete button skips confirmation', () => {
     const onDelete = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onDelete={onDelete} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onDelete={onDelete}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     const deleteBtn = screen.getByText('Delete');
@@ -306,6 +391,7 @@ describe('Message', () => {
     const onDelete = vi.fn();
     render(
       <Message
+        surfaceId="s1"
         message={mockMessage}
         currentUserId="user-1"
         onDelete={onDelete}
@@ -320,6 +406,7 @@ describe('Message', () => {
     const onDelete = vi.fn();
     render(
       <Message
+        surfaceId="s1"
         message={mockMessage}
         currentUserId="user-1"
         onDelete={onDelete}
@@ -336,6 +423,7 @@ describe('Message', () => {
   it('does not show options for pending messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={mockPendingMessage}
         currentUserId="user-1"
         onEdit={vi.fn()}
@@ -349,6 +437,7 @@ describe('Message', () => {
   it('does not show options for sent (non-delivered) messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, status: 'sent' }}
         currentUserId="user-1"
         onEdit={vi.fn()}
@@ -365,6 +454,7 @@ describe('Message', () => {
     const now = new Date();
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, created_at: now.toISOString() }}
         currentUserId="user-2"
         showAvatar={true}
@@ -380,6 +470,7 @@ describe('Message', () => {
   it('shows date and time for older messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, created_at: '2024-06-15T10:30:00Z' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -392,7 +483,9 @@ describe('Message', () => {
   });
 
   it('shows gutter timestamp when showAvatar is false', () => {
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={false} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={false} />
+    );
     const gutterTs = document.querySelector('.message-gutter-timestamp');
     expect(gutterTs).toBeInTheDocument();
   });
@@ -402,6 +495,7 @@ describe('Message', () => {
   it('shows (edited) tag on edited messages with header', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, edited_at: '2025-01-01T13:00:00Z' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -413,6 +507,7 @@ describe('Message', () => {
   it('shows inline (edited) tag on grouped edited messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, edited_at: '2025-01-01T13:00:00Z' }}
         currentUserId="user-2"
         showAvatar={false}
@@ -444,6 +539,7 @@ describe('Message', () => {
 
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@user-2>' }}
         currentUserId="user-1"
         chatContext="dm"
@@ -459,6 +555,7 @@ describe('Message', () => {
 
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@user-2>' }}
         currentUserId="user-1"
         chatContext="dm"
@@ -473,6 +570,7 @@ describe('Message', () => {
     useMemberStore.getState().addMember(mockMember2);
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@user-2> check this out' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -486,6 +584,7 @@ describe('Message', () => {
   it('styles current-user mention tokens as self mentions', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@user-1> check this out' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -501,6 +600,7 @@ describe('Message', () => {
     useMemberStore.getState().addMember(mockMember2);
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@user-2> check this out' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -515,6 +615,7 @@ describe('Message', () => {
   it('does not treat plain username mentions as self mentions', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey @testuser check this out' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -528,6 +629,7 @@ describe('Message', () => {
   it('styles broadcast mentions as self mentions', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Heads up @everyone' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -575,6 +677,7 @@ describe('Message', () => {
 
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@&role-42>' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -591,6 +694,7 @@ describe('Message', () => {
     useMemberStore.getState().addMember(mockMember2);
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey @testuser2 check this out' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -603,6 +707,7 @@ describe('Message', () => {
   it('renders unresolved mention tokens as-is', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hey <@unknown-id> check this' }}
         currentUserId="user-1"
         showAvatar={true}
@@ -619,6 +724,7 @@ describe('Message', () => {
   it('applies jumbo emoji class for single emoji messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: '😀' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -631,6 +737,7 @@ describe('Message', () => {
   it('applies jumbo class for 3 emoji', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: '😀😎🎉' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -643,6 +750,7 @@ describe('Message', () => {
   it('does not apply jumbo class for mixed text and emoji', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hello 😀' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -655,6 +763,7 @@ describe('Message', () => {
   it('does not apply jumbo class for 6+ emoji', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: '😀😎🎉🎊🎈🎁' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -667,6 +776,7 @@ describe('Message', () => {
   it('wraps individual emoji in emoji span', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Hello 😀 world' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -682,6 +792,7 @@ describe('Message', () => {
   it('does not apply emoji class on pendingKeys messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: '😀', pendingKeys: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -694,6 +805,7 @@ describe('Message', () => {
   it('does not apply emoji class on decryptFailed messages', () => {
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: '😀', decryptFailed: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -710,7 +822,7 @@ describe('Message', () => {
     // Message.tsx lines 392–394. A normal delivered message is structurally E2EE; no
     // per-message badge should appear under the E2EE-everywhere posture (#201).
     const { container } = render(
-      <Message message={mockMessage} currentUserId="user-2" showAvatar={true} />
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
     );
     expect(container.querySelector('.encrypted-indicator')).toBeNull();
     expect(screen.queryByTitle('End-to-end encrypted')).toBeNull();
@@ -721,6 +833,7 @@ describe('Message', () => {
     // #1041 (terminal decrypt-failure uses the locked-out glyph, distinct from pending).
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, decryptFailed: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -744,6 +857,7 @@ describe('Message', () => {
     // #1041 (transient pending state uses the key-arriving glyph, distinct from terminal).
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, pendingKeys: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -764,6 +878,7 @@ describe('Message', () => {
   it('plays decrypted-reveal when a pending-keys message resolves', () => {
     const { container, rerender } = render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, pendingKeys: true }}
         currentUserId="user-2"
         showAvatar={true}
@@ -775,6 +890,7 @@ describe('Message', () => {
     // Key arrives: pendingKeys flips false, content decrypts.
     rerender(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, pendingKeys: false }}
         currentUserId="user-2"
         showAvatar={true}
@@ -789,7 +905,7 @@ describe('Message', () => {
 
   it('does not play decrypted-reveal for a message that was never pending', () => {
     const { container } = render(
-      <Message message={mockMessage} currentUserId="user-2" showAvatar={true} />
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
     );
     expect(container.querySelector('.message-text.decrypted-reveal')).toBeNull();
   });
@@ -798,7 +914,9 @@ describe('Message', () => {
 
   it('opens profile card on avatar click', async () => {
     const user = userEvent.setup();
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     const avatarBtn = screen.getByLabelText('View user profile');
     await user.click(avatarBtn);
     // MemberProfileCard should render
@@ -807,7 +925,9 @@ describe('Message', () => {
 
   it('closes profile card when close handler is invoked', async () => {
     const user = userEvent.setup();
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     const avatarBtn = screen.getByLabelText('View user profile');
     await user.click(avatarBtn);
     const card = document.querySelector('.member-profile-card');
@@ -821,7 +941,9 @@ describe('Message', () => {
 
   it('opens profile card on username click (#226 — username is a trigger too)', async () => {
     const user = userEvent.setup();
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     // The username button shares the author's profile-card opener with the
     // avatar (lifted into useMessageProfileCard). Click the header username
     // specifically (not the avatar) and assert the same card opens.
@@ -852,7 +974,9 @@ describe('Message', () => {
         },
       ],
     });
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     const roleEmoji = document.querySelector('.message-role-emoji');
     expect(roleEmoji).toBeInTheDocument();
     expect(roleEmoji?.textContent).toBe('🛡️');
@@ -876,7 +1000,9 @@ describe('Message', () => {
         },
       ],
     });
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     const username = document.querySelector('.message-username') as HTMLElement;
     expect(username.style.color).toBe('rgb(255, 0, 0)');
   });
@@ -900,7 +1026,13 @@ describe('Message', () => {
       ],
     });
     render(
-      <Message message={mockMessage} currentUserId="user-2" chatContext="dm" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-2"
+        chatContext="dm"
+        showAvatar={true}
+      />
     );
     expect(document.querySelector('.message-role-emoji')).not.toBeInTheDocument();
   });
@@ -924,7 +1056,13 @@ describe('Message', () => {
       ],
     });
     render(
-      <Message message={mockMessage} currentUserId="user-2" chatContext="dm" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-2"
+        chatContext="dm"
+        showAvatar={true}
+      />
     );
     const username = document.querySelector('.message-username') as HTMLElement;
     expect(username.style.color).toBe('');
@@ -949,7 +1087,13 @@ describe('Message', () => {
       ],
     });
     render(
-      <Message message={mockMessage} currentUserId="user-2" chatContext="voice" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-2"
+        chatContext="voice"
+        showAvatar={true}
+      />
     );
     const roleEmoji = document.querySelector('.message-role-emoji');
     expect(roleEmoji).toBeInTheDocument();
@@ -965,7 +1109,13 @@ describe('Message', () => {
     const catId = useFriendOrgStore.getState().createCategory('Close Friends', '💜', '#fa709a');
     useFriendOrgStore.getState().assignFriend('user-1', catId);
     render(
-      <Message message={mockMessage} currentUserId="user-2" chatContext="dm" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-2"
+        chatContext="dm"
+        showAvatar={true}
+      />
     );
     const username = document.querySelector('.message-username') as HTMLElement;
     // '#fa709a' → rgb(250, 112, 154)
@@ -978,6 +1128,7 @@ describe('Message', () => {
     useFriendOrgStore.getState().assignFriend('user-1', catId);
     render(
       <Message
+        surfaceId="s1"
         message={mockMessage}
         currentUserId="user-2"
         chatContext="channel"
@@ -994,7 +1145,13 @@ describe('Message', () => {
     const user = userEvent.setup();
     const onEdit = vi.fn();
     render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={onEdit} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={onEdit}
+        showAvatar={true}
+      />
     );
     fireEvent.click(screen.getByLabelText('Message options'));
     expect(screen.getByText('Edit')).toBeInTheDocument();
@@ -1008,11 +1165,18 @@ describe('Message', () => {
 
   it('syncs editContent when message content changes while not editing', () => {
     const { rerender } = render(
-      <Message message={mockMessage} currentUserId="user-1" onEdit={vi.fn()} showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessage}
+        currentUserId="user-1"
+        onEdit={vi.fn()}
+        showAvatar={true}
+      />
     );
     // Rerender with new content
     rerender(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, content: 'Updated externally' }}
         currentUserId="user-1"
         onEdit={vi.fn()}
@@ -1028,7 +1192,14 @@ describe('Message', () => {
       ...mockMessage,
       reactions: [mockReaction, mockReaction2],
     };
-    render(<Message message={messageWithReactions} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message
+        surfaceId="s1"
+        message={messageWithReactions}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
     expect(document.querySelector('.reaction-bar')).toBeInTheDocument();
     expect(screen.getByText('👍')).toBeInTheDocument();
     expect(screen.getByText('❤️')).toBeInTheDocument();
@@ -1036,13 +1207,17 @@ describe('Message', () => {
 
   it('does not render ReactionBar when no reactions', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-1" showAvatar={true} />
+    );
     expect(document.querySelector('.reaction-bar')).not.toBeInTheDocument();
   });
 
   it('renders reply preview when replied_to is present', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockReplyMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockReplyMessage} currentUserId="user-1" showAvatar={true} />
+    );
     expect(document.querySelector('.reply-preview-bar')).toBeInTheDocument();
     expect(document.querySelector('.reply-preview-author')).toBeInTheDocument();
     expect(document.querySelector('.reply-preview-snippet')).toBeInTheDocument();
@@ -1055,7 +1230,9 @@ describe('Message', () => {
       reply_to_id: 'msg-deleted',
       replied_to: undefined,
     };
-    render(<Message message={deletedReply} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={deletedReply} currentUserId="user-1" showAvatar={true} />
+    );
     expect(screen.getByText('Original message is unavailable')).toBeInTheDocument();
   });
 
@@ -1064,6 +1241,7 @@ describe('Message', () => {
     const onScrollToMessage = vi.fn();
     render(
       <Message
+        surfaceId="s1"
         message={mockReplyMessage}
         currentUserId="user-1"
         showAvatar={true}
@@ -1077,19 +1255,35 @@ describe('Message', () => {
 
   it('shows pin indicator when message is pinned', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockPinnedMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message
+        surfaceId="s1"
+        message={mockPinnedMessage}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
     expect(document.querySelector('.message-pinned-indicator')).toBeInTheDocument();
   });
 
   it('applies pinned class when message is pinned', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockPinnedMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message
+        surfaceId="s1"
+        message={mockPinnedMessage}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
     expect(document.querySelector('.message.pinned')).toBeInTheDocument();
   });
 
   it('does not show pin indicator when message is not pinned', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockMessage} currentUserId="user-1" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-1" showAvatar={true} />
+    );
     expect(document.querySelector('.message-pinned-indicator')).not.toBeInTheDocument();
   });
 
@@ -1098,7 +1292,12 @@ describe('Message', () => {
   it('renders AttachmentDisplay when message has attachments', () => {
     useMemberStore.getState().addMember(mockMember);
     render(
-      <Message message={mockMessageWithAttachments} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={mockMessageWithAttachments}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     expect(screen.getByTestId('attachment-display')).toBeInTheDocument();
     expect(screen.getByText('attach-1')).toBeInTheDocument();
@@ -1107,7 +1306,9 @@ describe('Message', () => {
 
   it('does not render AttachmentDisplay when message has no attachments', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     expect(screen.queryByTestId('attachment-display')).not.toBeInTheDocument();
   });
 
@@ -1115,6 +1316,7 @@ describe('Message', () => {
     useMemberStore.getState().addMember(mockMember);
     render(
       <Message
+        surfaceId="s1"
         message={{ ...mockMessage, gif_slug: 'happy-cat-dance' }}
         currentUserId="user-2"
         showAvatar={true}
@@ -1126,7 +1328,9 @@ describe('Message', () => {
 
   it('does not render GifEmbed when message has no gif_slug', () => {
     useMemberStore.getState().addMember(mockMember);
-    render(<Message message={mockMessage} currentUserId="user-2" showAvatar={true} />);
+    render(
+      <Message surfaceId="s1" message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
     expect(screen.queryByTestId('gif-embed')).not.toBeInTheDocument();
   });
 
@@ -1139,6 +1343,7 @@ describe('Message', () => {
     useMemberStore.getState().addMember(mockMember);
     render(
       <Message
+        surfaceId="s1"
         message={{
           ...mockMessageWithAttachments,
           pendingKeys: true,
@@ -1160,6 +1365,7 @@ describe('Message', () => {
     useMemberStore.getState().addMember(mockMember);
     render(
       <Message
+        surfaceId="s1"
         message={{
           ...mockMessageWithAttachments,
           decryptFailed: true,
@@ -1173,5 +1379,812 @@ describe('Message', () => {
     const bodySlot = screen.getByTestId('attachment-message-body');
     expect(bodySlot.textContent).toBe('');
     expect(screen.queryByText(/STALE_OR_INVALID_CONTENT/)).not.toBeInTheDocument();
+  });
+});
+
+// ── #1959: store-driven edit box, per-surface focus return ──
+import { StrictMode } from 'react';
+import { act, within, render as bareRender } from '@testing-library/react';
+import { BrowserRouter } from 'react-router';
+import { ModalProvider } from '@/renderer/components/ui/ModalContext';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import type { MessageWithStatus } from '@/renderer/types/chat';
+
+type EditResult = void | Promise<boolean | void>;
+
+/** One chat panel as an owner renders it: a root carrying `data-chat-surface`, rows, a composer. */
+function Surface({
+  id,
+  children,
+  withComposer = true,
+}: Readonly<{ id: string; children?: React.ReactNode; withComposer?: boolean }>) {
+  return (
+    <div data-chat-surface={id} data-testid={`surface-${id}`}>
+      {children}
+      {withComposer && (
+        <textarea className="message-input-textarea" aria-label={`Composer ${id}`} />
+      )}
+    </div>
+  );
+}
+
+function row(
+  message: MessageWithStatus,
+  surfaceId: string,
+  onEdit?: (messageId: string, content: string) => EditResult,
+  extra: { onDelete?: (id: string) => void } = {}
+) {
+  return (
+    <Message
+      key={`${surfaceId}:${message.id}`}
+      message={message}
+      currentUserId="user-1"
+      surfaceId={surfaceId}
+      onEdit={onEdit}
+      onDelete={extra.onDelete}
+      showAvatar={true}
+    />
+  );
+}
+
+const editBoxes = (scope: ParentNode = document) =>
+  scope.querySelectorAll<HTMLTextAreaElement>('.message-edit-input');
+
+const openEdit = (surfaceId: string, messageId: string) =>
+  act(() => useChatStore.getState().setEditingMessage(surfaceId, messageId));
+
+describe('Message edit box driven by chatStore.editingMessage (#1959)', () => {
+  // This describe is a sibling of `describe('Message')`, so that block's beforeEach does not run
+  // here: reset explicitly or an open edit leaks between cases.
+  beforeEach(() => {
+    resetAllStores();
+    useMemberStore.getState().addMember(mockMember);
+  });
+
+  const rowOne = { ...mockMessage, id: 'm-1', content: 'First message body' };
+  const rowTwo = { ...mockMessage, id: 'm-2', content: 'Second message body' };
+
+  const renderRows = (onEdit = vi.fn()) => {
+    render(
+      <Surface id="s1">
+        {row(rowOne, 's1', onEdit)}
+        {row(rowTwo, 's1', onEdit)}
+      </Surface>
+    );
+    return onEdit;
+  };
+
+  const composer = (surfaceId = 's1') =>
+    within(screen.getByTestId(`surface-${surfaceId}`)).getByLabelText(`Composer ${surfaceId}`);
+
+  it('#1959 opens exactly the targeted row when the store names it', () => {
+    renderRows();
+    // Gate: nothing is open before the store is written.
+    expect(editBoxes()).toHaveLength(0);
+
+    openEdit('s1', 'm-2');
+
+    const boxes = editBoxes();
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0].value).toBe('Second message body');
+    expect(boxes[0].value).not.toBe('First message body');
+  });
+
+  it('#1959 the options-menu Edit action writes the store and opens the box', () => {
+    render(<Surface id="s1">{row(mockMessage, 's1', vi.fn())}</Surface>);
+    expect(useChatStore.getState().editingMessage).toBeNull();
+    fireEvent.click(screen.getByLabelText('Message options'));
+    fireEvent.click(screen.getByText('Edit'));
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: 's1',
+      messageId: mockMessage.id,
+    });
+    expect(editBoxes()).toHaveLength(1);
+  });
+
+  it('#1959 Escape clears the store and returns focus to the composer', () => {
+    renderRows();
+    openEdit('s1', 'm-2');
+    const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+    expect(textarea).toHaveFocus();
+
+    fireEvent.keyDown(textarea, { key: 'Escape' });
+
+    expect(useChatStore.getState().editingMessage).toBeNull();
+    expect(editBoxes()).toHaveLength(0);
+    expect(composer()).toHaveFocus();
+  });
+
+  it('#1959 Save clears the store and returns focus to the composer', () => {
+    const onEdit = renderRows();
+    openEdit('s1', 'm-2');
+    const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+    fireEvent.change(textarea, { target: { value: 'Rewritten body' } });
+
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+
+    expect(onEdit).toHaveBeenCalledWith('m-2', 'Rewritten body');
+    expect(useChatStore.getState().editingMessage).toBeNull();
+    expect(editBoxes()).toHaveLength(0);
+    expect(composer()).toHaveFocus();
+  });
+
+  it('#1959 the Cancel button clears the store and returns focus to the composer', () => {
+    renderRows();
+    openEdit('s1', 'm-2');
+    // Gate: the Cancel button exists only while the box is open.
+    const cancel = screen.getByText('Cancel');
+    expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-2' });
+
+    fireEvent.click(cancel);
+
+    expect(useChatStore.getState().editingMessage).toBeNull();
+    expect(editBoxes()).toHaveLength(0);
+    expect(composer()).toHaveFocus();
+  });
+
+  it('#1959 the edit textarea has the accessible name "Edit message"', () => {
+    renderRows();
+    openEdit('s1', 'm-1');
+    const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+    expect(textarea).toBeInTheDocument();
+    expect((textarea as HTMLTextAreaElement).value).toBe('First message body');
+  });
+
+  it('#1959 cancelling with no composer in the document does not throw and clears the store', () => {
+    render(
+      <Surface id="s1" withComposer={false}>
+        {row(mockMessage, 's1', vi.fn())}
+      </Surface>
+    );
+    openEdit('s1', mockMessage.id);
+    // Gate: the box is open and there is genuinely no composer to focus.
+    const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+    expect(document.querySelector('.message-input-textarea')).toBeNull();
+
+    expect(() => fireEvent.keyDown(textarea, { key: 'Escape' })).not.toThrow();
+
+    expect(useChatStore.getState().editingMessage).toBeNull();
+    expect(editBoxes()).toHaveLength(0);
+  });
+
+  describe('a Save that is refused leaves the edit open', () => {
+    it.each([
+      ['whitespace-only content', '   '],
+      ['unchanged content', 'Second message body'],
+    ])('#1959 Enter on %s does not submit, close or move focus', (_label, draft) => {
+      const onEdit = renderRows();
+      openEdit('s1', 'm-2');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: draft } });
+      // Gate: the box holds the draft under test and owns focus, so a refusal that moved
+      // focus to the composer would show below.
+      expect(textarea.value).toBe(draft);
+      expect(textarea).toHaveFocus();
+
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+
+      expect(onEdit).not.toHaveBeenCalled();
+      expect(useChatStore.getState().editingMessage).toEqual({
+        surfaceId: 's1',
+        messageId: 'm-2',
+      });
+      expect(editBoxes()).toHaveLength(1);
+      expect(document.activeElement).toBe(textarea);
+      expect(composer()).not.toHaveFocus();
+    });
+  });
+
+  describe('focus returns to the composer of the row own surface', () => {
+    const panelRow = { ...mockMessage, id: 'm-panel', content: 'Panel body' };
+    const mainRow = { ...mockMessage, id: 'm-main', content: 'Main body' };
+
+    it('#1959 cancelling in the later panel focuses that panel composer, not the first in the page', () => {
+      render(
+        <>
+          <Surface id="s-main">{row(mainRow, 's-main', vi.fn())}</Surface>
+          <Surface id="s-panel">{row(panelRow, 's-panel', vi.fn())}</Surface>
+        </>
+      );
+      openEdit('s-panel', 'm-panel');
+      // Gate: the edit box is open and has focus, so the change below is a real move.
+      const textarea = within(screen.getByTestId('surface-s-panel')).getByRole('textbox', {
+        name: 'Edit message',
+      });
+      expect(textarea).toHaveFocus();
+
+      fireEvent.keyDown(textarea, { key: 'Escape' });
+
+      expect(composer('s-panel')).toHaveFocus();
+      expect(composer('s-main')).not.toHaveFocus();
+    });
+
+    it('#1959 saving in the later panel focuses that panel composer', () => {
+      const onEdit = vi.fn();
+      render(
+        <>
+          <Surface id="s-main">{row(mainRow, 's-main', onEdit)}</Surface>
+          <Surface id="s-panel">{row(panelRow, 's-panel', onEdit)}</Surface>
+        </>
+      );
+      openEdit('s-panel', 'm-panel');
+      const textarea = within(screen.getByTestId('surface-s-panel')).getByRole('textbox', {
+        name: 'Edit message',
+      });
+      expect(textarea).toHaveFocus();
+      fireEvent.change(textarea, { target: { value: 'Panel body, rewritten' } });
+
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+
+      expect(onEdit).toHaveBeenCalledWith('m-panel', 'Panel body, rewritten');
+      expect(composer('s-panel')).toHaveFocus();
+      expect(composer('s-main')).not.toHaveFocus();
+    });
+
+    it('#1959 a surface with no composer does not push focus into another panel composer', () => {
+      render(
+        <>
+          <Surface id="s-main">{row(mainRow, 's-main', vi.fn())}</Surface>
+          <Surface id="s-panel" withComposer={false}>
+            {row(panelRow, 's-panel', vi.fn())}
+          </Surface>
+        </>
+      );
+      openEdit('s-panel', 'm-panel');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+      // Gate: the main panel composer exists and is not focused; the edit box holds focus.
+      expect(composer('s-main')).toBeInTheDocument();
+      expect(textarea).toHaveFocus();
+
+      fireEvent.keyDown(textarea, { key: 'Escape' });
+
+      expect(editBoxes()).toHaveLength(0);
+      expect(composer('s-main')).not.toHaveFocus();
+    });
+  });
+
+  describe('the same message shown in two surfaces', () => {
+    const shared = { ...mockMessage, id: 'm-shared', content: 'Shared body' };
+    const renderTwoPanels = () =>
+      render(
+        <>
+          <Surface id="s-main">{row(shared, 's-main', vi.fn())}</Surface>
+          <Surface id="s-panel">{row(shared, 's-panel', vi.fn())}</Surface>
+        </>
+      );
+
+    it('#1959 an edit opened for one surface opens only that surface row', () => {
+      renderTwoPanels();
+      // Gate: both rows are mounted and nothing is open.
+      expect(screen.getAllByText('Shared body')).toHaveLength(2);
+      expect(editBoxes()).toHaveLength(0);
+
+      openEdit('s-panel', 'm-shared');
+
+      expect(editBoxes()).toHaveLength(1);
+      expect(editBoxes(screen.getByTestId('surface-s-panel'))).toHaveLength(1);
+      expect(editBoxes(screen.getByTestId('surface-s-main'))).toHaveLength(0);
+    });
+
+    it('#1959 the Edit action in the other surface moves the open edit there only', () => {
+      renderTwoPanels();
+      openEdit('s-panel', 'm-shared');
+      // Gate: the edit is open in the panel before it is moved.
+      expect(editBoxes(screen.getByTestId('surface-s-panel'))).toHaveLength(1);
+
+      const main = within(screen.getByTestId('surface-s-main'));
+      fireEvent.click(main.getByLabelText('Message options'));
+      fireEvent.click(main.getByText('Edit'));
+
+      expect(useChatStore.getState().editingMessage).toEqual({
+        surfaceId: 's-main',
+        messageId: 'm-shared',
+      });
+      expect(editBoxes()).toHaveLength(1);
+      expect(editBoxes(screen.getByTestId('surface-s-main'))).toHaveLength(1);
+      expect(editBoxes(screen.getByTestId('surface-s-panel'))).toHaveLength(0);
+    });
+  });
+
+  describe('an edit ends with its row', () => {
+    const second = { ...mockMessage, id: 'm-2', content: 'Second message body' };
+
+    it('#1959 unmounting the editing row clears the open edit', () => {
+      const { unmount } = render(<Surface id="s1">{row(rowOne, 's1', vi.fn())}</Surface>);
+      openEdit('s1', 'm-1');
+      // Gate: the edit is open before the row goes away.
+      expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-1' });
+      expect(editBoxes()).toHaveLength(1);
+
+      unmount();
+
+      expect(useChatStore.getState().editingMessage).toBeNull();
+    });
+
+    it('#1959 unmounting a row that is not editing leaves the open edit alone', () => {
+      const both = (showFirst: boolean) => (
+        <Surface id="s1">
+          {showFirst && row(rowOne, 's1', vi.fn())}
+          {row(second, 's1', vi.fn())}
+        </Surface>
+      );
+      const { rerender } = render(both(true));
+      openEdit('s1', 'm-2');
+      // Gate: the first row is mounted and the second one is editing.
+      expect(screen.getByText('First message body')).toBeInTheDocument();
+      expect(editBoxes()).toHaveLength(1);
+
+      rerender(both(false));
+
+      expect(screen.queryByText('First message body')).not.toBeInTheDocument();
+      expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-2' });
+      expect(editBoxes()).toHaveLength(1);
+    });
+
+    it('#1959 unmounting the same message in another surface leaves the open edit alone', () => {
+      const panels = (showMain: boolean) => (
+        <>
+          {showMain && <Surface id="s-main">{row(rowOne, 's-main', vi.fn())}</Surface>}
+          <Surface id="s-panel">{row(rowOne, 's-panel', vi.fn())}</Surface>
+        </>
+      );
+      const { rerender } = render(panels(true));
+      openEdit('s-panel', 'm-1');
+      // Gate: both surfaces are mounted and the panel's edit is open.
+      expect(screen.getByTestId('surface-s-main')).toBeInTheDocument();
+      expect(editBoxes()).toHaveLength(1);
+
+      rerender(panels(false));
+
+      expect(screen.queryByTestId('surface-s-main')).not.toBeInTheDocument();
+      expect(useChatStore.getState().editingMessage).toEqual({
+        surfaceId: 's-panel',
+        messageId: 'm-1',
+      });
+      expect(editBoxes()).toHaveLength(1);
+    });
+
+    it('#1959 a row mounted not editing, then opened, stays open under StrictMode effect replay', () => {
+      // Count calls to the action the unmount cleanup uses: a replayed mount runs that cleanup
+      // once, which is the evidence that this render really replays effects.
+      const original = useChatStore.getState().clearEditingMessage;
+      const clearSpy = vi.fn(original);
+      act(() => useChatStore.setState({ clearEditingMessage: clearSpy }));
+
+      // StrictMode must be the TOPMOST element of a bare render to replay effects (tests.md).
+      bareRender(
+        <StrictMode>
+          <BrowserRouter>
+            <ModalProvider>
+              <Surface id="s1">{row(rowOne, 's1', vi.fn())}</Surface>
+            </ModalProvider>
+          </BrowserRouter>
+        </StrictMode>
+      );
+      // Gate: the replay ran the cleanup once and nothing is open yet.
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      expect(editBoxes()).toHaveLength(0);
+
+      openEdit('s1', 'm-1');
+
+      expect(editBoxes()).toHaveLength(1);
+      expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-1' });
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('content that arrives while the edit is open', () => {
+    // A live message is inserted as a fail-closed placeholder with empty text and an attachment
+    // (so it is editable), and its text lands later. Message takes its row as a prop, so the
+    // harness feeds it from the store the way the list does.
+    const CHANNEL = 'channel-1';
+    const placeholder = {
+      ...mockMessage,
+      id: 'm-late',
+      channel_id: CHANNEL,
+      content: '',
+      attachments: [{ ...mockAttachment, id: 'att-late' }],
+    } as MessageWithStatus;
+
+    function StoreBackedRow() {
+      const message = useChatStore((s) =>
+        s.messagesByChannel.get(CHANNEL)?.find((m) => m.id === 'm-late')
+      );
+      return <Surface id="s1">{message ? row(message, 's1', vi.fn()) : null}</Surface>;
+    }
+
+    const land = (content: string) =>
+      act(() => useChatStore.getState().updateMessage(CHANNEL, 'm-late', { content }));
+
+    beforeEach(() => {
+      act(() => useChatStore.getState().setMessages(CHANNEL, [placeholder]));
+    });
+
+    it('#1959 an untouched draft adopts the text when it arrives', () => {
+      render(<StoreBackedRow />);
+      openEdit('s1', 'm-late');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement;
+      // Gate: the box opened on the placeholder and is empty.
+      expect(textarea.value).toBe('');
+
+      land('Decrypted text');
+
+      expect(
+        (screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement).value
+      ).toBe('Decrypted text');
+    });
+
+    it('#1959 a draft the user changed is kept when newer text arrives', () => {
+      render(<StoreBackedRow />);
+      openEdit('s1', 'm-late');
+      land('Decrypted text');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement;
+      // Gate: the first arrival was adopted, so the draft is in step with the content.
+      expect(textarea.value).toBe('Decrypted text');
+      fireEvent.change(textarea, { target: { value: 'Decrypted text, my fix' } });
+      expect(textarea.value).toBe('Decrypted text, my fix');
+
+      land('Decrypted text from another device');
+
+      expect(
+        (screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement).value
+      ).toBe('Decrypted text, my fix');
+    });
+  });
+
+  describe('input method composition', () => {
+    it('#1959 Enter that commits an IME composition neither saves nor closes the box', () => {
+      const onEdit = renderRows();
+      openEdit('s1', 'm-2');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+      fireEvent.change(textarea, { target: { value: 'Rewritten body' } });
+      // Gate: the draft is submittable, so only the composition check can stop the save.
+      expect((textarea as HTMLTextAreaElement).value).toBe('Rewritten body');
+
+      fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+
+      expect(onEdit).not.toHaveBeenCalled();
+      expect(editBoxes()).toHaveLength(1);
+      expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-2' });
+
+      // Control: the same draft saves on a plain Enter, so the handler was live all along.
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+      expect(onEdit).toHaveBeenCalledWith('m-2', 'Rewritten body');
+    });
+
+    it('#1959 Escape that cancels an IME composition does not close the box', () => {
+      renderRows();
+      openEdit('s1', 'm-2');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+      expect(textarea).toHaveFocus();
+
+      fireEvent.keyDown(textarea, { key: 'Escape', isComposing: true });
+
+      expect(editBoxes()).toHaveLength(1);
+      expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-2' });
+    });
+  });
+
+  describe('a Save the server did not take', () => {
+    const ALERT = "Couldn't save your edit. Try again.";
+    const target = { ...mockMessage, id: 'm-2', content: 'Second message body' };
+
+    /** Opens m-2 in s1, rewrites it, presses Enter, and returns the textarea that was submitted. */
+    function submitRewrite(onEdit: (id: string, content: string) => EditResult) {
+      openEdit('s1', 'm-2');
+      const textarea = screen.getByRole('textbox', { name: 'Edit message' });
+      fireEvent.change(textarea, { target: { value: '  Rewritten body  ' } });
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+      // Gate: the optimistic close happened and nothing has been restored yet.
+      expect(onEdit).toHaveBeenCalledWith('m-2', 'Rewritten body');
+      expect(editBoxes()).toHaveLength(0);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    }
+
+    const settle = () => act(async () => {});
+
+    it.each([
+      ['false', () => Promise.resolve(false)],
+      ['undefined', () => Promise.resolve(undefined)],
+      ['a rejection', () => Promise.reject(new Error('network down'))],
+    ])(
+      '#1959 a save that resolves to %s reopens the box with the submitted text and an alert',
+      async (_label, outcome) => {
+        const onEdit = vi.fn(outcome);
+        render(<Surface id="s1">{row(target, 's1', onEdit)}</Surface>);
+        submitRewrite(onEdit);
+
+        await settle();
+
+        const textarea = screen.getByRole('textbox', {
+          name: 'Edit message',
+        }) as HTMLTextAreaElement;
+        expect(textarea.value).toBe('Rewritten body');
+        expect(screen.getByRole('alert')).toHaveTextContent(ALERT);
+        expect(useChatStore.getState().editingMessage).toEqual({
+          surfaceId: 's1',
+          messageId: 'm-2',
+        });
+
+        fireEvent.click(screen.getByText('Cancel'));
+
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(editBoxes()).toHaveLength(0);
+      }
+    );
+
+    it('#1959 resubmitting from the restored box clears the alert', async () => {
+      const onEdit = vi.fn(() => Promise.resolve(false));
+      render(<Surface id="s1">{row(target, 's1', onEdit)}</Surface>);
+      submitRewrite(onEdit);
+      await settle();
+      // Gate: the alert is showing.
+      expect(screen.getByRole('alert')).toHaveTextContent(ALERT);
+
+      fireEvent.keyDown(screen.getByRole('textbox', { name: 'Edit message' }), { key: 'Enter' });
+
+      expect(onEdit).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(editBoxes()).toHaveLength(0);
+    });
+
+    it('#1959 a save that resolves true leaves the box closed with no alert', async () => {
+      const onEdit = vi.fn(() => Promise.resolve(true));
+      render(<Surface id="s1">{row(target, 's1', onEdit)}</Surface>);
+      submitRewrite(onEdit);
+
+      await settle();
+
+      expect(editBoxes()).toHaveLength(0);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(useChatStore.getState().editingMessage).toBeNull();
+    });
+
+    it('#1959 a failure that lands after the row unmounted reopens nothing and does not throw', async () => {
+      let resolveSave: (saved: boolean) => void = () => {};
+      const onEdit = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveSave = resolve;
+          })
+      );
+      const { unmount } = render(<Surface id="s1">{row(target, 's1', onEdit)}</Surface>);
+      submitRewrite(onEdit);
+      unmount();
+      // Gate: the row is gone before the save settles.
+      expect(screen.queryByTestId('surface-s1')).not.toBeInTheDocument();
+
+      await expect(
+        act(async () => {
+          resolveSave(false);
+        })
+      ).resolves.toBeUndefined();
+
+      expect(useChatStore.getState().editingMessage).toBeNull();
+      expect(editBoxes()).toHaveLength(0);
+    });
+
+    it('#1959 a failure does not displace another edit opened in the same surface meanwhile', async () => {
+      let resolveSave: (saved: boolean) => void = () => {};
+      const onEdit = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveSave = resolve;
+          })
+      );
+      const other = { ...mockMessage, id: 'm-1', content: 'First message body' };
+      render(
+        <Surface id="s1">
+          {row(other, 's1', vi.fn())}
+          {row(target, 's1', onEdit)}
+        </Surface>
+      );
+      submitRewrite(onEdit);
+      openEdit('s1', 'm-1');
+      // Gate: the other row's edit is open before the first save settles.
+      expect(editBoxes()).toHaveLength(1);
+      expect(editBoxes()[0].value).toBe('First message body');
+
+      await act(async () => {
+        resolveSave(false);
+      });
+
+      expect(useChatStore.getState().editingMessage).toEqual({ surfaceId: 's1', messageId: 'm-1' });
+      expect(editBoxes()).toHaveLength(1);
+      expect(editBoxes()[0].value).toBe('First message body');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('#1959 an edit open in a different surface does not block the restore', async () => {
+      const onEdit = vi.fn(() => Promise.resolve(false));
+      render(
+        <>
+          <Surface id="s1">{row(target, 's1', onEdit)}</Surface>
+          <Surface id="s2">
+            {row({ ...mockMessage, id: 'm-9', content: 'Elsewhere' }, 's2')}
+          </Surface>
+        </>
+      );
+      submitRewrite(onEdit);
+      openEdit('s2', 'm-9');
+      // Gate: the other surface's edit is open.
+      expect(editBoxes(screen.getByTestId('surface-s2'))).toHaveLength(1);
+
+      await settle();
+
+      expect(editBoxes(screen.getByTestId('surface-s1'))).toHaveLength(1);
+      expect(editBoxes(screen.getByTestId('surface-s1'))[0].value).toBe('Rewritten body');
+      expect(screen.getByRole('alert')).toHaveTextContent(ALERT);
+    });
+  });
+
+  describe('an own message that cannot be read', () => {
+    const unreadable = { ...mockMessage, id: 'm-unreadable', decryptFailed: true };
+
+    it('#1959 the options menu offers Delete but not Edit', () => {
+      // Control: the readable message offers both, so the Edit omission below is the gate.
+      const { unmount } = render(
+        <Surface id="s1">{row(mockMessage, 's1', vi.fn(), { onDelete: vi.fn() })}</Surface>
+      );
+      fireEvent.click(screen.getByLabelText('Message options'));
+      expect(screen.getByText('Edit')).toBeInTheDocument();
+      expect(screen.getByText('Delete')).toBeInTheDocument();
+      unmount();
+
+      render(<Surface id="s1">{row(unreadable, 's1', vi.fn(), { onDelete: vi.fn() })}</Surface>);
+      fireEvent.click(screen.getByLabelText('Message options'));
+
+      expect(screen.getByText('Delete')).toBeInTheDocument();
+      expect(screen.queryByText('Edit')).not.toBeInTheDocument();
+    });
+
+    it('#1959 the context menu offers Delete Message but not Edit Message', () => {
+      const { unmount } = render(
+        <Surface id="s1">{row(mockMessage, 's1', vi.fn(), { onDelete: vi.fn() })}</Surface>
+      );
+      fireEvent.contextMenu(document.querySelector('article.message') as HTMLElement);
+      expect(screen.getByText('Edit Message')).toBeInTheDocument();
+      expect(screen.getByText('Delete Message')).toBeInTheDocument();
+      unmount();
+
+      render(<Surface id="s1">{row(unreadable, 's1', vi.fn(), { onDelete: vi.fn() })}</Surface>);
+      fireEvent.contextMenu(document.querySelector('article.message') as HTMLElement);
+
+      expect(screen.getByText('Delete Message')).toBeInTheDocument();
+      expect(screen.queryByText('Edit Message')).not.toBeInTheDocument();
+    });
+
+    it('#1959 an open edit closes its box when the row becomes unreadable', () => {
+      const { rerender } = render(<Surface id="s1">{row(mockMessage, 's1', vi.fn())}</Surface>);
+      openEdit('s1', mockMessage.id);
+      // Gate: the readable row shows its edit box.
+      expect(editBoxes()).toHaveLength(1);
+
+      rerender(
+        <Surface id="s1">{row({ ...mockMessage, decryptFailed: true }, 's1', vi.fn())}</Surface>
+      );
+
+      expect(editBoxes()).toHaveLength(0);
+      expect(screen.getByText(/unable to decrypt/i)).toBeInTheDocument();
+    });
+  });
+
+  describe('caret placement when the edit box opens', () => {
+    const body = 'Fix the typo at the end';
+    const caretRow = { ...mockMessage, id: 'm-caret', content: body };
+
+    it('#1959 opening through the store leaves the caret after the last character', () => {
+      render(<Surface id="s1">{row(caretRow, 's1', vi.fn())}</Surface>);
+      // Gate: no edit box yet, and the precondition that 0 and the length differ.
+      expect(screen.queryByRole('textbox', { name: 'Edit message' })).not.toBeInTheDocument();
+      expect(body.length).toBeGreaterThan(0);
+
+      openEdit('s1', caretRow.id);
+
+      const textarea = screen.getByRole('textbox', {
+        name: 'Edit message',
+      }) as HTMLTextAreaElement;
+      expect(textarea.value).toBe(body);
+      expect(textarea.selectionStart).toBe(body.length);
+      expect(textarea.selectionEnd).toBe(body.length);
+    });
+
+    it('#1959 opening through the Edit action leaves the caret after the last character', () => {
+      render(<Surface id="s1">{row(caretRow, 's1', vi.fn())}</Surface>);
+      expect(screen.queryByRole('textbox', { name: 'Edit message' })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByLabelText('Message options'));
+      fireEvent.click(screen.getByText('Edit'));
+
+      const textarea = screen.getByRole('textbox', {
+        name: 'Edit message',
+      }) as HTMLTextAreaElement;
+      expect(textarea.value).toBe(body);
+      expect(textarea.selectionStart).toBe(body.length);
+      expect(textarea.selectionEnd).toBe(body.length);
+    });
+
+    it('#1959 a re-render that leaves the value alone does not move a caret the user placed', () => {
+      const onEdit = vi.fn();
+      const { rerender } = render(<Surface id="s1">{row(caretRow, 's1', onEdit)}</Surface>);
+      openEdit('s1', caretRow.id);
+      const textarea = screen.getByRole('textbox', {
+        name: 'Edit message',
+      }) as HTMLTextAreaElement;
+      // Gate: the mount placement happened, so moving the caret below is a real change.
+      expect(textarea.selectionStart).toBe(body.length);
+
+      textarea.setSelectionRange(2, 2);
+      expect(textarea.selectionStart).toBe(2);
+
+      // A new message object with identical content forces the row (and the edit box) to
+      // re-render without touching the textarea's value.
+      rerender(<Surface id="s1">{row({ ...caretRow }, 's1', onEdit)}</Surface>);
+
+      const after = screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement;
+      expect(after).toBe(textarea);
+      expect(after.value).toBe(body);
+      expect(after.selectionStart).toBe(2);
+      expect(after.selectionEnd).toBe(2);
+    });
+
+    describe('scrolling the caret into view', () => {
+      // jsdom lays nothing out: scrollHeight is 0 and scrollTop ignores writes. Stub both on the
+      // prototype so `scrollTop = scrollHeight` has something to observe. scrollTop starts at 0
+      // like a fresh element, so only the production assignment can make the two equal.
+      const SCROLL_HEIGHT = 480;
+      const scrollTops = new WeakMap<object, number>();
+      const originalScrollHeight = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        'scrollHeight'
+      );
+      const originalScrollTop = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        'scrollTop'
+      );
+
+      beforeEach(() => {
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
+          configurable: true,
+          get: () => SCROLL_HEIGHT,
+        });
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollTop', {
+          configurable: true,
+          get(this: object) {
+            return scrollTops.get(this) ?? 0;
+          },
+          set(this: object, value: number) {
+            scrollTops.set(this, value);
+          },
+        });
+      });
+
+      afterEach(() => {
+        for (const [name, original] of [
+          ['scrollHeight', originalScrollHeight],
+          ['scrollTop', originalScrollTop],
+        ] as const) {
+          if (original) Object.defineProperty(HTMLTextAreaElement.prototype, name, original);
+          else delete (HTMLTextAreaElement.prototype as unknown as Record<string, unknown>)[name];
+        }
+      });
+
+      it('#1959 a long message opens scrolled to its end', () => {
+        render(<Surface id="s1">{row(caretRow, 's1', vi.fn())}</Surface>);
+        // Gate: a fresh textarea reads 0 for scrollTop while its scrollHeight is non-zero, so
+        // equality below can only come from the mount-time assignment.
+        const probe = document.createElement('textarea');
+        expect(probe.scrollTop).toBe(0);
+        expect(probe.scrollHeight).toBe(SCROLL_HEIGHT);
+
+        openEdit('s1', caretRow.id);
+
+        const textarea = screen.getByRole('textbox', {
+          name: 'Edit message',
+        }) as HTMLTextAreaElement;
+        expect(textarea.scrollTop).toBe(SCROLL_HEIGHT);
+        expect(textarea.scrollTop).toBe(textarea.scrollHeight);
+      });
+    });
   });
 });

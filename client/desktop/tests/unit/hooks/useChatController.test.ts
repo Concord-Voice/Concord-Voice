@@ -627,7 +627,7 @@ describe('useChatController', () => {
         mockApiFetch.mockReturnValueOnce(response.promise);
 
         const { result } = renderHook(() => useChatController(ctx));
-        let editPromise!: Promise<void>;
+        let editPromise!: Promise<boolean | undefined>;
         await act(async () => {
           editPromise = result.current.editMessage(messageId, 'freshwalrus');
           await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledOnce());
@@ -658,6 +658,154 @@ describe('useChatController', () => {
         expect(searchMessages('freshwalrus', ctx.id)).not.toContain(messageId);
       }
     );
+
+    // #1959: the resolved value tells the row whether the user's text still needs giving back.
+    describe('resolved value (#1959)', () => {
+      const savedResponse = {
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            message: {
+              content: 'encrypted-content',
+              key_version: 1,
+              edited_at: '2025-01-01T13:00:00Z',
+            },
+          }),
+      };
+
+      it('resolves true when the edit was saved and the row was updated', async () => {
+        mockApiFetch.mockResolvedValueOnce(savedResponse);
+        useChatStore.getState().addMessage('channel-2', {
+          ...mockMessage,
+          id: 'msg-1',
+          channel_id: 'channel-2',
+        });
+
+        const { result } = renderHook(() => useChatController(encryptedChannelCtx));
+        let resolved: boolean | undefined;
+        await act(async () => {
+          resolved = await result.current.editMessage('msg-1', 'saved text');
+        });
+
+        expect(resolved).toBe(true);
+        // The outermost observable: the store row really holds the saved text.
+        expect(
+          useChatStore
+            .getState()
+            .messagesByChannel.get('channel-2')
+            ?.find((message) => message.id === 'msg-1')?.content
+        ).toBe('saved text');
+      });
+
+      it('resolves false when the PATCH rejects, and leaves the row untouched', async () => {
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        mockApiFetch.mockRejectedValueOnce(new Error('network down'));
+        useChatStore.getState().addMessage('channel-2', {
+          ...mockMessage,
+          id: 'msg-1',
+          channel_id: 'channel-2',
+          content: 'original text',
+        });
+
+        try {
+          const { result } = renderHook(() => useChatController(encryptedChannelCtx));
+          let resolved: boolean | undefined;
+          await act(async () => {
+            resolved = await result.current.editMessage('msg-1', 'unsaved text');
+          });
+
+          expect(mockApiFetch).toHaveBeenCalledOnce();
+          expect(resolved).toBe(false);
+          expect(
+            useChatStore
+              .getState()
+              .messagesByChannel.get('channel-2')
+              ?.find((message) => message.id === 'msg-1')?.content
+          ).toBe('original text');
+        } finally {
+          consoleSpy.mockRestore();
+        }
+      });
+
+      it('does not resolve true when E2EE is not initialized, and sends nothing', async () => {
+        // Gate: with E2EE ready the same call resolves true, so the refusal below is the
+        // initialization check and not a broken fixture.
+        mockApiFetch.mockResolvedValueOnce(savedResponse);
+        const ready = renderHook(() => useChatController(encryptedChannelCtx));
+        let readyResolved: boolean | undefined;
+        await act(async () => {
+          readyResolved = await ready.result.current.editMessage('msg-1', 'edit');
+        });
+        expect(readyResolved).toBe(true);
+        expect(mockApiFetch).toHaveBeenCalledOnce();
+        mockApiFetch.mockClear();
+
+        mockE2EEIsInitialized = false;
+        const { result } = renderHook(() => useChatController(encryptedChannelCtx));
+        let resolved: boolean | undefined;
+        await act(async () => {
+          resolved = await result.current.editMessage('msg-1', 'edit');
+        });
+
+        // The contract is "anything other than true means not saved" (it is undefined).
+        expect(resolved).not.toBe(true);
+        expect(mockApiFetch).not.toHaveBeenCalled();
+      });
+
+      it('does not resolve true when the chat context has no id, and sends nothing', async () => {
+        const { result } = renderHook(() =>
+          useChatController({ type: 'channel', id: '', serverId: 'server-1' })
+        );
+        let resolved: boolean | undefined;
+        await act(async () => {
+          resolved = await result.current.editMessage('msg-1', 'edit');
+        });
+
+        expect(resolved).not.toBe(true);
+        expect(mockApiFetch).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['channel', encryptedChannelCtx],
+        ['DM', encryptedDMCtx],
+      ] as const)(
+        'resolves true when the %s message was deleted while the PATCH was in flight',
+        async (_, ctx) => {
+          const messageId = `msg-resolved-deleted-${ctx.type}`;
+          const response = deferred<Response>();
+          useChatStore.getState().addMessage(ctx.id, {
+            ...mockMessage,
+            id: messageId,
+            channel_id: ctx.id,
+          });
+          mockApiFetch.mockReturnValueOnce(response.promise);
+
+          const { result } = renderHook(() => useChatController(ctx));
+          let editPromise!: Promise<boolean | undefined>;
+          await act(async () => {
+            editPromise = result.current.editMessage(messageId, 'late edit');
+            await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledOnce());
+          });
+
+          useChatStore.getState().deleteMessage(ctx.id, messageId);
+          response.resolve(savedResponse as Response);
+          let resolved: boolean | undefined;
+          await act(async () => {
+            resolved = await editPromise;
+          });
+
+          // Nothing to give back: the message is gone, so the row must not restore text.
+          expect(resolved).toBe(true);
+          expect(
+            useChatStore
+              .getState()
+              .messagesByChannel.get(ctx.id)
+              ?.some((message) => message.id === messageId)
+          ).toBe(false);
+        }
+      );
+    });
 
     it('handles edit failure gracefully', async () => {
       mockApiFetch.mockResolvedValue({

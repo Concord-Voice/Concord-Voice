@@ -63,43 +63,54 @@ vi.mock('@/renderer/components/Chat/MessageList', () => ({
   },
 }));
 
+// Capture MessageInput props so a test can invoke the callbacks the composer owner passes in
+// (the real composer is mocked, so ArrowUp cannot be pressed on a textarea here).
+let capturedMessageInputProps: { onEditLastMessage?: () => void } = {};
+
 vi.mock('@/renderer/components/Chat/MessageInput', () => ({
-  default: ({
-    channelName,
-    disabled,
-    isChannelEncrypted,
-    serverId,
-    channelId,
-    onSendMessage,
-    expirationClause,
-  }: {
+  default: (props: {
     channelName?: string;
     disabled: boolean;
     isChannelEncrypted?: boolean;
     serverId?: string;
     channelId?: string;
     onSendMessage?: (...args: unknown[]) => void;
+    onEditLastMessage?: () => void;
     // The composer renders this slot, so a mock that drops it makes the
     // indicator invisible to every assertion with no error to explain why.
     expirationClause?: string | null;
-  }) => (
-    <div
-      data-testid="message-input"
-      data-channel={channelName}
-      data-disabled={disabled}
-      data-encrypted={isChannelEncrypted}
-      data-server-id={serverId}
-      data-channel-id={channelId}
-    >
-      <span>{`Messages are Encrypted End-to-End${expirationClause ?? ''}`}</span>
-      <button
-        data-testid="mock-send-btn"
-        onClick={() => onSendMessage?.('hello', undefined, undefined, ['att-1'], [{ id: 'att-1' }])}
+  }) => {
+    capturedMessageInputProps = props;
+    const {
+      channelName,
+      disabled,
+      isChannelEncrypted,
+      serverId,
+      channelId,
+      onSendMessage,
+      expirationClause,
+    } = props;
+    return (
+      <div
+        data-testid="message-input"
+        data-channel={channelName}
+        data-disabled={disabled}
+        data-encrypted={isChannelEncrypted}
+        data-server-id={serverId}
+        data-channel-id={channelId}
       >
-        Send
-      </button>
-    </div>
-  ),
+        <span>{`Messages are Encrypted End-to-End${expirationClause ?? ''}`}</span>
+        <button
+          data-testid="mock-send-btn"
+          onClick={() =>
+            onSendMessage?.('hello', undefined, undefined, ['att-1'], [{ id: 'att-1' }])
+          }
+        >
+          Send
+        </button>
+      </div>
+    );
+  },
 }));
 
 // Mock hooks
@@ -149,6 +160,7 @@ describe('ChatView', () => {
     mockPinMessage.mockReset();
     mockUnpinMessage.mockReset();
     capturedMessageListProps = {};
+    capturedMessageInputProps = {};
     useUserStore.setState({ user: mockUser });
     useChannelStore.setState({ channels: [mockChannel], activeChannelId: null });
     useServerStore.setState({ activeServerId: 'server-1' });
@@ -1097,5 +1109,94 @@ describe('ChatView', () => {
     await waitFor(() =>
       expect(screen.queryByRole('dialog', { name: 'Purge Messages' })).not.toBeInTheDocument()
     );
+  });
+});
+
+describe('ChatView Up Arrow edits the last own message (#1959)', () => {
+  // A sibling describe does not inherit the outer beforeEach, so seed what ChatView needs here.
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    capturedMessageListProps = {};
+    capturedMessageInputProps = {};
+    useUserStore.setState({ user: mockUser });
+    useChannelStore.setState({
+      channels: [mockChannel],
+      activeChannelId: 'channel-1',
+      currentServerId: 'server-1',
+    });
+    useServerStore.setState({ activeServerId: 'server-1' });
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ messages: [] }),
+    });
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockResolvedValue([]);
+  });
+
+  // The surface id the owner handed to MessageList must be the id on its root element: that
+  // equality is what ties a row's edit to this panel and no other.
+  function listSurfaceId(container: HTMLElement): string {
+    const passed = capturedMessageListProps.surfaceId;
+    expect(typeof passed).toBe('string');
+    expect(passed).not.toBe('');
+    expect(container.querySelector('.chat-view')?.getAttribute('data-chat-surface')).toBe(passed);
+    return passed as string;
+  }
+
+  const olderOwn = { ...mockMessage, id: 'own-older', created_at: '2025-01-01T12:00:00Z' };
+  const newestOwn = { ...mockMessage, id: 'own-newest', created_at: '2025-01-01T12:05:00Z' };
+  const newestFromOther = {
+    ...mockMessage2,
+    id: 'other-newest',
+    created_at: '2025-01-01T12:06:00Z',
+  };
+
+  it('hands the composer a callback that opens the newest own message for editing', () => {
+    useChatStore.setState({
+      messagesByChannel: new Map([['channel-1', [olderOwn, newestOwn]]]),
+      isConnected: true,
+    });
+    const { container } = render(<ChatView />);
+
+    // Positive gate: the wiring exists before anything is asserted about its effect.
+    expect(capturedMessageInputProps.onEditLastMessage).toEqual(expect.any(Function));
+    expect(useChatStore.getState().editingMessage).toBeNull();
+
+    act(() => capturedMessageInputProps.onEditLastMessage?.());
+
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: listSurfaceId(container),
+      messageId: 'own-newest',
+    });
+  });
+
+  it('skips other authors rows and opens the user own newest message', () => {
+    useChatStore.setState({
+      messagesByChannel: new Map([['channel-1', [olderOwn, newestOwn, newestFromOther]]]),
+      isConnected: true,
+    });
+    const { container } = render(<ChatView />);
+    expect(capturedMessageInputProps.onEditLastMessage).toEqual(expect.any(Function));
+
+    act(() => capturedMessageInputProps.onEditLastMessage?.());
+
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: listSurfaceId(container),
+      messageId: 'own-newest',
+    });
+  });
+
+  it('opens nothing when the thread holds no message by the current user', () => {
+    useChatStore.setState({
+      messagesByChannel: new Map([['channel-1', [newestFromOther]]]),
+      isConnected: true,
+    });
+    render(<ChatView />);
+    expect(capturedMessageInputProps.onEditLastMessage).toEqual(expect.any(Function));
+
+    act(() => capturedMessageInputProps.onEditLastMessage?.());
+
+    expect(useChatStore.getState().editingMessage).toBeNull();
   });
 });

@@ -43,7 +43,12 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
 
   it('renders a :smile:-only message at emoji-jumbo-1 (parity with a literal 😄)', () => {
     const { container } = render(
-      <Message message={makeMessage(':smile:')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage(':smile:')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     const messageText = container.querySelector('.message-text');
     // The jumbo class is the discriminator: absent before the fix, present after.
@@ -54,7 +59,12 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
 
   it('renders a literal 😄-only message at emoji-jumbo-1 (baseline both paths must match)', () => {
     const { container } = render(
-      <Message message={makeMessage('😄')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage('😄')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     const messageText = container.querySelector('.message-text');
     expect(messageText?.className).toContain('emoji-jumbo-1');
@@ -62,21 +72,36 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
 
   it('renders :smile::smile: at emoji-jumbo-2 (count scales with expanded emoji)', () => {
     const { container } = render(
-      <Message message={makeMessage(':smile::smile:')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage(':smile::smile:')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     expect(container.querySelector('.message-text')?.className).toContain('emoji-jumbo-2');
   });
 
   it('does NOT jumbo-scale mixed ":smile: hi" (still normal inline text)', () => {
     const { container } = render(
-      <Message message={makeMessage(':smile: hi')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage(':smile: hi')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     expect(container.querySelector('.message-text')?.className).not.toContain('emoji-jumbo');
   });
 
   it('preserves the code-span guard: `:smile:` renders literal, no expansion, no jumbo', () => {
     const { container } = render(
-      <Message message={makeMessage('`:smile:`')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage('`:smile:`')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     const messageText = container.querySelector('.message-text');
     expect(messageText?.className).not.toContain('emoji-jumbo');
@@ -88,7 +113,12 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
     // so markdown renders literal ":smile:". The jumbo decision must agree and
     // NOT expand it into a jumbo 😄 (the divergence #2070 set out to eliminate).
     const { container } = render(
-      <Message message={makeMessage('    :smile:')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage('    :smile:')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     const messageText = container.querySelector('.message-text');
     expect(messageText?.className).not.toContain('emoji-jumbo');
@@ -99,6 +129,7 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
   it('does NOT jumbo-scale an unknown shortcode (:definitelynotareal:)', () => {
     const { container } = render(
       <Message
+        surfaceId="s1"
         message={makeMessage(':definitelynotareal:')}
         currentUserId="user-2"
         showAvatar={true}
@@ -111,7 +142,12 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
   // (`    😄` is a code block markdown renders literally, not a jumbo emoji).
   it('does NOT jumbo-scale an indented (code-block) literal "    😄"', () => {
     const { container } = render(
-      <Message message={makeMessage('    😄')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage('    😄')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     expect(container.querySelector('.message-text')?.className).not.toContain('emoji-jumbo');
   });
@@ -121,7 +157,12 @@ describe('Message :shortcode: jumbo scaling (#2070)', () => {
   // stripped), matching the preexisting literal `😄\n😄` jumbo behavior.
   it('jumbo-scales a multi-line shortcode-only message ":smile:\\n:smile:" as jumbo-2', () => {
     const { container } = render(
-      <Message message={makeMessage(':smile:\n:smile:')} currentUserId="user-2" showAvatar={true} />
+      <Message
+        surfaceId="s1"
+        message={makeMessage(':smile:\n:smile:')}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
     );
     expect(container.querySelector('.message-text')?.className).toContain('emoji-jumbo-2');
   });

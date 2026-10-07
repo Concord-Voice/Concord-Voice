@@ -264,7 +264,10 @@ export function useChatController(ctx: ChatContext) {
           .getState()
           .messagesByChannel.get(ctx.id)
           ?.some((candidate) => candidate.id === messageId);
-        if (!messageStillExists) return;
+        // #1959: resolve true only when there is nothing to give back — the edit was saved, or
+        // the message is gone. Any other outcome (no context, e2ee not ready, a failed PATCH)
+        // means the user's text never reached the server, and the row restores it.
+        if (!messageStillExists) return true;
 
         updateMessage(ctx.id, messageId, {
           content: newContent,
@@ -280,12 +283,14 @@ export function useChatController(ctx: ChatContext) {
         } else {
           removeMessage(messageId);
         }
+        return true;
       } catch (err) {
         if (isDM) {
           console.error('Failed to edit DM message:', (err as Error).message);
         } else {
           console.error('Failed to edit message:', (err as Error).message);
         }
+        return false;
       }
     },
     [ctx.id, isDM, updateMessage]

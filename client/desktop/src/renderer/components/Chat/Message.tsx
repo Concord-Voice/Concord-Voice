@@ -5,6 +5,9 @@ import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore
 import { useDMStore, type DMParticipant } from '../../stores/chat/dmStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
+import { useChatStore } from '../../stores/chat/chatStore';
+import { canEditMessage } from '../../utils/chat/latestEditableOwnMessage';
+import { focusSurfaceComposer } from './chatSurface';
 import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import MessageAvatar from './MessageAvatar';
 import MessageActions from './MessageActions';
@@ -41,8 +44,10 @@ const EMPTY_DM_PARTICIPANTS: never[] = [];
 export interface MessageProps {
   message: MessageWithStatus;
   currentUserId: string;
+  /** The chat panel this row is in (#1959): scopes its edit and where focus returns. */
+  surfaceId: string;
   chatContext?: ChatContextType;
-  onEdit?: (messageId: string, newContent: string) => void;
+  onEdit?: EditHandler;
   onDelete?: (messageId: string) => void;
   onReply?: (message: MessageWithStatus) => void;
   onScrollToMessage?: (messageId: string) => void;
@@ -77,10 +82,30 @@ function formatTimestamp(timestamp: string): string {
   });
 }
 
+/**
+ * Puts the caret after the last character when the edit box mounts, and scrolls the box so the
+ * caret is in view (#1959). `autoFocus` alone leaves it at the start, so fixing a typo at the
+ * end of a message opened with Up Arrow or Edit first meant moving the caret. A stable
+ * module-level ref callback runs on mount only, never on a re-render, so it cannot move a caret
+ * the user has placed.
+ */
+function placeCaretAtEnd(el: HTMLTextAreaElement | null): void {
+  if (!el) return;
+  const end = el.value.length;
+  el.setSelectionRange(end, end);
+  el.scrollTop = el.scrollHeight;
+}
+
+/** What a row's `onEdit` handler may return: a promise that resolves `true` once the edit is
+ *  saved. Anything else it resolves to, or a rejection, means the text never reached the server,
+ *  and the row gives the draft back instead of losing it. */
+type EditHandler = (messageId: string, newContent: string) => void | Promise<boolean | void>;
+
 /** Inline edit box with save/cancel actions. */
 function MessageEditBox({
   content,
   originalContent,
+  saveFailed,
   onChange,
   onKeyDown,
   onSubmit,
@@ -88,6 +113,7 @@ function MessageEditBox({
 }: Readonly<{
   content: string;
   originalContent: string;
+  saveFailed: boolean;
   onChange: (value: string) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
   onSubmit: () => void;
@@ -97,12 +123,19 @@ function MessageEditBox({
     <div className="message-edit-box">
       <textarea
         className="message-edit-input"
+        aria-label="Edit message"
+        ref={placeCaretAtEnd}
         value={content}
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={onKeyDown}
         autoFocus
         rows={3}
       />
+      {saveFailed && (
+        <p className="message-edit-error" role="alert">
+          Couldn&apos;t save your edit. Try again.
+        </p>
+      )}
       <div className="message-edit-actions">
         <button className="btn-edit-cancel" onClick={onCancel}>
           Cancel
@@ -184,24 +217,24 @@ function MessageHeader({
   );
 }
 
-/** Submits an edit if the content has meaningfully changed. Returns true if submitted. */
+/** Submits an edit if the content has meaningfully changed. Returns null when nothing was
+ *  submitted, otherwise the submitted text and the handler's result. */
 function trySubmitEdit(
   editContent: string,
   originalContent: string,
   messageId: string,
-  onEdit?: (id: string, content: string) => void
-): boolean {
+  onEdit?: EditHandler
+): { trimmed: string; result: void | Promise<boolean | void> } | null {
   const trimmed = editContent.trim();
-  if (!trimmed || trimmed === originalContent || !onEdit) return false;
-  onEdit(messageId, trimmed);
-  return true;
+  if (!trimmed || trimmed === originalContent || !onEdit) return null;
+  return { trimmed, result: onEdit(messageId, trimmed) };
 }
 
-/** Handles keyboard shortcuts in the message edit textarea. */
 /** Renders the message actions bar, context menu, delete modal, and reaction picker. */
 function MessageOverlays({
   message,
   canModify,
+  canEdit,
   isEditing,
   isOwnMessage,
   shiftHeld,
@@ -220,6 +253,7 @@ function MessageOverlays({
 }: Readonly<{
   message: MessageWithStatus;
   canModify: boolean;
+  canEdit: boolean;
   isEditing: boolean;
   isOwnMessage: boolean;
   shiftHeld: boolean;
@@ -230,14 +264,15 @@ function MessageOverlays({
   setContextMenu: (v: { x: number; y: number } | null) => void;
   reactionPicker: { x: number; y: number } | null;
   setReactionPicker: (v: { x: number; y: number } | null) => void;
-  onEdit?: (messageId: string, newContent: string) => void;
+  onEdit?: EditHandler;
   onDelete?: (messageId: string) => void;
   onReply?: (message: MessageWithStatus) => void;
   onPinToggle?: (message: MessageWithStatus) => void;
   canPin?: boolean;
 }>) {
-  // Pre-compute conditional callbacks to keep JSX complexity flat
-  const editHandler = canModify && onEdit ? () => setIsEditing(true) : undefined;
+  // Pre-compute conditional callbacks to keep JSX complexity flat. Edit and Delete have
+  // different gates: an own message that cannot be read can still be deleted, never edited.
+  const editHandler = canEdit && onEdit ? () => setIsEditing(true) : undefined;
   const deleteHandler = canModify ? onDelete : undefined;
   const requestDeleteHandler = canModify ? () => setShowDeleteModal(true) : undefined;
   const replyHandler = onReply ? () => onReply(message) : undefined;
@@ -281,7 +316,7 @@ function MessageOverlays({
           isOwnMessage={isOwnMessage}
           canModify={canModify}
           onClose={() => setContextMenu(null)}
-          onEdit={() => setIsEditing(true)}
+          onEdit={editHandler}
           onDelete={() => {
             if (onDelete) {
               setShowDeleteModal(true);
@@ -310,7 +345,10 @@ function MessageOverlays({
   );
 }
 
+/** Handles keyboard shortcuts in the message edit textarea. A key that steers or ends an IME
+ *  composition belongs to the input method: Enter there commits the text, not the edit. */
 function handleEditKeyDown(e: React.KeyboardEvent, onSubmit: () => void, onCancel: () => void) {
+  if (e.nativeEvent.isComposing) return;
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     onSubmit();
@@ -503,6 +541,7 @@ function getAttachmentMessageBody(
 const Message: React.FC<MessageProps> = ({
   message,
   currentUserId,
+  surfaceId,
   chatContext = 'channel',
   onEdit,
   onDelete,
@@ -517,22 +556,58 @@ const Message: React.FC<MessageProps> = ({
   const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
   const gifPlayback = useSettingsStore((s) => s.appearance.gifPlayback);
   const loadGifsAutomatically = usePrivacyStore((s) => s.settings.loadGifsAutomatically);
-  const [isEditing, setIsEditing] = useState(false);
+  // #1959: the edit box is open when the store's open edit is this row in this chat surface,
+  // so the composer's Up Arrow shortcut can open it. The surface keeps two panels that show
+  // the same channel from opening the same edit. `setIsEditing` keeps the child props' boolean
+  // contract: true opens this row's edit, false clears it only if it is still this row's.
+  const isOwnMessage = message.user_id === currentUserId;
+  const canModify = isOwnMessage && isServerMessage(message);
+  const canEdit = canEditMessage(message, currentUserId);
+  const editingHere = useChatStore((s) => {
+    const editing = s.editingMessage;
+    return editing !== null && editing.surfaceId === surfaceId && editing.messageId === message.id;
+  });
+  // `canEdit` is part of the test, not only of the Edit actions: a row that stops being readable
+  // closes its box, and no store writer can open an edit on a row its user may not edit.
+  const isEditing = editingHere && canEdit;
+  const setEditingMessage = useChatStore((s) => s.setEditingMessage);
+  const clearEditingMessage = useChatStore((s) => s.clearEditingMessage);
+  const setIsEditing = useCallback(
+    (editing: boolean) => {
+      if (editing) setEditingMessage(surfaceId, message.id);
+      else clearEditingMessage(surfaceId, message.id);
+    },
+    [clearEditingMessage, message.id, setEditingMessage, surfaceId]
+  );
+  // An edit closes when its row unmounts — a channel or DM switch, or a panel closing — so an
+  // abandoned edit does not reopen, and take focus from the composer, when the row comes back.
+  useEffect(
+    () => () => clearEditingMessage(surfaceId, message.id),
+    [clearEditingMessage, message.id, surfaceId]
+  );
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const [editContent, setEditContent] = useState(message.content);
+  const [saveFailed, setSaveFailed] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [reactionPicker, setReactionPicker] = useState<{ x: number; y: number } | null>(null);
 
-  // Sync editContent when message content changes externally (not while editing)
+  // Keep the draft in step with the message. While not editing it mirrors the content. While
+  // editing it takes a new content only if the user has not changed the draft, so an edit
+  // opened before the text arrived (a decrypt landing, an edit from another device) fills in
+  // instead of staying stale, and text the user typed is never overwritten (#1959).
+  const syncedContentRef = useRef(message.content);
   useEffect(() => {
-    if (!isEditing) {
-      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets editContent from message.content when message is updated externally (not while user is editing); not a render loop
-      setEditContent(message.content);
-    }
+    const previous = syncedContentRef.current;
+    syncedContentRef.current = message.content;
+    setEditContent((draft) => (!isEditing || draft === previous ? message.content : draft));
   }, [message.content, isEditing]);
-
-  const isOwnMessage = message.user_id === currentUserId;
-  const canModify = isOwnMessage && isServerMessage(message);
 
   // Gate inside selectors so DM messages return stable empty refs and don't
   // re-render on unrelated server member/role store updates.
@@ -581,16 +656,49 @@ const Message: React.FC<MessageProps> = ({
     setContextMenu({ x: e.clientX, y: e.clientY });
   }, []);
 
+  // An edit the server never received is given back rather than lost: the box reopens with
+  // the user's text and says so. Skipped when the row has unmounted, or when another edit has
+  // been opened in this surface since — that edit keeps its own draft.
+  const restoreFailedEdit = useCallback(
+    (draft: string) => {
+      if (!mountedRef.current) return;
+      if (useChatStore.getState().editingMessage?.surfaceId === surfaceId) return;
+      setEditContent(draft);
+      setSaveFailed(true);
+      setIsEditing(true);
+    },
+    [setIsEditing, surfaceId]
+  );
+
   const handleEditSubmit = useCallback(() => {
-    if (trySubmitEdit(editContent, message.content, message.id, onEdit)) {
-      setIsEditing(false);
-    }
-  }, [editContent, message.content, message.id, onEdit]);
+    const submitted = trySubmitEdit(editContent, message.content, message.id, onEdit);
+    if (!submitted) return;
+    setSaveFailed(false);
+    setIsEditing(false);
+    focusSurfaceComposer(surfaceId);
+    if (!(submitted.result instanceof Promise)) return;
+    submitted.result.then(
+      (saved) => {
+        if (saved !== true) restoreFailedEdit(submitted.trimmed);
+      },
+      () => restoreFailedEdit(submitted.trimmed)
+    );
+  }, [
+    editContent,
+    message.content,
+    message.id,
+    onEdit,
+    restoreFailedEdit,
+    setIsEditing,
+    surfaceId,
+  ]);
 
   const handleEditCancel = useCallback(() => {
     setEditContent(message.content);
+    setSaveFailed(false);
     setIsEditing(false);
-  }, [message.content]);
+    focusSurfaceComposer(surfaceId);
+  }, [message.content, setIsEditing, surfaceId]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => handleEditKeyDown(e, handleEditSubmit, handleEditCancel),
@@ -648,6 +756,7 @@ const Message: React.FC<MessageProps> = ({
           <MessageEditBox
             content={editContent}
             originalContent={message.content}
+            saveFailed={saveFailed}
             onChange={setEditContent}
             onKeyDown={handleKeyDown}
             onSubmit={handleEditSubmit}
@@ -687,6 +796,7 @@ const Message: React.FC<MessageProps> = ({
         <MessageOverlays
           message={message}
           canModify={canModify}
+          canEdit={canEdit}
           isEditing={isEditing}
           isOwnMessage={isOwnMessage}
           shiftHeld={shiftHeld}

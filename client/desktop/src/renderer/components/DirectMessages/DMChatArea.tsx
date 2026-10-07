@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useId, useMemo, useRef, useEffect } from 'react';
 import { Ellipsis, MessageSquare, Users, Phone, Timer, Eraser } from 'lucide-react';
 import MessageList, { type MessageListHandle } from '../Chat/MessageList';
 import DMPinnedMessagesPanel from './DMPinnedMessagesPanel';
@@ -13,6 +13,7 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useReadMarker } from '../../hooks/messaging/useReadMarker';
+import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { voiceService } from '../../services/voice/voiceService';
@@ -318,6 +319,10 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
     selectedThreadId,
     { type: 'dm', onFetchComplete: handleFetchComplete }
   );
+  // #1959: this panel's id ties its rows, its composer and the delete-refusal flow together,
+  // so focus and an open edit never cross into another panel showing messages.
+  const surfaceId = useId();
+  const editLastMessage = useEditLastMessage(messages, currentUserId, surfaceId);
 
   // Advance the read marker while the thread stays open (#2006), so a message
   // read as it arrives doesn't come back as unread after a refresh —
@@ -395,7 +400,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
   }
 
   return (
-    <div className="dm-chat-area-wrapper">
+    <div className="dm-chat-area-wrapper" data-chat-surface={surfaceId}>
       <div
         className="dm-chat-placeholder"
         style={{ display: 'flex', flexDirection: 'column', height: '100%', flex: 1, minWidth: 0 }}
@@ -533,6 +538,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
 
         <div className="chat-messages" style={{ flex: 1, minHeight: 0 }}>
           <MessageList
+            surfaceId={surfaceId}
             ref={messageListRef}
             key={selectedThreadId}
             messages={messages}
@@ -573,6 +579,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
               conversationId={selectedThreadId}
               replyingTo={replyingTo}
               onCancelReply={cancelReply}
+              onEditLastMessage={editLastMessage}
               expirationClause={expirationClause(expiration.policy, expiration.policyState)}
             />
           </div>
@@ -676,6 +683,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
       )}
 
       <DeleteRefusalModal
+        surfaceId={surfaceId}
         refusal={deleteRefusal}
         onConfirm={confirmDelete}
         onDismiss={dismissDeleteRefusal}

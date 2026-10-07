@@ -2077,3 +2077,103 @@ describe('DMChatArea — active DM call (#1873)', () => {
     expect(screen.queryByTestId('voice-view')).not.toBeInTheDocument();
   });
 });
+
+// ── Up Arrow edits the last own message (#1959) ───────────────────────────────
+
+describe('DMChatArea — Up Arrow edits the last own message (#1959)', () => {
+  // A sibling describe does not inherit the outer beforeEach, so seed what the thread needs here.
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockGetPins.mockReset();
+    mockGetPins.mockResolvedValue([]);
+    capturedMLProps = {};
+    capturedMIProps = {};
+    useUserStore.setState({ user: mockUser });
+    useDMStore.setState({ conversations: [makeConversation()] });
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ messages: [] }),
+    });
+  });
+
+  // The surface id the owner handed to MessageList must be the id on its root element: that
+  // equality is what ties a row's edit to this panel and no other.
+  function listSurfaceId(container: HTMLElement): string {
+    const passed = capturedMLProps.surfaceId;
+    expect(typeof passed).toBe('string');
+    expect(passed).not.toBe('');
+    expect(
+      container.querySelector('.dm-chat-area-wrapper')?.getAttribute('data-chat-surface')
+    ).toBe(passed);
+    return passed as string;
+  }
+
+  const ownMessage = (id: string, createdAt: string) => ({
+    id,
+    channel_id: 'conv-1',
+    user_id: mockUser.id,
+    content: `own ${id}`,
+    username: mockUser.username,
+    display_name: mockUser.display_name,
+    status: 'delivered' as const,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+  const olderOwn = ownMessage('own-older', '2025-01-01T12:00:00Z');
+  const newestOwn = ownMessage('own-newest', '2025-01-01T12:05:00Z');
+  const newestFromOther = {
+    ...ownMessage('other-newest', '2025-01-01T12:06:00Z'),
+    user_id: 'user-2',
+    username: 'alice',
+    display_name: 'Alice',
+  };
+
+  it('hands the composer a callback that opens the newest own message for editing', () => {
+    useChatStore.setState({
+      messagesByChannel: new Map([['conv-1', [olderOwn, newestOwn]]]),
+      isConnected: true,
+    });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+
+    // Positive gate: the wiring exists before anything is asserted about its effect.
+    expect(capturedMIProps.onEditLastMessage).toEqual(expect.any(Function));
+    expect(useChatStore.getState().editingMessage).toBeNull();
+
+    act(() => (capturedMIProps.onEditLastMessage as () => void)());
+
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: listSurfaceId(container),
+      messageId: 'own-newest',
+    });
+  });
+
+  it('skips the other participant rows and opens the user own newest message', () => {
+    useChatStore.setState({
+      messagesByChannel: new Map([['conv-1', [olderOwn, newestOwn, newestFromOther]]]),
+      isConnected: true,
+    });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(capturedMIProps.onEditLastMessage).toEqual(expect.any(Function));
+
+    act(() => (capturedMIProps.onEditLastMessage as () => void)());
+
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: listSurfaceId(container),
+      messageId: 'own-newest',
+    });
+  });
+
+  it('opens nothing when the thread holds no message by the current user', () => {
+    useChatStore.setState({
+      messagesByChannel: new Map([['conv-1', [newestFromOther]]]),
+      isConnected: true,
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(capturedMIProps.onEditLastMessage).toEqual(expect.any(Function));
+
+    act(() => (capturedMIProps.onEditLastMessage as () => void)());
+
+    expect(useChatStore.getState().editingMessage).toBeNull();
+  });
+});

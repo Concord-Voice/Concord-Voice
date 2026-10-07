@@ -6,7 +6,8 @@ import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
-import { mockUser } from '../../../mocks/fixtures';
+import { mockUser, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { vi } from 'vitest';
 
 // ── Hooks mocks ──────────────────────────────────────────────────────────────
@@ -619,5 +620,88 @@ describe('VoiceTextChat — DM call', () => {
     render(<VoiceTextChat />);
     expect(screen.getByText(/All DMs have been disabled/)).toBeInTheDocument();
     expect(screen.queryByTestId('message-input')).not.toBeInTheDocument();
+  });
+});
+
+describe('VoiceTextChat — Up Arrow edits the last own message (#1959)', () => {
+  // A sibling describe does not inherit the outer beforeEach, so seed what the panel needs here.
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    capturedMessageListProps = {};
+    capturedMessageInputProps = {};
+    useVoiceStore.setState({
+      activeChannelId: VOICE_CHANNEL_ID,
+      voiceTextChatLayout: 'horizontal',
+    });
+    useChannelStore.setState({ channels: [linkedTextChannel] });
+    useUserStore.setState({ user: mockUser });
+  });
+
+  // The surface id the owner handed to MessageList must be the id on its root element: that
+  // equality is what ties a row's edit to this panel and no other.
+  function listSurfaceId(container: HTMLElement): string {
+    const passed = capturedMessageListProps.surfaceId;
+    expect(typeof passed).toBe('string');
+    expect(passed).not.toBe('');
+    expect(container.querySelector('.voice-text-chat')?.getAttribute('data-chat-surface')).toBe(
+      passed
+    );
+    return passed as string;
+  }
+
+  const olderOwn = { ...mockMessage, id: 'own-older', channel_id: TEXT_CHANNEL_ID };
+  const newestOwn = { ...mockMessage, id: 'own-newest', channel_id: TEXT_CHANNEL_ID };
+  const newestFromOther = { ...mockMessage2, id: 'other-newest', channel_id: TEXT_CHANNEL_ID };
+
+  async function serveMessages(messages: Array<typeof mockMessage>) {
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    (useMessageFetch as ReturnType<typeof vi.fn>).mockReturnValue({
+      messages,
+      isLoading: false,
+      hasMore: false,
+      error: null,
+      handleLoadMore: vi.fn(),
+      isHistoryReady: true,
+    });
+  }
+
+  it('hands the composer a callback that opens the newest own message for editing', async () => {
+    await serveMessages([olderOwn, newestOwn]);
+    const { container } = render(<VoiceTextChat />);
+
+    // Positive gate: the wiring exists before anything is asserted about its effect.
+    expect(capturedMessageInputProps.onEditLastMessage).toEqual(expect.any(Function));
+    expect(useChatStore.getState().editingMessage).toBeNull();
+
+    act(() => (capturedMessageInputProps.onEditLastMessage as () => void)());
+
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: listSurfaceId(container),
+      messageId: 'own-newest',
+    });
+  });
+
+  it('skips other authors rows and opens the user own newest message', async () => {
+    await serveMessages([olderOwn, newestOwn, newestFromOther]);
+    const { container } = render(<VoiceTextChat />);
+    expect(capturedMessageInputProps.onEditLastMessage).toEqual(expect.any(Function));
+
+    act(() => (capturedMessageInputProps.onEditLastMessage as () => void)());
+
+    expect(useChatStore.getState().editingMessage).toEqual({
+      surfaceId: listSurfaceId(container),
+      messageId: 'own-newest',
+    });
+  });
+
+  it('opens nothing when the thread holds no message by the current user', async () => {
+    await serveMessages([newestFromOther]);
+    render(<VoiceTextChat />);
+    expect(capturedMessageInputProps.onEditLastMessage).toEqual(expect.any(Function));
+
+    act(() => (capturedMessageInputProps.onEditLastMessage as () => void)());
+
+    expect(useChatStore.getState().editingMessage).toBeNull();
   });
 });

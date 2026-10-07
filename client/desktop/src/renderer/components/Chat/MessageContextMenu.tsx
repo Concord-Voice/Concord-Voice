@@ -9,7 +9,8 @@ interface MessageContextMenuProps {
   isOwnMessage: boolean;
   canModify: boolean;
   onClose: () => void;
-  onEdit: () => void;
+  /** Present only when the row may be edited; Edit is hidden without it (#1959). */
+  onEdit?: () => void;
   onDelete: () => void;
   onReaction?: () => void;
   onReply?: () => void;
@@ -124,7 +125,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
         }}
       />
 
-      {canModify && (
+      {canModify && onEdit && (
         <ContextMenu.Item
           icon={
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">

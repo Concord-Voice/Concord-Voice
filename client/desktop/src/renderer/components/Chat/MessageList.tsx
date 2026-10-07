@@ -20,12 +20,16 @@ import './MessageList.css';
 export interface MessageListProps {
   messages: MessageWithStatus[];
   currentUserId: string;
+  /** The owning chat panel's id (#1959), handed to every row; see `chatSurface.ts`. */
+  surfaceId: string;
   channelName?: string;
   chatContext?: ChatContextType;
   isLoading?: boolean;
   hasMore?: boolean;
   onLoadMore?: () => void;
-  onEditMessage?: (messageId: string, newContent: string) => void;
+  /** May return a promise resolving `true` once saved; any other outcome lets the row restore
+   *  the user's text (#1959). */
+  onEditMessage?: (messageId: string, newContent: string) => void | Promise<boolean | void>;
   onDeleteMessage?: (messageId: string) => void;
   onUnseenOnLeave?: (count: number) => void;
   /**
@@ -316,6 +320,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     {
       messages,
       currentUserId,
+      surfaceId,
       channelName,
       chatContext = 'channel',
       isLoading = false,
@@ -1183,6 +1188,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                     <Message
                       message={message}
                       currentUserId={currentUserId}
+                      surfaceId={surfaceId}
                       chatContext={chatContext}
                       onEdit={onEditMessage}
                       onDelete={onDeleteMessage}

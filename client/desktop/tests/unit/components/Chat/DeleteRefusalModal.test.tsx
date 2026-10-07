@@ -44,13 +44,17 @@ interface Props {
   onConfirm?: (step: { mfaCode?: string; currentPassword?: string }) => void;
   onDismiss?: () => void;
   purpose?: StepUpPurpose;
+  surfaceId?: string;
 }
+
+const SURFACE = 'surface-main';
 
 function ui({
   refusal,
   onConfirm = vi.fn(),
   onDismiss = vi.fn(),
   purpose = 'messages.delete',
+  surfaceId = SURFACE,
 }: Props) {
   return (
     <DeleteRefusalModal
@@ -58,6 +62,7 @@ function ui({
       onConfirm={onConfirm}
       onDismiss={onDismiss}
       purpose={purpose}
+      surfaceId={surfaceId}
     />
   );
 }
@@ -506,22 +511,34 @@ describe('DeleteRefusalModal', () => {
   });
 
   describe('focus', () => {
-    function addRow(id: string) {
+    // A chat panel root, as the owners render it: `data-chat-surface` on an element in the document.
+    function addSurface(id: string) {
+      const root = document.createElement('div');
+      root.dataset.chatSurface = id;
+      document.body.appendChild(root);
+      extraNodes.push(root);
+      return root;
+    }
+
+    function addRow(id: string, surface: HTMLElement = surfaceRoot) {
       const row = document.createElement('div');
       row.dataset.messageId = id;
       row.tabIndex = -1;
-      document.body.appendChild(row);
-      extraNodes.push(row);
+      surface.appendChild(row);
       return row;
     }
 
-    function addComposer() {
+    function addComposer(surface: HTMLElement = surfaceRoot) {
       const composer = document.createElement('textarea');
       composer.className = 'message-input-textarea';
-      document.body.appendChild(composer);
-      extraNodes.push(composer);
+      surface.appendChild(composer);
       return composer;
     }
+
+    let surfaceRoot: HTMLElement;
+    beforeEach(() => {
+      surfaceRoot = addSurface(SURFACE);
+    });
 
     it('moves focus into the first field when a challenge opens', () => {
       render(ui({ refusal: slot(PASSWORD) }));
@@ -575,6 +592,51 @@ describe('DeleteRefusalModal', () => {
       rerender(ui({ refusal: null }));
       expect(row).toHaveFocus();
       expect(other).not.toHaveFocus();
+    });
+
+    it('never lands on another panel that shows the same message', () => {
+      // The other panel comes FIRST in the document, so a document-wide lookup would find it.
+      const otherPanel = addSurface('surface-panel');
+      const otherRow = addRow('m1', otherPanel);
+      const otherComposer = addComposer(otherPanel);
+      const row = addRow('m1');
+      const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
+      // Gate: the modal is open and neither target has focus yet.
+      expect(screen.getByLabelText('Password')).toHaveFocus();
+
+      rerender(ui({ refusal: null }));
+
+      expect(row).toHaveFocus();
+      expect(otherRow).not.toHaveFocus();
+      expect(otherComposer).not.toHaveFocus();
+    });
+
+    it('falls back to its own composer, not another panel composer, when its row is gone', () => {
+      const otherPanel = addSurface('surface-panel');
+      const otherRow = addRow('m1', otherPanel);
+      const otherComposer = addComposer(otherPanel);
+      const composer = addComposer();
+      const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
+      expect(screen.getByLabelText('Password')).toHaveFocus();
+
+      rerender(ui({ refusal: null }));
+
+      expect(composer).toHaveFocus();
+      expect(otherRow).not.toHaveFocus();
+      expect(otherComposer).not.toHaveFocus();
+    });
+
+    it('moves focus nowhere when its own panel has neither row nor composer', () => {
+      const otherPanel = addSurface('surface-panel');
+      const otherRow = addRow('m1', otherPanel);
+      const otherComposer = addComposer(otherPanel);
+      const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
+      expect(screen.getByLabelText('Password')).toHaveFocus();
+
+      rerender(ui({ refusal: null }));
+
+      expect(otherRow).not.toHaveFocus();
+      expect(otherComposer).not.toHaveFocus();
     });
 
     it('does not steal focus for a modal that never opened', () => {

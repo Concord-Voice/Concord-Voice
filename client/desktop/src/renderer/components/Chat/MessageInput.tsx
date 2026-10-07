@@ -176,6 +176,32 @@ function getCtrlShortcutAction(
   return undefined;
 }
 
+/**
+ * #1959: Up Arrow in an EMPTY composer asks the owner to open the user's newest message for
+ * editing. Pure and module-level so `handleKeyDown` gains one call rather than a branch
+ * (Sonar S3776). Every condition is part of "empty": text, a staged attachment or a reply
+ * target each give Up another meaning; any modifier makes it a different shortcut (Alt+Up is
+ * channel navigation); an active IME composition routes Up through the candidate window; and
+ * an owner that passed no handler has opted out.
+ */
+export function shouldEditLastMessage(
+  key: string,
+  modifiers: { ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean },
+  state: {
+    enabled: boolean;
+    content: string;
+    hasFiles: boolean;
+    hasReplyTarget: boolean;
+    isComposing: boolean;
+  }
+): boolean {
+  if (key !== 'ArrowUp' || !state.enabled) return false;
+  if (modifiers.ctrlKey || modifiers.metaKey || modifiers.altKey || modifiers.shiftKey) {
+    return false;
+  }
+  return state.content === '' && !state.hasFiles && !state.hasReplyTarget && !state.isComposing;
+}
+
 export interface MessageInputProps {
   onSendMessage: (
     content: string,
@@ -200,6 +226,9 @@ export interface MessageInputProps {
   replyingTo?: MessageWithStatus | null;
   /** Cancel the reply */
   onCancelReply?: () => void;
+  /** #1959: Up Arrow in an empty composer asks the owner to open the user's newest message
+   *  for editing. The owner decides whether such a message exists; absent, the key is inert. */
+  onEditLastMessage?: () => void;
   /** Whether the user has permission to attach files */
   canAttachFiles?: boolean;
   /** Passive message-expiration status, rendered under the E2EE line in the composer's
@@ -224,6 +253,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   conversationId,
   replyingTo,
   onCancelReply,
+  onEditLastMessage,
   canAttachFiles = true,
   expirationClause,
 }) => {
@@ -309,6 +339,10 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const [showEmojiAutocomplete, setShowEmojiAutocomplete] = useState(false);
   const textareaId = useId();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // #1959: true between compositionstart and compositionend. Read alongside
+  // `nativeEvent.isComposing`, because some engines deliver the keydown that ends a
+  // composition with the flag already cleared.
+  const composingRef = useRef(false);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
   const gifBtnRef = useRef<HTMLButtonElement>(null);
   const inviteBtnRef = useRef<HTMLButtonElement>(null);
@@ -866,6 +900,25 @@ const MessageInput: React.FC<MessageInputProps> = ({
     // Open typeaheads consume their nav keys first.
     if (routeAutocompleteKeyDown(e)) return;
 
+    // #1959: Up Arrow in an empty composer edits the user's newest message.
+    if (
+      shouldEditLastMessage(
+        e.key,
+        { ctrlKey: e.ctrlKey, metaKey: e.metaKey, altKey: e.altKey, shiftKey: e.shiftKey },
+        {
+          enabled: onEditLastMessage !== undefined,
+          content,
+          hasFiles,
+          hasReplyTarget: Boolean(replyingTo),
+          isComposing: composingRef.current || e.nativeEvent.isComposing,
+        }
+      )
+    ) {
+      e.preventDefault();
+      onEditLastMessage?.();
+      return;
+    }
+
     // #1953: Ctrl+E / Ctrl+G open the emoji / GIF picker from the composer.
     // After the mention-autocomplete guard (an open typeahead consumes its keys
     // first) and before Enter-to-send. Exact-modifier match (Ctrl only, no
@@ -1069,6 +1122,12 @@ const MessageInput: React.FC<MessageInputProps> = ({
             onChange={handleChange}
             onKeyDown={handleKeyDown}
             onSelect={handleSelect}
+            onCompositionStart={() => {
+              composingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+            }}
             onPaste={(e) => {
               if (canAttachFiles && e.clipboardData.files.length > 0) {
                 e.preventDefault();

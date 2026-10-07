@@ -255,6 +255,14 @@
   border-color: var(--state-focused);
 }
 
+/* A save that did not reach the server (#1959). Text colour, not a red: the sentence carries
+   the signal, and --error-color fails 4.5:1 in 9 of the 30 scheme x theme blocks (#3455). */
+.message-edit-error {
+  margin: calc(6px * var(--sp, 1)) 0 0;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
 .message-edit-actions {
   display: flex;
   gap: calc(8px * var(--sp, 1));

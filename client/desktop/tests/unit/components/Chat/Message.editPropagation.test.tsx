@@ -41,7 +41,7 @@ function makeMessage(content: string, editedAt: string | null = null): MessageWi
 function MessageHarness() {
   const message = useChatStore((s) => s.messagesByChannel.get('channel-1')?.[0]);
   if (!message) return null;
-  return <Message message={message} currentUserId="user-2" showAvatar={true} />;
+  return <Message surfaceId="s1" message={message} currentUserId="user-2" showAvatar={true} />;
 }
 
 /**

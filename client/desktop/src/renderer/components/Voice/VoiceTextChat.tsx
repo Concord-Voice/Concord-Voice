@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { MessageSquare, Volume2, PanelBottom, PanelRight } from 'lucide-react';
 import MessageList from '../Chat/MessageList';
 import MessageInput from '../Chat/MessageInput';
@@ -10,6 +10,7 @@ import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useTTSSettingsStore } from '../../stores/audio/ttsSettingsStore';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useReadMarker } from '../../hooks/messaging/useReadMarker';
+import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
 import { apiFetch } from '../../services/system/apiClient';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useVoiceTextChatTarget } from '../../hooks/voice/useVoiceTextChatTarget';
@@ -114,6 +115,10 @@ const VoiceTextChat: React.FC = () => {
   );
 
   const currentUserId = user?.id || '';
+  // #1959: this panel's id ties its rows, its composer and the delete-refusal flow together,
+  // so focus and an open edit never cross into another panel showing messages.
+  const surfaceId = useId();
+  const editLastMessage = useEditLastMessage(messages, currentUserId, surfaceId);
 
   // Advance the read marker while the panel is open (#3289): a message read
   // as it arrives here. Same shape as ChatView and DMChatArea: debounced,
@@ -158,7 +163,7 @@ const VoiceTextChat: React.FC = () => {
   }
 
   return (
-    <div className="voice-text-chat">
+    <div className="voice-text-chat" data-chat-surface={surfaceId}>
       <div className="voice-text-chat__header">
         <MessageSquare size={14} />
         <span className="voice-text-chat__title">{targetName} Text Chat</span>
@@ -184,6 +189,7 @@ const VoiceTextChat: React.FC = () => {
 
       <div className="voice-text-chat__messages">
         <MessageList
+          surfaceId={surfaceId}
           key={targetId}
           messages={messages}
           currentUserId={currentUserId}
@@ -229,11 +235,13 @@ const VoiceTextChat: React.FC = () => {
             placeholder={`Message ${targetName} text chat...`}
             replyingTo={replyingTo}
             onCancelReply={cancelReply}
+            onEditLastMessage={editLastMessage}
           />
         </div>
       )}
 
       <DeleteRefusalModal
+        surfaceId={surfaceId}
         refusal={deleteRefusal}
         onConfirm={confirmDelete}
         onDismiss={dismissDeleteRefusal}

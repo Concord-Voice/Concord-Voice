@@ -4,6 +4,7 @@ import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import type { DeleteRefusalState, DeleteStepUp } from '../../hooks/messaging/useChatController';
 import type { DeleteRefusalView } from '../../services/messaging/deleteRefusal';
+import { findSurfaceComposer, findSurfaceMessageRow } from './chatSurface';
 import './DeleteRefusalModal.css';
 
 export interface DeleteRefusalModalProps {
@@ -14,6 +15,9 @@ export interface DeleteRefusalModalProps {
   onDismiss: () => void;
   /** `dm.message_delete` in a DM, `messages.delete` everywhere else. */
   purpose: StepUpPurpose;
+  /** The owning chat panel's id (#1959): focus returns to its row or its composer, never to
+   *  another panel's, where the next message would go to a different conversation. */
+  surfaceId: string;
 }
 
 const TITLES: Record<DeleteRefusalState['view']['view'], string> = {
@@ -57,16 +61,6 @@ function useCountdown(
   if (openedAt === undefined || retryAfterSeconds === undefined) return null;
   const elapsedMs = Math.max(0, now - openedAt);
   return Math.max(0, Math.ceil(retryAfterSeconds - elapsedMs / 1000));
-}
-
-/** Finds the row by attribute comparison, never a built selector — ids are
- *  server-issued and a quote in one must not reach querySelector as syntax
- *  (mirrors MessageList.tsx's findRow). */
-function findMessageRow(messageId: string): HTMLElement | null {
-  for (const row of document.querySelectorAll<HTMLElement>('[data-message-id]')) {
-    if (row.dataset.messageId === messageId) return row;
-  }
-  return null;
 }
 
 const CHALLENGE_COPY = "You've deleted several messages quickly. Confirm it's you to keep going.";
@@ -123,6 +117,7 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
   onConfirm,
   onDismiss,
   purpose,
+  surfaceId,
 }) => {
   const view = refusal?.view;
   const submitting = refusal?.submitting ?? false;
@@ -175,8 +170,8 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
     prevFocusTokenRef.current = focusToken;
   }, [view, focusToken]);
 
-  // T9 focus return: the row `[data-message-id]`, else the composer, never
-  // body. This runs in the PARENT's effect, which fires after Modal's own
+  // T9 focus return: the row `[data-message-id]`, else the composer, both in
+  // this modal's own chat panel (#1959), never body. This runs in the PARENT's effect, which fires after Modal's own
   // cleanup unmounts it (child effects clean up before the parent's run) — so
   // it overrides Modal's own restore-to-invoker behaviour, which would
   // otherwise land on <body>: the trigger (a context-menu item, or
@@ -191,10 +186,10 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
     const closedId = lastMessageIdRef.current;
     if (closedId === null) return;
     lastMessageIdRef.current = null;
-    const row = findMessageRow(closedId);
-    const target = row ?? document.querySelector<HTMLElement>('.message-input-textarea');
+    const row = findSurfaceMessageRow(surfaceId, closedId);
+    const target = row ?? findSurfaceComposer(surfaceId);
     target?.focus();
-  }, [messageId]);
+  }, [messageId, surfaceId]);
 
   if (!refusal || !view) return null;
 

@@ -17,7 +17,11 @@ describe('MessageContextMenu', () => {
     vi.useRealTimers();
   });
 
-  const renderMenu = (canModify = true, onReaction?: () => void) => {
+  const renderMenu = (
+    canModify = true,
+    onReaction?: () => void,
+    onEdit: (() => void) | null = mockOnEdit
+  ) => {
     return render(
       <MessageContextMenu
         message={mockMessage}
@@ -25,7 +29,7 @@ describe('MessageContextMenu', () => {
         isOwnMessage={canModify}
         canModify={canModify}
         onClose={mockOnClose}
-        onEdit={mockOnEdit}
+        onEdit={onEdit ?? undefined}
         onDelete={mockOnDelete}
         onReaction={onReaction}
       />
@@ -61,6 +65,19 @@ describe('MessageContextMenu', () => {
     renderMenu(false);
     expect(screen.queryByText('Edit Message')).not.toBeInTheDocument();
     expect(screen.queryByText('Delete Message')).not.toBeInTheDocument();
+  });
+
+  it('omits Edit Message when no onEdit is given, even for a message the user may modify', () => {
+    // Positive gate: with the handler the same menu offers it, so the omission below is caused
+    // by the missing prop and not by the fixture.
+    const { unmount } = renderMenu(true);
+    expect(screen.getByText('Edit Message')).toBeInTheDocument();
+    unmount();
+
+    renderMenu(true, undefined, null);
+
+    expect(screen.queryByText('Edit Message')).not.toBeInTheDocument();
+    expect(screen.getByText('Delete Message')).toBeInTheDocument();
   });
 
   it('calls onEdit when Edit clicked', () => {

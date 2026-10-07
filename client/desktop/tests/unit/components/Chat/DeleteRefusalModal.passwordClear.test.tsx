@@ -26,7 +26,7 @@ describe('DeleteRefusalModal password hygiene (#3509 frontend review)', () => {
     const onConfirm = vi.fn();
     const props = { onConfirm, onDismiss: vi.fn(), purpose: 'messages.delete' as const };
     const { rerender } = render(
-      <DeleteRefusalModal refusal={slot({ view: 'password' })} {...props} />
+      <DeleteRefusalModal surfaceId="s1" refusal={slot({ view: 'password' })} {...props} />
     );
 
     await user.type(screen.getByLabelText('Password'), FIXTURE_PW);
@@ -38,8 +38,10 @@ describe('DeleteRefusalModal password hygiene (#3509 frontend review)', () => {
       { view: 'unavailable' } as const,
       { view: 'failed' } as const,
     ]) {
-      rerender(<DeleteRefusalModal refusal={slot(view)} {...props} />);
-      rerender(<DeleteRefusalModal refusal={slot({ view: 'password' })} {...props} />);
+      rerender(<DeleteRefusalModal surfaceId="s1" refusal={slot(view)} {...props} />);
+      rerender(
+        <DeleteRefusalModal surfaceId="s1" refusal={slot({ view: 'password' })} {...props} />
+      );
       expect(screen.getByLabelText('Password')).toHaveValue('');
     }
   });
