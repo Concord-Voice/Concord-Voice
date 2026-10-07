@@ -1,11 +1,12 @@
-# Admin Portal build stage. This is the reviewed node:24-alpine multi-platform
-# index; the named admin_ui context keeps the primary Go context narrow.
-# The `node:24-alpine` tag component is load-bearing, not decorative: a bare
+# Admin Portal build stage. This is the reviewed node:26-alpine multi-platform
+# index at sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80;
+# the named admin_ui context keeps the primary Go context narrow.
+# The `node:26-alpine` tag component is load-bearing, not decorative: a bare
 # `FROM node@sha256:` gives Dependabot no variant to anchor on, so it resolves
 # the default tag (`node:latest`, currently Debian-based `node:26`). PR #2800
 # did exactly that -- swapping this stage to a 443 MB Debian image with nothing
 # in the diff to show it. Keep tag+digest together on every bump.
-FROM node:26-alpine@sha256:ef24c5053d50fdc3e4e56eb4e7ddb7861874ab0fdc797046ba897581deb8e868 AS admin-ui-builder
+FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80 AS admin-ui-builder
 
 WORKDIR /src
 COPY --from=admin_ui package.json package-lock.json ./

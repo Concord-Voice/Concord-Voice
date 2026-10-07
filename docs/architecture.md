@@ -743,7 +743,7 @@ login-enabled role must revoke successfully, or startup fails closed.
 
 **Port**: 3000 · **RTC ports**: 40000–40099/UDP (dev), 40000–41999/UDP (production) — UDP by default; ICE-TCP requires `MEDIASOUP_ENABLE_TCP=true` plus matching TCP ingress ([ADR-0040](adr/0040-ice-tcp-ingress-posture.md)) · Source: `services/media-plane/`
 
-**Tech Stack:** Node.js 24, mediasoup 3.26.0, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
+**Tech Stack:** Node.js 26, mediasoup 3.26.0, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
 
 **Responsibilities:**
 
@@ -1590,7 +1590,7 @@ Concord/
 | -------------- | --------------------------------------- | ------------------------------------------------------------------- |
 | Desktop client | Electron 43 + React 19 + TS native 7 / TS 6 API bridge (`tsc6` 6.0.3) | Mature WebRTC, fast iteration, OS keychain access                   |
 | Control plane  | Go 1.26 + Gin                           | Fast, concurrent, single-binary deploy                              |
-| Media plane    | Node.js 24 + mediasoup 3.22             | Mature, widely-used WebRTC SFU                                      |
+| Media plane    | Node.js 26 + mediasoup 3.22             | Mature, widely-used WebRTC SFU                                      |
 | Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |
 | Cache          | Redis 7 (server, node-redis 6.x client) | Sessions, presence, RBAC cache, rate limiting, voice room state     |
 | Messaging      | NATS 2.x                                | Lightweight inter-service voice events                              |
