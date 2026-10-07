@@ -2297,11 +2297,14 @@ class VoiceService {
 
   private hasLiveMicGraph(producer: mediasoupTypes.Producer): boolean {
     const graph = this.micGraph;
+    const currentSettings = useAudioSettingsStore.getState();
+    const needsPeakProtection = !currentSettings.musicMode && currentSettings.autoGainControl;
     return (
       this.producers.get('mic') === producer &&
       graph !== null &&
       !graph.failed &&
-      graph.track.readyState === 'live'
+      graph.track.readyState === 'live' &&
+      (!needsPeakProtection || (!graph.settings.musicMode && graph.settings.autoGainControl))
     );
   }
 
@@ -2455,14 +2458,11 @@ class VoiceService {
     producerTrackSafe: boolean
   ): void {
     const graph = this.micGraph;
-    const currentSettings = useAudioSettingsStore.getState();
-    const needsPeakProtection = !currentSettings.musicMode && currentSettings.autoGainControl;
     if (
       replaceSeq === this.liveAudioTrackReplaceSeq &&
       producerTrackSafe &&
       graph !== null &&
       this.hasLiveMicGraph(producer) &&
-      (!needsPeakProtection || (!graph.settings.musicMode && graph.settings.autoGainControl)) &&
       this.shouldResumeMicAfterTrackReplacement(producer.id)
     ) {
       graph.track.enabled = true;

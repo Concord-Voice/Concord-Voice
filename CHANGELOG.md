@@ -29,6 +29,7 @@ message.
 
 ### Fixed
 
+- **AGC failure holds pause** ([PR #3658](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3658)). If AGC fails, unmute and call restoration keep the previous unprotected microphone paused. It stays paused while AGC remains enabled.
 - **Voice-join errors stay out of the toolbar** — microphone and other join failures now appear in a small centered prompt, without pushing the client layout down. Dismiss or Escape closes the prompt.
 - **Voice joins capture the selected microphone once** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — server and direct-message calls capture the selected input after room and encryption setup. If capture finishes after a join has ended, or encrypted publication fails, Concord stops the track. A capture error now gives you useful next steps; the device may be unavailable or in use, so choose another microphone or close the app using it. Microphone permission errors point you to system settings. Audio setting changes preserve your mute, including when you press Mute during a microphone update, and changing an input or audio setting can retry a failed microphone update during a call. Speaking feedback keeps working after switching or rebuilding the microphone, including while alone in a call.
 - **Audio menus now show one Default option** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — it follows your operating system's default device, while named microphones and speakers remain selectable.

@@ -364,7 +364,11 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
-      svc.micGraph = { failed: false, track: { readyState: 'live' } };
+      svc.micGraph = {
+        failed: false,
+        track: { readyState: 'live' },
+        settings: { musicMode: false, autoGainControl: true },
+      };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();
@@ -380,7 +384,11 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
-      svc.micGraph = { failed: false, track: { readyState: 'live' } };
+      svc.micGraph = {
+        failed: false,
+        track: { readyState: 'live' },
+        settings: { musicMode: false, autoGainControl: true },
+      };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();
@@ -397,7 +405,11 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
-      svc.micGraph = { failed: false, track: { readyState: 'live' } };
+      svc.micGraph = {
+        failed: false,
+        track: { readyState: 'live' },
+        settings: { musicMode: false, autoGainControl: true },
+      };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();
@@ -413,7 +425,11 @@ describe('VoiceService enforcement guards', () => {
       const micProducer = createMockProducer('prod-mic', 'mic');
       micProducer.paused = true;
       svc.producers.set('mic', micProducer);
-      svc.micGraph = { failed: false, track: { readyState: 'live' } };
+      svc.micGraph = {
+        failed: false,
+        track: { readyState: 'live' },
+        settings: { musicMode: false, autoGainControl: true },
+      };
       useVoiceStore.getState().setMuted(true);
 
       await voiceService.toggleMute();

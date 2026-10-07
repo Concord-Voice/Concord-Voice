@@ -4,6 +4,7 @@ import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStor
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { voiceService } from '@/renderer/services/voice/voiceService';
+import { mockUser } from '../../mocks/fixtures';
 
 type Edge = { from: AudioNodeMock; to: AudioNodeMock };
 type AudioNodeMock = {
@@ -180,6 +181,20 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 }));
 
 describe('voiceService microphone processing graph (#3635)', () => {
+  const resumePaths = [
+    'toggleMute',
+    'resumeLocalProducer',
+    'Microphone Test restoration',
+    'solo exit',
+  ] as const;
+  const graphPolicies = [
+    ['AGC disabled', false, false],
+    ['Music Mode enabled', true, true],
+    ['AGC peak protection enabled', false, true],
+  ] as const;
+  const resumableControls = graphPolicies.flatMap(([mode, musicMode, autoGainControl]) =>
+    resumePaths.map((resumePath) => [mode, musicMode, autoGainControl, resumePath] as const)
+  );
   const originalAudioContext = globalThis.AudioContext;
   const originalAudioWorkletNode = globalThis.AudioWorkletNode;
   const originalMediaStream = globalThis.MediaStream;
@@ -672,6 +687,97 @@ describe('voiceService microphone processing graph (#3635)', () => {
       producerId: producer.id,
     });
   });
+
+  // Regression introduced by #3653: failed AGC activation must keep the retained graph paused.
+  it.each([
+    'toggleMute',
+    'resumeLocalProducer',
+    'Microphone Test restoration',
+    'solo exit',
+  ] as const)(
+    'does not resume a retained AGC-off graph through %s after enabling AGC fails',
+    async (resumePath) => {
+      useAudioSettingsStore.getState().setAutoGainControl(false);
+      useUserStore.setState({ user: { ...mockUser, id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' } });
+      await service.produceAudio();
+      service.setupLiveSubscriptions();
+      producer.pause.mockImplementation(() => Object.assign(producer, { paused: true }));
+      producer.resume.mockImplementation(() => Object.assign(producer, { paused: false }));
+      const oldGraph = service.micGraph;
+      expect(oldGraph.settings.autoGainControl).toBe(false);
+      Object.assign(producer, { kind: 'audio', paused: false, closed: false });
+      if (resumePath === 'Microphone Test restoration') {
+        service.beginTestSuspension();
+        Object.assign(producer, { paused: true });
+      }
+
+      service.socket = { emit: vi.fn() };
+      AudioContextMock.rejectNextModule = true;
+      useAudioSettingsStore.getState().setAutoGainControl(true);
+      await service.micReplaceTrackQueue;
+
+      expect(service.micGraph).toBe(oldGraph);
+      expect(useVoiceStore.getState().joinError).toMatch(/Microphone processing failed/);
+      const resumeCount = producer.resume.mock.calls.length;
+      Object.assign(producer, { paused: true });
+      if (resumePath === 'toggleMute') {
+        await service.toggleMute();
+        await service.toggleMute();
+      } else if (resumePath === 'resumeLocalProducer') {
+        service.resumeLocalProducer('mic');
+      } else if (resumePath === 'Microphone Test restoration') {
+        service.endTestSuspension();
+      } else {
+        useVoiceStore.setState({ isSoloBandwidthSaving: true });
+        service.exitSoloBandwidthSaving();
+      }
+
+      expect(
+        producer.resume,
+        'AGC-on policy must never resume the retained AGC-off graph'
+      ).toHaveBeenCalledTimes(resumeCount);
+      expect(
+        service.socket.emit,
+        'AGC-on policy must never resume the retained AGC-off graph'
+      ).not.toHaveBeenCalledWith('resume-producer', { producerId: producer.id });
+    }
+  );
+
+  it.each(resumableControls)(
+    '%s graph (musicMode=%s, autoGainControl=%s) can resume through %s',
+    async (_mode, musicMode, autoGainControl, resumePath) => {
+      useAudioSettingsStore.getState().setMusicMode(musicMode);
+      useAudioSettingsStore.getState().setAutoGainControl(autoGainControl);
+      await service.produceAudio();
+      service.setupLiveSubscriptions();
+      producer.pause.mockImplementation(() => Object.assign(producer, { paused: true }));
+      producer.resume.mockImplementation(() => Object.assign(producer, { paused: false }));
+      Object.assign(producer, { kind: 'audio', paused: false, closed: false });
+      service.socket = { emit: vi.fn() };
+      const resumeCount = producer.resume.mock.calls.length;
+
+      if (resumePath === 'toggleMute') {
+        Object.assign(producer, { paused: true });
+        useVoiceStore.setState({ isMuted: true });
+        await service.toggleMute();
+      } else if (resumePath === 'resumeLocalProducer') {
+        Object.assign(producer, { paused: true });
+        service.resumeLocalProducer('mic');
+      } else if (resumePath === 'Microphone Test restoration') {
+        service.beginTestSuspension();
+        service.endTestSuspension();
+      } else {
+        Object.assign(producer, { paused: true });
+        useVoiceStore.setState({ isSoloBandwidthSaving: true });
+        service.exitSoloBandwidthSaving();
+      }
+
+      expect(producer.resume).toHaveBeenCalledTimes(resumeCount + 1);
+      expect(service.socket.emit).toHaveBeenCalledWith('resume-producer', {
+        producerId: producer.id,
+      });
+    }
+  );
 
   it('recovers a processorerror-paused producer with a protected graph and ignores stale callbacks', async () => {
     useAudioSettingsStore.getState().setAutoGainControl(false);

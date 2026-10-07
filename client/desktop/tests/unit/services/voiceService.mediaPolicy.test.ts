@@ -259,7 +259,11 @@ describe('voiceService media-policy wiring (#2153)', () => {
   // ── the resume guard ─────────────────────────────────────────────────────
   it('CONTROL: an unlatched muted mic toggle does emit resume-producer (proves the harness reaches the emit)', async () => {
     svc.producers.set('mic', producerStub('mic-1', true));
-    svc.micGraph = { failed: false, track: { readyState: 'live' } };
+    svc.micGraph = {
+      failed: false,
+      track: { readyState: 'live' },
+      settings: { musicMode: false, autoGainControl: true },
+    };
     useVoiceStore.getState().setMuted(true);
     await svc.toggleMute();
     expect(emitted('resume-producer')).toEqual([['resume-producer', { producerId: 'mic-1' }]]);
