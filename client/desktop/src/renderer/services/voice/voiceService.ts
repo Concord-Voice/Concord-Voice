@@ -2483,14 +2483,16 @@ class VoiceService {
     producerTrackSafe: boolean
   ): void {
     const graph = this.micGraph;
+    // hasLiveMicGraph carries the peak-protection eligibility check (#3658), so
+    // this block needs only the current settings for the gate comparison.
+    const currentSettings = useAudioSettingsStore.getState();
     if (
       replaceSeq === this.liveAudioTrackReplaceSeq &&
       producerTrackSafe &&
       graph &&
       this.hasLiveMicGraph(producer) &&
       gateForAudioSettings(graph.settings).kind === 'dynamic' &&
-      gateForAudioSettings(currentSettings).kind === 'dynamic' &&
-      (!needsPeakProtection || (!graph.settings.musicMode && graph.settings.autoGainControl))
+      gateForAudioSettings(currentSettings).kind === 'dynamic'
     ) {
       graph.statusPaused = false;
     }
