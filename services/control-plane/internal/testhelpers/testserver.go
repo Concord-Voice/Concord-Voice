@@ -394,15 +394,9 @@ func (ts *TestServer) AddMemberToServer(t *testing.T, serverID, userID, role str
 
 	// Admins need an RBAC role with AdminPermissions (resolver uses roles table, not legacy role column)
 	if role == "admin" {
-		adminRoleID := uuid.New().String()
-		_, err = ts.DB.Exec(
-			`INSERT INTO roles (id, server_id, name, position, permissions, is_default, is_managed)
-			 VALUES ($1, $2, 'admin', 10, $3, FALSE, TRUE)
-			 ON CONFLICT DO NOTHING`,
-			adminRoleID, serverID, int64(rbac.AdminPermissions),
-		)
+		adminRoleID, err := ts.getOrCreateAdminRole(serverID)
 		if err != nil {
-			t.Fatalf("testhelpers: failed to create admin role: %v", err)
+			t.Fatalf("testhelpers: failed to create or reuse canonical admin role: %v", err)
 		}
 		_, err = ts.DB.Exec(
 			`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
@@ -412,6 +406,20 @@ func (ts *TestServer) AddMemberToServer(t *testing.T, serverID, userID, role str
 			t.Fatalf("testhelpers: failed to assign admin role: %v", err)
 		}
 	}
+}
+
+func (ts *TestServer) getOrCreateAdminRole(serverID string) (string, error) {
+	var adminRoleID string
+	err := ts.DB.QueryRow(
+		`INSERT INTO roles (id, server_id, name, position, permissions, is_default, is_managed)
+		 VALUES ($1, $2, 'admin', 10, $3, FALSE, TRUE)
+		 ON CONFLICT (server_id, name) DO UPDATE SET name = EXCLUDED.name
+		 WHERE (roles.position, roles.permissions, roles.is_default, roles.is_managed) =
+		       (EXCLUDED.position, EXCLUDED.permissions, EXCLUDED.is_default, EXCLUDED.is_managed)
+		 RETURNING id`,
+		uuid.New().String(), serverID, int64(rbac.AdminPermissions),
+	).Scan(&adminRoleID)
+	return adminRoleID, err
 }
 
 // DoRequest performs an HTTP request against the test router and returns the response.
