@@ -1,5 +1,5 @@
 # Build stage
-FROM ghcr.io/concord-voice/node-buildtools:24-alpine-2026-09-04@sha256:f94d703b688d942e89e6225977c0110560a9f2b5095377d209aca10e4cf5df2a AS builder
+FROM ghcr.io/concord-voice/node-buildtools:26-alpine-2026-10-07@sha256:163883defd34c5afeaad2eca717d6198793ab74f4de2e1e40785dadebade1e26 AS builder
 
 WORKDIR /app
 
@@ -28,7 +28,7 @@ RUN npm prune --omit=dev \
 # stubs/ must persist at runtime — fetch-blob resolves the symlink at require time.
 # See [internal]rules/media-plane.md "Docker Build Context Invariant" for the discipline.
 # Pin the runtime independently so deploy rebuilds cannot reuse a stale floating Node base.
-FROM node:26-alpine@sha256:ef24c5053d50fdc3e4e56eb4e7ddb7861874ab0fdc797046ba897581deb8e868
+FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80
 
 LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice-Alpha"
 LABEL org.opencontainers.image.description="Concord Voice media-plane (mediasoup SFU)"
