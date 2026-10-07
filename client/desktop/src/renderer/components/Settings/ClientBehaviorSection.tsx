@@ -103,7 +103,7 @@ export const ClientBehaviorSection: React.FC = () => {
   };
 
   return (
-    <CollapsibleSection id="client-behavior" title="Client Behavior" defaultOpen>
+    <CollapsibleSection id="client-behavior" title="Client Behavior">
       <p className="settings-section-description">
         Choose where the [×] close and [—] minimize buttons send Concord Voice. The dynamic panel
         below explains what each configuration does.

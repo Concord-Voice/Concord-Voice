@@ -315,7 +315,7 @@ const AboutUpdateSection: React.FC = () => {
   return (
     <>
       {/* Client Info */}
-      <CollapsibleSection id="section-client-info" title="Client Info" defaultOpen>
+      <CollapsibleSection id="section-client-info" title="Client Info">
         <div className="about-info-grid">
           <div className="about-info-row">
             <span className="about-info-label">App Version</span>
@@ -423,7 +423,7 @@ const AboutUpdateSection: React.FC = () => {
       </CollapsibleSection>
 
       {/* Developer (TEMPORARY — remove before BETA) */}
-      <CollapsibleSection id="section-developer" title="Developer" defaultOpen={false}>
+      <CollapsibleSection id="section-developer" title="Developer">
         <div className="about-setting-row">
           <div className="about-setting-info">
             <span className="about-setting-label">Developer Mode</span>

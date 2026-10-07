@@ -2,8 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ClientBehaviorSection } from '@/renderer/components/Settings/ClientBehaviorSection';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { resetAllStores } from '../../../../helpers/store-helpers';
 
 beforeEach(() => {
+  resetAllStores();
   vi.clearAllMocks();
   (window as unknown as { electron: unknown }).electron = {
     window: { setClientBehavior: vi.fn().mockResolvedValue(undefined) },
@@ -69,5 +71,18 @@ describe('ClientBehaviorSection', () => {
     const toToolbarClose = screen.getByLabelText(/To Toolbar.*Close/i);
     fireEvent.click(toToolbarClose);
     expect(useSettingsStore.getState().clientBehavior.toToolbar).toBe('close');
+  });
+
+  it('renders every section collapsed on first visit (#2365)', () => {
+    render(<ClientBehaviorSection />);
+    const id = 'client-behavior';
+    expect(document.getElementById(id), `${id} should be rendered`).not.toBeNull();
+    const open = Array.from(document.querySelectorAll('details.settings-collapsible[open]')).map(
+      (el) => el.id || '(no id)'
+    );
+    expect(
+      open,
+      `expected no Settings section to be open on first visit, but these are open: ${open.join(', ')}`
+    ).toEqual([]);
   });
 });

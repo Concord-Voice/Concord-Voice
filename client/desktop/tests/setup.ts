@@ -40,6 +40,7 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach, vi } from 'vitest';
+import { useSettingsCollapsibleStore } from '../src/renderer/stores/ui/settingsCollapsibleStore';
 
 // Auto-cleanup after each test. useRealTimers() mirrors client/admin's setup: without
 // it, a test whose assertion throws before its own useRealTimers() leaks fake timers
@@ -47,6 +48,12 @@ import { afterEach, vi } from 'vitest';
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  // #2365: CollapsibleSection mirrors every section's open state into this store, which
+  // opened an in-file leakage channel across the Settings suites — a test that opens a
+  // section would leave it open for the next test in the same file, and ten of those
+  // files never call resetAllStores(). One global reset closes the channel for current
+  // and future files (same shape as onceQueueLeak.setup.ts).
+  useSettingsCollapsibleStore.setState(useSettingsCollapsibleStore.getInitialState(), true);
 });
 
 // Provide Web Crypto API from Node's built-in webcrypto (jsdom lacks crypto.subtle)

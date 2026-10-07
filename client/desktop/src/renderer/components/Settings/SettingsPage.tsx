@@ -321,8 +321,19 @@ const SettingsPage: React.FC = () => {
   // (the pane-switch phase, OR the deferred-timer phase). The nav store outlives
   // this component, so a request still outstanding at unmount is stale and would
   // otherwise re-fire as a spurious pane-jump on the next open. (#1644 review, 2nd pass.)
+  //
+  // Only a REAL unmount may clear it (#2365). React.StrictMode (main.tsx) replays every
+  // effect on mount in development — cleanup, then setup again — without touching the
+  // DOM, and a clear that ran inside that replay dropped a request made BEFORE the page
+  // mounted (`openProfilePage`, the purge modal's privacy link) before the focus effect
+  // could act on it: the pane switched and the section never opened. A real unmount has
+  // already removed this page's DOM by the time passive cleanups run, so the content
+  // node's `isConnected` tells the two apart synchronously; the node is captured at setup
+  // because React detaches refs before the cleanup runs on both paths.
   useEffect(() => {
+    const node = contentRef.current;
     return () => {
+      if (node?.isConnected) return; // StrictMode's simulated unmount: still mounted
       useSettingsNavStore.getState().clearFocusRequest();
     };
   }, []);

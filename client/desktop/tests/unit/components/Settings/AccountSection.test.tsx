@@ -42,4 +42,21 @@ describe('AccountSection', () => {
     expect(document.getElementById('section-subscription')).toBeNull();
     expect(screen.queryByLabelText('Self Activity History')).not.toBeInTheDocument();
   });
+
+  it('renders every section collapsed on first visit (#2365)', () => {
+    render(<AccountSection />);
+    const ids = ['section-profile', 'section-password', 'section-nsfw-content'];
+    for (const id of ids) {
+      expect(document.getElementById(id), `${id} should be rendered`).not.toBeNull();
+    }
+    // Sweep every rendered section, not only the listed ids, so a new section that ships
+    // open is caught too.
+    const open = Array.from(document.querySelectorAll('details.settings-collapsible[open]')).map(
+      (el) => el.id || '(no id)'
+    );
+    expect(
+      open,
+      `expected no Settings section to be open on first visit, but these are open: ${open.join(', ')}`
+    ).toEqual([]);
+  });
 });

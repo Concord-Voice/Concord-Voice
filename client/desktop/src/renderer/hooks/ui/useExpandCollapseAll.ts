@@ -13,14 +13,15 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
  * container, plus actions to bulk-toggle them. Powers the Expand/Collapse
  * All button in `SettingsPage` (closes #297).
  *
- * Why DOM-walk rather than React-controlled state?
- * `CollapsibleSection` uses native `<details>`/`<summary>` and stores its
- * open state on the DOM element (via the `[open]` attribute), not in React.
- * Refactoring it to controlled state would touch all 9 call sites and the
- * existing tests for those call sites. Walking the DOM keeps the change
- * surgical and consistent with the existing pattern at SettingsPage.tsx
- * around the sidebar nav, which already does `el.open = true` on
- * `<details>` elements to auto-expand on navigation.
+ * Why DOM-walk rather than drive the store?
+ * `CollapsibleSection` renders a native `<details>`/`<summary>` and mirrors
+ * its open state into `useSettingsCollapsibleStore` from the `toggle` event
+ * (#2365). That event fires for script-driven `el.open = …` writes too, so
+ * setting `open` on the DOM here is enough: the store learns the result
+ * through each section's own handler, and every section is covered without
+ * a store call in this hook. It is also the pattern SettingsPage.tsx uses
+ * around the sidebar nav, which does `el.open = true` on `<details>`
+ * elements to auto-expand on navigation.
  *
  * Aggregate state is kept in sync via a MutationObserver watching for
  * `[open]` attribute changes on every matching child of the container.

@@ -16,7 +16,8 @@ visible during producer swaps, and a remote tile returns when its replacement
 attaches. A remote close can briefly clear the tile if it arrives first. Brief
 receiver gaps no longer turn off layered camera publishing for the whole room.
 Late media from an earlier voice session is closed before it can attach after a
-rejoin.
+rejoin. Settings sections now start collapsed and remember what you expand for
+the rest of the session.
 
 ### Fixed
 
@@ -24,6 +25,7 @@ rejoin.
 - **Voice joins capture the selected microphone once** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — server and direct-message calls capture the selected input after room and encryption setup. If capture finishes after a join has ended, or encrypted publication fails, Concord stops the track. A capture error now gives you useful next steps; the device may be unavailable or in use, so choose another microphone or close the app using it. Microphone permission errors point you to system settings. Audio setting changes preserve your mute, including when you press Mute during a microphone update, and changing an input or audio setting can retry a failed microphone update during a call. Speaking feedback keeps working after switching or rebuilding the microphone, including while alone in a call.
 - **Audio menus now show one Default option** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — it follows your operating system's default device, while named microphones and speakers remain selectable.
 - **Camera replacements and call cleanup preserve the right video** ([PR #3650](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3650)) — local previews survive swaps, and remote video turns on only after its replacement consumer attaches. A remote tile can briefly disappear if its old producer closes first; room-level debounce keeps that gap from disabling layered camera publishing. Queued camera loads are canceled when their producer closes or their owner leaves before the stream attaches. Late media from an earlier voice session is closed before it can attach after a rejoin.
+- **Settings sections start collapsed and stay the way you leave them** ([#2365](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2365), [PR #3651](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3651)) — every section in Settings now opens collapsed, including the six that used to open expanded. A section you expand stays expanded when you switch panes or close and reopen Settings, until Concord Voice restarts or reloads, so you can go test something and come straight back to the section you were working in. Expand all, the sidebar links and the update indicator remember what they open the same way.
 
 ### Changed
 
@@ -33,6 +35,8 @@ rejoin.
 - Refreshed the desktop icon library to lucide-react 1.48.0 ([PR #3645](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3645)).
 - **Electron updated to 44.5.0** ([PR #3599](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3599)).
 - **Voice-call connection libraries updated** ([PR #3602](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3602)) — mediasoup-client 3.24.1 and socket.io-client 4.8.4.
+- **HDR codec controls are separate** — Enable HDR allows supported HDR-capable codecs. Prioritize HDR Codecs prefers an HDR codec over hardware acceleration when both are available. If a codec check finishes after your camera or screen share starts, Concord Voice updates the active stream's codec choice. Neither setting guarantees HDR capture or display.
+- Voice, camera, and screen sends now use separate plan-based bitrate ceilings. The desktop lowers its send settings when a plan changes. When measured video use repeatedly exceeds an admitted limit, the server turns off video for a temporary cooldown while voice remains available. Closing a video stream during a server measurement does not erase its measured usage.
 
 ### Security
 
@@ -40,13 +44,7 @@ rejoin.
 - **Patched the desktop `source-map-js` dependency** ([#3619](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3619)) — updated from 1.2.1 to 1.2.2 to address malformed source-map denial of service ([CVE-2026-93749](https://github.com/advisories/GHSA-68fv-2mgg-jv7q), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - Updated the desktop development dependency `shell-quote` to 1.12.0 to address shell command injection in comment-bearing argument lists ([CVE-2026-102422](https://github.com/advisories/GHSA-pqg4-j6r4-53mv), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - **Media server dependency security update** ([#3620](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3620)) — updated the library that interprets forwarded client addresses to its patched release, and patched `source-map-js` and Vite in media development tooling. No configuration change is needed.
-
 - **Trusted-device recovery requires matching fingerprints on both devices** ([#3582](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3582)) — compare all eight groups and confirm the match on each device before your account key can be transferred and opened. Recovery keeps your original account key and message access. Updated servers refuse the old recovery protocol, so update and restart both devices and begin a fresh request. The server update clears pending recovery requests; it does not remove accounts, trusted devices, recovery circles or account keys.
-
-### Changed
-
-- **HDR codec controls are separate** — Enable HDR allows supported HDR-capable codecs. Prioritize HDR Codecs prefers an HDR codec over hardware acceleration when both are available. If a codec check finishes after your camera or screen share starts, Concord Voice updates the active stream's codec choice. Neither setting guarantees HDR capture or display.
-- Voice, camera, and screen sends now use separate plan-based bitrate ceilings. The desktop lowers its send settings when a plan changes. When measured video use repeatedly exceeds an admitted limit, the server turns off video for a temporary cooldown while voice remains available. Closing a video stream during a server measurement does not erase its measured usage.
 
 ## [0.2.48] — 2026-10-04
 

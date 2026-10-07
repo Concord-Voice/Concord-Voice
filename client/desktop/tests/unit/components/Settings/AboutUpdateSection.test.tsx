@@ -1,7 +1,11 @@
 import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import { vi } from 'vitest';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
-vi.mock('@/renderer/config', () => ({
+// Partial mock: `resetAllStores` (store-helpers) imports every store, and the apiClient
+// chain reads API_BASE/WS_BASE from this module at import time.
+vi.mock('@/renderer/config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/renderer/config')>()),
   SPA_VERSION: 'a'.repeat(40),
 }));
 
@@ -29,6 +33,7 @@ const mockSpaCheckForUpdate = vi.fn().mockResolvedValue({
 const mockSpaReloadLatest = vi.fn().mockResolvedValue({ mode: 'remote', changed: true });
 
 beforeEach(() => {
+  resetAllStores();
   // window.electron is already defined as writable in setup.ts — just assign
   (window as any).electron = {
     ...window.electron,
@@ -585,5 +590,18 @@ describe('AboutUpdateSection', () => {
       expect(screen.getByText("Couldn't check the interface")).toBeInTheDocument();
     });
     expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
+  });
+
+  it('renders every section collapsed on first visit (#2365)', () => {
+    render(<AboutUpdateSection />);
+    const id = 'section-client-info';
+    expect(document.getElementById(id), `${id} should be rendered`).not.toBeNull();
+    const open = Array.from(document.querySelectorAll('details.settings-collapsible[open]')).map(
+      (el) => el.id || '(no id)'
+    );
+    expect(
+      open,
+      `expected no Settings section to be open on first visit, but these are open: ${open.join(', ')}`
+    ).toEqual([]);
   });
 });

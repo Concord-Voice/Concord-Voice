@@ -12,13 +12,13 @@ import '../Profile/profileForms.css';
 function AccountSection() {
   return (
     <>
-      <CollapsibleSection id="section-profile" title="Profile Information" defaultOpen>
+      <CollapsibleSection id="section-profile" title="Profile Information">
         <ProfileInfoForm />
       </CollapsibleSection>
-      <CollapsibleSection id="section-password" title="Change Password" defaultOpen>
+      <CollapsibleSection id="section-password" title="Change Password">
         <PasswordChangeForm />
       </CollapsibleSection>
-      <CollapsibleSection id="section-nsfw-content" title="NSFW Content Access" defaultOpen>
+      <CollapsibleSection id="section-nsfw-content" title="NSFW Content Access">
         <NsfwContentGate />
       </CollapsibleSection>
     </>

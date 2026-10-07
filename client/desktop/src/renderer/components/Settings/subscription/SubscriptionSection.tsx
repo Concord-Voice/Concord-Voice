@@ -16,7 +16,7 @@ const SubscriptionSection: React.FC = () => {
         Subscriptions are coming in the near future to unlock the full Concord Voice experience.
         These planned options and prices may change before launch.
       </p>
-      <CollapsibleSection id="section-current-plan" title="Current Plan" defaultOpen>
+      <CollapsibleSection id="section-current-plan" title="Current Plan">
         <PlanCard info={info} />
         <FeatureGrid />
       </CollapsibleSection>

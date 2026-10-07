@@ -36,6 +36,7 @@ import { useNotificationNavigationStore } from '../../src/renderer/stores/ui/not
 import { useNotificationStore } from '../../src/renderer/stores/ui/notificationStore';
 import { useOsPermissionStore } from '../../src/renderer/stores/voice/osPermissionStore';
 import { usePermissionStore } from '../../src/renderer/stores/chat/permissionStore';
+import { useSettingsCollapsibleStore } from '../../src/renderer/stores/ui/settingsCollapsibleStore';
 import { useSettingsNavStore } from '../../src/renderer/stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '../../src/renderer/stores/ui/settingsOverlayStore';
 import { useTTSSettingsStore } from '../../src/renderer/stores/audio/ttsSettingsStore';
@@ -121,6 +122,7 @@ export function resetAllStores(): void {
   // under test being broken. Six test files had grown explicit workarounds.
   // Found while adding #2369 coverage on PR #3291.
   resetToInitialState(useSettingsStore);
+  resetToInitialState(useSettingsCollapsibleStore);
   resetToInitialState(useSettingsNavStore);
   resetToInitialState(useSettingsOverlayStore);
   resetToInitialState(useTTSSettingsStore);
