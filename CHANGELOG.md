@@ -31,6 +31,7 @@ rejoin.
 - Webcam speaker frames stay at a fixed size and show a steady accent highlight during voice calls. Avatar frames keep their speaking pulse ([#3595](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3595), [PR #3596](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3596)).
 - Refreshed the desktop icon library to lucide-react 1.48.0 ([PR #3645](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3645)).
 - **Electron updated to 44.5.0** ([PR #3599](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3599)).
+- **Voice-call connection libraries updated** ([PR #3602](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3602)) — mediasoup-client 3.24.1 and socket.io-client 4.8.4.
 
 ### Security
 
