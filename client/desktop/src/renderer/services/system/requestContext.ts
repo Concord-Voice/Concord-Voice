@@ -15,7 +15,11 @@
  */
 import { useAuthStore } from '../../stores/auth/authStore';
 import { apiFetch, type AuthLifecycleSnapshot } from './apiClient';
-import { captureRuntimeServerSelection, type RuntimeServerSelection } from './runtimeServerBase';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+  type RuntimeServerSelection,
+} from './runtimeServerBase';
 
 export interface ApiRequestContext {
   readonly serverSelection: RuntimeServerSelection;
@@ -35,6 +39,30 @@ export function captureApiRequestContext(): ApiRequestContext {
     serverSelection: captureRuntimeServerSelection(),
     authLifecycle: { accessToken, sessionId, authGeneration },
   };
+}
+
+/**
+ * True while the account and server `context` captured are still the current
+ * ones: the same check apiFetch's pre-dispatch fence makes, for a caller that
+ * must decide BEFORE it calls apiFetch (an expired session versus a silent
+ * discard). The account is the generation only, as in apiFetch, so a token
+ * refresh does not read as a switch.
+ */
+export function apiRequestContextIsCurrent(context: ApiRequestContext): boolean {
+  return (
+    useAuthStore.getState().authGeneration === context.authLifecycle.authGeneration &&
+    runtimeServerSelectionIsCurrent(context.serverSelection)
+  );
+}
+
+/**
+ * True for the AbortError apiFetch throws from its pre-dispatch fence, and
+ * that `fetch` throws for an aborted signal. A request sent with no signal can
+ * only have raised the fence's, so nothing was dispatched. jsdom's DOMException
+ * is not an Error subclass, hence both checks.
+ */
+export function isAbortError(err: unknown): boolean {
+  return (err instanceof DOMException || err instanceof Error) && err.name === 'AbortError';
 }
 
 /**

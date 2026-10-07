@@ -1,8 +1,11 @@
+import type { ReactElement } from 'react';
 import { render, screen, fireEvent } from '../../../test-utils';
 import MFAMethodPicker, {
   getAvailableCategories,
   getDefaultMethod,
 } from '@/renderer/components/Auth/MFAMethodPicker';
+import KeyIcon from '@/renderer/components/Auth/icons/KeyIcon';
+import PhoneIcon from '@/renderer/components/Auth/icons/PhoneIcon';
 
 describe('getAvailableCategories', () => {
   it('maps webauthn to webauthn category', () => {
@@ -146,5 +149,69 @@ describe('MFAMethodPicker', () => {
       />
     );
     expect(screen.queryByText('Email / SMS Code')).not.toBeInTheDocument();
+  });
+});
+
+// The two glyphs moved out of this file into `icons/` so the step-up picker can
+// share them. The extraction must be invisible: the markup below is the JSX the
+// picker carried before it, copied verbatim, and the picker's own rendering must
+// still equal it.
+describe('MFAMethodPicker extracted icons', () => {
+  const ORIGINAL_KEY = (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    >
+      <path d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+    </svg>
+  );
+  const ORIGINAL_PHONE = (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    >
+      <rect x="5" y="2" width="14" height="20" rx="2" />
+      <line x1="12" y1="18" x2="12" y2="18.01" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+
+  function markupOf(node: ReactElement): string {
+    return render(node).container.innerHTML;
+  }
+
+  function pickerIconHtml(label: string): string {
+    const view = render(
+      <MFAMethodPicker methods={['webauthn', 'totp']} currentMethod="totp" onSelect={vi.fn()} />
+    );
+    const button = view.getByText(label).closest('button');
+    return button?.querySelector('.mfa-method-picker-icon')?.innerHTML ?? '';
+  }
+
+  it('KeyIcon renders the markup the picker carried before the extraction', () => {
+    expect(markupOf(<KeyIcon />)).toBe(markupOf(ORIGINAL_KEY));
+  });
+
+  it('PhoneIcon renders the markup the picker carried before the extraction', () => {
+    expect(markupOf(<PhoneIcon />)).toBe(markupOf(ORIGINAL_PHONE));
+  });
+
+  it('the picker still shows the security-key glyph on the Security Key option', () => {
+    expect(pickerIconHtml('Security Key / Biometrics')).toBe(markupOf(ORIGINAL_KEY));
+  });
+
+  it('the picker still shows the phone glyph on the Authenticator App option', () => {
+    expect(pickerIconHtml('Authenticator App')).toBe(markupOf(ORIGINAL_PHONE));
+  });
+
+  it('draws two different glyphs', () => {
+    expect(markupOf(<KeyIcon />)).not.toBe(markupOf(<PhoneIcon />));
   });
 });

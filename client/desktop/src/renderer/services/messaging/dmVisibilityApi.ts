@@ -2,6 +2,7 @@ import { apiFetch } from '../system/apiClient';
 import {
   apiFetchInContext,
   captureApiRequestContext,
+  isAbortError,
   type ApiRequestContext,
 } from '../system/requestContext';
 import {
@@ -11,15 +12,15 @@ import {
 } from '../system/stepUpToken';
 
 /**
- * The methods an `mfa_required` refusal named, for Clear's MFA prompt. A
- * refusal that names none still gets a code prompt, as before the methods
- * were read at all.
+ * The methods an `mfa_required` refusal named, for Clear's MFA prompt, exactly
+ * as named: a refusal that names none, or none the prompt can verify, is the
+ * picker's no-usable-method state. Substituting a code prompt there showed a
+ * code box to an account that could not fill it.
  */
 function namedMfaMethods(value: unknown): string[] {
-  const methods = Array.isArray(value)
+  return Array.isArray(value)
     ? value.filter((method): method is string => typeof method === 'string')
     : [];
-  return methods.length > 0 ? methods : ['totp'];
 }
 
 export type ClearFactor = { kind: 'password' | 'mfa'; value: string };
@@ -35,12 +36,19 @@ export type ClearHistoryResult =
         | 'sessionExpired'
         | 'notFound'
         | 'refused'
-        | 'uncertain';
+        | 'uncertain'
+        /**
+         * Clear never left: apiFetch refused to dispatch it because the account
+         * or server changed after the capture. Nothing was sent, so nothing
+         * was cleared; discard it rather than report a transport failure.
+         */
+        | 'aborted';
     }
   | { kind: 'rateLimited'; retryAfterSeconds?: number }
   /**
-   * The account confirms with MFA. `methods` are the ones the server named, so
-   * an account whose factor is a security key is offered that ceremony (#3509).
+   * The account confirms with MFA. `methods` are the ones the server named,
+   * unfiltered and possibly empty, so an account whose factor is a security
+   * key is offered that ceremony (#3509).
    */
   | { kind: 'mfaRequired'; methods: string[] }
   /**
@@ -59,28 +67,34 @@ export async function hideDMThread(id: string): Promise<boolean> {
  * Clear's body, or the refusal that stopped it first. A password never reaches
  * Clear (#3509): it is exchanged at the mint endpoint for a single-use token
  * bound to `dm.clear`, and Clear gets `{ step_up_token }`.
+ *
+ * `context` is the caller's capture, when it has one; the exchange and Clear
+ * are admitted against it.
  */
 async function clearRequestBody(
-  factor?: ClearFactor
+  factor: ClearFactor | undefined,
+  context: ApiRequestContext | undefined
 ): Promise<{ body: object; context?: ApiRequestContext } | { refused: ClearHistoryResult }> {
-  if (factor?.kind === 'mfa') return { body: { mfa_code: factor.value } };
-  if (factor?.kind !== 'password') return { body: {} };
+  if (factor?.kind === 'mfa') return { body: { mfa_code: factor.value }, context };
+  if (factor?.kind !== 'password') return { body: {}, context };
   // The exchange and Clear are one operation: Clear is admitted against this
   // capture, so it refuses to dispatch if another account or server took over
   // after the exchange (#3509 review).
-  const context = captureApiRequestContext();
-  const minted = await mintPasswordStepUpToken(factor.value, 'dm.clear', context);
+  const operation = context ?? captureApiRequestContext();
+  const minted = await mintPasswordStepUpToken(factor.value, 'dm.clear', operation);
   if (minted.kind === 'refused') {
+    // The exchange never left, so there is nothing to say about the password.
+    if (minted.unsent) return { refused: { kind: 'aborted' } };
     // A wrong password keeps Clear's own arm, and an account that enrolled MFA
     // after the prompt opened moves to Clear's code stage; every other mint
     // refusal carries its copy for the password field.
     if (minted.reason === 'invalidPassword') return { refused: { kind: 'invalidPassword' } };
     if (minted.reason === 'mfaRequired') {
-      return { refused: { kind: 'mfaRequired', methods: namedMfaMethods(minted.methods) } };
+      return { refused: { kind: 'mfaRequired', methods: minted.methods ?? [] } };
     }
     return { refused: { kind: 'passwordRefused', message: passwordStepUpRefusalMessage(minted) } };
   }
-  return { body: { step_up_token: minted.token }, context };
+  return { body: { step_up_token: minted.token }, context: operation };
 }
 
 function forbiddenClearResult(
@@ -142,11 +156,18 @@ function clearResponseResult(
   return { kind: response.status >= 500 ? 'uncertain' : 'refused' };
 }
 
+/**
+ * `context` is the operation Clear belongs to (`captureApiRequestContext`): the
+ * credential stage passes the capture its factor was proven under, so the
+ * proof is never sent as another account or to another server. Without one,
+ * Clear is its own operation, as before.
+ */
 export async function clearDMHistory(
   id: string,
-  factor?: ClearFactor
+  factor?: ClearFactor,
+  context?: ApiRequestContext
 ): Promise<ClearHistoryResult> {
-  const request = await clearRequestBody(factor);
+  const request = await clearRequestBody(factor, context);
   if ('refused' in request) return request.refused;
   let response: Response;
   try {
@@ -159,8 +180,11 @@ export async function clearDMHistory(
       },
       request.context
     );
-  } catch {
-    return { kind: 'uncertain' };
+  } catch (err) {
+    // Clear is sent with no signal and no dispatch guard, so the only
+    // AbortError apiFetch can raise here is its pre-dispatch fence. Any other
+    // rejection may have reached the server.
+    return isAbortError(err) ? { kind: 'aborted' } : { kind: 'uncertain' };
   }
 
   const raw: unknown = await response.json().catch(() => null);

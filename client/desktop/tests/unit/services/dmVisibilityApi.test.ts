@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { apiFetch } from '@/renderer/services/system/apiClient';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import { clearDMHistory, hideDMThread } from '@/renderer/services/messaging/dmVisibilityApi';
 
 vi.mock('@/renderer/services/system/apiClient', () => ({ apiFetch: vi.fn() }));
@@ -15,6 +16,9 @@ const response = (status: number, body: unknown, headers: Record<string, string>
     headers: new Headers(headers),
     json: async () => body,
   }) as Response;
+
+const contextOf = (call: number) =>
+  (mockApiFetch.mock.calls[call]?.[2] as { context?: unknown } | undefined)?.context;
 
 describe('dm visibility API', () => {
   beforeEach(() => mockApiFetch.mockReset());
@@ -79,7 +83,10 @@ describe('dm visibility API', () => {
     expect(clearOpts?.context).toBe(mintOpts?.context);
   });
 
-  it('posts only the server-selected MFA factor after MFA is required', async () => {
+  // Inverted for D2: a refusal that names no methods used to be answered with
+  // `['totp']`, which showed a code box to an account that could not fill it.
+  // It now stays empty, and the picker lands on its no-usable-method state.
+  it('posts only the server-selected MFA factor after MFA is required, naming nothing it was not told', async () => {
     mockApiFetch.mockResolvedValueOnce(response(403, { mfa_required: true })).mockResolvedValueOnce(
       response(200, {
         conversation_id: CONVERSATION_ID,
@@ -87,10 +94,10 @@ describe('dm visibility API', () => {
       })
     );
 
-    // A refusal that names no methods still gets a code prompt.
+    // Mutant: reinstating the `['totp']` fallback.
     await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({
       kind: 'mfaRequired',
-      methods: ['totp'],
+      methods: [],
     });
     await expect(
       clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' })
@@ -188,5 +195,129 @@ describe('dm visibility API', () => {
 
     mockApiFetch.mockRejectedValueOnce(new Error('network failed'));
     await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({ kind: 'uncertain' });
+  });
+
+  describe('a request that never left (#3509 review)', () => {
+    const abort = () => new DOMException('Request lifecycle changed before dispatch', 'AbortError');
+
+    // Mutant: ignoring `minted.unsent`, which blames the password ("We couldn't
+    // check your password") for a request that was never made.
+    it('reports an unsent password exchange as aborted, and never sends Clear', async () => {
+      mockApiFetch.mockRejectedValueOnce(abort());
+
+      await expect(
+        clearDMHistory(CONVERSATION_ID, { kind: 'password', value: 'test-password-123' })
+      ).resolves.toEqual({ kind: 'aborted' });
+      expect(mockApiFetch).toHaveBeenCalledOnce();
+      expect(mockApiFetch.mock.calls[0]?.[0]).toBe('/api/v1/auth/step-up/password');
+    });
+
+    it('still blames the exchange for a transport failure that may have left', async () => {
+      mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+
+      await expect(
+        clearDMHistory(CONVERSATION_ID, { kind: 'password', value: 'test-password-123' })
+      ).resolves.toEqual({
+        kind: 'passwordRefused',
+        message: "We couldn't check your password. Try again.",
+      });
+      expect(mockApiFetch).toHaveBeenCalledOnce();
+    });
+
+    it('reports a Clear fenced before dispatch as aborted, and any other rejection as uncertain', async () => {
+      mockApiFetch.mockRejectedValueOnce(abort());
+      await expect(
+        clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' })
+      ).resolves.toEqual({ kind: 'aborted' });
+
+      mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      await expect(
+        clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' })
+      ).resolves.toEqual({ kind: 'uncertain' });
+    });
+  });
+
+  describe('the caller capture', () => {
+    it('admits an MFA Clear against the caller context, and a bare Clear against none', async () => {
+      const context = captureApiRequestContext();
+      mockApiFetch
+        .mockResolvedValueOnce(response(403, { error: 'x' }))
+        .mockResolvedValueOnce(response(403, { error: 'x' }));
+
+      await clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' }, context);
+      await clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' });
+
+      expect(contextOf(0)).toBe(context);
+      expect(mockApiFetch.mock.calls[1]).toHaveLength(2);
+    });
+
+    it('exchanges the password and sends Clear under the caller context', async () => {
+      const context = captureApiRequestContext();
+      mockApiFetch
+        .mockResolvedValueOnce(response(200, { step_up_token: 'minted-token', expires_in: 60 }))
+        .mockResolvedValueOnce(
+          response(200, { conversation_id: CONVERSATION_ID, cleared_at: '2026-09-23T20:00:00Z' })
+        );
+
+      await expect(
+        clearDMHistory(CONVERSATION_ID, { kind: 'password', value: 'test-password-123' }, context)
+      ).resolves.toEqual({ kind: 'success' });
+
+      // Mutant: the exchange taking its own capture instead of the caller's.
+      // Identity, not structure: a fresh capture of the same state is `toEqual`.
+      expect(contextOf(0)).toBe(context);
+      expect(contextOf(1)).toBe(context);
+    });
+  });
+
+  describe('mint refusals', () => {
+    it.each([
+      [423, { error_code: 'account_locked' }, 'Too many attempts. Try again later.'],
+      [404, { error: 'Not Found' }, "This server doesn't support this confirmation yet."],
+      [500, {}, "We couldn't check your password. Try again."],
+    ] as const)(
+      'puts the %i mint refusal on the password field and never sends Clear',
+      async (status, body, message) => {
+        mockApiFetch.mockResolvedValueOnce(response(status, body));
+
+        await expect(
+          clearDMHistory(CONVERSATION_ID, { kind: 'password', value: 'test-password-123' })
+        ).resolves.toEqual({ kind: 'passwordRefused', message });
+        expect(mockApiFetch).toHaveBeenCalledOnce();
+      }
+    );
+
+    it("maps Clear's refused token to the expiry copy", async () => {
+      mockApiFetch.mockResolvedValueOnce(
+        response(403, { password_required: true, step_up_token_invalid: true })
+      );
+
+      await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({
+        kind: 'passwordRefused',
+        message: 'Your confirmation expired. Enter your password again.',
+      });
+    });
+
+    it('moves an account that gained MFA mid-prompt to the code stage, naming what the mint named', async () => {
+      mockApiFetch.mockResolvedValueOnce(
+        response(403, { mfa_required: true, mfa_methods: ['totp', 'webauthn'] })
+      );
+
+      await expect(
+        clearDMHistory(CONVERSATION_ID, { kind: 'password', value: 'test-password-123' })
+      ).resolves.toEqual({ kind: 'mfaRequired', methods: ['totp', 'webauthn'] });
+    });
+  });
+
+  it('reads the no-factor flag, and the older copy, as an impossible step-up', async () => {
+    mockApiFetch.mockResolvedValueOnce(response(400, { step_up_unavailable: true }));
+
+    await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({ kind: 'stepUpImpossible' });
+  });
+
+  it('treats a non-object body as an empty one', async () => {
+    mockApiFetch.mockResolvedValueOnce(response(403, ['mfa_required']));
+
+    await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({ kind: 'refused' });
   });
 });

@@ -1,8 +1,11 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
-import { apiFetch } from '../../services/system/apiClient';
-import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
+import {
+  beginWebAuthnInlineVerification,
+  finishWebAuthnVerification,
+  performWebAuthnAssertion,
+} from '../../services/system/webauthnInlineStepUp';
 import {
   getAvailableCategories,
   getDefaultMethod,
@@ -15,45 +18,6 @@ import type { StepUpPurpose } from './stepUpPurpose';
 import './TOTPInput.css';
 
 // ── WebAuthn helpers (module-level, outside component) ─────────────────
-
-/** Perform the browser WebAuthn assertion ceremony. */
-async function performWebAuthnAssertion(
-  options: PublicKeyCredentialRequestOptions,
-  signal: AbortSignal
-): Promise<PublicKeyCredential> {
-  const credential = (await navigator.credentials.get({
-    publicKey: options,
-    signal,
-  })) as PublicKeyCredential;
-  if (!credential) throw new Error('No credential returned');
-  return credential;
-}
-
-/** Send the assertion response to the server and return the MFA token. */
-async function finishWebAuthnVerification(
-  credential: PublicKeyCredential,
-  _challengeToken: string
-): Promise<string> {
-  const assertion = credential.response as AuthenticatorAssertionResponse;
-  const finishRes = await apiFetch('/api/v1/mfa/webauthn/verify-inline/finish', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      id: credential.id,
-      rawId: bufferToBase64url(credential.rawId),
-      type: credential.type,
-      response: {
-        authenticatorData: bufferToBase64url(assertion.authenticatorData),
-        clientDataJSON: bufferToBase64url(assertion.clientDataJSON),
-        signature: bufferToBase64url(assertion.signature),
-        userHandle: assertion.userHandle ? bufferToBase64url(assertion.userHandle) : undefined,
-      },
-    }),
-  });
-  const finishData = await finishRes.json();
-  if (!finishRes.ok) throw new Error(finishData.error || 'Verification failed');
-  return finishData.mfa_token;
-}
 
 /** Classify a WebAuthn error into a user-facing message, or null for silent abort. */
 function classifyWebAuthnError(err: unknown): string | null {
@@ -233,28 +197,13 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
     try {
       // Step 1: Get assertion options from server, for this prompt's purpose
       // only (the token minted at finish is spendable on no other route).
-      const beginRes = await apiFetch('/api/v1/mfa/webauthn/verify-inline/begin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ purpose }),
-      });
-      const beginData = await beginRes.json();
-      if (!beginRes.ok) throw new Error(beginData.error || 'Failed to start verification');
-
-      // Convert base64url fields for WebAuthn API
-      const options = beginData.publicKey;
-      options.challenge = base64urlToBuffer(options.challenge);
-      if (options.allowCredentials) {
-        for (const cred of options.allowCredentials) {
-          cred.id = base64urlToBuffer(cred.id);
-        }
-      }
+      const options = await beginWebAuthnInlineVerification(purpose);
 
       // Step 2: Browser WebAuthn ceremony
       const credential = await performWebAuthnAssertion(options, controller.signal);
 
       // Step 3: Send assertion to server and get MFA token
-      const mfaToken = await finishWebAuthnVerification(credential, beginData.challengeToken);
+      const mfaToken = await finishWebAuthnVerification(credential);
       onVerify(mfaToken);
       // Leave the waiting state: the key has answered and Confirm is live.
       setWebauthnStatus('verified');

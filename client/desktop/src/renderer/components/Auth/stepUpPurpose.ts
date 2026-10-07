@@ -3,7 +3,8 @@
  *
  * Mirrors the server's closed `stepup.Purpose` set
  * (`services/control-plane/internal/stepup/purpose.go`), restricted to the
- * routes a desktop `MFAVerifyPrompt` actually guards. One value per ROUTE: the
+ * routes a desktop step-up prompt (`MFAVerifyPrompt` or the factor picker)
+ * actually guards. One value per ROUTE: the
  * server binds the minted WebAuthn inline token to this purpose and accepts it
  * only on that route, so a prompt must name the request its code is sent with,
  * never a neighbouring one. A value missing from the server's set is refused
@@ -18,6 +19,7 @@ export const STEP_UP_PURPOSES = [
   'mfa_settings.email_sms_disable',
   'mfa_settings.backup_email_set',
   'mfa_settings.recovery_key_replace',
+  'privacy.purge_fence_disable',
   'sessions.revoke',
   'sessions.revoke_all',
   'sessions.revocation_mode_set',
@@ -25,6 +27,7 @@ export const STEP_UP_PURPOSES = [
   'messages.channel_purge',
   'messages.server_purge',
   'dm.message_delete',
+  'dm.purge',
   'dm.clear',
 ] as const;
 

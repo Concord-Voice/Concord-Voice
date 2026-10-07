@@ -2,6 +2,9 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from
 import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
+import { MINT_PATH } from '../../helpers/stepUpTokenWire';
 import {
   isSoftLockChallengeResult,
   isStepUpPurgeResult,
@@ -263,6 +266,91 @@ describe('purgeMessages request shape', () => {
     );
     await purgeMessages({ context: 'server', scopeId: 'server-1', range: 'all' });
     expect(hit).toBe(true);
+  });
+});
+
+// The DM/group step-up proves its factor under ONE capture of the account and
+// server (useStepUpFactor's `run`) and hands it to the purge as the second
+// argument. The request is admitted against that capture, so a security-key
+// token or a password is never sent as another account or to another server.
+describe('purgeMessages request context', () => {
+  const DM_ROUTE = '*/api/v1/dm/conversations/:id/messages';
+
+  /** Counts the requests that reached a route. */
+  function countHits(method: 'delete' | 'post', route: string): () => number {
+    let hits = 0;
+    server.use(
+      http[method](route, () => {
+        hits += 1;
+        return HttpResponse.json({ deleted_count: 1, hidden_count: 0, step_up_token: 'tok' });
+      })
+    );
+    return () => hits;
+  }
+
+  const replaceAccount = () =>
+    useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 }));
+
+  // Mutant: the second argument dropped from apiFetchInContext, so the request
+  // goes out as whoever is signed in by then.
+  it.each(['dm', 'group'] as const)(
+    'a %s purge refuses to dispatch once the captured account was replaced',
+    async (context) => {
+      const hits = countHits('delete', DM_ROUTE);
+      const captured = captureApiRequestContext();
+      replaceAccount();
+
+      await expect(
+        purgeMessages(
+          { context, scopeId: CONVERSATION, range: '7d', mfaCode: FIXTURE_OTP },
+          captured
+        )
+      ).rejects.toMatchObject({ name: 'AbortError' });
+      expect(hits()).toBe(0);
+    }
+  );
+
+  it('a DM purge under a still-current capture is sent once', async () => {
+    const hits = countHits('delete', DM_ROUTE);
+    const captured = captureApiRequestContext();
+
+    const result = await purgeMessages(
+      { context: 'dm', scopeId: CONVERSATION, range: '7d', mfaCode: FIXTURE_OTP },
+      captured
+    );
+    expect(result).toEqual({ kind: 'success', deletedCount: 1, hiddenCount: 0 });
+    expect(hits()).toBe(1);
+  });
+
+  it('without a capture the purge is its own operation, as before', async () => {
+    const hits = countHits('delete', DM_ROUTE);
+    replaceAccount();
+
+    const result = await purgeMessages({ context: 'dm', scopeId: CONVERSATION, range: '7d' });
+    expect(result.kind).toBe('success');
+    expect(hits()).toBe(1);
+  });
+
+  // Mutant: the self-purge exchange ignoring the caller's capture and taking
+  // its own, so a password is minted for an account that is no longer current.
+  it('a self-purge password exchange is admitted against the supplied capture too', async () => {
+    const mints = countHits('post', `*${MINT_PATH}`);
+    const purges = countHits('delete', '*/api/v1/channels/:id/messages');
+    const captured = captureApiRequestContext();
+    replaceAccount();
+
+    // The mint reports a fenced exchange as a refusal (`unsent`) rather than
+    // throwing, and the soft-lock stage words it on the password field.
+    const result = await purgeMessages(
+      { context: 'channel', scopeId: CHANNEL, range: '7d', currentPassword: FIXTURE_PW },
+      captured
+    );
+    expect(result).toEqual({
+      kind: 'softLockChallenge',
+      view: { view: 'password', error: expect.any(String) },
+    });
+    expect(mints()).toBe(0);
+    expect(purges()).toBe(0);
   });
 });
 

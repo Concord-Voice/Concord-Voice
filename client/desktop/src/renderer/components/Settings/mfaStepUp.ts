@@ -1,4 +1,5 @@
 import { apiFetch } from '../../services/system/apiClient';
+import { isAbortError } from '../../services/system/requestContext';
 import { classifyStepUpRefusal, type StepUpRefusal } from '../../services/system/stepUpRefusal';
 
 /**
@@ -26,11 +27,6 @@ export async function mapMfaStepUpResponse(res: Response): Promise<MfaStepUpResu
   }
   const body: unknown = await res.json().catch(() => ({}));
   return classifyStepUpRefusal(res.status, body);
-}
-
-/** `apiFetch` throws a DOMException named AbortError; jsdom's is not an Error subclass. */
-function isAbortError(err: unknown): boolean {
-  return (err instanceof DOMException || err instanceof Error) && err.name === 'AbortError';
 }
 
 /**

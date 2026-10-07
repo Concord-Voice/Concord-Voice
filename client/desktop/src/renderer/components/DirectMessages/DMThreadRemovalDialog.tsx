@@ -1,12 +1,21 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
-import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import LoadingSpinner from '../Auth/LoadingSpinner';
+import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
+import {
+  useStepUpFactor,
+  type StepUpPhase,
+  type StepUpSubmit,
+  type StepUpSubmitOutcome,
+} from '../../hooks/auth/useStepUpFactor';
 import {
   clearDMHistory,
   hideDMThread,
   type ClearFactor,
+  type ClearHistoryResult,
 } from '../../services/messaging/dmVisibilityApi';
 import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import {
   captureAuthLifecycle,
   isSameAuthLifecycle,
@@ -25,10 +34,29 @@ interface DMThreadRemovalDialogProps {
   onRemoved: () => void;
 }
 
-type ClearStage = 'confirm' | 'password' | 'mfa' | 'uncertain';
+type ClearStage = 'confirm' | 'credentials' | 'uncertain';
 
 const CLEAR_UNCERTAIN_ERROR =
   'Could not confirm whether history was cleared. Check the thread before retrying.';
+
+/**
+ * Names the credential stage. The dialog title stays constant (ui/Modal binds
+ * it to aria-labelledby), so this heading is what announces the stage change
+ * and takes focus.
+ */
+const CREDENTIALS_HEADING = 'Confirm it is you';
+/**
+ * #3's password leg: shown only to an account with no inline method. Named
+ * here because a quoted literal beside the `passwordLeg` key reads to static
+ * analysis as a hard-coded credential (Sonar S2068, detect-secrets).
+ */
+const LEG_ONLY_WITHOUT_MFA = 'whenNoMfa' as const;
+
+/**
+ * The words for a session that is gone: the read's `session` refusal, an
+ * account or server change during the activation, and Clear's own 401.
+ */
+const SESSION_MESSAGE = 'Sign in again to clear history.';
 
 const REMOVAL_TITLES: Record<DMThreadRemovalTarget['action'], string> = {
   hide: 'Hide thread',
@@ -43,15 +71,81 @@ const REMOVAL_COPY: Record<DMThreadRemovalTarget['action'], string> = {
   leave: "Leave this group? You will lose access to this group's messages and encryption keys.",
 };
 
-function clearFactor(stage: ClearStage, credential: string): ClearFactor | undefined {
-  if (stage === 'password') return { kind: 'password', value: credential };
-  if (stage === 'mfa') return { kind: 'mfa', value: credential };
-  return undefined;
+/**
+ * The factor Clear is sent. The hook hands over a code or a security-key token
+ * when a method is offered; with none offered, the password leg is showing.
+ */
+function clearFactor(mfa: string | undefined, password: string): ClearFactor {
+  return mfa === undefined ? { kind: 'password', value: password } : { kind: 'mfa', value: mfa };
 }
 
-function removalActionLabel(action: DMThreadRemovalTarget['action'], isVerifying: boolean): string {
-  if (action === 'clear') return isVerifying ? 'Verify and clear' : 'Continue';
-  return REMOVAL_TITLES[action];
+/**
+ * Clear's answer as the factor hook reads it. A refusal of what was entered, or
+ * of the budget, is a `refusal` (the hook re-offers the credentials); any other
+ * reply means the server answered and may have read the code.
+ */
+function submitOutcome(result: ClearHistoryResult): StepUpSubmitOutcome {
+  switch (result.kind) {
+    case 'success':
+      return { kind: 'success' };
+    case 'uncertain':
+      return { kind: 'transport' };
+    case 'aborted':
+      return { kind: 'aborted' };
+    case 'passwordRequired':
+    case 'invalidPassword':
+    case 'invalidMfaCode':
+    case 'sessionExpired':
+      return { kind: 'refusal', refusal: { kind: result.kind } };
+    case 'mfaRequired':
+      return { kind: 'refusal', refusal: { kind: 'mfaRequired', methods: result.methods } };
+    case 'rateLimited':
+      return { kind: 'refusal', refusal: { kind: 'rateLimited' } };
+    case 'passwordRefused':
+    case 'notFound':
+    case 'stepUpImpossible':
+    case 'refused':
+      return { kind: 'answered' };
+  }
+}
+
+/**
+ * The banner for an answer that no credential field owns, or null. A refusal
+ * of the password, the code or the security key is worded by the credential
+ * stage itself, so it has no text here.
+ */
+function clearErrorText(result: ClearHistoryResult): string | null {
+  switch (result.kind) {
+    case 'rateLimited':
+      return result.retryAfterSeconds === undefined
+        ? 'Try again later.'
+        : `Try again in ${result.retryAfterSeconds} seconds.`;
+    case 'passwordRefused':
+      // #3509: the mint refused the password, or Clear refused the token.
+      return result.message;
+    case 'sessionExpired':
+      return SESSION_MESSAGE;
+    case 'notFound':
+      return 'This thread is no longer available.';
+    case 'stepUpImpossible':
+      return 'Set a password, enable MFA, or turn off purge protection in Privacy & Security.';
+    case 'refused':
+      return 'History could not be cleared.';
+    default:
+      return null;
+  }
+}
+
+/** The primary's label: the action, or for Clear the stage and activation it is in. */
+function primaryLabel(
+  action: DMThreadRemovalTarget['action'],
+  stage: ClearStage,
+  phase: StepUpPhase
+): string {
+  if (action !== 'clear') return REMOVAL_TITLES[action];
+  if (stage !== 'credentials') return 'Continue';
+  if (phase === 'ceremony') return 'Waiting…';
+  return phase === 'submitting' ? 'Clearing…' : 'Verify and clear';
 }
 
 async function restoreHiddenConversation(
@@ -79,40 +173,60 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   onClose,
   onRemoved,
 }) => {
+  const { conversation, action } = target;
   const cancelRef = useRef<HTMLButtonElement>(null);
-  const factorRef = useRef<HTMLInputElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
   const requestInFlightRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const [clearStage, setClearStage] = useState<ClearStage>('confirm');
-  const [credential, setCredential] = useState('');
+  // Wire secret. Component-local state only: never a store, never a log.
+  const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
-  // The methods Clear or the mint named when it asked for MFA, and a key that
-  // remounts the prompt so a cleared credential also clears its typed code.
-  const [mfaMethods, setMfaMethods] = useState<string[]>(['totp']);
-  const [promptKey, setPromptKey] = useState(0);
+  const requireAuthBeforePurge = usePrivacyStore((s) => s.settings.requireAuthBeforePurge);
 
-  const resetCredential = () => {
-    setCredential('');
-    setPromptKey((key) => key + 1);
-  };
+  const removable = !(conversation.isPersonal || (action === 'leave' && !conversation.isGroup));
+  // Fail closed on unknown: internal/dm/visibility.go reads the same setting
+  // that way, and a server too old to expose the field omits it entirely. With
+  // the setting off, Clear stays one click and sends no factor.
+  const stepUpRequired = action === 'clear' && requireAuthBeforePurge !== false;
 
-  useEffect(() => {
-    if (!busy && clearStage === 'password') factorRef.current?.focus();
-  }, [busy, clearStage, error]);
+  // passwordLeg set to whenNoMfa: the server asks for the password only when the
+  // account has no inline method (#3509), so the field shows for that account
+  // alone. `readFailure: 'block'`: a Clear sent with the wrong factor spends a
+  // purge unit that is never refunded, so a failed read blocks with Retry
+  // rather than guessing. The read starts when the dialog opens, so the stage
+  // is ready on arrival; `clearStage` also enables it for a Clear the server
+  // refused although the local setting said it would not (a stale setting).
+  const factor = useStepUpFactor({
+    enabled: removable && (stepUpRequired || clearStage === 'credentials'),
+    purpose: 'dm.clear',
+    passwordLeg: LEG_ONLY_WITHOUT_MFA,
+    readFailure: 'block',
+    allowBackup: true,
+  });
+  const stepUpSubmitting = factor.phase === 'submitting';
+  const cancelEnabled = !busy && !stepUpSubmitting;
 
-  if (
-    target.conversation.isPersonal ||
-    (target.action === 'leave' && !target.conversation.isGroup)
-  ) {
-    return null;
-  }
+  // A stage change moves focus to the stage heading, never to the primary.
+  useLayoutEffect(() => {
+    if (clearStage === 'credentials') headingRef.current?.focus();
+  }, [clearStage]);
 
-  const isVerifying = clearStage === 'password' || clearStage === 'mfa';
+  // An unresolved Clear leaves nothing but Cancel enabled, and the request that
+  // ended in it may still be settling when the stage changes, so wait for it.
+  useLayoutEffect(() => {
+    if (clearStage === 'uncertain' && cancelEnabled) cancelRef.current?.focus();
+  }, [clearStage, cancelEnabled]);
+
+  if (!removable) return null;
+
+  const inCredentials = clearStage === 'credentials';
 
   const invalidateAndRefetch = async (lifecycle: AuthLifecycleSnapshot): Promise<boolean> => {
     if (!isSameAuthLifecycle(lifecycle)) return false;
     globalThis.dispatchEvent(
-      new CustomEvent('messages-purged', { detail: { scopeId: target.conversation.id } })
+      new CustomEvent('messages-purged', { detail: { scopeId: conversation.id } })
     );
     await useDMStore.getState().fetchConversations();
     return isSameAuthLifecycle(lifecycle);
@@ -126,82 +240,65 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
       // implementation still leaves this operation unresolved and retry-blocked.
     }
     if (!isSameAuthLifecycle(lifecycle)) return;
-    resetCredential();
+    setPassword('');
     setClearStage('uncertain');
     setError(CLEAR_UNCERTAIN_ERROR);
   };
 
-  const submitClear = async () => {
-    if (requestInFlightRef.current || clearStage === 'uncertain') return;
+  /** Acts on Clear's answer for the current account. Resolves true once the dialog is closed. */
+  const applyClearResult = async (
+    result: ClearHistoryResult,
+    lifecycle: AuthLifecycleSnapshot
+  ): Promise<boolean> => {
+    if (result.kind === 'success') {
+      if (!(await invalidateAndRefetch(lifecycle))) return false;
+      onClose();
+      return true;
+    }
+    if (result.kind === 'uncertain') {
+      await setUncertainClear(lifecycle);
+      return false;
+    }
+    const text = clearErrorText(result);
+    if (text !== null) setError(text);
+    return false;
+  };
+
+  /** The credential stage's request, sent once by the hook after it proves the factor. */
+  const submitWithFactor: StepUpSubmit = async (mfa, context) => {
+    setError(null);
+    const lifecycle = captureAuthLifecycle();
+    try {
+      const result = await clearDMHistory(conversation.id, clearFactor(mfa, password), context);
+      // Nothing left for `aborted`, so what was typed is still what the user means to send.
+      if (result.kind !== 'aborted') setPassword('');
+      if (isSameAuthLifecycle(lifecycle)) await applyClearResult(result, lifecycle);
+      return submitOutcome(result);
+    } catch {
+      if (isSameAuthLifecycle(lifecycle)) await setUncertainClear(lifecycle);
+      return { kind: 'transport' };
+    }
+  };
+
+  /** Clear with the setting off: no factor, one click. */
+  const submitWithoutFactor = async () => {
+    if (requestInFlightRef.current) return;
 
     requestInFlightRef.current = true;
     setBusy(true);
     setError(null);
     let closed = false;
     const lifecycle = captureAuthLifecycle();
-    const factor = clearFactor(clearStage, credential);
 
     try {
-      const result = await clearDMHistory(target.conversation.id, factor);
+      const result = await clearDMHistory(conversation.id);
       if (!isSameAuthLifecycle(lifecycle)) return;
-      switch (result.kind) {
-        case 'passwordRequired':
-          resetCredential();
-          setClearStage('password');
-          return;
-        case 'mfaRequired':
-          resetCredential();
-          setMfaMethods(result.methods);
-          setClearStage('mfa');
-          return;
-        case 'invalidPassword':
-          resetCredential();
-          setError('That password is not correct.');
-          return;
-        case 'passwordRefused':
-          // #3509: the mint refused the password, or Clear refused the token.
-          resetCredential();
-          setError(result.message);
-          return;
-        case 'invalidMfaCode':
-          resetCredential();
-          setError('That code is not correct or has expired.');
-          return;
-        case 'success':
-          if (!(await invalidateAndRefetch(lifecycle))) return;
-          closed = true;
-          onClose();
-          return;
-        case 'uncertain':
-          await setUncertainClear(lifecycle);
-          return;
-        case 'rateLimited':
-          resetCredential();
-          setError(
-            result.retryAfterSeconds === undefined
-              ? 'Try again later.'
-              : `Try again in ${result.retryAfterSeconds} seconds.`
-          );
-          return;
-        case 'sessionExpired':
-          resetCredential();
-          setError('Sign in again to clear history.');
-          return;
-        case 'notFound':
-          resetCredential();
-          setError('This thread is no longer available.');
-          return;
-        case 'stepUpImpossible':
-          resetCredential();
-          setError(
-            'Set a password, enable MFA, or turn off purge protection in Privacy & Security.'
-          );
-          return;
-        case 'refused':
-          resetCredential();
-          setError('History could not be cleared.');
-          return;
+      if (result.kind === 'passwordRequired' || result.kind === 'mfaRequired') {
+        // The server asks although the local setting did not.
+        setClearStage('credentials');
+        return;
       }
+      closed = await applyClearResult(result, lifecycle);
     } catch {
       if (isSameAuthLifecycle(lifecycle)) await setUncertainClear(lifecycle);
     } finally {
@@ -217,15 +314,15 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
     wasActive: boolean
   ): Promise<boolean> => {
     try {
-      useDMStore.getState().discardConversationView(target.conversation.id);
-      if (!(await hideDMThread(target.conversation.id))) throw new Error('Hide failed');
+      useDMStore.getState().discardConversationView(conversation.id);
+      if (!(await hideDMThread(conversation.id))) throw new Error('Hide failed');
       if (!isSameAuthLifecycle(lifecycle)) return false;
       onClose();
       onRemoved();
       return true;
     } catch {
       if (!isSameAuthLifecycle(lifecycle)) return false;
-      await restoreHiddenConversation(target.conversation.id, wasActive, lifecycle);
+      await restoreHiddenConversation(conversation.id, wasActive, lifecycle);
       if (!isSameAuthLifecycle(lifecycle)) return false;
       setError('Could not confirm the hide. Check the thread list before retrying.');
       return false;
@@ -234,7 +331,7 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
 
   const submitLeave = async (lifecycle: AuthLifecycleSnapshot): Promise<boolean> => {
     try {
-      await useDMStore.getState().leaveGroup(target.conversation.id);
+      await useDMStore.getState().leaveGroup(conversation.id);
       if (!isSameAuthLifecycle(lifecycle)) return false;
       onClose();
       onRemoved();
@@ -247,8 +344,12 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   };
 
   const submitRemoval = async () => {
-    if (target.action === 'clear') {
-      await submitClear();
+    if (action === 'clear') {
+      // With the setting on, Continue is a local stage change: the hook has
+      // already read what the account will be asked for, so no factor-less
+      // Clear is sent to find out.
+      if (stepUpRequired) setClearStage('credentials');
+      else await submitWithoutFactor();
       return;
     }
     if (requestInFlightRef.current) return;
@@ -257,9 +358,9 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
     setBusy(true);
     setError(null);
     const lifecycle = captureAuthLifecycle();
-    const wasActive = useDMStore.getState().activeConversationId === target.conversation.id;
+    const wasActive = useDMStore.getState().activeConversationId === conversation.id;
     let removed: boolean;
-    if (target.action === 'hide') {
+    if (action === 'hide') {
       removed = await submitHide(lifecycle, wasActive);
     } else {
       removed = await submitLeave(lifecycle);
@@ -270,68 +371,49 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
     }
   };
 
-  const disabled = busy || clearStage === 'uncertain' || (isVerifying && credential.trim() === '');
   // Hide is reversible (the thread respawns on the next message), so it must not
   // borrow the destructive styling Clear and Leave share with Delete Server.
-  const tone = target.action === 'hide' ? ' dm-removal-neutral' : '';
+  const tone = action === 'hide' ? ' dm-removal-neutral' : '';
+  // The credential stage's primary is never natively disabled: it is
+  // `aria-disabled` while something is missing or a request is in flight, and
+  // its guarded click does nothing then, so focus stays on it (frontend.md).
+  const activation = inCredentials ? stepUpActivation(factor, password, submitWithFactor) : null;
+  const primaryDisabled = activation === null && (busy || clearStage === 'uncertain');
 
   return (
     <Modal
       isOpen={true}
       onClose={onClose}
-      title={REMOVAL_TITLES[target.action]}
+      title={REMOVAL_TITLES[action]}
       width="small"
-      dismissable={!busy}
+      dismissable={cancelEnabled}
       initialFocusRef={cancelRef}
     >
       <div className="delete-server-content">
+        {inCredentials && (
+          <h3 className="dm-removal-stage-heading" tabIndex={-1} ref={headingRef}>
+            {CREDENTIALS_HEADING}
+          </h3>
+        )}
+
         <div className={`delete-server-warning${tone}`}>
           <div className="confirm-action-message">
-            <p>{REMOVAL_COPY[target.action]}</p>
+            <p>{REMOVAL_COPY[action]}</p>
           </div>
         </div>
 
-        {clearStage === 'password' && (
-          <div className="delete-server-confirm">
-            <label className="form-label" htmlFor="dm-thread-removal-factor">
-              Password
-            </label>
-            <input
-              id="dm-thread-removal-factor"
-              ref={factorRef}
-              className="form-input"
-              type="password"
-              autoComplete="current-password"
-              value={credential}
-              aria-invalid={error !== null}
-              onChange={(event) => {
-                setCredential(event.target.value);
-                setError(null);
-              }}
-              disabled={busy}
-            />
-          </div>
-        )}
-
-        {clearStage === 'mfa' && (
-          <div className="delete-server-confirm">
-            {/* The prompt offers every method the server named, a security key
-                included; its token is minted for dm.clear alone. */}
-            <MFAVerifyPrompt
-              key={promptKey}
-              methods={mfaMethods}
-              purpose="dm.clear"
-              onVerify={(code) => {
-                setCredential(code);
-                setError(null);
-              }}
-              onCodeChange={(code) => {
-                setCredential(code);
-                if (code !== '') setError(null);
-              }}
-              disabled={busy}
-            />
-          </div>
+        {inCredentials && (
+          <StepUpCredentials
+            factor={factor}
+            password={password}
+            onPasswordChange={(value) => {
+              setPassword(value);
+              setError(null);
+            }}
+            primaryRef={primaryRef}
+            headingRef={headingRef}
+            sessionMessage={SESSION_MESSAGE}
+          />
         )}
 
         {error && (
@@ -346,17 +428,24 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
             type="button"
             className="delete-server-cancel-btn"
             onClick={onClose}
-            disabled={busy}
+            disabled={!cancelEnabled}
           >
             Cancel
           </button>
           <button
+            ref={primaryRef}
             type="button"
             className={`delete-server-confirm-btn${tone}`}
-            onClick={() => void submitRemoval()}
-            disabled={disabled}
+            onClick={activation ? activation.activate : () => void submitRemoval()}
+            aria-disabled={activation?.ariaDisabled || undefined}
+            disabled={primaryDisabled}
           >
-            {removalActionLabel(target.action, isVerifying)}
+            {activation !== null && factor.phase !== 'idle' && (
+              <>
+                <LoadingSpinner size="small" inline />{' '}
+              </>
+            )}
+            {primaryLabel(action, clearStage, factor.phase)}
           </button>
         </div>
       </div>

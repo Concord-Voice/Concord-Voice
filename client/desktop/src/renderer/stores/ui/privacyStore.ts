@@ -2,6 +2,11 @@ import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
+import {
+  apiFetchInContext,
+  isAbortError,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
 import { classifyStepUpRefusal, isStepUpFactorRefusal } from '../../services/system/stepUpRefusal';
 
 // DM Privacy Levels:
@@ -155,8 +160,13 @@ export type PrivacyUpdateRefusal =
   | { kind: 'stepUpImpossible'; message: string }
   | { kind: 'refused'; message: string };
 
-/** What `disablePurgeFence` answers with. It never throws. */
-export type PurgeFenceDisableResult = { kind: 'accepted' } | PrivacyUpdateRefusal;
+/**
+ * What `disablePurgeFence` answers with. It never throws. `aborted` means the
+ * request was never sent: `apiFetch`'s pre-dispatch fence refused it because
+ * the account or server changed since `context` was captured.
+ */
+export type PurgeFenceDisableResult =
+  { kind: 'accepted' } | { kind: 'aborted' } | PrivacyUpdateRefusal;
 
 /**
  * Maps a non-2xx privacy PATCH onto {@link PrivacyUpdateRefusal}.
@@ -325,14 +335,18 @@ interface PrivacyState {
   fetchPrivacy: () => Promise<void>;
   updatePrivacy: (
     updates: Partial<PrivacySettings>,
-    credentials?: PrivacyStepUpCredentials
+    credentials?: PrivacyStepUpCredentials,
+    context?: ApiRequestContext
   ) => Promise<void>;
   /**
    * #2765: the gated OFF transition. Resolves with the classified outcome
    * instead of throwing, so the step-up dialog can place a rejected factor on
    * the field that owns it.
    */
-  disablePurgeFence: (credentials: PrivacyStepUpCredentials) => Promise<PurgeFenceDisableResult>;
+  disablePurgeFence: (
+    credentials: PrivacyStepUpCredentials,
+    context?: ApiRequestContext
+  ) => Promise<PurgeFenceDisableResult>;
   clearPrivacy: () => void;
 }
 
@@ -394,7 +408,8 @@ export const usePrivacyStore = wrapStore(
 
         updatePrivacy: async (
           updates: Partial<PrivacySettings>,
-          credentials?: PrivacyStepUpCredentials
+          credentials?: PrivacyStepUpCredentials,
+          context?: ApiRequestContext
         ) => {
           const ticket = beginPrivacyWrite();
           const body: Record<string, boolean | number | string> = {};
@@ -408,11 +423,17 @@ export const usePrivacyStore = wrapStore(
           if (credentials?.currentPassword) body.current_password = credentials.currentPassword;
           if (credentials?.mfaCode) body.mfa_code = credentials.mfaCode;
 
-          const response = await apiFetch('/api/v1/users/me/privacy', {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
+          // With a context, the PATCH is admitted only for the account and
+          // server the caller captured it for (#2: the step-up run's capture).
+          const response = await apiFetchInContext(
+            '/api/v1/users/me/privacy',
+            {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            },
+            context
+          );
 
           if (!response.ok) {
             // A non-JSON failure (proxy HTML 502, empty 400) must not reject
@@ -473,12 +494,18 @@ export const usePrivacyStore = wrapStore(
           });
         },
 
-        disablePurgeFence: async (credentials: PrivacyStepUpCredentials) => {
+        disablePurgeFence: async (
+          credentials: PrivacyStepUpCredentials,
+          context?: ApiRequestContext
+        ) => {
           try {
-            await get().updatePrivacy({ requireAuthBeforePurge: false }, credentials);
+            await get().updatePrivacy({ requireAuthBeforePurge: false }, credentials, context);
             return { kind: 'accepted' };
           } catch (error) {
             if (error instanceof PrivacyUpdateError) return error.refusal;
+            // apiFetch's pre-dispatch fence: nothing was sent, so nothing is
+            // reported and the credentials are still the user's to send.
+            if (isAbortError(error)) return { kind: 'aborted' };
             // apiFetch rejects — rather than resolving with a status — when no
             // response arrives at all. Nothing was changed, so it is a refusal
             // like any other; only the message comes from the transport.

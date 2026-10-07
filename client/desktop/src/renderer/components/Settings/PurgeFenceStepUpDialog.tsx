@@ -1,10 +1,17 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import StepUpFields, { stepUpFieldErrors, stepUpRefusedField } from '../Purge/StepUpFields';
+import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
+import {
+  useStepUpFactor,
+  type StepUpPhase,
+  type StepUpSubmit,
+  type StepUpSubmitOutcome,
+} from '../../hooks/auth/useStepUpFactor';
 import { usePrivacyStore, type PurgeFenceDisableResult } from '../../stores/ui/privacyStore';
-// StepUpFields renders the shipped #1354 markup, so it needs the shipped #1354
-// stylesheet — the Settings pane never loads PurgeMessagesModal.
+import { apiRequestContextIsCurrent } from '../../services/system/requestContext';
+// The frame and footer are the shipped #1354 markup, so they need the shipped
+// #1354 stylesheet — the Settings pane never loads PurgeMessagesModal.
 import '../Purge/purgeMessages.css';
 
 interface PurgeFenceStepUpDialogProps {
@@ -30,16 +37,46 @@ const DISABLE_WARNING =
   'Without this, anyone with access to your unlocked account can permanently purge your ' +
   'message history.';
 
+/** The primary's label by phase; the two in-flight ones carry a spinner. */
+const PRIMARY_LABEL: Record<StepUpPhase, string> = {
+  idle: 'Turn Off',
+  ceremony: 'Waiting…',
+  submitting: 'Turning off...',
+};
+
 /**
- * Whether a refusal belongs above the fields rather than on one of them. The
- * server's own message is rendered for these — a missing factor, a rate limit,
- * and version skew each carry an actionable sentence the client must not
- * paraphrase.
+ * The two answers the credentials cannot render. The server's own message is
+ * shown for these: version skew, a rate limit and an outage each carry an
+ * actionable sentence the client must not paraphrase.
  */
-function bannerMessage(refusal: PurgeFenceDisableResult | null): string | null {
-  if (refusal === null || refusal.kind === 'accepted') return null;
-  if (refusal.kind === 'invalidPassword' || refusal.kind === 'invalidMfaCode') return null;
-  return refusal.message;
+type ServerAnswer = Extract<PurgeFenceDisableResult, { kind: 'refused' | 'stepUpImpossible' }>;
+
+function isServerAnswer(result: PurgeFenceDisableResult): result is ServerAnswer {
+  return result.kind === 'refused' || result.kind === 'stepUpImpossible';
+}
+
+/**
+ * The store's result in the hook's terms. The four field refusals go to the
+ * hook as the refusals they are. The store folds a 429, a 5xx and a transport
+ * failure into `refused`, so none of them can be told apart from an answer
+ * that spent the code, and `answered` is the safe reading for both arms.
+ */
+function toOutcome(result: PurgeFenceDisableResult): StepUpSubmitOutcome {
+  switch (result.kind) {
+    case 'accepted':
+      return { kind: 'success' };
+    case 'passwordRequired':
+    case 'invalidPassword':
+    case 'invalidMfaCode':
+      return { kind: 'refusal', refusal: { kind: result.kind } };
+    case 'mfaRequired':
+      return { kind: 'refusal', refusal: { kind: 'mfaRequired', methods: result.methods } };
+    case 'stepUpImpossible':
+    case 'refused':
+      return { kind: 'answered' };
+    case 'aborted':
+      return { kind: 'aborted' };
+  }
 }
 
 /**
@@ -48,142 +85,147 @@ function bannerMessage(refusal: PurgeFenceDisableResult | null): string | null {
  * PrivacySecuritySection is already at its S3776 cognitive-complexity ceiling,
  * and this dialog owns a small state machine of its own.
  *
- * Both wire secrets are component-local state. They are never written to a
- * store, never persisted, and never echoed into error copy
+ * The password is component-local state and the code lives in the factor hook.
+ * Neither is written to a store, persisted, or echoed into error copy
  * (`[internal]rules/observability.md`).
  */
 const PurgeFenceStepUpDialog: React.FC<PurgeFenceStepUpDialogProps> = ({ open, onClose }) => {
   const [password, setPassword] = useState('');
-  const [code, setCode] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [refusal, setRefusal] = useState<PurgeFenceDisableResult | null>(null);
+  const [answer, setAnswer] = useState<ServerAnswer | null>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
-  const codeRef = useRef<HTMLInputElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   const disablePurgeFence = usePrivacyStore((s) => s.disablePurgeFence);
 
-  // The password field ALWAYS renders. `mfa_required` without
-  // `password_required` does not identify a passwordless account — the server
-  // verifies the password factor first, so an MFA-enabled account that supplies
-  // a correct password and no code receives exactly that shape.
+  // passwordLeg set to always: the password field renders whatever the account
+  // holds. `mfa_required` without `password_required` does not identify a
+  // passwordless account — the server verifies the password factor first, so an
+  // MFA-enabled account that supplies a correct password and no code receives
+  // exactly that shape. Deriving visibility from it caused a retry loop
+  // (CodeRabbit review, #2792): the field vanished, the next submit sent no
+  // password, and the accepted password had to be retyped — two step-up
+  // attempts burned per cycle, so an actor holding BOTH correct factors could
+  // rate-limit themselves out of their own setting.
   //
-  // Deriving visibility from it caused a retry loop (CodeRabbit review, #2792):
-  // the field vanished, the next submit therefore sent no password, the server
-  // answered `password_required`, and the accepted password had to be retyped —
-  // two step-up attempts burned per cycle, so an actor holding BOTH correct
-  // factors could rate-limit themselves out of their own setting.
-  //
-  // An account with no password simply leaves this empty; the server already
-  // accepts MFA alone. Let the server's `password_required` and invalid-factor
-  // arms drive the copy instead of inferring account shape on the client.
-  const showPassword = true;
-  // Neither factor can satisfy an account that holds neither, so that refusal
+  // `readFailure: 'passwordOnly'`: a failed read must not lock the user out of
+  // a setting the server would accept. The submit is the check that counts, and
+  // its refusal mounts the picker.
+  const factor = useStepUpFactor({
+    enabled: open,
+    purpose: 'privacy.purge_fence_disable',
+    passwordLeg: 'always', // pragma: allowlist secret
+    readFailure: 'passwordOnly',
+    allowBackup: true,
+  });
+
+  // Neither factor can satisfy an account that holds neither, so that answer
   // offers no retryable field at all.
-  const deadEnd = refusal?.kind === 'stepUpImpossible';
-  const canSubmit = !busy && (password !== '' || code !== '');
-  const banner = bannerMessage(refusal);
+  const deadEnd = answer?.kind === 'stepUpImpossible';
+  const submitting = factor.phase === 'submitting';
 
   // The parent keeps this mounted behind a boolean, so closing must reset the
-  // machine: otherwise the credentials — and a stale refusal — carry into the
-  // next open.
+  // machine: otherwise the password — and a stale answer — carry into the next
+  // open. The hook drops its own state, the code included, when `open` flips.
   useEffect(() => {
     if (open) return;
     // The rule guards against wasted renders. Here the dialog is already closed,
-    // so the extra render is of nothing, and dropping the wire secrets the
+    // so the extra render is of nothing, and dropping the wire secret the
     // moment it closes outranks that.
     /* eslint-disable @eslint-react/set-state-in-effect -- credential hygiene, see above */
     setPassword('');
-    setCode('');
-    setRefusal(null);
+    setAnswer(null);
     /* eslint-enable @eslint-react/set-state-in-effect -- reset block ends here */
   }, [open]);
 
-  // A rejected factor returns focus to the field that owns it. Keyed on the
-  // refusal object, so a second wrong attempt of the same kind re-focuses too.
+  // The dead end unmounts the credentials and the primary. The enclosing
+  // <dialog> takes focus, as it does on the picker's own terminal states.
   useLayoutEffect(() => {
-    const field = stepUpRefusedField(refusal);
-    if (field === 'password') passwordRef.current?.focus();
-    else if (field === 'code') codeRef.current?.focus();
-  }, [refusal]);
+    if (deadEnd) cancelRef.current?.closest('dialog')?.focus();
+  }, [deadEnd]);
 
-  const handleSubmit = async () => {
-    if (!canSubmit) return;
-    setBusy(true);
-    try {
-      // Single-shot: whichever factors the user holds travel in the same
-      // request, so a rate-limited budget is not spent discovering which.
-      const result = await disablePurgeFence({
-        currentPassword: password || undefined,
-        mfaCode: code || undefined,
-      });
-      if (result.kind === 'accepted') {
-        // The store now holds the new setting and the switch follows it. The
-        // close effect drops the credentials.
-        onClose();
-        return;
-      }
-      // Drop the password only when it was rejected. Drop the code whenever the
-      // server may have used it up: it accepts each code once and can accept
-      // it yet still refuse the change. A password refusal is the one answer
-      // that leaves the code unread (the password is checked first), so a
-      // wrong password does not cost the user a fresh code they already typed.
-      if (result.kind === 'invalidPassword') setPassword('');
-      if (result.kind !== 'invalidPassword' && result.kind !== 'passwordRequired') setCode('');
-      setRefusal(result);
-    } finally {
-      // Without this the dialog is unclosable: `busy` disables the fieldset that
-      // owns Cancel, and `dismissable={!busy}` gates Escape and the backdrop.
-      setBusy(false);
-    }
+  // Single-shot: whichever factors the user holds travel in the same request,
+  // so a rate-limited budget is not spent discovering which. A WebAuthn token
+  // rides as `mfa_code`, exactly as a typed code does.
+  const submit: StepUpSubmit = async (mfa, context) => {
+    const result = await disablePurgeFence(
+      { currentPassword: password || undefined, mfaCode: mfa },
+      context
+    );
+    // An answer for an account or server that is no longer current belongs to
+    // the old one: the hook ends the attempt, and this dialog must neither show
+    // it nor close on it.
+    if (!apiRequestContextIsCurrent(context)) return toOutcome(result);
+    setAnswer(isServerAnswer(result) ? result : null);
+    // Only the password the server rejected is dropped; the hook keeps the code
+    // through a password refusal, so a wrong password does not cost a fresh one.
+    if (result.kind === 'invalidPassword') setPassword('');
+    // The store now holds the new setting and the switch follows it. The close
+    // effect drops the password.
+    if (result.kind === 'accepted') onClose();
+    return toOutcome(result);
   };
 
+  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit);
+
   return (
-    <Modal isOpen={open} onClose={onClose} title={TITLE} width="small" dismissable={!busy}>
+    <Modal
+      isOpen={open}
+      onClose={onClose}
+      title={TITLE}
+      width="small"
+      dismissable={!submitting}
+      initialFocusRef={passwordRef}
+    >
       <div className="purge-modal__body">
-        <fieldset disabled={busy} className="purge-modal__form">
+        <div className="purge-modal__form">
           <p className="purge-modal__stepup-body">{DISABLE_WARNING}</p>
 
-          {banner !== null && (
+          {answer !== null && (
             <p className="purge-modal__deadend" role="alert">
-              {banner}
+              {answer.message}
             </p>
           )}
 
           {!deadEnd && (
-            <StepUpFields
-              showPassword={showPassword}
+            <StepUpCredentials
+              factor={factor}
               password={password}
               onPasswordChange={setPassword}
-              code={code}
-              onCodeChange={setCode}
-              errors={stepUpFieldErrors(refusal)}
+              primaryRef={primaryRef}
               passwordRef={passwordRef}
-              codeRef={codeRef}
             />
           )}
 
           <div className="purge-modal__actions">
-            <button type="button" className="purge-modal__cancel" onClick={onClose}>
+            <button
+              ref={cancelRef}
+              type="button"
+              className="purge-modal__cancel"
+              disabled={submitting}
+              onClick={onClose}
+            >
               Cancel
             </button>
             {!deadEnd && (
               <button
+                ref={primaryRef}
                 type="button"
                 className="purge-modal__confirm"
-                disabled={!canSubmit}
-                onClick={() => void handleSubmit()}
+                aria-disabled={ariaDisabled || undefined}
+                onClick={activate}
               >
-                {busy ? (
-                  <>
-                    <LoadingSpinner size="small" inline /> Turning off...
-                  </>
+                {factor.phase === 'idle' ? (
+                  PRIMARY_LABEL.idle
                 ) : (
-                  'Turn Off'
+                  <>
+                    <LoadingSpinner size="small" inline /> {PRIMARY_LABEL[factor.phase]}
+                  </>
                 )}
               </button>
             )}
           </div>
-        </fieldset>
+        </div>
       </div>
     </Modal>
   );

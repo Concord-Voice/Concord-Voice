@@ -205,27 +205,31 @@ function selfPurgePurpose(context: 'channel' | 'server') {
  * single shot (spec R-7). A channel/server self-purge is an own-rule route, so
  * its password goes only to the mint endpoint and the route gets the token; a
  * refused exchange lands on the password field of the soft-lock stage.
+ *
+ * `context` is the caller's capture, when it has one; the purge, and any
+ * exchange before it, are admitted against it.
  */
 async function purgeStepUpFields(
-  args: PurgeArgs
+  args: PurgeArgs,
+  context: ApiRequestContext | undefined
 ): Promise<
   { fields: Record<string, string>; context?: ApiRequestContext } | { refused: PurgeResult }
 > {
   const fields: Record<string, string> = {};
   if (args.mfaCode) fields.mfa_code = args.mfaCode;
-  if (!args.currentPassword) return { fields };
+  if (!args.currentPassword) return { fields, context };
   if (args.context === 'dm' || args.context === 'group') {
     fields.current_password = args.currentPassword;
-    return { fields };
+    return { fields, context };
   }
   // The exchange and the purge are one operation: the purge is admitted
   // against this capture, so it refuses to dispatch if another account or
   // server took over after the exchange (#3509 review).
-  const context = captureApiRequestContext();
+  const operation = context ?? captureApiRequestContext();
   const minted = await mintPasswordStepUpToken(
     args.currentPassword,
     selfPurgePurpose(args.context),
-    context
+    operation
   );
   if (minted.kind === 'refused') {
     // An account that enrolled MFA after the prompt opened moves to the code
@@ -241,15 +245,24 @@ async function purgeStepUpFields(
     };
   }
   fields.step_up_token = minted.token;
-  return { fields, context };
+  return { fields, context: operation };
 }
 
-export async function purgeMessages(args: PurgeArgs): Promise<PurgeResult> {
+/**
+ * `context` is the operation the purge belongs to (`captureApiRequestContext`).
+ * The DM/group step-up passes the capture its factor was proven under, so a
+ * security-key token or a password is never sent as another account or to
+ * another server. Without one, the purge is its own operation, as before.
+ */
+export async function purgeMessages(
+  args: PurgeArgs,
+  context?: ApiRequestContext
+): Promise<PurgeResult> {
   // Single-shot: send whichever factors the actor has, together. Probing for
   // requirements costs a request against the same purge budget (spec R-7).
   // A passwordless SSO account with MFA sends the code alone — the server
   // accepts MFA as the whole step-up when there is no password hash.
-  const stepUp = await purgeStepUpFields(args);
+  const stepUp = await purgeStepUpFields(args, context);
   if ('refused' in stepUp) return stepUp.refused;
   const body: Record<string, unknown> = { range: args.range, ...stepUp.fields };
 

@@ -2070,6 +2070,36 @@
   outline-color: var(--state-focused);
 }
 
+/* Clear's credential stage (DMThreadRemovalDialog). ui/Modal keeps the dialog
+   title constant, so this heading is what names the stage and takes focus when
+   it opens; its ring is the focus token, not the accent. */
+.dm-removal-stage-heading {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-display-stack);
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 700;
+}
+
+.dm-removal-stage-heading:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 4px;
+}
+
+/* The credential stage's primary is aria-disabled, not disabled, so it stays
+   focusable and its click can say what is missing. It reads as the disabled
+   button does, and the hover lift stays off a button that will not act. */
+.delete-server-confirm-btn[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.delete-server-confirm-btn[aria-disabled='true']:hover:not(:disabled) {
+  background: var(--danger);
+  transform: none;
+  box-shadow: none;
+}
+
 .group-info-actions-divider {
   height: 1px;
   margin: calc(6px * var(--sp, 1)) 0;

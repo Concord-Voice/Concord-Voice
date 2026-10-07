@@ -13,7 +13,7 @@
  * The password is never logged, stored, or kept past the request.
  */
 
-import { apiFetchInContext, type ApiRequestContext } from './requestContext';
+import { apiFetchInContext, isAbortError, type ApiRequestContext } from './requestContext';
 import type { PasswordStepUpPurpose } from '../../components/Auth/stepUpPurpose';
 
 export const STEP_UP_PASSWORD_PATH = '/api/v1/auth/step-up/password';
@@ -41,6 +41,13 @@ export type PasswordStepUpMint =
       retryAfterSeconds?: number;
       /** On `mfaRequired`: the inline methods the mint named (`mfa_methods`). */
       methods?: string[];
+      /**
+       * The exchange never left: apiFetch refused to dispatch it because the
+       * account or server changed after the capture. Nothing was checked, so a
+       * flow that can tell a password failure from a request that was not made
+       * discards the attempt instead of blaming the password.
+       */
+      unsent?: true;
     };
 
 /** The exact refusal body `stepup.ErrMsgInvalidPassword` sends. */
@@ -71,7 +78,8 @@ function refusalReason(status: number, body: Record<string, unknown>): PasswordS
 /**
  * Exchanges `password` for a single-use token bound to `purpose`. Never
  * throws: a transport failure is a `failed` refusal, so a caller can always
- * put something on the password field.
+ * put something on the password field. A refusal apiFetch raised before
+ * dispatch is the same `failed` refusal marked `unsent`.
  *
  * `context` is the operation the token is minted for (`captureApiRequestContext`):
  * the caller passes the same context to the request that spends the token, so
@@ -94,8 +102,12 @@ export async function mintPasswordStepUpToken(
       },
       context
     );
-  } catch {
-    return { kind: 'refused', reason: 'failed' };
+  } catch (err) {
+    // The exchange is sent with no signal, so the only AbortError apiFetch can
+    // raise here is its pre-dispatch fence: nothing reached the server.
+    return isAbortError(err)
+      ? { kind: 'refused', reason: 'failed', unsent: true }
+      : { kind: 'refused', reason: 'failed' };
   }
   // An unreadable body (a proxy's HTML error page) is an empty one.
   const raw: unknown = await res.json().catch((): unknown => ({}));

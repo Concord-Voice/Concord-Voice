@@ -17,7 +17,18 @@ beforeEach(() => resetAllStores());
 
 describe('PurgeMessagesModal soft-lock factor change', () => {
   it('keeps focus in the dialog when the password stage becomes a security-key prompt', async () => {
+    // The channel/server soft-lock keeps its own prompt: it must never start
+    // the DM step-up stage's requirements read (GET /api/v1/mfa/step-up).
+    let reads = 0;
     server.use(
+      http.get('*/api/v1/mfa/step-up', () => {
+        reads += 1;
+        return HttpResponse.json({
+          methods: ['totp'],
+          default_method: 'totp',
+          backup_code_available: false,
+        });
+      }),
       http.delete('*/api/v1/channels/:id/messages', () =>
         HttpResponse.json(
           {
@@ -54,5 +65,6 @@ describe('PurgeMessagesModal soft-lock factor change', () => {
     await screen.findByRole('button', { name: 'Verify with security key' });
     expect(document.activeElement).not.toBe(document.body);
     expect(screen.getByRole('dialog').contains(document.activeElement)).toBe(true);
+    expect(reads).toBe(0);
   });
 });

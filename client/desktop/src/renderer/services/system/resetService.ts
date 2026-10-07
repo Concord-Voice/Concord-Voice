@@ -40,6 +40,7 @@ import { useLayoutStore } from '../../stores/ui/layoutStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { useSSOStore } from '../../stores/auth/ssoStore';
+import { useTotpAcceptedStore } from '../../stores/auth/totpAcceptedStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
@@ -179,6 +180,11 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // `mfa_required` phase, which would re-mount SSOPassphraseSetup or the MFA
   // modal at the next login screen with stolen-token-equivalent data.
   useSSOStore.getState().reset();
+
+  // Clear when this client last had a TOTP code accepted. It is keyed by
+  // account, but it is in-memory account posture that must not outlive the
+  // session it was recorded in (MFA factor picker, S2a privacy).
+  useTotpAcceptedStore.getState().reset();
 
   // Clear E2EE store flags — needsSSOUnlock and ready must reset on every
   // logout-class transition. Otherwise an SSO user logging back in via the

@@ -1,0 +1,211 @@
+/* Step-up credentials: the password field, the factor picker, and the status
+ * line a gated action's modal shows before its primary button
+ * (design 2026-09-26-mfa-factor-picker §4.2). Shared by StepUpCredentials and
+ * MFAFactorPicker, so every `.step-up__*` rule lives here.
+ *
+ * Every colour is a theme token, so this tracks all 32 theme blocks. Text is
+ * --text-primary throughout: --text-secondary on --bg-tertiary measures 4.31:1
+ * in Midnight Sky, and --danger as text fails AA in 9 of the 30 scheme x theme
+ * combinations. --danger appears only as a border and a tint; its borders
+ * clear the 3:1 non-text floor everywhere. Statuses (a terminal sentence, a
+ * cancelled passkey request, a changed method list) take no danger styling at
+ * all: they are not field errors.
+ */
+
+/* The root is a <fieldset>: it disables every control inside it while a request
+   is out, and the reset below strips the UA frame. */
+.step-up {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.step-up__field,
+.step-up__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.step-up__region {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The method region reserves its height so the footer does not move when the
+   read lands or the panel changes. The floor is confirmed in the captures. */
+.step-up__region--reserved {
+  min-height: calc(136px * var(--font-scale, 1));
+}
+
+.step-up__label {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+/* The WebAuthn panel's label takes focus after a switch to it. */
+.step-up__label:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 4px;
+}
+
+.step-up__helper {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.step-up__input {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  transition: border-color var(--motion-duration-fast) var(--motion-curve-base);
+}
+
+/* A code, not prose: fixed-width digits so a pasted "123 456" reads cleanly. */
+.step-up__input--totp,
+.step-up__input--backup {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: calc(16px * var(--font-scale, 1));
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+}
+
+.step-up__input--backup {
+  text-transform: uppercase;
+}
+
+.step-up__input:focus-visible {
+  border-color: var(--state-focused);
+  outline: 2px solid var(--state-focused);
+  outline-offset: 1px;
+}
+
+/* Paired with aria-invalid, the glyph and the message, so a rejection is never
+   signalled by colour alone (WCAG 1.4.1). Declared after :focus-visible so a
+   focused rejected field keeps its danger border. */
+.step-up__input[aria-invalid='true'] {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-tertiary));
+}
+
+/* Read-only during a WebAuthn ceremony: the password was captured at activation. */
+.step-up__input[readonly] {
+  cursor: default;
+}
+
+.step-up__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.step-up__error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-tertiary));
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.step-up__error-glyph {
+  flex-shrink: 0;
+  width: calc(16px * var(--font-scale, 1));
+  height: calc(16px * var(--font-scale, 1));
+  /* The box's --danger border carries the error cue. The glyph takes the text
+     colour: --danger on the box's tinted fill measures 2.63:1 in Cotton Candy
+     light and 2.91:1 in Foxden, below the 3:1 a graphic needs. */
+  stroke: var(--text-primary);
+}
+
+/* The always-mounted status line (an <output>). Empty it paints nothing and
+   takes no room; it stays rendered so a screen reader has a live region before
+   the first message arrives. */
+.step-up__status {
+  display: block;
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.step-up__status:not(:empty) {
+  margin-top: 10px;
+}
+
+/* Retry sits under the sentence that offers it. */
+.step-up__status + .step-up__link {
+  align-self: flex-start;
+  margin-top: 8px;
+}
+
+.step-up__switches {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+/* Switch links and Retry: text buttons, --text-primary and underlined, with a
+   24px minimum target (WCAG 2.5.8). */
+.step-up__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: calc(24px * var(--font-scale, 1));
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: calc(13px * var(--font-scale, 1));
+  text-align: left;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.step-up__link:hover:not(:disabled) {
+  text-decoration-thickness: 2px;
+}
+
+.step-up__link:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
+.step-up__link:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Reduced motion comes last: a media query carries no specificity, so it wins
+   over the plain rules above only on source order. */
+[data-reduce-animations='true'] .step-up__input {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .step-up__input {
+    transition: none;
+  }
+}

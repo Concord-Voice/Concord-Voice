@@ -196,12 +196,6 @@
   color: var(--text-primary);
 }
 
-.purge-modal__fields {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
 .purge-modal__field {
   display: flex;
   flex-direction: column;
@@ -235,21 +229,6 @@
 .purge-modal__field input[aria-invalid='true'] {
   border-color: var(--danger);
   background: color-mix(in srgb, var(--danger) 8%, var(--bg-tertiary));
-}
-
-.purge-modal__field-helper,
-.purge-modal__field-error {
-  margin: 0;
-  font-size: calc(12px * var(--font-scale, 1));
-  line-height: 1.4;
-}
-
-.purge-modal__field-helper {
-  color: var(--text-secondary);
-}
-
-.purge-modal__field-error {
-  color: var(--danger);
 }
 
 /* #3455 self-purge soft-lock stage. The rejection text takes --text-primary,
@@ -335,6 +314,20 @@
 .purge-modal__confirm:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* A step-up primary is aria-disabled while a credential is missing
+   or a passkey is awaited, not natively disabled: it stays focusable so its
+   activation guard can say what is missing. `:disabled` never matches it, so
+   without these rules it would look live exactly when it is not. */
+.purge-modal__confirm[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The hover fill above darkens anything not natively disabled. */
+.purge-modal__confirm[aria-disabled='true']:hover {
+  background: var(--danger);
 }
 
 .purge-modal__confirm:focus-visible {

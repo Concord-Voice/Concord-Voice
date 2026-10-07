@@ -41,6 +41,7 @@ import { useSettingsNavStore } from '../../src/renderer/stores/ui/settingsNavSto
 import { useSettingsOverlayStore } from '../../src/renderer/stores/ui/settingsOverlayStore';
 import { useTTSSettingsStore } from '../../src/renderer/stores/audio/ttsSettingsStore';
 import { useVideoSettingsStore } from '../../src/renderer/stores/voice/videoSettingsStore';
+import { useTotpAcceptedStore } from '../../src/renderer/stores/auth/totpAcceptedStore';
 
 interface InitialStateStore<State> {
   getInitialState(): State;
@@ -127,6 +128,7 @@ export function resetAllStores(): void {
   resetToInitialState(useSettingsOverlayStore);
   resetToInitialState(useTTSSettingsStore);
   resetToInitialState(useVideoSettingsStore);
+  useTotpAcceptedStore.getState().reset();
 
   // Clear persisted state from localStorage AND sessionStorage
   // (pendingRegistrationStore persists to sessionStorage)

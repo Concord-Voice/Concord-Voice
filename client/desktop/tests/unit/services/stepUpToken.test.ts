@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { apiFetch } from '@/renderer/services/system/apiClient';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import {
   mintPasswordStepUpToken,
   passwordStepUpRefusalMessage,
@@ -95,5 +96,71 @@ describe('mintPasswordStepUpToken (#3509)', () => {
     );
     expect(new Set(messages).size).toBe(4);
     expect(messages[0]).toBe('That password is not correct.');
+  });
+
+  describe('a request that never left', () => {
+    // Mutant: dropping the `unsent` mark (the caller then blames the password).
+    it('marks a refusal apiFetch raised before dispatch as unsent', async () => {
+      mockApiFetch.mockRejectedValueOnce(
+        new DOMException('Request lifecycle changed before dispatch', 'AbortError')
+      );
+
+      await expect(mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear')).resolves.toEqual({
+        kind: 'refused',
+        reason: 'failed',
+        unsent: true,
+      });
+      expect(mockApiFetch).toHaveBeenCalledOnce();
+    });
+
+    it('does not mark a transport failure unsent: it may have reached the server', async () => {
+      mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+
+      const result = await mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear');
+
+      expect(result).toEqual({ kind: 'refused', reason: 'failed' });
+      expect(result).not.toHaveProperty('unsent');
+    });
+
+    it('does not mark an answered refusal unsent', async () => {
+      mockApiFetch.mockResolvedValueOnce(response(500, {}));
+
+      expect(await mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear')).not.toHaveProperty('unsent');
+    });
+  });
+
+  it('admits the exchange against the caller context, and against none by default', async () => {
+    const context = captureApiRequestContext();
+    mockApiFetch
+      .mockResolvedValueOnce(response(200, { step_up_token: 'tok', expires_in: 60 }))
+      .mockResolvedValueOnce(response(200, { step_up_token: 'tok', expires_in: 60 }));
+
+    await mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear', context);
+    await mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear');
+
+    expect((mockApiFetch.mock.calls[0]?.[2] as { context?: unknown }).context).toBe(context);
+    expect(mockApiFetch.mock.calls[1]).toHaveLength(2);
+  });
+
+  it.each([404, 405])('names a %i as a server older than the endpoint', async (status) => {
+    mockApiFetch.mockResolvedValueOnce(response(status, {}));
+
+    const result = await mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear');
+
+    expect(result).toMatchObject({ kind: 'refused', reason: 'unsupported' });
+    expect(
+      passwordStepUpRefusalMessage(result as Extract<typeof result, { kind: 'refused' }>)
+    ).toBe("This server doesn't support this confirmation yet.");
+  });
+
+  it('names the methods an mfa_required refusal carries, dropping non-strings', async () => {
+    mockApiFetch.mockResolvedValueOnce(
+      response(403, { mfa_required: true, mfa_methods: ['webauthn', 3, 'totp'] })
+    );
+
+    await expect(mintPasswordStepUpToken(FIXTURE_PW, 'dm.clear')).resolves.toMatchObject({
+      reason: 'mfaRequired',
+      methods: ['webauthn', 'totp'],
+    });
   });
 });

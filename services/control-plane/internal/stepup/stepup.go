@@ -204,7 +204,7 @@ type Copy struct {
 	// Deliberately NOT named for the credential it describes. The pre-commit
 	// detect-secrets hook flags a password-shaped key sitting beside a quoted
 	// literal, and the copy that fills this field is a quoted literal — the
-	// same reason StepUpFields.tsx calls its prop `credentialError`. Renaming
+	// same hazard the desktop's step-up copy works around. Renaming
 	// this to PasswordRequired blocks every commit that touches the file.
 	CredentialRequired string
 }

@@ -75,6 +75,7 @@ import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
+import { useTotpAcceptedStore } from '@/renderer/stores/auth/totpAcceptedStore';
 import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
 import { savedGifsSyncService } from '@/renderer/services/system/savedGifsSync';
 import { friendOrgSyncService } from '@/renderer/services/system/friendOrgSync';
@@ -281,6 +282,18 @@ describe('resetService', () => {
       expect(useRichPresenceStore.getState().self.customText).toBeUndefined();
     });
 
+    // MFA factor picker (S2a): when this client last had a TOTP code accepted is
+    // in-memory account posture. Surviving a logout, it would tell the next
+    // account on a shared device that the previous one just used a code.
+    it('clears when each account last had a TOTP code accepted', () => {
+      useTotpAcceptedStore.getState().noteTotpAccepted('account-a', 1_700_000_000_000);
+      useTotpAcceptedStore.getState().noteTotpAccepted('account-b', 1_700_000_030_000);
+
+      gracefulReset();
+
+      expect(useTotpAcceptedStore.getState().acceptedAt).toEqual({});
+    });
+
     it('clears the entitlement set to the free floor (#1297 cross-account leak fix)', () => {
       useSubscriptionStore
         .getState()
@@ -428,6 +441,14 @@ describe('resetService', () => {
       nuclearReset();
 
       expect(useAudioSettingsStore.getState().perParticipantVolume).toEqual({});
+    });
+
+    it('inherits the TOTP-accepted clear (S2a)', () => {
+      useTotpAcceptedStore.getState().noteTotpAccepted('account-a', 1_700_000_000_000);
+
+      nuclearReset();
+
+      expect(useTotpAcceptedStore.getState().acceptedAt).toEqual({});
     });
 
     it('inherits the friend-request eligibility clear (#1241)', () => {

@@ -15,6 +15,14 @@ afterAll(() => server.close());
 
 beforeEach(() => {
   resetAllStores();
+  // A DM or group dialog reads GET /api/v1/mfa/step-up when it opens (its
+  // step-up stage is ready on arrival). Answer it, so the read never falls
+  // through to the network; the stage itself is covered in StepUp.test.tsx.
+  server.use(
+    http.get('*/api/v1/mfa/step-up', () =>
+      HttpResponse.json({ methods: ['totp'], default_method: 'totp', backup_code_available: false })
+    )
+  );
 });
 
 function channelModal(isOpen: boolean) {
@@ -299,6 +307,8 @@ describe('PurgeMessagesModal — step-up handoff', () => {
     await waitFor(() =>
       expect(screen.queryByRole('combobox', { name: 'Range' })).not.toBeInTheDocument()
     );
+    expect(screen.getByRole('heading', { name: 'Confirm it is you' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
     expect(screen.queryByText(/you may not have permission/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
   });
