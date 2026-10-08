@@ -3,16 +3,17 @@ import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import PurgeRangePicker from './PurgeRangePicker';
 import PurgeResult from './PurgeResult';
-import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
-import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import {
+  LEG_ONLY_WITHOUT_MFA,
   useStepUpFactor,
   type StepUpFactor,
+  type StepUpFactorRefusal,
   type StepUpSubmit,
   type StepUpSubmitOutcome,
 } from '../../hooks/auth/useStepUpFactor';
 import { PURGE_RANGE_PHRASES, type PurgeRange } from '../../constants/purgeRanges';
+import { softLockSeed, type DeleteRefusalView } from '../../services/messaging/deleteRefusal';
 import {
   isSoftLockChallengeResult,
   isStepUpPurgeResult,
@@ -24,7 +25,11 @@ import {
   type StepUpPurgeResult,
   type TerminalPurgeResult,
 } from '../../services/messaging/purgeApi';
-import { apiRequestContextIsCurrent, isAbortError } from '../../services/system/requestContext';
+import {
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  isAbortError,
+} from '../../services/system/requestContext';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
@@ -70,6 +75,20 @@ const SERVER_RANGE_HELPER = 'Channels you cannot moderate will be skipped.';
 const TRANSPORT_FAILURE: TerminalPurgeResult = { kind: 'networkError' };
 
 /**
+ * apiFetch's pre-dispatch fence (an account or server change) raised before
+ * anything left, so nothing was purged and there is nothing to report (D7).
+ */
+const NOT_SENT: PurgeOutcome = { kind: 'notSent' };
+
+/**
+ * The prompt a soft-lock retry's code is typed into. `purgeMessages` reads an
+ * `Invalid MFA code` refusal as that code's own (a challenge with an error) only
+ * when it is told the previous view was a code prompt; the methods are not read.
+ * Only the channel and server routes use it.
+ */
+const CODE_PROMPT: DeleteRefusalView = { view: 'confirm', methods: [] };
+
+/**
  * What the credential stage says when the session is gone before the purge was
  * sent: the read's own `session` refusal, or an account or server change during
  * the activation. The words are the result stage's `sessionExpired` copy
@@ -86,10 +105,28 @@ function isRetryableRefusal(
 }
 
 /**
+ * A soft-lock challenge the credential fields cannot answer (`refusal: null`)
+ * is no challenge: a refused password exchange that is no verdict on the
+ * password, such as a rate limit, a server without the endpoint, or a lookup
+ * that failed. Typing the password again answers none of them, so the purge
+ * ends with the exchange's own words, as any other reply the fields cannot
+ * word does. `purgeMessages` classified it from the mint's reason, so nothing
+ * here reads the copy.
+ */
+function endExchangeRefusal(outcome: PurgeOutcome): PurgeOutcome {
+  if (!isSoftLockChallengeResult(outcome) || outcome.refusal !== null) return outcome;
+  const { view } = outcome;
+  return { kind: 'softLockFailed', message: view.view === 'password' ? view.error : undefined };
+}
+
+/**
  * The credential hook's reading of a purge result. A refusal of what was
  * entered, or of the purge budget, is a `refusal` (a 429 provably read no
- * code). Any other reply is `answered`: the server replied, so it may have
- * read the code, and the dialog moves to the result stage.
+ * code), and so is a soft-lock challenge, whose refusal `purgeMessages`
+ * classified. A purge that never left is `aborted` (D7). Any other reply,
+ * including a challenge the fields cannot answer, is `answered`: the server
+ * replied, so it may have read the code, and the dialog moves to the result
+ * stage.
  */
 function toSubmitOutcome(outcome: PurgeOutcome): StepUpSubmitOutcome {
   if (isRetryableRefusal(outcome)) return { kind: 'refusal', refusal: outcome };
@@ -100,9 +137,25 @@ function toSubmitOutcome(outcome: PurgeOutcome): StepUpSubmitOutcome {
       return { kind: 'transport' };
     case 'rateLimited':
       return { kind: 'refusal', refusal: { kind: 'rateLimited' } };
+    case 'softLockChallenge':
+      return outcome.refusal === null
+        ? { kind: 'answered' }
+        : { kind: 'refusal', refusal: outcome.refusal };
+    case 'notSent':
+      return { kind: 'aborted' };
     default:
       return { kind: 'answered' };
   }
+}
+
+/** True when the reply asks the open credential stage for another try instead of ending it. */
+function staysInStage(outcome: PurgeOutcome): boolean {
+  return isRetryableRefusal(outcome) || isSoftLockChallengeResult(outcome);
+}
+
+/** True when the reply asks for credentials: it opens a credential stage. */
+function isChallenge(outcome: PurgeOutcome): boolean {
+  return isSoftLockChallengeResult(outcome) || isStepUpPurgeResult(outcome);
 }
 
 /**
@@ -159,25 +212,8 @@ function scopeSentence(
   }
 }
 
-interface SoftLockStageProps {
-  softLock: SoftLockChallengeView;
-  /** Remounts the MFA prompt empty after a spent code (#3466). */
-  promptKey: number;
-  purpose: StepUpPurpose;
-  busy: boolean;
-  canSubmit: boolean;
-  password: string;
-  onPasswordChange: (value: string) => void;
-  onCodeChange: (value: string) => void;
-  onSubmit: (e: React.SubmitEvent<HTMLFormElement>) => void;
-  onCancel: () => void;
-  headingRef: React.Ref<HTMLHeadingElement>;
-}
-
-interface DmStepUpStageProps {
+interface StepUpStageProps {
   factor: StepUpFactor;
-  /** The account holds neither a password nor MFA (the purge route's 400). */
-  impossible: boolean;
   password: string;
   onPasswordChange: (value: string) => void;
   primaryRef: React.RefObject<HTMLButtonElement | null>;
@@ -185,13 +221,22 @@ interface DmStepUpStageProps {
   ariaDisabled: boolean;
   onActivate: () => void;
   onCancel: () => void;
+}
+
+interface DmStepUpStageProps extends StepUpStageProps {
+  /** The account holds neither a password nor MFA (the purge route's 400). */
+  impossible: boolean;
   onGoToPrivacy: () => void;
 }
 
-/** The DM/group purge's credential stage, below its heading (#1354, picker PR 2). */
-const DmStepUpStage: React.FC<DmStepUpStageProps> = ({
+/**
+ * The credential fields and footer both purge step-ups share, below their
+ * heading: the intro sentence, the picker, and the action-named primary
+ * (`aria-disabled`, never natively disabled, so its guard can say what is missing).
+ */
+const StepUpForm: React.FC<StepUpStageProps & { intro: string }> = ({
+  intro,
   factor,
-  impossible,
   password,
   onPasswordChange,
   primaryRef,
@@ -199,35 +244,11 @@ const DmStepUpStage: React.FC<DmStepUpStageProps> = ({
   ariaDisabled,
   onActivate,
   onCancel,
-  onGoToPrivacy,
 }) => {
-  if (impossible) {
-    return (
-      <div className="purge-modal__form">
-        {/* No password and no MFA: there is nothing the user could type
-            that would work, so the stage offers no retryable field. */}
-        <p className="purge-modal__deadend">
-          Your account signs in without a password, so we cannot confirm your identity here. Turn
-          off <strong>Require authentication before purging</strong> in Privacy &amp; Security, then
-          try again.
-        </p>
-        <div className="purge-modal__actions">
-          <button type="button" className="purge-modal__cancel" onClick={onCancel}>
-            Cancel
-          </button>
-          <button type="button" className="purge-modal__confirm" onClick={onGoToPrivacy}>
-            Go to Privacy &amp; Security
-          </button>
-        </div>
-      </div>
-    );
-  }
   const busyLabel = factor.phase === 'ceremony' ? 'Waiting…' : 'Purging...';
   return (
     <div className="purge-modal__form">
-      <p className="purge-modal__stepup-body">
-        Purging messages is permanent, so we ask you to confirm your identity first.
-      </p>
+      <p className="purge-modal__stepup-body">{intro}</p>
 
       <StepUpCredentials
         factor={factor}
@@ -267,85 +288,63 @@ const DmStepUpStage: React.FC<DmStepUpStageProps> = ({
   );
 };
 
-/** The delete-rate soft-lock challenge (#3455): the purge again, with a factor. */
-const SoftLockStage: React.FC<SoftLockStageProps> = ({
-  softLock,
-  promptKey,
-  purpose,
-  busy,
-  canSubmit,
-  password,
-  onPasswordChange,
-  onCodeChange,
-  onSubmit,
-  onCancel,
-  headingRef,
-}) => (
+/**
+ * A credential stage's frame. The heading is the focus target for the stage
+ * change; the dialog keeps its own title, and this is what announces the new stage.
+ */
+const StepUpShell: React.FC<{
+  headingRef: React.RefObject<HTMLHeadingElement | null>;
+  children: React.ReactNode;
+}> = ({ headingRef, children }) => (
   <div className="purge-modal__stepup">
     <h3 className="purge-modal__stage-heading" tabIndex={-1} ref={headingRef}>
       Confirm it is you
     </h3>
-    <form onSubmit={onSubmit}>
-      <fieldset disabled={busy} className="purge-modal__form">
-        <p className="purge-modal__stepup-body">
-          You&apos;ve deleted several messages quickly. Confirm it&apos;s you to keep going.
+    {children}
+  </div>
+);
+
+/** The DM/group purge's credential stage (#1354, picker PR 2). */
+const DmStepUpStage: React.FC<DmStepUpStageProps> = ({ impossible, onGoToPrivacy, ...stage }) => (
+  <StepUpShell headingRef={stage.headingRef}>
+    {impossible ? (
+      <div className="purge-modal__form">
+        {/* No password and no MFA: there is nothing the user could type
+            that would work, so the stage offers no retryable field. */}
+        <p className="purge-modal__deadend">
+          Your account signs in without a password, so we cannot confirm your identity here. Turn
+          off <strong>Require authentication before purging</strong> in Privacy &amp; Security, then
+          try again.
         </p>
-
-        {softLock.view === 'confirm' ? (
-          <div className="purge-modal__softlock-prompt">
-            <MFAVerifyPrompt
-              key={promptKey}
-              methods={softLock.methods}
-              purpose={purpose}
-              onVerify={onCodeChange}
-              onCodeChange={onCodeChange}
-              disabled={busy}
-              error={softLock.error}
-            />
-          </div>
-        ) : (
-          <div className="purge-modal__field">
-            <label htmlFor="purge-softlock-password">Password</label>
-            <input
-              id="purge-softlock-password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(ev) => onPasswordChange(ev.target.value)}
-              aria-invalid={softLock.error !== undefined || undefined}
-              aria-describedby={
-                softLock.error === undefined ? undefined : 'purge-softlock-password-error'
-              }
-            />
-            {softLock.error !== undefined && (
-              <p
-                className="purge-modal__softlock-error"
-                id="purge-softlock-password-error"
-                role="alert"
-              >
-                {softLock.error}
-              </p>
-            )}
-          </div>
-        )}
-
         <div className="purge-modal__actions">
-          <button type="button" className="purge-modal__cancel" onClick={onCancel}>
+          <button type="button" className="purge-modal__cancel" onClick={stage.onCancel}>
             Cancel
           </button>
-          <button type="submit" className="purge-modal__confirm" disabled={!canSubmit}>
-            {busy ? (
-              <>
-                <LoadingSpinner size="small" inline /> Purging...
-              </>
-            ) : (
-              'Confirm and Purge'
-            )}
+          <button type="button" className="purge-modal__confirm" onClick={onGoToPrivacy}>
+            Go to Privacy &amp; Security
           </button>
         </div>
-      </fieldset>
-    </form>
-  </div>
+      </div>
+    ) : (
+      <StepUpForm
+        intro="Purging messages is permanent, so we ask you to confirm your identity first."
+        {...stage}
+      />
+    )}
+  </StepUpShell>
+);
+
+/**
+ * The delete-rate soft-lock challenge (#3455): the purge again, with a factor.
+ * Enrolment (E8) is a state of the credential fields, not of this stage.
+ */
+const SoftLockStepUpStage: React.FC<StepUpStageProps> = (stage) => (
+  <StepUpShell headingRef={stage.headingRef}>
+    <StepUpForm
+      intro="You've deleted several messages quickly. Confirm it's you to keep going."
+      {...stage}
+    />
+  </StepUpShell>
 );
 
 /**
@@ -390,18 +389,16 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<Stage>('configure');
   const [result, setResult] = useState<TerminalPurgeResult | null>(null);
-  // Wire secrets. Component-local state only — never a store, never a log,
-  // never echoed into error copy ([internal]rules/observability.md). The code is
-  // the soft-lock stage's; the DM/group step-up stage's lives in the factor hook.
+  // The wire secret. Component-local state only — never a store, never a log,
+  // never echoed into error copy ([internal]rules/observability.md). The code
+  // lives in the factor hooks.
   const [password, setPassword] = useState('');
-  const [code, setCode] = useState('');
   // The account holds neither a password nor MFA, so the step-up stage has
   // nothing to ask for (the purge route's 400).
   const [stepUpImpossible, setStepUpImpossible] = useState(false);
-  // #3455: the soft-lock challenge on screen, and the key that remounts the MFA
-  // prompt empty after an `Invalid MFA code` (#3466 — a code is spent by a try).
-  const [softLock, setSoftLock] = useState<SoftLockChallengeView | null>(null);
-  const [softLockKey, setSoftLockKey] = useState(0);
+  // #3455: the refusal that opened the soft-lock stage. It seeds the stage's
+  // factor hook and is never read again: the hook words every later reply.
+  const [softLockOpener, setSoftLockOpener] = useState<StepUpFactorRefusal | null>(null);
   const firstRangeRef = useRef<HTMLSelectElement>(null);
   const stageHeadingRef = useRef<HTMLHeadingElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
@@ -446,27 +443,32 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     readFailure: 'block',
     allowBackup: true,
   });
-  const stepUpSubmitting = factor.phase === 'submitting';
-  // One route, one purpose: the WebAuthn token this prompt mints is spendable on
-  // no other route (see MFAVerifyPrompt's `purpose`).
-  const softLockPurpose: StepUpPurpose =
-    context === 'server' ? 'messages.server_purge' : 'messages.channel_purge';
-  const canSubmitSoftLock =
-    !busy && (softLock?.view === 'password' ? password !== '' : code !== '');
+  // The delete-rate soft-lock (#3455) of a channel or server self-purge, enabled
+  // while its challenge is on screen. The seed is the refusal that opened it and
+  // applies when this instance starts, which is the render that sets `enabled`
+  // (G2). `whenNoMfa`: the own rule asks for a password only of an account with
+  // no inline method, and it travels as a minted token (#3509). `passwordOnly`: a
+  // failed read keeps the seeded methods rather than blocking a challenge that
+  // already named what it wants. One route, one purpose.
+  const softLockFactor = useStepUpFactor({
+    enabled: isOpen && stage === 'softlock',
+    purpose: context === 'server' ? 'messages.server_purge' : 'messages.channel_purge',
+    passwordLeg: LEG_ONLY_WITHOUT_MFA,
+    readFailure: 'passwordOnly',
+    allowBackup: true,
+    seed: softLockOpener,
+  });
+  const submitting = factor.phase === 'submitting' || softLockFactor.phase === 'submitting';
 
   // A stage change moves focus to the stage heading. The dialog title stays put:
   // ui/Modal binds it to aria-labelledby, so renaming it mid-interaction renames
-  // the dialog (WCAG 4.1.2 / 3.2.2). So does a soft-lock challenge that changes
-  // factor without leaving the stage — the mint naming MFA after the password
-  // was sent (#3509 review) — and the step-up dead end, which unmounts the
-  // button that was just pressed: the focused field unmounts, and without this
-  // focus would fall out of the dialog. A code prompt then takes focus for its
-  // first digit, which mounts after this runs. Inside the credential stage the
-  // factor's own focus table takes over (StepUpCredentials).
-  const softLockView = softLock?.view;
+  // the dialog (WCAG 4.1.2 / 3.2.2). So does the step-up dead end, which
+  // unmounts the button that was just pressed: the focused field unmounts, and
+  // without this focus would fall out of the dialog. Inside the credential stage
+  // the factor's own focus table takes over (StepUpCredentials).
   useLayoutEffect(() => {
     if (stage === 'stepup' || stage === 'softlock') stageHeadingRef.current?.focus();
-  }, [stage, softLockView, stepUpImpossible]);
+  }, [stage, stepUpImpossible]);
 
   // Unmounting would drop this state for free, but ChannelSettingsModal and
   // GroupInfoPanel render the dialog unconditionally behind a boolean `isOpen`,
@@ -483,13 +485,11 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     // routing through it, which is the case this guard exists for.
     /* eslint-disable @eslint-react/set-state-in-effect -- credential hygiene + confirm-friction reset, see above */
     setPassword('');
-    setCode('');
     setBusy(false);
     setStage('configure');
     setResult(null);
     setStepUpImpossible(false);
-    setSoftLock(null);
-    setSoftLockKey(0);
+    setSoftLockOpener(null);
     setRange(null);
     setTyped('');
     /* eslint-enable @eslint-react/set-state-in-effect -- reset block ends here */
@@ -510,18 +510,11 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     else if (openedScopeRef.current !== scope) onClose();
   }, [isOpen, context, scopeId, onClose]);
 
-  // The soft-lock gate runs before any purge batch, so nothing was purged.
-  // Any factor that travelled with the refused request may be spent, so the
-  // code is always dropped. The password never reaches here: the submit
-  // dropped it as it sent it to the mint (#3509 frontend review). The prompt
-  // remounts empty only when it STAYS on the confirm view with a per-attempt
-  // error (#3466) — never on the first challenge.
+  // The soft-lock gate runs before any purge batch, so nothing was purged. Only
+  // the first challenge gets here, from a purge sent without credentials: the
+  // stage's own tries are worded by its factor hook (submitStepUp).
   const showSoftLockChallenge = (next: SoftLockChallengeView) => {
-    if (softLock?.view === 'confirm' && next.view === 'confirm' && next.error !== undefined) {
-      setSoftLockKey((k) => k + 1);
-    }
-    setCode('');
-    setSoftLock(next);
+    setSoftLockOpener(softLockSeed(next));
     setStage('softlock');
   };
 
@@ -536,6 +529,8 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   };
 
   const applyOutcome = (outcome: PurgeOutcome) => {
+    // Nothing left, so nothing changes: the stage and what was typed stay (D7).
+    if (outcome.kind === 'notSent') return;
     if (isSoftLockChallengeResult(outcome)) {
       showSoftLockChallenge(outcome.view);
       return;
@@ -577,7 +572,6 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     // Nothing beyond this point needs the credentials; drop them before the
     // result stage renders.
     setPassword('');
-    setCode('');
     setResult(outcome);
     setStage('result');
   };
@@ -587,17 +581,22 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   // the fieldset that owns Cancel, and `dismissable={!busy}` removes the close
   // button and gates both Escape and the backdrop click. A stale request leaves
   // `busy` alone, because the close already reset it for the new open.
+  //
+  // A challenge asks for credentials for the account and server that sent it,
+  // so after a change it opens no stage: what would be typed there belongs to
+  // neither. The purge was refused before any batch, so nothing is reported.
   const runPurge = async (args: PurgeArgs) => {
     const generation = openGenerationRef.current;
+    const requestContext = captureApiRequestContext();
     setBusy(true);
     let outcome: PurgeOutcome;
     try {
-      outcome = await purgeMessages(args);
-    } catch {
-      outcome = TRANSPORT_FAILURE;
+      outcome = await purgeMessages(args, requestContext);
+    } catch (error) {
+      outcome = isAbortError(error) ? NOT_SENT : TRANSPORT_FAILURE;
     }
     if (generation !== openGenerationRef.current) return;
-    applyOutcome(outcome);
+    if (!isChallenge(outcome) || apiRequestContextIsCurrent(requestContext)) applyOutcome(outcome);
     setBusy(false);
   };
 
@@ -613,21 +612,30 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     await runPurge({ context, scopeId, range });
   };
 
-  // The DM/group purge with the credentials the factor hook prepared. The hook
-  // owns the phase, so there is no `busy` here, and it holds the spent-code
-  // rules, so only the result stage and the password are decided in this file.
-  // Single-shot: whichever factors the actor has travel in the same request.
-  // Probing for the requirement costs a call against the very purge budget the
-  // user is trying to spend on the purge itself (spec R-7).
+  // The purge with the credentials a factor hook prepared, for the DM/group
+  // step-up stage and the soft-lock stage alike (their contexts never overlap).
+  // The hook owns the phase, so there is no `busy` here, and it holds the
+  // spent-code rules, so only the result stage and the password are decided in
+  // this file. Single-shot: whichever factors the actor has travel in the same
+  // request. Probing for the requirement costs a call against the very purge
+  // budget the user is trying to spend on the purge itself (spec R-7).
   const submitStepUp: StepUpSubmit = async (mfa, requestContext) => {
     if (range === null) return { kind: 'aborted' };
     const generation = openGenerationRef.current;
+    const args: PurgeArgs = {
+      context,
+      scopeId,
+      range,
+      currentPassword: password || undefined,
+      mfaCode: mfa,
+      softLockPrior: CODE_PROMPT,
+    };
+    // A self-purge's password goes to the mint, not to the route, so it leaves
+    // component state as it is sent (#3509 frontend review).
+    if (!privateConversation) setPassword('');
     let outcome: PurgeOutcome;
     try {
-      outcome = await purgeMessages(
-        { context, scopeId, range, currentPassword: password || undefined, mfaCode: mfa },
-        requestContext
-      );
+      outcome = endExchangeRefusal(await purgeMessages(args, requestContext));
     } catch (error) {
       // apiFetch's pre-dispatch fence (an account or server change): the
       // request never left, so nothing was purged and the code is unspent.
@@ -641,8 +649,8 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     if (generation !== openGenerationRef.current || !apiRequestContextIsCurrent(requestContext)) {
       return submitted;
     }
-    if (isRetryableRefusal(outcome)) {
-      // The stage stays up and the hook words the refusal. Only the password
+    if (staysInStage(outcome)) {
+      // The stage stays up and the hook words the reply. Only the password
       // the server rejected is dropped, so a wrong password does not cost the
       // user a fresh code they already typed.
       if (outcome.kind === 'invalidPassword') setPassword('');
@@ -652,24 +660,8 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     return submitted;
   };
 
-  const { ariaDisabled, activate } = stepUpActivation(factor, password, submitStepUp);
-
-  const handleSoftLockSubmit = async (e: React.SubmitEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!canSubmitSoftLock || range === null || softLock === null) return;
-    const factor = softLock.view === 'password' ? { currentPassword: password } : { mfaCode: code };
-    // The previous attempt's error leaves as this one starts, so an identical
-    // refusal is announced again; the password leaves component state now,
-    // because this request sends it to the mint (#3509 frontend review).
-    setSoftLock(
-      softLock.view === 'password'
-        ? { view: 'password' }
-        : { view: 'confirm', methods: softLock.methods }
-    );
-    if (softLock.view === 'password') setPassword('');
-    // The same purge, re-sent with the factor the challenge asked for.
-    await runPurge({ context, scopeId, range, ...factor, softLockPrior: softLock });
-  };
+  const stepUp = stepUpActivation(factor, password, submitStepUp);
+  const softLockStepUp = stepUpActivation(softLockFactor, password, submitStepUp);
 
   const handleGoToPrivacy = () => {
     // The focus request is consumed by SettingsPage's effect, which only runs
@@ -696,7 +688,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       onClose={onClose}
       title={TITLES[context]}
       width="medium"
-      dismissable={!busy && !stepUpSubmitting}
+      dismissable={!busy && !submitting}
       initialFocusRef={firstRangeRef}
     >
       <div className="purge-modal__body">
@@ -705,41 +697,30 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
         )}
 
         {stage === 'stepup' && (
-          <div className="purge-modal__stepup">
-            {/* Focus target for the stage change. The dialog keeps its own
-                title — this heading is what announces the new stage. */}
-            <h3 className="purge-modal__stage-heading" tabIndex={-1} ref={stageHeadingRef}>
-              Confirm it is you
-            </h3>
-
-            <DmStepUpStage
-              factor={factor}
-              impossible={stepUpImpossible}
-              password={password}
-              onPasswordChange={setPassword}
-              primaryRef={primaryRef}
-              headingRef={stageHeadingRef}
-              ariaDisabled={ariaDisabled}
-              onActivate={activate}
-              onCancel={onClose}
-              onGoToPrivacy={handleGoToPrivacy}
-            />
-          </div>
-        )}
-
-        {stage === 'softlock' && softLock !== null && (
-          <SoftLockStage
-            softLock={softLock}
-            promptKey={softLockKey}
-            purpose={softLockPurpose}
-            busy={busy}
-            canSubmit={canSubmitSoftLock}
+          <DmStepUpStage
+            factor={factor}
+            impossible={stepUpImpossible}
             password={password}
             onPasswordChange={setPassword}
-            onCodeChange={setCode}
-            onSubmit={handleSoftLockSubmit}
-            onCancel={onClose}
+            primaryRef={primaryRef}
             headingRef={stageHeadingRef}
+            ariaDisabled={stepUp.ariaDisabled}
+            onActivate={stepUp.activate}
+            onCancel={onClose}
+            onGoToPrivacy={handleGoToPrivacy}
+          />
+        )}
+
+        {stage === 'softlock' && (
+          <SoftLockStepUpStage
+            factor={softLockFactor}
+            password={password}
+            onPasswordChange={setPassword}
+            primaryRef={primaryRef}
+            headingRef={stageHeadingRef}
+            ariaDisabled={softLockStepUp.ariaDisabled}
+            onActivate={softLockStepUp.activate}
+            onCancel={onClose}
           />
         )}
 

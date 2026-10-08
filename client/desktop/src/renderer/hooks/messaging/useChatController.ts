@@ -28,15 +28,18 @@ import { e2eeService } from '../../services/e2ee/e2eeService';
 import { indexMessage, removeMessage } from '../../services/messaging/searchService';
 import { wrapContentWithGifSlug } from '../../services/messaging/dmMessageSender';
 import {
+  mintRefusalView,
   toDeleteRefusalView,
+  toDeleteSubmitOutcome,
   type DeleteRefusalView,
 } from '../../services/messaging/deleteRefusal';
 import {
-  mintMfaMethods,
   mintPasswordStepUpToken,
   passwordStepUpRefusalMessage,
+  type PasswordStepUpMint,
 } from '../../services/system/stepUpToken';
 import type { PasswordStepUpPurpose } from '../../components/Auth/stepUpPurpose';
+import type { StepUpSubmitOutcome } from '../auth/useStepUpFactor';
 import type {
   ChatContext,
   ChatContextType,
@@ -54,20 +57,16 @@ export interface DeleteStepUp {
   currentPassword?: string;
 }
 
-/** A challenge view minus its per-attempt error; any other view as it is. */
-function withoutError(view: DeleteRefusalView): DeleteRefusalView {
-  if (view.view === 'confirm') return { view: 'confirm', methods: view.methods };
-  if (view.view === 'password') return { view: 'password' };
-  return view;
-}
-
 /**
- * What a retry sends, or the refusal that stopped it before the route. A
- * retry that exchanged a password carries the request context the exchange
- * ran under, so the delete is admitted against that same account and server.
+ * What a retry sends, or what stopped it before the route: a refusal, with the
+ * factor hook's reading of it, or an exchange that never left (D7). A retry
+ * carries the request context it belongs to, so the delete is admitted against
+ * that same account and server.
  */
 type DeleteRetry =
-  { body?: Record<string, string>; context?: ApiRequestContext } | { refusal: DeleteRefusalView };
+  | { body?: Record<string, string>; context?: ApiRequestContext }
+  | { refusal: DeleteRefusalView; outcome: StepUpSubmitOutcome }
+  | { notSent: true };
 
 /** Where a delete goes, and the purpose a password minted for it is bound to. */
 function deleteTarget(
@@ -91,48 +90,88 @@ function needsMint(
 }
 
 /** The retry body when no password exchange is needed: a code, or nothing. */
-function directRetryBody(step: DeleteStepUp | undefined): DeleteRetry {
-  return step?.mfaCode ? { body: { mfa_code: step.mfaCode } } : {};
+function directRetryBody(
+  step: DeleteStepUp | undefined,
+  context: ApiRequestContext | undefined
+): DeleteRetry {
+  return step?.mfaCode ? { body: { mfa_code: step.mfaCode }, context } : { context };
 }
 
 /**
  * The retry body for a password. The password goes only to the mint endpoint,
  * which answers a token bound to this route's purpose; the route then gets
- * `{ step_up_token }`, and a refused exchange becomes the password view's
- * error instead (#3509).
+ * `{ step_up_token }`, and a refused exchange fills the slot instead (#3509).
  *
- * The exchange and the delete are one operation, so the request context is
- * captured once here and returned with the body: the delete then refuses to
- * dispatch if another account or server took over after the exchange, and a
- * token is never spent as another account (#3509 review).
+ * The exchange and the delete are one operation, so they run against one
+ * request context, the caller's capture or one taken here, returned with the
+ * body: the delete then refuses to dispatch if another account or server took
+ * over after the exchange, and a token is never spent as another account
+ * (#3509 review).
  */
 async function mintedRetryBody(
   password: string,
-  purpose: PasswordStepUpPurpose
+  purpose: PasswordStepUpPurpose,
+  context: ApiRequestContext | undefined
 ): Promise<DeleteRetry> {
-  const context = captureApiRequestContext();
-  const minted = await mintPasswordStepUpToken(password, purpose, context);
-  if (minted.kind === 'refused') {
-    // An account that enrolled MFA after the prompt opened can never pass a
-    // password prompt: move to the code prompt with the methods it named.
-    const methods = mintMfaMethods(minted);
-    if (methods) return { refusal: { view: 'confirm', methods } };
-    return { refusal: { view: 'password', error: passwordStepUpRefusalMessage(minted) } };
+  const operation = context ?? captureApiRequestContext();
+  const minted = await mintPasswordStepUpToken(password, purpose, operation);
+  if (minted.kind === 'minted') {
+    return { body: { step_up_token: minted.token }, context: operation };
   }
-  return { body: { step_up_token: minted.token }, context };
+  // D7: the exchange never left, so there is nothing to say about the password.
+  if (minted.unsent) return { notSent: true };
+  return mintRefusalRetry(minted);
 }
 
 /**
- * The one refusal slot `DeleteRefusalModal` reads. `promptKey` is bumped only
- * when an `Invalid MFA code` refusal keeps the `confirm` view open (#3466) —
- * the remount is what clears a stale code out of the prompt.
+ * The slot's view of a refused exchange, with the factor hook's reading of it.
+ * The fields can answer only the methods it named or a wrong password. Any
+ * other refusal (a lockout, a server without the endpoint, a failed lookup, an
+ * MFA requirement naming no method) is no verdict on the password, so typing
+ * again answers nothing: the challenge ends Close-only with the exchange's own
+ * words, as the purge soft-lock's does (`endExchangeRefusal`).
  */
+function mintRefusalRetry(minted: Extract<PasswordStepUpMint, { kind: 'refused' }>): DeleteRetry {
+  const view = mintRefusalView(minted);
+  if (view.view === 'confirm') {
+    return {
+      refusal: view,
+      outcome: { kind: 'refusal', refusal: { kind: 'mfaRequired', methods: view.methods } },
+    };
+  }
+  if (minted.reason === 'invalidPassword') {
+    return { refusal: view, outcome: { kind: 'refusal', refusal: { kind: 'invalidPassword' } } };
+  }
+  return {
+    refusal: { view: 'failed', message: passwordStepUpRefusalMessage(minted) },
+    outcome: { kind: 'answered' },
+  };
+}
+
+/**
+ * True when the row should go: a success, or a 404 on a RETRY, which counts as
+ * gone because the message was deleted by the time the confirmation
+ * round-tripped (another moderator, another device).
+ */
+function deletedOrGone(res: Response, isRetry: boolean): boolean {
+  return res.ok || (isRetry && res.status === 404);
+}
+
+/** A body only when a factor is present (X10): a fresh delete carries none. */
+function deleteInit(body: Record<string, string> | undefined): RequestInit {
+  if (!body) return { method: 'DELETE' };
+  return {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
+
+/** The one refusal slot `DeleteRefusalModal` reads. */
 export interface DeleteRefusalState {
   messageId: string;
   view: DeleteRefusalView;
-  submitting: boolean;
   openedAt: number;
-  promptKey: number;
 }
 
 export interface SendOpts {
@@ -350,33 +389,20 @@ export function useChatController(ctx: ChatContext) {
       const openedAt = Date.now();
       setDeleteRefusal((cur) => {
         if (cur && cur.messageId !== messageId) return cur;
-        const priorView = cur?.view;
-        const view = viewFor(priorView);
-        // A fresh factor every retry (#3466): the prompt remounts empty only
-        // when it STAYS on the same challenge view with a new per-attempt
-        // error (a spent code, a refused password) — never on a first
-        // refusal or a change of view.
-        const bumpsPrompt =
-          priorView !== undefined &&
-          (view.view === 'confirm' || view.view === 'password') &&
-          priorView.view === view.view &&
-          view.error !== undefined;
-        return {
-          messageId,
-          view,
-          submitting: false,
-          openedAt,
-          promptKey: (cur?.promptKey ?? 0) + (bumpsPrompt ? 1 : 0),
-        };
+        return { messageId, view: viewFor(cur?.view), openedAt };
       });
     },
     []
   );
 
   const sendDelete = useCallback(
-    async (messageId: string, step?: DeleteStepUp) => {
-      if (!ctx.id) return;
-      if (inFlightDeleteIdsRef.current.has(messageId)) return;
+    async (
+      messageId: string,
+      step?: DeleteStepUp,
+      context?: ApiRequestContext
+    ): Promise<StepUpSubmitOutcome> => {
+      // Nothing is sent: no chat, or a delete for this id is already in flight.
+      if (!ctx.id || inFlightDeleteIdsRef.current.has(messageId)) return { kind: 'aborted' };
       inFlightDeleteIdsRef.current.add(messageId);
       const isRetry = step !== undefined;
       const sentFrom = ctx.id;
@@ -384,7 +410,11 @@ export function useChatController(ctx: ChatContext) {
       // the refusal slot belongs to the chat on screen. The mint round trip
       // (#3509) answers to the same rule: a mint refusal that lands after the
       // chat changed is discarded with everything else.
-      const stillShowing = () => isMountedRef.current && currentCtxIdRef.current === sentFrom;
+      const reportIfShowing = (viewFor: (prior?: DeleteRefusalView) => DeleteRefusalView) => {
+        if (isMountedRef.current && currentCtxIdRef.current === sentFrom) {
+          fillRefusalSlot(messageId, viewFor);
+        }
+      };
 
       try {
         const { url, purpose } = deleteTarget(isDM, ctx.id, messageId);
@@ -392,32 +422,23 @@ export function useChatController(ctx: ChatContext) {
         // Only a password costs a round trip before the route; a fresh delete
         // or a code goes out in this same tick, as before.
         const retry = needsMint(step)
-          ? await mintedRetryBody(step.currentPassword, purpose)
-          : directRetryBody(step);
+          ? await mintedRetryBody(step.currentPassword, purpose, context)
+          : directRetryBody(step, context);
+        // An exchange apiFetch refused to dispatch is the AbortError below.
+        if ('notSent' in retry) return { kind: 'aborted' };
         if ('refusal' in retry) {
-          if (stillShowing()) fillRefusalSlot(messageId, () => retry.refusal);
-          return;
+          reportIfShowing(() => retry.refusal);
+          return retry.outcome;
         }
 
-        const init: RequestInit = { method: 'DELETE' };
-        // A body is sent only when a factor is present (X10) — a fresh delete
-        // under the soft-lock threshold carries no body at all, unchanged
-        // from today.
-        if (retry.body) {
-          init.headers = { 'Content-Type': 'application/json' };
-          init.body = JSON.stringify(retry.body);
-        }
+        const res = await apiFetchInContext(url, deleteInit(retry.body), retry.context);
 
-        const res = await apiFetchInContext(url, init, retry.context);
-
-        if (res.ok || (isRetry && res.status === 404)) {
-          // A 404 on a RETRY counts as gone: the message was deleted by the
-          // time the confirmation round-tripped (another moderator, another
-          // device). The row is stale either way, so it is removed the same
+        if (deletedOrGone(res, isRetry)) {
+          // The row is stale either way, so a retry's 404 is removed the same
           // as a success. The vanished-message effect above closes the slot.
           storeDeleteMessage(ctx.id, messageId);
           removeMessage(messageId);
-          return;
+          return { kind: 'success' };
         }
 
         // safeJson throws on a non-JSON body (a proxy's HTML error page). That
@@ -425,18 +446,17 @@ export function useChatController(ctx: ChatContext) {
         // one and the mapper falls back to its own copy.
         const body: unknown = await safeJson(res).catch((): unknown => ({}));
         const retryAfter = res.headers.get('Retry-After');
-        if (!stillShowing()) return;
-        fillRefusalSlot(messageId, (prior) =>
-          toDeleteRefusalView(res.status, body, retryAfter, prior)
-        );
+        reportIfShowing((prior) => toDeleteRefusalView(res.status, body, retryAfter, prior));
+        return toDeleteSubmitOutcome(res.status, body);
       } catch (err) {
         // Transport failure — reported, not swallowed (the fix this issue
         // makes to the pre-existing behaviour below the soft-lock threshold).
         // apiFetch refuses to dispatch once the account or server changed
         // under it: nothing was sent, so there is nothing to report. The error
         // text is never shown — it is transport detail, not user copy.
-        if (!stillShowing() || isAbortError(err)) return;
-        fillRefusalSlot(messageId, () => ({ view: 'failed' }));
+        if (isAbortError(err)) return { kind: 'aborted' };
+        reportIfShowing(() => ({ view: 'failed' }));
+        return { kind: 'transport' };
       } finally {
         inFlightDeleteIdsRef.current.delete(messageId);
       }
@@ -444,17 +464,21 @@ export function useChatController(ctx: ChatContext) {
     [ctx.id, isDM, storeDeleteMessage, fillRefusalSlot]
   );
 
-  const deleteMessage = useCallback((messageId: string) => sendDelete(messageId), [sendDelete]);
+  // A fresh delete reports through the slot alone; its outcome is the hook's.
+  const deleteMessage = useCallback(
+    async (messageId: string): Promise<void> => {
+      await sendDelete(messageId);
+    },
+    [sendDelete]
+  );
 
+  // Resolves to the factor hook's reading of the retry (D6), so `run` can
+  // await it. `context` is the run's capture: the retry, and any password
+  // exchange before it, are admitted against it.
   const confirmDelete = useCallback(
-    (step: DeleteStepUp) => {
-      if (!deleteRefusal) return;
-      // The previous attempt's error leaves as the next one starts, so an
-      // identical refusal is a new live-region announcement, not a no-op.
-      setDeleteRefusal((cur) =>
-        cur ? { ...cur, submitting: true, view: withoutError(cur.view) } : cur
-      );
-      void sendDelete(deleteRefusal.messageId, step);
+    (step: DeleteStepUp, context?: ApiRequestContext): Promise<StepUpSubmitOutcome> => {
+      if (!deleteRefusal) return Promise.resolve({ kind: 'aborted' });
+      return sendDelete(deleteRefusal.messageId, step, context);
     },
     [deleteRefusal, sendDelete]
   );

@@ -1,14 +1,26 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useId, useRef } from 'react';
 import QRCode from 'qrcode';
 import { apiFetch, refreshAccessToken } from '../../services/system/apiClient';
+import {
+  apiFetchInContext,
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
 import TOTPInput from '../Auth/TOTPInput';
-import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import LoadingSpinner from '../Auth/LoadingSpinner';
+import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
 import type { StepUpPurpose } from '../Auth/stepUpPurpose';
+import {
+  useStepUpFactor,
+  type StepUpFactor,
+  type StepUpSubmit,
+} from '../../hooks/auth/useStepUpFactor';
 import BackupCodeDisplay from './BackupCodeDisplay';
 import RecoveryKeyDisplay from './RecoveryKeyDisplay';
-import ErrorBanner, { FieldError } from './ErrorBanner';
+import ErrorBanner from './ErrorBanner';
 import {
   generateRecoveryKey,
   wrapWithRecoveryKey,
@@ -17,16 +29,14 @@ import {
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { classifyStepUpRefusal } from '../../services/system/stepUpRefusal';
 import {
-  inlineMfaMethods,
   isStepUpLocked,
   stepUpBanner,
-  stepUpCodeMayBeSpent,
-  stepUpMfaError,
-  stepUpPasswordError,
-  stepUpPromptMethods,
   submitMfaStepUp,
+  toStepUpSubmitOutcome,
+  type MfaSeamHandler,
   type MfaStepUpResult,
 } from './mfaStepUp';
+import { refusalText } from './mfaResponse';
 
 // ── Extracted helpers (reduce cognitive complexity) ───────────────────
 
@@ -65,6 +75,23 @@ type Preparation =
 /** Where a component keeps a preparation. A ref, never state or a store. */
 interface PreparationSlot {
   current: Promise<Preparation> | null;
+}
+
+/**
+ * The replace step's preparation, held in a ref so key material never reaches
+ * state. `settled` is read synchronously by the send, which therefore awaits
+ * nothing: the primary stays down until the preparation has landed (D11, Q6).
+ * The holder's identity is how a late result learns it was abandoned.
+ */
+interface ReplaceHold {
+  settled: Preparation | null;
+}
+
+/** What the replace step renders from: no key material, only when it may act. */
+interface ReplaceSession {
+  /** Taken when the step opened, before the preparation read the keys (C82). */
+  capture: ApiRequestContext;
+  preparing: boolean;
 }
 
 /** This device's recovery-wrappable material, read once. Null when locked. */
@@ -147,15 +174,24 @@ async function resolvePreparation(slot: PreparationSlot): Promise<Preparation> {
  * First-time store after TOTP confirm-setup. Needs no credentials: the server
  * inserts only when no key exists, and answers 200 to a resend of the bytes it
  * already holds. A 403 carrying either step-up flag means a DIFFERENT key
- * already existed and was KEPT — never a silent 'done'.
+ * already existed and was KEPT — never a silent 'done'. Sent under `context`,
+ * taken before the keys were read, so a change of account or server since then
+ * sends nothing and reads as `failed`.
  */
-async function storeRecoveryKey(prepared: PreparedRecovery): Promise<RecoveryKeyOutcome> {
+async function storeRecoveryKey(
+  prepared: PreparedRecovery,
+  context: ApiRequestContext
+): Promise<RecoveryKeyOutcome> {
   try {
-    const res = await apiFetch('/api/v1/mfa/recovery-key', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(prepared.body),
-    });
+    const res = await apiFetchInContext(
+      '/api/v1/mfa/recovery-key',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prepared.body),
+      },
+      context
+    );
     if (res.ok) return { kind: 'created', key: prepared.key };
     const refusal = classifyStepUpRefusal(res.status, await res.json().catch(() => ({})));
     if (refusal.kind === 'passwordRequired' || refusal.kind === 'mfaRequired') {
@@ -177,6 +213,13 @@ function isAmbiguousOutcome(result: MfaStepUpResult): boolean {
   return (
     result.kind === 'networkError' || result.kind === 'failed' || result.kind === 'unavailable'
   );
+}
+
+/** What a send that found nothing it could send reports. Nothing left the device. */
+function unpreparedRefusal(settled: Preparation | null): MfaStepUpResult {
+  return settled?.kind === 'unavailable'
+    ? { kind: 'failed', message: REPLACE_KEYS_LOCKED_MESSAGE }
+    : { kind: 'failed' };
 }
 
 /** What the done screen says about the recovery key (F16). */
@@ -205,18 +248,36 @@ function classifyWebAuthnError(err: unknown): string {
   return err instanceof Error ? err.message : 'Registration failed';
 }
 
-/** Classify an error message into the appropriate form field. */
-function classifyErrorField(message: string): 'password' | 'mfa' | 'general' {
-  const lower = message.toLowerCase();
-  if (lower.includes('password')) return 'password';
-  if (lower.includes('mfa') || lower.includes('code')) return 'mfa';
-  return 'general';
+type CreationOptions = PublicKeyCredentialCreationOptions & Record<string, unknown>;
+
+/** The backup codes verify-setup answers with; none for any other body. */
+function readBackupCodes(data: unknown): string[] {
+  if (typeof data !== 'object' || data === null || !('backup_codes' in data)) return [];
+  const { backup_codes: codes } = data;
+  return Array.isArray(codes) ? codes.filter((c): c is string => typeof c === 'string') : [];
+}
+
+/** The secret and URL TOTP setup answers with, or null for any other body. */
+function readTotpSetup(data: unknown): { otpauthUrl: string; secret: string } | null {
+  if (typeof data !== 'object' || data === null) return null;
+  if (!('otpauth_url' in data) || !('secret' in data)) return null;
+  const { otpauth_url: otpauthUrl, secret } = data;
+  return typeof otpauthUrl === 'string' && typeof secret === 'string' // pragma: allowlist secret
+    ? { otpauthUrl, secret }
+    : null;
+}
+
+/** The creation options registration begin answers with, or null for any other body. */
+function readCreationOptions(data: unknown): CreationOptions | null {
+  if (typeof data !== 'object' || data === null || !('publicKey' in data)) return null;
+  const { publicKey } = data;
+  return typeof publicKey === 'object' && publicKey !== null
+    ? (publicKey as CreationOptions)
+    : null;
 }
 
 /** Convert base64url-encoded fields in WebAuthn options to ArrayBuffers. */
-function decodeWebAuthnOptions(
-  options: PublicKeyCredentialCreationOptions & Record<string, unknown>
-): void {
+function decodeWebAuthnOptions(options: CreationOptions): void {
   options.challenge = base64urlToBuffer(options.challenge as unknown as string);
   const user = options.user as unknown as Record<string, unknown>;
   user.id = base64urlToBuffer(user.id as string);
@@ -227,14 +288,100 @@ function decodeWebAuthnOptions(
   }
 }
 
-/** Determine whether a WebAuthn error should return the user to the password step. */
-function shouldResetToPasswordStep(err: unknown, msg: string, currentStep: WebAuthnStep): boolean {
-  const isNotAllowed = err instanceof DOMException && err.name === 'NotAllowedError';
-  const isBeginStepError =
-    currentStep === 'password' ||
-    msg.toLowerCase().includes('password') ||
-    msg.toLowerCase().includes('mfa');
-  return isNotAllowed || isBeginStepError;
+/** How long registration waits for the key before it gives up. */
+const REGISTRATION_TIMEOUT_MS = 60000;
+
+/**
+ * Creates the credential in the browser, giving up if the key never answers.
+ * Aborting `signal` closes the browser's prompt and ends the wait at once. The
+ * timeout is cleared however the wait ends, so no timer outlives it.
+ */
+async function createCredential(
+  options: CreationOptions,
+  signal: AbortSignal
+): Promise<PublicKeyCredential> {
+  // The browser's ceremony gets its own controller, so the timeout can end the
+  // prompt itself rather than only giving up on it: a prompt left open behind a
+  // wizard that has moved on could still mint a credential nothing finishes.
+  const ceremony = new AbortController();
+  const follow = () => ceremony.abort(signal.reason);
+  if (signal.aborted) follow();
+  else signal.addEventListener('abort', follow, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const givenUp = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        ceremony.abort(
+          new Error(
+            'Security key registration timed out. Make sure your key is connected and try again.'
+          )
+        ),
+      REGISTRATION_TIMEOUT_MS
+    );
+    ceremony.signal.addEventListener('abort', () => reject(ceremony.signal.reason), {
+      once: true,
+    });
+  });
+  try {
+    const credential = (await Promise.race([
+      navigator.credentials.create({ publicKey: options, signal: ceremony.signal }),
+      givenUp,
+    ])) as PublicKeyCredential | null;
+    if (!credential) throw new Error('No credential returned');
+    return credential;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', follow);
+  }
+}
+
+/**
+ * Sends the attestation to the server, bound to the capture the begin request
+ * ran under: the registration session it finishes belongs to that account.
+ */
+async function sendRegistrationFinish(
+  credential: PublicKeyCredential,
+  credentialName: string,
+  context: ApiRequestContext
+): Promise<void> {
+  const attestation = credential.response as AuthenticatorAttestationResponse;
+  const finishRes = await apiFetchInContext(
+    '/api/v1/mfa/webauthn/register/finish',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: credential.id,
+        rawId: bufferToBase64url(credential.rawId),
+        type: credential.type,
+        response: {
+          attestationObject: bufferToBase64url(attestation.attestationObject),
+          clientDataJSON: bufferToBase64url(attestation.clientDataJSON),
+        },
+        credential_name: credentialName,
+      }),
+    },
+    context
+  );
+  if (!finishRes.ok) throw new Error(await refusalText(finishRes, 'Registration failed'));
+}
+
+/**
+ * A seam handler as the factor hook's `submit`. Only the password the server
+ * refused is dropped: the hook keeps the code through a password refusal. A
+ * refusal for an account or server that is no longer current belongs to the
+ * old one, so it changes nothing here.
+ */
+function toSeamSubmit(
+  send: MfaSeamHandler,
+  password: string,
+  dropPassword: () => void
+): StepUpSubmit {
+  return async (mfa, context) => {
+    const result = await send(password, mfa, context);
+    if (result.kind === 'invalidPassword' && apiRequestContextIsCurrent(context)) dropPassword();
+    return toStepUpSubmitOutcome(result);
+  };
 }
 
 type SetupMethod = 'totp' | 'webauthn';
@@ -253,9 +400,11 @@ type WebAuthnStep = 'password' | 'registering' | 'done';
 interface MFASetupProps {
   method: SetupMethod;
   credentialType?: 'hardware' | 'platform';
-  mfaActive?: boolean; // true if user already has MFA enabled
-  activeMethods?: string[]; // raw method strings for MFA challenge
-  recoveryOnlyMethods?: string[];
+  /**
+   * True if the user already has MFA enabled. Wording only: which code the
+   * step asks for comes from `GET /mfa/step-up`, never from this.
+   */
+  mfaActive?: boolean;
   onComplete: () => void;
   onCancel: () => void;
 }
@@ -264,19 +413,15 @@ const MFASetup: React.FC<MFASetupProps> = ({
   method,
   credentialType = 'hardware',
   mfaActive,
-  activeMethods = [],
-  recoveryOnlyMethods = [],
   onComplete,
   onCancel,
 }) => {
   // Shared state
-  const [password, setPassword] = useState('');
-  const [mfaCode, setMfaCode] = useState('');
-  // Bumped to remount the password step's code prompt empty (see dropSetupCode).
-  const [setupPromptKey, setSetupPromptKey] = useState(0);
   const [error, setError] = useState('');
-  const [errorField, setErrorField] = useState<'password' | 'mfa' | 'general' | ''>('');
   const [loading, setLoading] = useState(false);
+  // The stage heading takes focus when a credential step ends in a terminal
+  // state (StepUpCredentials), so the wizard's own heading is that target.
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   // TOTP state
   const [totpStep, setTotpStep] = useState<TOTPStep>('password');
@@ -289,45 +434,34 @@ const MFASetup: React.FC<MFASetupProps> = ({
   const [recoveryOutcome, setRecoveryOutcome] = useState<'failed' | 'unavailable' | null>(null);
   const [recoveryFailures, setRecoveryFailures] = useState(0);
   const [recoveryNote, setRecoveryNote] = useState<RecoveryNote>(null);
-  // Methods from an mfa_required answer on the password step. The server's
-  // present list wins over `activeMethods`, which can be stale (F3's twin).
-  const [setupPromptMethods, setSetupPromptMethods] = useState<string[] | null>(null);
 
   // Prepared recovery-key uploads (F1/F2). Key material lives in these refs
   // and nowhere else — never state, never a store, never persisted, never
   // logged — and each is dropped on accept, Back, Continue, Done and unmount.
   const firstStorePrepRef = useRef<Promise<Preparation> | null>(null);
-  const replacePrepRef = useRef<Promise<Preparation> | null>(null);
+  const replacePrepRef = useRef<ReplaceHold | null>(null);
+  // The security-key ceremony in flight, held the same way: Cancel and unmount
+  // abort and drop it, and a ceremony that finds itself dropped sends nothing more.
+  const ceremonyRef = useRef<AbortController | null>(null);
   useEffect(
     () => () => {
       firstStorePrepRef.current = null;
       replacePrepRef.current = null;
+      ceremonyRef.current?.abort();
+      ceremonyRef.current = null;
     },
     []
   );
 
-  // Recovery-key replace state (spec §4.6.4, R-9). A fresh password entry —
-  // the wizard's own `password` state is deliberately NOT reused here, since
-  // replacing destroys the old key and requires present proof. The banner,
-  // the field errors and the lock are all derived from `replaceRefusal`.
-  const [replacePassword, setReplacePassword] = useState('');
-  const [replaceMfaCode, setReplaceMfaCode] = useState('');
-  const [replaceLoading, setReplaceLoading] = useState(false);
+  // Recovery-key replace state (spec §4.6.4, R-9). Replacing destroys the old
+  // key and requires present proof, so the step collects its own credentials
+  // (RecoveryReplaceStage) and the wizard holds none. The banner and the lock
+  // are both derived from `replaceRefusal`.
+  const [replaceSession, setReplaceSession] = useState<ReplaceSession | null>(null);
   const [replaceRefusal, setReplaceRefusal] = useState<MfaStepUpResult | null>(null);
-  const [replaceMfaPromptKey, setReplaceMfaPromptKey] = useState(0);
   // True once a replace attempt ended without a definite answer: the old key
   // may already be gone, so nothing may say it was "left in place".
   const [replaceUncertain, setReplaceUncertain] = useState(false);
-  const replacePasswordRef = useRef<HTMLInputElement>(null);
-
-  // Focus the password once a password refusal has rendered and the field is
-  // enabled again — focusing while it is still disabled does nothing (F4).
-  useEffect(() => {
-    if (replaceLoading) return;
-    if (replaceRefusal?.kind === 'passwordRequired' || replaceRefusal?.kind === 'invalidPassword') {
-      replacePasswordRef.current?.focus();
-    }
-  }, [replaceLoading, replaceRefusal]);
 
   // WebAuthn state
   const [webauthnStep, setWebauthnStep] = useState<WebAuthnStep>('password');
@@ -335,72 +469,37 @@ const MFASetup: React.FC<MFASetupProps> = ({
 
   // ── TOTP Flow ──────────────────────────────────────────────────────
 
-  const setFieldError = (message: string) => {
-    setError(message);
-    setErrorField(classifyErrorField(message));
+  /**
+   * Shows a begin answer that cannot go on and returns what it came to. An
+   * accepted answer without the body the next step needs is a failed begin.
+   */
+  const refuseBegin = (result: MfaStepUpResult): MfaStepUpResult => {
+    const shown: MfaStepUpResult = result.kind === 'accepted' ? { kind: 'failed' } : result;
+    setError(stepUpBanner(shown) ?? '');
+    return shown;
   };
 
   /**
-   * Drops the password step's code once a submission has settled. The server
-   * accepts each code once and can accept it yet still fail the request, so a
-   * code that was sent is never offered again: the stored copy is cleared and
-   * the prompt remounts empty, which keeps the submit disabled until a fresh
-   * code is typed.
+   * TOTP setup's step-up (#5): the one request the credentials gate. It runs
+   * under `run`'s capture, and everything after its await belongs to the
+   * account that sent it.
    */
-  const dropSetupCode = () => {
-    setMfaCode('');
-    setSetupPromptKey((k) => k + 1);
-  };
-
-  /**
-   * Applies a begin-step step-up refusal (TOTP setup / WebAuthn register
-   * begin) to the shared error state, using the same field routing and copy
-   * as every other step-up surface (`mfaStepUp.ts`) instead of the server's
-   * raw text. An mfa_required answer also names the methods to prompt for,
-   * even when the status this wizard opened with said MFA was off.
-   */
-  const noteSetupRefusal = (status: number, body: unknown) => {
-    const refusal = classifyStepUpRefusal(status, body);
-    if (refusal.kind === 'mfaRequired') setSetupPromptMethods(refusal.methods);
-    const passwordError = stepUpPasswordError(refusal);
-    const mfaError = stepUpMfaError(refusal);
-    if (passwordError !== undefined) {
-      setError(passwordError);
-      setErrorField('password');
-    } else if (mfaError === undefined) {
-      setError(stepUpBanner(refusal) ?? 'Something went wrong. Try again.');
-      setErrorField('general');
-    } else {
-      setError(mfaError);
-      setErrorField('mfa');
-    }
-  };
-
-  const handleTOTPSetup = async () => {
-    setLoading(true);
+  const beginTotpSetup: MfaSeamHandler = async (password, mfaCode, context) => {
     setError('');
-    setErrorField('');
-    try {
-      const res = await apiFetch('/api/v1/mfa/totp/setup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password, ...(mfaCode ? { mfa_code: mfaCode } : {}) }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        noteSetupRefusal(res.status, data);
-        return;
-      }
-
-      setOtpauthUrl(data.otpauth_url);
-      setTotpSecret(data.secret);
-      setTotpStep('qr');
-    } catch (err) {
-      setFieldError(err instanceof Error ? err.message : 'Setup failed');
-    } finally {
-      dropSetupCode();
-      setLoading(false);
-    }
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/totp/setup',
+      'POST',
+      {},
+      { password, mfaCode },
+      { context }
+    );
+    if (!apiRequestContextIsCurrent(context)) return result;
+    const setup = result.kind === 'accepted' ? readTotpSetup(result.data) : null;
+    if (setup === null) return refuseBegin(result);
+    setOtpauthUrl(setup.otpauthUrl);
+    setTotpSecret(setup.secret);
+    setTotpStep('qr');
+    return result;
   };
 
   const handleTOTPVerify = async (code: string) => {
@@ -412,10 +511,8 @@ const MFASetup: React.FC<MFASetupProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Verification failed');
-
-      setBackupCodes(data.backup_codes || []);
+      if (!res.ok) throw new Error(await refusalText(res, 'Verification failed'));
+      setBackupCodes(readBackupCodes(await res.json().catch(() => ({}))));
       setTotpStep('backup');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Invalid code');
@@ -429,10 +526,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
-    if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || 'Confirmation failed');
-    }
+    if (!res.ok) throw new Error(await refusalText(res, 'Confirmation failed'));
   };
 
   /** Dispatches a RecoveryKeyOutcome to its step — shared by the automatic
@@ -457,12 +551,15 @@ const MFASetup: React.FC<MFASetupProps> = ({
   };
 
   /** Prepares once and stores. A failed store keeps the prepared bytes so Try
-   * again resends them; every settled outcome drops them. */
+   * again resends them; every settled outcome drops them. The capture comes
+   * first, as the replace step's does (C82): bytes wrapped for one account are
+   * never sent as another. */
   const runFirstStore = async (): Promise<RecoveryKeyOutcome> => {
+    const capture = captureApiRequestContext();
     const prep = await resolvePreparation(firstStorePrepRef);
     if (prep.kind === 'unavailable') return { kind: 'unavailable' };
     if (prep.kind !== 'ready') return { kind: 'failed' };
-    const outcome = await storeRecoveryKey(prep.prepared);
+    const outcome = await storeRecoveryKey(prep.prepared, capture);
     if (outcome.kind !== 'failed') firstStorePrepRef.current = null;
     return outcome;
   };
@@ -512,253 +609,183 @@ const MFASetup: React.FC<MFASetupProps> = ({
     setTotpStep('done');
   };
 
+  /**
+   * Wraps a new key and holds it in a ref, so every attempt of this step sends
+   * the SAME bytes (F1/F2). The primary stays down until it lands, which is
+   * what lets the activation call `run` with nothing awaited in front of it
+   * (D11, Q6). `capture` is the one `run` works against: taken before the
+   * keys are read, so bytes wrapped for one account are never sent as another.
+   */
+  const startReplacePreparation = (capture: ApiRequestContext) => {
+    const hold: ReplaceHold = { settled: null };
+    replacePrepRef.current = hold;
+    setReplaceSession({ capture, preparing: true });
+    void prepareForCurrentKeys().then((settled) => {
+      // Back, Done, unmount, or a newer preparation: nobody is waiting for this.
+      if (replacePrepRef.current !== hold) return;
+      hold.settled = settled;
+      setReplaceSession((session) => session && { ...session, preparing: false });
+    });
+  };
+
   /** Opens the replace step and starts preparing the new key while the user
    * types their credentials (F1). A lock — a spent budget or a dead session —
    * survives Back and reopen; only a new wizard clears it (F10). */
   const handleOpenReplace = () => {
-    setReplacePassword('');
-    setReplaceMfaCode('');
     setReplaceRefusal((prev) => (isStepUpLocked(prev) ? prev : null));
-    replacePrepRef.current = prepareForCurrentKeys();
+    startReplacePreparation(captureApiRequestContext());
     setTotpStep('recovery-replace');
   };
 
   const handleReplaceBack = () => {
     replacePrepRef.current = null;
+    setReplaceSession(null);
     setTotpStep('recovery-kept');
   };
 
-  /** Records a refusal to a SENT replace request, mirroring the action modal:
-   * the password is cleared only when it was refused (handoff §1.1), the code
-   * whenever the server may have used it up. Display is derived at render. */
-  const applyReplaceRefusal = (result: MfaStepUpResult) => {
+  /**
+   * The replace step's one request, and only the request: the preparation
+   * finished before the primary came up. Where there is nothing it can send,
+   * it reports so and prepares again, so the next attempt can.
+   */
+  const sendReplace: MfaSeamHandler = async (password, mfaCode, context) => {
+    const settled = replacePrepRef.current?.settled ?? null;
+    if (settled?.kind !== 'ready' || !wrapsCurrentKeys(settled.prepared)) {
+      // Nothing was sent, so this is a refusal, not an ambiguous outcome,
+      // and the typed code is still unused — it stays.
+      setReplaceRefusal(unpreparedRefusal(settled));
+      startReplacePreparation(context);
+      return { kind: 'aborted' };
+    }
+    const { prepared } = settled;
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/recovery-key',
+      'PUT',
+      prepared.body,
+      { password, mfaCode },
+      { context }
+    );
+    // An answer for an account or server that is no longer current belongs to
+    // the old one: this wizard shows none of it.
+    if (!apiRequestContextIsCurrent(context)) return result;
+    if (result.kind === 'accepted') {
+      replacePrepRef.current = null;
+      setReplaceSession(null);
+      setReplaceUncertain(false);
+      setReplaceRefusal(null);
+      setRecoveryKey(prepared.key);
+      setTotpStep('recovery');
+      return result;
+    }
+    if (isAmbiguousOutcome(result)) setReplaceUncertain(true);
     setReplaceRefusal(result);
-    if (result.kind === 'passwordRequired' || result.kind === 'invalidPassword') {
-      setReplacePassword('');
-    }
-    if (stepUpCodeMayBeSpent(result)) {
-      setReplaceMfaPromptKey((k) => k + 1);
-      setReplaceMfaCode('');
-    }
-  };
-
-  const handleReplaceRecoveryKey = async () => {
-    setReplaceLoading(true);
-    try {
-      const prep = await resolvePreparation(replacePrepRef);
-      if (prep.kind === 'abandoned') return;
-      if (prep.kind !== 'ready') {
-        // Nothing was sent, so this is a refusal, not an ambiguous outcome,
-        // and the typed code is still unused — it stays.
-        setReplaceRefusal(
-          prep.kind === 'unavailable'
-            ? { kind: 'failed', message: REPLACE_KEYS_LOCKED_MESSAGE }
-            : { kind: 'failed' }
-        );
-        return;
-      }
-      const result = await submitMfaStepUp('/api/v1/mfa/recovery-key', 'PUT', prep.prepared.body, {
-        password: replacePassword,
-        mfaCode: replaceMfaCode,
-      });
-      if (result.kind === 'accepted') {
-        replacePrepRef.current = null;
-        setReplaceUncertain(false);
-        setReplaceRefusal(null);
-        setRecoveryKey(prep.prepared.key);
-        setTotpStep('recovery');
-        return;
-      }
-      if (isAmbiguousOutcome(result)) setReplaceUncertain(true);
-      applyReplaceRefusal(result);
-    } finally {
-      setReplaceLoading(false);
-    }
+    return result;
   };
 
   // ── WebAuthn Flow ──────────────────────────────────────────────────
 
-  const handleWebAuthnRegister = async () => {
-    setLoading(true);
-    setError('');
-    setErrorField('');
+  const keyName = credentialName || 'Security Key';
+
+  /**
+   * The browser ceremony and the finish request, once begin accepted. Never
+   * rejects. Both belong to the account that began, so a change of account or
+   * server since `context` ends it without touching this wizard.
+   *
+   * Cancel aborts the ceremony and drops it, so a key touched afterwards sends
+   * no finish. A finish already under way is not recalled: the key was touched
+   * before Cancel and the account now holds it, so its success still lands on
+   * 'done', while its failure changes nothing Cancel has not already reset.
+   */
+  const completeKeyRegistration = async (options: CreationOptions, context: ApiRequestContext) => {
+    const ceremony = new AbortController();
+    ceremonyRef.current = ceremony;
     try {
-      // Begin registration — validate password and get challenge from server
-      const beginRes = await apiFetch('/api/v1/mfa/webauthn/register/begin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          password,
-          ...(mfaCode ? { mfa_code: mfaCode } : {}),
-          credential_name: credentialName || 'Security Key',
-          credential_type: credentialType,
-        }),
-      });
-      const beginData = await beginRes.json();
-      if (!beginRes.ok) {
-        noteSetupRefusal(beginRes.status, beginData);
-        return;
-      }
-
       // Convert base64url fields for WebAuthn API
-      const options = beginData.publicKey;
       decodeWebAuthnOptions(options);
-
-      // Show the "waiting for key" step before triggering the browser dialog
-      setWebauthnStep('registering');
-
-      // Call browser WebAuthn API with timeout protection
-      const credential = (await Promise.race([
-        navigator.credentials.create({ publicKey: options }),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  'Security key registration timed out. Make sure your key is connected and try again.'
-                )
-              ),
-            60000
-          )
-        ),
-      ])) as PublicKeyCredential;
-      if (!credential) throw new Error('No credential returned');
-
-      const attestation = credential.response as AuthenticatorAttestationResponse;
-
-      // Finish registration by sending the attestation to the server
-      const finishRes = await apiFetch('/api/v1/mfa/webauthn/register/finish', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: credential.id,
-          rawId: bufferToBase64url(credential.rawId),
-          type: credential.type,
-          response: {
-            attestationObject: bufferToBase64url(attestation.attestationObject),
-            clientDataJSON: bufferToBase64url(attestation.clientDataJSON),
-          },
-          credential_name: credentialName || 'Security Key',
-        }),
-      });
-      if (!finishRes.ok) {
-        const finishData = await finishRes.json();
-        throw new Error(finishData.error || 'Registration failed');
-      }
+      const credential = await createCredential(options, ceremony.signal);
+      if (ceremonyRef.current !== ceremony) return;
+      await sendRegistrationFinish(credential, keyName, context);
+      if (!apiRequestContextIsCurrent(context)) return;
       // Uses the enrollment exemption, as after TOTP confirm.
       void refreshAccessToken().catch(() => console.warn('[mfa] Refresh after enrollment failed'));
       setWebauthnStep('done');
     } catch (err) {
-      const msg = classifyWebAuthnError(err);
-      setFieldError(msg);
-
-      // Go back to password step for cancellation or credential errors
-      if (shouldResetToPasswordStep(err, msg, webauthnStep)) {
-        setWebauthnStep('password');
-      }
-      // Otherwise stay on 'registering' step so the error banner is clearly visible
-    } finally {
-      dropSetupCode();
-      setLoading(false);
+      if (ceremonyRef.current !== ceremony || !apiRequestContextIsCurrent(context)) return;
+      // Every failure returns to the credentials step with its banner: begin
+      // spent the code or token that gated it, so a retry has to start there.
+      setError(classifyWebAuthnError(err));
+      setWebauthnStep('password');
     }
+  };
+
+  /**
+   * Security-key registration's step-up (#5): begin is the one request the
+   * credentials gate, so it is all `submit` sends. The ceremony follows it
+   * outside the step-up, in the 'registering' step.
+   */
+  const beginKeyRegistration: MfaSeamHandler = async (password, mfaCode, context) => {
+    setError('');
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/webauthn/register/begin',
+      'POST',
+      { credential_name: keyName, credential_type: credentialType },
+      { password, mfaCode },
+      { context }
+    );
+    if (!apiRequestContextIsCurrent(context)) return result;
+    const options = result.kind === 'accepted' ? readCreationOptions(result.data) : null;
+    if (options === null) return refuseBegin(result);
+    // Show the "waiting for key" step before triggering the browser dialog
+    setWebauthnStep('registering');
+    void completeKeyRegistration(options, context);
+    return result;
   };
 
   // ── Render helpers (reduce cognitive complexity) ────────────────────
 
-  // The password step asks for a code when the account is known to hold MFA,
-  // or when the server has just said it does.
-  const showSetupPrompt = mfaActive === true || setupPromptMethods !== null;
-  const replacePasswordError = stepUpPasswordError(replaceRefusal);
-
-  // Shared password + MFA-verify step used by both the TOTP and WebAuthn
-  // flows — they differ only in copy, an optional extra field, and the
-  // submit action.
-  const renderPasswordVerifyStep = (opts: {
-    intro: string;
-    activeIntro: string;
-    submitLabel: string;
-    busyLabel: string;
-    onSubmit: () => void;
-    /** The route the code is sent with: TOTP setup or WebAuthn register begin. */
-    purpose: StepUpPurpose;
-    extraFields?: React.ReactNode;
-  }) => (
-    <div className="mfa-setup-step">
-      <p>{showSetupPrompt ? opts.activeIntro : opts.intro}</p>
-      <input
-        type="password"
-        className={`form-input ${errorField === 'password' ? 'error' : ''}`}
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        placeholder="Your password"
-        disabled={loading}
-        autoFocus
-      />
-      {showSetupPrompt && (
-        <MFAVerifyPrompt
-          key={setupPromptKey}
-          methods={inlineMfaMethods(setupPromptMethods ?? activeMethods)}
-          recoveryOnlyMethods={recoveryOnlyMethods}
-          onVerify={setMfaCode}
-          purpose={opts.purpose}
-          onCodeChange={setMfaCode}
-          disabled={loading}
-          error={errorField === 'mfa' ? error : undefined}
-          excludeBackupCodes
-        />
-      )}
-      {opts.extraFields}
-      <ErrorBanner error={error} errorField={errorField} />
-      <div className="mfa-setup-actions">
-        <button
-          className="btn btn-primary"
-          onClick={opts.onSubmit}
-          disabled={loading || !password || (showSetupPrompt && !mfaCode)}
-        >
-          {loading ? opts.busyLabel : opts.submitLabel}
-        </button>
-        <button className="btn btn-secondary" onClick={onCancel}>
-          Cancel
-        </button>
-      </div>
-    </div>
+  // The credential steps (#5) are one stage for both flows — they differ only
+  // in copy, the key-name field, and the begin request.
+  const renderTOTPPasswordStep = () => (
+    <SetupCredentialsStage
+      purpose="mfa_settings.totp_setup"
+      intro="Enter your password to begin setup."
+      activeIntro="Verify your identity to add another method."
+      submitLabel="Continue"
+      busyLabel="Setting up..."
+      mfaActive={mfaActive}
+      error={error}
+      headingRef={headingRef}
+      onBegin={beginTotpSetup}
+      onCancel={onCancel}
+    />
   );
 
-  const renderTOTPPasswordStep = () =>
-    renderPasswordVerifyStep({
-      intro: 'Enter your password to begin setup.',
-      activeIntro: 'Verify your identity to add another method.',
-      submitLabel: 'Continue',
-      busyLabel: 'Setting up...',
-      onSubmit: handleTOTPSetup,
-      purpose: 'mfa_settings.totp_setup',
-    });
-
-  const renderWebAuthnPasswordStep = () =>
-    renderPasswordVerifyStep({
-      intro: 'Enter your password and name your key.',
-      activeIntro: 'Verify your identity and name your key.',
-      submitLabel: 'Register Key',
-      busyLabel: 'Registering...',
-      onSubmit: handleWebAuthnRegister,
-      purpose: 'mfa_settings.webauthn_register',
-      extraFields: (
-        <input
-          type="text"
-          className="form-input"
-          value={credentialName}
-          onChange={(e) => setCredentialName(e.target.value)}
-          placeholder={
-            credentialType === 'platform'
-              ? 'Key name (e.g. MacBook Touch ID, Windows Hello)'
-              : 'Key name (e.g. YubiKey 5, Google Titan)'
-          }
-          disabled={loading}
-        />
-      ),
-    });
+  const renderWebAuthnPasswordStep = () => (
+    <SetupCredentialsStage
+      purpose="mfa_settings.webauthn_register"
+      intro="Enter your password and name your key."
+      activeIntro="Verify your identity and name your key."
+      submitLabel="Register Key"
+      busyLabel="Registering..."
+      mfaActive={mfaActive}
+      error={error}
+      headingRef={headingRef}
+      nameField={{
+        value: credentialName,
+        onChange: setCredentialName,
+        placeholder:
+          credentialType === 'platform'
+            ? 'Key name (e.g. MacBook Touch ID, Windows Hello)'
+            : 'Key name (e.g. YubiKey 5, Google Titan)',
+      }}
+      onBegin={beginKeyRegistration}
+      onCancel={onCancel}
+    />
+  );
 
   const handleResetToPassword = () => {
+    ceremonyRef.current?.abort();
+    ceremonyRef.current = null;
     setWebauthnStep('password');
     setError('');
   };
@@ -766,18 +793,12 @@ const MFASetup: React.FC<MFASetupProps> = ({
   const renderWebAuthnRegisteringStep = () => (
     <div className="mfa-setup-step" style={{ alignItems: 'center' }}>
       <div style={{ textAlign: 'center', padding: '20px 0' }}>
-        {error ? <ErrorBanner error={error} size={20} /> : <WebAuthnWaitingPrompt />}
+        <WebAuthnWaitingPrompt />
       </div>
       <div className="mfa-setup-actions" style={{ justifyContent: 'center' }}>
-        {error ? (
-          <button className="btn btn-primary" onClick={handleResetToPassword}>
-            Try Again
-          </button>
-        ) : (
-          <button className="btn btn-secondary" onClick={handleResetToPassword}>
-            Cancel
-          </button>
-        )}
+        <button className="btn btn-secondary" onClick={handleResetToPassword}>
+          Cancel
+        </button>
       </div>
     </div>
   );
@@ -787,7 +808,9 @@ const MFASetup: React.FC<MFASetupProps> = ({
   if (method === 'totp') {
     return (
       <div className="mfa-setup-wizard">
-        <h3>Set Up Authenticator App</h3>
+        <h3 tabIndex={-1} ref={headingRef}>
+          Set Up Authenticator App
+        </h3>
 
         {totpStep === 'password' && renderTOTPPasswordStep()}
 
@@ -874,64 +897,14 @@ const MFASetup: React.FC<MFASetupProps> = ({
           </div>
         )}
 
-        {totpStep === 'recovery-replace' && (
-          <div className="mfa-setup-step">
-            <p>
-              Make a new recovery key. Confirm it&apos;s you with your password and a code from your
-              authenticator app.
-            </p>
-            <p className="mfa-modal-desc">Your old recovery key will stop working.</p>
-            <div className="mfa-verify-field">
-              <label htmlFor="mfa-replace-password">Password</label>
-              <input
-                id="mfa-replace-password"
-                ref={replacePasswordRef}
-                type="password"
-                autoComplete="current-password"
-                value={replacePassword}
-                onChange={(e) => setReplacePassword(e.target.value)}
-                placeholder="Your password"
-                disabled={replaceLoading}
-                aria-invalid={replacePasswordError !== undefined}
-                aria-describedby={replacePasswordError ? 'mfa-replace-password-error' : undefined}
-                autoFocus
-              />
-              {replacePasswordError && (
-                <FieldError id="mfa-replace-password-error">{replacePasswordError}</FieldError>
-              )}
-            </div>
-            <MFAVerifyPrompt
-              key={replaceMfaPromptKey}
-              methods={stepUpPromptMethods(replaceRefusal, ['totp'])}
-              onVerify={setReplaceMfaCode}
-              purpose="mfa_settings.recovery_key_replace"
-              onCodeChange={setReplaceMfaCode}
-              disabled={replaceLoading}
-              error={stepUpMfaError(replaceRefusal)}
-            />
-            <ErrorBanner error={stepUpBanner(replaceRefusal) ?? ''} />
-            <div className="mfa-setup-actions">
-              <button
-                className="btn btn-danger"
-                onClick={() => void handleReplaceRecoveryKey()}
-                disabled={
-                  replaceLoading ||
-                  isStepUpLocked(replaceRefusal) ||
-                  !replacePassword ||
-                  !replaceMfaCode
-                }
-              >
-                {replaceLoading ? 'Replacing...' : 'Replace recovery key'}
-              </button>
-              <button
-                className="btn btn-secondary"
-                onClick={handleReplaceBack}
-                disabled={replaceLoading}
-              >
-                Back
-              </button>
-            </div>
-          </div>
+        {totpStep === 'recovery-replace' && replaceSession !== null && (
+          <RecoveryReplaceStage
+            session={replaceSession}
+            result={replaceRefusal}
+            headingRef={headingRef}
+            onSend={sendReplace}
+            onBack={handleReplaceBack}
+          />
         )}
 
         {totpStep === 'done' && (
@@ -962,7 +935,7 @@ const MFASetup: React.FC<MFASetupProps> = ({
   // WebAuthn flow
   return (
     <div className="mfa-setup-wizard">
-      <h3>
+      <h3 tabIndex={-1} ref={headingRef}>
         {credentialType === 'platform' ? 'Set Up Platform Authenticator' : 'Set Up Security Key'}
       </h3>
 
@@ -1056,6 +1029,256 @@ const RecoveryKeptStep: React.FC<RecoveryKeptStepProps> = ({
     </div>
   </div>
 );
+
+interface StepUpStageFrameProps {
+  factor: StepUpFactor;
+  password: string;
+  onPasswordChange: (value: string) => void;
+  headingRef: React.RefObject<HTMLHeadingElement | null>;
+  /** The sentences above the credentials. */
+  intro: React.ReactNode;
+  /** What the action asks for beside the credentials, below them. */
+  children?: React.ReactNode;
+  /** The answer's general banner (`stepUpBanner`), or an earlier step's error. */
+  banner: string;
+  primary: {
+    className: string;
+    label: string;
+    busyLabel: string;
+    ariaDisabled: boolean;
+    onActivate: () => void;
+  };
+  secondaryLabel: string;
+  onSecondary: () => void;
+}
+
+/**
+ * What the two credential stages share: the intro, `StepUpCredentials`, and a
+ * footer whose primary is `aria-disabled` and never natively disabled, so its
+ * guard can say what is missing. The password takes focus on entry, as the
+ * `autoFocus` it replaces did.
+ */
+const StepUpStageFrame: React.FC<StepUpStageFrameProps> = ({
+  factor,
+  password,
+  onPasswordChange,
+  headingRef,
+  intro,
+  children,
+  banner,
+  primary,
+  secondaryLabel,
+  onSecondary,
+}) => {
+  const passwordRef = useRef<HTMLInputElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    passwordRef.current?.focus();
+  }, []);
+  const busyLabel = factor.phase === 'ceremony' ? 'Waiting…' : primary.busyLabel;
+  return (
+    <div className="mfa-setup-step">
+      {intro}
+      <StepUpCredentials
+        factor={factor}
+        password={password}
+        onPasswordChange={onPasswordChange}
+        primaryRef={primaryRef}
+        passwordRef={passwordRef}
+        headingRef={headingRef}
+      />
+      {children}
+      <ErrorBanner error={banner} />
+      <div className="mfa-setup-actions">
+        <button
+          ref={primaryRef}
+          type="button"
+          className={primary.className}
+          aria-disabled={primary.ariaDisabled || undefined}
+          onClick={primary.onActivate}
+        >
+          {factor.phase === 'idle' ? (
+            primary.label
+          ) : (
+            <>
+              <LoadingSpinner size="small" inline /> {busyLabel}
+            </>
+          )}
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          disabled={factor.phase === 'submitting'}
+          onClick={onSecondary}
+        >
+          {secondaryLabel}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+interface SetupCredentialsStageProps {
+  /** The route the code is sent with: TOTP setup or WebAuthn register begin. */
+  purpose: StepUpPurpose;
+  intro: string;
+  /** The sentence once the account is known to hold MFA. */
+  activeIntro: string;
+  submitLabel: string;
+  busyLabel: string;
+  mfaActive?: boolean;
+  /** Left by an earlier step of the wizard, e.g. a ceremony that failed. */
+  error: string;
+  headingRef: React.RefObject<HTMLHeadingElement | null>;
+  /** The security-key flow names its key beside the credentials. */
+  nameField?: { value: string; placeholder: string; onChange: (value: string) => void };
+  /** The gated begin request. Nothing else is sent from this stage. */
+  onBegin: MfaSeamHandler;
+  onCancel: () => void;
+}
+
+/**
+ * The enrolment step-up (#5), for TOTP setup and security-key registration.
+ * No backup code is offered: that is presentation, keeping enrolment on the
+ * real factor — the server would accept one (design §6).
+ */
+const SetupCredentialsStage: React.FC<SetupCredentialsStageProps> = ({
+  purpose,
+  intro,
+  activeIntro,
+  submitLabel,
+  busyLabel,
+  mfaActive,
+  error,
+  headingRef,
+  nameField,
+  onBegin,
+  onCancel,
+}) => {
+  const [password, setPassword] = useState('');
+  const nameFieldId = useId();
+  const factor = useStepUpFactor({
+    enabled: true,
+    purpose,
+    passwordLeg: 'always', // pragma: allowlist secret
+    readFailure: 'passwordOnly',
+    allowBackup: false,
+  });
+  const { ariaDisabled, activate } = stepUpActivation(
+    factor,
+    password,
+    toSeamSubmit(onBegin, password, () => setPassword(''))
+  );
+  return (
+    <StepUpStageFrame
+      factor={factor}
+      password={password}
+      onPasswordChange={setPassword}
+      headingRef={headingRef}
+      intro={<p>{mfaActive || factor.methods.length > 0 ? activeIntro : intro}</p>}
+      banner={error}
+      primary={{
+        className: 'btn btn-primary',
+        label: submitLabel,
+        busyLabel,
+        ariaDisabled,
+        onActivate: activate,
+      }}
+      secondaryLabel="Cancel"
+      onSecondary={onCancel}
+    >
+      {nameField && (
+        <div className="mfa-setup-field">
+          <label htmlFor={nameFieldId}>Key name</label>
+          <input
+            id={nameFieldId}
+            type="text"
+            className="form-input"
+            value={nameField.value}
+            onChange={(e) => nameField.onChange(e.target.value)}
+            placeholder={nameField.placeholder}
+            // The activation captured the name, as it did the password, so an
+            // edit while the security-key prompt is open would not be the one
+            // registered (§4.2's ceremony row).
+            readOnly={factor.phase === 'ceremony'}
+            disabled={factor.phase === 'submitting'}
+          />
+        </div>
+      )}
+    </StepUpStageFrame>
+  );
+};
+
+interface RecoveryReplaceStageProps {
+  session: ReplaceSession;
+  /** The last answer: the banner, and the lock after a spent budget or a dead session. */
+  result: MfaStepUpResult | null;
+  headingRef: React.RefObject<HTMLHeadingElement | null>;
+  /** The gated request. The preparation is the wizard's and has finished by now. */
+  onSend: MfaSeamHandler;
+  onBack: () => void;
+}
+
+/**
+ * The recovery-key replace step-up (#6). It prepares on entry, so the primary
+ * is held down until the new key is ready and the activation runs `run` with
+ * the capture taken then and nothing awaited in front of it (D11, Q6).
+ */
+const RecoveryReplaceStage: React.FC<RecoveryReplaceStageProps> = ({
+  session,
+  result,
+  headingRef,
+  onSend,
+  onBack,
+}) => {
+  const [password, setPassword] = useState('');
+  const factor = useStepUpFactor({
+    enabled: true,
+    purpose: 'mfa_settings.recovery_key_replace',
+    passwordLeg: 'always', // pragma: allowlist secret
+    readFailure: 'passwordOnly',
+    allowBackup: true,
+    preparing: session.preparing,
+  });
+  const { ariaDisabled, activate } = stepUpActivation(
+    factor,
+    password,
+    toSeamSubmit(onSend, password, () => setPassword('')),
+    { capture: session.capture }
+  );
+  // A speed bump: the server budget is the enforcement (isStepUpLocked).
+  const locked = isStepUpLocked(result);
+  const activateUnlessLocked = () => {
+    if (!locked) activate();
+  };
+  return (
+    <StepUpStageFrame
+      factor={factor}
+      password={password}
+      onPasswordChange={setPassword}
+      headingRef={headingRef}
+      intro={
+        <>
+          <p>
+            Make a new recovery key. Confirm it&apos;s you with your password and your second
+            factor.
+          </p>
+          <p className="mfa-modal-desc">Your old recovery key will stop working.</p>
+        </>
+      }
+      banner={stepUpBanner(result) ?? ''}
+      primary={{
+        className: 'btn btn-danger',
+        label: 'Replace recovery key',
+        busyLabel: 'Replacing...',
+        ariaDisabled: ariaDisabled || locked,
+        onActivate: activateUnlessLocked,
+      }}
+      secondaryLabel="Back"
+      onSecondary={onBack}
+    />
+  );
+};
 
 /** Waiting prompt shown during WebAuthn key registration. */
 const WebAuthnWaitingPrompt: React.FC = () => (

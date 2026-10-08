@@ -5,11 +5,7 @@ import {
   isAbortError,
   type ApiRequestContext,
 } from '../system/requestContext';
-import {
-  mintPasswordStepUpToken,
-  passwordStepUpRefusalMessage,
-  STEP_UP_TOKEN_EXPIRED_MESSAGE,
-} from '../system/stepUpToken';
+import { mintPasswordStepUpToken, passwordStepUpRefusalMessage } from '../system/stepUpToken';
 
 /**
  * The methods an `mfa_required` refusal named, for Clear's MFA prompt, exactly
@@ -29,7 +25,6 @@ export type ClearHistoryResult =
   | {
       kind:
         | 'success'
-        | 'passwordRequired'
         | 'invalidPassword'
         | 'invalidMfaCode'
         | 'stepUpImpossible'
@@ -46,15 +41,19 @@ export type ClearHistoryResult =
     }
   | { kind: 'rateLimited'; retryAfterSeconds?: number }
   /**
+   * Clear wants the password. `tokenExpired`: it refused the step-up token it
+   * was given (#3509), so the password field says the confirmation expired.
+   */
+  | { kind: 'passwordRequired'; tokenExpired?: true }
+  /**
    * The account confirms with MFA. `methods` are the ones the server named,
    * unfiltered and possibly empty, so an account whose factor is a security
    * key is offered that ceremony (#3509).
    */
   | { kind: 'mfaRequired'; methods: string[] }
   /**
-   * #3509: the password could not be exchanged for a step-up token, or Clear
-   * refused the token it was given. Nothing was cleared; `message` belongs on
-   * the password field.
+   * #3509: the password could not be exchanged for a step-up token. Nothing
+   * was cleared; `message` belongs on the password field.
    */
   | { kind: 'passwordRefused'; message: string };
 
@@ -105,7 +104,7 @@ function forbiddenClearResult(
     return { kind: 'refused' };
   }
   if (payload.password_required === true && payload.step_up_token_invalid === true) {
-    return { kind: 'passwordRefused', message: STEP_UP_TOKEN_EXPIRED_MESSAGE };
+    return { kind: 'passwordRequired', tokenExpired: true };
   }
   if (payload.password_required === true) return { kind: 'passwordRequired' };
   if (payload.mfa_required === true) {

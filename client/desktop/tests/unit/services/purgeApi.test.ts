@@ -1,15 +1,27 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
-import { MINT_PATH } from '../../helpers/stepUpTokenWire';
+import { FIXTURE_PW as MINT_PW, MINT_PATH, MINTED_TOKEN } from '../../helpers/stepUpTokenWire';
+import { passwordStepUpRefusalMessage } from '@/renderer/services/system/stepUpToken';
 import {
   isSoftLockChallengeResult,
   isStepUpPurgeResult,
   purgeMessages,
 } from '@/renderer/services/messaging/purgeApi';
+
+// The copy of a refused password exchange is wrapped so one case can reword it:
+// the challenge's `refusal` must be read from the wire and the mint's reason,
+// never from the text a view happens to carry.
+vi.mock('@/renderer/services/system/stepUpToken', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/system/stepUpToken')>();
+  return {
+    ...actual,
+    passwordStepUpRefusalMessage: vi.fn(actual.passwordStepUpRefusalMessage),
+  };
+});
 
 const CHANNEL = '11111111-1111-4111-8111-111111111111';
 const CONVERSATION = '44444444-4444-4444-8444-444444444444';
@@ -339,16 +351,14 @@ describe('purgeMessages request context', () => {
     const captured = captureApiRequestContext();
     replaceAccount();
 
-    // The mint reports a fenced exchange as a refusal (`unsent`) rather than
-    // throwing, and the soft-lock stage words it on the password field.
+    // The mint reports a fenced exchange as a refusal marked `unsent` rather
+    // than throwing, and nothing was checked, so the purge is NOT SENT (D7):
+    // never a password error, which would blame a password nobody tested.
     const result = await purgeMessages(
       { context: 'channel', scopeId: CHANNEL, range: '7d', currentPassword: FIXTURE_PW },
       captured
     );
-    expect(result).toEqual({
-      kind: 'softLockChallenge',
-      view: { view: 'password', error: expect.any(String) },
-    });
+    expect(result).toEqual({ kind: 'notSent' });
     expect(mints()).toBe(0);
     expect(purges()).toBe(0);
   });
@@ -380,6 +390,8 @@ describe('purgeMessages soft-lock (#3455)', () => {
       expect(await purgeMessages({ context, scopeId, range: '7d' })).toEqual({
         kind: 'softLockChallenge',
         view: { view: 'confirm', methods: ['totp', 'webauthn'] },
+        // The factor hook's reading: the soft-lock's own kind is its mfaRequired.
+        refusal: { kind: 'mfaRequired', methods: ['totp', 'webauthn'] },
       });
     });
 
@@ -388,10 +400,11 @@ describe('purgeMessages soft-lock (#3455)', () => {
       expect(await purgeMessages({ context, scopeId, range: '7d' })).toEqual({
         kind: 'softLockChallenge',
         view: { view: 'password' },
+        refusal: { kind: 'passwordRequired' },
       });
     });
 
-    it('an invalid code after a confirm challenge stays on it, with the per-attempt error', async () => {
+    it('an invalid code after a confirm challenge stays on it; the hook words the attempt', async () => {
       server.use(
         http.delete(path, () =>
           HttpResponse.json(
@@ -410,11 +423,8 @@ describe('purgeMessages soft-lock (#3455)', () => {
         })
       ).toEqual({
         kind: 'softLockChallenge',
-        view: {
-          view: 'confirm',
-          methods: ['totp'],
-          error: "That didn't work. Try again with a new code.",
-        },
+        view: { view: 'confirm', methods: ['totp'] },
+        refusal: { kind: 'invalidMfaCode' },
       });
     });
 
@@ -458,27 +468,89 @@ describe('purgeMessages soft-lock (#3455)', () => {
       ).toEqual({
         kind: 'softLockChallenge',
         view: { view: 'password', error: 'That password is not correct.' },
+        refusal: { kind: 'invalidPassword' },
       });
       expect(purged, 'a refused exchange never reaches the purge route').toBe(false);
     });
 
-    it('any other flagged 403 (enrolment required) is softLockFailed with the server text', async () => {
+    // E8 / D5: the enrolment body is `mfa_enrollment_required: true`, and the
+    // soft-lock adds `delete_rate_limited` and `Retry-After` to it. It must be
+    // the terminal challenge, never `softLockFailed` (a Retry and a countdown).
+    it.each([
+      ['with a Retry-After', { 'Retry-After': '60' }],
+      ['without one', undefined],
+    ])('a flagged enrolment 403 %s is the terminal enroll challenge', async (_label, headers) => {
       server.use(
         http.delete(path, () =>
           HttpResponse.json(
             {
               error: 'Set up an authenticator app or security key to do this.',
               delete_rate_limited: true,
-              code: 'mfa_enrollment_required',
+              mfa_enrollment_required: true,
             },
+            { status: 403, headers }
+          )
+        )
+      );
+      const result = await purgeMessages({ context, scopeId, range: '7d' });
+      expect(result).toEqual({
+        kind: 'softLockChallenge',
+        view: { view: 'enroll' },
+        refusal: { kind: 'enrollmentRequired' },
+      });
+      expect(result.kind).not.toBe('softLockFailed');
+    });
+
+    it('an enrolment 403 with no delete_rate_limited is #16’s purge D1 case: forbidden, unchanged', async () => {
+      server.use(
+        http.delete(path, () =>
+          HttpResponse.json(
+            { error: 'Set up an app', mfa_enrollment_required: true },
+            { status: 403 }
+          )
+        )
+      );
+      expect(await purgeMessages({ context, scopeId, range: '7d' })).toEqual({
+        kind: 'forbidden',
+      });
+    });
+
+    it('a flagged 403 the credential fields cannot answer is softLockFailed with the server text', async () => {
+      server.use(
+        http.delete(path, () =>
+          HttpResponse.json(
+            { error: 'Something else about the lock', delete_rate_limited: true },
             { status: 403, headers: { 'Retry-After': '60' } }
           )
         )
       );
       expect(await purgeMessages({ context, scopeId, range: '7d' })).toEqual({
         kind: 'softLockFailed',
-        message: 'Set up an authenticator app or security key to do this.',
+        message: 'Something else about the lock',
         retryAfterSeconds: 60,
+      });
+    });
+
+    // The challenge's `refusal` is read from the wire, so rewording the server's
+    // `error` text changes nothing about what the hook is told.
+    it('the confirm challenge’s refusal does not depend on the server’s error text', async () => {
+      server.use(
+        http.delete(path, () =>
+          HttpResponse.json(
+            {
+              error: 'Totally reworded',
+              delete_rate_limited: true,
+              mfa_required: true,
+              methods: ['totp'],
+            },
+            { status: 403 }
+          )
+        )
+      );
+      expect(await purgeMessages({ context, scopeId, range: '7d' })).toMatchObject({
+        kind: 'softLockChallenge',
+        view: { view: 'confirm', methods: ['totp'] },
+        refusal: { kind: 'mfaRequired', methods: ['totp'] },
       });
     });
 
@@ -565,6 +637,191 @@ describe('purgeMessages soft-lock (#3455)', () => {
       );
       expect((await purgeMessages({ context, scopeId, range: '7d' })).kind).toBe('rateLimited');
     });
+
+    describe('the password exchange (#3509, D7)', () => {
+      const replaceAccount = () =>
+        useAuthStore.setState((st) => ({ authGeneration: st.authGeneration + 1 }));
+
+      function standMintAndPurge(mint: () => Response) {
+        const wire = {
+          mint: [] as Record<string, unknown>[],
+          purge: [] as Record<string, unknown>[],
+        };
+        server.use(
+          http.post(`*${MINT_PATH}`, async ({ request }) => {
+            wire.mint.push((await request.json()) as Record<string, unknown>);
+            return mint();
+          }),
+          http.delete(path, async ({ request }) => {
+            wire.purge.push((await request.json()) as Record<string, unknown>);
+            return HttpResponse.json({ deleted_count: 3, hidden_count: 0 });
+          })
+        );
+        return wire;
+      }
+
+      const purgeWithPassword = (extra: Partial<Parameters<typeof purgeMessages>[0]> = {}) =>
+        purgeMessages({ context, scopeId, range: '7d', currentPassword: MINT_PW, ...extra });
+
+      it('the password goes to the mint with this route’s purpose; the purge carries only the token', async () => {
+        const wire = standMintAndPurge(() => HttpResponse.json({ step_up_token: MINTED_TOKEN }));
+
+        expect(await purgeWithPassword()).toEqual({
+          kind: 'success',
+          deletedCount: 3,
+          hiddenCount: 0,
+        });
+
+        expect(wire.mint).toEqual([
+          {
+            current_password: MINT_PW,
+            purpose: context === 'channel' ? 'messages.channel_purge' : 'messages.server_purge',
+          },
+        ]);
+        expect(wire.purge).toEqual([{ range: '7d', step_up_token: MINTED_TOKEN }]);
+        expect(wire.purge[0]).not.toHaveProperty('current_password');
+      });
+
+      // A security-key assertion token travels as the code field of the purge.
+      it('a WebAuthn assertion token reaches the purge body as mfa_code, with no exchange', async () => {
+        const wire = standMintAndPurge(() => HttpResponse.json({ step_up_token: MINTED_TOKEN }));
+        const assertion = 'webauthn-assertion-token-0123456789';
+
+        await purgeMessages({ context, scopeId, range: '7d', mfaCode: assertion });
+
+        expect(wire.purge).toEqual([{ range: '7d', mfa_code: assertion }]);
+        expect(wire.mint).toEqual([]);
+      });
+
+      it('a backup code is just another mfa_code on this route', async () => {
+        const wire = standMintAndPurge(() => HttpResponse.json({ step_up_token: MINTED_TOKEN }));
+
+        await purgeMessages({ context, scopeId, range: '7d', mfaCode: 'abcd-efgh-ijkl' });
+
+        expect(wire.purge).toEqual([{ range: '7d', mfa_code: 'abcd-efgh-ijkl' }]);
+      });
+
+      // D7: the mint never left (the account changed after the capture), so
+      // nothing was checked. A password error would blame a password nobody tested.
+      it('an exchange that never left is notSent, not a password error, and the purge is not sent', async () => {
+        const wire = standMintAndPurge(() => HttpResponse.json({ step_up_token: MINTED_TOKEN }));
+        const captured = captureApiRequestContext();
+        replaceAccount();
+
+        const result = await purgeMessages(
+          { context, scopeId, range: '7d', currentPassword: MINT_PW },
+          captured
+        );
+
+        expect(result).toEqual({ kind: 'notSent' });
+        expect(wire.mint).toEqual([]);
+        expect(wire.purge).toEqual([]);
+      });
+
+      it('an exchange that left and failed in transport is the password challenge, not notSent', async () => {
+        const wire = standMintAndPurge(() => HttpResponse.error());
+
+        const result = await purgeWithPassword();
+
+        expect(result).toEqual({
+          kind: 'softLockChallenge',
+          view: { view: 'password', error: "We couldn't check your password. Try again." },
+          refusal: null,
+        });
+        expect(wire.purge).toEqual([]);
+      });
+
+      it('a mint naming its methods moves the stage to the code prompt, seeded with them', async () => {
+        const wire = standMintAndPurge(() =>
+          HttpResponse.json(
+            { error: 'MFA required', mfa_required: true, mfa_methods: ['totp'] },
+            { status: 403 }
+          )
+        );
+
+        expect(await purgeWithPassword()).toEqual({
+          kind: 'softLockChallenge',
+          view: { view: 'confirm', methods: ['totp'] },
+          refusal: { kind: 'mfaRequired', methods: ['totp'] },
+        });
+        expect(wire.purge).toEqual([]);
+      });
+
+      it.each([
+        ['names no methods', { error: 'MFA required', mfa_required: true }],
+        ['names an empty list', { error: 'MFA required', mfa_required: true, mfa_methods: [] }],
+      ])(
+        'an mfaRequired mint that %s is no verdict on the password: refusal null',
+        async (_l, body) => {
+          standMintAndPurge(() => HttpResponse.json(body, { status: 403 }));
+
+          const result = await purgeWithPassword();
+
+          expect(result).toMatchObject({
+            kind: 'softLockChallenge',
+            view: { view: 'password' },
+            refusal: null,
+          });
+        }
+      );
+
+      it.each([
+        [
+          'a lockout',
+          () => HttpResponse.json({}, { status: 423, headers: { 'Retry-After': '30' } }),
+        ],
+        ['a rate limit', () => HttpResponse.json({}, { status: 429 })],
+        ['a server without the endpoint', () => HttpResponse.json({}, { status: 404 })],
+        ['a server error', () => HttpResponse.json({}, { status: 500 })],
+      ])('%s at the mint cannot be answered by typing again: refusal null', async (_l, mint) => {
+        const wire = standMintAndPurge(mint);
+
+        const result = await purgeWithPassword();
+
+        expect(result).toMatchObject({
+          kind: 'softLockChallenge',
+          view: { view: 'password', error: expect.any(String) },
+          refusal: null,
+        });
+        expect(wire.purge).toEqual([]);
+      });
+
+      it('a wrong password at the mint is the hook’s invalidPassword', async () => {
+        standMintAndPurge(() => HttpResponse.json({ error: 'Invalid password' }, { status: 403 }));
+
+        expect(await purgeWithPassword()).toMatchObject({
+          view: { view: 'password', error: 'That password is not correct.' },
+          refusal: { kind: 'invalidPassword' },
+        });
+      });
+
+      // Mutant: `refusal` derived by matching the view's copy.
+      it('rewording the mint’s copy changes nothing about the refusal', async () => {
+        const spy = vi.mocked(passwordStepUpRefusalMessage);
+        const real = spy.getMockImplementation();
+        spy.mockImplementation(() => 'Completely different wording');
+        try {
+          standMintAndPurge(() =>
+            HttpResponse.json({ error: 'Invalid password' }, { status: 403 })
+          );
+          expect(await purgeWithPassword()).toEqual({
+            kind: 'softLockChallenge',
+            view: { view: 'password', error: 'Completely different wording' },
+            refusal: { kind: 'invalidPassword' },
+          });
+
+          server.resetHandlers();
+          standMintAndPurge(() => HttpResponse.json({}, { status: 429 }));
+          expect(await purgeWithPassword()).toEqual({
+            kind: 'softLockChallenge',
+            view: { view: 'password', error: 'Completely different wording' },
+            refusal: null,
+          });
+        } finally {
+          if (real) spy.mockImplementation(real);
+        }
+      });
+    });
   });
 
   describe.each([['dm'], ['group']] as const)('on the %s route', (context) => {
@@ -642,5 +899,37 @@ describe('purgeMessages soft-lock (#3455)', () => {
       expect(isStepUpPurgeResult({ kind: 'softLockFailed' })).toBe(false);
       expect(isStepUpPurgeResult({ kind: 'verificationLimited' })).toBe(false);
     });
+  });
+});
+
+// mapTooManyRequests parses Retry-After itself (no-rot, T10): the guard the other
+// two parsers carry applies here too.
+describe('purgeMessages 429 Retry-After', () => {
+  const stand = (headers: Record<string, string>, body: Record<string, unknown> = {}) =>
+    server.use(
+      http.delete('*/api/v1/channels/:id/messages', () =>
+        HttpResponse.json(body, { status: 429, headers })
+      )
+    );
+  const purge = () => purgeMessages({ context: 'channel', scopeId: CHANNEL, range: '7d' });
+
+  it.each([
+    ['a negative value', '-5'],
+    ['an HTTP-date', 'Wed, 21 Oct 2026 07:28:00 GMT'],
+    ['an empty header', ''],
+    ['garbage', 'soon'],
+  ])('%s is no countdown on rateLimited', async (_label, header) => {
+    stand({ 'Retry-After': header });
+    expect(await purge()).toEqual({ kind: 'rateLimited', retryAfterSeconds: undefined });
+  });
+
+  it('a negative value is no countdown on verificationLimited either', async () => {
+    stand({ 'Retry-After': '-1' }, { step_up_budget_exhausted: true });
+    expect(await purge()).toEqual({ kind: 'verificationLimited', retryAfterSeconds: undefined });
+  });
+
+  it('zero is a legal countdown', async () => {
+    stand({ 'Retry-After': '0' });
+    expect(await purge()).toEqual({ kind: 'rateLimited', retryAfterSeconds: 0 });
   });
 });

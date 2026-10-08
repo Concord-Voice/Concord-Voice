@@ -11,12 +11,14 @@ import {
   type ApiRequestContext,
 } from '../system/requestContext';
 import { classifyStepUpRefusal, isStepUpFactorRefusal } from '../system/stepUpRefusal';
-import { toDeleteRefusalView, type DeleteRefusalView } from './deleteRefusal';
 import {
-  mintMfaMethods,
-  mintPasswordStepUpToken,
-  passwordStepUpRefusalMessage,
-} from '../system/stepUpToken';
+  mintRefusalView,
+  toDeleteRefusalView,
+  toDeleteSubmitOutcome,
+  type DeleteRefusalView,
+} from './deleteRefusal';
+import { mintPasswordStepUpToken, type PasswordStepUpMint } from '../system/stepUpToken';
+import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
 import type { PurgeRange } from '../../constants/purgeRanges';
 
 export type PurgeContext = 'channel' | 'server' | 'dm' | 'group';
@@ -41,8 +43,14 @@ export interface PurgeArgs {
   softLockPrior?: DeleteRefusalView;
 }
 
-/** The two soft-lock views that ask the user for a factor. */
-export type SoftLockChallengeView = Extract<DeleteRefusalView, { view: 'confirm' | 'password' }>;
+/**
+ * The soft-lock views the credential stage hosts: the two that ask for a
+ * factor, and enrolment (E8), which asks for nothing because nothing can pass.
+ */
+export type SoftLockChallengeView = Extract<
+  DeleteRefusalView,
+  { view: 'confirm' | 'password' | 'enroll' }
+>;
 
 export type PurgeResult =
   | { kind: 'success'; deletedCount: number; hiddenCount: number }
@@ -62,9 +70,28 @@ export type PurgeResult =
    * needs a factor before it will run. Not a DM step-up kind: the modal routes
    * it to its own stage, with the purge purposes rather than the DM fence's.
    */
-  | { kind: 'softLockChallenge'; view: SoftLockChallengeView }
-  /** #3455: any other soft-lock 403 (e.g. `mfa_enrollment_required`). Nothing was purged. */
+  | {
+      kind: 'softLockChallenge';
+      view: SoftLockChallengeView;
+      /**
+       * The factor hook's reading of this challenge, classified here from the
+       * wire and the mint's own reason, so no consumer re-derives it from the
+       * view's copy. `null` when the credential fields cannot answer it: a
+       * refused password exchange that is no verdict on the password (a rate
+       * limit, a server without the endpoint, a failed lookup, or an MFA
+       * requirement naming no method). Typing again answers none of them, so a
+       * consumer ends the stage with the view's copy.
+       */
+      refusal: StepUpFactorRefusal | null;
+    }
+  /** #3455: any other soft-lock 403. Nothing was purged. */
   | { kind: 'softLockFailed'; message?: string; retryAfterSeconds?: number }
+  /**
+   * D7: the soft-lock's password exchange never left, because apiFetch refused
+   * to dispatch it after an account or server change. Nothing was checked or
+   * purged, so nothing is shown and nothing is reported as a network failure.
+   */
+  | { kind: 'notSent' }
   | { kind: 'sessionExpired' }
   | { kind: 'networkError' }
   | { kind: 'unexpectedError' }
@@ -96,8 +123,11 @@ export type StepUpPurgeResult = Extract<
 
 export type SoftLockChallengeResult = Extract<PurgeResult, { kind: 'softLockChallenge' }>;
 
-/** Everything the result stage can render. */
-export type TerminalPurgeResult = Exclude<PurgeResult, StepUpPurgeResult | SoftLockChallengeResult>;
+/** Everything the result stage can render. A purge that was not sent renders nothing. */
+export type TerminalPurgeResult = Exclude<
+  PurgeResult,
+  StepUpPurgeResult | SoftLockChallengeResult | { kind: 'notSent' }
+>;
 
 export function isStepUpPurgeResult(result: PurgeResult): result is StepUpPurgeResult {
   return STEP_UP_RESULT_KINDS.has(result.kind);
@@ -117,6 +147,17 @@ function purgePath(context: PurgeContext, scopeId: string): string {
     case 'group':
       return `/api/v1/dm/conversations/${scopeId}/messages`;
   }
+}
+
+/**
+ * A route's soft-lock challenge, with the delete soft-lock's own reading of the
+ * same refusal (D6) as its `refusal`, so the two soft-locks hand their factor
+ * hooks the same kinds. The views that reach here are each answerable.
+ */
+function routeChallenge(view: SoftLockChallengeView, payload: unknown): SoftLockChallengeResult {
+  const outcome = toDeleteSubmitOutcome(403, payload);
+  const refusal = outcome.kind === 'refusal' ? outcome.refusal : null;
+  return { kind: 'softLockChallenge', view, refusal };
 }
 
 /**
@@ -141,8 +182,8 @@ function mapForbidden(payload: unknown, args: PurgeArgs, retryAfter: string | nu
     (payload as { delete_rate_limited?: unknown }).delete_rate_limited === true;
   if (isSelfPurgeRoute && flagged) {
     const view = toDeleteRefusalView(403, payload, retryAfter, args.softLockPrior);
-    if (view.view === 'confirm' || view.view === 'password') {
-      return { kind: 'softLockChallenge', view };
+    if (view.view === 'confirm' || view.view === 'password' || view.view === 'enroll') {
+      return routeChallenge(view, payload);
     }
     if (view.view === 'failed') {
       return {
@@ -162,7 +203,7 @@ async function mapTooManyRequests(res: Response): Promise<PurgeResult> {
   // is derived from the header and never from a hardcoded allowance.
   const header = res.headers.get('Retry-After');
   const seconds = header ? Number.parseInt(header, 10) : Number.NaN;
-  const retryAfterSeconds = Number.isFinite(seconds) ? seconds : undefined;
+  const retryAfterSeconds = Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
   // A self-purge past the delete-rate soft-lock charges the shared step-up
   // attempt budget, which also answers 429. Only its flag tells the two apart
   // (#3455, X17), and "purge limit reached" would misstate what ran out.
@@ -194,6 +235,23 @@ function errorText(payload: unknown): string | undefined {
   return typeof error === 'string' ? error : undefined;
 }
 
+/**
+ * The challenge a refused password exchange leaves on screen, read from the
+ * mint's reason and never from its copy. `mintRefusalView` moves a mint that
+ * names its methods to the code prompt, and only that prompt or a wrong
+ * password is something the credential fields can answer: the same reading
+ * the delete soft-lock gives its exchange (`useChatController`).
+ */
+function mintChallenge(
+  minted: Extract<PasswordStepUpMint, { kind: 'refused' }>
+): SoftLockChallengeResult {
+  const view = mintRefusalView(minted);
+  let refusal: StepUpFactorRefusal | null = null;
+  if (view.view === 'confirm') refusal = { kind: 'mfaRequired', methods: view.methods };
+  else if (minted.reason === 'invalidPassword') refusal = { kind: 'invalidPassword' };
+  return { kind: 'softLockChallenge', view, refusal };
+}
+
 /** The self-purge routes' purposes at the mint endpoint, one per route. */
 function selfPurgePurpose(context: 'channel' | 'server') {
   return context === 'channel' ? 'messages.channel_purge' : 'messages.server_purge';
@@ -204,7 +262,8 @@ function selfPurgePurpose(context: 'channel' | 'server') {
  * A DM/group purge keeps its hard step-up: password and code together, in a
  * single shot (spec R-7). A channel/server self-purge is an own-rule route, so
  * its password goes only to the mint endpoint and the route gets the token; a
- * refused exchange lands on the password field of the soft-lock stage.
+ * refused exchange lands on the soft-lock stage, and one that never left is
+ * `notSent`.
  *
  * `context` is the caller's capture, when it has one; the purge, and any
  * exchange before it, are admitted against it.
@@ -232,17 +291,9 @@ async function purgeStepUpFields(
     operation
   );
   if (minted.kind === 'refused') {
-    // An account that enrolled MFA after the prompt opened moves to the code
-    // prompt with the methods the mint named.
-    const methods = mintMfaMethods(minted);
-    return {
-      refused: {
-        kind: 'softLockChallenge',
-        view: methods
-          ? { view: 'confirm', methods }
-          : { view: 'password', error: passwordStepUpRefusalMessage(minted) },
-      },
-    };
+    // D7: the exchange never left, so there is nothing to say about the password.
+    if (minted.unsent) return { refused: { kind: 'notSent' } };
+    return { refused: mintChallenge(minted) };
   }
   fields.step_up_token = minted.token;
   return { fields, context: operation };

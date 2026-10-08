@@ -1,6 +1,6 @@
 import { createRef } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen, userEvent, within } from '../../../test-utils';
+import { fireEvent, render, screen, userEvent, within } from '../../../test-utils';
 import MFAFactorPicker, {
   StepUpFieldError,
   type MFAFactorPickerHandle,
@@ -27,6 +27,7 @@ function props(overrides: Partial<MFAFactorPickerProps> = {}): MFAFactorPickerPr
     onSwitch: vi.fn(),
     recentlyUsedCode: false,
     error: null,
+    onEnter: vi.fn(),
     ...overrides,
   };
 }
@@ -215,5 +216,44 @@ describe('StepUpFieldError', () => {
     expect(glyph).toHaveAttribute('aria-hidden', 'true');
     expect(glyph).toHaveClass('step-up__error-glyph');
     expect(alert.textContent).toBe('Nope.');
+  });
+});
+
+// Design §4.3: every path works with Enter. The owner presses its primary.
+describe('Enter in the code input', () => {
+  // Mutant: the code input without its Enter handler, or one that never calls onEnter.
+  it.each(['totp', 'backup'] as const)('%s: a plain Enter calls onEnter once', async (method) => {
+    const onEnter = vi.fn();
+    render(<MFAFactorPicker {...props({ method, onEnter })} />);
+    await userEvent.click(screen.getByRole('textbox'));
+    await userEvent.keyboard('{Enter}');
+    expect(onEnter).toHaveBeenCalledOnce();
+  });
+
+  // Mutant: isPlainEnter dropping the composition check, the repeat check or any
+  // modifier check. A held Enter must not press the primary again after a refusal.
+  it.each([
+    ['auto-repeating', { repeat: true }],
+    ['composing', { isComposing: true }],
+    ['Shift', { shiftKey: true }],
+    ['Alt', { altKey: true }],
+    ['Ctrl', { ctrlKey: true }],
+    ['Meta', { metaKey: true }],
+  ] as const)('an Enter while %s does not', (_name, init) => {
+    const onEnter = vi.fn();
+    render(<MFAFactorPicker {...props({ onEnter })} />);
+    const input = screen.getByRole('textbox');
+    fireEvent.keyDown(input, { key: 'Enter', ...init });
+    expect(onEnter).not.toHaveBeenCalled();
+    // Positive control: the same input does answer a plain Enter.
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onEnter).toHaveBeenCalledOnce();
+  });
+
+  it('another key does not', () => {
+    const onEnter = vi.fn();
+    render(<MFAFactorPicker {...props({ onEnter })} />);
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: '1' });
+    expect(onEnter).not.toHaveBeenCalled();
   });
 });

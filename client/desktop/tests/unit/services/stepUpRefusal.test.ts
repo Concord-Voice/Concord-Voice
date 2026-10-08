@@ -169,6 +169,69 @@ describe('classifyStepUpRefusal — delete-rate soft-lock (#3455)', () => {
   });
 });
 
+describe('classifyStepUpRefusal — enrolment required (#3464, E8)', () => {
+  const ENROLL = {
+    error: 'Set up an authenticator app or security key to do this.',
+    mfa_enrollment_required: true,
+  };
+
+  // Mutant: the arm removed (it then falls to `failed` with the server text).
+  it('403 mfa_enrollment_required → enrollmentRequired', () => {
+    expect(classifyStepUpRefusal(403, ENROLL)).toEqual({ kind: 'enrollmentRequired' });
+  });
+
+  // Mutant: the arm placed after the `delete_rate_limited` check, or gated on
+  // its absence (the soft-lock adds the flag to every 403 it writes).
+  it('with delete_rate_limited it is still enrollmentRequired', () => {
+    expect(classifyStepUpRefusal(403, { ...ENROLL, delete_rate_limited: true })).toEqual({
+      kind: 'enrollmentRequired',
+    });
+  });
+
+  // Mutant: the arm placed after `mfa_required`, so a body carrying both is
+  // read as a code challenge no input can complete.
+  it.each<[string, Record<string, unknown>]>([
+    ['mfa_required', { mfa_required: true, methods: ['totp'] }],
+    ['mfa_required and delete_rate_limited', { mfa_required: true, delete_rate_limited: true }],
+    ['password_required', { password_required: true }],
+  ])('wins over %s', (_name, extra) => {
+    expect(classifyStepUpRefusal(403, { ...ENROLL, ...extra })).toEqual({
+      kind: 'enrollmentRequired',
+    });
+  });
+
+  // Mutant: the flag read loosely (`!== undefined`, truthiness).
+  it.each<[string, unknown]>([
+    ['false', false],
+    ['absent', undefined],
+    ['the string "true"', 'true'],
+    ['1', 1],
+    ['null', null],
+  ])('a flag of %s is not enrolment', (_name, flag) => {
+    const body: Record<string, unknown> = { error: 'x', mfa_enrollment_required: flag };
+    expect(classifyStepUpRefusal(403, body)).toEqual({ kind: 'failed', message: 'x' });
+  });
+
+  it('false does not hide the challenge the body carries', () => {
+    expect(
+      classifyStepUpRefusal(403, {
+        mfa_enrollment_required: false,
+        mfa_required: true,
+        methods: [],
+      })
+    ).toEqual({ kind: 'mfaRequired', methods: [] });
+  });
+
+  // Mutant: the arm moved out of the 403 switch so other statuses read it.
+  it.each([400, 409, 429, 500, 503])('the flag under status %i is not enrolment', (status) => {
+    expect(classifyStepUpRefusal(status, ENROLL).kind).not.toBe('enrollmentRequired');
+  });
+
+  it('enrollmentRequired is not a credential-field refusal', () => {
+    expect(isStepUpFactorRefusal({ kind: 'enrollmentRequired' })).toBe(false);
+  });
+});
+
 describe('isStepUpFactorRefusal', () => {
   it('is true only for the four field-owned kinds', () => {
     expect(isStepUpFactorRefusal({ kind: 'passwordRequired' })).toBe(true);

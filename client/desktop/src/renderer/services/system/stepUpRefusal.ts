@@ -10,7 +10,7 @@
  * reading the old contract. Each consumer now maps this result onto its own
  * union, so its callers keep their shape while the wire is read in one place.
  *
- * The two boolean flags are the intended contract and are matched first. The
+ * The boolean flags are the intended contract and are matched first. The
  * two exact string comparisons are NOT: `Invalid password` and `Invalid MFA
  * code` carry no machine-readable discriminator, so equality on the frozen seam
  * strings is the only signal (handoff X1). Rewording either server string
@@ -32,6 +32,11 @@ export interface StepUpRefusalBody {
    * credential change). The remedy is the same password prompt, again.
    */
   step_up_token_invalid?: unknown;
+  /**
+   * #3464: the action needs an inline confirmation and the actor holds no
+   * inline factor (`stepup.EnrollmentRequired`). Carries no `mfa_required`.
+   */
+  mfa_enrollment_required?: unknown;
 }
 
 export type StepUpRefusal =
@@ -48,6 +53,11 @@ export type StepUpRefusal =
   | { kind: 'deleteRateLimited'; methods: string[] }
   | { kind: 'invalidPassword' }
   | { kind: 'invalidMfaCode' }
+  /**
+   * #3464: no code this account could send would pass, because it has no
+   * authenticator app or security key. Terminal: the remedy is enrolment.
+   */
+  | { kind: 'enrollmentRequired' }
   | { kind: 'rateLimited' }
   /** 503: the attempt budget could not be evaluated. Nothing was checked or changed. */
   | { kind: 'unavailable' }
@@ -74,7 +84,11 @@ function serverMessage(body: StepUpRefusalBody): string | undefined {
 }
 
 function classifyForbidden(body: StepUpRefusalBody): StepUpRefusal {
-  // Matched first (#3455 §2.10): the delete-rate soft-lock always pairs
+  // Matched before everything, with or without the soft-lock's
+  // `delete_rate_limited`, which the soft-lock adds to every 403 it writes
+  // (E8). Read as anything else it invites a retry no input can complete.
+  if (body.mfa_enrollment_required === true) return { kind: 'enrollmentRequired' };
+  // Matched next (#3455 §2.10): the delete-rate soft-lock always pairs
   // `delete_rate_limited` with `mfa_required`, and a route that does not know
   // about the soft-lock must never mistake this for its own `mfaRequired`.
   if (body.delete_rate_limited === true && body.mfa_required === true) {

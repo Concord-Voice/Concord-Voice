@@ -287,14 +287,15 @@ describe('dm visibility API', () => {
       }
     );
 
-    it("maps Clear's refused token to the expiry copy", async () => {
+    // Mutant: the refused token read as a plain password challenge, or as a banner.
+    it("maps Clear's refused token to a password challenge that says it expired", async () => {
       mockApiFetch.mockResolvedValueOnce(
         response(403, { password_required: true, step_up_token_invalid: true })
       );
 
       await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({
-        kind: 'passwordRefused',
-        message: 'Your confirmation expired. Enter your password again.',
+        kind: 'passwordRequired',
+        tokenExpired: true,
       });
     });
 

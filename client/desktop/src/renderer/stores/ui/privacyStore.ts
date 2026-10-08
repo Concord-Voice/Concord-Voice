@@ -199,6 +199,11 @@ export function classifyPrivacyRefusal(
     // password first), so it is never a signal to drop the password field —
     // PurgeFenceStepUpDialog keeps it up for exactly that reason (#2792).
     const refusal = classifyStepUpRefusal(status, body);
+    // E8: the account holds no factor any input could supply, so it is the
+    // dead end `stepUpImpossible` already names. As `refused` it would leave
+    // the credentials up and invite a retry no input can complete. The
+    // privacy PATCH does not send it today; the server's text is the copy.
+    if (refusal.kind === 'enrollmentRequired') return { kind: 'stepUpImpossible', message };
     return isStepUpFactorRefusal(refusal) ? { ...refusal, message } : { kind: 'refused', message };
   }
 

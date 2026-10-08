@@ -1,5 +1,19 @@
-import { act, render, screen, userEvent } from '../../../test-utils';
+import { act, fireEvent, render, screen, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
+import { resetAllStores } from '../../../helpers/store-helpers';
+import { deferred } from '../../../helpers/deferred';
+import {
+  bodiesTo,
+  installStepUpApi,
+  jsonResponse,
+  readCount,
+  readOffers,
+} from '../../../helpers/stepUpApi';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import {
+  apiRequestContextIsCurrent,
+  type ApiRequestContext,
+} from '@/renderer/services/system/requestContext';
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 
@@ -57,31 +71,6 @@ vi.mock('@/renderer/components/Auth/TOTPInput', () => ({
   ),
 }));
 
-vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
-  default: ({
-    methods,
-    onVerify,
-    disabled,
-    error,
-  }: {
-    methods: string[];
-    onVerify: (code: string) => void;
-    disabled?: boolean;
-    error?: string;
-    excludeBackupCodes?: boolean;
-    recoveryOnlyMethods?: string[];
-  }) => (
-    <div data-testid="mfa-verify-prompt" data-methods={methods.join(',')}>
-      <input
-        data-testid="mfa-verify-input"
-        disabled={disabled}
-        onChange={(e) => onVerify(e.target.value)}
-      />
-      {error && <span data-testid="mfa-verify-error">{error}</span>}
-    </div>
-  ),
-}));
-
 vi.mock('@/renderer/components/Settings/BackupCodeDisplay', () => ({
   default: ({
     codes,
@@ -133,347 +122,506 @@ import {
 } from '@/renderer/utils/crypto/crypto';
 import MFASetup from '@/renderer/components/Settings/MFASetup';
 
-describe('MFASetup', () => {
-  const onComplete = vi.fn();
-  const onCancel = vi.fn();
+// ── API double ─────────────────────────────────────────────────────────
+//
+// Routed by path, never by call order: the requirements read
+// (`GET /api/v1/mfa/step-up`) opens each credentials stage, so it lands among
+// the wizard's own requests at a point no case should depend on. "Mutant:"
+// comments name the production change a case exists to turn red.
 
+const PATHS = {
+  totpSetup: '/api/v1/mfa/totp/setup',
+  verifySetup: '/api/v1/mfa/totp/verify-setup',
+  confirmSetup: '/api/v1/mfa/totp/confirm-setup',
+  recoveryKey: '/api/v1/mfa/recovery-key',
+  keyBegin: '/api/v1/mfa/webauthn/register/begin',
+  inlineBegin: '/api/v1/mfa/webauthn/verify-inline/begin',
+  keyFinish: '/api/v1/mfa/webauthn/register/finish',
+} as const;
+
+const FIXTURE_PW = 'mypassword';
+const FIXTURE_OTP = '654321';
+const REPLACE_LABEL = 'Replace recovery key';
+const CODE_LABEL = 'Authenticator app code';
+
+const SETUP_BODY = {
+  otpauth_url: 'otpauth://totp/Concord:test@example.com?secret=JBSWY3DPEHPK3PXP',
+  secret: 'JBSWY3DPEHPK3PXP',
+};
+const CREATION_OPTIONS = {
+  publicKey: {
+    challenge: 'dGVzdC1jaGFsbGVuZ2U',
+    rp: { name: 'Concord', id: 'localhost' },
+    user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+  },
+};
+
+type Reply = Response | Promise<Response>;
+/** A route's answer. `n` is how many times that path has been asked, from 1. */
+type Route = (n: number) => Reply;
+
+interface Scenario {
+  /** What the requirements read offers. Set on the returned handle to change it mid-case. */
+  offers?: string[];
+  backup?: boolean;
+  totpSetup?: Route;
+  verifySetup?: Route;
+  confirmSetup?: Route;
+  recoveryKey?: Route;
+  keyBegin?: Route;
+  keyFinish?: Route;
+  /** The step-up's own security-key begin (`verify-inline`), not the registration's. */
+  inlineBegin?: Route;
+}
+
+interface Api {
+  offers: string[];
+  backup: boolean;
+}
+
+function serve(scenario: Scenario = {}): Api {
+  const api: Api = { offers: scenario.offers ?? [], backup: scenario.backup ?? false };
+  const asked = new Map<string, number>();
+  const ok = (): Reply => jsonResponse(200, {});
+  const routes: Record<string, Route> = {
+    [PATHS.totpSetup]: scenario.totpSetup ?? (() => jsonResponse(200, SETUP_BODY)),
+    [PATHS.verifySetup]:
+      scenario.verifySetup ?? (() => jsonResponse(200, { backup_codes: ['CODE1'] })),
+    [PATHS.confirmSetup]: scenario.confirmSetup ?? ok,
+    [PATHS.recoveryKey]: scenario.recoveryKey ?? ok,
+    [PATHS.keyBegin]: scenario.keyBegin ?? (() => jsonResponse(200, CREATION_OPTIONS)),
+    [PATHS.keyFinish]: scenario.keyFinish ?? ok,
+    ...(scenario.inlineBegin ? { [PATHS.inlineBegin]: scenario.inlineBegin } : {}),
+  };
+  installStepUpApi(mockApiFetch, {
+    read: () => readOffers(api.offers, api.backup),
+    route: (path) => {
+      const route = routes[path];
+      if (!route) throw new Error(`unexpected request ${path}`);
+      const n = (asked.get(path) ?? 0) + 1;
+      asked.set(path, n);
+      return route(n);
+    },
+  });
+  return api;
+}
+
+/** A first store that finds a key already held, then whatever `later` answers. */
+function keptThen(later: Route = () => jsonResponse(200, {})): Route {
+  return (n) => (n === 1 ? jsonResponse(403, { password_required: true }) : later(n));
+}
+
+const networkLoss = (): never => {
+  throw new TypeError('Failed to fetch');
+};
+
+const callsTo = (path: string) => mockApiFetch.mock.calls.filter((c) => c[0] === path);
+/** The `ApiRequestContext` each request to `path` was admitted against, if any. */
+const contextsOf = (path: string) =>
+  callsTo(path).map((c) => (c[2] as { context?: unknown } | undefined)?.context);
+
+// ── Drivers ────────────────────────────────────────────────────────────
+
+const onComplete = vi.fn();
+const onCancel = vi.fn();
+
+type SetupProps = Partial<React.ComponentProps<typeof MFASetup>>;
+
+const renderTotp = (props: SetupProps = {}) =>
+  render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} {...props} />);
+const renderKey = (props: SetupProps = {}) =>
+  render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} {...props} />);
+
+const button = (name: string) => screen.getByRole('button', { name });
+const click = (name: string) => fireEvent.click(button(name));
+const typePassword = (value = FIXTURE_PW) =>
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value } });
+/** Waits for the field: it exists only once the read has offered the method. */
+const typeCode = async (value = FIXTURE_OTP, label = CODE_LABEL) =>
+  fireEvent.change(await screen.findByLabelText(label), { target: { value } });
+const valueOf = (label: string) => (screen.getByLabelText(label) as HTMLInputElement).value;
+/** Resolves once the primary can act: the read landed and everything is filled. */
+const untilActionable = (name: string) =>
+  waitFor(() => expect(button(name)).not.toHaveAttribute('aria-disabled'));
+
+/** Password (and code, when the read offers TOTP) typed and Continue pressed. */
+async function beginTotp(withCode = false) {
+  typePassword();
+  if (withCode) await typeCode();
+  await untilActionable('Continue');
+  click('Continue');
+}
+
+/** Drives the authenticator flow to the QR step. */
+async function toQr() {
+  renderTotp();
+  await beginTotp();
+  await screen.findByTestId('totp-submit');
+}
+
+async function toBackupCodes() {
+  await toQr();
+  fireEvent.click(screen.getByTestId('totp-submit'));
+  await screen.findByTestId('backup-confirm');
+}
+
+/** Confirms the backup codes and so starts the first recovery-key store. */
+async function toRecoveryStep() {
+  await toBackupCodes();
+  fireEvent.click(screen.getByTestId('backup-confirm'));
+}
+
+/** Through a first store that finds a key held, and into the replace step. */
+async function toReplaceStep(api: Api, offers: string[] = []) {
+  await toKeptStep();
+  api.offers = offers;
+  click(REPLACE_LABEL);
+  await screen.findByText('Your old recovery key will stop working.');
+}
+
+/** Reaches the "kept" step without opening the replace step. */
+async function toKeptStep() {
+  await toRecoveryStep();
+  await screen.findByRole('button', { name: REPLACE_LABEL });
+}
+
+const recoveryText = (text: string) => screen.findByText(text);
+const FAILED_COPY =
+  "We couldn't create your recovery key. Without one, you'll lose access to your encrypted message history if you forget your password.";
+const UNAVAILABLE_COPY =
+  "We couldn't create your recovery key because your encryption keys aren't unlocked on this device. Without one, you'll lose access to your encrypted message history if you forget your password.";
+
+/** Stubs `navigator.credentials.create` for the security-key ceremony. */
+function stubCreate(create: () => Promise<unknown>) {
+  Object.defineProperty(navigator, 'credentials', {
+    value: { create: vi.fn(create) },
+    writable: true,
+    configurable: true,
+  });
+}
+
+const mockCredential = () => {
+  const buffer = new Uint8Array([1, 2, 3]).buffer;
+  return {
+    id: 'credential-id',
+    rawId: buffer,
+    type: 'public-key',
+    response: { attestationObject: buffer, clientDataJSON: buffer },
+  };
+};
+
+/** Password (and code) typed and Register Key pressed. */
+async function beginKey(withCode = false) {
+  typePassword();
+  if (withCode) await typeCode();
+  await untilActionable('Register Key');
+  click('Register Key');
+}
+
+describe('MFASetup', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
+    mockApiFetch.mockReset();
+    useAuthStore.getState().setAccessToken('mock-token');
+    serve();
   });
 
-  // ── TOTP Flow ──────────────────────────────────────────────────────────
+  // ── TOTP Flow (#5) ─────────────────────────────────────────────────────
 
   describe('TOTP Flow', () => {
     it('renders TOTP setup wizard title', () => {
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
+      renderTotp();
       expect(screen.getByText('Set Up Authenticator App')).toBeInTheDocument();
     });
 
-    it('renders password input on initial step', () => {
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      expect(screen.getByPlaceholderText('Your password')).toBeInTheDocument();
+    it('labels the password field', () => {
+      renderTotp();
+      expect(screen.getByLabelText('Password')).toBeInTheDocument();
     });
 
     it('renders continue and cancel buttons', () => {
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      expect(screen.getByText('Continue')).toBeInTheDocument();
-      expect(screen.getByText('Cancel')).toBeInTheDocument();
+      renderTotp();
+      expect(button('Continue')).toBeInTheDocument();
+      expect(button('Cancel')).toBeInTheDocument();
     });
 
     it('shows setup prompt for new MFA', () => {
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
+      renderTotp();
       expect(screen.getByText('Enter your password to begin setup.')).toBeInTheDocument();
     });
 
     it('shows identity verification message when mfaActive', () => {
-      render(<MFASetup method="totp" mfaActive onComplete={onComplete} onCancel={onCancel} />);
+      renderTotp({ mfaActive: true });
       expect(screen.getByText('Verify your identity to add another method.')).toBeInTheDocument();
     });
 
-    it('shows MFA verify prompt when mfaActive', () => {
-      render(
-        <MFASetup
-          method="totp"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      expect(screen.getByTestId('mfa-verify-prompt')).toBeInTheDocument();
-    });
-
-    it('disables Continue button when password is empty', () => {
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      expect(screen.getByText('Continue')).toBeDisabled();
-    });
-
-    it('enables Continue button when password is entered', async () => {
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      expect(screen.getByText('Continue')).not.toBeDisabled();
-    });
-
-    it('disables Continue when mfaActive and no mfa code provided', async () => {
-      const user = userEvent.setup();
-      render(
-        <MFASetup
-          method="totp"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      // mfaActive but no mfaCode entered yet
-      expect(screen.getByText('Continue')).toBeDisabled();
-    });
-
-    it('calls onCancel when cancel button is clicked', async () => {
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.click(screen.getByText('Cancel'));
+    it('calls onCancel when cancel button is clicked', () => {
+      renderTotp();
+      click('Cancel');
       expect(onCancel).toHaveBeenCalled();
     });
 
-    it('calls TOTP setup API with password', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          otpauth_url: 'otpauth://totp/Concord:test@example.com?secret=JBSWY3DPEHPK3PXP',
-          secret: 'JBSWY3DPEHPK3PXP',
-        }),
-      });
+    // §1.3. Mutant: the code field renders unconditionally. An account the read
+    // says has no inline method would be asked for a code it cannot produce.
+    it('asks for no code when the read offers no method', async () => {
+      serve({ offers: [] });
+      renderTotp();
+      typePassword();
+      await untilActionable('Continue');
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        expect(mockApiFetch).toHaveBeenCalledWith(
-          '/api/v1/mfa/totp/setup',
-          expect.objectContaining({ method: 'POST' })
-        );
-      });
+      expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Backup code')).not.toBeInTheDocument();
     });
 
-    it('includes mfa_code in setup request when mfaActive', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          otpauth_url: 'otpauth://totp/test',
-          secret: 'SECRET',
-        }),
-      });
+    it('asks for the authenticator code when the read offers TOTP, with or without mfaActive', async () => {
+      serve({ offers: ['totp'] });
+      renderTotp();
 
-      const user = userEvent.setup();
-      render(
-        <MFASetup
-          method="totp"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
+      expect(await screen.findByLabelText(CODE_LABEL)).toBeInTheDocument();
+      // The read decides, not the prop: the wording follows what it found.
+      expect(screen.getByText('Verify your identity to add another method.')).toBeInTheDocument();
+    });
 
-      // Simulate MFA code entry via the mock prompt
-      const mfaInput = screen.getByTestId('mfa-verify-input');
-      await user.type(mfaInput, '654321');
+    // Mutant: `allowBackup: true` on the setup stage. Enrolment must stay on the
+    // real factor, so a backup code is never offered here even when the account
+    // holds some (design §6).
+    it.each([['totp'], ['webauthn']] as const)(
+      'never offers a backup code on the %s flow, though the account has them',
+      async (method) => {
+        serve({ offers: ['totp'], backup: true });
+        render(<MFASetup method={method} onComplete={onComplete} onCancel={onCancel} />);
+        await screen.findByLabelText(CODE_LABEL);
 
-      await user.click(screen.getByText('Continue'));
+        expect(
+          screen.queryByRole('button', { name: 'Use a backup code instead' })
+        ).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Backup code')).not.toBeInTheDocument();
+      }
+    );
 
-      await vi.waitFor(() => {
-        const body = JSON.parse((mockApiFetch.mock.calls[0][1] as { body: string }).body);
-        expect(body.mfa_code).toBe('654321');
+    it('keeps Continue aria-disabled, not natively disabled, until the password is entered', async () => {
+      renderTotp();
+      expect(button('Continue')).toHaveAttribute('aria-disabled', 'true');
+      expect(button('Continue')).not.toBeDisabled();
+
+      click('Continue');
+      expect(await screen.findByText('Enter your password to continue.')).toBeInTheDocument();
+      expect(callsTo(PATHS.totpSetup)).toHaveLength(0);
+    });
+
+    it('enables Continue once the password is entered and the read landed', async () => {
+      renderTotp();
+      typePassword();
+      await untilActionable('Continue');
+      expect(button('Continue')).not.toBeDisabled();
+    });
+
+    it('keeps Continue down, saying what is missing, until the offered code is entered', async () => {
+      serve({ offers: ['totp'] });
+      renderTotp({ mfaActive: true });
+      typePassword();
+      await screen.findByLabelText(CODE_LABEL);
+      expect(button('Continue')).toHaveAttribute('aria-disabled', 'true');
+
+      click('Continue');
+      expect(
+        await screen.findByText('Enter the 6-digit code from your authenticator app to continue.')
+      ).toBeInTheDocument();
+      expect(callsTo(PATHS.totpSetup)).toHaveLength(0);
+    });
+
+    it('calls TOTP setup with the password, under the capture the run took', async () => {
+      renderTotp();
+      await beginTotp();
+
+      await waitFor(() => expect(callsTo(PATHS.totpSetup)).toHaveLength(1));
+      const [body] = bodiesTo(mockApiFetch, PATHS.totpSetup);
+      expect(body).toEqual({ password: FIXTURE_PW });
+      expect(callsTo(PATHS.totpSetup)[0][1]).toMatchObject({ method: 'POST' });
+      const [context] = contextsOf(PATHS.totpSetup);
+      expect(context).toBeDefined();
+      expect(apiRequestContextIsCurrent(context as never)).toBe(true);
+    });
+
+    it('includes mfa_code in the setup request when the read offers TOTP', async () => {
+      serve({ offers: ['totp'] });
+      renderTotp({ mfaActive: true });
+      await beginTotp(true);
+
+      await waitFor(() => expect(callsTo(PATHS.totpSetup)).toHaveLength(1));
+      expect(bodiesTo(mockApiFetch, PATHS.totpSetup)[0]).toEqual({
+        password: FIXTURE_PW,
+        mfa_code: FIXTURE_OTP,
       });
     });
 
     it('advances to QR step after successful setup', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          otpauth_url: 'otpauth://totp/Concord:test@example.com?secret=JBSWY3DPEHPK3PXP',
-          secret: 'JBSWY3DPEHPK3PXP',
-        }),
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(
-            'Scan this QR code with your authenticator app, then enter the 6-digit code below.'
-          )
-        ).toBeInTheDocument();
-      });
+      await toQr();
+      expect(
+        screen.getByText(
+          'Scan this QR code with your authenticator app, then enter the 6-digit code below.'
+        )
+      ).toBeInTheDocument();
     });
 
     it('shows manual secret entry on QR step', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          otpauth_url: 'otpauth://totp/test',
-          secret: 'JBSWY3DPEHPK3PXP',
-        }),
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText("Can't scan? Enter manually")).toBeInTheDocument();
-        expect(screen.getByText('JBSWY3DPEHPK3PXP')).toBeInTheDocument();
-      });
+      await toQr();
+      expect(screen.getByText("Can't scan? Enter manually")).toBeInTheDocument();
+      expect(screen.getByText('JBSWY3DPEHPK3PXP')).toBeInTheDocument();
     });
 
-    it('shows error on setup failure', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        json: async () => ({ error: 'Incorrect password' }),
-      });
+    it('treats an accepted setup answer without a secret as a failed begin', async () => {
+      serve({ totpSetup: () => jsonResponse(200, { unexpected: true }) });
+      renderTotp();
+      await beginTotp();
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpassword');
-      await user.click(screen.getByText('Continue'));
+      expect(await screen.findByText('Something went wrong. Try again.')).toBeInTheDocument();
+      expect(screen.queryByTestId('totp-input')).not.toBeInTheDocument();
+    });
 
-      await vi.waitFor(() => {
-        expect(screen.getByText('Incorrect password')).toBeInTheDocument();
+    it('shows the server text on a setup failure', async () => {
+      serve({ totpSetup: () => jsonResponse(500, { error: 'Server unavailable' }) });
+      renderTotp();
+      await beginTotp();
+
+      expect(await screen.findByText('Server unavailable')).toBeInTheDocument();
+      expect(document.querySelector('.mfa-setup-error-banner')).toBeInTheDocument();
+    });
+
+    it('shows the shared copy against the password field for an invalidPassword refusal', async () => {
+      serve({ totpSetup: () => jsonResponse(403, { error: 'Invalid password' }) });
+      renderTotp();
+      await beginTotp();
+
+      expect(await screen.findByText('That password is not correct.')).toBeInTheDocument();
+      expect(screen.getByLabelText('Password')).toHaveAttribute('aria-invalid', 'true');
+      // The server read the password and refused it: it is not offered again.
+      expect(valueOf('Password')).toBe('');
+    });
+
+    // The code was never read when the password failed, so it is still good.
+    it('keeps the code through a password refusal and drops only the password', async () => {
+      serve({
+        offers: ['totp'],
+        totpSetup: () => jsonResponse(403, { error: 'Invalid password' }),
       });
+      renderTotp({ mfaActive: true });
+      await beginTotp(true);
+
+      await screen.findByText('That password is not correct.');
+      expect(valueOf(CODE_LABEL)).toBe(FIXTURE_OTP);
+      expect(valueOf('Password')).toBe('');
+    });
+
+    it('shows the shared code copy, and no banner, for an invalidMfaCode refusal', async () => {
+      serve({
+        offers: ['totp'],
+        totpSetup: () => jsonResponse(403, { error: 'Invalid MFA code' }),
+      });
+      renderTotp({ mfaActive: true });
+      await beginTotp(true);
+
+      expect(
+        await screen.findByText(
+          "That code didn't work. It may be mistyped or already used. Enter the next code your app shows."
+        )
+      ).toBeInTheDocument();
+      expect(document.querySelector('.mfa-setup-error-banner')).not.toBeInTheDocument();
+    });
+
+    // F3's twin. The read said no method was needed; the server then named one.
+    it('shows the code field when a setup answer names a method the read did not offer', async () => {
+      serve({
+        offers: [],
+        totpSetup: () =>
+          jsonResponse(403, {
+            error: 'MFA verification required',
+            mfa_required: true,
+            methods: ['totp', 'email'],
+          }),
+      });
+      renderTotp();
+      await beginTotp();
+
+      const field = await screen.findByLabelText(CODE_LABEL);
+      expect(field).toBeInTheDocument();
+      expect(button('Continue')).toHaveAttribute('aria-disabled', 'true');
+      await typeCode();
+      expect(button('Continue')).not.toHaveAttribute('aria-disabled');
+    });
+
+    // Server budget: a spent budget names itself, and the code is untouched.
+    it('shows the shared rate-limit copy for a 429 setup refusal', async () => {
+      serve({
+        totpSetup: () => jsonResponse(429, { error: 'Too many verification attempts' }),
+      });
+      renderTotp();
+      await beginTotp();
+
+      expect(
+        await screen.findByText('Too many attempts. Try again in a few minutes.')
+      ).toBeInTheDocument();
+    });
+
+    // A sent code is never offered again. The server accepts each TOTP code once
+    // and can accept it yet still fail the request.
+    it('a failed setup request clears the code and puts Continue back down', async () => {
+      serve({
+        offers: ['totp'],
+        totpSetup: () => jsonResponse(500, { error: 'Internal server error' }),
+      });
+      renderTotp({ mfaActive: true });
+      await beginTotp(true);
+
+      expect(await screen.findByText('Internal server error')).toBeInTheDocument();
+      expect(valueOf(CODE_LABEL)).toBe('');
+      expect(button('Continue')).toHaveAttribute('aria-disabled', 'true');
     });
 
     it('shows error on TOTP verify failure', async () => {
-      // First call: setup succeeds
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'TESTSECRET' }),
-      });
+      serve({ verifySetup: () => jsonResponse(400, { error: 'Invalid TOTP code' }) });
+      await toQr();
+      fireEvent.click(screen.getByTestId('totp-submit'));
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-input')).toBeInTheDocument());
-
-      // Second call: verify fails
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        json: async () => ({ error: 'Invalid TOTP code' }),
-      });
-
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByTestId('totp-error')).toHaveTextContent('Invalid TOTP code');
-      });
+      expect(await screen.findByTestId('totp-error')).toHaveTextContent('Invalid TOTP code');
     });
 
-    it('shows error on confirm-setup failure', async () => {
-      // Setup
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
+    it('advances to backup codes after TOTP verification', async () => {
+      serve({
+        verifySetup: () =>
+          jsonResponse(200, { backup_codes: ['AAAA1111', 'BBBB2222', 'CCCC3333'] }),
       });
+      await toBackupCodes();
+      expect(screen.getByText('AAAA1111, BBBB2222, CCCC3333')).toBeInTheDocument();
+    });
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
+    it('shows error on confirm-setup failure and does not refresh the session', async () => {
+      serve({ confirmSetup: () => jsonResponse(500, { error: 'Session expired' }) });
+      await toBackupCodes();
+      fireEvent.click(screen.getByTestId('backup-confirm'));
 
-      await vi.waitFor(() => expect(screen.getByTestId('totp-input')).toBeInTheDocument());
-
-      // Verify
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ backup_codes: ['CODE1'] }),
-      });
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-code-display')).toBeInTheDocument());
-
-      // Confirm fails
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        json: async () => ({ error: 'Session expired' }),
-      });
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Session expired')).toBeInTheDocument();
-      });
+      expect(await screen.findByText('Session expired')).toBeInTheDocument();
       expect(
         mockRefreshAccessToken,
         'MFA did not activate, so there is no grant to use'
       ).not.toHaveBeenCalled();
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(0);
     });
-
-    it('advances to backup codes after TOTP verification', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'TESTSECRET' }),
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByTestId('totp-input')).toBeInTheDocument();
-      });
-
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ backup_codes: ['AAAA1111', 'BBBB2222', 'CCCC3333'] }),
-      });
-
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByTestId('backup-code-display')).toBeInTheDocument();
-        expect(screen.getByText('AAAA1111, BBBB2222, CCCC3333')).toBeInTheDocument();
-      });
-    });
-
-    // Drives TOTP setup through confirm-setup to the recovery-key step.
-    async function completeTOTPToRecoveryKey() {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'TESTSECRET' }),
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-input')).toBeInTheDocument());
-
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ backup_codes: ['CODE1'] }),
-      });
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-code-display')).toBeInTheDocument());
-
-      mockApiFetch
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument();
-        expect(screen.getByText('AAAA-BBBB-CCCC-DDDD')).toBeInTheDocument();
-      });
-      return user;
-    }
 
     it('completes full TOTP flow through recovery key', async () => {
-      const user = await completeTOTPToRecoveryKey();
+      await toRecoveryStep();
+      await screen.findByText('AAAA-BBBB-CCCC-DDDD');
       // The server exempts this session from the pre-MFA challenge for 30 s
       // after enrollment; refreshing now uses that grant instead of prompting
       // for the code again at the next token refresh.
       expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
 
-      await user.click(screen.getByTestId('recovery-confirm'));
+      fireEvent.click(screen.getByTestId('recovery-confirm'));
+      expect(await screen.findByText('MFA Activated!')).toBeInTheDocument();
 
-      await vi.waitFor(() => {
-        expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
-      });
-
-      await user.click(screen.getByText('Done'));
+      click('Done');
       expect(onComplete).toHaveBeenCalled();
     });
 
@@ -483,397 +631,119 @@ describe('MFASetup', () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       mockRefreshAccessToken.mockRejectedValueOnce(new Error('ipc unavailable'));
 
-      await completeTOTPToRecoveryKey();
+      await toRecoveryStep();
+      await screen.findByTestId('recovery-key-display');
 
-      await vi.waitFor(() =>
+      await waitFor(() =>
         expect(warn).toHaveBeenCalledWith('[mfa] Refresh after enrollment failed')
       );
       warn.mockRestore();
     });
 
     it('skips recovery key when skip is clicked', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('recovery-skip')).toBeInTheDocument());
-      await user.click(screen.getByTestId('recovery-skip'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
-      });
+      await toRecoveryStep();
+      fireEvent.click(await screen.findByTestId('recovery-skip'));
+      expect(await screen.findByText('MFA Activated!')).toBeInTheDocument();
     });
 
     it('routes to recovery-failed (unavailable) when wrapping key is null — never silently to done', async () => {
       mockE2eeService.getWrappingKey.mockReturnValueOnce(null);
+      await toRecoveryStep();
 
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }); // confirm-setup
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(
-            "We couldn't create your recovery key because your encryption keys aren't unlocked on this device. Without one, you'll lose access to your encrypted message history if you forget your password."
-          )
-        ).toBeInTheDocument();
-      });
+      expect(await recoveryText(UNAVAILABLE_COPY)).toBeInTheDocument();
       expect(screen.queryByText('MFA Activated!')).not.toBeInTheDocument();
       // unavailable never offers a retry — retrying cannot succeed.
       expect(screen.queryByText('Try again')).not.toBeInTheDocument();
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(0);
 
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => {
-        expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
-      });
+      click('Continue');
+      expect(await screen.findByText('MFA Activated!')).toBeInTheDocument();
     });
 
     it('routes to recovery-failed (failed) when the recovery-key store call fails — never silently to done', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        // Recovery key store fails with a plain 500 — not 403, so this is
-        // 'failed' rather than 'kept'.
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 500,
-          json: async () => ({ error: 'storage error' }),
-        });
+      // A plain 500 — not 403, so this is 'failed' rather than 'kept'.
+      serve({ recoveryKey: () => jsonResponse(500, { error: 'storage error' }) });
+      await toRecoveryStep();
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(
-            "We couldn't create your recovery key. Without one, you'll lose access to your encrypted message history if you forget your password."
-          )
-        ).toBeInTheDocument();
-      });
+      expect(await recoveryText(FAILED_COPY)).toBeInTheDocument();
       expect(screen.queryByText('MFA Activated!')).not.toBeInTheDocument();
       expect(screen.getByText('Try again')).toBeInTheDocument();
 
-      await user.click(screen.getByText('Continue without a recovery key'));
-      await vi.waitFor(() => {
-        expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
-      });
+      click('Continue without a recovery key');
+      expect(await screen.findByText('MFA Activated!')).toBeInTheDocument();
     });
 
-    it('wraps prefs key when available', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    it('wraps the prefs key into the recovery-key upload when available', async () => {
+      await toRecoveryStep();
+      await screen.findByTestId('recovery-key-display');
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      // Check that PUT to recovery-key includes prefs payload
-      await vi.waitFor(() => {
-        const putCall = mockApiFetch.mock.calls.find(
-          (call: unknown[]) => call[0] === '/api/v1/mfa/recovery-key'
-        );
-        expect(putCall).toBeDefined();
-        const body = JSON.parse((putCall![1] as { body: string }).body);
-        expect(body.recovery_wrapped_prefs_key).toBe('mock-wrapped-prefs');
-        expect(body.recovery_prefs_key_salt).toBe('mock-prefs-salt');
-      });
+      const [body] = bodiesTo(mockApiFetch, PATHS.recoveryKey);
+      expect(body.recovery_wrapped_prefs_key).toBe('mock-wrapped-prefs');
+      expect(body.recovery_prefs_key_salt).toBe('mock-prefs-salt');
     });
 
-    it('omits prefs payload when prefs key is null', async () => {
+    it('omits the prefs payload when there is no prefs key', async () => {
       mockE2eeService.getPreferencesKeyBase64.mockReturnValueOnce(null);
+      await toRecoveryStep();
+      await screen.findByTestId('recovery-key-display');
 
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => {
-        const putCall = mockApiFetch.mock.calls.find(
-          (call: unknown[]) => call[0] === '/api/v1/mfa/recovery-key'
-        );
-        if (putCall) {
-          const body = JSON.parse((putCall[1] as { body: string }).body);
-          expect(body.recovery_wrapped_prefs_key).toBeUndefined();
-        }
-      });
+      const [body] = bodiesTo(mockApiFetch, PATHS.recoveryKey);
+      expect(body.recovery_wrapped_private_key).toBe('mock-wrapped-key');
+      expect(body).not.toHaveProperty('recovery_wrapped_prefs_key');
+      expect(body).not.toHaveProperty('recovery_prefs_key_salt');
     });
 
-    it('sets error field to password and shows the shared copy for an invalidPassword refusal', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        json: async () => ({ error: 'Invalid password' }),
-      });
+    // The first store needs no credentials: the server inserts only when no key exists.
+    it('sends the first recovery-key store without credentials', async () => {
+      await toRecoveryStep();
+      await screen.findByTestId('recovery-key-display');
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrong');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('That password is not correct.')).toBeInTheDocument();
-        // The password input should have error class
-        const passwordInput = screen.getByPlaceholderText('Your password');
-        expect(passwordInput.className).toContain('error');
-      });
+      const [body] = bodiesTo(mockApiFetch, PATHS.recoveryKey);
+      expect(body).not.toHaveProperty('password');
+      expect(body).not.toHaveProperty('mfa_code');
     });
   });
 
-  // ── ErrorBanner sub-component ───────────────────────────────────────
-
-  describe('ErrorBanner (extracted sub-component)', () => {
-    it('shows error banner for general error field', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        json: async () => ({ error: 'Server unavailable' }),
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'testpw');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Server unavailable')).toBeInTheDocument();
-      });
-      // The error banner should render (general classification, not password/mfa)
-      const banner = document.querySelector('.mfa-setup-error-banner');
-      expect(banner).toBeInTheDocument();
-    });
-
-    it('does not show error banner when errorField is mfa', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        json: async () => ({ error: 'Invalid MFA code' }),
-      });
-
-      const user = userEvent.setup();
-      render(
-        <MFASetup
-          method="totp"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'testpw');
-      // Type an MFA code
-      const mfaInput = screen.getByTestId('mfa-verify-input');
-      await user.type(mfaInput, '123456');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => {
-        // MFA error should be sent to the MFAVerifyPrompt (the shared copy,
-        // not the server's raw text), not shown as a banner.
-        expect(screen.getByTestId('mfa-verify-error')).toHaveTextContent(
-          'That code is not correct, or it has expired. Try the next one.'
-        );
-      });
-    });
-  });
-
-  // ── Recovery key exception handling ─────────────────────────────────
+  // ── Recovery key generation exception ───────────────────────────────
 
   describe('Recovery key generation exception', () => {
-    it('routes to recovery-failed when generateAndStoreRecoveryKey throws — never silently to done', async () => {
-      // Make crypto functions throw
-      const { generateRecoveryKey } = await import('@/renderer/utils/crypto/crypto');
+    it('routes to recovery-failed when generateRecoveryKey throws — never silently to done', async () => {
       vi.mocked(generateRecoveryKey).mockImplementationOnce(() => {
         throw new Error('crypto failure');
       });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await toRecoveryStep();
 
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }); // confirm-setup
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(
-            "We couldn't create your recovery key. Without one, you'll lose access to your encrypted message history if you forget your password."
-          )
-        ).toBeInTheDocument();
-      });
+      expect(await recoveryText(FAILED_COPY)).toBeInTheDocument();
       expect(screen.queryByText('MFA Activated!')).not.toBeInTheDocument();
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(0);
+      warn.mockRestore();
 
-      await user.click(screen.getByText('Continue without a recovery key'));
-      await vi.waitFor(() => {
-        expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
-      });
+      click('Continue without a recovery key');
+      expect(await screen.findByText('MFA Activated!')).toBeInTheDocument();
     });
   });
 
   // ── Recovery-key outcome routing (spec §4.6.3 — the 'kept' branch) ───────
 
   describe('recovery-key outcome routing — kept', () => {
-    const setupThroughBackupConfirm = async (user: ReturnType<typeof userEvent.setup>) => {
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-    };
-
     it('routes to recovery-kept via a 403 password_required body', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 403,
-          json: async () => ({ password_required: true }),
-        });
+      serve({ recoveryKey: () => jsonResponse(403, { password_required: true }) });
+      await toRecoveryStep();
 
-      const user = userEvent.setup();
-      await setupThroughBackupConfirm(user);
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(/A recovery key is already saved for your account/)
-        ).toBeInTheDocument();
-      });
+      expect(
+        await screen.findByText(/A recovery key is already saved for your account/)
+      ).toBeInTheDocument();
       expect(screen.queryByText('MFA Activated!')).not.toBeInTheDocument();
     });
 
     it('routes to recovery-kept via an mfa_required-only body (SSO-shaped, R-11)', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 403,
-          json: async () => ({ mfa_required: true }),
-        });
+      serve({ recoveryKey: () => jsonResponse(403, { mfa_required: true }) });
+      await toRecoveryStep();
 
-      const user = userEvent.setup();
-      await setupThroughBackupConfirm(user);
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(/A recovery key is already saved for your account/)
-        ).toBeInTheDocument();
-      });
+      expect(
+        await screen.findByText(/A recovery key is already saved for your account/)
+      ).toBeInTheDocument();
       expect(screen.queryByText('MFA Activated!')).not.toBeInTheDocument();
     });
   });
@@ -882,111 +752,45 @@ describe('MFASetup', () => {
 
   describe('retry after recovery-failed', () => {
     it('calls only the key upload, never confirm-setup again', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup (#1)
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 500,
-          json: async () => ({ error: 'storage error' }),
-        }); // recovery-key PUT #1 fails
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => expect(screen.getByText('Try again')).toBeInTheDocument());
-
-      const confirmSetupCallCount = () =>
-        mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/mfa/totp/confirm-setup').length;
-      expect(confirmSetupCallCount()).toBe(1);
-
-      mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) }); // retry succeeds
-      await user.click(screen.getByText('Try again'));
-
-      // A successful retry routes to 'created', the same target as the
-      // first-try happy path — the recovery-key display, not straight to
-      // 'done'.
-      await vi.waitFor(() => {
-        expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument();
+      serve({
+        recoveryKey: (n) =>
+          n === 1 ? jsonResponse(500, { error: 'storage error' }) : jsonResponse(200),
       });
+      await toRecoveryStep();
+      await screen.findByText('Try again');
+      expect(callsTo(PATHS.confirmSetup)).toHaveLength(1);
+
+      click('Try again');
+      // A successful retry routes to 'created', the same target as the
+      // first-try happy path — the recovery-key display, not straight to 'done'.
+      await screen.findByTestId('recovery-key-display');
 
       // The retry must not have called confirm-setup a second time — it had
       // already committed before the recovery-key upload ever ran.
-      expect(confirmSetupCallCount()).toBe(1);
+      expect(callsTo(PATHS.confirmSetup)).toHaveLength(1);
     });
 
     // regression: repeat retry failure re-rendered an identical screen
     it('changes the alert text on every repeat failure so a retry never looks inert', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 500,
-          json: async () => ({ error: 'storage error' }),
-        }); // recovery-key PUT #1 fails
+      serve({ recoveryKey: () => jsonResponse(500, { error: 'storage error' }) });
+      await toRecoveryStep();
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-
-      await vi.waitFor(() => expect(screen.getByText('Try again')).toBeInTheDocument());
+      await screen.findByText('Try again');
       const firstFailureText = screen.getByRole('alert').textContent;
       expect(firstFailureText).toContain('recovery key');
-      const recoveryPutCount = () =>
-        mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/mfa/recovery-key').length;
-      expect(recoveryPutCount()).toBe(1);
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(1);
 
       // Retry #1 fails again.
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        json: async () => ({ error: 'storage error' }),
-      });
-      await user.click(screen.getByText('Try again'));
-      await vi.waitFor(() => expect(recoveryPutCount()).toBe(2));
-      await vi.waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled()
-      );
+      click('Try again');
+      await waitFor(() => expect(callsTo(PATHS.recoveryKey)).toHaveLength(2));
+      await waitFor(() => expect(button('Try again')).toBeEnabled());
       const retry1Text = screen.getByRole('alert').textContent;
       expect(retry1Text).toContain('recovery key');
 
       // Retry #2 fails again.
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        json: async () => ({ error: 'storage error' }),
-      });
-      await user.click(screen.getByText('Try again'));
-      await vi.waitFor(() => expect(recoveryPutCount()).toBe(3));
-      await vi.waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled()
-      );
+      click('Try again');
+      await waitFor(() => expect(callsTo(PATHS.recoveryKey)).toHaveLength(3));
+      await waitFor(() => expect(button('Try again')).toBeEnabled());
       const retry2Text = screen.getByRole('alert').textContent;
       expect(retry2Text).toContain('recovery key');
 
@@ -995,356 +799,381 @@ describe('MFASetup', () => {
     });
   });
 
-  // ── Replace step (spec §4.6.4, R-9) ───────────────────────────────────────
+  // F16: the done screen says plainly when there is no usable key.
+  it('continuing without a recovery key says so on the done screen (F16)', async () => {
+    serve({ recoveryKey: () => jsonResponse(500, {}) });
+    await toRecoveryStep();
+
+    await screen.findByText('Continue without a recovery key');
+    click('Continue without a recovery key');
+    expect(await screen.findByText('MFA Activated!')).toBeInTheDocument();
+    expect(screen.getByText(/This account has no recovery key you can use\./)).toBeInTheDocument();
+  });
+
+  // ── Replace step (#6; spec §4.6.4, R-9) ───────────────────────────────────
+
+  /** The recovery-* fields of every recovery-key PUT, in call order. */
+  const recoveryBodies = () =>
+    bodiesTo(mockApiFetch, PATHS.recoveryKey).map((body) => ({
+      recovery_wrapped_private_key: body.recovery_wrapped_private_key,
+      recovery_key_salt: body.recovery_key_salt,
+      recovery_wrapped_prefs_key: body.recovery_wrapped_prefs_key,
+      recovery_prefs_key_salt: body.recovery_prefs_key_salt,
+    }));
+
+  const replaceButton = () => button(REPLACE_LABEL);
 
   describe('recovery-key replace step', () => {
-    const setupToKept = async (user: ReturnType<typeof userEvent.setup>) => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ backup_codes: ['CODE1'] }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 403,
-          json: async () => ({ password_required: true }),
-        });
-
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-      await vi.waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Replace recovery key' })).toBeInTheDocument()
-      );
-    };
-
     it('Back returns to recovery-kept without submitting a request', async () => {
-      const user = userEvent.setup();
-      await setupToKept(user);
-      const callsBefore = mockApiFetch.mock.calls.length;
+      const api = serve({ recoveryKey: keptThen() });
+      await toReplaceStep(api);
 
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
-      );
-
-      await user.click(screen.getByText('Back'));
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText(/A recovery key is already saved for your account/)
-        ).toBeInTheDocument();
-      });
-      expect(mockApiFetch.mock.calls.length).toBe(callsBefore);
+      click('Back');
+      expect(
+        await screen.findByText(/A recovery key is already saved for your account/)
+      ).toBeInTheDocument();
+      // Only the first store: opening and leaving the step sent no key.
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(1);
     });
 
     it('happy path: submits the new key and lands on the recovery step showing it', async () => {
-      const user = userEvent.setup();
-      await setupToKept(user);
+      const api = serve({ recoveryKey: keptThen() });
+      await toReplaceStep(api, ['totp']);
 
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
-      );
+      typePassword('freshpw');
+      await typeCode();
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
 
-      await user.type(screen.getByPlaceholderText('Your password'), 'freshpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-
-      mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) }); // overwrite PUT
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-
-      await vi.waitFor(() => {
-        expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument();
-        expect(screen.getByText('AAAA-BBBB-CCCC-DDDD')).toBeInTheDocument();
+      await screen.findByTestId('recovery-key-display');
+      expect(screen.getByText('AAAA-BBBB-CCCC-DDDD')).toBeInTheDocument();
+      const [, body] = bodiesTo(mockApiFetch, PATHS.recoveryKey);
+      expect(body).toMatchObject({
+        password: 'freshpw', // pragma: allowlist secret
+        mfa_code: FIXTURE_OTP,
+        recovery_wrapped_private_key: 'mock-wrapped-key', // pragma: allowlist secret
       });
+    });
 
-      const call = [...mockApiFetch.mock.calls]
-        .reverse()
-        .find((c) => c[0] === '/api/v1/mfa/recovery-key');
-      expect(call).toBeDefined();
-      const body = JSON.parse((call![1] as { body: string }).body);
-      expect(body.password).toBe('freshpw');
-      expect(body.mfa_code).toBe('654321');
+    // §1.3. Mutant: the code field renders unconditionally on the replace step.
+    it('asks for the password alone when the read offers no method', async () => {
+      const api = serve({ recoveryKey: keptThen() });
+      await toReplaceStep(api, []);
+
+      typePassword('freshpw');
+      await untilActionable(REPLACE_LABEL);
+      expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+
+      click(REPLACE_LABEL);
+      await screen.findByTestId('recovery-key-display');
+      const [, body] = bodiesTo(mockApiFetch, PATHS.recoveryKey);
+      expect(body).toHaveProperty('password', 'freshpw');
+      expect(body).not.toHaveProperty('mfa_code');
+    });
+
+    // The replace step is the one #5/#6 surface that does take a backup code.
+    it('offers a backup code beside TOTP when the read reports one, and sends it as mfa_code', async () => {
+      const api = serve({ recoveryKey: keptThen(), backup: true });
+      await toReplaceStep(api, ['totp']);
+
+      typePassword('freshpw');
+      fireEvent.click(await screen.findByRole('button', { name: 'Use a backup code instead' }));
+      fireEvent.change(screen.getByLabelText('Backup code'), { target: { value: 'EXCI3G5F' } });
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+
+      await screen.findByTestId('recovery-key-display');
+      expect(bodiesTo(mockApiFetch, PATHS.recoveryKey)[1]).toMatchObject({ mfa_code: 'EXCI3G5F' });
     });
 
     it('refusal routing: invalidPassword shows the field error and clears the password', async () => {
-      const user = userEvent.setup();
-      await setupToKept(user);
-
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
-      );
-
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '000000');
-
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        json: async () => ({ error: 'Invalid password' }),
+      const api = serve({
+        recoveryKey: keptThen(() => jsonResponse(403, { error: 'Invalid password' })),
       });
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+      await toReplaceStep(api, ['totp']);
+      typePassword('wrongpw');
+      await typeCode('000000');
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
 
-      await vi.waitFor(() => {
-        expect(screen.getByText('That password is not correct.')).toBeInTheDocument();
-      });
-      expect((screen.getByPlaceholderText('Your password') as HTMLInputElement).value).toBe('');
+      expect(await screen.findByText('That password is not correct.')).toBeInTheDocument();
+      expect(valueOf('Password')).toBe('');
       // Refusal keeps the wizard on the replace step, not the recovery step.
       expect(screen.queryByTestId('recovery-key-display')).not.toBeInTheDocument();
     });
 
-    it('refusal routing: invalidMfaCode shows the prompt error and clears the code', async () => {
-      const user = userEvent.setup();
-      await setupToKept(user);
-
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
-      );
-
-      await user.type(screen.getByPlaceholderText('Your password'), 'freshpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '000000');
-
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        json: async () => ({ error: 'Invalid MFA code' }),
+    it('refusal routing: invalidMfaCode shows the code error and clears the code', async () => {
+      const api = serve({
+        recoveryKey: keptThen(() => jsonResponse(403, { error: 'Invalid MFA code' })),
       });
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+      await toReplaceStep(api, ['totp']);
+      typePassword('freshpw');
+      await typeCode('000000');
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
 
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText('That code is not correct, or it has expired. Try the next one.')
-        ).toBeInTheDocument();
-      });
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(
+        await screen.findByText(
+          "That code didn't work. It may be mistyped or already used. Enter the next code your app shows."
+        )
+      ).toBeInTheDocument();
+      expect(valueOf(CODE_LABEL)).toBe('');
     });
 
     // The server accepts each code once and can accept it yet still fail the
     // request, so a code that reached it is never offered again.
-    it('a 500 after the code was sent clears the code and disables Replace', async () => {
-      const user = userEvent.setup();
-      await setupToKept(user);
-
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'freshpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        json: async () => ({ error: 'Internal server error' }),
+    it('a 500 after the code was sent clears the code and puts Replace back down', async () => {
+      const api = serve({
+        recoveryKey: keptThen(() => jsonResponse(500, { error: 'Internal server error' })),
       });
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+      await toReplaceStep(api, ['totp']);
+      typePassword('freshpw');
+      await typeCode();
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
 
-      await vi.waitFor(() => {
-        expect(screen.getByText('Internal server error')).toBeInTheDocument();
-      });
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
-      expect(screen.getByRole('button', { name: 'Replace recovery key' })).toBeDisabled();
+      expect(await screen.findByText('Internal server error')).toBeInTheDocument();
+      expect(valueOf(CODE_LABEL)).toBe('');
+      expect(replaceButton()).toHaveAttribute('aria-disabled', 'true');
     });
 
     it('a wrong password keeps the code, which the server never read', async () => {
-      const user = userEvent.setup();
-      await setupToKept(user);
-
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByText('Your old recovery key will stop working.')).toBeInTheDocument()
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        json: async () => ({ error: 'Invalid password' }),
+      const api = serve({
+        recoveryKey: keptThen(() => jsonResponse(403, { error: 'Invalid password' })),
       });
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
+      await toReplaceStep(api, ['totp']);
+      typePassword('wrongpw');
+      await typeCode();
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
 
-      await vi.waitFor(() => {
-        expect(screen.getByText('That password is not correct.')).toBeInTheDocument();
+      await screen.findByText('That password is not correct.');
+      expect(valueOf(CODE_LABEL)).toBe(FIXTURE_OTP);
+    });
+  });
+
+  // ── Preparation before the activation (#6; C9, C82, D11) ──────────────────
+
+  describe('recovery-key replace step — preparation', () => {
+    // Mutant: the stage drops `preparing`. The primary would be live while the
+    // key is still being wrapped, and a click would run before there is
+    // anything to send.
+    it('keeps the primary down and sends no PUT until the new key is prepared', async () => {
+      const api = serve({ recoveryKey: keptThen() });
+      await toKeptStep();
+      const wrapping = deferred<{ wrappedKey: string; salt: string }>();
+      vi.mocked(wrapWithRecoveryKey).mockImplementationOnce(() => wrapping.promise);
+
+      api.offers = [];
+      click(REPLACE_LABEL);
+      await screen.findByText('Your old recovery key will stop working.');
+      typePassword('freshpw');
+      // The read has landed and the password is in: only preparation is missing.
+      await waitFor(() => expect(readCount(mockApiFetch)).toBe(2));
+      await act(async () => {});
+
+      expect(replaceButton()).toHaveAttribute('aria-disabled', 'true');
+      click(REPLACE_LABEL);
+      expect(screen.getByRole('status')).toHaveTextContent('Getting things ready…');
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(1);
+
+      await act(async () => wrapping.resolve({ wrappedKey: 'late-wrapped', salt: 'late-salt' }));
+      await untilActionable(REPLACE_LABEL);
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(1);
+
+      click(REPLACE_LABEL);
+      await screen.findByTestId('recovery-key-display');
+      expect(bodiesTo(mockApiFetch, PATHS.recoveryKey)[1]).toMatchObject({
+        recovery_wrapped_private_key: 'late-wrapped', // pragma: allowlist secret
       });
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('654321');
+    });
+
+    // C82. Mutant: the activation passes no capture, so `run` takes its own at
+    // the click. A change of account after the step opened would then go
+    // unnoticed, and key material wrapped for one account would be sent as
+    // another.
+    it('sends nothing when the account changed after the step opened', async () => {
+      const api = serve({ recoveryKey: keptThen() });
+      await toReplaceStep(api);
+      typePassword('freshpw');
+      await untilActionable(REPLACE_LABEL);
+
+      act(() => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 })));
+      click(REPLACE_LABEL);
+
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Sign in again'));
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(1);
+      expect(screen.queryByTestId('recovery-key-display')).not.toBeInTheDocument();
+    });
+
+    it('sends the PUT under a live ApiRequestContext', async () => {
+      const api = serve({ recoveryKey: keptThen() });
+      await toReplaceStep(api);
+      typePassword('freshpw');
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+      await screen.findByTestId('recovery-key-display');
+
+      const [, replaceContext] = contextsOf(PATHS.recoveryKey);
+      expect(replaceContext).toBeDefined();
+      expect(apiRequestContextIsCurrent(replaceContext as never)).toBe(true);
+    });
+
+    it('stays in the step, saying so, when this device holds no keys to wrap', async () => {
+      const api = serve({ recoveryKey: keptThen() });
+      await toKeptStep();
+      mockE2eeService.getWrappingKey.mockReturnValueOnce(null);
+      api.offers = [];
+      click(REPLACE_LABEL);
+      await screen.findByText('Your old recovery key will stop working.');
+      typePassword('freshpw');
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+
+      expect(
+        await screen.findByText(
+          "Your encryption keys aren't unlocked on this device, so a new recovery key can't be made here."
+        )
+      ).toBeInTheDocument();
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(1);
     });
   });
 
   // ── I1: the replace step routes every refusal kind ────────────────────────
 
   describe('recovery-key replace step — refusal table (I1)', () => {
-    const toReplaceStep = async (user: ReturnType<typeof userEvent.setup>) => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ backup_codes: ['CODE1'] }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 403,
-          json: async () => ({ password_required: true }),
-        }); // first store → kept
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-      await vi.waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Replace recovery key' })).toBeInTheDocument()
-      );
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() => expect(screen.getByLabelText('Password')).toBeInTheDocument());
+    const attempt = async () => {
+      typePassword('freshpw');
+      await typeCode();
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+      await waitFor(() => expect(screen.queryByText('Replacing...')).not.toBeInTheDocument());
     };
 
-    const attempt = async (
-      user: ReturnType<typeof userEvent.setup>,
-      response: { ok: boolean; status: number; body: unknown } | 'network'
-    ) => {
-      await user.type(screen.getByLabelText('Password'), 'freshpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-      if (response === 'network') {
-        mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
-      } else {
-        mockApiFetch.mockResolvedValueOnce({
-          ok: response.ok,
-          status: response.status,
-          json: async () => response.body,
-        });
-      }
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() => expect(screen.queryByText('Replacing...')).not.toBeInTheDocument());
+    const toReplace = async (response: 'network' | { status: number; body: unknown }) => {
+      const api = serve({
+        recoveryKey: keptThen(() =>
+          response === 'network' ? networkLoss() : jsonResponse(response.status, response.body)
+        ),
+      });
+      await toReplaceStep(api, ['totp']);
+      return api;
     };
-
-    const replaceButton = () => screen.getByRole('button', { name: 'Replace recovery key' });
 
     it.each([
       {
-        name: 'passwordRequired → password field error, password cleared',
-        response: { ok: false, status: 403, body: { password_required: true } },
+        name: 'passwordRequired → password field error, code kept',
+        response: { status: 403, body: { password_required: true } },
         text: 'Enter your password to continue.',
-        clearsPassword: true,
+        keepsCode: true,
         locks: false,
       },
       {
-        name: 'mfaRequired → code prompt error',
-        response: { ok: false, status: 403, body: { mfa_required: true, methods: ['totp'] } },
-        text: 'Verify with your authenticator app or security key to continue.',
-        clearsPassword: false,
+        name: 'mfaRequired → code field asks again',
+        response: { status: 403, body: { mfa_required: true, methods: ['totp'] } },
+        text: 'Enter the 6-digit code from your authenticator app to continue.',
         locks: false,
       },
       {
-        name: 'rateLimited → banner and lock',
-        response: { ok: false, status: 429, body: { error: 'Too many verification attempts' } },
+        // The budget answers before anything is read (C30), so the code is kept
+        // for when the limit lifts. Mutant: the hook's default clearing it.
+        name: 'rateLimited → banner and lock, code kept',
+        response: { status: 429, body: { error: 'Too many verification attempts' } },
         text: 'Too many attempts. Try again in a few minutes.',
-        clearsPassword: false,
-        locks: true,
-      },
-      {
-        name: 'sessionExpired → banner and lock',
-        response: { ok: false, status: 401, body: {} },
-        text: 'Your session needs to be verified again. Sign in again to continue.',
-        clearsPassword: false,
+        keepsCode: true,
         locks: true,
       },
       {
         name: 'unavailable → outage banner, no lock',
-        response: { ok: false, status: 503, body: {} },
+        response: { status: 503, body: {} },
         text: 'Verification is temporarily unavailable. Try again in a few minutes.',
-        clearsPassword: false,
         locks: false,
       },
       {
         name: 'failed → the server text in the banner',
-        response: { ok: false, status: 500, body: { error: 'Verification failed' } },
+        response: { status: 500, body: { error: 'Verification failed' } },
         text: 'Verification failed',
-        clearsPassword: false,
         locks: false,
       },
-    ])('$name', async ({ response, text, clearsPassword, locks }) => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
-      await attempt(user, response);
+    ])('$name', async ({ response, text, keepsCode, locks }) => {
+      await toReplace(response);
+      await attempt();
+
       expect(await screen.findByText(text)).toBeInTheDocument();
-      expect((screen.getByLabelText('Password') as HTMLInputElement).value).toBe(
-        clearsPassword ? '' : 'freshpw'
-      );
-      // Only a password refusal leaves the code unread; every other answer may
-      // have spent it, so the prompt comes back empty.
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe(
-        clearsPassword ? '654321' : ''
-      );
+      // None of these refusals names the password wrong, so it stays.
+      expect(valueOf('Password')).toBe('freshpw');
+      // A password refusal and a rate limit leave the code unread; every other
+      // answer may have spent it, so the field comes back empty.
+      expect(valueOf(CODE_LABEL)).toBe(keepsCode ? FIXTURE_OTP : '');
       // Re-entering what was cleared re-enables Replace unless the refusal locked it.
-      if (clearsPassword) await user.type(screen.getByLabelText('Password'), 'freshpw');
-      else await user.type(screen.getByTestId('mfa-verify-input'), '765432');
-      if (locks) expect(replaceButton()).toBeDisabled();
-      else expect(replaceButton()).toBeEnabled();
+      if (!keepsCode) await typeCode('765432');
+      if (locks) expect(replaceButton()).toHaveAttribute('aria-disabled', 'true');
+      else expect(replaceButton()).not.toHaveAttribute('aria-disabled');
       expect(screen.queryByTestId('recovery-key-display')).not.toBeInTheDocument();
     });
 
-    it('an mfa_required refusal prompts for the methods the server named', async () => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
-      await attempt(user, {
-        ok: false,
-        status: 403,
-        body: { mfa_required: true, methods: ['webauthn', 'email'] },
-      });
-      await vi.waitFor(() =>
-        expect(screen.getByTestId('mfa-verify-prompt').dataset.methods).toBe('webauthn')
-      );
+    // Mutant: a 401 mapped to `answered`, which left the stage live with the
+    // password and an active Replace under a dead session (picker PR 3 review).
+    it('sessionExpired → the terminal state: one sentence, no fields, Replace inert', async () => {
+      await toReplace({ status: 401, body: {} });
+      await attempt();
+
+      expect(await screen.findByText('Sign in again to continue.')).toBeInTheDocument();
+      expect(screen.getAllByText(/Sign in again/)).toHaveLength(1);
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+      expect(replaceButton()).toHaveAttribute('aria-disabled', 'true');
+      click(REPLACE_LABEL);
+      // The first store and the one refused attempt; the inert click added none.
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(2);
+    });
+
+    it('a locked primary sends nothing when activated', async () => {
+      await toReplace({ status: 429, body: {} });
+      await attempt();
+      await screen.findByText('Too many attempts. Try again in a few minutes.');
+
+      typePassword('freshpw');
+      await typeCode('765432');
+      click(REPLACE_LABEL);
+      // The first store and the one refused attempt; the locked click added none.
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(2);
     });
 
     it('a lock survives Back and reopening the step (F10)', async () => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
-      await attempt(user, { ok: false, status: 429, body: {} });
-      await user.click(screen.getByRole('button', { name: 'Back' }));
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await user.type(screen.getByLabelText('Password'), 'freshpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-      expect(replaceButton()).toBeDisabled();
+      const api = await toReplace({ status: 429, body: {} });
+      await attempt();
+      click('Back');
+      api.offers = ['totp'];
+      click(REPLACE_LABEL);
+      typePassword('freshpw');
+      await typeCode();
+
+      expect(replaceButton()).toHaveAttribute('aria-disabled', 'true');
       expect(
         screen.getByText('Too many attempts. Try again in a few minutes.')
       ).toBeInTheDocument();
     });
 
     it('a password refusal focuses the password field once it is enabled again (F4)', async () => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
-      await attempt(user, { ok: false, status: 403, body: { error: 'Invalid password' } });
-      await vi.waitFor(() =>
-        expect(document.activeElement).toBe(screen.getByLabelText('Password'))
-      );
+      await toReplace({ status: 403, body: { error: 'Invalid password' } });
+      await attempt();
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Password')));
     });
 
     it('after an ambiguous outcome, Back no longer claims the old key was left in place', async () => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
-      await attempt(user, 'network');
-      await user.click(screen.getByRole('button', { name: 'Back' }));
+      await toReplace('network');
+      await attempt();
+      await screen.findByText("Couldn't reach the server. Check your connection and try again.");
+      click('Back');
 
       expect(screen.queryByText(/so we left it in place/)).not.toBeInTheDocument();
       expect(
         screen.getByText(/couldn't confirm whether your recovery key was replaced/)
       ).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Finish replacing' })).toBeInTheDocument();
+      expect(button('Finish replacing')).toBeInTheDocument();
 
-      await user.click(screen.getByRole('button', { name: 'Continue' }));
+      click('Continue');
       expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
       expect(
         screen.getByText(/couldn't confirm your recovery key was replaced/)
@@ -1352,23 +1181,29 @@ describe('MFASetup', () => {
     });
 
     it('Finish replacing reopens the step and a success lands on the new key', async () => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
-      await attempt(user, 'network');
-      await user.click(screen.getByRole('button', { name: 'Back' }));
-      await user.click(screen.getByRole('button', { name: 'Finish replacing' }));
-      await attempt(user, { ok: true, status: 200, body: {} });
-      await vi.waitFor(() =>
-        expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument()
-      );
-      await user.click(screen.getByTestId('recovery-confirm'));
+      const api = serve({
+        recoveryKey: (n) =>
+          n === 1
+            ? jsonResponse(403, { password_required: true })
+            : n === 2
+              ? networkLoss()
+              : jsonResponse(200),
+      });
+      await toReplaceStep(api, ['totp']);
+      await attempt();
+      await screen.findByText("Couldn't reach the server. Check your connection and try again.");
+      click('Back');
+      click('Finish replacing');
+      await attempt();
+
+      await screen.findByTestId('recovery-key-display');
+      fireEvent.click(screen.getByTestId('recovery-confirm'));
       expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
       expect(screen.queryByText(/couldn't confirm/)).not.toBeInTheDocument();
     });
 
     it('the lead line and the consequence come before the fields (F16)', async () => {
-      const user = userEvent.setup();
-      await toReplaceStep(user);
+      await toReplace({ status: 500, body: {} });
       const consequence = screen.getByText('Your old recovery key will stop working.');
       const password = screen.getByLabelText('Password');
       expect(screen.getByText(/^Make a new recovery key\./)).toBeInTheDocument();
@@ -1376,58 +1211,6 @@ describe('MFASetup', () => {
         consequence.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING
       ).toBeTruthy();
     });
-  });
-
-  // ── F16: the done screen says plainly when there is no usable key ────────
-
-  it('continuing without a recovery key says so on the done screen (F16)', async () => {
-    mockApiFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ backup_codes: ['CODE1'] }) })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) });
-    const user = userEvent.setup();
-    render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-    await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-    await user.click(screen.getByText('Continue'));
-    await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-    await user.click(screen.getByTestId('totp-submit'));
-    await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-    await user.click(screen.getByTestId('backup-confirm'));
-    await vi.waitFor(() =>
-      expect(screen.getByText('Continue without a recovery key')).toBeInTheDocument()
-    );
-    await user.click(screen.getByText('Continue without a recovery key'));
-    expect(screen.getByText('MFA Activated!')).toBeInTheDocument();
-    expect(screen.getByText(/This account has no recovery key you can use\./)).toBeInTheDocument();
-  });
-
-  // ── F3's twin on the password step ───────────────────────────────────────
-
-  it('an mfa_required answer on the password step shows the prompt even when mfaActive was false', async () => {
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({
-        error: 'MFA verification required',
-        mfa_required: true,
-        methods: ['totp', 'email'],
-      }),
-    });
-    const user = userEvent.setup();
-    render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-    expect(screen.queryByTestId('mfa-verify-prompt')).not.toBeInTheDocument();
-    await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-    await user.click(screen.getByText('Continue'));
-
-    const prompt = await screen.findByTestId('mfa-verify-prompt');
-    expect(prompt.dataset.methods).toBe('totp');
-    expect(screen.getByText('Continue')).toBeDisabled();
-    await user.type(screen.getByTestId('mfa-verify-input'), '123456');
-    expect(screen.getByText('Continue')).toBeEnabled();
   });
 
   // ── Recovery-key identity across an ambiguous retry (C4, F1/F2) ─────────
@@ -1468,338 +1251,282 @@ describe('MFASetup', () => {
         .mockResolvedValue({ wrappedKey: 'mock-wrapped-prefs', salt: 'mock-prefs-salt' });
     });
 
-    /** The recovery-* fields of every recovery-key PUT, in call order. */
-    const recoveryBodies = () =>
-      mockApiFetch.mock.calls
-        .filter((c) => c[0] === '/api/v1/mfa/recovery-key')
-        .map((c) => {
-          const body = JSON.parse((c[1] as { body: string }).body) as Record<string, string>;
-          return {
-            recovery_wrapped_private_key: body.recovery_wrapped_private_key,
-            recovery_key_salt: body.recovery_key_salt,
-            recovery_wrapped_prefs_key: body.recovery_wrapped_prefs_key,
-            recovery_prefs_key_salt: body.recovery_prefs_key_salt,
-          };
-        });
-
     /** The key a body wraps, read back out of `wrapped(<key>)`. */
     const keyWrappedBy = (wrapped: string) => /^wrapped\((.+)\)$/.exec(wrapped)?.[1];
 
     it('first store: a retry after a lost response resends identical bytes and shows the key they wrap', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ backup_codes: ['CODE1'] }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockRejectedValueOnce(new TypeError('Failed to fetch')); // PUT #1: response lost
+      // PUT #1: response lost. The retry's idempotent re-store answers 200.
+      serve({ recoveryKey: (n) => (n === 1 ? networkLoss() : jsonResponse(200)) });
+      await toRecoveryStep();
+      await screen.findByText('Try again');
 
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-      await vi.waitFor(() => expect(screen.getByText('Try again')).toBeInTheDocument());
-
-      // The server committed PUT #1 and the idempotent re-store answers 200.
-      mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-      await user.click(screen.getByText('Try again'));
-      await vi.waitFor(() =>
-        expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument()
-      );
+      click('Try again');
+      await screen.findByTestId('recovery-key-display');
 
       const [first, retry] = recoveryBodies();
       expect(retry, 'the retry must resend the exact bytes of the first attempt').toEqual(first);
       expect(screen.getByTestId('recovery-key').textContent).toBe(
-        keyWrappedBy(retry.recovery_wrapped_private_key)
+        keyWrappedBy(retry.recovery_wrapped_private_key as string)
       );
     });
 
     it('replace: a retry after a network error resends identical bytes and shows the key they wrap', async () => {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'S' }),
-        })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ backup_codes: ['CODE1'] }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // confirm-setup
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 403,
-          json: async () => ({ password_required: true }),
-        }); // first store: a key already exists → kept
-
-      const user = userEvent.setup();
-      render(<MFASetup method="totp" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'pw');
-      await user.click(screen.getByText('Continue'));
-      await vi.waitFor(() => expect(screen.getByTestId('totp-submit')).toBeInTheDocument());
-      await user.click(screen.getByTestId('totp-submit'));
-      await vi.waitFor(() => expect(screen.getByTestId('backup-confirm')).toBeInTheDocument());
-      await user.click(screen.getByTestId('backup-confirm'));
-      await vi.waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Replace recovery key' })).toBeInTheDocument()
-      );
-
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() => expect(screen.getByLabelText('Password')).toBeInTheDocument());
-      await user.type(screen.getByLabelText('Password'), 'freshpw');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-
-      mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch')); // replace #1 lost
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(
-          screen.getByText("Couldn't reach the server. Check your connection and try again.")
-        ).toBeInTheDocument()
-      );
+      // PUT #1 is the first store (kept), #2 the lost replace, #3 its retry.
+      const api = serve({
+        recoveryKey: (n) =>
+          n === 1
+            ? jsonResponse(403, { password_required: true })
+            : n === 2
+              ? networkLoss()
+              : jsonResponse(200),
+      });
+      await toReplaceStep(api, ['totp']);
+      typePassword('freshpw');
+      await typeCode();
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+      await screen.findByText("Couldn't reach the server. Check your connection and try again.");
 
       // The first code may have been spent by the lost request, so the retry
       // needs a fresh one; the key material must still be byte-identical.
-      await user.type(screen.getByTestId('mfa-verify-input'), '765432');
-      mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) }); // replace #2
-      await user.click(screen.getByRole('button', { name: 'Replace recovery key' }));
-      await vi.waitFor(() =>
-        expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument()
-      );
+      await typeCode('765432');
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+      await screen.findByTestId('recovery-key-display');
 
-      // Body [0] is the credential-less first store (kept); [1] and [2] are the
-      // two replace attempts.
       const [, attempt, retry] = recoveryBodies();
       expect(retry, 'the retry must resend the exact bytes of the first attempt').toEqual(attempt);
       expect(screen.getByTestId('recovery-key').textContent).toBe(
-        keyWrappedBy(retry.recovery_wrapped_private_key)
+        keyWrappedBy(retry.recovery_wrapped_private_key as string)
       );
     });
   });
 
-  // ── WebAuthn Flow ──────────────────────────────────────────────────────
+  // ── WebAuthn Flow (#5) ─────────────────────────────────────────────────
 
   describe('WebAuthn Flow', () => {
     it('renders WebAuthn setup wizard title for hardware key', () => {
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
+      renderKey();
       expect(screen.getByText('Set Up Security Key')).toBeInTheDocument();
     });
 
     it('renders WebAuthn setup wizard title for platform authenticator', () => {
-      render(
-        <MFASetup
-          method="webauthn"
-          credentialType="platform"
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
+      renderKey({ credentialType: 'platform' });
       expect(screen.getByText('Set Up Platform Authenticator')).toBeInTheDocument();
     });
 
-    it('renders password input for WebAuthn', () => {
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      expect(screen.getByPlaceholderText('Your password')).toBeInTheDocument();
+    it('labels the password field', () => {
+      renderKey();
+      expect(screen.getByLabelText('Password')).toBeInTheDocument();
     });
 
-    it('renders key name input with hardware key placeholder', () => {
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      expect(
-        screen.getByPlaceholderText('Key name (e.g. YubiKey 5, Google Titan)')
-      ).toBeInTheDocument();
+    // Mutant: the label's `htmlFor` or the input's `id` is dropped. The field
+    // would be unnamed to a screen reader, with only the placeholder left.
+    it('gives the key name field an accessible label, with the hardware placeholder', () => {
+      renderKey();
+      const field = screen.getByLabelText('Key name');
+      expect(field).toHaveAttribute('placeholder', 'Key name (e.g. YubiKey 5, Google Titan)');
     });
 
-    it('renders key name input with platform placeholder', () => {
-      render(
-        <MFASetup
-          method="webauthn"
-          credentialType="platform"
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
+    it('gives the key name field an accessible label, with the platform placeholder', () => {
+      renderKey({ credentialType: 'platform' });
+      expect(screen.getByLabelText('Key name')).toHaveAttribute(
+        'placeholder',
+        'Key name (e.g. MacBook Touch ID, Windows Hello)'
       );
-      expect(
-        screen.getByPlaceholderText('Key name (e.g. MacBook Touch ID, Windows Hello)')
-      ).toBeInTheDocument();
     });
 
     it('renders Register Key button', () => {
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      expect(screen.getByText('Register Key')).toBeInTheDocument();
+      renderKey();
+      expect(button('Register Key')).toBeInTheDocument();
     });
 
-    it('disables Register Key button when password is empty', () => {
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      expect(screen.getByText('Register Key')).toBeDisabled();
+    it('keeps Register Key aria-disabled, not natively disabled, until the password is entered', async () => {
+      renderKey();
+      expect(button('Register Key')).toHaveAttribute('aria-disabled', 'true');
+      expect(button('Register Key')).not.toBeDisabled();
+
+      typePassword();
+      await untilActionable('Register Key');
+      expect(button('Register Key')).not.toBeDisabled();
     });
 
-    it('enables Register Key button when password is entered', async () => {
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      expect(screen.getByText('Register Key')).not.toBeDisabled();
-    });
-
-    it('calls onCancel when cancel button is clicked in WebAuthn flow', async () => {
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.click(screen.getByText('Cancel'));
+    it('calls onCancel when cancel button is clicked in WebAuthn flow', () => {
+      renderKey();
+      click('Cancel');
       expect(onCancel).toHaveBeenCalled();
     });
 
-    it('shows MFA verify prompt when mfaActive in WebAuthn flow', () => {
-      render(
-        <MFASetup
-          method="webauthn"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      expect(screen.getByTestId('mfa-verify-prompt')).toBeInTheDocument();
-    });
-
     it('shows identity verification message for WebAuthn when mfaActive', () => {
-      render(<MFASetup method="webauthn" mfaActive onComplete={onComplete} onCancel={onCancel} />);
+      renderKey({ mfaActive: true });
       expect(screen.getByText('Verify your identity and name your key.')).toBeInTheDocument();
     });
 
     it('shows password prompt for WebAuthn when not mfaActive', () => {
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
+      renderKey();
       expect(screen.getByText('Enter your password and name your key.')).toBeInTheDocument();
     });
 
-    it('shows error on WebAuthn begin failure', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        json: async () => ({ error: 'Incorrect password' }),
+    // §1.3.
+    it('asks for no code when the read offers no method', async () => {
+      renderKey();
+      typePassword();
+      await untilActionable('Register Key');
+      expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+    });
+
+    it('keeps Register Key down until the offered code is entered', async () => {
+      serve({ offers: ['totp'] });
+      renderKey({ mfaActive: true });
+      typePassword();
+      await screen.findByLabelText(CODE_LABEL);
+      expect(button('Register Key')).toHaveAttribute('aria-disabled', 'true');
+      expect(callsTo(PATHS.keyBegin)).toHaveLength(0);
+    });
+
+    // The activation captured the name, as it does the password, so an edit
+    // while the step-up's security-key prompt is open would be shown but not
+    // sent. Mutant: the field disabled for `submitting` only (picker PR 3 review).
+    it('freezes the key name while the step-up security-key prompt is open', async () => {
+      const begin = deferred<Response>();
+      serve({ offers: ['webauthn'], inlineBegin: () => begin.promise });
+      renderKey({ mfaActive: true });
+      fireEvent.change(screen.getByLabelText('Key name'), { target: { value: 'Key A' } });
+      typePassword();
+      await untilActionable('Register Key');
+      // Positive control: editable before the activation.
+      expect(screen.getByLabelText('Key name')).not.toHaveAttribute('readonly');
+
+      click('Register Key');
+      await waitFor(() => expect(callsTo(PATHS.inlineBegin)).toHaveLength(1));
+      expect(screen.getByLabelText('Key name')).toHaveAttribute('readonly');
+
+      // The prompt ends without a token: the field is editable again.
+      await act(async () => begin.resolve(jsonResponse(500, {})));
+      await waitFor(() =>
+        expect(screen.getByLabelText('Key name')).not.toHaveAttribute('readonly')
+      );
+      expect(callsTo(PATHS.keyBegin)).toHaveLength(0);
+    });
+
+    it('sends the typed key name, the credential type and the code on begin and finish', async () => {
+      serve({ offers: ['totp'] });
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey({ mfaActive: true, credentialType: 'platform' });
+      fireEvent.change(screen.getByLabelText('Key name'), { target: { value: 'My Touch ID' } });
+      await beginKey(true);
+
+      await screen.findByText('Security Key Registered!');
+      expect(bodiesTo(mockApiFetch, PATHS.keyBegin)[0]).toEqual({
+        credential_name: 'My Touch ID',
+        credential_type: 'platform',
+        password: FIXTURE_PW,
+        mfa_code: FIXTURE_OTP,
       });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpw');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Incorrect password')).toBeInTheDocument();
+      expect(bodiesTo(mockApiFetch, PATHS.keyFinish)[0]).toMatchObject({
+        credential_name: 'My Touch ID',
       });
     });
 
-    // Wrong-password and rate-limited begin refusals now route through the
-    // shared step-up classifier and copy (mfaStepUp.ts) instead of showing
-    // the server's raw text, matching every other step-up surface.
+    it('names the key "Security Key" when none is typed', async () => {
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
+
+      await screen.findByText('Security Key Registered!');
+      expect(bodiesTo(mockApiFetch, PATHS.keyBegin)[0]).toMatchObject({
+        credential_name: 'Security Key',
+      });
+    });
+
+    it('admits both registration requests against the one capture', async () => {
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
+      await screen.findByText('Security Key Registered!');
+
+      const [begin] = contextsOf(PATHS.keyBegin);
+      const [finish] = contextsOf(PATHS.keyFinish);
+      expect(begin).toBeDefined();
+      expect(finish).toBe(begin);
+    });
+
+    it('shows the server text on a begin failure', async () => {
+      serve({ keyBegin: () => jsonResponse(500, { error: 'Incorrect password' }) });
+      renderKey();
+      await beginKey();
+      expect(await screen.findByText('Incorrect password')).toBeInTheDocument();
+    });
+
+    // Wrong-password and rate-limited begin refusals route through the shared
+    // step-up classifier and copy (mfaStepUp.ts), not the server's raw text.
     it('shows the shared copy against the password field for an invalidPassword begin refusal', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        json: async () => ({ error: 'Invalid password' }),
-      });
+      serve({ keyBegin: () => jsonResponse(403, { error: 'Invalid password' }) });
+      renderKey();
+      await beginKey();
 
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpw');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('That password is not correct.')).toBeInTheDocument();
-        expect(screen.getByPlaceholderText('Your password').className).toContain('error');
-      });
+      expect(await screen.findByText('That password is not correct.')).toBeInTheDocument();
+      expect(screen.getByLabelText('Password')).toHaveAttribute('aria-invalid', 'true');
     });
 
     it('shows the shared rate-limit copy for a 429 begin refusal', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 429,
-        json: async () => ({ error: 'Too many verification attempts' }),
+      serve({
+        keyBegin: () => jsonResponse(429, { error: 'Too many verification attempts' }),
       });
+      renderKey();
+      await beginKey();
 
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'wrongpw');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText('Too many attempts. Try again in a few minutes.')
-        ).toBeInTheDocument();
-      });
+      expect(
+        await screen.findByText('Too many attempts. Try again in a few minutes.')
+      ).toBeInTheDocument();
     });
 
-    it('transitions to registering step and shows waiting message on success begin', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          publicKey: {
-            challenge: 'dGVzdC1jaGFsbGVuZ2U',
-            rp: { name: 'Concord', id: 'localhost' },
-            user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-          },
-        }),
-      });
+    it('treats an accepted begin answer without creation options as a failed begin', async () => {
+      serve({ keyBegin: () => jsonResponse(200, { nothing: true }) });
+      renderKey();
+      await beginKey();
 
-      // navigator.credentials.create never resolves (simulates waiting for key)
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockReturnValue(new Promise(() => {})),
-        },
-        writable: true,
-        configurable: true,
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Waiting for your security key...')).toBeInTheDocument();
-      });
+      expect(await screen.findByText('Something went wrong. Try again.')).toBeInTheDocument();
+      expect(screen.queryByText('Waiting for your security key...')).not.toBeInTheDocument();
     });
 
-    // Registers a security key whose finish request answers finishOk.
-    async function registerSecurityKey(finishOk: boolean) {
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            publicKey: {
-              challenge: 'dGVzdC1jaGFsbGVuZ2U',
-              rp: { name: 'Concord', id: 'localhost' },
-              user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-              pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-            },
-          }),
-        })
-        .mockResolvedValueOnce({
-          ok: finishOk,
-          json: async () => (finishOk ? {} : { error: 'Registration failed' }),
-        });
-      const buffer = new Uint8Array([1, 2, 3]).buffer;
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockResolvedValue({
-            id: 'credential-id',
-            rawId: buffer,
-            type: 'public-key',
-            response: { attestationObject: buffer, clientDataJSON: buffer },
-          }),
-        },
-        writable: true,
-        configurable: true,
-      });
+    it('transitions to the registering step and shows the waiting message on a successful begin', async () => {
+      stubCreate(() => new Promise(() => {}));
+      renderKey();
+      await beginKey();
 
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-      await vi.waitFor(() =>
-        expect(
-          screen.getByText(finishOk ? 'Security Key Registered!' : 'Registration failed')
-        ).toBeInTheDocument()
-      );
-    }
+      expect(await screen.findByText('Waiting for your security key...')).toBeInTheDocument();
+      // Waiting, not failed: Cancel is on offer and there is no retry yet.
+      expect(screen.queryByText('Try Again')).not.toBeInTheDocument();
+      expect(button('Cancel')).toBeInTheDocument();
+    });
+
+    it('shows Registering... while the begin request is out', async () => {
+      serve({ keyBegin: () => new Promise<Response>(() => {}) });
+      renderKey();
+      await beginKey();
+      expect(await screen.findByText('Registering...')).toBeInTheDocument();
+    });
+
+    it('shows the done step, and Done completes the wizard', async () => {
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
+
+      expect(await screen.findByText('Security Key Registered!')).toBeInTheDocument();
+      expect(
+        screen.getByText('Your security key is now active and protecting your account.')
+      ).toBeInTheDocument();
+      click('Done');
+      expect(onComplete).toHaveBeenCalled();
+    });
+
+    it('reaches the done step for a platform authenticator too', async () => {
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey({ credentialType: 'platform' });
+      await beginKey();
+      expect(await screen.findByText('Security Key Registered!')).toBeInTheDocument();
+    });
 
     // The server exempts the registering session from the pre-MFA challenge for
     // 30 s after a first enrollment; refreshing now uses that grant instead of
@@ -1810,7 +1537,14 @@ describe('MFASetup', () => {
     ] as const)(
       'refreshes the session right after registration only when it succeeds (finish ok: %s)',
       async (finishOk, refreshes) => {
-        await registerSecurityKey(finishOk);
+        serve({
+          keyFinish: () =>
+            finishOk ? jsonResponse(200, {}) : jsonResponse(400, { error: 'Registration failed' }),
+        });
+        stubCreate(() => Promise.resolve(mockCredential()));
+        renderKey();
+        await beginKey();
+        await screen.findByText(finishOk ? 'Security Key Registered!' : 'Registration failed');
         expect(mockRefreshAccessToken).toHaveBeenCalledTimes(refreshes);
       }
     );
@@ -1818,326 +1552,72 @@ describe('MFASetup', () => {
     it('finishes registration when the refresh after it rejects', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       mockRefreshAccessToken.mockRejectedValueOnce(new Error('ipc unavailable'));
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
 
-      await registerSecurityKey(true);
-
-      await vi.waitFor(() =>
+      await screen.findByText('Security Key Registered!');
+      await waitFor(() =>
         expect(warn).toHaveBeenCalledWith('[mfa] Refresh after enrollment failed')
       );
       warn.mockRestore();
     });
-
-    it('shows Registering... text while loading', async () => {
-      mockApiFetch.mockReturnValue(new Promise(() => {})); // never resolves
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Registering...')).toBeInTheDocument();
-      });
-    });
-
-    it('disables Register Key when mfaActive and no mfa code', async () => {
-      const user = userEvent.setup();
-      render(
-        <MFASetup
-          method="webauthn"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      expect(screen.getByText('Register Key')).toBeDisabled();
-    });
-
-    it('returns to password step on generic credentials.create error', async () => {
-      // Begin succeeds, browser credentials.create rejects with a generic error.
-      // Because the React state closure captures webauthnStep='password',
-      // shouldResetToPasswordStep returns true, resetting to the password step.
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          publicKey: {
-            challenge: 'dGVzdC1jaGFsbGVuZ2U',
-            rp: { name: 'Concord', id: 'localhost' },
-            user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-          },
-        }),
-      });
-
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockRejectedValue(new Error('Something went wrong')),
-        },
-        writable: true,
-        configurable: true,
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        // Returns to password step with the error banner shown
-        expect(screen.getByPlaceholderText('Your password')).toBeInTheDocument();
-        expect(screen.getByText('Something went wrong')).toBeInTheDocument();
-      });
-    });
-
-    it('shows Cancel button on registering step when no error (key waiting)', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          publicKey: {
-            challenge: 'dGVzdC1jaGFsbGVuZ2U',
-            rp: { name: 'Concord', id: 'localhost' },
-            user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-          },
-        }),
-      });
-
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockReturnValue(new Promise(() => {})),
-        },
-        writable: true,
-        configurable: true,
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Waiting for your security key...')).toBeInTheDocument();
-        // In waiting state (no error), Cancel button should be shown, not Try Again
-        expect(screen.queryByText('Try Again')).not.toBeInTheDocument();
-        expect(screen.getByText('Cancel')).toBeInTheDocument();
-      });
-    });
-
-    it('returns to password step when NotAllowedError occurs (user cancelled)', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          publicKey: {
-            challenge: 'dGVzdC1jaGFsbGVuZ2U',
-            rp: { name: 'Concord', id: 'localhost' },
-            user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-          },
-        }),
-      });
-
-      const notAllowedError = new DOMException('User cancelled', 'NotAllowedError');
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockRejectedValue(notAllowedError),
-        },
-        writable: true,
-        configurable: true,
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        // NotAllowedError classifies to "Registration cancelled or timed out"
-        // and shouldResetToPasswordStep returns true, so we're back to password step
-        expect(screen.getByPlaceholderText('Your password')).toBeInTheDocument();
-        expect(
-          screen.getByText('Registration cancelled or timed out. Try again.')
-        ).toBeInTheDocument();
-      });
-    });
-
-    it('shows WebAuthn done step with Security Key Registered message', async () => {
-      // Simulate full WebAuthn success — need to complete the begin+finish flow
-      const mockCredential = {
-        id: 'mock-cred-id',
-        rawId: new ArrayBuffer(16),
-        type: 'public-key',
-        response: {
-          attestationObject: new ArrayBuffer(32),
-          clientDataJSON: new ArrayBuffer(32),
-        },
-      };
-
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            publicKey: {
-              challenge: 'dGVzdC1jaGFsbGVuZ2U',
-              rp: { name: 'Concord', id: 'localhost' },
-              user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-              pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-            },
-          }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({}),
-        });
-
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockResolvedValue(mockCredential),
-        },
-        writable: true,
-        configurable: true,
-      });
-
-      const user = userEvent.setup();
-      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Security Key Registered!')).toBeInTheDocument();
-        expect(
-          screen.getByText('Your security key is now active and protecting your account.')
-        ).toBeInTheDocument();
-      });
-
-      await user.click(screen.getByText('Done'));
-      expect(onComplete).toHaveBeenCalled();
-    });
-
-    it('renders platform authenticator title for WebAuthn done step', async () => {
-      const mockCredential = {
-        id: 'mock-cred-id',
-        rawId: new ArrayBuffer(16),
-        type: 'public-key',
-        response: {
-          attestationObject: new ArrayBuffer(32),
-          clientDataJSON: new ArrayBuffer(32),
-        },
-      };
-
-      mockApiFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            publicKey: {
-              challenge: 'dGVzdC1jaGFsbGVuZ2U',
-              rp: { name: 'Concord', id: 'localhost' },
-              user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-              pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-            },
-          }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({}),
-        });
-
-      Object.defineProperty(navigator, 'credentials', {
-        value: {
-          create: vi.fn().mockResolvedValue(mockCredential),
-        },
-        writable: true,
-        configurable: true,
-      });
-
-      const user = userEvent.setup();
-      render(
-        <MFASetup
-          method="webauthn"
-          credentialType="platform"
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.click(screen.getByText('Register Key'));
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Security Key Registered!')).toBeInTheDocument();
-      });
-    });
   });
 
-  // ── A sent code is never offered again ────────────────────────────────
+  // ── A failed key ceremony returns to the credentials step ───────────────
   //
-  // The server accepts a TOTP code at most once, and can accept it yet still
-  // fail the request. The password step keeps its password across a failure,
-  // so a code left behind it would re-send a spent code behind an enabled
-  // submit button.
+  // Begin spent the code or token that gated it, so a retry has to start at the
+  // credentials step, with its banner. The stage remounts there: its read runs
+  // again and the password and code it held are gone.
 
-  describe('password step drops a code once it was sent', () => {
-    const beginOk = () =>
-      mockApiFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          publicKey: {
-            challenge: 'dGVzdC1jaGFsbGVuZ2U',
-            rp: { name: 'Concord', id: 'localhost' },
-            user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
-            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-          },
-        }),
-      });
+  describe('a failed key ceremony returns to the password step', () => {
+    it('on a generic credentials.create error', async () => {
+      stubCreate(() => Promise.reject(new Error('Something went wrong')));
+      renderKey();
+      await beginKey();
 
-    const stubCreate = (create: () => Promise<unknown>) =>
-      Object.defineProperty(navigator, 'credentials', {
-        value: { create: vi.fn(create) },
-        writable: true,
-        configurable: true,
-      });
-
-    const renderWebAuthn = () =>
-      render(
-        <MFASetup
-          method="webauthn"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
-      );
-
-    const fillAndRegister = async (user: ReturnType<typeof userEvent.setup>) => {
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-      expect(screen.getByRole('button', { name: 'Register Key' })).toBeEnabled();
-      await user.click(screen.getByRole('button', { name: 'Register Key' }));
-    };
-
-    it('security key: a cancelled key dialog returns to a step that needs a new code', async () => {
-      beginOk();
-      stubCreate(() => Promise.reject(new DOMException('User cancelled', 'NotAllowedError')));
-
-      const user = userEvent.setup();
-      renderWebAuthn();
-      await fillAndRegister(user);
-
-      await vi.waitFor(() => {
-        expect(
-          screen.getByText('Registration cancelled or timed out. Try again.')
-        ).toBeInTheDocument();
-      });
-      // Back on the password step with the password kept but the spent code gone.
-      expect((screen.getByPlaceholderText('Your password') as HTMLInputElement).value).toBe(
-        'mypassword'
-      );
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
-      expect(screen.getByRole('button', { name: 'Register Key' })).toBeDisabled();
+      expect(await screen.findByText('Something went wrong')).toBeInTheDocument();
+      expect(screen.getByLabelText('Password')).toBeInTheDocument();
+      expect(button('Register Key')).toBeInTheDocument();
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(0);
     });
 
-    it('security key: Cancel while the key dialog is open, then its timeout, needs a new code', async () => {
-      beginOk();
+    it('on NotAllowedError (the user cancelled)', async () => {
+      stubCreate(() => Promise.reject(new DOMException('User cancelled', 'NotAllowedError')));
+      renderKey();
+      await beginKey();
+
+      expect(
+        await screen.findByText('Registration cancelled or timed out. Try again.')
+      ).toBeInTheDocument();
+      expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    });
+
+    it('on a rejected finish request', async () => {
+      serve({ keyFinish: () => jsonResponse(400, { error: 'Registration failed' }) });
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
+
+      expect(await screen.findByText('Registration failed')).toBeInTheDocument();
+      expect(screen.getByLabelText('Password')).toBeInTheDocument();
+      expect(screen.queryByText('Security Key Registered!')).not.toBeInTheDocument();
+    });
+
+    it('with the spent code gone and Register Key back down', async () => {
+      serve({ offers: ['totp'] });
+      stubCreate(() => Promise.reject(new DOMException('User cancelled', 'NotAllowedError')));
+      renderKey({ mfaActive: true });
+      await beginKey(true);
+
+      await screen.findByText('Registration cancelled or timed out. Try again.');
+      expect(valueOf(CODE_LABEL)).toBe('');
+      expect(button('Register Key')).toHaveAttribute('aria-disabled', 'true');
+      expect(callsTo(PATHS.keyBegin)).toHaveLength(1);
+    });
+
+    it('when Cancel is pressed while the key dialog is open and the dialog then times out', async () => {
+      serve({ offers: ['totp'] });
       // The OS dialog stays open until the test closes it.
       let closeDialog: (err: unknown) => void = () => {};
       stubCreate(
@@ -2146,71 +1626,347 @@ describe('MFASetup', () => {
             closeDialog = reject;
           })
       );
+      renderKey({ mfaActive: true });
+      await beginKey(true);
+      await screen.findByText('Waiting for your security key...');
 
-      const user = userEvent.setup();
-      renderWebAuthn();
-      await fillAndRegister(user);
-
-      await vi.waitFor(() => {
-        expect(screen.queryByPlaceholderText('Your password')).not.toBeInTheDocument();
-      });
-      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      click('Cancel');
       await act(async () => {
         closeDialog(new DOMException('Timed out', 'NotAllowedError'));
       });
 
-      await vi.waitFor(() => {
-        expect(screen.getByRole('button', { name: 'Register Key' })).toBeDisabled();
-      });
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      await waitFor(() => expect(button('Register Key')).toHaveAttribute('aria-disabled', 'true'));
+      expect(await screen.findByLabelText(CODE_LABEL)).toHaveValue('');
       // Only the begin request was sent; nothing re-sent the spent code.
-      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      expect(callsTo(PATHS.keyBegin)).toHaveLength(1);
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(0);
+      expect(onCancel).not.toHaveBeenCalled();
     });
 
-    it('security key: a failed begin clears the code and disables Register Key', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        json: async () => ({ error: 'Internal server error' }),
+    it('a failed begin clears the code and puts Register Key back down', async () => {
+      serve({
+        offers: ['totp'],
+        keyBegin: () => jsonResponse(500, { error: 'Internal server error' }),
       });
+      renderKey({ mfaActive: true });
+      await beginKey(true);
 
-      const user = userEvent.setup();
-      renderWebAuthn();
-      await fillAndRegister(user);
-
-      await vi.waitFor(() => {
-        expect(screen.getByText('Internal server error')).toBeInTheDocument();
-      });
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
-      expect(screen.getByRole('button', { name: 'Register Key' })).toBeDisabled();
+      expect(await screen.findByText('Internal server error')).toBeInTheDocument();
+      expect(valueOf(CODE_LABEL)).toBe('');
+      expect(button('Register Key')).toHaveAttribute('aria-disabled', 'true');
     });
+  });
 
-    it('authenticator app: a failed setup request clears the code and disables Continue', async () => {
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        json: async () => ({ error: 'Internal server error' }),
-      });
+  // ── The first store is bound to a capture (EE3) ──────────────────────────
+  //
+  // The double lacks apiFetch's pre-dispatch fence, so `fenceStaleCaptures`
+  // adds it: a request admitted against a capture that is no longer current is
+  // refused before it reaches the route, as apiFetch refuses it.
 
-      const user = userEvent.setup();
-      render(
-        <MFASetup
-          method="totp"
-          mfaActive
-          activeMethods={['totp']}
-          onComplete={onComplete}
-          onCancel={onCancel}
-        />
+  describe('first recovery-key store under a capture (EE3)', () => {
+    function fenceStaleCaptures() {
+      const dispatch = mockApiFetch.getMockImplementation();
+      if (dispatch === undefined) throw new Error('serve() first');
+      mockApiFetch.mockImplementation(
+        (path: string, init?: RequestInit, opts?: { context?: ApiRequestContext }) =>
+          opts?.context !== undefined && !apiRequestContextIsCurrent(opts.context)
+            ? Promise.reject(
+                new DOMException('Request lifecycle changed before dispatch', 'AbortError')
+              )
+            : dispatch(path, init, opts)
       );
-      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
-      await user.type(screen.getByTestId('mfa-verify-input'), '654321');
-      await user.click(screen.getByRole('button', { name: 'Continue' }));
+    }
 
-      await vi.waitFor(() => {
-        expect(screen.getByText('Internal server error')).toBeInTheDocument();
+    /** Confirms the codes with the key wrapping held; `switchAccount` lands while it is held. */
+    async function storeAcrossPreparation(switchAccount: boolean) {
+      const stored = vi.fn(() => jsonResponse(200, {}));
+      serve({ recoveryKey: stored });
+      fenceStaleCaptures();
+      const wrapping = deferred<{ wrappedKey: string; salt: string }>();
+      vi.mocked(wrapWithRecoveryKey).mockImplementationOnce(() => wrapping.promise);
+
+      await toRecoveryStep();
+      // The keys have been read: the capture was taken before that.
+      await waitFor(() => expect(wrapWithRecoveryKey).toHaveBeenCalled());
+      if (switchAccount) {
+        act(() => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 })));
+      }
+      await act(async () => wrapping.resolve({ wrappedKey: 'wrapped', salt: 'salt' }));
+      return stored;
+    }
+
+    // Positive control: the same held preparation, with no switch, is stored.
+    it('stores the prepared key under the capture when nothing changed', async () => {
+      const stored = await storeAcrossPreparation(false);
+
+      await screen.findByTestId('recovery-key-display');
+      expect(stored).toHaveBeenCalledTimes(1);
+      const [context] = contextsOf(PATHS.recoveryKey);
+      expect(apiRequestContextIsCurrent(context as ApiRequestContext)).toBe(true);
+    });
+
+    // Mutant: the capture taken after the preparation, or none at all. The key
+    // wrapped for the old account would then go out as the new one.
+    it('sends nothing when the account changed while the key was being prepared', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const stored = await storeAcrossPreparation(true);
+
+      expect(await recoveryText(FAILED_COPY)).toBeInTheDocument();
+      expect(stored).not.toHaveBeenCalled();
+      expect(screen.queryByTestId('recovery-key-display')).not.toBeInTheDocument();
+      warn.mockRestore();
+    });
+  });
+
+  // ── A refused answer that is not JSON (CR4) ───────────────────────────────
+  //
+  // A proxy or gateway answers with an HTML page. Its parse error is not the
+  // wizard's to show: each step falls back to its own sentence.
+
+  describe('a refused answer whose body is not JSON (CR4)', () => {
+    const htmlPage = () =>
+      new Response('<html><body>Bad gateway</body></html>', {
+        status: 502,
+        headers: { 'Content-Type': 'text/html' },
       });
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
-      expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    const parseError = () => screen.queryByText(/Unexpected token|not valid JSON/);
+
+    it('verify-setup shows its own failure', async () => {
+      serve({ verifySetup: htmlPage });
+      await toQr();
+      fireEvent.click(screen.getByTestId('totp-submit'));
+
+      expect(await screen.findByTestId('totp-error')).toHaveTextContent('Verification failed');
+      expect(parseError()).not.toBeInTheDocument();
+      expect(screen.queryByTestId('backup-confirm')).not.toBeInTheDocument();
+    });
+
+    it('confirm-setup shows its own failure', async () => {
+      serve({ confirmSetup: htmlPage });
+      await toBackupCodes();
+      fireEvent.click(screen.getByTestId('backup-confirm'));
+
+      expect(await screen.findByText('Confirmation failed')).toBeInTheDocument();
+      expect(parseError()).not.toBeInTheDocument();
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(0);
+    });
+
+    it('register finish shows its own failure', async () => {
+      serve({ keyFinish: htmlPage });
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
+
+      expect(await screen.findByText('Registration failed')).toBeInTheDocument();
+      expect(parseError()).not.toBeInTheDocument();
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(1);
+    });
+  });
+
+  // ── Cancel ends the key ceremony (CR6) ────────────────────────────────────
+
+  describe('Cancel during the key ceremony (CR6)', () => {
+    /** Begins registration with the browser's prompt held open until `touch` settles. */
+    async function toHeldCeremony() {
+      const touch = deferred<unknown>();
+      stubCreate(() => touch.promise);
+      const view = renderKey();
+      await beginKey();
+      await screen.findByText('Waiting for your security key...');
+      return { touch, view };
+    }
+    const ceremonySignal = () =>
+      (vi.mocked(navigator.credentials.create).mock.calls[0][0] as CredentialCreationOptions)
+        .signal;
+    /** Two macrotask turns: enough for the credential to reach the finish request. */
+    const settle = async () => {
+      for (let i = 0; i < 2; i++) {
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+      }
+    };
+
+    // Positive control: released without Cancel, the same held ceremony
+    // finishes within the same settling the cases below allow.
+    it('a ceremony released without Cancel sends the finish and lands on done', async () => {
+      const { touch } = await toHeldCeremony();
+      expect(ceremonySignal()?.aborted).toBe(false);
+
+      touch.resolve(mockCredential());
+      await settle();
+
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(1);
+      expect(screen.getByText('Security Key Registered!')).toBeInTheDocument();
+    });
+
+    // Mutant: Cancel only resets the step. The prompt stays open, and a touch
+    // after it registers the key and jumps the wizard to done.
+    it('a key touched after Cancel sends no finish and leaves the wizard on the credentials step', async () => {
+      const { touch } = await toHeldCeremony();
+      click('Cancel');
+      // The browser's prompt is told to close.
+      expect(ceremonySignal()?.aborted).toBe(true);
+
+      touch.resolve(mockCredential());
+      await settle();
+
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(0);
+      expect(screen.queryByText('Security Key Registered!')).not.toBeInTheDocument();
+      expect(button('Register Key')).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('a key touched after the wizard closed sends no finish', async () => {
+      const { touch, view } = await toHeldCeremony();
+      view.unmount();
+
+      touch.resolve(mockCredential());
+      await settle();
+
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(0);
+    });
+
+    // The credential lands first, so the abort comes too late to end the wait:
+    // only the dropped ceremony stops the finish. Mutant: unmount aborts but
+    // does not drop it.
+    it('a key touched in the same turn the wizard closes sends no finish', async () => {
+      const { touch, view } = await toHeldCeremony();
+      touch.resolve(mockCredential());
+      view.unmount();
+      await settle();
+
+      expect(callsTo(PATHS.keyFinish)).toHaveLength(0);
+    });
+
+    // Mutant: the 60 s registration timeout never cleared. Every ceremony that
+    // ended early would leave it running for a minute. Spies, not fake timers:
+    // once the wait has ended the stray timer changes nothing anyone can see,
+    // and a timer count would also count React's, RTL's and the hook's own.
+    it.each([
+      ['answered', 'answer'],
+      ['cancelled', 'cancel'],
+      ['closed with the wizard', 'unmount'],
+    ] as const)('clears the registration timeout once the ceremony is %s', async (_name, end) => {
+      const setSpy = vi.spyOn(globalThis, 'setTimeout');
+      const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+      try {
+        const { touch, view } = await toHeldCeremony();
+        const index = setSpy.mock.calls.findIndex(([, ms]) => ms === 60000);
+        expect(index).toBeGreaterThanOrEqual(0);
+        const timer = setSpy.mock.results[index].value;
+        // Positive control: the wait is still on, so nothing has cleared it.
+        expect(clearSpy).not.toHaveBeenCalledWith(timer);
+
+        if (end === 'answer') touch.resolve(mockCredential());
+        else if (end === 'cancel') click('Cancel');
+        else view.unmount();
+        await settle();
+
+        expect(clearSpy).toHaveBeenCalledWith(timer);
+      } finally {
+        setSpy.mockRestore();
+        clearSpy.mockRestore();
+      }
+    });
+
+    // Mutant: the timeout only rejecting the race. The browser's prompt would
+    // stay open behind a wizard that has given up, and a later touch could
+    // mint a credential nothing finishes.
+    it('aborts the browser ceremony when the registration times out', async () => {
+      const setSpy = vi.spyOn(globalThis, 'setTimeout');
+      try {
+        await toHeldCeremony();
+        const index = setSpy.mock.calls.findIndex(([, ms]) => ms === 60000);
+        expect(index).toBeGreaterThanOrEqual(0);
+        // Positive control: the ceremony is live until the timeout fires.
+        expect(ceremonySignal()?.aborted).toBe(false);
+
+        const fire = setSpy.mock.calls[index][0] as () => void;
+        await act(async () => fire());
+
+        expect(ceremonySignal()?.aborted).toBe(true);
+        expect(callsTo(PATHS.keyFinish)).toHaveLength(0);
+      } finally {
+        setSpy.mockRestore();
+      }
+    });
+
+    // The key was touched before Cancel, so the account holds it: done says so.
+    it('a finish already under way when Cancel lands still reports the registered key', async () => {
+      const finish = deferred<Response>();
+      serve({ keyFinish: () => finish.promise });
+      const { touch } = await toHeldCeremony();
+      touch.resolve(mockCredential());
+      await waitFor(() => expect(callsTo(PATHS.keyFinish)).toHaveLength(1));
+
+      click('Cancel');
+      await act(async () => finish.resolve(jsonResponse(200, {})));
+
+      expect(await screen.findByText('Security Key Registered!')).toBeInTheDocument();
+    });
+  });
+
+  // ── Enrolment required (TB1) ──────────────────────────────────────────────
+  //
+  // A 403 with `mfa_enrollment_required` is the hook's terminal state: the
+  // stage says so, keeps the primary down, and drops the password field. No
+  // banner says it a second time.
+
+  describe('an account that must enrol first (TB1)', () => {
+    const ENROLLMENT_TEXT = 'Set up an authenticator app or security key in Settings to do this.';
+    const enrollmentRequired = () =>
+      jsonResponse(403, { error: 'Set up MFA first', mfa_enrollment_required: true });
+
+    /** The terminal state as every surface below shows it. */
+    function expectEnrolmentTerminal(primary: string, heading: string) {
+      expect(button(primary)).toHaveAttribute('aria-disabled', 'true');
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: heading })).toHaveFocus();
+    }
+
+    // Mutant: `enrollmentRequired` answered as a banner or as `failed`.
+    it('#5 TOTP setup: the sentence, Continue down, and the wizard stays on credentials', async () => {
+      serve({ totpSetup: enrollmentRequired });
+      renderTotp();
+      await beginTotp();
+
+      expect(await screen.findByText(ENROLLMENT_TEXT)).toBeInTheDocument();
+      expectEnrolmentTerminal('Continue', 'Set Up Authenticator App');
+      expect(screen.queryByTestId('totp-submit')).not.toBeInTheDocument();
+      // Positive control: the one request went out, so the sentence is its answer.
+      expect(callsTo(PATHS.totpSetup)).toHaveLength(1);
+      click('Continue');
+      expect(callsTo(PATHS.totpSetup)).toHaveLength(1);
+    });
+
+    it('#5 security-key begin: the sentence, Register Key down, and no ceremony', async () => {
+      serve({ keyBegin: enrollmentRequired });
+      stubCreate(() => Promise.resolve(mockCredential()));
+      renderKey();
+      await beginKey();
+
+      expect(await screen.findByText(ENROLLMENT_TEXT)).toBeInTheDocument();
+      expectEnrolmentTerminal('Register Key', 'Set Up Security Key');
+      expect(navigator.credentials.create).not.toHaveBeenCalled();
+      expect(callsTo(PATHS.keyBegin)).toHaveLength(1);
+    });
+
+    it('#6 recovery-key replace: the sentence, Replace down, and no new key shown', async () => {
+      const api = serve({ recoveryKey: keptThen(enrollmentRequired) });
+      await toReplaceStep(api);
+      typePassword('freshpw');
+      await untilActionable(REPLACE_LABEL);
+      click(REPLACE_LABEL);
+
+      expect(await screen.findByText(ENROLLMENT_TEXT)).toBeInTheDocument();
+      expectEnrolmentTerminal(REPLACE_LABEL, 'Set Up Authenticator App');
+      expect(screen.queryByTestId('recovery-key-display')).not.toBeInTheDocument();
+      // The first store and the one refused replace; the inert primary adds none.
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(2);
+      click(REPLACE_LABEL);
+      expect(callsTo(PATHS.recoveryKey)).toHaveLength(2);
     });
   });
 });

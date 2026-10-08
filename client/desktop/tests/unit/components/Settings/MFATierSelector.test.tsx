@@ -1,8 +1,11 @@
 import React from 'react';
-import { render, screen, fireEvent, act } from '../../../test-utils';
+import { render, screen, fireEvent, act, waitFor, within } from '../../../test-utils';
 import { vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { deferred } from '../../../helpers/deferred';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { apiRequestContextIsCurrent } from '@/renderer/services/system/requestContext';
 
 // ── Service mock ─────────────────────────────────────────────────────────────
 vi.mock('@/renderer/services/system/apiClient', () => ({
@@ -38,41 +41,6 @@ vi.mock('@/renderer/components/Settings/ToggleSwitch', () => ({
   ),
 }));
 
-// Captures the methods/excludeBackupCodes props each render passes, and wires
-// onVerify to a real input so tests can drive the MFA code field (T14, and the
-// Confirm-enablement rule for the two step-up-gated action types).
-vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
-  default: ({
-    methods,
-    excludeBackupCodes,
-    onVerify,
-    purpose,
-    disabled,
-    error,
-  }: {
-    methods: string[];
-    excludeBackupCodes?: boolean;
-    purpose: string | null;
-    onVerify: (code: string) => void;
-    disabled?: boolean;
-    error?: string;
-  }) => (
-    <div
-      data-testid="mfa-verify-prompt"
-      data-methods={methods.join(',')}
-      data-exclude-backup-codes={String(!!excludeBackupCodes)}
-      data-purpose={String(purpose)}
-    >
-      <input
-        data-testid="mfa-verify-input"
-        disabled={disabled}
-        onChange={(e) => onVerify(e.target.value)}
-      />
-      {error && <span>{error}</span>}
-    </div>
-  ),
-}));
-
 vi.mock('@/renderer/components/Auth/RecoveryApprovalModal', () => ({
   default: () => <div data-testid="recovery-approval-modal" />,
 }));
@@ -85,6 +53,72 @@ vi.mock('@/renderer/components/Settings/MFA.css', () => ({}));
 
 import MFATierSelector from '@/renderer/components/Settings/MFATierSelector';
 import { apiFetch } from '@/renderer/services/system/apiClient';
+
+// ── API double ───────────────────────────────────────────────────────────────
+//
+// Routed by path, never by call order: the requirements read
+// (`GET /api/v1/mfa/step-up`) opens each modal and changes the order of
+// everything after it. "Mutant:" comments name the production change a case
+// exists to turn red.
+
+const READ_PATH = '/api/v1/mfa/step-up';
+const BEGIN_PATH = '/api/v1/mfa/webauthn/verify-inline/begin';
+
+interface Call {
+  path: string;
+  body: Record<string, unknown> | null;
+  /** The `ApiRequestContext` the request was admitted against, if any. */
+  context: unknown;
+}
+const calls: Call[] = [];
+
+function json(body: unknown, status = 200): Response {
+  return { ok: status >= 200 && status < 300, status, json: async () => body } as Response;
+}
+
+/** A read answering `methods`, the first of them the server's default. */
+const readOffers =
+  (methods: string[], backup = false) =>
+  (): Response =>
+    json({ methods, default_method: methods[0] ?? null, backup_code_available: backup });
+const readStatus = (status: number) => (): Response => json({}, status);
+
+interface Scenario {
+  read?: () => Response | Promise<Response>;
+  begin?: () => Response | Promise<Response>;
+}
+
+function serveApi(scenario: Scenario = {}) {
+  vi.mocked(apiFetch).mockImplementation(
+    async (path: string, init?: RequestInit, opts?: { context?: unknown }) => {
+      calls.push({
+        path,
+        body: typeof init?.body === 'string' ? JSON.parse(init.body) : null,
+        context: opts?.context,
+      });
+      if (path === READ_PATH) return (scenario.read ?? readOffers(['totp']))();
+      if (path === BEGIN_PATH) return (scenario.begin ?? (() => json({ error: 'x' }, 500)))();
+      // Every other section read: not a 2xx, so it keeps its unknown state.
+      return { json: async () => ({}) } as Response;
+    }
+  );
+}
+
+const readCalls = () => calls.filter((c) => c.path === READ_PATH);
+const beginCalls = () => calls.filter((c) => c.path === BEGIN_PATH);
+
+const typePassword = (value = 'pw') =>
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value } });
+const typeCode = (input: HTMLElement, value = '123456') =>
+  fireEvent.change(input, { target: { value } });
+const submitConfirm = async (name = 'Confirm') => {
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name }));
+  });
+};
+/** Resolves once the primary can act: the read landed and everything is filled. */
+const untilActionable = (name = 'Confirm') =>
+  waitFor(() => expect(screen.getByRole('button', { name })).not.toHaveAttribute('aria-disabled'));
 
 // ── Default props ────────────────────────────────────────────────────────────
 const defaultProps = {
@@ -108,6 +142,9 @@ describe('MFATierSelector', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    calls.length = 0;
+    useAuthStore.getState().setAccessToken('mock-token');
+    serveApi();
   });
 
   // ── Basic rendering ──────────────────────────────────────────────────────
@@ -303,39 +340,48 @@ describe('MFATierSelector', () => {
     expect(screen.queryByText('Reset TOTP')).not.toBeInTheDocument();
   });
 
-  it('shows password input in action modal', () => {
+  it('shows a labelled password field in the action modal', () => {
     render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
     fireEvent.click(screen.getByText('Reset'));
-    expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument();
+    expect(screen.getByLabelText('Password')).toHaveAttribute('type', 'password');
   });
 
-  it('disables Confirm button when password is empty', () => {
+  it('keeps Confirm aria-disabled, not natively disabled, while the password is empty', async () => {
     render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
     fireEvent.click(screen.getByText('Reset'));
-    expect(screen.getByText('Confirm')).toBeDisabled();
-  });
-
-  it('enables Reset TOTP Confirm once the password and an MFA code are entered', () => {
-    render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
-    fireEvent.click(screen.getByText('Reset'));
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'mypassword' },
-    });
-    fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
-    expect(screen.getByText('Confirm')).not.toBeDisabled();
-  });
-
-  it('calls onResetTOTP when Confirm is clicked in reset modal', async () => {
-    render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
-    fireEvent.click(screen.getByText('Reset'));
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'mypassword' },
-    });
-    fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
+    const confirm = screen.getByRole('button', { name: 'Confirm' });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).not.toBeDisabled();
     await act(async () => {
-      fireEvent.click(screen.getByText('Confirm'));
+      fireEvent.click(confirm);
     });
-    expect(defaultProps.onResetTOTP).toHaveBeenCalledWith('mypassword', '123456');
+    expect(defaultProps.onResetTOTP).not.toHaveBeenCalled();
+  });
+
+  it('enables Reset TOTP Confirm once the password and an authenticator code are entered', async () => {
+    render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+    fireEvent.click(screen.getByText('Reset'));
+    typePassword('mypassword');
+    const code = await screen.findByLabelText('Authenticator app code');
+    expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    fireEvent.change(code, { target: { value: '123456' } });
+    expect(screen.getByRole('button', { name: 'Confirm' })).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('calls onResetTOTP with the password, the code and the run capture when Confirm is clicked', async () => {
+    render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+    fireEvent.click(screen.getByText('Reset'));
+    typePassword('mypassword');
+    typeCode(await screen.findByLabelText('Authenticator app code'));
+    await submitConfirm();
+    expect(defaultProps.onResetTOTP).toHaveBeenCalledWith(
+      'mypassword',
+      '123456',
+      expect.anything()
+    );
   });
 
   it('shows the server text when an action fails with a body the seam does not classify', async () => {
@@ -348,13 +394,9 @@ describe('MFATierSelector', () => {
     });
     render(<MFATierSelector {...defaultProps} activeMethods={['totp']} onResetTOTP={failReset} />);
     fireEvent.click(screen.getByText('Reset'));
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'mypassword' },
-    });
-    fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
-    await act(async () => {
-      fireEvent.click(screen.getByText('Confirm'));
-    });
+    typePassword('mypassword');
+    typeCode(await screen.findByLabelText('Authenticator app code'));
+    await submitConfirm();
     await vi.waitFor(() =>
       expect(
         screen.getByText('The authenticator app could not be reset. Try again.')
@@ -492,15 +534,16 @@ describe('MFATierSelector', () => {
     });
     fireEvent.click(screen.getByText('Save'));
 
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'mypw' },
-    });
-    fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '654321' } });
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Save backup email' }));
-    });
+    typePassword('mypw');
+    typeCode(await screen.findByLabelText('Authenticator app code'), '654321');
+    await submitConfirm('Save backup email');
 
-    expect(onSetBackupEmail).toHaveBeenCalledWith('valid@example.com', 'mypw', '654321');
+    expect(onSetBackupEmail).toHaveBeenCalledWith(
+      'valid@example.com',
+      'mypw',
+      '654321',
+      expect.anything()
+    );
   });
 
   it('hides email input when Cancel is clicked', () => {
@@ -564,7 +607,7 @@ describe('MFATierSelector', () => {
       fireEvent.click(screen.getByText('Reset'));
 
       expect(screen.getByRole('dialog')).toBeInTheDocument();
-      const password = screen.getByPlaceholderText('Enter your password');
+      const password = screen.getByLabelText('Password');
       await vi.waitFor(() => expect(document.activeElement).toBe(password));
     });
 
@@ -586,7 +629,7 @@ describe('MFATierSelector', () => {
       fireEvent.click(screen.getByText('Reset'));
 
       const dialog = screen.getByRole('dialog');
-      const password = screen.getByPlaceholderText('Enter your password');
+      const password = screen.getByLabelText('Password');
       await vi.waitFor(() => expect(document.activeElement).toBe(password));
 
       const focusables = focusablesIn(dialog);
@@ -604,7 +647,7 @@ describe('MFATierSelector', () => {
       fireEvent.click(screen.getByText('Reset'));
 
       const dialog = screen.getByRole('dialog');
-      const password = screen.getByPlaceholderText('Enter your password');
+      const password = screen.getByLabelText('Password');
       await vi.waitFor(() => expect(document.activeElement).toBe(password));
 
       const focusables = focusablesIn(dialog);
@@ -618,85 +661,480 @@ describe('MFATierSelector', () => {
     });
   });
 
-  // ── Action modal — Confirm-enablement rule for the two step-up-gated types ─
-  // (spec R-4: the code is required up front so a password-only submit cannot
-  // burn a shared attempt on a request that must fail with mfa_required.)
+  // ── Action modal — which credential fields the read decides (plan §1.3, §3) ──
+  //
+  // The modal asks for what `GET /api/v1/mfa/step-up` says the account can use.
+  // `activeMethods` is the last status fetch and never decides a field.
 
-  describe('action modal — Confirm enablement (step-up-gated types)', () => {
-    it('requires password AND an MFA code when the account holds real MFA', () => {
-      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'email']} />);
-      fireEvent.click(screen.getByText('Disable'));
-      const confirm = () => screen.getByRole('button', { name: 'Disable Email/SMS' });
+  describe('action modal — credential fields follow the read (§1.3)', () => {
+    type Opener = { name: string; confirm: string; open: () => void; handler: string };
+    const openers: Opener[] = [
+      {
+        name: 'disable email/SMS',
+        confirm: 'Disable Email/SMS',
+        handler: 'onDisableEmailSms',
+        open: () => fireEvent.click(screen.getByText('Disable')),
+      },
+      {
+        name: 'set backup email',
+        confirm: 'Save backup email',
+        handler: 'onSetBackupEmail',
+        open: () => {
+          fireEvent.click(screen.getByText('Add'));
+          fireEvent.change(screen.getByPlaceholderText('backup@example.com'), {
+            target: { value: 'valid@example.com' },
+          });
+          fireEvent.click(screen.getByText('Save'));
+        },
+      },
+      {
+        name: 'recovery-only toggle',
+        confirm: 'Confirm',
+        handler: 'onToggleRecoveryOnly',
+        open: () => fireEvent.click(screen.getAllByTestId('toggle-switch')[0]),
+      },
+    ];
 
-      expect(confirm()).toBeDisabled();
-      fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-        target: { value: 'pw' },
+    describe.each(openers)('$name', ({ confirm, open, handler }) => {
+      // Mutant: the code field renders unconditionally. With `methods: []` the
+      // account has no inline factor, so a required code box can never be filled.
+      it('shows no code field and sends the password alone when the read returns no methods', async () => {
+        serveApi({ read: readOffers([]) });
+        const spy = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+        render(
+          <MFATierSelector
+            {...defaultProps}
+            activeMethods={['totp', 'email']}
+            {...{ [handler]: spy }}
+          />
+        );
+        open();
+        typePassword('pw');
+        await untilActionable(confirm);
+
+        expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Backup code')).not.toBeInTheDocument();
+        expect(screen.queryByText(/Passkey or security key/)).not.toBeInTheDocument();
+        await submitConfirm(confirm);
+        const call = spy.mock.calls[0];
+        expect(call.at(-3)).toBe('pw');
+        expect(call.at(-2)).toBeUndefined();
       });
-      expect(confirm()).toBeDisabled(); // password alone is not enough — a real MFA method exists
-      fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
-      expect(confirm()).not.toBeDisabled();
+
+      it('shows the code field, and sends the code, when the read returns TOTP', async () => {
+        serveApi({ read: readOffers(['totp']) });
+        const spy = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+        render(
+          <MFATierSelector {...defaultProps} activeMethods={['email']} {...{ [handler]: spy }} />
+        );
+        open();
+        typePassword('pw');
+        typeCode(await screen.findByLabelText('Authenticator app code'));
+        await untilActionable(confirm);
+        await submitConfirm(confirm);
+        expect(spy.mock.calls[0].at(-2)).toBe('123456');
+      });
     });
 
-    it('enables on password alone when the account has no real MFA method', () => {
+    // Mutant: the field set derived from `activeMethods` rather than the read.
+    it('ignores a stale activeMethods that names TOTP when the read returns none', async () => {
+      serveApi({ read: readOffers([]) });
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'email']} />);
+      fireEvent.click(screen.getByText('Disable'));
+      typePassword('pw');
+      await untilActionable('Disable Email/SMS');
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+    });
+
+    it('shows the code field for an account the stale activeMethods says has none', async () => {
+      serveApi({ read: readOffers(['totp']) });
       render(<MFATierSelector {...defaultProps} activeMethods={['email']} />);
       fireEvent.click(screen.getByText('Disable'));
-      const confirm = () => screen.getByRole('button', { name: 'Disable Email/SMS' });
+      expect(await screen.findByLabelText('Authenticator app code')).toBeInTheDocument();
+    });
 
-      expect(confirm()).toBeDisabled();
-      fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-        target: { value: 'pw' },
+    it('reads once per open, and not before the modal opens', async () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'email']} />);
+      expect(readCalls()).toHaveLength(0);
+      fireEvent.click(screen.getByText('Disable'));
+      await waitFor(() => expect(readCalls()).toHaveLength(1));
+    });
+
+    it('does not offer email or SMS, even when the read lists them', async () => {
+      serveApi({
+        read: () =>
+          json({
+            methods: ['totp', 'email', 'sms'],
+            default_method: 'totp',
+            backup_code_available: false,
+          }),
       });
-      expect(confirm()).not.toBeDisabled();
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'email']} />);
+      fireEvent.click(screen.getByText('Disable'));
+      await screen.findByLabelText('Authenticator app code');
+      const dialog = within(screen.getByRole('dialog'));
+      expect(dialog.queryByLabelText(/email|sms/i)).not.toBeInTheDocument();
+      expect(dialog.queryByRole('button', { name: /instead/i })).not.toBeInTheDocument();
     });
   });
 
-  // ── Action modal — MFA methods filter + excludeBackupCodes (spec R-13/T14) ─
+  // ── Action modal — backup codes (plan §3: backup offered on #4) ──────────
 
-  // A WebAuthn inline token is bound to the purpose the prompt names, so each
-  // action must name the route its code is actually sent with (#3453 RS11).
-  describe('action modal — MFAVerifyPrompt purpose', () => {
-    it('names the email/SMS disable route for Disable', () => {
-      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn', 'email']} />);
-      fireEvent.click(screen.getByText('Disable'));
-      expect(screen.getByTestId('mfa-verify-prompt').dataset.purpose).toBe(
-        'mfa_settings.email_sms_disable'
+  describe('action modal — backup code', () => {
+    it('offers a backup code beside TOTP when the read reports one', async () => {
+      serveApi({ read: readOffers(['totp'], true) });
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      expect(
+        await screen.findByRole('button', { name: 'Use a backup code instead' })
+      ).toBeInTheDocument();
+    });
+
+    it('does not offer one when the read reports none', async () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      await screen.findByLabelText('Authenticator app code');
+      expect(
+        screen.queryByRole('button', { name: 'Use a backup code instead' })
+      ).not.toBeInTheDocument();
+    });
+
+    // regression: a typed backup code was never sent unless Enter was pressed
+    it('keeps Confirm down when only the password has been entered', async () => {
+      serveApi({ read: readOffers(['totp'], true) });
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      typePassword('mypassword');
+      await screen.findByLabelText('Authenticator app code');
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
       );
     });
 
-    it('names the TOTP disable route for Reset', () => {
+    it('calls onResetTOTP with the typed backup code, never an empty string', async () => {
+      serveApi({ read: readOffers(['totp'], true) });
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      typePassword('mypassword');
+      fireEvent.click(await screen.findByRole('button', { name: 'Use a backup code instead' }));
+      fireEvent.change(screen.getByLabelText('Backup code'), { target: { value: 'EXCI3G5F' } });
+      await submitConfirm();
+
+      expect(defaultProps.onResetTOTP).toHaveBeenCalledWith(
+        'mypassword',
+        'EXCI3G5F',
+        expect.anything()
+      );
+      expect(defaultProps.onResetTOTP).not.toHaveBeenCalledWith(
+        'mypassword',
+        '',
+        expect.anything()
+      );
+    });
+  });
+
+  // ── Action modal — reset-totp floors TOTP (D10, Q3, C26) ──────────────────
+  //
+  // The route binds a TOTP `code` as required, so TOTP is offered whatever the
+  // read says; a failed read must not cost it.
+
+  describe('action modal — reset-totp keeps TOTP when the read gives none', () => {
+    // Mutant: the TOTP floor removed from reset-totp.
+    it.each([
+      ['an empty method list', readOffers([])],
+      ['a failed read', readStatus(503)],
+      ['a server without the route', readStatus(404)],
+    ])('still asks for the authenticator code after %s', async (_name, read) => {
+      serveApi({ read });
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      typePassword('pw');
+      const code = await screen.findByLabelText('Authenticator app code');
+      await waitFor(() => expect(readCalls()).toHaveLength(1));
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+
+      fireEvent.change(code, { target: { value: '123456' } });
+      await submitConfirm();
+      expect(defaultProps.onResetTOTP).toHaveBeenCalledWith('pw', '123456', expect.anything());
+    });
+
+    it('does not floor any other action: a failed read leaves the password alone', async () => {
+      serveApi({ read: readStatus(503) });
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'email']} />);
+      fireEvent.click(screen.getByText('Disable'));
+      typePassword('pw');
+      await untilActionable('Disable Email/SMS');
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+    });
+
+    it('adds to the floor when the read offers a security key, and keeps both reachable', async () => {
+      serveApi({ read: readOffers(['webauthn']) });
       render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn']} />);
       fireEvent.click(screen.getByText('Reset'));
-      expect(screen.getByTestId('mfa-verify-prompt').dataset.purpose).toBe(
+      fireEvent.click(await screen.findByRole('button', { name: 'Use authenticator app instead' }));
+      expect(screen.getByLabelText('Authenticator app code')).toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'Use passkey or security key instead' })
+      ).toBeInTheDocument();
+    });
+  });
+
+  // ── Action modal — revoke-webauthn is password only (D10) ─────────────────
+
+  describe('action modal — revoke-webauthn takes the password alone', () => {
+    const key = {
+      id: 'cred-1',
+      credential_name: 'Key A',
+      credential_type: 'hardware',
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const renderRevoke = (
+      onRevokeWebAuthnKey = vi.fn().mockResolvedValue({ kind: 'accepted', data: null })
+    ) => {
+      serveApi({ read: readOffers(['totp', 'webauthn'], true) });
+      render(
+        <MFATierSelector
+          {...defaultProps}
+          activeMethods={['totp', 'webauthn']}
+          webauthnCredentials={[key]}
+          onRevokeWebAuthnKey={onRevokeWebAuthnKey}
+        />
+      );
+      fireEvent.click(screen.getByText('Revoke'));
+      return onRevokeWebAuthnKey;
+    };
+
+    // Mutant: revoke-webauthn runs the factor hook, so it reads and shows a factor.
+    it('issues no requirements read and shows no factor, whatever the account holds', async () => {
+      renderRevoke();
+      typePassword('pw');
+      await untilActionable('Confirm');
+      // Let any read that was wrongly started land before asserting it did not.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(readCalls()).toHaveLength(0);
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Backup code')).not.toBeInTheDocument();
+      expect(screen.queryByText('Passkey or security key')).not.toBeInTheDocument();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    });
+
+    it('sends (credentialId, password, undefined, context) on the password alone', async () => {
+      const onRevoke = renderRevoke();
+      typePassword('pw');
+      await submitConfirm();
+      expect(onRevoke).toHaveBeenCalledWith('cred-1', 'pw', undefined, expect.anything());
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    // Mutant: the revoke capturing at the click. revoke-webauthn runs no
+    // factor hook, so nothing else binds the typed password to the account the
+    // modal opened under; it would go out under the next one.
+    it('sends nothing, and says so, when the account changed after the modal opened', async () => {
+      const onRevoke = renderRevoke();
+      typePassword('pw');
+      act(() => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 })));
+      await submitConfirm();
+
+      expect(await screen.findByText(/Sign in again to continue/)).toBeInTheDocument();
+      expect(onRevoke).not.toHaveBeenCalled();
+    });
+
+    // The key revoke has no stage to end, so its banner says it. Mutant: the
+    // stage-less path using `stepUpBanner`, which leaves a dead session unsaid.
+    it('a dead session is said in the banner and locks Confirm', async () => {
+      const onRevoke = renderRevoke(vi.fn().mockResolvedValue({ kind: 'sessionExpired' }));
+      typePassword('pw');
+      await submitConfirm();
+      expect(
+        await screen.findByText('Your session has expired. Sign in again to continue.')
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+      expect(onRevoke).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps Confirm aria-disabled and sends nothing without a password', async () => {
+      const onRevoke = renderRevoke();
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+      await submitConfirm();
+      expect(onRevoke).not.toHaveBeenCalled();
+    });
+
+    it('a refused password is a field error, empties the field and takes focus back', async () => {
+      const onRevoke = renderRevoke(vi.fn().mockResolvedValue({ kind: 'invalidPassword' }));
+      typePassword('wrong');
+      await submitConfirm();
+      expect(await screen.findByText('That password is not correct.')).toBeInTheDocument();
+      expect(screen.getByLabelText('Password')).toHaveValue('');
+      await vi.waitFor(() =>
+        expect(document.activeElement).toBe(screen.getByLabelText('Password'))
+      );
+      expect(onRevoke).toHaveBeenCalledTimes(1);
+    });
+
+    // `revoking` is state, so two activations in one tick both read it false.
+    // Each is dispatched natively inside ONE act, so no render runs between them.
+    // Mutant: the single-flight latch never set.
+    it.each([
+      ['a double click', (field: HTMLElement, button: HTMLElement) => [button, button]],
+      ['Enter then a click', (field: HTMLElement, button: HTMLElement) => [field, button]],
+    ])('%s sends exactly one revoke', async (_name, targets) => {
+      const gate = deferred<{ kind: 'accepted'; data: null }>();
+      const onRevoke = renderRevoke(vi.fn(() => gate.promise));
+      typePassword('pw');
+      const field = screen.getByLabelText('Password');
+      const button = screen.getByRole('button', { name: 'Confirm' });
+
+      act(() => {
+        for (const target of targets(field, button)) {
+          if (target === field) {
+            target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          } else {
+            target.click();
+          }
+        }
+      });
+
+      expect(onRevoke).toHaveBeenCalledTimes(1);
+      await act(async () => gate.resolve({ kind: 'accepted', data: null }));
+    });
+
+    // The password is this modal's only input, so Enter must submit it as the
+    // stage's fields do (`isPlainEnter`).
+    // Mutant: the field's Enter handler not pressing the primary.
+    it('a plain Enter in the password field presses Confirm', async () => {
+      const onRevoke = renderRevoke();
+      typePassword('pw');
+      await act(async () => {
+        fireEvent.keyDown(screen.getByLabelText('Password'), { key: 'Enter' });
+      });
+      expect(onRevoke).toHaveBeenCalledWith('cred-1', 'pw', undefined, expect.anything());
+    });
+
+    // Positive control: the case above shows a plain Enter on this field does press.
+    it.each([
+      ['Shift', { shiftKey: true }],
+      ['Ctrl', { ctrlKey: true }],
+      ['Alt', { altKey: true }],
+      ['Meta', { metaKey: true }],
+      ['an auto-repeat', { repeat: true }],
+    ])('%s Enter does not press Confirm', async (_name, modifiers) => {
+      const onRevoke = renderRevoke();
+      typePassword('pw');
+      await act(async () => {
+        fireEvent.keyDown(screen.getByLabelText('Password'), { key: 'Enter', ...modifiers });
+      });
+      expect(onRevoke).not.toHaveBeenCalled();
+    });
+
+    // Revoking a key verifies the password alone, so nothing on it may mint a
+    // security-key token or name a purpose a token could be spent on.
+    it('sends no security-key begin and names no purpose, even for a key-only account', async () => {
+      const onRevoke = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+      serveApi({ read: readOffers(['webauthn']), begin: () => json({ publicKey: {} }) });
+      render(
+        <MFATierSelector
+          {...defaultProps}
+          activeMethods={['webauthn']}
+          webauthnCredentials={[key]}
+          onRevokeWebAuthnKey={onRevoke}
+        />
+      );
+      fireEvent.click(screen.getByText('Revoke'));
+      typePassword('pw');
+      await submitConfirm();
+
+      expect(onRevoke).toHaveBeenCalledWith('cred-1', 'pw', undefined, expect.anything());
+      expect(beginCalls()).toHaveLength(0);
+      expect(readCalls()).toHaveLength(0);
+      expect(calls.some((c) => c.body !== null && 'purpose' in c.body)).toBe(false);
+    });
+
+    it('a rate limit locks Confirm', async () => {
+      renderRevoke(vi.fn().mockResolvedValue({ kind: 'rateLimited' }));
+      typePassword('pw');
+      await submitConfirm();
+      expect(
+        await screen.findByText('Too many attempts. Try again in a few minutes.')
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+    });
+  });
+
+  // ── Action modal — the route each code is minted for ──────────────────────
+  //
+  // A WebAuthn inline token is bound to the purpose its begin request names, so
+  // each action must name the route its code is actually sent with (#3453 RS11).
+
+  describe('action modal — security-key purpose', () => {
+    const purposeOf = async (open: () => void, confirm: string) => {
+      serveApi({ read: readOffers(['webauthn']) });
+      open();
+      typePassword('pw');
+      await untilActionable(confirm);
+      await submitConfirm(confirm);
+      await waitFor(() => expect(beginCalls()).toHaveLength(1));
+      return beginCalls()[0].body?.purpose;
+    };
+
+    it('names the email/SMS disable route for Disable', async () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn', 'email']} />);
+      expect(
+        await purposeOf(() => fireEvent.click(screen.getByText('Disable')), 'Disable Email/SMS')
+      ).toBe('mfa_settings.email_sms_disable');
+    });
+
+    it('names the TOTP disable route for Reset', async () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn']} />);
+      expect(await purposeOf(() => fireEvent.click(screen.getByText('Reset')), 'Confirm')).toBe(
         'mfa_settings.totp_disable'
       );
     });
-  });
 
-  describe('action modal — MFAVerifyPrompt methods filter', () => {
-    it('passes only the totp/webauthn subset, excluding email/sms', () => {
+    it('names the recovery-only route for the recovery-only toggle', async () => {
       render(<MFATierSelector {...defaultProps} activeMethods={['totp', 'webauthn', 'email']} />);
-      fireEvent.click(screen.getByText('Disable'));
-      const prompt = screen.getByTestId('mfa-verify-prompt');
-      expect(prompt.dataset.methods).toBe('totp,webauthn');
-      expect(prompt.dataset.excludeBackupCodes).toBe('false');
+      expect(
+        await purposeOf(() => fireEvent.click(screen.getAllByTestId('toggle-switch')[0]), 'Confirm')
+      ).toBe('mfa_settings.recovery_only_set');
     });
 
-    it('sets excludeBackupCodes when totp is absent (backup codes verify only via TOTP)', () => {
-      render(<MFATierSelector {...defaultProps} activeMethods={['webauthn', 'email']} />);
-      fireEvent.click(screen.getByText('Disable'));
-      const prompt = screen.getByTestId('mfa-verify-prompt');
-      expect(prompt.dataset.methods).toBe('webauthn');
-      expect(prompt.dataset.excludeBackupCodes).toBe('true');
+    it('names the backup-email route for the backup email', async () => {
+      render(
+        <MFATierSelector
+          {...defaultProps}
+          activeMethods={['totp', 'webauthn', 'email']}
+          backupEmail=""
+        />
+      );
+      const open = () => {
+        fireEvent.click(screen.getByText('Add'));
+        fireEvent.change(screen.getByPlaceholderText('backup@example.com'), {
+          target: { value: 'valid@example.com' },
+        });
+        fireEvent.click(screen.getByText('Save'));
+      };
+      expect(await purposeOf(open, 'Save backup email')).toBe('mfa_settings.backup_email_set');
     });
   });
 
   // ── Action modal — MfaStepUpResult routing (spec §4.3, handoff §1.1) ───────
   //
   // Each `kind` a gated handler can return routes to a distinct, observable
-  // target: a specific field error, the general banner, a lock, or the modal
-  // closing. The switch in `applyRefusal` has exactly one case per kind and no
-  // other code path produces these strings, so each assertion below pins its
-  // own case rather than sharing an outcome with a sibling case.
+  // target: a field error, the general banner, a lock, or the modal closing.
 
   describe('action modal — MfaStepUpResult kind routing', () => {
     const renderDisableModal = (onDisableEmailSms: ReturnType<typeof vi.fn>) => {
@@ -710,158 +1148,144 @@ describe('MFATierSelector', () => {
       fireEvent.click(screen.getByText('Disable'));
     };
 
-    const fillCredentials = () => {
-      fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-        target: { value: 'mypassword' },
-      });
-      fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
+    const fillCredentials = async () => {
+      typePassword('mypassword');
+      typeCode(await screen.findByLabelText('Authenticator app code'));
     };
 
-    const submit = async () => {
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Disable Email/SMS' }));
-      });
-    };
+    const submit = () => submitConfirm('Disable Email/SMS');
+    const confirm = () => screen.getByRole('button', { name: 'Disable Email/SMS' });
+    const codeValue = () =>
+      (screen.getByLabelText('Authenticator app code') as HTMLInputElement).value;
+    const passwordValue = () => (screen.getByLabelText('Password') as HTMLInputElement).value;
 
     it('accepted: closes the modal', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'accepted', data: null }));
+      await fillCredentials();
       await submit();
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
-    it('passwordRequired: shows the field error and clears the password', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'passwordRequired' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('passwordRequired: asks for the password and clears it', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'passwordRequired' }));
+      await fillCredentials();
       await submit();
       expect(await screen.findByText('Enter your password to continue.')).toBeInTheDocument();
-      expect((screen.getByPlaceholderText('Enter your password') as HTMLInputElement).value).toBe(
-        ''
-      );
+      expect(passwordValue()).toBe('');
     });
 
-    it('invalidPassword: shows the field error and clears the password', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'invalidPassword' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('invalidPassword: shows the field error, clears the password and keeps the code the server never read', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'invalidPassword' }));
+      await fillCredentials();
       await submit();
       expect(await screen.findByText('That password is not correct.')).toBeInTheDocument();
-      expect((screen.getByPlaceholderText('Enter your password') as HTMLInputElement).value).toBe(
-        ''
-      );
+      expect(passwordValue()).toBe('');
+      expect(codeValue()).toBe('123456');
     });
 
-    it('mfaRequired: shows the MFA-prompt error and keeps the password', async () => {
-      const onDisableEmailSms = vi
-        .fn()
-        .mockResolvedValue({ kind: 'mfaRequired', methods: ['totp'] });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('mfaRequired: asks for the code the server named and keeps the password', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'mfaRequired', methods: ['totp'] }));
+      await fillCredentials();
       await submit();
       expect(
-        await screen.findByText('Verify with your authenticator app or security key to continue.')
+        await screen.findByText('Enter the 6-digit code from your authenticator app to continue.')
       ).toBeInTheDocument();
-      expect((screen.getByPlaceholderText('Enter your password') as HTMLInputElement).value).toBe(
-        'mypassword'
-      );
+      expect(passwordValue()).toBe('mypassword');
     });
 
-    it('invalidMfaCode: shows the MFA-prompt error and clears the code field', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'invalidMfaCode' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('invalidMfaCode: marks the code and empties the field', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'invalidMfaCode' }));
+      await fillCredentials();
       await submit();
-      expect(
-        await screen.findByText('That code is not correct, or it has expired. Try the next one.')
-      ).toBeInTheDocument();
-      // The prompt remounts (key bump) empty rather than showing the rejected code.
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
+      expect(await screen.findByText(/That code didn't work/)).toBeInTheDocument();
+      expect(codeValue()).toBe('');
     });
 
     it('rateLimited: shows the banner and locks Confirm', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'rateLimited' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'rateLimited' }));
+      await fillCredentials();
       await submit();
       expect(
         await screen.findByText('Too many attempts. Try again in a few minutes.')
       ).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+      expect(confirm()).toHaveAttribute('aria-disabled', 'true');
     });
 
-    it('sessionExpired: shows the banner and locks Confirm', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'sessionExpired' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    // Mutant: a 401 as `answered`, which left the stage live with the password
+    // and an active Confirm under a dead session (picker PR 3 review).
+    it('sessionExpired: the stage ends, drops the password and locks Confirm', async () => {
+      const onDisable = vi.fn().mockResolvedValue({ kind: 'sessionExpired' });
+      renderDisableModal(onDisable);
+      await fillCredentials();
       await submit();
-      expect(
-        await screen.findByText(
-          'Your session needs to be verified again. Sign in again to continue.'
-        )
-      ).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+      expect(await screen.findByText('Sign in again to continue.')).toBeInTheDocument();
+      // One sentence: the banner leaves the dead session to the stage.
+      expect(screen.getAllByText(/Sign in again/)).toHaveLength(1);
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+      expect(confirm()).toHaveAttribute('aria-disabled', 'true');
+      await submit();
+      expect(onDisable).toHaveBeenCalledTimes(1);
     });
 
-    it('networkError: shows the banner, keeps the password, and asks for a fresh code', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'networkError' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('networkError: shows the banner, keeps the password and asks for a fresh code', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'networkError' }));
+      await fillCredentials();
       await submit();
       expect(
         await screen.findByText("Couldn't reach the server. Check your connection and try again.")
       ).toBeInTheDocument();
-      expect((screen.getByPlaceholderText('Enter your password') as HTMLInputElement).value).toBe(
-        'mypassword'
-      );
+      expect(passwordValue()).toBe('mypassword');
       // The request may have reached the server, which accepts each code once.
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
-      fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '654321' } });
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toBeDisabled();
+      expect(codeValue()).toBe('');
+      expect(confirm()).toHaveAttribute('aria-disabled', 'true');
+      typeCode(screen.getByLabelText('Authenticator app code'), '654321');
+      expect(confirm()).not.toHaveAttribute('aria-disabled');
     });
 
     it('failed: shows the generic banner', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'failed' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'failed' }));
+      await fillCredentials();
       await submit();
       expect(await screen.findByText('Something went wrong. Try again.')).toBeInTheDocument();
     });
 
     // The server accepts each code once and can accept one yet still fail the
     // request (a 500 after the code verified), so the code is never re-offered.
-    it('failed (a 500 after the code was sent): clears the code and disables Confirm', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'failed' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('failed (a 500 after the code was sent): clears the code and holds Confirm', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'failed' }));
+      await fillCredentials();
       await submit();
       await screen.findByText('Something went wrong. Try again.');
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('');
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+      expect(codeValue()).toBe('');
+      expect(confirm()).toHaveAttribute('aria-disabled', 'true');
     });
 
-    it('invalidPassword: keeps the code, which the server never read', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'invalidPassword' });
-      renderDisableModal(onDisableEmailSms);
-      fillCredentials();
+    it('enrollmentRequired: shows the set-up sentence and nothing to fill', async () => {
+      renderDisableModal(vi.fn().mockResolvedValue({ kind: 'enrollmentRequired' }));
+      await fillCredentials();
       await submit();
-      await screen.findByText('That password is not correct.');
-      expect((screen.getByTestId('mfa-verify-input') as HTMLInputElement).value).toBe('123456');
+      expect(
+        await screen.findByText(
+          'Set up an authenticator app or security key in Settings to do this.'
+        )
+      ).toBeInTheDocument();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(confirm()).toHaveAttribute('aria-disabled', 'true');
     });
   });
 
   // ── I2 (F3): a stale activeMethods must not hide the code prompt ──────────
   //
-  // `activeMethods` is the last status fetch; the server's `methods` on an
-  // mfa_required refusal is the present truth. With no real MFA in the stale
-  // list the modal rendered no prompt, so an mfa_required answer left the user
-  // with a password field, an error they could not act on, and a Confirm that
-  // spent another of the five shared attempts on every click.
+  // The server's `methods` on an mfa_required refusal is the present truth. A
+  // modal that read a password-only account and is then told otherwise shows
+  // the code field, with only the inline-verifiable subset of the list.
 
-  describe('action modal — stale methods (I2)', () => {
-    it('renders the code prompt from refusal.methods after an mfa_required refusal', async () => {
+  describe('action modal — a refusal naming methods the read did not (I2)', () => {
+    it('renders the code field from refusal.methods after an mfa_required refusal', async () => {
+      serveApi({ read: readOffers([]) });
       const onDisableEmailSms = vi
         .fn()
         .mockResolvedValueOnce({ kind: 'mfaRequired', methods: ['totp', 'email'] })
@@ -874,31 +1298,24 @@ describe('MFATierSelector', () => {
         />
       );
       fireEvent.click(screen.getByText('Disable'));
-      expect(screen.queryByTestId('mfa-verify-prompt')).not.toBeInTheDocument();
+      typePassword('pw');
+      await untilActionable('Disable Email/SMS');
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+      await submitConfirm('Disable Email/SMS');
 
-      fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-        target: { value: 'pw' },
-      });
-      const confirm = () => screen.getByRole('button', { name: 'Disable Email/SMS' });
-      await act(async () => {
-        fireEvent.click(confirm());
-      });
-
-      const prompt = await screen.findByTestId('mfa-verify-prompt');
+      const code = await screen.findByLabelText('Authenticator app code');
       // Only the inline-verifiable subset of the server's list (policy P1).
-      expect(prompt.dataset.methods).toBe('totp');
-      expect(
-        screen.getByText('Verify with your authenticator app or security key to continue.')
-      ).toBeInTheDocument();
+      const dialog = within(screen.getByRole('dialog'));
+      expect(dialog.queryByLabelText(/email|sms/i)).not.toBeInTheDocument();
+      expect(dialog.queryByRole('button', { name: /instead/i })).not.toBeInTheDocument();
+      const confirm = () => screen.getByRole('button', { name: 'Disable Email/SMS' });
       // The code is now required before another attempt is spent.
-      expect(confirm()).toBeDisabled();
+      expect(confirm()).toHaveAttribute('aria-disabled', 'true');
 
-      fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
-      expect(confirm()).not.toBeDisabled();
-      await act(async () => {
-        fireEvent.click(confirm());
-      });
-      expect(onDisableEmailSms).toHaveBeenLastCalledWith('pw', '123456');
+      fireEvent.change(code, { target: { value: '123456' } });
+      expect(confirm()).not.toHaveAttribute('aria-disabled');
+      await submitConfirm('Disable Email/SMS');
+      expect(onDisableEmailSms).toHaveBeenLastCalledWith('pw', '123456', expect.anything());
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
   });
@@ -906,31 +1323,23 @@ describe('MFATierSelector', () => {
   // ── I4: every action routes through the step-up result, with its own args ──
 
   describe('action modal — all six actions route and pass their arguments (I4)', () => {
-    const fillPassword = (value = 'pw') =>
-      fireEvent.change(screen.getByPlaceholderText('Enter your password'), { target: { value } });
-    const fillCode = (value = '123456') =>
-      fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value } });
-    const confirm = async (name: string) => {
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name }));
-      });
-    };
+    const accepted = () => vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
 
-    it('reset-totp → onResetTOTP(password, code), then closes', async () => {
-      const onResetTOTP = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+    it('reset-totp → onResetTOTP(password, code, context), then closes', async () => {
+      const onResetTOTP = accepted();
       render(
         <MFATierSelector {...defaultProps} activeMethods={['totp']} onResetTOTP={onResetTOTP} />
       );
       fireEvent.click(screen.getByText('Reset'));
-      fillPassword();
-      fillCode();
-      await confirm('Confirm');
-      expect(onResetTOTP).toHaveBeenCalledWith('pw', '123456');
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      await submitConfirm();
+      expect(onResetTOTP).toHaveBeenCalledWith('pw', '123456', expect.anything());
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
-    it('revoke-webauthn → onRevokeWebAuthnKey(credentialId, password) on the password alone', async () => {
-      const onRevokeWebAuthnKey = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+    it('revoke-webauthn → onRevokeWebAuthnKey(credentialId, password, undefined, context) on the password alone', async () => {
+      const onRevokeWebAuthnKey = accepted();
       render(
         <MFATierSelector
           {...defaultProps}
@@ -947,14 +1356,19 @@ describe('MFATierSelector', () => {
         />
       );
       fireEvent.click(screen.getByText('Revoke'));
-      fillPassword();
-      await confirm('Confirm');
-      expect(onRevokeWebAuthnKey).toHaveBeenCalledWith('cred-1', 'pw');
+      typePassword();
+      await submitConfirm();
+      expect(onRevokeWebAuthnKey).toHaveBeenCalledWith(
+        'cred-1',
+        'pw',
+        undefined,
+        expect.anything()
+      );
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
-    it('toggle-recovery-only → onToggleRecoveryOnly(method, value, password, code), code required', async () => {
-      const onToggleRecoveryOnly = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+    it('toggle-recovery-only → onToggleRecoveryOnly(method, value, password, code, context), code required', async () => {
+      const onToggleRecoveryOnly = accepted();
       render(
         <MFATierSelector
           {...defaultProps}
@@ -963,17 +1377,26 @@ describe('MFATierSelector', () => {
         />
       );
       fireEvent.click(screen.getAllByTestId('toggle-switch')[0]);
-      fillPassword();
-      // Now on the step-up seam: a password alone would spend an attempt on a
-      // request that must fail with mfa_required.
-      expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
-      fillCode();
-      await confirm('Confirm');
-      expect(onToggleRecoveryOnly).toHaveBeenCalledWith('email', true, 'pw', '123456');
+      typePassword();
+      const code = await screen.findByLabelText('Authenticator app code');
+      // A password alone would spend an attempt on a request that must fail.
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+      fireEvent.change(code, { target: { value: '123456' } });
+      await submitConfirm();
+      expect(onToggleRecoveryOnly).toHaveBeenCalledWith(
+        'email',
+        true,
+        'pw',
+        '123456',
+        expect.anything()
+      );
     });
 
-    it('disable-emailsms → onDisableEmailSms(password, code)', async () => {
-      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'accepted', data: null });
+    it('disable-emailsms → onDisableEmailSms(password, code, context)', async () => {
+      const onDisableEmailSms = accepted();
       render(
         <MFATierSelector
           {...defaultProps}
@@ -982,10 +1405,10 @@ describe('MFATierSelector', () => {
         />
       );
       fireEvent.click(screen.getByText('Disable'));
-      fillPassword();
-      fillCode();
-      await confirm('Disable Email/SMS');
-      expect(onDisableEmailSms).toHaveBeenCalledWith('pw', '123456');
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      await submitConfirm('Disable Email/SMS');
+      expect(onDisableEmailSms).toHaveBeenCalledWith('pw', '123456', expect.anything());
     });
 
     it('a 409 inline-factor refusal shows its message in the banner and keeps the modal open', async () => {
@@ -996,15 +1419,18 @@ describe('MFATierSelector', () => {
         <MFATierSelector {...defaultProps} activeMethods={['totp']} onResetTOTP={onResetTOTP} />
       );
       fireEvent.click(screen.getByText('Reset'));
-      fillPassword();
-      fillCode();
-      await confirm('Confirm');
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      await submitConfirm();
       expect(await screen.findByText(message)).toBeInTheDocument();
       expect(screen.getByRole('dialog')).toBeInTheDocument();
       // Not a lock: a fresh code (the sent one may be spent) re-enables Confirm.
-      expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
-      fillCode();
-      expect(screen.getByRole('button', { name: 'Confirm' })).not.toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Confirm' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+      typeCode(screen.getByLabelText('Authenticator app code'));
+      expect(screen.getByRole('button', { name: 'Confirm' })).not.toHaveAttribute('aria-disabled');
     });
 
     it('unavailable shows the outage copy and does not lock', async () => {
@@ -1017,18 +1443,23 @@ describe('MFATierSelector', () => {
         />
       );
       fireEvent.click(screen.getByText('Disable'));
-      fillPassword();
-      fillCode();
-      await confirm('Disable Email/SMS');
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      await submitConfirm('Disable Email/SMS');
       expect(
         await screen.findByText(
           'Verification is temporarily unavailable. Try again in a few minutes.'
         )
       ).toBeInTheDocument();
       // Not a lock: a fresh code (the sent one may be spent) re-enables Confirm.
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
-      fillCode();
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+      typeCode(screen.getByLabelText('Authenticator app code'));
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toHaveAttribute(
+        'aria-disabled'
+      );
     });
 
     it('a lock survives until the modal is reopened, then clears', async () => {
@@ -1041,15 +1472,80 @@ describe('MFATierSelector', () => {
         />
       );
       fireEvent.click(screen.getByText('Disable'));
-      fillPassword();
-      fillCode();
-      await confirm('Disable Email/SMS');
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toBeDisabled();
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      await submitConfirm('Disable Email/SMS');
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
       fireEvent.click(screen.getByText('Cancel'));
       fireEvent.click(screen.getByText('Disable'));
-      fillPassword();
-      fillCode();
-      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toBeDisabled();
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      expect(screen.getByRole('button', { name: 'Disable Email/SMS' })).not.toHaveAttribute(
+        'aria-disabled'
+      );
+    });
+  });
+
+  // ── The run's capture (C82) ───────────────────────────────────────────────
+
+  describe('action modal — one capture per activation', () => {
+    // Mutant: a request sent outside the run's capture. The handler must be
+    // handed the capture `run` worked against, so its request is admitted
+    // against the same account and server as the proof.
+    it('admits the security-key begin request against a capture', async () => {
+      serveApi({ read: readOffers(['webauthn']) });
+      const onDisableEmailSms = vi.fn().mockResolvedValue({ kind: 'failed' });
+      render(
+        <MFATierSelector
+          {...defaultProps}
+          activeMethods={['webauthn', 'email']}
+          onDisableEmailSms={onDisableEmailSms}
+        />
+      );
+      fireEvent.click(screen.getByText('Disable'));
+      typePassword();
+      await untilActionable('Disable Email/SMS');
+      // A begin that fails ends the run before the handler is called; the
+      // capture it used is then the only one there is.
+      await submitConfirm('Disable Email/SMS');
+      await waitFor(() => expect(beginCalls()).toHaveLength(1));
+      expect(beginCalls()[0].context).toBeDefined();
+      expect(onDisableEmailSms).not.toHaveBeenCalled();
+    });
+
+    // A change before the click is caught by the capture the stage took when
+    // it opened (useStepUpFactor's tests). A change DURING the run, here while
+    // the begin request is out, must stop it before anything carrying the
+    // proof is sent.
+    it('sends nothing, and says so, when the account changed during the run', async () => {
+      const begin = deferred<Response>();
+      serveApi({ read: readOffers(['webauthn']), begin: () => begin.promise });
+      render(<MFATierSelector {...defaultProps} activeMethods={['webauthn', 'email']} />);
+      fireEvent.click(screen.getByText('Disable'));
+      typePassword();
+      await untilActionable('Disable Email/SMS');
+      await submitConfirm('Disable Email/SMS');
+      await waitFor(() => expect(beginCalls()).toHaveLength(1));
+
+      act(() => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 })));
+      await act(async () => begin.resolve(json({ publicKey: {} })));
+
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Sign in again'));
+      expect(defaultProps.onDisableEmailSms).not.toHaveBeenCalled();
+      expect(calls.filter((c) => c.path.endsWith('/verify-inline/finish'))).toHaveLength(0);
+    });
+
+    it('hands the handler a live ApiRequestContext', async () => {
+      render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+      fireEvent.click(screen.getByText('Reset'));
+      typePassword();
+      typeCode(await screen.findByLabelText('Authenticator app code'));
+      await submitConfirm();
+      const context = defaultProps.onResetTOTP.mock.calls[0][2];
+      expect(apiRequestContextIsCurrent(context)).toBe(true);
     });
   });
 
@@ -1065,19 +1561,13 @@ describe('MFATierSelector', () => {
       />
     );
     fireEvent.click(screen.getByText('Disable'));
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'wrong' },
-    });
-    const code = screen.getByTestId('mfa-verify-input');
-    fireEvent.change(code, { target: { value: '123456' } });
+    typePassword('wrong');
+    const code = await screen.findByLabelText('Authenticator app code');
+    typeCode(code);
     code.focus();
     expect(document.activeElement).toBe(code);
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Disable Email/SMS' }));
-    });
-    await vi.waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByPlaceholderText('Enter your password'))
-    );
+    await submitConfirm('Disable Email/SMS');
+    await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Password')));
   });
 
   // ── I8: removing the backup email ────────────────────────────────────────
@@ -1100,14 +1590,10 @@ describe('MFATierSelector', () => {
     expect(
       screen.getByText('old@example.com will no longer be able to recover your account.')
     ).toBeInTheDocument();
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'pw' },
-    });
-    fireEvent.change(screen.getByTestId('mfa-verify-input'), { target: { value: '123456' } });
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Remove backup email' }));
-    });
-    expect(onSetBackupEmail).toHaveBeenCalledWith('', 'pw', '123456');
+    typePassword();
+    typeCode(await screen.findByLabelText('Authenticator app code'));
+    await submitConfirm('Remove backup email');
+    expect(onSetBackupEmail).toHaveBeenCalledWith('', 'pw', '123456', expect.anything());
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     // Accepted leaves edit mode.
     expect(screen.getByText('Change')).toBeInTheDocument();

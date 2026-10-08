@@ -1,47 +1,75 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen, userEvent } from '../../../test-utils';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { http, HttpResponse } from 'msw';
+import { act, fireEvent, render, screen, userEvent, waitFor } from '../../../test-utils';
+import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import DeleteRefusalModal from '@/renderer/components/Chat/DeleteRefusalModal';
+import { deferred } from '../../../helpers/deferred';
+import DeleteRefusalModal, {
+  type DeleteRefusalModalProps,
+} from '@/renderer/components/Chat/DeleteRefusalModal';
 import type { DeleteRefusalState } from '@/renderer/hooks/messaging/useChatController';
+import type { StepUpSubmitOutcome } from '@/renderer/hooks/auth/useStepUpFactor';
 import type { DeleteRefusalView } from '@/renderer/services/messaging/deleteRefusal';
 import type { StepUpPurpose } from '@/renderer/components/Auth/stepUpPurpose';
 
-// #3455 T7/T8/T9: the single-message delete refusal dialog. It is controlled by
-// the hook's one refusal slot, so these tests drive it with a slot value and
-// assert what a person sees, types and hears.
+// #3455 T7/T8/T9, rewritten for picker PR 3: the single-message delete refusal
+// dialog hosts the shared StepUpCredentials stage. It is controlled by the
+// hook's one refusal slot, so these tests drive it with a slot value, answer
+// the factor hook's read with MSW, and assert what a person sees, types and
+// hears. `onConfirm` resolves to the outcome the hook words in place.
+//
+// Removed on purpose (the state they pinned no longer exists): the slot's
+// `submitting` and `promptKey`, and the confirm/password views' `error`. The
+// input remount and the per-attempt copy now belong to the factor hook, and are
+// pinned here through the outcomes `onConfirm` resolves to.
 
-// The security-key path is the only observable carrier of `purpose`.
-const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/system/apiClient', () => ({
-  apiFetch: (...args: unknown[]) => mockApiFetch(...args),
-  API_BASE: 'http://localhost:8080',
-}));
+beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
 
 const FIXTURE_PW = 'hunter2-fixture';
 const CODE = '123456';
+const BACKUP = 'abcd1234';
+const WEBAUTHN_TOKEN = 'webauthn-inline-token';
+const READ_PATH = '*/api/v1/mfa/step-up';
+const BEGIN_PATH = '*/api/v1/mfa/webauthn/verify-inline/begin';
+const FINISH_PATH = '*/api/v1/mfa/webauthn/verify-inline/finish';
+const ENROLLMENT_COPY = 'Set up an authenticator app or security key in Settings to do this.';
 
 function slot(
   view: DeleteRefusalView,
   extra: Partial<DeleteRefusalState> = {}
 ): DeleteRefusalState {
-  return {
-    messageId: 'm1',
-    view,
-    submitting: false,
-    openedAt: Date.now(),
-    promptKey: 0,
-    ...extra,
-  };
+  return { messageId: 'm1', view, openedAt: Date.now(), ...extra };
 }
 
 const CONFIRM: DeleteRefusalView = { view: 'confirm', methods: ['totp'] };
 const PASSWORD: DeleteRefusalView = { view: 'password' };
+const ENROLL: DeleteRefusalView = { view: 'enroll' };
+
+/** What the account's step-up read answers. */
+function readAnswers(methods: string[], backup = false) {
+  return http.get(READ_PATH, () =>
+    HttpResponse.json({
+      methods,
+      default_method: methods[0] ?? null,
+      backup_code_available: backup,
+    })
+  );
+}
+
+const refusal = (r: Extract<StepUpSubmitOutcome, { kind: 'refusal' }>['refusal']) =>
+  ({ kind: 'refusal', refusal: r }) as const;
+
+type Confirm = ReturnType<typeof vi.fn<DeleteRefusalModalProps['onConfirm']>>;
+const okConfirm = (): Confirm =>
+  vi.fn<DeleteRefusalModalProps['onConfirm']>(async () => ({ kind: 'success' }));
 
 interface Props {
   refusal: DeleteRefusalState | null;
-  onConfirm?: (step: { mfaCode?: string; currentPassword?: string }) => void;
+  onConfirm?: DeleteRefusalModalProps['onConfirm'];
   onDismiss?: () => void;
   purpose?: StepUpPurpose;
   surfaceId?: string;
@@ -50,15 +78,15 @@ interface Props {
 const SURFACE = 'surface-main';
 
 function ui({
-  refusal,
-  onConfirm = vi.fn(),
+  refusal: state,
+  onConfirm = okConfirm(),
   onDismiss = vi.fn(),
   purpose = 'messages.delete',
   surfaceId = SURFACE,
 }: Props) {
   return (
     <DeleteRefusalModal
-      refusal={refusal}
+      refusal={state}
       onConfirm={onConfirm}
       onDismiss={onDismiss}
       purpose={purpose}
@@ -67,18 +95,16 @@ function ui({
   );
 }
 
-async function typeCode(user: ReturnType<typeof userEvent.setup>, code = CODE) {
-  await user.click(screen.getByRole('textbox', { name: 'Digit 1' }));
-  await user.keyboard(code);
-}
-
-function digitValues(): string[] {
-  return screen.getAllByRole('textbox').map((el) => (el as HTMLInputElement).value);
+const totpInput = () => screen.findByLabelText('Authenticator app code');
+async function typeCode(code = CODE) {
+  await userEvent.setup().type(await totpInput(), code);
 }
 
 function confirmButton() {
-  return screen.getByRole('button', { name: /^Confirm/ });
+  return screen.getByRole('button', { name: /^(Confirm|Waiting|Confirming)/ });
 }
+const confirmIsInert = () => expect(confirmButton()).toHaveAttribute('aria-disabled', 'true');
+const confirmIsLive = () => expect(confirmButton()).not.toHaveAttribute('aria-disabled');
 
 // Nodes a test appends to the document outside React; removed after each test.
 const extraNodes: HTMLElement[] = [];
@@ -86,8 +112,8 @@ const extraNodes: HTMLElement[] = [];
 describe('DeleteRefusalModal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockApiFetch.mockReset();
     resetAllStores();
+    server.use(readAnswers(['totp']));
   });
 
   afterEach(() => {
@@ -101,44 +127,35 @@ describe('DeleteRefusalModal', () => {
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
-    it('confirm: an MFA prompt inside a dialog titled for the person, with no error text', () => {
+    it('confirm: a code field inside a dialog titled for the person, with no error text', async () => {
       render(ui({ refusal: slot(CONFIRM) }));
 
       const dialog = screen.getByRole('dialog', { name: "Confirm it's you" });
       expect(dialog).toHaveTextContent(
         "You've deleted several messages quickly. Confirm it's you to keep going."
       );
-      expect(screen.getByText('MFA Verification')).toBeInTheDocument();
-      expect(screen.getAllByRole('textbox')).toHaveLength(6);
+      expect(await totpInput()).toBeInTheDocument();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
 
-    it('confirm: shows the per-attempt error the mapper supplied', () => {
-      render(
-        ui({ refusal: slot({ ...CONFIRM, error: "That didn't work. Try again with a new code." }) })
-      );
-      expect(screen.getByRole('alert')).toHaveTextContent(
-        "That didn't work. Try again with a new code."
-      );
-    });
-
-    it('password: a labelled password field, not an MFA prompt', () => {
+    it('password: a labelled password field, not a code field', async () => {
+      server.use(readAnswers([]));
       render(ui({ refusal: slot(PASSWORD) }));
 
       expect(screen.getByRole('dialog', { name: "Confirm it's you" })).toBeInTheDocument();
-      expect(screen.getByLabelText('Password')).toHaveAttribute('type', 'password');
-      expect(screen.queryByText('MFA Verification')).not.toBeInTheDocument();
-      expect(screen.getByLabelText('Password')).not.toHaveAttribute('aria-invalid');
+      const field = await screen.findByLabelText('Password');
+      expect(field).toHaveAttribute('type', 'password');
+      expect(field).not.toHaveAttribute('aria-invalid');
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
     });
 
-    it('password: a refused password is announced and tied to the field', () => {
-      render(ui({ refusal: slot({ view: 'password', error: 'That password is not correct.' }) }));
+    // E8 (Q5): the dialog keeps its name, so it does not change mid-flow.
+    it('enroll: the dialog is still "Confirm it\'s you", and says what to do in Settings', async () => {
+      render(ui({ refusal: slot(ENROLL) }));
 
-      expect(screen.getByRole('alert')).toHaveTextContent('That password is not correct.');
-      expect(screen.getByLabelText('Password')).toHaveAttribute('aria-invalid', 'true');
-      expect(screen.getByLabelText('Password')).toHaveAccessibleDescription(
-        'That password is not correct.'
-      );
+      expect(screen.getByRole('dialog', { name: "Confirm it's you" })).toBeInTheDocument();
+      expect(await screen.findByText(ENROLLMENT_COPY)).toBeInTheDocument();
     });
 
     it('wait: names the problem, offers Close only, and has no form', () => {
@@ -202,137 +219,376 @@ describe('DeleteRefusalModal', () => {
     });
   });
 
-  describe('confirming with a code', () => {
-    it('keeps Confirm disabled until a complete code exists, then sends only the code', async () => {
-      const user = userEvent.setup();
-      const onConfirm = vi.fn();
-      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+  // E8, and the #17 loop: an account with no authenticator app or security key
+  // can type nothing that passes, so the dialog must offer nothing to retry.
+  describe('enrolment (E8)', () => {
+    async function renderEnroll(view: DeleteRefusalView = ENROLL) {
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot(view), onConfirm }));
+      await screen.findByText(ENROLLMENT_COPY);
+      return onConfirm;
+    }
 
-      expect(confirmButton()).toBeDisabled();
-      // The prompt autofocuses digit 1 and each digit advances focus.
-      await user.keyboard('123');
-      expect(confirmButton()).toBeDisabled();
-
-      await user.keyboard('456');
-      expect(confirmButton()).toBeEnabled();
-      await user.click(confirmButton());
-
-      expect(onConfirm).toHaveBeenCalledTimes(1);
-      expect(onConfirm).toHaveBeenCalledWith({ mfaCode: CODE });
+    it('offers no input of any kind', async () => {
+      await renderEnroll();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+      expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     });
 
-    it('editing a completed code disables Confirm again', async () => {
-      const user = userEvent.setup();
-      render(ui({ refusal: slot(CONFIRM) }));
-      await typeCode(user);
-      expect(confirmButton()).toBeEnabled();
+    it('has no Retry, no countdown and no live alert', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      render(ui({ refusal: slot(ENROLL, { openedAt: Date.now() }) }));
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
 
-      await user.click(screen.getByRole('textbox', { name: 'Digit 6' }));
-      await user.keyboard('{Backspace}');
-      expect(confirmButton()).toBeDisabled();
+      const dialog = screen.getByRole('dialog');
+      expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+      expect(dialog).not.toHaveTextContent(/try again/i);
+      expect(dialog).not.toHaveTextContent(/\d+s\b/);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(vi.getTimerCount(), 'no countdown interval is running').toBe(0);
     });
 
-    it('submitting the form with no code sends nothing', async () => {
-      const user = userEvent.setup();
-      const onConfirm = vi.fn();
-      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+    it('its primary can never send: aria-disabled, and activating it sends nothing', async () => {
+      const onConfirm = await renderEnroll();
 
-      await user.click(screen.getByRole('textbox', { name: 'Digit 1' }));
-      await user.keyboard('{Enter}');
+      confirmIsInert();
+      await userEvent.setup().click(confirmButton());
+      fireEvent.keyDown(confirmButton(), { key: 'Enter' });
+
       expect(onConfirm).not.toHaveBeenCalled();
     });
 
-    it('an invalid code remounts the prompt empty (promptKey bump) and clears Confirm', async () => {
-      const user = userEvent.setup();
-      const { rerender } = render(ui({ refusal: slot(CONFIRM) }));
-      await typeCode(user);
-      expect(digitValues()).toEqual([...CODE]);
-      expect(confirmButton()).toBeEnabled();
+    it('is not a dead end: Cancel dismisses', async () => {
+      const onDismiss = vi.fn();
+      render(ui({ refusal: slot(ENROLL), onDismiss }));
+      await screen.findByText(ENROLLMENT_COPY);
 
-      rerender(
-        ui({
-          refusal: slot(
-            { ...CONFIRM, error: "That didn't work. Try again with a new code." },
-            { promptKey: 1 }
-          ),
-        })
-      );
-
-      expect(digitValues()).toEqual(['', '', '', '', '', '']);
-      expect(confirmButton()).toBeDisabled();
-      expect(screen.getByRole('alert')).toHaveTextContent("That didn't work");
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
     });
 
-    it('a refusal that does NOT bump the key leaves a typed code in place', async () => {
-      const user = userEvent.setup();
-      const { rerender } = render(ui({ refusal: slot(CONFIRM) }));
-      await typeCode(user);
+    it('carries no danger styling', async () => {
+      await renderEnroll();
+      const dialog = screen.getByRole('dialog');
+      for (const el of [dialog, ...dialog.querySelectorAll('*')]) {
+        expect(el.getAttribute('class') ?? '').not.toMatch(/danger/i);
+      }
+    });
 
-      rerender(ui({ refusal: slot(CONFIRM, { openedAt: Date.now() + 1 }) }));
-      expect(digitValues()).toEqual([...CODE]);
+    it('a read that would offer a method cannot revive it: the seed ends the instance', async () => {
+      server.use(readAnswers(['totp', 'webauthn'], true));
+      await renderEnroll();
+      // Give a (wrongly) restarted read time to land.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+      expect(screen.getByText(ENROLLMENT_COPY)).toBeInTheDocument();
+    });
+
+    // The retry's own enrolment 403 reaches the hook as an outcome, and the
+    // controller swaps the slot's view in the same beat.
+    it('an enrolment answer to a retry ends the stage: the password field goes, the copy appears', async () => {
+      server.use(readAnswers([]));
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () =>
+        refusal({ kind: 'enrollmentRequired' })
+      );
+      const { rerender } = render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      const user = userEvent.setup();
+      await user.type(await screen.findByLabelText('Password'), FIXTURE_PW);
+      await user.click(confirmButton());
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      rerender(ui({ refusal: slot(ENROLL), onConfirm }));
+
+      expect(await screen.findByText(ENROLLMENT_COPY)).toBeInTheDocument();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('confirming with a code', () => {
+    it('keeps Confirm inert until a complete code exists, then sends only the code', async () => {
+      const user = userEvent.setup();
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      const input = await totpInput();
+
+      confirmIsInert();
+      await user.type(input, '123');
+      confirmIsInert();
+
+      await user.type(input, '456');
+      confirmIsLive();
+      await user.click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      expect(onConfirm.mock.calls[0][0]).toEqual({ mfaCode: CODE });
+    });
+
+    it('hands the controller the run’s request context with the code', async () => {
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      await typeCode();
+      await userEvent.setup().click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      expect(onConfirm.mock.calls[0][1], 'the capture the retry is admitted against').toBeDefined();
+    });
+
+    it('editing a completed code makes Confirm inert again', async () => {
+      const user = userEvent.setup();
+      render(ui({ refusal: slot(CONFIRM) }));
+      await typeCode();
+      confirmIsLive();
+
+      await user.type(await totpInput(), '{Backspace}');
+      confirmIsInert();
+    });
+
+    it('activating Confirm with no code sends nothing and names what is missing', async () => {
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      await totpInput();
+
+      await userEvent.setup().click(confirmButton());
+
+      expect(onConfirm).not.toHaveBeenCalled();
+      expect((await screen.findAllByText(/Enter the 6-digit code/)).length).toBeGreaterThan(0);
+    });
+
+    // The #17 kill: a backup code was refused here before the picker.
+    it('a backup code is accepted, and travels as the code', async () => {
+      server.use(readAnswers(['totp'], true));
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      const user = userEvent.setup();
+
+      await user.click(await screen.findByRole('button', { name: 'Use a backup code instead' }));
+      await user.type(await screen.findByLabelText('Backup code'), BACKUP);
+      await user.click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      expect(onConfirm.mock.calls[0][0]).toEqual({ mfaCode: BACKUP });
+    });
+
+    it('no backup code is offered when the account has none', async () => {
+      server.use(readAnswers(['totp'], false));
+      render(ui({ refusal: slot(CONFIRM) }));
+      await totpInput();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(screen.queryByRole('button', { name: 'Use a backup code instead' })).toBeNull();
+    });
+
+    // G2: the refusal that opened the dialog already named the methods.
+    it('a failed read keeps the seeded methods rather than blocking the delete', async () => {
+      server.use(http.get(READ_PATH, () => HttpResponse.json({ error: 'boom' }, { status: 500 })));
+      render(ui({ refusal: slot({ view: 'confirm', methods: ['totp'] }) }));
+
+      expect(await totpInput()).toBeInTheDocument();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+      expect(screen.getByLabelText('Authenticator app code')).toBeInTheDocument();
+    });
+
+    it('an invalid code is worded in place by the hook, and the input is emptied and focused', async () => {
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () =>
+        refusal({ kind: 'invalidMfaCode' })
+      );
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      await typeCode();
+      await userEvent.setup().click(confirmButton());
+
+      expect(await screen.findByText(/That code didn't work/)).toBeInTheDocument();
+      const input = await totpInput();
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(input).toHaveValue('');
+      confirmIsInert();
+    });
+
+    it('an aborted attempt shows nothing and keeps what was typed', async () => {
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () => ({
+        kind: 'aborted',
+      }));
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      await typeCode();
+      await userEvent.setup().click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      await waitFor(() => confirmIsLive());
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.queryByText(/didn't work|network|couldn't/i)).not.toBeInTheDocument();
+      expect(await totpInput()).toHaveValue(CODE);
+    });
+  });
+
+  describe('confirming with a security key', () => {
+    let mockGet: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      mockGet = vi.fn().mockResolvedValue({
+        id: 'credential-id',
+        rawId: new Uint8Array([1, 2, 3]).buffer,
+        type: 'public-key',
+        response: {
+          authenticatorData: new Uint8Array([10, 20]).buffer,
+          clientDataJSON: new Uint8Array([30, 40]).buffer,
+          signature: new Uint8Array([50, 60]).buffer,
+          userHandle: null,
+        },
+      });
+      Object.defineProperty(navigator, 'credentials', {
+        value: { get: mockGet },
+        writable: true,
+        configurable: true,
+      });
+    });
+
+    function ceremonyWorks(begins: unknown[] = []) {
+      server.use(
+        readAnswers(['webauthn']),
+        http.post(BEGIN_PATH, async ({ request }) => {
+          begins.push(await request.json());
+          return HttpResponse.json({
+            publicKey: { challenge: 'AQID', rpId: 'localhost', allowCredentials: [] },
+          });
+        }),
+        http.post(FINISH_PATH, () => HttpResponse.json({ mfa_token: WEBAUTHN_TOKEN }))
+      );
+    }
+
+    // A WebAuthn token not reaching the delete: the controller sends `mfaCode`.
+    it.each(['messages.delete', 'dm.message_delete'] as const)(
+      'the token minted for %s is the code the controller is handed',
+      async (purpose) => {
+        const begins: unknown[] = [];
+        ceremonyWorks(begins);
+        const onConfirm = okConfirm();
+        render(
+          ui({ refusal: slot({ view: 'confirm', methods: ['webauthn'] }), purpose, onConfirm })
+        );
+        await screen.findByText('Passkey or security key');
+
+        await userEvent.setup().click(confirmButton());
+
+        await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+        expect(begins).toEqual([{ purpose }]);
+        expect(onConfirm.mock.calls[0][0]).toEqual({ mfaCode: WEBAUTHN_TOKEN });
+      }
+    );
+
+    it('a cancelled ceremony sends nothing and returns focus to the primary', async () => {
+      ceremonyWorks();
+      mockGet.mockRejectedValue(new DOMException('cancelled', 'NotAllowedError'));
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot({ view: 'confirm', methods: ['webauthn'] }), onConfirm }));
+      await screen.findByText('Passkey or security key');
+
+      await userEvent.setup().click(confirmButton());
+
+      expect(await screen.findByText(/cancelled or timed out/)).toBeInTheDocument();
+      await waitFor(() => expect(confirmButton()).toHaveFocus());
+      expect(onConfirm).not.toHaveBeenCalled();
     });
   });
 
   describe('confirming with a password', () => {
-    it('keeps Confirm disabled until a password is typed, then sends only the password', async () => {
-      const user = userEvent.setup();
-      const onConfirm = vi.fn();
-      render(ui({ refusal: slot(PASSWORD), onConfirm }));
-
-      expect(confirmButton()).toBeDisabled();
-      await user.type(screen.getByLabelText('Password'), FIXTURE_PW);
-      expect(confirmButton()).toBeEnabled();
-      await user.click(confirmButton());
-
-      expect(onConfirm).toHaveBeenCalledWith({ currentPassword: FIXTURE_PW });
+    beforeEach(() => {
+      server.use(readAnswers([]));
     });
 
-    it('Enter in the field submits it', async () => {
-      const user = userEvent.setup();
-      const onConfirm = vi.fn();
-      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+    const field = () => screen.findByLabelText('Password');
+    const enter = async (value = FIXTURE_PW) => userEvent.setup().type(await field(), value);
 
-      await user.type(screen.getByLabelText('Password'), `${FIXTURE_PW}{Enter}`);
-      expect(onConfirm).toHaveBeenCalledWith({ currentPassword: FIXTURE_PW });
+    it('keeps Confirm inert until a password is typed, then sends only the password', async () => {
+      const onConfirm = okConfirm();
+      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      await field();
+
+      confirmIsInert();
+      await enter();
+      confirmIsLive();
+      await userEvent.setup().click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      expect(onConfirm.mock.calls[0][0]).toEqual({ currentPassword: FIXTURE_PW });
     });
 
-    it('an invalid password clears the field', async () => {
-      const user = userEvent.setup();
-      const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
-      await user.type(screen.getByLabelText('Password'), FIXTURE_PW);
+    it('the sent password leaves the field, whatever the controller answered', async () => {
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () => ({
+        kind: 'answered',
+      }));
+      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      await enter();
+      await userEvent.setup().click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(screen.getByLabelText('Password')).toHaveValue(''));
+    });
+
+    // D7: nothing was sent, so what was typed is still what the person means.
+    it('an aborted attempt keeps the password', async () => {
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () => ({
+        kind: 'aborted',
+      }));
+      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      await enter();
+      await userEvent.setup().click(confirmButton());
+
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+      await waitFor(() => confirmIsLive());
       expect(screen.getByLabelText('Password')).toHaveValue(FIXTURE_PW);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
 
-      rerender(
-        ui({
-          refusal: slot(
-            { view: 'password', error: 'That password is not correct.' },
-            { promptKey: 1 }
-          ),
-        })
+    it('a refused password is worded on the emptied, focused, described field', async () => {
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () =>
+        refusal({ kind: 'invalidPassword' })
       );
+      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      await enter();
+      await userEvent.setup().click(confirmButton());
 
-      expect(screen.getByLabelText('Password')).toHaveValue('');
-      expect(confirmButton()).toBeDisabled();
+      expect(await screen.findByRole('alert')).toHaveTextContent('That password is not correct.');
+      const input = screen.getByLabelText('Password');
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(input).toHaveValue('');
+      expect(input).toHaveAttribute('aria-invalid', 'true');
+      expect(input).toHaveAccessibleDescription('That password is not correct.');
     });
 
-    it('a different message starts from an empty password field', async () => {
-      const user = userEvent.setup();
-      const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
-      await user.type(screen.getByLabelText('Password'), FIXTURE_PW);
+    // C2: the account gained an authenticator since the prompt opened.
+    it('a mint that names methods moves the dialog from the password to the code', async () => {
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(async () =>
+        refusal({ kind: 'mfaRequired', methods: ['totp'] })
+      );
+      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      await enter();
+      await userEvent.setup().click(confirmButton());
 
-      rerender(ui({ refusal: slot(PASSWORD, { messageId: 'm2' }) }));
-      expect(screen.getByLabelText('Password')).toHaveValue('');
+      expect(await totpInput()).toBeInTheDocument();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
     });
 
-    it('keeps the typed password while the attempt is merely in flight', async () => {
-      const user = userEvent.setup();
-      const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
-      await user.type(screen.getByLabelText('Password'), FIXTURE_PW);
+    it('keeps the typed password while the attempt is merely in flight, read-only', async () => {
+      const pending = deferred<StepUpSubmitOutcome>();
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(() => pending.promise);
+      render(ui({ refusal: slot(PASSWORD), onConfirm }));
+      await enter();
+      await userEvent.setup().click(confirmButton());
 
-      rerender(ui({ refusal: slot(PASSWORD, { submitting: true }) }));
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
       expect(screen.getByLabelText('Password')).toHaveValue(FIXTURE_PW);
-      expect(screen.getByLabelText('Password')).toBeDisabled();
+      await act(async () => {
+        pending.resolve({ kind: 'success' });
+      });
     });
+
+    // Removed with the unchanged behaviour: "a different message starts from an
+    // empty password field". The controller keeps one slot and closes it before
+    // another message can fill it, so the dialog never sees an in-place swap.
   });
 
   describe('while submitting', () => {
@@ -340,23 +596,55 @@ describe('DeleteRefusalModal', () => {
       ['confirm', CONFIRM],
       ['password', PASSWORD],
     ] as const)('%s: is not dismissable and says so', async (_, view) => {
+      server.use(readAnswers(view.view === 'confirm' ? ['totp'] : []));
       const user = userEvent.setup();
       const onDismiss = vi.fn();
-      render(ui({ refusal: slot(view, { submitting: true }), onDismiss }));
+      const pending = deferred<StepUpSubmitOutcome>();
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(() => pending.promise);
+      render(ui({ refusal: slot(view), onConfirm, onDismiss }));
+      if (view.view === 'confirm') await typeCode();
+      else await user.type(await screen.findByLabelText('Password'), FIXTURE_PW);
 
-      expect(screen.getByRole('button', { name: 'Confirming…' })).toBeDisabled();
+      await user.click(confirmButton());
+
+      const busy = await screen.findByRole('button', { name: 'Confirming…' });
+      expect(busy).toHaveAttribute('aria-disabled', 'true');
       expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
       // ui/Modal drops its header X when dismissable is false.
       expect(screen.queryByRole('button', { name: 'Close' })).not.toBeInTheDocument();
 
       await user.keyboard('{Escape}');
       expect(onDismiss).not.toHaveBeenCalled();
+
+      await act(async () => {
+        pending.resolve({ kind: 'success' });
+      });
+    });
+
+    it('does not submit a second time', async () => {
+      const user = userEvent.setup();
+      const pending = deferred<StepUpSubmitOutcome>();
+      const onConfirm = vi.fn<DeleteRefusalModalProps['onConfirm']>(() => pending.promise);
+      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      await typeCode();
+      await user.click(confirmButton());
+      await screen.findByRole('button', { name: 'Confirming…' });
+
+      await user.click(screen.getByRole('button', { name: 'Confirming…' }));
+      fireEvent.keyDown(screen.getByRole('button', { name: 'Confirming…' }), { key: 'Enter' });
+
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        pending.resolve({ kind: 'success' });
+      });
     });
 
     it('is dismissable by Escape, the header X and Cancel when idle', async () => {
+      server.use(readAnswers([]));
       const user = userEvent.setup();
       const onDismiss = vi.fn();
       render(ui({ refusal: slot(PASSWORD), onDismiss }));
+      await screen.findByLabelText('Password');
 
       await user.keyboard('{Escape}');
       expect(onDismiss).toHaveBeenCalledTimes(1);
@@ -364,13 +652,6 @@ describe('DeleteRefusalModal', () => {
       expect(onDismiss).toHaveBeenCalledTimes(2);
       await user.click(screen.getByRole('button', { name: 'Cancel' }));
       expect(onDismiss).toHaveBeenCalledTimes(3);
-    });
-
-    it('does not submit a second time', async () => {
-      const onConfirm = vi.fn();
-      render(ui({ refusal: slot(PASSWORD, { submitting: true }), onConfirm }));
-      expect(screen.getByRole('button', { name: 'Confirming…' })).toBeDisabled();
-      expect(onConfirm).not.toHaveBeenCalled();
     });
   });
 
@@ -540,9 +821,24 @@ describe('DeleteRefusalModal', () => {
       surfaceRoot = addSurface(SURFACE);
     });
 
-    it('moves focus into the first field when a challenge opens', () => {
+    it('moves focus into the first field once the read lands', async () => {
+      server.use(readAnswers([]));
       render(ui({ refusal: slot(PASSWORD) }));
-      expect(screen.getByLabelText('Password')).toHaveFocus();
+      const field = await screen.findByLabelText('Password');
+      await waitFor(() => expect(field).toHaveFocus());
+    });
+
+    it('lands on the code input when the account has no password leg', async () => {
+      render(ui({ refusal: slot(CONFIRM) }));
+      const input = await totpInput();
+      await waitFor(() => expect(input).toHaveFocus());
+    });
+
+    it('an enrolment dialog puts focus inside the dialog, never on a field that is not there', async () => {
+      render(ui({ refusal: slot(ENROLL) }));
+      await screen.findByText(ENROLLMENT_COPY);
+      const dialog = screen.getByRole('dialog');
+      await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
     });
 
     it('moves focus to Close on a Close-only view', () => {
@@ -594,7 +890,8 @@ describe('DeleteRefusalModal', () => {
       expect(other).not.toHaveFocus();
     });
 
-    it('never lands on another panel that shows the same message', () => {
+    it('never lands on another panel that shows the same message', async () => {
+      server.use(readAnswers([]));
       // The other panel comes FIRST in the document, so a document-wide lookup would find it.
       const otherPanel = addSurface('surface-panel');
       const otherRow = addRow('m1', otherPanel);
@@ -602,7 +899,8 @@ describe('DeleteRefusalModal', () => {
       const row = addRow('m1');
       const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
       // Gate: the modal is open and neither target has focus yet.
-      expect(screen.getByLabelText('Password')).toHaveFocus();
+      const field = await screen.findByLabelText('Password');
+      await waitFor(() => expect(field).toHaveFocus());
 
       rerender(ui({ refusal: null }));
 
@@ -611,13 +909,15 @@ describe('DeleteRefusalModal', () => {
       expect(otherComposer).not.toHaveFocus();
     });
 
-    it('falls back to its own composer, not another panel composer, when its row is gone', () => {
+    it('falls back to its own composer, not another panel composer, when its row is gone', async () => {
+      server.use(readAnswers([]));
       const otherPanel = addSurface('surface-panel');
       const otherRow = addRow('m1', otherPanel);
       const otherComposer = addComposer(otherPanel);
       const composer = addComposer();
       const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
-      expect(screen.getByLabelText('Password')).toHaveFocus();
+      const field = await screen.findByLabelText('Password');
+      await waitFor(() => expect(field).toHaveFocus());
 
       rerender(ui({ refusal: null }));
 
@@ -626,12 +926,14 @@ describe('DeleteRefusalModal', () => {
       expect(otherComposer).not.toHaveFocus();
     });
 
-    it('moves focus nowhere when its own panel has neither row nor composer', () => {
+    it('moves focus nowhere when its own panel has neither row nor composer', async () => {
+      server.use(readAnswers([]));
       const otherPanel = addSurface('surface-panel');
       const otherRow = addRow('m1', otherPanel);
       const otherComposer = addComposer(otherPanel);
       const { rerender } = render(ui({ refusal: slot(PASSWORD) }));
-      expect(screen.getByLabelText('Password')).toHaveFocus();
+      const field = await screen.findByLabelText('Password');
+      await waitFor(() => expect(field).toHaveFocus());
 
       rerender(ui({ refusal: null }));
 
@@ -652,29 +954,11 @@ describe('DeleteRefusalModal', () => {
     });
   });
 
-  describe('purpose', () => {
-    it.each(['messages.delete', 'dm.message_delete'] as const)(
-      'binds a security-key token to %s',
-      async (purpose) => {
-        mockApiFetch.mockReturnValueOnce(new Promise(() => {}));
-        const user = userEvent.setup();
-        render(ui({ refusal: slot({ view: 'confirm', methods: ['webauthn'] }), purpose }));
-
-        await user.click(screen.getByRole('button', { name: 'Verify with security key' }));
-
-        const [url, init] = mockApiFetch.mock.calls[0];
-        expect(url).toBe('/api/v1/mfa/webauthn/verify-inline/begin');
-        expect(JSON.parse(init.body)).toEqual({ purpose });
-      }
-    );
-  });
-
   describe('no --danger (T8)', () => {
     const VIEWS: DeleteRefusalView[] = [
       CONFIRM,
-      { ...CONFIRM, error: 'Try again' },
       PASSWORD,
-      { view: 'password', error: 'That password is not correct.' },
+      ENROLL,
       { view: 'wait', reason: 'requests', retryAfterSeconds: 3 },
       { view: 'unavailable' },
       { view: 'failed', message: 'Nope' },

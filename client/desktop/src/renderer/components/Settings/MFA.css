@@ -116,12 +116,6 @@
   font-style: italic;
 }
 
-.mfa-backup-status {
-  font-size: 13px;
-  color: var(--text-secondary, #bbb);
-  padding: 8px 0;
-}
-
 /* ── Recovery-Only / Hardened Toggle Rows ─────────────────────── */
 
 /* A listed method or setting that is not offered yet. Full-contrast text on a
@@ -309,6 +303,22 @@
   cursor: not-allowed;
 }
 
+/* A step-up primary (.btn) is aria-disabled while a credential is missing or a
+   passkey is awaited, not natively disabled: it stays focusable so its
+   activation guard can say what is missing. `.btn:disabled` never matches it,
+   so without these rules it would look live exactly when it is not. */
+.btn[aria-disabled='true'] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* The primary's hover lift and press are for a live button only. */
+.btn.btn-primary[aria-disabled='true']:hover,
+.btn.btn-primary[aria-disabled='true']:active {
+  transform: none;
+  box-shadow: none;
+}
+
 /* ── MFA Setup Wizard ──────────────────────────────────────────── */
 
 .mfa-setup-wizard {
@@ -333,10 +343,17 @@
   line-height: 1.5;
 }
 
-.mfa-setup-error {
-  color: var(--error-color, #ed4245);
-  font-size: 13px;
-  margin: 0;
+/* A labelled field inside a setup step (the security-key name). */
+.mfa-setup-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mfa-setup-field label {
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
 }
 
 .mfa-setup-error-banner {
@@ -390,50 +407,6 @@
   border-radius: 8px;
   width: fit-content;
   margin: 0 auto;
-}
-
-/* ── Dev Mode Email/SMS Stub ──────────────────────────────────── */
-
-.mfa-dev-banner {
-  background: rgba(240, 160, 32, 0.15);
-  border: 1px solid var(--warning-color, #f0a020);
-  border-radius: 6px;
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--warning-color, #f0a020);
-  margin-bottom: 12px;
-}
-
-.mfa-dev-codes {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  background: var(--bg-tertiary, #333);
-  border-radius: 8px;
-  border: 1px dashed var(--warning-color, #f0a020);
-}
-
-.mfa-dev-code-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.mfa-dev-code-label {
-  font-size: 13px;
-  color: var(--text-secondary, #bbb);
-  min-width: 80px;
-}
-
-.mfa-dev-code-value {
-  font-family: var(--font-mono, monospace);
-  font-size: 24px;
-  font-weight: 700;
-  color: var(--warning-color, #f0a020);
-  letter-spacing: 4px;
-  user-select: all;
 }
 
 .mfa-verify-field {
@@ -645,12 +618,6 @@
   margin: 0;
 }
 
-.mfa-modal-alt {
-  font-size: 12px;
-  color: var(--text-secondary);
-  margin: 0;
-}
-
 .mfa-modal-cancel {
   align-self: center;
 }
@@ -681,13 +648,6 @@
 .backup-code-field {
   max-width: 200px;
   font-size: 18px;
-}
-
-.backup-code-actions {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
 }
 
 /* ── MFA Status Bar ──────────────────────────────────────────────── */
@@ -763,20 +723,6 @@
 .btn-reset-danger:disabled {
   opacity: 0.4;
   cursor: not-allowed;
-}
-
-/* ── MFA Verify Prompt ───────────────────────────────────────────── */
-
-.mfa-verify-prompt {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.mfa-verify-prompt-label {
-  font-size: 12px;
-  color: var(--text-secondary, #bbb);
-  font-weight: 500;
 }
 
 /* ── SSO Security toggles (issue #270) ───────────────────────────── */

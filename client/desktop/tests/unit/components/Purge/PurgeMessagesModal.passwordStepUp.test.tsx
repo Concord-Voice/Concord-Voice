@@ -31,7 +31,16 @@ afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {
   resetAllStores();
+  server.use(passwordOnlyRead());
 });
+
+// The stage reads the account's inline methods. Stubbed so the result never
+// depends on whatever answers an unhandled request: a password-only account,
+// as the password_required challenge says.
+const passwordOnlyRead = () =>
+  http.get('*/api/v1/mfa/step-up', () =>
+    HttpResponse.json({ methods: [], default_method: null, backup_code_available: false })
+  );
 
 const noop = () => {};
 

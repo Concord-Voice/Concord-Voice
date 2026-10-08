@@ -1,6 +1,7 @@
 import React, { useCallback, useRef, useState, useEffect } from 'react';
 import ToggleSwitch from './ToggleSwitch';
-import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
+import { isPlainEnter } from '../Auth/MFAFactorPicker';
 import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import RecoveryApprovalModal from '../Auth/RecoveryApprovalModal';
 import RecoveryCircle from './RecoveryCircle';
@@ -23,12 +24,22 @@ import {
 } from '../../services/system/deviceRecoveryService';
 import { apiFetch } from '../../services/system/apiClient';
 import {
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
+import {
+  useStepUpFactor,
+  type StepUpPhase,
+  type StepUpSubmit,
+} from '../../hooks/auth/useStepUpFactor';
+import {
   isStepUpLocked,
+  passwordOnlyBanner,
   stepUpBanner,
-  stepUpCodeMayBeSpent,
-  stepUpMfaError,
   stepUpPasswordError,
-  stepUpPromptMethods,
+  toStepUpSubmitOutcome,
+  type MfaSeamHandler,
   type MfaStepUpResult,
 } from './mfaStepUp';
 
@@ -231,32 +242,6 @@ function renderActionBody(
 }
 
 /**
- * Whether Confirm waits for an MFA code. The four actions on the step-up seam
- * need one whenever the account holds an inline factor, up front, so a
- * password-only submit does not spend one of the five shared attempts on a
- * request that must fail with mfa_required (spec R-4). Reset TOTP always
- * does: its server binds `code` as required and the account necessarily holds
- * TOTP. Revoke takes the password alone. An mfa_required refusal overrides all
- * of it — the server has just said a code is needed, whatever the last status
- * fetch believed (F3).
- */
-function actionNeedsCode(
-  type: ActionType,
-  hasRealMFA: boolean,
-  refusal: MfaStepUpResult | null
-): boolean {
-  if (refusal?.kind === 'mfaRequired') return true;
-  switch (type) {
-    case 'reset-totp':
-      return true;
-    case 'revoke-webauthn':
-      return false;
-    default:
-      return hasRealMFA;
-  }
-}
-
-/**
  * The step-up purpose of the request an action's code is sent with, which is
  * the one route a WebAuthn inline token minted in its prompt can be spent on.
  * Revoking a key sends the password alone, so it has none.
@@ -278,33 +263,317 @@ function actionPurpose(type: ActionType): StepUpPurpose | null {
   }
 }
 
+/** The six action handlers, each a step-up seam handler (mfaStepUp.ts). */
+interface ActionHandlers {
+  onToggleRecoveryOnly?: MfaSeamHandler<[method: string, recoveryOnly: boolean]>;
+  onToggleRecoveryHardened?: MfaSeamHandler<[enabled: boolean]>;
+  onResetTOTP?: MfaSeamHandler;
+  onRevokeWebAuthnKey?: MfaSeamHandler<[credentialId: string]>;
+  onDisableEmailSms?: MfaSeamHandler;
+  onSetBackupEmail?: MfaSeamHandler<[email: string]>;
+}
+
+/** What an action reports when its handler is not wired or its modal state is incomplete. */
+const UNAVAILABLE: MfaStepUpResult = { kind: 'failed' };
+
 /** Runs `toggle-recovery-only`, or reports it unavailable when no handler is
  * wired or the modal is missing its method/value. Extracted from
- * {@link MFATierSelector}'s `executeAction` to reduce its cognitive
- * complexity (SonarCloud typescript:S3776). */
+ * {@link executeAction} to reduce its cognitive complexity (SonarCloud
+ * typescript:S3776). */
 function runToggleRecoveryOnly(
   modal: ActionModalState,
-  handler: MFATierSelectorProps['onToggleRecoveryOnly'],
+  handler: ActionHandlers['onToggleRecoveryOnly'],
   password: string,
-  mfaCode: string
+  mfaCode: string | undefined,
+  context: ApiRequestContext
 ): MfaStepUpResult | Promise<MfaStepUpResult> {
   return handler && modal.toggleMethod !== undefined && modal.toggleValue !== undefined
-    ? handler(modal.toggleMethod, modal.toggleValue, password, mfaCode)
-    : { kind: 'failed' };
+    ? handler(modal.toggleMethod, modal.toggleValue, password, mfaCode, context)
+    : UNAVAILABLE;
 }
 
 /** Runs `toggle-hardened`, or reports it unavailable when no handler is wired
  * or the modal is missing its value. Sibling to {@link runToggleRecoveryOnly}. */
 function runToggleHardened(
   modal: ActionModalState,
-  handler: MFATierSelectorProps['onToggleRecoveryHardened'],
+  handler: ActionHandlers['onToggleRecoveryHardened'],
   password: string,
-  mfaCode: string
+  mfaCode: string | undefined,
+  context: ApiRequestContext
 ): MfaStepUpResult | Promise<MfaStepUpResult> {
   return handler && modal.toggleValue !== undefined
-    ? handler(modal.toggleValue, password, mfaCode)
-    : { kind: 'failed' };
+    ? handler(modal.toggleValue, password, mfaCode, context)
+    : UNAVAILABLE;
 }
+
+/** Runs the action behind the modal, under the capture of the activation that
+ * called it (C82). Every one of the six answers with the step-up result shape,
+ * so there is one routing path and no action can surface a refusal the others
+ * would route differently. */
+async function executeAction(
+  modal: ActionModalState,
+  handlers: ActionHandlers,
+  password: string,
+  mfaCode: string | undefined,
+  context: ApiRequestContext
+): Promise<MfaStepUpResult> {
+  switch (modal.type) {
+    case 'reset-totp':
+      return handlers.onResetTOTP ? handlers.onResetTOTP(password, mfaCode, context) : UNAVAILABLE;
+    case 'revoke-webauthn':
+      return handlers.onRevokeWebAuthnKey && modal.credentialId
+        ? handlers.onRevokeWebAuthnKey(modal.credentialId, password, mfaCode, context)
+        : UNAVAILABLE;
+    case 'toggle-recovery-only':
+      return runToggleRecoveryOnly(
+        modal,
+        handlers.onToggleRecoveryOnly,
+        password,
+        mfaCode,
+        context
+      );
+    case 'toggle-hardened':
+      return runToggleHardened(
+        modal,
+        handlers.onToggleRecoveryHardened,
+        password,
+        mfaCode,
+        context
+      );
+    case 'disable-emailsms':
+      return handlers.onDisableEmailSms
+        ? handlers.onDisableEmailSms(password, mfaCode, context)
+        : UNAVAILABLE;
+    case 'set-backup-email':
+      return handlers.onSetBackupEmail
+        ? handlers.onSetBackupEmail(modal.pendingBackupEmail ?? '', password, mfaCode, context)
+        : UNAVAILABLE;
+  }
+}
+
+/**
+ * Reset TOTP binds a TOTP `code` as required, so TOTP is this route's floor
+ * (Q3): a failed read leaves it offered and a read can only add to it.
+ */
+const RESET_TOTP_FLOOR = ['totp'] as const;
+
+/** The primary's label by phase; the in-flight ones replace the action's own. */
+function primaryLabel(modal: ActionModalState, phase: StepUpPhase, busy: boolean): string {
+  if (phase === 'ceremony') return 'Waiting…';
+  return busy ? 'Processing...' : getActionConfirmLabel(modal);
+}
+
+interface ActionPasswordFieldProps {
+  value: string;
+  onChange: (value: string) => void;
+  error: string | undefined;
+  disabled: boolean;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+  /** A plain Enter presses the host's primary, as in `StepUpCredentials`. */
+  onEnter: () => void;
+}
+
+/**
+ * The password field of an action that verifies the password alone, where the
+ * factor hook has no leg to show (revoke-webauthn, D10).
+ */
+const ActionPasswordField: React.FC<ActionPasswordFieldProps> = ({
+  value,
+  onChange,
+  error,
+  disabled,
+  inputRef,
+  onEnter,
+}) => (
+  <div className="mfa-verify-field">
+    <label htmlFor="mfa-action-password">Password</label>
+    <input
+      id="mfa-action-password"
+      ref={inputRef}
+      type="password"
+      autoComplete="current-password"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        if (!isPlainEnter(e)) return;
+        e.preventDefault();
+        onEnter();
+      }}
+      placeholder="Enter your password"
+      disabled={disabled}
+      aria-invalid={error !== undefined}
+      aria-describedby={error ? 'mfa-action-password-error' : undefined}
+    />
+    {error && <FieldError id="mfa-action-password-error">{error}</FieldError>}
+  </div>
+);
+
+interface ActionModalProps {
+  modal: ActionModalState;
+  backupEmail: string | undefined;
+  handlers: ActionHandlers;
+  onClose: () => void;
+  /** The action was accepted; the host closes the modal. */
+  onAccepted: (modal: ActionModalState) => void;
+}
+
+/**
+ * The confirmation modal of one action (handoff §1.1). Mounted only while an
+ * action is open, so every open starts from a fresh password, factor and
+ * result. The title is fixed at open and never mutated (WCAG 4.1.2 / 3.2.2).
+ *
+ * Five actions take the password and a code through `StepUpCredentials`.
+ * Revoking a key takes the password alone, so its factor hook is disabled and
+ * the password is collected and sent here (D10).
+ */
+const ActionModal: React.FC<ActionModalProps> = ({
+  modal,
+  backupEmail,
+  handlers,
+  onClose,
+  onAccepted,
+}) => {
+  const [password, setPassword] = useState('');
+  // The last answer. The banner and the lock derive from it (mfaStepUp.ts), so
+  // they cannot disagree. The lock clears only when the modal is reopened
+  // (handoff §1.1 / §5).
+  const [result, setResult] = useState<MfaStepUpResult | null>(null);
+  const [revoking, setRevoking] = useState(false);
+  // The account and server this modal opened under. The password typed here
+  // belongs to them, so a switch before the click sends nothing anywhere:
+  // revoke-webauthn runs no factor hook, whose own open-time capture covers
+  // the other actions (picker PR 3 review).
+  const [openedContext] = useState(captureApiRequestContext);
+  // The password-only revoke's single-flight latch. `revoking` is state, so two
+  // activations in one tick (a double click, Enter then a click) both read it
+  // false; the ref is set before the first await.
+  const revokeInFlightRef = useRef(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
+
+  const passwordOnly = modal.type === 'revoke-webauthn';
+  const factor = useStepUpFactor({
+    enabled: !passwordOnly,
+    purpose: actionPurpose(modal.type),
+    passwordLeg: 'always', // pragma: allowlist secret
+    readFailure: 'passwordOnly',
+    allowBackup: true,
+    floorMethods: modal.type === 'reset-totp' ? RESET_TOTP_FLOOR : undefined,
+  });
+  const submitting = revoking || factor.phase === 'submitting';
+  const locked = isStepUpLocked(result);
+  const passwordError = passwordOnly ? stepUpPasswordError(result) : undefined;
+
+  // Focus the password field once a password refusal has rendered AND the
+  // field is enabled again. Focusing inside the submit handler ran while the
+  // input was still `disabled` for loading, so the call was a no-op (F4). The
+  // factor hook's credentials place their own focus.
+  useEffect(() => {
+    if (passwordError !== undefined && !revoking) passwordRef.current?.focus();
+  }, [passwordError, revoking, result]);
+
+  /** Applies an answer, unless the account or server changed since `context`:
+   * an answer for the old one is neither shown nor acted on. Only a refused
+   * password is dropped (handoff §1.1); the hook decides about the code. */
+  const settle = (answer: MfaStepUpResult, context: ApiRequestContext) => {
+    if (!apiRequestContextIsCurrent(context)) return;
+    setResult(answer);
+    if (stepUpPasswordError(answer) !== undefined) setPassword('');
+    if (answer.kind === 'accepted') onAccepted(modal);
+  };
+
+  const submit: StepUpSubmit = async (mfa, context) => {
+    const answer = await executeAction(modal, handlers, password, mfa, context);
+    settle(answer, context);
+    return toStepUpSubmitOutcome(answer);
+  };
+
+  const revoke = async () => {
+    if (revokeInFlightRef.current) return;
+    if (password === '') {
+      setResult({ kind: 'passwordRequired' });
+      return;
+    }
+    if (!apiRequestContextIsCurrent(openedContext)) {
+      setPassword('');
+      setResult({ kind: 'sessionExpired' });
+      return;
+    }
+    revokeInFlightRef.current = true;
+    const context = openedContext;
+    setRevoking(true);
+    try {
+      settle(await executeAction(modal, handlers, password, undefined, context), context);
+    } finally {
+      revokeInFlightRef.current = false;
+      setRevoking(false);
+    }
+  };
+
+  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit);
+  const onPrimary = () => {
+    if (locked || submitting) return;
+    if (passwordOnly) void revoke();
+    else activate();
+  };
+  const primaryDisabled = locked || (passwordOnly ? submitting || password === '' : ariaDisabled);
+
+  return (
+    <Modal
+      isOpen
+      onClose={onClose}
+      title={getActionTitle(modal)}
+      width="small"
+      dismissable={!submitting}
+      initialFocusRef={passwordRef}
+    >
+      <div className="mfa-action-body">
+        {renderActionBody(modal, backupEmail)}
+
+        {passwordOnly ? (
+          <ActionPasswordField
+            value={password}
+            onChange={setPassword}
+            error={passwordError}
+            disabled={revoking}
+            inputRef={passwordRef}
+            onEnter={() => primaryRef.current?.click()}
+          />
+        ) : (
+          <StepUpCredentials
+            factor={factor}
+            password={password}
+            onPasswordChange={setPassword}
+            primaryRef={primaryRef}
+            passwordRef={passwordRef}
+          />
+        )}
+
+        <ErrorBanner error={(passwordOnly ? passwordOnlyBanner : stepUpBanner)(result) ?? ''} />
+
+        <div className="mfa-setup-actions">
+          <button
+            ref={primaryRef}
+            type="button"
+            className={getActionConfirmClass(modal)}
+            aria-disabled={primaryDisabled || undefined}
+            onClick={onPrimary}
+          >
+            {primaryLabel(modal, factor.phase, submitting)}
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-secondary"
+            onClick={onClose}
+            disabled={submitting}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+};
 
 interface RecoveryCircleConfig {
   has_circle: boolean;
@@ -371,7 +640,7 @@ function getTierCredentials(
   );
 }
 
-interface MFATierSelectorProps {
+interface MFATierSelectorProps extends ActionHandlers {
   activeMethods: string[];
   recoveryOnlyMethods?: string[];
   backupCodesRemaining?: number;
@@ -380,21 +649,6 @@ interface MFATierSelectorProps {
   onSetupTOTP: () => void;
   onSetupWebAuthn: (credentialType: 'hardware' | 'platform') => void;
   onSetupEmailSms?: () => void;
-  onToggleRecoveryOnly?: (
-    method: string,
-    recoveryOnly: boolean,
-    password: string,
-    mfaCode: string
-  ) => Promise<MfaStepUpResult>;
-  onToggleRecoveryHardened?: (
-    enabled: boolean,
-    password: string,
-    mfaCode: string
-  ) => Promise<MfaStepUpResult>;
-  onResetTOTP?: (password: string, code: string) => Promise<MfaStepUpResult>;
-  onRevokeWebAuthnKey?: (credentialId: string, password: string) => Promise<MfaStepUpResult>;
-  onDisableEmailSms?: (password: string, mfaCode: string) => Promise<MfaStepUpResult>;
-  onSetBackupEmail?: (email: string, password: string, mfaCode: string) => Promise<MfaStepUpResult>;
 }
 
 const MFATierSelector: React.FC<MFATierSelectorProps> = ({
@@ -425,19 +679,8 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
   // disabling that sole MFA type would leave only Email/SMS (which isn't real MFA).
   const soleRealMFAWithEmailSms = realMFATypeCount === 1 && hasEmailOrSms;
 
-  // Action modal state
+  // The open action; the modal itself owns the rest of its state.
   const [actionModal, setActionModal] = useState<ActionModalState | null>(null);
-  const [actionPassword, setActionPassword] = useState('');
-  const [actionMfaCode, setActionMfaCode] = useState('');
-  // The last refusal. The field errors, the banner and the lock are all
-  // derived from it (mfaStepUp.ts), so they cannot disagree with each other.
-  // The lock clears only when the modal is reopened (handoff §1.1 / §5).
-  const [actionRefusal, setActionRefusal] = useState<MfaStepUpResult | null>(null);
-  const [actionLoading, setActionLoading] = useState(false);
-  // Bumped on an invalid-code refusal so MFAVerifyPrompt remounts empty
-  // (handoff §1.1) rather than showing a stale rejected code.
-  const [mfaPromptKey, setMfaPromptKey] = useState(0);
-  const passwordRef = useRef<HTMLInputElement>(null);
 
   // Recovery key state
   const [hasRecoveryKey, setHasRecoveryKey] = useState(false);
@@ -582,88 +825,13 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
 
   // Stable identity: Modal re-registers its Escape listener whenever onClose
   // changes, which an inline arrow would do on every render.
-  const clearActionModal = useCallback(() => {
-    setActionModal(null);
-    setActionPassword('');
-    setActionMfaCode('');
-    setActionRefusal(null);
-  }, []);
+  const clearActionModal = useCallback(() => setActionModal(null), []);
 
-  const openActionModal = (state: ActionModalState) => {
-    setActionModal(state);
-    setActionPassword('');
-    setActionMfaCode('');
-    setActionRefusal(null);
-  };
-
-  // Focus the password field once a password refusal has rendered AND the
-  // field is enabled again. Focusing inside the submit handler ran while the
-  // input was still `disabled` for loading, so the call was a no-op (F4).
-  useEffect(() => {
-    if (actionLoading) return;
-    if (actionRefusal?.kind === 'passwordRequired' || actionRefusal?.kind === 'invalidPassword') {
-      passwordRef.current?.focus();
-    }
-  }, [actionLoading, actionRefusal]);
-
-  /** Runs the action behind the modal. Every one of the six answers with the
-   * step-up result shape, so there is one routing path and no action can
-   * surface a refusal the others would route differently. */
-  const executeAction = async (modal: ActionModalState): Promise<MfaStepUpResult> => {
-    const unavailable: MfaStepUpResult = { kind: 'failed' };
-    switch (modal.type) {
-      case 'reset-totp':
-        return onResetTOTP ? onResetTOTP(actionPassword, actionMfaCode) : unavailable;
-      case 'revoke-webauthn':
-        return onRevokeWebAuthnKey && modal.credentialId
-          ? onRevokeWebAuthnKey(modal.credentialId, actionPassword)
-          : unavailable;
-      case 'toggle-recovery-only':
-        return runToggleRecoveryOnly(modal, onToggleRecoveryOnly, actionPassword, actionMfaCode);
-      case 'toggle-hardened':
-        return runToggleHardened(modal, onToggleRecoveryHardened, actionPassword, actionMfaCode);
-      case 'disable-emailsms':
-        return onDisableEmailSms ? onDisableEmailSms(actionPassword, actionMfaCode) : unavailable;
-      case 'set-backup-email':
-        return onSetBackupEmail
-          ? onSetBackupEmail(modal.pendingBackupEmail ?? '', actionPassword, actionMfaCode)
-          : unavailable;
-    }
-  };
-
-  /** Records a refusal, clears the password only when it was refused (handoff
-   * §1.1), and clears the code whenever the server may have used it up — the
-   * prompt remounts empty so Confirm waits for a fresh one. Where the refusal
-   * is SHOWN is derived at render. */
-  const applyRefusal = (result: MfaStepUpResult) => {
-    setActionRefusal(result);
-    if (result.kind === 'passwordRequired' || result.kind === 'invalidPassword') {
-      setActionPassword('');
-    }
-    if (stepUpCodeMayBeSpent(result)) {
-      setMfaPromptKey((k) => k + 1);
-      setActionMfaCode('');
-    }
-  };
-
-  const handleAction = async () => {
-    if (!actionModal) return;
-    setActionLoading(true);
-
-    try {
-      const result = await executeAction(actionModal);
-      if (result.kind === 'accepted') {
-        // The draft-email reset is scoped to a saved/removed backup email —
-        // cancelling or failing the modal leaves the draft untouched
-        // (handoff §1.2).
-        if (actionModal.type === 'set-backup-email') setEditingBackupEmail(false);
-        clearActionModal();
-        return;
-      }
-      applyRefusal(result);
-    } finally {
-      setActionLoading(false);
-    }
+  // The draft-email reset is scoped to a saved/removed backup email —
+  // cancelling or failing the modal leaves the draft untouched (handoff §1.2).
+  const closeAcceptedAction = (accepted: ActionModalState) => {
+    if (accepted.type === 'set-backup-email') setEditingBackupEmail(false);
+    clearActionModal();
   };
 
   /**
@@ -682,24 +850,8 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
       setEditingBackupEmail(false);
       return;
     }
-    openActionModal({ type: 'set-backup-email', pendingBackupEmail: trimmed });
+    setActionModal({ type: 'set-backup-email', pendingBackupEmail: trimmed });
   };
-
-  const actionTitle = getActionTitle(actionModal);
-  const needsCode = actionModal
-    ? actionNeedsCode(actionModal.type, hasRealMFA, actionRefusal)
-    : false;
-  const confirmEnabled = actionModal
-    ? !actionLoading &&
-      actionPassword !== '' &&
-      (!needsCode || actionMfaCode !== '') &&
-      !isStepUpLocked(actionRefusal)
-    : false;
-  // The prompt renders whenever a code could be asked for: the account's
-  // known factors, or the server's own list on an mfa_required refusal (F3).
-  const showActionPrompt = hasRealMFA || actionRefusal?.kind === 'mfaRequired';
-  const actionPromptMethods = stepUpPromptMethods(actionRefusal, activeMethods);
-  const actionPasswordError = stepUpPasswordError(actionRefusal);
 
   return (
     <div className="mfa-tier-selector">
@@ -763,7 +915,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                         ? 'Disable Email/SMS first — this is your only real MFA method'
                         : 'Reset TOTP enrollment'
                     }
-                    onClick={() => openActionModal({ type: 'reset-totp' })}
+                    onClick={() => setActionModal({ type: 'reset-totp' })}
                   >
                     Reset
                   </button>
@@ -803,7 +955,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                             : 'Revoke this key'
                         }
                         onClick={() =>
-                          openActionModal({
+                          setActionModal({
                             type: 'revoke-webauthn',
                             credentialId: cred.id,
                             credentialName: cred.credential_name,
@@ -843,7 +995,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                 <button
                   type="button"
                   className="btn btn-uniform btn-danger"
-                  onClick={() => openActionModal({ type: 'disable-emailsms' })}
+                  onClick={() => setActionModal({ type: 'disable-emailsms' })}
                 >
                   Disable
                 </button>
@@ -870,7 +1022,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                     } else {
                       method = tier.methodKey || '';
                     }
-                    openActionModal({
+                    setActionModal({
                       type: 'toggle-recovery-only',
                       toggleMethod: method,
                       toggleValue: checked,
@@ -1219,77 +1371,25 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
         />
       )}
 
-      {/* Action confirmation modal — reused by all eight action types (handoff
-          §1.1). Moved onto ui/Modal for dialog semantics (role, Tab trap,
-          Escape, focus return); the title is fixed at open and never mutated. */}
-      <Modal
-        isOpen={actionModal !== null}
-        onClose={clearActionModal}
-        title={actionTitle}
-        width="small"
-        dismissable={!actionLoading}
-        initialFocusRef={passwordRef}
-      >
-        {actionModal && (
-          <div className="mfa-action-body">
-            {renderActionBody(actionModal, backupEmail)}
-
-            <div className="mfa-verify-field">
-              <label htmlFor="mfa-action-password">Password</label>
-              <input
-                id="mfa-action-password"
-                ref={passwordRef}
-                type="password"
-                autoComplete="current-password"
-                value={actionPassword}
-                onChange={(e) => setActionPassword(e.target.value)}
-                placeholder="Enter your password"
-                disabled={actionLoading}
-                aria-invalid={actionPasswordError !== undefined}
-                aria-describedby={actionPasswordError ? 'mfa-action-password-error' : undefined}
-              />
-              {actionPasswordError && (
-                <FieldError id="mfa-action-password-error">{actionPasswordError}</FieldError>
-              )}
-            </div>
-
-            {showActionPrompt && (
-              <MFAVerifyPrompt
-                key={mfaPromptKey}
-                methods={actionPromptMethods}
-                recoveryOnlyMethods={recoveryOnlyMethods}
-                onVerify={setActionMfaCode}
-                purpose={actionPurpose(actionModal.type)}
-                onCodeChange={setActionMfaCode}
-                disabled={actionLoading}
-                error={stepUpMfaError(actionRefusal)}
-                excludeBackupCodes={!actionPromptMethods.includes('totp')}
-              />
-            )}
-
-            <ErrorBanner error={stepUpBanner(actionRefusal) ?? ''} />
-
-            <div className="mfa-setup-actions">
-              <button
-                type="button"
-                className={getActionConfirmClass(actionModal)}
-                onClick={() => void handleAction()}
-                disabled={!confirmEnabled}
-              >
-                {actionLoading ? 'Processing...' : getActionConfirmLabel(actionModal)}
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm btn-secondary"
-                onClick={clearActionModal}
-                disabled={actionLoading}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
-      </Modal>
+      {/* Action confirmation modal — reused by all six action types (handoff
+          §1.1), on ui/Modal for dialog semantics (role, Tab trap, Escape, focus
+          return). Mounted per open, so each starts from empty credentials. */}
+      {actionModal && (
+        <ActionModal
+          modal={actionModal}
+          backupEmail={backupEmail}
+          handlers={{
+            onToggleRecoveryOnly,
+            onToggleRecoveryHardened,
+            onResetTOTP,
+            onRevokeWebAuthnKey,
+            onDisableEmailSms,
+            onSetBackupEmail,
+          }}
+          onClose={clearActionModal}
+          onAccepted={closeAcceptedAction}
+        />
+      )}
     </div>
   );
 };

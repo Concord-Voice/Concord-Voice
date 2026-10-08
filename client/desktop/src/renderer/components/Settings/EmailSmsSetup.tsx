@@ -1,49 +1,77 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { apiFetch, refreshAccessToken } from '../../services/system/apiClient';
+import { apiRequestContextIsCurrent } from '../../services/system/requestContext';
+import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
+import {
+  useStepUpFactor,
+  type StepUpPhase,
+  type StepUpSubmit,
+} from '../../hooks/auth/useStepUpFactor';
+import ErrorBanner from './ErrorBanner';
+import { stepUpBanner, submitMfaStepUp, toStepUpSubmitOutcome } from './mfaStepUp';
+import { refusalText } from './mfaResponse';
 
 type Step = 'password' | 'verify' | 'done';
 
 interface EmailSmsSetupProps {
-  mfaActive: boolean;
   onComplete: () => void;
   onCancel: () => void;
 }
 
-const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ mfaActive, onComplete, onCancel }) => {
+const PRIMARY_LABEL: Record<StepUpPhase, string> = {
+  idle: 'Send Code',
+  ceremony: 'Waiting…',
+  submitting: 'Sending...',
+};
+
+const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ onComplete, onCancel }) => {
   const [step, setStep] = useState<Step>('password');
   const [password, setPassword] = useState('');
-  const [mfaCode, setMfaCode] = useState('');
   const [emailCode, setEmailCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
 
-  const handleSetup = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const res = await apiFetch('/api/v1/mfa/email-sms/setup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          password,
-          ...(mfaCode ? { mfa_code: mfaCode } : {}),
-          methods: ['email'],
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Setup failed');
+  // The factor picker serves the credential step only; the emailed code that
+  // follows is this wizard's own. The offered set never contains email or SMS
+  // (G1), and the request below names email alone: SMS is not offered (D14).
+  const factor = useStepUpFactor({
+    enabled: step === 'password',
+    purpose: 'mfa_settings.email_sms_setup',
+    passwordLeg: 'always', // pragma: allowlist secret
+    readFailure: 'passwordOnly',
+    allowBackup: true,
+  });
 
-      setStep('verify');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Setup failed');
-    } finally {
-      // A code that was sent is never offered again, whatever the answer: the
-      // server accepts each code once and can accept it yet still fail the
-      // request. Also covers Back from the verify step.
-      setMfaCode('');
-      setLoading(false);
-    }
+  useEffect(() => {
+    if (step === 'password') passwordRef.current?.focus();
+  }, [step]);
+
+  const submit: StepUpSubmit = async (mfa, context) => {
+    const result = await submitMfaStepUp(
+      '/api/v1/mfa/email-sms/setup',
+      'POST',
+      { methods: ['email'] },
+      { password, mfaCode: mfa },
+      { context }
+    );
+    // An answer for an account or server that is no longer current belongs to
+    // the old one: the hook ends the attempt, and this wizard must neither show
+    // it nor advance on it.
+    if (!apiRequestContextIsCurrent(context)) return toStepUpSubmitOutcome(result);
+    setError(stepUpBanner(result) ?? '');
+    // The password the server rejected is dropped, and so is the one it accepted:
+    // a sent credential is spent, and Back must not return to the field filled.
+    // The hook keeps the code through a password refusal, so a wrong password
+    // does not cost a fresh one.
+    if (result.kind === 'invalidPassword' || result.kind === 'accepted') setPassword('');
+    if (result.kind === 'accepted') setStep('verify');
+    return toStepUpSubmitOutcome(result);
   };
+
+  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit);
 
   const handleVerify = async () => {
     setLoading(true);
@@ -54,8 +82,7 @@ const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ mfaActive, onComplete, on
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ codes: { email: emailCode } }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Verification failed');
+      if (!res.ok) throw new Error(await refusalText(res, 'Verification failed'));
 
       // Uses the enrollment exemption, as after TOTP confirm in MFASetup.
       void refreshAccessToken().catch(() => console.warn('[mfa] Refresh after enrollment failed'));
@@ -69,41 +96,38 @@ const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ mfaActive, onComplete, on
 
   return (
     <div className="mfa-setup-wizard">
-      <h3>Set Up Email MFA</h3>
+      <h3 tabIndex={-1} ref={headingRef}>
+        Set Up Email MFA
+      </h3>
 
       {step === 'password' && (
         <div className="mfa-setup-step">
-          <p>Enter your password to send a verification code to your account email.</p>
-          <input
-            type="password"
-            className={`form-input ${error ? 'error' : ''}`}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Your password"
-            disabled={loading}
-            autoFocus
+          <p>Confirm it&apos;s you to send a verification code to your account email.</p>
+          <StepUpCredentials
+            factor={factor}
+            password={password}
+            onPasswordChange={setPassword}
+            primaryRef={primaryRef}
+            passwordRef={passwordRef}
+            headingRef={headingRef}
           />
-          {mfaActive && (
-            <input
-              type="text"
-              className="form-input"
-              value={mfaCode}
-              onChange={(e) => setMfaCode(e.target.value)}
-              placeholder="MFA code from your authenticator"
-              disabled={loading}
-              autoComplete="one-time-code"
-            />
-          )}
-          {error && <p className="mfa-setup-error">{error}</p>}
+          <ErrorBanner error={error} />
           <div className="mfa-setup-actions">
             <button
+              ref={primaryRef}
+              type="button"
               className="btn btn-primary"
-              onClick={handleSetup}
-              disabled={loading || !password || (mfaActive && !mfaCode)}
+              aria-disabled={ariaDisabled || undefined}
+              onClick={activate}
             >
-              {loading ? 'Sending...' : 'Send Code'}
+              {PRIMARY_LABEL[factor.phase]}
             </button>
-            <button className="btn btn-secondary" onClick={onCancel}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              disabled={factor.phase === 'submitting'}
+              onClick={onCancel}
+            >
               Cancel
             </button>
           </div>
@@ -129,7 +153,7 @@ const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ mfaActive, onComplete, on
             />
           </div>
 
-          {error && <p className="mfa-setup-error">{error}</p>}
+          <ErrorBanner error={error} />
           <div className="mfa-setup-actions">
             <button
               className="btn btn-primary"

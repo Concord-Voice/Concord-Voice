@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The inline WebAuthn step-up helpers shared by MFAVerifyPrompt and the factor
-// picker (design 2026-09-26-mfa-factor-picker D14). Oracle: what is put on the
+// The inline WebAuthn step-up helpers behind the factor picker's hook
+// (`useStepUpFactor`; design 2026-09-26-mfa-factor-picker D14). Oracle: what is put on the
 // wire (path, body, the caller's context and signal) and what the helpers
 // throw for each answer the server can give.
 
@@ -115,7 +115,7 @@ describe('beginWebAuthnInlineVerification', () => {
     expect(options.allowCredentials).toBeUndefined();
   });
 
-  it('is its own operation without a context or signal (as MFAVerifyPrompt sends it)', async () => {
+  it('is its own operation without a context or signal (a caller that passes neither)', async () => {
     mockApiFetch.mockResolvedValueOnce(json(BEGIN_OPTIONS));
 
     await beginWebAuthnInlineVerification('dm.purge');

@@ -3,6 +3,7 @@ import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
 import {
+  LEG_ONLY_WITHOUT_MFA,
   useStepUpFactor,
   type StepUpPhase,
   type StepUpSubmit,
@@ -21,6 +22,11 @@ import {
   isSameAuthLifecycle,
   type AuthLifecycleSnapshot,
 } from '../../services/system/postLoginHydrationLifecycle';
+import {
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
 import '../ui/ConfirmActionModal.css';
 
 export type DMThreadRemovalTarget = {
@@ -45,13 +51,6 @@ const CLEAR_UNCERTAIN_ERROR =
  * and takes focus.
  */
 const CREDENTIALS_HEADING = 'Confirm it is you';
-/**
- * #3's password leg: shown only to an account with no inline method. Named
- * here because a quoted literal beside the `passwordLeg` key reads to static
- * analysis as a hard-coded credential (Sonar S2068, detect-secrets).
- */
-const LEG_ONLY_WITHOUT_MFA = 'whenNoMfa' as const;
-
 /**
  * The words for a session that is gone: the read's `session` refusal, an
  * account or server change during the activation, and Clear's own 401.
@@ -93,6 +92,13 @@ function submitOutcome(result: ClearHistoryResult): StepUpSubmitOutcome {
     case 'aborted':
       return { kind: 'aborted' };
     case 'passwordRequired':
+      // #3509: a refused token keeps its expiry, so the password field says so.
+      return {
+        kind: 'refusal',
+        refusal: result.tokenExpired
+          ? { kind: 'passwordRequired', tokenExpired: true }
+          : { kind: 'passwordRequired' },
+      };
     case 'invalidPassword':
     case 'invalidMfaCode':
     case 'sessionExpired':
@@ -121,7 +127,7 @@ function clearErrorText(result: ClearHistoryResult): string | null {
         ? 'Try again later.'
         : `Try again in ${result.retryAfterSeconds} seconds.`;
     case 'passwordRefused':
-      // #3509: the mint refused the password, or Clear refused the token.
+      // #3509: the mint refused the password.
       return result.message;
     case 'sessionExpired':
       return SESSION_MESSAGE;
@@ -146,6 +152,15 @@ function primaryLabel(
   if (stage !== 'credentials') return 'Continue';
   if (phase === 'ceremony') return 'Waiting…';
   return phase === 'submitting' ? 'Clearing…' : 'Verify and clear';
+}
+
+/**
+ * True while Clear's answer still belongs to the account and server that sent
+ * it (D20). The lifecycle covers the account; the activation's context covers
+ * the runtime server too, which a switch changes without touching the account.
+ */
+function answerIsCurrent(lifecycle: AuthLifecycleSnapshot, context: ApiRequestContext): boolean {
+  return isSameAuthLifecycle(lifecycle) && apiRequestContextIsCurrent(context);
 }
 
 async function restoreHiddenConversation(
@@ -223,23 +238,29 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
 
   const inCredentials = clearStage === 'credentials';
 
-  const invalidateAndRefetch = async (lifecycle: AuthLifecycleSnapshot): Promise<boolean> => {
-    if (!isSameAuthLifecycle(lifecycle)) return false;
+  const invalidateAndRefetch = async (
+    lifecycle: AuthLifecycleSnapshot,
+    context: ApiRequestContext
+  ): Promise<boolean> => {
+    if (!answerIsCurrent(lifecycle, context)) return false;
     globalThis.dispatchEvent(
       new CustomEvent('messages-purged', { detail: { scopeId: conversation.id } })
     );
     await useDMStore.getState().fetchConversations();
-    return isSameAuthLifecycle(lifecycle);
+    return answerIsCurrent(lifecycle, context);
   };
 
-  const setUncertainClear = async (lifecycle: AuthLifecycleSnapshot) => {
+  const setUncertainClear = async (
+    lifecycle: AuthLifecycleSnapshot,
+    context: ApiRequestContext
+  ) => {
     try {
-      await invalidateAndRefetch(lifecycle);
+      await invalidateAndRefetch(lifecycle, context);
     } catch {
       // fetchConversations normally reports errors in the store. A thrown
       // implementation still leaves this operation unresolved and retry-blocked.
     }
-    if (!isSameAuthLifecycle(lifecycle)) return;
+    if (!answerIsCurrent(lifecycle, context)) return;
     setPassword('');
     setClearStage('uncertain');
     setError(CLEAR_UNCERTAIN_ERROR);
@@ -248,15 +269,16 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   /** Acts on Clear's answer for the current account. Resolves true once the dialog is closed. */
   const applyClearResult = async (
     result: ClearHistoryResult,
-    lifecycle: AuthLifecycleSnapshot
+    lifecycle: AuthLifecycleSnapshot,
+    context: ApiRequestContext
   ): Promise<boolean> => {
     if (result.kind === 'success') {
-      if (!(await invalidateAndRefetch(lifecycle))) return false;
+      if (!(await invalidateAndRefetch(lifecycle, context))) return false;
       onClose();
       return true;
     }
     if (result.kind === 'uncertain') {
-      await setUncertainClear(lifecycle);
+      await setUncertainClear(lifecycle, context);
       return false;
     }
     const text = clearErrorText(result);
@@ -272,10 +294,13 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
       const result = await clearDMHistory(conversation.id, clearFactor(mfa, password), context);
       // Nothing left for `aborted`, so what was typed is still what the user means to send.
       if (result.kind !== 'aborted') setPassword('');
-      if (isSameAuthLifecycle(lifecycle)) await applyClearResult(result, lifecycle);
+      // The stage's terminal state words a dead session; a banner would say it twice.
+      if (result.kind !== 'sessionExpired' && answerIsCurrent(lifecycle, context)) {
+        await applyClearResult(result, lifecycle, context);
+      }
       return submitOutcome(result);
     } catch {
-      if (isSameAuthLifecycle(lifecycle)) await setUncertainClear(lifecycle);
+      if (answerIsCurrent(lifecycle, context)) await setUncertainClear(lifecycle, context);
       return { kind: 'transport' };
     }
   };
@@ -289,18 +314,22 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
     setError(null);
     let closed = false;
     const lifecycle = captureAuthLifecycle();
+    // The request carries no factor; the capture still fences it, so a switch
+    // before it leaves sends nothing (D20).
+    const context = captureApiRequestContext();
 
     try {
-      const result = await clearDMHistory(conversation.id);
-      if (!isSameAuthLifecycle(lifecycle)) return;
+      const result = await clearDMHistory(conversation.id, undefined, context);
+      // An answer from the old server opens nothing and says nothing here (D20).
+      if (!answerIsCurrent(lifecycle, context)) return;
       if (result.kind === 'passwordRequired' || result.kind === 'mfaRequired') {
         // The server asks although the local setting did not.
         setClearStage('credentials');
         return;
       }
-      closed = await applyClearResult(result, lifecycle);
+      closed = await applyClearResult(result, lifecycle, context);
     } catch {
-      if (isSameAuthLifecycle(lifecycle)) await setUncertainClear(lifecycle);
+      if (answerIsCurrent(lifecycle, context)) await setUncertainClear(lifecycle, context);
     } finally {
       if (isSameAuthLifecycle(lifecycle)) {
         requestInFlightRef.current = false;

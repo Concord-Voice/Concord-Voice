@@ -196,58 +196,6 @@
   color: var(--text-primary);
 }
 
-.purge-modal__field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.purge-modal__field label {
-  color: var(--text-secondary);
-  font-size: calc(13px * var(--font-scale, 1));
-  font-weight: 600;
-}
-
-.purge-modal__field input {
-  padding: 10px 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  font-size: calc(14px * var(--font-scale, 1));
-  transition: border-color 0.2s ease;
-}
-
-.purge-modal__field input:focus-visible {
-  border-color: var(--state-focused);
-  outline: 2px solid var(--state-focused);
-  outline-offset: 1px;
-}
-
-/* Paired with aria-invalid and the message below, so the rejection is never
-   signalled by colour alone (WCAG 1.4.1). */
-.purge-modal__field input[aria-invalid='true'] {
-  border-color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 8%, var(--bg-tertiary));
-}
-
-/* #3455 self-purge soft-lock stage. The rejection text takes --text-primary,
-   not --danger: --danger as label text on --bg-secondary fails AA in 9 of the
-   30 scheme x theme combinations. The message still travels with aria-invalid
-   and role="alert", so nothing is colour-only. */
-.purge-modal__softlock-error {
-  margin: 0;
-  color: var(--text-primary);
-  font-size: calc(13px * var(--font-scale, 1));
-  line-height: 1.4;
-}
-
-.purge-modal__softlock-prompt {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
 /* Result ------------------------------------------------------------------ */
 
 .purge-modal__result p {
@@ -341,8 +289,7 @@
 [data-reduce-animations='true'] .purge-modal__scope,
 [data-reduce-animations='true'] .purge-modal__cancel,
 [data-reduce-animations='true'] .purge-modal__done,
-[data-reduce-animations='true'] .purge-modal__confirm,
-[data-reduce-animations='true'] .purge-modal__field input {
+[data-reduce-animations='true'] .purge-modal__confirm {
   transition: none;
 }
 

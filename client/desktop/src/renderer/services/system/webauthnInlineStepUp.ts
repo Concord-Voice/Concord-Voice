@@ -7,12 +7,12 @@
  * token is a credential: it is never logged or stored, and the caller sends it
  * with the one request it was minted for.
  *
- * `MFAVerifyPrompt` and the factor picker's `useStepUpFactor` share these
- * (design 2026-09-26-mfa-factor-picker §4.1, D14). `context` admits begin and
+ * The factor picker's `useStepUpFactor` uses these (design
+ * 2026-09-26-mfa-factor-picker §4.1, D14). `context` admits begin and
  * finish against the caller's capture (`captureApiRequestContext`), so a switch
  * of account or server between them is refused before dispatch; `signal`
  * cancels a request still in flight. Without either, each request is its own
- * operation, as `MFAVerifyPrompt` has always sent it.
+ * operation.
  */
 
 import type { StepUpPurpose } from '../../components/Auth/stepUpPurpose';

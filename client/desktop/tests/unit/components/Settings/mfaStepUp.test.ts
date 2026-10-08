@@ -5,11 +5,14 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import {
   isStepUpLocked,
   mapMfaStepUpResponse,
+  passwordOnlyBanner,
   stepUpBanner,
-  stepUpPromptMethods,
   submitMfaStepUp,
+  toStepUpSubmitOutcome,
   type MfaStepUpResult,
 } from '@/renderer/components/Settings/mfaStepUp';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 
 const PATH = '/api/v1/mfa/email-sms/disable';
 
@@ -28,6 +31,12 @@ beforeEach(() => {
 });
 
 describe('mapMfaStepUpResponse — one case per kind', () => {
+  // The wire body a settings route sends an account with no inline factor (E8).
+  it('maps a 403 mfa_enrollment_required to enrollmentRequired', async () => {
+    const res = new Response(JSON.stringify({ mfa_enrollment_required: true }), { status: 403 });
+    expect(await mapMfaStepUpResponse(res)).toEqual({ kind: 'enrollmentRequired' });
+  });
+
   it('maps 2xx to accepted, carrying the parsed body', async () => {
     const res = new Response(JSON.stringify({ backup_email: 'a@b.com' }), { status: 200 });
     const result = await mapMfaStepUpResponse(res);
@@ -229,7 +238,145 @@ describe('submitMfaStepUp — request shape', () => {
   });
 });
 
+describe("submitMfaStepUp — the run's capture (C82)", () => {
+  it('a stale capture resolves aborted and sends nothing', async () => {
+    let hits = 0;
+    server.use(
+      http.post('*' + PATH, () => {
+        hits += 1;
+        return HttpResponse.json({ message: 'ok' });
+      })
+    );
+    const context = captureApiRequestContext();
+    // The account changed after the capture was taken.
+    useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 }));
+    const result = await submitMfaStepUp(
+      PATH,
+      'POST',
+      {},
+      { password: FIXTURE_PW, mfaCode: FIXTURE_OTP },
+      { context }
+    );
+    expect(result).toEqual({ kind: 'aborted' });
+    expect(hits).toBe(0);
+  });
+
+  it('a current capture sends the request and accepts', async () => {
+    let hits = 0;
+    server.use(
+      http.post('*' + PATH, () => {
+        hits += 1;
+        return HttpResponse.json({ message: 'ok' });
+      })
+    );
+    const context = captureApiRequestContext();
+    const result = await submitMfaStepUp(
+      PATH,
+      'POST',
+      {},
+      { password: FIXTURE_PW, mfaCode: FIXTURE_OTP },
+      { context }
+    );
+    expect(result.kind).toBe('accepted');
+    expect(hits).toBe(1);
+  });
+
+  it('codeField is honoured together with a capture, and mfa_code is then absent', async () => {
+    let body: Record<string, unknown> = {};
+    server.use(
+      http.post('*/api/v1/mfa/totp/disable', async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ message: 'ok' });
+      })
+    );
+    await submitMfaStepUp(
+      '/api/v1/mfa/totp/disable',
+      'POST',
+      {},
+      { password: FIXTURE_PW, mfaCode: FIXTURE_OTP },
+      { codeField: 'code', context: captureApiRequestContext() }
+    );
+    expect(body.code).toBe(FIXTURE_OTP);
+    expect('mfa_code' in body).toBe(false);
+  });
+
+  it('a code of undefined sends neither field', async () => {
+    let body: Record<string, unknown> = {};
+    server.use(
+      http.post('*' + PATH, async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ message: 'ok' });
+      })
+    );
+    await submitMfaStepUp(PATH, 'POST', {}, { password: FIXTURE_PW, mfaCode: undefined });
+    expect(body).toEqual({ password: FIXTURE_PW });
+  });
+});
+
+describe('toStepUpSubmitOutcome', () => {
+  it('accepted is a success', () => {
+    expect(toStepUpSubmitOutcome({ kind: 'accepted', data: null })).toEqual({ kind: 'success' });
+  });
+
+  it.each([
+    { kind: 'passwordRequired' },
+    { kind: 'invalidPassword' },
+    { kind: 'invalidMfaCode' },
+    { kind: 'mfaRequired', methods: ['totp'] },
+    { kind: 'enrollmentRequired' },
+    // Mutant: a 401 as `answered`, which left the stage live with the password
+    // and an active primary under a dead session (picker PR 3 review).
+    { kind: 'sessionExpired' },
+  ] as const)('$kind reaches the hook as itself', (result) => {
+    expect(toStepUpSubmitOutcome(result)).toEqual({ kind: 'refusal', refusal: result });
+  });
+
+  // C30: the budget is charged before any factor is read, so a 429 proves the
+  // code unspent. As `answered` it would be recorded as a TOTP acceptance.
+  it('rateLimited is a refusal, not an answer', () => {
+    expect(toStepUpSubmitOutcome({ kind: 'rateLimited' })).toEqual({
+      kind: 'refusal',
+      refusal: { kind: 'rateLimited' },
+    });
+  });
+
+  it.each([
+    { kind: 'deleteRateLimited', retryAfterSeconds: 3 },
+    { kind: 'inlineFactorRequired', message: 'x' },
+    { kind: 'unavailable' },
+    { kind: 'failed' },
+  ] as unknown as MfaStepUpResult[])(
+    '$kind may have spent the code, so it is answered',
+    (result) => {
+      expect(toStepUpSubmitOutcome(result)).toEqual({ kind: 'answered' });
+    }
+  );
+
+  it('a lost response is a transport failure and a fenced request is aborted', () => {
+    expect(toStepUpSubmitOutcome({ kind: 'networkError' })).toEqual({ kind: 'transport' });
+    expect(toStepUpSubmitOutcome({ kind: 'aborted' })).toEqual({ kind: 'aborted' });
+  });
+});
+
 describe('shared presentation helpers', () => {
+  it("stepUpBanner: enrolment and a dead session are the stage's to say, not a banner", () => {
+    expect(stepUpBanner({ kind: 'enrollmentRequired' })).toBeNull();
+    expect(stepUpBanner({ kind: 'sessionExpired' })).toBeNull();
+  });
+
+  // Mutant: the stage-less key revoke falling back to `stepUpBanner`, which
+  // says nothing about a dead session now that the stage words it.
+  it('passwordOnlyBanner: the dead session in words, everything else as stepUpBanner', () => {
+    expect(passwordOnlyBanner({ kind: 'sessionExpired' })).toBe(
+      'Your session has expired. Sign in again to continue.'
+    );
+    expect(passwordOnlyBanner({ kind: 'rateLimited' })).toBe(
+      'Too many attempts. Try again in a few minutes.'
+    );
+    expect(passwordOnlyBanner({ kind: 'invalidPassword' })).toBeNull();
+    expect(passwordOnlyBanner(null)).toBeNull();
+  });
+
   it('stepUpBanner: one line per banner kind, null for field kinds', () => {
     expect(stepUpBanner({ kind: 'unavailable' })).toBe(
       'Verification is temporarily unavailable. Try again in a few minutes.'
@@ -253,16 +400,5 @@ describe('shared presentation helpers', () => {
     expect(isStepUpLocked({ kind: 'unavailable' })).toBe(false);
     expect(isStepUpLocked({ kind: 'networkError' })).toBe(false);
     expect(isStepUpLocked(null)).toBe(false);
-  });
-
-  it('stepUpPromptMethods: the server list wins, filtered to inline factors', () => {
-    expect(
-      stepUpPromptMethods({ kind: 'mfaRequired', methods: ['webauthn', 'sms'] }, ['totp'])
-    ).toEqual(['webauthn']);
-    // An empty or email-only server list falls back to the known methods.
-    expect(
-      stepUpPromptMethods({ kind: 'mfaRequired', methods: ['email'] }, ['totp', 'email'])
-    ).toEqual(['totp']);
-    expect(stepUpPromptMethods(null, ['totp', 'webauthn', 'email'])).toEqual(['totp', 'webauthn']);
   });
 });

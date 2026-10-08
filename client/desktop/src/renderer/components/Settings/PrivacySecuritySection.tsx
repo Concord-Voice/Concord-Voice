@@ -10,15 +10,23 @@ import {
 } from '../../stores/ui/privacyStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import { apiFetch, API_BASE } from '../../services/system/apiClient';
+import {
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+} from '../../services/system/requestContext';
+import { adaptSessionsRefusal, serverErrorText } from '../../services/system/stepUpRouteAdapters';
+import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import Modal from '../ui/Modal';
 import MFATierSelector, { WebAuthnCredential } from './MFATierSelector';
 import MFASetup from './MFASetup';
-import { submitMfaStepUp, type MfaStepUpResult } from './mfaStepUp';
+import { submitMfaStepUp, type MfaSeamHandler } from './mfaStepUp';
 import ErrorBanner from './ErrorBanner';
-import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
-import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import BackupCodeDisplay from './BackupCodeDisplay';
+import BackupCodeRegenerateStage from './BackupCodeRegenerateStage';
+import SessionStepUpDialog, {
+  sessionStepUpKey,
+  type SessionStepUpAction,
+} from './SessionStepUpDialog';
 import EmailSmsSetup from './EmailSmsSetup';
 import CollapsibleSection from './CollapsibleSection';
 import {
@@ -93,6 +101,29 @@ async function fetchSessionsData(): Promise<SessionsFetchResult> {
     pastSessions: data.past_sessions || [],
     revocationMode: data.revocation_mode,
   };
+}
+
+const REVOKE_FAILED = 'Failed to revoke session';
+
+/** What a single revoke's credential-free DELETE came to (#7). */
+type RevokeAnswer =
+  | { kind: 'revoked' }
+  | { kind: 'stepUp'; seed: StepUpFactorRefusal }
+  | { kind: 'failed'; message: string };
+
+/**
+ * Reads a single revoke's answer through the route adapter. A body that is not
+ * JSON (a proxy's error page) reads as no body, so it reaches the banner as
+ * the generic sentence instead of as a parse error.
+ */
+async function readRevokeAnswer(response: Response): Promise<RevokeAnswer> {
+  if (response.ok) return { kind: 'revoked' };
+  const body: unknown = await response.json().catch(() => null);
+  const refusal = adaptSessionsRefusal(response.status, body);
+  if (refusal?.kind === 'mfaRequired' || refusal?.kind === 'passwordRequired') {
+    return { kind: 'stepUp', seed: refusal };
+  }
+  return { kind: 'failed', message: serverErrorText(body) ?? REVOKE_FAILED };
 }
 
 interface MFAStatusFetchResult {
@@ -215,85 +246,6 @@ export function resolveSSOToggleError(errorCode: string | undefined): string {
   if (errorCode === 'would_lock_out')
     return 'That change would lock you out. Link an SSO provider first.';
   return 'Failed to update security setting.';
-}
-
-/** Renders either an MFA verify prompt or a password input, depending on whether MFA is active. */
-const AuthVerifyField: React.FC<{
-  hasMFA: boolean;
-  mfaMethods: string[];
-  mfaRecoveryOnly: string[];
-  password: string;
-  onPasswordChange: (v: string) => void;
-  onMfaVerify: (code: string) => void;
-  /** The sessions route the code is sent with (see MFAVerifyPrompt). */
-  purpose: StepUpPurpose;
-  error: string;
-  onClearError: () => void;
-  disabled: boolean;
-  inputId: string;
-  onEnterKey?: () => void;
-  excludeBackupCodes?: boolean;
-  /** Remounts the code prompt empty when it changes (see `dropCode`). */
-  promptKey: number;
-}> = ({
-  hasMFA,
-  mfaMethods,
-  mfaRecoveryOnly,
-  password,
-  onPasswordChange,
-  onMfaVerify,
-  purpose,
-  error,
-  onClearError,
-  disabled,
-  inputId,
-  onEnterKey,
-  excludeBackupCodes,
-  promptKey,
-}) => {
-  if (hasMFA) {
-    return (
-      <MFAVerifyPrompt
-        key={promptKey}
-        methods={mfaMethods}
-        recoveryOnlyMethods={mfaRecoveryOnly}
-        onVerify={(code) => {
-          onMfaVerify(code);
-          onClearError();
-        }}
-        purpose={purpose}
-        onCodeChange={onMfaVerify}
-        disabled={disabled}
-        error={error || undefined}
-        excludeBackupCodes={excludeBackupCodes}
-      />
-    );
-  }
-  return (
-    <div className="revoke-password-input">
-      <label htmlFor={inputId}>Password</label>
-      <input
-        id={inputId}
-        type="password"
-        value={password}
-        onChange={(e) => {
-          onPasswordChange(e.target.value);
-          onClearError();
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && password && onEnterKey) onEnterKey();
-        }}
-        placeholder="Enter your password"
-        autoFocus
-      />
-      {error && <span className="revoke-password-error">{error}</span>}
-    </div>
-  );
-};
-
-/** Compute the disabled state for an auth-gated confirm button. */
-function isAuthConfirmDisabled(hasMFA: boolean, mfaCode: string, password: string): boolean {
-  return hasMFA ? !mfaCode : !password;
 }
 
 /**
@@ -699,26 +651,17 @@ const PrivacySecuritySection: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<string | null>(null);
-  const [isRevokingAll, setIsRevokingAll] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null); // session id for individual confirm
-  const [showRevokeAllModal, setShowRevokeAllModal] = useState(false);
-  const [revokePassword, setRevokePassword] = useState('');
-  const [revokeMfaCode, setRevokeMfaCode] = useState('');
-  const [revokePasswordError, setRevokePasswordError] = useState('');
 
   // Revocation mode (Simple / Secure toggle)
   const [revocationMode, setRevocationMode] = useState<'simple' | 'secure'>('secure');
-  const [showModeChangeModal, setShowModeChangeModal] = useState(false);
-  const [pendingMode, setPendingMode] = useState<'simple' | 'secure' | null>(null);
-  const [modeChangePassword, setModeChangePassword] = useState('');
-  const [modeChangeMfaCode, setModeChangeMfaCode] = useState('');
-  const [modeChangeError, setModeChangeError] = useState('');
-  const [isChangingMode, setIsChangingMode] = useState(false);
 
-  // Individual session revoke auth modal
-  const [showSessionPasswordModal, setShowSessionPasswordModal] = useState(false);
-  const [sessionPasswordTarget, setSessionPasswordTarget] = useState<string | null>(null);
-  const [sessionMfaCode, setSessionMfaCode] = useState('');
+  // The one step-up dialog for revoke, revoke-all and the mode change (#7).
+  // `seed` is the refusal that opened a refusal-triggered one (single revoke).
+  const [sessionStepUp, setSessionStepUp] = useState<{
+    action: SessionStepUpAction;
+    seed: StepUpFactorRefusal | null;
+  } | null>(null);
 
   // MFA state
   const [mfaMethods, setMfaMethods] = useState<string[]>([]);
@@ -736,26 +679,11 @@ const PrivacySecuritySection: React.FC = () => {
   const [webauthnCredentialType, setWebauthnCredentialType] = useState<'hardware' | 'platform'>(
     'hardware'
   );
-  const [sessionPassword, setSessionPassword] = useState('');
-  const [sessionPasswordError, setSessionPasswordError] = useState('');
 
   // Backup code reset modal
   const [showBackupReset, setShowBackupReset] = useState(false);
-  const [backupResetPassword, setBackupResetPassword] = useState('');
-  const [backupResetMfaCode, setBackupResetMfaCode] = useState('');
-  const [backupResetError, setBackupResetError] = useState('');
-  const [backupResetLoading, setBackupResetLoading] = useState(false);
   const [backupResetCodes, setBackupResetCodes] = useState<string[] | null>(null);
-
-  // The server accepts each MFA code once and can accept one yet still fail
-  // the request, so every code prompt here drops its code once a submission
-  // settles: the stored copy, and — by remounting the prompt — the digits on
-  // screen, so Confirm stays disabled until a fresh code is typed.
-  const [codePromptKey, setCodePromptKey] = useState(0);
-  const dropCode = (setCode: (code: string) => void) => {
-    setCode('');
-    setCodePromptKey((k) => k + 1);
-  };
+  const backupResetHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -990,28 +918,6 @@ const PrivacySecuritySection: React.FC = () => {
     fetchSSOSecurity();
   }, [fetchSessions, fetchPrivacy, fetchMFAStatus, fetchSSOSecurity]);
 
-  const handleBackupReset = async () => {
-    setBackupResetError('');
-    setBackupResetLoading(true);
-    try {
-      const res = await apiFetch('/api/v1/mfa/backup-codes/regenerate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // The route binds the code as `code`, not the step-up seam's `mfa_code`.
-        body: JSON.stringify({ password: backupResetPassword, code: backupResetMfaCode }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to regenerate backup codes');
-      setBackupResetCodes(data.backup_codes || []);
-      fetchMFAStatus();
-    } catch (err) {
-      setBackupResetError(err instanceof Error ? err.message : 'Failed to regenerate codes');
-    } finally {
-      dropCode(setBackupResetMfaCode);
-      setBackupResetLoading(false);
-    }
-  };
-
   // Sort sessions: current session always first, then by last_used descending
   const sortedSessions = useMemo(() => {
     return [...sessions].sort((a, b) => {
@@ -1021,7 +927,34 @@ const PrivacySecuritySection: React.FC = () => {
     });
   }, [sessions]);
 
-  const handleRevoke = async (sessionId: string, password?: string, mfaCode?: string) => {
+  /** Signs out of the session this client holds (revoked itself, or revoked with every other). */
+  const endCurrentSession = async () => {
+    await logout();
+    navigate('/');
+  };
+
+  /** A session the server revoked: sign out if it was this one, else drop it from the list. */
+  const applyRevoked = async (sessionId: string) => {
+    if (sessions.find((s) => s.id === sessionId)?.is_current) {
+      await endCurrentSession();
+      return;
+    }
+    setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+    void fetchSessions();
+  };
+
+  // A dialog that is already open keeps its action: a second Revoke's refusal
+  // landing while it is up is dropped, never re-pointing the open dialog at
+  // another session.
+  const openStepUp = (action: SessionStepUpAction, seed: StepUpFactorRefusal | null = null) =>
+    setSessionStepUp((open) => open ?? { action, seed });
+  const closeStepUp = () => setSessionStepUp(null);
+
+  // Single revoke is refusal-triggered: the first DELETE carries no credential,
+  // and the server's `auth_required` / `password_required` opens the step-up
+  // dialog seeded with that refusal (#7). Revoke-all and the mode change open
+  // the dialog up front instead.
+  const handleRevoke = async (sessionId: string) => {
     if (!accessToken) return;
 
     // Check if this is the current session — requires confirmation
@@ -1033,197 +966,43 @@ const PrivacySecuritySection: React.FC = () => {
 
     setConfirmRevoke(null);
     setRevokingId(sessionId);
+    // Captured before the request and sent with it: an answer that lands after
+    // an account or server change belongs to the old one, so it neither opens
+    // a dialog nor touches the list.
+    const context = captureApiRequestContext();
 
     try {
-      const fetchOpts = buildAuthFetchOpts('DELETE', password, mfaCode);
-      const response = await apiFetch(`/api/v1/sessions/${sessionId}`, fetchOpts);
-
-      if (!response.ok) {
-        const data = await response.json();
-        if (response.status === 403) {
-          const handled = handleRevoke403(data.error, sessionId);
-          if (handled) {
-            setRevokingId(null);
-            return;
-          }
-        }
-        throw new Error(data.error || 'Failed to revoke session');
-      }
-
-      // Success — close password modal if open
-      setShowSessionPasswordModal(false);
-      setSessionPasswordTarget(null);
-      setSessionPassword('');
-      setSessionPasswordError('');
-
-      // If we revoked the current session, log out
-      if (session?.is_current) {
-        await logout();
-        navigate('/');
-        return;
-      }
-
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-      fetchSessions();
+      const response = await apiFetch(
+        `/api/v1/sessions/${sessionId}`,
+        { method: 'DELETE' },
+        { context }
+      );
+      const answer = await readRevokeAnswer(response);
+      if (!apiRequestContextIsCurrent(context)) return;
+      if (answer.kind === 'stepUp') openStepUp({ kind: 'revoke', sessionId }, answer.seed);
+      else if (answer.kind === 'failed') setError(answer.message);
+      else await applyRevoked(sessionId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to revoke session');
+      if (apiRequestContextIsCurrent(context)) {
+        setError(err instanceof Error ? err.message : REVOKE_FAILED);
+      }
     } finally {
-      dropCode(setSessionMfaCode);
       setRevokingId(null);
     }
   };
 
-  /** Build fetch options with optional auth body. */
-  const buildAuthFetchOpts = (method: string, password?: string, mfaCode?: string): RequestInit => {
-    const opts: RequestInit = { method };
-    if (!password && !mfaCode) return opts;
-    opts.headers = { 'Content-Type': 'application/json' };
-    const body: Record<string, string> = {};
-    if (password) body.password = password;
-    if (mfaCode) body.mfa_code = mfaCode;
-    opts.body = JSON.stringify(body);
-    return opts;
-  };
-
-  /** Handle 403 errors from session revocation. Returns true if handled (should abort). */
-  const handleRevoke403 = (errorCode: string, sessionId: string): boolean => {
-    if (errorCode === 'password_required' || errorCode === 'auth_required') {
-      setSessionPasswordTarget(sessionId);
-      setSessionPassword('');
-      setSessionMfaCode('');
-      setSessionPasswordError('');
-      setShowSessionPasswordModal(true);
-      return true;
-    }
-    if (errorCode === 'Incorrect password' || errorCode === 'Invalid MFA code') {
-      setSessionPasswordError(errorCode);
-      return true;
-    }
-    return false;
-  };
-
-  const openRevokeAllModal = () => {
-    setRevokePassword('');
-    setRevokeMfaCode('');
-    setRevokePasswordError('');
-    setShowRevokeAllModal(true);
-  };
-
-  const closeRevokeAllModal = () => {
-    setShowRevokeAllModal(false);
-    setRevokePassword('');
-    setRevokeMfaCode('');
-    setRevokePasswordError('');
-  };
-
-  const openModeChangeModal = (mode: 'simple' | 'secure') => {
-    setPendingMode(mode);
-    setModeChangePassword('');
-    setModeChangeMfaCode('');
-    setModeChangeError('');
-    setShowModeChangeModal(true);
-  };
-
-  const closeModeChangeModal = () => {
-    setShowModeChangeModal(false);
-    setPendingMode(null);
-    setModeChangePassword('');
-    setModeChangeMfaCode('');
-    setModeChangeError('');
-  };
-
-  const handleModeChange = async () => {
-    if (!accessToken || !pendingMode) return;
-    if (hasMFA ? !modeChangeMfaCode : !modeChangePassword) return;
-
-    setIsChangingMode(true);
-
-    try {
-      const body: Record<string, string> = { mode: pendingMode };
-      if (hasMFA) body.mfa_code = modeChangeMfaCode;
-      else body.password = modeChangePassword;
-
-      const response = await apiFetch('/api/v1/sessions/revocation-mode', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (!response.ok) {
-        const data = await response.json();
-        if (response.status === 403) {
-          setModeChangeError(data.error || 'Authentication failed');
-          setIsChangingMode(false);
-          return;
-        }
-        throw new Error(data.error || 'Failed to change revocation mode');
-      }
-
-      const data = await response.json();
-      setRevocationMode(data.revocation_mode);
-      closeModeChangeModal();
-    } catch (err) {
-      setModeChangeError(err instanceof Error ? err.message : 'Failed to change revocation mode');
-    } finally {
-      dropCode(setModeChangeMfaCode);
-      setIsChangingMode(false);
-    }
-  };
-
-  const closeSessionPasswordModal = () => {
-    setShowSessionPasswordModal(false);
-    setSessionPasswordTarget(null);
-    setSessionPassword('');
-    setSessionMfaCode('');
-    setSessionPasswordError('');
-  };
-
-  const hasMFA = mfaMethods.length > 0;
-
-  const handleRevokeAll = async () => {
-    if (!accessToken) return;
-
-    const requiredField = hasMFA ? revokeMfaCode : revokePassword;
-    if (!requiredField) {
-      setRevokePasswordError(hasMFA ? 'MFA verification is required' : 'Password is required');
-      return;
-    }
-
-    setIsRevokingAll(true);
-
-    try {
-      const body: Record<string, unknown> = { include_current: true };
-      if (hasMFA) body.mfa_code = revokeMfaCode;
-      else body.password = revokePassword;
-
-      const response = await apiFetch('/api/v1/sessions/revoke-all', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (!response.ok) {
-        const data = await response.json();
-        if (response.status === 403) {
-          setRevokePasswordError(data.error || 'Authentication failed');
-          setIsRevokingAll(false);
-          return;
-        }
-        throw new Error(data.error || 'Failed to revoke sessions');
-      }
-
-      setRevokePassword('');
-      setRevokeMfaCode('');
-      setShowRevokeAllModal(false);
-      // All sessions revoked including current — log out
-      await logout();
-      navigate('/');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to revoke sessions');
-      setShowRevokeAllModal(false);
-    } finally {
-      dropCode(setRevokeMfaCode);
-      setIsRevokingAll(false);
+  const handleStepUpAccepted = (action: SessionStepUpAction) => {
+    closeStepUp();
+    switch (action.kind) {
+      case 'revoke':
+        void applyRevoked(action.sessionId);
+        break;
+      case 'revokeAll':
+        void endCurrentSession();
+        break;
+      case 'modeChange':
+        setRevocationMode(action.mode);
+        break;
     }
   };
 
@@ -1281,33 +1060,40 @@ const PrivacySecuritySection: React.FC = () => {
   // ─── MFA action handlers (extracted from JSX props so their branching does
   // not inflate this component's cognitive complexity) ─────────────────────
   // Every MFA settings action resolves an MfaStepUpResult and never throws:
-  // the modal routes all six through one path (mfaStepUp.ts). The status is
-  // refetched only after an accepted change — a refusal changed nothing.
-  const handleResetTOTP = async (password: string, code: string): Promise<MfaStepUpResult> => {
+  // the modal routes all six through one path (mfaStepUp.ts). Each is an
+  // `MfaSeamHandler`: the modal's `run` hands it the capture its request is
+  // sent under (C82), and its own side effects run only while that capture is
+  // current — an answer that lands after an account or server change belongs
+  // to the old one. The status is refetched only after an accepted change — a
+  // refusal changed nothing.
+  const handleResetTOTP: MfaSeamHandler = async (password, mfaCode, context) => {
     // TOTPDisable predates the seam and binds the code as `code`.
     const result = await submitMfaStepUp(
       '/api/v1/mfa/totp/disable',
       'POST',
       {},
-      { password, mfaCode: code },
-      { codeField: 'code' }
+      { password, mfaCode },
+      { codeField: 'code', context }
     );
-    if (result.kind === 'accepted') fetchMFAStatus();
+    if (result.kind === 'accepted' && apiRequestContextIsCurrent(context)) fetchMFAStatus();
     return result;
   };
 
-  const handleRevokeWebAuthnKey = async (
-    credentialId: string,
-    password: string
-  ): Promise<MfaStepUpResult> => {
+  const handleRevokeWebAuthnKey: MfaSeamHandler<[credentialId: string]> = async (
+    credentialId,
+    password,
+    _mfaCode,
+    context
+  ) => {
     // The route verifies the password alone; no code is sent.
     const result = await submitMfaStepUp(
       `/api/v1/mfa/webauthn/credentials/${credentialId}`,
       'DELETE',
       {},
-      { password, mfaCode: '' }
+      { password, mfaCode: undefined },
+      { context }
     );
-    if (result.kind === 'accepted') {
+    if (result.kind === 'accepted' && apiRequestContextIsCurrent(context)) {
       // Signal the authenticator to clean up the deleted credential (best-effort).
       const data = (result.data ?? {}) as { remaining_credential_ids?: string[]; user_id?: string };
       await signalRemovedWebAuthnCredential(data);
@@ -1316,32 +1102,32 @@ const PrivacySecuritySection: React.FC = () => {
     return result;
   };
 
-  const handleDisableEmailSms = async (
-    password: string,
-    mfaCode: string
-  ): Promise<MfaStepUpResult> => {
+  const handleDisableEmailSms: MfaSeamHandler = async (password, mfaCode, context) => {
     const result = await submitMfaStepUp(
       '/api/v1/mfa/email-sms/disable',
       'POST',
       {},
-      { password, mfaCode }
+      { password, mfaCode },
+      { context }
     );
-    if (result.kind === 'accepted') fetchMFAStatus();
+    if (result.kind === 'accepted' && apiRequestContextIsCurrent(context)) fetchMFAStatus();
     return result;
   };
 
-  const handleSetBackupEmail = async (
-    email: string,
-    password: string,
-    mfaCode: string
-  ): Promise<MfaStepUpResult> => {
+  const handleSetBackupEmail: MfaSeamHandler<[email: string]> = async (
+    email,
+    password,
+    mfaCode,
+    context
+  ) => {
     const result = await submitMfaStepUp(
       '/api/v1/mfa/backup-email',
       'PUT',
       { email },
-      { password, mfaCode }
+      { password, mfaCode },
+      { context }
     );
-    if (result.kind === 'accepted') {
+    if (result.kind === 'accepted' && apiRequestContextIsCurrent(context)) {
       const data = result.data as { backup_email?: string } | null;
       setMfaBackupEmail(data?.backup_email ?? '');
     }
@@ -1350,19 +1136,27 @@ const PrivacySecuritySection: React.FC = () => {
 
   // Nothing shows the flag while the hardened toggle is dormant, so an
   // accepted change has no state to update.
-  const handleToggleRecoveryHardened = (
-    enabled: boolean,
-    password: string,
-    mfaCode = ''
-  ): Promise<MfaStepUpResult> =>
-    submitMfaStepUp('/api/v1/mfa/recovery-hardened', 'PUT', { enabled }, { password, mfaCode });
+  const handleToggleRecoveryHardened: MfaSeamHandler<[enabled: boolean]> = (
+    enabled,
+    password,
+    mfaCode,
+    context
+  ) =>
+    submitMfaStepUp(
+      '/api/v1/mfa/recovery-hardened',
+      'PUT',
+      { enabled },
+      { password, mfaCode },
+      { context }
+    );
 
-  const handleToggleRecoveryOnly = async (
-    method: string,
-    recoveryOnly: boolean,
-    password: string,
-    mfaCode = ''
-  ): Promise<MfaStepUpResult> => {
+  const handleToggleRecoveryOnly: MfaSeamHandler<[method: string, recoveryOnly: boolean]> = async (
+    method,
+    recoveryOnly,
+    password,
+    mfaCode,
+    context
+  ) => {
     const newList = recoveryOnly
       ? [...mfaRecoveryOnly, method]
       : mfaRecoveryOnly.filter((m) => m !== method);
@@ -1370,9 +1164,10 @@ const PrivacySecuritySection: React.FC = () => {
       '/api/v1/mfa/recovery-only',
       'PUT',
       { methods: newList },
-      { password, mfaCode }
+      { password, mfaCode },
+      { context }
     );
-    if (result.kind === 'accepted') {
+    if (result.kind === 'accepted' && apiRequestContextIsCurrent(context)) {
       const data = result.data as { recovery_only_methods?: unknown } | null;
       const methods = data?.recovery_only_methods;
       if (!Array.isArray(methods)) {
@@ -1390,7 +1185,6 @@ const PrivacySecuritySection: React.FC = () => {
     <>
       {mfaSetupMethod === 'email-sms' && (
         <EmailSmsSetup
-          mfaActive={mfaMethods.length > 0}
           onComplete={() => {
             setMfaSetupMethod(null);
             fetchMFAStatus();
@@ -1403,8 +1197,6 @@ const PrivacySecuritySection: React.FC = () => {
           method={mfaSetupMethod}
           credentialType={mfaSetupMethod === 'webauthn' ? webauthnCredentialType : undefined}
           mfaActive={mfaMethods.length > 0}
-          activeMethods={mfaMethods}
-          recoveryOnlyMethods={mfaRecoveryOnly}
           onComplete={() => {
             setMfaSetupMethod(null);
             fetchMFAStatus();
@@ -1454,13 +1246,20 @@ const PrivacySecuritySection: React.FC = () => {
     </>
   );
 
+  const closeBackupReset = () => {
+    setShowBackupReset(false);
+    setBackupResetCodes(null);
+  };
+
   // Backup-code reset modal — extracted so its nested conditional does not
   // inflate this component's cognitive complexity (S3776).
   const renderBackupResetModal = () =>
     showBackupReset && (
       <div className="mfa-modal-overlay">
         <div className="mfa-modal">
-          <h3>Reset Backup Codes</h3>
+          <h3 tabIndex={-1} ref={backupResetHeadingRef}>
+            Reset Backup Codes
+          </h3>
           <p className="mfa-modal-desc">
             This will invalidate all existing backup codes and generate new ones.
           </p>
@@ -1468,60 +1267,19 @@ const PrivacySecuritySection: React.FC = () => {
           {backupResetCodes ? (
             <BackupCodeDisplay
               codes={backupResetCodes}
-              onConfirm={() => {
-                setShowBackupReset(false);
-                setBackupResetCodes(null);
-              }}
+              onConfirm={closeBackupReset}
               disabled={false}
             />
           ) : (
-            <>
-              <div className="mfa-verify-field">
-                <label htmlFor="backup-reset-password">Password</label>
-                <input
-                  id="backup-reset-password"
-                  type="password"
-                  value={backupResetPassword}
-                  onChange={(e) => setBackupResetPassword(e.target.value)}
-                  placeholder="Enter your password"
-                  disabled={backupResetLoading}
-                />
-              </div>
-
-              <MFAVerifyPrompt
-                key={codePromptKey}
-                methods={mfaMethods}
-                recoveryOnlyMethods={mfaRecoveryOnly}
-                onVerify={setBackupResetMfaCode}
-                // Backup-code regeneration checks an authenticator-app code
-                // and nothing else: no inline token (so no security-key
-                // option) and no backup code.
-                purpose={null}
-                excludeBackupCodes
-                onCodeChange={setBackupResetMfaCode}
-                disabled={backupResetLoading}
-                error={backupResetError || undefined}
-              />
-
-              <div className="mfa-setup-actions">
-                <button
-                  type="button"
-                  className="btn btn-sm btn-primary"
-                  onClick={handleBackupReset}
-                  disabled={backupResetLoading || !backupResetPassword || !backupResetMfaCode}
-                >
-                  {backupResetLoading ? 'Regenerating...' : 'Regenerate Codes'}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm btn-secondary"
-                  onClick={() => setShowBackupReset(false)}
-                  disabled={backupResetLoading}
-                >
-                  Cancel
-                </button>
-              </div>
-            </>
+            <BackupCodeRegenerateStage
+              headingRef={backupResetHeadingRef}
+              onRegenerated={(codes) => {
+                setBackupResetCodes(codes);
+                void fetchMFAStatus();
+              }}
+              onTotpRemoved={() => void fetchMFAStatus()}
+              onCancel={closeBackupReset}
+            />
           )}
         </div>
       </div>
@@ -1674,9 +1432,6 @@ const PrivacySecuritySection: React.FC = () => {
               disabled={!mfaBackupRemaining || mfaMethods.length === 0}
               onClick={() => {
                 setShowBackupReset(true);
-                setBackupResetPassword('');
-                setBackupResetMfaCode('');
-                setBackupResetError('');
                 setBackupResetCodes(null);
               }}
             >
@@ -1768,7 +1523,8 @@ const PrivacySecuritySection: React.FC = () => {
               <button
                 className={`revocation-mode-btn ${revocationMode === 'secure' ? 'active' : ''}`}
                 onClick={() => {
-                  if (revocationMode !== 'secure') openModeChangeModal('secure');
+                  if (revocationMode !== 'secure')
+                    openStepUp({ kind: 'modeChange', mode: 'secure' });
                 }}
               >
                 Secure
@@ -1776,7 +1532,8 @@ const PrivacySecuritySection: React.FC = () => {
               <button
                 className={`revocation-mode-btn ${revocationMode === 'simple' ? 'active' : ''}`}
                 onClick={() => {
-                  if (revocationMode !== 'simple') openModeChangeModal('simple');
+                  if (revocationMode !== 'simple')
+                    openStepUp({ kind: 'modeChange', mode: 'simple' });
                 }}
               >
                 Simple
@@ -1797,8 +1554,7 @@ const PrivacySecuritySection: React.FC = () => {
               <div className="sessions-actions-top">
                 <button
                   className="sessions-revoke-all-btn"
-                  onClick={openRevokeAllModal}
-                  disabled={isRevokingAll}
+                  onClick={() => openStepUp({ kind: 'revokeAll' })}
                 >
                   Revoke All Sessions
                 </button>
@@ -1820,154 +1576,15 @@ const PrivacySecuritySection: React.FC = () => {
           </>
         )}
 
-        <Modal
-          isOpen={showRevokeAllModal}
-          onClose={closeRevokeAllModal}
-          title="Revoke All Sessions"
-          width="small"
-        >
-          <div className="revoke-all-modal-content">
-            <p className="revoke-all-modal-description">
-              You&apos;re about to revoke all of your active session tokens, which will log you out
-              of all sessions, including this one.{' '}
-              {hasMFA
-                ? 'Verify your identity to continue.'
-                : 'In order to continue, please input your password.'}
-            </p>
-            <AuthVerifyField
-              hasMFA={hasMFA}
-              mfaMethods={mfaMethods}
-              mfaRecoveryOnly={mfaRecoveryOnly}
-              password={revokePassword}
-              onPasswordChange={setRevokePassword}
-              onMfaVerify={setRevokeMfaCode}
-              promptKey={codePromptKey}
-              purpose="sessions.revoke_all"
-              error={revokePasswordError}
-              onClearError={() => setRevokePasswordError('')}
-              disabled={isRevokingAll}
-              inputId="revoke-all-password"
-              onEnterKey={handleRevokeAll}
-            />
-            <div className="revoke-all-modal-actions">
-              <button className="revoke-all-modal-cancel-btn" onClick={closeRevokeAllModal}>
-                No, Cancel
-              </button>
-              <button
-                className="revoke-all-modal-confirm-btn"
-                onClick={handleRevokeAll}
-                disabled={
-                  isRevokingAll || isAuthConfirmDisabled(hasMFA, revokeMfaCode, revokePassword)
-                }
-              >
-                {isRevokingAll ? 'Revoking...' : 'Yes, Revoke All Sessions'}
-              </button>
-            </div>
-          </div>
-        </Modal>
-
-        {/* Individual session revoke auth modal */}
-        <Modal
-          isOpen={showSessionPasswordModal}
-          onClose={closeSessionPasswordModal}
-          title="Verify Your Identity"
-          width="small"
-        >
-          <div className="revoke-all-modal-content">
-            <p className="revoke-all-modal-description">
-              For your security, {hasMFA ? 'verify your identity' : 'please enter your password'} to
-              revoke this session.
-            </p>
-            <AuthVerifyField
-              hasMFA={hasMFA}
-              mfaMethods={mfaMethods}
-              mfaRecoveryOnly={mfaRecoveryOnly}
-              password={sessionPassword}
-              onPasswordChange={setSessionPassword}
-              onMfaVerify={setSessionMfaCode}
-              promptKey={codePromptKey}
-              purpose="sessions.revoke"
-              error={sessionPasswordError}
-              onClearError={() => setSessionPasswordError('')}
-              disabled={revokingId === sessionPasswordTarget}
-              inputId="session-revoke-password"
-              onEnterKey={
-                sessionPasswordTarget
-                  ? () => handleRevoke(sessionPasswordTarget, sessionPassword)
-                  : undefined
-              }
-            />
-            <div className="revoke-all-modal-actions">
-              <button className="revoke-all-modal-cancel-btn" onClick={closeSessionPasswordModal}>
-                Cancel
-              </button>
-              <button
-                className="revoke-all-modal-confirm-btn"
-                onClick={() =>
-                  sessionPasswordTarget &&
-                  handleRevoke(
-                    sessionPasswordTarget,
-                    hasMFA ? undefined : sessionPassword,
-                    hasMFA ? sessionMfaCode : undefined
-                  )
-                }
-                disabled={
-                  isAuthConfirmDisabled(hasMFA, sessionMfaCode, sessionPassword) ||
-                  revokingId === sessionPasswordTarget
-                }
-              >
-                {revokingId === sessionPasswordTarget ? 'Revoking...' : 'Confirm & Revoke'}
-              </button>
-            </div>
-          </div>
-        </Modal>
-
-        {/* Revocation mode change modal */}
-        <Modal
-          isOpen={showModeChangeModal}
-          onClose={closeModeChangeModal}
-          title="Change Revocation Mode"
-          width="small"
-        >
-          <div className="revoke-all-modal-content">
-            <p className="revoke-all-modal-description">
-              {pendingMode === 'simple'
-                ? 'Switching to Simple Revocation. You will be able to authenticate once and freely manage sessions for a short period.'
-                : 'Switching to Secure Revocation. Authentication will be required to revoke sessions under certain circumstances.'}
-            </p>
-            <AuthVerifyField
-              hasMFA={hasMFA}
-              mfaMethods={mfaMethods}
-              mfaRecoveryOnly={mfaRecoveryOnly}
-              password={modeChangePassword}
-              onPasswordChange={setModeChangePassword}
-              onMfaVerify={setModeChangeMfaCode}
-              promptKey={codePromptKey}
-              purpose="sessions.revocation_mode_set"
-              error={modeChangeError}
-              onClearError={() => setModeChangeError('')}
-              disabled={isChangingMode}
-              inputId="mode-change-password"
-              onEnterKey={handleModeChange}
-              excludeBackupCodes
-            />
-            <div className="revoke-all-modal-actions">
-              <button className="revoke-all-modal-cancel-btn" onClick={closeModeChangeModal}>
-                Cancel
-              </button>
-              <button
-                className="revoke-all-modal-confirm-btn"
-                onClick={handleModeChange}
-                disabled={
-                  isChangingMode ||
-                  isAuthConfirmDisabled(hasMFA, modeChangeMfaCode, modeChangePassword)
-                }
-              >
-                {isChangingMode ? 'Changing...' : 'Confirm'}
-              </button>
-            </div>
-          </div>
-        </Modal>
+        {sessionStepUp && (
+          <SessionStepUpDialog
+            key={sessionStepUpKey(sessionStepUp.action)}
+            action={sessionStepUp.action}
+            seed={sessionStepUp.seed}
+            onClose={closeStepUp}
+            onAccepted={handleStepUpAccepted}
+          />
+        )}
       </CollapsibleSection>
 
       {pastSessions.length > 0 && (

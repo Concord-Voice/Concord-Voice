@@ -319,8 +319,9 @@ describe('DMThreadRemovalDialog', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
       await waitFor(() => expect(fetchConversations).toHaveBeenCalledOnce());
 
-      // Mutant: protection off still issuing the read or asking for credentials.
-      expect(mockClearDMHistory.mock.calls).toEqual([['dm-1']]);
+      // Mutant: protection off still issuing the read or asking for credentials,
+      // or sending without the context captured at activation.
+      expect(mockClearDMHistory.mock.calls).toEqual([['dm-1', undefined, expect.anything()]]);
       expect(readHits()).toBe(0);
       expect(screen.queryByRole('heading', { name: CREDENTIALS })).not.toBeInTheDocument();
       expect(purged).toHaveBeenCalledOnce();
@@ -393,6 +394,19 @@ describe('DMThreadRemovalDialog', () => {
       );
       expect(screen.queryByRole('heading', { name: CREDENTIALS })).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled();
+      expect(onClose).not.toHaveBeenCalled();
+    });
+
+    // With no stage there is no terminal state to say it, so the banner does.
+    // Mutant: the factor path's banner suppression applied to this path too.
+    it('says a dead session in the banner when no stage is open', async () => {
+      mockClearDMHistory.mockResolvedValueOnce({ kind: 'sessionExpired' });
+      renderDialog('clear');
+
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('Sign in again to clear history.');
+      expect(screen.queryByRole('heading', { name: CREDENTIALS })).not.toBeInTheDocument();
       expect(onClose).not.toHaveBeenCalled();
     });
 
@@ -752,7 +766,6 @@ describe('DMThreadRemovalDialog', () => {
           { kind: 'passwordRefused', message: 'That password is not correct.' },
           'That password is not correct.',
         ],
-        [{ kind: 'sessionExpired' }, 'Sign in again to clear history.'],
         [{ kind: 'notFound' }, 'This thread is no longer available.'],
         [
           { kind: 'stepUpImpossible' },
@@ -770,6 +783,25 @@ describe('DMThreadRemovalDialog', () => {
         expect(screen.getByRole('dialog')).toBeInTheDocument();
         expect(onClose).not.toHaveBeenCalled();
         expect(mockClearDMHistory).toHaveBeenCalledOnce();
+      });
+
+      // Mutant: the 401 left to the hook's default (the stage stays live with an
+      // active primary), or the banner saying the dead session a second time.
+      it('a dead session ends the stage: one sentence, no field, an inert primary', async () => {
+        mockClearDMHistory.mockResolvedValueOnce({ kind: 'sessionExpired' });
+        renderDialog('clear');
+        await continueToCredentials();
+        await enterCode();
+        fireEvent.click(verify());
+
+        expect(await screen.findByText('Sign in again to clear history.')).toBeInTheDocument();
+        expect(screen.getAllByText('Sign in again to clear history.')).toHaveLength(1);
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+        expect(verify()).toHaveAttribute('aria-disabled', 'true');
+        fireEvent.click(verify());
+        expect(mockClearDMHistory).toHaveBeenCalledOnce();
+        expect(onClose).not.toHaveBeenCalled();
       });
 
       // Mutant: `uncertain` retried, or the stage left open to a second submit.

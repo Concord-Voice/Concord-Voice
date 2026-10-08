@@ -11,14 +11,26 @@ import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 // M2 — a mint the server does not have is named as unsupported;
 // L2 — a password_required refusal without step_up_token_invalid still clears
 //      the sent password;
-// L3 — the previous error is cleared while the retry is in flight;
+// L3 — a retry's outcome is worded from the retry alone (the stage no longer
+//      clears the previous error by hand: `withoutError` is gone);
 // L4 — a mint and purge still in flight when the dialog closes and reopens
 //      must not write their outcome into the reopened dialog.
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
-beforeEach(() => resetAllStores());
+beforeEach(() => {
+  resetAllStores();
+  server.use(passwordOnlyRead());
+});
+
+// The stage reads the account's inline methods. Stubbed so the result never
+// depends on whatever answers an unhandled request: a password-only account,
+// as the password_required challenge says.
+const passwordOnlyRead = () =>
+  http.get('*/api/v1/mfa/step-up', () =>
+    HttpResponse.json({ methods: [], default_method: null, backup_code_available: false })
+  );
 
 const CHANNEL_PATH = '*/api/v1/channels/:id/messages';
 const PASSWORD_CHALLENGE = {
@@ -72,7 +84,7 @@ describe('PurgeMessagesModal mint refusals (#3509 frontend review)', () => {
 
     await user.click(submit());
 
-    expect(await screen.findByText('MFA Verification')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Authenticator app code')).toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
   });
 
@@ -83,9 +95,13 @@ describe('PurgeMessagesModal mint refusals (#3509 frontend review)', () => {
 
     await user.click(submit());
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      "This server doesn't support this confirmation yet."
-    );
+    // The fields cannot answer a missing endpoint, so `endExchangeRefusal`
+    // ends the purge as a `softLockFailed` result carrying the exchange's own
+    // words, not a stage that asks for the password again.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent("This server doesn't support this confirmation yet.");
+    expect(screen.getByRole('button', { name: 'Done' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
   });
 
   it('L2: a plain password_required after the exchange leaves no password behind', async () => {
@@ -98,27 +114,26 @@ describe('PurgeMessagesModal mint refusals (#3509 frontend review)', () => {
     await waitFor(() => expect(screen.getByLabelText('Password')).toHaveValue(''));
   });
 
-  it('L3: the previous error is cleared while the retry is in flight', async () => {
+  it('L3: a retry that is refused again is worded again, in place', async () => {
     purgeAnswers([challenge]);
-    let release!: () => void;
     let calls = 0;
     mintAnswers(() => {
       calls += 1;
-      if (calls === 1) return HttpResponse.json({ error: 'Invalid password' }, { status: 403 });
-      return new Promise<Response>((r) => {
-        release = () => r(HttpResponse.json({ error: 'Invalid password' }, { status: 403 }));
-      });
+      return HttpResponse.json({ error: 'Invalid password' }, { status: 403 });
     });
     const { user } = await toPasswordStage();
     await user.click(submit());
     expect(await screen.findByRole('alert')).toHaveTextContent('That password is not correct.');
 
+    // The rejected password was dropped, so the retry starts from an empty field.
+    await waitFor(() => expect(screen.getByLabelText('Password')).toHaveValue(''));
     await user.type(screen.getByLabelText('Password'), FIXTURE_PW);
     await user.click(submit());
 
-    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
-    release();
+    await waitFor(() => expect(calls).toBe(2));
     expect(await screen.findByRole('alert')).toHaveTextContent('That password is not correct.');
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
   });
 
   it('L4: an outcome that lands after the dialog closed and reopened is dropped', async () => {

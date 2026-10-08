@@ -5,7 +5,9 @@ import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import { deferred } from '../../helpers/deferred';
+import { confirmAndSettle, confirmInFlight } from '../../helpers/confirmDelete';
 import type { ChatContext } from '@/renderer/types/chat';
 
 // #3455 T7: the delete-rate soft-lock refusal slot in useChatController. The
@@ -123,9 +125,7 @@ describe('useChatController delete refusal (#3455)', () => {
     it('a retry with a code sends only mfa_code', async () => {
       const { result } = await refuseFirst();
       mockApiFetch.mockResolvedValueOnce(res(200, {}));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
       await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
 
       expect(lastInit().method).toBe('DELETE');
@@ -141,9 +141,7 @@ describe('useChatController delete refusal (#3455)', () => {
         res(200, { step_up_token: 'minted-token', expires_in: 60 })
       );
       mockApiFetch.mockResolvedValueOnce(res(200, {}));
-      await act(async () => {
-        result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-      });
+      await confirmAndSettle({ result }, { currentPassword: FIXTURE_PW });
       await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(3));
 
       const [mintPath, mintInit] = mockApiFetch.mock.calls[1] as [string, RequestInit];
@@ -159,9 +157,7 @@ describe('useChatController delete refusal (#3455)', () => {
     it('a retry with an empty factor still sends no body', async () => {
       const { result } = await refuseFirst();
       mockApiFetch.mockResolvedValueOnce(res(200, {}));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: '', currentPassword: '' });
-      });
+      await confirmAndSettle({ result }, { mfaCode: '', currentPassword: '' });
       await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
 
       expect(lastInit()).toEqual({ method: 'DELETE' });
@@ -175,18 +171,15 @@ describe('useChatController delete refusal (#3455)', () => {
       ]);
 
       mockApiFetch.mockResolvedValueOnce(res(200, {}));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
       await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
       expect(mockApiFetch.mock.calls[1][0]).toBe('/api/v1/dm/conversations/conv-1/messages/dm-m1');
     });
 
     it('confirmDelete with nothing on screen sends nothing', async () => {
       const { result } = renderHook(() => useChatController(channelCtx));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      const outcome = await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
+      expect(outcome).toEqual({ kind: 'aborted' });
       expect(mockApiFetch).not.toHaveBeenCalled();
       expect(result.current.deleteRefusal).toBeNull();
     });
@@ -199,9 +192,9 @@ describe('useChatController delete refusal (#3455)', () => {
       expect(result.current.deleteRefusal).toMatchObject({
         messageId: 'm1',
         view: { view: 'confirm', methods: ['totp'] },
-        submitting: false,
-        promptKey: 0,
       });
+      expect(result.current.deleteRefusal).not.toHaveProperty('submitting');
+      expect(result.current.deleteRefusal).not.toHaveProperty('promptKey');
       expect(storedIds('channel-1')).toEqual(['m1']);
     });
 
@@ -290,30 +283,30 @@ describe('useChatController delete refusal (#3455)', () => {
       expect(result.current.deleteRefusal).toBeNull();
     });
 
-    it('marks the slot submitting while the retry is in flight, and clears it on success', async () => {
+    it('a retry in flight keeps the slot, then resolves to success and clears it', async () => {
       const { result } = await refuseFirst();
       const retry = deferred<Response>();
       mockApiFetch.mockReturnValueOnce(retry.promise);
 
-      act(() => result.current.confirmDelete({ mfaCode: FIXTURE_OTP }));
-      expect(result.current.deleteRefusal?.submitting).toBe(true);
+      const retryPending = confirmInFlight({ result }, { mfaCode: FIXTURE_OTP });
+      expect(result.current.deleteRefusal?.view).toEqual({ view: 'confirm', methods: ['totp'] });
 
       await act(async () => {
         retry.resolve(res(200, {}));
+        await retryPending;
       });
+      await expect(retryPending).resolves.toEqual({ kind: 'success' });
       await waitFor(() => expect(result.current.deleteRefusal).toBeNull());
       expect(storedIds('channel-1')).toEqual([]);
     });
 
-    it('a refused retry ends submitting and shows the new refusal', async () => {
+    it('a refused retry shows the new refusal and resolves it as answered', async () => {
       const { result } = await refuseFirst();
       mockApiFetch.mockResolvedValueOnce(res(503, { error: 'Soft-lock unavailable' }));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      const outcome = await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
       await waitFor(() => expect(result.current.deleteRefusal?.view.view).toBe('unavailable'));
 
-      expect(result.current.deleteRefusal?.submitting).toBe(false);
+      expect(outcome).toEqual({ kind: 'answered' });
       expect(storedIds('channel-1')).toEqual(['m1']);
     });
   });
@@ -383,9 +376,7 @@ describe('useChatController delete refusal (#3455)', () => {
     it('on a RETRY counts as gone: the row is removed and the slot cleared', async () => {
       const { result } = await refuseFirst();
       mockApiFetch.mockResolvedValueOnce(res(404, { error: 'Message not found' }));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
 
       await waitFor(() => expect(result.current.deleteRefusal).toBeNull());
       expect(storedIds('channel-1')).toEqual([]);
@@ -522,17 +513,20 @@ describe('useChatController delete refusal (#3455)', () => {
         const { result, rerender } = await refuseFirst();
         const retry = deferred<Response>();
         mockApiFetch.mockReturnValueOnce(retry.promise);
-        act(() => result.current.confirmDelete({ mfaCode: FIXTURE_OTP }));
+        const retryPending = confirmInFlight({ result }, { mfaCode: FIXTURE_OTP });
         seed('channel-2', 'm1');
         rerender({ c: otherChannelCtx });
 
         await act(async () => {
           retry.resolve(res(403, { ...CHALLENGE, error: 'Invalid code' }));
+          await retryPending;
         });
         await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
 
         expect(result.current.deleteRefusal).toBeNull();
-        act(() => result.current.confirmDelete({ mfaCode: FIXTURE_OTP }));
+        await expect(confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP })).resolves.toEqual({
+          kind: 'aborted',
+        });
         expect(mockApiFetch).toHaveBeenCalledTimes(2);
       });
 
@@ -620,10 +614,20 @@ describe('useChatController delete refusal (#3455)', () => {
       expect(result.current.deleteRefusal).toMatchObject({
         messageId: 'm1',
         view: { view: 'failed' },
-        submitting: false,
       });
       // Transport detail is never user copy.
       expect(result.current.deleteRefusal?.view).not.toHaveProperty('message');
+    });
+
+    it('an AbortError on a RETRY is aborted, never a network error, and keeps the slot', async () => {
+      const { result } = await refuseFirst();
+      mockApiFetch.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
+
+      const outcome = await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
+
+      expect(outcome).toEqual({ kind: 'aborted' });
+      expect(result.current.deleteRefusal?.view).toEqual({ view: 'confirm', methods: ['totp'] });
+      expect(storedIds('channel-1')).toEqual(['m1']);
     });
 
     it('an AbortError (account or server changed under the request) reports nothing', async () => {
@@ -638,15 +642,13 @@ describe('useChatController delete refusal (#3455)', () => {
       expect(storedIds('channel-1')).toEqual(['m1']);
     });
 
-    it('a transport failure on a retry keeps the message and ends submitting', async () => {
+    it('a transport failure on a retry keeps the message and resolves as transport', async () => {
       const { result } = await refuseFirst();
       mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      const outcome = await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
       await waitFor(() => expect(result.current.deleteRefusal?.view.view).toBe('failed'));
 
-      expect(result.current.deleteRefusal?.submitting).toBe(false);
+      expect(outcome).toEqual({ kind: 'transport' });
       expect(storedIds('channel-1')).toEqual(['m1']);
     });
   });
@@ -660,80 +662,237 @@ describe('useChatController delete refusal (#3455)', () => {
 
       vi.setSystemTime(new Date('2026-09-30T10:05:00Z'));
       mockApiFetch.mockResolvedValueOnce(res(429, { error: 'slow' }, { 'Retry-After': '30' }));
-      await act(async () => {
-        result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
-      });
+      await confirmAndSettle({ result }, { mfaCode: FIXTURE_OTP });
       await waitFor(() => expect(result.current.deleteRefusal?.view.view).toBe('wait'));
 
       expect(result.current.deleteRefusal?.openedAt).toBe(Date.parse('2026-09-30T10:05:00Z'));
     });
   });
 
-  describe('promptKey (#3466)', () => {
-    async function retryWith(hook: Awaited<ReturnType<typeof refuseFirst>>, response: Response) {
+  // Replaces the promptKey (#3466) block, removed on purpose: the slot no longer
+  // counts attempts or carries a per-attempt error. The factor hook empties and
+  // refocuses its own input from the outcome, so what the controller owes it is
+  // the right outcome for each answer, and a view that stays bare.
+  describe('the outcome a retry resolves to (D6)', () => {
+    it.each([
+      [
+        'an invalid code',
+        res(403, { error: 'Invalid MFA code' }),
+        { kind: 'refusal', refusal: { kind: 'invalidMfaCode' } },
+      ],
+      [
+        'a re-issued soft-lock challenge',
+        res(403, CHALLENGE),
+        { kind: 'refusal', refusal: { kind: 'mfaRequired', methods: ['totp'] } },
+      ],
+      [
+        'a wrong password at the route',
+        res(403, { error: 'Invalid password' }),
+        { kind: 'refusal', refusal: { kind: 'invalidPassword' } },
+      ],
+      ['a 500', res(500, { error: 'boom' }), { kind: 'answered' }],
+      [
+        'a spent budget',
+        res(429, { step_up_budget_exhausted: true }),
+        { kind: 'refusal', refusal: { kind: 'rateLimited' } },
+      ],
+    ] as const)('%s', async (_label, response, expected) => {
+      const hook = await refuseFirst();
       mockApiFetch.mockResolvedValueOnce(response);
-      const before = mockApiFetch.mock.calls.length;
+      expect(await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP })).toEqual(expected);
+    });
+
+    it('an invalid code keeps the confirm view with its methods and no per-attempt error', async () => {
+      const hook = await refuseFirst();
+      mockApiFetch.mockResolvedValueOnce(res(403, { error: 'Invalid MFA code' }));
+      await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP });
+
+      expect(hook.result.current.deleteRefusal?.view).toEqual({
+        view: 'confirm',
+        methods: ['totp'],
+      });
+    });
+
+    it('a wrong password at the route moves to the bare password view', async () => {
+      const hook = await refuseFirst();
+      mockApiFetch.mockResolvedValueOnce(res(403, { error: 'Invalid password' }));
+      await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP });
+
+      expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'password' });
+    });
+
+    // The delete soft-lock's own kind is the hook's mfaRequired.
+    it('the soft-lock challenge on a retry is the hook’s mfaRequired with the methods', async () => {
+      const hook = await refuseFirst();
+      mockApiFetch.mockResolvedValueOnce(res(403, { ...CHALLENGE, methods: ['webauthn', 'totp'] }));
+      const outcome = await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP });
+
+      expect(outcome).toEqual({
+        kind: 'refusal',
+        refusal: { kind: 'mfaRequired', methods: ['webauthn', 'totp'] },
+      });
+      expect(hook.result.current.deleteRefusal?.view).toEqual({
+        view: 'confirm',
+        methods: ['webauthn', 'totp'],
+      });
+    });
+
+    it('a 404 on a retry is success: the row is gone', async () => {
+      const hook = await refuseFirst();
+      mockApiFetch.mockResolvedValueOnce(res(404, { error: 'Message not found' }));
+      expect(await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP })).toEqual({ kind: 'success' });
+    });
+  });
+
+  // E8 and the #17 loop: both wire shapes of the enrolment refusal must reach
+  // the slot as the terminal enroll view and the hook as the terminal kind.
+  describe.each([
+    ['without delete_rate_limited', { mfa_enrollment_required: true }, {}],
+    [
+      'with delete_rate_limited and a Retry-After',
+      { delete_rate_limited: true, mfa_enrollment_required: true },
+      { 'Retry-After': '60' },
+    ],
+  ])('enrolment %s', (_label, wire, headers) => {
+    const body = { error: 'Set up an authenticator app or security key to do this.', ...wire };
+
+    it('on the FIRST delete, fills the slot with the enroll view: no failed view, no countdown', async () => {
+      seed('channel-1', 'm1');
+      mockApiFetch.mockResolvedValueOnce(res(403, body, headers));
+      const { result } = renderHook(() => useChatController(channelCtx));
       await act(async () => {
-        hook.result.current.confirmDelete({ mfaCode: FIXTURE_OTP });
+        await result.current.deleteMessage('m1');
       });
-      await waitFor(() => expect(mockApiFetch.mock.calls.length).toBe(before + 1));
-      await waitFor(() => expect(hook.result.current.deleteRefusal?.submitting).toBe(false));
-    }
 
-    it('starts at 0 on the first refusal', async () => {
-      const { result } = await refuseFirst();
-      expect(result.current.deleteRefusal?.promptKey).toBe(0);
+      expect(result.current.deleteRefusal?.view).toEqual({ view: 'enroll' });
+      expect(storedIds('channel-1')).toEqual(['m1']);
     });
 
-    it('bumps on each invalid code that stays on the confirm view', async () => {
+    it('on a RETRY, ends the stage: the enroll view, and the hook’s terminal refusal', async () => {
       const hook = await refuseFirst();
+      mockApiFetch.mockResolvedValueOnce(res(403, body, headers));
 
-      await retryWith(hook, res(403, { error: 'Invalid MFA code' }));
-      expect(hook.result.current.deleteRefusal).toMatchObject({
-        view: { view: 'confirm', error: "That didn't work. Try again with a new code." },
-        promptKey: 1,
-      });
+      const outcome = await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP });
 
-      await retryWith(hook, res(403, { error: 'Invalid MFA code' }));
-      expect(hook.result.current.deleteRefusal?.promptKey).toBe(2);
+      expect(outcome).toEqual({ kind: 'refusal', refusal: { kind: 'enrollmentRequired' } });
+      expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'enroll' });
     });
 
-    it('bumps on an invalid password that stays on the password view', async () => {
+    it('through the password exchange too: a minted token the route then refuses', async () => {
       const hook = await refuseFirst(channelCtx, 'm1', PASSWORD_CHALLENGE);
+      mockApiFetch.mockResolvedValueOnce(res(200, { step_up_token: 'tok', expires_in: 60 }));
+      mockApiFetch.mockResolvedValueOnce(res(403, body, headers));
 
-      await retryWith(hook, res(403, { error: 'Invalid password' }));
-      expect(hook.result.current.deleteRefusal).toMatchObject({
-        view: { view: 'password', error: 'That password is not correct.' },
-        promptKey: 1,
+      const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+      expect(outcome).toEqual({ kind: 'refusal', refusal: { kind: 'enrollmentRequired' } });
+      expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'enroll' });
+    });
+  });
+
+  // The factor the hook proved reaches the delete body (a WebAuthn token and a
+  // backup code are both just the code).
+  describe('the retry body', () => {
+    it.each([
+      ['a WebAuthn assertion token', 'webauthn-assertion-token-0123456789'],
+      ['a backup code', 'abcd1234'],
+      ['a TOTP code', FIXTURE_OTP],
+    ])('%s is sent as mfa_code, on the channel route', async (_label, code) => {
+      const hook = await refuseFirst();
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+
+      expect(await confirmAndSettle(hook, { mfaCode: code })).toEqual({ kind: 'success' });
+
+      expect(mockApiFetch.mock.calls.at(-1)?.[0]).toBe('/api/v1/messages/m1');
+      expect(JSON.parse(lastInit().body as string)).toEqual({ mfa_code: code });
+    });
+
+    it('a WebAuthn token is sent as mfa_code on the DM route too', async () => {
+      const hook = await refuseFirst(dmCtx, 'dm-m1');
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+
+      await confirmAndSettle(hook, { mfaCode: 'webauthn-assertion-token-0123456789' });
+
+      expect(mockApiFetch.mock.calls.at(-1)?.[0]).toBe(
+        '/api/v1/dm/conversations/conv-1/messages/dm-m1'
+      );
+      expect(JSON.parse(lastInit().body as string)).toEqual({
+        mfa_code: 'webauthn-assertion-token-0123456789',
       });
     });
 
-    it('does not bump when the same challenge is simply re-issued without a per-attempt error', async () => {
+    it('a code wins over a password: nothing is minted', async () => {
       const hook = await refuseFirst();
-      await retryWith(hook, res(403, CHALLENGE));
-      expect(hook.result.current.deleteRefusal).toMatchObject({
-        view: { view: 'confirm' },
-        promptKey: 0,
-      });
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+
+      await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP, currentPassword: FIXTURE_PW });
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(lastInit().body as string)).toEqual({ mfa_code: FIXTURE_OTP });
     });
 
-    it('does not bump when the view changes, even to one carrying an error', async () => {
+    // apiFetch owns the pre-dispatch fence (mocked here), so what this layer
+    // owes it is the run's capture on the retry, and on the exchange before it.
+    it('the run’s capture is what admits the retry', async () => {
       const hook = await refuseFirst();
-      await retryWith(hook, res(403, { error: 'Invalid password' }));
-      expect(hook.result.current.deleteRefusal).toMatchObject({
-        view: { view: 'password', error: 'That password is not correct.' },
-        promptKey: 0,
-      });
+      const capture = captureApiRequestContext();
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+
+      await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP }, capture);
+
+      expect(mockApiFetch.mock.calls.at(-1)?.[2]).toEqual({ context: capture });
     });
 
-    it('keeps the running count through a non-bumping refusal', async () => {
-      const hook = await refuseFirst();
-      await retryWith(hook, res(403, { error: 'Invalid MFA code' }));
-      await retryWith(hook, res(500, { error: 'boom' }));
-      expect(hook.result.current.deleteRefusal).toMatchObject({
-        view: { view: 'failed', message: 'boom' },
-        promptKey: 1,
+    it('the same capture admits the password exchange and the delete after it', async () => {
+      const hook = await refuseFirst(channelCtx, 'm1', PASSWORD_CHALLENGE);
+      const capture = captureApiRequestContext();
+      mockApiFetch.mockResolvedValueOnce(res(200, { step_up_token: 'tok', expires_in: 60 }));
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+
+      await confirmAndSettle(hook, { currentPassword: FIXTURE_PW }, capture);
+
+      expect(mockApiFetch.mock.calls[1][2]).toEqual({ context: capture });
+      expect(mockApiFetch.mock.calls[2][2]).toEqual({ context: capture });
+    });
+
+    it('a retry without a capture still binds the exchange and the delete to one context', async () => {
+      const hook = await refuseFirst(channelCtx, 'm1', PASSWORD_CHALLENGE);
+      mockApiFetch.mockResolvedValueOnce(res(200, { step_up_token: 'tok', expires_in: 60 }));
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+
+      await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+      const mintContext = (mockApiFetch.mock.calls[1][2] as { context: unknown }).context;
+      expect(mintContext).toBeDefined();
+      expect((mockApiFetch.mock.calls[2][2] as { context: unknown }).context).toBe(mintContext);
+    });
+  });
+
+  // D7: nothing was sent, so the factor hook is told "aborted" and nothing is
+  // shown. A password error here would blame a password nobody tested.
+  describe('an unsent password exchange (D7)', () => {
+    it('is aborted: no password error, no failed view, and no delete follows', async () => {
+      const hook = await refuseFirst(channelCtx, 'm1', PASSWORD_CHALLENGE);
+      mockApiFetch.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
+
+      const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+      expect(outcome).toEqual({ kind: 'aborted' });
+      expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'password' });
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(mockApiFetch.mock.calls[1][0]).toBe('/api/v1/auth/step-up/password');
+    });
+
+    it('releases the id: a later delete of the same message goes out', async () => {
+      const hook = await refuseFirst(channelCtx, 'm1', PASSWORD_CHALLENGE);
+      mockApiFetch.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
+      await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+      mockApiFetch.mockResolvedValueOnce(res(200, {}));
+      await act(async () => {
+        await hook.result.current.deleteMessage('m1');
       });
+      expect(mockApiFetch).toHaveBeenCalledTimes(3);
     });
   });
 });

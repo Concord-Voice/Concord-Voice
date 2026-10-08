@@ -1,17 +1,29 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
-import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
+import StepUpCredentials, { stepUpActivation } from '../Auth/StepUpCredentials';
 import type { StepUpPurpose } from '../Auth/stepUpPurpose';
+import {
+  LEG_ONLY_WITHOUT_MFA,
+  useStepUpFactor,
+  type StepUpFactor,
+  type StepUpPhase,
+  type StepUpSubmit,
+  type StepUpSubmitOutcome,
+} from '../../hooks/auth/useStepUpFactor';
 import type { DeleteRefusalState, DeleteStepUp } from '../../hooks/messaging/useChatController';
-import type { DeleteRefusalView } from '../../services/messaging/deleteRefusal';
+import { softLockSeed, type DeleteRefusalView } from '../../services/messaging/deleteRefusal';
+import type { ApiRequestContext } from '../../services/system/requestContext';
 import { findSurfaceComposer, findSurfaceMessageRow } from './chatSurface';
 import './DeleteRefusalModal.css';
 
 export interface DeleteRefusalModalProps {
   /** The hook's one refusal slot. `null` renders nothing. */
   refusal: DeleteRefusalState | null;
-  /** Re-sends the same delete with a factor. */
-  onConfirm: (step: DeleteStepUp) => void;
+  /**
+   * Re-sends the same delete with a factor, against the activation's own
+   * request context. Resolves to the factor hook's reading of the retry.
+   */
+  onConfirm: (step: DeleteStepUp, context?: ApiRequestContext) => Promise<StepUpSubmitOutcome>;
   onDismiss: () => void;
   /** `dm.message_delete` in a DM, `messages.delete` everywhere else. */
   purpose: StepUpPurpose;
@@ -20,9 +32,21 @@ export interface DeleteRefusalModalProps {
   surfaceId: string;
 }
 
+/**
+ * The views that hold a credential stage; the rest are Close-only. Enrolment is
+ * one of them because it is the stage's own terminal state (E8): it shares the
+ * title and the intro, and renders its sentence through the stage.
+ */
+type CredentialView = Extract<DeleteRefusalView, { view: 'confirm' | 'password' | 'enroll' }>;
+
+function isCredentialView(view: DeleteRefusalView): view is CredentialView {
+  return view.view === 'confirm' || view.view === 'password' || view.view === 'enroll';
+}
+
 const TITLES: Record<DeleteRefusalState['view']['view'], string> = {
   confirm: "Confirm it's you",
   password: "Confirm it's you",
+  enroll: "Confirm it's you",
   wait: 'Deleting too quickly',
   unavailable: "Can't delete right now",
   failed: "Couldn't delete that message",
@@ -86,31 +110,92 @@ function closedBodyCopy(
   return remaining !== null && remaining > 0 ? `${base} You can try again in ${remaining}s.` : base;
 }
 
-function SubmitActions({
-  submitting,
-  canSubmit,
+/** The primary's label by phase. Text only: this modal carries no glyphs (see its stylesheet). */
+const PRIMARY_LABEL: Record<StepUpPhase, string> = {
+  idle: 'Confirm',
+  ceremony: 'Waiting…',
+  submitting: 'Confirming…',
+};
+
+/**
+ * What the retry carries: the code or security-key token the hook proved, else
+ * the password the leg collected. The password never reaches the delete route;
+ * the controller exchanges it for a token first (#3509).
+ */
+function stepFor(mfa: string | undefined, password: string): DeleteStepUp {
+  return mfa === undefined ? { currentPassword: password } : { mfaCode: mfa };
+}
+
+interface CredentialStageProps {
+  factor: StepUpFactor;
+  describedById: string;
+  onConfirm: DeleteRefusalModalProps['onConfirm'];
+  onCancel: () => void;
+}
+
+/**
+ * The credential stage: the intro, the picker's fields, and the footer. It owns
+ * the password, so the one wire secret dies with the stage whenever the refusal
+ * closes or gives way to a Close-only view. The code lives in the factor hook.
+ */
+const CredentialStage: React.FC<CredentialStageProps> = ({
+  factor,
+  describedById,
+  onConfirm,
   onCancel,
-}: Readonly<{ submitting: boolean; canSubmit: boolean; onCancel: () => void }>) {
+}) => {
+  // Component-local state only: never a store, never logged
+  // ([internal]rules/observability.md).
+  const [password, setPassword] = useState('');
+  const primaryRef = useRef<HTMLButtonElement>(null);
+  const submitting = factor.phase === 'submitting';
+
+  const submit: StepUpSubmit = async (mfa, context) => {
+    const outcome = await onConfirm(stepFor(mfa, password), context);
+    // Sent once, to the mint; nothing keeps it after that, whatever view the
+    // attempt ends on (#3509 frontend review). `aborted` sent nothing, so what
+    // was typed is still what the person means to send.
+    if (outcome.kind !== 'aborted') setPassword('');
+    return outcome;
+  };
+  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit);
+
   return (
-    <div className="delete-refusal-modal__actions">
-      <button
-        type="button"
-        className="delete-refusal-modal__cancel"
-        onClick={onCancel}
-        disabled={submitting}
-      >
-        Cancel
-      </button>
-      <button
-        type="submit"
-        className="delete-refusal-modal__confirm"
-        disabled={!canSubmit || submitting}
-      >
-        {submitting ? 'Confirming…' : 'Confirm'}
-      </button>
+    <div className="delete-refusal-modal__stage">
+      <p id={describedById} className="delete-refusal-modal__body">
+        {CHALLENGE_COPY}
+      </p>
+      <StepUpCredentials
+        factor={factor}
+        password={password}
+        onPasswordChange={setPassword}
+        primaryRef={primaryRef}
+        focusOnReady
+      />
+      <div className="delete-refusal-modal__actions">
+        <button
+          type="button"
+          className="delete-refusal-modal__cancel"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          Cancel
+        </button>
+        {/* aria-disabled, never native `disabled`: the guarded click names what
+            is missing, and a natively disabled button would drop focus to <body>. */}
+        <button
+          ref={primaryRef}
+          type="button"
+          className="delete-refusal-modal__confirm"
+          aria-disabled={ariaDisabled || undefined}
+          onClick={activate}
+        >
+          {PRIMARY_LABEL[factor.phase]}
+        </button>
+      </div>
     </div>
   );
-}
+};
 
 const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
   refusal,
@@ -120,55 +205,47 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
   surfaceId,
 }) => {
   const view = refusal?.view;
-  const submitting = refusal?.submitting ?? false;
   const messageId = refusal?.messageId ?? null;
 
-  // Wire secrets. Component-local state only — never a store, never logged
-  // ([internal]rules/observability.md).
-  const [password, setPassword] = useState('');
-  const [mfaCode, setMfaCode] = useState('');
-  // A typed factor never outlives its attempt: a new delete target, or a
-  // refusal that remounts the prompt (`promptKey`, #3466 — a code is spent by a
-  // try; a refused password is cleared), starts from empty. Reset during render
-  // rather than in an effect, as MFAVerifyPrompt does for its own refusal text.
-  const attemptKey = `${messageId ?? ''}:${refusal?.promptKey ?? 0}`;
-  const [seenAttemptKey, setSeenAttemptKey] = useState(attemptKey);
-  if (attemptKey !== seenAttemptKey) {
-    setSeenAttemptKey(attemptKey);
-    setPassword('');
-    setMfaCode('');
-  }
+  // `seed` is read only when an instance starts, so it travels in the render
+  // that flips `enabled`. The refusal that opened the dialog already carries the
+  // account's methods, which stand through a failed read (G2). A password view
+  // seeds the empty set on this `whenNoMfa` leg, and enrolment ends the instance
+  // at once. `readFailure: 'passwordOnly'`: a failed read must not lock out a
+  // delete the server would accept, and the retry is the check that counts.
+  const factor = useStepUpFactor({
+    enabled: view !== undefined && isCredentialView(view),
+    purpose,
+    passwordLeg: LEG_ONLY_WITHOUT_MFA,
+    readFailure: 'passwordOnly',
+    allowBackup: true,
+    seed: view === undefined ? null : softLockSeed(view),
+  });
+  const submitting = factor.phase === 'submitting';
 
   const countdownRetryAfter =
     view?.view === 'wait' || view?.view === 'failed' ? view.retryAfterSeconds : undefined;
   const remaining = useCountdown(refusal?.openedAt, countdownRetryAfter);
   const announceZero = remaining === 0;
 
-  const formRef = useRef<HTMLFormElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const initialFocusRef = useRef<HTMLElement | null>(null);
 
-  // Runs before Modal's own mount-focus effect (useLayoutEffect vs
-  // useEffect), so Modal's containerRef.focus() never overrides the first
-  // field's autofocus. Modal only focuses on OPEN, so a later change of view
-  // (confirm -> wait, which unmounts the focused field) or a refused password
-  // (the field was disabled while submitting) re-targets and re-focuses here.
-  const focusToken = view ? `${view.view}:${refusal?.promptKey ?? 0}` : null;
-  const prevFocusTokenRef = useRef<string | null>(null);
+  // Runs before Modal's own mount-focus effect (useLayoutEffect vs useEffect),
+  // so a dialog that opens on a Close-only view lands on Close; the button is
+  // mounted only on those views, so a credential view leaves this null and the
+  // dialog takes focus (the stage hands it on once it has a field). Modal only
+  // focuses on OPEN, so a later change of view (confirm -> wait, which unmounts
+  // the focused field) re-focuses here rather than letting focus fall to <body>.
+  const prevViewKindRef = useRef<DeleteRefusalView['view'] | null>(null);
   useLayoutEffect(() => {
-    if (!view || focusToken === null) {
-      prevFocusTokenRef.current = null;
-      return;
+    const kind = view?.view ?? null;
+    initialFocusRef.current = closeButtonRef.current;
+    if (prevViewKindRef.current !== null && prevViewKindRef.current !== kind) {
+      closeButtonRef.current?.focus();
     }
-    initialFocusRef.current =
-      view.view === 'confirm' || view.view === 'password'
-        ? (formRef.current?.querySelector<HTMLElement>('input, button') ?? null)
-        : closeButtonRef.current;
-    if (prevFocusTokenRef.current !== null && prevFocusTokenRef.current !== focusToken) {
-      initialFocusRef.current?.focus();
-    }
-    prevFocusTokenRef.current = focusToken;
-  }, [view, focusToken]);
+    prevViewKindRef.current = kind;
+  }, [view]);
 
   // T9 focus return: the row `[data-message-id]`, else the composer, both in
   // this modal's own chat panel (#1959), never body. This runs in the PARENT's effect, which fires after Modal's own
@@ -193,23 +270,6 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
 
   if (!refusal || !view) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (view.view === 'confirm') {
-      if (!mfaCode) return;
-      onConfirm({ mfaCode });
-    } else if (view.view === 'password') {
-      if (!password) return;
-      onConfirm({ currentPassword: password });
-      // Sent once, to the mint; nothing keeps it after that, whatever view
-      // the attempt ends on (#3509 frontend review).
-      setPassword('');
-    }
-  };
-
-  const canSubmit =
-    view.view === 'confirm' ? mfaCode !== '' : view.view === 'password' && password !== '';
-
   const describedById = `delete-refusal-body-${refusal.messageId}`;
 
   return (
@@ -223,58 +283,14 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
       describedById={describedById}
     >
       <div className="delete-refusal-modal">
-        {view.view === 'confirm' && (
-          <form ref={formRef} onSubmit={handleSubmit}>
-            <p id={describedById} className="delete-refusal-modal__body">
-              {CHALLENGE_COPY}
-            </p>
-            <MFAVerifyPrompt
-              key={refusal.promptKey}
-              methods={view.methods}
-              purpose={purpose}
-              onVerify={setMfaCode}
-              onCodeChange={setMfaCode}
-              disabled={submitting}
-              error={view.error}
-            />
-            <SubmitActions submitting={submitting} canSubmit={canSubmit} onCancel={onDismiss} />
-          </form>
-        )}
-
-        {view.view === 'password' && (
-          <form ref={formRef} onSubmit={handleSubmit}>
-            <p id={describedById} className="delete-refusal-modal__body">
-              {CHALLENGE_COPY}
-            </p>
-            <div className="delete-refusal-modal__field">
-              <label htmlFor="delete-refusal-password">Password</label>
-              <input
-                id="delete-refusal-password"
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={submitting}
-                aria-invalid={view.error !== undefined || undefined}
-                aria-describedby={
-                  view.error === undefined ? undefined : 'delete-refusal-password-error'
-                }
-              />
-              {view.error !== undefined && (
-                <p
-                  className="delete-refusal-modal__field-error"
-                  id="delete-refusal-password-error"
-                  role="alert"
-                >
-                  {view.error}
-                </p>
-              )}
-            </div>
-            <SubmitActions submitting={submitting} canSubmit={canSubmit} onCancel={onDismiss} />
-          </form>
-        )}
-
-        {(view.view === 'wait' || view.view === 'unavailable' || view.view === 'failed') && (
+        {isCredentialView(view) ? (
+          <CredentialStage
+            factor={factor}
+            describedById={describedById}
+            onConfirm={onConfirm}
+            onCancel={onDismiss}
+          />
+        ) : (
           <>
             {view.view === 'wait' && view.reason === 'verification' && (
               <p className="delete-refusal-modal__body">{VERIFICATION_WAIT_COPY}</p>

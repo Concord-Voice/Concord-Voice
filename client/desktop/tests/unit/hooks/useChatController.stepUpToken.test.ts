@@ -7,6 +7,7 @@ import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { ChatContext } from '@/renderer/types/chat';
 import { FIXTURE_PW, MINT_PATH } from '../../helpers/stepUpTokenWire';
+import { confirmAndSettle, confirmInFlight } from '../../helpers/confirmDelete';
 
 // The delete flow's handling of the password step-up exchange (#3509): what a
 // mint refusal and a refused token do to the refusal slot, and the
@@ -78,9 +79,7 @@ describe('useChatController password step-up token (#3509)', () => {
     const hook = await refused();
     mockApiFetch.mockResolvedValueOnce(json(403, { error: 'Invalid password' }));
 
-    await act(async () => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
 
     await waitFor(() =>
       expect(hook.result.current.deleteRefusal?.view).toEqual({
@@ -88,29 +87,30 @@ describe('useChatController password step-up token (#3509)', () => {
         error: 'That password is not correct.',
       })
     );
-    expect(hook.result.current.deleteRefusal?.submitting).toBe(false);
+    expect(outcome).toEqual({ kind: 'refusal', refusal: { kind: 'invalidPassword' } });
     expect(mockApiFetch.mock.calls.map((c) => c[0])).toEqual(['/api/v1/messages/m1', MINT_PATH]);
   });
 
-  it('the account lockout lands on the password field', async () => {
+  // FE1: no typing answers it, so the slot ends Close-only with the lockout's words.
+  it('the account lockout ends the challenge with its words, and no typing answers it', async () => {
     const hook = await refused();
     mockApiFetch.mockResolvedValueOnce(json(423, { error_code: 'account_locked' }));
 
-    await act(async () => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
 
     await waitFor(() =>
       expect(hook.result.current.deleteRefusal?.view).toEqual({
-        view: 'password',
-        error: 'Too many attempts. Try again in 30 seconds.',
+        view: 'failed',
+        message: 'Too many attempts. Try again in 30 seconds.',
       })
     );
+    expect(outcome).toEqual({ kind: 'answered' });
   });
 
-  it('a refused token re-prompts with the expiry copy and remounts the field', async () => {
+  // The server's own text no longer reaches the view: the hook words the reply
+  // from the marked refusal in the outcome, so the view stays bare.
+  it('a refused token re-prompts with a bare password view and a marked refusal', async () => {
     const hook = await refused();
-    const before = hook.result.current.deleteRefusal?.promptKey ?? 0;
     mockApiFetch.mockResolvedValueOnce(json(200, { step_up_token: 'stale', expires_in: 60 }));
     mockApiFetch.mockResolvedValueOnce(
       json(403, {
@@ -120,17 +120,28 @@ describe('useChatController password step-up token (#3509)', () => {
       })
     );
 
-    await act(async () => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
 
     await waitFor(() =>
-      expect(hook.result.current.deleteRefusal?.view).toEqual({
-        view: 'password',
-        error: 'Your confirmation expired. Enter your password again.',
-      })
+      expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'password' })
     );
-    expect(hook.result.current.deleteRefusal?.promptKey).toBe(before + 1);
+    expect(outcome).toEqual({
+      kind: 'refusal',
+      refusal: { kind: 'passwordRequired', tokenExpired: true },
+    });
+  });
+
+  it('a minted token, not the password, is what the delete route receives', async () => {
+    const hook = await refused();
+    mockApiFetch.mockResolvedValueOnce(json(200, { step_up_token: 'fresh', expires_in: 60 }));
+    mockApiFetch.mockResolvedValueOnce(json(200, {}));
+
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+    expect(outcome).toEqual({ kind: 'success' });
+    const init = mockApiFetch.mock.calls[2][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({ step_up_token: 'fresh' });
+    expect(init.body).not.toContain(FIXTURE_PW);
   });
 
   it('a mint refusal that lands after the chat changed is discarded', async () => {
@@ -138,13 +149,12 @@ describe('useChatController password step-up token (#3509)', () => {
     const mint = deferred<Response>();
     mockApiFetch.mockReturnValueOnce(mint.promise);
 
-    act(() => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+    const pending = confirmInFlight(hook, { currentPassword: FIXTURE_PW });
     hook.rerender({ c: otherCtx });
     await act(async () => {
       mint.resolve(json(403, { error: 'Invalid password' }));
       await mint.promise;
+      await pending;
     });
 
     expect(hook.result.current.deleteRefusal).toBeNull();

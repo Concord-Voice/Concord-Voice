@@ -7,19 +7,35 @@
  * 503, a budget-unavailable 503 and a lock-conflict 503 — so every branch here
  * routes by a machine-readable flag or an exact frozen string, never by
  * status alone (design spec §2.8, X11/X17). This module owns that reading in
- * one place; `useChatController` never inspects the body itself.
+ * one place; `useChatController` never inspects the body itself. It also gives
+ * the step-up factor hook its seed and its outcome for the same refusal, and
+ * maps a refused password exchange onto the view, for delete and purge alike.
  */
 
+import type { StepUpFactorRefusal, StepUpSubmitOutcome } from '../../hooks/auth/useStepUpFactor';
 import { classifyStepUpRefusal } from '../system/stepUpRefusal';
-import { STEP_UP_TOKEN_EXPIRED_MESSAGE } from '../system/stepUpToken';
+import {
+  mintMfaMethods,
+  passwordStepUpRefusalMessage,
+  type PasswordStepUpMint,
+} from '../system/stepUpToken';
 
 export type DeleteRefusalView =
-  | { view: 'confirm'; methods: string[]; error?: string }
+  | { view: 'confirm'; methods: string[] }
   /**
-   * D-1's own-rule path: a plain password field, never MFAVerifyPrompt. The
+   * D-1's own-rule path: a plain password field, never a factor picker. The
    * password goes to the mint endpoint, never to the delete route (#3509).
+   * `error` is a refused exchange's words (`mintRefusalView`), which end a
+   * challenge the field cannot answer; a wrong password is worded by the
+   * credential stage itself.
    */
   | { view: 'password'; error?: string }
+  /**
+   * E8: the account holds no authenticator app or security key, so nothing it
+   * could type would pass. Terminal: no input, no Retry and no countdown, with
+   * or without the soft-lock's `Retry-After`. The link is #3456's.
+   */
+  | { view: 'enroll' }
   | { view: 'wait'; reason: 'requests' | 'verification'; retryAfterSeconds?: number }
   /** Nothing was checked or changed. No countdown: the header is a guess. */
   | { view: 'unavailable' }
@@ -61,26 +77,20 @@ function fromStepUpRefusal(
       // `delete_rate_limited` (design spec §2.8), so classifyStepUpRefusal
       // should already have matched `deleteRateLimited` above.
       return { view: 'confirm', methods: refusal.methods };
+    // The credential stage words a refused password or code in place from the
+    // hook's outcome (`toDeleteSubmitOutcome`), so these views carry no copy.
     case 'passwordRequired':
-      // A refused step-up token (#3509) re-prompts with its own copy; the
-      // caller remounts the field empty because the view keeps an error.
-      return refusal.tokenExpired
-        ? { view: 'password', error: STEP_UP_TOKEN_EXPIRED_MESSAGE }
-        : { view: 'password' };
     case 'invalidPassword':
-      return { view: 'password', error: 'That password is not correct.' };
+      return { view: 'password' };
     case 'invalidMfaCode':
       return prior?.view === 'confirm'
-        ? {
-            view: 'confirm',
-            methods: prior.methods,
-            error: "That didn't work. Try again with a new code.",
-          }
+        ? { view: 'confirm', methods: prior.methods }
         : { view: 'failed', message: "That didn't work. Try again with a new code." };
+    case 'enrollmentRequired':
+      // Never `failed`: its countdown and Retry invite an attempt that can
+      // only be refused the same way.
+      return { view: 'enroll' };
     default:
-      // Includes `mfa_enrollment_required`: the server's own text already
-      // says the fix ("Set up an authenticator app or security key to do
-      // this."). #3456 turns it into a link (T10) — nothing to build here.
       return {
         view: 'failed',
         message: refusal.kind === 'failed' ? refusal.message : undefined,
@@ -95,9 +105,7 @@ function fromStepUpRefusal(
  *
  * @param prior The view already on screen, when this is a retry. Only read to
  *   decide whether an `Invalid MFA code` refusal keeps the confirm view (with
- *   its methods) open rather than falling back to a bare failure — the caller
- *   is responsible for bumping the prompt key (#3466) when it sees this
- *   pairing; this function has no component to remount.
+ *   its methods) open rather than falling back to a bare failure.
  */
 export function toDeleteRefusalView(
   status: number,
@@ -133,4 +141,61 @@ export function toDeleteRefusalView(
   // function ever runs), 500, and anything else: the server's own text when
   // it sent one, with a countdown appended only when the header is present.
   return { view: 'failed', message: bodyErrorText(rawBody), retryAfterSeconds };
+}
+
+/**
+ * The factor hook's reading of the same refusal (D6). The soft-lock's own
+ * `deleteRateLimited` is the hook's `mfaRequired`, because the hook knows no
+ * delete-specific kind. A refusal no credential can answer is `answered`.
+ */
+export function toDeleteSubmitOutcome(status: number, rawBody: unknown): StepUpSubmitOutcome {
+  const refusal = classifyStepUpRefusal(status, rawBody);
+  switch (refusal.kind) {
+    case 'deleteRateLimited':
+      return { kind: 'refusal', refusal: { kind: 'mfaRequired', methods: refusal.methods } };
+    case 'failed':
+    case 'unavailable':
+    case 'inlineFactorRequired':
+      return { kind: 'answered' };
+    default:
+      return { kind: 'refusal', refusal };
+  }
+}
+
+/**
+ * The challenge a refused password exchange (#3509) leaves on screen. An
+ * account that enrolled MFA after the prompt opened can never pass a password
+ * prompt, so a mint that names its methods moves to the code prompt; any other
+ * refusal stays on the password view with the exchange's words. Only a wrong
+ * password is something that view can answer, so a caller ends the challenge
+ * with those words for the rest. A caller handles an `unsent` exchange before
+ * this (D7): nothing was checked, so there is nothing to say.
+ */
+export function mintRefusalView(
+  refusal: Extract<PasswordStepUpMint, { kind: 'refused' }>
+): Extract<DeleteRefusalView, { view: 'confirm' | 'password' }> {
+  const methods = mintMfaMethods(refusal);
+  return methods
+    ? { view: 'confirm', methods }
+    : { view: 'password', error: passwordStepUpRefusalMessage(refusal) };
+}
+
+/**
+ * The factor hook's seed for the view that opened the dialog (G2), or null
+ * for a view that hosts no credential. A `deleteRateLimited` seed would seed
+ * nothing, so the confirm view seeds the `mfaRequired` its methods came from.
+ * The password view is the own rule finding no inline method, which on a
+ * `whenNoMfa` leg seeds the empty set. Enrolment ends the instance at once.
+ */
+export function softLockSeed(view: DeleteRefusalView): StepUpFactorRefusal | null {
+  switch (view.view) {
+    case 'confirm':
+      return { kind: 'mfaRequired', methods: view.methods };
+    case 'password':
+      return { kind: 'passwordRequired' };
+    case 'enroll':
+      return { kind: 'enrollmentRequired' };
+    default:
+      return null;
+  }
 }

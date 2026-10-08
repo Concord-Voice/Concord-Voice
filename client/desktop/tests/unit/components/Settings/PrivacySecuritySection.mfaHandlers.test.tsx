@@ -132,9 +132,6 @@ vi.mock('@/renderer/components/Settings/MFATierSelector', () => ({
 vi.mock('@/renderer/components/Settings/MFASetup', () => ({
   default: () => <div data-testid="mfa-setup">MFASetup</div>,
 }));
-vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
-  default: () => <div data-testid="mfa-verify-prompt">MFAVerifyPrompt</div>,
-}));
 vi.mock('@/renderer/components/Settings/BackupCodeDisplay', () => ({
   default: () => <div data-testid="backup-code-display">BackupCodeDisplay</div>,
 }));
@@ -159,24 +156,19 @@ vi.mock('@/renderer/stores/ui/clientConfigStore', () => ({
 }));
 
 import PrivacySecuritySection from '@/renderer/components/Settings/PrivacySecuritySection';
-import type { MfaStepUpResult } from '@/renderer/components/Settings/mfaStepUp';
+import type { MfaSeamHandler } from '@/renderer/components/Settings/mfaStepUp';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
+
+/** The capture a modal's `run` hands every handler (C82). */
+const ctx = captureApiRequestContext;
 
 interface MFASelectorProps {
-  onResetTOTP: (password: string, code: string) => Promise<MfaStepUpResult>;
-  onRevokeWebAuthnKey: (credentialId: string, password: string) => Promise<MfaStepUpResult>;
-  onDisableEmailSms: (password: string, mfaCode: string) => Promise<MfaStepUpResult>;
-  onSetBackupEmail: (email: string, password: string, mfaCode: string) => Promise<MfaStepUpResult>;
-  onToggleRecoveryHardened: (
-    enabled: boolean,
-    password: string,
-    mfaCode?: string
-  ) => Promise<MfaStepUpResult>;
-  onToggleRecoveryOnly: (
-    method: string,
-    recoveryOnly: boolean,
-    password: string,
-    mfaCode?: string
-  ) => Promise<MfaStepUpResult>;
+  onResetTOTP: MfaSeamHandler;
+  onRevokeWebAuthnKey: MfaSeamHandler<[credentialId: string]>;
+  onDisableEmailSms: MfaSeamHandler;
+  onSetBackupEmail: MfaSeamHandler<[email: string]>;
+  onToggleRecoveryHardened: MfaSeamHandler<[enabled: boolean]>;
+  onToggleRecoveryOnly: MfaSeamHandler<[method: string, recoveryOnly: boolean]>;
 }
 
 /** ok-response helper. */
@@ -241,10 +233,15 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onResetTOTP posts {password, code} to totp/disable and resolves accepted', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({})); // the disable POST
-    await expect(h.onResetTOTP('pw', '123456')).resolves.toEqual({ kind: 'accepted', data: {} });
+    await expect(h.onResetTOTP('pw', '123456', ctx())).resolves.toEqual({
+      kind: 'accepted',
+      data: {},
+    });
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/api/v1/mfa/totp/disable',
-      expect.objectContaining({ method: 'POST' })
+      expect.objectContaining({ method: 'POST' }),
+      // The run's capture travels with the request (C82).
+      expect.objectContaining({ context: expect.anything() })
     );
     // TOTPDisable binds the code as `code`, not `mfa_code`.
     expect(lastBodyFor('/api/v1/mfa/totp/disable')).toEqual({
@@ -256,7 +253,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onResetTOTP carries the server text on a refusal the seam does not classify', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(fail({ error: 'wrong code' }, 403));
-    await expect(h.onResetTOTP('pw', '000000')).resolves.toEqual({
+    await expect(h.onResetTOTP('pw', '000000', ctx())).resolves.toEqual({
       kind: 'failed',
       message: 'wrong code',
     });
@@ -267,7 +264,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     mockApiFetch.mockResolvedValueOnce(
       fail({ error: 'Turn off email first.', inline_factor_required: true }, 409)
     );
-    await expect(h.onResetTOTP('pw', '000000')).resolves.toEqual({
+    await expect(h.onResetTOTP('pw', '000000', ctx())).resolves.toEqual({
       kind: 'inlineFactorRequired',
       message: 'Turn off email first.',
     });
@@ -282,13 +279,13 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     await vi.waitFor(() => expect(statusReads()).toBe(1));
 
     mockApiFetch.mockResolvedValueOnce(fail({ error: 'Invalid password' }, 403));
-    await h.onResetTOTP('pw', '000000');
+    await h.onResetTOTP('pw', '000000', ctx());
     mockApiFetch.mockResolvedValueOnce(fail({ error: 'Invalid password' }, 403));
-    await h.onDisableEmailSms('pw', '000000');
+    await h.onDisableEmailSms('pw', '000000', ctx());
     expect(statusReads()).toBe(1);
 
     mockApiFetch.mockResolvedValueOnce(ok({}));
-    await h.onResetTOTP('pw', '123456');
+    await h.onResetTOTP('pw', '123456', ctx());
     await vi.waitFor(() => expect(statusReads()).toBe(2));
   });
 
@@ -297,7 +294,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     mockApiFetch.mockRejectedValueOnce(
       new DOMException('Request lifecycle changed before dispatch', 'AbortError')
     );
-    await expect(h.onDisableEmailSms('pw', '123456')).resolves.toEqual({ kind: 'aborted' });
+    await expect(h.onDisableEmailSms('pw', '123456', ctx())).resolves.toEqual({ kind: 'aborted' });
   });
 
   it('onRevokeWebAuthnKey deletes the credential and signals the authenticator', async () => {
@@ -310,12 +307,14 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     mockApiFetch.mockResolvedValueOnce(
       ok({ remaining_credential_ids: ['AAEC', 'BBED'], user_id: 'user-uuid-123' })
     );
-    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw')).resolves.toMatchObject({
+    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw', undefined, ctx())).resolves.toMatchObject({
       kind: 'accepted',
     });
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/api/v1/mfa/webauthn/credentials/cred-1',
-      expect.objectContaining({ method: 'DELETE' })
+      expect.objectContaining({ method: 'DELETE' }),
+      // The run's capture travels with the request (C82).
+      expect.objectContaining({ context: expect.anything() })
     );
     // The route verifies the password alone.
     expect(lastBodyFor('/api/v1/mfa/webauthn/credentials/cred-1')).toEqual({ password: 'pw' }); // pragma: allowlist secret
@@ -331,7 +330,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
 
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({})); // no remaining_credential_ids / user_id
-    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw')).resolves.toMatchObject({
+    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw', undefined, ctx())).resolves.toMatchObject({
       kind: 'accepted',
     });
     expect(signal).not.toHaveBeenCalled();
@@ -347,7 +346,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
       ok({ remaining_credential_ids: ['AAEC'], user_id: 'user-uuid-123' })
     );
     // Signal rejects, but the revoke still resolves accepted — the signal is a hint.
-    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw')).resolves.toMatchObject({
+    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw', undefined, ctx())).resolves.toMatchObject({
       kind: 'accepted',
     });
     vi.unstubAllGlobals();
@@ -356,7 +355,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onRevokeWebAuthnKey resolves failed with the server text when the delete fails', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(fail({ error: 'Credential not found' }, 404));
-    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw')).resolves.toEqual({
+    await expect(h.onRevokeWebAuthnKey('cred-1', 'pw', undefined, ctx())).resolves.toEqual({
       kind: 'failed',
       message: 'Credential not found',
     });
@@ -371,13 +370,15 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onDisableEmailSms posts to email-sms/disable and resolves accepted on success', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({}));
-    await expect(h.onDisableEmailSms('pw', '123456')).resolves.toEqual({
+    await expect(h.onDisableEmailSms('pw', '123456', ctx())).resolves.toEqual({
       kind: 'accepted',
       data: {},
     });
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/api/v1/mfa/email-sms/disable',
-      expect.objectContaining({ method: 'POST' })
+      expect.objectContaining({ method: 'POST' }),
+      // The run's capture travels with the request (C82).
+      expect.objectContaining({ context: expect.anything() })
     );
     expect(lastBodyFor('/api/v1/mfa/email-sms/disable')).toEqual({
       password: 'pw', // pragma: allowlist secret
@@ -388,26 +389,30 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onDisableEmailSms omits mfa_code from the body when it is empty', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({}));
-    await h.onDisableEmailSms('pw', '');
+    await h.onDisableEmailSms('pw', '', ctx());
     expect(lastBodyFor('/api/v1/mfa/email-sms/disable')).toEqual({ password: 'pw' }); // pragma: allowlist secret
   });
 
   it('onDisableEmailSms maps a step-up refusal instead of throwing', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(fail({ error: 'Invalid password' }, 403));
-    await expect(h.onDisableEmailSms('pw', '')).resolves.toEqual({ kind: 'invalidPassword' });
+    await expect(h.onDisableEmailSms('pw', '', ctx())).resolves.toEqual({
+      kind: 'invalidPassword',
+    });
   });
 
   it('onSetBackupEmail PUTs the email and resolves accepted on success', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({ backup_email: 'new@example.com' }));
-    await expect(h.onSetBackupEmail('new@example.com', 'pw', '123456')).resolves.toEqual({
+    await expect(h.onSetBackupEmail('new@example.com', 'pw', '123456', ctx())).resolves.toEqual({
       kind: 'accepted',
       data: { backup_email: 'new@example.com' },
     });
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/api/v1/mfa/backup-email',
-      expect.objectContaining({ method: 'PUT' })
+      expect.objectContaining({ method: 'PUT' }),
+      // The run's capture travels with the request (C82).
+      expect.objectContaining({ context: expect.anything() })
     );
     expect(lastBodyFor('/api/v1/mfa/backup-email')).toEqual({
       email: 'new@example.com',
@@ -419,7 +424,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onSetBackupEmail omits mfa_code from the body when it is empty', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({ backup_email: 'new@example.com' }));
-    await h.onSetBackupEmail('new@example.com', 'pw', '');
+    await h.onSetBackupEmail('new@example.com', 'pw', '', ctx());
     expect(lastBodyFor('/api/v1/mfa/backup-email')).toEqual({
       email: 'new@example.com',
       password: 'pw', // pragma: allowlist secret
@@ -429,7 +434,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onSetBackupEmail maps a step-up refusal instead of returning false', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(fail({ password_required: true }, 403));
-    await expect(h.onSetBackupEmail('bad', '', '')).resolves.toEqual({
+    await expect(h.onSetBackupEmail('bad', '', '', ctx())).resolves.toEqual({
       kind: 'passwordRequired',
     });
   });
@@ -437,7 +442,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onToggleRecoveryHardened PUTs {enabled, password, mfa_code} and resolves accepted', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(ok({ recovery_hardened: true }));
-    await expect(h.onToggleRecoveryHardened(true, 'pw', '123456')).resolves.toEqual({
+    await expect(h.onToggleRecoveryHardened(true, 'pw', '123456', ctx())).resolves.toEqual({
       kind: 'accepted',
       data: { recovery_hardened: true },
     });
@@ -451,7 +456,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onToggleRecoveryHardened resolves networkError on a rejected fetch', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockRejectedValueOnce(new Error('network down'));
-    await expect(h.onToggleRecoveryHardened(false, 'pw')).resolves.toEqual({
+    await expect(h.onToggleRecoveryHardened(false, 'pw', undefined, ctx())).resolves.toEqual({
       kind: 'networkError',
     });
   });
@@ -461,7 +466,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     mockApiFetch.mockResolvedValueOnce(
       fail({ error: 'MFA verification required', mfa_required: true, methods: ['totp'] }, 403)
     );
-    await expect(h.onToggleRecoveryHardened(true, 'pw', '')).resolves.toEqual({
+    await expect(h.onToggleRecoveryHardened(true, 'pw', '', ctx())).resolves.toEqual({
       kind: 'mfaRequired',
       methods: ['totp'],
     });
@@ -472,7 +477,9 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
     mockApiFetch.mockResolvedValueOnce(
       ok({ recovery_only_methods: ['totp'], recovery_hardened: true })
     );
-    await expect(h.onToggleRecoveryOnly('totp', true, 'pw', '123456')).resolves.toMatchObject({
+    await expect(
+      h.onToggleRecoveryOnly('totp', true, 'pw', '123456', ctx())
+    ).resolves.toMatchObject({
       kind: 'accepted',
     });
     expect(lastBodyFor('/api/v1/mfa/recovery-only')).toEqual({
@@ -488,14 +495,14 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
       mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/mfa/status').length;
     await vi.waitFor(() => expect(statusReads()).toBe(1));
     mockApiFetch.mockResolvedValueOnce(ok({}));
-    await h.onToggleRecoveryOnly('totp', true, 'pw', '123456');
+    await h.onToggleRecoveryOnly('totp', true, 'pw', '123456', ctx());
     await vi.waitFor(() => expect(statusReads()).toBe(2));
   });
 
   it('onToggleRecoveryOnly resolves networkError on a rejected fetch', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockRejectedValueOnce(new Error('network down'));
-    await expect(h.onToggleRecoveryOnly('totp', false, 'pw')).resolves.toEqual({
+    await expect(h.onToggleRecoveryOnly('totp', false, 'pw', undefined, ctx())).resolves.toEqual({
       kind: 'networkError',
     });
   });
@@ -503,7 +510,7 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
   it('onToggleRecoveryOnly resolves rateLimited on a 429', async () => {
     const h = await renderAndCaptureHandlers();
     mockApiFetch.mockResolvedValueOnce(fail({ error: 'Too many verification attempts' }, 429));
-    await expect(h.onToggleRecoveryOnly('totp', true, 'pw', '123456')).resolves.toEqual({
+    await expect(h.onToggleRecoveryOnly('totp', true, 'pw', '123456', ctx())).resolves.toEqual({
       kind: 'rateLimited',
     });
   });

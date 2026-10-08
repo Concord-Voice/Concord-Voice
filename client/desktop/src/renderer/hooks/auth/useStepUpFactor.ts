@@ -11,19 +11,26 @@
  * Invariants, each enforced in this file:
  *
  * - One activation at a time (C6). A synchronous ref is the guard, set before
- *   the first await and released in `finally`; `phase` cannot be, because two
- *   activations can land before React commits it, and a second WebAuthn begin
- *   replaces the first one's server session.
+ *   the first await; `phase` cannot be, because two activations can land
+ *   before React commits it, and a second WebAuthn begin replaces the first
+ *   one's server session. The guard holds the id of the attempt that set it:
+ *   ending the attempt releases it, and a run's `finally` releases it only
+ *   while it still holds that run's id, so a request still out from an ended
+ *   attempt never latches the instance that replaced it.
  * - Nothing is sent as another account or to another server (C45, C75, C82).
- *   `run` works against ONE `ApiRequestContext`, its own or the caller's
- *   capture taken before preparation, and checks it before begin, before the
- *   browser ceremony, before finish, and immediately before `submit`. A change ends in the
- *   terminal `sessionExpired` status with nothing further sent. Begin, finish
- *   and the surface's request are also admitted against that context, so
+ *   An instance captures the account and server it opened for, and `run`
+ *   works against ONE `ApiRequestContext`: that capture, or the caller's taken
+ *   before preparation. It checks both before begin, before the browser
+ *   ceremony, before finish, and immediately before `submit`, so a change
+ *   since the instance opened ends in the terminal `sessionExpired` status
+ *   with nothing further sent, even when it landed before the activation. A
+ *   token refresh is no change: the account is its generation. Begin, finish
+ *   and the surface's request are also admitted against the run's context, so
  *   apiFetch refuses a change that lands after the last check.
- * - No proof outlives its attempt (C56). Switching methods, disabling, and
- *   unmounting bump the attempt and abort the ceremony; a token whose finish
- *   resolved anyway is dropped at the pre-`submit` check, unsent.
+ * - No proof outlives its attempt (C56). Switching methods, disabling,
+ *   changing the instance's configuration, and unmounting bump the attempt and
+ *   abort the ceremony; a token whose finish resolved anyway is dropped at the
+ *   pre-`submit` check, unsent, and a request already out applies nothing.
  * - No read result applies outside the open instance that started it (C57).
  *   Each read carries a sequence number; a result applies only while its
  *   number is current and its signal is not aborted.
@@ -70,8 +77,22 @@ export type StepUpMethod = InlineStepUpMethod | 'backup';
 /** When the surface collects the password. `'none'` waits for its first caller (Q3). */
 export type StepUpPasswordLeg = 'always' | 'whenNoMfa'; // pragma: allowlist secret
 
+/**
+ * The `whenNoMfa` leg by name. Hosts pass this, not the quoted literal, which
+ * beside a `passwordLeg` key reads to static analysis as a hard-coded
+ * credential (Sonar S2068, detect-secrets).
+ */
+export const LEG_ONLY_WITHOUT_MFA = 'whenNoMfa' satisfies StepUpPasswordLeg;
+
 /** What a failed read does on this route (§2): block with Retry, or the password alone. */
 export type StepUpReadFailure = 'block' | 'passwordOnly';
+
+/**
+ * A refusal the hook applies: the classifier's, or a route adapter's
+ * `mfaRequired` whose list is not the step-up set (#7). Its `methods: null`
+ * leaves the read's set standing (§2, Q4).
+ */
+export type StepUpFactorRefusal = StepUpRefusal | { kind: 'mfaRequired'; methods: null };
 
 export interface StepUpFactorProps {
   /** The surface is open and its action needs a step-up. The read starts on true. */
@@ -82,6 +103,25 @@ export interface StepUpFactorProps {
   readFailure: StepUpReadFailure;
   /** Offer a backup code when the read reports one and TOTP is offered. */
   allowBackup: boolean;
+  /**
+   * The refusal that opened a refusal-triggered surface (#7, #17). It applies
+   * when an instance starts and is never read again (G2): a `ready` read
+   * replaces the set it seeds, and a failed or unsupported read keeps it, with
+   * no backup code.
+   */
+  seed?: StepUpFactorRefusal | null;
+  /**
+   * Methods offered whatever the read or a refusal says (C4, C26): a read
+   * only adds to them. With `purpose: null` no read runs, because only a
+   * security key could join the floor and it needs a purpose.
+   */
+  floorMethods?: readonly InlineStepUpMethod[];
+  /**
+   * The host is still preparing what its `submit` sends (#6, #10; D11, Q6). It
+   * keeps the primary down through `firstMissing`, and is not part of the open
+   * instance, so toggling it never resets the dialog. Omitted, nothing is.
+   */
+  preparing?: boolean;
 }
 
 /**
@@ -92,9 +132,13 @@ export interface StepUpFactorProps {
  *   which is also where an `unsupported` read, or an `unavailable` one on a
  *   `passwordOnly` route, lands.
  * - `blocked`: an `unavailable` read on a `block` route. Retry is offered.
- * - `refused`, `noUsableMethod`, `sessionExpired`: terminal for this instance.
- *   `noUsableMethod` is an `mfa_required` naming nothing this app can collect
- *   (G1); `sessionExpired` is an account or server change during `run` (C45).
+ * - `refused`, `noUsableMethod`, `enrollmentRequired`, `sessionExpired`:
+ *   terminal for this instance. `noUsableMethod` is an `mfa_required` naming
+ *   nothing this app can collect (G1); `enrollmentRequired` is an account with
+ *   no inline factor at all (E8); `sessionExpired` is an account or server
+ *   change during `run` (C45), or a `sessionExpired` refusal: the route
+ *   answered 401 after `apiFetch`'s refresh retry, so nothing sent under this
+ *   session can pass.
  */
 export type StepUpStatus =
   | { kind: 'reading' }
@@ -102,6 +146,7 @@ export type StepUpStatus =
   | { kind: 'blocked' }
   | { kind: 'refused'; reason: StepUpReadRefusalReason }
   | { kind: 'noUsableMethod' }
+  | { kind: 'enrollmentRequired' }
   | { kind: 'sessionExpired' };
 
 /** `ceremony`: the WebAuthn exchange is running. `submitting`: the request is out. */
@@ -111,22 +156,30 @@ export type StepUpPhase = 'idle' | 'ceremony' | 'submitting';
  * The one status line the credential UI shows, by kind (copy is §4.2's):
  *
  * - `checking`: activation while the read is in flight.
+ * - `preparing`: activation while the host prepares. Shown only while it does.
  * - `missing`: an empty required field, from the activation guard or from an
  *   `mfa_required` / `password_required` refusal (C2, C6).
+ * - `tokenExpired`: a `password_required` refusal of a minted password token
+ *   (#3509). The password field asks again, saying the confirmation expired.
  * - `invalidPassword`, `invalidFactor`: a refusal of what was entered.
  * - `webauthnCancelled`: cancelled, timed out, or the server's session expired.
+ * - `webauthnRateLimited`: begin or finish answered 429 (D19). A `rateLimited`
+ *   refusal of the gated request is not this: its surface words that one.
  * - `methodsChanged`: a re-read moved the active panel (C13).
  */
 export type StepUpNotice =
   | { kind: 'checking' }
+  | { kind: 'preparing' }
   | { kind: 'missing'; field: 'password' | StepUpMethod }
+  | { kind: 'tokenExpired' }
   | { kind: 'invalidPassword' }
   | { kind: 'invalidFactor'; method: StepUpMethod }
   | { kind: 'webauthnCancelled' }
+  | { kind: 'webauthnRateLimited' }
   | { kind: 'methodsChanged' };
 
 /** Why the primary cannot act yet; `unavailable` is a state no input can complete. */
-export type StepUpMissing = 'reading' | 'password' | 'code' | 'unavailable';
+export type StepUpMissing = 'reading' | 'password' | 'code' | 'preparing' | 'unavailable';
 
 /**
  * What the surface's request came to, mapped from its own result union.
@@ -139,7 +192,7 @@ export type StepUpMissing = 'reading' | 'password' | 'code' | 'unavailable';
  */
 export type StepUpSubmitOutcome =
   | { kind: 'success' }
-  | { kind: 'refusal'; refusal: StepUpRefusal }
+  | { kind: 'refusal'; refusal: StepUpFactorRefusal }
   | { kind: 'answered' }
   | { kind: 'transport' }
   | { kind: 'aborted' };
@@ -182,6 +235,8 @@ export interface StepUpFactor {
   /**
    * The activation: proves the active factor and calls `submit` once.
    * Resolves to `submit`'s outcome, or null when nothing was submitted.
+   * `capture` is a host's own (C82); omitted, the run works against the
+   * account and server the instance opened for.
    */
   run: (submit: StepUpSubmit, capture?: ApiRequestContext) => Promise<StepUpSubmitOutcome | null>;
 }
@@ -193,11 +248,20 @@ interface FactorConfig {
   readFailure: StepUpReadFailure;
   passwordLeg: StepUpPasswordLeg;
   allowBackup: boolean;
+  /** `floorMethods`, strongest first, without a security key when there is no purpose. */
+  floor: readonly InlineStepUpMethod[];
 }
 
 interface FactorState {
   /** The open instance this state belongs to; a change resets it. */
   instance: string;
+  /**
+   * The account and server the instance opened for. A password typed into it
+   * was typed for them, so `run` sends nothing once they are not current.
+   */
+  opened: ApiRequestContext;
+  /** This instance runs the requirements read: it started neither terminal nor read-free. */
+  reads: boolean;
   status: StepUpStatus;
   offered: readonly InlineStepUpMethod[];
   serverDefault: InlineStepUpMethod | null;
@@ -220,29 +284,25 @@ type CeremonyStop =
 
 const INVALID_WEBAUTHN: StepUpNotice = { kind: 'invalidFactor', method: 'webauthn' };
 const WEBAUTHN_CANCELLED: StepUpNotice = { kind: 'webauthnCancelled' };
+const WEBAUTHN_RATE_LIMITED: StepUpNotice = { kind: 'webauthnRateLimited' };
+const PREPARING: StepUpNotice = { kind: 'preparing' };
+const TOKEN_EXPIRED: StepUpNotice = { kind: 'tokenExpired' };
 
-function initialState(instance: string): FactorState {
-  return {
-    instance,
-    status: { kind: 'reading' },
-    offered: [],
-    serverDefault: null,
-    backupCodeAvailable: false,
-    method: null,
-    code: '',
-    attempt: 0,
-    phase: 'idle',
-    notice: null,
-    reread: null,
-  };
-}
-
-/** The inline methods in `methods` this route can verify: no key without a purpose. */
-function offerable(
+/** The inline methods in `methods` a route with `purpose` can verify: no key without one. */
+function verifiable(
   methods: readonly string[],
   purpose: StepUpPurpose | null
 ): InlineStepUpMethod[] {
   return intersectInline(methods).filter((method) => purpose !== null || method !== 'webauthn');
+}
+
+/**
+ * The set this route offers for `methods`: its floor plus what it can verify.
+ * Every write of `offered` goes through here, so nothing removes a floor
+ * member (C26).
+ */
+function offerable(methods: readonly string[], config: FactorConfig): InlineStepUpMethod[] {
+  return verifiable([...config.floor, ...methods], config.purpose);
 }
 
 function availableMethods(
@@ -270,6 +330,83 @@ function withOffered(
   return { ...next, method: kept ? state.method : pickDefaultMethod(offered, state.serverDefault) };
 }
 
+/** `state` offering its floor alone: what the route offers when no inline method is known. */
+function toFloor(state: FactorState, config: FactorConfig): FactorState {
+  return withOffered(state, offerable([], config), config);
+}
+
+/**
+ * `state` with the set an authoritative `mfa_required` list names (G1). A list
+ * naming nothing this route can collect is the terminal no-usable-method state.
+ */
+function withRequired(
+  state: FactorState,
+  methods: readonly string[],
+  config: FactorConfig
+): FactorState {
+  const offered = offerable(methods, config);
+  if (offered.length > 0) return withOffered(state, offered, config);
+  return { ...state, offered, method: null, status: { kind: 'noUsableMethod' } };
+}
+
+/**
+ * Applies a refusal-triggered surface's seed (G2). The seeded set is the
+ * strongest-first default with no backup code, until a `ready` read replaces
+ * it. `methods: null` seeds nothing; enrolment ends the instance at once.
+ */
+function seeded(
+  state: FactorState,
+  seed: StepUpFactorRefusal | null | undefined,
+  config: FactorConfig
+): FactorState {
+  switch (seed?.kind) {
+    case 'enrollmentRequired':
+      return { ...state, status: { kind: 'enrollmentRequired' } };
+    case 'mfaRequired':
+      return seed.methods === null ? state : withRequired(state, seed.methods, config);
+    case 'passwordRequired': {
+      // On `whenNoMfa` the server found no inline method (C2).
+      const leg = config.passwordLeg;
+      const next = leg === 'whenNoMfa' ? toFloor(state, config) : state;
+      // A plain seed is the challenge that opened the surface, so nothing was
+      // refused and it says nothing; an expired confirmation says so (#3509).
+      return seed.tokenExpired === true ? { ...next, notice: TOKEN_EXPIRED } : next;
+    }
+    default:
+      return state;
+  }
+}
+
+/**
+ * The state an open instance starts in: its floor, then its seed. Only an
+ * instance that starts `reading` runs the read, so a terminal seed sends
+ * nothing, and neither does a floor route with no purpose.
+ */
+function initialState(
+  instance: string,
+  config: FactorConfig,
+  seed: StepUpFactorRefusal | null | undefined
+): FactorState {
+  const readFree = config.purpose === null && config.floor.length > 0;
+  const blank: FactorState = {
+    instance,
+    opened: captureApiRequestContext(),
+    reads: false,
+    status: readFree ? { kind: 'ready' } : { kind: 'reading' },
+    offered: [],
+    serverDefault: null,
+    backupCodeAvailable: false,
+    method: null,
+    code: '',
+    attempt: 0,
+    phase: 'idle',
+    notice: null,
+    reread: null,
+  };
+  const started = seeded(toFloor(blank, config), seed, config);
+  return { ...started, reads: started.status.kind === 'reading' };
+}
+
 /** After a submit that may have spent the code: drop it and remount the input. */
 function spent(state: FactorState): FactorState {
   return { ...state, code: '', attempt: state.attempt + 1 };
@@ -293,7 +430,7 @@ function readTransition(
   const settled = { ...state, notice: afterRead(state.notice) };
   switch (result.kind) {
     case 'ready': {
-      const offered = offerable(result.methods, config.purpose);
+      const offered = offerable(result.methods, config);
       return {
         ...settled,
         status: { kind: 'ready' },
@@ -339,7 +476,7 @@ function rereadTransition(
     return { ...spent(exposed), status: { kind: 'refused', reason: result.reason }, notice: null };
   }
   if (result.kind !== 'ready') return exposed;
-  const offered = offerable(result.methods, config.purpose);
+  const offered = offerable(result.methods, config);
   const next = {
     ...exposed,
     offered,
@@ -362,7 +499,7 @@ function rereadTransition(
  */
 function refusalTransition(
   state: FactorState,
-  refusal: StepUpRefusal,
+  refusal: StepUpFactorRefusal,
   submitted: StepUpMethod | null,
   config: FactorConfig
 ): FactorState {
@@ -370,12 +507,9 @@ function refusalTransition(
   switch (refusal.kind) {
     case 'mfaRequired': {
       // Authoritative over the read; email and SMS never join the set (G1).
-      const offered = offerable(refusal.methods, config.purpose);
-      if (offered.length === 0) {
-        const none = { ...spent(idle), offered, method: null, notice: null };
-        return { ...none, status: { kind: 'noUsableMethod' } };
-      }
-      const next = withOffered(spent(idle), offered, config);
+      // `null` (#7) names no set, so the read's stands (§2).
+      const { methods } = refusal;
+      const next = methods === null ? spent(idle) : withRequired(spent(idle), methods, config);
       return {
         ...next,
         notice: next.method === null ? null : { kind: 'missing', field: next.method },
@@ -383,14 +517,18 @@ function refusalTransition(
     }
     case 'passwordRequired': {
       // On `whenNoMfa` the server asks for the password only when it found
-      // no inline method at submit time, so the set is now empty (C2).
+      // no inline method at submit time, so the set is now the floor (C2).
       const leg = config.passwordLeg;
-      if (leg === 'whenNoMfa') {
-        const none = { ...spent(idle), offered: [], method: null };
-        return { ...none, notice: { kind: 'missing', field: 'password' } };
-      }
-      return { ...idle, notice: { kind: 'missing', field: 'password' } };
+      const next = leg === 'whenNoMfa' ? toFloor(spent(idle), config) : idle;
+      // A refused minted token (#3509) is not an empty field: the password was
+      // accepted and the confirmation it bought expired, so the field says so.
+      const notice: StepUpNotice =
+        refusal.tokenExpired === true ? TOKEN_EXPIRED : { kind: 'missing', field: 'password' };
+      return { ...next, notice };
     }
+    case 'enrollmentRequired':
+      // No code this account could send would pass (E8).
+      return { ...spent(idle), status: { kind: 'enrollmentRequired' }, notice: null };
     case 'invalidPassword':
       return { ...idle, notice: { kind: 'invalidPassword' } };
     case 'invalidMfaCode':
@@ -398,6 +536,15 @@ function refusalTransition(
         ...spent(idle),
         notice: submitted === null ? null : { kind: 'invalidFactor', method: submitted },
       };
+    case 'rateLimited':
+      // The limiter answers before anything is read (C30), so the code is still
+      // the user's to send once it lifts; clearing it would cost a backup code
+      // the user must find again. The surface words the limit.
+      return { ...idle, notice: null };
+    case 'sessionExpired':
+      // The server declared the session dead after the refresh retry: nothing
+      // sent from this instance can pass, so it ends as an account switch does.
+      return expired(idle);
     default:
       // The surface renders everything else.
       return { ...spent(idle), notice: null };
@@ -409,7 +556,7 @@ function refusalTransition(
  * factor removed elsewhere exactly as it refuses a wrong code. Never any other
  * refusal, so one response causes at most one read (C32).
  */
-function refusalRereads(refusal: StepUpRefusal): boolean {
+function refusalRereads(refusal: StepUpFactorRefusal): boolean {
   return refusal.kind === 'invalidMfaCode';
 }
 
@@ -485,6 +632,8 @@ function codeComplete(method: StepUpMethod | null, code: string): boolean {
 function ceremonyFailure(err: unknown): CeremonyStop {
   if (err instanceof WebAuthnInlineError) {
     if (err.status === 401) return { kind: 'sessionExpired' };
+    // A spent begin or finish quota says nothing about the key (D19): no re-read.
+    if (err.status === 429) return { kind: 'failed', notice: WEBAUTHN_RATE_LIMITED, reread: false };
     if (err.serverError === NO_INLINE_SESSION) {
       return { kind: 'failed', notice: WEBAUTHN_CANCELLED, reread: false };
     }
@@ -543,6 +692,14 @@ async function submitOnce(
   }
 }
 
+/**
+ * Clears `ref` only while it still holds `owner`, so a run that settles late
+ * never clears what a newer run claimed.
+ */
+function releaseIfHeld<T>(ref: { current: T | null }, owner: T): void {
+  if (ref.current === owner) ref.current = null;
+}
+
 function missingNotice(missing: StepUpMissing, method: StepUpMethod | null): StepUpNotice | null {
   switch (missing) {
     case 'reading':
@@ -551,6 +708,8 @@ function missingNotice(missing: StepUpMissing, method: StepUpMethod | null): Ste
       return { kind: 'missing', field: 'password' };
     case 'code':
       return method === null ? null : { kind: 'missing', field: method };
+    case 'preparing':
+      return PREPARING;
     case 'unavailable':
       return null;
   }
@@ -567,13 +726,21 @@ function showsPassword(state: FactorState, config: FactorConfig): boolean {
 function firstMissingIn(
   state: FactorState,
   passwordShown: boolean,
-  password: string
+  password: string,
+  preparing: boolean
 ): StepUpMissing | null {
   const { kind } = state.status;
   if (kind !== 'reading' && kind !== 'ready') return 'unavailable';
   if (passwordShown && password === '') return 'password';
   if (kind === 'reading') return 'reading';
-  return codeComplete(state.method, state.code) ? null : 'code';
+  if (!codeComplete(state.method, state.code)) return 'code';
+  // Last, so the guard names what the user can still fill in first.
+  return preparing ? 'preparing' : null;
+}
+
+/** A `preparing` notice left over from a preparation that has finished is not shown. */
+function shownNotice(notice: StepUpNotice | null, preparing: boolean): StepUpNotice | null {
+  return notice?.kind === 'preparing' && !preparing ? null : notice;
 }
 
 // ── The hook ─────────────────────────────────────────────────────────────
@@ -584,31 +751,49 @@ export function useStepUpFactor({
   passwordLeg,
   readFailure,
   allowBackup,
+  seed,
+  floorMethods,
+  preparing = false,
 }: StepUpFactorProps): StepUpFactor {
+  // The floor by value: an array literal is a new array on every render.
+  const floorKey = floorMethods?.join(',') ?? '';
   const config = useMemo<FactorConfig>(
-    () => ({ purpose, readFailure, passwordLeg, allowBackup }),
-    [purpose, readFailure, passwordLeg, allowBackup]
+    () => ({
+      purpose,
+      readFailure,
+      passwordLeg,
+      allowBackup,
+      floor: verifiable(floorKey.split(','), purpose),
+    }),
+    [purpose, readFailure, passwordLeg, allowBackup, floorKey]
   );
   // An open instance is `enabled` plus the configuration it opened with; any
   // change starts a fresh one, and the result lives only for that instance.
-  const instance = `${enabled}|${purpose}|${readFailure}|${passwordLeg}|${allowBackup}`;
+  // The seed is not part of it: it is read only when an instance starts.
+  // Neither is `preparing`, which only holds the primary down.
+  const instance = `${enabled}|${purpose}|${readFailure}|${passwordLeg}|${allowBackup}|${floorKey}`;
 
-  const [factorState, setFactorState] = useState(() => initialState(instance));
+  const [factorState, setFactorState] = useState(() => initialState(instance, config, seed));
   let state = factorState;
   if (factorState.instance !== instance) {
-    state = initialState(instance);
+    state = initialState(instance, config, seed);
     setFactorState(state);
   }
 
-  const runningRef = useRef(false);
+  /** The attempt that holds the single-flight latch (C6), or null. */
+  const runningRef = useRef<number | null>(null);
   const runAttemptRef = useRef(0);
   const ceremonyRef = useRef<AbortController | null>(null);
   const readSeqRef = useRef(0);
   const readAbortRef = useRef<AbortController | null>(null);
 
-  /** Ends the current attempt: its ceremony aborts and its proof is dropped (C56). */
+  /**
+   * Ends the current attempt: its ceremony aborts, its proof is dropped (C56),
+   * and the latch it held is released.
+   */
   const endAttempt = useCallback(() => {
     runAttemptRef.current += 1;
+    runningRef.current = null;
     ceremonyRef.current?.abort();
     ceremonyRef.current = null;
   }, []);
@@ -641,8 +826,9 @@ export function useStepUpFactor({
     [config]
   );
 
+  const { reads } = state;
   useEffect(() => {
-    if (!enabled) return undefined;
+    if (!enabled || !reads) return undefined;
     startRead('initial');
     return () => {
       // Disabled or unmounted: nothing in flight may land (C57).
@@ -650,16 +836,17 @@ export function useStepUpFactor({
       readAbortRef.current?.abort();
       readAbortRef.current = null;
     };
-  }, [enabled, startRead]);
+  }, [enabled, reads, startRead]);
 
-  // The attempt ends in the commit that disables the instance, not at the
-  // later passive flush: a finish that resolves in between would otherwise
-  // pass the pre-submit gate after the dialog closed (C56). A running
-  // ceremony stops with it.
+  // The attempt ends in the commit that disables the instance or replaces it
+  // with another, not at the later passive flush: a finish that resolves in
+  // between would otherwise pass the pre-submit gate after the dialog closed
+  // (C56), and an older run's outcome would land on the new instance. A
+  // running ceremony stops with it.
   useLayoutEffect(() => {
     if (!enabled) return undefined;
     return endAttempt;
-  }, [enabled, endAttempt]);
+  }, [enabled, instance, endAttempt]);
 
   const { offered, backupCodeAvailable } = state;
   const methods = useMemo(
@@ -688,8 +875,8 @@ export function useStepUpFactor({
   }, [enabled, state.status.kind, startRead]);
 
   const firstMissing = useCallback(
-    (password: string) => firstMissingIn(state, passwordLegShown, password),
-    [state, passwordLegShown]
+    (password: string) => firstMissingIn(state, passwordLegShown, password, preparing),
+    [state, passwordLegShown, preparing]
   );
 
   const announceMissing = useCallback((missing: StepUpMissing) => {
@@ -702,26 +889,31 @@ export function useStepUpFactor({
   const run = useCallback(
     async (submit: StepUpSubmit, capture?: ApiRequestContext) => {
       // Nothing is queued: an incomplete or busy activation starts nothing.
-      if (runningRef.current || !enabled || state.phase !== 'idle') return null;
+      if (runningRef.current !== null || !enabled || state.phase !== 'idle') return null;
       if (state.status.kind !== 'ready') return null;
       const method = state.method;
       const code = codeToSend(method, state.code);
       if (code === '') return null;
 
-      runningRef.current = true; // C6: set before the first await.
+      const attempt = ++runAttemptRef.current;
+      runningRef.current = attempt; // C6: set before the first await.
       // This run's answer is newer than any re-read an earlier refusal started,
       // so that read must not land over it (C13, C32).
       readSeqRef.current += 1;
       readAbortRef.current?.abort();
       readAbortRef.current = null;
-      const context = capture ?? captureApiRequestContext(); // C82
+      const { opened } = state;
+      const context = capture ?? opened; // C82
+      // A host's capture counts only while the instance's own does: one taken
+      // after a change must not carry what was typed before it.
+      const current = () =>
+        apiRequestContextIsCurrent(context) && apiRequestContextIsCurrent(opened);
       const accountId = useUserStore.getState().user?.id ?? null;
-      const attempt = ++runAttemptRef.current;
       const controller = new AbortController();
       ceremonyRef.current = controller;
       const gate = (): RunGate => {
         if (attempt !== runAttemptRef.current || controller.signal.aborted) return 'stale';
-        return apiRequestContextIsCurrent(context) ? 'live' : 'sessionExpired';
+        return current() ? 'live' : 'sessionExpired';
       };
       const stop = (ended: CeremonyStop): null => {
         // A stale attempt belongs to an instance that has moved on: silent.
@@ -751,12 +943,15 @@ export function useStepUpFactor({
         const outcome = await submitOnce(submit, mfa, context);
         recordTotpAcceptance(code, outcome, accountId, context);
         if (attempt !== runAttemptRef.current) return outcome;
-        setFactorState(outcomeUpdate(outcome, method, config, apiRequestContextIsCurrent(context)));
-        if (outcome.kind === 'refusal' && refusalRereads(outcome.refusal)) startRead('reread');
+        setFactorState(outcomeUpdate(outcome, method, config, current()));
+        // An instance that runs no read runs no re-read either (C4).
+        if (outcome.kind === 'refusal' && refusalRereads(outcome.refusal) && state.reads) {
+          startRead('reread');
+        }
         return outcome;
       } finally {
-        runningRef.current = false;
-        if (ceremonyRef.current === controller) ceremonyRef.current = null;
+        releaseIfHeld(runningRef, attempt);
+        releaseIfHeld(ceremonyRef, controller);
       }
     },
     [enabled, state, config, startRead]
@@ -770,7 +965,7 @@ export function useStepUpFactor({
     code: state.code,
     attempt: state.attempt,
     phase: state.phase,
-    notice: state.notice,
+    notice: shownNotice(state.notice, preparing),
     reread: state.reread,
     setCode,
     switchTo,

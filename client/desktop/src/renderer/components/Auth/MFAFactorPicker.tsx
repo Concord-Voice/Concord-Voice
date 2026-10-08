@@ -23,6 +23,27 @@ export interface MFAFactorPickerProps {
   recentlyUsedCode: boolean;
   /** This panel's message, already worded; null for none. */
   error: string | null;
+  /** A plain Enter in the code input (design §4.3): the owner presses its primary. */
+  onEnter: () => void;
+}
+
+/**
+ * A plain Enter: not one an input method is composing with, not one a
+ * modifier changes, and not the auto-repeat of a held key: the field keeps
+ * focus through a refusal, so a held Enter would press the primary again
+ * against the answer it just got. The stage's password field uses it too, so
+ * the two inputs submit on the same key.
+ */
+export function isPlainEnter(e: React.KeyboardEvent): boolean {
+  return (
+    e.key === 'Enter' &&
+    !e.repeat &&
+    !e.nativeEvent.isComposing &&
+    !e.shiftKey &&
+    !e.altKey &&
+    !e.ctrlKey &&
+    !e.metaKey
+  );
 }
 
 interface StepUpFieldErrorProps {
@@ -91,6 +112,7 @@ const MFAFactorPicker: React.FC<MFAFactorPickerProps> = ({
   onSwitch,
   recentlyUsedCode,
   error,
+  onEnter,
 }) => {
   const baseId = useId();
   const labelId = `${baseId}-label`;
@@ -150,6 +172,11 @@ const MFAFactorPicker: React.FC<MFAFactorPickerProps> = ({
             spellCheck={false}
             value={code}
             onChange={(e) => onCodeChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (!isPlainEnter(e)) return;
+              e.preventDefault();
+              onEnter();
+            }}
             aria-invalid={error !== null || undefined}
             aria-describedby={describedBy}
           />

@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen, userEvent, waitFor, within } from '../../../test-utils';
+import { act, fireEvent, render, screen, userEvent, waitFor, within } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { deferred } from '../../../helpers/deferred';
 
@@ -41,12 +41,23 @@ import {
 import { totpHintExpiresAt } from '@/renderer/services/system/stepUpRequirements';
 import { useTotpAcceptedStore } from '@/renderer/stores/auth/totpAcceptedStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { resetRuntimeServerBase } from '@/renderer/services/system/runtimeServerBase';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
+import {
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '@/renderer/services/system/requestContext';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 const ACCOUNT = 'acct-1';
 const TYPED = 'swordfish';
 const CHECKING = 'Checking your verification methods…';
 const WAITING = 'Waiting for your passkey or security key…';
+const PREPARING = 'Getting things ready…';
+const RATE_LIMITED = 'Too many attempts. Try again in a few minutes.';
+const ENROLLMENT = 'Set up an authenticator app or security key in Settings to do this.';
 const RECENT = 'You just used a code from your authenticator app. Enter the next one it shows.';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -98,6 +109,11 @@ interface StageProps {
   sessionMessage?: string;
   /** False omits `headingRef`, so the enclosing dialog takes terminal focus. */
   heading?: boolean;
+  /** The capture a host took when it began preparing, passed to `stepUpActivation`. */
+  capture?: ApiRequestContext;
+  focusOnReady?: boolean;
+  /** Renders a Cancel button before the stage, for a focus the stage must not take. */
+  cancel?: boolean;
 }
 
 /** A host: heading, the stage, and a primary wired with `stepUpActivation`. */
@@ -108,15 +124,21 @@ function Stage({
   submit = async () => ({ kind: 'success' }),
   sessionMessage,
   heading = true,
+  capture,
+  focusOnReady,
+  cancel = false,
 }: Readonly<StageProps>) {
   const primaryRef = useRef<HTMLButtonElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit);
+  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit, {
+    capture,
+  });
   return (
     <dialog open tabIndex={-1} aria-label="Confirm">
       <h2 ref={headingRef} tabIndex={-1}>
         Confirm
       </h2>
+      {cancel && <button type="button">Cancel</button>}
       <StepUpCredentials
         factor={factor}
         password={password}
@@ -124,6 +146,7 @@ function Stage({
         primaryRef={primaryRef}
         headingRef={heading ? headingRef : undefined}
         sessionMessage={sessionMessage}
+        focusOnReady={focusOnReady}
       />
       <button type="button" ref={primaryRef} aria-disabled={ariaDisabled} onClick={activate}>
         Continue
@@ -293,6 +316,13 @@ const ROWS: Row[] = [
     blocked: true,
   },
   {
+    name: 'enrolment required',
+    factor: none({ kind: 'enrollmentRequired' }),
+    status: ENROLLMENT,
+    alerts: 0,
+    blocked: true,
+  },
+  {
     name: 'ceremony',
     factor: ready('webauthn', { phase: 'ceremony' }),
     status: WAITING,
@@ -401,6 +431,22 @@ const ROWS: Row[] = [
     blocked: false,
   },
   {
+    name: 'notice: preparing',
+    factor: notice({ kind: 'preparing' }, { firstMissing: vi.fn(() => 'preparing') }),
+    status: PREPARING,
+    alerts: 0,
+    panel: 'Authenticator app code',
+    blocked: true,
+  },
+  {
+    name: 'notice: passkey rate limited',
+    factor: ready('webauthn', { notice: { kind: 'webauthnRateLimited' } }),
+    status: RATE_LIMITED,
+    alerts: 0,
+    panel: 'Passkey or security key',
+    blocked: false,
+  },
+  {
     name: 'notice: methods changed',
     factor: notice({ kind: 'methodsChanged' }),
     status: 'Your verification methods changed. Use the one shown.',
@@ -444,7 +490,15 @@ describe('the accessibility contract holds in every state', () => {
   it('the rows cover every StepUpStatus kind and every StepUpNotice kind', () => {
     const covered = new Set(ROWS.map((row) => row.factor.status.kind));
     expect([...covered].sort()).toEqual(
-      ['blocked', 'noUsableMethod', 'ready', 'reading', 'refused', 'sessionExpired'].sort()
+      [
+        'blocked',
+        'enrollmentRequired',
+        'noUsableMethod',
+        'ready',
+        'reading',
+        'refused',
+        'sessionExpired',
+      ].sort()
     );
     const notices = new Set(ROWS.map((row) => row.factor.notice?.kind).filter(Boolean));
     expect([...notices].sort()).toEqual(
@@ -454,7 +508,9 @@ describe('the accessibility contract holds in every state', () => {
         'invalidPassword',
         'methodsChanged',
         'missing',
+        'preparing',
         'webauthnCancelled',
+        'webauthnRateLimited',
       ].sort()
     );
   });
@@ -599,6 +655,7 @@ describe('the password field', () => {
   it.each([
     ['refused', { kind: 'refused', reason: 'account' }],
     ['no usable method', { kind: 'noUsableMethod' }],
+    ['enrolment required', { kind: 'enrollmentRequired' }],
     ['session expired', { kind: 'sessionExpired' }],
   ] as const)('is emptied through the host once the status is %s', async (_name, status) => {
     const onPasswordChange = vi.fn();
@@ -886,15 +943,33 @@ describe('stepUpActivation', () => {
     expect(factor.run).not.toHaveBeenCalled();
   });
 
-  // The run captures its own request context; the activation carries no
-  // caller capture, so `run` receives the host submit and nothing else.
-  it('runs once with the host submit alone when complete', () => {
+  // Without a capture the run works against its instance's own, so `run`
+  // receives the host submit and no capture.
+  // Mutant: a capture invented here (a fresh one) for a host that gave none.
+  it('runs once with the host submit and no capture when complete', () => {
     const factor = makeFactor();
     const { ariaDisabled, activate } = stepUpActivation(factor, TYPED, submit);
     expect(ariaDisabled).toBe(false);
     activate();
-    expect(factor.run).toHaveBeenCalledExactlyOnceWith(submit);
+    expect(factor.run).toHaveBeenCalledExactlyOnceWith(submit, undefined);
     expect(factor.announceMissing).not.toHaveBeenCalled();
+  });
+
+  // Mutant (C82): the capture dropped, so `run` takes a fresh one and a
+  // capture taken before preparation is spent against whoever is current now.
+  it('runs with the capture it was given', () => {
+    const factor = makeFactor();
+    const capture = captureApiRequestContext();
+    const { activate } = stepUpActivation(factor, TYPED, submit, { capture });
+    activate();
+    expect(factor.run).toHaveBeenCalledExactlyOnceWith(submit, capture);
+  });
+
+  // Mutant: the capture read from the wrong option, or only on the busy path.
+  it('an empty options object is the same as none', () => {
+    const factor = makeFactor();
+    stepUpActivation(factor, TYPED, submit, {}).activate();
+    expect(factor.run).toHaveBeenCalledExactlyOnceWith(submit, undefined);
   });
 
   it('asks the hook about the password it was given', () => {
@@ -1037,6 +1112,7 @@ describe('focus', () => {
     it.each([
       ['refused', { kind: 'refused', reason: 'account' }],
       ['no usable method', { kind: 'noUsableMethod' }],
+      ['enrolment required', { kind: 'enrollmentRequired' }],
       ['session expired', { kind: 'sessionExpired' }],
     ] as const)('%s lands on the heading, never the primary or body', (_name, status) => {
       move(ready('totp'), none(status));
@@ -1093,6 +1169,211 @@ describe('focus', () => {
   });
 });
 
+// ── Enrolment required (E8; T2) ──────────────────────────────────────────
+
+describe('enrolment required', () => {
+  /** What the state must be, whichever way it was reached: a sentence and nothing to act on. */
+  function expectEnrolmentState() {
+    expect(statusLine().tagName).toBe('OUTPUT');
+    expect(statusLine().textContent).toBe(ENROLLMENT);
+    // Not an error: no alert role, no danger carrier, no invalid field.
+    expect(screen.queryAllByRole('alert')).toHaveLength(0);
+    expect(document.querySelector('[class*="danger"], .step-up__error')).toBeNull();
+    expect(document.querySelector('[aria-invalid]')).toBeNull();
+    // Nothing to collect and nothing to retry or follow (E4 is #3456's).
+    expect(document.querySelectorAll('input')).toHaveLength(0);
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(document.querySelector('.step-up__panel')).toBeNull();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+    const stage = statusLine().closest('fieldset');
+    expect(stage).not.toBeNull();
+    expect(within(stage as HTMLElement).queryAllByRole('button')).toHaveLength(0);
+    // The primary is the host's, and it cannot be activated.
+    expect(primary()).toHaveAttribute('aria-disabled', 'true');
+    expect(primary()).not.toBeDisabled();
+    // The stand-in for an axe run (no axe library exists in this repo).
+    expectContract(0);
+  }
+
+  // Mutant: the arm routed to `blocked` or `refused` (a Retry, a danger carrier,
+  // a different sentence); an alert role or danger class on the sentence.
+  it('shows the sentence as a polite status with nothing to act on', () => {
+    render(<Stage factor={none({ kind: 'enrollmentRequired' })} />);
+    expectEnrolmentState();
+  });
+
+  // Mutant: focus left on the primary or body, or the heading missing from the table.
+  it('puts focus on the heading, not the primary or body', () => {
+    render(<Stage factor={none({ kind: 'enrollmentRequired' })} />);
+    expect(headingEl()).toHaveFocus();
+  });
+
+  it('puts focus on the dialog when the host named no heading', () => {
+    render(<Stage factor={none({ kind: 'enrollmentRequired' })} heading={false} />);
+    expect(screen.getByRole('dialog')).toHaveFocus();
+  });
+
+  // Mutant: the sentence says it only for the seeded case, so a stage that
+  // reaches enrolment later keeps the previous status text.
+  it('replaces a usable stage with it, moving focus to the heading', () => {
+    const view = render(<Stage factor={ready('totp')} />);
+    passwordField().focus();
+    view.rerender(<Stage factor={none({ kind: 'enrollmentRequired' })} />);
+    expectEnrolmentState();
+    expect(headingEl()).toHaveFocus();
+  });
+
+  // Mutant: `activate` running, or announcing, on a state no input can complete.
+  it('activating the primary does nothing, by click or by keyboard', async () => {
+    const factor = none({ kind: 'enrollmentRequired' });
+    const submit = vi.fn<StepUpSubmit>(async () => ({ kind: 'success' }));
+    render(<Stage factor={factor} submit={submit} />);
+
+    await userEvent.click(primary());
+    primary().focus();
+    await userEvent.keyboard('{Enter}');
+    await userEvent.keyboard(' ');
+
+    expect(factor.run).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expectEnrolmentState();
+  });
+});
+
+// ── focusOnReady (T10b) ──────────────────────────────────────────────────
+
+describe('focusOnReady', () => {
+  const reading = () => none({ kind: 'reading' }, { passwordLegShown: true });
+  const withoutPassword = (method: 'totp' | 'webauthn') =>
+    ready(method, { passwordLegShown: false });
+  const keyLabel = () =>
+    within(screen.getByRole('group', { name: 'Passkey or security key' })).getByText(
+      'Passkey or security key'
+    );
+
+  /** Opens on a read in flight, with focus where a host leaves it. */
+  function open(
+    where: 'heading' | 'dialog' | 'nowhere',
+    props: Partial<StageProps> = {}
+  ): { rerender: (factor: StepUpFactor) => void } {
+    const stage = (factor: StepUpFactor) => (
+      <Stage factor={factor} focusOnReady heading={where !== 'dialog'} {...props} />
+    );
+    const view = render(stage(reading()));
+    if (where === 'heading') headingEl().focus();
+    if (where === 'dialog') screen.getByRole('dialog').focus();
+    return { rerender: (factor) => view.rerender(stage(factor)) };
+  }
+
+  // Mutant: the landing effect gated on something other than `ready`, or the
+  // password branch missing.
+  it.each(['heading', 'dialog', 'nowhere'] as const)(
+    'lands on the password field when the read arrives and focus is on %s',
+    (where) => {
+      const view = open(where);
+      expect(passwordField()).not.toHaveFocus();
+
+      view.rerender(ready('totp'));
+
+      expect(passwordField()).toHaveFocus();
+    }
+  );
+
+  // Mutant: the picker branch missing, or the password preferred when it is absent.
+  it('with no password leg, lands on the code input', () => {
+    const view = open('heading');
+    view.rerender(withoutPassword('totp'));
+    expect(screen.getByRole('textbox', { name: 'Authenticator app code' })).toHaveFocus();
+  });
+
+  it('with no password leg and a security key, lands on the key label', () => {
+    const view = open('heading');
+    view.rerender(withoutPassword('webauthn'));
+    expect(keyLabel()).toHaveFocus();
+  });
+
+  // Mutant: the pending flag never spent, so every later `ready` takes focus.
+  it('fires once: a second landing in the same instance takes nothing', () => {
+    const view = open('heading');
+    view.rerender(ready('totp'));
+    expect(passwordField()).toHaveFocus();
+
+    // The instance restarts its read (a new purpose) and the host's focus returns to the heading.
+    view.rerender(reading());
+    expect(headingEl()).toHaveFocus();
+    view.rerender(ready('totp'));
+
+    expect(headingEl()).toHaveFocus();
+    expect(passwordField()).not.toHaveFocus();
+  });
+
+  // Mutant: the `focusIsUnclaimed` check dropped, so a person who has already
+  // reached another control is pulled away from it.
+  it('does not take focus the person moved elsewhere', () => {
+    const view = open('nowhere', { cancel: true });
+    screen.getByRole('button', { name: 'Cancel' }).focus();
+
+    view.rerender(ready('totp'));
+
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    expect(passwordField()).not.toHaveFocus();
+  });
+
+  it('does not take focus from a field the person already reached', () => {
+    const view = open('nowhere');
+    passwordField().focus();
+
+    view.rerender(ready('totp'));
+
+    expect(passwordField()).toHaveFocus();
+  });
+
+  // Mutant: a fallback that blurs, or focuses `body`, when there is nothing to focus.
+  it('never focuses the body: with nothing to land on, focus stays where it was', () => {
+    const view = open('heading');
+
+    view.rerender(none({ kind: 'ready' }, { passwordLegShown: false }));
+
+    expect(headingEl()).toHaveFocus();
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  // Mutant: the flag armed by `focusOnReady` alone, so an instance that opens
+  // `ready` (no read to wait for) takes focus on mount.
+  it('a stage that mounts already ready leaves the host focus alone', () => {
+    const view = render(<Stage factor={ready('totp')} focusOnReady />);
+    expect(document.activeElement).toBe(document.body);
+
+    // A later read is not the opening one: it still takes nothing.
+    view.rerender(<Stage factor={reading()} focusOnReady />);
+    view.rerender(<Stage factor={ready('totp')} focusOnReady />);
+
+    expect(passwordField()).not.toHaveFocus();
+    expect(headingEl()).toHaveFocus();
+  });
+
+  // Mutant: the prop defaulting to true, or ignored.
+  it('moves nothing when the host did not ask', () => {
+    const view = render(<Stage factor={reading()} />);
+    headingEl().focus();
+
+    view.rerender(<Stage factor={ready('totp')} />);
+
+    expect(headingEl()).toHaveFocus();
+  });
+
+  // Mutant: the landing effect declared after the notice effect, so it wins over a refusal's target.
+  it('yields to a refusal that lands on the same commit', () => {
+    const view = open('heading');
+
+    view.rerender(ready('totp', { notice: { kind: 'missing', field: 'totp' } }));
+
+    expect(screen.getByRole('textbox', { name: 'Authenticator app code' })).toHaveFocus();
+  });
+});
+
 // ── Against the real hook ────────────────────────────────────────────────
 
 const READ = '/api/v1/mfa/step-up';
@@ -1140,11 +1421,31 @@ const BASE: StepUpFactorProps = {
 
 function Host({
   submit,
+  capture,
+  focusOnReady,
+  cancel,
   ...config
-}: Readonly<Partial<StepUpFactorProps> & { submit: StepUpSubmit }>) {
+}: Readonly<
+  Partial<StepUpFactorProps> & {
+    submit: StepUpSubmit;
+    capture?: ApiRequestContext;
+    focusOnReady?: boolean;
+    cancel?: boolean;
+  }
+>) {
   const factor = useStepUpFactor({ ...BASE, ...config });
   const [typed, setTyped] = useState('');
-  return <Stage factor={factor} password={typed} onPasswordChange={setTyped} submit={submit} />;
+  return (
+    <Stage
+      factor={factor}
+      password={typed}
+      onPasswordChange={setTyped}
+      submit={submit}
+      capture={capture}
+      focusOnReady={focusOnReady}
+      cancel={cancel}
+    />
+  );
 }
 
 const okSubmit = () => vi.fn<StepUpSubmit>(async () => ({ kind: 'success' }));
@@ -1449,6 +1750,52 @@ describe('against the real hook', () => {
       await waitFor(() => expect(statusLine()).toHaveTextContent('Sign in again to continue.'));
       await waitFor(() => expect(hostPassword()).toBeEmptyDOMElement());
     });
+
+    // Mutant: the clearing effect or the heading focus missing the enrolment
+    // kind (E8), which leaves a dead password field and the primary focused.
+    it('empties the password and lands on the heading when the request answers enrolment required', async () => {
+      routes[READ] = () => readBody(['totp'], 'totp');
+      const submit = vi.fn<StepUpSubmit>(async () => ({
+        kind: 'refusal',
+        refusal: { kind: 'enrollmentRequired' },
+      }));
+      render(<ProbedHost submit={submit} />);
+      await userEvent.type(passwordField(), TYPED);
+      await userEvent.type(await totpInput(), '123456');
+
+      await userEvent.click(primary());
+
+      await waitFor(() => expect(statusLine().textContent).toBe(ENROLLMENT));
+      await waitFor(() => expect(hostPassword()).toBeEmptyDOMElement());
+      expect(headingEl()).toHaveFocus();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+      expect(screen.queryAllByRole('alert')).toHaveLength(0);
+      expectContract(0);
+    });
+  });
+
+  // A refusal-triggered surface opens straight on the state (G2).
+  describe('an instance seeded with enrolment required', () => {
+    // Mutant: the seed still starting the read, or showing a password leg.
+    it('shows the sentence at once, reads nothing and offers nothing to act on', async () => {
+      const submit = okSubmit();
+      render(<Host submit={submit} seed={{ kind: 'enrollmentRequired' }} />);
+
+      expect(statusLine().textContent).toBe(ENROLLMENT);
+      expect(headingEl()).toHaveFocus();
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+      expect(primary()).toHaveAttribute('aria-disabled', 'true');
+      expectContract(0);
+
+      await userEvent.click(primary());
+
+      expect(submit).not.toHaveBeenCalled();
+      expect(hits(READ)).toHaveLength(0);
+      expect(statusLine().textContent).toBe(ENROLLMENT);
+      expect(screen.queryAllByRole('alert')).toHaveLength(0);
+    });
   });
 
   // Mutant: begin's `res.json()` without the `.catch`. A proxy's HTML 401 then
@@ -1529,5 +1876,423 @@ describe('against the real hook', () => {
       await waitFor(() => expect(primary()).toHaveFocus());
       expectContract(1);
     });
+  });
+
+  // ── The host is still preparing (T1c; D11, Q6, C82) ─────────────────────
+
+  describe('preparing', () => {
+    /** A complete form on an authenticator-app account, while the host prepares. */
+    async function completeForm(props: Partial<React.ComponentProps<typeof Host>> = {}) {
+      routes[READ] = () => readBody(['totp'], 'totp', true);
+      const submit = okSubmit();
+      const view = render(<Host submit={submit} preparing {...props} />);
+      await userEvent.type(passwordField(), TYPED);
+      const input = await totpInput();
+      await userEvent.type(input, '123456');
+      return { submit, view, input };
+    }
+
+    // Mutant: `preparing` treated as non-blocking.
+    it('keeps the primary aria-disabled while preparing, then frees it', async () => {
+      const { submit, view } = await completeForm();
+
+      expect(primary()).toHaveAttribute('aria-disabled', 'true');
+      expect(primary()).not.toBeDisabled();
+
+      view.rerender(<Host submit={submit} preparing={false} />);
+
+      expect(primary()).toHaveAttribute('aria-disabled', 'false');
+    });
+
+    // Mutant: the click handler starting the ceremony, or running, before
+    // preparation has finished.
+    it('an activation shows "Getting things ready…" and submits nothing', async () => {
+      const { submit } = await completeForm();
+
+      await userEvent.click(primary());
+
+      expect(statusLine().textContent).toBe(PREPARING);
+      expect(screen.queryAllByRole('alert')).toHaveLength(0);
+      expect(submit).not.toHaveBeenCalled();
+      expectContract(0);
+    });
+
+    it('an activation starts no passkey ceremony either', async () => {
+      routes[READ] = () => readBody(['webauthn'], 'webauthn', false);
+      const submit = okSubmit();
+      render(<Host submit={submit} preparing />);
+      await screen.findByRole('group', { name: 'Passkey or security key' });
+      await userEvent.type(passwordField(), TYPED);
+      expect(primary()).toHaveAttribute('aria-disabled', 'true');
+
+      await userEvent.click(primary());
+
+      expect(statusLine().textContent).toBe(PREPARING);
+      expect(hits(BEGIN)).toHaveLength(0);
+      expect(mockGet).not.toHaveBeenCalled();
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    // Mutant: `preparing` checked before the fields, hiding what the person can still fill in.
+    it('a missing password still wins, with its own text', async () => {
+      routes[READ] = () => readBody(['totp'], 'totp', true);
+      const submit = okSubmit();
+      render(<Host submit={submit} preparing />);
+      await userEvent.type(await totpInput(), '123456');
+
+      await userEvent.click(primary());
+
+      expect(screen.getByRole('alert')).toHaveTextContent('Enter your password to continue.');
+      expect(statusLine().textContent).toBe('');
+      expect(passwordField()).toHaveFocus();
+    });
+
+    it('a missing code still wins, with its own text', async () => {
+      routes[READ] = () => readBody(['totp'], 'totp', true);
+      const submit = okSubmit();
+      render(<Host submit={submit} preparing />);
+      await userEvent.type(passwordField(), TYPED);
+      const input = await totpInput();
+
+      await userEvent.click(primary());
+
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Enter the 6-digit code from your authenticator app to continue.'
+      );
+      expect(statusLine().textContent).toBe('');
+      expect(input).toHaveFocus();
+    });
+
+    // Mutant: `preparing` joining the instance key, which would clear the code
+    // and read again; or the notice outliving the preparation it answered.
+    it('flipping preparing false without a remount keeps the code and the instance', async () => {
+      const { submit, view, input } = await completeForm();
+      await userEvent.click(primary());
+      expect(statusLine().textContent).toBe(PREPARING);
+
+      view.rerender(<Host submit={submit} preparing={false} />);
+
+      expect(statusLine().textContent).toBe('');
+      expect(screen.getByRole('textbox', { name: 'Authenticator app code' })).toBe(input);
+      expect(input).toHaveValue('123456');
+      expect(passwordField()).toHaveValue(TYPED);
+      expect(hits(READ)).toHaveLength(1);
+
+      await userEvent.click(primary());
+      await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+      expect(submit.mock.calls[0][0]).toBe('123456');
+    });
+
+    // Mutant (C82): the capture not passed on, so `run` takes a fresh one.
+    it('run works against the capture the host took when it began preparing', async () => {
+      const capture = captureApiRequestContext();
+      const { submit, view } = await completeForm({ capture });
+      view.rerender(<Host submit={submit} capture={capture} preparing={false} />);
+
+      await userEvent.click(primary());
+
+      await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+      expect(submit.mock.calls[0][1]).toBe(capture);
+    });
+
+    it('a capture taken before an account change ends in session-expired, sending nothing', async () => {
+      const capture = captureApiRequestContext();
+      const { submit, view } = await completeForm({ capture });
+      view.rerender(<Host submit={submit} capture={capture} preparing={false} />);
+      act(() => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 })));
+
+      await userEvent.click(primary());
+
+      await waitFor(() => expect(statusLine()).toHaveTextContent('Sign in again to continue.'));
+      expect(submit).not.toHaveBeenCalled();
+    });
+  });
+
+  // SE3: what was typed into a stage was typed for the account and server it
+  // opened for, so a change before the activation sends nothing anywhere.
+  describe('an account or server change after the stage opened', () => {
+    async function typedForm() {
+      routes[READ] = () => readBody(['totp'], 'totp', true);
+      const submit = okSubmit();
+      render(<Host submit={submit} />);
+      await userEvent.type(passwordField(), TYPED);
+      await userEvent.type(await totpInput(), '123456');
+      return submit;
+    }
+
+    // Mutant: `run` defaulting to a capture taken at activation, not at open.
+    it.each([
+      ['server', () => setRuntimeServerBase('https://other-server.example.test')],
+      ['account', () => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 }))],
+    ])('a %s change sends nothing and shows the session sentence', async (_name, change) => {
+      const submit = await typedForm();
+      act(() => change());
+
+      await userEvent.click(primary());
+
+      await waitFor(() => expect(statusLine()).toHaveTextContent('Sign in again to continue.'));
+      expect(submit).not.toHaveBeenCalled();
+      expect(mockApiFetch.mock.calls.map(([path]) => path)).toEqual([READ]);
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    });
+
+    it('with no change, the same flow sends once', async () => {
+      const submit = await typedForm();
+
+      await userEvent.click(primary());
+
+      await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+      expect(submit.mock.calls[0][0]).toBe('123456');
+    });
+  });
+
+  // ── A 429 from the passkey ceremony (D19) ───────────────────────────────
+
+  describe('a 429 from the passkey ceremony', () => {
+    // Mutant: a 429 mapped back to the invalid-key copy (an alert on the group).
+    it.each([
+      ['begin', BEGIN],
+      ['finish', FINISH],
+    ] as const)(
+      '%s: says so as a polite status, with no alert and no re-read',
+      async (_step, path) => {
+        routes[READ] = () => readBody(['webauthn', 'totp'], 'webauthn', false);
+        routes[path] = () => json({ error: 'Too many requests' }, 429);
+        const submit = okSubmit();
+        render(<Host submit={submit} />);
+        await screen.findByRole('group', { name: 'Passkey or security key' });
+        await userEvent.type(passwordField(), TYPED);
+
+        await userEvent.click(primary());
+
+        await waitFor(() => expect(statusLine().textContent).toBe(RATE_LIMITED));
+        expect(statusLine().closest('[role="alert"]')).toBeNull();
+        expect(screen.queryAllByRole('alert')).toHaveLength(0);
+        expect(document.body.textContent).not.toMatch(/couldn't verify/i);
+        expect(hits(READ)).toHaveLength(1);
+        expect(submit).not.toHaveBeenCalled();
+        // Retrying needs a touch, so focus returns to the primary, which stays usable.
+        expect(primary()).toHaveFocus();
+        expect(primary()).toHaveAttribute('aria-disabled', 'false');
+        expectContract(0);
+      }
+    );
+  });
+
+  // ── focusOnReady against the real read (T10b) ───────────────────────────
+
+  describe('focusOnReady', () => {
+    it('lands on the password field once the opening read arrives', async () => {
+      const read = deferred<Response>();
+      routes[READ] = () => read.promise;
+      render(<Host submit={okSubmit()} focusOnReady />);
+      headingEl().focus();
+      expect(headingEl()).toHaveFocus();
+
+      await act(async () => read.resolve(readBody(['totp'], 'totp', true)));
+
+      await waitFor(() => expect(passwordField()).toHaveFocus());
+    });
+
+    it('with no password leg, lands on the security key', async () => {
+      const read = deferred<Response>();
+      routes[READ] = () => read.promise;
+      render(
+        <Host
+          submit={okSubmit()}
+          focusOnReady
+          passwordLeg="whenNoMfa" // pragma: allowlist secret
+        />
+      );
+      headingEl().focus();
+
+      await act(async () => read.resolve(readBody(['webauthn'], 'webauthn', false)));
+
+      const group = await screen.findByRole('group', { name: 'Passkey or security key' });
+      await waitFor(() => expect(within(group).getByText('Passkey or security key')).toHaveFocus());
+    });
+
+    it('does not take focus from Cancel when the read lands', async () => {
+      const read = deferred<Response>();
+      routes[READ] = () => read.promise;
+      render(<Host submit={okSubmit()} focusOnReady cancel />);
+      screen.getByRole('button', { name: 'Cancel' }).focus();
+
+      await act(async () => read.resolve(readBody(['totp'], 'totp', true)));
+      await totpInput();
+
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    });
+  });
+});
+
+// ── An expired confirmation (#3509, T1d) ─────────────────────────────────
+
+describe('an expired confirmation (#3509)', () => {
+  const EXPIRED_COPY = 'Your confirmation expired. Enter your password again.';
+
+  // Mutants: the notice placed off the password field; the copy not the shared one.
+  it('sits on the password field with the shared copy, marked and described', async () => {
+    const { STEP_UP_TOKEN_EXPIRED_MESSAGE } =
+      await import('@/renderer/services/system/stepUpToken');
+    render(<Stage factor={ready('totp', { notice: { kind: 'tokenExpired' } })} />);
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent(STEP_UP_TOKEN_EXPIRED_MESSAGE);
+    expect(alert).toHaveTextContent(EXPIRED_COPY);
+    expect(passwordField()).toHaveAttribute('aria-invalid', 'true');
+    expect(ids(passwordField())).toEqual([alert.id]);
+    expect(screen.getByRole('textbox', { name: 'Authenticator app code' })).not.toHaveAttribute(
+      'aria-invalid'
+    );
+    expectContract(1);
+  });
+
+  // Mutant: `tokenExpired` missing from the focus table.
+  it('moves focus to the password field', () => {
+    const view = render(<Stage factor={ready('totp')} />);
+    view.rerender(<Stage factor={ready('totp', { notice: { kind: 'tokenExpired' } })} />);
+    expect(passwordField()).toHaveFocus();
+  });
+
+  describe('against the real hook', () => {
+    beforeEach(() => {
+      routes = { [READ]: () => readBody(['totp'], 'totp', true) };
+      mockApiFetch.mockReset();
+      mockApiFetch.mockImplementation(async (path: string, init: RequestInit) => {
+        const route = routes[path];
+        if (!route) throw new Error(`unexpected request to ${path}`);
+        return route(init);
+      });
+    });
+
+    afterEach(() => {
+      resetRuntimeServerBase();
+    });
+
+    // Mutant: the hook ignoring `tokenExpired` on a run's outcome.
+    it('a refused token from the request shows the expiry on the password field', async () => {
+      const submit = vi.fn<StepUpSubmit>(async () => ({
+        kind: 'refusal',
+        refusal: { kind: 'passwordRequired', tokenExpired: true },
+      }));
+      render(<Host submit={submit} />);
+      await userEvent.type(passwordField(), TYPED);
+      await userEvent.type(
+        await screen.findByRole('textbox', { name: 'Authenticator app code' }),
+        '123456'
+      );
+
+      await userEvent.click(primary());
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent(EXPIRED_COPY);
+      expect(alert).not.toHaveTextContent('Enter your password to continue.');
+      expect(passwordField()).toHaveFocus();
+      expect(passwordField()).toHaveAttribute('aria-invalid', 'true');
+      expect(submit).toHaveBeenCalledTimes(1);
+      expectContract(1);
+    });
+
+    // Mutant: the hook ignoring `tokenExpired` on the seed.
+    it('a seeded refused token shows the expiry on the password field once the read lands', async () => {
+      routes[READ] = () => readBody([], null);
+      render(
+        <Host
+          submit={vi.fn<StepUpSubmit>()}
+          passwordLeg="whenNoMfa" // pragma: allowlist secret
+          seed={{ kind: 'passwordRequired', tokenExpired: true }}
+        />
+      );
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent(EXPIRED_COPY);
+      expect(passwordField()).toHaveAttribute('aria-invalid', 'true');
+      expect(ids(passwordField())).toEqual([alert.id]);
+    });
+
+    // Mutant: an unmarked password refusal worded as expired.
+    it('an unmarked password refusal still asks for the password', async () => {
+      const submit = vi.fn<StepUpSubmit>(async () => ({
+        kind: 'refusal',
+        refusal: { kind: 'passwordRequired' },
+      }));
+      render(<Host submit={submit} />);
+      await userEvent.type(passwordField(), TYPED);
+      await userEvent.type(
+        await screen.findByRole('textbox', { name: 'Authenticator app code' }),
+        '123456'
+      );
+
+      await userEvent.click(primary());
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent('Enter your password to continue.');
+      expect(alert).not.toHaveTextContent(EXPIRED_COPY);
+    });
+  });
+});
+
+// ── Enter presses the primary (design §4.3) ──────────────────────────────
+
+describe('Enter in a field', () => {
+  const codeField = () => screen.getByRole('textbox', { name: 'Authenticator app code' });
+
+  // Mutant: the password field without its Enter handler.
+  it('in the password field runs a complete activation', () => {
+    const run = vi.fn(async () => null);
+    render(<Stage factor={ready('totp', { run })} />);
+    fireEvent.keyDown(passwordField(), { key: 'Enter' });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  // Mutant: the picker's onEnter not wired to the host's primary.
+  it('in the code field runs a complete activation', () => {
+    const run = vi.fn(async () => null);
+    render(<Stage factor={ready('totp', { run })} />);
+    fireEvent.keyDown(codeField(), { key: 'Enter' });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  // Mutant: Enter calling `run` directly, past the activation guard.
+  it('on an incomplete stage names what is missing and sends nothing', () => {
+    const run = vi.fn(async () => null);
+    const announceMissing = vi.fn();
+    render(
+      <Stage factor={ready('totp', { run, announceMissing, firstMissing: vi.fn(() => 'totp') })} />
+    );
+    fireEvent.keyDown(passwordField(), { key: 'Enter' });
+    expect(announceMissing).toHaveBeenCalledWith('totp');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  // Mutant: the guard's busy check bypassed by a key.
+  it('while a run is in flight does nothing', () => {
+    const run = vi.fn(async () => null);
+    render(<Stage factor={ready('totp', { run, phase: 'ceremony' })} />);
+    fireEvent.keyDown(passwordField(), { key: 'Enter' });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  // Mutant: the password field pressing the primary on a modified Enter.
+  it.each([
+    ['Shift', { shiftKey: true }],
+    ['Ctrl', { ctrlKey: true }],
+  ])('%s+Enter in the password field does nothing; a plain Enter then runs', (_k, modifier) => {
+    const run = vi.fn(async () => null);
+    render(<Stage factor={ready('totp', { run })} />);
+    fireEvent.keyDown(passwordField(), { key: 'Enter', ...modifier });
+    expect(run).not.toHaveBeenCalled();
+    fireEvent.keyDown(passwordField(), { key: 'Enter' });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  // Mutant: the password field submitting on an IME's Enter.
+  it('while an input method is composing does nothing', () => {
+    const run = vi.fn(async () => null);
+    render(<Stage factor={ready('totp', { run })} />);
+    fireEvent.keyDown(passwordField(), { key: 'Enter', isComposing: true });
+    expect(run).not.toHaveBeenCalled();
+    fireEvent.keyDown(passwordField(), { key: 'Enter' });
+    expect(run).toHaveBeenCalledOnce();
   });
 });

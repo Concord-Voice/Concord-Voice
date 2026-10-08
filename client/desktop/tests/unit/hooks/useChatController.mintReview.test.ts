@@ -7,6 +7,7 @@ import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { ChatContext } from '@/renderer/types/chat';
 import { FIXTURE_PW } from '../../helpers/stepUpTokenWire';
+import { confirmAndSettle, confirmInFlight } from '../../helpers/confirmDelete';
 
 // Reproductions from the #3509 frontend review for the delete flow:
 // M1 — a mint refusal with mfa_required (the account enrolled MFA after the
@@ -14,8 +15,11 @@ import { FIXTURE_PW } from '../../helpers/stepUpTokenWire';
 //      not leave a password prompt that can never pass;
 // M2 — a 404 from the mint (a server older than the step-up endpoint) gets
 //      copy saying the server does not support this yet, not "try again";
-// L3 — the previous error is cleared when a retry starts, so a repeated
-//      identical refusal is announced again.
+// L3 — a retry in flight leaves the slot as it was and resolves to the outcome
+//      the factor hook words in place. (The old L3 cleared the view's error when
+//      a retry started, so a repeated identical refusal announced again; the
+//      view carries no per-attempt error for the stage to clear any more, and
+//      the hook's own notice handles the repeat.)
 
 vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({ getState: () => 'connected' }),
@@ -80,9 +84,7 @@ describe('useChatController mint refusals (#3509 frontend review)', () => {
       })
     );
 
-    await act(async () => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
 
     await waitFor(() =>
       expect(hook.result.current.deleteRefusal?.view).toEqual({
@@ -90,47 +92,80 @@ describe('useChatController mint refusals (#3509 frontend review)', () => {
         methods: ['webauthn'],
       })
     );
+    // The factor hook moves to the same methods from the outcome.
+    expect(outcome).toEqual({
+      kind: 'refusal',
+      refusal: { kind: 'mfaRequired', methods: ['webauthn'] },
+    });
   });
 
+  // FE1: typing again answers nothing, so the slot ends Close-only with the words.
   it('M2: a mint the server does not have is named as unsupported, not retryable', async () => {
     const hook = await refusedWithPassword();
     mockApiFetch.mockResolvedValueOnce(json(404, { error: 'Not Found' }));
 
-    await act(async () => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
 
     await waitFor(() =>
       expect(hook.result.current.deleteRefusal?.view).toEqual({
-        view: 'password',
-        error: "This server doesn't support this confirmation yet.",
+        view: 'failed',
+        message: "This server doesn't support this confirmation yet.",
       })
     );
+    // Typing again answers nothing, so the hook is told only that it was answered.
+    expect(outcome).toEqual({ kind: 'answered' });
   });
 
-  it('L3: a retry clears the previous error while it is in flight', async () => {
+  it('L3: a retry in flight leaves the view alone, then resolves to the invalid-password outcome', async () => {
     const hook = await refusedWithPassword();
-    mockApiFetch.mockResolvedValueOnce(json(403, { error: 'Invalid password' }));
-    await act(async () => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
-    await waitFor(() => expect(hook.result.current.deleteRefusal?.view).toHaveProperty('error'));
-
     let release!: (r: Response) => void;
     mockApiFetch.mockReturnValueOnce(new Promise<Response>((r) => (release = r)));
-    act(() => {
-      hook.result.current.confirmDelete({ currentPassword: FIXTURE_PW });
-    });
+
+    const pending = confirmInFlight(hook, { currentPassword: FIXTURE_PW });
 
     expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'password' });
     await act(async () => {
       release(json(403, { error: 'Invalid password' }));
+      await pending;
     });
-    await waitFor(() =>
-      expect(hook.result.current.deleteRefusal?.view).toEqual({
-        view: 'password',
-        error: 'That password is not correct.',
-      })
-    );
+    await expect(pending).resolves.toEqual({
+      kind: 'refusal',
+      refusal: { kind: 'invalidPassword' },
+    });
+    expect(hook.result.current.deleteRefusal?.view).toEqual({
+      view: 'password',
+      error: 'That password is not correct.',
+    });
+  });
+
+  // D7: nothing was sent, so nothing is shown and nothing is reported.
+  it('D7: an exchange apiFetch refuses to dispatch is aborted and leaves the slot as it was', async () => {
+    const hook = await refusedWithPassword();
+    mockApiFetch.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
+    const before = hook.result.current.deleteRefusal;
+
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+    expect(outcome).toEqual({ kind: 'aborted' });
+    expect(hook.result.current.deleteRefusal).toEqual(before);
+    expect(hook.result.current.deleteRefusal?.view).toEqual({ view: 'password' });
+    // The mint left no delete behind it.
+    expect(mockApiFetch.mock.calls.map((c) => c[0])).toEqual([
+      '/api/v1/messages/m1',
+      '/api/v1/auth/step-up/password',
+    ]);
+  });
+
+  it('D7: a mint that failed in transport ends the challenge with its words, not aborted', async () => {
+    const hook = await refusedWithPassword();
+    mockApiFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+
+    const outcome = await confirmAndSettle(hook, { currentPassword: FIXTURE_PW });
+
+    expect(outcome).toEqual({ kind: 'answered' });
+    expect(hook.result.current.deleteRefusal?.view).toEqual({
+      view: 'failed',
+      message: "We couldn't check your password. Try again.",
+    });
   });
 });

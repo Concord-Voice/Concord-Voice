@@ -2,7 +2,7 @@
  * base64url ↔ ArrayBuffer codecs (RFC 4648 §5) for WebAuthn payloads:
  * server options arrive base64url-encoded and navigator.credentials
  * consumes/produces raw ArrayBuffers. Single shared copy — previously
- * duplicated privately in Login.tsx, MFASetup.tsx, and MFAVerifyPrompt.tsx.
+ * duplicated privately in Login.tsx and MFASetup.tsx.
  */
 
 export function base64urlToBuffer(base64url: string): ArrayBuffer {

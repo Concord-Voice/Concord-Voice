@@ -16,35 +16,12 @@
   margin: 0;
 }
 
-.delete-refusal-modal__field {
+/* The credential stage (StepUpCredentials styles its own fields): the intro,
+   the fields and the footer, spaced like the Close-only views around it. */
+.delete-refusal-modal__stage {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-
-.delete-refusal-modal__field label {
-  font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-secondary);
-}
-
-.delete-refusal-modal__field input {
-  padding: 10px 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  font-size: calc(14px * var(--font-scale, 1));
-}
-
-.delete-refusal-modal__field input:focus-visible {
-  outline: 2px solid var(--state-focused);
-  outline-offset: 1px;
-}
-
-.delete-refusal-modal__field-error {
-  font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-primary);
-  margin: 0;
+  gap: 16px;
 }
 
 .delete-refusal-modal__actions {
@@ -91,7 +68,9 @@
   outline-offset: 2px;
 }
 
-.delete-refusal-modal__confirm:disabled {
+/* aria-disabled, not disabled: the primary stays focusable and its click says
+   what is missing. It reads as the disabled button does. */
+.delete-refusal-modal__confirm[aria-disabled='true'] {
   opacity: 0.5;
   cursor: not-allowed;
 }

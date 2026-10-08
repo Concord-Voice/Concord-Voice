@@ -46,11 +46,6 @@ export const FieldError: React.FC<FieldErrorProps> = ({ id, children }) => (
 
 interface ErrorBannerProps {
   error: string;
-  /** When `'mfa'`, the banner is suppressed — the MFA-specific error already
-   * renders inline inside `MFAVerifyPrompt`, and duplicating it here would
-   * show the same refusal twice. Callers with no field concept (the action
-   * modal) simply never pass `'mfa'`. */
-  errorField?: string;
   size?: number;
 }
 
@@ -62,8 +57,8 @@ interface ErrorBannerProps {
  * private component inside `MFASetup.tsx`; extracted so both surfaces reuse
  * the exact same markup instead of drifting apart.
  */
-const ErrorBanner: React.FC<ErrorBannerProps> = ({ error, errorField = '', size = 16 }) => {
-  if (!error || errorField === 'mfa') return null;
+const ErrorBanner: React.FC<ErrorBannerProps> = ({ error, size = 16 }) => {
+  if (!error) return null;
   return (
     <div className="mfa-setup-error-banner" role="alert">
       <AlertGlyph size={size} />

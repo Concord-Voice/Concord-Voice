@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { http, HttpResponse } from 'msw';
-import { render, screen, userEvent } from '../../../test-utils';
+import { render, screen, userEvent, waitFor } from '../../../test-utils';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { FIXTURE_PW, MINT_PATH } from '../../../helpers/stepUpTokenWire';
@@ -17,15 +17,16 @@ beforeEach(() => resetAllStores());
 
 describe('PurgeMessagesModal soft-lock factor change', () => {
   it('keeps focus in the dialog when the password stage becomes a security-key prompt', async () => {
-    // The channel/server soft-lock keeps its own prompt: it must never start
-    // the DM step-up stage's requirements read (GET /api/v1/mfa/step-up).
+    // The soft-lock stage reads the account's methods before it offers the
+    // password field (an account with no inline method). Focus must stay in
+    // the dialog throughout, including across that read and the mint's reply.
     let reads = 0;
     server.use(
       http.get('*/api/v1/mfa/step-up', () => {
         reads += 1;
         return HttpResponse.json({
-          methods: ['totp'],
-          default_method: 'totp',
+          methods: [],
+          default_method: null,
           backup_code_available: false,
         });
       }),
@@ -58,13 +59,22 @@ describe('PurgeMessagesModal soft-lock factor change', () => {
     );
     await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
     await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
-    // Submitted from the field itself, so the focused element is the one that
-    // unmounts when the challenge changes.
-    await user.type(await screen.findByLabelText('Password'), `${FIXTURE_PW}{Enter}`);
+    const field = await screen.findByLabelText('Password');
+    await user.type(field, FIXTURE_PW);
+    // The field is focused when the challenge changes, so it is the focused
+    // element that unmounts.
+    field.focus();
+    const dialog = screen.getByRole('dialog');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.click(screen.getByRole('button', { name: 'Confirm and Purge' }));
 
-    await screen.findByRole('button', { name: 'Verify with security key' });
+    // The mint named a security key: the password field gives way to the key's
+    // panel (a single method, so its own primary rather than a picker).
+    await waitFor(() => expect(screen.queryByLabelText('Password')).not.toBeInTheDocument());
+    expect(await screen.findByText('Passkey or security key')).toBeInTheDocument();
     expect(document.activeElement).not.toBe(document.body);
     expect(screen.getByRole('dialog').contains(document.activeElement)).toBe(true);
-    expect(reads).toBe(0);
+    // The requirements read is allowed, and it happens (the field waited for it).
+    expect(reads).toBeGreaterThan(0);
   });
 });

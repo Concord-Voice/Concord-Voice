@@ -384,6 +384,8 @@ describe('codeProvenUnspent', () => {
     mfaRequired: { refusal: { kind: 'mfaRequired', methods: ['totp'] }, unspent: true },
     passwordRequired: { refusal: { kind: 'passwordRequired' }, unspent: true },
     rateLimited: { refusal: { kind: 'rateLimited' }, unspent: true },
+    // Mutant: enrolment missing from the list (C30): a TOTP acceptance would be recorded.
+    enrollmentRequired: { refusal: { kind: 'enrollmentRequired' }, unspent: true },
     deleteRateLimited: {
       refusal: { kind: 'deleteRateLimited', methods: ['totp'] },
       unspent: false,
@@ -397,7 +399,7 @@ describe('codeProvenUnspent', () => {
     failed: { refusal: { kind: 'failed' }, unspent: false },
   };
 
-  // Mutants: true for anything outside the five, or false for one of them.
+  // Mutants: true for anything outside the six, or false for one of them.
   it.each(Object.entries(REFUSALS))('%s', (_kind, { refusal, unspent }) => {
     expect(codeProvenUnspent(refusal)).toBe(unspent);
   });

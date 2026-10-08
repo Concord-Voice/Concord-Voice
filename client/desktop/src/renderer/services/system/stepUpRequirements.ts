@@ -120,14 +120,17 @@ export function isBackupShaped(code: string): boolean {
 /**
  * True for a refusal that proves the submitted code was not spent, so a
  * TOTP-shaped code is not recorded as accepted (C30). Every other answer,
- * including success and a lost response, may have spent it.
+ * including success and a lost response, may have spent it. Only the kind is
+ * read, so a route adapter's refusal (`mfaRequired` with `methods: null`)
+ * answers the same way.
  */
-export function codeProvenUnspent(refusal: StepUpRefusal): boolean {
+export function codeProvenUnspent(refusal: Pick<StepUpRefusal, 'kind'>): boolean {
   switch (refusal.kind) {
     case 'invalidMfaCode':
     case 'invalidPassword':
     case 'mfaRequired':
     case 'passwordRequired':
+    case 'enrollmentRequired':
     case 'rateLimited':
       return true;
     default:

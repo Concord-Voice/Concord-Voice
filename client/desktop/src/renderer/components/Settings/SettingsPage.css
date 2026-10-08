@@ -1118,11 +1118,14 @@
   transition: all 0.15s ease;
 }
 
-.revoke-all-modal-confirm-btn:hover:not(:disabled) {
+.revoke-all-modal-confirm-btn:hover:not(:disabled):not([aria-disabled='true']) {
   opacity: 0.9;
 }
 
-.revoke-all-modal-confirm-btn:disabled {
+/* The step-up primary is aria-disabled, not disabled: it stays focusable so its
+   activation guard can say what is missing. `:disabled` never matches it. */
+.revoke-all-modal-confirm-btn:disabled,
+.revoke-all-modal-confirm-btn[aria-disabled='true'] {
   opacity: 0.5;
   cursor: not-allowed;
 }

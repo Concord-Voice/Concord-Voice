@@ -20,6 +20,7 @@ import {
   useStepUpFactor,
   type StepUpFactor,
   type StepUpFactorProps,
+  type StepUpFactorRefusal,
   type StepUpSubmit,
   type StepUpSubmitOutcome,
 } from '@/renderer/hooks/auth/useStepUpFactor';
@@ -34,7 +35,6 @@ import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
-import type { StepUpRefusal } from '@/renderer/services/system/stepUpRefusal';
 
 const READ = '/api/v1/mfa/step-up';
 const BEGIN = '/api/v1/mfa/webauthn/verify-inline/begin';
@@ -151,7 +151,7 @@ function submitting(outcome: StepUpSubmitOutcome) {
   return vi.fn<StepUpSubmit>(async () => outcome);
 }
 
-function refusal(r: StepUpRefusal): StepUpSubmitOutcome {
+function refusal(r: StepUpFactorRefusal): StepUpSubmitOutcome {
   return { kind: 'refusal', refusal: r };
 }
 
@@ -508,7 +508,7 @@ describe('firstMissing and announceMissing', () => {
       typeCode(view, '');
 
       expect(view.result.current.passwordLegShown).toBe(false);
-      expect(view.result.current.firstMissing('')).toBe('code');
+      expect(view.result.current.status).toEqual({ kind: 'ready' });
     });
   });
 
@@ -837,6 +837,71 @@ describe('an account or server change ends the run with nothing further sent', (
     expect(submit).toHaveBeenCalledTimes(1);
   });
 
+  // SE3: the instance captured its account and server when it opened, so a
+  // change BEFORE the activation is caught too, not only one during it.
+  // Mutant: `run` defaulting to a capture taken at activation, not at open.
+  // That default alone survives by design: the gate's `opened` check catches it.
+  it.each(changes)('between open and activation, for a code: %s', async (_name, change) => {
+    const view = await mountTotp();
+    change();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+
+    expect(submit).not.toHaveBeenCalled();
+    expect(view.result.current.status).toEqual({ kind: 'sessionExpired' });
+    expect(view.result.current.code).toBe('');
+  });
+
+  it.each(changes)('between open and activation, for a security key: %s', async (_n, change) => {
+    const view = await mountReady();
+    change();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+
+    expect(hits(BEGIN)).toHaveLength(0);
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(view.result.current.status).toEqual({ kind: 'sessionExpired' });
+  });
+
+  // Mutant: a host's capture admitted without the instance's own check, so a
+  // capture taken after the change carries what was typed before it.
+  it.each(changes)('with a host capture taken after the change: %s', async (_name, change) => {
+    const view = await mountTotp();
+    change();
+    const capture = captureApiRequestContext();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit, capture)).toBeNull();
+
+    expect(submit).not.toHaveBeenCalled();
+    expect(view.result.current.status).toEqual({ kind: 'sessionExpired' });
+  });
+
+  // Positive controls for the three above: the same flows with no change send.
+  it('sends the code when nothing changed since the instance opened', async () => {
+    const view = await mountTotp();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toEqual({ kind: 'success' });
+
+    expect(submit).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends when only the access token refreshed between open and activation', async () => {
+    const view = await mountTotp();
+    useAuthStore.setState({ accessToken: 'refreshed-token' });
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toEqual({ kind: 'success' });
+    typeCode(view, '654321');
+    expect(await run(view, submit, captureApiRequestContext())).toEqual({ kind: 'success' });
+
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
   it('ends in sessionExpired when begin answers 401', async () => {
     const view = await mountReady();
     routes[BEGIN] = () => json({ error: 'Unauthorized' }, 401);
@@ -990,6 +1055,8 @@ describe('recording a TOTP acceptance (S2a)', () => {
     ['mfaRequired', refusal({ kind: 'mfaRequired', methods: ['totp'] }), false],
     ['passwordRequired', refusal({ kind: 'passwordRequired' }), false],
     ['rateLimited', refusal({ kind: 'rateLimited' }), false],
+    // Mutant: `codeProvenUnspent` missing enrolment (C30, E8).
+    ['enrollmentRequired', refusal({ kind: 'enrollmentRequired' }), false],
     ['aborted', { kind: 'aborted' }, false],
   ])('%s -> recorded: %s', async (_name, outcome, expected) => {
     const view = await mountTotp();
@@ -1123,6 +1190,40 @@ describe('a refusal of the gated request', () => {
     expect(view.result.current.code).toBe('123456');
     expect(view.result.current.attempt).toBe(0);
     expect(view.result.current.phase).toBe('idle');
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // A route limiter answers before anything is read (C30), so the code is the
+  // user's to send once the limit lifts. Mutant: `rateLimited` falling to the
+  // default arm, which clears the code and remounts the input (picker PR 3 review).
+  it('keeps the code and the input on a rateLimited refusal', async () => {
+    const view = await mountTotp();
+
+    await run(view, submitting(refusal({ kind: 'rateLimited' })));
+
+    expect(view.result.current.code).toBe('123456');
+    expect(view.result.current.attempt).toBe(0);
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.phase).toBe('idle');
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+  });
+
+  // A 401 after `apiFetch`'s refresh retry: nothing this instance sends can
+  // pass. Mutant: `sessionExpired` falling to the default arm, which left the
+  // stage ready, the password leg shown, and the activation live.
+  it('ends the instance on a sessionExpired refusal and sends nothing more', async () => {
+    const view = await mountTotp();
+
+    await run(view, submitting(refusal({ kind: 'sessionExpired' })));
+
+    expect(view.result.current.status).toEqual({ kind: 'sessionExpired' });
+    expect(view.result.current.code).toBe('');
+    expect(view.result.current.passwordLegShown).toBe(false);
+    expect(view.result.current.firstMissing('hunter2')).toBe('unavailable');
+    typeCode(view, '654321');
+    const submit = submitting({ kind: 'success' });
+    expect(await run(view, submit)).toBeNull();
+    expect(submit).not.toHaveBeenCalled();
     expect(hits(READ)).toHaveLength(1);
   });
 
@@ -1479,5 +1580,843 @@ describe('a ceremony that mints no token', () => {
     expect(await run(view, submit)).toBeNull();
     expect(await run(view, submit)).toEqual({ kind: 'success' });
     expect(hits(BEGIN)).toHaveLength(2);
+  });
+});
+
+// ── G2 / C4 / C26 / E8: the seed, the floor and enrolment ────────────────
+
+const SEED_TOTP: StepUpFactorRefusal = { kind: 'mfaRequired', methods: ['totp'] };
+
+describe('the seed (G2)', () => {
+  // Mutants: the seed ignored; email or SMS admitted from it (G1).
+  it('seeds the inline intersection of an mfaRequired list, strongest first', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({
+      seed: { kind: 'mfaRequired', methods: ['sms', 'totp', 'email', 'webauthn'] },
+    });
+
+    expect(view.result.current.status).toEqual({ kind: 'reading' });
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+    // The strongest member is the default.
+    expect(view.result.current.method).toBe('webauthn');
+    await act(async () => answer.resolve(readBody(['totp'], 'totp')));
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+  });
+
+  // Mutant: a seed naming a security key kept on a route with no purpose.
+  it('seeds no security key on a route without a purpose', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({
+      purpose: null,
+      seed: { kind: 'mfaRequired', methods: ['webauthn', 'totp'] },
+    });
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+    await act(async () => answer.resolve(readBody(['totp'], 'totp')));
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+  });
+
+  // Mutants: `methods: null` seeding an empty list (or no usable method); the
+  // read's set not standing once it lands.
+  it('seeds nothing for methods: null, so the read set stands', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({ seed: { kind: 'mfaRequired', methods: null } });
+
+    expect(view.result.current.status).toEqual({ kind: 'reading' });
+    expect(view.result.current.methods).toEqual([]);
+    expect(view.result.current.method).toBeNull();
+
+    await act(async () => answer.resolve(readBody(['webauthn', 'totp'], 'totp', true)));
+    await waitFor(() => expect(view.result.current.status).toEqual({ kind: 'ready' }), SETTLE);
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp', 'backup']);
+    expect(view.result.current.method).toBe('totp');
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: passwordRequired seeding a set, or ending the instance, on whenNoMfa.
+  it('seeds an empty set for passwordRequired on a whenNoMfa route, and the read still runs', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({
+      passwordLeg: 'whenNoMfa', // pragma: allowlist secret
+      seed: { kind: 'passwordRequired' },
+    });
+
+    expect(view.result.current.status).toEqual({ kind: 'reading' });
+    expect(view.result.current.methods).toEqual([]);
+    expect(view.result.current.method).toBeNull();
+
+    await act(async () => answer.resolve(readBody(['totp'], 'totp')));
+    await waitFor(() => expect(view.result.current.status).toEqual({ kind: 'ready' }), SETTLE);
+    expect(view.result.current.methods).toEqual(['totp']);
+  });
+
+  // Mutants: enrolment seeded as reading; a read sent for it; the primary able to act.
+  it('ends an enrollmentRequired seed at once, with no read and nothing to submit', async () => {
+    const view = mount({ seed: { kind: 'enrollmentRequired' } });
+    await act(async () => {});
+
+    expect(view.result.current.status).toEqual({ kind: 'enrollmentRequired' });
+    expect(view.result.current.methods).toEqual([]);
+    expect(view.result.current.method).toBeNull();
+    expect(view.result.current.passwordLegShown).toBe(false);
+    expect(view.result.current.firstMissing('hunter2')).toBe('unavailable');
+    expect(hits(READ)).toHaveLength(0);
+    const submit = submitting({ kind: 'success' });
+    expect(await run(view, submit)).toBeNull();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  // Mutant: a seed naming only email or SMS left reading, or offering them (G1).
+  it('ends a seeded mfaRequired naming only email in noUsableMethod, with no read', async () => {
+    const view = mount({ seed: { kind: 'mfaRequired', methods: ['email'] } });
+    await act(async () => {});
+
+    expect(view.result.current.status).toEqual({ kind: 'noUsableMethod' });
+    expect(view.result.current.methods).toEqual([]);
+    expect(view.result.current.method).toBeNull();
+    expect(hits(READ)).toHaveLength(0);
+  });
+
+  it.each<[string, StepUpFactorRefusal]>([
+    ['invalidPassword', { kind: 'invalidPassword' }],
+    ['invalidMfaCode', { kind: 'invalidMfaCode' }],
+    ['sessionExpired', { kind: 'sessionExpired' }],
+  ])('seeds nothing for %s and still reads', async (_name, seed) => {
+    routes[READ] = () => readBody(['totp'], 'totp');
+
+    const view = await mountReady({ seed });
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: the seed read again on a re-render (it applies when an instance starts).
+  it('is read only when an instance starts', async () => {
+    routes[READ] = () => readBody(['webauthn', 'totp'], 'totp');
+    const view = await mountReady({ seed: SEED_TOTP });
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+
+    view.rerender({ ...BASE, seed: { kind: 'enrollmentRequired' } });
+    await act(async () => {});
+
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+  });
+});
+
+describe('a seeded set against the read (G2)', () => {
+  // Mutant: `ready` merging into, or losing to, the seeded set.
+  it('is replaced by a ready read', async () => {
+    routes[READ] = () => readBody(['webauthn'], 'webauthn', true);
+
+    const view = await mountReady({ seed: SEED_TOTP });
+
+    // `totp` was seeded, the read did not list it, and `backup` needs TOTP.
+    expect(view.result.current.methods).toEqual(['webauthn']);
+    expect(view.result.current.method).toBe('webauthn');
+  });
+
+  // Mutants: `unsupported` resetting the set to the floor; a backup code
+  // offered on a seed-only set; the default lost.
+  it('is kept by an unsupported read, with no backup and the strongest member as default', async () => {
+    routes[READ] = () => json({ error: 'not found' }, 404);
+
+    const view = await mountReady({
+      seed: { kind: 'mfaRequired', methods: ['totp', 'webauthn'] },
+    });
+
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+    expect(view.result.current.method).toBe('webauthn');
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+  });
+
+  // Mutant: `unavailable` resetting the set, on either read-failure policy.
+  it('is kept by an unavailable read on a passwordOnly route, with no backup', async () => {
+    routes[READ] = () => json({}, 503);
+
+    const view = await mountReady({ seed: SEED_TOTP, readFailure: 'passwordOnly' });
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+  });
+
+  it('is kept by an unavailable read on a block route, which stays blocked', async () => {
+    routes[READ] = () => json({}, 503);
+
+    const view = mount({ seed: SEED_TOTP, readFailure: 'block' });
+    await waitFor(() => expect(view.result.current.status).toEqual({ kind: 'blocked' }), SETTLE);
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+  });
+
+  // Mutant: a refused read leaving the seeded set usable beside a terminal status.
+  it('does not outlive a refused read', async () => {
+    routes[READ] = () => json({ code: 'EMAIL_NOT_VERIFIED' }, 403);
+
+    const view = mount({ seed: SEED_TOTP });
+
+    await waitFor(
+      () =>
+        expect(view.result.current.status).toEqual({ kind: 'refused', reason: 'emailUnverified' }),
+      SETTLE
+    );
+  });
+});
+
+describe('floorMethods (C4, C26)', () => {
+  // Mutant: the floor ignored, or replaced by the read.
+  it('offers the floor and the read, strongest first', async () => {
+    routes[READ] = () => readBody(['webauthn'], 'webauthn');
+
+    const view = await mountReady({ floorMethods: ['totp'] });
+
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+  });
+
+  it('keeps a floor member the read does not list', async () => {
+    routes[READ] = () => readBody([], null);
+
+    const view = await mountReady({ floorMethods: ['totp'] });
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+  });
+
+  // Mutant: the floor applied only after the read, so the first paint has no code box.
+  it('offers the floor while the read is in flight', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({ floorMethods: ['totp'] });
+
+    expect(view.result.current.status).toEqual({ kind: 'reading' });
+    expect(view.result.current.methods).toEqual(['totp']);
+    await act(async () => answer.resolve(readBody(['totp'], 'totp')));
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+  });
+
+  // Mutant: a read run when there is a floor and no purpose.
+  it('with purpose: null runs no read, and is ready at once', async () => {
+    const view = mount({ purpose: null, floorMethods: ['totp'] });
+    await act(async () => {});
+
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+    expect(hits(READ)).toHaveLength(0);
+  });
+
+  // Mutant: a security key kept in a read-free floor (it needs a purpose).
+  it('with purpose: null drops a security key from the floor', async () => {
+    const view = mount({ purpose: null, floorMethods: ['webauthn', 'totp'] });
+    await act(async () => {});
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(hits(READ)).toHaveLength(0);
+  });
+
+  // Mutant: a read-free instance running the C13 re-read after a bad code.
+  it('with purpose: null runs no re-read after invalidMfaCode either', async () => {
+    const view = mount({ purpose: null, floorMethods: ['totp'] });
+    typeCode(view, '123456');
+
+    await run(view, submitting(refusal({ kind: 'invalidMfaCode' })));
+    await act(async () => {});
+
+    expect(hits(READ)).toHaveLength(0);
+    expect(view.result.current.reread).toBeNull();
+  });
+
+  // Mutant: a floor with no purpose that drops every member still skipping the read.
+  it('with purpose: null and a floor of only a security key still reads', async () => {
+    routes[READ] = () => readBody(['totp'], 'totp');
+
+    const view = await mountReady({ purpose: null, floorMethods: ['webauthn'] });
+
+    expect(hits(READ)).toHaveLength(1);
+    expect(view.result.current.methods).toEqual(['totp']);
+  });
+
+  // Mutants: a failed read emptying the floor, on any policy.
+  it.each<[string, Response | (() => Response), 'block' | 'passwordOnly']>([
+    ['an unavailable read on a passwordOnly route', () => json({}, 503), 'passwordOnly'],
+    ['an unsupported read', () => json({}, 404), 'passwordOnly'],
+    ['an unavailable read on a block route', () => json({}, 503), 'block'],
+  ])('survives %s', async (_name, answer, readFailure) => {
+    routes[READ] = typeof answer === 'function' ? answer : () => answer;
+
+    const view = mount({ floorMethods: ['totp'], readFailure });
+    await waitFor(() => expect(view.result.current.status.kind).not.toBe('reading'), SETTLE);
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+  });
+
+  // Mutants: a re-read replacing the set outright; an empty re-read removing
+  // the floor member (C26).
+  it('survives a re-read that returns no methods', async () => {
+    let reads = 0;
+    routes[READ] = () =>
+      ++reads === 1 ? readBody(['webauthn', 'totp'], 'webauthn') : readBody([], null);
+    const view = await mountReady({ floorMethods: ['totp'] });
+    typeCode(view, '123456');
+    // Panels are `webauthn` first: move to the floor member before submitting.
+    act(() => view.result.current.switchTo('totp'));
+    typeCode(view, '123456');
+
+    await run(view, submitting(refusal({ kind: 'invalidMfaCode' })));
+    await waitFor(() => expect(view.result.current.reread?.kind).toBe('ready'), SETTLE);
+
+    expect(hits(READ)).toHaveLength(2);
+    // The re-read dropped the key but not the floor member, so nothing moved.
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+    expect(view.result.current.notice).toEqual({ kind: 'invalidFactor', method: 'totp' });
+  });
+
+  // Mutant: a refusal list replacing the floor (C26).
+  it('survives an mfaRequired list that does not name it', async () => {
+    routes[READ] = () => readBody(['webauthn', 'totp'], 'webauthn');
+    const view = await mountReady({ floorMethods: ['totp'] });
+
+    await run(view, submitting(refusal({ kind: 'mfaRequired', methods: ['webauthn'] })));
+
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+  });
+
+  // Mutant: a list naming only email ending the instance although the floor offers a code.
+  it('keeps an mfaRequired list naming only email out of noUsableMethod', async () => {
+    routes[READ] = () => readBody(['totp'], 'totp');
+    const view = await mountReady({ floorMethods: ['totp'] });
+    typeCode(view, '123456');
+
+    await run(view, submitting(refusal({ kind: 'mfaRequired', methods: ['email'] })));
+
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+  });
+
+  // Mutant: the floor dropped from a seed's set.
+  it('joins a seeded set', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({
+      floorMethods: ['totp'],
+      seed: { kind: 'mfaRequired', methods: ['webauthn'] },
+    });
+
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+    await act(async () => answer.resolve(readBody([], null)));
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+    // A ready read replaces the seed but not the floor.
+    expect(view.result.current.methods).toEqual(['totp']);
+  });
+
+  // Mutant: a null-methods refusal emptying the set it did not name (#7).
+  it('survives an adapter mfaRequired with methods: null', async () => {
+    routes[READ] = () => readBody(['webauthn', 'totp'], 'webauthn');
+    const view = await mountReady({ floorMethods: ['totp'] });
+    typeCode(view, '123456');
+    act(() => view.result.current.switchTo('totp'));
+    typeCode(view, '123456');
+
+    await run(view, submitting(refusal({ kind: 'mfaRequired', methods: null })));
+
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+    expect(view.result.current.method).toBe('totp');
+    expect(view.result.current.notice).toEqual({ kind: 'missing', field: 'totp' });
+    expect(view.result.current.code).toBe('');
+  });
+});
+
+describe('an mfaRequired refusal with methods: null (#7, §2)', () => {
+  // Mutant: `null` read as an empty list, emptying the set the read learned.
+  it('leaves the read set standing and asks for the active factor again', async () => {
+    routes[READ] = () => readBody(['webauthn', 'totp'], 'totp', true);
+    const view = await mountReady();
+    typeCode(view, '123456');
+
+    await run(view, submitting(refusal({ kind: 'mfaRequired', methods: null })));
+
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp', 'backup']);
+    expect(view.result.current.method).toBe('totp');
+    expect(view.result.current.notice).toEqual({ kind: 'missing', field: 'totp' });
+    expect(view.result.current.code).toBe('');
+    expect(view.result.current.attempt).toBe(1);
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: `codeProvenUnspent` keyed on the list rather than the kind.
+  it('records no TOTP acceptance: the code was provably unspent', async () => {
+    const view = await mountTotp();
+
+    await run(view, submitting(refusal({ kind: 'mfaRequired', methods: null })));
+
+    expect(useTotpAcceptedStore.getState().acceptedAt).toEqual({});
+  });
+});
+
+describe('enrolment required (E8)', () => {
+  // Mutants: the arm falling to the default (a retry no input can complete);
+  // a re-read started; the code kept.
+  it('is terminal for the instance: no panel, no password leg, no further read', async () => {
+    const view = await mountTotp();
+
+    expect(await run(view, submitting(refusal({ kind: 'enrollmentRequired' })))).toEqual({
+      kind: 'refusal',
+      refusal: { kind: 'enrollmentRequired' },
+    });
+    await act(async () => {});
+
+    expect(view.result.current.status).toEqual({ kind: 'enrollmentRequired' });
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.phase).toBe('idle');
+    expect(view.result.current.code).toBe('');
+    expect(view.result.current.passwordLegShown).toBe(false);
+    expect(view.result.current.firstMissing('hunter2')).toBe('unavailable');
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: a terminal status that still lets the activation send.
+  it('sends nothing on a later activation', async () => {
+    const view = await mountTotp();
+    await run(view, submitting(refusal({ kind: 'enrollmentRequired' })));
+    typeCode(view, '654321');
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  // Mutant: `codeProvenUnspent` missing enrolment, so the S2a hint records a
+  // code the server never read.
+  it('records no TOTP acceptance', async () => {
+    const view = await mountTotp();
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+
+    await run(view, submitting(refusal({ kind: 'enrollmentRequired' })));
+
+    expect(useTotpAcceptedStore.getState().acceptedAt).toEqual({});
+  });
+
+  // Mutant: the arm gated on the route's password policy.
+  it('is terminal on a whenNoMfa route and a read-free floor route too', async () => {
+    routes[READ] = () => readBody(['totp'], 'totp');
+    const whenNoMfa = await mountReady({ passwordLeg: 'whenNoMfa' }); // pragma: allowlist secret
+    typeCode(whenNoMfa, '123456');
+    await run(whenNoMfa, submitting(refusal({ kind: 'enrollmentRequired' })));
+    expect(whenNoMfa.result.current.status).toEqual({ kind: 'enrollmentRequired' });
+
+    const floor = mount({ purpose: null, floorMethods: ['totp'] });
+    typeCode(floor, '123456');
+    await run(floor, submitting(refusal({ kind: 'enrollmentRequired' })));
+    expect(floor.result.current.status).toEqual({ kind: 'enrollmentRequired' });
+  });
+});
+
+// ── D19: a spent WebAuthn quota says nothing about the key ───────────────
+
+describe('a 429 from the inline WebAuthn ceremony (D19)', () => {
+  const RATE_LIMITED = { kind: 'webauthnRateLimited' };
+
+  /** A security-key instance with a partial code already typed, to prove it survives. */
+  async function mountKey() {
+    const view = await mountReady();
+    typeCode(view, '123');
+    return view;
+  }
+
+  // Mutant: a 429 mapped back to INVALID_WEBAUTHN, blaming the key for the quota.
+  it('begin answering 429 shows the rate-limit notice, not the invalid-key one', async () => {
+    routes[BEGIN] = () => json({ error: 'Too many requests' }, 429);
+    const view = await mountKey();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+
+    expect(view.result.current.notice).toEqual(RATE_LIMITED);
+    expect(view.result.current.phase).toBe('idle');
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(hits(FINISH)).toHaveLength(0);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  // Mutant: as above, on the finish step.
+  it('finish answering 429 shows the rate-limit notice, not the invalid-key one', async () => {
+    routes[FINISH] = () => json({ error: 'Too many requests' }, 429);
+    const view = await mountKey();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+
+    expect(view.result.current.notice).toEqual(RATE_LIMITED);
+    expect(view.result.current.phase).toBe('idle');
+    expect(mockGet).toHaveBeenCalledTimes(1);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  // Mutant: a 429 started the C25 re-read, or the notice cleared the code.
+  it.each([
+    ['begin', BEGIN],
+    ['finish', FINISH],
+  ] as const)('%s: no re-read, and the code is not cleared', async (_step, path) => {
+    routes[path] = () => json({ error: 'Too many requests' }, 429);
+    const view = await mountKey();
+    const attempt = view.result.current.attempt;
+
+    await run(view, submitting({ kind: 'success' }));
+    await act(async () => {});
+
+    expect(hits(READ)).toHaveLength(1);
+    expect(view.result.current.reread).toBeNull();
+    expect(view.result.current.code).toBe('123');
+    expect(view.result.current.attempt).toBe(attempt);
+  });
+
+  // Mutant: the 429 test placed after the C25 key-gone test, so a quota refusal
+  // carrying that body string re-reads and blames the key.
+  it('begin answering 429 with the no-credentials body still does not re-read', async () => {
+    routes[BEGIN] = () => json({ error: 'No WebAuthn credentials registered' }, 429);
+    const view = await mountKey();
+
+    await run(view, submitting({ kind: 'success' }));
+    await act(async () => {});
+
+    expect(view.result.current.notice).toEqual(RATE_LIMITED);
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: the rate-limit branch widened to every non-2xx status.
+  it('keeps the invalid-key notice for other failed answers', async () => {
+    routes[BEGIN] = () => json({ error: 'Failed to start verification' }, 503);
+    const view = await mountKey();
+
+    await run(view, submitting({ kind: 'success' }));
+
+    expect(view.result.current.notice).toEqual({ kind: 'invalidFactor', method: 'webauthn' });
+  });
+
+  it('can be tried again once the quota has recovered', async () => {
+    let answers = 0;
+    routes[BEGIN] = () =>
+      ++answers === 1
+        ? json({ error: 'Too many requests' }, 429)
+        : json({ publicKey: { challenge: 'AQID', rpId: 'localhost', allowCredentials: [] } });
+    const view = await mountReady();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+    expect(await run(view, submit)).toEqual({ kind: 'success' });
+
+    expect(view.result.current.notice).toBeNull();
+  });
+});
+
+// ── D21: the single-flight latch belongs to its attempt ──────────────────
+
+describe('the single-flight latch is bound to the attempt (D21)', () => {
+  /** Starts a TOTP run whose request never settles until the test says so. */
+  async function startHung(view: View) {
+    const answer = deferred<StepUpSubmitOutcome>();
+    const submit = vi.fn<StepUpSubmit>(() => answer.promise);
+    let pending!: Promise<StepUpSubmitOutcome | null>;
+    await act(async () => {
+      pending = view.result.current.run(submit);
+    });
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    return { answer, pending, submit };
+  }
+
+  async function reopen(view: View) {
+    view.rerender({ ...BASE, enabled: false });
+    view.rerender({ ...BASE, enabled: true });
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+  }
+
+  // Mutant: `endAttempt` bumping the attempt id but leaving the latch set, so a
+  // surface closed and reopened while a signal-less submit hangs never activates.
+  it('a hung submit, then close and reopen, leaves the new instance activatable', async () => {
+    const view = await mountTotp();
+    await startHung(view);
+
+    await reopen(view);
+    typeCode(view, '654321');
+    const fresh = submitting({ kind: 'success' });
+
+    expect(await run(view, fresh)).toEqual({ kind: 'success' });
+    expect(fresh).toHaveBeenCalledTimes(1);
+    expect(fresh.mock.calls[0][0]).toBe('654321');
+  });
+
+  // Mutant: `finally` clearing the latch unconditionally, so the old run
+  // settling late lets a second activation start beside the new run.
+  it("an older run's finally does not clear a newer run's latch", async () => {
+    const view = await mountTotp();
+    const old = await startHung(view);
+    await reopen(view);
+    typeCode(view, '654321');
+    // A second activation that read the instance before the new run committed
+    // its phase (the C6 double click): the latch is all that stops it.
+    const beforeCommit = view.result.current.run;
+    const newer = await startHung(view);
+
+    await act(async () => {
+      old.answer.resolve({ kind: 'success' });
+      await old.pending;
+    });
+    const third = submitting({ kind: 'success' });
+    let second: StepUpSubmitOutcome | null | undefined;
+    await act(async () => {
+      second = await beforeCommit(third);
+    });
+
+    expect(second).toBeNull();
+    expect(third).not.toHaveBeenCalled();
+
+    await act(async () => {
+      newer.answer.resolve({ kind: 'success' });
+      await newer.pending;
+    });
+    typeCode(view, '111111');
+    expect(await run(view, third)).toEqual({ kind: 'success' });
+  });
+
+  // Mutant: an old attempt's outcome applied to the instance that replaced it.
+  it("an old run's outcome is returned but not applied to the reopened instance", async () => {
+    const view = await mountTotp();
+    const old = await startHung(view);
+    await reopen(view);
+    typeCode(view, '654321');
+    const attempt = view.result.current.attempt;
+
+    await act(async () => {
+      old.answer.resolve(refusal({ kind: 'invalidMfaCode' }));
+      expect(await old.pending).toEqual(refusal({ kind: 'invalidMfaCode' }));
+    });
+    await act(async () => {});
+
+    expect(view.result.current.code).toBe('654321');
+    expect(view.result.current.attempt).toBe(attempt);
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.phase).toBe('idle');
+    // The refusal would have started a re-read; the instance that asked is gone.
+    expect(hits(READ)).toHaveLength(2);
+  });
+
+  // Mutant: the attempt ending only on `enabled`, so a configuration change
+  // leaves the ceremony running for the instance that replaced it.
+  it('a purpose change while open aborts the ceremony and applies nothing', async () => {
+    const view = await mountReady({ purpose: 'dm.purge' });
+    const credential = deferred<unknown>();
+    mockGet.mockImplementation(() => credential.promise);
+    const submit = submitting({ kind: 'success' });
+    let pending!: Promise<StepUpSubmitOutcome | null>;
+    await act(async () => {
+      pending = view.result.current.run(submit);
+    });
+    await waitFor(() => expect(mockGet).toHaveBeenCalled());
+    const { signal } = mockGet.mock.calls[0][0] as { signal: AbortSignal };
+    expect(signal.aborted).toBe(false);
+
+    view.rerender({ ...BASE, purpose: 'dm.clear' });
+
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      credential.resolve(CREDENTIAL);
+      expect(await pending).toBeNull();
+    });
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+
+    expect(hits(FINISH)).toHaveLength(0);
+    expect(submit).not.toHaveBeenCalled();
+    expect(view.result.current.phase).toBe('idle');
+    expect(view.result.current.notice).toBeNull();
+  });
+
+  // Mutant: the old submit's refusal landing on the new purpose's instance.
+  it('a purpose change while a request is out: the old outcome is not applied to the new instance', async () => {
+    const view = await mountTotp();
+    const old = await startHung(view);
+
+    view.rerender({ ...BASE, purpose: 'dm.clear' });
+    await waitFor(() => expect(view.result.current.status.kind).toBe('ready'), SETTLE);
+    typeCode(view, '654321');
+
+    await act(async () => {
+      old.answer.resolve(refusal({ kind: 'invalidMfaCode' }));
+      await old.pending;
+    });
+    await act(async () => {});
+
+    expect(view.result.current.code).toBe('654321');
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.phase).toBe('idle');
+    expect(hits(READ)).toHaveLength(2);
+    // And the latch the old run held is gone: the new instance can activate.
+    const fresh = submitting({ kind: 'success' });
+    expect(await run(view, fresh)).toEqual({ kind: 'success' });
+  });
+});
+
+// ── D11 / Q6 / C82: the host is still preparing ──────────────────────────
+
+describe('preparing (D11, Q6)', () => {
+  // Mutant: `preparing` treated as non-blocking, so the primary acts mid-preparation.
+  it('holds the primary down last: it is the only thing left once the form is complete', async () => {
+    const view = await mountTotp('123456', { preparing: true });
+
+    expect(view.result.current.firstMissing('hunter2')).toBe('preparing');
+
+    view.rerender({ ...BASE, preparing: false });
+    expect(view.result.current.firstMissing('hunter2')).toBeNull();
+  });
+
+  // Mutant: `preparing` checked before the fields, hiding what the user can still fill in.
+  it('names a missing password or code first, then reading, before preparing', async () => {
+    const view = await mountTotp('', { preparing: true });
+    expect(view.result.current.firstMissing('')).toBe('password');
+    expect(view.result.current.firstMissing('hunter2')).toBe('code');
+
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+    const reading = mount({ preparing: true });
+    expect(reading.result.current.firstMissing('hunter2')).toBe('reading');
+    await act(async () => answer.resolve(readBody(['totp'], 'totp')));
+  });
+
+  // Mutant: a terminal status reporting `preparing` instead of the state no input can complete.
+  it('a terminal status stays unavailable whatever the host is doing', async () => {
+    const view = mount({ preparing: true, seed: { kind: 'enrollmentRequired' } });
+
+    expect(view.result.current.status).toEqual({ kind: 'enrollmentRequired' });
+    expect(view.result.current.firstMissing('hunter2')).toBe('unavailable');
+  });
+
+  // Mutant: `missingNotice` mapping 'preparing' to null (or to the checking copy).
+  it('announces the preparing notice, and withdraws it once preparation finishes', async () => {
+    const view = await mountTotp('123456', { preparing: true });
+
+    act(() => view.result.current.announceMissing('preparing'));
+    expect(view.result.current.notice).toEqual({ kind: 'preparing' });
+
+    view.rerender({ ...BASE, preparing: false });
+    expect(view.result.current.notice).toBeNull();
+  });
+
+  // Mutant: `preparing` joining the instance key, which resets the dialog.
+  it('flipping preparing without a remount keeps the code and the instance', async () => {
+    const view = await mountTotp('123456', { preparing: true });
+    act(() => view.result.current.announceMissing('code'));
+    const before = view.result.current;
+
+    view.rerender({ ...BASE, preparing: false });
+    await act(async () => {});
+
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+    expect(view.result.current.code).toBe('123456');
+    expect(view.result.current.attempt).toBe(before.attempt);
+    expect(view.result.current.method).toBe('totp');
+    expect(view.result.current.notice).toEqual(before.notice);
+    expect(hits(READ)).toHaveLength(1);
+
+    view.rerender({ ...BASE, preparing: true });
+    expect(view.result.current.code).toBe('123456');
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: `run` taking a fresh capture instead of the caller's (C82): a
+  // capture taken before preparation would then be spent against the account
+  // that is current now.
+  it('run works against the capture it is given, not a fresh one', async () => {
+    const view = await mountTotp();
+    const capture = captureApiRequestContext();
+    switchAccount();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit, capture)).toBeNull();
+
+    expect(submit).not.toHaveBeenCalled();
+    expect(view.result.current.status).toEqual({ kind: 'sessionExpired' });
+  });
+
+  it('run hands the capture it was given to submit', async () => {
+    const view = await mountTotp();
+    const capture = captureApiRequestContext();
+    const submit = submitting({ kind: 'success' });
+
+    await run(view, submit, capture);
+
+    expect(submit.mock.calls[0][1]).toBe(capture);
+  });
+});
+
+// ── An expired confirmation (#3509, T1d) ─────────────────────────────────
+
+describe('an expired confirmation (#3509)', () => {
+  const EXPIRED: StepUpFactorRefusal = { kind: 'passwordRequired', tokenExpired: true };
+
+  // Mutant: `tokenExpired` ignored on a run's refusal, so the field says it is empty.
+  it('a refused token on an always route says the confirmation expired, and keeps the code', async () => {
+    const view = await mountTotp();
+
+    await run(view, submitting(refusal(EXPIRED)));
+
+    expect(view.result.current.notice).toEqual({ kind: 'tokenExpired' });
+    expect(view.result.current.methods).toEqual(['totp', 'backup']);
+    expect(view.result.current.code).toBe('123456');
+    expect(view.result.current.passwordLegShown).toBe(true);
+  });
+
+  // Mutant: the expired notice dropped on the whenNoMfa branch, or that branch's floor lost.
+  it('a refused token on a whenNoMfa route empties the set and says the confirmation expired', async () => {
+    routes[READ] = () => readBody(['totp'], 'totp', true);
+    const view = await mountReady({ passwordLeg: 'whenNoMfa' }); // pragma: allowlist secret
+    typeCode(view, '123456');
+
+    await run(view, submitting(refusal(EXPIRED)));
+
+    expect(view.result.current.notice).toEqual({ kind: 'tokenExpired' });
+    expect(view.result.current.methods).toEqual([]);
+    expect(view.result.current.passwordLegShown).toBe(true);
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+  });
+
+  // Mutant: `tokenExpired` ignored on the seed.
+  it('a seeded refused token says so from the start, and the read does not clear it', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+
+    const view = mount({
+      passwordLeg: 'whenNoMfa', // pragma: allowlist secret
+      seed: EXPIRED,
+    });
+
+    expect(view.result.current.notice).toEqual({ kind: 'tokenExpired' });
+    await act(async () => answer.resolve(readBody([], null)));
+    await waitFor(() => expect(view.result.current.status).toEqual({ kind: 'ready' }), SETTLE);
+    expect(view.result.current.passwordLegShown).toBe(true);
+    expect(view.result.current.notice).toEqual({ kind: 'tokenExpired' });
+  });
+
+  // Mutant: every passwordRequired seed worded as expired, or as an empty field.
+  it('an unmarked passwordRequired seed says nothing: it opened the surface, nothing was refused', async () => {
+    const view = await mountReady({ seed: { kind: 'passwordRequired' } });
+    expect(view.result.current.notice).toBeNull();
   });
 });

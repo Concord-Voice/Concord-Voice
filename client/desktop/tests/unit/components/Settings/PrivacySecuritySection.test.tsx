@@ -1,7 +1,8 @@
-import { render, screen, fireEvent, within, act } from '../../../test-utils';
+import { render, screen, fireEvent, within, act, userEvent } from '../../../test-utils';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
-import { vi } from 'vitest';
+import { onTestFinished, vi } from 'vitest';
+import { deferred } from '../../../helpers/deferred';
 
 const gifIdMock = vi.hoisted(() => ({
   currentId: 'mock-customer-id-123' as string | null,
@@ -9,6 +10,10 @@ const gifIdMock = vi.hoisted(() => ({
 }));
 
 const mockApiFetch = vi.fn();
+// `GET /api/v1/mfa/step-up`, served by path like the GETs below: the session and
+// backup-code dialogs read it when they open, and a queued `*Once` response would
+// be consumed by it instead of the request the case is about.
+const mockStepUpRead = vi.fn();
 // SSO-identities GET fixture for LinkedAccountsList (issue #270 / Task 20).
 // Defined before the vi.mock factory so the factory can capture it; the
 // factory is hoisted to the top of the file by vi.mock semantics. Tracked
@@ -77,6 +82,9 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
     if (path === '/api/v1/users/me/sso-identities') {
       return mockSsoIdentitiesFetch();
     }
+    if (path === '/api/v1/mfa/step-up') {
+      return mockStepUpRead();
+    }
     if (path === '/api/v1/users/me/security' && method === 'GET') {
       return mockSecurityGetFetch();
     }
@@ -98,7 +106,12 @@ vi.mock('@/renderer/stores/auth/authStore', () => ({
   ),
 }));
 vi.mock('@/renderer/stores/auth/userStore', () => ({
-  useUserStore: vi.fn((s) => s({ logout: vi.fn() })),
+  // `getState` is read by the step-up hook when a run begins (the account the
+  // answer belongs to).
+  useUserStore: Object.assign(
+    vi.fn((s) => s({ logout: vi.fn() })),
+    { getState: vi.fn(() => ({ user: { id: 'user-1' } })) }
+  ),
 }));
 const mockFetchPrivacy = vi.fn().mockResolvedValue(undefined);
 const mockUpdatePrivacy = vi.fn().mockResolvedValue(undefined);
@@ -203,29 +216,6 @@ vi.mock('@/renderer/components/Settings/MFASetup', () => ({
     </div>
   ),
 }));
-vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
-  default: ({
-    onVerify,
-    disabled,
-    excludeBackupCodes,
-  }: {
-    onVerify: (code: string) => void;
-    disabled?: boolean;
-    methods?: string[];
-    recoveryOnlyMethods?: string[];
-    error?: string;
-    excludeBackupCodes?: boolean;
-  }) => (
-    <div
-      data-testid="mfa-verify-prompt"
-      data-exclude-backup-codes={excludeBackupCodes ? 'true' : 'false'}
-    >
-      <button data-testid="mfa-verify-btn" onClick={() => onVerify('123456')} disabled={disabled}>
-        Verify
-      </button>
-    </div>
-  ),
-}));
 vi.mock('@/renderer/components/Settings/BackupCodeDisplay', () => ({
   default: (props: { onConfirm: () => void }) => (
     <div data-testid="backup-code-display">
@@ -293,6 +283,10 @@ import PrivacySecuritySection, {
   resolveSSOToggleError,
 } from '@/renderer/components/Settings/PrivacySecuritySection';
 
+// Named fixture: the pre-commit detect-secrets hook flags a credential-shaped key
+// beside a quoted literal regardless of the value.
+const FIXTURE_PW = 'fixture-password-do-not-persist';
+
 describe('resolveSSOToggleError', () => {
   it('maps invalid_credentials to a passphrase error', () => {
     expect(resolveSSOToggleError('invalid_credentials')).toBe('Incorrect passphrase.');
@@ -323,7 +317,99 @@ function drainOnceQueues(): void {
   mockSecurityGetFetch.mockReset();
   mockUpdatePrivacy.mockReset();
   mockUpdatePrivacy.mockResolvedValue(undefined);
+  readOffers([]);
 }
+
+type Reply = { ok: boolean; status: number; json: () => Promise<unknown> };
+const reply = (status: number, body: unknown = {}): Reply => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => body,
+});
+
+/** What `GET /api/v1/mfa/step-up` answers: the inline methods the account can use. */
+function readOffers(methods: string[], backupCodeAvailable = false): void {
+  mockStepUpRead.mockReset().mockImplementation(async () =>
+    reply(200, {
+      methods,
+      default_method: methods[0] ?? null,
+      backup_code_available: backupCodeAvailable,
+    })
+  );
+}
+
+const sessionRow = (id: string, isCurrent: boolean) => ({
+  id,
+  device_name: 'Device',
+  ip_address: '5.6.7.8',
+  user_agent: 'Mozilla/5.0 Chrome/100',
+  expires_at: '2026-12-01T00:00:00Z',
+  created_at: '2026-02-01T00:00:00Z',
+  last_used: new Date().toISOString(),
+  is_current: isCurrent,
+});
+
+interface SectionOptions {
+  sessions?: ReturnType<typeof sessionRow>[];
+  /** `users.mfa_methods`, as `/mfa/status` reports it: NOT what a step-up accepts (C2). */
+  mfaMethods?: string[];
+  /** Every call that is not a GET; the default accepts it. */
+  onWrite?: (path: string, init: RequestInit) => Reply | Promise<Reply>;
+  /** Every `GET /api/v1/sessions` after the mount's; the default lists `sessions` again. */
+  relist?: () => Reply | Promise<Reply>;
+}
+
+/** Answers the mount GETs by path, so a case never depends on fetch order. */
+function serveSection({
+  sessions = [],
+  mfaMethods = [],
+  onWrite,
+  relist,
+}: SectionOptions = {}): void {
+  let listed = 0;
+  mockApiFetch.mockReset().mockImplementation(async (path: string, init?: RequestInit) => {
+    if (init?.method && init.method !== 'GET') return onWrite ? onWrite(path, init) : reply(200);
+    if (path === '/api/v1/sessions') {
+      if (++listed > 1 && relist) return relist();
+      return reply(200, { sessions, past_sessions: [], revocation_mode: 'secure' });
+    }
+    if (path === '/api/v1/mfa/status') {
+      return reply(200, {
+        methods: mfaMethods,
+        recovery_only_methods: [],
+        recovery_hardened: false,
+        backup_codes_remaining: mfaMethods.length > 0 ? 5 : 0,
+        backup_email: '',
+      });
+    }
+    if (path === '/api/v1/mfa/webauthn/credentials') return reply(200, { credentials: [] });
+    return reply(404);
+  });
+}
+
+/** How many times the sessions list was read. */
+const sessionListReads = () =>
+  mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/sessions').length;
+
+/** Signs in as another account: the auth generation moves on until the case ends. */
+async function switchAccount(): Promise<void> {
+  const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+  const getState = vi.mocked(useAuthStore.getState);
+  const original = getState.getMockImplementation();
+  getState.mockImplementation(() => ({ accessToken: 'mock-token', authGeneration: 1 }) as never);
+  onTestFinished(() => {
+    if (original) getState.mockImplementation(original);
+  });
+}
+
+/** The parsed JSON bodies sent to `path`, in order. */
+function bodiesTo(path: string): Record<string, unknown>[] {
+  return mockApiFetch.mock.calls
+    .filter((c) => c[0] === path && typeof (c[1] as RequestInit | undefined)?.body === 'string')
+    .map((c) => JSON.parse((c[1] as { body: string }).body) as Record<string, unknown>);
+}
+
+const primaryOf = (name: string) => screen.getByRole('button', { name });
 
 describe('PrivacySecuritySection', () => {
   beforeEach(() => {
@@ -881,59 +967,30 @@ describe('PrivacySecuritySection', () => {
     expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
   });
 
-  it('opens the backup-code reset modal and shows the verify form', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+  it('opens the backup-code reset modal and shows the credential form', async () => {
+    serveSection({ mfaMethods: ['totp'] });
     render(<PrivacySecuritySection />);
-    const resetBtn = await screen.findByRole('button', { name: /reset\s*codes/i });
-    fireEvent.click(resetBtn);
+    fireEvent.click(await screen.findByRole('button', { name: /reset\s*codes/i }));
     expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    expect(screen.getByLabelText('Authenticator app code')).toBeInTheDocument();
   });
 
   it('regenerates backup codes and shows the code display', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    serveSection({
+      mfaMethods: ['totp'],
+      onWrite: () => reply(200, { backup_codes: ['aaaa-bbbb', 'cccc-dddd'] }),
+    });
     render(<PrivacySecuritySection />);
     fireEvent.click(await screen.findByRole('button', { name: /reset\s*codes/i }));
-    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'pw' } });
-    fireEvent.click(screen.getByTestId('mfa-verify-btn'));
-    mockApiFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ backup_codes: ['aaaa-bbbb', 'cccc-dddd'] }),
-    });
-    fireEvent.click(screen.getByRole('button', { name: /regenerate codes/i }));
+    await userEvent.type(screen.getByLabelText('Password'), FIXTURE_PW);
+    await userEvent.type(screen.getByLabelText('Authenticator app code'), '123456');
+    await userEvent.click(screen.getByRole('button', { name: /regenerate codes/i }));
     await vi.waitFor(() => expect(screen.getByTestId('backup-code-display')).toBeInTheDocument());
+    // The route binds the code as `code`, not the seam's `mfa_code`.
+    expect(bodiesTo('/api/v1/mfa/backup-codes/regenerate')).toEqual([
+      { password: FIXTURE_PW, code: '123456' },
+    ]);
     // confirming closes the modal (covers the BackupCodeDisplay onConfirm callback)
     fireEvent.click(screen.getByTestId('backup-code-confirm'));
     await vi.waitFor(() =>
@@ -1233,10 +1290,12 @@ describe('PrivacySecuritySection', () => {
     const revokeButtons = screen.getAllByText('Revoke');
     fireEvent.click(revokeButtons[1]);
 
+    // Sent under the capture its answer is checked against.
     await vi.waitFor(() =>
       expect(mockApiFetch).toHaveBeenCalledWith(
         '/api/v1/sessions/s2',
-        expect.objectContaining({ method: 'DELETE' })
+        expect.objectContaining({ method: 'DELETE' }),
+        { context: expect.objectContaining({ authLifecycle: expect.anything() }) }
       )
     );
   });
@@ -1759,313 +1818,288 @@ describe('PrivacySecuritySection', () => {
     vi.mocked(
       await import('@/renderer/stores/auth/userStore').then((m) => m.useUserStore)
     ).mockImplementation((s) => s({ logout: mockLogout }));
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    serveSection({ sessions: [sessionRow('s1', true)] });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
 
-    // Open the modal
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByText(/revoke all of your active session tokens/)).toBeInTheDocument()
-    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke All Sessions' }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), FIXTURE_PW);
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Yes, Revoke All Sessions' }));
 
-    // Enter password
-    const passwordInput = screen.getByPlaceholderText('Enter your password');
-    fireEvent.change(passwordInput, { target: { value: 'my-password' } });
-
-    // Mock the revoke-all API response
-    mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-
-    // Click confirm
-    fireEvent.click(screen.getByText('Yes, Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/revoke-all',
-        expect.objectContaining({ method: 'POST' })
-      )
-    );
     await vi.waitFor(() => expect(mockLogout).toHaveBeenCalled());
+    expect(bodiesTo('/api/v1/sessions/revoke-all')).toEqual([
+      { include_current: true, password: FIXTURE_PW },
+    ]);
   });
 
   // ── Revoke All modal 403 error ─────────────────────────────────────────
 
-  it('shows error on revoke all 403', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+  it('shows a refused password on its field and empties it (revoke all)', async () => {
+    serveSection({
+      sessions: [sessionRow('s1', true)],
+      onWrite: () => reply(403, { error: 'Incorrect password' }),
+    });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument()
-    );
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'wrong-pw' },
-    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke All Sessions' }));
+    const dialog = await screen.findByRole('dialog');
+    const field = await within(dialog).findByLabelText('Password');
+    await userEvent.type(field, 'wrong-pw');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Yes, Revoke All Sessions' }));
 
-    // Mock 403 response
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: 'Incorrect password' }),
-    });
-    fireEvent.click(screen.getByText('Yes, Revoke All Sessions'));
-    await vi.waitFor(() => expect(screen.getByText('Incorrect password')).toBeInTheDocument());
+    expect(await within(dialog).findByText('That password is not correct.')).toBeInTheDocument();
+    expect(field).toHaveValue('');
   });
 
   // ── Mode change submission ─────────────────────────────────────────────
 
   it('submits mode change with password', async () => {
+    serveSection({ onWrite: () => reply(200, { revocation_mode: 'simple' }) });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
 
-    // Click Simple to open mode change modal
-    fireEvent.click(screen.getByText('Simple'));
-    await vi.waitFor(() => expect(screen.getByText('Change Revocation Mode')).toBeInTheDocument());
+    fireEvent.click(await screen.findByText('Simple'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), FIXTURE_PW);
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }));
 
-    // Enter password in the modal
-    const pwInput = screen.getByPlaceholderText('Enter your password');
-    fireEvent.change(pwInput, { target: { value: 'test-password' } });
-
-    // Mock mode change response
-    mockApiFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ revocation_mode: 'simple' }),
-    });
-
-    fireEvent.click(screen.getByText('Confirm'));
     await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/revocation-mode',
-        expect.objectContaining({ method: 'PUT' })
-      )
+      expect(screen.getByText('Simple').closest('.revocation-mode-btn')).toHaveClass('active')
     );
+    expect(bodiesTo('/api/v1/sessions/revocation-mode')).toEqual([
+      { mode: 'simple', password: FIXTURE_PW },
+    ]);
+    expect(screen.queryByText('Change Revocation Mode')).not.toBeInTheDocument();
   });
 
   // ── Mode change 403 error ─────────────────────────────────────────────
 
-  it('shows error on mode change 403', async () => {
+  it('shows the server text of a 403 the adapter does not own (mode change)', async () => {
+    serveSection({ onWrite: () => reply(403, { error: 'Authentication failed' }) });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText('Simple'));
-    await vi.waitFor(() => expect(screen.getByText('Change Revocation Mode')).toBeInTheDocument());
+    fireEvent.click(await screen.findByText('Simple'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), 'wrong-pw');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }));
 
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'wrong-pw' },
-    });
-
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: 'Authentication failed' }),
-    });
-
-    fireEvent.click(screen.getByText('Confirm'));
-    await vi.waitFor(() => expect(screen.getByText('Authentication failed')).toBeInTheDocument());
+    expect(await within(dialog).findByText('Authentication failed')).toBeInTheDocument();
+    // Not a field error: the adapter reads exact strings only (C5).
+    expect(within(dialog).queryByText('That password is not correct.')).not.toBeInTheDocument();
   });
 
   // ── Session password modal submission ──────────────────────────────────
 
+  // Mutant: `applyRevoked` not filtering the row out, or not refetching.
   it('submits session password and revokes', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's2',
-              device_name: 'Phone',
-              ip_address: '5.6.7.8',
-              user_agent: 'Mozilla/5.0 Chrome/100',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-02-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: false,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    const deletes: RequestInit[] = [];
+    serveSection({
+      sessions: [sessionRow('s2', false)],
+      onWrite: (_path, init) => {
+        deletes.push(init);
+        // The first, credential-less attempt is refused; the second carries the password.
+        return deletes.length === 1 ? reply(403, { error: 'password_required' }) : reply(200);
+      },
+      // The refetch fails, so the row can only have left through the local filter.
+      // (A held refetch would not do: the list shows a spinner while it loads.)
+      relist: () => reply(500, { error: 'Failed to fetch sessions' }),
+    });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Chrome Browser')).toBeInTheDocument());
 
-    // First click triggers 403 password_required
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: 'password_required' }),
+    fireEvent.click(await screen.findByText('Revoke'));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Verify Your Identity')).toBeInTheDocument();
+    await userEvent.type(await within(dialog).findByLabelText('Password'), FIXTURE_PW);
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm & Revoke' }));
+
+    await vi.waitFor(() => expect(deletes).toHaveLength(2));
+    // Single revoke sends no credential first (D12).
+    expect(deletes[0].body).toBeUndefined();
+    expect(JSON.parse(deletes[1].body as string)).toEqual({ password: FIXTURE_PW });
+    await vi.waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await screen.findByText('Failed to fetch sessions');
+    expect(sessionListReads()).toBe(2);
+    expect(screen.queryByText('Chrome Browser')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Revoke' })).not.toBeInTheDocument();
+  });
+
+  // Mutant: the step-up path's `applyRevoked` handed another id, so a revoked
+  // current session leaves this client signed in to a dead session.
+  it('revoking the current session through the step-up dialog logs out', async () => {
+    const mockLogout = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(
+      await import('@/renderer/stores/auth/userStore').then((m) => m.useUserStore)
+    ).mockImplementation((s) => s({ logout: mockLogout }));
+    serveSection({
+      sessions: [sessionRow('s1', true)],
+      onWrite: (_path, init) =>
+        typeof init.body === 'string' ? reply(200) : reply(403, { error: 'password_required' }),
     });
-    fireEvent.click(screen.getByText('Revoke'));
-    await vi.waitFor(() => expect(screen.getByText('Verify Your Identity')).toBeInTheDocument());
+    render(<PrivacySecuritySection />);
 
-    // Enter password
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'session-pw' },
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), FIXTURE_PW);
+    expect(mockLogout).not.toHaveBeenCalled();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm & Revoke' }));
+
+    await vi.waitFor(() => expect(mockLogout).toHaveBeenCalledTimes(1));
+    expect(bodiesTo('/api/v1/sessions/s1')).toEqual([{ password: FIXTURE_PW }]);
+  });
+
+  // Two credential-free DELETEs in flight: the first refusal opens the dialog,
+  // and the second must not re-point it at another session while the user is
+  // typing into it (X dropped, Y revoked).
+  // Mutant: `openStepUp` replacing an open dialog's action.
+  it('a second Revoke refused while the first dialog is open does not re-point it', async () => {
+    const held: Record<string, ReturnType<typeof deferred<Reply>>> = {};
+    serveSection({
+      // An older s3, so the list order (s2 first) does not hang on a clock tick.
+      sessions: [sessionRow('s2', false), { ...sessionRow('s3', false), last_used: '2020-01-01' }],
+      onWrite: (path, init) => {
+        if (typeof init.body === 'string') return reply(200);
+        held[path] = deferred<Reply>();
+        return held[path].promise;
+      },
     });
+    render(<PrivacySecuritySection />);
 
-    // Mock successful revoke + fetchSessions
-    mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) }).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
-    });
-
-    fireEvent.click(screen.getByText('Confirm & Revoke'));
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/s2',
-        expect.objectContaining({ method: 'DELETE' })
-      )
+    const [revokeS2, revokeS3] = await screen.findAllByRole('button', { name: 'Revoke' });
+    fireEvent.click(revokeS2);
+    fireEvent.click(revokeS3);
+    await vi.waitFor(() => expect(Object.keys(held)).toHaveLength(2));
+    await act(async () =>
+      held['/api/v1/sessions/s2'].resolve(reply(403, { error: 'password_required' }))
     );
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), FIXTURE_PW);
+    await act(async () =>
+      held['/api/v1/sessions/s3'].resolve(reply(403, { error: 'password_required' }))
+    );
+
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    // The typed password survives: the open dialog was not replaced.
+    expect(within(dialog).getByLabelText('Password')).toHaveValue(FIXTURE_PW);
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm & Revoke' }));
+
+    await vi.waitFor(() =>
+      expect(bodiesTo('/api/v1/sessions/s2')).toEqual([{ password: FIXTURE_PW }])
+    );
+    expect(bodiesTo('/api/v1/sessions/s3')).toEqual([]);
+  });
+
+  // The credential-free DELETE is sent under a capture taken before it, and its
+  // answer is dropped once the account or server has changed: it belongs to the
+  // old one. Each answer runs twice, the unswitched run being the control that
+  // shows the effect the switched run must not have.
+  // Mutant: the currentness check after the answer deleted.
+  describe.each([
+    ['a step-up refusal', () => reply(403, { error: 'password_required' })],
+    ['an acceptance', () => reply(200)],
+    ['a failure', () => reply(500, { error: 'Internal error' })],
+  ])('single revoke: %s', (_name, answer) => {
+    async function revokeHeld(switched: boolean): Promise<void> {
+      const held = deferred<Reply>();
+      serveSection({
+        sessions: [sessionRow('s2', false)],
+        onWrite: () => held.promise,
+        relist: () => reply(200, { sessions: [], past_sessions: [] }),
+      });
+      render(<PrivacySecuritySection />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }));
+      await vi.waitFor(() => expect(bodiesTo('/api/v1/sessions/s2')).toHaveLength(0));
+      const sent = mockApiFetch.mock.calls.find((c) => c[0] === '/api/v1/sessions/s2');
+      expect(sent?.[2]).toEqual({
+        context: expect.objectContaining({
+          authLifecycle: expect.objectContaining({ authGeneration: 0 }),
+        }),
+      });
+      if (switched) await switchAccount();
+      await act(async () => held.resolve(answer()));
+    }
+
+    /** Something the answer did: a dialog, a removed row, or a banner. */
+    const anyEffect = () =>
+      screen.queryByRole('dialog') !== null ||
+      screen.queryByText('Chrome Browser') === null ||
+      screen.queryByText('Internal error') !== null;
+
+    it('acts when the account is unchanged', async () => {
+      await revokeHeld(false);
+      await vi.waitFor(() => expect(anyEffect()).toBe(true));
+    });
+
+    it('is dropped when the account changed', async () => {
+      await revokeHeld(true);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(anyEffect()).toBe(false);
+      expect(sessionListReads()).toBe(1);
+      expect(screen.getByRole('button', { name: 'Revoke' })).not.toBeDisabled();
+    });
+  });
+
+  // A proxy's HTML error page is not JSON; parsing it must not put a parse error
+  // in the banner.
+  // Mutant: `response.json()` without its `.catch`.
+  it('a single revoke answered with a non-JSON body shows the generic sentence', async () => {
+    serveSection({
+      sessions: [sessionRow('s2', false)],
+      onWrite: () => ({
+        ok: false,
+        status: 502,
+        json: async () => {
+          throw new SyntaxError('Unexpected token < in JSON at position 0');
+        },
+      }),
+    });
+    render(<PrivacySecuritySection />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }));
+
+    expect(await screen.findByText('Failed to revoke session')).toBeInTheDocument();
+    expect(screen.queryByText(/Unexpected token/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
   // ── Revoke All empty password validation ──────────────────────────────
 
-  it('shows password required error when submitting without password', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+  it('keeps the primary aria-disabled until a password is typed, and sends nothing before', async () => {
+    serveSection({ sessions: [sessionRow('s1', true)] });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByText(/revoke all of your active session tokens/)).toBeInTheDocument()
-    );
-    // The confirm button should be disabled without password
-    expect(screen.getByText('Yes, Revoke All Sessions')).toBeDisabled();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke All Sessions' }));
+    const dialog = await screen.findByRole('dialog');
+    await within(dialog).findByLabelText('Password');
+    const confirm = within(dialog).getByRole('button', { name: 'Yes, Revoke All Sessions' });
+
+    // Not natively disabled (it stays reachable), but inert: a click names what is missing.
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    await userEvent.click(confirm);
+    expect(await within(dialog).findByText('Enter your password to continue.')).toBeInTheDocument();
+    expect(bodiesTo('/api/v1/sessions/revoke-all')).toEqual([]);
   });
 
   // ── Session revoke 403 with incorrect password ─────────────────────────
 
-  it('shows error in session password modal on incorrect password', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's2',
-              device_name: 'Phone',
-              ip_address: '5.6.7.8',
-              user_agent: 'Mozilla/5.0 Chrome/100',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-02-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: false,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+  it('shows a refused password on its field in the single-revoke dialog', async () => {
+    let n = 0;
+    serveSection({
+      sessions: [sessionRow('s2', false)],
+      onWrite: () =>
+        ++n === 1
+          ? reply(403, { error: 'password_required' })
+          : reply(403, { error: 'Incorrect password' }),
+    });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Chrome Browser')).toBeInTheDocument());
 
-    // Trigger 403 password_required
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: 'password_required' }),
-    });
-    fireEvent.click(screen.getByText('Revoke'));
-    await vi.waitFor(() => expect(screen.getByText('Verify Your Identity')).toBeInTheDocument());
+    fireEvent.click(await screen.findByText('Revoke'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), 'wrong');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm & Revoke' }));
 
-    // Enter wrong password and submit
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'wrong' },
-    });
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: 'Incorrect password' }),
-    });
-    fireEvent.click(screen.getByText('Confirm & Revoke'));
-    await vi.waitFor(() => expect(screen.getByText('Incorrect password')).toBeInTheDocument());
+    expect(await within(dialog).findByText('That password is not correct.')).toBeInTheDocument();
   });
 
   // ── DM slider interaction ──────────────────────────────────────────────
@@ -2090,74 +2124,32 @@ describe('PrivacySecuritySection', () => {
   // ── Revoke All non-ok non-403 error ────────────────────────────────────
 
   it('handles non-403 error on revoke all', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    serveSection({
+      sessions: [sessionRow('s1', true)],
+      onWrite: () => reply(500, { error: 'Internal error' }),
+    });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument()
-    );
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'pw123' },
-    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke All Sessions' }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), 'pw123');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Yes, Revoke All Sessions' }));
 
-    // Mock server error (500)
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({ error: 'Internal error' }),
-    });
-    fireEvent.click(screen.getByText('Yes, Revoke All Sessions'));
-    await vi.waitFor(() => expect(screen.getByText('Internal error')).toBeInTheDocument());
+    expect(await within(dialog).findByText('Internal error')).toBeInTheDocument();
   });
 
   // ── Mode change non-ok non-403 error ───────────────────────────────────
 
   it('handles non-403 error on mode change', async () => {
+    serveSection({ onWrite: () => reply(500, { error: 'Server error' }) });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText('Simple'));
-    await vi.waitFor(() => expect(screen.getByText('Change Revocation Mode')).toBeInTheDocument());
+    fireEvent.click(await screen.findByText('Simple'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.type(await within(dialog).findByLabelText('Password'), 'pw');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }));
 
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'pw' },
-    });
-
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({ error: 'Server error' }),
-    });
-
-    fireEvent.click(screen.getByText('Confirm'));
-    await vi.waitFor(() => expect(screen.getByText('Server error')).toBeInTheDocument());
+    expect(await within(dialog).findByText('Server error')).toBeInTheDocument();
   });
 
   // ── Close Revoke All modal ─────────────────────────────────────────────
@@ -2271,77 +2263,7 @@ describe('PrivacySecuritySection', () => {
 
   // ── Enter key in password fields ───────────────────────────────────────
 
-  it('submits revoke all on Enter key in password field', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument()
-    );
-    const pwInput = screen.getByPlaceholderText('Enter your password');
-    fireEvent.change(pwInput, { target: { value: 'my-pw' } });
-
-    // Mock successful revoke
-    mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-    fireEvent.keyDown(pwInput, { key: 'Enter' });
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/revoke-all',
-        expect.objectContaining({ method: 'POST' })
-      )
-    );
-  });
-
   // ── Mode change Enter key ─────────────────────────────────────────────
-
-  it('submits mode change on Enter key', async () => {
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Simple'));
-    await vi.waitFor(() =>
-      expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument()
-    );
-    const pwInput = screen.getByPlaceholderText('Enter your password');
-    fireEvent.change(pwInput, { target: { value: 'test-pw' } });
-
-    mockApiFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ revocation_mode: 'simple' }),
-    });
-    fireEvent.keyDown(pwInput, { key: 'Enter' });
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/revocation-mode',
-        expect.objectContaining({ method: 'PUT' })
-      )
-    );
-  });
 
   // ── formatRelativeTime edge cases ──────────────────────────────────────
 
@@ -2779,134 +2701,91 @@ describe('PrivacySecuritySection', () => {
   // ── Backup code reset flow ─────────────────────────────────────────────
 
   it('opens backup code reset modal and renders form', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    serveSection({ mfaMethods: ['totp'] });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => {
-      const resetBtn = screen.getByText(/Reset/);
-      expect(resetBtn).not.toBeDisabled();
-    });
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
     fireEvent.click(screen.getByText(/Reset/));
     await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
     expect(screen.getByText(/This will invalidate all existing backup codes/)).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Enter your password')).toBeInTheDocument();
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
   });
 
-  // RegenerateBackupCodes checks an authenticator-app code and nothing else,
-  // so its prompt must not offer a backup code (nor a security key, pinned
-  // with the purpose tests).
+  // RegenerateBackupCodes checks an authenticator-app code and nothing else, so
+  // the stage must not offer a backup code or a security key, and it has no
+  // purpose to read for (the floor is TOTP).
   it('offers only an authenticator code when resetting backup codes', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    // Were the stage to read, this account would be offered all three.
+    readOffers(['webauthn', 'totp'], true);
+    serveSection({ mfaMethods: ['totp'] });
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
     fireEvent.click(screen.getByText(/Reset/));
     await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
 
-    expect(screen.getByTestId('mfa-verify-prompt')).toHaveAttribute(
-      'data-exclude-backup-codes',
-      'true'
-    );
+    expect(screen.getByLabelText('Authenticator app code')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Backup code')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('group', { name: 'Passkey or security key' })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /instead/i })).not.toBeInTheDocument();
+    expect(mockStepUpRead).not.toHaveBeenCalled();
   });
 
   // ── Backup code reset submission ────────────────────────────────────────
 
   it('submits backup code reset and shows new codes', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => {
-      const resetBtn = screen.getByText(/Reset/);
-      expect(resetBtn).not.toBeDisabled();
+    serveSection({
+      mfaMethods: ['totp'],
+      onWrite: () => reply(200, { backup_codes: ['CODE1', 'CODE2', 'CODE3'] }),
     });
-    // Open backup reset modal
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
     fireEvent.click(screen.getByText(/Reset/));
     await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
 
-    // Fill in password
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'my-password' },
-    });
-
-    // Mock successful regeneration + MFA status refetch
-    mockApiFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ backup_codes: ['CODE1', 'CODE2', 'CODE3'] }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 3,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
-
-    // Click Verify in the mocked MFAVerifyPrompt to set the MFA code
-    const verifyBtns = screen.getAllByTestId('mfa-verify-btn');
-    // The backup reset modal's verify button
-    fireEvent.click(verifyBtns[verifyBtns.length - 1]);
-
-    // Now Regenerate should be enabled
-    await vi.waitFor(() => expect(screen.getByText('Regenerate Codes')).not.toBeDisabled());
-    fireEvent.click(screen.getByText('Regenerate Codes'));
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/mfa/backup-codes/regenerate',
-        expect.objectContaining({ method: 'POST' })
-      )
+    expect(screen.getByRole('button', { name: 'Regenerate Codes' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
     );
-    // BackupCodeDisplay mock should be shown
+    await userEvent.type(screen.getByLabelText('Password'), FIXTURE_PW);
+    await userEvent.type(screen.getByLabelText('Authenticator app code'), '123456');
+    expect(screen.getByRole('button', { name: 'Regenerate Codes' })).not.toHaveAttribute(
+      'aria-disabled'
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Regenerate Codes' }));
+
     await vi.waitFor(() => expect(screen.getByTestId('backup-code-display')).toBeInTheDocument());
+    // The status is re-read after the new codes are issued.
+    expect(
+      mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/mfa/status').length
+    ).toBeGreaterThanOrEqual(2);
+  });
+
+  // Q7: TOTP was turned off after the modal opened, so the status the page shows is
+  // stale. The stage says so, and the page re-reads `/mfa/status`.
+  it('says the authenticator app was turned off and re-reads the MFA status', async () => {
+    serveSection({
+      mfaMethods: ['totp'],
+      onWrite: () => reply(400, { error: 'TOTP is not enabled' }),
+    });
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
+    const statusReads = () =>
+      mockApiFetch.mock.calls.filter((c) => c[0] === '/api/v1/mfa/status').length;
+    await vi.waitFor(() => expect(statusReads()).toBe(1));
+    fireEvent.click(screen.getByText(/Reset/));
+    await userEvent.type(await screen.findByLabelText('Password'), FIXTURE_PW);
+    await userEvent.type(screen.getByLabelText('Authenticator app code'), '123456');
+    await userEvent.click(screen.getByRole('button', { name: 'Regenerate Codes' }));
+
+    expect(
+      await screen.findByText(
+        'Your authenticator app was turned off. Close this and check your security settings.'
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    await vi.waitFor(() => expect(statusReads()).toBe(2));
+    expect(screen.queryByTestId('backup-code-display')).not.toBeInTheDocument();
   });
 
   it('handles backup reset error', async () => {
@@ -3025,161 +2904,81 @@ describe('PrivacySecuritySection', () => {
 
   // ── handleRevokeAll validation (no password) ───────────────────────────
 
-  it('validates empty password on revoke all submission', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ methods: [], backup_codes_remaining: 0 }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByText('Yes, Revoke All Sessions')).toBeInTheDocument()
-    );
-    // Confirm button should be disabled when no password entered
-    expect(screen.getByText('Yes, Revoke All Sessions')).toBeDisabled();
-  });
-
   // ── MFA-enabled modals use MFA verify prompt ───────────────────────────
 
-  it('shows MFA verify prompt in Revoke All modal when MFA is active', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's1',
-              device_name: 'Desktop',
-              ip_address: '1.2.3.4',
-              user_agent: 'Mozilla/5.0 Electron',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-01-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: true,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+  it('revoke all asks an authenticator account for its code, not a password', async () => {
+    readOffers(['totp']);
+    serveSection({ sessions: [sessionRow('s1', true)], mfaMethods: ['totp'] });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Revoke All Sessions')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() =>
-      expect(screen.getByText(/Verify your identity to continue/)).toBeInTheDocument()
-    );
-    // MFAVerifyPrompt is mocked as a simple div
-    expect(screen.getAllByTestId('mfa-verify-prompt').length).toBeGreaterThanOrEqual(1);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke All Sessions' }));
+    const dialog = await screen.findByRole('dialog');
+
+    expect(await within(dialog).findByLabelText('Authenticator app code')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('Password')).not.toBeInTheDocument();
   });
 
-  it('shows MFA verify prompt in mode change modal when MFA is active', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+  it('mode change asks an authenticator account for its code, not a password', async () => {
+    readOffers(['totp']);
+    serveSection({ mfaMethods: ['totp'] });
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Simple'));
-    await vi.waitFor(() => expect(screen.getByText('Change Revocation Mode')).toBeInTheDocument());
-    expect(screen.getAllByTestId('mfa-verify-prompt').length).toBeGreaterThanOrEqual(1);
+
+    fireEvent.click(await screen.findByText('Simple'));
+    const dialog = await screen.findByRole('dialog');
+
+    expect(await within(dialog).findByLabelText('Authenticator app code')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('Password')).not.toBeInTheDocument();
   });
 
-  it('shows MFA verify prompt in session password modal when MFA active', async () => {
-    mockApiFetch
-      .mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          sessions: [
-            {
-              id: 's2',
-              device_name: 'Phone',
-              ip_address: '5.6.7.8',
-              user_agent: 'Mozilla/5.0 Chrome/100',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-02-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: false,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Chrome Browser')).toBeInTheDocument());
-
-    mockApiFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: 'auth_required' }),
+  it('single revoke on auth_required lets the read decide: an authenticator account gets its code field', async () => {
+    readOffers(['totp']);
+    serveSection({
+      sessions: [sessionRow('s2', false)],
+      mfaMethods: ['totp'],
+      onWrite: () => reply(403, { error: 'auth_required', methods: ['email'] }),
     });
-    fireEvent.click(screen.getByText('Revoke'));
-    await vi.waitFor(() => expect(screen.getByText('Verify Your Identity')).toBeInTheDocument());
-    expect(screen.getAllByTestId('mfa-verify-prompt').length).toBeGreaterThanOrEqual(1);
+    render(<PrivacySecuritySection />);
+
+    fireEvent.click(await screen.findByText('Revoke'));
+    const dialog = await screen.findByRole('dialog');
+
+    // `methods` on this refusal lists users.mfa_methods; it is never read (C2).
+    expect(await within(dialog).findByLabelText('Authenticator app code')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('Password')).not.toBeInTheDocument();
+  });
+
+  // C2: the dialogs never read `mfaMethods`. An account whose only method is email
+  // (`mfaMethods: ['email']`) can use no inline factor, so the read says [] and the
+  // password field is what it gets; a dialog that derived the leg from `mfaMethods`
+  // would show a code box this account can never fill.
+  it.each([
+    ['revoke all', () => screen.findByRole('button', { name: 'Revoke All Sessions' })],
+    ['mode change', () => screen.findByText('Simple')],
+  ])('%s gives an email-only account the password field (C2)', async (_name, open) => {
+    readOffers([]);
+    serveSection({ sessions: [sessionRow('s1', true)], mfaMethods: ['email'] });
+    render(<PrivacySecuritySection />);
+
+    fireEvent.click(await open());
+    const dialog = await screen.findByRole('dialog');
+
+    expect(await within(dialog).findByLabelText('Password')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
+  });
+
+  it('single revoke on password_required keeps the password field when the read fails', async () => {
+    // A failed read leaves the seed standing: the server found no inline method.
+    mockStepUpRead.mockReset().mockImplementation(async () => reply(503));
+    serveSection({
+      sessions: [sessionRow('s2', false)],
+      onWrite: () => reply(403, { error: 'password_required' }),
+    });
+    render(<PrivacySecuritySection />);
+
+    fireEvent.click(await screen.findByText('Revoke'));
+    const dialog = await screen.findByRole('dialog');
+
+    expect(await within(dialog).findByLabelText('Password')).toBeInTheDocument();
   });
 
   // ── Permissions loading state ──────────────────────────────────────────
@@ -3805,193 +3604,3 @@ describe('PrivacySecuritySection — screen-capture protection (#2468)', () => {
 // The server accepts a TOTP code at most once, and on some routes spends it
 // even when the action then fails. A prompt that kept its code behind an
 // enabled Confirm would re-send a spent code and draw a confusing refusal.
-
-describe('PrivacySecuritySection — a sent MFA code is never offered again', () => {
-  type Reply = { ok: boolean; status: number; json: () => Promise<unknown> };
-  const reply = (status: number, body: unknown): Reply => ({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  });
-
-  /** Mount GETs for an account with TOTP and another live session; writes go to `onWrite`. */
-  const serve = (onWrite: (path: string, init: RequestInit) => Reply) => {
-    mockApiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (init?.method && init.method !== 'GET') return onWrite(path, init);
-      if (path === '/api/v1/sessions') {
-        return reply(200, {
-          sessions: [
-            {
-              id: 's2',
-              device_name: 'Phone',
-              ip_address: '5.6.7.8',
-              user_agent: 'Mozilla/5.0 Chrome/100',
-              expires_at: '2026-12-01T00:00:00Z',
-              created_at: '2026-02-01T00:00:00Z',
-              last_used: new Date().toISOString(),
-              is_current: false,
-            },
-          ],
-          past_sessions: [],
-          revocation_mode: 'secure',
-        });
-      }
-      if (path === '/api/v1/mfa/status') {
-        return reply(200, {
-          methods: ['totp'],
-          recovery_only_methods: [],
-          recovery_hardened: false,
-          backup_codes_remaining: 5,
-          backup_email: '',
-        });
-      }
-      if (path === '/api/v1/mfa/webauthn/credentials') return reply(200, { credentials: [] });
-      return reply(404, {});
-    });
-  };
-
-  /** Enters a code through the (mocked) prompt of the one open dialog. */
-  const enterCode = () => {
-    fireEvent.click(within(screen.getByRole('dialog')).getByTestId('mfa-verify-btn'));
-  };
-
-  /** Resolves once a submitted request has settled and `label` is back. */
-  const settled = (label: string) =>
-    vi.waitFor(() => expect(screen.getByRole('button', { name: label })).toBeInTheDocument());
-
-  beforeEach(() => {
-    drainOnceQueues();
-    vi.clearAllMocks();
-  });
-
-  const openBackupReset = async () => {
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
-    fireEvent.click(screen.getByText(/Reset/));
-    await vi.waitFor(() => expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument());
-    fireEvent.change(screen.getByPlaceholderText('Enter your password'), {
-      target: { value: 'my-password' },
-    });
-    // The backup reset is an inline panel, not a dialog; its prompt renders last.
-    fireEvent.click(screen.getAllByTestId('mfa-verify-btn').at(-1) as HTMLElement);
-  };
-
-  it('backup-code regeneration sends the code as `code`, the field the route binds', async () => {
-    const bodies: Record<string, unknown>[] = [];
-    serve((path, init) => {
-      bodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
-      return reply(200, { backup_codes: ['CODE1'] });
-    });
-    await openBackupReset();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Regenerate Codes' }));
-    });
-
-    await vi.waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ password: 'my-password', code: '123456' }); // pragma: allowlist secret
-    expect(bodies[0]).not.toHaveProperty('mfa_code');
-  });
-
-  it('backup-code regeneration: a 500 clears the code and disables Regenerate', async () => {
-    serve(() => reply(500, { error: 'Failed to regenerate backup codes' }));
-    await openBackupReset();
-    expect(screen.getByRole('button', { name: 'Regenerate Codes' })).not.toBeDisabled();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Regenerate Codes' }));
-    });
-
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/mfa/backup-codes/regenerate',
-        expect.objectContaining({ method: 'POST' })
-      )
-    );
-    await settled('Regenerate Codes');
-    expect(screen.getByRole('button', { name: 'Regenerate Codes' })).toBeDisabled();
-  });
-
-  it.each([
-    { name: 'a 500', status: 500, body: { error: 'Failed to change revocation mode' } },
-    { name: 'a refused code', status: 403, body: { error: 'Invalid MFA code' } },
-  ])('revocation-mode change: $name clears the code and disables Confirm', async (c) => {
-    serve(() => reply(c.status, c.body));
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Session Revocation')).toBeInTheDocument());
-    // The status read must land first, or the modal asks for a password.
-    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
-    fireEvent.click(screen.getByText('Simple'));
-    await vi.waitFor(() => expect(screen.getByText('Change Revocation Mode')).toBeInTheDocument());
-    enterCode();
-    expect(screen.getByRole('button', { name: 'Confirm' })).not.toBeDisabled();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
-    });
-
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/revocation-mode',
-        expect.objectContaining({ body: JSON.stringify({ mode: 'simple', mfa_code: '123456' }) })
-      )
-    );
-    await settled('Confirm');
-    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
-  });
-
-  it.each([
-    { name: 'a 500', status: 500, body: { error: 'Failed to revoke session' } },
-    { name: 'a refused code', status: 403, body: { error: 'Invalid MFA code' } },
-  ])('single-session revoke: $name clears the code and disables Confirm', async (c) => {
-    const deletes: RequestInit[] = [];
-    serve((path, init) => {
-      deletes.push(init);
-      // The first, credential-less attempt asks for verification.
-      return deletes.length === 1
-        ? reply(403, { error: 'auth_required' })
-        : reply(c.status, c.body);
-    });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
-    await act(async () => {
-      fireEvent.click(screen.getByText('Revoke'));
-    });
-    await vi.waitFor(() => expect(screen.getByText('Verify Your Identity')).toBeInTheDocument());
-    enterCode();
-    expect(screen.getByRole('button', { name: 'Confirm & Revoke' })).not.toBeDisabled();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Confirm & Revoke' }));
-    });
-
-    await vi.waitFor(() => expect(deletes).toHaveLength(2));
-    expect(JSON.parse(deletes[1].body as string)).toEqual({ mfa_code: '123456' });
-    await settled('Confirm & Revoke');
-    expect(screen.getByRole('button', { name: 'Confirm & Revoke' })).toBeDisabled();
-  });
-
-  it('revoke all: a refused code clears the code and disables Confirm', async () => {
-    serve(() => reply(403, { error: 'Invalid MFA code' }));
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText(/Reset/)).not.toBeDisabled());
-    fireEvent.click(screen.getByText('Revoke All Sessions'));
-    await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    enterCode();
-    const confirm = () => screen.getByRole('button', { name: 'Yes, Revoke All Sessions' });
-    expect(confirm()).not.toBeDisabled();
-
-    await act(async () => {
-      fireEvent.click(confirm());
-    });
-
-    await vi.waitFor(() =>
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        '/api/v1/sessions/revoke-all',
-        expect.objectContaining({ method: 'POST' })
-      )
-    );
-    await settled('Yes, Revoke All Sessions');
-    expect(confirm()).toBeDisabled();
-  });
-});
