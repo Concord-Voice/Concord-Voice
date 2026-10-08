@@ -2128,6 +2128,28 @@ describe('a 429 from the inline WebAuthn ceremony (D19)', () => {
   });
 });
 
+// ── Step-up rpId relay: begin's relying party must be this server's ──────
+
+describe("begin naming another server's relying party", () => {
+  // Mutant: begin decoding the server's options without binding the rpId, so
+  // the key signs for another server and this one receives the proof.
+  it('refuses before the key is asked, and shows the invalid-key notice', async () => {
+    setRuntimeServerBase('https://evil-selfhost.example');
+    routes[BEGIN] = () =>
+      json({ publicKey: { challenge: 'AQID', rpId: 'concordvoice.chat', allowCredentials: [] } });
+    const view = await mountReady();
+    const submit = submitting({ kind: 'success' });
+
+    expect(await run(view, submit)).toBeNull();
+
+    expect(view.result.current.notice).toEqual({ kind: 'invalidFactor', method: 'webauthn' });
+    expect(view.result.current.phase).toBe('idle');
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(hits(FINISH)).toHaveLength(0);
+    expect(submit).not.toHaveBeenCalled();
+  });
+});
+
 // ── D21: the single-flight latch belongs to its attempt ──────────────────
 
 describe('the single-flight latch is bound to the attempt (D21)', () => {

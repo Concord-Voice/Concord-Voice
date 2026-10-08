@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The inline WebAuthn step-up helpers behind the factor picker's hook
 // (`useStepUpFactor`; design 2026-09-26-mfa-factor-picker D14). Oracle: what is put on the
@@ -22,6 +22,11 @@ import {
   WebAuthnInlineError,
 } from '@/renderer/services/system/webauthnInlineStepUp';
 import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
+import {
+  getApiBase,
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -76,6 +81,10 @@ beforeEach(() => {
   mockApiFetch.mockReset();
 });
 
+afterEach(() => {
+  resetRuntimeServerBase();
+});
+
 describe('the frozen server strings', () => {
   it('match the control plane exactly', () => {
     expect(NO_WEBAUTHN_CREDENTIALS).toBe('No WebAuthn credentials registered');
@@ -89,7 +98,7 @@ describe('beginWebAuthnInlineVerification', () => {
   it('posts the purpose and decodes the challenge and credential ids', async () => {
     mockApiFetch.mockResolvedValueOnce(json(BEGIN_OPTIONS));
 
-    const options = await beginWebAuthnInlineVerification('dm.purge');
+    const options = await beginWebAuthnInlineVerification('dm.purge', captureApiRequestContext());
 
     const [path, init] = mockApiFetch.mock.calls[0];
     expect(path).toBe(WEBAUTHN_INLINE_BEGIN_PATH);
@@ -110,19 +119,17 @@ describe('beginWebAuthnInlineVerification', () => {
       json({ publicKey: { challenge: 'AQID', rpId: 'localhost' } })
     );
 
-    const options = await beginWebAuthnInlineVerification('dm.clear');
+    const options = await beginWebAuthnInlineVerification('dm.clear', captureApiRequestContext());
 
     expect(options.allowCredentials).toBeUndefined();
   });
 
-  it('is its own operation without a context or signal (a caller that passes neither)', async () => {
+  it('sends no signal when the caller passes none', async () => {
     mockApiFetch.mockResolvedValueOnce(json(BEGIN_OPTIONS));
 
-    await beginWebAuthnInlineVerification('dm.purge');
+    await beginWebAuthnInlineVerification('dm.purge', captureApiRequestContext());
 
-    const call = mockApiFetch.mock.calls[0];
-    expect(call).toHaveLength(2);
-    expect('signal' in call[1]).toBe(false);
+    expect('signal' in mockApiFetch.mock.calls[0][1]).toBe(false);
   });
 
   it('forwards the caller context and signal', async () => {
@@ -140,7 +147,9 @@ describe('beginWebAuthnInlineVerification', () => {
   it('throws the server error text with the step and status on a non-2xx', async () => {
     mockApiFetch.mockResolvedValueOnce(json({ error: NO_WEBAUTHN_CREDENTIALS }, 400));
 
-    const err = await thrown(beginWebAuthnInlineVerification('dm.purge'));
+    const err = await thrown(
+      beginWebAuthnInlineVerification('dm.purge', captureApiRequestContext())
+    );
 
     expect(err.step).toBe('begin');
     expect(err.status).toBe(400);
@@ -158,7 +167,9 @@ describe('beginWebAuthnInlineVerification', () => {
   ])('falls back to generic copy and a null serverError for %s', async (_name, body) => {
     mockApiFetch.mockResolvedValueOnce(json(body, 500));
 
-    const err = await thrown(beginWebAuthnInlineVerification('dm.purge'));
+    const err = await thrown(
+      beginWebAuthnInlineVerification('dm.purge', captureApiRequestContext())
+    );
 
     expect(err.serverError).toBeNull();
     expect(err.message).toBe('Failed to start verification');
@@ -169,7 +180,9 @@ describe('beginWebAuthnInlineVerification', () => {
     const failure = new TypeError('Failed to fetch');
     mockApiFetch.mockRejectedValueOnce(failure);
 
-    await expect(beginWebAuthnInlineVerification('dm.purge')).rejects.toBe(failure);
+    await expect(
+      beginWebAuthnInlineVerification('dm.purge', captureApiRequestContext())
+    ).rejects.toBe(failure);
   });
 
   // Mutant: `res.json()` without the `.catch`, so an HTML error body rejects
@@ -179,7 +192,9 @@ describe('beginWebAuthnInlineVerification', () => {
     async (status) => {
       mockApiFetch.mockResolvedValueOnce(html(status));
 
-      const err = await thrown(beginWebAuthnInlineVerification('dm.purge'));
+      const err = await thrown(
+        beginWebAuthnInlineVerification('dm.purge', captureApiRequestContext())
+      );
 
       expect(err.step).toBe('begin');
       expect(err.status).toBe(status);
@@ -187,6 +202,142 @@ describe('beginWebAuthnInlineVerification', () => {
       expect(err.message).toBe('Failed to start verification');
     }
   );
+});
+
+// Every server shares one renderer origin, so the browser's own rpId check
+// cannot tell them apart. A server could name another server's relying party
+// in begin and relay the assertion the user's key signs for it. Oracle: the
+// browser ceremony runs only for the relying party of the server the proof is
+// sent to, and with no option begin does not use.
+describe("step-up rpId relay: the relying party is bound to the proof's server", () => {
+  const EVIL = 'https://evil-selfhost.example';
+
+  function stubCeremony() {
+    const get = vi.fn().mockResolvedValue(credential());
+    Object.defineProperty(navigator, 'credentials', {
+      value: { get },
+      writable: true,
+      configurable: true,
+    });
+    return get;
+  }
+
+  function beginAnswers(publicKey: Record<string, unknown>) {
+    mockApiFetch.mockImplementation(async (path: string) =>
+      path === WEBAUTHN_INLINE_BEGIN_PATH
+        ? json({ publicKey })
+        : json({ mfa_token: 'inline-token' })
+    );
+  }
+
+  /** Begin, ceremony, finish: the order both callers run them in. */
+  async function stepUp(context = captureApiRequestContext()): Promise<string> {
+    const { signal } = new AbortController();
+    const options = await beginWebAuthnInlineVerification('dm.purge', context, signal);
+    const cred = await performWebAuthnAssertion(options, signal);
+    return finishWebAuthnVerification(cred, context, signal);
+  }
+
+  it("refuses a server naming another server's relying party, before the ceremony", async () => {
+    setRuntimeServerBase(EVIL);
+    beginAnswers({
+      challenge: 'AQID',
+      rpId: 'concordvoice.chat',
+      allowCredentials: [{ type: 'public-key', id: 'BAUG' }],
+    });
+    const get = stubCeremony();
+
+    await expect(stepUp(captureApiRequestContext())).rejects.toThrow(
+      'Server returned WebAuthn options for another server.'
+    );
+
+    expect(get).not.toHaveBeenCalled();
+    expect(mockApiFetch.mock.calls.map(([path]) => path)).toEqual([WEBAUTHN_INLINE_BEGIN_PATH]);
+  });
+
+  it("runs the ceremony for the server's own relying party (control)", async () => {
+    expect(getApiBase()).toBe('http://localhost:8080');
+    beginAnswers({ challenge: 'AQID', rpId: 'localhost' });
+    const get = stubCeremony();
+
+    await expect(stepUp()).resolves.toBe('inline-token');
+
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls[0][0].publicKey.rpId).toBe('localhost');
+  });
+
+  it("accepts the official service's relying party for its API host", async () => {
+    setRuntimeServerBase('https://api.concordvoice.chat');
+    beginAnswers({ challenge: 'AQID', rpId: 'concordvoice.chat' });
+    const get = stubCeremony();
+
+    await expect(stepUp(captureApiRequestContext())).resolves.toBe('inline-token');
+
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutant: binding to the current server rather than the captured one. With a
+  // context, apiFetch sends begin and finish to the captured server only.
+  it('binds to the captured server when the caller passes a context', async () => {
+    setRuntimeServerBase(EVIL);
+    const context = captureApiRequestContext();
+    resetRuntimeServerBase();
+    beginAnswers({ challenge: 'AQID', rpId: 'localhost' });
+    const get = stubCeremony();
+
+    await expect(stepUp(context)).rejects.toThrow(
+      'Server returned WebAuthn options for another server.'
+    );
+
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  // Mutant: a parse failure caught and the raw options passed on (fail-open),
+  // or the whole body parsed in place of its publicKey.
+  it.each([
+    ['an empty body', {}],
+    ['a null publicKey', { publicKey: null }],
+    ['options outside publicKey', { challenge: 'AQID', rpId: 'localhost' }],
+    ['a publicKey with no rpId', { publicKey: { challenge: 'AQID' } }],
+  ])('refuses %s before the ceremony', async (_name, body) => {
+    mockApiFetch.mockResolvedValue(json(body));
+    const get = stubCeremony();
+
+    await expect(stepUp()).rejects.toThrow('Server returned invalid WebAuthn options.');
+
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('refuses a 2xx begin whose body is not JSON, before the ceremony', async () => {
+    mockApiFetch.mockResolvedValue(html(200));
+    const get = stubCeremony();
+
+    await expect(stepUp()).rejects.toThrow('Server returned invalid WebAuthn options.');
+
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  // Mutant: checking the rpId but keeping the spread decode.
+  it('passes the browser no option begin does not use', async () => {
+    beginAnswers({
+      challenge: 'AQID',
+      rpId: 'localhost',
+      userVerification: 'required',
+      allowCredentials: [{ type: 'public-key', id: 'BAUG', transports: ['usb'], extra: 'x' }],
+      extensions: { appid: 'https://concordvoice.chat' },
+      hints: ['hybrid'],
+    });
+    const get = stubCeremony();
+
+    await stepUp();
+
+    const publicKey = get.mock.calls[0][0].publicKey;
+    expect(publicKey).not.toHaveProperty('extensions');
+    expect(publicKey).not.toHaveProperty('hints');
+    expect(publicKey.allowCredentials[0]).not.toHaveProperty('extra');
+    expect(publicKey.allowCredentials[0].transports).toEqual(['usb']);
+    expect(publicKey.userVerification).toBe('required');
+  });
 });
 
 describe('performWebAuthnAssertion', () => {
@@ -226,7 +377,7 @@ describe('finishWebAuthnVerification', () => {
   it('posts the base64url-encoded assertion and returns the token', async () => {
     mockApiFetch.mockResolvedValueOnce(json({ mfa_token: 'inline-token' }));
 
-    const token = await finishWebAuthnVerification(credential());
+    const token = await finishWebAuthnVerification(credential(), captureApiRequestContext());
 
     expect(token).toBe('inline-token');
     const [path, init] = mockApiFetch.mock.calls[0];
@@ -248,21 +399,19 @@ describe('finishWebAuthnVerification', () => {
   it('omits userHandle when the authenticator sent none', async () => {
     mockApiFetch.mockResolvedValueOnce(json({ mfa_token: 'inline-token' }));
 
-    await finishWebAuthnVerification(credential(null));
+    await finishWebAuthnVerification(credential(null), captureApiRequestContext());
 
     expect(JSON.parse(mockApiFetch.mock.calls[0][1].body).response).not.toHaveProperty(
       'userHandle'
     );
   });
 
-  it('is its own operation without a context or signal', async () => {
+  it('sends no signal when the caller passes none', async () => {
     mockApiFetch.mockResolvedValueOnce(json({ mfa_token: 'inline-token' }));
 
-    await finishWebAuthnVerification(credential());
+    await finishWebAuthnVerification(credential(), captureApiRequestContext());
 
-    const call = mockApiFetch.mock.calls[0];
-    expect(call).toHaveLength(2);
-    expect('signal' in call[1]).toBe(false);
+    expect('signal' in mockApiFetch.mock.calls[0][1]).toBe(false);
   });
 
   it('forwards the caller context and signal', async () => {
@@ -280,7 +429,7 @@ describe('finishWebAuthnVerification', () => {
   it('throws the server error text on a non-2xx, including the expired-session string', async () => {
     mockApiFetch.mockResolvedValueOnce(json({ error: NO_INLINE_SESSION }, 400));
 
-    const err = await thrown(finishWebAuthnVerification(credential()));
+    const err = await thrown(finishWebAuthnVerification(credential(), captureApiRequestContext()));
 
     expect(err.step).toBe('finish');
     expect(err.status).toBe(400);
@@ -290,7 +439,7 @@ describe('finishWebAuthnVerification', () => {
   it('falls back to generic copy when a non-2xx names no error', async () => {
     mockApiFetch.mockResolvedValueOnce(json({}, 401));
 
-    const err = await thrown(finishWebAuthnVerification(credential()));
+    const err = await thrown(finishWebAuthnVerification(credential(), captureApiRequestContext()));
 
     expect(err.status).toBe(401);
     expect(err.serverError).toBeNull();
@@ -303,7 +452,9 @@ describe('finishWebAuthnVerification', () => {
     async (status) => {
       mockApiFetch.mockResolvedValueOnce(html(status));
 
-      const err = await thrown(finishWebAuthnVerification(credential()));
+      const err = await thrown(
+        finishWebAuthnVerification(credential(), captureApiRequestContext())
+      );
 
       expect(err.step).toBe('finish');
       expect(err.status).toBe(status);
@@ -317,7 +468,7 @@ describe('finishWebAuthnVerification', () => {
   it('fails closed, as a WebAuthnInlineError, on a 2xx whose body is not JSON', async () => {
     mockApiFetch.mockResolvedValueOnce(html(200));
 
-    const err = await thrown(finishWebAuthnVerification(credential()));
+    const err = await thrown(finishWebAuthnVerification(credential(), captureApiRequestContext()));
 
     expect(err.step).toBe('finish');
     expect(err.status).toBe(200);
@@ -332,7 +483,7 @@ describe('finishWebAuthnVerification', () => {
   ])('fails closed on a 2xx with %s', async (_name, body) => {
     mockApiFetch.mockResolvedValueOnce(json(body, 200));
 
-    const err = await thrown(finishWebAuthnVerification(credential()));
+    const err = await thrown(finishWebAuthnVerification(credential(), captureApiRequestContext()));
 
     expect(err.step).toBe('finish');
     expect(err.status).toBe(200);

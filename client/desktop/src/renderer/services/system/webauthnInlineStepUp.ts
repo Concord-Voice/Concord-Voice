@@ -8,15 +8,16 @@
  * with the one request it was minted for.
  *
  * The factor picker's `useStepUpFactor` uses these (design
- * 2026-09-26-mfa-factor-picker §4.1, D14). `context` admits begin and
- * finish against the caller's capture (`captureApiRequestContext`), so a switch
- * of account or server between them is refused before dispatch; `signal`
- * cancels a request still in flight. Without either, each request is its own
- * operation.
+ * 2026-09-26-mfa-factor-picker §4.1, D14). `context` is required: it admits
+ * begin and finish against the caller's capture (`captureApiRequestContext`),
+ * so both go to the server whose relying party begin was checked against, and
+ * a switch of account or server between them is refused before dispatch.
+ * `signal` cancels a request still in flight.
  */
 
 import type { StepUpPurpose } from '../../components/Auth/stepUpPurpose';
-import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
+import { bufferToBase64url } from '../../utils/crypto/base64url';
+import { parseWebAuthnOptions } from '../../utils/webauthnOptions';
 import { apiFetchInContext, type ApiRequestContext } from './requestContext';
 
 export const WEBAUTHN_INLINE_BEGIN_PATH = '/api/v1/mfa/webauthn/verify-inline/begin';
@@ -66,30 +67,6 @@ function postJson(body: unknown, signal: AbortSignal | undefined): RequestInit {
   return init;
 }
 
-/** Begin's `publicKey`, as JSON: the binary fields are base64url strings. */
-type RequestOptionsJSON = Omit<
-  PublicKeyCredentialRequestOptions,
-  'challenge' | 'allowCredentials'
-> & {
-  challenge: string;
-  allowCredentials?: (Omit<PublicKeyCredentialDescriptor, 'id'> & { id: string })[];
-};
-
-function decodeRequestOptions(json: RequestOptionsJSON): PublicKeyCredentialRequestOptions {
-  const { challenge, allowCredentials, ...rest } = json;
-  const options: PublicKeyCredentialRequestOptions = {
-    ...rest,
-    challenge: base64urlToBuffer(challenge),
-  };
-  if (allowCredentials) {
-    options.allowCredentials = allowCredentials.map((cred) => ({
-      ...cred,
-      id: base64urlToBuffer(cred.id),
-    }));
-  }
-  return options;
-}
-
 /**
  * Asks the server for an assertion challenge for `purpose`. The token finish
  * mints is spendable on that purpose's route only, so `purpose` must name the
@@ -97,9 +74,11 @@ function decodeRequestOptions(json: RequestOptionsJSON): PublicKeyCredentialRequ
  */
 export async function beginWebAuthnInlineVerification(
   purpose: StepUpPurpose | null,
-  context?: ApiRequestContext,
+  context: ApiRequestContext,
   signal?: AbortSignal
 ): Promise<PublicKeyCredentialRequestOptions> {
+  // The server apiFetch sends begin and finish to.
+  const apiBase = context.serverSelection.apiBase;
   const res = await apiFetchInContext(
     WEBAUTHN_INLINE_BEGIN_PATH,
     postJson({ purpose }, signal),
@@ -111,8 +90,12 @@ export async function beginWebAuthnInlineVerification(
   if (!res.ok) {
     throw new WebAuthnInlineError('begin', res.status, data, 'Failed to start verification');
   }
-  // The browser validates the options themselves; this only decodes them.
-  return decodeRequestOptions((data as { publicKey: RequestOptionsJSON }).publicKey);
+  // Every server shares one renderer origin, so the browser's own rpId check
+  // cannot tell them apart. The rpId must be the relying party of the server
+  // the proof goes to, or a server could name another server's relying party
+  // and relay the assertion. Unknown keys (extensions, hints) are dropped. A
+  // refusal throws, so the ceremony never runs.
+  return parseWebAuthnOptions((data as { publicKey?: unknown } | null)?.publicKey, apiBase);
 }
 
 /** Performs the browser WebAuthn assertion ceremony. */
@@ -131,7 +114,7 @@ export async function performWebAuthnAssertion(
 /** Sends the assertion to the server and returns the inline token it mints. */
 export async function finishWebAuthnVerification(
   credential: PublicKeyCredential,
-  context?: ApiRequestContext,
+  context: ApiRequestContext,
   signal?: AbortSignal
 ): Promise<string> {
   const assertion = credential.response as AuthenticatorAssertionResponse;
