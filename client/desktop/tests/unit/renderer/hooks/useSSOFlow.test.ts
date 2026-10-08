@@ -6,10 +6,15 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import {
+  captureRuntimeServerSelection,
   getApiBase,
   resetRuntimeServerBase,
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
+import {
+  __resetChallengeIssuersForTests,
+  challengeIssuerFor,
+} from '@/renderer/services/system/challengeIssuer';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock the service so we drive the hook through every SSOResult shape
@@ -440,6 +445,35 @@ describe('useSSOFlow', () => {
       expect(state.maskedEmail).toBe('m***@example.test');
       expect(state.ssoToken).toBe('sso-tok-2');
     }
+  });
+
+  // The modal sends a challenge token only to the server recorded as its
+  // issuer, so the record must exist before the challenge is published.
+  it('mfa_required: records the reserved selection as the issuer before publishing', async () => {
+    __resetChallengeIssuersForTests();
+    const reserved = captureRuntimeServerSelection();
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'mfa_required',
+      mfaChallengeToken: 'mfa-chal-issuer',
+      methods: ['totp'],
+    });
+    let issuerWhenPublished: unknown = 'not published';
+    const unsubscribe = useMFAChallengeStore.subscribe((state) => {
+      if (state.challengeToken === 'mfa-chal-issuer') {
+        issuerWhenPublished = challengeIssuerFor(state.challengeToken);
+      }
+    });
+
+    try {
+      const { result } = renderHook(() => useSSOFlow());
+      await act(async () => {
+        await result.current.begin('google');
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(issuerWhenPublished).toEqual(reserved);
   });
 
   it('mfa_required: dispatches mfa_required phase with challenge token', async () => {

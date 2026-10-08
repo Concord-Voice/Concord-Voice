@@ -19,6 +19,7 @@ import {
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
 } from './runtimeServerBase';
+import { recordChallengeIssuer } from './challengeIssuer';
 import { getDesktopClientVersion } from '../../utils/runtime/clientVersion';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import type { TerminalAttestationCode } from '../../stores/auth/attestationFailureStore';
@@ -334,10 +335,12 @@ function sameOrigin(a: string, b: string): boolean {
 /**
  * Handle MFA challenge during token refresh if the server flags a suspicious session.
  * Returns the new access token if MFA verification + retry succeeds, null otherwise.
+ * `refreshSelection` is the server selection the refresh was sent under.
  */
 async function handleMfaChallengeIfNeeded(
   result: import('../../../main/ipcContract').RefreshResult,
-  lifecycle: AuthLifecycleSnapshot
+  lifecycle: AuthLifecycleSnapshot,
+  refreshSelection: RuntimeServerSelection
 ): Promise<string | null> {
   if (result.status !== 'mfa_required' || !result.mfaChallengeToken) return null;
   if (!authLifecycleIsCurrent(lifecycle)) return null;
@@ -352,6 +355,9 @@ async function handleMfaChallengeIfNeeded(
 
   const { useMFAChallengeStore } = await import('../../stores/auth/mfaChallengeStore');
   if (!authLifecycleIsCurrent(lifecycle)) return null;
+  // Recorded before the challenge is published: the modal sends its token only
+  // to this server, and refuses it once the selection has moved on.
+  recordChallengeIssuer(result.mfaChallengeToken, refreshSelection);
   const webauthnOptions = webauthnOptionsOrNull(result.mfaWebauthnOptions, getApiBase());
   const mfaResult = await useMFAChallengeStore
     .getState()
@@ -405,6 +411,9 @@ async function handleMfaChallengeIfNeeded(
 async function performTokenRefresh(lifecycle: AuthLifecycleSnapshot): Promise<string | null> {
   if (!globalThis.electron?.refreshToken) return null;
 
+  // Taken before the request leaves. The selection can move while it is out,
+  // and a challenge it returns belongs to the server it was sent under.
+  const refreshSelection = captureRuntimeServerSelection();
   const result = await globalThis.electron.refreshToken();
   if (!authLifecycleIsCurrent(lifecycle)) return null;
   if (result.status === 'ok' && result.accessToken) {
@@ -415,7 +424,7 @@ async function performTokenRefresh(lifecycle: AuthLifecycleSnapshot): Promise<st
   }
 
   // Handle suspicious session MFA challenge
-  return handleMfaChallengeIfNeeded(result, lifecycle);
+  return handleMfaChallengeIfNeeded(result, lifecycle, refreshSelection);
 }
 
 export async function refreshAccessToken(): Promise<string | null> {

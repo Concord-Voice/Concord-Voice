@@ -53,6 +53,14 @@
   margin: 0;
 }
 
+/* The email send's error, below the code input rather than inside it. Its
+   parent stretches its children, so it centres itself as the input's own
+   error line is centred. */
+.mfa-send-error {
+  align-self: center;
+  text-align: center;
+}
+
 .totp-backup-link {
   background: none;
   border: none;

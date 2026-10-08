@@ -5,7 +5,8 @@ import { useModalStack } from '../ui/ModalContext';
 // the modals under it go inert and their Escape and Tab handlers stand down.
 import { TOP_LAYER_DEPTH } from '../../hooks/ui/useTopLayerDialog';
 import { ensureMachineId, safeJson } from '../../services/system/apiClient';
-import { apiUrl, captureRuntimeServerSelection } from '../../services/system/runtimeServerBase';
+import { runtimeServerSelectionIsCurrent } from '../../services/system/runtimeServerBase';
+import { challengeIssuerFor } from '../../services/system/challengeIssuer';
 import {
   completeSSOMFA,
   SSOServiceError,
@@ -19,6 +20,9 @@ import MFAMethodPicker, {
   getAvailableCategories,
   MFAMethodCategory,
 } from './MFAMethodPicker';
+import { useSignInEmailCode, type SignInEmailCode } from './signInEmailCode';
+import SendNewCodeButton from './SendNewCodeButton';
+import { responseIssuedSessionID, revokeMalformedLoginSession } from './loginSessionRevoke';
 import { intersectInline, pickDefaultMethod } from '../../services/system/stepUpRequirements';
 import { bufferToBase64url } from '../../utils/crypto/base64url';
 import './TOTPInput.css';
@@ -33,6 +37,13 @@ const MFA_PROOF_TIMEOUT_MS = 30_000;
 
 const GENERIC_PROOF_ERROR = 'Verification failed. Please try again.';
 const TIMEOUT_PROOF_ERROR = 'Verification timed out. Please try again.';
+// One line: the error slot centres only a message that does not wrap.
+const ORIGIN_CHANGED_ERROR = 'The server changed. Cancel and try again.';
+
+// The server selection moved on after the challenge arrived. Its token belongs
+// to the server that issued it, so nothing more is sent for it, and a result
+// that lands after the move is not acted on.
+class ChallengeOriginChangedError extends Error {}
 
 // Codes main's sso:completeMFA raises itself. The server's verify endpoint
 // answers with readable `error` text instead, which is shown as it is.
@@ -49,6 +60,7 @@ const SSO_PROOF_ERRORS: Record<string, string> = {
 // AbortError, not a TimeoutError. Never log token/proof material — only the
 // error `.message` per [internal]rules/observability.md.
 function resolveMfaProofError(err: unknown, timedOut: boolean): string {
+  if (err instanceof ChallengeOriginChangedError) return ORIGIN_CHANGED_ERROR;
   if (timedOut || (err instanceof DOMException && err.name === 'TimeoutError')) {
     return TIMEOUT_PROOF_ERROR;
   }
@@ -59,6 +71,28 @@ function resolveMfaProofError(err: unknown, timedOut: boolean): string {
   }
   console.error('MFA verify failed:', (err as Error).message);
   return GENERIC_PROOF_ERROR;
+}
+
+// A send can outlive its challenge, as a proof can (see submitMfaProof).
+const isLiveChallenge = (token: string) => useMFAChallengeStore.getState().challengeToken === token;
+
+// The email panel for a challenge whose issuer is unknown: nothing is sent,
+// and the panel says so. Its token has no server it may go to.
+const NO_ISSUER_EMAIL_CODE: SignInEmailCode = {
+  sendError: ORIGIN_CHANGED_ERROR,
+  failed: false,
+  retry: () => {},
+};
+
+/** The email panel's state: the refusal when a challenge offering email has no issuer. */
+function emailCodeForIssuer(
+  challengeToken: string | null,
+  issuer: unknown,
+  methods: readonly string[],
+  sent: SignInEmailCode
+): SignInEmailCode {
+  const issuerUnknown = Boolean(challengeToken) && issuer === null;
+  return issuerUnknown && methods.includes('email') ? NO_ISSUER_EMAIL_CODE : sent;
 }
 
 /**
@@ -146,6 +180,13 @@ const MFAChallengeModal: React.FC = () => {
   // when they change.
   const webauthnOptions = useMFAChallengeStore((s) => s.webauthnOptions);
 
+  // The server selection the challenge was raised under, recorded by the code
+  // that raised it before publishing it (see challengeIssuer.ts). Null when
+  // none was recorded or the record has outlived the challenge. Nothing is
+  // sent for the token then: taking the selection here instead would send it
+  // to whichever server is selected when the modal renders.
+  const challengeSelection = challengeIssuerFor(challengeToken);
+
   // The modal stays mounted between challenges, so a new one starts clean: its
   // own default method, no error, and no spinner left from a proof that
   // belonged to the challenge before it.
@@ -175,13 +216,24 @@ const MFAChallengeModal: React.FC = () => {
   const submitMfaProof = useCallback(
     async (proof: { method: string; code?: string; assertion?: unknown }): Promise<void> => {
       if (!challengeToken) return;
+      // No recorded issuer means no server this token may go to.
+      if (!challengeSelection) {
+        setError(ORIGIN_CHANGED_ERROR);
+        setInputKey((k) => k + 1);
+        return;
+      }
       // A proof can outlive its challenge (a replacement challenge supersedes
       // it in flight), so its result only touches the challenge it was sent for.
       const isCurrent = () => useMFAChallengeStore.getState().challengeToken === challengeToken;
+      const selection = challengeSelection;
+      const requireOrigin = () => {
+        if (!runtimeServerSelectionIsCurrent(selection)) throw new ChallengeOriginChangedError();
+      };
       setLoading(true);
       setError('');
       const timeout = AbortSignal.timeout(MFA_PROOF_TIMEOUT_MS);
       try {
+        requireOrigin();
         // `proof` already carries exactly the fields for its method ({method,code}
         // or {method,assertion}), so it spreads directly into the payload/body.
         if (purpose === 'sso_login' && ssoContext) {
@@ -192,14 +244,20 @@ const MFAChallengeModal: React.FC = () => {
               credentialOwner: ssoContext.credentialOwner,
               ...proof,
             },
-            captureRuntimeServerSelection()
+            selection
           );
+          // No origin check here. Main has already stored this completion's
+          // refresh credential and the server has issued its session, so it
+          // must reach useSSOFlow even after a move: that fence, not this one,
+          // clears the stored credential and revokes the session when the
+          // selection has moved. Dropping it here would leave both alive.
           completeChallenge({ verified: true, ssoCompletion: completion }, challengeToken);
           return;
         }
 
-        const machineId = await ensureMachineId();
-        const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
+        const machineId = await ensureMachineId(selection.apiBase);
+        requireOrigin();
+        const res = await fetch(`${selection.apiBase}/api/v1/auth/mfa/verify`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -211,6 +269,17 @@ const MFAChallengeModal: React.FC = () => {
         });
 
         const data = await safeJson<MFAVerifyResponse & { error?: string }>(res);
+        if (!runtimeServerSelectionIsCurrent(selection)) {
+          // An answer accepted after the move is not acted on, so any session
+          // it issued is revoked at the server that issued it. This branch's
+          // only purpose today (suspicious_refresh) returns no tokens, so this
+          // is defence in depth. Not awaited: revokeAbortedSession has no
+          // timeout, and Cancel stays disabled while the proof is loading.
+          if (res.ok) {
+            void revokeMalformedLoginSession(data, selection.apiBase, responseIssuedSessionID(res));
+          }
+          throw new ChallengeOriginChangedError();
+        }
         if (res.ok) {
           completeChallenge({ verified: true, payload: data }, challengeToken);
         } else if (isCurrent()) {
@@ -227,7 +296,7 @@ const MFAChallengeModal: React.FC = () => {
         if (isCurrent()) setLoading(false);
       }
     },
-    [challengeToken, completeChallenge, purpose, ssoContext]
+    [challengeToken, challengeSelection, completeChallenge, purpose, ssoContext]
   );
 
   const handleVerify = useCallback(
@@ -353,6 +422,21 @@ const MFAChallengeModal: React.FC = () => {
     wasLoadingRef.current = loading;
   }, [loading]);
 
+  // Renderer-direct for every purpose, sso_login included: the route takes
+  // only the challenge token. Like a proof, it goes to the server the
+  // challenge was raised under, and only while that is still the selection.
+  // The hook reads a null selection as no challenge open, so a challenge with
+  // no issuer is refused here.
+  const sendEmailCode = useSignInEmailCode({
+    challengeToken,
+    serverSelection: challengeSelection,
+    mode,
+    methods,
+    originChangedError: ORIGIN_CHANGED_ERROR,
+    isCurrent: isLiveChallenge,
+  });
+  const emailCode = emailCodeForIssuer(challengeToken, challengeSelection, methods, sendEmailCode);
+
   // Early return AFTER all hooks
   if (!challengeToken) return null;
 
@@ -453,12 +537,15 @@ const MFAChallengeModal: React.FC = () => {
         )}
 
         {mode === 'email-sms' && (
-          <TOTPInput
-            key={inputKey}
-            onSubmit={(code) => handleVerify(code, methods.includes('email') ? 'email' : 'sms')}
-            disabled={loading}
-            error={error}
-          />
+          <>
+            <TOTPInput
+              key={inputKey}
+              onSubmit={(code) => handleVerify(code, methods.includes('email') ? 'email' : 'sms')}
+              disabled={loading}
+              error={error}
+            />
+            <SendNewCodeButton emailCode={emailCode} disabled={loading} />
+          </>
         )}
 
         {mode !== 'method-select' && hasMultipleMethods && (

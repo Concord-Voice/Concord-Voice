@@ -7,10 +7,15 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import {
+  captureRuntimeServerSelection,
   getApiBase,
   resetRuntimeServerBase,
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
+import {
+  __resetChallengeIssuersForTests,
+  challengeIssuerFor,
+} from '@/renderer/services/system/challengeIssuer';
 
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
@@ -353,6 +358,43 @@ describe('apiClient', () => {
   // ─── MFA challenge flow in refreshAccessToken ──────────────────────
 
   describe('refreshAccessToken MFA challenge', () => {
+    // The modal sends a challenge token only to the server recorded as its
+    // issuer, so the record must name the server the refresh was sent under,
+    // and exist before the challenge is published.
+    it.each([
+      { name: 'moves while the refresh is out', moves: true },
+      { name: 'does not move (control)', moves: false },
+    ])(
+      'records the selection the refresh was sent under as the issuer when the selection $name',
+      async ({ moves }) => {
+        __resetChallengeIssuersForTests();
+        useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', 'sess-before-mfa');
+        const sentUnder = captureRuntimeServerSelection();
+        globalThis.electron = {
+          refreshToken: vi.fn(async () => {
+            if (moves) setRuntimeServerBase('https://other-server.test');
+            return {
+              status: 'mfa_required',
+              mfaChallengeToken: 'challenge-issuer',
+              mfaMethods: ['totp'],
+            };
+          }),
+        } as any;
+        let issuerWhenPublished: unknown = 'not published';
+        const showChallengeSpy = vi
+          .spyOn(useMFAChallengeStore.getState(), 'showChallenge')
+          .mockImplementation(async (token) => {
+            issuerWhenPublished = challengeIssuerFor(token);
+            return { verified: false };
+          });
+
+        await refreshAccessToken();
+
+        expect(issuerWhenPublished).toEqual(sentUnder);
+        showChallengeSpy.mockRestore();
+      }
+    );
+
     it('handles MFA challenge → showChallenge → retry refresh', async () => {
       const generation = useAuthStore
         .getState()

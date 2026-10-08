@@ -26,6 +26,7 @@ import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useMFAChallengeStore, type MFAChallengeResult } from '../../stores/auth/mfaChallengeStore';
 import { revokeAbortedSession } from '../../services/system/apiClient';
+import { recordChallengeIssuer } from '../../services/system/challengeIssuer';
 import { methodsForOptions, webauthnOptionsOrNull } from '../../utils/webauthnOptions';
 import {
   captureRuntimeServerSelection,
@@ -266,6 +267,10 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
             // branch sets a phase nothing renders against and the user is
             // stranded.
             setState({ phase: 'mfa_required', mfaChallengeToken: result.mfaChallengeToken });
+            // Recorded before the challenge is published: the modal sends its
+            // token only to the server this flow reserved, and refuses it once
+            // the selection has moved on.
+            recordChallengeIssuer(result.mfaChallengeToken, serverSelection);
             const webauthnOptions = webauthnOptionsOrNull(
               result.webauthnOptions,
               serverSelection.apiBase

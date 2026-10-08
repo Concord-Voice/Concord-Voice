@@ -2,6 +2,11 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import { vi } from 'vitest';
 import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import {
+  __resetChallengeIssuersForTests,
+  recordChallengeIssuer,
+} from '@/renderer/services/system/challengeIssuer';
+import { captureRuntimeServerSelection } from '@/renderer/services/system/runtimeServerBase';
 import Modal from '@/renderer/components/ui/Modal';
 import MFAChallengeModal from '@/renderer/components/Auth/MFAChallengeModal';
 import AttestationFailedModalHost from '@/renderer/components/AttestationFailedModal';
@@ -36,7 +41,11 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 installTopLayerEmulation();
 const getRoot = installRootHarness();
 
+// Records the issuer before publishing, as the code that raises a challenge
+// does: the modal sends nothing for a token with no recorded issuer.
 function openChallenge() {
+  __resetChallengeIssuersForTests();
+  recordChallengeIssuer('tok', captureRuntimeServerSelection());
   act(() => {
     useMFAChallengeStore.setState({
       challengeToken: 'tok',

@@ -6,6 +6,8 @@ import {
 } from '@/renderer/stores/auth/mfaChallengeStore';
 import { completeSSOMFA, abandonSSOReservation } from '@/renderer/services/system/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { recordIssuerOnPublish } from '../../../helpers/challengeIssuer';
+import { __resetChallengeIssuersForTests } from '@/renderer/services/system/challengeIssuer';
 
 // Mock global fetch
 const mockFetch = vi.fn();
@@ -181,9 +183,19 @@ const mockWebAuthnOptions = {
 } as unknown as PublicKeyCredentialRequestOptions;
 
 describe('MFAChallengeModal', () => {
+  // Every challenge here is published through the store, so the issuer the
+  // producers would record is recorded as each one is published.
+  let stopRecordingIssuers: () => void;
+
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllStores();
+    __resetChallengeIssuersForTests();
+    stopRecordingIssuers = recordIssuerOnPublish();
+  });
+
+  afterEach(() => {
+    stopRecordingIssuers();
   });
 
   it('renders nothing when no challenge token is present', () => {

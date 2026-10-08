@@ -39,6 +39,9 @@ import MFAMethodPicker, {
   getAvailableCategories,
   MFAMethodCategory,
 } from './MFAMethodPicker';
+import { useSignInEmailCode } from './signInEmailCode';
+import SendNewCodeButton from './SendNewCodeButton';
+import { responseIssuedSessionID, revokeMalformedLoginSession } from './loginSessionRevoke';
 import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
@@ -104,45 +107,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function responseError(data: unknown, fallback: string): string {
   const parsed = LoginErrorResponseSchema.safeParse(data);
   return parsed.success ? (parsed.data.error ?? fallback) : fallback;
-}
-
-function malformedLoginSession(data: unknown, apiBase: string) {
-  const record = isRecord(data) ? data : {};
-  return {
-    accessToken: typeof record.access_token === 'string' ? record.access_token : null,
-    refreshToken: typeof record.refresh_token === 'string' ? record.refresh_token : null,
-    sessionId: typeof record.session_id === 'string' ? record.session_id : null,
-    apiBase,
-  };
-}
-
-function responseIssuedSessionID(response: Response): string | null {
-  return response.headers?.get('X-Concord-Session-ID')?.trim() || null;
-}
-
-async function revokeMalformedLoginSession(
-  data: unknown,
-  apiBase: string,
-  issuedSessionID: string | null
-): Promise<void> {
-  const session = malformedLoginSession(data, apiBase);
-  // When present, the response header is the backend's authoritative refresh
-  // row ID. Prefer it to any partially decoded body value; this is precisely
-  // the malformed-success path the header exists to recover.
-  if (issuedSessionID !== null) session.sessionId = issuedSessionID;
-  if (
-    session.refreshToken !== null ||
-    (session.accessToken !== null && session.sessionId !== null)
-  ) {
-    await revokeAbortedSession(session);
-  } else if (issuedSessionID !== null) {
-    await revokeAbortedSession({
-      accessToken: null,
-      sessionId: issuedSessionID,
-      cookieBound: true,
-      apiBase,
-    });
-  }
 }
 
 async function parseLoginResponseJson(response: Response, apiBase: string): Promise<unknown> {
@@ -1346,6 +1310,18 @@ const Login: React.FC<LoginProps> = ({
     [mfaMethods, mfaRecoveryOnly]
   );
 
+  // The email code goes to the server that issued the challenge, as verify
+  // does. The selection is null whenever the two-factor step is not open. A
+  // move is reported as verify reports one (LoginOriginChangedError), without
+  // staging the notice describeLoginError stages for a torn-down sign-in.
+  const emailCode = useSignInEmailCode({
+    challengeToken: mfaChallengeToken,
+    serverSelection: mfaServerSelection,
+    mode: mfaMode,
+    methods: mfaMethods,
+    originChangedError: TEARDOWN_ABORT_NOTICE,
+  });
+
   const handleWebAuthnSuccess = async (credential: Credential) => {
     const pkc = credential as PublicKeyCredential;
     const response = pkc.response as AuthenticatorAssertionResponse;
@@ -1501,14 +1477,17 @@ const Login: React.FC<LoginProps> = ({
             )}
 
             {mfaMode === 'email-sms' && (
-              <TOTPInput
-                key={mfaInputKey}
-                onSubmit={(code) =>
-                  handleMFAVerify(code, mfaMethods.includes('email') ? 'email' : 'sms')
-                }
-                disabled={isSubmitting}
-                error={mfaError}
-              />
+              <>
+                <TOTPInput
+                  key={mfaInputKey}
+                  onSubmit={(code) =>
+                    handleMFAVerify(code, mfaMethods.includes('email') ? 'email' : 'sms')
+                  }
+                  disabled={isSubmitting}
+                  error={mfaError}
+                />
+                <SendNewCodeButton emailCode={emailCode} disabled={isSubmitting} />
+              </>
             )}
 
             {/* "Choose another form" link */}
