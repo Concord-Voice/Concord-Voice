@@ -3,6 +3,7 @@ import {
   captureApiRequestContext,
 } from '../../services/system/requestContext';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { hasPendingDrafts, useDraftSettingsStore } from '../../stores/ui/draftSettingsStore';
 import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
 import {
   useSettingsOverlayStore,
@@ -81,19 +82,32 @@ export function verificationReturnLabel(target: VerificationReturn): string {
  * failed refetch still reopens it, since the server stays authoritative. An
  * account or server change during the refetch reopens nothing. Nothing is
  * pending, nothing happens.
+ *
+ * Either way App Settings goes, and its draft layer with it, so a change the
+ * user has not applied holds the return exactly as "Back to app" holds its
+ * close: nothing is taken and nothing closes until it is applied or reverted.
+ *
+ * Resolves true when it left App Settings.
  */
-export async function returnFromVerificationSetup(): Promise<void> {
+export async function returnFromVerificationSetup(): Promise<boolean> {
+  if (hasPendingDrafts(useDraftSettingsStore.getState().drafts)) return false;
   const overlay = useSettingsOverlayStore.getState();
   const target = overlay.takeVerificationReturn();
-  if (target === null) return;
+  if (target === null) return false;
   if (target.kind === 'chat') {
     overlay.close();
-    return;
+    return true;
   }
   const context = captureApiRequestContext();
   await usePermissionStore.getState().fetchServerPermissions(target.serverId);
-  if (!apiRequestContextIsCurrent(context)) return;
+  if (!apiRequestContextIsCurrent(context)) return false;
+  // The refetch is a wait: a change made during it holds the return as well.
+  if (hasPendingDrafts(useDraftSettingsStore.getState().drafts)) {
+    useSettingsOverlayStore.getState().setVerificationReturn(target);
+    return false;
+  }
   useSettingsOverlayStore
     .getState()
     .openSettings('server', { serverId: target.serverId, section: target.section });
+  return true;
 }

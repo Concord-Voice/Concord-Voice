@@ -225,12 +225,27 @@ function callSetter(store: Record<string, unknown>, field: string, value: unknow
 // Store
 // ---------------------------------------------------------------------------
 
-interface DraftOverlays {
+export interface DraftOverlays {
   appearance: Partial<DraftableAppearanceSettings>;
   audio: Partial<DraftableAudioSettings>;
   video: Partial<DraftableVideoSettings>;
   tts: Partial<DraftableTTSSettings>;
   contentProtection?: boolean;
+}
+
+/**
+ * Whether Settings holds a change the user has not applied. Leaving Settings
+ * tears the draft layer down, and the change with it, so every way out asks
+ * this first: the "Back to app" button and the verification-setup return.
+ */
+export function hasPendingDrafts(drafts: DraftOverlays): boolean {
+  return (
+    Object.keys(drafts.appearance).length > 0 ||
+    Object.keys(drafts.audio).length > 0 ||
+    Object.keys(drafts.video).length > 0 ||
+    Object.keys(drafts.tts).length > 0 ||
+    drafts.contentProtection !== undefined
+  );
 }
 
 const emptyDrafts = (): DraftOverlays => ({

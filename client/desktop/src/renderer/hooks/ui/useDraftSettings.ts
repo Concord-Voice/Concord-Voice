@@ -2,6 +2,7 @@ import { useEffect, useCallback } from 'react';
 import { useStoreWithEqualityFn } from 'zustand/traditional';
 import { shallow } from 'zustand/shallow';
 import {
+  hasPendingDrafts,
   useDraftSettingsStore,
   type DraftableAudioSettings,
   type DraftableVideoSettings,
@@ -153,14 +154,7 @@ export function useDraftSettingsLifecycle() {
 export function useDraftActions() {
   const apply = useDraftSettingsStore((s) => s.apply);
   const revert = useDraftSettingsStore((s) => s.revert);
-  const hasPendingChanges = useDraftSettingsStore(
-    (s) =>
-      Object.keys(s.drafts.appearance).length > 0 ||
-      Object.keys(s.drafts.audio).length > 0 ||
-      Object.keys(s.drafts.video).length > 0 ||
-      Object.keys(s.drafts.tts).length > 0 ||
-      s.drafts.contentProtection !== undefined
-  );
+  const hasPendingChanges = useDraftSettingsStore((s) => hasPendingDrafts(s.drafts));
   const hwAccelChanged = useDraftSettingsStore((s) => 'hardwareAcceleration' in s.drafts.video);
   const contentProtectionApplying = useDraftSettingsStore((s) => s.contentProtectionApplying);
   const contentProtectionApplyFailed = useDraftSettingsStore((s) => s.contentProtectionApplyFailed);

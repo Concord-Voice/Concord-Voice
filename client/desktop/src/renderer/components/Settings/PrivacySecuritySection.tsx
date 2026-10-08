@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useId, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useUserStore } from '../../stores/auth/userStore';
@@ -10,6 +10,7 @@ import {
 } from '../../stores/ui/privacyStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
+import { hasPendingDrafts, useDraftSettingsStore } from '../../stores/ui/draftSettingsStore';
 import { apiFetch, API_BASE } from '../../services/system/apiClient';
 import {
   apiRequestContextIsCurrent,
@@ -379,18 +380,35 @@ const BackupCodesCount: React.FC<{ remaining: number | undefined }> = ({ remaini
  * opened from somewhere (the pending return) and a TOTP or key setup has just
  * finished here. Nothing else renders; the pending return is taken on use, so
  * the button goes with it.
+ *
+ * Leaving App Settings drops a change the user has not applied, so while one
+ * is pending the button stays focusable but does nothing, and says why; the
+ * Apply/Revert prompt is already on screen, as for "Back to app".
  */
 const VerificationReturnButton: React.FC<{ setupCompleted: boolean }> = ({ setupCompleted }) => {
   const target = useSettingsOverlayStore((s) => s.verificationReturn);
+  const pendingChanges = useDraftSettingsStore((s) => hasPendingDrafts(s.drafts));
+  const hintId = useId();
   if (!setupCompleted || target === null) return null;
   return (
-    <button
-      type="button"
-      className="btn btn-sm btn-secondary"
-      onClick={() => void returnFromVerificationSetup()}
-    >
-      {verificationReturnLabel(target)}
-    </button>
+    <>
+      <button
+        type="button"
+        className="btn btn-sm btn-secondary"
+        aria-disabled={pendingChanges || undefined}
+        aria-describedby={pendingChanges ? hintId : undefined}
+        onClick={() => {
+          if (!pendingChanges) void returnFromVerificationSetup();
+        }}
+      >
+        {verificationReturnLabel(target)}
+      </button>
+      {pendingChanges && (
+        <span className="settings-row-hint" id={hintId}>
+          Apply or revert your settings changes first.
+        </span>
+      )}
+    </>
   );
 };
 

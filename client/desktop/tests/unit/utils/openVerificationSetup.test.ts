@@ -11,6 +11,11 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
+import {
+  hasPendingDrafts,
+  useDraftSettingsStore,
+  type DraftOverlays,
+} from '@/renderer/stores/ui/draftSettingsStore';
 
 // The "Set up verification" route (#3456 §3.6a) and its "Back to ..." return.
 // The stores are real; only the permission refetch is replaced, since it is the
@@ -35,6 +40,13 @@ function stubPermissionFetch(impl: (serverId: string) => Promise<void> = async (
 beforeEach(() => {
   resetAllStores();
 });
+
+const NO_DRAFTS: DraftOverlays = { appearance: {}, audio: {}, video: {}, tts: {} };
+
+/** A change made in App Settings and not yet applied. */
+function stageDraft(drafts: Partial<DraftOverlays> = { appearance: { uiScale: 1.25 } }): void {
+  useDraftSettingsStore.setState({ drafts: { ...NO_DRAFTS, ...drafts } });
+}
 
 describe('openVerificationSetup', () => {
   // Mutant: closeHost called before the guard, or the guard's verdict not read (`!(await ...)` dropped).
@@ -245,6 +257,75 @@ describe('returnFromVerificationSetup', () => {
     expect(overlay().open).toBeNull();
   });
 
+  // Mutant: the leading hasPendingDrafts check dropped: closing the overlay tears the draft down.
+  it('an unapplied change holds the chat return: nothing closes and the slot stays', async () => {
+    await openVerificationSetup({ returnTo: { kind: 'chat' } });
+    stageDraft();
+
+    const left = await returnFromVerificationSetup();
+
+    expect(left).toBe(false);
+    expect(overlay().open).toBe('app');
+    expect(overlay().verificationReturn).toEqual({ kind: 'chat' });
+    expect(useDraftSettingsStore.getState().drafts.appearance).toEqual({ uiScale: 1.25 });
+  });
+
+  // Mutant: the leading check moved after takeVerificationReturn or the refetch.
+  it('an unapplied change holds the Server Settings return before anything is fetched', async () => {
+    const fetchServerPermissions = stubPermissionFetch();
+    await openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: 's2', section: 'roles' },
+    });
+    stageDraft({ contentProtection: true });
+
+    const left = await returnFromVerificationSetup();
+
+    expect(left).toBe(false);
+    expect(fetchServerPermissions).not.toHaveBeenCalled();
+    expect(overlay().open).toBe('app');
+    expect(overlay().verificationReturn).toEqual({
+      kind: 'serverSettings',
+      serverId: 's2',
+      section: 'roles',
+    });
+  });
+
+  // Mutant: the post-refetch hasPendingDrafts check dropped, or the slot not put back.
+  it('a change made during the refetch holds the return, and puts the slot back', async () => {
+    const gate = deferred<void>();
+    stubPermissionFetch(() => gate.promise);
+    await openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: 's2', section: 'roles' },
+    });
+
+    const returning = returnFromVerificationSetup();
+    await Promise.resolve();
+    expect(overlay().verificationReturn).toBeNull();
+    stageDraft();
+    gate.resolve();
+
+    expect(await returning).toBe(false);
+    expect(overlay().open).toBe('app');
+    expect(overlay().verificationReturn).toEqual({
+      kind: 'serverSettings',
+      serverId: 's2',
+      section: 'roles',
+    });
+  });
+
+  // Control for the three above: with nothing staged the same returns go through.
+  it('resolves true once it has left App Settings', async () => {
+    stubPermissionFetch();
+    await openVerificationSetup({ returnTo: { kind: 'chat' } });
+    expect(await returnFromVerificationSetup()).toBe(true);
+
+    await openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: 's2', section: 'members' },
+    });
+    expect(await returnFromVerificationSetup()).toBe(true);
+    expect(overlay().open).toBe('server');
+  });
+
   // Mutant: the slot taken only after the refetch: a reentrant press during it acts twice.
   it('takes the slot before the refetch, so a press during it does nothing', async () => {
     const gate = deferred<void>();
@@ -282,5 +363,22 @@ describe('the pending return is session-scoped', () => {
     overlay().close();
 
     expect(overlay().verificationReturn).toBeNull();
+  });
+});
+
+describe('hasPendingDrafts', () => {
+  // Mutant: any one layer dropped from the predicate: that layer's change is lost on the way out.
+  it.each<[string, Partial<DraftOverlays>]>([
+    ['appearance', { appearance: { uiScale: 1.25 } }],
+    ['audio', { audio: { inputVolume: 50 } }],
+    ['video', { video: { supportSvc: false } }],
+    ['tts', { tts: { ttsEnabled: true } }],
+    ['screen-capture protection', { contentProtection: false }],
+  ])('counts a %s draft', (_layer, drafts) => {
+    expect(hasPendingDrafts({ ...NO_DRAFTS, ...drafts })).toBe(true);
+  });
+
+  it('is false with nothing staged', () => {
+    expect(hasPendingDrafts(NO_DRAFTS)).toBe(false);
   });
 });

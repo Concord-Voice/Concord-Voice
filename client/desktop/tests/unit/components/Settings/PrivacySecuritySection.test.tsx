@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, within, act, userEvent } from '../../../test-utils';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { onTestFinished, vi } from 'vitest';
 import { deferred } from '../../../helpers/deferred';
 
@@ -90,6 +91,13 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
     }
     if (path === '/api/v1/users/me/presence-settings' && method === 'GET') {
       return mockPresenceGetFetch();
+    }
+    // The friend store's mount fetch (PresenceExceptions, RecoveryCircle) runs
+    // until the store is hydrated, so it used to fire in whichever case ran
+    // first and take that case's sessions response: the first case to run
+    // alone then read its MFA status from the wrong reply.
+    if (path === '/api/v1/friends' && method === 'GET') {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ friends: [] }) });
     }
     return mockApiFetch(...args);
   },
@@ -965,6 +973,52 @@ describe('PrivacySecuritySection', () => {
     queueStatusRefetch();
     fireEvent.click(screen.getByTestId('mfa-setup-complete'));
     expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
+  });
+
+  // The "Back to …" return leaves App Settings, which tears its unapplied
+  // changes down: while one is pending the button holds, as "Back to app" does.
+  describe('the verification return with an unapplied settings change', () => {
+    const NO_DRAFTS = { appearance: {}, audio: {}, video: {}, tts: {} };
+
+    async function finishSetupWithReturnPending() {
+      useSettingsOverlayStore.setState({ open: 'app', verificationReturn: { kind: 'chat' } });
+      onTestFinished(() => {
+        useSettingsOverlayStore.setState({ open: null, verificationReturn: null });
+        useDraftSettingsStore.setState({ drafts: NO_DRAFTS });
+      });
+      render(<PrivacySecuritySection />);
+      await screen.findByTestId('mfa-tier-selector');
+      fireEvent.click(screen.getByTestId('stub-setup-totp'));
+      queueStatusRefetch();
+      fireEvent.click(screen.getByTestId('mfa-setup-complete'));
+      return screen.findByRole('button', { name: 'Back to chat' });
+    }
+
+    // Mutant: the button's own `!pendingChanges` guard or its aria-disabled dropped (the helper alone would still hold it, silently).
+    it('stays focusable, says why, and goes nowhere', async () => {
+      const back = await finishSetupWithReturnPending();
+      act(() => {
+        useDraftSettingsStore.setState({ drafts: { ...NO_DRAFTS, appearance: { uiScale: 1.25 } } });
+      });
+
+      expect(back).toHaveAttribute('aria-disabled', 'true');
+      expect(back).toHaveAccessibleDescription('Apply or revert your settings changes first.');
+      await userEvent.click(back);
+
+      expect(useSettingsOverlayStore.getState().open).toBe('app');
+      expect(useSettingsOverlayStore.getState().verificationReturn).toEqual({ kind: 'chat' });
+    });
+
+    // Control: once the change is applied or reverted the same button goes back.
+    it('goes back once nothing is pending', async () => {
+      const back = await finishSetupWithReturnPending();
+
+      expect(back).not.toHaveAttribute('aria-disabled');
+      expect(screen.queryByText('Apply or revert your settings changes first.')).toBeNull();
+      await userEvent.click(back);
+
+      await vi.waitFor(() => expect(useSettingsOverlayStore.getState().open).toBeNull());
+    });
   });
 
   it('opens the backup-code reset modal and shows the credential form', async () => {

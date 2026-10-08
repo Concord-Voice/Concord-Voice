@@ -130,10 +130,10 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
 
   const form: ServerUpdateForm = { name, icon, banner, allowEmbeddedContent };
 
-  // Setting up verification leaves this page, and its unsaved edits with it: ask first.
-  const { confirmDiscard, prompt: discardPrompt } = useDiscardPrompt(
-    () => server !== undefined && hasUnsavedChanges(server, form)
-  );
+  // Setting up verification leaves this page, and its unsaved edits with it: ask first. The
+  // General edits outlive a switch to Roles or Members, so those sections ask about them too.
+  const pageIsDirty = () => server !== undefined && hasUnsavedChanges(server, form);
+  const { confirmDiscard, prompt: discardPrompt } = useDiscardPrompt(pageIsDirty);
 
   const hasServerPerm = usePermissionStore((s) => s.hasServerPermission);
   const canManageServer = server ? hasServerPerm(server.id, Permissions.MANAGE_SERVER) : false;
@@ -595,6 +595,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         onCreateRole={handleCreateRole}
         onSaveRole={handleSaveRole}
         onDeleteRole={handleDeleteRole}
+        pageIsDirty={pageIsDirty}
       />
     </div>
   );
@@ -608,6 +609,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         onToggleRole={handleToggleRole}
         serverId={server.id}
         ownerUserId={server.owner_id}
+        confirmDiscard={confirmDiscard}
       />
     </div>
   );

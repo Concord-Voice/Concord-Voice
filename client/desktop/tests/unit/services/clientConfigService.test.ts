@@ -1410,3 +1410,73 @@ describe('purgeKeepsPinned capability — THROUGH THE PARSER', () => {
     expect(renderHook(() => usePurgeKeepsPinned()).result.current).toBe(false);
   });
 });
+
+describe('mfaEnforcedDangerousActions capability — THROUGH THE PARSER', () => {
+  // The MFA-enforcement toggle (#3456) reads `mfaEnforcementCapability`, and only
+  // `confirmed-unsupported` locks its ON. These go through the parser, not the
+  // setter: zod strips an undeclared key, so a schema line lost from
+  // `ServerCapabilitiesSchema` would read every server as too old to enforce, and
+  // a test that set the store directly would stay green through it.
+  const withEnforcement = (features: Record<string, unknown>): unknown => ({
+    server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+    auth: { emailVerificationRequired: true, oauthProviders: [] },
+    features: { voiceTiersSupported: true, ...features },
+    policyVersion: 'test',
+  });
+  const capability = () => useClientConfigStore.getState().mfaEnforcementCapability;
+
+  // Mutant: the schema line dropped (the key is stripped), or `mfaEnforcementCapabilityOf` reading `!== false`.
+  it('a true capability survives the parse and reads supported', async () => {
+    mockApiFetch.mockResolvedValueOnce(
+      jsonResponse(withEnforcement({ mfaEnforcedDangerousActions: true }))
+    );
+
+    await clientConfigService.refreshServerCapabilities();
+
+    expect(capability()).toEqual({ status: 'supported' });
+    // The parsed payload still carries the field, so another path setting the
+    // state could not be what passed the line above.
+    expect(
+      useClientConfigStore.getState().serverCapabilities?.features.mfaEnforcedDangerousActions
+    ).toBe(true);
+  });
+
+  // Mutant: `mfaEnforcementCapabilityOf` treating anything but `false` as supported, or absence as an error.
+  it.each([
+    ['absent (a server predating the toggle)', {}],
+    ['false', { mfaEnforcedDangerousActions: false }],
+  ])('%s is confirmed-unsupported', async (_label, features) => {
+    mockApiFetch.mockResolvedValueOnce(jsonResponse(withEnforcement(features)));
+
+    await clientConfigService.refreshServerCapabilities();
+
+    expect(capability()).toEqual({ status: 'confirmed-unsupported' });
+  });
+
+  // Mutant: the schema widened to coerce (`z.coerce.boolean()` or `z.any()`), turning a malformed
+  // payload into a confident answer about the server.
+  it.each([
+    ['string', 'yes'],
+    ['number', 1],
+    ['null', null],
+  ])('rejects a non-boolean %s rather than coercing it', async (_label, value) => {
+    mockApiFetch.mockResolvedValueOnce(
+      jsonResponse(withEnforcement({ mfaEnforcedDangerousActions: value }))
+    );
+
+    await clientConfigService.refreshServerCapabilities();
+
+    // We could not ask: the third state, which leaves ON live.
+    expect(capability()).toEqual({ status: 'error' });
+  });
+
+  // Mutant: `setCapabilityError` dropping the MFA line, leaving `loading` (or an older answer) in place.
+  it('a failed fetch is an error, not unsupported', async () => {
+    useClientConfigStore.getState().setMfaEnforcementCapability({ status: 'supported' });
+    mockApiFetch.mockRejectedValueOnce(new Error('offline'));
+
+    await clientConfigService.refreshServerCapabilities();
+
+    expect(capability()).toEqual({ status: 'error' });
+  });
+});

@@ -51,6 +51,12 @@ interface RoleEditorPanelProps {
     roleId: string,
     confirmation?: WriteConfirmation
   ) => Promise<PermissionWriteOutcome>;
+  /**
+   * Whether the page around the panel holds edits of its own (Server Settings'
+   * General form, which outlives a switch to Roles). Setting up verification
+   * leaves the page, so the panel's one discard question covers those too.
+   */
+  pageIsDirty?: () => boolean;
 }
 
 type RoleWritePurpose = Extract<StepUpPurpose, 'roles.create' | 'roles.update'>;
@@ -119,6 +125,7 @@ const RoleEditorPanel: React.FC<RoleEditorPanelProps> = ({
   onCreateRole,
   onSaveRole,
   onDeleteRole,
+  pageIsDirty,
 }) => {
   const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
   const [editRoleName, setEditRoleName] = useState('');
@@ -164,7 +171,8 @@ const RoleEditorPanel: React.FC<RoleEditorPanelProps> = ({
   const returnTo = { kind: 'serverSettings', serverId, section: 'roles' } as const;
   // Edits the form holds that the role does not. Leaving Server Settings to set
   // up verification, from a refused save or a refused delete, would lose them
-  // (D-4); with nothing selected, or nothing changed, there is nothing to lose.
+  // (D-4), and the page's own edits with them; with nothing selected, or
+  // nothing changed, there is nothing to lose.
   const formIsDirty = () =>
     selectedRole !== null &&
     (editRoleName !== selectedRole.name ||
@@ -173,7 +181,9 @@ const RoleEditorPanel: React.FC<RoleEditorPanelProps> = ({
       editRoleDisplaySeparately !== selectedRole.display_separately ||
       editRoleMentionable !== selectedRole.mentionable ||
       editRolePermissions !== parsePermissions(selectedRole.permissions));
-  const { confirmDiscard, prompt: discardPrompt } = useDiscardPrompt(formIsDirty);
+  const { confirmDiscard, prompt: discardPrompt } = useDiscardPrompt(
+    () => formIsDirty() || pageIsDirty?.() === true
+  );
 
   // One write at a time: from the first send until the dialog it may open has
   // closed. A second would replace the first's refusal, and the dialog under

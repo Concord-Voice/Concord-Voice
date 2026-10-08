@@ -13,6 +13,7 @@ import {
   type GatedReply,
 } from '../../../helpers/gatedRoute';
 import { createMockWsService } from '../../../helpers/wsServiceMock';
+import { moderationMember } from '../../../helpers/moderationPurge';
 
 // Server Settings' save under MFA enforcement (#3456 §3.4 "Settings save", §3.6a). The page, the
 // dialog, the factor hook, the refusal adapter and openVerificationSetup are real; only `apiFetch`
@@ -42,6 +43,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockServer } from '../../../mocks/fixtures';
 import {
   ADMIN_PERMISSIONS,
+  BAN,
   INVITE,
   MANAGE_ROLES,
   MANAGE_ROLES_ASSIGN,
@@ -317,6 +319,65 @@ describe('"Set up verification" from the save dialog', () => {
       serverId: 'server-1',
       section: 'general',
     });
+  });
+});
+
+// General's edits are page state, so they outlive a switch to Roles or Members, and "Set up
+// verification" from either section leaves the page and them with it. Each section asks about
+// them first, even with nothing of its own changed. The panels are real; only the network is not.
+describe('"Set up verification" from Roles or Members, with General edited', () => {
+  const ROLES_PATH = `${SERVER_PATH}/roles`;
+  const BAN_PATH = `${SERVER_PATH}/bans/${moderationMember.user_id}`;
+
+  beforeEach(() => {
+    useMemberStore.setState({ members: [moderationMember] });
+    usePermissionStore.setState((st) => ({
+      serverPermissions: { 'server-1': (st.serverPermissions['server-1'] ?? 0n) | BAN },
+    }));
+    installStepUpApi(mockApiFetch, {
+      read: () => readOffers([]),
+      route: (path) => {
+        if (path === SETTING_PATH)
+          return jsonResponse(200, { enforce_mfa_dangerous_actions: false });
+        if (path === ROLES_PATH || path === BAN_PATH) return asReply(ENROLMENT_REQUIRED);
+        return jsonResponse(404);
+      },
+    });
+  });
+
+  async function editGeneralThenOpen(section: 'Roles' | 'Members') {
+    await renderPage();
+    await userEvent.clear(nameField());
+    await userEvent.type(nameField(), NEW_NAME);
+    await userEvent.click(screen.getByRole('button', { name: section }));
+  }
+
+  async function expectAskedFirst() {
+    await userEvent.click(await screen.findByRole('button', { name: SETUP_LINK }));
+    expect(await screen.findByRole('dialog', { name: DISCARD_TITLE })).toBeInTheDocument();
+    expect(useSettingsOverlayStore.getState().open).toBeNull();
+    expect(useSettingsOverlayStore.getState().verificationReturn).toBeNull();
+  }
+
+  // Mutant: ServerSettingsPage stops passing `pageIsDirty` to RoleEditorPanel.
+  it('a refused role create asks about the General edits', async () => {
+    await editGeneralThenOpen('Roles');
+    await userEvent.click(await screen.findByText('+ Create Role'));
+    await expectAskedFirst();
+  });
+
+  // Mutant: ServerSettingsPage stops passing `confirmDiscard` to MemberListPanel, or the panel to ModerationDialog.
+  it('a refused ban asks about the General edits', async () => {
+    await editGeneralThenOpen('Members');
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Open context menu for Alice' })
+    );
+    // The menu's Ban opens the confirmation, whose own Ban sends.
+    await userEvent.click(screen.getByRole('button', { name: 'Ban' }));
+    const confirmation = await screen.findByRole('dialog');
+    await userEvent.click(within(confirmation).getByRole('button', { name: 'Ban' }));
+    await screen.findByText(ENROLMENT_TEXT);
+    await expectAskedFirst();
   });
 });
 

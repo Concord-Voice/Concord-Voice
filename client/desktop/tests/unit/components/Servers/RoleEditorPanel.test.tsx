@@ -726,6 +726,47 @@ describe('RoleEditorPanel', () => {
     });
   });
 
+  // The General form's edits outlive a switch to Roles, and leaving for App
+  // Settings drops them with the rest of the page: the panel's one question
+  // covers them even when the role form itself is untouched.
+  describe("the page's own edits", () => {
+    const DISCARD = 'Discard unsaved changes?';
+
+    async function refuseCreateForEnrolment() {
+      defaultProps.onCreateRole.mockResolvedValue(refusedWith(ENROLMENT_REQUIRED));
+      await userEvent.click(screen.getByText('+ Create Role'));
+      await userEvent.click(await screen.findByRole('button', { name: SETUP_LINK }));
+    }
+
+    // Mutation: dropping `pageIsDirty` from the panel's discard predicate leaves for App Settings unasked (red).
+    it('a dirty page is asked about before setup, with the role form untouched', async () => {
+      render(<RoleEditorPanel {...defaultProps} pageIsDirty={() => true} />);
+      await refuseCreateForEnrolment();
+
+      const discard = await screen.findByRole('dialog', { name: DISCARD });
+      expect(useSettingsOverlayStore.getState().verificationReturn).toBeNull();
+      await userEvent.click(within(discard).getByRole('button', { name: 'Discard Changes' }));
+      await waitFor(() =>
+        expect(useSettingsOverlayStore.getState().verificationReturn).toEqual({
+          kind: 'serverSettings',
+          serverId: 'server-1',
+          section: 'roles',
+        })
+      );
+    });
+
+    // Control: a clean page and a clean form leave at once, with no question.
+    it('a clean page is not asked about', async () => {
+      render(<RoleEditorPanel {...defaultProps} pageIsDirty={() => false} />);
+      await refuseCreateForEnrolment();
+
+      await waitFor(() =>
+        expect(useSettingsOverlayStore.getState().verificationReturn).not.toBeNull()
+      );
+      expect(screen.queryByRole('dialog', { name: DISCARD })).toBeNull();
+    });
+  });
+
   describe('delete', () => {
     // Mutation: calling onDeleteRole from the Delete button directly (no confirmation, R11) turns this red.
     it('opens a confirmation first and sends nothing until it is confirmed', async () => {

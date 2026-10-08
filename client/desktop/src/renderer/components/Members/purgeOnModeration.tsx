@@ -319,6 +319,8 @@ interface ModerationDialogProps {
   target: ServerMember | null;
   /** Where "Set up verification" comes back to: the chat, or the Server Settings section this sits in. */
   returnTo: VerificationReturn;
+  /** Asked before "Set up verification" leaves a page with unsaved edits; see `openVerificationSetup`. */
+  confirmDiscard?: () => boolean | Promise<boolean>;
   /** The notice to announce once the action has committed. */
   onNotice: (notice: string) => void;
   /** The action is over, however it ended: the host forgets its target. */
@@ -341,6 +343,7 @@ export function ModerationDialog({
   serverId,
   target,
   returnTo,
+  confirmDiscard,
   onNotice,
   onEnd,
   focusFallback,
@@ -436,7 +439,7 @@ export function ModerationDialog({
         onSuccess={succeeded}
         onClose={endStepUp}
         onSetUpVerification={() => {
-          void openVerificationSetup({ returnTo, closeHost: endStepUp });
+          void openVerificationSetup({ returnTo, confirmDiscard, closeHost: endStepUp });
         }}
         focusFallback={focusFallback}
       />

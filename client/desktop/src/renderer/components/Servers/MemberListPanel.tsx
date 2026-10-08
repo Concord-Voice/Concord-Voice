@@ -18,6 +18,11 @@ interface MemberListPanelProps {
   onToggleRole: (userId: string, roleId: string, hasRole: boolean) => void;
   serverId: string;
   ownerUserId: string;
+  /**
+   * Server Settings' discard guard: "Set up verification" leaves the page, and
+   * the General edits that outlive a switch to Members go with it.
+   */
+  confirmDiscard?: () => boolean | Promise<boolean>;
 }
 
 function AddRoleDropdown({
@@ -158,6 +163,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   onToggleRole,
   serverId,
   ownerUserId,
+  confirmDiscard,
 }) => {
   const [contextMenu, setContextMenu] = useState<{
     member: ServerMember;
@@ -390,6 +396,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
         serverId={serverId}
         target={banTarget}
         returnTo={{ kind: 'serverSettings', serverId, section: 'members' }}
+        confirmDiscard={confirmDiscard}
         onNotice={setModerationNotice}
         onEnd={() => setBanTarget(null)}
         focusFallback={focusMemberList}
@@ -400,6 +407,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
         serverId={serverId}
         target={kickTarget}
         returnTo={{ kind: 'serverSettings', serverId, section: 'members' }}
+        confirmDiscard={confirmDiscard}
         onNotice={setModerationNotice}
         onEnd={() => setKickTarget(null)}
         focusFallback={focusMemberList}
