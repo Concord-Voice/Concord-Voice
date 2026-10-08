@@ -1503,6 +1503,9 @@ func (h *Handler) invalidateMemberPermissions(serverID, userID, action string) {
 // An empty body binds to the zero value, so existing bodyless callers are unaffected.
 type RemoveMemberRequest struct {
 	PurgeMessages bool `json:"purge_messages"`
+	// IncludePinned lets the purge delete the member's pinned messages too
+	// (#3458). Absent, null and false keep them; ignored without purge_messages.
+	IncludePinned bool `json:"include_pinned"`
 	// MFACode confirms a kick that purges on a server enforcing MFA on
 	// dangerous actions (#3454 A-6). A plain field, never stepup.Fields: this
 	// is not an own-rule route, so it neither refuses current_password nor
@@ -1781,7 +1784,8 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// #1353: additive purge applies ONLY to a moderator removal, never a self-leave
 	// (no moderation intent — a user leaving must not bulk-wipe their own history).
 	if fenceReq.purge {
-		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "kick", purgeProvenance(fence.gateOutcome))
+		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "kick", purgeProvenance(fence.gateOutcome),
+			req.IncludePinned)
 	}
 
 	// The member is removed and fully de-authorized by this point; only presence
@@ -1825,6 +1829,9 @@ func (h *Handler) classifyBanFenceError(
 type BanRequest struct {
 	Reason        string `json:"reason"`
 	PurgeMessages bool   `json:"purge_messages"` // #1353 additive purge-on-ban (optional; default false)
+	// IncludePinned lets the purge delete the member's pinned messages too
+	// (#3458). Absent, null and false keep them; ignored without purge_messages.
+	IncludePinned bool `json:"include_pinned"`
 	// MFACode confirms the ban on a server enforcing MFA on dangerous actions
 	// (#3454 A-6). A plain field, never stepup.Fields, as on RemoveMemberRequest.
 	MFACode string `json:"mfa_code" binding:"max=256"`
@@ -2272,7 +2279,8 @@ func (h *Handler) BanMember(c *gin.Context) {
 	// #1353: additive purge — runs AFTER the ban has committed; a denied/failed purge
 	// never affects the ban (best-effort, surfaced via the purge object only).
 	if req.PurgeMessages {
-		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "ban", purgeProvenance(fence.gateOutcome))
+		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "ban", purgeProvenance(fence.gateOutcome),
+			req.IncludePinned)
 	}
 
 	// Banned and fully de-authorized by this point; only presence delivery

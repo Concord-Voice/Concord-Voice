@@ -1581,6 +1581,33 @@ func hideDMMessageForDownload(t *testing.T, ts *testSetup, viewer, conversationI
 	require.NoError(t, err)
 }
 
+// A pinned message is never hidden (#3458 §18.1), so its attachment is served
+// to a participant whose Clear range covers it, and refused once it is
+// unpinned. The peer uploads, so the uploader-preview fallback cannot serve it.
+func TestDownloadAttachmentDMVisibility_PinnedMessageUnderClearRange(t *testing.T) {
+	ts := setupMediaTest(t)
+	actor := ts.createTestUser(t, "mediapinnedactor")
+	peer := ts.createTestUser(t, "mediapinnedpeer")
+	convID := ts.createTestDMConversation(t, actor, peer)
+	fileID, messageID := insertDMDownloadFixture(t, ts, peer, convID, []byte("pinned-bytes"))
+	_, err := ts.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, messageID, peer)
+	require.NoError(t, err)
+	hideDMMessageForDownload(t, ts, actor, convID, time.Unix(0, 0), time.Now().Add(time.Minute), true)
+	download := func() *httptest.ResponseRecorder {
+		return ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, actor, gin.Params{{Key: "file_id", Value: fileID}})
+	}
+
+	pinned := download()
+	assert.Equal(t, http.StatusOK, pinned.Code)
+	assert.Equal(t, []byte("pinned-bytes"), pinned.Body.Bytes())
+
+	_, err = ts.db.Exec(`UPDATE dm_messages SET pinned_at = NULL, pinned_by = NULL WHERE id = $1`, messageID)
+	require.NoError(t, err)
+	unpinned := download()
+	assert.Equal(t, http.StatusForbidden, unpinned.Code)
+	assert.False(t, bytes.Contains(unpinned.Body.Bytes(), []byte("pinned-bytes")))
+}
+
 func TestDownloadAttachmentDMVisibility(t *testing.T) {
 	t.Run("hidden linked attachment is denied to actor but readable by peer", func(t *testing.T) {
 		ts := setupMediaTest(t)

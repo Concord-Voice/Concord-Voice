@@ -53,13 +53,18 @@ func TestClearReapQueriesShape(t *testing.T) {
 		assert.Contains(t, q, "ORDER BY created_at, id", name)
 		// SKIP LOCKED is what keeps the reap out of expiry's lock order (§10).
 		assert.Contains(t, q, "FOR UPDATE SKIP LOCKED", name)
-		// I10: pinned rows below W are reaped like any other row.
-		assert.NotContains(t, strings.ToLower(q), "pinned", name)
 	}
 	assert.Contains(t, clearReapSelectBelow, "created_at < $2::timestamptz")
+	// A pin is visible to every participant (#3458 §18), so the below-W reap
+	// keeps it; with no participant left (clearReapSelectAll) nobody can see
+	// it and it goes with the rest.
+	assert.Contains(t, clearReapSelectBelow, "pinned_at IS NULL")
+	assert.NotContains(t, strings.ToLower(clearReapSelectAll), "pinned")
 
 	// The audit shape is fixed: no actor, target, server or lower bound, and the
-	// row is written completed in the batch transaction (D1).
-	assert.Contains(t, clearReapAudit, "VALUES (NULL, $1, $2, NULL, NULL, NULL, $3, $4, 'completed', $5, NOW())")
+	// row is written completed in the batch transaction (D1). include_pinned is
+	// bound, never left to the column's TRUE default (#3458 §18.2).
+	assert.Contains(t, clearReapAudit, "reason, status, deleted_count, completed_at, include_pinned)")
+	assert.Contains(t, clearReapAudit, "VALUES (NULL, $1, $2, NULL, NULL, NULL, $3, $4, 'completed', $5, NOW(), $6)")
 	assert.Equal(t, "clear", ClearReason)
 }

@@ -337,6 +337,26 @@ func TestGetCapabilities_AttachmentEnvelopeVersions_ReaderFloor(t *testing.T) {
 	}
 }
 
+// TestGetCapabilities_PurgeKeepsPinned: the desktop shows the "include pinned
+// messages" option only when this key reads true (#3458). A renamed or absent
+// key hides the option, and an older server that deletes pins must never be
+// told the client keeps them. Both instance types honour it.
+func TestGetCapabilities_PurgeKeepsPinned(t *testing.T) {
+	for _, instance := range []string{"saas", "self-hosted"} {
+		t.Run(instance, func(t *testing.T) {
+			w, c := newTestContext()
+			servercapabilities.NewHandler(&config.Config{InstanceType: instance}).GetCapabilities(c)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+			features, ok := body["features"].(map[string]any)
+			require.True(t, ok, "features object missing")
+			assert.Equal(t, true, features["purgeKeepsPinned"])
+		})
+	}
+}
+
 // The MFA-enforced dangerous-actions capability (#3454, C5). A client offers to
 // turn enforcement ON only when this is true (X16), so a handler nobody wired
 // must say false, and say it explicitly.

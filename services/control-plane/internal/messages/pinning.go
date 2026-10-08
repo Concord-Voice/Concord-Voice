@@ -38,49 +38,64 @@ func (h *Handler) withDMMessageMutation(ctx context.Context, conversationID, use
 		return errDMMessageMutationNotParticipant
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		tx, err := h.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin dm message mutation: %w", err)
-		}
-		err = func() error {
-			// Preparation owns the users-before-parent prefix and must precede the
-			// sender's credential guard.
-			if _, guardErr := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockNoKeyUpdate); guardErr != nil {
-				return guardErr
-			}
-			if guardErr := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); guardErr != nil {
-				return guardErr
-			}
-			var participantID string
-			if err := tx.QueryRowContext(ctx,
-				`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
-			).Scan(&participantID); errors.Is(err, sql.ErrNoRows) {
-				return errDMMessageMutationNotParticipant
-			} else if err != nil {
-				return fmt.Errorf("lock dm message participant: %w", err)
-			}
-			if err := mutation(tx); err != nil {
-				return err
-			}
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("commit dm message mutation: %w", err)
-			}
-			return nil
-		}()
-		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			if h.log != nil {
-				h.log.Error("Failed to rollback dm message mutation", "error", rbErr)
-			}
-			if err == nil {
-				return fmt.Errorf("rollback dm message mutation: %w", rbErr)
-			}
-		}
+		err := h.attemptDMMessageMutation(ctx, conversationID, userID, credentialEpoch, actor, mutation)
 		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
 			continue
 		}
 		return err
 	}
 	return dmblock.ErrMembershipChanged
+}
+
+// attemptDMMessageMutation runs one transaction of withDMMessageMutation and
+// always rolls it back, which is a no-op after a commit.
+func (h *Handler) attemptDMMessageMutation(
+	ctx context.Context, conversationID, userID, credentialEpoch string, actor uuid.UUID, mutation func(*sql.Tx) error,
+) error {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dm message mutation: %w", err)
+	}
+	err = runDMMessageMutationTx(ctx, tx, conversationID, userID, credentialEpoch, actor, mutation)
+	if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+		if h.log != nil {
+			h.log.Error("Failed to rollback dm message mutation", "error", rbErr)
+		}
+		if err == nil {
+			return fmt.Errorf("rollback dm message mutation: %w", rbErr)
+		}
+	}
+	return err
+}
+
+// runDMMessageMutationTx is the body of one attempt: fence, participation,
+// the mutation, and the commit.
+func runDMMessageMutationTx(
+	ctx context.Context, tx *sql.Tx, conversationID, userID, credentialEpoch string, actor uuid.UUID, mutation func(*sql.Tx) error,
+) error {
+	// Preparation owns the users-before-parent prefix and must precede the
+	// sender's credential guard.
+	if _, guardErr := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockNoKeyUpdate); guardErr != nil {
+		return guardErr
+	}
+	if guardErr := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); guardErr != nil {
+		return guardErr
+	}
+	var participantID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
+	).Scan(&participantID); errors.Is(err, sql.ErrNoRows) {
+		return errDMMessageMutationNotParticipant
+	} else if err != nil {
+		return fmt.Errorf("lock dm message participant: %w", err)
+	}
+	if err := mutation(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit dm message mutation: %w", err)
+	}
+	return nil
 }
 
 const (
@@ -140,6 +155,58 @@ func (h *Handler) lockChannelMessageMutationTx(c *gin.Context, tx *sql.Tx, messa
 	return channelID, serverID, channelType, true
 }
 
+// requirePinPermission answers a channel pin or unpin whose actor lacks
+// PermPinMessages, or whose check failed, and reports whether it may go on.
+func (h *Handler) requirePinPermission(c *gin.Context, serverID, userID, channelID, genericMsg string) bool {
+	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermPinMessages)
+	if permErr != nil {
+		h.log.Error(errMsgFailedCheckPerms, "error", permErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
+		return false
+	}
+	if !hasPerm {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return false
+	}
+	return true
+}
+
+// lockChannelPinCap takes the per-channel pin lock and reports whether the
+// pin may go on. The cap is a COUNT under READ COMMITTED, and the channel is
+// only locked FOR SHARE, so two pins of different messages could both count
+// 49 and land 51. This lock serializes channel pins from count to commit.
+// Only this path takes the key, and always as its first lock, so a waiter
+// holds nothing and it cannot join a deadlock cycle. It is keyed by the
+// message's own channel_id, the value the cap's count is scoped to.
+func (h *Handler) lockChannelPinCap(c *gin.Context, tx *sql.Tx, messageID string) bool {
+	if _, err := tx.ExecContext(c.Request.Context(), `
+		SELECT pg_advisory_xact_lock(hashtextextended('concord.channel_pin:' || channel_id::text, 0))
+		FROM messages WHERE id = $1`, messageID); err != nil {
+		h.log.Error(errMsgPinFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return false
+	}
+	return true
+}
+
+// respondChannelPinNotApplied answers a channel pin whose UPDATE matched no
+// row: the message is already pinned, or the channel is at its pin cap.
+func (h *Handler) respondChannelPinNotApplied(c *gin.Context, tx *sql.Tx, messageID string) {
+	var existingPinnedAt *time.Time
+	var existingPinnedBy *string
+	checkErr := tx.QueryRowContext(c.Request.Context(), `SELECT pinned_at, pinned_by FROM messages WHERE id = $1`, messageID).Scan(&existingPinnedAt, &existingPinnedBy)
+	if checkErr != nil {
+		h.log.Error(errMsgPinFailed, "error", checkErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return
+	}
+	if existingPinnedAt != nil {
+		c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": existingPinnedAt, "pinned_by": existingPinnedBy, "already_pinned": true})
+		return
+	}
+	c.JSON(http.StatusConflict, gin.H{"error": errMsgPinLimitReached})
+}
+
 // PinMessage pins a message in its channel or DM conversation.
 // For server channels, requires PermPinMessages. For DM conversations,
 // any participant may pin.
@@ -163,14 +230,7 @@ func (h *Handler) PinMessage(c *gin.Context) {
 	}
 
 	channelID, serverID := mctx.channelID, mctx.serverID
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermPinMessages)
-	if permErr != nil {
-		h.log.Error(errMsgFailedCheckPerms, "error", permErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
-		return
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+	if !h.requirePinPermission(c, serverID, userID, channelID, errMsgPinFailed) {
 		return
 	}
 
@@ -185,14 +245,14 @@ func (h *Handler) PinMessage(c *gin.Context) {
 			h.log.Error("Failed to rollback message pin transaction", "error", rbErr)
 		}
 	}()
+	if !h.lockChannelPinCap(c, tx, messageID) {
+		return
+	}
 	lockedChannelID, _, _, allowed := h.lockChannelMessageMutationTx(c, tx, messageID, userID, rbac.PermPinMessages, errMsgPinFailed)
 	if !allowed {
 		return
 	}
 	channelID = lockedChannelID
-	// NOTE: Under high concurrency, two simultaneous requests could both see
-	// COUNT(*) < 50 and succeed. For production at scale, consider wrapping in
-	// a transaction with an advisory lock keyed by channel_id.
 	var pinnedAt time.Time
 	var pinnedBy string
 	err = tx.QueryRowContext(c.Request.Context(), `
@@ -203,21 +263,8 @@ func (h *Handler) PinMessage(c *gin.Context) {
 		RETURNING pinned_at, pinned_by
 	`, userID, messageID, channelID, maxPinsPerChannel).Scan(&pinnedAt, &pinnedBy)
 
-	if err == sql.ErrNoRows {
-		// Disambiguate: already pinned vs limit reached
-		var existingPinnedAt *time.Time
-		var existingPinnedBy *string
-		checkErr := tx.QueryRowContext(c.Request.Context(), `SELECT pinned_at, pinned_by FROM messages WHERE id = $1`, messageID).Scan(&existingPinnedAt, &existingPinnedBy)
-		if checkErr != nil {
-			h.log.Error(errMsgPinFailed, "error", checkErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
-			return
-		}
-		if existingPinnedAt != nil {
-			c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": existingPinnedAt, "pinned_by": existingPinnedBy, "already_pinned": true})
-			return
-		}
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgPinLimitReached})
+	if errors.Is(err, sql.ErrNoRows) {
+		h.respondChannelPinNotApplied(c, tx, messageID)
 		return
 	}
 	if err != nil {
@@ -232,7 +279,7 @@ func (h *Handler) PinMessage(c *gin.Context) {
 	}
 
 	// Broadcast to channel (server channel: recheck per-recipient view access).
-	broadcastPin(h.hub, channelID, messageID, pinnedAt, pinnedBy, true)
+	h.broadcastPin(channelID, messageID, pinnedAt, pinnedBy, true)
 
 	c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": pinnedAt, "pinned_by": pinnedBy})
 }
@@ -248,6 +295,10 @@ func (h *Handler) pinDMMessage(c *gin.Context, messageID, userID, conversationID
 	err := h.withDMMessageMutation(c.Request.Context(), conversationID, userID, middleware.TokenCredentialEpoch(c), func(tx *sql.Tx) error {
 		// The request-time lookup only shapes the response. Recheck visibility
 		// inside the locked mutation so Clear cannot make hidden history mutable.
+		//
+		// The HiddenRangeFilter on the pin_count subquery no longer excludes
+		// anything: a pinned message is never hidden (#3458 §18), so the cap
+		// counts every pin, including pins inside history the pinner cleared.
 		//nolint:gosec // G202: HiddenRangeFilter is a compile-time SQL fragment; values are parameterized.
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		err := tx.QueryRowContext(c.Request.Context(), `
@@ -354,14 +405,7 @@ func (h *Handler) UnpinMessage(c *gin.Context) {
 	}
 
 	channelID, serverID := mctx.channelID, mctx.serverID
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermPinMessages)
-	if permErr != nil {
-		h.log.Error(errMsgFailedCheckPerms, "error", permErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgUnpinFailed})
-		return
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+	if !h.requirePinPermission(c, serverID, userID, channelID, errMsgUnpinFailed) {
 		return
 	}
 
@@ -411,19 +455,24 @@ func (h *Handler) UnpinMessage(c *gin.Context) {
 		return
 	}
 
-	// Broadcast to channel
-	channelUUID, parseErr := uuid.Parse(channelID)
-	if parseErr == nil {
-		h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
-			Type: "message_unpinned",
-			Data: map[string]interface{}{
-				"message_id": messageID,
-				"channel_id": channelID,
-			},
-		})
-	}
-
+	h.broadcastUnpin(channelID, messageID)
 	c.JSON(http.StatusOK, gin.H{"message_id": messageID})
+}
+
+// broadcastUnpin tells the channel's authorized viewers a message was unpinned.
+func (h *Handler) broadcastUnpin(channelID, messageID string) {
+	channelUUID, parseErr := uuid.Parse(channelID)
+	if parseErr != nil {
+		h.log.Warn("Skipped the unpin broadcast for an unparseable channel ID", "error", parseErr)
+		return
+	}
+	h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
+		Type: "message_unpinned",
+		Data: map[string]interface{}{
+			"message_id": messageID,
+			"channel_id": channelID,
+		},
+	})
 }
 
 // unpinDMMessage handles the DM branch of UnpinMessage. The caller has already
@@ -622,10 +671,15 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 		return
 	}
 
-	// purge.HiddenRangeFilter excludes pins the requester purged-from-view
-	// (#1352 receiver-hide) — a hidden message must not resurface via the pin
-	// list. Concatenated fragment is a compile-time constant; values are
-	// parameterized.
+	// purge.HiddenRangeFilter is applied as on every dm_messages reader, but it
+	// matches nothing here: a hidden range never covers a pinned message
+	// (#3458 §18), so a pin stays in this list for a viewer who cleared or
+	// purge-hid its history. Concatenated fragment is a compile-time constant;
+	// values are parameterized.
+	//
+	// The EXISTS is the authorization gate; the check above only shapes the
+	// 404. It is evaluated in the same snapshot as the rows, so a participant
+	// removed after that check reads nothing rather than the pins.
 	//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	rows, err := h.db.Query(`
@@ -635,6 +689,7 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 		FROM dm_messages dm
 		INNER JOIN users u ON dm.user_id = u.id
 		WHERE dm.conversation_id = $1 AND dm.pinned_at IS NOT NULL
+		  AND EXISTS (SELECT 1 FROM dm_participants dp WHERE dp.conversation_id = dm.conversation_id AND dp.user_id = $2)
 		`+purge.HiddenRangeFilter("dm", 2)+`
 		ORDER BY dm.pinned_at DESC
 	`, conversationID, userID)
@@ -653,8 +708,10 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 			&m.PinnedAt, &m.PinnedBy, &m.EditedAt, &m.ExpiresAt, &m.CreatedAt, &m.UpdatedAt,
 			&m.Username, &m.DisplayName, &m.AvatarURL,
 		); scanErr != nil {
+			// A short list with a 200 would misreport the pin count.
 			h.log.Error("Failed to scan pinned DM message row", "error", scanErr)
-			continue
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchPinsFailed})
+			return
 		}
 		pinned = append(pinned, m)
 	}
@@ -672,9 +729,10 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 // server channels (CV-CAN-021..026). DM conversations must pass false: they
 // have no server view permission and deliveryAuthForChannel queries the
 // channels table, so the authorized path would drop the event entirely.
-func broadcastPin(hub *websocket.Hub, channelID, messageID string, pinnedAt time.Time, pinnedBy string, authorized bool) {
+func (h *Handler) broadcastPin(channelID, messageID string, pinnedAt time.Time, pinnedBy string, authorized bool) {
 	channelUUID, err := uuid.Parse(channelID)
 	if err != nil {
+		h.log.Warn("Skipped the pin broadcast for an unparseable channel ID", "error", err)
 		return
 	}
 	msg := websocket.OutgoingMessage{
@@ -687,8 +745,8 @@ func broadcastPin(hub *websocket.Hub, channelID, messageID string, pinnedAt time
 		},
 	}
 	if authorized {
-		hub.BroadcastToChannelAuthorized(channelUUID, msg)
+		h.hub.BroadcastToChannelAuthorized(channelUUID, msg)
 	} else {
-		hub.BroadcastToChannel(channelUUID, msg)
+		h.hub.BroadcastToChannel(channelUUID, msg)
 	}
 }

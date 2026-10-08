@@ -22,8 +22,10 @@ const (
 
 // clearReapCandidateQuery finds conversations where the reap has work: every
 // current participant cleared (branch A), or none remain (branch B), and a
-// message still exists below W. The EXISTS keeps already-reaped conversations
-// out, and re-finds a call-event later stamped below W.
+// unpinned message still exists below W (any message, pinned or not, when none
+// remain: nobody can see a pin then, so the reap takes it). The EXISTS keeps
+// already-reaped conversations out, and re-finds a call-event later stamped
+// below W.
 const clearReapCandidateQuery = `WITH cand AS (
   SELECT DISTINCT hr.conversation_id AS id FROM dm_message_hidden_ranges hr
    WHERE hr.includes_own AND hr.hidden_from = '-infinity'::timestamptz
@@ -36,7 +38,7 @@ SELECT c.id FROM cand JOIN dm_conversations c ON c.id = cand.id
  CROSS JOIN LATERAL (` + dmvisibility.ClearWatermarkLateral + `) w
  WHERE NOT c.is_personal AND w.uncleared = 0
    AND EXISTS (SELECT 1 FROM dm_messages m WHERE m.conversation_id = c.id
-               AND (w.participants = 0 OR m.created_at < w.watermark))
+               AND (w.participants = 0 OR (m.created_at < w.watermark AND m.pinned_at IS NULL)))
  ORDER BY c.id LIMIT $2`
 
 // ClearReapBatchRunner is the narrow engine surface the sweeper needs.

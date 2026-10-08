@@ -334,7 +334,7 @@ type provenanceRecorder struct {
 }
 
 func (r *provenanceRecorder) PurgeUserServerMessages(
-	_ context.Context, _, _, _, _ string, provenance messages.PurgeProvenance,
+	_ context.Context, _, _, _, _ string, provenance messages.PurgeProvenance, _ bool,
 ) (int, messages.PurgeStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

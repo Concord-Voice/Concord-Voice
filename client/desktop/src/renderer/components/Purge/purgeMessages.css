@@ -100,6 +100,67 @@
   line-height: 1.5;
 }
 
+/* Include pinned messages (#3458) ----------------------------------------- */
+
+/* No border and no fill: the row is an option, not a card. The whole label is
+   the target, at least 44px tall. */
+.purge-modal__option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.purge-modal__option label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+/* accent-color alone fails WCAG 1.4.11 in one block: checked, Concord light
+   fills the box with --accent-fill at 2.68:1 against the dialog. The native
+   control already picks a legible check for the fill, so only the edge needs
+   help: a --text-secondary ring measures at least 5.68:1 in all 30 blocks. */
+.purge-modal__option input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent-fill);
+  outline: 1px solid var(--text-secondary);
+  outline-offset: -1px;
+  border-radius: 3px;
+  cursor: inherit;
+}
+
+.purge-modal__option input:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
+.purge-modal__option:has(input:disabled) {
+  opacity: 0.5;
+}
+
+.purge-modal__option:has(input:disabled) label {
+  cursor: not-allowed;
+}
+
+.purge-modal__option-label {
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+/* The same pair as .purge-modal__ranges-helper, on the modal background:
+   --text-secondary on --bg-tertiary falls below AA in Midnight Sky. */
+.purge-modal__option-helper {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
 /* Scope echo -------------------------------------------------------------- */
 
 /* The single tinted element: the sentence naming what will be destroyed. The
@@ -131,6 +192,13 @@
 
 .purge-modal__scope strong {
   color: var(--text-primary);
+}
+
+/* The pin sentence, on its own line under the echo. When pins are included it
+   is a <strong>, which the rule above lifts to --text-primary. */
+.purge-modal__scope-pins {
+  display: block;
+  margin-top: 6px;
 }
 
 /* Typed confirmation ------------------------------------------------------ */
@@ -193,6 +261,18 @@
 }
 
 .purge-modal__deadend strong {
+  color: var(--text-primary);
+}
+
+/* The pin sentence again, read-only, on the credential stages. */
+.purge-modal__pin-recap {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.purge-modal__pin-recap strong {
   color: var(--text-primary);
 }
 

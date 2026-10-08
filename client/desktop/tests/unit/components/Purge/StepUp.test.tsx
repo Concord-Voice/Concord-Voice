@@ -381,7 +381,7 @@ describe('PurgeMessagesModal — step-up gate', () => {
     await reachStepUp(user);
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ range: '7d' });
+    expect(bodies[0]).toEqual({ range: '7d', include_pinned: false });
     expect(screen.queryByRole('heading', { name: 'Confirm it is you' })).not.toBeInTheDocument();
     expect(reads.count()).toBe(0);
   });
@@ -439,7 +439,7 @@ describe('PurgeMessagesModal — what the read decides', () => {
     await user.type(passwordField(), FIXTURE_PW);
     await user.click(primary());
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ range: '7d', current_password: FIXTURE_PW });
+    expect(bodies[0]).toEqual({ range: '7d', current_password: FIXTURE_PW, include_pinned: false });
   });
 
   // Mutant: `unsupported` blocking #1. A server that predates the route is
@@ -459,7 +459,7 @@ describe('PurgeMessagesModal — what the read decides', () => {
     await user.type(passwordField(), FIXTURE_PW);
     await user.click(primary());
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ range: '7d', current_password: FIXTURE_PW });
+    expect(bodies[0]).toEqual({ range: '7d', current_password: FIXTURE_PW, include_pinned: false });
   });
 
   // Mutant: `unavailable` falling through to the password leg on #1. The purge
@@ -593,7 +593,12 @@ describe('PurgeMessagesModal — what the read decides', () => {
     await user.click(primary());
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ range: '7d', current_password: FIXTURE_PW, mfa_code: 'ABCD1234' });
+    expect(bodies[0]).toEqual({
+      range: '7d',
+      current_password: FIXTURE_PW,
+      mfa_code: 'ABCD1234',
+      include_pinned: false,
+    });
   });
 
   it('offers no backup code when the read did not report one', async () => {
@@ -650,6 +655,7 @@ describe('PurgeMessagesModal — single-shot submission', () => {
     await waitFor(() => expect(bodies).toHaveLength(1));
     expect(bodies[0]).toEqual({
       range: '7d',
+      include_pinned: false,
       current_password: FIXTURE_PW,
       mfa_code: FIXTURE_OTP,
     });
@@ -730,7 +736,12 @@ describe('PurgeMessagesModal — single-shot submission', () => {
     await user.click(primary());
 
     await waitFor(() => expect(bodies).toHaveLength(2));
-    expect(bodies[1]).toEqual({ range: '7d', current_password: FIXTURE_PW, mfa_code: FIXTURE_OTP });
+    expect(bodies[1]).toEqual({
+      range: '7d',
+      include_pinned: false,
+      current_password: FIXTURE_PW,
+      mfa_code: FIXTURE_OTP,
+    });
   });
 
   it('reveals the fields when a credential-less purge is refused', async () => {
@@ -1106,6 +1117,7 @@ describe('PurgeMessagesModal — security key', () => {
       range: '7d',
       current_password: FIXTURE_PW,
       mfa_code: FIXTURE_TOKEN,
+      include_pinned: false,
     });
     expect(await screen.findByText('Purged 1 message.')).toBeInTheDocument();
   });

@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -212,6 +215,68 @@ func TestPinMessageLimitReached(t *testing.T) {
 }
 
 // --- Unpin Message Tests ---
+
+// The channel pin cap is a COUNT under READ COMMITTED, so without the
+// per-channel advisory lock two pins of different messages can both count 49
+// and land 51 (CWE-362, #3552 red-team). Each round races eight pins at 49
+// pinned. Every contender is a different member, so the per-user pin rate
+// limit (10 a minute) never turns one into a 429 and every round contends.
+func TestChannelPinCapHoldsUnderConcurrentPins(t *testing.T) {
+	const contenders, rounds = 8, 8
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "pincap_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Pin Cap Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	pinnerRole := ts.CreateTestRole(t, serverID, "pinner", 5, int64(rbac.PermPinMessages))
+	pinners := make([]testhelpers.TestUser, contenders)
+	for i := range pinners {
+		pinners[i] = ts.CreateTestUser(t, fmt.Sprintf("pincap_%d", i))
+		ts.AddMemberToServer(t, serverID, pinners[i].ID, "member")
+		ts.AssignRoleToUser(t, serverID, pinners[i].ID, pinnerRole)
+	}
+	for i := 0; i < 49; i++ {
+		id := ts.CreateTestMessage(t, channelID, owner, fmt.Sprintf("pre-%d", i))
+		_, err := ts.DB.Exec(`UPDATE messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, id, owner.ID)
+		require.NoError(t, err)
+	}
+
+	for round := 0; round < rounds; round++ {
+		cands := make([]string, contenders)
+		for i := range cands {
+			cands[i] = ts.CreateTestMessage(t, channelID, owner, fmt.Sprintf("cand-%d-%d", round, i))
+		}
+		codes := make([]int, contenders)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range cands {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				codes[i] = ts.DoRequest("POST", pinAPIMsg+cands[i]+pinPath, nil,
+					testhelpers.AuthHeaders(pinners[i].AccessToken)).Code
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		won := 0
+		for _, code := range codes {
+			require.Contains(t, []int{http.StatusOK, http.StatusConflict}, code,
+				"round %d: every contender must reach the cap check, codes=%v", round, codes)
+			if code == http.StatusOK {
+				won++
+			}
+		}
+		var total int
+		require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM messages WHERE channel_id = $1 AND pinned_at IS NOT NULL`, channelID).Scan(&total))
+		require.Equal(t, 50, total, "round %d: the cap must hold under concurrent pins, codes=%v", round, codes)
+		require.Equal(t, 1, won, "round %d: exactly one contender takes the last slot, codes=%v", round, codes)
+
+		_, err := ts.DB.Exec(`UPDATE messages SET pinned_at = NULL, pinned_by = NULL WHERE id = ANY($1::uuid[])`, pq.Array(cands))
+		require.NoError(t, err)
+	}
+}
 
 func TestUnpinMessageSuccess(t *testing.T) {
 	ts := setupTS(t)

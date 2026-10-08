@@ -182,6 +182,17 @@ func (f clearReapFixture) audits(t *testing.T) []clearReapAuditRow {
 	return out
 }
 
+// pinScope reads what a clear-reap audit row says about pins: include_pinned,
+// and whether 000164's AFTER INSERT trigger mirrored it into
+// message_purges_kept_pins (it does exactly when include_pinned is FALSE).
+func (f clearReapFixture) pinScope(t *testing.T, purgeID string) (includePinned, keptRow bool) {
+	t.Helper()
+	require.NoError(t, f.db.QueryRow(`
+		SELECT p.include_pinned, EXISTS (SELECT 1 FROM message_purges_kept_pins k WHERE k.purge_id = p.id)
+		  FROM message_purges p WHERE p.id = $1`, purgeID).Scan(&includePinned, &keptRow))
+	return includePinned, keptRow
+}
+
 // requireClearAuditShape pins the §4 row: system-owned, no actor, target,
 // server or lower bound, completed in the batch transaction.
 func requireClearAuditShape(t *testing.T, a clearReapAuditRow, contextType ContextType, deleted int) {
@@ -285,9 +296,10 @@ func TestRunClearReapBatchReapsEverythingWhenNoParticipantRemains(t *testing.T) 
 	assert.False(t, audits[0].rangeTo.Valid, "W = +infinity is recorded as a NULL range_to (D9)")
 }
 
-// I10: a Clear range hides pinned messages too, so a pin below W is reaped like
-// any other row. A keep-pins predicate on the victim select turns this red.
-func TestRunClearReapBatchReapsPinnedMessagesBelowWatermark(t *testing.T) {
+// A pin is visible to every participant whatever the Clear ranges say (#3458
+// §18), so the below-W reap keeps it. Dropping the pinned_at predicate from the
+// victim select turns this red.
+func TestRunClearReapBatchKeepsPinnedMessagesBelowWatermark(t *testing.T) {
 	f := seedClearReapConversation(t, false, false, 2)
 	a, b := f.members[0], f.members[1]
 	pinnedBelow := f.seedMessage(t, a, f.at(1))
@@ -301,9 +313,46 @@ func TestRunClearReapBatchReapsPinnedMessagesBelowWatermark(t *testing.T) {
 
 	res := f.reap(t, f.newEngine(5000))
 
-	assert.Equal(t, 2, res.DeletedCount)
-	assert.False(t, f.messageExists(t, pinnedBelow), "a pinned message below W must be reaped")
+	assert.Equal(t, 1, res.DeletedCount)
+	assert.True(t, f.messageExists(t, pinnedBelow), "a pinned message below W is visible to every participant and must survive")
 	assert.True(t, f.messageExists(t, pinnedAbove), "a message above W must survive, pinned or not")
+	// The evidence must say so: a below-W batch never deletes a pin, so the
+	// column's TRUE default would record a pin deletion that did not happen.
+	include, kept := f.pinScope(t, res.PurgeID)
+	assert.False(t, include, "a below-W batch keeps every pin: include_pinned must be FALSE")
+	assert.True(t, kept, "a keep-pins audit row must be mirrored into message_purges_kept_pins")
+
+	// Unpinned, it is an ordinary row below W and the next reap takes it.
+	_, err = f.db.Exec(`UPDATE dm_messages SET pinned_at = NULL, pinned_by = NULL WHERE id = $1`, pinnedBelow)
+	require.NoError(t, err)
+
+	res = f.reap(t, f.newEngine(5000))
+
+	assert.Equal(t, 1, res.DeletedCount)
+	assert.False(t, f.messageExists(t, pinnedBelow), "an unpinned message below W must be reaped")
+	assert.True(t, f.messageExists(t, pinnedAbove))
+}
+
+// With no participant left nobody can see a pin, and keeping it would block
+// orphan retirement forever, so the zero-participant select deletes it too.
+func TestRunClearReapBatchReapsPinnedMessagesWhenNoParticipantRemains(t *testing.T) {
+	f := seedClearReapConversation(t, true, false, 2)
+	pinned := f.seedMessage(t, f.members[0], f.at(1))
+	f.seedMessage(t, f.members[1], f.at(2))
+	_, err := f.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, pinned, f.members[0])
+	require.NoError(t, err)
+	_, err = f.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1`, f.conversationID)
+	require.NoError(t, err)
+
+	res := f.reap(t, f.newEngine(5000))
+
+	assert.Equal(t, ClearReapReaped, res.Outcome)
+	assert.Equal(t, 2, res.DeletedCount)
+	assert.False(t, f.messageExists(t, pinned), "a pin nobody can see must be reaped with the rest")
+	assert.Zero(t, f.countMessages(t))
+	include, kept := f.pinScope(t, res.PurgeID)
+	assert.True(t, include, "the zero-participant batch deletes pins: include_pinned must be TRUE")
+	assert.False(t, kept, "a pin-deleting audit row must not be mirrored into message_purges_kept_pins")
 }
 
 func TestRunClearReapBatchStridesAndReportsMore(t *testing.T) {

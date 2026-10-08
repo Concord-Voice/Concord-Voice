@@ -52,9 +52,12 @@ func mergeRanges(rs []Range) []Range {
 }
 
 // InsertHiddenRange records a hidden window for (userID, convID), merging it with the user's
-// existing ranges for that conversation, and returns the count of OTHER participants' messages
-// now covered by the newly-added window (for the audit hidden_count). Runs inside the caller's
-// transaction so the merge + count are atomic. All values parameterized.
+// existing ranges for that conversation, and returns the count of OTHER participants' unpinned
+// messages now covered by the newly-added window (for the audit hidden_count). Runs inside the
+// caller's transaction so the merge + count are atomic. All values parameterized.
+//
+// A pinned message is never hidden (#3458 §18): the read filter exempts it, so the count excludes
+// it and the window itself needs no holes.
 func InsertHiddenRange(ctx context.Context, tx *sql.Tx, userID, convID string, from, to time.Time) (int, error) {
 	return storeHiddenRange(ctx, tx, userID, convID, Range{From: from, To: to}, true)
 }
@@ -73,6 +76,15 @@ func InsertClearRange(ctx context.Context, tx *sql.Tx, userID, convID string, cu
 // participant row, including an empty range set. Callers lock the users and
 // dm_conversations parent rows in that order before this participant lock.
 func storeHiddenRange(ctx context.Context, tx *sql.Tx, userID, convID string, added Range, countPeers bool) (int, error) {
+	// Re-take the conversation row first so the pin state the count reads is
+	// frozen: DM pin and unpin lock it FOR NO KEY UPDATE (#3458). Callers
+	// already hold it, so this adds no lock-order edge.
+	var lockedConv string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR SHARE`, convID).Scan(&lockedConv); err != nil {
+		return 0, fmt.Errorf("lock hidden-range conversation: %w", err)
+	}
+
 	var participantID string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT user_id FROM dm_participants WHERE user_id = $1 AND conversation_id = $2 FOR UPDATE`,
@@ -116,6 +128,9 @@ func storeHiddenRange(ctx context.Context, tx *sql.Tx, userID, convID string, ad
 		return 0, fmt.Errorf("close hidden ranges: %w", err)
 	}
 
+	if countPeers && added.infiniteFrom {
+		return 0, fmt.Errorf("legacy hidden range cannot have infinite lower bound")
+	}
 	merged := mergeRanges(append(existing, added))
 
 	// Replace the user's ranges for this conversation with the merged set.
@@ -124,40 +139,48 @@ func storeHiddenRange(ctx context.Context, tx *sql.Tx, userID, convID string, ad
 		userID, convID); err != nil {
 		return 0, fmt.Errorf("clear hidden ranges: %w", err)
 	}
-	for _, r := range merged {
-		if err := insertStoredRange(ctx, tx, userID, convID, r); err != nil {
-			return 0, fmt.Errorf("insert hidden range: %w", err)
-		}
+	if err := insertStoredRanges(ctx, tx, userID, convID, merged); err != nil {
+		return 0, fmt.Errorf("insert hidden ranges: %w", err)
 	}
 
 	if !countPeers {
 		return 0, nil
 	}
-	if added.infiniteFrom {
-		return 0, fmt.Errorf("legacy hidden range cannot have infinite lower bound")
-	}
-	// Count OTHER participants' messages now inside the just-added window.
+	// Count OTHER participants' unpinned messages inside the just-added
+	// window; a pinned message is never hidden (#3458 §18).
 	var hidden int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT count(*) FROM dm_messages
-		 WHERE conversation_id = $1 AND user_id <> $2 AND created_at >= $3 AND created_at < $4`,
+		 WHERE conversation_id = $1 AND user_id <> $2 AND created_at >= $3 AND created_at < $4
+		   AND pinned_at IS NULL`,
 		convID, userID, added.From, added.To).Scan(&hidden); err != nil {
 		return 0, fmt.Errorf("count hidden messages: %w", err)
 	}
 	return hidden, nil
 }
 
-func insertStoredRange(ctx context.Context, tx *sql.Tx, userID, convID string, r Range) error {
-	if r.infiniteFrom {
-		_, err := tx.ExecContext(ctx,
-			`INSERT INTO dm_message_hidden_ranges (user_id, conversation_id, hidden_from, hidden_to, includes_own)
-			 VALUES ($1, $2, '-infinity'::timestamptz, $3, $4)`, userID, convID, r.To, r.IncludesOwn)
-		return err
+// insertStoredRanges writes rs in one statement. Bounds travel as
+// microsecond-exact text, with -infinity literal, so they survive the
+// round trip exactly rather than through the driver's nanosecond encoding.
+func insertStoredRanges(ctx context.Context, tx *sql.Tx, userID, convID string, rs []Range) error {
+	froms, tos, owns := make([]string, len(rs)), make([]string, len(rs)), make([]bool, len(rs))
+	for i, r := range rs {
+		froms[i] = "-infinity"
+		if !r.infiniteFrom {
+			froms[i] = microText(r.From)
+		}
+		tos[i], owns[i] = microText(r.To), r.IncludesOwn
 	}
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO dm_message_hidden_ranges (user_id, conversation_id, hidden_from, hidden_to, includes_own)
-		 VALUES ($1, $2, $3, $4, $5)`, userID, convID, r.From, r.To, r.IncludesOwn)
+		 SELECT $1, $2, f::timestamptz, t::timestamptz, o
+		 FROM unnest($3::text[], $4::text[], $5::boolean[]) AS u(f, t, o)`,
+		userID, convID, pq.Array(froms), pq.Array(tos), pq.Array(owns))
 	return err
+}
+
+func microText(t time.Time) string {
+	return t.UTC().Truncate(time.Microsecond).Format("2006-01-02T15:04:05.000000Z")
 }
 
 func parseHiddenRangeTime(value string) (time.Time, error) {

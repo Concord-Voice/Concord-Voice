@@ -46,6 +46,10 @@ export const ServerCapabilitiesSchema = z.object({
     /** Versions whose init-session geometry this control plane understands.
      *  Missing on older servers; callers must select v2 in that case. */
     attachmentEnvelopeVersions: z.array(z.union([z.literal(2), z.literal(3)])).optional(),
+    /** Whether purges keep pinned messages by default and honour
+     *  `include_pinned` (#3458). Absent on older servers, which delete pins;
+     *  the purge dialogs then hide the option and say nothing about pins. */
+    purgeKeepsPinned: z.boolean().optional(),
   }),
 });
 
@@ -139,3 +143,11 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set, get) 
       acceptedConfigRevision: 0,
     }),
 }));
+
+/** Whether the connected server keeps pinned messages through a purge
+ *  (#3458). Subscribed, so a dialog sees the value the moment it lands; each
+ *  dialog samples it once on open. Anything but an explicit true (an older
+ *  server, a failed fetch, not yet loaded) reads false. */
+export function usePurgeKeepsPinned(): boolean {
+  return useClientConfigStore((s) => s.serverCapabilities?.features.purgeKeepsPinned === true);
+}

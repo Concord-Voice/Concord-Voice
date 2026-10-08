@@ -352,6 +352,59 @@ func TestGetChannelPins_DM_NonParticipant_404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+// The participant pre-check only shapes the 404: the pin query itself must
+// refuse a viewer removed after it, or that viewer reads the pins anyway
+// (#3552 security P3-1). dm_messages is held so the pin query waits AFTER the
+// pre-check has passed, and the viewer is removed while it waits.
+func TestGetChannelPins_DMParticipantRemovedAfterPreCheckReadsNothing(t *testing.T) {
+	ts := setupTS(t)
+	u1 := ts.CreateTestUser(t, "dmpinrace_a")
+	u2 := ts.CreateTestUser(t, "dmpinrace_b")
+	convID := ts.CreateDMConversation(t, u1.ID, u2.ID)
+	msgID := insertDMMessageDirect(t, ts, convID, u1.ID, "pinned")
+	require.Equal(t, http.StatusOK,
+		ts.DoRequest("POST", pinAPIMsg+msgID+pinPath, nil, testhelpers.AuthHeaders(u1.AccessToken)).Code)
+
+	blocker, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.Exec(`LOCK TABLE dm_messages IN ACCESS EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest("GET", pinAPICh+convID+pinsPath, nil, testhelpers.AuthHeaders(u2.AccessToken))
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND query LIKE '%INNER JOIN users u ON dm.user_id = u.id%'
+		)`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, 5*time.Second, 10*time.Millisecond, "the pin query should be waiting, past the participant pre-check")
+
+	_, err = blocker.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, u2.ID)
+	require.NoError(t, err)
+	require.NoError(t, blocker.Commit())
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pin read did not resume after the removal committed")
+	}
+
+	require.Equal(t, http.StatusOK, w.Code, bodyFmtPlaceholder, w.Body.String())
+	var resp struct {
+		PinnedMessages []map[string]interface{} `json:"pinned_messages"`
+		Count          int                      `json:"count"`
+	}
+	testhelpers.ParseJSON(t, w, &resp)
+	assert.Zero(t, resp.Count, "a viewer removed after the pre-check must read no pins")
+	assert.Empty(t, resp.PinnedMessages)
+}
+
 func TestGetChannelPins_DM_Empty(t *testing.T) {
 	ts := setupTS(t)
 	u1 := ts.CreateTestUser(t, "dmgetpins_empty_a")
@@ -406,6 +459,32 @@ func TestPinMessage_DM_LimitReached(t *testing.T) {
 	w := ts.DoRequest("POST", pinAPIMsg+extra+pinPath, nil,
 		testhelpers.AuthHeaders(u1.AccessToken))
 	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+// TestDMPinCapCountsPinsInClearedHistory proves the pin cap counts every pin,
+// including pins inside history the pinner cleared. A pinned message is never
+// hidden (#3458 §18), so Clear no longer lets a pinner shed the cap (F1).
+func TestDMPinCapCountsPinsInClearedHistory(t *testing.T) {
+	ts := setupTS(t)
+	actor := ts.CreateTestUser(t, "dmpin_capclear_actor")
+	peer := ts.CreateTestUser(t, "dmpin_capclear_peer")
+	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
+
+	for i := 0; i < 50; i++ {
+		insertDMMessageDirect(t, ts, convID, peer.ID, "peer message before clear")
+	}
+	_, err := ts.DB.Exec(
+		`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2
+		 WHERE conversation_id = $1`, convID, peer.ID)
+	require.NoError(t, err)
+
+	markDMHistoryCleared(t, ts, actor.ID, convID)
+	extra := insertDMMessageDirect(t, ts, convID, peer.ID, "message after clear")
+
+	w := ts.DoRequest("POST", pinAPIMsg+extra+pinPath, nil,
+		testhelpers.AuthHeaders(actor.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "Maximum of 50 pinned messages per channel")
 }
 
 func TestGetChannelPins_UnknownID_404(t *testing.T) {

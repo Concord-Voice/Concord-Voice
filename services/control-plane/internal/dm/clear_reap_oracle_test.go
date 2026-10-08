@@ -35,6 +35,7 @@ const clearReapOracleStates = 200
 type oracleMessage struct {
 	id        string
 	createdAt time.Time
+	pinned    bool
 }
 
 func TestClearReapOracleDeletesExactlyWhatEveryParticipantHasCleared(t *testing.T) {
@@ -139,7 +140,7 @@ func runClearReapOracleState(t *testing.T, db *sql.DB, engine *purge.Engine, rng
 		require.NoError(t, err)
 	}
 
-	// 10-30 messages at spread timestamps; some pinned (I10), some call events
+	// 10-30 messages at spread timestamps; some pinned (#3458 §18), some call events
 	// stamped in the past.
 	numMessages := 10 + rng.Intn(21)
 	seeded := make([]oracleMessage, 0, numMessages)
@@ -157,11 +158,12 @@ func runClearReapOracleState(t *testing.T, db *sql.DB, engine *purge.Engine, rng
 		require.NoError(t, db.QueryRow(`
 			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
 			VALUES ($1, $2, 'oracle', $3, $4) RETURNING id`, conversationID, author, msgType, createdAt).Scan(&id))
-		if rng.Intn(5) == 0 {
+		pinned := rng.Intn(5) == 0
+		if pinned {
 			_, err := db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, id, author)
 			require.NoError(t, err)
 		}
-		seeded = append(seeded, oracleMessage{id: id, createdAt: createdAt})
+		seeded = append(seeded, oracleMessage{id: id, createdAt: createdAt, pinned: pinned})
 	}
 
 	visibleBefore := make(map[string]map[string]bool, len(participants))
@@ -186,7 +188,9 @@ func runClearReapOracleState(t *testing.T, db *sql.DB, engine *purge.Engine, rng
 	expectedDeleted := make(map[string]bool)
 	if eligible {
 		for _, m := range seeded {
-			if unbounded || m.createdAt.Before(w) {
+			// A pin is visible to every participant (#3458 §18), so only the
+			// zero-participant reap, where nobody can see it, takes one.
+			if unbounded || (m.createdAt.Before(w) && !m.pinned) {
 				expectedDeleted[m.id] = true
 			}
 		}
@@ -210,7 +214,7 @@ func runClearReapOracleState(t *testing.T, db *sql.DB, engine *purge.Engine, rng
 	}
 
 	require.Equal(t, sortedKeys(expectedDeleted), sortedKeys(actualDeleted),
-		"state %d: deleted set must equal {m : created_at < W} exactly (completeness+soundness)", seq)
+		"state %d: deleted set must equal {m : created_at < W and not pinned} exactly (completeness+soundness)", seq)
 
 	for _, p := range participants {
 		for id := range actualDeleted {

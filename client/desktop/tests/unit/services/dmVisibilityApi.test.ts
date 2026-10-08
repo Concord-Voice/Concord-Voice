@@ -1,8 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { apiFetch } from '@/renderer/services/system/apiClient';
 import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import { clearDMHistory, hideDMThread } from '@/renderer/services/messaging/dmVisibilityApi';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 
 vi.mock('@/renderer/services/system/apiClient', () => ({ apiFetch: vi.fn() }));
 
@@ -237,6 +239,93 @@ describe('dm visibility API', () => {
     });
   });
 
+  // #3552 review: the claim is rechecked after any step-up mint, right before
+  // Clear is sent, and every resend apiFetch would make is refused.
+  describe('Clear keeps its pin promise to the moment it is sent', () => {
+    const PASSWORD = { kind: 'password', value: 'test-password-123' } as const; // pragma: allowlist secret
+    let refresh: ReturnType<typeof vi.spyOn>;
+
+    // Opens with the capability confirmed; each recheck answers `advertised()`.
+    function keepsPinnedWhile(advertised: () => boolean) {
+      useClientConfigStore.setState({
+        serverCapabilities: {
+          auth: { oauthProviders: [] },
+          features: { purgeKeepsPinned: true },
+        } as never,
+      });
+      refresh = vi
+        .spyOn(clientConfigService, 'refreshServerCapabilities')
+        .mockImplementation(async () => {
+          useClientConfigStore.setState({
+            serverCapabilities: {
+              auth: { oauthProviders: [] },
+              features: { purgeKeepsPinned: advertised() },
+            } as never,
+          });
+        });
+    }
+
+    afterEach(() => refresh.mockRestore());
+
+    // Mutant: the recheck before the mint, which then admits a Clear the
+    // server stopped confirming while the password was exchanged.
+    it('sends no Clear when the server stops keeping pins during the mint', async () => {
+      keepsPinnedWhile(() => mockApiFetch.mock.calls.length === 0);
+      mockApiFetch.mockResolvedValueOnce(
+        response(200, { step_up_token: 'minted-token', expires_in: 60 })
+      );
+
+      await expect(clearDMHistory(CONVERSATION_ID, PASSWORD, undefined, 'keep')).resolves.toEqual({
+        kind: 'pinClaimUnconfirmed',
+      });
+      expect(mockApiFetch).toHaveBeenCalledOnce();
+      expect(mockApiFetch.mock.calls[0]?.[0]).toBe('/api/v1/auth/step-up/password');
+    });
+
+    it('sends Clear once after the mint when the server still keeps pins', async () => {
+      keepsPinnedWhile(() => true);
+      mockApiFetch
+        .mockResolvedValueOnce(response(200, { step_up_token: 'minted-token', expires_in: 60 }))
+        .mockResolvedValueOnce(
+          response(200, { conversation_id: CONVERSATION_ID, cleared_at: '2026-09-23T20:00:00Z' })
+        );
+
+      await expect(clearDMHistory(CONVERSATION_ID, PASSWORD, undefined, 'keep')).resolves.toEqual({
+        kind: 'success',
+      });
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(mockApiFetch.mock.calls[1]?.[0]).toBe(
+        `/api/v1/dm/conversations/${CONVERSATION_ID}/clear`
+      );
+    });
+
+    // Mutant: a Clear that keeps nothing still pays for a recheck.
+    it('sends a Clear that promises nothing about pins without a recheck', async () => {
+      keepsPinnedWhile(() => false);
+      mockApiFetch.mockResolvedValueOnce(
+        response(200, { conversation_id: CONVERSATION_ID, cleared_at: '2026-09-23T20:00:00Z' })
+      );
+
+      await expect(clearDMHistory(CONVERSATION_ID)).resolves.toEqual({ kind: 'success' });
+      expect(refresh).not.toHaveBeenCalled();
+    });
+
+    // apiFetch runs the guard before each dispatch, so a refresh resend reaches
+    // it a second time. Mutant: the refusal read as `uncertain`, which tells
+    // the user Clear may have happened when nothing was done.
+    it('reports a resend its pin guard refused as pinClaimUnconfirmed', async () => {
+      keepsPinnedWhile(() => true);
+      mockApiFetch.mockImplementationOnce(async (_path, _init, opts) => {
+        opts?.assertBeforeDispatch?.();
+        opts?.assertBeforeDispatch?.();
+        return response(200, {});
+      });
+      await expect(clearDMHistory(CONVERSATION_ID, undefined, undefined, 'keep')).resolves.toEqual({
+        kind: 'pinClaimUnconfirmed',
+      });
+    });
+  });
+
   describe('the caller capture', () => {
     it('admits an MFA Clear against the caller context, and a bare Clear against none', async () => {
       const context = captureApiRequestContext();
@@ -248,7 +337,7 @@ describe('dm visibility API', () => {
       await clearDMHistory(CONVERSATION_ID, { kind: 'mfa', value: '123456' });
 
       expect(contextOf(0)).toBe(context);
-      expect(mockApiFetch.mock.calls[1]).toHaveLength(2);
+      expect(contextOf(1)).toBeUndefined();
     });
 
     it('exchanges the password and sends Clear under the caller context', async () => {

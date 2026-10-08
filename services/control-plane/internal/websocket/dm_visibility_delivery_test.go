@@ -335,7 +335,7 @@ func TestDeletedDMMessageDeliveryUsesCapturedSource(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	source := NewDeletedDMMessageVisibilitySource(fixture.peerID, fixture.createdAt)
+	source := NewDeletedDMMessageVisibilitySource(fixture.peerID, fixture.createdAt, sql.NullTime{})
 	completeDMDelivery(t, fixture.hub, DMBroadcastMessage{
 		ConversationID:   fixture.conversationID,
 		VisibilitySource: &source,
@@ -347,6 +347,67 @@ func TestDeletedDMMessageDeliveryUsesCapturedSource(t *testing.T) {
 		t.Fatalf("cleared actor received deleted-source frame: %s", frame)
 	default:
 	}
+	peer := readClientMsg(t, fixture.peerClient)
+	assert.Equal(t, "dm_message_deleted", peer["type"])
+}
+
+// A pinned message is never hidden (#3458 §18.1): the cleared actor receives
+// the message's acknowledgement while it stays pinned, and not once it is
+// unpinned, because the range still covers it.
+func TestDMMessageDeliveryOriginAckDeliversPinnedUnderClearRange(t *testing.T) {
+	fixture := newDMVisibilityDeliveryFixture(t)
+	tx, err := fixture.db.Begin()
+	require.NoError(t, err)
+	fixture.addClearRange(t, tx)
+	require.NoError(t, tx.Commit())
+	ack := func() DMBroadcastMessage {
+		source := NewDMMessageVisibilitySource(fixture.messageID)
+		return DMBroadcastMessage{
+			ConversationID:   fixture.conversationID,
+			VisibilitySource: &source,
+			VisibilityMode:   dmVisibilityDeliveryOriginClient,
+			OriginClientID:   &fixture.actorClient.ID,
+			Data:             OutgoingMessage{Type: "dm_message_ack", Data: map[string]interface{}{"id": fixture.messageID.String()}},
+		}
+	}
+
+	_, err = fixture.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, fixture.messageID, fixture.peerID)
+	require.NoError(t, err)
+	completeDMDelivery(t, fixture.hub, ack())
+	frame := readClientMsg(t, fixture.actorClient)
+	assert.Equal(t, "dm_message_ack", frame["type"])
+
+	_, err = fixture.db.Exec(`UPDATE dm_messages SET pinned_at = NULL, pinned_by = NULL WHERE id = $1`, fixture.messageID)
+	require.NoError(t, err)
+	completeDMDelivery(t, fixture.hub, ack())
+	requireDMDelivery(t, fixture.actorClient, false)
+}
+
+// A deleted message's source carries the pin state captured before the
+// delete, so the shared predicate still applies to it: a viewer whose Clear
+// range covers a pinned message saw it (#3458 §18.1) and receives its delete.
+func TestDeletedPinnedDMMessageDeliveryReachesClearedViewer(t *testing.T) {
+	fixture := newDMVisibilityDeliveryFixture(t)
+	tx, err := fixture.db.Begin()
+	require.NoError(t, err)
+	fixture.addClearRange(t, tx)
+	var pinnedAt sql.NullTime
+	require.NoError(t, tx.QueryRow(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1 RETURNING pinned_at`,
+		fixture.messageID, fixture.peerID).Scan(&pinnedAt))
+	require.True(t, pinnedAt.Valid)
+	_, err = tx.Exec(`DELETE FROM dm_messages WHERE id = $1`, fixture.messageID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	source := NewDeletedDMMessageVisibilitySource(fixture.peerID, fixture.createdAt, pinnedAt)
+	completeDMDelivery(t, fixture.hub, DMBroadcastMessage{
+		ConversationID:   fixture.conversationID,
+		VisibilitySource: &source,
+		VisibilityMode:   dmVisibilityDeliverySubscribers,
+		Data:             OutgoingMessage{Type: "dm_message_deleted", Data: map[string]interface{}{"id": fixture.messageID.String()}},
+	})
+	actor := readClientMsg(t, fixture.actorClient)
+	assert.Equal(t, "dm_message_deleted", actor["type"])
 	peer := readClientMsg(t, fixture.peerClient)
 	assert.Equal(t, "dm_message_deleted", peer["type"])
 }

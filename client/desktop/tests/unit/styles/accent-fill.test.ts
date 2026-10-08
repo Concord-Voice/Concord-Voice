@@ -52,6 +52,11 @@ const KNOWN_TEXT_FREE_FILLS = new Set([
   '.settings-volume-slider::-webkit-slider-thumb',
   '.sync-toggle.active',
   '.update-banner__progress',
+  // "Include pinned messages" and the kick/ban purge opt-in (#3458): native
+  // checkboxes tinted with accent-color. The box carries no text; the label is a
+  // sibling element on the dialog background.
+  ".member-purge-optin input[type='checkbox']",
+  '.purge-modal__option input',
 ]);
 
 // Recursively collect every .css file under `dir`.

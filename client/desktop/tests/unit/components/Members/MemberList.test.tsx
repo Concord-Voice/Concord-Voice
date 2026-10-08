@@ -21,6 +21,13 @@ import { ADMIN_PERMISSIONS } from '@/renderer/utils/policy/permissions';
 import { mockUser, mockServer, mockMember, mockMember2 } from '../../../mocks/fixtures';
 
 import MemberList from '@/renderer/components/Members/MemberList';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
+
+// Opening a purge dialog refreshes the capability (#3552 review). These tests
+// set the capability in the store directly, so the refresh is stubbed.
+beforeEach(() => {
+  vi.spyOn(clientConfigService, 'refreshServerCapabilities').mockResolvedValue();
+});
 
 // Mock apiFetch to control member loading
 const mockApiFetch = vi.fn();
@@ -263,8 +270,10 @@ describe('MemberList', () => {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ purge_messages: false }),
-        }
+          body: JSON.stringify({ purge_messages: false, include_pinned: false }),
+        },
+        // Admitted against the confirming account; no purge, so no pin guard.
+        { context: expect.anything(), assertBeforeDispatch: undefined }
       );
       // Member should be removed from store
       const members = useMemberStore.getState().members;
@@ -339,8 +348,9 @@ describe('MemberList', () => {
         {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ purge_messages: false }),
-        }
+          body: JSON.stringify({ purge_messages: false, include_pinned: false }),
+        },
+        { context: expect.anything(), assertBeforeDispatch: undefined }
       );
       const members = useMemberStore.getState().members;
       expect(members.find((m) => m.user_id === mockMember.user_id)).toBeUndefined();

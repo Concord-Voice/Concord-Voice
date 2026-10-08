@@ -36,6 +36,9 @@ func ParseRange(rangeStr string) (*time.Time, error) {
 	if !ok {
 		return nil, fmt.Errorf("purge: unknown range %q", rangeStr)
 	}
-	cutoff := time.Now().UTC().Add(-interval)
+	// Truncated to the microsecond, PostgreSQL's timestamp resolution, so the
+	// delete, the audit row and the DM hide pieces all share one exact value
+	// (#3458 spec D6).
+	cutoff := time.Now().UTC().Add(-interval).Truncate(time.Microsecond)
 	return &cutoff, nil
 }

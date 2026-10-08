@@ -1,9 +1,13 @@
 import React from 'react';
-import type { PurgeContext, TerminalPurgeResult } from '../../services/messaging/purgeApi';
+import type { PinMode, PurgeContext, TerminalPurgeResult } from '../../services/messaging/purgeApi';
 
 interface PurgeResultProps {
   context: PurgeContext;
   result: TerminalPurgeResult;
+  /** The mode the purge was sent with. Only a success claims anything about pins. */
+  pinMode: PinMode;
+  /** Said after a success's counts: whose pinned messages a purge left visible (#3458). */
+  peerPinNote?: string;
   onDone: () => void;
 }
 
@@ -38,39 +42,58 @@ const GONE_COPY: Record<PurgeContext, string> = {
   group: 'This conversation no longer exists.',
 };
 
+/** The zero-count sentence: which clauses survive depends on what a purge left visible. */
+function zeroResultText(kept: boolean, peerPinNote: string | undefined): string {
+  if (kept) return 'Nothing to purge. Pinned messages are kept.';
+  if (peerPinNote) return `Nothing to purge. ${peerPinNote}`;
+  return 'No messages matched that range. Nothing to purge.';
+}
+
 /**
  * Success text. A server-wide purge broadcasts deleted_count 0 per channel by
- * design, so its count is never rendered (copy deck §4).
+ * design, so its count is never rendered (copy deck §4). A purge that kept
+ * pins says so (#3458). One that included them says nothing of its own pins,
+ * but carries the peer-pin note when peers' pins stayed visible: appended to
+ * the counts, and in place of "No messages matched" on a zero result. One
+ * against a server that predates the option reads as it always has.
  */
 function SuccessBody({
   context,
   deletedCount,
   hiddenCount,
+  pinMode,
+  peerPinNote,
 }: Readonly<{
   context: PurgeContext;
   deletedCount: number;
   hiddenCount: number;
+  pinMode: PinMode;
+  peerPinNote?: string;
 }>) {
+  const kept = pinMode === 'keep';
   if (context === 'server') {
     return (
       <output className="purge-modal__status">
-        Messages purged. Channels you cannot moderate were skipped.
+        {kept
+          ? 'Messages purged. Pinned messages were kept. Channels you cannot moderate were skipped.'
+          : 'Messages purged. Channels you cannot moderate were skipped.'}
       </output>
     );
   }
   // An authorized purge of an already-empty scope returns 200 with zero. It is
-  // a success, not an error and not an empty state to apologise for.
+  // a success, not an error and not an empty state to apologise for. With pins
+  // kept, "no messages matched" may be false, so that clause goes. With pins
+  // included and a peer note to say, a peer's pin in range did match and stayed
+  // visible, so that clause goes for the same reason and the note replaces it.
   if (deletedCount === 0 && hiddenCount === 0) {
-    return (
-      <output className="purge-modal__status">
-        No messages matched that range. Nothing to purge.
-      </output>
-    );
+    return <output className="purge-modal__status">{zeroResultText(kept, peerPinNote)}</output>;
   }
   return (
     <output className="purge-modal__status">
       {`Purged ${deletedCount} ${deletedCount === 1 ? 'message' : 'messages'}.`}
       {hiddenCount > 0 && ` ${hiddenCount} more hidden from you.`}
+      {kept && ' Pinned messages were kept.'}
+      {peerPinNote && ` ${peerPinNote}`}
     </output>
   );
 }
@@ -78,7 +101,14 @@ function SuccessBody({
 function ResultBody({
   context,
   result,
-}: Readonly<{ context: PurgeContext; result: TerminalPurgeResult }>) {
+  pinMode,
+  peerPinNote,
+}: Readonly<{
+  context: PurgeContext;
+  result: TerminalPurgeResult;
+  pinMode: PinMode;
+  peerPinNote?: string;
+}>) {
   switch (result.kind) {
     case 'success':
       return (
@@ -86,6 +116,8 @@ function ResultBody({
           context={context}
           deletedCount={result.deletedCount}
           hiddenCount={result.hiddenCount}
+          pinMode={pinMode}
+          peerPinNote={peerPinNote}
         />
       );
     case 'rateLimited': {
@@ -178,9 +210,15 @@ function ResultBody({
   }
 }
 
-const PurgeResult: React.FC<PurgeResultProps> = ({ context, result, onDone }) => (
+const PurgeResult: React.FC<PurgeResultProps> = ({
+  context,
+  result,
+  pinMode,
+  peerPinNote,
+  onDone,
+}) => (
   <div className="purge-modal__result">
-    <ResultBody context={context} result={result} />
+    <ResultBody context={context} result={result} pinMode={pinMode} peerPinNote={peerPinNote} />
     <div className="purge-modal__actions">
       <button type="button" className="purge-modal__done" onClick={onDone}>
         Done

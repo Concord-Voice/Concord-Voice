@@ -8,8 +8,8 @@ import MemberItem from './MemberItem';
 import MemberProfileCard from './MemberProfileCard';
 import MemberContextMenu from './MemberContextMenu';
 import UserProfileModal from './UserProfileModal';
-import ConfirmActionModal from '../ui/ConfirmActionModal';
-import { PurgeMessagesOptIn, moderateMember } from './purgeOnModeration';
+import { ModerationConfirmModal, moderateMember } from './purgeOnModeration';
+import type { PinMode } from '../../services/messaging/purgeApi';
 import { Moon, Search, Users } from 'lucide-react';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './MemberList.css';
@@ -152,11 +152,18 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   const [fullProfileUserId, setFullProfileUserId] = useState<string | null>(null);
   const [banTarget, setBanTarget] = useState<ServerMember | null>(null);
   const [kickTarget, setKickTarget] = useState<ServerMember | null>(null);
-  const [purgeOnBan, setPurgeOnBan] = useState(false);
-  const [purgeOnKick, setPurgeOnKick] = useState(false);
   // ConfirmActionModal closes itself on success, so the purge outcome (#1354) is
   // announced by this sidebar instead of inside the modal.
   const [moderationNotice, setModerationNotice] = useState('');
+  // The dialogs render only while `activeServer` is set, so the id is present.
+  const runModeration = useCallback(
+    async (target: ServerMember, action: 'ban' | 'kick', alsoPurge: boolean, pinMode: PinMode) => {
+      if (!activeServerId) return;
+      const { notice } = await moderateMember(activeServerId, target, action, alsoPurge, pinMode);
+      setModerationNotice(notice);
+    },
+    [activeServerId]
+  );
   const [openGroup, setOpenGroup] = useState<OpenMemberGroup | null>(null);
   const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
   const compactTriggerId = useId();
@@ -592,52 +599,22 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
         />
       )}
 
-      {/* Ban Confirmation Modal */}
+      {/* Ban and Kick Confirmation Modals */}
       {activeServer && (
-        <ConfirmActionModal
-          isOpen={!!banTarget}
-          onClose={() => {
-            setBanTarget(null);
-            setPurgeOnBan(false);
-          }}
-          title={`Ban ${banTarget?.display_name || banTarget?.username || 'User'}`}
-          message="This will permanently remove them from the server and prevent them from rejoining."
-          extraContent={<PurgeMessagesOptIn checked={purgeOnBan} onChange={setPurgeOnBan} />}
-          // Degrades gracefully: an unchecked box never blocks the ban.
-          confirmLabel={purgeOnBan ? 'Ban and purge' : 'Ban'}
-          loadingLabel="Banning..."
-          onConfirm={async () => {
-            if (!banTarget) return;
-            const { notice } = await moderateMember(activeServer.id, banTarget, 'ban', purgeOnBan);
-            setModerationNotice(notice);
-          }}
-        />
-      )}
-
-      {/* Kick Confirmation Modal */}
-      {activeServer && (
-        <ConfirmActionModal
-          isOpen={!!kickTarget}
-          onClose={() => {
-            setKickTarget(null);
-            setPurgeOnKick(false);
-          }}
-          title={`Kick ${kickTarget?.display_name || kickTarget?.username || 'User'}`}
-          message="This will remove them from the server. They can rejoin with a new invite."
-          extraContent={<PurgeMessagesOptIn checked={purgeOnKick} onChange={setPurgeOnKick} />}
-          confirmLabel={purgeOnKick ? 'Kick and purge' : 'Kick'}
-          loadingLabel="Kicking..."
-          onConfirm={async () => {
-            if (!kickTarget) return;
-            const { notice } = await moderateMember(
-              activeServer.id,
-              kickTarget,
-              'kick',
-              purgeOnKick
-            );
-            setModerationNotice(notice);
-          }}
-        />
+        <>
+          <ModerationConfirmModal
+            action="ban"
+            target={banTarget}
+            onClose={() => setBanTarget(null)}
+            onConfirm={runModeration}
+          />
+          <ModerationConfirmModal
+            action="kick"
+            target={kickTarget}
+            onClose={() => setKickTarget(null)}
+            onConfirm={runModeration}
+          />
+        </>
       )}
     </div>
   );

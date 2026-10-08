@@ -22,6 +22,8 @@ import {
   isSameAuthLifecycle,
   type AuthLifecycleSnapshot,
 } from '../../services/system/postLoginHydrationLifecycle';
+import { usePurgeKeepsPinnedAtOpen } from '../../hooks/messaging/usePurgeKeepsPinnedAtOpen';
+import { PIN_CLAIM_UNCONFIRMED_MESSAGE, type PinMode } from '../../services/messaging/purgeApi';
 import {
   apiRequestContextIsCurrent,
   captureApiRequestContext,
@@ -63,6 +65,10 @@ const REMOVAL_TITLES: Record<DMThreadRemovalTarget['action'], string> = {
   leave: 'Leave group',
 };
 
+// An older server's Clear still hides pinned messages, so this is shown only
+// once a fresh capability answer confirms the server keeps them (#3552 review).
+const CLEAR_KEEPS_PINS = 'Pinned messages stay in the chat.';
+
 const REMOVAL_COPY: Record<DMThreadRemovalTarget['action'], string> = {
   hide: "Hide this thread? You'll still receive new messages. The thread will reappear when someone sends a message.",
   clear:
@@ -90,6 +96,7 @@ function submitOutcome(result: ClearHistoryResult): StepUpSubmitOutcome {
     case 'uncertain':
       return { kind: 'transport' };
     case 'aborted':
+    case 'pinClaimUnconfirmed':
       return { kind: 'aborted' };
     case 'passwordRequired':
       // #3509: a refused token keeps its expiry, so the password field says so.
@@ -137,6 +144,8 @@ function clearErrorText(result: ClearHistoryResult): string | null {
       return 'Set a password, enable MFA, or turn off purge protection in Privacy & Security.';
     case 'refused':
       return 'History could not be cleared.';
+    case 'pinClaimUnconfirmed':
+      return PIN_CLAIM_UNCONFIRMED_MESSAGE;
     default:
       return null;
   }
@@ -199,6 +208,13 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const requireAuthBeforePurge = usePrivacyStore((s) => s.settings.requireAuthBeforePurge);
+  // Only Clear makes the pin claim, so only Clear asks the server.
+  const clearKeepsPins = usePurgeKeepsPinnedAtOpen(action === 'clear');
+  // The promise shown at open is rechecked inside clearDMHistory, after any
+  // step-up mint and right before Clear is sent, as purge rechecks its claim:
+  // a control plane rolled back since then still hides pinned messages on
+  // Clear, and its reaper can delete them.
+  const clearPinMode: PinMode = clearKeepsPins ? 'keep' : 'unsupported';
 
   const removable = !(conversation.isPersonal || (action === 'leave' && !conversation.isGroup));
   // Fail closed on unknown: internal/dm/visibility.go reads the same setting
@@ -291,9 +307,14 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
     setError(null);
     const lifecycle = captureAuthLifecycle();
     try {
-      const result = await clearDMHistory(conversation.id, clearFactor(mfa, password), context);
-      // Nothing left for `aborted`, so what was typed is still what the user means to send.
-      if (result.kind !== 'aborted') setPassword('');
+      const result = await clearDMHistory(
+        conversation.id,
+        clearFactor(mfa, password),
+        context,
+        clearPinMode
+      );
+      // Nothing was judged for either, so what was typed is still what the user means to send.
+      if (result.kind !== 'aborted' && result.kind !== 'pinClaimUnconfirmed') setPassword('');
       // The stage's terminal state words a dead session; a banner would say it twice.
       if (result.kind !== 'sessionExpired' && answerIsCurrent(lifecycle, context)) {
         await applyClearResult(result, lifecycle, context);
@@ -315,11 +336,12 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
     let closed = false;
     const lifecycle = captureAuthLifecycle();
     // The request carries no factor; the capture still fences it, so a switch
-    // before it leaves sends nothing (D20).
+    // before it leaves, or while the pin recheck is in flight, sends nothing
+    // (D20, #3552 review).
     const context = captureApiRequestContext();
 
     try {
-      const result = await clearDMHistory(conversation.id, undefined, context);
+      const result = await clearDMHistory(conversation.id, undefined, context, clearPinMode);
       // An answer from the old server opens nothing and says nothing here (D20).
       if (!answerIsCurrent(lifecycle, context)) return;
       if (result.kind === 'passwordRequired' || result.kind === 'mfaRequired') {
@@ -427,7 +449,11 @@ const DMThreadRemovalDialog: React.FC<DMThreadRemovalDialogProps> = ({
 
         <div className={`delete-server-warning${tone}`}>
           <div className="confirm-action-message">
-            <p>{REMOVAL_COPY[action]}</p>
+            <p>
+              {action === 'clear' && clearKeepsPins
+                ? `${REMOVAL_COPY.clear} ${CLEAR_KEEPS_PINS}`
+                : REMOVAL_COPY[action]}
+            </p>
           </div>
         </div>
 

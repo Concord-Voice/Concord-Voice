@@ -31,6 +31,7 @@ const (
 type serverMessagePurger interface {
 	PurgeUserServerMessages(
 		ctx context.Context, serverID, actorID, target, reason string, provenance messages.PurgeProvenance,
+		includePinned bool,
 	) (int, messages.PurgeStatus, error)
 }
 
@@ -84,8 +85,10 @@ func purgeProvenance(o mfaenforce.Outcome) messages.PurgeProvenance {
 // deny / Redis outage -> skipped_rate_limited; any failure (including a nil/unwired purger) ->
 // failed. All non-completed paths are logged PII-safe (never message content or usernames,
 // per observability.md #1/#2). provenance is purgeProvenance of the committed ban or removal.
+// includePinned is the request's include_pinned (#3458); false keeps the target's pinned messages.
 func (h *Handler) applyPurgeOnModeration(
 	ctx context.Context, serverID, actorID, targetUserID, reason string, provenance messages.PurgeProvenance,
+	includePinned bool,
 ) purgeOutcome {
 	if h.purger == nil {
 		h.log.Error("purge-on-moderation: no purger wired", "server_id", serverID, "reason", reason)
@@ -130,7 +133,8 @@ func (h *Handler) applyPurgeOnModeration(
 		}
 	}
 
-	count, status, err := h.purger.PurgeUserServerMessages(pctx, serverID, actorID, targetUserID, reason, provenance)
+	count, status, err := h.purger.PurgeUserServerMessages(pctx, serverID, actorID, targetUserID, reason, provenance,
+		includePinned)
 	// Treat the returned status as authoritative alongside err (#1353 review, CodeRabbit):
 	// a PurgeFailed status must resolve to failed even on a nil error, never logged as completed.
 	if err != nil || status == messages.PurgeFailed {
@@ -140,7 +144,8 @@ func (h *Handler) applyPurgeOnModeration(
 	if status == messages.PurgeSkippedUnauthorized {
 		h.log.Info("purge-on-moderation skipped (unauthorized)", "server_id", serverID, "reason", reason)
 	} else {
-		h.log.Info("purge-on-moderation completed", "server_id", serverID, "reason", reason, "deleted", count)
+		h.log.Info("purge-on-moderation completed", "server_id", serverID, "reason", reason, "deleted", count,
+			"include_pinned", includePinned)
 	}
 	return purgeOutcome{Requested: true, Status: status, PurgedCount: count}
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
-import { http, HttpResponse } from 'msw';
+import { delay, http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
@@ -7,10 +7,18 @@ import { captureApiRequestContext } from '@/renderer/services/system/requestCont
 import { FIXTURE_PW as MINT_PW, MINT_PATH, MINTED_TOKEN } from '../../helpers/stepUpTokenWire';
 import { passwordStepUpRefusalMessage } from '@/renderer/services/system/stepUpToken';
 import {
+  includePinnedFor,
   isSoftLockChallengeResult,
   isStepUpPurgeResult,
+  PinClaimReplayRefused,
+  pinClaimDispatchGuard,
+  pinClaimStillHonoured,
+  pinModeFor,
   purgeMessages,
 } from '@/renderer/services/messaging/purgeApi';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { signInRefreshableSession } from '../../helpers/refreshReplay';
 
 // The copy of a refused password exchange is wrapped so one case can reword it:
 // the challenge's `refusal` must be read from the wire and the mint's reason,
@@ -230,7 +238,7 @@ describe('purgeMessages request shape', () => {
       })
     );
     await purgeMessages({ context: 'channel', scopeId: CHANNEL, range: '30d' });
-    expect(body).toEqual({ range: '30d' });
+    expect(body).toEqual({ range: '30d', include_pinned: false });
   });
 
   it('sends both step-up factors together in one request', async () => {
@@ -253,6 +261,7 @@ describe('purgeMessages request shape', () => {
       range: '7d',
       current_password: FIXTURE_PW,
       mfa_code: FIXTURE_OTP,
+      include_pinned: false,
     });
   });
 
@@ -572,7 +581,7 @@ describe('purgeMessages soft-lock (#3455)', () => {
         })
       );
       await purgeMessages({ context, scopeId, range: '7d', mfaCode: FIXTURE_OTP });
-      expect(body).toEqual({ range: '7d', mfa_code: FIXTURE_OTP });
+      expect(body).toEqual({ range: '7d', mfa_code: FIXTURE_OTP, include_pinned: false });
     });
 
     it('a 429 carrying the step-up budget flag is verificationLimited, with its countdown', async () => {
@@ -678,7 +687,9 @@ describe('purgeMessages soft-lock (#3455)', () => {
             purpose: context === 'channel' ? 'messages.channel_purge' : 'messages.server_purge',
           },
         ]);
-        expect(wire.purge).toEqual([{ range: '7d', step_up_token: MINTED_TOKEN }]);
+        expect(wire.purge).toEqual([
+          { range: '7d', include_pinned: false, step_up_token: MINTED_TOKEN },
+        ]);
         expect(wire.purge[0]).not.toHaveProperty('current_password');
       });
 
@@ -689,7 +700,7 @@ describe('purgeMessages soft-lock (#3455)', () => {
 
         await purgeMessages({ context, scopeId, range: '7d', mfaCode: assertion });
 
-        expect(wire.purge).toEqual([{ range: '7d', mfa_code: assertion }]);
+        expect(wire.purge).toEqual([{ range: '7d', include_pinned: false, mfa_code: assertion }]);
         expect(wire.mint).toEqual([]);
       });
 
@@ -698,7 +709,9 @@ describe('purgeMessages soft-lock (#3455)', () => {
 
         await purgeMessages({ context, scopeId, range: '7d', mfaCode: 'abcd-efgh-ijkl' });
 
-        expect(wire.purge).toEqual([{ range: '7d', mfa_code: 'abcd-efgh-ijkl' }]);
+        expect(wire.purge).toEqual([
+          { range: '7d', include_pinned: false, mfa_code: 'abcd-efgh-ijkl' },
+        ]);
       });
 
       // D7: the mint never left (the account changed after the capture), so
@@ -899,6 +912,294 @@ describe('purgeMessages soft-lock (#3455)', () => {
       expect(isStepUpPurgeResult({ kind: 'softLockFailed' })).toBe(false);
       expect(isStepUpPurgeResult({ kind: 'verificationLimited' })).toBe(false);
     });
+  });
+});
+
+// #3458: the wire value is derived from one PinMode, and always sent.
+describe('include_pinned', () => {
+  it('only an explicit include sends true', () => {
+    expect(includePinnedFor('include')).toBe(true);
+    expect(includePinnedFor('keep')).toBe(false);
+    expect(includePinnedFor('unsupported')).toBe(false);
+  });
+
+  it('an unsupported server is unsupported whatever the checkbox says', () => {
+    expect(pinModeFor(false, true)).toBe('unsupported');
+    expect(pinModeFor(false, false)).toBe('unsupported');
+    expect(pinModeFor(true, true)).toBe('include');
+    expect(pinModeFor(true, false)).toBe('keep');
+  });
+
+  // include_pinned is derived from the mode alone, so it cannot disagree with
+  // the claim the dialog showed. Only `unsupported` and the default are tested
+  // here: `keep` and `include` make a pin claim and need a fresh capability
+  // answer, covered below.
+  it.each([
+    { pinMode: 'unsupported' as const, sent: false },
+    { pinMode: undefined, sent: false },
+  ])('the body carries include_pinned=$sent for mode $pinMode', async ({ pinMode, sent }) => {
+    const bodies: unknown[] = [];
+    server.use(
+      http.delete('*/api/v1/channels/:id/messages', async ({ request }) => {
+        bodies.push(await request.json());
+        return HttpResponse.json({ deleted_count: 1, hidden_count: 0 });
+      })
+    );
+    await purgeMessages({ context: 'channel', scopeId: CHANNEL, range: '7d', pinMode });
+    expect(bodies).toEqual([{ range: '7d', include_pinned: sent }]);
+  });
+});
+
+// #3552 review: a send that makes a pin claim goes only on a fresh capability
+// answer that still advertises purgeKeepsPinned.
+describe('pinClaimStillHonoured', () => {
+  const caps = (keepsPinned?: boolean) => ({
+    auth: { oauthProviders: [] },
+    features: keepsPinned === undefined ? {} : { purgeKeepsPinned: keepsPinned },
+  });
+  const refreshAnswers = (next: () => ReturnType<typeof caps> | null) =>
+    vi.spyOn(clientConfigService, 'refreshServerCapabilities').mockImplementation(async () => {
+      useClientConfigStore.setState({ serverCapabilities: next() });
+    });
+
+  beforeEach(() => useClientConfigStore.setState({ serverCapabilities: caps(true) }));
+
+  it('makes no request for a mode that claims nothing', async () => {
+    const refresh = refreshAnswers(() => caps(false));
+    expect(await pinClaimStillHonoured('unsupported')).toBe(true);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('goes on a fresh answer that still advertises the capability', async () => {
+    refreshAnswers(() => caps(true));
+    expect(await pinClaimStillHonoured('keep')).toBe(true);
+    expect(await pinClaimStillHonoured('include')).toBe(true);
+  });
+
+  it('stops on an answer without it: a rolled-back server', async () => {
+    refreshAnswers(() => caps());
+    expect(await pinClaimStillHonoured('keep')).toBe(false);
+  });
+
+  it('stops on a failed refresh', async () => {
+    refreshAnswers(() => null);
+    expect(await pinClaimStillHonoured('keep')).toBe(false);
+  });
+
+  it('stops when no new answer arrived, so the cached value never decides', async () => {
+    // Counted here: the suite keeps mock calls between tests (clearMocks: false).
+    let refreshes = 0;
+    vi.spyOn(clientConfigService, 'refreshServerCapabilities').mockImplementation(async () => {
+      refreshes += 1;
+    });
+    expect(await pinClaimStillHonoured('keep')).toBe(false);
+    // One retry for a superseded refresh, then it gives up.
+    expect(refreshes).toBe(2);
+  });
+
+  // Gitar on #3552, through the real refresh: a refresh another caller starts
+  // aborts the recheck's, which returns without an answer. Mutant: no second
+  // attempt, so a server that still keeps pins is refused.
+  it('asks once more when another refresh superseded its own', async () => {
+    vi.restoreAllMocks();
+    server.use(
+      http.get('*/api/v1/server/capabilities', async () => {
+        await delay(30);
+        return HttpResponse.json(caps(true));
+      })
+    );
+
+    const recheck = pinClaimStillHonoured('keep');
+    // The poll, say, starting while the recheck's request is in flight.
+    const poll = clientConfigService.refreshServerCapabilities();
+
+    expect(await recheck).toBe(true);
+    await poll;
+  });
+
+  // Codex P1 on #3552: the step-up mint is a request of its own, so the recheck
+  // runs after it, immediately before the delete. A recheck taken before the
+  // mint would pass on the pre-rollback answer and send the delete.
+  it.each([
+    ['the server rolled back during the mint', false, 0],
+    ['control: the capability is still advertised', true, 1],
+  ])('a self-purge rechecks after the step-up mint: %s', async (_name, keepsAfterMint, deletes) => {
+    let minted = false;
+    let purged = 0;
+    vi.spyOn(clientConfigService, 'refreshServerCapabilities').mockImplementation(async () => {
+      useClientConfigStore.setState({ serverCapabilities: caps(minted ? keepsAfterMint : true) });
+    });
+    server.use(
+      http.post(`*${MINT_PATH}`, () => {
+        minted = true;
+        return HttpResponse.json({ step_up_token: MINTED_TOKEN, expires_in: 60 });
+      }),
+      http.delete('*/api/v1/channels/:id/messages', () => {
+        purged += 1;
+        return HttpResponse.json({ deleted_count: 1, hidden_count: 0 });
+      })
+    );
+
+    const result = await purgeMessages({
+      context: 'channel',
+      scopeId: CHANNEL,
+      range: '7d',
+      currentPassword: FIXTURE_PW,
+      pinMode: 'keep',
+    });
+
+    expect(minted).toBe(true);
+    expect(purged).toBe(deletes);
+    expect(result.kind).toBe(deletes === 1 ? 'success' : 'unavailable');
+  });
+});
+
+// Codex P1s on #3552. The pin recheck is a request of its own, so the purge it
+// gates must stay bound to the account that confirmed it, and apiFetch's own
+// recovery must not resend it without a new recheck.
+describe('pin-claim purge dispatch (#3552 review)', () => {
+  const DM_ROUTE = '*/api/v1/dm/conversations/:id/messages';
+  const keepsPinned = () => ({
+    auth: { oauthProviders: [] },
+    features: { purgeKeepsPinned: true },
+  });
+  const recheckAnswers = (during?: () => void) =>
+    vi.spyOn(clientConfigService, 'refreshServerCapabilities').mockImplementation(async () => {
+      during?.();
+      useClientConfigStore.setState({ serverCapabilities: keepsPinned() });
+    });
+  /** Counts the deletes; the first `refusals` are answered 401, the rest succeed. */
+  const deletes = (refusals = 0) => {
+    let hits = 0;
+    server.use(
+      http.delete(DM_ROUTE, () => {
+        hits += 1;
+        return hits <= refusals
+          ? new HttpResponse(null, { status: 401 })
+          : HttpResponse.json({ deleted_count: 1, hidden_count: 0 });
+      })
+    );
+    return () => hits;
+  };
+
+  beforeEach(() => useClientConfigStore.setState({ serverCapabilities: keepsPinned() }));
+
+  // Mutant: the capture taken after the recheck, or none, so the delete goes
+  // out as the account that signed in meanwhile.
+  it.each([
+    ['the account is replaced during the recheck', true, 0],
+    ['control: the account stays', false, 1],
+  ])('a purge without a capture: %s', async (_name, replace, sent) => {
+    recheckAnswers(
+      replace
+        ? () => useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 }))
+        : undefined
+    );
+    const hits = deletes();
+
+    const purge = purgeMessages({
+      context: 'dm',
+      scopeId: CONVERSATION,
+      range: '7d',
+      pinMode: 'keep',
+    });
+    if (replace) await expect(purge).rejects.toMatchObject({ name: 'AbortError' });
+    else await expect(purge).resolves.toMatchObject({ kind: 'success' });
+    expect(hits()).toBe(sent);
+  });
+
+  // Mutant: no dispatch guard, so the refresh resends the delete unchecked. The
+  // `unsupported` row is the control: no claim, so the ordinary resend happens.
+  it.each([
+    ['keep', 1, { kind: 'unavailable' }],
+    ['include', 1, { kind: 'unavailable' }],
+    ['unsupported', 2, { kind: 'success', deletedCount: 1, hiddenCount: 0 }],
+  ] as const)('a %s purge answered 401 is sent %i time(s)', async (pinMode, sent, result) => {
+    signInRefreshableSession();
+    recheckAnswers();
+    const hits = deletes(1);
+
+    await expect(
+      purgeMessages({ context: 'dm', scopeId: CONVERSATION, range: '7d', pinMode })
+    ).resolves.toEqual(result);
+    expect(hits()).toBe(sent);
+  });
+
+  // Codex P1 on #3552: a capability poll that lands while apiFetch awaits the
+  // attestation IPC, after the recheck passed. Mutant: the guard checks only
+  // whether a dispatch already happened, so the delete goes out.
+  it.each([
+    ['the option is withdrawn during the attestation await', true, 0, { kind: 'unavailable' }],
+    ['control: the option stays', false, 1, { kind: 'success', deletedCount: 1, hiddenCount: 0 }],
+  ] as const)('a keep purge: %s', async (_name, withdraw, sent, result) => {
+    recheckAnswers();
+    const hits = deletes();
+    const g = globalThis as { electron?: Record<string, unknown> };
+    const before = g.electron;
+    g.electron = {
+      ...before,
+      attestation: {
+        getToken: async () => {
+          if (withdraw) {
+            useClientConfigStore.setState({
+              serverCapabilities: { auth: { oauthProviders: [] }, features: {} },
+            });
+          }
+          return null;
+        },
+        clearToken: async () => undefined,
+      },
+    };
+    try {
+      await expect(
+        purgeMessages({ context: 'dm', scopeId: CONVERSATION, range: '7d', pinMode: 'keep' })
+      ).resolves.toEqual(result);
+    } finally {
+      g.electron = before;
+    }
+    expect(hits()).toBe(sent);
+  });
+});
+
+describe('pinClaimDispatchGuard', () => {
+  const advertise = (keepsPinned: boolean | undefined) =>
+    useClientConfigStore.setState({
+      serverCapabilities: {
+        auth: { oauthProviders: [] },
+        features: keepsPinned === undefined ? {} : { purgeKeepsPinned: keepsPinned },
+      },
+    });
+
+  beforeEach(() => advertise(true));
+
+  it('guards nothing for a mode that claims nothing', () => {
+    expect(pinClaimDispatchGuard('unsupported')).toBeUndefined();
+  });
+
+  it.each(['keep', 'include'] as const)(
+    'lets one %s dispatch through and refuses the next',
+    (mode) => {
+      const guard = pinClaimDispatchGuard(mode);
+      expect(() => guard?.()).not.toThrow();
+      expect(() => guard?.()).toThrow(PinClaimReplayRefused);
+    }
+  );
+
+  // Mutant: the advertised check removed, or `!== true` loosened to `=== false`
+  // (an absent flag must refuse too).
+  it.each([
+    ['keep', false],
+    ['keep', undefined],
+    ['include', false],
+    ['include', undefined],
+  ] as const)('refuses a first %s dispatch when the option reads %s', (mode, keepsPinned) => {
+    advertise(keepsPinned);
+    expect(() => pinClaimDispatchGuard(mode)?.()).toThrow(PinClaimReplayRefused);
+  });
+
+  it('refuses a first dispatch with no capabilities cached', () => {
+    useClientConfigStore.setState({ serverCapabilities: null });
+    expect(() => pinClaimDispatchGuard('keep')?.()).toThrow(PinClaimReplayRefused);
   });
 });
 

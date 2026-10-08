@@ -11,6 +11,10 @@ import {
 } from '@/renderer/services/messaging/dmVisibilityApi';
 import DMThreadRemovalDialog from '@/renderer/components/DirectMessages/DMThreadRemovalDialog';
 import { vi, describe, beforeEach, afterEach, expect, it } from 'vitest';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { answerCapabilityRefresh } from '../../../helpers/capabilityRefresh';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
+import { PIN_CLAIM_UNCONFIRMED_MESSAGE } from '@/renderer/services/messaging/purgeApi';
 
 // DM Clear on the shared step-up stage (picker PR 2, surface #3). The service
 // is mocked, so what the dialog SENDS is observable as `clearDMHistory`'s
@@ -205,6 +209,40 @@ describe('DMThreadRemovalDialog', () => {
     );
   });
 
+  // An older server's Clear still hides pinned messages, so the dialog promises
+  // they stay only once a fresh capability answer confirms it (#3552 review).
+  it.each([
+    { name: 'confirms', keepsPinned: true, promises: true },
+    { name: 'does not confirm', keepsPinned: false, promises: false },
+  ])(
+    'promises pinned messages stay only when the server $name it',
+    async ({ keepsPinned, promises }) => {
+      useClientConfigStore.setState({
+        serverCapabilities: {
+          auth: { oauthProviders: [] },
+          features: { purgeKeepsPinned: keepsPinned },
+        } as never,
+      });
+      const refresh = answerCapabilityRefresh();
+      renderDialog('clear');
+
+      const dialog = screen.getByRole('dialog', { name: 'Clear history for me' });
+      await waitFor(() => expect(refresh).toHaveBeenCalled());
+      await waitFor(() =>
+        promises
+          ? expect(dialog).toHaveTextContent('Pinned messages stay in the chat.')
+          : expect(dialog).toHaveTextContent('Other participants will not be notified')
+      );
+      if (!promises) expect(dialog).not.toHaveTextContent('Pinned messages');
+    }
+  );
+
+  it('refreshes no capability for Hide', () => {
+    const refresh = answerCapabilityRefresh();
+    renderDialog('hide');
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
   it('keeps group Leave distinct and warns about encryption keys', () => {
     renderDialog('leave', groupConversation);
 
@@ -320,8 +358,11 @@ describe('DMThreadRemovalDialog', () => {
       await waitFor(() => expect(fetchConversations).toHaveBeenCalledOnce());
 
       // Mutant: protection off still issuing the read or asking for credentials,
-      // or sending without the context captured at activation.
-      expect(mockClearDMHistory.mock.calls).toEqual([['dm-1', undefined, expect.anything()]]);
+      // or sending without the context captured at activation. No pin promise
+      // without the capability, so nothing to recheck.
+      expect(mockClearDMHistory.mock.calls).toEqual([
+        ['dm-1', undefined, expect.anything(), 'unsupported'],
+      ]);
       expect(readHits()).toBe(0);
       expect(screen.queryByRole('heading', { name: CREDENTIALS })).not.toBeInTheDocument();
       expect(purged).toHaveBeenCalledOnce();
@@ -378,7 +419,12 @@ describe('DMThreadRemovalDialog', () => {
         await enter();
         fireEvent.click(verify());
         await waitFor(() => expect(mockClearDMHistory).toHaveBeenCalledTimes(2));
-        expect(mockClearDMHistory).toHaveBeenLastCalledWith('dm-1', factor, expect.anything());
+        expect(mockClearDMHistory).toHaveBeenLastCalledWith(
+          'dm-1',
+          factor,
+          expect.anything(),
+          'unsupported'
+        );
         await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
       }
     );
@@ -495,7 +541,8 @@ describe('DMThreadRemovalDialog', () => {
       expect(mockClearDMHistory).toHaveBeenCalledWith(
         'dm-1',
         { kind: 'mfa', value: CODE },
-        expect.anything()
+        expect.anything(),
+        'unsupported'
       );
       expect(purged).toHaveBeenCalledOnce();
       expect(purged.mock.calls[0][0]).toMatchObject({ detail: { scopeId: 'dm-1' } });
@@ -513,7 +560,7 @@ describe('DMThreadRemovalDialog', () => {
 
       await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
       expect(mockClearDMHistory.mock.calls).toEqual([
-        ['dm-1', { kind: 'password', value: PASSWORD_VALUE }, expect.anything()],
+        ['dm-1', { kind: 'password', value: PASSWORD_VALUE }, expect.anything(), 'unsupported'],
       ]);
     });
 
@@ -678,7 +725,8 @@ describe('DMThreadRemovalDialog', () => {
         expect(mockClearDMHistory).toHaveBeenLastCalledWith(
           'dm-1',
           { kind: 'mfa', value: CODE },
-          expect.anything()
+          expect.anything(),
+          'unsupported'
         );
       });
 
@@ -941,5 +989,76 @@ describe('DMThreadRemovalDialog', () => {
     expect(mockHideDMThread).not.toHaveBeenCalled();
     expect(mockClearDMHistory).not.toHaveBeenCalled();
     expect(onRemoved).toHaveBeenCalledOnce();
+  });
+
+  // The promise is rechecked inside clearDMHistory, after any step-up mint and
+  // right before Clear is sent (covered in dmVisibilityApi.test.ts). The dialog
+  // asks for it, words a refusal, and admits Clear against the confirming
+  // account (#3552 review).
+  describe('Clear keeps its pin promise to the moment it is sent', () => {
+    // Opens with the capability confirmed by a fresh answer.
+    function keepsPinnedAtOpen() {
+      useClientConfigStore.setState({
+        serverCapabilities: {
+          auth: { oauthProviders: [] },
+          features: { purgeKeepsPinned: true },
+        } as never,
+      });
+      vi.spyOn(clientConfigService, 'refreshServerCapabilities').mockImplementation(async () => {
+        useClientConfigStore.setState({
+          serverCapabilities: {
+            auth: { oauthProviders: [] },
+            features: { purgeKeepsPinned: true },
+          } as never,
+        });
+      });
+    }
+
+    // Mutant: the dialog passes no pin mode, so clearDMHistory never rechecks.
+    it('asks the one-click Clear to keep pins, and words a claim the server no longer confirms', async () => {
+      setProtection(false);
+      keepsPinnedAtOpen();
+      mockClearDMHistory.mockResolvedValueOnce({ kind: 'pinClaimUnconfirmed' });
+      renderDialog('clear');
+      expect(await screen.findByText(/Pinned messages stay in the chat\./)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+      expect(await screen.findByText(PIN_CLAIM_UNCONFIRMED_MESSAGE)).toBeInTheDocument();
+      expect(mockClearDMHistory.mock.calls[0][3]).toBe('keep');
+      expect(onClose).not.toHaveBeenCalled();
+    });
+
+    it('asks the factor Clear to keep pins, and words a claim the server no longer confirms', async () => {
+      keepsPinnedAtOpen();
+      mockClearDMHistory.mockResolvedValueOnce({ kind: 'pinClaimUnconfirmed' });
+      renderDialog('clear');
+      expect(await screen.findByText(/Pinned messages stay in the chat\./)).toBeInTheDocument();
+
+      await continueToCredentials();
+      await enterCode();
+      fireEvent.click(verify());
+
+      expect(await screen.findByText(PIN_CLAIM_UNCONFIRMED_MESSAGE)).toBeInTheDocument();
+      expect(mockClearDMHistory.mock.calls[0][3]).toBe('keep');
+      expect(onClose).not.toHaveBeenCalled();
+    });
+
+    // Codex P1 on #3552. Mutant: no capture at the click, so Clear is admitted
+    // against whoever is signed in when the recheck answers.
+    it('admits the one-click Clear against the account that confirmed it', async () => {
+      setProtection(false);
+      keepsPinnedAtOpen();
+      const confirmedGeneration = useAuthStore.getState().authGeneration;
+      renderDialog('clear');
+      expect(await screen.findByText(/Pinned messages stay in the chat\./)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+      await waitFor(() => expect(mockClearDMHistory).toHaveBeenCalledOnce());
+      const [, , context, pinMode] = mockClearDMHistory.mock.calls[0];
+      expect(context?.authLifecycle.authGeneration).toBe(confirmedGeneration);
+      expect(pinMode).toBe('keep');
+    });
   });
 });

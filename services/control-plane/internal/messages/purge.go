@@ -65,6 +65,8 @@ type serverPurgeRequest struct {
 	rangeFrom       *time.Time
 	rangeLabel      string
 	credentialEpoch *string
+	// includePinned is the request's include_pinned (#3458); false keeps pins.
+	includePinned bool
 	// admission is the HTTP route's composed admission, run as the plan's
 	// Plan.Admit (#3454 A-3); nil on the ban/kick path, whose plan has no
 	// Admit and keeps its pooled audit row (A-3.7).
@@ -92,6 +94,10 @@ func (r serverPurgeRequest) specProvenance(ds purge.DeleteSpec) PurgeProvenance 
 type purgeRequest struct {
 	Range        string  `json:"range" binding:"required"`
 	TargetUserID *string `json:"target_user_id"`
+	// IncludePinned lets the purge delete pinned messages in scope (#3458).
+	// Absent, null and false all keep them: every degraded path errs toward
+	// keeping data.
+	IncludePinned bool `json:"include_pinned"`
 	stepup.Fields
 }
 
@@ -161,7 +167,8 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		serverID: serverID, userID: userID, purpose: stepup.PurposeChannelPurge,
 		input: req.stepUp(), epoch: epoch,
 		rangeFrom: rangeFrom, deletes: deletes, notFound: "Channel not found",
-		forbidden: errMsgChannelPurgeForbidden,
+		forbidden:     errMsgChannelPurgeForbidden,
+		includePinned: req.IncludePinned,
 		authorize: func(ctx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
 			return h.authorizeChannelPurgeBatchTx(ctx, tx, guard, ds)
 		},
@@ -184,7 +191,8 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		Guard: func(ctx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
 			return h.guardChannelPurgeBatch(ctx, tx, guard, ds)
 		},
-		Admit: h.selfPurgeAdmit(softLock.admission),
+		Admit:         h.selfPurgeAdmit(softLock.admission),
+		IncludePinned: req.IncludePinned,
 	}
 	res, err := h.purgeEngine.Run(purgeCtx, plan)
 	if h.refuseSelfPurge(c, softLock) {
@@ -195,7 +203,8 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("Channel purged", "channel_id", channelID, "actor", userID, "deleted", res.DeletedCount)
+	h.log.Info("Channel purged", "channel_id", channelID, "actor", userID, "deleted", res.DeletedCount,
+		"include_pinned", req.IncludePinned)
 	h.emitChannelPurged(channelID, userID, res.DeletedCount, req.Range)
 	// hidden_count is structurally 0 for server contexts — returned so the response
 	// shape matches spec §4 { deleted_count, hidden_count } across ALL contexts.
@@ -485,19 +494,21 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 
 	deletes, status, err := h.authorizeServerPurge(purgeCtx, serverID, userID, req.TargetUserID)
 	if status != PurgeCompleted {
-		h.respondServerPurge(c, serverID, userID, 0, status, err)
+		h.respondServerPurge(c, serverID, userID, 0, status, err, req.IncludePinned)
 		return
 	}
 	epoch := middleware.TokenCredentialEpoch(c)
 	sreq := serverPurgeRequest{
 		serverID: serverID, actorID: userID, target: req.TargetUserID, reason: "manual",
 		rangeFrom: rangeFrom, rangeLabel: req.Range, credentialEpoch: ptr(epoch),
+		includePinned: req.IncludePinned,
 	}
 	softLock, ok := h.gatePurge(purgeCtx, c, selfPurge{
 		serverID: serverID, userID: userID, purpose: stepup.PurposeServerPurge,
 		input: req.stepUp(), epoch: epoch,
 		rangeFrom: rangeFrom, deletes: deletes, notFound: "Server not found",
-		forbidden: errMsgServerPurgeForbidden,
+		forbidden:     errMsgServerPurgeForbidden,
+		includePinned: req.IncludePinned,
 		authorize: func(ctx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
 			return h.authorizeServerPurgeBatchTx(ctx, tx, sreq, ds)
 		},
@@ -512,12 +523,14 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 		return
 	}
 	h.settleSelfPurge(purgeCtx, softLock, err)
-	h.respondServerPurge(c, serverID, userID, deleted, status, err)
+	h.respondServerPurge(c, serverID, userID, deleted, status, err, req.IncludePinned)
 }
 
 // respondServerPurge writes PurgeServer's outcome. A skip carries RS5's
 // refusal as its error when the MFA mask caused it (serverPurgeDeletes).
-func (h *Handler) respondServerPurge(c *gin.Context, serverID, userID string, deleted int, status PurgeStatus, err error) {
+func (h *Handler) respondServerPurge(
+	c *gin.Context, serverID, userID string, deleted int, status PurgeStatus, err error, includePinned bool,
+) {
 	switch status {
 	case PurgeSkippedUnauthorized:
 		if err != nil {
@@ -532,7 +545,7 @@ func (h *Handler) respondServerPurge(c *gin.Context, serverID, userID string, de
 		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
 	default:
-		h.log.Info("Server purged", "server_id", serverID, "actor", userID, "deleted", deleted)
+		h.log.Info("Server purged", "server_id", serverID, "actor", userID, "deleted", deleted, "include_pinned", includePinned)
 		// hidden_count is structurally 0 for server contexts — returned so the response
 		// shape matches spec §4 { deleted_count, hidden_count } across ALL contexts.
 		c.JSON(http.StatusOK, gin.H{"deleted_count": deleted, "hidden_count": 0})
@@ -615,7 +628,8 @@ func (h *Handler) runServerPurge(ctx context.Context, req serverPurgeRequest, de
 		Guard: func(guardCtx context.Context, tx *sql.Tx, ds purge.DeleteSpec) error {
 			return h.guardServerPurgeBatch(guardCtx, tx, req, ds)
 		},
-		Admit: h.selfPurgeAdmit(req.admission),
+		Admit:         h.selfPurgeAdmit(req.admission),
+		IncludePinned: req.includePinned,
 	}
 	res, err := h.purgeEngine.Run(ctx, plan)
 	if err != nil {
@@ -768,13 +782,15 @@ func serverPurgeSpecs(
 // moderation (ban/kick) path; reason is "ban" or "kick". Thin wrapper over purgeServerCore so
 // the members package can consume it through a narrow interface without the range machinery.
 // provenance is how the ban or removal transaction admitted the purge (#3454 A-3.7).
+// includePinned is the kick/ban request's include_pinned (#3458): false keeps pinned messages.
 func (h *Handler) PurgeUserServerMessages(
 	ctx context.Context, serverID, actorID, target, reason string, provenance PurgeProvenance,
+	includePinned bool,
 ) (int, PurgeStatus, error) {
 	t := target
 	return h.purgeServerCore(ctx, serverPurgeRequest{
 		serverID: serverID, actorID: actorID, target: &t, reason: reason, rangeLabel: "all",
-		provenance: provenance,
+		provenance: provenance, includePinned: includePinned,
 	})
 }
 
@@ -978,7 +994,9 @@ const selfPurgeCountCap = stepup.DeleteSoftLockDayThreshold + 1
 // the actor's own-rule setting, a missing row reading TRUE — and the ids of a
 // bounded set of the actor's messages the purge will delete; their number is
 // the count. The predicate is the engine's selectBatch predicate over the
-// self-authored specs' channels.
+// self-authored specs' channels, pin filter included (#3458 invariant I3: the
+// soft-lock counts exactly the rows the purge may delete), so keeping pins
+// never charges the delete-rate budget for messages that are not deleted.
 const selfPurgeSoftLockQuery = `
 	SELECT s.enforce_mfa_dangerous_actions,
 	       COALESCE((SELECT ps.require_auth_before_purge FROM privacy_settings ps WHERE ps.user_id = $2), TRUE),
@@ -987,6 +1005,7 @@ const selfPurgeSoftLockQuery = `
 	            WHERE channel_id = ANY($3::uuid[])
 	              AND user_id = $2
 	              AND ($4::timestamptz IS NULL OR created_at >= $4::timestamptz)
+	              AND ($6::boolean OR pinned_at IS NULL)
 	            LIMIT $5) own)
 	FROM servers s WHERE s.id = $1`
 
@@ -1002,6 +1021,9 @@ type selfPurge struct {
 	deletes          []purge.DeleteSpec
 	// notFound is the route's 404 copy for a server deleted in flight.
 	notFound string
+	// includePinned is the request's include_pinned, so the count matches what
+	// the purge may delete.
+	includePinned bool
 	// forbidden is the route's generic 403 copy, the answer to an admission
 	// whose authority check refused a D1 spec.
 	forbidden string
@@ -1165,7 +1187,7 @@ func (h *Handler) gateSelfPurge(ctx context.Context, c *gin.Context, p selfPurge
 	g := p.gate()
 	var counted pq.StringArray
 	if err := h.db.QueryRowContext(ctx, selfPurgeSoftLockQuery,
-		p.serverID, p.userID, pq.Array(own), p.rangeFrom, selfPurgeCountCap,
+		p.serverID, p.userID, pq.Array(own), p.rangeFrom, selfPurgeCountCap, p.includePinned,
 	).Scan(&g.enforcing, &g.ownRule, &counted); err != nil {
 		h.log.Error("Self-purge soft-lock read failed", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})

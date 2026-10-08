@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"database/sql"
 	"time"
 
 	"github.com/google/uuid"
@@ -138,12 +139,15 @@ const (
 )
 
 // DMMessageVisibilitySource identifies the immutable source of a
-// message-derived delivery. Deleted messages retain their author and persisted
-// creation time so the shared visibility predicate still applies after delete.
+// message-derived delivery. Deleted messages retain their author, persisted
+// creation time and pin state so the shared visibility predicate still applies
+// after delete: a pinned message is never hidden (#3458), so a viewer whose
+// range covers it saw it and must receive its delete.
 type DMMessageVisibilitySource struct {
 	messageID        uuid.UUID
 	deletedAuthorID  uuid.UUID
 	deletedCreatedAt time.Time
+	deletedPinnedAt  sql.NullTime
 }
 
 // NewDMMessageVisibilitySource constructs a source for a persisted message.
@@ -152,9 +156,11 @@ func NewDMMessageVisibilitySource(messageID uuid.UUID) DMMessageVisibilitySource
 }
 
 // NewDeletedDMMessageVisibilitySource constructs a source captured in the
-// delete transaction before its message row is removed.
-func NewDeletedDMMessageVisibilitySource(authorID uuid.UUID, createdAt time.Time) DMMessageVisibilitySource {
-	return DMMessageVisibilitySource{deletedAuthorID: authorID, deletedCreatedAt: createdAt}
+// delete transaction before its message row is removed. pinnedAt is the row's
+// pinned_at as read under that transaction's lock; NULL means unpinned, which
+// leaves the message hidden wherever a range covers it.
+func NewDeletedDMMessageVisibilitySource(authorID uuid.UUID, createdAt time.Time, pinnedAt sql.NullTime) DMMessageVisibilitySource {
+	return DMMessageVisibilitySource{deletedAuthorID: authorID, deletedCreatedAt: createdAt, deletedPinnedAt: pinnedAt}
 }
 
 func (s DMMessageVisibilitySource) isPersisted() bool {

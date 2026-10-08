@@ -1361,6 +1361,82 @@ func TestGetMessages_NotParticipant(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
+// readDMHistoryAcrossRemoval holds dm_messages so GetMessages' history query
+// waits AFTER the participant pre-check has passed, removes the viewer while
+// it waits, and returns the response once the removal has committed.
+func readDMHistoryAcrossRemoval(t *testing.T, ts *testhelpers.TestServer, convID, viewerID, token, rawQuery string) *httptest.ResponseRecorder {
+	t.Helper()
+	blocker, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.Exec(`LOCK TABLE dm_messages IN ACCESS EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- ts.DoRequest("GET", pathDMConversationsPrefix+convID+pathMessages+rawQuery, nil, testhelpers.AuthHeaders(token))
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND query LIKE '%INNER JOIN users u ON u.id = m.user_id%'
+		)`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, 5*time.Second, 10*time.Millisecond, "the history query should be waiting, past the participant pre-check")
+
+	_, err = blocker.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, viewerID)
+	require.NoError(t, err)
+	require.NoError(t, blocker.Commit())
+	select {
+	case w := <-result:
+		return w
+	case <-time.After(5 * time.Second):
+		t.Fatal("history read did not resume after the removal committed")
+		return nil
+	}
+}
+
+// The participant pre-check only shapes the 403: the history query itself must
+// refuse a viewer removed after it, or that viewer reads the page anyway
+// (#3552 security P3-1). Both query shapes are covered, latest page and cursor.
+func TestGetMessages_ParticipantRemovedAfterPreCheckReadsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cursor bool
+	}{{"latest page", false}, {"cursor page", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupTS(t)
+			user1 := ts.CreateTestUser(t, "getmsgrace1")
+			user2 := ts.CreateTestUser(t, "getmsgrace2")
+			ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+			convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+			base := time.Now().Add(-time.Hour)
+			ids := make([]string, 0, 2)
+			for i := 0; i < 2; i++ {
+				id := uuid.New().String()
+				_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at)
+					VALUES ($1, $2, $3, 'ciphertext', 'text', $4)`, id, convID, user1.ID, base.Add(time.Duration(i)*time.Second))
+				require.NoError(t, err)
+				ids = append(ids, id)
+			}
+			rawQuery := ""
+			if tc.cursor {
+				rawQuery = "?before=" + ids[1] // the older message is on this page
+			}
+
+			w := readDMHistoryAcrossRemoval(t, ts, convID, user2.ID, user2.AccessToken, rawQuery)
+
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var body map[string]interface{}
+			testhelpers.ParseJSON(t, w, &body)
+			messages := testhelpers.JSONField[[]interface{}](t, body, "messages")
+			assert.Empty(t, messages, "a viewer removed after the pre-check must read no history")
+		})
+	}
+}
+
 func TestGetMessages_InvalidConversationID(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "getmsginv")
@@ -2405,6 +2481,35 @@ func TestDeleteMessage_RetirementFailureRollsBack(t *testing.T) {
 		assert.Equal(t, secondID, event.Data["id"], "successful delete should produce the observation event")
 		break
 	}
+}
+
+// A pinned message is never hidden (#3458 §18.1), so a viewer whose Clear
+// range covers it saw it, and its delete must reach them: the delete captures
+// the row's pin state under its lock for the visibility-scoped broadcast. The
+// unpinned message under the same range stays hidden, and is deleted first so
+// a leaked frame for it would arrive before the pinned one's.
+func TestDeleteMessage_PinnedUnderViewerClearRangeReachesViewer(t *testing.T) {
+	ts := setupTS(t)
+	author := ts.CreateTestUser(t, "delpinauthor")
+	viewer := ts.CreateTestUser(t, "delpinviewer")
+	ts.CreateFriendship(t, author.ID, viewer.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, author.ID, viewer.ID)
+	hiddenID := insertDMMessage(t, ts, convID, author.ID, "cleared and unpinned")
+	pinnedID := insertDMMessage(t, ts, convID, author.ID, "cleared but pinned")
+	_, err := ts.DB.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, pinnedID, author.ID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO dm_message_hidden_ranges (user_id, conversation_id, hidden_from, hidden_to, includes_own)
+		VALUES ($1, $2, '-infinity', NOW(), TRUE)`, viewer.ID, convID)
+	require.NoError(t, err)
+	conn := dialDMObserver(t, ts, viewer.ID, convID)
+
+	for _, id := range []string{hiddenID, pinnedID} {
+		w := ts.DoRequest("DELETE", pathDMConversationsPrefix+convID+pathMsgSlash+id, nil, testhelpers.AuthHeaders(author.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	}
+	deleted := readUntilDMEvent(t, conn, "dm_message_delete")
+	assert.Equal(t, pinnedID, deleted["id"], "only the pinned message's delete reaches the viewer whose range covers both")
 }
 
 func TestDeleteMessage_NotAuthor(t *testing.T) {

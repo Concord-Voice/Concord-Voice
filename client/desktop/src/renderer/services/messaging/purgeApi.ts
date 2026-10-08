@@ -5,11 +5,8 @@
  * consume the discriminated result union and never see a status code.
  */
 
-import {
-  apiFetchInContext,
-  captureApiRequestContext,
-  type ApiRequestContext,
-} from '../system/requestContext';
+import { apiFetch } from '../system/apiClient';
+import { captureApiRequestContext, type ApiRequestContext } from '../system/requestContext';
 import { classifyStepUpRefusal, isStepUpFactorRefusal } from '../system/stepUpRefusal';
 import {
   mintRefusalView,
@@ -20,8 +17,121 @@ import {
 import { mintPasswordStepUpToken, type PasswordStepUpMint } from '../system/stepUpToken';
 import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
 import type { PurgeRange } from '../../constants/purgeRanges';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
+import { clientConfigService } from '../system/clientConfigService';
 
 export type PurgeContext = 'channel' | 'server' | 'dm' | 'group';
+
+/**
+ * How a purge treats pinned messages (#3458). `unsupported` is a server that
+ * does not advertise `features.purgeKeepsPinned`: the option is hidden and the
+ * copy says nothing about pins.
+ */
+export type PinMode = 'keep' | 'include' | 'unsupported';
+
+/**
+ * The wire value for a mode. Only an explicit `include` sends true: an older
+ * server ignores the key and deletes pins, which `unsupported` copy already
+ * describes, while a newer server whose capability read failed keeps them.
+ */
+export function includePinnedFor(mode: PinMode): boolean {
+  return mode === 'include';
+}
+
+/** A dialog's mode from its sampled capability and its checkbox. */
+export function pinModeFor(supported: boolean, include: boolean): PinMode {
+  if (!supported) return 'unsupported';
+  return include ? 'include' : 'keep';
+}
+
+/** Nothing was sent: the server's handling of pinned messages was not confirmed. */
+export const PIN_CLAIM_UNCONFIRMED_MESSAGE =
+  "Couldn't confirm how the server handles pinned messages. Try again.";
+
+/**
+ * Whether a send in this mode may go: a mode that makes a pin claim first
+ * refreshes the capability, and goes only on a fresh answer that still
+ * advertises it (#3552 review). A server rolled back after the dialog opened
+ * ignores `include_pinned` and deletes pins, so a withdrawn, failed or
+ * superseded refresh stops the send. The window left is the one between this
+ * answer and the request.
+ *
+ * A refresh another caller starts (the poll, a dialog opening) aborts this one,
+ * which then returns without touching the store, so an unchanged store means
+ * "no answer yet", not "no". One more refresh is asked for before giving up
+ * (#3552 review).
+ */
+export async function pinClaimStillHonoured(mode: PinMode): Promise<boolean> {
+  if (mode === 'unsupported') return true;
+  const before = useClientConfigStore.getState().serverCapabilities;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await clientConfigService.refreshServerCapabilities();
+    const after = useClientConfigStore.getState().serverCapabilities;
+    if (after !== before) return after !== null && after.features.purgeKeepsPinned === true;
+  }
+  return false;
+}
+
+/**
+ * apiFetch would have sent a pin-claim request a second time, or after the
+ * server stopped advertising the option. Nothing was done.
+ */
+export class PinClaimReplayRefused extends Error {
+  constructor() {
+    super(PIN_CLAIM_UNCONFIRMED_MESSAGE);
+    this.name = 'PinClaimReplayRefused';
+  }
+}
+
+/**
+ * The dispatch guard for a request that makes a pin claim. The claim was
+ * confirmed for one dispatch, and apiFetch resends a request after a token
+ * refresh or a re-attestation without asking again, so a server rolled back
+ * in between would delete the pins (#3552 review). The resend is refused. The
+ * first dispatch was turned away by middleware before any handler ran, so
+ * nothing was done.
+ *
+ * apiFetch also awaits version and attestation work before the first
+ * dispatch, and a capability poll can land in that time, so the first
+ * dispatch is refused too unless the current capabilities still advertise the
+ * option (#3552 review). The guard runs synchronously as the request leaves.
+ * ponytail: refused rather than rechecked and resent; add the resend if
+ * refresh-time replays turn out common.
+ */
+export function pinClaimDispatchGuard(mode: PinMode): (() => void) | undefined {
+  if (mode === 'unsupported') return undefined;
+  let dispatched = false;
+  return () => {
+    const advertised =
+      useClientConfigStore.getState().serverCapabilities?.features.purgeKeepsPinned === true;
+    if (dispatched || !advertised) throw new PinClaimReplayRefused();
+    dispatched = true;
+  };
+}
+
+/**
+ * Sends a request that makes a pin claim. The claim is rechecked here, right
+ * before the request, so nothing a caller awaits (a step-up mint, say) can come
+ * between the two, and apiFetch's own resend is refused. Null means nothing was
+ * done and the claim was not confirmed. A mode that claims nothing just sends.
+ */
+export async function sendPinClaim(
+  path: string,
+  init: RequestInit,
+  context: ApiRequestContext | undefined,
+  mode: PinMode
+): Promise<Response | null> {
+  if (!(await pinClaimStillHonoured(mode))) return null;
+  try {
+    return await apiFetch(path, init, {
+      context,
+      assertBeforeDispatch: pinClaimDispatchGuard(mode),
+    });
+  } catch (err) {
+    if (err instanceof PinClaimReplayRefused) return null;
+    throw err;
+  }
+}
 
 export interface PurgeArgs {
   context: PurgeContext;
@@ -41,6 +151,15 @@ export interface PurgeArgs {
    * keep the confirm view (and its methods) open — see `toDeleteRefusalView`.
    */
   softLockPrior?: DeleteRefusalView;
+  /**
+   * The dialog's mode, and the only source of `include_pinned` (see
+   * `includePinnedFor`), so the claim and the wire value cannot disagree.
+   * Omitted means `unsupported`: no pin claim, `include_pinned: false`. When
+   * the mode makes a pin claim, `purgeMessages` rechecks the capability
+   * immediately before the request, after any step-up mint, so no other
+   * request sits between the check and the delete (#3552 review).
+   */
+  pinMode?: PinMode;
 }
 
 /**
@@ -265,30 +384,25 @@ function selfPurgePurpose(context: 'channel' | 'server') {
  * refused exchange lands on the soft-lock stage, and one that never left is
  * `notSent`.
  *
- * `context` is the caller's capture, when it has one; the purge, and any
- * exchange before it, are admitted against it.
+ * `context` is the purge's operation. The exchange is admitted against it too,
+ * so the purge refuses to dispatch if another account or server took over
+ * after the exchange (#3509 review).
  */
 async function purgeStepUpFields(
   args: PurgeArgs,
-  context: ApiRequestContext | undefined
-): Promise<
-  { fields: Record<string, string>; context?: ApiRequestContext } | { refused: PurgeResult }
-> {
+  context: ApiRequestContext
+): Promise<{ fields: Record<string, string> } | { refused: PurgeResult }> {
   const fields: Record<string, string> = {};
   if (args.mfaCode) fields.mfa_code = args.mfaCode;
-  if (!args.currentPassword) return { fields, context };
+  if (!args.currentPassword) return { fields };
   if (args.context === 'dm' || args.context === 'group') {
     fields.current_password = args.currentPassword;
-    return { fields, context };
+    return { fields };
   }
-  // The exchange and the purge are one operation: the purge is admitted
-  // against this capture, so it refuses to dispatch if another account or
-  // server took over after the exchange (#3509 review).
-  const operation = context ?? captureApiRequestContext();
   const minted = await mintPasswordStepUpToken(
     args.currentPassword,
     selfPurgePurpose(args.context),
-    operation
+    context
   );
   if (minted.kind === 'refused') {
     // D7: the exchange never left, so there is nothing to say about the password.
@@ -296,36 +410,48 @@ async function purgeStepUpFields(
     return { refused: mintChallenge(minted) };
   }
   fields.step_up_token = minted.token;
-  return { fields, context: operation };
+  return { fields };
 }
 
 /**
  * `context` is the operation the purge belongs to (`captureApiRequestContext`).
  * The DM/group step-up passes the capture its factor was proven under, so a
  * security-key token or a password is never sent as another account or to
- * another server. Without one, the purge is its own operation, as before.
+ * another server. Without one, the purge captures its own when called, so an
+ * account or server change during the requests it awaits first (the mint, the
+ * pin recheck) stops it rather than sending it as the new account (#3552 review).
  */
 export async function purgeMessages(
   args: PurgeArgs,
   context?: ApiRequestContext
 ): Promise<PurgeResult> {
+  const operation = context ?? captureApiRequestContext();
   // Single-shot: send whichever factors the actor has, together. Probing for
   // requirements costs a request against the same purge budget (spec R-7).
   // A passwordless SSO account with MFA sends the code alone — the server
   // accepts MFA as the whole step-up when there is no password hash.
-  const stepUp = await purgeStepUpFields(args, context);
+  const stepUp = await purgeStepUpFields(args, operation);
   if ('refused' in stepUp) return stepUp.refused;
-  const body: Record<string, unknown> = { range: args.range, ...stepUp.fields };
+  const pinMode = args.pinMode ?? 'unsupported';
+  const body: Record<string, unknown> = {
+    range: args.range,
+    include_pinned: includePinnedFor(pinMode),
+    ...stepUp.fields,
+  };
 
-  const res = await apiFetchInContext(
+  // A server rolled back since the dialog opened, or during the mint above,
+  // ignores include_pinned and deletes pins, so the claim is rechecked here.
+  const res = await sendPinClaim(
     purgePath(args.context, args.scopeId),
     {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     },
-    stepUp.context
+    operation,
+    pinMode
   );
+  if (res === null) return { kind: 'unavailable' };
 
   if (res.ok) {
     // The server always emits a body, but a non-JSON 200 injected by an intermediary would

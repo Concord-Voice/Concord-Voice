@@ -47,10 +47,13 @@ type dmMessageDeleteTarget struct {
 }
 
 // dmDeletedMessage is what the committed delete read under its locks, for the
-// visibility-scoped broadcast.
+// visibility-scoped broadcast. pinnedAt is part of it because a pinned message
+// is never hidden (#3458): without it the broadcast would treat the deleted
+// row as unpinned and withhold its delete from viewers who could see it.
 type dmDeletedMessage struct {
 	authorID  uuid.UUID
 	createdAt time.Time
+	pinnedAt  sql.NullTime
 }
 
 // dmDeleteFence is the delete transaction's session fence: the
@@ -274,9 +277,9 @@ func (h *Handler) deleteDMMessageTx(ctx context.Context, t dmMessageDeleteTarget
 			var locked dmDeletedMessage
 			//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
 			if err := tx.QueryRowContext(ctx,
-				`SELECT m.user_id, m.created_at FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3)+` FOR UPDATE`,
+				`SELECT m.user_id, m.created_at, m.pinned_at FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3)+` FOR UPDATE`,
 				t.messageID, t.convID, t.userID,
-			).Scan(&locked.authorID, &locked.createdAt); err != nil {
+			).Scan(&locked.authorID, &locked.createdAt, &locked.pinnedAt); err != nil {
 				return fmt.Errorf("recheck DM message author: %w", err)
 			}
 			if locked.authorID != t.actorUUID {

@@ -142,7 +142,10 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     await user.click(submit());
 
     expect(await screen.findByText('Purged 4 messages.')).toBeInTheDocument();
-    expect(bodies).toEqual([{ range: '7d' }, { range: '7d', mfa_code: CODE }]);
+    expect(bodies).toEqual([
+      { range: '7d', include_pinned: false },
+      { range: '7d', include_pinned: false, mfa_code: CODE },
+    ]);
   });
 
   // The #17 twin: a backup code was refused on the soft-lock before the picker.
@@ -156,7 +159,7 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     await user.click(submit());
 
     expect(await screen.findByText('Purged 1 message.')).toBeInTheDocument();
-    expect(bodies.at(-1)).toEqual({ range: '7d', mfa_code: 'abcd1234' });
+    expect(bodies.at(-1)).toEqual({ range: '7d', include_pinned: false, mfa_code: 'abcd1234' });
   });
 
   // Rewritten for #3509: the password goes only to the mint endpoint, and the
@@ -179,7 +182,10 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
 
     expect(await screen.findByText('Purged 2 messages.')).toBeInTheDocument();
     expect(mints).toEqual([{ current_password: FIXTURE_PW, purpose: 'messages.channel_purge' }]);
-    expect(bodies).toEqual([{ range: '7d' }, { range: '7d', step_up_token: 'minted-token' }]);
+    expect(bodies).toEqual([
+      { range: '7d', include_pinned: false },
+      { range: '7d', include_pinned: false, step_up_token: 'minted-token' },
+    ]);
     expect(JSON.stringify(bodies)).not.toContain(FIXTURE_PW);
   });
 
@@ -191,7 +197,10 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     await user.click(submit());
 
     expect(await screen.findByText(/Messages purged\./)).toBeInTheDocument();
-    expect(bodies).toEqual([{ range: '7d' }, { range: '7d', mfa_code: CODE }]);
+    expect(bodies).toEqual([
+      { range: '7d', include_pinned: false },
+      { range: '7d', include_pinned: false, mfa_code: CODE },
+    ]);
   });
 
   it('an invalid code is worded in place: the input is emptied and focused, and Confirm is inert', async () => {
@@ -227,7 +236,7 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     await user.click(submit());
 
     expect(await screen.findByText('Purged 1 message.')).toBeInTheDocument();
-    expect(bodies.at(-1)).toEqual({ range: '7d', mfa_code: CODE });
+    expect(bodies.at(-1)).toEqual({ range: '7d', include_pinned: false, mfa_code: CODE });
   });
 
   // Rewritten for #3509: an invalid password is the mint's refusal now, and
@@ -244,7 +253,7 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     expect(screen.getByLabelText('Password')).toHaveValue('');
     expect(screen.getByLabelText('Password')).toHaveAttribute('aria-invalid', 'true');
     submitIsInert();
-    expect(bodies).toEqual([{ range: '7d' }]);
+    expect(bodies).toEqual([{ range: '7d', include_pinned: false }]);
   });
 
   // TA3: the retry's route refused the minted token (#3509). The stage stays,
@@ -268,7 +277,10 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     expect(field).toHaveFocus();
     expect(screen.getAllByText(EXPIRED_COPY)).toHaveLength(1);
     expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
-    expect(bodies).toEqual([{ range: '7d' }, { range: '7d', step_up_token: 'minted-token' }]);
+    expect(bodies).toEqual([
+      { range: '7d', include_pinned: false },
+      { range: '7d', include_pinned: false, step_up_token: 'minted-token' },
+    ]);
   });
 
   it('a spent verification budget ends in a result that says nothing was purged', async () => {
@@ -442,7 +454,7 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     await user.click(submit());
 
     expect(await screen.findByText('Purged 3 messages.')).toBeInTheDocument();
-    expect(bodies.at(-1)).toEqual({ range: '7d', mfa_code: CODE });
+    expect(bodies.at(-1)).toEqual({ range: '7d', include_pinned: false, mfa_code: CODE });
   });
 
   // D7: nothing left, so nothing is shown and nothing is called a network failure.
@@ -493,7 +505,7 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
       expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
       expect(screen.getByRole('heading', { name: 'Confirm it is you' })).toBeInTheDocument();
       // Only the unanswered first purge ever reached the server.
-      expect(bodies).toEqual([{ range: '7d' }]);
+      expect(bodies).toEqual([{ range: '7d', include_pinned: false }]);
     });
 
     it('an unsent retry with a code shows nothing and keeps the code', async () => {
@@ -605,7 +617,7 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
 
         await waitFor(() => expect(bodies).toHaveLength(2));
         expect(begins).toEqual([purpose]);
-        expect(bodies[1]).toEqual({ range: '7d', mfa_code: WEBAUTHN_TOKEN });
+        expect(bodies[1]).toEqual({ range: '7d', include_pinned: false, mfa_code: WEBAUTHN_TOKEN });
       }
     );
   });

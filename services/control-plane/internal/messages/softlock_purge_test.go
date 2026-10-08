@@ -170,7 +170,7 @@ func TestSelfPurge_ModerationPathNeverCounts(t *testing.T) {
 	s.enroll(t, w.owner.ID)
 	s.seed(t, w.channelID, w.owner, 20)
 
-	deleted, status, err := s.handler.PurgeUserServerMessages(context.Background(), w.serverID, w.owner.ID, w.owner.ID, "ban", messages.PurgeExempt)
+	deleted, status, err := s.handler.PurgeUserServerMessages(context.Background(), w.serverID, w.owner.ID, w.owner.ID, "ban", messages.PurgeExempt, false)
 	require.NoError(t, err)
 	assert.Equal(t, messages.PurgeCompleted, status)
 	assert.Equal(t, 20, deleted)

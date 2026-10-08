@@ -81,7 +81,41 @@ func TestDMReactionVisibility_LegacyRangeKeepsActorMessagesVisible(t *testing.T)
 	assert.Equal(t, "👍", actorBody.Reactions[0].Emoji)
 }
 
-func TestDMPinVisibility_ClearRangeHidesActorButPreservesPeer(t *testing.T) {
+// dmPinCount returns the pin count the token's user reads for convID.
+func dmPinCount(t *testing.T, ts *testhelpers.TestServer, convID, token string) int {
+	t.Helper()
+	read := ts.DoRequest("GET", pinAPICh+convID+pinsPath, nil, testhelpers.AuthHeaders(token))
+	require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	var body struct {
+		Count int `json:"count"`
+	}
+	testhelpers.ParseJSON(t, read, &body)
+	return body.Count
+}
+
+// dmVisibleMessageIDs returns the message IDs the token's user reads from the
+// conversation's history, through the DM fetch's hidden-range filter.
+func dmVisibleMessageIDs(t *testing.T, ts *testhelpers.TestServer, convID, token string) []string {
+	t.Helper()
+	read := ts.DoRequest("GET", "/api/v1/dm/conversations/"+convID+"/messages", nil, testhelpers.AuthHeaders(token))
+	require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	var body struct {
+		Messages []struct {
+			ID string `json:"id"`
+		} `json:"messages"`
+	}
+	testhelpers.ParseJSON(t, read, &body)
+	ids := make([]string, 0, len(body.Messages))
+	for _, message := range body.Messages {
+		ids = append(ids, message.ID)
+	}
+	return ids
+}
+
+// A pinned message is never hidden (#3458 §18.1): Clear leaves the pin and
+// the message visible to the actor, who can still unpin it, and the unpin
+// returns the message to the history the actor cleared.
+func TestDMPinVisibility_ClearRangeKeepsPinVisible(t *testing.T) {
 	ts := setupTS(t)
 	actor := ts.CreateTestUser(t, "dmvisibility_pin_actor")
 	peer := ts.CreateTestUser(t, "dmvisibility_pin_peer")
@@ -92,31 +126,63 @@ func TestDMPinVisibility_ClearRangeHidesActorButPreservesPeer(t *testing.T) {
 		testhelpers.AuthHeaders(peer.AccessToken)).Code)
 	markDMHistoryCleared(t, ts, actor.ID, convID)
 
-	t.Run("cleared actor cannot read or mutate hidden pin target", func(t *testing.T) {
-		read := ts.DoRequest("GET", pinAPICh+convID+pinsPath, nil,
-			testhelpers.AuthHeaders(actor.AccessToken))
-		require.Equal(t, http.StatusOK, read.Code, read.Body.String())
-		var body struct {
-			Count int `json:"count"`
-		}
-		testhelpers.ParseJSON(t, read, &body)
-		assert.Equal(t, 0, body.Count)
-
-		mutate := ts.DoRequest("DELETE", pinAPIMsg+msgID+pinPath, nil,
-			testhelpers.AuthHeaders(actor.AccessToken))
-		assert.Equal(t, http.StatusNotFound, mutate.Code, mutate.Body.String())
+	t.Run("cleared actor still reads the pin and the message", func(t *testing.T) {
+		assert.Equal(t, 1, dmPinCount(t, ts, convID, actor.AccessToken))
+		assert.Contains(t, dmVisibleMessageIDs(t, ts, convID, actor.AccessToken), msgID)
 	})
 
-	t.Run("peer still reads the pin", func(t *testing.T) {
-		read := ts.DoRequest("GET", pinAPICh+convID+pinsPath, nil,
-			testhelpers.AuthHeaders(peer.AccessToken))
-		require.Equal(t, http.StatusOK, read.Code, read.Body.String())
-		var body struct {
-			Count int `json:"count"`
-		}
-		testhelpers.ParseJSON(t, read, &body)
-		assert.Equal(t, 1, body.Count)
+	t.Run("actor unpins it and the cleared range hides it again", func(t *testing.T) {
+		unpin := ts.DoRequest("DELETE", pinAPIMsg+msgID+pinPath, nil,
+			testhelpers.AuthHeaders(actor.AccessToken))
+		require.Equal(t, http.StatusOK, unpin.Code, unpin.Body.String())
+		assert.NotContains(t, dmVisibleMessageIDs(t, ts, convID, actor.AccessToken), msgID)
+		assert.Equal(t, 0, dmPinCount(t, ts, convID, actor.AccessToken))
 	})
+
+	t.Run("peer still reads the unpinned message", func(t *testing.T) {
+		assert.Contains(t, dmVisibleMessageIDs(t, ts, convID, peer.AccessToken), msgID)
+	})
+}
+
+// A pinned message under the actor's Clear range stays reactable (#3458
+// §18.1), and once it is unpinned the range hides it from the reaction reader
+// and writer again.
+func TestDMReactionVisibility_PinnedMessageUnderClearRange(t *testing.T) {
+	ts := setupTS(t)
+	actor := ts.CreateTestUser(t, "dmvisibility_pinreact_actor")
+	peer := ts.CreateTestUser(t, "dmvisibility_pinreact_peer")
+	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
+	msgID := insertDMMessageDirect(t, ts, convID, actor.ID, "pinned reaction target")
+
+	require.Equal(t, http.StatusOK, ts.DoRequest("POST", pinAPIMsg+msgID+pinPath, nil,
+		testhelpers.AuthHeaders(peer.AccessToken)).Code)
+	markDMHistoryCleared(t, ts, actor.ID, convID)
+
+	react := ts.DoRequest("PUT", reactURL(msgID), emojiBody("👍"), testhelpers.AuthHeaders(actor.AccessToken))
+	require.Equal(t, http.StatusOK, react.Code, react.Body.String())
+	read := ts.DoRequest("GET", reactURL(msgID), nil, testhelpers.AuthHeaders(actor.AccessToken))
+	require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	var body struct {
+		Reactions []struct {
+			Emoji string `json:"emoji"`
+		} `json:"reactions"`
+	}
+	testhelpers.ParseJSON(t, read, &body)
+	require.Len(t, body.Reactions, 1)
+	assert.Equal(t, "👍", body.Reactions[0].Emoji)
+
+	unpin := ts.DoRequest("DELETE", pinAPIMsg+msgID+pinPath, nil, testhelpers.AuthHeaders(peer.AccessToken))
+	require.Equal(t, http.StatusOK, unpin.Code, unpin.Body.String())
+
+	hiddenRead := ts.DoRequest("GET", reactURL(msgID), nil, testhelpers.AuthHeaders(actor.AccessToken))
+	assert.Equal(t, http.StatusNotFound, hiddenRead.Code, hiddenRead.Body.String())
+	hiddenReact := ts.DoRequest("PUT", reactURL(msgID), emojiBody("❤️"), testhelpers.AuthHeaders(actor.AccessToken))
+	assert.Equal(t, http.StatusNotFound, hiddenReact.Code, hiddenReact.Body.String())
+	var hearts int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM dm_message_reactions WHERE message_id = $1 AND emoji = $2`, msgID, "❤️",
+	).Scan(&hearts))
+	assert.Zero(t, hearts, "a reaction to a message the range hides again must not be written")
 }
 
 // TestDMReactionVisibility_ClearFirstDoesNotMutate proves the hidden-range

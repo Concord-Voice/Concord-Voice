@@ -552,7 +552,7 @@ func TestPurgeProvenance_BanKickPin(t *testing.T) {
 			s.setEnforcing(t, w.serverID, tc.enforcing)
 
 			deleted, status, err := s.handler.PurgeUserServerMessages(context.Background(),
-				w.serverID, w.moderator.ID, w.author.ID, "ban", tc.provenance)
+				w.serverID, w.moderator.ID, w.author.ID, "ban", tc.provenance, false)
 
 			assert.Equal(t, tc.want, status)
 			if tc.want == messages.PurgeFailed {

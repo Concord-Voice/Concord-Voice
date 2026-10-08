@@ -1,5 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { useClientConfigStore, usePurgeKeepsPinned } from '@/renderer/stores/ui/clientConfigStore';
+import { renderHook } from '@testing-library/react';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -1365,5 +1366,47 @@ describe('clientConfigService', () => {
 
       warnSpy.mockRestore();
     });
+  });
+});
+
+// #3458: purgeKeepsPinned must survive the parse. Setting the store directly
+// would pass even if the schema dropped the key, which is exactly how
+// chunkedAttachmentUpload once shipped unreachable.
+describe('purgeKeepsPinned capability — THROUGH THE PARSER', () => {
+  const withPinned = (features: Record<string, unknown>): unknown => ({
+    server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+    auth: { emailVerificationRequired: true, oauthProviders: [] },
+    features: { voiceTiersSupported: true, ...features },
+    policyVersion: 'test',
+  });
+
+  it('a true capability reaches the store and the selector', async () => {
+    mockApiFetch.mockResolvedValueOnce(jsonResponse(withPinned({ purgeKeepsPinned: true })));
+
+    await clientConfigService.refreshServerCapabilities();
+
+    expect(useClientConfigStore.getState().serverCapabilities?.features.purgeKeepsPinned).toBe(
+      true
+    );
+    expect(renderHook(() => usePurgeKeepsPinned()).result.current).toBe(true);
+  });
+
+  it.each([
+    ['absent (an older server)', {}],
+    ['false', { purgeKeepsPinned: false }],
+  ])('%s reads false', async (_label, features) => {
+    mockApiFetch.mockResolvedValueOnce(jsonResponse(withPinned(features)));
+
+    await clientConfigService.refreshServerCapabilities();
+
+    expect(renderHook(() => usePurgeKeepsPinned()).result.current).toBe(false);
+  });
+
+  it('a failed fetch reads false', async () => {
+    mockApiFetch.mockRejectedValueOnce(new Error('offline'));
+
+    await clientConfigService.refreshServerCapabilities();
+
+    expect(renderHook(() => usePurgeKeepsPinned()).result.current).toBe(false);
   });
 });

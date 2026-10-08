@@ -1,5 +1,19 @@
+import { useState } from 'react';
 import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore';
-import { apiFetch, safeJson } from '../../services/system/apiClient';
+import { safeJson } from '../../services/system/apiClient';
+import { captureApiRequestContext } from '../../services/system/requestContext';
+import {
+  includePinnedFor,
+  PIN_CLAIM_UNCONFIRMED_MESSAGE,
+  pinModeFor,
+  sendPinClaim,
+  type PinMode,
+} from '../../services/messaging/purgeApi';
+import { usePurgeKeepsPinnedAtOpen } from '../../hooks/messaging/usePurgeKeepsPinnedAtOpen';
+import ConfirmActionModal from '../ui/ConfirmActionModal';
+import './purgeOnModeration.css';
+
+export { PIN_CLAIM_UNCONFIRMED_MESSAGE };
 
 /**
  * The kick/ban purge opt-in (#1354), shared by the two surfaces that can ban or
@@ -42,12 +56,16 @@ export interface PurgeNoticeResult {
 export function purgeNotice(
   name: string,
   verb: 'banned' | 'kicked',
-  status: string
+  status: string,
+  pinMode: PinMode
 ): PurgeNoticeResult {
   switch (status) {
     case 'completed':
       return {
-        notice: `${name} was ${verb} and their messages were purged.`,
+        notice:
+          pinMode === 'keep'
+            ? `${name} was ${verb} and their messages were purged. Pinned messages were kept.`
+            : `${name} was ${verb} and their messages were purged.`,
         unknownStatus: false,
       };
     case 'skipped_unauthorized':
@@ -72,40 +90,136 @@ export function purgeNotice(
   }
 }
 
+const PURGE_SUMMARY: Record<PinMode, string> = {
+  keep: 'Their messages will be permanently removed from every channel you can moderate, except pinned messages.',
+  include:
+    'Their messages, including pinned messages, will be permanently removed from every channel you can moderate.',
+  unsupported: 'Their messages will be permanently removed from every channel you can moderate.',
+};
+
 /**
- * The kick and ban request structs carry only `purge_messages bool`, so this is
- * a checkbox and nothing more — a range picker would promise a choice the API
- * does not accept. Absent on Leave Server: self-removal never purges.
+ * The kick and ban request structs carry only `purge_messages` and
+ * `include_pinned`, so these are checkboxes and nothing more — a range picker
+ * would promise a choice the API does not accept. Absent on Leave Server:
+ * self-removal never purges. The pinned choice appears only under a checked
+ * opt-in on a server that keeps pins (#3458); unchecking the opt-in clears it.
  */
 export function PurgeMessagesOptIn({
   checked,
   onChange,
-}: Readonly<{ checked: boolean; onChange: (next: boolean) => void }>) {
+  pinMode,
+  onIncludePinnedChange,
+}: Readonly<{
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  pinMode: PinMode;
+  onIncludePinnedChange: (next: boolean) => void;
+}>) {
   return (
     <div className="member-purge-optin">
-      <label style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <label className="member-purge-optin__row">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => {
+            onChange(e.target.checked);
+            if (!e.target.checked) onIncludePinnedChange(false);
+          }}
+        />
         <span>Also purge their messages in this server</span>
       </label>
-      {checked && (
-        <p
-          style={{
-            color: 'var(--text-secondary)',
-            fontSize: 'calc(12px * var(--font-scale, 1))',
-            margin: '6px 0 0',
-          }}
-        >
-          Their messages will be permanently removed from every channel you can moderate.
-        </p>
+      {checked && pinMode !== 'unsupported' && (
+        <label className="member-purge-optin__row member-purge-optin__pinned">
+          <input
+            type="checkbox"
+            checked={pinMode === 'include'}
+            onChange={(e) => onIncludePinnedChange(e.target.checked)}
+          />
+          <span>Include pinned messages</span>
+        </label>
       )}
+      {checked && <p className="member-purge-optin__summary">{PURGE_SUMMARY[pinMode]}</p>}
     </div>
+  );
+}
+
+type ModerationAction = 'ban' | 'kick';
+
+const MODERATION_COPY: Record<
+  ModerationAction,
+  { verb: string; message: string; purgeLabel: string; loadingLabel: string }
+> = {
+  ban: {
+    verb: 'Ban',
+    message: 'This will permanently remove them from the server and prevent them from rejoining.',
+    purgeLabel: 'Ban and purge',
+    loadingLabel: 'Banning...',
+  },
+  kick: {
+    verb: 'Kick',
+    message: 'This will remove them from the server. They can rejoin with a new invite.',
+    purgeLabel: 'Kick and purge',
+    loadingLabel: 'Kicking...',
+  },
+};
+
+/**
+ * The ban or kick confirmation, open while `target` is set. It owns the purge
+ * opt-in, resets it on close, and samples the pinned-message capability when it
+ * opens (#3458), so `onConfirm` receives exactly what the dialog showed.
+ */
+export function ModerationConfirmModal({
+  action,
+  target,
+  onClose,
+  onConfirm,
+}: Readonly<{
+  action: ModerationAction;
+  target: ServerMember | null;
+  onClose: () => void;
+  onConfirm: (
+    target: ServerMember,
+    action: ModerationAction,
+    alsoPurge: boolean,
+    pinMode: PinMode
+  ) => Promise<void>;
+}>) {
+  const [alsoPurge, setAlsoPurge] = useState(false);
+  const [includePinned, setIncludePinned] = useState(false);
+  const pinMode = pinModeFor(usePurgeKeepsPinnedAtOpen(target !== null), includePinned);
+  const copy = MODERATION_COPY[action];
+  return (
+    <ConfirmActionModal
+      isOpen={target !== null}
+      onClose={() => {
+        setAlsoPurge(false);
+        setIncludePinned(false);
+        onClose();
+      }}
+      title={`${copy.verb} ${target?.display_name || target?.username || 'User'}`}
+      message={copy.message}
+      extraContent={
+        <PurgeMessagesOptIn
+          checked={alsoPurge}
+          onChange={setAlsoPurge}
+          pinMode={pinMode}
+          onIncludePinnedChange={setIncludePinned}
+        />
+      }
+      // Degrades gracefully: an unchecked box never blocks the ban or kick.
+      confirmLabel={alsoPurge ? copy.purgeLabel : copy.verb}
+      loadingLabel={copy.loadingLabel}
+      onConfirm={async () => {
+        if (target) await onConfirm(target, action, alsoPurge, pinMode);
+      }}
+    />
   );
 }
 
 /**
  * One request shape for both moderation actions on both surfaces: the endpoints
  * differ only in method and path, and both accept the same optional
- * `purge_messages` body.
+ * `purge_messages` and `include_pinned` body.
  *
  * Returns the purge notice the caller should announce — empty when no purge was
  * requested, or when the server reported a status this client does not know
@@ -120,20 +234,34 @@ export function PurgeMessagesOptIn({
 export async function moderateMember(
   serverId: string,
   target: ServerMember,
-  action: 'ban' | 'kick',
-  alsoPurge: boolean
+  action: ModerationAction,
+  alsoPurge: boolean,
+  pinMode: PinMode
 ): Promise<PurgeNoticeResult> {
   const isBan = action === 'ban';
-  const res = await apiFetch(
+  // The account and server that confirmed, captured before the recheck's
+  // request: a change while it is in flight refuses the action rather than
+  // sending it as the new account (#3552 review).
+  const operation = captureApiRequestContext();
+  // A purge that promises something about pins is rechecked right before the
+  // request: a rollback since the dialog opened would delete them anyway
+  // (#3552 review). Without a purge there is no claim to check.
+  const res = await sendPinClaim(
     isBan
       ? `/api/v1/servers/${serverId}/bans/${target.user_id}`
       : `/api/v1/servers/${serverId}/members/${target.user_id}`,
     {
       method: isBan ? 'POST' : 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ purge_messages: alsoPurge }),
-    }
+      body: JSON.stringify({
+        purge_messages: alsoPurge,
+        include_pinned: includePinnedFor(pinMode),
+      }),
+    },
+    operation,
+    alsoPurge ? pinMode : 'unsupported'
   );
+  if (res === null) throw new Error(PIN_CLAIM_UNCONFIRMED_MESSAGE);
   if (!res.ok) {
     // `safeJson` throws on a non-JSON content-type as well as on a parse
     // failure, so an HTML 502 from a proxy would otherwise surface its own
@@ -155,5 +283,5 @@ export async function moderateMember(
   // undescribable happened.
   if (!body?.purge) return { notice: '', unknownStatus: false };
   const verb = isBan ? 'banned' : 'kicked';
-  return purgeNotice(target.display_name || target.username, verb, body.purge.status);
+  return purgeNotice(target.display_name || target.username, verb, body.purge.status, pinMode);
 }

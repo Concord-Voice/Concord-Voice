@@ -12,6 +12,10 @@ import {
   stubBanNonJsonFailure,
   type ModerationPurgeOutcome,
 } from '../../../helpers/moderationPurge';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { answerCapabilityRefresh } from '../../../helpers/capabilityRefresh';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
+import { PIN_CLAIM_UNCONFIRMED_MESSAGE } from '@/renderer/components/Members/purgeOnModeration';
 import MemberListPanel from '@/renderer/components/Servers/MemberListPanel';
 import LeaveServerModal from '@/renderer/components/Servers/LeaveServerModal';
 
@@ -22,6 +26,11 @@ const SERVER_ID = 's1';
 vi.mock('@/renderer/components/Members/MemberContextMenu', async () => {
   const { memberContextMenuDouble } = await import('../../../helpers/moderationPurge');
   return memberContextMenuDouble();
+});
+
+// The pin choice waits for a capability answer after the dialog opens (#3552).
+beforeEach(() => {
+  answerCapabilityRefresh();
 });
 
 const mockMembers = [moderationMember];
@@ -94,7 +103,7 @@ describe('MemberListPanel purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ban and purge' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: true });
+    expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: false });
   });
 
   it('sends purge_messages false when the box is unchecked', async () => {
@@ -105,7 +114,7 @@ describe('MemberListPanel purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ban' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: false });
+    expect(bodies[0]).toEqual({ purge_messages: false, include_pinned: false });
     // No purge was requested, so the server returns no purge fragment and there
     // is nothing to announce.
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
@@ -199,7 +208,7 @@ describe('MemberListPanel purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Kick and purge' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: true });
+    expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: false });
     await waitFor(() =>
       expect(screen.getByRole('status')).toHaveTextContent(
         'Alice was kicked and their messages were purged.'
@@ -254,6 +263,48 @@ describe('MemberListPanel purge-on-moderation (#1354)', () => {
     expect(await screen.findByText('Ban failed')).toBeInTheDocument();
     // The JSON parse error must never reach the user in place of our message.
     expect(document.body.textContent).not.toContain('text/html');
+  });
+
+  // #3458: runModeration forwards the mode, so a ban that includes pins says so.
+  it('a ban that includes pinned messages sends include_pinned true', async () => {
+    useClientConfigStore.setState({
+      serverCapabilities: { auth: { oauthProviders: [] }, features: { purgeKeepsPinned: true } },
+    });
+    const bodies = stubBan({ requested: true, status: 'completed', purged_count: 4 });
+    render(<MemberListPanel {...defaultProps} />);
+    openDialog('ban');
+
+    fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include pinned messages' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Ban and purge' }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: true });
+  });
+
+  // A rollback after the open answer would delete pins under "kept" copy, so
+  // the ban rechecks the capability and sends nothing on a withdrawal (#3552).
+  it('a capability withdrawn between open and confirm stops the ban', async () => {
+    const withPins = { auth: { oauthProviders: [] }, features: { purgeKeepsPinned: true } };
+    useClientConfigStore.setState({ serverCapabilities: withPins });
+    vi.mocked(clientConfigService.refreshServerCapabilities)
+      .mockImplementationOnce(async () => {
+        useClientConfigStore.setState({ serverCapabilities: { ...withPins } });
+      })
+      .mockImplementationOnce(async () => {
+        useClientConfigStore.setState({
+          serverCapabilities: { auth: { oauthProviders: [] }, features: {} },
+        });
+      });
+    const bodies = stubBan({ requested: true, status: 'completed', purged_count: 4 });
+    render(<MemberListPanel {...defaultProps} />);
+    openDialog('ban');
+
+    fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+    fireEvent.click(screen.getByRole('button', { name: 'Ban and purge' }));
+
+    expect(await screen.findByText(PIN_CLAIM_UNCONFIRMED_MESSAGE)).toBeInTheDocument();
+    expect(bodies).toHaveLength(0);
   });
 });
 

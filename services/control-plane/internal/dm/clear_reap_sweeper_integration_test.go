@@ -114,6 +114,54 @@ func TestClearReapSweeperDiscoversZeroParticipantGroupsOnlyWhenMessagesRemain(t 
 	assert.NotContains(t, discovered, empty)
 }
 
+// A pin below W is visible to every participant (#3458 §18), so the reap keeps
+// it and a conversation whose only message below W is pinned has no work. The
+// candidate predicate must agree, or the sweeper re-selects it on every pass.
+func TestClearReapSweeperDoesNotDiscoverAConversationWhoseOnlyMessageBelowWIsPinned(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	conversationID := seedHiddenEmptyConversation(t, db, false, false, 2)
+	insertRetirementMessage(t, db, conversationID)
+	_, err := db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = user_id WHERE conversation_id = $1`, conversationID)
+	require.NoError(t, err)
+	clearAllParticipants(t, db, conversationID, time.Now().Add(time.Hour))
+	s := NewClearReapSweeper(db, nil, logger.NewWithWriter(io.Discard))
+
+	pinned, err := s.candidateIDsAfter(context.Background(), "")
+	require.NoError(t, err)
+	assert.NotContains(t, pinned, conversationID, "a pin below W is not reapable work")
+
+	_, err = db.Exec(`UPDATE dm_messages SET pinned_at = NULL, pinned_by = NULL WHERE conversation_id = $1`, conversationID)
+	require.NoError(t, err)
+
+	unpinned, err := s.candidateIDsAfter(context.Background(), "")
+	require.NoError(t, err)
+	assert.Contains(t, unpinned, conversationID, "once unpinned the message is reapable work")
+}
+
+// With no participant left nobody can see a pin, so the reap deletes it
+// (#3458 §18.2) and a zero-participant conversation holding only pinned
+// messages still has work. Were the pinned_at carve-out applied to the
+// zero-participant arm too, the sweeper would never select it, and the pins
+// (and the conversation they keep from retirement) would stay forever.
+func TestClearReapSweeperDiscoversAZeroParticipantConversationHoldingOnlyPins(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	conversationID := seedHiddenEmptyConversation(t, db, false, true, 2)
+	insertRetirementMessage(t, db, conversationID)
+	_, err := db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = user_id WHERE conversation_id = $1`, conversationID)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1`, conversationID)
+	require.NoError(t, err)
+	var unpinned int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_messages WHERE conversation_id = $1 AND pinned_at IS NULL`, conversationID).Scan(&unpinned))
+	require.Zero(t, unpinned, "precondition: every remaining message is pinned")
+	s := NewClearReapSweeper(db, nil, logger.NewWithWriter(io.Discard))
+
+	discovered, err := s.candidateIDsAfter(context.Background(), "")
+
+	require.NoError(t, err)
+	assert.Contains(t, discovered, conversationID, "pins nobody can see are reapable work")
+}
+
 func TestClearReapSweeperExcludesAnAlreadyReapedConversation(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	log := logger.NewWithWriter(io.Discard)

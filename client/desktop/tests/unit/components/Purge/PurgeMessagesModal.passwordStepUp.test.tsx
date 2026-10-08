@@ -150,6 +150,7 @@ describe('PurgeMessagesModal password step-up (#3509)', () => {
       expect.soft(mints[0]?.body).toEqual({ current_password: FIXTURE_PW, purpose });
       expect.soft(purges().at(-1)?.body, 'the route is retried with the minted token').toEqual({
         range: '7d',
+        include_pinned: false,
         step_up_token: MINTED_TOKEN,
       });
     }

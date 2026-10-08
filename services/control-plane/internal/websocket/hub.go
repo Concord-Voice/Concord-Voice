@@ -6066,17 +6066,19 @@ func visibleDMMessageDeliveryRecipients(
 			dmvisibility.HiddenRangeFilterForViewerExpr("m", "dp.user_id"),
 			conversationID, source.messageID, uuidArrayParam(userIDs))
 	} else if source.isDeleted() {
+		// The synthetic row carries every column the shared predicate reads,
+		// pinned_at included: a pinned message is never hidden (#3458).
 		//nolint:gosec // G202: aliases are compile-time constants; values are parameterized.
 		rows, err = tx.QueryContext(ctx, `
 			WITH source AS (
-				SELECT $2::uuid AS user_id, $3::timestamptz AS created_at, $1::uuid AS conversation_id
+				SELECT $2::uuid AS user_id, $3::timestamptz AS created_at, $4::timestamptz AS pinned_at, $1::uuid AS conversation_id
 			)
 			SELECT dp.user_id
 			FROM dm_participants dp
 			CROSS JOIN source m
-			WHERE dp.conversation_id = $1 AND dp.user_id = ANY($4::uuid[])`+
+			WHERE dp.conversation_id = $1 AND dp.user_id = ANY($5::uuid[])`+
 			dmvisibility.HiddenRangeFilterForViewerExpr("m", "dp.user_id"),
-			conversationID, source.deletedAuthorID, source.deletedCreatedAt, uuidArrayParam(userIDs))
+			conversationID, source.deletedAuthorID, source.deletedCreatedAt, source.deletedPinnedAt, uuidArrayParam(userIDs))
 	} else {
 		return nil, errors.New("invalid DM message delivery source")
 	}

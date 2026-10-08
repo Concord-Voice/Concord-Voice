@@ -15,5 +15,6 @@ func TestHiddenRangeFilterForViewerExpr_UsesCallerAndViewer(t *testing.T) {
 	assert.Contains(t, fragment, "hr.conversation_id = message.conversation_id")
 	assert.Contains(t, fragment, "message.created_at >= hr.hidden_from")
 	assert.Contains(t, fragment, "message.created_at < hr.hidden_to")
+	assert.Contains(t, fragment, "message.pinned_at IS NULL", "a pinned message is never hidden (#3458)")
 	assert.Contains(t, fragment, "hr.includes_own OR message.user_id <> participant.user_id")
 }

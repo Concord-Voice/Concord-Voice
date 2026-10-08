@@ -101,6 +101,10 @@ type FeaturesInfo struct {
 	// Omitted when the routes are not reachable, so clients cannot mistake a
 	// format capability for route availability.
 	AttachmentEnvelopeVersions []int `json:"attachmentEnvelopeVersions,omitempty"`
+	// Whether purges honour include_pinned and keep pinned messages by default
+	// (#3458). Always true on this build; NOT omitempty, so a client reads its
+	// absence as an older server that deletes pins, and hides the option.
+	PurgeKeepsPinned bool `json:"purgeKeepsPinned"`
 	// Whether a server's "Enforce MFA On Dangerous Actions" setting actually
 	// gates the dangerous actions (#3454). NOT omitempty, for the reason
 	// ChunkedAttachmentUpload gives: a server without the gates says false
@@ -175,6 +179,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			EntitlementMode:             entitlementMode,
 			ActivityHistorySupported:    activityHistorySupported(h.cfg),
 			ChunkedAttachmentUpload:     h.chunkedAttachmentUpload,
+			PurgeKeepsPinned:            true,
 			MFAEnforcedDangerousActions: h.mfaEnforcedDangerousActions,
 		},
 		PolicyVersion: policyVersion,

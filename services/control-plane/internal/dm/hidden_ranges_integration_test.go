@@ -118,7 +118,7 @@ func TestApplyReceiverHideLocksParentsBeforeParticipant(t *testing.T) {
 				err    error
 			}, 1)
 			go func() {
-				hidden, hideErr := h.applyReceiverHide(hideCtx, actor, convID, nil, purgeID, 0, "")
+				hidden, hideErr := h.applyReceiverHide(hideCtx, actor, convID, nil, purge.Result{PurgeID: purgeID}, "")
 				hideDone <- struct {
 					hidden int
 					err    error
@@ -334,4 +334,59 @@ func TestHiddenRanges_FilterOwnAndPeerMessagesByProvenance(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 	assert.ElementsMatch(t, []string{"own-new", "peer-new"}, visible)
+}
+
+// A pinned message is never hidden (#3458 §18.1). The range still covers it,
+// so unpinning hides it again — from both provenances a Clear range carries.
+func TestHiddenRanges_PinnedMessageIsNeverHidden(t *testing.T) {
+	db := hiddenTestDB(t)
+	convID, alice, bob := seedHiddenConv(t, db)
+	now := time.Now().UTC()
+	ids := make([]string, 0, 2)
+	for _, message := range []struct{ user, body string }{{alice, "own-pinned"}, {bob, "peer-pinned"}} {
+		var id string
+		require.NoError(t, db.QueryRow(`
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
+			VALUES ($1, $2, $3, 'text', $4) RETURNING id`, convID, message.user, message.body, now.Add(-2*time.Hour)).Scan(&id))
+		ids = append(ids, id)
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, InsertClearRange(context.Background(), tx, alice, convID, now.Add(-time.Hour)))
+	require.NoError(t, tx.Commit())
+
+	//nolint:gosec // G202: fixed aliases and parameter positions are composed with the shared filter helper; values remain parameterized.
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf -- fixed alias and placeholder are supplied by the trusted shared visibility helper; convID and viewer remain bound parameters.
+	query := `SELECT dm.content FROM dm_messages dm WHERE dm.conversation_id = $1` + purge.HiddenRangeFilter("dm", 2)
+	visibleTo := func(viewer string) []string {
+		rows, err := db.Query(query, convID, viewer)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, rows.Close()) }()
+		visible := []string{}
+		for rows.Next() {
+			var content string
+			require.NoError(t, rows.Scan(&content))
+			visible = append(visible, content)
+		}
+		require.NoError(t, rows.Err())
+		return visible
+	}
+	setPinned := func(pinned bool) {
+		for _, id := range ids {
+			var err error
+			if pinned {
+				_, err = db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, id, bob)
+			} else {
+				_, err = db.Exec(`UPDATE dm_messages SET pinned_at = NULL, pinned_by = NULL WHERE id = $1`, id)
+			}
+			require.NoError(t, err)
+		}
+	}
+
+	require.Empty(t, visibleTo(alice), "control: the Clear range hides both while unpinned")
+	setPinned(true)
+	assert.ElementsMatch(t, []string{"own-pinned", "peer-pinned"}, visibleTo(alice), "a pinned message is never hidden")
+	setPinned(false)
+	assert.Empty(t, visibleTo(alice), "unpinning returns both to the range")
+	assert.ElementsMatch(t, []string{"own-pinned", "peer-pinned"}, visibleTo(bob), "the peer's view never depended on the pin")
 }

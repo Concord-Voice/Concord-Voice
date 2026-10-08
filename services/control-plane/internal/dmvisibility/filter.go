@@ -14,11 +14,17 @@ import (
 // HiddenRangeFilterForViewerExpr returns the anti-join that excludes messages
 // hidden for a fixed, compile-time SQL viewer expression. Callers must never
 // pass request data as either identifier or expression.
+//
+// A pinned message is never hidden (#3458 §18). The range still covers it, so
+// unpinning hides it again from every viewer whose range does. alias must name
+// a row that carries pinned_at; a synthetic row stands in for a deleted message
+// with the pin state captured before the delete, never a guessed one.
 func HiddenRangeFilterForViewerExpr(alias, viewerExpr string) string {
 	return fmt.Sprintf(` AND NOT EXISTS (
   SELECT 1 FROM dm_message_hidden_ranges hr
   WHERE hr.user_id = %[2]s AND hr.conversation_id = %[1]s.conversation_id
     AND %[1]s.created_at >= hr.hidden_from AND %[1]s.created_at < hr.hidden_to
+    AND %[1]s.pinned_at IS NULL
     AND (hr.includes_own OR %[1]s.user_id <> %[2]s))`, alias, viewerExpr)
 }
 

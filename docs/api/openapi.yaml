@@ -2911,6 +2911,10 @@ paths:
         on a server that does not enforce, so send it only on a retry after a 403 `mfa_required`.
         The budget fails closed: an unreachable Redis store is a 503 `step_up_budget_unavailable`. A
         purge of the actor's own messages is not gated by this rule.
+
+
+        Pinned messages are kept unless the request sets `include_pinned`
+        (#3458), and the soft-lock counts only the messages the purge may delete.
       operationId: purgeChannelMessages
       security:
       - BearerAuth: []
@@ -3887,6 +3891,7 @@ paths:
                     - maxMembersPerServer
                     - entitlementMode
                     - chunkedAttachmentUpload
+                    - purgeKeepsPinned
                     - mfaEnforcedDangerousActions
                     properties:
                       voiceTiersSupported:
@@ -3915,6 +3920,16 @@ paths:
                           Clients MUST fail closed to the single-shot
                           /media/upload/attachment path on anything but an
                           explicit true.
+                      purgeKeepsPinned:
+                        type: boolean
+                        description: >-
+                          Whether purges on this server keep pinned messages by
+                          default and honour `include_pinned` (#3458). Always
+                          true on a server that has the field. Always present,
+                          never omitted: an older server that deletes pinned
+                          messages lacks the key, so clients MUST offer the
+                          "include pinned messages" choice only on an explicit
+                          true.
                       mfaEnforcedDangerousActions:
                         type: boolean
                         description: >-
@@ -4725,7 +4740,9 @@ paths:
         destructive-operation limit with the other purge routes. Operators set
         the request count and window with `PURGE_RATE_LIMIT` and
         `PURGE_RATE_WINDOW_SEC`; an exceeded limit returns 429 with
-        `Retry-After` and the applicable rate-limit headers.
+        `Retry-After` and the applicable rate-limit headers. Pinned messages
+        stay visible after a Clear (#3458): the range never hides a pinned
+        message, and unpinning one inside the cleared history hides it again.
       operationId: clearDMConversation
       security:
       - BearerAuth: []
@@ -4826,7 +4843,14 @@ paths:
 
 
         Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
-        allows).'
+        allows).
+
+        Pinned messages are kept unless the request sets `include_pinned`
+        (#3458). Without `include_pinned`, the actor''s own pinned messages are
+        not deleted; with `include_pinned: true` they are deleted for every
+        participant. Other participants'' pinned messages are never hidden: a hidden range does not
+        cover a pinned message, so the actor still sees it until it is unpinned,
+        and unpinning it inside the range hides it again.'
       operationId: purgeDMConversationMessages
       security:
       - BearerAuth: []
@@ -12481,6 +12505,10 @@ paths:
         on a server that does not enforce, so send it only on a retry after a 403 `mfa_required`.
         The budget fails closed: an unreachable Redis store is a 503 `step_up_budget_unavailable`. A
         purge of the actor's own messages is not gated by this rule.
+
+
+        Pinned messages are kept unless the request sets `include_pinned`
+        (#3458), and the soft-lock counts only the messages the purge may delete.
       operationId: purgeServerMessages
       security:
       - BearerAuth: []
@@ -19661,6 +19689,14 @@ components:
             may target any author; `Manage Own Messages` alone may target only the
             caller. Omission selects all authors for `Manage All Messages` and the
             caller''s own messages for `Manage Own Messages`.'
+        include_pinned:
+          type: boolean
+          default: false
+          description: >-
+            When true, pinned messages in scope are deleted with the rest.
+            Absent or false keeps them (#3458). Honoured by servers advertising
+            `features.purgeKeepsPinned`. Older servers ignore it and delete
+            pinned messages.
         mfa_code:
           type: string
           maxLength: 256
@@ -19704,6 +19740,14 @@ components:
           - 90d
           - all
           example: all
+        include_pinned:
+          type: boolean
+          default: false
+          description: >-
+            When true, pinned messages in scope are deleted with the rest.
+            Absent or false keeps them (#3458). Honoured by servers advertising
+            `features.purgeKeepsPinned`. Older servers ignore it and delete
+            pinned messages.
         current_password:
           type: string
           format: password
@@ -19729,8 +19773,9 @@ components:
         hidden_count:
           type: integer
           minimum: 0
-          description: 'Messages hidden from the actor''s own view only (DM/group
-            receiver-hide). Structurally 0 for channel and server purges.'
+          description: 'Unpinned messages hidden from the actor''s own view only
+            (DM/group receiver-hide). Pinned messages are never hidden, so they
+            are not counted. Structurally 0 for channel and server purges.'
           example: 7
     UpdateChannelRequest:
       type: object
@@ -22247,6 +22292,15 @@ components:
           description: >-
             When true and the actor holds Manage All Messages, additionally purge the banned
             user's server-wide messages. Additive — the ban succeeds regardless of purge outcome.
+        include_pinned:
+          type: boolean
+          default: false
+          description: >-
+            When true and `purge_messages` is true, the member's pinned messages are
+            purged with the rest.
+            Absent or false keeps them (#3458). Honoured by servers advertising
+            `features.purgeKeepsPinned`. Older servers ignore it and delete
+            pinned messages.
         mfa_code:
           $ref: '#/components/schemas/DangerousActionMFACode'
     RemoveMemberRequest:
@@ -22260,6 +22314,15 @@ components:
             When true, the actor holds Manage All Messages, and this is a moderator removal
             (not a self-leave), additionally purge the removed user's server-wide messages.
             Additive — the removal succeeds regardless of purge outcome.
+        include_pinned:
+          type: boolean
+          default: false
+          description: >-
+            When true and `purge_messages` is true, the member's pinned messages are
+            purged with the rest.
+            Absent or false keeps them (#3458). Honoured by servers advertising
+            `features.purgeKeepsPinned`. Older servers ignore it and delete
+            pinned messages.
         mfa_code:
           $ref: '#/components/schemas/DangerousActionMFACode'
     PurgeOutcome:

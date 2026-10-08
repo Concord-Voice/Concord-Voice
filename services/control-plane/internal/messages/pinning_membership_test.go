@@ -100,9 +100,9 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 }
 
 // TestDMPinClearAfterLookupCannotMutateHiddenMessage pins the transaction-time
-// visibility fence: a Clear committed after request lookup must invalidate both
-// pin and unpin writes, while the existing visibility delivery test proves the
-// unaffected peer still sees the persisted pin.
+// visibility fence: a Clear committed after request lookup must invalidate a
+// pin of the message it hides. A pinned message is never hidden (#3458 §18), so
+// the same Clear leaves an unpin of a pinned message in force.
 func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 	h := newReactionHelperHandler(t)
 	h.hub = websocket.NewHub(nil, nil)
@@ -128,12 +128,10 @@ func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 		assert.False(t, pinnedAt.Valid, "hidden history was mutated by the stale pin request")
 	})
 
-	t.Run("unpin", func(t *testing.T) {
+	t.Run("unpin of a pinned message stays in force", func(t *testing.T) {
 		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 		_, err := h.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $1 WHERE id = $2`, actorID, messageID)
 		require.NoError(t, err)
-		var before time.Time
-		require.NoError(t, h.db.QueryRow(`SELECT pinned_at FROM dm_messages WHERE id = $1`, messageID).Scan(&before))
 		c, _ := pinBranchContext()
 		_, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
@@ -147,12 +145,9 @@ func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 		c.Set("user_id", actorID)
 		h.unpinDMMessage(c, messageID, conversationID)
 
-		assert.Equal(t, http.StatusNotFound, w.Code, "Clear committed after lookup must invalidate the unpin mutation")
+		assert.Equal(t, http.StatusOK, w.Code, "a Clear cannot hide a pinned message, so it cannot invalidate its unpin")
 		var after sql.NullTime
 		require.NoError(t, h.db.QueryRowContext(context.Background(), `SELECT pinned_at FROM dm_messages WHERE id = $1`, messageID).Scan(&after))
-		assert.True(t, after.Valid, "hidden history was mutated by the stale unpin request")
-		if after.Valid {
-			assert.WithinDuration(t, before, after.Time, time.Microsecond)
-		}
+		assert.False(t, after.Valid, "the unpin of a visible pinned message must apply")
 	})
 }

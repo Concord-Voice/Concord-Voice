@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import PurgeRangePicker from './PurgeRangePicker';
@@ -17,7 +17,9 @@ import { softLockSeed, type DeleteRefusalView } from '../../services/messaging/d
 import {
   isSoftLockChallengeResult,
   isStepUpPurgeResult,
+  pinModeFor,
   purgeMessages,
+  type PinMode,
   type PurgeArgs,
   type PurgeContext,
   type PurgeResult as PurgeOutcome,
@@ -25,6 +27,7 @@ import {
   type StepUpPurgeResult,
   type TerminalPurgeResult,
 } from '../../services/messaging/purgeApi';
+import { usePurgeKeepsPinnedAtOpen } from '../../hooks/messaging/usePurgeKeepsPinnedAtOpen';
 import {
   apiRequestContextIsCurrent,
   captureApiRequestContext,
@@ -221,6 +224,8 @@ interface StepUpStageProps {
   ariaDisabled: boolean;
   onActivate: () => void;
   onCancel: () => void;
+  /** What happens to pinned messages, as the configure stage said (#3458). */
+  pinRecap: React.ReactNode;
 }
 
 interface DmStepUpStageProps extends StepUpStageProps {
@@ -244,11 +249,13 @@ const StepUpForm: React.FC<StepUpStageProps & { intro: string }> = ({
   ariaDisabled,
   onActivate,
   onCancel,
+  pinRecap,
 }) => {
   const busyLabel = factor.phase === 'ceremony' ? 'Waiting…' : 'Purging...';
   return (
     <div className="purge-modal__form">
       <p className="purge-modal__stepup-body">{intro}</p>
+      {pinRecap}
 
       <StepUpCredentials
         factor={factor}
@@ -375,6 +382,97 @@ function scopeNote(
   }
 }
 
+/**
+ * A DM, or a group the viewer only belongs to: a purge there removes the
+ * viewer's own messages and never reaches a peer's pins (#3458).
+ */
+function purgeLeavesPeerPins(context: PurgeContext, role: 'admin' | 'member'): boolean {
+  return context === 'dm' || (context === 'group' && role === 'member');
+}
+
+/** Whose pins are left visible: the other person in a DM, otherwise "others". */
+function peerLabel(context: PurgeContext, scopeName: string): string {
+  return context === 'dm' ? scopeName : 'others';
+}
+
+/**
+ * Said when a purge deleted the viewer's own pinned messages but cannot touch a
+ * peer's: those stay visible, and unpinning is how to hide them (#3458, §18.2).
+ * The dialog's pin sentence and the result both read it from here, so the two
+ * cannot drift. Undefined unless pins were included in a DM or group-member purge.
+ */
+function peerPinNote(
+  context: PurgeContext,
+  role: 'admin' | 'member',
+  scopeName: string,
+  mode: PinMode
+): string | undefined {
+  if (mode !== 'include' || !purgeLeavesPeerPins(context, role)) return undefined;
+  return `Pinned messages from ${peerLabel(context, scopeName)} stay visible. Unpin them to hide them.`;
+}
+
+/**
+ * What the purge does with pinned messages (#3458). One string, so it reads as
+ * one sentence wherever it lands. Empty when the server predates the option:
+ * that server deletes pins, and today's copy already says nothing about them.
+ */
+function pinSentence(
+  context: PurgeContext,
+  role: 'admin' | 'member',
+  scopeName: string,
+  selfScopeOnly: boolean,
+  mode: PinMode
+): string {
+  if (mode === 'unsupported') return '';
+  const include = mode === 'include';
+  const peerNote = peerPinNote(context, role, scopeName, mode);
+  if (peerNote !== undefined) return `Your pinned messages will be deleted too. ${peerNote}`;
+  if (purgeLeavesPeerPins(context, role)) {
+    // Only keep mode reaches here: include already returned through peerNote.
+    return `Your pinned messages are kept. Pinned messages from ${peerLabel(context, scopeName)} stay visible to you.`;
+  }
+  if (context === 'group') {
+    return include
+      ? 'Pinned messages will be deleted for everyone.'
+      : 'Pinned messages are kept for everyone.';
+  }
+  if (selfScopeOnly) {
+    return include ? 'Your pinned messages will be deleted too.' : 'Your pinned messages are kept.';
+  }
+  return include ? 'Pinned messages will be deleted too.' : 'Pinned messages are kept.';
+}
+
+/** The pin sentence, bold when pins go too: the wording and the weight both change. */
+function pinText(sentence: string, mode: PinMode): React.ReactNode {
+  return mode === 'include' ? <strong>{sentence}</strong> : sentence;
+}
+
+interface PinnedOptionProps {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}
+
+/** The "Include pinned messages" choice. A native checkbox: the whole row is the target. */
+const PinnedOption: React.FC<PinnedOptionProps> = ({ checked, onChange }) => {
+  const helperId = useId();
+  return (
+    <div className="purge-modal__option">
+      <label>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          aria-describedby={helperId}
+        />
+        <span className="purge-modal__option-label">Include pinned messages</span>
+      </label>
+      <p className="purge-modal__option-helper" id={helperId}>
+        Pinned messages are kept unless you include them.
+      </p>
+    </div>
+  );
+};
+
 const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   context,
   isOpen,
@@ -385,6 +483,10 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
   selfScopeOnly = false,
 }) => {
   const [range, setRange] = useState<PurgeRange | null>(null);
+  const [includePinned, setIncludePinned] = useState(false);
+  // Every stage's copy and the wire value derive from one per-open sample, so
+  // the option cannot vanish mid-step-up when a capability refresh lands.
+  const pinMode = pinModeFor(usePurgeKeepsPinnedAtOpen(isOpen), includePinned);
   const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<Stage>('configure');
@@ -491,6 +593,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     setStepUpImpossible(false);
     setSoftLockOpener(null);
     setRange(null);
+    setIncludePinned(false);
     setTyped('');
     /* eslint-enable @eslint-react/set-state-in-effect -- reset block ends here */
   }, [isOpen]);
@@ -591,6 +694,8 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     setBusy(true);
     let outcome: PurgeOutcome;
     try {
+      // A send that promises something about pins rechecks the capability
+      // inside purgeMessages, immediately before the request.
       outcome = await purgeMessages(args, requestContext);
     } catch (error) {
       outcome = isAbortError(error) ? NOT_SENT : TRANSPORT_FAILURE;
@@ -609,7 +714,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       setStage('stepup');
       return;
     }
-    await runPurge({ context, scopeId, range });
+    await runPurge({ context, scopeId, range, pinMode });
   };
 
   // The purge with the credentials a factor hook prepared, for the DM/group
@@ -629,6 +734,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       currentPassword: password || undefined,
       mfaCode: mfa,
       softLockPrior: CODE_PROMPT,
+      pinMode,
     };
     // A self-purge's password goes to the mint, not to the route, so it leaves
     // component state as it is sent (#3509 frontend review).
@@ -681,6 +787,9 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       ? null
       : scopeSentence(context, scopeName, PURGE_RANGE_PHRASES[range], selfScopeOnly);
   const note = scopeNote(context, role, scopeName);
+  const pins = pinSentence(context, role, scopeName, selfScopeOnly, pinMode);
+  const pinRecap =
+    pins === '' ? null : <p className="purge-modal__pin-recap">{pinText(pins, pinMode)}</p>;
 
   return (
     <Modal
@@ -693,7 +802,13 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     >
       <div className="purge-modal__body">
         {stage === 'result' && result !== null && (
-          <PurgeResult context={context} result={result} onDone={onClose} />
+          <PurgeResult
+            context={context}
+            result={result}
+            pinMode={pinMode}
+            peerPinNote={peerPinNote(context, role, scopeName, pinMode)}
+            onDone={onClose}
+          />
         )}
 
         {stage === 'stepup' && (
@@ -708,6 +823,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
             onActivate={stepUp.activate}
             onCancel={onClose}
             onGoToPrivacy={handleGoToPrivacy}
+            pinRecap={pinRecap}
           />
         )}
 
@@ -721,6 +837,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
             ariaDisabled={softLockStepUp.ariaDisabled}
             onActivate={softLockStepUp.activate}
             onCancel={onClose}
+            pinRecap={pinRecap}
           />
         )}
 
@@ -734,6 +851,10 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
             />
 
             {note !== null && <p className="purge-modal__scope-note">{note}</p>}
+
+            {pinMode !== 'unsupported' && (
+              <PinnedOption checked={includePinned} onChange={setIncludePinned} />
+            )}
 
             {sentence !== null && (
               <p className="purge-modal__scope">
@@ -757,6 +878,9 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
                   {sentence.lead}
                   <strong>{sentence.name}</strong>
                   {sentence.tail}
+                  {pins !== '' && (
+                    <span className="purge-modal__scope-pins">{pinText(pins, pinMode)}</span>
+                  )}
                 </span>
               </p>
             )}

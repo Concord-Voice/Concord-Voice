@@ -57,17 +57,22 @@ const (
   FROM dm_conversations c CROSS JOIN LATERAL (` + dmvisibility.ClearWatermarkLateral + `) w
  WHERE c.id = $1`
 	// dm_messages only: no messages-table variant exists, so a channel reap is
-	// structurally impossible. No pinned_at predicate (I10).
+	// structurally impossible. A pinned row is visible to every participant
+	// (#3458 §18), so it survives until unpinned; with no participant left
+	// (clearReapSelectAll) nobody can see it and it goes with the rest.
 	clearReapSelectBelow = `SELECT id FROM dm_messages
-WHERE conversation_id = $1 AND created_at < $2::timestamptz
+WHERE conversation_id = $1 AND created_at < $2::timestamptz AND pinned_at IS NULL
 ORDER BY created_at, id LIMIT $3 FOR UPDATE SKIP LOCKED`
 	clearReapSelectAll = `SELECT id FROM dm_messages
 WHERE conversation_id = $1
 ORDER BY created_at, id LIMIT $2 FOR UPDATE SKIP LOCKED`
+	// include_pinned is written, never defaulted: a below-W batch keeps every
+	// pin, so it records FALSE (and 000164's trigger mirrors it into
+	// message_purges_kept_pins); only the zero-participant batch deletes pins.
 	clearReapAudit = `INSERT INTO message_purges
     (actor_id, context_type, context_id, server_id, target_user_id, range_from, range_to,
-     reason, status, deleted_count, completed_at)
-VALUES (NULL, $1, $2, NULL, NULL, NULL, $3, $4, 'completed', $5, NOW())
+     reason, status, deleted_count, completed_at, include_pinned)
+VALUES (NULL, $1, $2, NULL, NULL, NULL, $3, $4, 'completed', $5, NOW(), $6)
 RETURNING id`
 )
 
@@ -79,13 +84,14 @@ RETURNING id`
 //
 // INVARIANT. A row is deleted only if, in a snapshot taken after this
 // transaction was granted the conversation's FOR NO KEY UPDATE lock, the row's
-// created_at is below every current participant's latest Clear cutoff — or the
-// conversation has no current participant. It holds because every writer that
-// could lower W (AddMember) or add a row below it (send, call event) takes the
-// same parent lock, so it either committed before the watermark statement's
-// snapshot or waits for this commit. Reading W before the lock, caching it
-// across batches, or a participant insert that skips the parent lock each
-// breaks it; the failure is deleting history a newcomer can still read.
+// created_at is below every current participant's latest Clear cutoff and the
+// row is not pinned — or the conversation has no current participant. It holds
+// because every writer that could lower W (AddMember) or add a row below it
+// (send, call event) takes the same parent lock, so it either committed before
+// the watermark statement's snapshot or waits for this commit. Reading W before
+// the lock, caching it across batches, or a participant insert that skips the
+// parent lock each breaks it; the failure is deleting history a newcomer can
+// still read.
 func (e *Engine) RunClearReapBatch(ctx context.Context, p ClearReapPlan) (ClearReapResult, error) {
 	conversationID, err := uuid.Parse(p.ConversationID)
 	if err != nil || conversationID == uuid.Nil {
@@ -239,7 +245,8 @@ func readClearWatermarkTx(ctx context.Context, tx *sql.Tx, conversationID uuid.U
 
 // writeClearReapAuditTx records one committed-with-it batch (§4). range_to is
 // the same W that bounded the victim select, so the evidence matches the
-// deletion bound exactly.
+// deletion bound exactly; include_pinned is true only for the unbounded select,
+// the one that deletes pins (#3458 §18.2).
 func writeClearReapAuditTx(ctx context.Context, tx *sql.Tx, conversationID uuid.UUID, group bool, w dmvisibility.ClearWatermark, deleted int) (string, error) {
 	contextType := ContextDM
 	if group {
@@ -250,7 +257,7 @@ func writeClearReapAuditTx(ctx context.Context, tx *sql.Tx, conversationID uuid.
 		rangeTo = w.At
 	}
 	var purgeID string
-	if err := tx.QueryRowContext(ctx, clearReapAudit, string(contextType), conversationID, rangeTo, ClearReason, deleted).Scan(&purgeID); err != nil {
+	if err := tx.QueryRowContext(ctx, clearReapAudit, string(contextType), conversationID, rangeTo, ClearReason, deleted, w.Unbounded).Scan(&purgeID); err != nil {
 		return "", fmt.Errorf("purge: write clear reap audit: %w", err)
 	}
 	return purgeID, nil

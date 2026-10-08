@@ -5,6 +5,7 @@ import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { server as mswServer } from '../../../mocks/server';
 import { mockUser, mockServer } from '../../../mocks/fixtures';
 import {
@@ -18,6 +19,14 @@ import {
 } from '../../../helpers/moderationPurge';
 import { http, HttpResponse } from 'msw';
 import MemberList from '@/renderer/components/Members/MemberList';
+import { answerCapabilityRefresh } from '../../../helpers/capabilityRefresh';
+
+// Opening a purge dialog refreshes the capability and offers the pin choice
+// only once that answer lands (#3552 review). These tests set the capability
+// in the store directly, so the stub answers with what the store holds.
+beforeEach(() => {
+  answerCapabilityRefresh();
+});
 
 const MEMBERS_URL = `${MODERATION_API_BASE}/api/v1/servers/${mockServer.id}/members`;
 
@@ -98,7 +107,7 @@ describe('MemberList purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ban and purge' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: true });
+    expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: false });
   });
 
   it('sends purge_messages false when the box is unchecked', async () => {
@@ -108,7 +117,7 @@ describe('MemberList purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ban' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: false });
+    expect(bodies[0]).toEqual({ purge_messages: false, include_pinned: false });
     // No purge was requested, so the server returns no purge fragment and there
     // is nothing to announce.
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
@@ -196,7 +205,7 @@ describe('MemberList purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Kick and purge' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: true });
+    expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: false });
     await waitFor(() =>
       expect(screen.getByRole('status')).toHaveTextContent(
         'Alice was kicked and their messages were purged.'
@@ -211,7 +220,7 @@ describe('MemberList purge-on-moderation (#1354)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Kick' }));
 
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(bodies[0]).toEqual({ purge_messages: false });
+    expect(bodies[0]).toEqual({ purge_messages: false, include_pinned: false });
   });
 
   it('clears the notice when the active server changes', async () => {
@@ -266,5 +275,91 @@ describe('MemberList purge-on-moderation (#1354)', () => {
       expect(screen.queryByRole('checkbox', { name: PURGE_CHECKBOX })).not.toBeInTheDocument()
     );
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  });
+
+  // #3458: the nested "Include pinned messages" choice.
+  describe('include pinned messages (#3458)', () => {
+    const PINNED = { name: 'Include pinned messages' };
+    const setKeepsPinned = (value: boolean | undefined) =>
+      useClientConfigStore.setState({
+        serverCapabilities: {
+          auth: { oauthProviders: [] },
+          features: value === undefined ? {} : { purgeKeepsPinned: value },
+        },
+      });
+
+    it('appears only under a checked opt-in, and unchecking the opt-in clears it', async () => {
+      setKeepsPinned(true);
+      await renderAndOpen('ban');
+      expect(screen.queryByRole('checkbox', PINNED)).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      expect(
+        screen.getByText(
+          'Their messages will be permanently removed from every channel you can moderate, except pinned messages.'
+        )
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('checkbox', PINNED));
+      expect(
+        screen.getByText(
+          'Their messages, including pinned messages, will be permanently removed from every channel you can moderate.'
+        )
+      ).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      expect(screen.getByRole('checkbox', PINNED)).not.toBeChecked();
+    });
+
+    it('is absent on an older server, whose copy stays as today', async () => {
+      setKeepsPinned(undefined);
+      await renderAndOpen('kick');
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      expect(screen.queryByRole('checkbox', PINNED)).not.toBeInTheDocument();
+      expect(
+        screen.getByText(
+          'Their messages will be permanently removed from every channel you can moderate.'
+        )
+      ).toBeInTheDocument();
+    });
+
+    it('a ban that includes pins sends include_pinned true', async () => {
+      setKeepsPinned(true);
+      const bodies = stubBan({ requested: true, status: 'completed', purged_count: 4 });
+      await renderAndOpen('ban');
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      fireEvent.click(screen.getByRole('checkbox', PINNED));
+      fireEvent.click(screen.getByRole('button', { name: 'Ban and purge' }));
+
+      await waitFor(() => expect(bodies).toHaveLength(1));
+      expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: true });
+    });
+
+    it('a kick that keeps pins sends false and says pins were kept', async () => {
+      setKeepsPinned(true);
+      const bodies = stubKick({ requested: true, status: 'completed', purged_count: 4 });
+      await renderAndOpen('kick');
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      fireEvent.click(screen.getByRole('button', { name: 'Kick and purge' }));
+
+      await waitFor(() => expect(bodies).toHaveLength(1));
+      expect(bodies[0]).toEqual({ purge_messages: true, include_pinned: false });
+      expect(
+        await screen.findByText(/their messages were purged\. Pinned messages were kept\./)
+      ).toBeInTheDocument();
+    });
+
+    it('closing the dialog clears the choice', async () => {
+      setKeepsPinned(true);
+      await renderAndOpen('ban');
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      fireEvent.click(screen.getByRole('checkbox', PINNED));
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      fireEvent.contextMenu(screen.getByText('Alice'));
+      fireEvent.click(screen.getByRole('button', { name: 'Open ban dialog' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: PURGE_CHECKBOX }));
+      expect(screen.getByRole('checkbox', PINNED)).not.toBeChecked();
+    });
   });
 });

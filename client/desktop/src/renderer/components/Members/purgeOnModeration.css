@@ -1,0 +1,42 @@
+/* The kick/ban purge opt-in (#1354, #3458), shared by MemberList and
+   MemberListPanel. Moved out of inline styles so focus can be styled. */
+.member-purge-optin__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* The whole row is the click target, at the 44px minimum the standalone
+     purge option uses (WCAG 2.5.5). */
+  min-height: 44px;
+  cursor: pointer;
+}
+
+/* The ring keeps the checked box's edge at or above 3:1 in every block; see
+   .purge-modal__option input for the measurement. The box is sized and
+   unmargined like that one: the nested row's indent below is arithmetic on an
+   18px box, which an unsized native checkbox (13px, with its own margins) breaks. */
+.member-purge-optin input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent-fill);
+  outline: 1px solid var(--text-secondary);
+  outline-offset: -1px;
+  border-radius: 3px;
+}
+
+.member-purge-optin input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
+/* Aligned under the parent label's text: an 18px box plus the 8px gap. The
+   44px rows already space it from the row above. */
+.member-purge-optin__pinned {
+  margin: 0 0 0 26px;
+}
+
+.member-purge-optin__summary {
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  margin: 6px 0 0;
+}

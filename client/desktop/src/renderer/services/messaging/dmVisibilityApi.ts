@@ -1,11 +1,11 @@
 import { apiFetch } from '../system/apiClient';
 import {
-  apiFetchInContext,
   captureApiRequestContext,
   isAbortError,
   type ApiRequestContext,
 } from '../system/requestContext';
 import { mintPasswordStepUpToken, passwordStepUpRefusalMessage } from '../system/stepUpToken';
+import { sendPinClaim, type PinMode } from './purgeApi';
 
 /**
  * The methods an `mfa_required` refusal named, for Clear's MFA prompt, exactly
@@ -37,7 +37,14 @@ export type ClearHistoryResult =
          * or server changed after the capture. Nothing was sent, so nothing
          * was cleared; discard it rather than report a transport failure.
          */
-        | 'aborted';
+        | 'aborted'
+        /**
+         * Clear promised to keep pins and the server no longer confirmed it: the
+         * recheck before sending failed, or apiFetch would have resent the
+         * request after a token refresh or re-attestation (the first send was
+         * turned away before the handler ran). Nothing was cleared.
+         */
+        | 'pinClaimUnconfirmed';
     }
   | { kind: 'rateLimited'; retryAfterSeconds?: number }
   /**
@@ -159,32 +166,37 @@ function clearResponseResult(
  * `context` is the operation Clear belongs to (`captureApiRequestContext`): the
  * credential stage passes the capture its factor was proven under, so the
  * proof is never sent as another account or to another server. Without one,
- * Clear is its own operation, as before.
+ * Clear is its own operation, as before. `pinMode` is `keep` when the dialog
+ * promises pinned messages stay: the claim is rechecked after any step-up mint,
+ * right before Clear is sent, and a refused recheck sends nothing (#3552 review).
  */
 export async function clearDMHistory(
   id: string,
   factor?: ClearFactor,
-  context?: ApiRequestContext
+  context?: ApiRequestContext,
+  pinMode: PinMode = 'unsupported'
 ): Promise<ClearHistoryResult> {
   const request = await clearRequestBody(factor, context);
   if ('refused' in request) return request.refused;
-  let response: Response;
+  let response: Response | null;
   try {
-    response = await apiFetchInContext(
+    response = await sendPinClaim(
       `/api/v1/dm/conversations/${id}/clear`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request.body),
       },
-      request.context
+      request.context,
+      pinMode
     );
   } catch (err) {
-    // Clear is sent with no signal and no dispatch guard, so the only
-    // AbortError apiFetch can raise here is its pre-dispatch fence. Any other
-    // rejection may have reached the server.
+    // Clear is sent with no signal, and its only dispatch guard is settled by
+    // sendPinClaim, so the only AbortError apiFetch can raise here is its
+    // pre-dispatch fence. Any other rejection may have reached the server.
     return isAbortError(err) ? { kind: 'aborted' } : { kind: 'uncertain' };
   }
+  if (response === null) return { kind: 'pinClaimUnconfirmed' };
 
   const raw: unknown = await response.json().catch(() => null);
   const payload =

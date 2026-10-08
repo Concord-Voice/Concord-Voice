@@ -6,7 +6,7 @@
 // The engine is deliberately store-agnostic: handlers do all context-specific
 // authorization, build a Plan, and call Run. Table/column identifiers select
 // only fixed SQL templates; all VALUES flow through parameterized placeholders
-// ($1..$4).
+// ($1..$7).
 package purge
 
 import (
@@ -92,6 +92,11 @@ type Plan struct {
 	// self-purge soft-lock confirms here: a single-use factor is spent only by
 	// a purge that was admitted (#3455).
 	Admit func(context.Context, *sql.Tx) error
+	// IncludePinned, when true, lets the purge delete pinned messages in
+	// scope. The zero value keeps them (#3458): every degraded path errs toward
+	// keeping data. A kept pin stays kept for the whole DeleteSpec even if it is
+	// unpinned between batches (spec invariant I1).
+	IncludePinned bool
 }
 
 // ErrNotAdmitted wraps every error Run returns from admitting a purge —
@@ -155,6 +160,7 @@ func validateIdentifiers(s DeleteSpec) error {
 
 type deleteQuerySet struct {
 	selectBatch         string
+	selectPinned        string
 	selectExpiry        string
 	selectOne           string
 	selectAttachedMedia string
@@ -170,9 +176,17 @@ WHERE channel_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
   AND ($3::uuid IS NULL OR user_id = $3)
   AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
+  AND ($6::boolean OR (pinned_at IS NULL
+       AND NOT (id = ANY(COALESCE($7::uuid[], '{}'::uuid[])))))
 ORDER BY created_at, id
 LIMIT $4
 FOR UPDATE`,
+		selectPinned: `SELECT id FROM messages
+WHERE channel_id = $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+  AND ($3::uuid IS NULL OR user_id = $3)
+  AND ($4::uuid[] IS NULL OR id = ANY($4::uuid[]))
+  AND pinned_at IS NOT NULL`,
 		selectExpiry: `SELECT id FROM messages
 WHERE id = ANY($1::uuid[])
   AND channel_id = $2
@@ -199,9 +213,17 @@ WHERE conversation_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
   AND ($3::uuid IS NULL OR user_id = $3)
   AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
+  AND ($6::boolean OR (pinned_at IS NULL
+       AND NOT (id = ANY(COALESCE($7::uuid[], '{}'::uuid[])))))
 ORDER BY created_at, id
 LIMIT $4
 FOR UPDATE`,
+		selectPinned: `SELECT id FROM dm_messages
+WHERE conversation_id = $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+  AND ($3::uuid IS NULL OR user_id = $3)
+  AND ($4::uuid[] IS NULL OR id = ANY($4::uuid[]))
+  AND pinned_at IS NOT NULL`,
 		selectExpiry: `SELECT id FROM dm_messages
 WHERE id = ANY($1::uuid[])
   AND conversation_id = $2
@@ -244,6 +266,9 @@ type Engine struct {
 	// NewEngine never sets them and no production caller can.
 	beforeClearLockHook     func()
 	afterClearWatermarkHook func(*sql.Tx)
+	// afterBatchHook runs after each committed purge batch (#3458 tests). Nil in
+	// production.
+	afterBatchHook func()
 }
 
 // NewEngine constructs a purge engine. maxBatch is the batched-delete stride.
@@ -522,15 +547,23 @@ func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds D
 		return 0, fmt.Errorf("purge: query set for %q not found", ds.MessagesTable)
 	}
 
+	// kept is the spec's sticky keep-set K (#3458, spec §4): every row any
+	// batch of this DeleteSpec observed as pinned. It only grows, so a row
+	// unpinned between batches stays kept, and a retried batch keeps what the
+	// rolled-back attempt captured, which only errs toward keeping data.
+	kept := map[string]struct{}{}
 	total := 0
 	for {
-		affected, refs, err := e.deleteBatch(ctx, purgeID, q, p, ds)
+		affected, refs, err := e.deleteBatch(ctx, purgeID, q, p, ds, kept)
 		if err != nil {
 			return total, err
 		}
 
 		e.reaper.EnqueueBlobDeletes(refs)
 		total += affected
+		if e.afterBatchHook != nil {
+			e.afterBatchHook()
+		}
 		if affected < e.maxBatch {
 			break
 		}
@@ -538,9 +571,9 @@ func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds D
 	return total, nil
 }
 
-func (e *Engine) deleteBatch(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
+func (e *Engine) deleteBatch(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec, kept map[string]struct{}) (int, []media.BlobRef, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		affected, refs, err := e.deleteBatchOnce(ctx, purgeID, queries, p, ds)
+		affected, refs, err := e.deleteBatchOnce(ctx, purgeID, queries, p, ds, kept)
 		if !errors.Is(err, dmblock.ErrMembershipChanged) || attempt == 1 {
 			return affected, refs, err
 		}
@@ -550,7 +583,7 @@ func (e *Engine) deleteBatch(ctx context.Context, purgeID string, queries delete
 
 // deleteBatchOnce retries only a rolled-back membership-drift batch; prior
 // committed batches are never replayed.
-func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
+func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec, kept map[string]struct{}) (int, []media.BlobRef, error) {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("purge: begin batch tx: %w", err)
@@ -566,25 +599,23 @@ func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries de
 		}
 	}
 
-	rows, err := tx.QueryContext(ctx, queries.selectBatch, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch, pq.Array(ds.OnlyIDs))
+	// Capture pinned rows before AND after the victim SELECT (#3458, spec §4).
+	// Before catches a row pinned now and unpinned while the SELECT waits on a
+	// lock; after catches a row whose pin committed during that wait, which
+	// the SELECT's recheck skipped. Both are plain reads: no lock, no new edge.
+	if !p.IncludePinned {
+		if err := e.capturePinned(ctx, tx, queries, p, ds, kept); err != nil {
+			return 0, nil, err
+		}
+	}
+	messageIDs, err := e.selectVictims(ctx, tx, queries, p, ds, kept)
 	if err != nil {
-		return 0, nil, fmt.Errorf("purge: select batch victims: %w", err)
+		return 0, nil, err
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			e.log.Warn("purge: failed to close batch victim rows", "error", closeErr)
+	if !p.IncludePinned {
+		if err := e.capturePinned(ctx, tx, queries, p, ds, kept); err != nil {
+			return 0, nil, err
 		}
-	}()
-	messageIDs := make([]string, 0, e.maxBatch)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return 0, nil, fmt.Errorf("purge: scan batch victim: %w", err)
-		}
-		messageIDs = append(messageIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, nil, fmt.Errorf("purge: iterate batch victims: %w", err)
 	}
 	if len(messageIDs) == 0 {
 		return 0, nil, nil
@@ -597,6 +628,61 @@ func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries de
 		return 0, nil, err
 	}
 	return affected, refs, nil
+}
+
+// selectVictims locks one batch of victims. The kept-set is bound as a
+// non-nil array; the SQL's COALESCE keeps a NULL from selecting nothing.
+func (e *Engine) selectVictims(ctx context.Context, tx *sql.Tx, queries deleteQuerySet, p Plan, ds DeleteSpec, kept map[string]struct{}) ([]string, error) {
+	keptIDs := make([]string, 0, len(kept))
+	for id := range kept {
+		keptIDs = append(keptIDs, id)
+	}
+	rows, err := tx.QueryContext(ctx, queries.selectBatch, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch,
+		pq.Array(ds.OnlyIDs), p.IncludePinned, pq.Array(keptIDs))
+	if err != nil {
+		return nil, fmt.Errorf("purge: select batch victims: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close batch victim rows", "error", closeErr)
+		}
+	}()
+	messageIDs := make([]string, 0, e.maxBatch)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("purge: scan batch victim: %w", err)
+		}
+		messageIDs = append(messageIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("purge: iterate batch victims: %w", err)
+	}
+	return messageIDs, nil
+}
+
+// capturePinned adds every currently pinned row in the spec's scope to kept.
+func (e *Engine) capturePinned(ctx context.Context, tx *sql.Tx, queries deleteQuerySet, p Plan, ds DeleteSpec, kept map[string]struct{}) error {
+	rows, err := tx.QueryContext(ctx, queries.selectPinned, ds.ScopeID, p.RangeFrom, ds.Author, pq.Array(ds.OnlyIDs))
+	if err != nil {
+		return fmt.Errorf("purge: capture pinned messages: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close pinned capture rows", "error", closeErr)
+		}
+	}()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("purge: scan pinned message: %w", err)
+		}
+		kept[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("purge: iterate pinned messages: %w", err)
+	}
+	return nil
 }
 
 // recordBatchAndCommit adds a batch's deletions to the audit row and commits the
@@ -885,10 +971,10 @@ func insertAuditInProgress(ctx context.Context, q rowQuerier, p Plan) (string, e
 	var id string
 	err := q.QueryRowContext(ctx, `
 		INSERT INTO message_purges
-		    (actor_id, context_type, context_id, server_id, target_user_id, range_from, reason, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'in_progress')
+		    (actor_id, context_type, context_id, server_id, target_user_id, range_from, reason, include_pinned, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress')
 		RETURNING id`,
-		p.ActorID, string(p.ContextType), p.ContextID, p.ServerID, p.Target, p.RangeFrom, p.Reason,
+		p.ActorID, string(p.ContextType), p.ContextID, p.ServerID, p.Target, p.RangeFrom, p.Reason, p.IncludePinned,
 	).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("purge: write in_progress audit: %w", err)

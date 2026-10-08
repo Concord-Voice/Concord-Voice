@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000163)
+## Existing Migrations (000001–000164)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -273,6 +273,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000161 | version_voice_pending_admissions | Add exact admission and socket identity columns to pending admissions |
 | 000162 | add_step_up_tokens | `step_up_tokens` — single-use, purpose-bound password and WebAuthn step-up tokens, stored as SHA-256 only and spent in the consumer's transaction (#3455, PR #3509) |
 | 000163 | trusted_device_recovery_v2 | `recovery_requests` — hash-only JTI and bound v2 offer/approval/completion context; drain ephemeral ceremonies and guard rollback while live v2 requests remain (#2550, #2621, #2622) |
+| 000164 | message_purges_include_pinned | `message_purges.include_pinned` — whether a purge included pinned messages; DEFAULT TRUE (every earlier purge deleted pins, and expiry still does); the clear reap writes it explicitly, FALSE for a watermark-bounded batch and TRUE for a zero-participant one. An AFTER INSERT trigger mirrors each keep-pins purge into `message_purges_kept_pins`, so the down drops only the column and a re-up restores FALSE from that table (#3458) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use

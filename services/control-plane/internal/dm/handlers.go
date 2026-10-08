@@ -2321,6 +2321,9 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		return
 	}
 
+	// This check only shapes the 403. The gate is the participant EXISTS in
+	// each history query below: it is evaluated in the same snapshot as the
+	// rows, so a participant removed after this check reads nothing.
 	if !h.isParticipant(convID, userID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
 		return
@@ -2349,6 +2352,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			FROM dm_messages m
 			INNER JOIN users u ON u.id = m.user_id
 			WHERE m.conversation_id = $1
+			  AND EXISTS (SELECT 1 FROM dm_participants dp WHERE dp.conversation_id = m.conversation_id AND dp.user_id = $4)
 			  AND m.created_at < (SELECT cursor_m.created_at FROM dm_messages cursor_m WHERE cursor_m.id = $2 AND cursor_m.conversation_id = $1
 			  `+purge.HiddenRangeFilter("cursor_m", 4)+`)
 			`+hiddenRangeFilter(4)+`
@@ -2365,6 +2369,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			FROM dm_messages m
 			INNER JOIN users u ON u.id = m.user_id
 			WHERE m.conversation_id = $1
+			  AND EXISTS (SELECT 1 FROM dm_participants dp WHERE dp.conversation_id = m.conversation_id AND dp.user_id = $3)
 			`+hiddenRangeFilter(3)+`
 			ORDER BY m.created_at DESC
 			LIMIT $2
@@ -3634,7 +3639,7 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	if h.hub != nil {
 		h.hub.BroadcastToDMMessageAllParticipants(
 			conversationUUID,
-			websocket.NewDeletedDMMessageVisibilitySource(deleted.authorID, deleted.createdAt),
+			websocket.NewDeletedDMMessageVisibilitySource(deleted.authorID, deleted.createdAt, deleted.pinnedAt),
 			actorUUID,
 			msg,
 		)

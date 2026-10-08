@@ -232,7 +232,7 @@ func TestDMMessageDelivery_WrapperDispatchesTypedVisibility(t *testing.T) {
 	assert.Equal(t, dmVisibilityDeliverySubscribers, queued.VisibilityMode)
 
 	excluded := uuid.New()
-	source := NewDeletedDMMessageVisibilitySource(uuid.New(), time.Now().UTC())
+	source := NewDeletedDMMessageVisibilitySource(uuid.New(), time.Now().UTC(), sql.NullTime{Time: time.Now().UTC(), Valid: true})
 	hub.BroadcastToDMMessageAllParticipants(conversationID, source, excluded, OutgoingMessage{Type: "pin"})
 	queued = <-hub.dmBroadcast
 	require.NotNil(t, queued.VisibilitySource)

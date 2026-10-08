@@ -33,6 +33,10 @@ type dmPurgeRequest struct {
 	Range           string `json:"range" binding:"required"`
 	CurrentPassword string `json:"current_password"`
 	MFACode         string `json:"mfa_code"`
+	// IncludePinned lets the purge delete the actor's own pinned messages
+	// (#3458). Absent and false keep them. A peer's pinned message is never
+	// hidden, whatever this says.
+	IncludePinned bool `json:"include_pinned"`
 }
 
 // PurgeConversation handles DELETE /dm/conversations/:id/messages — bulk-delete a
@@ -47,7 +51,9 @@ type dmPurgeRequest struct {
 //
 // Step-up auth (spec §6): when the actor's require_auth_before_purge is true
 // (fail-closed default), current_password (+ MFA if enabled) is verified BEFORE
-// any mutation. DM/group only — server purges are RBAC-gated, never step-up.
+// any mutation. This preference governs DM/group purges only; channel and
+// server purges have their own gates (the self-purge soft-lock step-up and a
+// server's MFA enforcement on dangerous actions, in internal/messages).
 func (h *Handler) PurgeConversation(c *gin.Context) {
 	userID := c.GetString("user_id")
 	convID := c.Param("id")
@@ -129,6 +135,7 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 			return nil
 		},
 		DeferCompletion: hide,
+		IncludePinned:   req.IncludePinned,
 	}
 
 	res, err := h.purgeEngine.Run(purgeCtx, plan)
@@ -141,7 +148,7 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 		if h.afterDMPurgeDeleteHook != nil {
 			h.afterDMPurgeDeleteHook()
 		}
-		hidden, err := h.applyReceiverHide(purgeCtx, userID, convID, rangeFrom, res.PurgeID, res.DeletedCount, credentialEpoch)
+		hidden, err := h.applyReceiverHide(purgeCtx, userID, convID, rangeFrom, res, credentialEpoch)
 		if err != nil {
 			h.log.Error("DM purge hide failed", "error", err, "conversation_id", convID, "deleted", res.DeletedCount)
 			h.failPartialPurge(c, convID, userID, req.Range, res.DeletedCount)
@@ -151,7 +158,7 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 	}
 
 	h.log.Info("DM conversation purged", "conversation_id", convID, "actor", userID,
-		"deleted", res.DeletedCount, "hidden", res.HiddenCount)
+		"deleted", res.DeletedCount, "hidden", res.HiddenCount, "include_pinned", req.IncludePinned)
 	h.emitDMPurged(convID, userID, res.DeletedCount, req.Range)
 	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": res.HiddenCount})
 }
@@ -191,7 +198,7 @@ func (h *Handler) failPartialPurge(c *gin.Context, convID, actorID, rng string, 
 // delete-for-both and returns how many of the peers' messages it covers. The hide
 // runs in its own transaction; a failure leaves the audit row at in_progress, which
 // is the recovery handle for the accepted delete/hide TOCTOU (spec §7).
-func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, rangeFrom *time.Time, purgeID string, deleted int, credentialEpoch string) (int, error) {
+func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, rangeFrom *time.Time, res purge.Result, credentialEpoch string) (int, error) {
 	// Hidden window: [range cutoff (or epoch for All Time), now].
 	from := time.Time{}
 	if rangeFrom != nil {
@@ -212,11 +219,13 @@ func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, 
 				return fmt.Errorf("guard DM hide credential epoch: %w", err)
 			}
 			var err error
-			hidden, err = InsertHiddenRange(ctx, tx, userID, convID, from, time.Now().UTC())
+			// Microsecond-truncated like ParseRange's lower bound, so both ends
+			// are exactly what the database stores.
+			hidden, err = InsertHiddenRange(ctx, tx, userID, convID, from, time.Now().UTC().Truncate(time.Microsecond))
 			if err != nil {
 				return fmt.Errorf("insert hidden range: %w", err)
 			}
-			if err := h.purgeEngine.FinalizeHiddenTx(ctx, tx, purgeID, deleted, hidden); err != nil {
+			if err := h.purgeEngine.FinalizeHiddenTx(ctx, tx, res.PurgeID, res.DeletedCount, hidden); err != nil {
 				return err
 			}
 			if err := tx.Commit(); err != nil {
