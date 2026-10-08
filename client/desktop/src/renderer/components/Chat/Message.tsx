@@ -598,16 +598,18 @@ const Message: React.FC<MessageProps> = ({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [reactionPicker, setReactionPicker] = useState<{ x: number; y: number } | null>(null);
 
-  // Keep the draft in step with the message. While not editing it mirrors the content. While
-  // editing it takes a new content only if the user has not changed the draft, so an edit
+  // Keep a failed draft until cancel or resubmit. Otherwise, it mirrors the content while
+  // not editing, and takes new content during editing only if the user has not changed the draft. An edit
   // opened before the text arrived (a decrypt landing, an edit from another device) fills in
   // instead of staying stale, and text the user typed is never overwritten (#1959).
   const syncedContentRef = useRef(message.content);
   useEffect(() => {
     const previous = syncedContentRef.current;
     syncedContentRef.current = message.content;
-    setEditContent((draft) => (!isEditing || draft === previous ? message.content : draft));
-  }, [message.content, isEditing]);
+    setEditContent((draft) =>
+      !saveFailed && (!isEditing || draft === previous) ? message.content : draft
+    );
+  }, [message.content, isEditing, saveFailed]);
 
   // Gate inside selectors so DM messages return stable empty refs and don't
   // re-render on unrelated server member/role store updates.
@@ -658,13 +660,15 @@ const Message: React.FC<MessageProps> = ({
 
   // An edit the server never received is given back rather than lost: the box reopens with
   // the user's text and says so. Skipped when the row has unmounted, or when another edit has
-  // been opened in this surface since — that edit keeps its own draft.
+  // been opened in this surface since — that edit keeps its own draft. While another surface
+  // is editing, retain the failed draft locally without reopening over that surface's edit.
   const restoreFailedEdit = useCallback(
     (draft: string) => {
       if (!mountedRef.current) return;
       if (useChatStore.getState().editingMessage?.surfaceId === surfaceId) return;
       setEditContent(draft);
       setSaveFailed(true);
+      if (useChatStore.getState().editingMessage !== null) return;
       setIsEditing(true);
     },
     [setIsEditing, surfaceId]

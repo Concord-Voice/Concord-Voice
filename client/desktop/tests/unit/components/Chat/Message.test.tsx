@@ -1995,8 +1995,14 @@ describe('Message edit box driven by chatStore.editingMessage (#1959)', () => {
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
 
-    it('#1959 an edit open in a different surface does not block the restore', async () => {
-      const onEdit = vi.fn(() => Promise.resolve(false));
+    it('#1959 a failed save preserves both drafts across chat surfaces', async () => {
+      let resolveSave: (saved: boolean) => void = () => {};
+      const onEdit = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveSave = resolve;
+          })
+      );
       render(
         <>
           <Surface id="s1">{row(target, 's1', onEdit)}</Surface>
@@ -2007,12 +2013,76 @@ describe('Message edit box driven by chatStore.editingMessage (#1959)', () => {
       );
       submitRewrite(onEdit);
       openEdit('s2', 'm-9');
-      // Gate: the other surface's edit is open.
-      expect(editBoxes(screen.getByTestId('surface-s2'))).toHaveLength(1);
+      const secondEdit = editBoxes(screen.getByTestId('surface-s2'))[0];
+      fireEvent.change(secondEdit, { target: { value: 'Unsaved second surface text' } });
+      expect(secondEdit.value).toBe('Unsaved second surface text');
 
-      await settle();
+      await act(async () => {
+        resolveSave(false);
+      });
 
-      expect(editBoxes(screen.getByTestId('surface-s1'))).toHaveLength(1);
+      expect(useChatStore.getState().editingMessage).toEqual({
+        surfaceId: 's2',
+        messageId: 'm-9',
+      });
+      expect(editBoxes(screen.getByTestId('surface-s2'))[0].value).toBe(
+        'Unsaved second surface text'
+      );
+      expect(editBoxes(screen.getByTestId('surface-s1'))).toHaveLength(0);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+      fireEvent.click(within(screen.getByTestId('surface-s2')).getByText('Cancel'));
+      openEdit('s1', 'm-2');
+
+      expect(editBoxes(screen.getByTestId('surface-s1'))[0].value).toBe('Rewritten body');
+      expect(screen.getByRole('alert')).toHaveTextContent(ALERT);
+    });
+
+    it('#1959 a failed draft survives a message update while another surface edits', async () => {
+      let resolveSave: (saved: boolean) => void = () => {};
+      const onEdit = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveSave = resolve;
+          })
+      );
+      const surfaces = (firstContent: string) => (
+        <>
+          <Surface id="s1">{row({ ...target, content: firstContent }, 's1', onEdit)}</Surface>
+          <Surface id="s2">
+            {row({ ...mockMessage, id: 'm-9', content: 'Elsewhere' }, 's2')}
+          </Surface>
+        </>
+      );
+      const { rerender } = render(surfaces('Second message body'));
+      submitRewrite(onEdit);
+      openEdit('s2', 'm-9');
+      const secondEdit = editBoxes(screen.getByTestId('surface-s2'))[0];
+      fireEvent.change(secondEdit, { target: { value: 'Unsaved second surface text' } });
+      expect(secondEdit.value).toBe('Unsaved second surface text');
+
+      await act(async () => {
+        resolveSave(false);
+      });
+
+      expect(useChatStore.getState().editingMessage).toEqual({
+        surfaceId: 's2',
+        messageId: 'm-9',
+      });
+      expect(editBoxes(screen.getByTestId('surface-s2'))[0].value).toBe(
+        'Unsaved second surface text'
+      );
+      expect(editBoxes(screen.getByTestId('surface-s1'))).toHaveLength(0);
+
+      rerender(surfaces('Updated authoritative content'));
+      expect(screen.getByText('Updated authoritative content')).toBeInTheDocument();
+      expect(editBoxes(screen.getByTestId('surface-s2'))[0].value).toBe(
+        'Unsaved second surface text'
+      );
+
+      fireEvent.click(within(screen.getByTestId('surface-s2')).getByText('Cancel'));
+      openEdit('s1', 'm-2');
+
       expect(editBoxes(screen.getByTestId('surface-s1'))[0].value).toBe('Rewritten body');
       expect(screen.getByRole('alert')).toHaveTextContent(ALERT);
     });

@@ -44,6 +44,7 @@ you used most recently.
 
 ### Fixed
 
+- A delayed failed message edit no longer closes an edit in another chat panel or loses its unsaved text. The failed draft remains available when reopened while its message stays mounted.
 - **The microphone resumes after a settings change with the Dynamic noise gate** (internal development reference omitted) — with the noise gate set to Dynamic, changing a microphone setting or device during a call could stop before the microphone was turned back on.
 - **AGC failure holds pause** (internal development reference omitted). If AGC fails, unmute and call restoration keep the previous unprotected microphone paused. It stays paused while AGC remains enabled.
 - **Signing in with an email code now sends the code** (internal development reference omitted) — when the sign-in screen, or a session check, asks for a code from your email, the app now asks the server to send it. Before, the email never arrived and the code could not be entered. If sending fails, **Send a new code** asks again. While a session check is open, the app sends its code and your answer only to the server that asked for them, even if you switch servers.
