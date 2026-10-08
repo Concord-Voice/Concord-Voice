@@ -1105,7 +1105,83 @@ describe('tokenManager', () => {
         mfaChallengeToken: 'chal-tok',
         mfaMethods: ['totp'],
         mfaRecoveryOnlyMethods: ['recovery_code'],
+        // The server that issued the challenge: the one main refreshed against.
+        mfaApiBase: 'http://localhost:8080',
       });
+    });
+
+    it('passes the challenge WebAuthn options through unparsed', async () => {
+      storeRefreshToken({
+        refreshToken: 'rt-abc',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      const webauthnOptions = { publicKey: { challenge: 'AQID', rpId: 'localhost' } };
+      mockNetFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: 'mfa_upgrade_required',
+            mfa_challenge_token: 'chal-wa',
+            methods: ['webauthn'],
+            webauthn_options: webauthnOptions,
+          },
+          403
+        )
+      );
+
+      const result = await performRefresh();
+      expect(result.status).toBe('mfa_required');
+      expect(result.mfaWebauthnOptions).toEqual(webauthnOptions);
+      expect(result.mfaApiBase).toBe('http://localhost:8080');
+    });
+
+    // #3663 review. Mutant: the default dropped, so the modal always opens on
+    // the strongest method; or the lists cast, so a string reaches the renderer.
+    it('carries default_method, and keeps only strings from the method lists', async () => {
+      storeRefreshToken({
+        refreshToken: 'rt-abc',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      mockNetFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: 'suspicious_session_mfa',
+            mfa_challenge_token: 'chal-default',
+            methods: 'totp',
+            recovery_only_methods: ['backup_code', 7],
+            default_method: 'totp',
+          },
+          403
+        )
+      );
+
+      const result = await performRefresh();
+      expect(result.mfaMethods).toEqual([]);
+      expect(result.mfaRecoveryOnlyMethods).toEqual(['backup_code']);
+      expect(result.mfaDefaultMethod).toBe('totp');
+    });
+
+    it('drops a default_method that is not a string', async () => {
+      storeRefreshToken({
+        refreshToken: 'rt-abc',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      mockNetFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: 'suspicious_session_mfa',
+            mfa_challenge_token: 'chal-default',
+            methods: ['totp'],
+            default_method: 42,
+          },
+          403
+        )
+      );
+
+      const result = await performRefresh();
+      expect(result.mfaDefaultMethod).toBeUndefined();
     });
 
     it('returns refresh_failed on 403 without MFA data', async () => {

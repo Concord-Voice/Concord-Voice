@@ -45,38 +45,10 @@ import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { useSSOStore } from '../../stores/auth/ssoStore';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
 import { Eye, EyeOff } from 'lucide-react';
-import { base64urlToBuffer } from '../../utils/crypto/base64url';
+import { methodsForOptions, webauthnOptionsOrNull } from '../../utils/webauthnOptions';
 import './Login.css';
 import './TOTPInput.css';
 import ConcordWordmark from './ConcordWordmark';
-
-const AuthenticatorTransportSchema = z.enum([
-  'ble',
-  'hybrid',
-  'internal',
-  'nfc',
-  'smart-card',
-  'usb',
-]);
-const WebAuthnRequestSchema = z.object({
-  challenge: z.string().min(1),
-  timeout: z.number().nonnegative().optional(),
-  rpId: z.string().min(1).optional(),
-  allowCredentials: z
-    .array(
-      z.object({
-        type: z.literal('public-key'),
-        id: z.string().min(1),
-        transports: z.array(AuthenticatorTransportSchema).optional(),
-      })
-    )
-    .optional(),
-  userVerification: z.enum(['discouraged', 'preferred', 'required']).optional(),
-});
-const WebAuthnServerOptionsSchema = z.union([
-  WebAuthnRequestSchema,
-  z.object({ publicKey: WebAuthnRequestSchema }).transform(({ publicKey }) => publicKey),
-]);
 
 const UserProfileSchema = z
   .object({
@@ -211,30 +183,6 @@ async function parseLoginSuccessResponse(
     throw new Error('Server returned an invalid login response.');
   }
   return parsed.data;
-}
-
-function parseWebAuthnOptions(serverOptions: unknown): PublicKeyCredentialRequestOptions {
-  const parsed = WebAuthnServerOptionsSchema.safeParse(serverOptions);
-  if (!parsed.success) throw new Error('Server returned invalid WebAuthn options.');
-  const pk = parsed.data;
-  const opts: PublicKeyCredentialRequestOptions = {
-    challenge: base64urlToBuffer(pk.challenge),
-    timeout: pk.timeout,
-    rpId: pk.rpId,
-  };
-  if (pk.allowCredentials) {
-    opts.allowCredentials = pk.allowCredentials.map((cred) => ({
-      type: cred.type,
-      id: base64urlToBuffer(cred.id),
-      // TypeScript's lib.dom omits WebAuthn Level 3's smart-card value. The
-      // closed Zod enum above matches the backend's go-webauthn v0.17.4 contract.
-      transports: cred.transports?.map((transport) => transport as AuthenticatorTransport),
-    }));
-  }
-  if (pk.userVerification) {
-    opts.userVerification = pk.userVerification;
-  }
-  return opts;
 }
 
 /** Check that Electron safeStorage is available, returning an error message or null */
@@ -662,11 +610,21 @@ const Login: React.FC<LoginProps> = ({
     data: MFARequiredResponse,
     requestSelection: RuntimeServerSelection
   ) => {
-    const serverMethods = data.methods;
+    const parsedWebAuthnOptions = webauthnOptionsOrNull(
+      data.webauthn_options,
+      requestSelection.apiBase
+    );
+    const serverMethods = methodsForOptions(data.methods, parsedWebAuthnOptions);
+    // Options the server sent but that cannot be used, with no other method
+    // left: the sign-in fails here rather than open on a dead security-key pane.
+    if (
+      data.webauthn_options != null &&
+      !parsedWebAuthnOptions &&
+      serverMethods.includes('webauthn')
+    ) {
+      throw new Error('Server returned invalid WebAuthn options.');
+    }
     const recoveryOnly = data.recovery_only_methods ?? [];
-    const parsedWebAuthnOptions = data.webauthn_options
-      ? parseWebAuthnOptions(data.webauthn_options)
-      : null;
     setMfaChallengeToken(data.mfa_challenge_token);
     setMfaMethods(serverMethods);
     setMfaRecoveryOnly(recoveryOnly);

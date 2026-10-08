@@ -392,6 +392,7 @@ describe('mapSessionResponse', () => {
         methods: ['totp', 'webauthn'],
         recovery_only_methods: ['backup_code'],
         webauthn_options: { rpId: 'x' },
+        default_method: 'totp',
       })
     ).toEqual({
       kind: 'mfa_challenge',
@@ -399,7 +400,15 @@ describe('mapSessionResponse', () => {
       methods: ['totp', 'webauthn'],
       recoveryOnlyMethods: ['backup_code'],
       webauthnOptions: { rpId: 'x' },
+      defaultMethod: 'totp',
     });
+  });
+
+  // #3663 review. Mutant: the field copied unchecked.
+  it('drops a default_method that is not a string', () => {
+    const mapped = mapSessionResponse({ mfa_challenge_token: 'm', methods: [], default_method: 7 });
+    expect(mapped).toMatchObject({ kind: 'mfa_challenge' });
+    expect((mapped as { defaultMethod?: unknown }).defaultMethod).toBeUndefined();
   });
 
   it('maps sso_registration_required → sso_token/new_user', () => {

@@ -281,8 +281,27 @@
  *        shell below 30 simply does not tell the user — the share keeps its video and
  *        its app sound goes silent with no notice, which is the pre-30 behaviour.
  *        Capability, not demand.
+ * - v31: `auth:refreshToken`'s `RefreshResult` gains `mfaWebauthnOptions`, the
+ *        server's `webauthn_options` from a `suspicious_session_mfa` or
+ *        `mfa_upgrade_required` challenge, passed through unparsed. The renderer
+ *        parses it before the challenge modal mounts `WebAuthnPrompt`. Before this,
+ *        main dropped the field, so the refresh modal could never offer the security
+ *        key the server had already challenged for.
+ *
+ *        It also gains `mfaApiBase`, the origin main refreshed against. The renderer
+ *        opens the challenge only when that is the server it is on, so a proof never
+ *        goes to a server other than the one that issued the challenge.
+ *
+ *        It also gains `mfaDefaultMethod`, the server's advisory `default_method`
+ *        (the factor the account used most recently), so the modal opens on that
+ *        factor rather than always on the strongest one.
+ *
+ *        The SERVER's spaIpcContract stays 19: the fields are optional, and a shell
+ *        below 31 omits them, which leaves the modal without a security key, without
+ *        the server check and on the strongest method — the pre-31 behaviour.
+ *        Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 30;
+export const IPC_CONTRACT_VERSION = 31;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.
@@ -338,6 +357,12 @@ export interface RefreshResult {
   mfaChallengeToken?: string;
   mfaMethods?: string[];
   mfaRecoveryOnlyMethods?: string[];
+  /** The server's `webauthn_options`, unparsed (v31). */
+  mfaWebauthnOptions?: unknown;
+  /** The origin main refreshed against, which issued the challenge (v31). */
+  mfaApiBase?: string;
+  /** The server's advisory `default_method` for the challenge (v31). */
+  mfaDefaultMethod?: string;
 }
 
 export type SelfHostedProbeResult =

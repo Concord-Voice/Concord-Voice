@@ -81,18 +81,18 @@ vi.mock('@/renderer/components/Auth/BackupCodeInput', () => ({
 }));
 
 // Build a minimal-but-valid PublicKeyCredential mock for the WebAuthn parity
-// tests. The component's handler runs btoa(String.fromCodePoint(...))
-// across each ArrayBuffer field, so any well-formed buffer works.
+// tests. The bytes are chosen so standard base64 would hold '+', '/' and '='
+// padding, which base64url replaces or drops.
 function makeMockCredential(): Credential {
   const buf = (bytes: number[]) => new Uint8Array(bytes).buffer;
   return {
     id: 'mock-cred-id',
-    rawId: buf([1, 2, 3, 4]),
+    rawId: buf([0xfb, 0xef, 0xbe]),
     type: 'public-key',
     response: {
-      authenticatorData: buf([5, 6, 7, 8]),
-      clientDataJSON: buf([9, 10, 11, 12]),
-      signature: buf([13, 14, 15, 16]),
+      authenticatorData: buf([0xff, 0xff, 0xff]),
+      clientDataJSON: buf([1, 2, 3, 4]),
+      signature: buf([0xfb, 0xff]),
       userHandle: null,
     },
   } as unknown as Credential;
@@ -727,6 +727,134 @@ describe('MFAChallengeModal', () => {
         payload: verifyResponseBody,
       });
     });
+  });
+
+  // #3663 review: go-webauthn reads unpadded base64url. Mutant: plain btoa,
+  // which pads and uses '+' and '/', so a real ceremony's proof is refused.
+  it('WebAuthn: sends every binary field as unpadded base64url', async () => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'test-token',
+      methods: ['webauthn'],
+      recoveryOnlyMethods: [],
+      webauthnOptions: mockWebAuthnOptions,
+      resolve: vi.fn(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ access_token: 'jwt-webauthn', session_id: 'sess-webauthn' }),
+    });
+
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByTestId('webauthn-success'));
+
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    expect(body.assertion).toEqual({
+      id: 'mock-cred-id',
+      rawId: '----',
+      type: 'public-key',
+      response: {
+        authenticatorData: '____',
+        clientDataJSON: 'AQIDBA',
+        signature: '-_8',
+        userHandle: null,
+      },
+    });
+  });
+
+  // #3663 review: the server names the factor the account used most recently.
+  // Mutant: the modal ignores it, so a TOTP user meets the security-key
+  // ceremony first.
+  it.each([
+    ['opens on the server default', [], 'totp', 'totp-input'],
+    ['opens on the strongest method when the server names none', [], null, 'webauthn-prompt'],
+    ['ignores a default the challenge does not offer', ['totp'], 'totp', 'webauthn-prompt'],
+  ])('%s', (_name, recoveryOnlyMethods, defaultMethod, shown) => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'default-token',
+      methods: ['webauthn', 'totp'],
+      recoveryOnlyMethods,
+      webauthnOptions: mockWebAuthnOptions,
+      defaultMethod,
+      resolve: vi.fn(),
+    } as never);
+
+    render(<MFAChallengeModal />);
+
+    expect(screen.getByTestId(shown)).toBeInTheDocument();
+  });
+
+  // Mutant: the reset for a new challenge recomputes the strongest method.
+  it('opens a replacing challenge on its own server default', () => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'first-token',
+      methods: ['webauthn', 'totp'],
+      recoveryOnlyMethods: [],
+      webauthnOptions: mockWebAuthnOptions,
+      defaultMethod: null,
+      resolve: vi.fn(),
+    } as never);
+    render(<MFAChallengeModal />);
+    expect(screen.getByTestId('webauthn-prompt')).toBeInTheDocument();
+
+    act(() => {
+      useMFAChallengeStore.setState({
+        challengeToken: 'second-token',
+        defaultMethod: 'totp',
+      } as never);
+    });
+
+    expect(screen.getByTestId('totp-input')).toBeInTheDocument();
+  });
+
+  // #3663 review: the server consumes a ceremony when it judges the assertion.
+  // Mutant: the panel keeps the prompt, which then waits forever with the
+  // refusal hidden.
+  it('WebAuthn: a refused assertion shows the reason and how to start again', async () => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'refused-token',
+      methods: ['webauthn'],
+      recoveryOnlyMethods: [],
+      webauthnOptions: mockWebAuthnOptions,
+      resolve: vi.fn(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: 'Invalid assertion' }),
+    });
+
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByTestId('webauthn-success'));
+
+    expect(await screen.findByText('Invalid assertion')).toBeInTheDocument();
+    expect(
+      screen.getByText('This security key request can no longer be used. Cancel and try again.')
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('webauthn-prompt')).not.toBeInTheDocument();
+  });
+
+  // Mutant: the spent mark kept for the next challenge, which then never asks.
+  it('WebAuthn: a new challenge after a refused one offers the prompt again', async () => {
+    useMFAChallengeStore.setState({
+      challengeToken: 'spent-token',
+      methods: ['webauthn'],
+      recoveryOnlyMethods: [],
+      webauthnOptions: mockWebAuthnOptions,
+      resolve: vi.fn(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: 'Invalid assertion' }),
+    });
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByTestId('webauthn-success'));
+    await screen.findByText('Invalid assertion');
+
+    act(() => {
+      useMFAChallengeStore.setState({ challengeToken: 'fresh-token' });
+    });
+
+    expect(screen.getByTestId('webauthn-prompt')).toBeInTheDocument();
   });
 
   it('WebAuthn: does NOT call completeChallenge on failed verification (modal stays open)', async () => {

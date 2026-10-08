@@ -732,15 +732,25 @@ export async function restoreRefreshToken(): Promise<RestoreRefreshTokenResult> 
   return { status: 'ok', token, apiBase: meta.apiBase, rememberMe: meta.rememberMe };
 }
 
-async function tryParseMfaChallenge(response: Response): Promise<RefreshResult | null> {
+/** `value` when it is an array, keeping only its strings; otherwise empty. */
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+async function tryParseMfaChallenge(
+  response: Response,
+  apiBase: string
+): Promise<RefreshResult | null> {
   if (response.status !== 403) return null;
 
   try {
     const errData = (await response.json()) as {
       error?: string;
       mfa_challenge_token?: string;
-      methods?: string[];
-      recovery_only_methods?: string[];
+      methods?: unknown;
+      recovery_only_methods?: unknown;
+      webauthn_options?: unknown;
+      default_method?: unknown;
     };
     if (
       (errData.error === 'suspicious_session_mfa' || errData.error === 'mfa_upgrade_required') &&
@@ -750,8 +760,15 @@ async function tryParseMfaChallenge(response: Response): Promise<RefreshResult |
       return {
         status: 'mfa_required',
         mfaChallengeToken: errData.mfa_challenge_token,
-        mfaMethods: errData.methods || [],
-        mfaRecoveryOnlyMethods: errData.recovery_only_methods || [],
+        // The lists cross IPC typed as string arrays, so anything else is
+        // dropped here rather than thrown on in the renderer (#3663 review).
+        mfaMethods: stringList(errData.methods),
+        mfaRecoveryOnlyMethods: stringList(errData.recovery_only_methods),
+        mfaWebauthnOptions: errData.webauthn_options,
+        mfaApiBase: apiBase,
+        // Advisory: the factor the account used most recently (picker design §2).
+        mfaDefaultMethod:
+          typeof errData.default_method === 'string' ? errData.default_method : undefined,
       };
     }
   } catch {
@@ -820,7 +837,7 @@ function performOwnedRefresh(): Promise<OwnedRefreshResult> {
       });
 
       if (!response.ok) {
-        const mfaResult = await tryParseMfaChallenge(response);
+        const mfaResult = await tryParseMfaChallenge(response, owner.apiBase);
         if (mfaResult) return { result: mfaResult, owner };
         console.warn(`[TokenManager] Refresh failed: HTTP ${response.status}`);
         return { result: { status: 'refresh_failed' }, owner };

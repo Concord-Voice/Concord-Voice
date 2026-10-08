@@ -23,6 +23,7 @@ import { getDesktopClientVersion } from '../../utils/runtime/clientVersion';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import type { TerminalAttestationCode } from '../../stores/auth/attestationFailureStore';
 import type { ApiRequestContext } from './requestContext';
+import { methodsForOptions, webauthnOptionsOrNull } from '../../utils/webauthnOptions';
 
 export { API_BASE } from '../../config';
 
@@ -321,6 +322,15 @@ function refreshedRequestLifecycleIsCurrent(
   return signal?.aborted !== true && refreshedAuthLifecycleIsCurrent(snapshot, refreshedToken);
 }
 
+/** Whether two bases name the same origin. An unparseable one matches nothing. */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Handle MFA challenge during token refresh if the server flags a suspicious session.
  * Returns the new access token if MFA verification + retry succeeds, null otherwise.
@@ -331,16 +341,28 @@ async function handleMfaChallengeIfNeeded(
 ): Promise<string | null> {
   if (result.status !== 'mfa_required' || !result.mfaChallengeToken) return null;
   if (!authLifecycleIsCurrent(lifecycle)) return null;
+  // The challenge belongs to the server main refreshed against, and the modal
+  // sends its proof to the server the renderer is on. When they differ the proof
+  // would go to a server that did not issue the challenge, so it is not offered.
+  // A shell below contract 31 does not name the server; that is the pre-31 path.
+  if (result.mfaApiBase !== undefined && !sameOrigin(result.mfaApiBase, getApiBase())) {
+    console.warn('[MFA] refresh challenge came from another server; not offered');
+    return null;
+  }
 
   const { useMFAChallengeStore } = await import('../../stores/auth/mfaChallengeStore');
   if (!authLifecycleIsCurrent(lifecycle)) return null;
+  const webauthnOptions = webauthnOptionsOrNull(result.mfaWebauthnOptions, getApiBase());
   const mfaResult = await useMFAChallengeStore
     .getState()
     .showChallenge(
       result.mfaChallengeToken,
-      result.mfaMethods || [],
+      methodsForOptions(result.mfaMethods || [], webauthnOptions),
       'suspicious_refresh',
-      result.mfaRecoveryOnlyMethods || []
+      result.mfaRecoveryOnlyMethods || [],
+      undefined,
+      webauthnOptions,
+      result.mfaDefaultMethod
     );
   if (!mfaResult.verified || !authLifecycleIsCurrent(lifecycle)) return null;
 

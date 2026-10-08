@@ -26,6 +26,7 @@ import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useMFAChallengeStore, type MFAChallengeResult } from '../../stores/auth/mfaChallengeStore';
 import { revokeAbortedSession } from '../../services/system/apiClient';
+import { methodsForOptions, webauthnOptionsOrNull } from '../../utils/webauthnOptions';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
@@ -256,7 +257,7 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
           case 'logged_in':
             await admitDirectSSOLogin(result, reservationGeneration, serverSelection, setState);
             break;
-          case 'mfa_required':
+          case 'mfa_required': {
             // Bridge to the canonical MFA modal. The store records the SSO-side
             // phase (so AuthFlow / Login can render fall-back UI if needed) AND
             // the global useMFAChallengeStore is loaded so MFAChallengeModal —
@@ -265,16 +266,22 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
             // branch sets a phase nothing renders against and the user is
             // stranded.
             setState({ phase: 'mfa_required', mfaChallengeToken: result.mfaChallengeToken });
+            const webauthnOptions = webauthnOptionsOrNull(
+              result.webauthnOptions,
+              serverSelection.apiBase
+            );
             useMFAChallengeStore
               .getState()
               .showChallenge(
                 result.mfaChallengeToken,
-                result.methods ?? [],
+                methodsForOptions(result.methods ?? [], webauthnOptions),
                 'sso_login',
                 result.recoveryOnlyMethods,
                 // #2424: carry the reserved owner + provider so the modal can
                 // route the MFA proof through sso:completeMFA under this owner.
-                { provider, credentialOwner: result.credentialOwner }
+                { provider, credentialOwner: result.credentialOwner },
+                webauthnOptions,
+                result.defaultMethod
               )
               .then((mfaResult) =>
                 handleSSOMfaResult(mfaResult, reservationGeneration, serverSelection, setState)
@@ -294,6 +301,7 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
                 }
               });
             break;
+          }
           case 'register_required':
             setState({
               phase: 'register_required',

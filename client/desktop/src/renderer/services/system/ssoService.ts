@@ -57,6 +57,8 @@ export type SSOResult =
       recoveryOnlyMethods?: string[];
       /** PublicKeyCredentialRequestOptions when "webauthn" is in methods */
       webauthnOptions?: unknown;
+      /** The server's advisory `default_method`: the factor used most recently. */
+      defaultMethod?: string;
       /**
        * #2424: the opaque owner reserved at SSO sign-in, preserved across the MFA
        * challenge. The renderer carries it to `sso:completeMFA` so main stores the
@@ -131,6 +133,7 @@ function mapSSOResult(result: SSOSignInResult): SSOResult {
         methods: result.methods,
         recoveryOnlyMethods: result.recoveryOnlyMethods,
         webauthnOptions: result.webauthnOptions,
+        defaultMethod: result.defaultMethod,
         credentialOwner: result.credentialOwner,
       };
     case 'sso_token':

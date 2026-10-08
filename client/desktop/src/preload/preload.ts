@@ -200,6 +200,9 @@ contextBridge.exposeInMainWorld('electron', {
       mfaChallengeToken?: string;
       mfaMethods?: string[];
       mfaRecoveryOnlyMethods?: string[];
+      mfaWebauthnOptions?: unknown;
+      mfaApiBase?: string;
+      mfaDefaultMethod?: string;
     }>,
   clearTokens: (opts?: { keepDeepLinks?: boolean }) => ipcRenderer.invoke('auth:clearTokens', opts),
   clearTokensIfOwner: (owner: CredentialOwner) =>
@@ -768,6 +771,9 @@ export interface ElectronAPI {
     mfaChallengeToken?: string;
     mfaMethods?: string[];
     mfaRecoveryOnlyMethods?: string[];
+    mfaWebauthnOptions?: unknown;
+    mfaApiBase?: string;
+    mfaDefaultMethod?: string;
   }>;
   clearTokens: (opts?: { keepDeepLinks?: boolean }) => Promise<void>;
   clearTokensIfOwner: (owner: CredentialOwner) => Promise<boolean | { status: 'rejected' }>;

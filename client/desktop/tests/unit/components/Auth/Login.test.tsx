@@ -2254,6 +2254,7 @@ describe('Login', () => {
           webauthn_options: {
             publicKey: {
               challenge: 'Y2hhbGxlbmdl',
+              rpId: 'localhost',
               allowCredentials: [{ type: 'public-key', id: 42 }],
             },
           },
@@ -2272,6 +2273,56 @@ describe('Login', () => {
     expect(screen.queryByText('Two-Factor Authentication')).not.toBeInTheDocument();
   });
 
+  // #3663 review, H1: the server this sign-in went to may not name another
+  // server's relying party. Mutant: Login parses without the API base, so the
+  // ceremony runs for the named relying party.
+  describe("a challenge naming another server's relying party", () => {
+    const foreignOptions = {
+      webauthn_options: { publicKey: { challenge: 'Y2hhbGxlbmdl', rpId: 'concordvoice.chat' } },
+    };
+
+    async function signIn() {
+      const user = userEvent.setup();
+      render(<Login {...defaultProps} />);
+      await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+      await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+      await user.click(screen.getByText('Sign In'));
+    }
+
+    it('offers the other methods and no security key', async () => {
+      const getCredential = vi.fn();
+      Object.defineProperty(navigator, 'credentials', {
+        value: { get: getCredential },
+        writable: true,
+        configurable: true,
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeMFAResponse(['webauthn', 'totp'], foreignOptions),
+      });
+
+      await signIn();
+
+      expect(await screen.findByText('Two-Factor Authentication')).toBeInTheDocument();
+      expect(screen.queryByText(/security key/i)).not.toBeInTheDocument();
+      expect(getCredential).not.toHaveBeenCalled();
+    });
+
+    it('fails the sign-in when the security key was the only method', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeMFAResponse(['webauthn'], foreignOptions),
+      });
+
+      await signIn();
+
+      expect(
+        await screen.findByText('Server returned invalid WebAuthn options.')
+      ).toBeInTheDocument();
+      expect(screen.queryByText('Two-Factor Authentication')).not.toBeInTheDocument();
+    });
+  });
+
   it('accepts the backend-supported WebAuthn smart-card transport', async () => {
     const getCredential = vi.fn().mockReturnValue(new Promise(() => {}));
     Object.defineProperty(navigator, 'credentials', {
@@ -2286,6 +2337,7 @@ describe('Login', () => {
           webauthn_options: {
             publicKey: {
               challenge: 'Y2hhbGxlbmdl',
+              rpId: 'localhost',
               allowCredentials: [
                 {
                   type: 'public-key',

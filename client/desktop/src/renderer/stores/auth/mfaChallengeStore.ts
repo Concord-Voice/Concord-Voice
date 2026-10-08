@@ -97,12 +97,15 @@ interface MFAChallengeState {
    * WebAuthn challenge options when the server has issued a WebAuthn challenge.
    * Null when the WebAuthn flow is not active or the caller has not supplied
    * options. The MFAChallengeModal mounts WebAuthnPrompt only when this is
-   * non-null (otherwise it shows the fallback message). Callers that surface
-   * a WebAuthn-capable mfa_required response should use setState directly to
-   * populate this field; the existing showChallenge signature is left
-   * unchanged for source compatibility.
+   * non-null (otherwise it shows the fallback message). Callers pass the
+   * parsed server options as showChallenge's last argument.
    */
   webauthnOptions: PublicKeyCredentialRequestOptions | null;
+  /**
+   * The server's advisory `default_method`: the factor the account used most
+   * recently. The modal opens on it when it is offered, else on the strongest.
+   */
+  defaultMethod: string | null;
   /**
    * SSO routing context (#2424). Non-null only for the 'sso_login' purpose;
    * carries the provider + owner the modal needs to call `sso:completeMFA`.
@@ -117,7 +120,9 @@ interface MFAChallengeState {
     methods: string[],
     purpose: MFAChallengePurpose,
     recoveryOnlyMethods?: string[],
-    ssoContext?: MFASSOContext
+    ssoContext?: MFASSOContext,
+    webauthnOptions?: PublicKeyCredentialRequestOptions | null,
+    defaultMethod?: string | null
   ) => Promise<MFAChallengeResult>;
   /**
    * Called by the modal after successful MFA verification. `forToken` (#2424)
@@ -137,10 +142,19 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
   recoveryOnlyMethods: [],
   purpose: null,
   webauthnOptions: null,
+  defaultMethod: null,
   ssoContext: null,
   resolve: null,
 
-  showChallenge: (token, methods, purpose, recoveryOnlyMethods, ssoContext) => {
+  showChallenge: (
+    token,
+    methods,
+    purpose,
+    recoveryOnlyMethods,
+    ssoContext,
+    webauthnOptions,
+    defaultMethod
+  ) => {
     // Every caller awaits this promise, so each one must settle. A challenge
     // this one replaces is settled not-verified rather than dropped, and an
     // empty token settles at once: the modal treats it as no challenge, so
@@ -156,7 +170,8 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
         methods,
         recoveryOnlyMethods: recoveryOnlyMethods || [],
         purpose,
-        webauthnOptions: null,
+        webauthnOptions: webauthnOptions ?? null,
+        defaultMethod: defaultMethod ?? null,
         ssoContext: ssoContext ?? null,
         resolve,
       });
@@ -175,6 +190,7 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
       recoveryOnlyMethods: [],
       purpose: null,
       webauthnOptions: null,
+      defaultMethod: null,
       ssoContext: null,
       resolve: null,
     });
@@ -189,6 +205,7 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
       recoveryOnlyMethods: [],
       purpose: null,
       webauthnOptions: null,
+      defaultMethod: null,
       ssoContext: null,
       resolve: null,
     });

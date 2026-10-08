@@ -121,6 +121,7 @@ describe('startSSOFlow', () => {
         methods: ['totp'],
         recoveryOnlyMethods: ['backup_code'],
         webauthnOptions: { rpId: 'y' },
+        defaultMethod: 'totp',
       });
       const result = await startSSOFlow('google', API_BASE);
       expect(result).toEqual({
@@ -129,6 +130,7 @@ describe('startSSOFlow', () => {
         methods: ['totp'],
         recoveryOnlyMethods: ['backup_code'],
         webauthnOptions: { rpId: 'y' },
+        defaultMethod: 'totp',
       });
     });
 

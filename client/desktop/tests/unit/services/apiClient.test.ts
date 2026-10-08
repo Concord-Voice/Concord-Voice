@@ -7,6 +7,7 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import {
+  getApiBase,
   resetRuntimeServerBase,
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
@@ -365,6 +366,10 @@ describe('apiClient', () => {
             mfaChallengeToken: 'challenge-abc',
             mfaMethods: ['totp', 'webauthn'],
             mfaRecoveryOnlyMethods: ['recovery'],
+            mfaWebauthnOptions: { challenge: 'AQID', rpId: 'localhost' },
+            // #3663 review. Mutant: the default not passed, so the modal
+            // always opens on the strongest method.
+            mfaDefaultMethod: 'totp',
           })
           // Second call (after MFA verified): success
           .mockResolvedValueOnce({
@@ -387,14 +392,142 @@ describe('apiClient', () => {
         'challenge-abc',
         ['totp', 'webauthn'],
         'suspicious_refresh',
-        ['recovery']
+        ['recovery'],
+        undefined,
+        expect.objectContaining({ rpId: 'localhost' }),
+        'totp'
       );
+      const options = showChallengeSpy.mock.calls[0][5];
+      expect(Array.from(new Uint8Array(options?.challenge as ArrayBuffer))).toEqual([1, 2, 3]);
       expect(useAuthStore.getState().accessToken).toBe('mfa-refreshed-token');
       expect(useAuthStore.getState().sessionId).toBe('sess-123');
       expect(useAuthStore.getState().authGeneration).toBe(generation);
       expect(globalThis.electron!.refreshToken).toHaveBeenCalledTimes(2);
 
       showChallengeSpy.mockRestore();
+    });
+
+    it('still shows the challenge, without a security key, when the WebAuthn options are malformed', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValueOnce({
+          status: 'mfa_required',
+          mfaChallengeToken: 'challenge-bad-options',
+          mfaMethods: ['webauthn', 'email'],
+          mfaWebauthnOptions: { rpId: 'localhost' },
+        }),
+      } as any;
+
+      const showChallengeSpy = vi
+        .spyOn(useMFAChallengeStore.getState(), 'showChallenge')
+        .mockResolvedValue({ verified: false });
+
+      await refreshAccessToken();
+
+      // Without usable options a security key has nothing behind it, so the
+      // challenge opens on the method that is left (#3663 review).
+      expect(showChallengeSpy).toHaveBeenCalledWith(
+        'challenge-bad-options',
+        ['email'],
+        'suspicious_refresh',
+        [],
+        undefined,
+        null,
+        undefined
+      );
+
+      showChallengeSpy.mockRestore();
+    });
+
+    // #3663 review, H1. Mutant: the options parsed against any server but the
+    // one the renderer is on, so the ceremony runs for the named relying party.
+    it("offers no security key for another server's relying party", async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValueOnce({
+          status: 'mfa_required',
+          mfaChallengeToken: 'challenge-foreign-rp',
+          mfaMethods: ['webauthn', 'email'],
+          mfaWebauthnOptions: { challenge: 'AQID', rpId: 'concordvoice.chat' },
+        }),
+      } as any;
+      const showChallengeSpy = vi
+        .spyOn(useMFAChallengeStore.getState(), 'showChallenge')
+        .mockResolvedValue({ verified: false });
+
+      await refreshAccessToken();
+
+      expect(showChallengeSpy).toHaveBeenCalledWith(
+        'challenge-foreign-rp',
+        ['email'],
+        'suspicious_refresh',
+        [],
+        undefined,
+        null,
+        undefined
+      );
+      showChallengeSpy.mockRestore();
+    });
+
+    it('opens a challenge from a shell below contract 31, which sends neither options nor the server', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValueOnce({
+          status: 'mfa_required',
+          mfaChallengeToken: 'challenge-old-shell',
+          mfaMethods: ['webauthn', 'totp'],
+        }),
+      } as any;
+      const showChallengeSpy = vi
+        .spyOn(useMFAChallengeStore.getState(), 'showChallenge')
+        .mockResolvedValue({ verified: false });
+
+      await refreshAccessToken();
+
+      expect(showChallengeSpy).toHaveBeenCalledWith(
+        'challenge-old-shell',
+        ['totp'],
+        'suspicious_refresh',
+        [],
+        undefined,
+        null,
+        undefined
+      );
+      showChallengeSpy.mockRestore();
+    });
+
+    // #3663 review: the proof goes to the renderer's server, so a challenge
+    // another server issued is not offered. Mutant: no origin check, so the
+    // challenge opens and its proof is sent to the wrong server.
+    it.each([
+      ['another server issued it', 'https://other-server.example', 0],
+      ['control: the current server issued it', `${getApiBase()}/`, 1],
+    ])('a refresh challenge when %s', async (_name, mfaApiBase, opened) => {
+      resetRuntimeServerBase();
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValueOnce({
+          status: 'mfa_required',
+          mfaChallengeToken: 'challenge-origin',
+          mfaMethods: ['totp'],
+          mfaApiBase,
+        }),
+      } as any;
+      let shown = 0;
+      const showChallengeSpy = vi
+        .spyOn(useMFAChallengeStore.getState(), 'showChallenge')
+        .mockImplementation(async () => {
+          shown += 1;
+          return { verified: false };
+        });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const token = await refreshAccessToken();
+
+      expect(token).toBeNull();
+      expect(shown).toBe(opened);
+      showChallengeSpy.mockRestore();
+      warn.mockRestore();
     });
 
     it('returns null when MFA challenge is declined', async () => {

@@ -462,6 +462,92 @@ describe('useSSOFlow', () => {
     expect(useAuthStore.getState().accessToken).toBeNull();
   });
 
+  it('mfa_required: hands the challenge modal the parsed WebAuthn options', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'mfa_required',
+      mfaChallengeToken: 'mfa-chal-webauthn',
+      methods: ['webauthn'],
+      webauthnOptions: { publicKey: { challenge: 'AQID', rpId: 'localhost' } },
+      // #3663 review. Mutant: the default not passed to the store.
+      defaultMethod: 'totp',
+      credentialOwner: 72,
+    });
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    expect(useMFAChallengeStore.getState().defaultMethod).toBe('totp');
+    const options = useMFAChallengeStore.getState().webauthnOptions;
+    expect(options?.rpId).toBe('localhost');
+    expect(Array.from(new Uint8Array(options?.challenge as ArrayBuffer))).toEqual([1, 2, 3]);
+  });
+
+  it('mfa_required: malformed WebAuthn options still open the challenge, without a security key', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'mfa_required',
+      mfaChallengeToken: 'mfa-chal-bad-options',
+      methods: ['webauthn', 'email'],
+      webauthnOptions: { rpId: 'localhost' },
+      credentialOwner: 73,
+    });
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    expect(useMFAChallengeStore.getState().challengeToken).toBe('mfa-chal-bad-options');
+    expect(useMFAChallengeStore.getState().webauthnOptions).toBeNull();
+    // Nothing is behind a security key, so the challenge offers email only (#3663 review).
+    expect(useMFAChallengeStore.getState().methods).toEqual(['email']);
+  });
+
+  // #3663 review, H1: the relying party must belong to the server the SSO
+  // sign-in went to. Mutant: any other API base, so either row flips.
+  it.each([
+    ['https://evil-selfhost.example', null, ['email']],
+    ['https://api.concordvoice.chat', 'concordvoice.chat', ['webauthn', 'email']],
+  ])(
+    'mfa_required: on %s, a challenge for concordvoice.chat offers %s',
+    async (apiBase, rpId, methods) => {
+      setRuntimeServerBase(apiBase);
+      mockedStartSSOFlow.mockResolvedValueOnce({
+        kind: 'mfa_required',
+        mfaChallengeToken: 'mfa-chal-rp',
+        methods: ['webauthn', 'email'],
+        webauthnOptions: { publicKey: { challenge: 'AQID', rpId: 'concordvoice.chat' } },
+        credentialOwner: 74,
+      });
+
+      const { result } = renderHook(() => useSSOFlow());
+      await act(async () => {
+        await result.current.begin('google');
+      });
+
+      expect(useMFAChallengeStore.getState().webauthnOptions?.rpId ?? null).toBe(rpId);
+      expect(useMFAChallengeStore.getState().methods).toEqual(methods);
+    }
+  );
+
+  it('mfa_required: a challenge with no WebAuthn options keeps a security key that is its only method', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'mfa_required',
+      mfaChallengeToken: 'mfa-chal-no-options',
+      methods: ['webauthn'],
+      credentialOwner: 74,
+    });
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    expect(useMFAChallengeStore.getState().webauthnOptions).toBeNull();
+    expect(useMFAChallengeStore.getState().methods).toEqual(['webauthn']);
+  });
+
   it('mfa_required: post-verify hydrates useAuthStore from the main-verified completion and arms SSO unlock gate', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'mfa_required',

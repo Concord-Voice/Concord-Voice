@@ -39,6 +39,8 @@ export type SSOSignInResult =
       methods: string[];
       recoveryOnlyMethods?: string[];
       webauthnOptions?: unknown;
+      /** The server's advisory `default_method`: the factor used most recently. */
+      defaultMethod?: string;
       // #2424: the SSO CredentialOwner reserved at sign-in is preserved across the
       // MFA challenge and returned as opaque challenge context. The renderer must
       // pass it back to sso:completeMFA so main can conditionally store the MFA

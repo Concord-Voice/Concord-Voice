@@ -95,6 +95,52 @@ describe('mfaChallengeStore', () => {
     await promise;
   });
 
+  it('stores the WebAuthn options a challenge carries, and a challenge without any clears them', () => {
+    const options: PublicKeyCredentialRequestOptions = {
+      challenge: new Uint8Array([1, 2, 3]).buffer,
+      rpId: 'localhost',
+    };
+    void useMFAChallengeStore
+      .getState()
+      .showChallenge('token-wa', ['webauthn'], 'suspicious_refresh', [], undefined, options);
+    expect(useMFAChallengeStore.getState().webauthnOptions).toBe(options);
+
+    void useMFAChallengeStore
+      .getState()
+      .showChallenge('token-next', ['totp'], 'suspicious_refresh');
+    expect(useMFAChallengeStore.getState().webauthnOptions).toBeNull();
+  });
+
+  // #3663 review. Mutant: the default not stored, or kept after the challenge ends.
+  it('stores the server default a challenge carries, and clears it with the challenge', () => {
+    void useMFAChallengeStore
+      .getState()
+      .showChallenge(
+        'token-d',
+        ['webauthn', 'totp'],
+        'suspicious_refresh',
+        [],
+        undefined,
+        null,
+        'totp'
+      );
+    expect(useMFAChallengeStore.getState().defaultMethod).toBe('totp');
+
+    useMFAChallengeStore.getState().clearChallenge();
+    expect(useMFAChallengeStore.getState().defaultMethod).toBeNull();
+
+    void useMFAChallengeStore
+      .getState()
+      .showChallenge('token-e', ['totp'], 'suspicious_refresh', [], undefined, null, 'totp');
+    useMFAChallengeStore
+      .getState()
+      .completeChallenge({ verified: true, payload: { access_token: 'tok' } });
+    expect(useMFAChallengeStore.getState().defaultMethod).toBeNull();
+
+    void useMFAChallengeStore.getState().showChallenge('token-f', ['totp'], 'suspicious_refresh');
+    expect(useMFAChallengeStore.getState().defaultMethod).toBeNull();
+  });
+
   it('stores ssoContext and resolves the ssoCompletion variant for sso_login (#2424)', async () => {
     const promise = useMFAChallengeStore
       .getState()

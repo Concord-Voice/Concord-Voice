@@ -44,6 +44,20 @@ export function constantTimeEquals(a: string, b: string): boolean {
  * Maps a raw /session response body into a main-process-only result. The IPC
  * handler stores refreshToken and returns the sanitized SSOSignInResult.
  */
+/** The SSO MFA challenge, each field projected explicitly so an unknown key is dropped. */
+function mapMfaChallenge(body: Record<string, unknown>, token: string): MainSSOSignInResult {
+  return {
+    kind: 'mfa_challenge',
+    mfaChallengeToken: token,
+    methods: Array.isArray(body.methods) ? (body.methods as string[]) : [],
+    recoveryOnlyMethods: Array.isArray(body.recovery_only_methods)
+      ? (body.recovery_only_methods as string[])
+      : undefined,
+    webauthnOptions: body.webauthn_options,
+    defaultMethod: typeof body.default_method === 'string' ? body.default_method : undefined,
+  };
+}
+
 export function mapSessionResponse(body: Record<string, unknown>): MainSSOSignInResult {
   if (
     typeof body.access_token === 'string' &&
@@ -61,15 +75,7 @@ export function mapSessionResponse(body: Record<string, unknown>): MainSSOSignIn
     };
   }
   if (typeof body.mfa_challenge_token === 'string' && body.mfa_challenge_token.length > 0) {
-    return {
-      kind: 'mfa_challenge',
-      mfaChallengeToken: body.mfa_challenge_token,
-      methods: Array.isArray(body.methods) ? (body.methods as string[]) : [],
-      recoveryOnlyMethods: Array.isArray(body.recovery_only_methods)
-        ? (body.recovery_only_methods as string[])
-        : undefined,
-      webauthnOptions: body.webauthn_options,
-    };
+    return mapMfaChallenge(body, body.mfa_challenge_token);
   }
   if (
     body.sso_registration_required === true &&

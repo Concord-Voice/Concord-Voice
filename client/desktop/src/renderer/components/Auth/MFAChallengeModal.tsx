@@ -19,6 +19,8 @@ import MFAMethodPicker, {
   getAvailableCategories,
   MFAMethodCategory,
 } from './MFAMethodPicker';
+import { intersectInline, pickDefaultMethod } from '../../services/system/stepUpRequirements';
+import { bufferToBase64url } from '../../utils/crypto/base64url';
 import './TOTPInput.css';
 // The challenge's own styles. MFA.css otherwise arrives only with the lazy
 // Settings chunk, so a challenge raised before Settings was ever opened (login,
@@ -59,6 +61,59 @@ function resolveMfaProofError(err: unknown, timedOut: boolean): string {
   return GENERIC_PROOF_ERROR;
 }
 
+/**
+ * The method a challenge opens on: the server's `default_method` (the factor
+ * the account used most recently) when the challenge offers it, else the
+ * strongest offered method (#3663 review).
+ */
+function challengeDefaultMethod(
+  methods: string[],
+  recoveryOnlyMethods: string[],
+  serverDefault: string | null
+): MFAMethodCategory {
+  const offered = intersectInline(getAvailableCategories(methods, recoveryOnlyMethods));
+  return (
+    pickDefaultMethod(offered, serverDefault) ?? getDefaultMethod(methods, recoveryOnlyMethods)
+  );
+}
+
+const WEBAUTHN_SPENT = 'This security key request can no longer be used. Cancel and try again.';
+
+/**
+ * The security-key method. The prompt runs only with options for a ceremony
+ * the server has not yet judged; a refused assertion consumed it, so the panel
+ * shows why and how to get a new one instead of waiting forever (#3663 review).
+ */
+const WebAuthnPanel: React.FC<{
+  options: PublicKeyCredentialRequestOptions | null;
+  spent: boolean;
+  error: string;
+  onSuccess: (credential: Credential) => void;
+  onError: (message: string) => void;
+  onCancel: () => void;
+}> = ({ options, spent, error, onSuccess, onError, onCancel }) => {
+  if (options && !spent) {
+    return (
+      <WebAuthnPrompt
+        requestOptions={options}
+        onSuccess={onSuccess}
+        onError={onError}
+        onCancel={onCancel}
+      />
+    );
+  }
+  return (
+    <div style={{ textAlign: 'center' }}>
+      {error && <p className="totp-error">{error}</p>}
+      <p className="mfa-modal-desc">
+        {spent
+          ? WEBAUTHN_SPENT
+          : 'WebAuthn verification will be triggered by the server challenge.'}
+      </p>
+    </div>
+  );
+};
+
 const MFAChallengeModal: React.FC = () => {
   const challengeToken = useMFAChallengeStore((s) => s.challengeToken);
   const methods = useMFAChallengeStore((s) => s.methods);
@@ -67,10 +122,14 @@ const MFAChallengeModal: React.FC = () => {
   const ssoContext = useMFAChallengeStore((s) => s.ssoContext);
   const completeChallenge = useMFAChallengeStore((s) => s.completeChallenge);
   const clearChallenge = useMFAChallengeStore((s) => s.clearChallenge);
+  const serverDefault = useMFAChallengeStore((s) => s.defaultMethod);
 
   const defaultMethod = useMemo(
-    () => (methods.length > 0 ? getDefaultMethod(methods, recoveryOnlyMethods) : 'totp'),
-    [methods, recoveryOnlyMethods]
+    () =>
+      methods.length > 0
+        ? challengeDefaultMethod(methods, recoveryOnlyMethods, serverDefault)
+        : 'totp',
+    [methods, recoveryOnlyMethods, serverDefault]
   );
 
   const [mode, setMode] = useState<MFAMethodCategory | 'method-select'>(defaultMethod);
@@ -79,9 +138,12 @@ const MFAChallengeModal: React.FC = () => {
   // Bumped when a code is refused, remounting the code input empty: each code
   // is accepted once, so a refused code is either wrong or spent.
   const [inputKey, setInputKey] = useState(0);
-  // WebAuthn options now flow through the store so callers (or tests) can
-  // populate them via setState. The modal subscribes selectively and remounts
-  // WebAuthnPrompt when options arrive.
+  // The server consumes a ceremony when it judges the assertion, so after a
+  // refused one the prompt cannot run again for this challenge (#3663 review).
+  const [webauthnSpent, setWebauthnSpent] = useState(false);
+  // The caller passes the challenge's parsed WebAuthn options to showChallenge,
+  // which stores them with the token. WebAuthnPrompt restarts its ceremony
+  // when they change.
   const webauthnOptions = useMFAChallengeStore((s) => s.webauthnOptions);
 
   // The modal stays mounted between challenges, so a new one starts clean: its
@@ -91,9 +153,10 @@ const MFAChallengeModal: React.FC = () => {
   if (challengeToken !== prevTokenRef.current) {
     prevTokenRef.current = challengeToken;
     if (challengeToken) {
-      if (methods.length > 0) setMode(getDefaultMethod(methods, recoveryOnlyMethods));
+      if (methods.length > 0) setMode(defaultMethod);
       setError('');
       setLoading(false);
+      setWebauthnSpent(false);
     }
   }
 
@@ -176,24 +239,26 @@ const MFAChallengeModal: React.FC = () => {
     async (credential: Credential) => {
       const pkc = credential as PublicKeyCredential;
       const response = pkc.response as AuthenticatorAssertionResponse;
+      // go-webauthn reads unpadded base64url, as Login sends it (#3663 review).
       const assertion = {
         id: pkc.id,
-        rawId: btoa(String.fromCodePoint(...new Uint8Array(pkc.rawId))),
+        rawId: bufferToBase64url(pkc.rawId),
         type: pkc.type,
         response: {
-          authenticatorData: btoa(
-            String.fromCodePoint(...new Uint8Array(response.authenticatorData))
-          ),
-          clientDataJSON: btoa(String.fromCodePoint(...new Uint8Array(response.clientDataJSON))),
-          signature: btoa(String.fromCodePoint(...new Uint8Array(response.signature))),
-          userHandle: response.userHandle
-            ? btoa(String.fromCodePoint(...new Uint8Array(response.userHandle)))
-            : null,
+          authenticatorData: bufferToBase64url(response.authenticatorData),
+          clientDataJSON: bufferToBase64url(response.clientDataJSON),
+          signature: bufferToBase64url(response.signature),
+          userHandle: response.userHandle ? bufferToBase64url(response.userHandle) : null,
         },
       };
       await submitMfaProof({ method: 'webauthn', assertion });
+      // Still this challenge, so the server refused the assertion: a verified
+      // one completes the challenge and clears the token.
+      if (useMFAChallengeStore.getState().challengeToken === challengeToken) {
+        setWebauthnSpent(true);
+      }
     },
-    [submitMfaProof]
+    [submitMfaProof, challengeToken]
   );
 
   const handleWebAuthnError = useCallback((errMsg: string) => {
@@ -374,26 +439,17 @@ const MFAChallengeModal: React.FC = () => {
         )}
 
         {mode === 'webauthn' && (
-          <>
-            {webauthnOptions ? (
-              <WebAuthnPrompt
-                requestOptions={webauthnOptions}
-                onSuccess={handleWebAuthnSuccess}
-                onError={handleWebAuthnError}
-                onCancel={() => {
-                  setMode('method-select');
-                  setError('');
-                }}
-              />
-            ) : (
-              <div style={{ textAlign: 'center' }}>
-                <p className="mfa-modal-desc">
-                  WebAuthn verification will be triggered by the server challenge.
-                </p>
-                {error && <p className="totp-error">{error}</p>}
-              </div>
-            )}
-          </>
+          <WebAuthnPanel
+            options={webauthnOptions}
+            spent={webauthnSpent}
+            error={error}
+            onSuccess={handleWebAuthnSuccess}
+            onError={handleWebAuthnError}
+            onCancel={() => {
+              setMode('method-select');
+              setError('');
+            }}
+          />
         )}
 
         {mode === 'email-sms' && (
