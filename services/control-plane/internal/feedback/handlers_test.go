@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -863,4 +864,35 @@ func TestBuildIssue_Screenshots(t *testing.T) {
 
 		assert.NotContains(t, body, "## Screenshots")
 	})
+}
+
+// Regression for #3584. A local combined driver can supply the actual public
+// Compose origin; ordinary package runs keep both independent positive controls.
+func TestSubmit_PublicSelfhostScreenshotOrigin(t *testing.T) {
+	const screenshotPath = "/api/v1/media/feedback-screenshots/550e8400-e29b-41d4-a716-446655440000"
+	cases := []struct{ name, origin, wantURL string }{
+		{"public API origin", "https://api.feedback-host.example.invalid",
+			"https://api.feedback-host.example.invalid" + screenshotPath},
+		{"explicit screenshot origin", "https://screenshots.example.invalid",
+			"https://screenshots.example.invalid" + screenshotPath},
+	}
+	if origin, supplied := os.LookupEnv("CONCORD_TEST_SELFHOST_MEDIA_ORIGIN"); supplied {
+		wantURL := os.Getenv("CONCORD_TEST_SELFHOST_EXPECTED_SCREENSHOT_URL")
+		require.NotEmpty(t, wantURL, "rendered Compose consumer fixture needs an independent expected screenshot URL")
+		cases = append(cases, struct{ name, origin, wantURL string }{"rendered public Compose origin", origin, wantURL})
+	}
+	for _, cell := range cases {
+		t.Run(cell.name, func(t *testing.T) {
+			github := &fakeGitHub{}
+			handler := NewHandler(logger.New("test"), github, testCorrKey, cell.origin)
+			response := doPost(t, newTestEngine(t, handler, "owned-screenshot-reporter"), map[string]interface{}{
+				"type": "bug", "title": "Screenshot report", "description": "Screenshot should reach the issue.",
+				"attachments": []map[string]string{{"url": screenshotPath}},
+			})
+			require.Equal(t, http.StatusOK, response.Code, "screenshot fixture must pass report validation")
+			require.Len(t, github.calls, 1, "enabled feedback must reach the issue creation boundary")
+			assert.Contains(t, github.calls[0].Body, "![screenshot-1]("+cell.wantURL+")",
+				"public self-host feedback must embed the absolute screenshot link using the consumed media origin")
+		})
+	}
 }

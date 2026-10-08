@@ -56,10 +56,10 @@ info:
   version: 1.0.0
   contact:
     name: Concord
-    url: https://github.com/Concord-Voice/Concord-Voice-Alpha
+    url: https://github.com/Concord-Voice/Concord-Voice
   license:
     name: CVSL 1.0
-    url: https://github.com/Concord-Voice/Concord-Voice-Alpha/blob/main/LICENSE
+    url: https://github.com/Concord-Voice/Concord-Voice/blob/main/LICENSE
 servers:
 - url: http://localhost:8080/api/v1
   description: Local development
@@ -6512,8 +6512,15 @@ paths:
         client that bypasses the client-side scrub.
 
 
-        Dev / self-hosted: when FEEDBACK_PAT is empty the handler logs the
-        assembled issue body and returns `{dev: true}` without filing a real issue.
+        Self-hosted instances disable feedback by default with
+        FEEDBACK_REPO=selfhost/disabled and return 503 with
+        `{error: feedback_disabled}` before reading the report. Operators can
+        enable submission by configuring their feedback repository and FEEDBACK_PAT.
+
+
+        Development configurations with an empty repository or FEEDBACK_PAT use
+        the dev stub, which logs the assembled issue body and returns `{dev: true}`
+        without filing a real issue. Production credential validation still applies.
 
 
         Rate limit: 10 requests per hour per user.
@@ -6638,8 +6645,8 @@ paths:
                       the server ran the dev-stub path.
                   dev:
                     type: boolean
-                    description: True when the server logged the issue body instead
-                      of filing it (FEEDBACK_PAT unset).
+                    description: True when a development configuration logged the
+                      issue body instead of filing it (repository or FEEDBACK_PAT unset).
         '400':
           description: Invalid request body (missing required field, oversize, or
             unknown type)
@@ -6651,6 +6658,19 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '502':
           description: GitHub API call failed (only on the non-dev path)
+        '503':
+          description: Feedback is disabled for this self-hosted instance
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                properties:
+                  error:
+                    type: string
+                    enum:
+                    - feedback_disabled
   /redeem:
     post:
       tags:
@@ -8364,6 +8384,8 @@ paths:
 
         Registered without auth so GitHub''s camo image proxy can fetch a screenshot embedded in a filed feedback issue.
 
+        Explicitly disabled feedback returns 503 feedback_disabled with Cache-Control: no-store before storage access.
+
         Rate limit: 120 requests per minute (IP-based).
 
         '
@@ -8404,7 +8426,14 @@ paths:
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
-          description: Media storage not configured
+          description: >-
+            Feedback is disabled (feedback_disabled) or media storage is not configured.
+            Disabled feedback refuses before accessing storage.
+          headers:
+            Cache-Control:
+              description: no-store when feedback is disabled
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -9096,6 +9125,8 @@ paths:
         Returns an unguessable public media path (`/api/v1/media/feedback-screenshots/<uuid>`) the client passes
         to POST /feedback as attachments[].url.
 
+        Explicitly disabled feedback returns 503 feedback_disabled with Cache-Control: no-store before reading the upload body or processing images.
+
         Rate limit: 12 requests per minute.
 
         '
@@ -9136,7 +9167,14 @@ paths:
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
-          description: Media storage not configured
+          description: >-
+            Feedback is disabled (feedback_disabled) or media storage is not configured.
+            Disabled feedback refuses before reading the upload body or writing media.
+          headers:
+            Cache-Control:
+              description: no-store when feedback is disabled
+              schema:
+                type: string
           content:
             application/json:
               schema:

@@ -4,6 +4,7 @@ package api
 import (
 	"crypto/sha256"
 	"io"
+	"strings"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedback"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -11,16 +12,20 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// buildFeedbackHandler constructs the #158 feedback handler. When the
-// feedback PAT / repo are set in cfg, it wires the GitHub REST client; when
-// either is empty (dev / self-hosted) the handler runs the log-only stub
-// (see internal/feedback/handlers.go). Production guard at config.go
-// fatal-exits before we ever reach the stub path in `ENVIRONMENT=production`.
+// buildFeedbackHandler constructs the #158 feedback handler. The reserved
+// self-host disabled repository selects a handler that refuses reports before
+// reading them. Other configurations wire the GitHub REST client when both
+// credentials are set, or retain the development stub when either is empty.
+// Config's production credential guard remains mandatory.
 //
 // Mirrors the `buildPrivacyHandler` / `buildOAuthHandler` / `build*Handler`
 // pattern — extracted so NewRouter's cognitive complexity stays under the
 // SonarCloud threshold.
 func buildFeedbackHandler(cfg *config.Config, log *logger.Logger) *feedback.Handler {
+	if config.IsSelfHostedInstance(cfg.InstanceType) &&
+		strings.EqualFold(strings.TrimSpace(cfg.GitHubFeedback.Repo), "selfhost/disabled") {
+		return feedback.NewDisabledHandler()
+	}
 	var github feedback.GitHubIssueCreator
 	if cfg.GitHubFeedback.Token != "" && cfg.GitHubFeedback.Repo != "" {
 		github = feedback.NewClient(cfg.GitHubFeedback.Token, cfg.GitHubFeedback.Repo)

@@ -311,7 +311,7 @@ obligations — see the [Privacy Policy](./docs/privacy-policy.md).
 **Preferred methods:**
 
 1. **GitHub Security Advisories (Recommended)**
-   - Go to [Security tab](https://github.com/Concord-Voice/Concord-Voice-Alpha/security/advisories)
+   - Go to internal development reference omitted
    - Click "Report a vulnerability"
    - Fill out the form
 
@@ -398,7 +398,7 @@ If we shut down or change direction, you can always self-host.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/Concord-Voice/Concord-Voice-Alpha.git
+git clone https://github.com/Concord-Voice/Concord-Voice.git
 cd Concord-Voice-Alpha
 
 # 2. Install git hooks (prevents committing secrets)
@@ -573,7 +573,7 @@ npm test
 
 ### How do I self-host Concord Voice?
 
-**Status:** The self-hosting installer shipped in #1616 — see `[internal]selfhost-quickstart.md`. A versioned, verified public bundle is tracked at #2506, and air-gapped/offline distribution at #210 (v1.1.0). Narrative deployment guide tracked at #819.
+**Status:** The self-hosting installer shipped in #1616 — see `docs/runbooks/selfhost-quickstart.md`. A versioned, verified public bundle is tracked at #2506, and air-gapped/offline distribution at #210 (v1.1.0). Narrative deployment guide tracked at #819.
 
 **Current workaround** (for developers):
 
@@ -689,11 +689,11 @@ Screen sharing uses WebRTC via the mediasoup SFU. Features include:
 
 ### Can I upload files?
 
-**Status:** Shipped in the v0.2.0-Beta chat-enhancements series (#168 series), with file & image attachments delivered in [#470](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/470).
+**Status:** Shipped in the v0.2.0-Beta chat-enhancements series (#168 series), with file & image attachments delivered in internal development reference omitted.
 
 Supported uploads:
 
-- Image uploads (with two-tier media access via the MinIO object-storage layer, [#325](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/325))
+- Image uploads (with two-tier media access via the MinIO object-storage layer, internal development reference omitted)
 - General file attachments via the chat composer
 - Profile and server image assets (avatars, banners, server icons)
 
@@ -870,8 +870,8 @@ npm run dev
 **Resources:**
 
 - **Documentation:** [docs/](./docs/)
-- **GitHub Discussions:** [Ask questions](https://github.com/Concord-Voice/Concord-Voice-Alpha/discussions)
-- **GitHub Issues:** [Report bugs](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues)
+- **GitHub Discussions:** internal development reference omitted
+- **GitHub Issues:** internal development reference omitted
 - **Security Issues:** security@concordvoice.com
 - **Data Privacy:** privacy@concordvoice.com
 - **General Inquiries:** contact-us@concordvoice.com

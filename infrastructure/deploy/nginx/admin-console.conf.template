@@ -1,0 +1,42 @@
+# Rendered by concord-ctl.sh nginx-reload (envsubst ${ADMIN_DOMAIN} from /opt/concord/.env
+# ADMIN_WEBAUTHN_RP_ID). The codename is an operational secret — NEVER committed; it is
+# injected at deploy time. Installed only when ADMIN_CONSOLE_ENABLED=true.
+
+# Its own format: conf.d loads before sites-enabled, so `timed` from
+# concordvoice.conf is not defined yet when this file is parsed. $log_uri is
+# concordvoice.conf's map variable; nginx resolves variables after parsing.
+log_format admin_timed '$remote_addr - $remote_user [$time_local] '
+                       '"$request_method $log_uri $server_protocol" $status $body_bytes_sent '
+                       '"$http_referer" "$http_user_agent" '
+                       'rt=$request_time urt=$upstream_response_time';
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${ADMIN_DOMAIN};
+
+    access_log /var/log/nginx/access.log admin_timed;
+
+    # Cloudflare Origin Certificate (*.concordvoice.chat) — not in public CT logs.
+    ssl_certificate     /etc/nginx/cloudflare/origin.pem;
+    ssl_certificate_key /etc/nginx/cloudflare/origin.key;
+
+    client_max_body_size 1M;             # WebAuthn assertions are tiny
+
+    # Admin console + ceremony — all under /admin (control_plane 127.0.0.1:8080).
+    # cfaccess.go (L3) enforces the Cf-Access-Jwt-Assertion inside the app.
+    location = /admin {
+        return 308 /admin/;
+    }
+    location /admin/ {
+        proxy_pass http://control_plane;
+        proxy_http_version 1.1;
+        proxy_set_header Host              ${ADMIN_DOMAIN}; # rendered from ADMIN_WEBAUTHN_RP_ID
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Forward the Access assertion to the origin app (L3 verifies it).
+        proxy_set_header Cf-Access-Jwt-Assertion $http_cf_access_jwt_assertion;
+    }
+    location / { return 404; }
+}

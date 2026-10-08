@@ -7,10 +7,10 @@ info:
   version: 1.0.0
   contact:
     name: Concord
-    url: https://github.com/Concord-Voice/Concord-Voice-Alpha
+    url: https://github.com/Concord-Voice/Concord-Voice
   license:
     name: CVSL 1.0
-    url: https://github.com/Concord-Voice/Concord-Voice-Alpha/blob/main/LICENSE
+    url: https://github.com/Concord-Voice/Concord-Voice/blob/main/LICENSE
 servers:
   - url: https://{adminHost}/admin/api/v1
     description: Deployment-provided hosted admin endpoint

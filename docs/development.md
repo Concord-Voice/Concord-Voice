@@ -334,7 +334,7 @@ setup→cleanup window — so a concurrent worktree's cleanup can truncate rows 
 test is still using, **at any migration version**. Matching migration counts does
 not prevent this; it only prevents the separate schema-divergence hazard. Give the
 second worktree its own `DATABASE_URL`, or run the two serially. See the same
-rules file, and [#2790](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2790)
+rules file, and internal development reference omitted
 for the fix.
 
 ### Media Plane

@@ -35,7 +35,7 @@ func TestAttachmentBackends_CredentialGate(t *testing.T) {
 			cfg := &Config{CloudflareR2: CloudflareR2Config{
 				Endpoint:        "https://accountid.r2.cloudflarestorage.com",
 				Region:          "auto",
-				Bucket:          "concord-voice-r2-us-east",
+				Bucket:          "synthetic-attachment-bucket",
 				AccessKeyID:     tc.key,
 				SecretAccessKey: tc.secret,
 			}}
@@ -47,7 +47,7 @@ func TestAttachmentBackends_CredentialGate(t *testing.T) {
 			}
 			require.Len(t, got, 1)
 			assert.Equal(t, AttachmentBackendR2USEast, got[0].ID)
-			assert.Equal(t, "concord-voice-r2-us-east", got[0].Bucket)
+			assert.Equal(t, "synthetic-attachment-bucket", got[0].Bucket)
 			assert.Equal(t, "auto", got[0].Region)
 		})
 	}
@@ -75,7 +75,7 @@ func TestObjectBackendString_RedactsBothCredentials(t *testing.T) {
 		ID:              AttachmentBackendR2USEast,
 		Endpoint:        "https://accountid.r2.cloudflarestorage.com",
 		Region:          "auto",
-		Bucket:          "concord-voice-r2-us-east",
+		Bucket:          "synthetic-attachment-bucket",
 		AccessKeyID:     "AKIAEXAMPLEKEYID",
 		SecretAccessKey: "super-secret-value",
 	}
@@ -88,7 +88,7 @@ func TestObjectBackendString_RedactsBothCredentials(t *testing.T) {
 
 	// The non-secret destination fields SHOULD survive — a redaction that hides
 	// the endpoint too would make a misconfiguration undiagnosable.
-	assert.Contains(t, rendered, "concord-voice-r2-us-east")
+	assert.Contains(t, rendered, "synthetic-attachment-bucket")
 	assert.Contains(t, rendered, "accountid.r2.cloudflarestorage.com")
 
 	// Length markers are present and correct, so an operator can tell "unset"

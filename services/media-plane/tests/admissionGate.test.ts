@@ -188,7 +188,7 @@ describe('compileTrustedProxies', () => {
   // spoofable and the handshake ceiling is trivially evaded — the gate would be
   // authenticating the attacker's own claim about where they came from. The
   // control-plane rejects 0.0.0.0/0 and ::/0 explicitly
-  // ([internal]install-selfhost.sh); this guards on the prefix
+  // (infrastructure/deploy/install-selfhost.sh); this guards on the prefix
   // length so every all-traffic spelling is covered, not just those literals.
   it('rejects an all-traffic /0 rule in any spelling', () => {
     const warn = vi.fn();

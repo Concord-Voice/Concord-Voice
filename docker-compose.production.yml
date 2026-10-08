@@ -1,0 +1,235 @@
+# Public self-host production settings. Layer with docker-compose.yml and
+# docker-compose.selfhost.yml using Compose >= 2.24.5 and --profile services.
+# The final self-host layer owns the reviewed published-port posture.
+# Host nginx, certificates and root security-log preparation are prerequisites.
+# This overlay contains no managed release, SPA or credential-directory mounts.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *hardening
+    image: concordvoice-postgres:16-alpine
+    build:
+      context: ./infrastructure/docker/postgres
+      dockerfile: Dockerfile
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '1.5'
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=3
+        -c shared_buffers=512MB
+        -c effective_cache_size=1536MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=128MB
+        -c log_min_duration_statement=1000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U concord -d concord"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init:/docker-entrypoint-initdb.d
+
+  redis:
+    <<: *hardening
+    read_only: true
+    tmpfs: [/tmp:size=32M]
+    cap_add: [SETGID, SETUID, DAC_OVERRIDE]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1'
+    command: >
+      redis-server
+        --appendonly yes
+        --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+        --save 900 1
+        --save 300 10
+        --save 60 10000
+        --maxmemory 384mb
+        --maxmemory-policy allkeys-lru
+
+  nats:
+    <<: *hardening
+    read_only: true
+    tmpfs: [/tmp:size=64M]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1'
+
+  coturn:
+    <<: *hardening
+    cap_add: [NET_BIND_SERVICE]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1'
+    # Certificate mount is inherited from the base model's COTURN_CERTS_DIR.
+    # Advertise the host's NAT address, while Coturn chooses a container-local
+    # relay socket address on the bridge network.
+    command:
+      - turnserver
+      - -c
+      - /etc/coturn/turnserver.conf
+      - "--static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set}"
+      - "--realm=${TURN_REALM:-${DOMAIN:?DOMAIN must be set}}"
+      - --listening-ip=0.0.0.0
+      - "--external-ip=${PUBLIC_IP:?PUBLIC_IP must be set}"
+      - --cert=/etc/coturn/certs/cert.pem
+      - --pkey=/etc/coturn/certs/key.pem
+
+  minio:
+    <<: *hardening
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: '1'
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}"
+      MINIO_BROWSER: "off"
+
+  ops-agent:
+    # Managed metrics collector is outside the basic public runtime. Its host
+    # socket and filesystem mounts must not enter the selected services model.
+    profiles: !override [selfhost-managed-ops-inactive]
+    restart: "on-failure:5"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  control-plane:
+    <<: *hardening
+    build:
+      context: ./services/control-plane
+      dockerfile: Dockerfile
+      additional_contexts:
+        admin_ui: ./client/admin
+    # The Dockerfile requires this context even when the runtime console is off.
+    env_file: !reset []
+    read_only: true
+    group_add: ["10001"]
+    tmpfs: [/tmp:size=64M]
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.5'
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    volumes: !override
+      - type: bind
+        source: /var/log/concord-security/control-plane
+        target: /var/log/concord-security/control-plane
+        read_only: false
+        bind:
+          create_host_path: false
+    environment:
+      ENVIRONMENT: production
+      INSTANCE_TYPE: "${INSTANCE_TYPE:-self-hosted}"
+      SERVER_VERSION: "${SERVER_VERSION:-dev}"
+      CLIENT_MIN_VERSION: "${CLIENT_MIN_VERSION:-}"
+      DATABASE_URL: "postgres://concord:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/concord?sslmode=disable"
+      REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379"
+      MEDIA_PLANE_URL: "https://media.${DOMAIN:?DOMAIN must be set}"
+      TURN_SERVER_HOST: "${TURN_SERVER_HOST:-turn.${DOMAIN:?DOMAIN must be set}}"
+      TURN_SECRET: "${TURN_SECRET:?TURN_SECRET must be set}"
+      TURN_REALM: "${TURN_REALM:-${DOMAIN:?DOMAIN must be set}}"
+      ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,spa-cache://concord,https://spa.${DOMAIN}"
+      MFA_ENCRYPTION_KEY: "${MFA_ENCRYPTION_KEY:?MFA_ENCRYPTION_KEY must be set}"
+      MFA_ENCRYPTION_KEY_VERSION: "${MFA_ENCRYPTION_KEY_VERSION:-1}"
+      MFA_ENCRYPTION_KEYS_RETIRED: "${MFA_ENCRYPTION_KEYS_RETIRED:-}"
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:?TRUSTED_PROXY_CIDRS must name the host nginx ingress CIDR}"
+      HSTS_HEADER_VALUE: "${HSTS_HEADER_VALUE:-}"
+      SMTP_HOST: "${SMTP_HOST:?SMTP_HOST must be set}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM: "${SMTP_FROM:?SMTP_FROM must be set}"
+      WEBAUTHN_RP_ID: "${WEBAUTHN_RP_ID:-${DOMAIN:?DOMAIN must be set}}"
+      WEBAUTHN_RP_ORIGINS: "${WEBAUTHN_RP_ORIGINS:-https://${DOMAIN},https://api.${DOMAIN},app://concord,spa-cache://concord,https://spa.${DOMAIN}}"
+      STORAGE_BACKEND: minio
+      STORAGE_ENDPOINT: minio:9000
+      STORAGE_ACCESS_KEY: "${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}"
+      STORAGE_SECRET_KEY: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}"
+      STORAGE_USE_SSL: "false"
+      STORAGE_BUCKET: "${STORAGE_BUCKET:-${MINIO_BUCKET:-concord-media}}"
+      ATTACHMENT_WRITE_BACKEND: "${ATTACHMENT_WRITE_BACKEND:-legacy}"
+      FEEDBACK_PAT: "${FEEDBACK_PAT:?FEEDBACK_PAT must be set}"
+      FEEDBACK_REPO: "${FEEDBACK_REPO:?FEEDBACK_REPO must be set}"
+      PUBLIC_MEDIA_BASE_URL: "${PUBLIC_MEDIA_BASE_URL:-https://api.${DOMAIN}}"
+      ADMIN_CONSOLE_ENABLED: "${ADMIN_CONSOLE_ENABLED:-false}"
+      ADMIN_WEBAUTHN_RP_ID: "${ADMIN_WEBAUTHN_RP_ID:-}"
+      ADMIN_WEBAUTHN_RP_ORIGINS: "${ADMIN_WEBAUTHN_RP_ORIGINS:-}"
+      ADMIN_WEBAUTHN_ALLOWED_AAGUIDS: "${ADMIN_WEBAUTHN_ALLOWED_AAGUIDS:-}"
+      CF_ACCESS_AUD: "${CF_ACCESS_AUD:-}"
+      CF_ACCESS_TEAM_DOMAIN: "${CF_ACCESS_TEAM_DOMAIN:-}"
+
+  media-plane:
+    <<: *hardening
+    read_only: true
+    group_add: ["10001"]
+    tmpfs: [/tmp:size=128M]
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '3'
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    environment:
+      ENVIRONMENT: production
+      ANNOUNCED_IP: "${PUBLIC_IP:?PUBLIC_IP must be set}"
+      ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,spa-cache://concord,https://spa.${DOMAIN}"
+      RTC_MIN_PORT: "40000"
+      RTC_MAX_PORT: "41999"
+      NUM_WORKERS: "3"
+      MEDIASOUP_ENABLE_TCP: "false"
+      TRUSTED_PROXIES: "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+    ports:
+      - "40000-41999:40000-41999/udp"
+    volumes:
+      - type: bind
+        source: /var/log/concord-security/media-plane
+        target: /var/log/concord-security/media-plane
+        read_only: false
+        bind:
+          create_host_path: false

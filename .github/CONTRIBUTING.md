@@ -23,7 +23,7 @@ This project adheres to the [Contributor Covenant](CODE_OF_CONDUCT.md) Code of C
 2. **Clone your fork** locally
 3. **Add upstream remote**:
    ```bash
-   git remote add upstream https://github.com/Concord-Voice/Concord-Voice-Alpha.git
+   git remote add upstream https://github.com/Concord-Voice/Concord-Voice.git
    ```
 4. **Create a feature branch** from `main`:
    ```bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Concord Voice — Unified Dev Lifecycle CLI
 #
-# Mirrors [internal]concord-ctl.sh verb grammar where possible.
+# Mirrors infrastructure/deploy/concord-ctl.sh verb grammar where possible.
 # This file is laptop-only — NEVER copied to /opt/concord on production servers.
 #
 # Usage: ./scripts/concord-dev.sh <verb> [options]

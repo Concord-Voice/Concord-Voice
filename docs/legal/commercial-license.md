@@ -82,9 +82,9 @@ compliance requirements without trusting a third party with your data.
 Concord Voice makes **no** federal-compliance claim. There is no DISA STIG
 hardening, no FIPS 140-3 validated cryptographic module, and no FedRAMP
 authorization. The epic that scoped this work
-([#692](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/692), with
-children [#700](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/700)
-and [#701](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/701)) was
+(internal development reference omitted, with
+children internal development reference omitted
+and internal development reference omitted) was
 closed as **not planned** on 2026-05-14 without being built. The recorded reason:
 *"Federal/DoD compliance scope removed from current planning — no active customer
 driver … Reopen if a federal customer commit materializes."*

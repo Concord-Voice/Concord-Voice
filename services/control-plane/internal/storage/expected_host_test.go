@@ -90,7 +90,7 @@ func TestGenuineVendorEndpointsAreAccepted(t *testing.T) {
 	// function that refuses everything -- which fails closed, and also fails.
 	suffix := productionSuffix(t)
 	cases := []struct{ name, endpoint string }{
-		{"the pinned production destination", "https://e489155a831a9f9f30c8c581e7f4b207.r2.cloudflarestorage.com"},
+		{"synthetic vendor destination", "https://synthetic-account.r2.cloudflarestorage.com"},
 		{"explicit port", "https://abc123.r2.cloudflarestorage.com:443"},
 		{"mixed case (DNS is case-insensitive)", "https://ABC123.R2.CloudflareStorage.COM"},
 		{"fully-qualified trailing dot", "https://abc123.r2.cloudflarestorage.com."},
@@ -139,7 +139,7 @@ func TestNewVendorClient_RefusesEndpointOutsideTheDeclaredVendor(t *testing.T) {
 		Endpoint:           "https://evil.example.com#.r2.cloudflarestorage.com",
 		ExpectedHostSuffix: productionSuffix(t),
 		Region:             "auto",
-		Bucket:             "concord-voice-r2-us-east",
+		Bucket:             "synthetic-attachment-bucket",
 		AccessKeyID:        "k",
 		SecretAccessKey:    "s",
 	}, nil)
@@ -161,10 +161,10 @@ func TestNewVendorClient_AcceptsAGenuineVendorEndpoint(t *testing.T) {
 	// now registers UNAVAILABLE instead of dialling.
 	c, err := newVendorClient(config.ObjectBackend{
 		ID:                 config.AttachmentBackendR2USEast,
-		Endpoint:           "https://e489155a831a9f9f30c8c581e7f4b207.r2.cloudflarestorage.com",
+		Endpoint:           "https://synthetic-account.r2.cloudflarestorage.com",
 		ExpectedHostSuffix: productionSuffix(t),
 		Region:             "auto",
-		Bucket:             "concord-voice-r2-us-east",
+		Bucket:             "synthetic-attachment-bucket",
 		AccessKeyID:        "k",
 		SecretAccessKey:    "s",
 	}, nil)

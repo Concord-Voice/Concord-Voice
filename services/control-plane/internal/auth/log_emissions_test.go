@@ -20,7 +20,7 @@ package auth_test
 // same shape (discipline rule + AST-walking test that locks the rule).
 //
 // Spec: [internal]specs/2026-05-27-1161-strip-token-fingerprints-design.md
-// Issue: https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1161
+// Issue: internal development reference omitted
 
 import (
 	"bytes"

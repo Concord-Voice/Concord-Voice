@@ -1,0 +1,40 @@
+# Self-host published-port posture (#3538).
+# Added ONLY by infrastructure/deploy/concord-ctl.sh in the self-host contract mode
+# (and by concord-selfhost). Managed hosts receive this file through deploy-manifest
+# and never reference it; their port security stays the DOCKER-USER rules from
+# provision-production.sh.
+#
+# Postgres, Redis and NATS get NO host socket. Control-plane and media-plane are
+# published on 127.0.0.1 only (host nginx and the health probes use loopback). That
+# DNAT still matches on every interface; what keeps the LAN out is Docker's raw-table
+# DROP for non-loopback 127.0.0.1 traffic, hence the Engine >= 28.3.3 floor. TURN and
+# mediasoup RTP stay public. Docker-published ports are NOT filtered by UFW on IPv4.
+#
+# Needs Compose >= 2.24.5: older Compose silently IGNORES !override and MERGES the
+# lists, rendering 0.0.0.0:8080 next to 127.0.0.1:8080. The posture gate in
+# concord-ctl.sh refuses that render; see [internal]selfhost-port-posture.py.
+services:
+  postgres:
+    ports: !reset []
+  redis:
+    ports: !reset []
+  nats:
+    ports: !reset []
+  pgadmin:
+    ports: !reset []
+  redis-commander:
+    ports: !reset []
+  control-plane:
+    ports: !override
+      - "127.0.0.1:8080:8080"
+  media-plane:
+    # Match the supported two-CPU self-host floor; workers and quota move together.
+    environment:
+      NUM_WORKERS: "2"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+    ports: !override
+      - "127.0.0.1:3000:3000"
+      - "40000-41999:40000-41999/udp"

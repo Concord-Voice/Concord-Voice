@@ -148,7 +148,7 @@ func TestRegistry_UnconstructableBackendDoesNotAbortBoot(t *testing.T) {
 func TestRegistry_CredentiallessBackendIsNotRegistered(t *testing.T) {
 	cfg := &config.Config{CloudflareR2: config.CloudflareR2Config{
 		Endpoint: "https://accountid.r2.cloudflarestorage.com",
-		Bucket:   "concord-voice-r2-us-east",
+		Bucket:   "synthetic-attachment-bucket",
 	}}
 
 	registry := NewRegistry(cfg, &Client{}, testRegistryLogger())

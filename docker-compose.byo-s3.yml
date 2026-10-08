@@ -1,0 +1,20 @@
+services:
+  minio:
+    profiles:
+      - selfhost-bundled-minio-inactive
+  control-plane:
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    environment:
+      STORAGE_BACKEND: "${STORAGE_BACKEND:?STORAGE_BACKEND must be set for BYO storage}"
+      STORAGE_ENDPOINT: "${STORAGE_ENDPOINT:?STORAGE_ENDPOINT must be set for BYO storage}"
+      STORAGE_REGION: "${STORAGE_REGION:-}"
+      STORAGE_ACCESS_KEY: "${STORAGE_ACCESS_KEY:?STORAGE_ACCESS_KEY must be set for BYO storage}"
+      STORAGE_SECRET_KEY: "${STORAGE_SECRET_KEY:?STORAGE_SECRET_KEY must be set for BYO storage}"
+      STORAGE_USE_SSL: "${STORAGE_USE_SSL:?STORAGE_USE_SSL must be set for BYO storage}"
+      STORAGE_BUCKET: "${STORAGE_BUCKET:?STORAGE_BUCKET must be set for BYO storage}"

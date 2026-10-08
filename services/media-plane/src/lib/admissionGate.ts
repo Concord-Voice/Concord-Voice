@@ -85,7 +85,7 @@ function addTrustedEntry(list: BlockList, entry: string): boolean {
     // makes X-Real-IP universally spoofable and the handshake ceiling trivially
     // evadable — the gate would authenticate the attacker's own claim about
     // where they came from. Mirrors the control-plane's explicit 0.0.0.0/0 and
-    // ::/0 rejection in [internal]install-selfhost.sh, but guards on
+    // ::/0 rejection in infrastructure/deploy/install-selfhost.sh, but guards on
     // the prefix length so every spelling is covered, not just those two
     // literals. Skipping (not throwing) keeps startup alive; a list that was
     // ONLY /0 entries compiles to size 0 and degrades to the inert gate.

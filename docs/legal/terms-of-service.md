@@ -507,7 +507,7 @@ Concord Voice at concordvoice.chat and associated domains.
 The Concord Voice **source code** is separately licensed under the
 **Concord Voice Source License 1.0** ("CVSL"), the full text of which
 is available at
-[https://github.com/Concord-Voice/Concord-Voice-Alpha/blob/main/LICENSE](https://github.com/Concord-Voice/Concord-Voice-Alpha/blob/main/LICENSE)
+[https://github.com/Concord-Voice/Concord-Voice/blob/main/LICENSE](https://github.com/Concord-Voice/Concord-Voice/blob/main/LICENSE)
 and reproduced in the Concord Voice repository. The CVSL governs your
 right to download, modify, self-host, and distribute the Concord Voice
 software. These Terms of Service do not modify, supersede, or replace

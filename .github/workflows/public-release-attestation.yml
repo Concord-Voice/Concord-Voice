@@ -4,30 +4,176 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Desktop release tag to attest, e.g. desktop-v0.2.3.'
+        description: 'Exact desktop-v or selfhost-v release tag to attest.'
         required: true
         type: string
       expected_asset_sha256_b64:
         description: 'Base64-encoded SHA-256 manifest generated from the Alpha source release assets.'
         required: true
         type: string
+      expected_public_sha:
+        description: 'Required exact staged public commit for self-host attestations.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 jobs:
-  attest-release:
-    name: Attest public release assets
-    runs-on: ubuntu-latest
+  download-selfhost-release:
+    # Draft release downloads require push access. Keep that App capability in this
+    # job; it never checks out a tree or executes downloaded release assets.
+    name: Download verified self-host draft assets
+    runs-on: blacksmith-2vcpu-ubuntu-2404 # ADR-0016 public attester exception; ADR-0013 network-bound class; ADR-0005 minimum 2 vCPU
+    environment: selfhost-release-attestation
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload_selfhost_assets.outputs.artifact-id }}
+    if: >-
+      github.repository == 'Concord-Voice/Concord-Voice' &&
+      github.event_name == 'workflow_dispatch' &&
+      (github.actor == 'concord-public-mirror-publisher[bot]' ||
+       github.actor == 'concord-voice-public-mirror-publisher[bot]') &&
+      startsWith(github.ref, 'refs/tags/selfhost-v') &&
+      startsWith(inputs.release_tag, 'selfhost-v') &&
+      github.ref == format('refs/tags/{0}', inputs.release_tag) &&
+      inputs.expected_public_sha == github.sha
     steps:
+      - name: Validate exact self-host dispatch before App token
+        id: validate_selfhost_dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_PUBLIC_SHA: ${{ inputs.expected_public_sha }}
+        run: |
+          set -euo pipefail
+          [ "${GITHUB_REPOSITORY:-}" = 'Concord-Voice/Concord-Voice' ] || { echo '::error::invalid self-host attestation repository'; exit 1; }
+          [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] || { echo '::error::invalid self-host attestation event'; exit 1; }
+          case "${GITHUB_ACTOR:-}" in
+            'concord-public-mirror-publisher[bot]'|'concord-voice-public-mirror-publisher[bot]') ;;
+            *) echo '::error::self-host attestations require the public mirror publisher App'; exit 1 ;;
+          esac
+          [[ "$RELEASE_TAG" =~ ^selfhost-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo '::error::invalid self-host version'; exit 1; }
+          [ "${GITHUB_REF:-}" = "refs/tags/$RELEASE_TAG" ] || { echo '::error::self-host attestation tag ref mismatch'; exit 1; }
+          [[ "$EXPECTED_PUBLIC_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::invalid self-host public identity'; exit 1; }
+          [ "${GITHUB_SHA:-}" = "$EXPECTED_PUBLIC_SHA" ] || { echo '::error::self-host attestation workflow identity mismatch'; exit 1; }
+          if ! tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)"; then
+            echo '::error::self-host release tag identity lookup failed'
+            exit 1
+          fi
+          [ "$tag_commit" = "$EXPECTED_PUBLIC_SHA" ] || { echo '::error::self-host release tag identity mismatch'; exit 1; }
+          printf 'validated=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Mint Publisher App token for draft download only
+        id: selfhost-download-token
+        if: steps.validate_selfhost_dispatch.outputs.validated == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PUBLIC_MIRROR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUBLIC_MIRROR_APP_PRIVATE_KEY }}
+          owner: Concord-Voice
+          repositories: Concord-Voice
+          permission-contents: write
+
+      - name: Download and validate exact self-host draft assets
+        id: validate_selfhost_assets
+        if: steps.validate_selfhost_dispatch.outputs.validated == 'true'
+        env:
+          GH_TOKEN: ${{ steps.selfhost-download-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_ASSET_SHA256_B64: ${{ inputs.expected_asset_sha256_b64 }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#selfhost-v}"
+          rm -rf release-assets
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          shopt -s nullglob dotglob
+          files=(release-assets/*)
+          expected_names=("concord-selfhost-$version.tar.gz" selfhost-manifest.json SHA256SUMS)
+          [ "${#files[@]}" -eq 3 ] || { echo '::error::self-host release must contain exactly three assets'; exit 1; }
+          for asset in "${files[@]}"; do
+            [ -f "$asset" ] && [ ! -L "$asset" ] || { echo '::error::self-host release asset must be a regular file'; exit 1; }
+            found=0
+            for expected in "${expected_names[@]}"; do
+              if [ "${asset##*/}" = "$expected" ]; then found=1; break; fi
+            done
+            [ "$found" -eq 1 ] || { echo '::error::unexpected self-host release asset name'; exit 1; }
+          done
+          if ! printf '%s' "$EXPECTED_ASSET_SHA256_B64" | base64 --decode > expected-sha256.txt; then
+            echo '::error::expected_asset_sha256_b64 is not valid base64'
+            exit 1
+          fi
+          : > actual-sha256.txt
+          for asset in "${files[@]}"; do
+            digest="$(sha256sum "$asset" | awk '{print $1}')"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::invalid self-host release asset digest'; exit 1; }
+            printf '%s  %s\n' "$digest" "${asset##*/}" >> actual-sha256.txt
+          done
+          LC_ALL=C sort expected-sha256.txt > expected-sha256.sorted
+          LC_ALL=C sort actual-sha256.txt > actual-sha256.sorted
+          if ! cmp -s expected-sha256.sorted actual-sha256.sorted; then
+            echo '::error::public release asset digest mismatch versus Alpha source manifest'
+            exit 1
+          fi
+
+      - name: Hand validated assets to isolated signer
+        id: upload_selfhost_assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: selfhost-release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  attest-release:
+    # This job has only its GITHUB_TOKEN and rechecks the same-run asset digests.
+    name: Attest public release assets
+    runs-on: blacksmith-2vcpu-ubuntu-2404 # ADR-0016 public attester exception; ADR-0013 network-bound class; ADR-0005 minimum 2 vCPU
+    needs: [download-selfhost-release]
+    if: >-
+      always() && !cancelled() &&
+      github.repository == 'Concord-Voice/Concord-Voice' &&
+      github.event_name == 'workflow_dispatch' &&
+      ((startsWith(inputs.release_tag, 'desktop-v') &&
+        needs.download-selfhost-release.result == 'skipped') ||
+       (startsWith(inputs.release_tag, 'selfhost-v') &&
+        needs.download-selfhost-release.result == 'success' &&
+        needs.download-selfhost-release.outputs.artifact_id != ''))
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Validate immutable self-host artifact identity
+        id: validate_selfhost_artifact_id
+        if: startsWith(inputs.release_tag, 'selfhost-v')
+        env:
+          SELFHOST_ARTIFACT_ID: ${{ needs.download-selfhost-release.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          [[ "$SELFHOST_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo '::error::invalid self-host release artifact identity'; exit 1; }
+          printf 'validated=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Download same-run validated self-host assets
+        if: steps.validate_selfhost_artifact_id.outputs.validated == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          # The successful downloader's immutable ID also survives a signer-only retry.
+          artifact-ids: ${{ needs.download-selfhost-release.outputs.artifact_id }}
+          merge-multiple: true
+          path: release-assets
+
       - name: Download and validate public release assets
         id: validate_release_assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           EXPECTED_ASSET_SHA256_B64: ${{ inputs.expected_asset_sha256_b64 }}
+          EXPECTED_PUBLIC_SHA: ${{ inputs.expected_public_sha }}
         run: |
           set -euo pipefail
           allowed_dispatch_actor=0
@@ -47,22 +193,48 @@ jobs:
           fi
 
           case "$RELEASE_TAG" in
-            desktop-v*) ;;
-            *) echo "::error::release_tag must start with desktop-v"; exit 1 ;;
+            desktop-v*)
+              family=desktop
+              version="${RELEASE_TAG#desktop-v}"
+              floor="${PMIRROR_VERSION_FLOOR:-0.2.0}"
+              if [ "$(printf '%s\n%s\n' "${version%%[-+]*}" "$floor" | sort -V | head -n1)" != "$floor" ]; then
+                printf 'should_attest=false\n' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            selfhost-v*)
+              [ "${GITHUB_REPOSITORY:-}" = 'Concord-Voice/Concord-Voice' ] || { echo '::error::invalid self-host attestation repository'; exit 1; }
+              [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] || { echo '::error::invalid self-host attestation event'; exit 1; }
+              case "${GITHUB_ACTOR:-}" in
+                'concord-public-mirror-publisher[bot]'|'concord-voice-public-mirror-publisher[bot]') ;;
+                *) echo '::error::self-host attestations require the public mirror publisher App'; exit 1 ;;
+              esac
+              family=selfhost
+              version="${RELEASE_TAG#selfhost-v}"
+              [[ "$RELEASE_TAG" =~ ^selfhost-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo '::error::invalid self-host version'; exit 1; }
+              [ "${GITHUB_REF:-}" = "refs/tags/$RELEASE_TAG" ] || { echo '::error::self-host attestation tag ref mismatch'; exit 1; }
+              [[ "$EXPECTED_PUBLIC_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::invalid self-host public identity'; exit 1; }
+              [ "$GITHUB_SHA" = "$EXPECTED_PUBLIC_SHA" ] || { echo '::error::self-host attestation workflow identity mismatch'; exit 1; }
+              if ! tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)"; then
+                echo '::error::self-host release tag identity lookup failed'
+                exit 1
+              fi
+              [ "$tag_commit" = "$EXPECTED_PUBLIC_SHA" ] || { echo '::error::self-host release tag identity mismatch'; exit 1; }
+              ;;
+            *) echo "::error::unsupported release tag family"; exit 1 ;;
           esac
-          version="${RELEASE_TAG#desktop-v}"
-          floor="${PMIRROR_VERSION_FLOOR:-0.2.0}"
-          if [ "$(printf '%s\n%s\n' "${version%%[-+]*}" "$floor" | sort -V | head -n1)" != "$floor" ]; then
-            printf 'should_attest=false\n' >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ "$family" = desktop ]; then
+            rm -rf release-assets
+            mkdir -p release-assets
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
           fi
-          printf 'should_attest=true\n' >> "$GITHUB_OUTPUT"
-          rm -rf release-assets
-          mkdir -p release-assets
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
 
           expected_release_asset_names() {
             local version="$1" arch
+            if [ "$family" = selfhost ]; then
+              printf 'concord-selfhost-%s.tar.gz\nselfhost-manifest.json\nSHA256SUMS\n' "$version"
+              return
+            fi
             for arch in arm64 x64; do
               printf 'ConcordVoice-%s-macos-%s.dmg\n' "$version" "$arch"
               printf 'ConcordVoice-%s-macos-%s.zip\n' "$version" "$arch"
@@ -78,7 +250,7 @@ jobs:
             printf 'latest.yml\nlatest-mac.yml\nlatest-linux.yml\n'
           }
 
-          shopt -s nullglob
+          shopt -s nullglob dotglob
           files=(release-assets/*)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::release $RELEASE_TAG has no assets to attest"
@@ -103,6 +275,7 @@ jobs:
           done < <(expected_release_asset_names "$version")
 
           for asset in "${files[@]}"; do
+            [ -f "$asset" ] && [ ! -L "$asset" ] || { echo '::error::release asset must be a regular file'; exit 1; }
             found=0
             for expected in "${expected_names[@]}"; do
               if [ "${asset##*/}" = "$expected" ]; then
@@ -145,14 +318,17 @@ jobs:
           fi
           : > actual-sha256.txt
           for asset in "${files[@]}"; do
-            printf '%s  %s\n' "$(sha256_file "$asset")" "${asset##*/}" >> actual-sha256.txt
+            digest="$(sha256_file "$asset")"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::invalid release asset digest'; exit 1; }
+            printf '%s  %s\n' "$digest" "${asset##*/}" >> actual-sha256.txt
           done
           LC_ALL=C sort expected-sha256.txt > expected-sha256.sorted
           LC_ALL=C sort actual-sha256.txt > actual-sha256.sorted
-          if ! diff -u expected-sha256.sorted actual-sha256.sorted; then
+          if ! cmp -s expected-sha256.sorted actual-sha256.sorted; then
             echo "::error::public release asset digest mismatch versus Alpha source manifest"
             exit 1
           fi
+          printf 'should_attest=true\n' >> "$GITHUB_OUTPUT"
 
       - name: Attest release assets
         if: steps.validate_release_assets.outputs.should_attest == 'true'

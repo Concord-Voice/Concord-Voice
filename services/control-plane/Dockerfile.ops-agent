@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ops-age
 
 FROM scratch
 
-LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice-Alpha"
+LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice"
 LABEL org.opencontainers.image.description="Concord Voice isolated operations metrics agent"
 LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
 

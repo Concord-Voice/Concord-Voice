@@ -118,11 +118,13 @@ type GitHubIssueCreator interface {
 
 // Handler owns the POST /api/v1/feedback endpoint.
 //
-// Dev stub: when `github == nil` the handler logs the assembled issue body
-// and returns `{dev: true}` without making any network call. This is the
-// stub-in-dev / hard-fail-in-prod posture — config.go's production guard
-// fatal-exits before we ever construct a nil-github Handler in production.
+// Explicitly disabled self-host feedback refuses before reading report bodies.
+// Dev stub: an ordinary handler with `github == nil` logs submission metadata
+// and returns `{dev: true}` without making any network call. Config's production
+// guard rejects empty feedback credentials before constructing the ordinary stub.
 type Handler struct {
+	disabled bool
+
 	log     *logger.Logger
 	github  GitHubIssueCreator
 	corrKey []byte // HKDF-derived correlation key (see buildFeedbackHandler)
@@ -141,6 +143,24 @@ func NewHandler(log *logger.Logger, github GitHubIssueCreator, corrKey []byte, m
 	return &Handler{log: log, github: github, corrKey: corrKey, mediaBaseURL: mediaBaseURL}
 }
 
+// NewDisabledHandler builds the explicitly disabled self-host feedback handler.
+// It needs no client, correlation key or logger.
+func NewDisabledHandler() *Handler {
+	return &Handler{disabled: true}
+}
+
+// RequireEnabled refuses screenshot upload and proxy requests when the same
+// handler that owns report submission is explicitly disabled. Upload
+// authentication and existing route rate limits remain upstream.
+func (h *Handler) RequireEnabled(c *gin.Context) {
+	if h.disabled {
+		c.Header("Cache-Control", "no-store")
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "feedback_disabled"})
+		return
+	}
+	c.Next()
+}
+
 // Submit handles POST /api/v1/feedback. Requires the AuthRequired
 // middleware upstream so `user_id` is on the Gin context. Rate limit is
 // enforced upstream via middleware.RateLimitByUser(redis, 10, 1*time.Hour) —
@@ -150,6 +170,10 @@ func (h *Handler) Submit(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	if h.disabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "feedback_disabled"})
 		return
 	}
 

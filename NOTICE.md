@@ -115,7 +115,7 @@ checksum, the dependency patch and checksum, `go.mod` and `go.sum` checksums,
 source provenance, the runtime-manifest digest, Concord's Dockerfile, and the
 reproducible build recipe. The upstream tag and commit remain unchanged; the
 derivative commit records only the bounded manifest patch. See the
-[MinIO refresh runbook]([internal]refresh-minio-image.md) for verified
+[MinIO refresh runbook](docs/runbooks/refresh-minio-image.md) for verified
 release identities. The public build materials are maintained at
 [Concord-Voice/Concord-Voice `infrastructure/docker/minio`](https://github.com/Concord-Voice/Concord-Voice/tree/main/infrastructure/docker/minio).
 The runtime image preserves upstream `LICENSE`, `NOTICE`, and `CREDITS`

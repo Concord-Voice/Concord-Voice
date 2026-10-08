@@ -8,7 +8,7 @@
 
 > ### Consumer history
 >
-> [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226)
+> internal development reference omitted
 > first pinned the shared `docker-compose.yml` consumer on **2026-07-14** to the
 > upstream-only release. The current consumer pin uses the published derivative
 > recorded in the "Current Fixed Release" table below.
@@ -149,13 +149,13 @@ object PUT (200), HEAD (200), GET
 SHA-256 of the uploaded and downloaded bytes. This exercises standard S3
 operations only; it does not validate admin APIs. See the official
 [`CURLOPT_AWS_SIGV4` documentation](https://curl.se/libcurl/c/CURLOPT_AWS_SIGV4.html).
-The successful [publisher run](https://github.com/Concord-Voice/Concord-Voice-Alpha/actions/runs/36305893881)
+The successful internal development reference omitted
 verified native amd64 S3 operations and runtime metadata, plus native arm64
 startup, readiness, shutdown, and metadata. The publisher arm64 job did not run
 full S3 checks; separate local native arm64 validation passed the full S3
 lifecycle and object-hash checks. After publication, both public artifacts were
 independently pulled from empty authentication stores by digest and verified;
-see [the tracker evidence](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1975#issuecomment-5854238424).
+see internal development reference omitted.
 The artifact checks do not establish production CVE coverage.
 
 The derivative source inputs are recorded in
@@ -315,7 +315,7 @@ are what make a statement lapse when the image or the dependency changes.
 ## 4. Shared Consumer and Future Servers
 
 **Done.** The shared `docker-compose.yml` consumer was first added after public digest
-proofs passed, by [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226)
+proofs passed, by internal development reference omitted
 on 2026-07-14. It now carries the current derivative's exact Concord
 `tag@sha256:digest`, retains `pull_policy: missing`, and has no Docker Hub fallback.
 Verify with `grep -n 'image:.*minio' docker-compose.yml`.
@@ -417,10 +417,10 @@ stop. Do not improvise destructive recovery.
 | Runtime digest | `sha256:a1d35733ca68335cc4782e7a81eafa577d841c70ebf9e51fc07f54978fcfc494` |
 | Source digest | `sha256:66977d4270328fb09813b1509d492adc25bb6d7b8f2d369b80a6a8c22629bfe4` |
 
-These identities come from [successful publisher run 36305893881](https://github.com/Concord-Voice/Concord-Voice-Alpha/actions/runs/36305893881).
+These identities come from internal development reference omitted.
 The source archive checksum, derivative metadata, source-runtime binding, and
 exact-main recipe were verified. The independent anonymous digest pulls are
-recorded in [the tracker evidence](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1975#issuecomment-5854238424).
+recorded in internal development reference omitted.
 The upstream tag and commit are unchanged.
 
 The shared Compose consumer is pinned to the runtime digest above. The **live server**

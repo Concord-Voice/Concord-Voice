@@ -1571,6 +1571,7 @@ func NewRouter(
 			// in filed bug-report issues without an Authorization header (#1747).
 			v1.GET("/media/feedback-screenshots/:id",
 				middleware.RateLimitByIP(redis, 120, 1*time.Minute),
+				feedbackHandler.RequireEnabled,
 				mediaHandler.ProxyFeedbackScreenshot,
 			)
 		} else {
@@ -1585,7 +1586,7 @@ func NewRouter(
 			v1.GET("/media/server-icons/:server_id", mediaUnavailable)
 			v1.GET("/media/server-banners/:server_id", mediaUnavailable)
 			v1.GET("/media/dm-icons/:conversationId", mediaUnavailable)
-			v1.GET("/media/feedback-screenshots/:id", mediaUnavailable)
+			v1.GET("/media/feedback-screenshots/:id", feedbackHandler.RequireEnabled, mediaUnavailable)
 		}
 
 		// Client attestation routes (#677). Verify takes the configured TTL via
@@ -3069,6 +3070,7 @@ func NewRouter(
 			// modest burst above the dm-icon rate.
 			mediaRoutes.POST("/upload/feedback-screenshot",
 				middleware.RateLimitByUser(redis, 12, 1*time.Minute),
+				feedbackHandler.RequireEnabled,
 				mediaHandler.UploadFeedbackScreenshot,
 			)
 
@@ -3105,7 +3107,7 @@ func NewRouter(
 			mediaRoutes.POST("/upload/server-icon", mediaUnavailable503)
 			mediaRoutes.POST("/upload/server-banner", mediaUnavailable503)
 			mediaRoutes.POST("/upload/dm-icon", mediaUnavailable503)
-			mediaRoutes.POST("/upload/feedback-screenshot", mediaUnavailable503)
+			mediaRoutes.POST("/upload/feedback-screenshot", feedbackHandler.RequireEnabled, mediaUnavailable503)
 			mediaRoutes.POST("/upload/attachment", mediaUnavailable503)
 			mediaRoutes.GET("/attachments/:file_id", mediaUnavailable503)
 			mediaRoutes.DELETE("/:file_id", mediaUnavailable503)

@@ -14,7 +14,7 @@ All notable changes to Concord Voice will be documented in this file.
 
 ### Fixed
 
-- **Something** ([#2000](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2000)) — detail.
+- **Something** ([#2000](https://example.invalid/pull/2000)) — detail.
 
 ## [0.2.20] — 2026-06-30 (hotfix)
 

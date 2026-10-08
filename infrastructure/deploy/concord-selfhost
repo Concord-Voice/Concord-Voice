@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# Concord Voice — self-hosted operator CLI (#1616).
+# Day-2 lifecycle/monitoring for a self-hosted instance. Thin wrapper over the
+# production compose stack. Operator analogue of concord-ctl.sh, minus the
+# Actions-pipeline verbs (sync-releases, verify-registration, sudoers-sync, nginx-reload).
+#
+# Usage: ./infrastructure/deploy/concord-selfhost <verb> [args]
+#   Run from the repo root (compose auto-loads ./.env). Migrations auto-run at startup.
+#
+# Exit codes: 0 ok | 1 runtime / unknown verb
+set -euo pipefail
+
+# ── Constants ──────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+readonly PROJECT_ROOT
+CONCORD_CTL="${CONCORD_CTL_OVERRIDE:-$SCRIPT_DIR/concord-ctl.sh}"
+readonly CONCORD_CTL
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly NC='\033[0m'
+
+# Sourcing is read-only; resolve lazily so help needs no installed environment.
+# shellcheck source=selfhost-storage.sh
+source "$SCRIPT_DIR/selfhost-storage.sh"
+
+# Reserved for a richer per-service status in a follow-up (#1616 scope).
+# ponytail: expand status verb to iterate SERVICES for per-container health loop.
+# shellcheck disable=SC2034  # SERVICES is reserved for the follow-up status loop
+readonly SERVICES=(control-plane media-plane postgres redis nats minio coturn)
+
+# Restricted security-event log boundary (#2273). The production overlay bind-
+# mounts its per-service directories with create_host_path: false, and only the
+# root-only `selfhost-security-event-logging.sh security-event-logging` creates them (#3561).
+SECURITY_LOG_ROOT="${CONCORD_SECURITY_LOG_ROOT_OVERRIDE:-/var/log/concord-security}"
+readonly SECURITY_LOG_ROOT
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+# compose ARGS... — all direct verbs share the persisted model and recovery scope.
+compose() {
+  if [[ -z "$SELFHOST_STORAGE_PROJECT_ROOT" ]]; then
+    selfhost_storage_resolve "$PROJECT_ROOT" || return 1
+  fi
+  case "${1:-}" in
+    up|build|restart|recreate|start|create)
+      if [[ "$SELFHOST_STORAGE_MODE_RESOLVED" == byo-s3 ]]; then
+        local target
+        for target in "${@:2}"; do
+          if [[ "$target" == minio ]]; then
+            echo 'selfhost-storage: explicit MinIO target refused' >&2
+            return 1
+          fi
+        done
+      fi
+      selfhost_storage_assert_no_running_minio || return 1
+      selfhost_storage_compose "$@" || return $?
+      selfhost_storage_assert_no_running_minio
+      ;;
+    stop|down)
+      selfhost_storage_stop_stale_minio || return 1
+      selfhost_storage_compose "$@"
+      ;;
+    ps)
+      local rc=0
+      selfhost_storage_assert_no_running_minio || rc=1
+      selfhost_storage_compose "$@" || rc=1
+      return "$rc"
+      ;;
+    *) selfhost_storage_compose "$@" ;;
+  esac
+}
+
+# guarded_ctl ARGS... — reuse the canonical rollout/rollback state machine in
+# a strictly-attested self-host mode. The root installer .env is the sole
+# canonical writer; concord-ctl still compares it with rendered production
+# Compose and refuses a managed-style deploy.env.local rollout writer.
+guarded_ctl() {
+  if [[ ! -x "$CONCORD_CTL" ]]; then
+    echo -e "${RED}guarded concord-ctl.sh is missing or not executable${NC}" >&2
+    return 1
+  fi
+  ACTIVITY_HISTORY_CONTRACT_MODE=selfhost \
+    COMPOSE_OVERRIDE=docker-compose.production.yml \
+    COMPOSE_PROFILES=services \
+    "$CONCORD_CTL" "$@"
+}
+
+# require_security_log_boundary — refuse `up` before Docker's opaque "bind source
+# path does not exist". Checks the ROOT only: it is root:concord-security-writers
+# 0750 and the operator is never in that group, so the per-service directories
+# are unreadable from here on a correctly prepared host.
+# ponytail: existence + not-a-symlink only; the provisioner owns the trust checks
+# and create_host_path: false remains the real gate.
+require_security_log_boundary() {
+  [[ -d "$SECURITY_LOG_ROOT" && ! -L "$SECURITY_LOG_ROOT" ]] && return 0
+  echo -e "${RED}✗ security-event log boundary missing: $SECURITY_LOG_ROOT${NC}" >&2
+  echo "  Prepare it once as root (idempotent), then re-run up:" >&2
+  # %q: a checkout path with a space must survive being pasted into a root shell.
+  printf '    sudo %q security-event-logging\n' "$SCRIPT_DIR/selfhost-security-event-logging.sh" >&2
+  return 1
+}
+
+usage() {
+  cat <<'USAGE'
+concord-selfhost — self-hosted operator CLI
+
+Usage: ./infrastructure/deploy/concord-selfhost <verb> [args]
+
+Verbs:
+  up           guarded build + start; refuses implicit first activation
+               (a previously activated stack restarts via its durable receipt)
+               and refuses until the security-event log boundary is prepared
+  activity-history-activate --confirm-drained
+               explicitly activate from a fully drained control-plane set
+  activity-history-rollback --confirm-drained --old-image <digest> [--downgrade-schema]
+               guarded disable/checkpoint/immutable old-image rollback
+  down         stop AND remove containers + network (docker compose down)
+  stop         pause containers, leave them in place (docker compose stop)
+  status       per-service container state (docker compose ps)
+  logs [--no-follow] [args] [svc]
+               follow logs, or return a completed sample with --no-follow
+               --no-follow rejects explicit follow flags
+  health       probe control-plane over 127.0.0.1 and check live port bindings
+               against the self-host posture (#3538), then prove the coturn
+               TLS listener serves the selected certificate on port 5349
+  --help       show this help
+
+Run from the repo root. The .env in the repo root is auto-loaded by compose.
+Migrations run automatically at control-plane startup.
+USAGE
+}
+
+verb_health() {
+  local code rc=0 tls_helper
+  selfhost_storage_resolve "$PROJECT_ROOT" || return 1
+  selfhost_storage_assert_no_running_minio || rc=1
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
+    http://127.0.0.1:8080/api/v1/client/config 2>/dev/null)" || true
+  code="${code:-000}"
+  if [[ "$code" == "200" ]]; then
+    echo -e "${GREEN}✓ control-plane healthy (HTTP 200)${NC}"
+  else
+    echo -e "${RED}✗ control-plane unhealthy (HTTP $code)${NC}" >&2
+    rc=1
+  fi
+  if guarded_ctl selfhost-port-check; then
+    echo -e "${GREEN}✓ published ports match the self-host posture${NC}"
+  else
+    echo -e "${RED}✗ published-port posture check failed (see above)${NC}" >&2
+    rc=1
+  fi
+  tls_helper="$SCRIPT_DIR/selfhost-tls.sh"
+  if [[ -f "$tls_helper" ]]; then
+    # Source the dependency only for health: status and recovery remain usable
+    # without a TLS observer installation.
+    # shellcheck source=selfhost-tls.sh
+    source "$tls_helper"
+    if selfhost_tls_ready; then
+      echo 'coturn TLS listener loaded the selected certificate (5349).'
+    else
+      echo '✗ coturn TLS readiness failed (see fixed selfhost-tls reason above)' >&2
+      rc=1
+    fi
+  else
+    echo 'selfhost-tls: observer prerequisite unavailable' >&2
+    rc=1
+  fi
+  return "$rc"
+}
+
+# Resolve the selected service set before logs. A refused name gets a finite
+# reason rather than an unrelated Compose failure being mistaken for refusal.
+verb_logs() {
+  local follow=1 model services argument skip_value=0 options=1
+  local -a targets=() log_scope=()
+  if [[ "${1:-}" == --no-follow ]]; then
+    follow=0
+    shift
+  fi
+  for argument in "$@"; do
+    if [[ "$skip_value" == 1 ]]; then
+      skip_value=0
+      continue
+    fi
+    if [[ "$options" == 1 ]]; then
+      case "$argument" in
+        --) options=0; continue ;;
+        --tail|-n|--since|--until|--index) skip_value=1; continue ;;
+        --follow|--follow=*|-f)
+          if [[ "$follow" == 0 ]]; then
+            echo 'selfhost-storage: conflicting log follow options' >&2
+            return 1
+          fi
+          continue ;;
+        --*) continue ;;
+        -*f*|-t*n)
+          if [[ "$follow" == 0 && "$argument" == *f* ]]; then
+            echo 'selfhost-storage: conflicting log follow options' >&2
+            return 1
+          fi
+          if [[ "$argument" =~ ^-[tf]+n$ ]]; then skip_value=1; fi
+          continue ;;
+        -*) continue ;;
+      esac
+    fi
+    targets+=("$argument")
+  done
+  # Include declared inactive services for read-only recovery validation.
+  model="$(compose --profile '*' config --format json)" || return $?
+  services="$(printf '%s' "$model" | python3 -c '
+import json, re, sys
+try:
+    model = json.load(sys.stdin)
+    services = model["services"]
+    if not isinstance(services, dict):
+        raise ValueError()
+    declared = []
+    for name, config in services.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+            raise ValueError()
+        if not isinstance(config, dict):
+            raise ValueError()
+        profiles = config.get("profiles", [])
+        if not isinstance(profiles, list) or any(not isinstance(p, str) for p in profiles):
+            raise ValueError()
+        # Read-only recovery logs include declared inactive-profile services.
+        # This does not start containers or change deployment selection.
+        declared.append(name)
+    if not declared:
+        raise ValueError()
+    print("\n".join(declared))
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+')" || {
+    echo 'selfhost-storage: log service model invalid' >&2
+    return 1
+  }
+  for argument in "${targets[@]}"; do
+    if [[ ! "$argument" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] \
+        || ! printf '%s\n' "$services" | grep -Fx -- "$argument" >/dev/null; then
+      echo 'selfhost-storage: unknown log service' >&2
+      return 1
+    fi
+  done
+  if (( ${#targets[@]} )); then
+    # Explicit recovery targets may belong to an inactive deployment profile.
+    # Untargeted logs retain the ordinary active-service scope.
+    log_scope=(--profile '*')
+  fi
+  if [[ "$follow" == 1 ]]; then
+    compose "${log_scope[@]}" logs -f "$@"
+  else
+    compose "${log_scope[@]}" logs "$@"
+  fi
+}
+
+# ── Verb dispatch ──────────────────────────────────────────────────────
+
+main() {
+  case "${1:-}" in
+    up)         require_security_log_boundary && guarded_ctl rebuild ;;
+    activity-history-activate)
+      shift
+      guarded_ctl activity-history-activate "$@"
+      ;;
+    activity-history-rollback)
+      shift
+      guarded_ctl activity-history-rollback "$@"
+      ;;
+    down)       compose down ;;
+    stop)       compose stop ;;
+    status)     compose ps ;;
+    logs)       shift; verb_logs "$@" ;;
+    health)     verb_health ;;
+    --help|-h|"") usage ;;
+    *)
+      echo -e "${RED}unknown verb: $1${NC}" >&2
+      usage >&2
+      return 1
+      ;;
+  esac
+}
+
+# ── Source-vs-execute guard ────────────────────────────────────────────
+# Tests do `source concord-selfhost` to call helpers without running main.
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
