@@ -200,7 +200,8 @@ describe('ImageCropEditor', () => {
         '/api/v1/media/upload/avatar',
         expect.objectContaining({
           method: 'POST',
-        })
+        }),
+        expect.objectContaining({ context: expect.anything() })
       );
       expect(onConfirm).toHaveBeenCalledWith('/api/v1/media/avatars/123');
     });

@@ -12,7 +12,7 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 80 schemas total: 77 subscriber events (handled via wsService.on) + 3
+ * 82 schemas total: 79 subscriber events (handled via wsService.on) + 3
  * envelope-only events (connected, connection_ready, heartbeat_ack) consumed
  * internally by wsService.handleMessage — all must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts
@@ -1423,6 +1423,42 @@ export const RoleUnassignedSchema = z.object({
   }),
 });
 
+// ──────────── Permission refresh (2 events) — #3456 ────────────────────
+
+/**
+ * `server_permissions_changed` — every member's permissions on this server may
+ * have changed, so a client re-reads them. Sent after the server's MFA
+ * enforcement setting changes, and also after a commit whose acknowledgement
+ * was lost, because the change may have applied. It carries the server id and
+ * nothing else: never the direction of the change, and nothing about anyone's
+ * enrollment.
+ * Server emitter: `services/control-plane/internal/servers/mfa_enforcement.go`
+ * (`serverPermissionsChangedMessage`, sent by `announceServerPermissionsChanged`
+ * through `BroadcastToServerContext`).
+ */
+export const ServerPermissionsChangedSchema = z.object({
+  type: z.literal('server_permissions_changed'),
+  data: z.object({
+    server_id: UUID,
+  }),
+});
+
+/**
+ * `permissions_changed` — the receiving user's own permissions may have
+ * changed on any server, so a client re-reads them. Sent to that user's clients
+ * only, after a committed change to their inline MFA factors. Body
+ * intentionally empty, and identical for a gained factor and a lost one.
+ * `z.object({})` accepts `{}` and rejects `null`: the server sends a non-nil
+ * empty map, never `"data":null` (`HeartbeatAckSchema` precedent).
+ * Server emitter: `permissionsChangedMessage` in
+ * `services/control-plane/internal/api/permission_change_notifier.go` — keep in
+ * sync.
+ */
+export const PermissionsChangedSchema = z.object({
+  type: z.literal('permissions_changed'),
+  data: z.object({}),
+});
+
 // ──────────── E2EE (3 events) — Task A9 (security-verified) ───────────
 
 /**
@@ -1762,7 +1798,7 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (80 schemas: 77 subscriber + 3 envelope)
+// 4. The discriminated union (82 schemas: 79 subscriber + 3 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 /** Message-expiration policy change (#1351).
@@ -1916,6 +1952,10 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   RoleAssignedSchema,
   RoleUnassignedSchema,
 
+  // Permission refresh (#3456) (2)
+  ServerPermissionsChangedSchema,
+  PermissionsChangedSchema,
+
   // E2EE (3)
   KeyNeededSchema,
   KeyRevocationSchema,
@@ -1943,9 +1983,10 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ConnectionReadySchema,
   HeartbeatAckSchema,
 ]);
-// TOTAL: 80 schemas (77 subscriber + 3 envelope-only;
+// TOTAL: 82 schemas (79 subscriber + 3 envelope-only;
 // +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive;
-// +6 server-role events #2359).
+// +6 server-role events #2359; +server_permissions_changed/permissions_changed
+// #3456).
 // The count is asserted in tests/unit/types/ws-events.test.ts so an addition
 // cannot silently drift the number quoted in [internal]rules/frontend.md.
 
@@ -2042,6 +2083,12 @@ export type RoleDeletedPayload = z.infer<typeof RoleDeletedSchema>['data'];
 export type RolesReorderedPayload = z.infer<typeof RolesReorderedSchema>['data'];
 export type RoleAssignedPayload = z.infer<typeof RoleAssignedSchema>['data'];
 export type RoleUnassignedPayload = z.infer<typeof RoleUnassignedSchema>['data'];
+
+// Permission refresh (#3456)
+export type ServerPermissionsChangedPayload = z.infer<
+  typeof ServerPermissionsChangedSchema
+>['data'];
+export type PermissionsChangedPayload = z.infer<typeof PermissionsChangedSchema>['data'];
 
 // E2EE
 export type KeyNeededPayload = z.infer<typeof KeyNeededSchema>['data'];

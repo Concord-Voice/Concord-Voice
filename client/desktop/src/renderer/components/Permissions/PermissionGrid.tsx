@@ -1,4 +1,5 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useId } from 'react';
+import { ShieldAlert } from 'lucide-react';
 import { PERMISSION_CATEGORIES, type PermissionInfo } from '../../utils/policy/permissions';
 import './PermissionGrid.css';
 
@@ -12,6 +13,19 @@ interface PermissionGridProps {
 }
 
 type OverrideState = 'allow' | 'neutral' | 'deny';
+
+/** The id of a `dangerous` row's note, which the control that turns the bit on points at. */
+function noteIdFor(base: string, perm: PermissionInfo): string | undefined {
+  return perm.dangerous ? `${base}-${perm.key}` : undefined;
+}
+
+/**
+ * Said on every `dangerous` row in both modes (#3456 §3.7). The grid edits a
+ * role, not the viewer's own grants, so it never masks or disables a control:
+ * which bits a server gates is the server's decision, answered when a save is
+ * sent.
+ */
+const MFA_NOTE = 'Turning this on needs MFA confirmation on servers that enforce MFA.';
 
 function getOverrideState(allow: bigint, deny: bigint, bit: bigint): OverrideState {
   // Deny takes precedence over allow if both bits are set (matches SBAC semantics)
@@ -28,6 +42,8 @@ const PermissionGrid: React.FC<PermissionGridProps> = ({
   deny = 0n,
   onDenyChange,
 }) => {
+  const noteBaseId = useId();
+
   const handleToggle = useCallback(
     (bit: bigint) => {
       if (disabled) return;
@@ -67,6 +83,7 @@ const PermissionGrid: React.FC<PermissionGridProps> = ({
           role="switch"
           aria-checked={isActive}
           aria-label={perm.label}
+          aria-describedby={noteIdFor(noteBaseId, perm)}
           tabIndex={0}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
@@ -79,7 +96,7 @@ const PermissionGrid: React.FC<PermissionGridProps> = ({
         </div>
       );
     },
-    [value, handleToggle]
+    [value, handleToggle, noteBaseId]
   );
 
   const renderOverrideControl = useCallback(
@@ -92,6 +109,7 @@ const PermissionGrid: React.FC<PermissionGridProps> = ({
             className={`permission-tristate-btn${state === 'allow' ? ' allow-active' : ''}`}
             onClick={() => handleOverride(perm.bit, state === 'allow' ? 'neutral' : 'allow')}
             aria-label={`Allow ${perm.label}`}
+            aria-describedby={noteIdFor(noteBaseId, perm)}
             title="Allow"
           >
             &#x2713;
@@ -117,7 +135,7 @@ const PermissionGrid: React.FC<PermissionGridProps> = ({
         </div>
       );
     },
-    [value, deny, handleOverride]
+    [value, deny, handleOverride, noteBaseId]
   );
 
   return (
@@ -130,6 +148,12 @@ const PermissionGrid: React.FC<PermissionGridProps> = ({
               <div className="permission-info">
                 <span className="permission-label">{perm.label}</span>
                 <span className="permission-description">{perm.description}</span>
+                {perm.dangerous && (
+                  <span className="permission-mfa-note" id={noteIdFor(noteBaseId, perm)}>
+                    <ShieldAlert size={14} aria-hidden="true" />
+                    <span>{MFA_NOTE}</span>
+                  </span>
+                )}
               </div>
               {mode === 'override' ? renderOverrideControl(perm) : renderRoleControl(perm)}
             </div>

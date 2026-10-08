@@ -46,6 +46,11 @@ export const ServerCapabilitiesSchema = z.object({
     /** Versions whose init-session geometry this control plane understands.
      *  Missing on older servers; callers must select v2 in that case. */
     attachmentEnvelopeVersions: z.array(z.union([z.literal(2), z.literal(3)])).optional(),
+    /** Whether this control plane gates dangerous actions on MFA for a server
+     *  that enforces it (#3454). The server always sends it; absent means a
+     *  server that predates it, and zod STRIPS a key it does not declare, so
+     *  this line is what makes the capability readable at all (#3456 X16). */
+    mfaEnforcedDangerousActions: z.boolean().optional(),
     /** Whether purges keep pinned messages by default and honour
      *  `include_pinned` (#3458). Absent on older servers, which delete pins;
      *  the purge dialogs then hide the option and say nothing about pins. */
@@ -81,6 +86,27 @@ export type ActivityHistoryCapabilityState =
   | { status: 'confirmed-unsupported' }
   | { status: 'error'; lastConfirmedSupported: boolean };
 
+/** Whether dangerous actions are gated on MFA, as the same FOUR states
+ *  (#3456 X16). Only `confirmed-unsupported` is a fact about the server: a
+ *  payload that parsed and does not carry the key. `loading` and `error` say we
+ *  have not been told, so a caller must not claim the server is too old on
+ *  either; the server stays the authority on every request. */
+export type MfaEnforcementCapabilityState =
+  | { status: 'loading' }
+  | { status: 'supported' }
+  | { status: 'confirmed-unsupported' }
+  | { status: 'error' };
+
+/** The capability a parsed capabilities payload states. A failed fetch is
+ *  `error`, set by `clientConfigService.setCapabilityError`, never this. */
+export function mfaEnforcementCapabilityOf(
+  capabilities: ServerCapabilities
+): MfaEnforcementCapabilityState {
+  return capabilities.features.mfaEnforcedDangerousActions === true
+    ? { status: 'supported' }
+    : { status: 'confirmed-unsupported' };
+}
+
 interface ClientConfig {
   minVersion: string;
   featureFlags: FeatureFlags;
@@ -94,6 +120,8 @@ interface ClientConfigState extends ClientConfig {
   serverCapabilities: ServerCapabilities | null;
   activityHistoryCapability: ActivityHistoryCapabilityState;
   chunkedUploadCapability: ChunkedUploadCapabilityState;
+  /** Set by the capabilities fetch on both paths, like the two above. */
+  mfaEnforcementCapability: MfaEnforcementCapabilityState;
   lastFetchedAt: number | null;
   configRequestRevision: number;
   acceptedConfigRevision: number;
@@ -102,6 +130,7 @@ interface ClientConfigState extends ClientConfig {
   setServerCapabilities: (capabilities: ServerCapabilities | null) => void;
   setActivityHistoryCapability: (capability: ActivityHistoryCapabilityState) => void;
   setChunkedUploadCapability: (capability: ChunkedUploadCapabilityState) => void;
+  setMfaEnforcementCapability: (capability: MfaEnforcementCapabilityState) => void;
   resetForRuntimeServer: () => void;
 }
 
@@ -115,6 +144,7 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set, get) 
   serverCapabilities: null,
   activityHistoryCapability: { status: 'loading' },
   chunkedUploadCapability: { status: 'loading' },
+  mfaEnforcementCapability: { status: 'loading' },
   lastFetchedAt: null,
   configRequestRevision: 0,
   acceptedConfigRevision: 0,
@@ -128,6 +158,7 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set, get) 
   setServerCapabilities: (serverCapabilities) => set({ serverCapabilities }),
   setActivityHistoryCapability: (activityHistoryCapability) => set({ activityHistoryCapability }),
   setChunkedUploadCapability: (chunkedUploadCapability) => set({ chunkedUploadCapability }),
+  setMfaEnforcementCapability: (mfaEnforcementCapability) => set({ mfaEnforcementCapability }),
   resetForRuntimeServer: () =>
     set({
       minVersion: '',
@@ -139,6 +170,7 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set, get) 
       serverCapabilities: null,
       activityHistoryCapability: { status: 'loading' },
       chunkedUploadCapability: { status: 'loading' },
+      mfaEnforcementCapability: { status: 'loading' },
       lastFetchedAt: null,
       acceptedConfigRevision: 0,
     }),

@@ -446,9 +446,16 @@
   margin-top: 8px;
 }
 
-.create-role-btn:hover {
+.create-role-btn:hover:not([aria-disabled='true']) {
   border-color: var(--accent-primary);
   color: var(--accent-primary);
+}
+
+/* A role write is in flight: aria-disabled + a JS guard (RoleHierarchyList.tsx),
+   so the button keeps focus. Same shape as ShareTunePill.css. */
+.create-role-btn[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ─── Members Section ─── */

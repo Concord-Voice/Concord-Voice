@@ -160,6 +160,38 @@ describe('ServerSettingsPage', () => {
     expect(useSettingsOverlayStore.getState().open).toBeNull();
   });
 
+  // #3456 §3.6a: "Back to Server Settings" swaps this page in for App Settings inside a
+  // dialog that is already open, so the control that held focus is gone.
+  // Mutant: the mount effect removed (focus stays on <body>).
+  it('puts focus on the active section when it opens with nothing focused', async () => {
+    const { useSettingsOverlayStore } = await import('@/renderer/stores/ui/settingsOverlayStore');
+    useSettingsOverlayStore
+      .getState()
+      .openSettings('server', { serverId: 'server-1', section: 'roles' });
+    (document.activeElement as HTMLElement | null)?.blur();
+
+    try {
+      render(<ServerSettingsPage serverId="server-1" />);
+
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: /Roles/ }));
+    } finally {
+      // The store is module state, and the cases after this one expect General.
+      useSettingsOverlayStore.getState().close();
+    }
+  });
+
+  // Mutant: the effect taking focus from wherever it already is.
+  it('leaves focus alone when something already holds it', () => {
+    const outside = document.createElement('button');
+    document.body.appendChild(outside);
+    outside.focus();
+
+    render(<ServerSettingsPage serverId="server-1" />);
+
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+  });
+
   it('shows "Server not found" when server does not exist', () => {
     useServerStore.setState({ servers: [] });
     render(<ServerSettingsPage serverId="server-1" />);
@@ -287,7 +319,8 @@ describe('ServerSettingsPage', () => {
     await vi.waitFor(() => {
       expect(mockApiFetch).toHaveBeenCalledWith(
         expect.stringContaining('/api/v1/servers/server-1'),
-        expect.objectContaining({ method: 'PATCH' })
+        expect.objectContaining({ method: 'PATCH' }),
+        expect.objectContaining({ context: expect.anything() })
       );
     });
   });

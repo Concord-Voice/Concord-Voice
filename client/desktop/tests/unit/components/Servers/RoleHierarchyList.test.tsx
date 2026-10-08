@@ -87,6 +87,7 @@ interface RenderOpts {
   roles?: Role[];
   viewer?: RoleViewer;
   selectedRoleId?: string | null;
+  createDisabled?: boolean;
 }
 
 function renderRail(opts: RenderOpts = {}) {
@@ -102,6 +103,7 @@ function renderRail(opts: RenderOpts = {}) {
       selectedRoleId={opts.selectedRoleId ?? null}
       onSelectRole={onSelectRole}
       onCreateRole={onCreateRole}
+      createDisabled={opts.createDisabled}
     />
   );
   return { ...utils, onSelectRole, onCreateRole };
@@ -840,6 +842,27 @@ describe('read-only presentations', () => {
     expect(container.querySelector('ul.role-hierarchy')).toBeNull();
     expect(screen.queryByRole('note')).toBeNull();
     expect(screen.getByRole('button', { name: '+ Create Role' })).toBeInTheDocument();
+  });
+
+  // Mutation: dropping the `createDisabled` guard from the button's onClick creates over a write in flight (red).
+  it('a create control marked unavailable stays focusable and does not create', async () => {
+    const { onCreateRole } = renderRail({ createDisabled: true });
+    const button = screen.getByRole('button', { name: '+ Create Role' });
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    expect(button).not.toBeDisabled();
+    await userEvent.click(button);
+    button.focus();
+    expect(button).toHaveFocus();
+    expect(onCreateRole).not.toHaveBeenCalled();
+  });
+
+  // Mutation: rendering `aria-disabled="false"` or the guard `createDisabled` unconditionally breaks the available control (red).
+  it('an available create control carries no aria-disabled and creates', async () => {
+    const { onCreateRole } = renderRail();
+    const button = screen.getByRole('button', { name: '+ Create Role' });
+    expect(button).not.toHaveAttribute('aria-disabled');
+    await userEvent.click(button);
+    expect(onCreateRole).toHaveBeenCalledTimes(1);
   });
 });
 

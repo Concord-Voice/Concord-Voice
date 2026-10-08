@@ -1,0 +1,81 @@
+/* #3456 §3.6: the "some permissions need MFA" banner under the sidebar's server
+   header. Text and glyph are --text-primary: --text-secondary on --bg-tertiary
+   measures 4.31:1 in Midnight Sky, and nothing here is a --danger. */
+
+.mfa-restricted-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+/* Sits on the first line of text: a 16px glyph against a 13px x 1.4 line. */
+.mfa-restricted-notice__glyph {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.mfa-restricted-notice__body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mfa-restricted-notice__text {
+  margin: 0;
+}
+
+/* A text button, --text-primary and underlined, with a 24px minimum target
+   (WCAG 2.5.8): the shape the step-up stage's links use. */
+.mfa-restricted-notice__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: calc(24px * var(--font-scale, 1));
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.mfa-restricted-notice__link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.mfa-restricted-notice__link:focus-visible,
+.mfa-restricted-notice__dismiss:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
+.mfa-restricted-notice__dismiss {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  min-width: calc(24px * var(--font-scale, 1));
+  min-height: calc(24px * var(--font-scale, 1));
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+/* --bg-active, not --state-hover: --bg-hover sits a shade from this --bg-tertiary
+   fill in the default theme, so the hover would not show. */
+.mfa-restricted-notice__dismiss:hover {
+  background-color: var(--bg-active);
+}

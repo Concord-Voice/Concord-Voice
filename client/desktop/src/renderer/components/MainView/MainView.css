@@ -44,6 +44,13 @@
   white-space: nowrap;
 }
 
+/* The server name is focused by script (tabindex -1) when the MFA notice under
+   it is dismissed, so it needs the keyboard ring a focusable control gets. */
+.channel-header-name-row h3:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
 .server-e2ee-indicator {
   display: flex;
   align-items: center;

@@ -1,6 +1,10 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { usePermissionStore, type ChannelOverride } from '@/renderer/stores/chat/permissionStore';
+import {
+  usePermissionStore,
+  type ChannelOverride,
+  type PermissionWriteOutcome,
+} from '@/renderer/stores/chat/permissionStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { server } from '../../../mocks/server';
@@ -116,7 +120,7 @@ describe('ChannelSettingsModal', () => {
   const mockOnClose = vi.fn();
   const mockFetchChannelOverrides = vi.fn();
   const mockFetchRoles = vi.fn();
-  const mockUpsertChannelOverride = vi.fn().mockResolvedValue(true);
+  const mockUpsertChannelOverride = vi.fn().mockResolvedValue({ ok: true });
   const mockDeleteChannelOverride = vi.fn().mockResolvedValue(true);
   const mockSetCategorySync = vi.fn().mockResolvedValue(true);
 
@@ -931,7 +935,7 @@ describe('ChannelSettingsModal — sync and override writes exclude each other (
   });
 
   it('keeps the sync switch inert while an override save is in flight', async () => {
-    const save = deferred<boolean>();
+    const save = deferred<PermissionWriteOutcome>();
     const setCategorySync = vi.fn().mockResolvedValue(true);
     usePermissionStore.setState({
       fetchChannelOverrides: vi.fn(),
@@ -964,7 +968,7 @@ describe('ChannelSettingsModal — sync and override writes exclude each other (
     expect(setCategorySync).not.toHaveBeenCalled();
 
     await act(async () => {
-      save.resolve(false);
+      save.resolve({ ok: false, kind: 'network' });
     });
     expect(screen.getByRole('alert')).toBeInTheDocument();
     expect(screen.getByRole('switch')).not.toHaveAttribute('aria-disabled', 'true');
@@ -975,7 +979,7 @@ describe('ChannelSettingsModal — sync and override writes exclude each other (
     usePermissionStore.setState({
       fetchChannelOverrides: vi.fn(),
       fetchRoles: vi.fn(),
-      upsertChannelOverride: vi.fn().mockResolvedValue(true),
+      upsertChannelOverride: vi.fn().mockResolvedValue({ ok: true }),
       deleteChannelOverride: vi.fn().mockResolvedValue(true),
       setCategorySync: vi.fn().mockReturnValue(sync.promise),
       serverRoles: { 'server-1': [mockRole, mockRole2] },

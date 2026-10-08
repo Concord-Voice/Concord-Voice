@@ -6,6 +6,12 @@
 import type { StoreApi } from 'zustand';
 import { createStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
+import {
+  apiFetchInContext,
+  captureApiRequestContext,
+  isAbortError,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
 import { useChannelStore } from './channelStore';
 import {
   captureAuthLifecycle,
@@ -36,6 +42,55 @@ export interface UpsertOverrideRequest {
   allow: string;
   deny: string;
 }
+
+export interface CreateRoleRequest {
+  name: string;
+  color?: string;
+  permissions?: string;
+}
+
+export type UpdateRoleRequest = Partial<{
+  name: string;
+  color: string;
+  emoji: string;
+  permissions: string;
+  display_separately: boolean;
+  mentionable: boolean;
+}>;
+
+/**
+ * What a step-up re-send of a role or override write adds to its first send
+ * (#3456 §3.3): the code the dialog proved and the account and server it opened
+ * for. The first send has neither.
+ */
+export interface WriteConfirmation {
+  /** Sent as `mfa_code`. Absent when the dialog sends with no factor (the server decides). */
+  readonly mfaCode: string | undefined;
+  /** The request refuses to dispatch once the account or server is no longer this one. */
+  readonly context: ApiRequestContext;
+}
+
+/**
+ * Why a role or override write did not land, in the shape of `ReorderOutcome`
+ * (#3406): `ok` first, then a `kind`.
+ *
+ * - `refused`: the server answered non-2xx. `body` is its JSON, or null when it
+ *   was not JSON. The host reads it (`adaptDangerousActionRefusal`) to decide
+ *   whether the answer asks for verification. `context` is the account and
+ *   server the request went out as: a refusal that opens the dialog hands it
+ *   on as the dialog's `capture`, so the re-send is admitted against the
+ *   session the server refused and never against a successor (C82).
+ * - `aborted`: nothing was sent, because the account or server changed first.
+ * - `network`: the outcome is unknown here: the request failed in transit, or
+ *   the account changed while it was out, so this view applied nothing.
+ */
+export type PermissionWriteFailure =
+  | { ok: false; kind: 'refused'; status: number; body: unknown; context: ApiRequestContext }
+  | { ok: false; kind: 'aborted' | 'network' };
+
+export type PermissionWriteOutcome = { ok: true } | PermissionWriteFailure;
+
+export type RoleCreateOutcome = { ok: true; role: Role } | PermissionWriteFailure;
 
 /** Shown when a 403 carries no readable `error` string — never a re-worded server reason. */
 const REORDER_DENIED_FALLBACK = 'You cannot reorder these roles.';
@@ -148,8 +203,10 @@ async function trackPermissionWrite<T>(
  * scope's floor to a fresh ticket, so every read begun before that point is
  * known to be older than the write. Keys match `channelOverrides` (a channel id
  * or `category:<id>`) and `rolesScope` for roles. Tickets only ever grow, so
- * nothing here needs resetting with the store: an account change is fenced by
- * the auth lifecycle before a read ever reaches `settleRead`.
+ * correctness never needs a sequence reset: an account change is fenced by the
+ * auth lifecycle before a read ever reaches `settleRead`. `reset()` still drops
+ * the `permissions:` scopes, because those are keyed by server and channel id
+ * and would otherwise outlive the account that read them.
  */
 interface ReadSequence {
   next: number;
@@ -158,6 +215,15 @@ interface ReadSequence {
 }
 
 const readSequences = new Map<string, ReadSequence>();
+
+/** Prefix of the effective-permission scopes, so `reset()` can drop exactly those. */
+const PERMISSIONS_SCOPE_PREFIX = 'permissions:';
+
+function clearPermissionReadSequences(): void {
+  for (const scopeKey of readSequences.keys()) {
+    if (scopeKey.startsWith(PERMISSIONS_SCOPE_PREFIX)) readSequences.delete(scopeKey);
+  }
+}
 
 function readSequence(scopeKey: string): ReadSequence {
   let sequence = readSequences.get(scopeKey);
@@ -202,6 +268,79 @@ function rolesScope(serverId: string): string {
   return `roles:${serverId}`;
 }
 
+const WRITE_ABORTED: PermissionWriteFailure = { ok: false, kind: 'aborted' };
+/**
+ * A write whose outcome this view cannot state. Also what a host reads a
+ * rejected write as: the store's own actions never reject, but a prop a host is
+ * handed might.
+ */
+export const WRITE_UNKNOWN: PermissionWriteFailure = { ok: false, kind: 'network' };
+
+type WriteSent = { ok: true; response: Response } | PermissionWriteFailure;
+
+/**
+ * Sends one role or override write. The first send carries no `confirmation`
+ * and is the host's request as it always was; a step-up re-send adds `mfa_code`
+ * to the same body and is admitted against the dialog's account and server
+ * (#3456 §3.3). A refusal is returned with its status and body rather than
+ * worded here: only the host knows whether it asks for verification.
+ *
+ * Both sends go out against one captured context, which the refusal carries:
+ * the first send's own, captured here, or the re-send's, which is the first
+ * send's handed back through the dialog. A host never has to capture after
+ * the answer lands, when the account or server may already be another (C82).
+ */
+async function sendWrite(
+  path: string,
+  method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
+  body: object | undefined,
+  confirmation: WriteConfirmation | undefined
+): Promise<WriteSent> {
+  const code = confirmation?.mfaCode;
+  const sent = code === undefined ? body : { ...body, mfa_code: code };
+  const init: RequestInit =
+    sent === undefined
+      ? { method }
+      : { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sent) };
+  const context = confirmation?.context ?? captureApiRequestContext();
+  try {
+    const response = await apiFetchInContext(path, init, context);
+    if (response.ok) return { ok: true, response };
+    return {
+      ok: false,
+      kind: 'refused',
+      status: response.status,
+      body: await response.json().catch(() => null),
+      context,
+    };
+  } catch (err) {
+    return isAbortError(err) ? WRITE_ABORTED : WRITE_UNKNOWN;
+  }
+}
+
+/**
+ * The read-sequence keys of the two effective-permission reads (#3456, F10).
+ * Prefixed, because `channelOverrides` already keys its own sequence on a bare
+ * channel id and the two must not share a ticket counter.
+ */
+function serverPermissionsScope(serverId: string): string {
+  return `${PERMISSIONS_SCOPE_PREFIX}server:${serverId}`;
+}
+
+function channelPermissionsScope(channelId: string): string {
+  return `${PERMISSIONS_SCOPE_PREFIX}channel:${channelId}`;
+}
+
+/** Set or clear one server's `mfa_restricted` flag. The flag is stored only when true. */
+function withMfaRestricted(
+  current: Record<string, true>,
+  serverId: string,
+  restricted: boolean
+): Record<string, true> {
+  const { [serverId]: _previous, ...rest } = current;
+  return restricted ? { ...rest, [serverId]: true } : rest;
+}
+
 /**
  * The store update that drops one override from a scope's list, keyed like
  * channelOverrides. Module-level so the delete actions, which run inside
@@ -229,6 +368,11 @@ interface PermissionState {
   serverPermissions: Record<string, bigint>;
   // User's effective permissions per channel
   channelPermissions: Record<string, bigint>;
+  // Servers whose last GET /servers/:id/permissions carried `mfa_restricted: true`
+  // (#3453/#3456): the viewer's dangerous bits are masked there until they enrol
+  // a second factor. Stored only when true, never persisted and never logged, and
+  // known only for servers MainView has made active (the route is not fanned out).
+  mfaRestrictedByServer: Record<string, true>;
   // Channel overrides keyed by channel ID
   channelOverrides: Record<string, ChannelOverride[]>;
   // Override writes and category syncs whose request has not settled, keyed
@@ -247,23 +391,26 @@ interface PermissionState {
 
   // --- Role management ---
   fetchRoles: (serverId: string) => Promise<boolean>;
+  // The three role writes and the two override upserts answer with a result
+  // union, not a bare boolean, so a host can tell a refusal that asks for
+  // verification from one that does not (#3456). `confirmation` is set only on
+  // the step-up dialog's re-send.
   createRole: (
     serverId: string,
-    data: { name: string; color?: string; permissions?: string }
-  ) => Promise<Role | null>;
+    data: CreateRoleRequest,
+    confirmation?: WriteConfirmation
+  ) => Promise<RoleCreateOutcome>;
   updateRole: (
     serverId: string,
     roleId: string,
-    data: Partial<{
-      name: string;
-      color: string;
-      emoji: string;
-      permissions: string;
-      display_separately: boolean;
-      mentionable: boolean;
-    }>
-  ) => Promise<boolean>;
-  deleteRole: (serverId: string, roleId: string) => Promise<boolean>;
+    data: UpdateRoleRequest,
+    confirmation?: WriteConfirmation
+  ) => Promise<PermissionWriteOutcome>;
+  deleteRole: (
+    serverId: string,
+    roleId: string,
+    confirmation?: WriteConfirmation
+  ) => Promise<PermissionWriteOutcome>;
   reorderRoles: (serverId: string, payload: RoleReorderPayload) => Promise<ReorderOutcome>;
   assignRole: (serverId: string, userId: string, roleId: string) => Promise<boolean>;
   unassignRole: (serverId: string, userId: string, roleId: string) => Promise<boolean>;
@@ -271,15 +418,36 @@ interface PermissionState {
   // --- Server permissions ---
   fetchServerPermissions: (serverId: string) => Promise<void>;
   fetchChannelPermissions: (channelId: string) => Promise<void>;
+  /**
+   * Drop cached effective permissions for these channels AND discard any read of
+   * them already in flight, so a response that began before the eviction cannot
+   * put a pre-change answer back (#3456).
+   */
+  evictChannelPermissions: (channelIds: readonly string[]) => void;
+  /**
+   * The same for servers: drops the cached effective permissions AND the
+   * `mfa_restricted` flag, and discards any read in flight. For servers the
+   * viewer is not looking at, whose answer an account-wide change has outdated;
+   * the next activation re-reads (#3456).
+   */
+  evictServerPermissions: (serverIds: readonly string[]) => void;
 
   // --- Channel overrides (SBAC) ---
   fetchChannelOverrides: (channelId: string) => Promise<void>;
-  upsertChannelOverride: (channelId: string, data: UpsertOverrideRequest) => Promise<boolean>;
+  upsertChannelOverride: (
+    channelId: string,
+    data: UpsertOverrideRequest,
+    confirmation?: WriteConfirmation
+  ) => Promise<PermissionWriteOutcome>;
   deleteChannelOverride: (channelId: string, overrideId: string) => Promise<boolean>;
 
   // --- Category overrides ---
   fetchCategoryOverrides: (categoryId: string) => Promise<void>;
-  upsertCategoryOverride: (categoryId: string, data: UpsertOverrideRequest) => Promise<boolean>;
+  upsertCategoryOverride: (
+    categoryId: string,
+    data: UpsertOverrideRequest,
+    confirmation?: WriteConfirmation
+  ) => Promise<PermissionWriteOutcome>;
   deleteCategoryOverride: (categoryId: string, overrideId: string) => Promise<boolean>;
 
   // --- Category sync ---
@@ -291,6 +459,7 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   roleViewer: {},
   serverPermissions: {},
   channelPermissions: {},
+  mfaRestrictedByServer: {},
   channelOverrides: {},
   permissionWritesInFlight: {},
 
@@ -302,15 +471,18 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
   // captures the account before its request and re-checks it before any write
   // that follows an await (round 8): a continuation from the previous account
   // writes nothing.
-  reset: () =>
+  reset: () => {
+    clearPermissionReadSequences();
     set({
       serverRoles: {},
       roleViewer: {},
       serverPermissions: {},
       channelPermissions: {},
+      mfaRestrictedByServer: {},
       channelOverrides: {},
       permissionWritesInFlight: {},
-    }),
+    });
+  },
 
   hasServerPermission: (serverId: string, perm: bigint): boolean => {
     const perms = get().serverPermissions[serverId];
@@ -354,18 +526,14 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     }
   },
 
-  createRole: async (serverId: string, data) => {
+  createRole: async (serverId, data, confirmation) => {
     const lifecycle = captureAuthLifecycle();
+    const sent = await sendWrite(`/api/v1/servers/${serverId}/roles`, 'POST', data, confirmation);
+    if (!sent.ok) return sent;
     try {
-      const res = await apiFetch(`/api/v1/servers/${serverId}/roles`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      if (!res.ok) return null;
-      const json = await res.json();
+      const json = await sent.response.json();
       const role = json.role as Role;
-      if (!isSameAuthLifecycle(lifecycle)) return null;
+      if (!isSameAuthLifecycle(lifecycle)) return WRITE_UNKNOWN;
       markWriteConfirmed(rolesScope(serverId));
       // Add to local state
       set((state) => ({
@@ -376,24 +544,25 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
           ),
         },
       }));
-      return role;
+      return { ok: true, role };
     } catch {
-      return null;
+      return WRITE_UNKNOWN;
     }
   },
 
-  updateRole: async (serverId: string, roleId: string, data) => {
+  updateRole: async (serverId, roleId, data, confirmation) => {
     const lifecycle = captureAuthLifecycle();
+    const sent = await sendWrite(
+      `/api/v1/servers/${serverId}/roles/${roleId}`,
+      'PATCH',
+      data,
+      confirmation
+    );
+    if (!sent.ok) return sent;
     try {
-      const res = await apiFetch(`/api/v1/servers/${serverId}/roles/${roleId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      if (!res.ok) return false;
-      const json = await res.json();
+      const json = await sent.response.json();
       const serverRole = json.role as Role | undefined;
-      if (!isSameAuthLifecycle(lifecycle)) return false;
+      if (!isSameAuthLifecycle(lifecycle)) return WRITE_UNKNOWN;
       markWriteConfirmed(rolesScope(serverId));
       set((state) => ({
         serverRoles: {
@@ -416,30 +585,30 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
           }),
         },
       }));
-      return true;
+      return { ok: true };
     } catch {
-      return false;
+      return WRITE_UNKNOWN;
     }
   },
 
-  deleteRole: async (serverId: string, roleId: string) => {
+  deleteRole: async (serverId, roleId, confirmation) => {
     const lifecycle = captureAuthLifecycle();
-    try {
-      const res = await apiFetch(`/api/v1/servers/${serverId}/roles/${roleId}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
-      markWriteConfirmed(rolesScope(serverId));
-      set((state) => ({
-        serverRoles: {
-          ...state.serverRoles,
-          [serverId]: (state.serverRoles[serverId] ?? []).filter((r) => r.id !== roleId),
-        },
-      }));
-      return true;
-    } catch {
-      return false;
-    }
+    const sent = await sendWrite(
+      `/api/v1/servers/${serverId}/roles/${roleId}`,
+      'DELETE',
+      undefined,
+      confirmation
+    );
+    if (!sent.ok) return sent;
+    if (!isSameAuthLifecycle(lifecycle)) return WRITE_UNKNOWN;
+    markWriteConfirmed(rolesScope(serverId));
+    set((state) => ({
+      serverRoles: {
+        ...state.serverRoles,
+        [serverId]: (state.serverRoles[serverId] ?? []).filter((r) => r.id !== roleId),
+      },
+    }));
+    return { ok: true };
   },
 
   reorderRoles: async (serverId: string, payload: RoleReorderPayload): Promise<ReorderOutcome> => {
@@ -506,18 +675,32 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
 
   // ─── Server Permissions ────────────────────────────────────────────
 
+  // Both effective-permission reads are fenced twice after their await (#3456,
+  // F10): by account, because `reset()` cannot cancel a request already sent, and
+  // by read order per key, so an older response landing after a newer one cannot
+  // put an older answer back. The permission-change events make overlapping reads
+  // routine: the event's refetch races the one MainView or MessageInput issued on
+  // navigation. A read that loses on either count writes nothing.
   fetchServerPermissions: async (serverId: string) => {
     const lifecycle = captureAuthLifecycle();
+    const scope = serverPermissionsScope(serverId);
+    const ticket = beginRead(scope);
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/permissions`);
       if (!res.ok) return;
       const data = await res.json();
       if (!isSameAuthLifecycle(lifecycle)) return;
+      if (settleRead(scope, ticket) !== 'commit') return;
       set((state) => ({
         serverPermissions: {
           ...state.serverPermissions,
           [serverId]: parseEffectivePermissions(data.permissions),
         },
+        mfaRestrictedByServer: withMfaRestricted(
+          state.mfaRestrictedByServer,
+          serverId,
+          data.mfa_restricted === true
+        ),
       }));
     } catch {
       // Network error
@@ -526,11 +709,14 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
 
   fetchChannelPermissions: async (channelId: string) => {
     const lifecycle = captureAuthLifecycle();
+    const scope = channelPermissionsScope(channelId);
+    const ticket = beginRead(scope);
     try {
       const res = await apiFetch(`/api/v1/channels/${channelId}/permissions`);
       if (!res.ok) return;
       const data = await res.json();
       if (!isSameAuthLifecycle(lifecycle)) return;
+      if (settleRead(scope, ticket) !== 'commit') return;
       set((state) => ({
         channelPermissions: {
           ...state.channelPermissions,
@@ -540,6 +726,39 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     } catch {
       // Network error
     }
+  },
+
+  evictChannelPermissions: (channelIds: readonly string[]) => {
+    // Raising the floor makes every read begun before now `stale`, and these
+    // reads hold no local patch to reconcile, so a stale one simply writes
+    // nothing. A read begun after this lands normally.
+    for (const channelId of channelIds) markWriteConfirmed(channelPermissionsScope(channelId));
+    set((state) => {
+      const cached = channelIds.filter((channelId) => channelId in state.channelPermissions);
+      if (cached.length === 0) return state;
+      const next = { ...state.channelPermissions };
+      for (const channelId of cached) delete next[channelId];
+      return { channelPermissions: next };
+    });
+  },
+
+  evictServerPermissions: (serverIds: readonly string[]) => {
+    // As for channels: the raised floor makes any read begun before now write
+    // nothing, and the entry and its `mfa_restricted` flag go together.
+    for (const serverId of serverIds) markWriteConfirmed(serverPermissionsScope(serverId));
+    set((state) => {
+      const cached = serverIds.filter(
+        (serverId) => serverId in state.serverPermissions || serverId in state.mfaRestrictedByServer
+      );
+      if (cached.length === 0) return state;
+      const serverPermissions = { ...state.serverPermissions };
+      const mfaRestrictedByServer = { ...state.mfaRestrictedByServer };
+      for (const serverId of cached) {
+        delete serverPermissions[serverId];
+        delete mfaRestrictedByServer[serverId];
+      }
+      return { serverPermissions, mfaRestrictedByServer };
+    });
   },
 
   // ─── Channel Overrides (SBAC) ──────────────────────────────────────
@@ -566,23 +785,21 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     }
   },
 
-  upsertChannelOverride: (channelId: string, data: UpsertOverrideRequest) =>
+  upsertChannelOverride: (channelId, data, confirmation) =>
     trackPermissionWrite(set, channelId, async () => {
       const lifecycle = captureAuthLifecycle();
-      try {
-        const res = await apiFetch(`/api/v1/channels/${channelId}/overrides`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data),
-        });
-        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
-        markWriteConfirmed(channelId);
-        // Refetch to get updated list
-        await get().fetchChannelOverrides(channelId);
-        return true;
-      } catch {
-        return false;
-      }
+      const sent = await sendWrite(
+        `/api/v1/channels/${channelId}/overrides`,
+        'PUT',
+        data,
+        confirmation
+      );
+      if (!sent.ok) return sent;
+      if (!isSameAuthLifecycle(lifecycle)) return WRITE_UNKNOWN;
+      markWriteConfirmed(channelId);
+      // Refetch to get updated list
+      await get().fetchChannelOverrides(channelId);
+      return { ok: true } as const;
     }),
 
   deleteChannelOverride: (channelId: string, overrideId: string) =>
@@ -625,22 +842,20 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     }
   },
 
-  upsertCategoryOverride: (categoryId: string, data: UpsertOverrideRequest) =>
+  upsertCategoryOverride: (categoryId, data, confirmation) =>
     trackPermissionWrite(set, `category:${categoryId}`, async () => {
       const lifecycle = captureAuthLifecycle();
-      try {
-        const res = await apiFetch(`/api/v1/categories/${categoryId}/overrides`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data),
-        });
-        if (!res.ok || !isSameAuthLifecycle(lifecycle)) return false;
-        markWriteConfirmed(`category:${categoryId}`);
-        await get().fetchCategoryOverrides(categoryId);
-        return true;
-      } catch {
-        return false;
-      }
+      const sent = await sendWrite(
+        `/api/v1/categories/${categoryId}/overrides`,
+        'PUT',
+        data,
+        confirmation
+      );
+      if (!sent.ok) return sent;
+      if (!isSameAuthLifecycle(lifecycle)) return WRITE_UNKNOWN;
+      markWriteConfirmed(`category:${categoryId}`);
+      await get().fetchCategoryOverrides(categoryId);
+      return { ok: true } as const;
     }),
 
   deleteCategoryOverride: (categoryId: string, overrideId: string) =>

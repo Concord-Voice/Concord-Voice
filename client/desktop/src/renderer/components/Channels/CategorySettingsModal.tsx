@@ -1,10 +1,9 @@
 import React, { useEffect } from 'react';
 import Modal from '../ui/Modal';
-import OverridePanel from '../Permissions/OverridePanel';
+import OverridePanel, { type OverrideUpsertArgs } from '../Permissions/OverridePanel';
 import {
   usePermissionStore,
   ChannelOverride,
-  UpsertOverrideRequest,
   NO_PERMISSION_WRITES,
 } from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
@@ -48,7 +47,8 @@ const CategorySettingsModal: React.FC<CategorySettingsModalProps> = ({
     }
   }, [isOpen, category.id, serverId, fetchCategoryOverrides, fetchRoles]);
 
-  const handleUpsert = (data: UpsertOverrideRequest) => upsertCategoryOverride(category.id, data);
+  const handleUpsert = (...args: OverrideUpsertArgs) =>
+    upsertCategoryOverride(category.id, ...args);
 
   const handleDelete = (overrideId: string) => deleteCategoryOverride(category.id, overrideId);
 
@@ -66,6 +66,7 @@ const CategorySettingsModal: React.FC<CategorySettingsModalProps> = ({
         onUpsert={handleUpsert}
         onDelete={handleDelete}
         writesInFlight={writesInFlight}
+        stepUpPurpose="overrides.category_upsert"
         emptyMessage="No permission overrides configured for this category."
       />
     </Modal>

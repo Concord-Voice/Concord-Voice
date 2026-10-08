@@ -79,6 +79,7 @@ function makeFactor(overrides: Partial<StepUpFactor> = {}): StepUpFactor {
     firstMissing: vi.fn(() => null),
     announceMissing: vi.fn(),
     run: vi.fn(async () => null),
+    confirmCurrent: vi.fn(() => true),
     ...overrides,
   };
 }

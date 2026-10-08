@@ -74,8 +74,11 @@ import { useUserStore } from '../../stores/auth/userStore';
 /** A panel the picker can show. A backup code is never a default (§3). */
 export type StepUpMethod = InlineStepUpMethod | 'backup';
 
-/** When the surface collects the password. `'none'` waits for its first caller (Q3). */
-export type StepUpPasswordLeg = 'always' | 'whenNoMfa'; // pragma: allowlist secret
+/**
+ * When the surface collects the password. `'none'` never does: its route reads
+ * no password (the dangerous-action gates, #3456 V18).
+ */
+export type StepUpPasswordLeg = 'always' | 'whenNoMfa' | 'none'; // pragma: allowlist secret
 
 /**
  * The `whenNoMfa` leg by name. Hosts pass this, not the quoted literal, which
@@ -83,6 +86,14 @@ export type StepUpPasswordLeg = 'always' | 'whenNoMfa'; // pragma: allowlist sec
  * credential (Sonar S2068, detect-secrets).
  */
 export const LEG_ONLY_WITHOUT_MFA = 'whenNoMfa' satisfies StepUpPasswordLeg;
+
+/**
+ * The `none` leg by name, for the same reason as `LEG_ONLY_WITHOUT_MFA`. No
+ * refusal names a password field on it, and with nothing offered the primary
+ * sends with no factor: the server's answer, not a client guess, decides
+ * whether one is needed (#3456 §3.3).
+ */
+export const FACTOR_ONLY_LEG = 'none' satisfies StepUpPasswordLeg;
 
 /** What a failed read does on this route (§2): block with Retry, or the password alone. */
 export type StepUpReadFailure = 'block' | 'passwordOnly';
@@ -239,6 +250,14 @@ export interface StepUpFactor {
    * account and server the instance opened for.
    */
   run: (submit: StepUpSubmit, capture?: ApiRequestContext) => Promise<StepUpSubmitOutcome | null>;
+  /**
+   * For a control that leaves the surface rather than submitting ("Set up
+   * verification"): true while the account and server the instance opened for
+   * (and `capture`, a host's own, when given) are still current. Otherwise the
+   * instance ends as `sessionExpired` and the caller does nothing, so a
+   * terminal state left standing through a change cannot act for the new one.
+   */
+  confirmCurrent: (capture?: ApiRequestContext) => boolean;
 }
 
 // ── State and pure transitions ───────────────────────────────────────────
@@ -365,6 +384,8 @@ function seeded(
     case 'mfaRequired':
       return seed.methods === null ? state : withRequired(state, seed.methods, config);
     case 'passwordRequired': {
+      // No field to ask in: the default arm, and the host words it.
+      if (config.passwordLeg === FACTOR_ONLY_LEG) return state;
       // On `whenNoMfa` the server found no inline method (C2).
       const leg = config.passwordLeg;
       const next = leg === 'whenNoMfa' ? toFloor(state, config) : state;
@@ -410,6 +431,16 @@ function initialState(
 /** After a submit that may have spent the code: drop it and remount the input. */
 function spent(state: FactorState): FactorState {
   return { ...state, code: '', attempt: state.attempt + 1 };
+}
+
+/** A refusal the surface renders itself: the code may be spent, and nothing is noticed. */
+function unrendered(state: FactorState): FactorState {
+  return { ...spent(state), notice: null };
+}
+
+/** A refusal about the password field, which the `none` leg does not have. */
+function namesPassword(refusal: StepUpFactorRefusal): boolean {
+  return refusal.kind === 'passwordRequired' || refusal.kind === 'invalidPassword';
 }
 
 function expired(state: FactorState): FactorState {
@@ -504,6 +535,9 @@ function refusalTransition(
   config: FactorConfig
 ): FactorState {
   const idle = { ...state, phase: 'idle' as const };
+  // A notice aimed at a field that does not exist would announce nothing and
+  // move focus nowhere: the default arm.
+  if (config.passwordLeg === FACTOR_ONLY_LEG && namesPassword(refusal)) return unrendered(idle);
   switch (refusal.kind) {
     case 'mfaRequired': {
       // Authoritative over the read; email and SMS never join the set (G1).
@@ -547,7 +581,7 @@ function refusalTransition(
       return expired(idle);
     default:
       // The surface renders everything else.
-      return { ...spent(idle), notice: null };
+      return unrendered(idle);
   }
 }
 
@@ -561,10 +595,12 @@ function refusalRereads(refusal: StepUpFactorRefusal): boolean {
 }
 
 /**
- * The state an answered submit leaves: a refusal goes through
- * `refusalTransition`; an unsent request leaves the code unspent, or ends the
- * instance when the account or server changed; anything else may have spent
- * the code, so it is cleared.
+ * The state an answered submit leaves. An answer that lands once the account
+ * or server has changed ends the instance, whatever it was: it belongs to the
+ * old one, and the surface must not stand asking for a code for an action that
+ * may already have gone through. Otherwise a refusal goes through
+ * `refusalTransition`; an unsent request leaves the code unspent; anything
+ * else may have spent the code, so it is cleared.
  */
 function outcomeUpdate(
   outcome: StepUpSubmitOutcome,
@@ -572,15 +608,16 @@ function outcomeUpdate(
   config: FactorConfig,
   contextCurrent: boolean
 ): (state: FactorState) => FactorState {
+  if (!contextCurrent) return expired;
   switch (outcome.kind) {
     case 'refusal': {
       const { refusal } = outcome;
       return (s) => refusalTransition(s, refusal, method, config);
     }
     case 'aborted':
-      return contextCurrent ? (s) => ({ ...s, phase: 'idle' }) : expired;
+      return (s) => ({ ...s, phase: 'idle' });
     default:
-      return (s) => ({ ...spent(s), phase: 'idle', notice: null });
+      return (s) => unrendered({ ...s, phase: 'idle' });
   }
 }
 
@@ -716,11 +753,14 @@ function missingNotice(missing: StepUpMissing, method: StepUpMethod | null): Ste
 }
 
 function showsPassword(state: FactorState, config: FactorConfig): boolean {
-  const leg = config.passwordLeg;
-  if (leg === 'always') {
-    return state.status.kind === 'reading' || state.status.kind === 'ready';
+  switch (config.passwordLeg) {
+    case 'always':
+      return state.status.kind === 'reading' || state.status.kind === 'ready';
+    case 'whenNoMfa':
+      return state.status.kind === 'ready' && state.offered.length === 0;
+    case 'none':
+      return false;
   }
-  return state.status.kind === 'ready' && state.offered.length === 0;
 }
 
 function firstMissingIn(
@@ -957,6 +997,17 @@ export function useStepUpFactor({
     [enabled, state, config, startRead]
   );
 
+  const confirmCurrent = useCallback(
+    (capture?: ApiRequestContext) => {
+      const { opened } = state;
+      const current =
+        apiRequestContextIsCurrent(capture ?? opened) && apiRequestContextIsCurrent(opened);
+      if (!current) setFactorState(expired);
+      return current;
+    },
+    [state]
+  );
+
   return {
     status: state.status,
     methods,
@@ -973,5 +1024,6 @@ export function useStepUpFactor({
     firstMissing,
     announceMissing,
     run,
+    confirmCurrent,
   };
 }

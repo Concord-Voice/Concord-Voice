@@ -1,7 +1,15 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore';
+import type { VerificationReturn } from '../../stores/ui/settingsOverlayStore';
 import { safeJson } from '../../services/system/apiClient';
-import { captureApiRequestContext } from '../../services/system/requestContext';
+import type { ApiRequestContext } from '../../services/system/requestContext';
+import {
+  describeFailureWith,
+  resendWithCode,
+  sendFirst,
+  type Dispatch,
+  type FrozenRequest,
+} from '../../services/system/dangerousActionRequest';
 import {
   includePinnedFor,
   PIN_CLAIM_UNCONFIRMED_MESSAGE,
@@ -10,7 +18,12 @@ import {
   type PinMode,
 } from '../../services/messaging/purgeApi';
 import { usePurgeKeepsPinnedAtOpen } from '../../hooks/messaging/usePurgeKeepsPinnedAtOpen';
+import { useStepUpHandoff } from '../../hooks/auth/useStepUpHandoff';
+import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
+import { openVerificationSetup } from '../../utils/ui/openVerificationSetup';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
+import DangerousActionStepUpDialog from '../Auth/DangerousActionStepUpDialog';
+import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import './purgeOnModeration.css';
 
 export { PIN_CLAIM_UNCONFIRMED_MESSAGE };
@@ -143,89 +156,100 @@ export function PurgeMessagesOptIn({
   );
 }
 
-type ModerationAction = 'ban' | 'kick';
-
-const MODERATION_COPY: Record<
-  ModerationAction,
-  { verb: string; message: string; purgeLabel: string; loadingLabel: string }
-> = {
-  ban: {
-    verb: 'Ban',
-    message: 'This will permanently remove them from the server and prevent them from rejoining.',
-    purgeLabel: 'Ban and purge',
-    loadingLabel: 'Banning...',
-  },
-  kick: {
-    verb: 'Kick',
-    message: 'This will remove them from the server. They can rejoin with a new invite.',
-    purgeLabel: 'Kick and purge',
-    loadingLabel: 'Kicking...',
-  },
-};
-
-/**
- * The ban or kick confirmation, open while `target` is set. It owns the purge
- * opt-in, resets it on close, and samples the pinned-message capability when it
- * opens (#3458), so `onConfirm` receives exactly what the dialog showed.
- */
-export function ModerationConfirmModal({
-  action,
-  target,
-  onClose,
-  onConfirm,
-}: Readonly<{
-  action: ModerationAction;
-  target: ServerMember | null;
-  onClose: () => void;
-  onConfirm: (
-    target: ServerMember,
-    action: ModerationAction,
-    alsoPurge: boolean,
-    pinMode: PinMode
-  ) => Promise<void>;
-}>) {
-  const [alsoPurge, setAlsoPurge] = useState(false);
-  const [includePinned, setIncludePinned] = useState(false);
-  const pinMode = pinModeFor(usePurgeKeepsPinnedAtOpen(target !== null), includePinned);
-  const copy = MODERATION_COPY[action];
-  return (
-    <ConfirmActionModal
-      isOpen={target !== null}
-      onClose={() => {
-        setAlsoPurge(false);
-        setIncludePinned(false);
-        onClose();
-      }}
-      title={`${copy.verb} ${target?.display_name || target?.username || 'User'}`}
-      message={copy.message}
-      extraContent={
-        <PurgeMessagesOptIn
-          checked={alsoPurge}
-          onChange={setAlsoPurge}
-          pinMode={pinMode}
-          onIncludePinnedChange={setIncludePinned}
-        />
-      }
-      // Degrades gracefully: an unchecked box never blocks the ban or kick.
-      confirmLabel={alsoPurge ? copy.purgeLabel : copy.verb}
-      loadingLabel={copy.loadingLabel}
-      onConfirm={async () => {
-        if (target) await onConfirm(target, action, alsoPurge, pinMode);
-      }}
-    />
-  );
-}
+export type ModerationAction = 'ban' | 'kick';
 
 /**
  * One request shape for both moderation actions on both surfaces: the endpoints
  * differ only in method and path, and both accept the same optional
- * `purge_messages` and `include_pinned` body.
+ * `purge_messages` and `include_pinned` body (and, on a re-send after
+ * verification, `mfa_code`).
+ */
+function moderationRequest(
+  serverId: string,
+  target: ServerMember,
+  action: ModerationAction,
+  alsoPurge: boolean,
+  pinMode: PinMode
+): FrozenRequest {
+  const body = { purge_messages: alsoPurge, include_pinned: includePinnedFor(pinMode) };
+  return action === 'ban'
+    ? { path: `/api/v1/servers/${serverId}/bans/${target.user_id}`, method: 'POST', body }
+    : { path: `/api/v1/servers/${serverId}/members/${target.user_id}`, method: 'DELETE', body };
+}
+
+/**
+ * The purge sub-outcome of a committed ban or kick. Best-effort: the moderation
+ * action has already committed, so a response we cannot parse must never surface
+ * as a failed ban or kick.
+ */
+async function readPurgeOutcome(res: Response): Promise<ModerationPurgeOutcome | undefined> {
+  try {
+    const body = await safeJson<{ purge?: ModerationPurgeOutcome }>(res);
+    return body?.purge;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What a committed ban or kick does locally. No purge fragment means none was
+ * requested — nothing to say, and nothing undescribable happened.
+ */
+function settleModeration(
+  target: ServerMember,
+  action: ModerationAction,
+  purge: ModerationPurgeOutcome | undefined,
+  pinMode: PinMode
+): PurgeNoticeResult {
+  useMemberStore.getState().removeMember(target.user_id);
+  if (!purge) return { notice: '', unknownStatus: false };
+  const verb = action === 'ban' ? 'banned' : 'kicked';
+  return purgeNotice(memberName(target), verb, purge.status, pinMode);
+}
+
+/**
+ * Every send of a moderation request, the code-less first one and the
+ * verified re-send alike, goes through the pin claim (#3458): a purge that
+ * promises to keep pins is rechecked right before the request, because a server
+ * rolled back since the dialog opened would delete them anyway (#3552 review).
+ * Without a purge there is no claim to check. Null: nothing was sent.
+ */
+function pinClaimDispatch(alsoPurge: boolean, pinMode: PinMode): Dispatch {
+  const claim = alsoPurge ? pinMode : 'unsupported';
+  return (path, init, context) => sendPinClaim(path, init, context, claim);
+}
+
+/** `User` stands in for a member the roster no longer names. */
+function memberName(member: ServerMember | null | undefined): string {
+  return member?.display_name || member?.username || 'User';
+}
+
+export type ModerationResult =
+  | { kind: 'done'; notice: PurgeNoticeResult }
+  /**
+   * The server wants the actor verified first. `request` is what was sent,
+   * frozen, and `context` the account and server it went out as.
+   */
+  | {
+      kind: 'stepUp';
+      request: FrozenRequest;
+      refusal: StepUpFactorRefusal;
+      context: ApiRequestContext;
+    };
+
+/**
+ * Sends a ban or kick with no code. Returns the purge notice the caller should
+ * announce — empty when no purge was requested, or when the server reported a
+ * status this client does not know (`unknownStatus` tells those two apart) —
+ * or, on a server that enforces MFA for dangerous actions, the refusal that
+ * hands the frozen request to `ModerationDialog`'s step-up (#3456). A kick
+ * without a purge is not gated, so only a lack of enrolment opens that.
+ * `ConfirmActionModal` closes itself on success, so the notice belongs to the
+ * calling component's own `role="status"` region rather than to the modal.
  *
- * Returns the purge notice the caller should announce — empty when no purge was
- * requested, or when the server reported a status this client does not know
- * (`unknownStatus` tells those two apart). `ConfirmActionModal` closes itself on
- * success, so the notice belongs to the calling component's own `role="status"`
- * region rather than to the modal.
+ * Any other refusal throws an `Error` carrying the server's sentence, or ours
+ * when it sent none. A non-JSON body (an HTML 502 from a proxy) must not put
+ * its own parse message in front of the user in place of that.
  *
  * `alsoPurge` rather than `purgeMessages`: the latter is the name of the purge
  * service function exported from `services/messaging/purgeApi.ts`, and this module — or
@@ -237,51 +261,185 @@ export async function moderateMember(
   action: ModerationAction,
   alsoPurge: boolean,
   pinMode: PinMode
-): Promise<PurgeNoticeResult> {
-  const isBan = action === 'ban';
-  // The account and server that confirmed, captured before the recheck's
-  // request: a change while it is in flight refuses the action rather than
-  // sending it as the new account (#3552 review).
-  const operation = captureApiRequestContext();
-  // A purge that promises something about pins is rechecked right before the
-  // request: a rollback since the dialog opened would delete them anyway
-  // (#3552 review). Without a purge there is no claim to check.
-  const res = await sendPinClaim(
-    isBan
-      ? `/api/v1/servers/${serverId}/bans/${target.user_id}`
-      : `/api/v1/servers/${serverId}/members/${target.user_id}`,
-    {
-      method: isBan ? 'POST' : 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        purge_messages: alsoPurge,
-        include_pinned: includePinnedFor(pinMode),
-      }),
-    },
-    operation,
-    alsoPurge ? pinMode : 'unsupported'
-  );
-  if (res === null) throw new Error(PIN_CLAIM_UNCONFIRMED_MESSAGE);
-  if (!res.ok) {
-    // `safeJson` throws on a non-JSON content-type as well as on a parse
-    // failure, so an HTML 502 from a proxy would otherwise surface its own
-    // message ("Expected JSON but got text/html…") to the user in place of ours.
-    const data = await safeJson<{ error?: string }>(res).catch(() => null);
-    throw new Error(data?.error || (isBan ? 'Ban failed' : 'Kick failed'));
+): Promise<ModerationResult> {
+  const request = moderationRequest(serverId, target, action, alsoPurge, pinMode);
+  const failure = action === 'ban' ? 'Ban failed' : 'Kick failed';
+  const first = await sendFirst(request, failure, {
+    gated: action === 'ban' || alsoPurge,
+    dispatch: pinClaimDispatch(alsoPurge, pinMode),
+    unsentMessage: PIN_CLAIM_UNCONFIRMED_MESSAGE,
+  });
+  if (first.kind === 'stepUp') {
+    return { kind: 'stepUp', request, refusal: first.refusal, context: first.context };
   }
-  useMemberStore.getState().removeMember(target.user_id);
+  const purge = await readPurgeOutcome(first.response);
+  return { kind: 'done', notice: settleModeration(target, action, purge, pinMode) };
+}
 
-  // Best-effort: the moderation action has already committed, so a response we
-  // cannot parse must never surface as a failed ban or kick.
-  let body: { purge?: ModerationPurgeOutcome } | null = null;
-  try {
-    body = await safeJson<{ purge?: ModerationPurgeOutcome }>(res);
-  } catch {
-    body = null;
+interface ModerationCopy {
+  verb: string;
+  message: string;
+  loadingLabel: string;
+  purpose: StepUpPurpose;
+  describeFailure: (status: number, body: unknown) => string;
+}
+
+const MODERATION_COPY: Record<ModerationAction, ModerationCopy> = {
+  ban: {
+    verb: 'Ban',
+    message: 'This will permanently remove them from the server and prevent them from rejoining.',
+    loadingLabel: 'Banning...',
+    purpose: 'members.ban',
+    describeFailure: describeFailureWith('Ban failed'),
+  },
+  kick: {
+    verb: 'Kick',
+    message: 'This will remove them from the server. They can rejoin with a new invite.',
+    loadingLabel: 'Kicking...',
+    purpose: 'members.kick_purge',
+    describeFailure: describeFailureWith('Kick failed'),
+  },
+};
+
+/** What the verification dialog is for, frozen with the request it will re-send. */
+interface PendingModeration {
+  request: FrozenRequest;
+  refusal: StepUpFactorRefusal;
+  context: ApiRequestContext;
+  target: ServerMember;
+  alsoPurge: boolean;
+  /** What the confirmation showed about pins, and the claim every send rechecks. */
+  pinMode: PinMode;
+}
+
+interface ModerationDialogProps {
+  action: ModerationAction;
+  serverId: string;
+  /** The member being moderated; null while no confirmation is open. */
+  target: ServerMember | null;
+  /** Where "Set up verification" comes back to: the chat, or the Server Settings section this sits in. */
+  returnTo: VerificationReturn;
+  /** The notice to announce once the action has committed. */
+  onNotice: (notice: string) => void;
+  /** The action is over, however it ended: the host forgets its target. */
+  onEnd: () => void;
+  /** Where focus goes when the member row that opened the menu is gone. */
+  focusFallback: () => HTMLElement | null;
+}
+
+/**
+ * The confirmation for a ban or a kick, shared by the member sidebar and the
+ * server settings member list, and the verification that stands in its place
+ * when a server enforcing MFA refuses the first send (#3456 §3.4, D-5).
+ *
+ * The confirmation owns the purge opt-in. The first send carries it, and the
+ * dialog re-sends that same frozen request with `mfa_code`, so a checkbox
+ * flipped meanwhile could not change what is verified.
+ */
+export function ModerationDialog({
+  action,
+  serverId,
+  target,
+  returnTo,
+  onNotice,
+  onEnd,
+  focusFallback,
+}: Readonly<ModerationDialogProps>) {
+  const copy = MODERATION_COPY[action];
+  const [alsoPurge, setAlsoPurge] = useState(false);
+  const [includePinned, setIncludePinned] = useState(false);
+  // Sampled when the confirmation opens (#3458), so the send carries exactly
+  // what the dialog showed.
+  const pinMode = pinModeFor(usePurgeKeepsPinnedAtOpen(target !== null), includePinned);
+  const purgeOutcomeRef = useRef<ModerationPurgeOutcome | undefined>(undefined);
+
+  const { pending, ending, handOff, confirmClosed, endStepUp } =
+    useStepUpHandoff<PendingModeration>(() => {
+      setAlsoPurge(false);
+      setIncludePinned(false);
+      onEnd();
+    });
+
+  const confirm = async () => {
+    if (!target) return;
+    const result = await moderateMember(serverId, target, action, alsoPurge, pinMode);
+    if (result.kind === 'done') {
+      onNotice(result.notice.notice);
+      return;
+    }
+    const { request, refusal, context } = result;
+    handOff({ request, refusal, context, target, alsoPurge, pinMode });
+  };
+
+  const send = async (mfaCode: string | undefined, context: ApiRequestContext) => {
+    if (pending === null) return { kind: 'aborted' as const };
+    const result = await resendWithCode(
+      pending.request,
+      mfaCode,
+      context,
+      pinClaimDispatch(pending.alsoPurge, pending.pinMode),
+      PIN_CLAIM_UNCONFIRMED_MESSAGE
+    );
+    if (result.kind === 'ok') purgeOutcomeRef.current = await readPurgeOutcome(result.response);
+    return result;
+  };
+
+  const succeeded = () => {
+    if (pending !== null) {
+      const { target: settled, pinMode: settledPins } = pending;
+      onNotice(settleModeration(settled, action, purgeOutcomeRef.current, settledPins).notice);
+    }
+    purgeOutcomeRef.current = undefined;
+    endStepUp();
+  };
+
+  const purging = pending?.alsoPurge ?? false;
+  let purgeClause = '';
+  if (purging) {
+    purgeClause =
+      pending?.pinMode === 'include'
+        ? ' and purge their messages, pinned messages included'
+        : ' and purge their messages';
   }
-  // No purge fragment means none was requested — nothing to say, and nothing
-  // undescribable happened.
-  if (!body?.purge) return { notice: '', unknownStatus: false };
-  const verb = isBan ? 'banned' : 'kicked';
-  return purgeNotice(target.display_name || target.username, verb, body.purge.status, pinMode);
+  return (
+    <>
+      <ConfirmActionModal
+        // Not during the hand-off's ending commit: reopened for that one commit,
+        // the confirmation would take focus and drop it to <body> as onEnd closes it.
+        isOpen={target !== null && pending === null && !ending}
+        onClose={confirmClosed}
+        title={`${copy.verb} ${memberName(target)}`}
+        message={copy.message}
+        extraContent={
+          <PurgeMessagesOptIn
+            checked={alsoPurge}
+            onChange={setAlsoPurge}
+            pinMode={pinMode}
+            onIncludePinnedChange={setIncludePinned}
+          />
+        }
+        // Degrades gracefully: an unchecked box never blocks the action.
+        confirmLabel={alsoPurge ? `${copy.verb} and purge` : copy.verb}
+        loadingLabel={copy.loadingLabel}
+        onConfirm={confirm}
+      />
+      <DangerousActionStepUpDialog
+        isOpen={pending !== null}
+        purpose={copy.purpose}
+        seed={pending?.refusal}
+        intro={`This server asks you to verify before you ${copy.verb.toLowerCase()} ${memberName(pending?.target)}${purgeClause}.`}
+        primaryLabel={purging ? `${copy.verb} and purge` : copy.verb}
+        busyLabel={copy.loadingLabel}
+        send={send}
+        capture={pending?.context}
+        describeFailure={copy.describeFailure}
+        onSuccess={succeeded}
+        onClose={endStepUp}
+        onSetUpVerification={() => {
+          void openVerificationSetup({ returnTo, closeHost: endStepUp });
+        }}
+        focusFallback={focusFallback}
+      />
+    </>
+  );
 }

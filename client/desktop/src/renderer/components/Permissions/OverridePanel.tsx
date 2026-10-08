@@ -1,21 +1,48 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { AlertCircle } from 'lucide-react';
 import PermissionGrid from './PermissionGrid';
+import DangerousActionStepUpDialog from '../Auth/DangerousActionStepUpDialog';
+import type { StepUpPurpose } from '../Auth/stepUpPurpose';
+import { focusTargetIn } from '../ui/focusTarget';
 import {
   ChannelOverride,
   UpsertOverrideRequest,
   NO_PERMISSION_WRITES,
+  WRITE_UNKNOWN,
+  type PermissionWriteOutcome,
+  type WriteConfirmation,
 } from '../../stores/chat/permissionStore';
 import { Role } from '../../types/server';
 import { ServerMember } from '../../stores/chat/memberStore';
+import { describeFailureWith } from '../../services/system/dangerousActionRequest';
+import {
+  sendResultOf,
+  stepUpSeedOf,
+  type PermissionWriteStepUpSeed,
+} from '../../services/system/permissionWriteStepUp';
+import { openVerificationSetup } from '../../utils/ui/openVerificationSetup';
 import { parsePermissions, parseExactPermissions, countBits } from '../../utils/policy/permissions';
 import './OverridePanel.css';
+
+/** The two D1 gates an override upsert can meet: one per route (#3456 §3.4). */
+export type OverrideStepUpPurpose = Extract<
+  StepUpPurpose,
+  'overrides.channel_upsert' | 'overrides.category_upsert'
+>;
+
+/**
+ * What `onUpsert` takes. `confirmation` is set only on the step-up dialog's
+ * re-send, which carries the same request plus the proven code (#3456 §3.3); a
+ * host forwards the tuple whole so the first send reaches the store as it always
+ * did, with no trailing argument.
+ */
+export type OverrideUpsertArgs = [data: UpsertOverrideRequest, confirmation?: WriteConfirmation];
 
 interface OverridePanelProps {
   overrides: ChannelOverride[];
   roles: Role[];
   members: ServerMember[];
-  onUpsert: (data: UpsertOverrideRequest) => Promise<boolean>;
+  onUpsert: (...args: OverrideUpsertArgs) => Promise<PermissionWriteOutcome>;
   onDelete: (overrideId: string) => Promise<boolean>;
   disabled?: boolean;
   emptyMessage?: string;
@@ -30,6 +57,8 @@ interface OverridePanelProps {
    *  started by an earlier instance whose modal was closed (#3406 review,
    *  round 6). */
   writesInFlight?: readonly number[];
+  /** The gate the host's route sits behind: a security-key token is accepted only there. */
+  stepUpPurpose: OverrideStepUpPurpose;
 }
 
 /** Which write attempt a rejected promise belongs to — decides which of the
@@ -65,6 +94,22 @@ const WriteErrorAlert: React.FC<{ message: string }> = ({ message }) => (
   </div>
 );
 
+const STEP_UP_INTRO = 'This server asks you to verify before you change permission overrides.';
+const describeUpsertFailure = describeFailureWith('Failed to save permission override.');
+
+/**
+ * An upsert the server refused for verification, held while the dialog is up
+ * (#3456 §3.4). `request` is the body as first sent: the re-send adds
+ * `mfa_code` to exactly this and never re-reads the editor or the add form.
+ * `context` is the account and server it was first sent as, the dialog's capture.
+ */
+interface PendingStepUp extends PermissionWriteStepUpSeed {
+  site: 'edit' | 'add';
+  request: UpsertOverrideRequest;
+  /** The override the editor held when Save was pressed; null for an add. */
+  overrideId: string | null;
+}
+
 const OverridePanel: React.FC<OverridePanelProps> = ({
   overrides,
   roles,
@@ -76,6 +121,7 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
   locked = false,
   onWritePendingChange,
   writesInFlight = NO_PERMISSION_WRITES,
+  stepUpPurpose,
 }) => {
   const [selectedOverrideId, setSelectedOverrideId] = useState<string | null>(null);
   const [editAllow, setEditAllow] = useState<bigint>(0n);
@@ -95,6 +141,11 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
   // attempt, on Cancel, on selecting an override, on any grid edit, and on any
   // add-target change — never left to go stale across an unrelated action.
   const [writeError, setWriteError] = useState<{ site: WriteErrorSite } | null>(null);
+
+  // The refused upsert the step-up dialog is open for. Its Save or Add stays
+  // in flight until the dialog ends, so every lock below holds meanwhile and
+  // the parent's `onWritePendingChange` sees the write as still pending.
+  const [stepUp, setStepUp] = useState<PendingStepUp | null>(null);
 
   // Busy state per write button (#3406 finding 2): disables the button that
   // triggered a write while that write is in flight, so a double-click can't
@@ -149,6 +200,10 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
   selectedOverrideIdRef.current = selectedOverrideId;
   const addFieldsRef = useRef({ addTargetType, addTargetId, addAllow, addDeny });
   addFieldsRef.current = { addTargetType, addTargetId, addAllow, addDeny };
+  // Where focus goes when the dialog closes and the control that opened it has
+  // left or is disabled: the add form, else the editor's buttons (never <body>).
+  const addSectionRef = useRef<HTMLDivElement>(null);
+  const editActionsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -217,6 +272,18 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
     setWriteError(null);
   }, []);
 
+  // A prop a host hands in might reject; the store's own upserts never do.
+  const attemptUpsert = useCallback(
+    (...args: OverrideUpsertArgs) => onUpsert(...args).catch(() => WRITE_UNKNOWN),
+    [onUpsert]
+  );
+
+  const resetAddForm = useCallback(() => {
+    setAddTargetId('');
+    setAddAllow(0n);
+    setAddDeny(0n);
+  }, []);
+
   const handleSaveOverride = useCallback(
     async (override: ChannelOverride) => {
       const operation = ++operationRef.current;
@@ -224,31 +291,39 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
       setIsSavingOverride(true);
       setSavesInFlight((n) => n + 1);
       // Fail closed (D4): the editor closes only on a write the caller confirmed.
-      // A refusal, or a caller that rejects instead of settling false, keeps it
-      // open with the alert.
-      const ok = await onUpsert({
+      // A refusal, or a caller that rejects instead of settling, keeps it open
+      // with the alert.
+      const request: UpsertOverrideRequest = {
         target_type: override.target_type,
         target_id: override.target_id,
         allow: editAllow.toString(),
         deny: editDeny.toString(),
-      }).catch(() => false);
-      // Settled, current or not: this request can no longer commit, so it
-      // stops holding the write lock.
-      if (mountedRef.current) setSavesInFlight((n) => n - 1);
+      };
+      const outcome = await attemptUpsert(request);
       // Stale write (#3406): a Cancel, a re-select, or another write started
       // while this one was in flight — drop the result silently. Only the
       // current save owns the busy flag: a Cancel already released it, and a
       // newer save may hold it now.
-      if (!mountedRef.current || operation !== operationRef.current) return;
+      const current = mountedRef.current && operation === operationRef.current;
+      const seed = stepUpSeedOf(outcome);
+      if (current && seed !== null) {
+        // Not over: the dialog re-sends this request, and the lock holds until it ends.
+        setStepUp({ site: 'edit', request, ...seed, overrideId: override.id });
+        return;
+      }
+      // Settled, current or not: this request can no longer commit, so it
+      // stops holding the write lock.
+      if (mountedRef.current) setSavesInFlight((n) => n - 1);
+      if (!current) return;
       setIsSavingOverride(false);
       if (selectedOverrideIdRef.current !== override.id) return;
-      if (!ok) {
+      if (!outcome.ok) {
         setWriteError({ site: 'edit' });
         return;
       }
       setSelectedOverrideId(null);
     },
-    [editAllow, editDeny, onUpsert]
+    [editAllow, editDeny, attemptUpsert]
   );
 
   const handleDeleteOverride = useCallback(
@@ -286,13 +361,13 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
     const snapshot = { addTargetType, addTargetId, addAllow, addDeny };
     setWriteError(null);
     setIsAddingOverride(true);
-    const ok = await onUpsert({
+    const request: UpsertOverrideRequest = {
       target_type: addTargetType,
       target_id: addTargetId,
       allow: addAllow.toString(),
       deny: addDeny.toString(),
-    }).catch(() => false);
-    if (mountedRef.current) setIsAddingOverride(false);
+    };
+    const outcome = await attemptUpsert(request);
     // Stale write (#3406): a newer add attempt, or a target/type/bits change
     // since this one started — drop the result silently.
     const stillCurrent =
@@ -302,15 +377,56 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
       addFieldsRef.current.addTargetId === snapshot.addTargetId &&
       addFieldsRef.current.addAllow === snapshot.addAllow &&
       addFieldsRef.current.addDeny === snapshot.addDeny;
+    const seed = stepUpSeedOf(outcome);
+    if (stillCurrent && seed !== null) {
+      // Not over: the dialog re-sends this request, and the lock holds until it ends.
+      setStepUp({ site: 'add', request, ...seed, overrideId: null });
+      return;
+    }
+    if (mountedRef.current) setIsAddingOverride(false);
     if (!stillCurrent) return;
-    if (!ok) {
+    if (!outcome.ok) {
       setWriteError({ site: 'add' });
       return;
     }
-    setAddTargetId('');
-    setAddAllow(0n);
-    setAddDeny(0n);
-  }, [addTargetType, addTargetId, addAllow, addDeny, onUpsert]);
+    resetAddForm();
+  }, [addTargetType, addTargetId, addAllow, addDeny, attemptUpsert, resetAddForm]);
+
+  // The dialog ended without a write landing (Cancel, Escape, or "Set up
+  // verification", which abandons the request): the attempt is over and its
+  // lock goes. Nothing failed, so no alert, and the editor or form is as it was.
+  const endStepUp = useCallback(() => {
+    if (stepUp === null) return;
+    setStepUp(null);
+    if (stepUp.site === 'add') {
+      setIsAddingOverride(false);
+      return;
+    }
+    setSavesInFlight((n) => n - 1);
+    setIsSavingOverride(false);
+  }, [stepUp]);
+
+  const handleStepUpSuccess = useCallback(() => {
+    if (stepUp === null) return;
+    endStepUp();
+    if (stepUp.site === 'add') {
+      resetAddForm();
+    } else if (selectedOverrideIdRef.current === stepUp.overrideId) {
+      setSelectedOverrideId(null);
+    }
+  }, [stepUp, endStepUp, resetAddForm]);
+
+  const resendUpsert = async (
+    mfaCode: string | undefined,
+    context: WriteConfirmation['context']
+  ) => {
+    if (stepUp === null) return { kind: 'aborted' } as const;
+    return sendResultOf(await attemptUpsert(stepUp.request, { mfaCode, context }));
+  };
+
+  const focusFallback = () =>
+    focusTargetIn(addSectionRef.current) ?? focusTargetIn(editActionsRef.current);
+  const isAddStepUp = stepUp?.site === 'add';
 
   const selectedOverride = useMemo(
     () => overrides.find((o) => o.id === selectedOverrideId) ?? null,
@@ -454,7 +570,7 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
             </output>
           )}
           {writeError?.site === 'edit' && <WriteErrorAlert message={SAVE_ERROR_MESSAGE} />}
-          <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+          <div ref={editActionsRef} style={{ marginTop: 12, display: 'flex', gap: 8 }}>
             <button
               className="add-override-btn"
               onClick={() => handleSaveOverride(selectedOverride)}
@@ -471,7 +587,7 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
 
       {/* Add Override Section */}
       {!disabled && !selectedOverride && (
-        <div className="add-override-section">
+        <div ref={addSectionRef} className="add-override-section">
           <div className="section-header">Add Override</div>
           <div className="add-override-row">
             <select
@@ -530,6 +646,26 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
           </button>
         </div>
       )}
+
+      {/* The step-up dialog stands over the panel, beside the write alerts above
+          and never inside one. */}
+      <DangerousActionStepUpDialog
+        isOpen={stepUp !== null}
+        purpose={stepUpPurpose}
+        seed={stepUp?.refusal}
+        capture={stepUp?.context}
+        intro={STEP_UP_INTRO}
+        primaryLabel={isAddStepUp ? 'Add Override' : 'Save Override'}
+        busyLabel={isAddStepUp ? 'Adding...' : 'Saving...'}
+        send={resendUpsert}
+        describeFailure={describeUpsertFailure}
+        onSuccess={handleStepUpSuccess}
+        onClose={endStepUp}
+        onSetUpVerification={() => {
+          void openVerificationSetup({ returnTo: { kind: 'chat' }, closeHost: endStepUp });
+        }}
+        focusFallback={focusFallback}
+      />
     </>
   );
 };

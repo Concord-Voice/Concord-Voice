@@ -13,6 +13,7 @@ import {
 import type { DeleteRefusalState, DeleteStepUp } from '../../hooks/messaging/useChatController';
 import { softLockSeed, type DeleteRefusalView } from '../../services/messaging/deleteRefusal';
 import type { ApiRequestContext } from '../../services/system/requestContext';
+import { openVerificationSetup } from '../../utils/ui/openVerificationSetup';
 import { findSurfaceComposer, findSurfaceMessageRow } from './chatSurface';
 import './DeleteRefusalModal.css';
 
@@ -131,6 +132,8 @@ interface CredentialStageProps {
   describedById: string;
   onConfirm: DeleteRefusalModalProps['onConfirm'];
   onCancel: () => void;
+  /** The account and server the refused delete went out as (C82). */
+  capture: ApiRequestContext;
 }
 
 /**
@@ -143,6 +146,7 @@ const CredentialStage: React.FC<CredentialStageProps> = ({
   describedById,
   onConfirm,
   onCancel,
+  capture,
 }) => {
   // Component-local state only: never a store, never logged
   // ([internal]rules/observability.md).
@@ -158,7 +162,15 @@ const CredentialStage: React.FC<CredentialStageProps> = ({
     if (outcome.kind !== 'aborted') setPassword('');
     return outcome;
   };
-  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit);
+  // The retry and the setup link work against the refused delete's capture.
+  const { ariaDisabled, activate } = stepUpActivation(factor, password, submit, { capture });
+
+  // The enrolment state's "Set up verification" (#3456 §3.6a). The delete is
+  // abandoned, never retried on return: the dialog closes through the same
+  // dismissal as Cancel, and the person repeats the delete themselves.
+  const setUpVerification = () => {
+    void openVerificationSetup({ returnTo: { kind: 'chat' }, closeHost: onCancel });
+  };
 
   return (
     <div className="delete-refusal-modal__stage">
@@ -171,6 +183,8 @@ const CredentialStage: React.FC<CredentialStageProps> = ({
         onPasswordChange={setPassword}
         primaryRef={primaryRef}
         focusOnReady
+        onSetUpVerification={setUpVerification}
+        capture={capture}
       />
       <div className="delete-refusal-modal__actions">
         <button
@@ -289,6 +303,7 @@ const DeleteRefusalModal: React.FC<DeleteRefusalModalProps> = ({
             describedById={describedById}
             onConfirm={onConfirm}
             onCancel={onDismiss}
+            capture={refusal.context}
           />
         ) : (
           <>

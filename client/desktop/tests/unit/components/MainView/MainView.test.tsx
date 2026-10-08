@@ -1,10 +1,11 @@
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, userEvent } from '../../../test-utils';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import { ADMIN_PERMISSIONS } from '@/renderer/utils/policy/permissions';
-import { mockServer, mockChannel } from '../../../mocks/fixtures';
+import { mockServer, mockServer2, mockChannel } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 const channelPanelPresentation = vi.hoisted(() => ({ compact: false }));
@@ -841,5 +842,142 @@ describe('MainView', () => {
     } finally {
       globalThis.electron = previousElectron;
     }
+  });
+});
+
+// The MFA notice under the channel sidebar's server header (#3456 §3.6). The
+// component itself is covered in MfaRestrictedNotice.test.tsx; this pins where
+// MainView puts it and what it wires in. Real stores; the layout seams above
+// stand in for chrome only.
+//
+// "Mutant:" comments name the production change each case exists to turn red.
+describe('MainView MFA notice', () => {
+  const SENTENCE = 'Some of your permissions on this server need MFA.';
+
+  // MainView refetches the active server's permissions on mount and on every server
+  // switch, and a "not restricted" read clears the flag. So the network a flagged
+  // server answers with has to agree with the flag, or the read removes the notice
+  // before the click lands. Servers outside this set answer mfa_restricted: false.
+  let flaggedOnServer = new Set<string>();
+
+  function flag(...serverIds: string[]) {
+    flaggedOnServer = new Set(serverIds);
+    usePermissionStore.setState({
+      mfaRestrictedByServer: Object.fromEntries(serverIds.map((id) => [id, true as const])),
+    });
+  }
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    flaggedOnServer = new Set();
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      const serverId = /^\/api\/v1\/servers\/([^/]+)\/permissions$/.exec(path)?.[1];
+      return {
+        ok: true,
+        json: async () =>
+          serverId === undefined
+            ? {}
+            : { permissions: '0', mfa_restricted: flaggedOnServer.has(serverId) },
+      } as Response;
+    });
+    channelPanelPresentation.compact = false;
+    useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: 'server-1' });
+    useChannelStore.setState({ channels: [mockChannel], activeChannelId: 'channel-1' });
+  });
+
+  afterEach(() => {
+    // Back to the file-wide default so later describes see the original mock.
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true, json: async () => ({}) } as Response);
+  });
+
+  // Mutant: <MfaRestrictedNotice> removed from renderChannelBody.
+  it('renders under the header, above the server actions, when the active server is flagged', () => {
+    flag('server-1');
+    render(<MainView />);
+
+    const notice = screen.getByText(SENTENCE).closest('.mfa-restricted-notice') as HTMLElement;
+    const header = screen.getByRole('heading', { name: mockServer.name });
+    const actions = screen.getByTestId('server-action-bar');
+    expect(notice.parentElement).toBe(actions.parentElement);
+    expect(header.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(notice.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // Mutant: the notice rendered unconditionally, or handed a constant serverId.
+  it('renders nothing while the active server is not flagged', () => {
+    render(<MainView />);
+
+    expect(screen.queryByText(SENTENCE)).not.toBeInTheDocument();
+  });
+
+  // Mutant: the notice handed `activeServerId` of another server, or the flag read from any key.
+  it('renders nothing when only a non-active server is flagged', () => {
+    flag('server-2');
+    render(<MainView />);
+
+    expect(screen.queryByText(SENTENCE)).not.toBeInTheDocument();
+  });
+
+  // Mutant: `compact={compact}` dropped from the notice's props.
+  it('renders nothing in the compact dock presentation', () => {
+    channelPanelPresentation.compact = true;
+    flag('server-1');
+    render(<MainView />);
+
+    expect(screen.queryByText(SENTENCE)).not.toBeInTheDocument();
+  });
+
+  // Mutant: the notice moved outside the `activeServer &&` guard.
+  it('renders nothing with no active server', () => {
+    useServerStore.setState({ activeServerId: null });
+    flag('server-1');
+    render(<MainView />);
+
+    expect(screen.queryByText(SENTENCE)).not.toBeInTheDocument();
+  });
+
+  // Mutant: the header <h3> loses `ref={serverNameRef}`, or `returnFocusRef` is not passed on.
+  it('dismissing moves focus to the server-name heading', async () => {
+    flag('server-1');
+    render(<MainView />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss MFA notice' }));
+
+    expect(screen.queryByText(SENTENCE)).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: mockServer.name })).toHaveFocus();
+  });
+
+  // Mutant: `tabIndex={-1}` removed from the <h3>: focus() is a no-op and lands on <body>.
+  it('the server-name heading is focusable by script but not by Tab', () => {
+    render(<MainView />);
+
+    expect(screen.getByRole('heading', { name: mockServer.name })).toHaveAttribute(
+      'tabindex',
+      '-1'
+    );
+  });
+
+  // Mutant: dismissal keyed by anything but the active server's id.
+  it("a dismissal on one server leaves another flagged server's notice showing", async () => {
+    flag('server-1', 'server-2');
+    render(<MainView />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss MFA notice' }));
+    expect(screen.queryByText(SENTENCE)).not.toBeInTheDocument();
+    useServerStore.setState({ activeServerId: 'server-2' });
+
+    expect(await screen.findByText(SENTENCE)).toBeInTheDocument();
+  });
+
+  // Mutant: the notice's link not wired to openVerificationSetup with a chat return.
+  it('the set-up link opens App Settings with a chat return', async () => {
+    flag('server-1');
+    render(<MainView />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Set up verification' }));
+
+    expect(useSettingsOverlayStore.getState().open).toBe('app');
+    expect(useSettingsOverlayStore.getState().verificationReturn).toEqual({ kind: 'chat' });
   });
 });

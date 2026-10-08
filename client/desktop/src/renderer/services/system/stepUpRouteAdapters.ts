@@ -10,14 +10,19 @@
  * - #8, backup-code regeneration (`RegenerateBackupCodes`,
  *   `internal/mfa/handlers.go`).
  *
- * Each adapter matches its route's strings EXACTLY and returns `null` for every
- * response it does not own (C5), so the surface's own handling runs instead of
- * a guess. Rewording a server string therefore degrades it to `null`, never to
- * a factor error on the wrong field. Never widen these to substring or
- * case-folded matches.
+ * A third family, the dangerous-action gates (#3456 §3.2), does write the seam
+ * bodies, but shares its 429 and 503 statuses with the gated routes' own
+ * limiters and failures, which the classifier maps by status alone.
+ *
+ * Each adapter matches its route's strings or flags EXACTLY and returns `null`
+ * for every response it does not own (C5), so the surface's own handling runs
+ * instead of a guess. Rewording a server string therefore degrades it to
+ * `null`, never to a factor error on the wrong field. Never widen these to
+ * substring or case-folded matches.
  */
 
 import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
+import { classifyStepUpRefusal, type StepUpRefusal } from './stepUpRefusal';
 
 /** The `error` member of a parsed body, without trusting the body's shape. */
 function errorOf(body: unknown): unknown {
@@ -84,5 +89,66 @@ export function adaptBackupCodeRegenerateRefusal(
     return null;
   }
   if (status === 400 && error === 'Password and TOTP code are required') return { kind: 'failed' };
+  return null;
+}
+
+/**
+ * The flags a dangerous-action gate puts on its 429 and 503 (#3456 V15):
+ * `stepup.Budget`'s two refusals and `mfaenforce.WriteBusy`. Each is read as
+ * `=== true` only.
+ */
+interface DangerousActionFlags {
+  step_up_budget_exhausted?: unknown;
+  step_up_budget_unavailable?: unknown;
+  lock_conflict?: unknown;
+}
+
+/** Narrows a parsed body to its flags without trusting the body's shape. */
+function flagsOf(body: unknown): DangerousActionFlags {
+  return typeof body === 'object' && body !== null ? body : {};
+}
+
+/**
+ * The 403 kinds a D1 gate writes. No D1 gate reads a password (#3456 V18), so
+ * `passwordRequired` and `invalidPassword` are not its answers, and
+ * `deleteRateLimited` is the soft-lock's: each is `null`, and so is `failed`.
+ */
+function dangerousActionForbidden(refusal: StepUpRefusal): StepUpFactorRefusal | null {
+  switch (refusal.kind) {
+    case 'enrollmentRequired':
+    case 'mfaRequired':
+    case 'invalidMfaCode':
+      return refusal;
+    default:
+      return null;
+  }
+}
+
+/**
+ * A refusal from a dangerous-action (D1) gate, `mfaenforce.Require`, or the
+ * MFA-enforcement toggle's OFF confirmation, `mfaenforce.ConfirmTx` (#3456
+ * §3.2).
+ *
+ * The 429 and 503 are owned only when flagged: the budget's 429 is charged
+ * before the gate's transaction, so the code it carried was not spent; the
+ * budget's 503 and the gate's lock conflict are `unavailable`. An unflagged
+ * 429 or 503 is the gated route's own limiter or failure, so it is `null` and
+ * the host's own mapping runs. A 403 goes through `classifyStepUpRefusal`,
+ * which keeps its flag-first order (`enrollmentRequired` first).
+ */
+export function adaptDangerousActionRefusal(
+  status: number,
+  body: unknown
+): StepUpFactorRefusal | null {
+  const flags = flagsOf(body);
+  if (status === 429) {
+    return flags.step_up_budget_exhausted === true ? { kind: 'rateLimited' } : null;
+  }
+  if (status === 503) {
+    const owned = flags.step_up_budget_unavailable === true || flags.lock_conflict === true;
+    return owned ? { kind: 'unavailable' } : null;
+  }
+  if (status === 403) return dangerousActionForbidden(classifyStepUpRefusal(403, body));
+  if (status === 401) return { kind: 'sessionExpired' };
   return null;
 }

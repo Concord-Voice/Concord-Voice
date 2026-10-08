@@ -31,6 +31,7 @@ import type {
 import type { ExpirationPolicy } from '../../services/messaging/expirationPolicyApi';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { isPendingKeyError } from '../../services/e2ee/e2eeErrors';
+import { createPermissionRefresh } from '../../services/system/permissionRefresh';
 import { preferencesSyncService } from '../../services/system/preferencesSync';
 import { savedGifsSyncService } from '../../services/system/savedGifsSync';
 import { friendOrgSyncService } from '../../services/system/friendOrgSync';
@@ -942,6 +943,9 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       notificationSoundService.stopLoop('call-ringing');
       dmCallSoundState.backgroundRingtoneConversationId = null;
     });
+    // Owns the jittered and debounced permission refetches (#3456). Created per
+    // effect so its timers are cleared with the handlers that arm them.
+    const permissionRefresh = createPermissionRefresh();
     const messageContentOperationOwner = createMessageContentOperationOwner();
     const pendingMessagePlaceholders = new Map<string, { channelId: string; messageId: string }>();
     const settleMessagePlaceholder = (channelId: string, messageId: string) =>
@@ -1655,6 +1659,17 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
 
     const unsubRoleDeleted = wsService.on('role_deleted', (msg) => {
       void usePermissionStore.getState().fetchRoles(msg.data.server_id);
+    });
+
+    // Permission-change events (#3456). The payloads carry no direction and no
+    // permission data: they only say "re-read", and the schedule (jitter, drop
+    // while pending, debounce, no retry) lives in `permissionRefresh`.
+    const unsubServerPermissionsChanged = wsService.on('server_permissions_changed', (msg) => {
+      permissionRefresh.serverPermissionsChanged(msg.data.server_id);
+    });
+
+    const unsubPermissionsChanged = wsService.on('permissions_changed', () => {
+      permissionRefresh.ownPermissionsChanged();
     });
 
     // Server deleted — msg.data narrowed to ServerDeletedPayload.
@@ -2567,6 +2582,9 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubRolesReordered();
       unsubRoleCreated();
       unsubRoleDeleted();
+      unsubServerPermissionsChanged();
+      unsubPermissionsChanged();
+      permissionRefresh.dispose();
       unsubServerDeleted();
       unsubMemberRemoved();
       unsubMemberTimeout();

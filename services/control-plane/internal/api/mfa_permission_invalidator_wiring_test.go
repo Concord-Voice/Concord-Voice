@@ -90,6 +90,7 @@ func TestRequirePermissionInvalidatorWired_ExitsOnlyWhenUnwired(t *testing.T) {
 	case "wired":
 		h := &mfa.Handler{}
 		h.SetPermissionInvalidator(stubPermissionInvalidator{})
+		h.SetPermissionChangeNotifier(newTestNotifierOnly()) // #3456: the guard now needs both
 		requirePermissionInvalidatorWired(logger.New("test"), h)
 		return
 	}

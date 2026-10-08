@@ -1,5 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
+import {
+  useSettingsOverlayStore,
+  type ServerSettingsSection,
+} from '../../stores/ui/settingsOverlayStore';
 import ImageCropEditor from '../ui/ImageCropEditor';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import ToggleSwitch from '../Settings/ToggleSwitch';
@@ -7,6 +10,9 @@ import RoleEditorPanel from './RoleEditorPanel';
 import MemberListPanel from './MemberListPanel';
 import IconUploadArea from './IconUploadArea';
 import BannerUploadArea from './BannerUploadArea';
+import MfaEnforcementSetting from './MfaEnforcementSetting';
+import ServerSaveStepUpDialog, { type PendingServerSave } from './ServerSaveStepUpDialog';
+import { useDiscardPrompt } from './useDiscardPrompt';
 import { useImageUpload } from '../../hooks/messaging/useImageUpload';
 import { useSectionObserver } from '../../hooks/ui/useSectionObserver';
 import {
@@ -19,18 +25,33 @@ import {
 import { ServerNameField, ServerFormBanners } from './ServerNameField';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useInviteStore } from '../../stores/chat/inviteStore';
-import { usePermissionStore } from '../../stores/chat/permissionStore';
+import {
+  usePermissionStore,
+  type UpdateRoleRequest,
+  type CreateRoleRequest,
+  type WriteConfirmation,
+} from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { Permissions } from '../../utils/policy/permissions';
-import { apiFetch } from '../../services/system/apiClient';
+import {
+  buildServerUpdateBody,
+  hasUnsavedChanges,
+  updateServer,
+  type ServerUpdateForm,
+  type UpdatedServer,
+} from '../../services/system/serverUpdateApi';
 import { formatFileSize } from '../../utils/crypto/attachmentCrypto';
+import { openVerificationSetup } from '../../utils/ui/openVerificationSetup';
 import type { ServerInviteWithCreator, Role } from '../../types/server';
 import './ServerSettingsPage.css';
 
 const EMPTY_INVITES: ServerInviteWithCreator[] = [];
 const EMPTY_ROLES: Role[] = [];
 
-type SettingsSection = 'general' | 'roles' | 'members';
+const NAME_INPUT_ID = 'server-settings-name';
+const focusNameField = () => document.getElementById(NAME_INPUT_ID);
+
+type SettingsSection = ServerSettingsSection;
 
 interface NavItem {
   id: SettingsSection;
@@ -54,17 +75,35 @@ interface ServerSettingsPageProps {
 
 const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => {
   const closeOverlay = useSettingsOverlayStore((s) => s.close);
+  // The section the overlay was opened at (the verification-setup return,
+  // #3456 §3.6a); omitted, General.
+  const openedSection = useSettingsOverlayStore((s) => s.payload?.section) ?? 'general';
   const servers = useServerStore((s) => s.servers);
   const server = servers.find((s) => s.id === serverId);
 
-  const [activeSection, setActiveSection] = useState<SettingsSection>('general');
+  const [activeSection, setActiveSection] = useState<SettingsSection>(openedSection);
   const [activeSubsection, setActiveSubsection] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const navRef = useRef<HTMLElement>(null);
+
+  // Opened in place of App Settings ("Back to Server Settings", #3456 §3.6a),
+  // the page swaps inside a dialog that is already open, so nothing returns
+  // focus: the control that held it left with App Settings. The active
+  // section's nav item takes it then, never <body>. Opened any other way,
+  // focus is already somewhere and stays there.
+  const serverShown = server !== undefined;
+  useEffect(() => {
+    if (!serverShown) return;
+    const active = document.activeElement;
+    if (active !== null && active !== document.body) return;
+    navRef.current?.querySelector<HTMLElement>('.settings-nav-item.active')?.focus();
+  }, [serverShown]);
 
   // General tab state
   const [name, setName] = useState(server?.name || '');
   const [errors, setErrors] = useState<ServerFormErrors>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [pendingSave, setPendingSave] = useState<PendingServerSave | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [inviteCopied, setInviteCopied] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
@@ -88,6 +127,13 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
     onError: (msg) => setErrors((prev) => ({ ...prev, banner: msg })),
     initialUrl: server?.banner_url,
   });
+
+  const form: ServerUpdateForm = { name, icon, banner, allowEmbeddedContent };
+
+  // Setting up verification leaves this page, and its unsaved edits with it: ask first.
+  const { confirmDiscard, prompt: discardPrompt } = useDiscardPrompt(
+    () => server !== undefined && hasUnsavedChanges(server, form)
+  );
 
   const hasServerPerm = usePermissionStore((s) => s.hasServerPermission);
   const canManageServer = server ? hasServerPerm(server.id, Permissions.MANAGE_SERVER) : false;
@@ -222,6 +268,8 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
       setErrors({});
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets isSubmitting on server identity change; not a render loop
       setIsSubmitting(false);
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: drops a refused save that belongs to the previous server on server identity change; not a render loop
+      setPendingSave(null);
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: clears successMessage on server identity change; not a render loop
       setSuccessMessage(null);
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets inviteCopied on server identity change; not a render loop
@@ -231,7 +279,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets allowEmbeddedContent from server prop on server identity change; not a render loop
       setAllowEmbeddedContent(server.allow_embedded_content ?? false);
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets activeSection on server identity change; not a render loop
-      setActiveSection('general');
+      setActiveSection(openedSection);
     }
     // eslint-disable-next-line @eslint-react/exhaustive-deps -- snapshot-on-switch; see block comment above effect
   }, [server?.id]);
@@ -290,6 +338,28 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
     return Object.keys(newErrors).length === 0;
   };
 
+  /**
+   * `savedId` is the server the save went out for. The store takes the route's answer for that
+   * server whatever is shown now; the page announces it only while it still shows that server.
+   */
+  const applySavedServer = (saved: UpdatedServer, savedId: string) => {
+    useServerStore.getState().updateServer(savedId, saved);
+    if (savedId === server.id) setSuccessMessage('Server updated successfully!');
+  };
+
+  /**
+   * Leaves for App Settings to set up verification. The form is asked about first (D-4), and
+   * `closeHost` closes the caller's dialog only once that is settled. The refused action is
+   * abandoned, not retried on return.
+   */
+  const setUpVerification = (closeHost: () => void) => {
+    void openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: server.id, section: 'general' },
+      confirmDiscard,
+      closeHost,
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrors({});
@@ -297,85 +367,44 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
     if (!validateForm()) return;
     setIsSubmitting(true);
     try {
-      const body: {
-        name: string;
-        icon_url?: string | null;
-        banner_url?: string | null;
-        allow_embedded_content?: boolean;
-      } = {
-        name: name.trim(),
-      };
-      if (icon.removed) {
-        body.icon_url = null;
-      } else if (icon.imageUrl && icon.imageUrl !== server.icon_url) {
-        body.icon_url = icon.imageUrl;
+      const serverId = server.id;
+      const body = buildServerUpdateBody(server, form);
+      const result = await updateServer(serverId, body);
+      if (result.kind === 'ok') {
+        applySavedServer(result.server, serverId);
+      } else if (result.kind === 'stepUp') {
+        // A server that enforces MFA wants a verified code before it saves: the dialog re-sends
+        // exactly this body with one, and never re-reads the form.
+        setPendingSave({ serverId, body, refusal: result.refusal, context: result.context });
+      } else {
+        setErrors({ general: result.message });
       }
-      if (banner.removed) {
-        body.banner_url = null;
-      } else if (banner.imageUrl && banner.imageUrl !== server.banner_url) {
-        body.banner_url = banner.imageUrl;
-      }
-      if (allowEmbeddedContent !== server.allow_embedded_content) {
-        body.allow_embedded_content = allowEmbeddedContent;
-      }
-      const response = await apiFetch(`/api/v1/servers/${server.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to update server');
-      useServerStore.getState().updateServer(server.id, {
-        name: data.server.name,
-        icon_url: data.server.icon_url,
-        banner_url: data.server.banner_url,
-        allow_embedded_content: data.server.allow_embedded_content,
-        updated_at: data.server.updated_at,
-      });
-      setSuccessMessage('Server updated successfully!');
-      setIsSubmitting(false);
     } catch (error) {
       setErrors({
         general:
           error instanceof Error ? error.message : 'Failed to update server. Please try again.',
       });
+    } finally {
       setIsSubmitting(false);
     }
   };
 
   // ─── Roles handlers ───
 
-  const handleCreateRole = async () => {
-    const existingNames = new Set(serverRoles.map((r) => r.name));
-    let roleName = 'New Role';
-    let counter = 2;
-    while (existingNames.has(roleName)) {
-      roleName = `New Role ${counter++}`;
-    }
-    return await createRole(server.id, {
-      name: roleName,
-      color: '#99aab5',
-      permissions: '0',
-    });
-  };
+  // `RoleEditorPanel` builds the request once per create; `confirmation` is set only on the
+  // step-up dialog's re-send of it (#3456). The outcome goes back to the panel, which tells a
+  // refusal that asks for verification from one that does not.
+  const handleCreateRole = (request: CreateRoleRequest, confirmation?: WriteConfirmation) =>
+    createRole(server.id, request, confirmation);
 
-  const handleSaveRole = async (
+  const handleSaveRole = (
     roleId: string,
-    data: {
-      name: string;
-      color: string;
-      emoji: string;
-      permissions: string;
-      display_separately: boolean;
-      mentionable: boolean;
-    }
-  ) => {
-    await updateRole(server.id, roleId, data);
-  };
+    data: Required<UpdateRoleRequest>,
+    confirmation?: WriteConfirmation
+  ) => updateRole(server.id, roleId, data, confirmation);
 
-  const handleDeleteRole = async (roleId: string) => {
-    await deleteRole(server.id, roleId);
-  };
+  const handleDeleteRole = (roleId: string, confirmation?: WriteConfirmation) =>
+    deleteRole(server.id, roleId, confirmation);
 
   // ─── Members handlers ───
 
@@ -421,7 +450,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         />
 
         <ServerNameField
-          inputId="server-settings-name"
+          inputId={NAME_INPUT_ID}
           name={name}
           error={errors.name}
           disabled={isSubmitting}
@@ -520,6 +549,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
           <span className="form-hint">Invites default to 1 use, expire in 24 hours.</span>
         </div>
       )}
+      <MfaEnforcementSetting serverId={server.id} confirmDiscard={confirmDiscard} />
       {/* Icon Crop Editor */}
       <ImageCropEditor
         isOpen={icon.showCrop}
@@ -532,6 +562,8 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         upload={{
           endpoint: '/api/v1/media/upload/server-icon',
           extraFields: { server_id: server.id },
+          stepUpPurpose: 'media.server_icon_upload',
+          onSetUpVerification: setUpVerification,
         }}
       />
 
@@ -547,6 +579,8 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         upload={{
           endpoint: '/api/v1/media/upload/server-banner',
           extraFields: { server_id: server.id },
+          stepUpPurpose: 'media.server_banner_upload',
+          onSetUpVerification: setUpVerification,
         }}
       />
     </form>
@@ -597,7 +631,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         <div className="settings-page-inner">
           <div className="settings-layout">
             {/* Left sidebar */}
-            <nav className="settings-nav">
+            <nav ref={navRef} className="settings-nav">
               <div className="settings-nav-scroll">
                 <button className="settings-back-btn" onClick={closeOverlay}>
                   <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
@@ -658,6 +692,17 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
           </div>
         </div>
       </div>
+      <ServerSaveStepUpDialog
+        pending={pendingSave}
+        onSaved={(saved, savedId) => {
+          applySavedServer(saved, savedId);
+          setPendingSave(null);
+        }}
+        onClose={() => setPendingSave(null)}
+        onSetUpVerification={setUpVerification}
+        focusFallback={focusNameField}
+      />
+      {discardPrompt}
     </div>
   );
 };

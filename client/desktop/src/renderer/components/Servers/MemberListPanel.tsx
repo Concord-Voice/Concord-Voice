@@ -8,8 +8,8 @@ import type { Role } from '../../types/server';
 import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import MemberContextMenu from '../Members/MemberContextMenu';
 import UserProfileModal from '../Members/UserProfileModal';
-import { ModerationConfirmModal, moderateMember } from '../Members/purgeOnModeration';
-import type { PinMode } from '../../services/messaging/purgeApi';
+import { focusTargetIn } from '../ui/focusTarget';
+import { ModerationDialog } from '../Members/purgeOnModeration';
 import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
 interface MemberListPanelProps {
@@ -170,6 +170,10 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   // announced by this panel instead of inside the modal.
   const [moderationNotice, setModerationNotice] = useState('');
   const [renderedAtMs] = useState(() => Date.now());
+  const listRef = useRef<HTMLDivElement>(null);
+  // The row that opened the ban or kick menu may be the member just removed, so
+  // when verification closes with nothing to return to, focus goes to the list.
+  const focusMemberList = useCallback(() => focusTargetIn(listRef.current), []);
 
   const fullProfileMemberData = fullProfileUserId
     ? (members.find((m) => m.user_id === fullProfileUserId) ?? null)
@@ -195,14 +199,6 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
     setModerationNotice('');
   }, [serverId]);
 
-  const runModeration = useCallback(
-    async (target: ServerMember, action: 'ban' | 'kick', alsoPurge: boolean, pinMode: PinMode) => {
-      const { notice } = await moderateMember(serverId, target, action, alsoPurge, pinMode);
-      setModerationNotice(notice);
-    },
-    [serverId]
-  );
-
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLButtonElement>, member: ServerMember) => {
       if (e.key === 'Enter' || e.key === ' ') {
@@ -216,7 +212,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   );
 
   return (
-    <div className="members-list">
+    <div ref={listRef} className="members-list">
       <div className="settings-member-list-header">
         <span>User</span>
         <span>Roles</span>
@@ -389,17 +385,24 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
         />
       )}
 
-      <ModerationConfirmModal
+      <ModerationDialog
         action="ban"
+        serverId={serverId}
         target={banTarget}
-        onClose={() => setBanTarget(null)}
-        onConfirm={runModeration}
+        returnTo={{ kind: 'serverSettings', serverId, section: 'members' }}
+        onNotice={setModerationNotice}
+        onEnd={() => setBanTarget(null)}
+        focusFallback={focusMemberList}
       />
-      <ModerationConfirmModal
+
+      <ModerationDialog
         action="kick"
+        serverId={serverId}
         target={kickTarget}
-        onClose={() => setKickTarget(null)}
-        onConfirm={runModeration}
+        returnTo={{ kind: 'serverSettings', serverId, section: 'members' }}
+        onNotice={setModerationNotice}
+        onEnd={() => setKickTarget(null)}
+        focusFallback={focusMemberList}
       />
     </div>
   );

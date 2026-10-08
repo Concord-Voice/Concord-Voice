@@ -117,11 +117,15 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   return { promise, resolve };
 }
 
+// The upsert contract is PermissionWriteOutcome, not a boolean (#3456).
+const WRITE_OK = { ok: true } as const;
+const WRITE_REFUSED = { ok: false, kind: 'refused', status: 500, body: null } as const;
+
 const defaultProps = {
   overrides: [] as ChannelOverride[],
   roles: [mockRole, mockRole2],
   members: [mockMember],
-  onUpsert: vi.fn().mockResolvedValue(true),
+  onUpsert: vi.fn().mockResolvedValue(WRITE_OK),
   onDelete: vi.fn().mockResolvedValue(true),
 };
 
@@ -210,7 +214,7 @@ describe('OverridePanel', () => {
 
   // 10. Saves override calls onUpsert with correct data
   it('saves override and calls onUpsert with correct data', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(true);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_OK);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} overrides={[mockRoleOverride]} />);
     clickOverrideItem('Moderator');
 
@@ -330,7 +334,7 @@ describe('OverridePanel', () => {
 
   // 19. Adds override calls onUpsert
   it('adds override and calls onUpsert', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(true);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_OK);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} />);
 
     const targetSelect = screen.getAllByRole('combobox')[1];
@@ -350,7 +354,7 @@ describe('OverridePanel', () => {
 
   // 20. Does not call onUpsert when no target selected
   it('does not call onUpsert when no target selected', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(true);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_OK);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} />);
 
     const addBtn = screen.getByRole('button', { name: 'Add Override' });
@@ -364,7 +368,7 @@ describe('OverridePanel', () => {
 
   // 21. Resets form after add
   it('resets form after add', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(true);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_OK);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} />);
 
     const targetSelect = screen.getAllByRole('combobox')[1];
@@ -380,7 +384,7 @@ describe('OverridePanel', () => {
 
   // 22. Does not clear selection when onUpsert returns false (save)
   it('does not clear selection when onUpsert returns false (save)', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(false);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_REFUSED);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} overrides={[mockRoleOverride]} />);
     clickOverrideItem('Moderator');
     expect(screen.getByText('Editing: Moderator')).toBeInTheDocument();
@@ -410,7 +414,7 @@ describe('OverridePanel', () => {
 
   // 24. Does not reset add form when onUpsert returns false (add)
   it('does not reset add form when onUpsert returns false (add)', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(false);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_REFUSED);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} />);
 
     const targetSelect = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
@@ -461,7 +465,7 @@ describe('OverridePanel — V1-V5 regression (#3406)', () => {
   // copy and the edited bits still on the grid; a retried save that
   // succeeds closes the editor and clears the alert.
   it('V1: a rejected save keeps the editor open with the alert; a retry that succeeds closes it', async () => {
-    const onUpsert = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const onUpsert = vi.fn().mockResolvedValueOnce(WRITE_REFUSED).mockResolvedValueOnce(WRITE_OK);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} overrides={[mockRoleOverride]} />);
     clickOverrideItem('Moderator');
     fireEvent.click(screen.getByTestId('set-allow'));
@@ -523,7 +527,7 @@ describe('OverridePanel — V1-V5 regression (#3406)', () => {
   // V2 (add): a rejected add keeps the chosen target and the edited bits and
   // shows the save-alert copy; a retry that succeeds resets the form.
   it('V2: a rejected add keeps the target and bits with the alert; a retry that succeeds resets the form', async () => {
-    const onUpsert = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const onUpsert = vi.fn().mockResolvedValueOnce(WRITE_REFUSED).mockResolvedValueOnce(WRITE_OK);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} />);
 
     const targetSelect = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
@@ -570,7 +574,7 @@ describe('OverridePanel — V1-V5 regression (#3406)', () => {
   // V4 (clearing): the alert clears on Cancel, on a grid edit while the
   // editor stays open, and immediately on a retry (before it resolves).
   it('V4a: Cancel clears a stale save alert', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(false);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_REFUSED);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} overrides={[mockRoleOverride]} />);
     clickOverrideItem('Moderator');
     await act(async () => {
@@ -599,7 +603,7 @@ describe('OverridePanel — V1-V5 regression (#3406)', () => {
   });
 
   it('V4e: changing the add target clears a stale add alert', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(false);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_REFUSED);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} />);
     const [typeSelect, targetSelect] = screen.getAllByRole('combobox');
     fireEvent.change(targetSelect, { target: { value: 'role-1' } });
@@ -621,7 +625,7 @@ describe('OverridePanel — V1-V5 regression (#3406)', () => {
   });
 
   it('V4b: a grid edit clears a stale save alert without closing the editor', async () => {
-    const onUpsert = vi.fn().mockResolvedValue(false);
+    const onUpsert = vi.fn().mockResolvedValue(WRITE_REFUSED);
     render(<OverridePanel {...defaultProps} onUpsert={onUpsert} overrides={[mockRoleOverride]} />);
     clickOverrideItem('Moderator');
     await act(async () => {

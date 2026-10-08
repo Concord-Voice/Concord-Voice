@@ -8,8 +8,8 @@ import MemberItem from './MemberItem';
 import MemberProfileCard from './MemberProfileCard';
 import MemberContextMenu from './MemberContextMenu';
 import UserProfileModal from './UserProfileModal';
-import { ModerationConfirmModal, moderateMember } from './purgeOnModeration';
-import type { PinMode } from '../../services/messaging/purgeApi';
+import { focusTargetIn } from '../ui/focusTarget';
+import { ModerationDialog } from './purgeOnModeration';
 import { Moon, Search, Users } from 'lucide-react';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './MemberList.css';
@@ -155,18 +155,13 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   // ConfirmActionModal closes itself on success, so the purge outcome (#1354) is
   // announced by this sidebar instead of inside the modal.
   const [moderationNotice, setModerationNotice] = useState('');
-  // The dialogs render only while `activeServer` is set, so the id is present.
-  const runModeration = useCallback(
-    async (target: ServerMember, action: 'ban' | 'kick', alsoPurge: boolean, pinMode: PinMode) => {
-      if (!activeServerId) return;
-      const { notice } = await moderateMember(activeServerId, target, action, alsoPurge, pinMode);
-      setModerationNotice(notice);
-    },
-    [activeServerId]
-  );
   const [openGroup, setOpenGroup] = useState<OpenMemberGroup | null>(null);
   const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
   const compactTriggerId = useId();
+  const listRef = useRef<HTMLDivElement>(null);
+  // The row that opened the ban or kick menu may be the member just removed, so
+  // when verification closes with nothing to return to, focus goes to the list.
+  const focusMemberList = useCallback(() => focusTargetIn(listRef.current), []);
 
   // Derive live member data from store (not stale snapshots)
   const selectedMemberData = selectedMember
@@ -414,7 +409,7 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   }, [openGroup, selectedGroup]);
 
   return (
-    <div className={`member-list${compact ? ' member-list--compact' : ''}`}>
+    <div ref={listRef} className={`member-list${compact ? ' member-list--compact' : ''}`}>
       {!compact && (
         <div className="member-list-header">
           <h3>Members</h3>
@@ -599,20 +594,26 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
         />
       )}
 
-      {/* Ban and Kick Confirmation Modals */}
+      {/* Ban and Kick Confirmations */}
       {activeServer && (
         <>
-          <ModerationConfirmModal
+          <ModerationDialog
             action="ban"
+            serverId={activeServer.id}
             target={banTarget}
-            onClose={() => setBanTarget(null)}
-            onConfirm={runModeration}
+            returnTo={{ kind: 'chat' }}
+            onNotice={setModerationNotice}
+            onEnd={() => setBanTarget(null)}
+            focusFallback={focusMemberList}
           />
-          <ModerationConfirmModal
+          <ModerationDialog
             action="kick"
+            serverId={activeServer.id}
             target={kickTarget}
-            onClose={() => setKickTarget(null)}
-            onConfirm={runModeration}
+            returnTo={{ kind: 'chat' }}
+            onNotice={setModerationNotice}
+            onEnd={() => setKickTarget(null)}
+            focusFallback={focusMemberList}
           />
         </>
       )}

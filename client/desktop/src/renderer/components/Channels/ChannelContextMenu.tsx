@@ -15,6 +15,7 @@ import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { Channel } from '../../types/chat';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
+import MfaRestrictedMenuItem from '../Servers/MfaRestrictedMenuItem';
 import './ChannelContextMenu.css';
 
 interface ChannelContextMenuProps {
@@ -154,6 +155,10 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
         label={copiedLink ? 'Copied!' : 'Copy Link'}
         onClick={handleCopyLink}
       />
+
+      {/* Upper group: a member whose channel controls the server is withholding
+          until they enrol finds the way to fix that where those controls would be. */}
+      <MfaRestrictedMenuItem serverId={serverId} onClose={onClose} />
 
       {/* Edit Channel — admin/owner only */}
       {canEdit && (

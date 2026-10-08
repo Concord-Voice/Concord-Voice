@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { apiFetch } from './apiClient';
 import {
   useClientConfigStore,
+  mfaEnforcementCapabilityOf,
   ServerCapabilitiesSchema,
   type ServerCapabilities,
 } from '../../stores/ui/clientConfigStore';
@@ -245,6 +246,7 @@ class ClientConfigService {
           ? { status: 'supported' }
           : { status: 'confirmed-unsupported' }
       );
+      store.setMfaEnforcementCapability(mfaEnforcementCapabilityOf(capabilities));
     } catch {
       if (this.isCurrentCapabilityRequest(controller, generation)) {
         this.setCapabilityError();
@@ -284,6 +286,7 @@ class ClientConfigService {
     // path, but only one of them is a fact about the server -- and the copy the
     // user sees differs.
     store.setChunkedUploadCapability({ status: 'error' });
+    store.setMfaEnforcementCapability({ status: 'error' });
     store.setActivityHistoryCapability({
       status: 'error',
       lastConfirmedSupported:

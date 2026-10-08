@@ -10416,6 +10416,11 @@ paths:
 
         In hardened recovery mode, both email AND sms codes must be provided.
 
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
+
         Rate limit: 5 requests per minute (user-based).
 
         '
@@ -11276,6 +11281,10 @@ paths:
 
         Self-heals stale denormalized flags before responding.
 
+        When the self-heal repairs a stale flag, every connected client of the
+        account receives the same `permissions_changed` WebSocket event as the
+        factor-writing routes.
+
         Rate limit: 10 requests per minute (user-based).
 
         '
@@ -11373,6 +11382,11 @@ paths:
       summary: Activate TOTP MFA (enrollment step 2)
       description: 'Activates MFA after the user confirms they saved their backup codes.
 
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
+
         Rate limit: 5 requests per minute (user-based).
 
         '
@@ -11406,6 +11420,11 @@ paths:
       description: 'Deletes the TOTP enrollment. Requires password and a valid MFA code.
 
         Idempotent — returns 200 even when no TOTP enrollment exists.
+
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
 
         Rate limit: 3 requests per minute (user-based).
 
@@ -11475,6 +11494,11 @@ paths:
 
         confirmation (and a valid MFA code if MFA is already active).
 
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
+
         Rate limit: 3 requests per minute (user-based).
 
         '
@@ -11534,6 +11558,11 @@ paths:
         Does NOT activate MFA yet — call /mfa/totp/confirm-setup afterwards.
 
         5 failed attempts trigger a 15-minute lockout.
+
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
 
         Rate limit: 5 requests per minute (user-based).
 
@@ -11777,6 +11806,11 @@ paths:
 
         Returns the remaining credential IDs so the client can update the authenticator.
 
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
+
         Rate limit: 3 requests per minute (user-based).
 
         '
@@ -11938,6 +11972,11 @@ paths:
       description: 'Completes registration with the authenticator''s attestation response and
 
         stores the credential. Consumes the single-use registration session.
+
+        Once the change commits, every connected client of the account receives
+        a `permissions_changed` WebSocket event (`data` is `{}`). It is the same
+        for a gained and a lost factor, and it is sent after the cached
+        permissions are invalidated (or the invalidation has been attempted).
 
         Rate limit: 5 requests per minute (user-based).
 
@@ -13928,6 +13967,15 @@ paths:
         that the flip happened. The cached permission generation for every
         server member is bumped after a value change commits, so the next
         permission read on any member reflects it.
+
+
+        After the bump, the server broadcasts `server_permissions_changed`
+        (`{"server_id": "<uuid>"}`) to every subscriber of the server, once per
+        changed request. It is sent whenever the update ran, including when the
+        commit acknowledgement is lost and the route answers 500, and never for a
+        no-op or a refused request. The event names no direction. It does tell a
+        connected member that the setting may have changed, though not what it
+        changed to.
 
 
         Rate limit: 10 requests per minute (fail-open, matching `UpdateServer`).
@@ -17400,6 +17448,15 @@ paths:
         | `server_updated` | `server_id`, `name`, `icon_url` | Server modified |
 
         | `server_deleted` | `server_id` | Server deleted |
+
+        | `server_permissions_changed` | `server_id` | Sent to every subscriber of the server when
+        `PUT /servers/{id}/mfa-enforcement` changes the setting (or may have: a lost commit acknowledgement
+        also sends it). Names no direction and carries no permission value; the client re-reads its own
+        permissions for that server. |
+
+        | `permissions_changed` | none (`data` is `{}`) | Sent to the account''s own connected clients after
+        a committed change to its MFA factors. Names no factor and no direction; the client re-reads its
+        permissions. |
 
         | `channel_created` | channel fields | New channel |
 

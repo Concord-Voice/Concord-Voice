@@ -105,7 +105,7 @@ describe('CategorySettingsModal', () => {
   const mockOnClose = vi.fn();
   const mockFetchCategoryOverrides = vi.fn();
   const mockFetchRoles = vi.fn();
-  const mockUpsertCategoryOverride = vi.fn().mockResolvedValue(true);
+  const mockUpsertCategoryOverride = vi.fn().mockResolvedValue({ ok: true });
   const mockDeleteCategoryOverride = vi.fn().mockResolvedValue(true);
 
   beforeEach(() => {

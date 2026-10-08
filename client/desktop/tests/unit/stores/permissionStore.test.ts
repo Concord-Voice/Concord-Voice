@@ -1,5 +1,6 @@
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import type { Channel } from '@/renderer/types/chat';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -319,8 +320,8 @@ describe('permissionStore', () => {
         permissions: '128',
       });
 
-      expect(result).not.toBeNull();
-      expect(result?.name).toBe('Moderator');
+      expect(result.ok).toBe(true);
+      expect(result.ok && result.role.name).toBe('Moderator');
       const roles = usePermissionStore.getState().serverRoles['server-1'];
       expect(roles).toHaveLength(1);
     });
@@ -348,7 +349,7 @@ describe('permissionStore', () => {
       expect(roles[0].position).toBeGreaterThanOrEqual(roles[1].position);
     });
 
-    it('returns null on API error', async () => {
+    it('reports the refusal with its status and body on an API error', async () => {
       server.use(
         http.post(`${API_BASE}/api/v1/servers/:id/roles`, () => {
           return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
@@ -356,10 +357,16 @@ describe('permissionStore', () => {
       );
 
       const result = await usePermissionStore.getState().createRole('server-1', { name: 'Mod' });
-      expect(result).toBeNull();
+      expect(result).toEqual({
+        ok: false,
+        kind: 'refused',
+        status: 403,
+        body: { error: 'Forbidden' },
+        context: captureApiRequestContext(),
+      });
     });
 
-    it('returns null on network error', async () => {
+    it('reports an unknown outcome on a network error', async () => {
       server.use(
         http.post(`${API_BASE}/api/v1/servers/:id/roles`, () => {
           return HttpResponse.error();
@@ -367,7 +374,7 @@ describe('permissionStore', () => {
       );
 
       const result = await usePermissionStore.getState().createRole('server-1', { name: 'Mod' });
-      expect(result).toBeNull();
+      expect(result).toEqual({ ok: false, kind: 'network' });
     });
 
     it('initializes server roles array if none exists', async () => {
@@ -385,7 +392,7 @@ describe('permissionStore', () => {
 
       // No existing roles for server-1
       const result = await usePermissionStore.getState().createRole('server-1', { name: 'Role' });
-      expect(result).not.toBeNull();
+      expect(result.ok).toBe(true);
       expect(usePermissionStore.getState().serverRoles['server-1']).toHaveLength(1);
     });
   });
@@ -408,7 +415,7 @@ describe('permissionStore', () => {
       const result = await usePermissionStore.getState().updateRole('server-1', 'role-1', {
         name: 'Updated Name',
       });
-      expect(result).toBe(true);
+      expect(result).toEqual({ ok: true });
       expect(usePermissionStore.getState().serverRoles['server-1'][0].name).toBe('Updated Name');
     });
 
@@ -433,7 +440,7 @@ describe('permissionStore', () => {
       expect(role.color).toBe('#ff0000');
     });
 
-    it('returns false on API error', async () => {
+    it('reports the refusal with its status and body on an API error', async () => {
       server.use(
         http.patch(`${API_BASE}/api/v1/servers/:id/roles/:roleId`, () => {
           return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
@@ -443,10 +450,16 @@ describe('permissionStore', () => {
       const result = await usePermissionStore.getState().updateRole('server-1', 'role-1', {
         name: 'X',
       });
-      expect(result).toBe(false);
+      expect(result).toEqual({
+        ok: false,
+        kind: 'refused',
+        status: 403,
+        body: { error: 'Forbidden' },
+        context: captureApiRequestContext(),
+      });
     });
 
-    it('returns false on network error', async () => {
+    it('reports an unknown outcome on a network error', async () => {
       server.use(
         http.patch(`${API_BASE}/api/v1/servers/:id/roles/:roleId`, () => {
           return HttpResponse.error();
@@ -456,7 +469,7 @@ describe('permissionStore', () => {
       const result = await usePermissionStore.getState().updateRole('server-1', 'role-1', {
         name: 'X',
       });
-      expect(result).toBe(false);
+      expect(result).toEqual({ ok: false, kind: 'network' });
     });
 
     it('updates partial fields (only name)', async () => {
@@ -522,13 +535,13 @@ describe('permissionStore', () => {
       });
 
       const result = await usePermissionStore.getState().deleteRole('server-1', 'role-1');
-      expect(result).toBe(true);
+      expect(result).toEqual({ ok: true });
       const roles = usePermissionStore.getState().serverRoles['server-1'];
       expect(roles).toHaveLength(1);
       expect(roles[0].id).toBe('role-2');
     });
 
-    it('returns false on API error', async () => {
+    it('reports the refusal with its status and body on an API error', async () => {
       server.use(
         http.delete(`${API_BASE}/api/v1/servers/:id/roles/:roleId`, () => {
           return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
@@ -536,10 +549,16 @@ describe('permissionStore', () => {
       );
 
       const result = await usePermissionStore.getState().deleteRole('server-1', 'role-1');
-      expect(result).toBe(false);
+      expect(result).toEqual({
+        ok: false,
+        kind: 'refused',
+        status: 403,
+        body: { error: 'Forbidden' },
+        context: captureApiRequestContext(),
+      });
     });
 
-    it('returns false on network error', async () => {
+    it('reports an unknown outcome on a network error', async () => {
       server.use(
         http.delete(`${API_BASE}/api/v1/servers/:id/roles/:roleId`, () => {
           return HttpResponse.error();
@@ -547,7 +566,7 @@ describe('permissionStore', () => {
       );
 
       const result = await usePermissionStore.getState().deleteRole('server-1', 'role-1');
-      expect(result).toBe(false);
+      expect(result).toEqual({ ok: false, kind: 'network' });
     });
   });
 
@@ -970,11 +989,11 @@ describe('permissionStore', () => {
         deny: '0',
       });
 
-      expect(result).toBe(true);
+      expect(result).toEqual({ ok: true });
       expect(usePermissionStore.getState().channelOverrides['ch-1']).toHaveLength(1);
     });
 
-    it('returns false on API error', async () => {
+    it('reports the refusal with its status and body on an API error', async () => {
       server.use(
         http.put(`${API_BASE}/api/v1/channels/:id/overrides`, () => {
           return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
@@ -987,10 +1006,16 @@ describe('permissionStore', () => {
         allow: '0',
         deny: '0',
       });
-      expect(result).toBe(false);
+      expect(result).toEqual({
+        ok: false,
+        kind: 'refused',
+        status: 403,
+        body: { error: 'Forbidden' },
+        context: captureApiRequestContext(),
+      });
     });
 
-    it('returns false on network error', async () => {
+    it('reports an unknown outcome on a network error', async () => {
       server.use(
         http.put(`${API_BASE}/api/v1/channels/:id/overrides`, () => {
           return HttpResponse.error();
@@ -1003,7 +1028,7 @@ describe('permissionStore', () => {
         allow: '0',
         deny: '0',
       });
-      expect(result).toBe(false);
+      expect(result).toEqual({ ok: false, kind: 'network' });
     });
   });
 
@@ -1155,11 +1180,11 @@ describe('permissionStore', () => {
         deny: '0',
       });
 
-      expect(result).toBe(true);
+      expect(result).toEqual({ ok: true });
       expect(usePermissionStore.getState().channelOverrides['category:cat-1']).toHaveLength(1);
     });
 
-    it('returns false on API error', async () => {
+    it('reports the refusal with its status and body on an API error', async () => {
       server.use(
         http.put(`${API_BASE}/api/v1/categories/:id/overrides`, () => {
           return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
@@ -1172,10 +1197,16 @@ describe('permissionStore', () => {
         allow: '0',
         deny: '0',
       });
-      expect(result).toBe(false);
+      expect(result).toEqual({
+        ok: false,
+        kind: 'refused',
+        status: 403,
+        body: { error: 'Forbidden' },
+        context: captureApiRequestContext(),
+      });
     });
 
-    it('returns false on network error', async () => {
+    it('reports an unknown outcome on a network error', async () => {
       server.use(
         http.put(`${API_BASE}/api/v1/categories/:id/overrides`, () => {
           return HttpResponse.error();
@@ -1188,7 +1219,7 @@ describe('permissionStore', () => {
         allow: '0',
         deny: '0',
       });
-      expect(result).toBe(false);
+      expect(result).toEqual({ ok: false, kind: 'network' });
     });
   });
 
@@ -1417,7 +1448,7 @@ describe('permissionStore', () => {
           deny: '0',
         });
 
-        expect(ok).toBe(true);
+        expect(ok).toEqual({ ok: true });
         expect(captured).toMatchObject({ allow: '4611686018427387905', deny: '0' });
         expect(typeof captured?.allow).toBe('string');
         expect(typeof captured?.deny).toBe('string');

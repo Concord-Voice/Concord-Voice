@@ -44,6 +44,7 @@ import { useTotpAcceptedStore } from '../../stores/auth/totpAcceptedStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
 import { preferencesSyncService } from './preferencesSync';
@@ -185,6 +186,15 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // account, but it is in-memory account posture that must not outlive the
   // session it was recorded in (MFA factor picker, S2a privacy).
   useTotpAcceptedStore.getState().reset();
+
+  // A pending "Back to …" from verification setup names the ending account's
+  // chat or server (#3456 §3.6a), so it must not reach whoever signs in next.
+  useSettingsOverlayStore.getState().clearVerificationReturn();
+
+  // Which servers' MFA notices were dismissed is per account too (#3456 §3.6):
+  // server ids are not secret, but a dismissal the next account never made
+  // would hide a notice it has not seen.
+  useSettingsOverlayStore.getState().clearMfaNoticeDismissals();
 
   // Clear E2EE store flags — needsSSOUnlock and ready must reset on every
   // logout-class transition. Otherwise an SSO user logging back in via the

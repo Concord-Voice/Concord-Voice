@@ -30,6 +30,24 @@ export const STEP_UP_PURPOSES = [
   'dm.message_delete',
   'dm.purge',
   'dm.clear',
+  // #3456: turning a server's MFA enforcement off (`mfaenforce.ConfirmTx`),
+  // then the dangerous-action gates (#3454), one per D1 route. A D1 channel or
+  // server purge sends `messages.channel_purge` / `messages.server_purge`
+  // above: the same route, so the same purpose.
+  'servers.mfa_enforcement_disable',
+  'channels.delete',
+  'servers.update',
+  'media.server_icon_upload',
+  'media.server_banner_upload',
+  'members.ban',
+  'members.kick_purge',
+  'roles.delete',
+  'roles.create',
+  'roles.update',
+  'channels.expiration_shorten',
+  'servers.delete',
+  'overrides.channel_upsert',
+  'overrides.category_upsert',
 ] as const;
 
 export type StepUpPurpose = (typeof STEP_UP_PURPOSES)[number];

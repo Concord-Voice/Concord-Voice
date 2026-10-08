@@ -65,6 +65,26 @@
   line-height: 1.4;
 }
 
+/* #3456 §3.7: a bit the server may gate behind MFA. The glyph is a non-text mark
+   at --text-secondary (3:1 floor); the sentence is --text-primary because
+   --text-secondary on the --bg-tertiary hover fill measures 4.31:1 in Midnight Sky. */
+.permission-mfa-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 2px;
+  font-family: inherit;
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.permission-mfa-note svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--text-secondary);
+}
+
 /* Role mode: pill toggle switch */
 .permission-toggle {
   position: relative;

@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { apiFetch } from '../system/apiClient';
+import { apiFetchInContext, isAbortError, type ApiRequestContext } from '../system/requestContext';
+import { adaptDangerousActionRefusal } from '../system/stepUpRouteAdapters';
 
 const expirationWindowSchema = z.union([
   z.literal(3600),
@@ -45,6 +46,11 @@ export type ExpirationRequest =
       mode: 'set';
       window_seconds: ExpirationWindowSeconds;
       retroactive: 'apply' | 'new_only';
+      /**
+       * Confirms a shortening on a server that enforces MFA on dangerous actions (#3456). Sent
+       * only on the re-send after a channel's `gated` answer, never on the first request.
+       */
+      mfa_code?: string;
     }
   | { mode: 'clear'; retroactive: 'clear_pending' | 'leave_pending' }
   | { mode: 'resume'; revision: number };
@@ -66,7 +72,19 @@ export type ExpirationMutationResult =
         | 'unavailable';
       retryAfterSeconds?: number;
     }
-  | { kind: 'ambiguous' };
+  | { kind: 'ambiguous' }
+  /**
+   * The request never left: `apiFetch`'s pre-dispatch fence refused it because the account or
+   * server moved since the `context` it was admitted against. Unlike `ambiguous`, nothing may
+   * have been applied, so there is nothing to refresh.
+   */
+  | { kind: 'aborted' }
+  /**
+   * A channel's dangerous-action gate answered instead of the policy route (#3456): it asks for
+   * a verified code, refuses the one sent, or is busy. `status` and `body` are the response as
+   * received, for `adaptDangerousActionRefusal`. Channel scope only: the DM route has no gate.
+   */
+  | { kind: 'gated'; status: number; body: unknown };
 
 export interface ExpirationPolicyReadRequest {
   targetId: string;
@@ -95,6 +113,7 @@ const expirationRequestSchema = z.discriminatedUnion('mode', [
     mode: z.literal('set'),
     window_seconds: expirationWindowSchema,
     retroactive: z.enum(['apply', 'new_only']),
+    mfa_code: z.string().min(1).max(256).optional(),
   }),
   z.strictObject({
     mode: z.literal('clear'),
@@ -161,20 +180,6 @@ function retryAfterSeconds(response: Response): number | undefined {
   return Number.isSafeInteger(seconds) ? seconds : undefined;
 }
 
-async function responsePolicy(response: Response): Promise<ExpirationPolicy | undefined> {
-  return parseExpirationPolicyResponse(await response.json().catch(() => undefined));
-}
-
-async function policyMutationResult(
-  response: Response,
-  status: 200 | 409 | 503
-): Promise<ExpirationMutationResult> {
-  const policy = await responsePolicy(response);
-  if (status === 200) return policy ? { kind: 'ok', policy } : { kind: 'ambiguous' };
-  if (status === 409) return policy ? { kind: 'conflict', policy } : { kind: 'conflict' };
-  return policy ? { kind: 'partial', candidate: policy } : { kind: 'partial' };
-}
-
 function rateLimitedMutationResult(response: Response): ExpirationMutationResult {
   const seconds = retryAfterSeconds(response);
   return seconds === undefined
@@ -200,9 +205,51 @@ function rejectedMutationResult(status: number): ExpirationMutationResult | unde
   }
 }
 
+/**
+ * What a response to the PATCH came to. The gate's answer is read before the status decides
+ * what the body is (F11): a 503 whose body is a policy is the ambiguous commit, `partial`; the
+ * gate's own 503 carries a flag and is `gated`; any other 503 is a retryable failure. A 401 is
+ * the session, whatever the body says, and keeps its own result.
+ */
+function mutationResult(
+  scope: ExpirationScope,
+  response: Response,
+  body: unknown
+): ExpirationMutationResult {
+  const { status } = response;
+  if (
+    scope.kind === 'channel' &&
+    status !== 401 &&
+    adaptDangerousActionRefusal(status, body) !== null
+  ) {
+    return { kind: 'gated', status, body };
+  }
+  const policy = parseExpirationPolicyResponse(body);
+  switch (status) {
+    case 200:
+      return policy ? { kind: 'ok', policy } : { kind: 'ambiguous' };
+    case 409:
+      return policy ? { kind: 'conflict', policy } : { kind: 'conflict' };
+    case 503:
+      return policy
+        ? { kind: 'partial', candidate: policy }
+        : { kind: 'rejected', reason: 'unavailable' };
+    case 429:
+      return rateLimitedMutationResult(response);
+    default:
+      return rejectedMutationResult(status) ?? { kind: 'ambiguous' };
+  }
+}
+
+/**
+ * `context` is the capture the PATCH belongs to. The step-up re-send passes the one its factor was
+ * proven under, so a code is never sent as another account or to another server; without one the
+ * PATCH is its own operation.
+ */
 export async function updateExpirationPolicy(
   scope: ExpirationScope,
-  request: ExpirationRequest
+  request: ExpirationRequest,
+  context?: ApiRequestContext
 ): Promise<ExpirationMutationResult> {
   if (!expirationRequestSchema.safeParse(request).success) {
     return { kind: 'rejected', reason: 'invalidRequest' };
@@ -210,20 +257,18 @@ export async function updateExpirationPolicy(
 
   let response: Response;
   try {
-    response = await apiFetch(expirationPath(scope), {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-    });
-  } catch {
-    return { kind: 'ambiguous' };
+    response = await apiFetchInContext(
+      expirationPath(scope),
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+      context
+    );
+  } catch (err) {
+    return isAbortError(err) ? { kind: 'aborted' } : { kind: 'ambiguous' };
   }
 
-  if (response.status === 200 || response.status === 409 || response.status === 503) {
-    return policyMutationResult(response, response.status);
-  }
-  if (response.status === 429) return rateLimitedMutationResult(response);
-  const rejected = rejectedMutationResult(response.status);
-  if (rejected) return rejected;
-  return { kind: 'ambiguous' };
+  return mutationResult(scope, response, await response.json().catch(() => undefined));
 }

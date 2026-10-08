@@ -133,6 +133,18 @@ type PermissionInvalidator interface {
 	BumpUserPermissionGeneration(ctx context.Context, userID string) error
 }
 
+// PermissionChangeNotifier tells a user's own connected clients that their
+// permissions may have changed, so a desktop re-reads what it shows (#3456).
+// invalidatePermissionState calls it after the bump attempt. It reports
+// nothing back: the server stays authoritative on every request, so a lost
+// notification costs only a stale display until the next read, and the
+// implementation logs its own failure. Declared here, at the consumer, for the
+// same reason as PermissionInvalidator: internal/api adapts the WebSocket hub
+// to it, so mfa does not import websocket.
+type PermissionChangeNotifier interface {
+	NotifyPermissionsChanged(ctx context.Context, userID string)
+}
+
 // Handler implements MFA API endpoints and the Verifier interface.
 type Handler struct {
 	db             *sql.DB
@@ -146,6 +158,7 @@ type Handler struct {
 	environment    string // "development", "staging", "production"
 	securityEvents securityevent.Emitter
 	permissions    PermissionInvalidator
+	permNotifier   PermissionChangeNotifier
 }
 
 // Ensure Handler implements Verifier at compile time.
@@ -210,10 +223,33 @@ func (h *Handler) HasPermissionInvalidator() bool {
 	return h.permissions != nil
 }
 
+// SetPermissionChangeNotifier injects the notifier invalidatePermissionState
+// calls after its bump (#3456). The router wires it beside the invalidator, and
+// requirePermissionInvalidatorWired refuses to boot without it: unwired, a
+// factor change would leave the user's desktop showing controls the mask has
+// just removed, or hiding ones it has just restored, until its next re-read.
+func (h *Handler) SetPermissionChangeNotifier(n PermissionChangeNotifier) {
+	h.permNotifier = n
+}
+
+// HasPermissionChangeNotifier reports whether SetPermissionChangeNotifier ran
+// with a non-nil value. The boot guard asks it for the reason
+// HasPermissionInvalidator gives.
+func (h *Handler) HasPermissionChangeNotifier() bool {
+	return h.permNotifier != nil
+}
+
 // invalidatePermissionState bumps userID's permission generation after a
-// committed change to their inline factors (spec §6). Call it only after the
-// commit: called earlier, a concurrent read could recompute from the factor
-// state the commit is about to replace and cache it under the new generation.
+// committed change to their inline factors (spec §6), then tells the user's own
+// clients to re-read their permissions (#3456). Call it only after the commit:
+// called earlier, a concurrent read could recompute from the factor state the
+// commit is about to replace and cache it under the new generation.
+//
+// The bump runs FIRST and the notification follows whatever it returned: a
+// client that re-read before the bump could be served the value the bump is
+// about to retire. With no invalidator the helper is a no-op, notification
+// included, and with no notifier it only bumps; the router's boot guard makes
+// both unreachable in production.
 //
 // It runs detached from the request's cancellation (context.WithoutCancel keeps
 // the values), since a client that hangs up after the commit must not leave the
@@ -221,14 +257,19 @@ func (h *Handler) HasPermissionInvalidator() bool {
 // change has committed, and the resolver has already retried and fallen back to
 // a scan-invalidate before reporting one. The line is identical for a gained
 // and a lost factor and names no method (I7, observability principle 7), which
-// the signature guarantees by carrying neither.
+// the signature guarantees by carrying neither; the notification likewise
+// carries no factor state, so it is identical in both directions too.
 func (h *Handler) invalidatePermissionState(ctx context.Context, userID string) {
 	if h.permissions == nil {
 		return
 	}
-	if err := h.permissions.BumpUserPermissionGeneration(context.WithoutCancel(ctx), userID); err != nil {
+	ctx = context.WithoutCancel(ctx)
+	if err := h.permissions.BumpUserPermissionGeneration(ctx, userID); err != nil {
 		h.log.Error("Failed to invalidate cached permissions after an MFA factor change",
 			"failure_class", "perm_generation_bump", "error", err)
+	}
+	if h.permNotifier != nil {
+		h.permNotifier.NotifyPermissionsChanged(ctx, userID)
 	}
 }
 

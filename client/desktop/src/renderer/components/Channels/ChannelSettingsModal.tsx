@@ -1,12 +1,11 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Eraser } from 'lucide-react';
 import Modal from '../ui/Modal';
-import OverridePanel from '../Permissions/OverridePanel';
+import OverridePanel, { type OverrideUpsertArgs } from '../Permissions/OverridePanel';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import {
   usePermissionStore,
   ChannelOverride,
-  UpsertOverrideRequest,
   NO_PERMISSION_WRITES,
 } from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
@@ -108,7 +107,7 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
     }
   }, [isSyncLocked, synced, channel.id, setCategorySync]);
 
-  const handleUpsert = (data: UpsertOverrideRequest) => upsertChannelOverride(channel.id, data);
+  const handleUpsert = (...args: OverrideUpsertArgs) => upsertChannelOverride(channel.id, ...args);
 
   const handleDelete = (overrideId: string) => deleteChannelOverride(channel.id, overrideId);
 
@@ -164,6 +163,7 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
         locked={isSyncPending}
         onWritePendingChange={setIsOverrideWritePending}
         writesInFlight={writesInFlight}
+        stepUpPurpose="overrides.channel_upsert"
         emptyMessage="No permission overrides configured for this channel."
       />
 

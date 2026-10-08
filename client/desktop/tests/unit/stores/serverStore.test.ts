@@ -15,6 +15,10 @@ import {
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
 import { deferred } from '../../helpers/deferred';
+import {
+  createPermissionRefresh,
+  OWN_REFRESH_DEBOUNCE_MS,
+} from '@/renderer/services/system/permissionRefresh';
 
 const API_BASE = 'http://localhost:8080';
 
@@ -128,6 +132,47 @@ describe('serverStore', () => {
 
       expect(requests).toBe(1);
       expect(useServerStore.getState().servers.map((server) => server.id)).toEqual([mockServer.id]);
+    });
+
+    // #3456. `permissions_changed` re-reads memberships through the REAL dedup:
+    // a fetch begun before the change that is still in flight would otherwise be
+    // the last word on every server's `permissions`, because the refresh's own
+    // fetchServers() joins it and returns at once.
+    it('permissions_changed fetches the list again after one begun before it settles', async () => {
+      const started = deferred();
+      const release = deferred();
+      let requests = 0;
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, async () => {
+          requests += 1;
+          if (requests > 1) {
+            return HttpResponse.json({ servers: [{ ...mockServer, permissions: '2048' }] });
+          }
+          started.resolve();
+          await release.promise;
+          // The answer the server gave BEFORE the account's factors changed.
+          return HttpResponse.json({ servers: [{ ...mockServer, permissions: '1024' }] });
+        })
+      );
+      const refresh = createPermissionRefresh();
+      try {
+        const preChange = useServerStore.getState().fetchServers();
+        await started.promise;
+
+        refresh.ownPermissionsChanged();
+        await new Promise((resolve) => setTimeout(resolve, OWN_REFRESH_DEBOUNCE_MS + 50));
+        // Waiting on the fetch in flight, not joining it: nothing was requested yet.
+        expect(requests).toBe(1);
+        release.resolve();
+        await preChange;
+
+        await vi.waitFor(() => expect(requests).toBe(2));
+        await vi.waitFor(() =>
+          expect(useServerStore.getState().servers.map((s) => s.permissions)).toEqual(['2048'])
+        );
+      } finally {
+        refresh.dispose();
+      }
     });
 
     // CODEX P2 (#2363 round 2). fetchServers commits a WHOLE-ARRAY replace, and a

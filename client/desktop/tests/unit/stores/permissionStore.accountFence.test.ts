@@ -283,8 +283,8 @@ describe('writes that re-read are fenced to the account that started them (#3406
           allow: '1024',
           deny: '0',
         }),
-      fenced: false as unknown,
-      control: true as unknown,
+      fenced: { ok: false, kind: 'network' } as unknown,
+      control: { ok: true } as unknown,
     },
     {
       name: 'a category override save',
@@ -299,8 +299,8 @@ describe('writes that re-read are fenced to the account that started them (#3406
           allow: '1024',
           deny: '0',
         }),
-      fenced: false as unknown,
-      control: true as unknown,
+      fenced: { ok: false, kind: 'network' } as unknown,
+      control: { ok: true } as unknown,
     },
     {
       name: 'a role reorder',

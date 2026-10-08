@@ -17,6 +17,7 @@ vi.mock('@/renderer/services/system/apiClient', async (importOriginal) => ({
 }));
 
 import {
+  FACTOR_ONLY_LEG,
   useStepUpFactor,
   type StepUpFactor,
   type StepUpFactorProps,
@@ -2440,5 +2441,163 @@ describe('an expired confirmation (#3509)', () => {
   it('an unmarked passwordRequired seed says nothing: it opened the surface, nothing was refused', async () => {
     const view = await mountReady({ seed: { kind: 'passwordRequired' } });
     expect(view.result.current.notice).toBeNull();
+  });
+});
+
+// ── The 'none' password leg (#3456 §3.3, T2b) ────────────────────────────
+//
+// The dangerous-action gates read no password, so this leg never shows a
+// field, never names one in a notice, and with an empty set at `ready` lets
+// the primary send with no factor: the server's answer decides what is needed.
+
+describe("the 'none' password leg (#3456)", () => {
+  const NONE: Partial<StepUpFactorProps> = {
+    passwordLeg: FACTOR_ONLY_LEG,
+    readFailure: 'passwordOnly',
+    purpose: 'channels.delete',
+  };
+
+  // Mutant: `showsPassword`'s 'none' arm returning true, or falling through to the whenNoMfa rule.
+  it('shows no password field while reading, with a method offered, or with none offered', async () => {
+    const answer = deferred<Response>();
+    routes[READ] = () => answer.promise;
+    const view = mount(NONE);
+    expect(view.result.current.status).toEqual({ kind: 'reading' });
+    expect(view.result.current.passwordLegShown).toBe(false);
+
+    await act(async () => answer.resolve(readBody(['totp'], 'totp', true)));
+    await waitFor(() => expect(view.result.current.status).toEqual({ kind: 'ready' }), SETTLE);
+    expect(view.result.current.passwordLegShown).toBe(false);
+
+    routes[READ] = () => readBody([], null);
+    const unenrolled = await mountReady(NONE);
+    expect(unenrolled.result.current.methods).toEqual([]);
+    expect(unenrolled.result.current.passwordLegShown).toBe(false);
+  });
+
+  // Mutant: a failed read on this leg falling to the password-only field.
+  it('shows no password field when the read failed on a passwordOnly route', async () => {
+    routes[READ] = () => json({ error: 'down' }, 503);
+    const view = await mountReady(NONE);
+    expect(view.result.current.methods).toEqual([]);
+    expect(view.result.current.passwordLegShown).toBe(false);
+    expect(view.result.current.firstMissing('')).toBeNull();
+  });
+
+  // Mutant: `firstMissingIn` asking for a password the leg does not show.
+  it('never reports a missing password, whatever the password argument is', async () => {
+    const view = await mountTotp('123456', NONE);
+    expect(view.result.current.firstMissing('')).toBeNull();
+    typeCode(view, '12');
+    expect(view.result.current.firstMissing('')).toBe('code');
+  });
+
+  // Mutant: the 'none' guard removed from `refusalTransition`, so the refusal
+  // announces a missing password field and moves focus nowhere.
+  it('takes the default arm for a passwordRequired refusal: code spent, no notice, set kept', async () => {
+    const view = await mountTotp('123456', NONE);
+    const before = view.result.current.attempt;
+
+    await run(view, submitting(refusal({ kind: 'passwordRequired' })));
+
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.methods).toEqual(['totp', 'backup']);
+    expect(view.result.current.code).toBe('');
+    expect(view.result.current.attempt).toBe(before + 1);
+    expect(view.result.current.phase).toBe('idle');
+    expect(view.result.current.status).toEqual({ kind: 'ready' });
+  });
+
+  // Mutant: the same guard missing the expired-token case, or the set emptied as on whenNoMfa.
+  it('says nothing for an expired-token refusal either, and does not empty the set', async () => {
+    const view = await mountTotp('123456', NONE);
+
+    await run(view, submitting(refusal({ kind: 'passwordRequired', tokenExpired: true })));
+
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.methods).toEqual(['totp', 'backup']);
+    expect(view.result.current.passwordLegShown).toBe(false);
+  });
+
+  // Mutant: `namesPassword` dropping invalidPassword.
+  it('takes the default arm for an invalidPassword refusal', async () => {
+    const view = await mountTotp('123456', NONE);
+
+    await run(view, submitting(refusal({ kind: 'invalidPassword' })));
+
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.code).toBe('');
+  });
+
+  // Mutant: the 'none' guard widened to every refusal (swallowing the field refusals).
+  it('still words an invalid code against its field', async () => {
+    const view = await mountTotp('123456', NONE);
+
+    await run(view, submitting(refusal({ kind: 'invalidMfaCode' })));
+
+    expect(view.result.current.notice).toEqual({ kind: 'invalidFactor', method: 'totp' });
+  });
+
+  // Mutant: the seeded() 'none' guard removed, so an expired-token seed says so about a field that is not there.
+  it('takes the default arm for a passwordRequired seed: no notice, and the read still runs', async () => {
+    const view = mount({ ...NONE, seed: { kind: 'passwordRequired', tokenExpired: true } });
+    expect(view.result.current.status).toEqual({ kind: 'reading' });
+    expect(view.result.current.notice).toBeNull();
+
+    await waitFor(() => expect(view.result.current.status).toEqual({ kind: 'ready' }), SETTLE);
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.methods).toEqual(['webauthn', 'totp']);
+    expect(view.result.current.passwordLegShown).toBe(false);
+    expect(hits(READ)).toHaveLength(1);
+  });
+
+  // Mutant: `firstMissingIn`/`run` demanding a method, or `codeToSend` returning '' for no method.
+  it('sends with no factor when nothing is offered at ready', async () => {
+    routes[READ] = () => readBody([], null);
+    const view = await mountReady(NONE);
+    const submit = submitting({ kind: 'success' });
+
+    expect(view.result.current.method).toBeNull();
+    expect(view.result.current.firstMissing('')).toBeNull();
+    const outcome = await run(view, submit);
+
+    expect(outcome).toEqual({ kind: 'success' });
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit.mock.calls[0][0]).toBeUndefined();
+  });
+
+  // Mutant: the empty-set send predicted client-side instead of left to the server's answer.
+  it("lets the server's mfaRequired answer to that code-less send mount the picker", async () => {
+    routes[READ] = () => readBody([], null);
+    const view = await mountReady(NONE);
+
+    await run(view, submitting(refusal({ kind: 'mfaRequired', methods: ['totp'] })));
+
+    expect(view.result.current.methods).toEqual(['totp']);
+    expect(view.result.current.method).toBe('totp');
+    expect(view.result.current.notice).toEqual({ kind: 'missing', field: 'totp' });
+    expect(view.result.current.passwordLegShown).toBe(false);
+  });
+
+  // Mutant: the enrolment refusal ignored on this leg.
+  it("lets the server's enrollmentRequired answer to that code-less send end the stage", async () => {
+    routes[READ] = () => readBody([], null);
+    const view = await mountReady(NONE);
+
+    await run(view, submitting(refusal({ kind: 'enrollmentRequired' })));
+
+    expect(view.result.current.status).toEqual({ kind: 'enrollmentRequired' });
+    expect(view.result.current.notice).toBeNull();
+  });
+
+  // Mutant: the unrendered() path keeping a stale notice after a non-step-up answer.
+  it('clears the code and the notice after an answer the host words itself', async () => {
+    const view = await mountTotp('123456', NONE);
+
+    await run(view, submitting({ kind: 'answered' }));
+
+    expect(view.result.current.code).toBe('');
+    expect(view.result.current.notice).toBeNull();
+    expect(view.result.current.phase).toBe('idle');
   });
 });

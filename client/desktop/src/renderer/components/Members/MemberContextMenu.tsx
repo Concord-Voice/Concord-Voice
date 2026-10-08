@@ -15,6 +15,7 @@ import {
 import ContextMenu from '../ui/ContextMenu';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { EnforcementMenuItems } from '../ui/EnforcementMenuItems';
+import MfaRestrictedMenuItem from '../Servers/MfaRestrictedMenuItem';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 
@@ -288,6 +289,11 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
           onClick={handleSendFriendRequest}
         />
       )}
+
+      {/* Upper group, ahead of the moderation controls it explains the absence of
+          (Kick, Ban): a viewer the server is withholding those from until they
+          enrol finds the way to fix that here. */}
+      <MfaRestrictedMenuItem serverId={serverId} onClose={onClose} />
 
       {/* Assign Role — requires MANAGE_ROLES_ASSIGN, hidden for owner/self */}
       {canAssignRole && (

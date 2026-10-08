@@ -136,7 +136,8 @@ describe('moderateMember dispatch (#3552 review)', () => {
 
     const ban = moderateMember(SERVER, target, 'ban', true, 'keep');
     if (replace) await expect(ban).rejects.toMatchObject({ name: 'AbortError' });
-    else await expect(ban).resolves.toMatchObject({ unknownStatus: false });
+    else
+      await expect(ban).resolves.toMatchObject({ kind: 'done', notice: { unknownStatus: false } });
     expect(hits()).toBe(sent);
   });
 
@@ -152,7 +153,8 @@ describe('moderateMember dispatch (#3552 review)', () => {
 
     const ban = moderateMember(SERVER, target, 'ban', alsoPurge, 'keep');
     if (alsoPurge) await expect(ban).rejects.toThrow(PIN_CLAIM_UNCONFIRMED_MESSAGE);
-    else await expect(ban).resolves.toMatchObject({ unknownStatus: false });
+    else
+      await expect(ban).resolves.toMatchObject({ kind: 'done', notice: { unknownStatus: false } });
     expect(hits()).toBe(sent);
   });
 });

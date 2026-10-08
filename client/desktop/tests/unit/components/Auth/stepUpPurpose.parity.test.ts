@@ -43,4 +43,52 @@ describe('StepUpPurpose Go/TS parity (#3455)', () => {
     expect(goValues).not.toContain(undefined);
     expect([...PASSWORD_STEP_UP_PURPOSES].sort()).toEqual([...goValues].sort());
   });
+
+  // #3456: the 14 purposes the MFA-enforcement toggle's OFF confirmation and
+  // the dangerous-action gates mint for. The superset check above cannot see a
+  // purpose DELETED from the mirror, which would leave a route whose factor
+  // picker begins a WebAuthn token with no purpose to name.
+  // Mutant: any one of these removed from STEP_UP_PURPOSES.
+  const MFA_ENFORCEMENT_PURPOSES = [
+    'servers.mfa_enforcement_disable',
+    'channels.delete',
+    'servers.update',
+    'media.server_icon_upload',
+    'media.server_banner_upload',
+    'members.ban',
+    'members.kick_purge',
+    'roles.delete',
+    'roles.create',
+    'roles.update',
+    'channels.expiration_shorten',
+    'servers.delete',
+    'overrides.channel_upsert',
+    'overrides.category_upsert',
+  ];
+
+  it('the 14 #3456 purposes are in the TS mirror and in the Go closed set', () => {
+    const source = readFileSync(purposeGoPath, 'utf-8');
+    const goValues = new Set(Array.from(source.matchAll(/Purpose\s*=\s*"([^"]+)"/g), (m) => m[1]));
+    expect(MFA_ENFORCEMENT_PURPOSES).toHaveLength(14);
+    const asStrings: readonly string[] = STEP_UP_PURPOSES;
+    for (const purpose of MFA_ENFORCEMENT_PURPOSES) {
+      expect(asStrings, `${purpose} missing from the TS mirror`).toContain(purpose);
+      expect(goValues, `${purpose} missing from Go`).toContain(purpose);
+    }
+  });
+
+  // Mutant: a #3456 purpose added to PASSWORD_STEP_UP_PURPOSES. No D1 gate
+  // reads a password, so a password mint for one would be refused by Go's
+  // ownRulePurposes with a 400.
+  it('none of the 14 #3456 purposes is a password step-up purpose', () => {
+    const passwordPurposes: readonly string[] = PASSWORD_STEP_UP_PURPOSES;
+    for (const purpose of MFA_ENFORCEMENT_PURPOSES) {
+      expect(passwordPurposes).not.toContain(purpose);
+    }
+  });
+
+  // Mutant: a duplicate or a typo'd entry in the mirror.
+  it('the mirror has no duplicate purposes', () => {
+    expect(new Set(STEP_UP_PURPOSES).size).toBe(STEP_UP_PURPOSES.length);
+  });
 });

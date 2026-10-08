@@ -433,14 +433,16 @@ describe('PurgeMessagesModal — soft-lock stage', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('an enrolment 403 on the FIRST purge without delete_rate_limited is #16’s case: a plain result', async () => {
+  // #3456 C-6: the D1 gate's enrolment refusal was a plain result with no way
+  // forward. It opens the MFA stage on the enrolment state instead.
+  it('an enrolment 403 on the FIRST purge without delete_rate_limited is the D1 stage, not a result', async () => {
     scriptedPurge(CHANNEL_PATH, [
       challenge({ error: 'Set up an app', mfa_enrollment_required: true }),
     ]);
     await startChannelPurge();
 
-    expect(await screen.findByRole('alert')).toBeInTheDocument();
-    expect(screen.queryByText(ENROLLMENT_COPY)).not.toBeInTheDocument();
+    expect(await screen.findByText(ENROLLMENT_COPY)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   // G2: the refusal that opened the stage already named the methods.

@@ -1201,7 +1201,8 @@ describe('DMChatArea', () => {
     await waitFor(() => {
       expect(mockApiFetch).toHaveBeenCalledWith(
         '/api/v1/dm/conversations/conv-1/messages/msg-1',
-        expect.objectContaining({ method: 'DELETE' })
+        expect.objectContaining({ method: 'DELETE' }),
+        { context: expect.objectContaining({ authLifecycle: expect.anything() }) }
       );
     });
   });

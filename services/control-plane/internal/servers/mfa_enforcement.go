@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
@@ -16,6 +18,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
 // The "Enforce MFA On Dangerous Actions" setting (#3453):
@@ -69,9 +72,18 @@ const (
 // cause, whose prefix names the stage. None carries anything that differs
 // between enrolled and unenrolled actors (I7).
 const (
-	failureClassMFAPermBump   = "perm_generation_bump"
-	failureClassMFAEnforceErr = "mfa_enforcement_internal"
+	failureClassMFAPermBump         = "perm_generation_bump"
+	failureClassMFAEnforceErr       = "mfa_enforcement_internal"
+	failureClassPermChangeBroadcast = "perm_change_broadcast"
 )
+
+// serverPermissionsChangedTimeout bounds the server_permissions_changed
+// broadcast (#3456). It runs on the request goroutine after the commit, so an
+// unbounded send on a saturated hub queue would hang a PUT whose change has
+// already committed. One second rather than rbac's ten: rbac's events are
+// revocations, while this one only asks members to re-read what the server
+// still enforces on every request.
+const serverPermissionsChangedTimeout = time.Second
 
 // errMFAEnforcementForbidden is the authorization refusal: neither the owner
 // nor a holder of raw bit 62.
@@ -215,9 +227,10 @@ func authorizeMFAEnforcement(ctx context.Context, q stepup.RowQuerier, ownerID, 
 //  7. The UPDATE, which leaves updated_at alone.
 //
 // After a clean commit: clear the budget for a verified OFF, then, only when the
-// value changed, bump the server's permission generation and emit the success
-// event. A commit that reports an error still bumps whenever the UPDATE ran, and
-// emits nothing (see applyMFAEnforcement).
+// value changed, refresh every member's view (bump the server's permission
+// generation, then announce server_permissions_changed) and emit the success
+// event. A commit that reports an error still refreshes whenever the UPDATE
+// ran, and emits no success event (see applyMFAEnforcement).
 func (h *Handler) PutMFAEnforcement(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
@@ -291,11 +304,13 @@ func bindMFAEnforcementRequest(c *gin.Context) (mfaEnforcementRequest, bool) {
 //
 // A Commit() error does not prove a rollback: the server can apply the COMMIT
 // and lose only its acknowledgement (spec correction C-3). So when the UPDATE
-// ran, the server's permission generation is bumped whatever Commit returns.
-// On a true rollback that costs one cache miss per member; skipping it after a
-// commit that applied ON would serve every member's unmasked value for the
-// cache TTL. The success event is not sent: that would claim a change the
-// route cannot confirm.
+// ran, every member's view is refreshed whatever Commit returns. On a true
+// rollback that costs one cache miss and one re-read per member; skipping it
+// after a commit that applied ON would serve every member's unmasked value for
+// the cache TTL. The Nightwatch success event is not sent: that would claim a
+// change the route cannot confirm. server_permissions_changed is, because it
+// claims only that cached permissions may be stale, which is exactly what the
+// bump claims.
 func (h *Handler) applyMFAEnforcement(
 	ctx context.Context, c *gin.Context, serverID, userID string, enabled bool, code string,
 ) (changed bool, err error) {
@@ -338,7 +353,7 @@ func (h *Handler) applyMFAEnforcement(
 	}
 	if err := commitMFAEnforcementTx(tx); err != nil {
 		if changed {
-			h.bumpMFAEnforcementGeneration(ctx, serverID)
+			h.refreshMFAEnforcementViews(ctx, serverID)
 		}
 		return false, fmt.Errorf("commit: %w", err)
 	}
@@ -382,22 +397,65 @@ func (h *Handler) respondMFAEnforcementError(c *gin.Context, err error) {
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAEnforcementFailed})
 }
 
-// bumpMFAEnforcementGeneration bumps the server's permission generation so the
-// next read on any member is fresh (I6). It is detached from the request,
-// because a client that hangs up must not leave it undone. Both callers reach
-// it only after the transaction's outcome is settled or unknowable: after a
-// clean commit, or after a commit error (see applyMFAEnforcement).
-func (h *Handler) bumpMFAEnforcementGeneration(ctx context.Context, serverID string) {
+// refreshMFAEnforcementViews bumps the server's permission generation so the
+// next read on any member is fresh (I6), then tells the server's subscribers to
+// make that read (#3456). Both are detached from the request, because a client
+// that hangs up must not leave either undone. Both callers reach it only after
+// the transaction's outcome is settled or unknowable: after a clean commit, or
+// after a commit error (see applyMFAEnforcement). Neither a no-op request nor a
+// refusal reaches it.
+//
+// The bump runs FIRST and the announcement follows whatever it returned: a
+// member that re-read on the event before the bump could be served, or could
+// recompute and cache, the value the bump is about to retire. A failed bump has
+// already retried and fallen back inside the resolver, so the re-read is still
+// the best the member can do.
+func (h *Handler) refreshMFAEnforcementViews(ctx context.Context, serverID string) {
 	if err := h.resolver.BumpServerPermissionGeneration(context.WithoutCancel(ctx), serverID); err != nil {
 		h.log.Error("Failed to refresh cached permissions after an MFA enforcement change",
 			"failure_class", failureClassMFAPermBump, "error", err)
 	}
+	h.announceServerPermissionsChanged(ctx, serverID)
 }
 
-// afterMFAEnforcementChange runs after a commit that changed the value: bump
-// the server's permission generation so the next read on any member is fresh
-// (I6), then record the success for Nightwatch. Both are detached from the
-// request, because a client that hangs up must not leave either undone.
+// announceServerPermissionsChanged sends server_permissions_changed to every
+// subscriber of the server. The frame carries the server id and nothing else
+// (F12): it says THAT the setting may have changed, never in which direction,
+// and nothing about anyone's enrollment. The id is re-rendered from its parsed
+// form, so the wire always carries the canonical lowercase spelling whatever
+// spelling the request used. A failure logs one line that carries no
+// identifier and no direction (I7), byte-identical to the user event's in
+// internal/api. A nil hub is skipped: only tests build a handler without one.
+func (h *Handler) announceServerPermissionsChanged(ctx context.Context, serverID string) {
+	if h.hub == nil {
+		return
+	}
+	delivered := false
+	if server, err := uuid.Parse(serverID); err == nil {
+		broadcastCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serverPermissionsChangedTimeout)
+		delivered = h.hub.BroadcastToServerContext(broadcastCtx, server, serverPermissionsChangedMessage(server))
+		cancel()
+	}
+	if !delivered {
+		h.log.Error("Failed to announce a permission change", "failure_class", failureClassPermChangeBroadcast)
+	}
+}
+
+// serverPermissionsChangedMessage is the server_permissions_changed frame:
+// {"type":"server_permissions_changed","data":{"server_id":"<uuid>"}}. Keep it
+// in sync with ServerPermissionsChangedSchema in
+// client/desktop/src/renderer/types/ws-events.ts.
+func serverPermissionsChangedMessage(serverID uuid.UUID) websocket.OutgoingMessage {
+	return websocket.OutgoingMessage{
+		Type: "server_permissions_changed",
+		Data: map[string]interface{}{"server_id": serverID.String()},
+	}
+}
+
+// afterMFAEnforcementChange runs after a commit that changed the value:
+// refresh every member's view (refreshMFAEnforcementViews), then record the
+// success for Nightwatch. Both are detached from the request, because a client
+// that hangs up must not leave either undone.
 //
 // The success reason names the direction. That is the server's setting, not
 // anyone's enrollment: both directions imply an enrolled actor, and every
@@ -405,7 +463,7 @@ func (h *Handler) bumpMFAEnforcementGeneration(ctx context.Context, serverID str
 // fallback, so no refusal is ever told apart from another (I7).
 func (h *Handler) afterMFAEnforcementChange(c *gin.Context, serverID string, enabled bool) {
 	ctx := context.WithoutCancel(c.Request.Context())
-	h.bumpMFAEnforcementGeneration(ctx, serverID)
+	h.refreshMFAEnforcementViews(ctx, serverID)
 	event := securityevent.Event{
 		EventType:     securityevent.EventPrivilegedAction,
 		Outcome:       securityevent.OutcomeSuccess,

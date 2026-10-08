@@ -62,6 +62,20 @@ export interface StepUpCredentialsProps {
    * wait for, and the host's own initial focus stands.
    */
   focusOnReady?: boolean;
+  /**
+   * Opens verification setup (#3456 §3.6a). Given, the enrolment state offers a
+   * "Set up verification" button after its sentence; focus still goes to the
+   * heading, so the sentence is read before the button is reached. Omitted,
+   * the stage renders exactly as it does without it. The button acts only
+   * while the account and server the stage opened for (and `capture`, when
+   * given) are current; after a change it ends the stage as `sessionExpired`.
+   */
+  onSetUpVerification?: () => void;
+  /**
+   * The host's own capture (C82), the one it passes to `stepUpActivation`, so
+   * "Set up verification" is fenced to the same account and server as `run`.
+   */
+  capture?: ApiRequestContext;
 }
 
 /** `stepUpActivation`'s optional inputs, for a host that prepares before `run`. */
@@ -342,6 +356,8 @@ const StepUpCredentials: React.FC<StepUpCredentialsProps> = ({
   passwordRef: hostPasswordRef,
   sessionMessage = DEFAULT_SESSION_MESSAGE,
   focusOnReady = false,
+  onSetUpVerification,
+  capture,
 }) => {
   const { status, phase, notice, method, methods } = factor;
   const ownPasswordRef = useRef<HTMLInputElement>(null);
@@ -476,6 +492,17 @@ const StepUpCredentials: React.FC<StepUpCredentialsProps> = ({
         {status.kind === 'blocked' && (
           <button type="button" className="step-up__link" onClick={retry}>
             Retry
+          </button>
+        )}
+        {status.kind === 'enrollmentRequired' && onSetUpVerification !== undefined && (
+          <button
+            type="button"
+            className="step-up__link"
+            onClick={() => {
+              if (factor.confirmCurrent(capture)) onSetUpVerification();
+            }}
+          >
+            Set up verification
           </button>
         )}
       </div>

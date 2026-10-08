@@ -7,6 +7,7 @@ import {
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './SettingsOverlayHost.css';
 import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
+import { focusTargetIn } from '../ui/focusTarget';
 
 const SettingsPage = lazy(() => import('./SettingsPage'));
 const ServerSettingsPage = lazy(() => import('../Servers/ServerSettingsPage'));
@@ -35,6 +36,21 @@ const dialogCancelsOnEscape = (() => {
  *    stops propagation)
  *  - explicit close() from store (e.g. back button inside the page)
  */
+/**
+ * Where focus goes when Settings closes and the control that opened it has left
+ * the document (a step-up dialog that closed for "Set up verification", a menu
+ * that unmounted): the composer, then the channel list, then the server rail.
+ * The native dialog returns focus to that control when it can; otherwise it
+ * lands on `<body>`, which this replaces.
+ */
+function chatFocusTarget(): HTMLElement | null {
+  for (const selector of ['.message-input-textarea', '.channel-list', '.server-bar']) {
+    const target = focusTargetIn(document.querySelector<HTMLElement>(selector));
+    if (target !== null) return target;
+  }
+  return null;
+}
+
 const SettingsOverlayHost: React.FC = () => {
   const open = useSettingsOverlayStore((s) => s.open);
   const payload = useSettingsOverlayStore((s) => s.payload);
@@ -55,6 +71,18 @@ const SettingsOverlayHost: React.FC = () => {
     } else if (!open && dlg.open) {
       dlg.close();
     }
+  }, [open]);
+
+  // After every close, whatever path it took (the store, Escape, the backdrop):
+  // the native dialog's own focus return has already run by now, so focus left
+  // on <body> means its invoker is gone.
+  const wasOpenRef = useRef(Boolean(open));
+  useEffect(() => {
+    const closed = wasOpenRef.current && !open;
+    wasOpenRef.current = Boolean(open);
+    if (!closed) return;
+    const active = document.activeElement;
+    if (active === null || active === document.body) chatFocusTarget()?.focus();
   }, [open]);
 
   // Lock body scroll while open (showModal already inerts the rest of the

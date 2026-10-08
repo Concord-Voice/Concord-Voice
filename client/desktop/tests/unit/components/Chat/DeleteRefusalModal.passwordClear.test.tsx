@@ -5,6 +5,7 @@ import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import DeleteRefusalModal from '@/renderer/components/Chat/DeleteRefusalModal';
 import type { DeleteRefusalState } from '@/renderer/hooks/messaging/useChatController';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import type { DeleteRefusalView } from '@/renderer/services/messaging/deleteRefusal';
 
 // Reproduction from the #3509 frontend review (L1): once the password has
@@ -21,7 +22,7 @@ afterAll(() => server.close());
 const FIXTURE_PW = 'hunter2-fixture';
 
 function slot(view: DeleteRefusalView): DeleteRefusalState {
-  return { messageId: 'm1', view, openedAt: 1 };
+  return { messageId: 'm1', view, openedAt: 1, context: captureApiRequestContext() };
 }
 
 const OTHER_VIEWS = [

@@ -639,19 +639,25 @@ func requireStepUpBudgetWired(log *logger.Logger, u *users.Handler) {
 }
 
 // requirePermissionInvalidatorWired fatal-exits when the MFA handler has no
-// permission invalidator (#3453).
+// permission invalidator (#3453) or no permission-change notifier (#3456).
 //
 // The handler treats a nil invalidator as a no-op, so an unwired one fails
 // OPEN, and silently: a member who removes their last inline factor keeps
 // their cached dangerous permissions on every enforcing server until the cache
-// TTL expires. Boot is where that should surface. It interrogates the HANDLER,
-// never the resolver value, for the reason requirePresenceRecheckWired gives:
+// TTL expires. An unwired notifier is silent too: the desktop never learns to
+// re-read, so it shows controls the mask has removed until the user navigates.
+// Boot is where either should surface. It interrogates the HANDLER, never the
+// resolver or hub value, for the reason requirePresenceRecheckWired gives:
 // rbac.NewResolver never returns nil, so checking that value could not see a
 // deleted SetPermissionInvalidator call. Extracted from NewRouter, which sits
 // at the go:S3776 limit.
 func requirePermissionInvalidatorWired(log *logger.Logger, h *mfa.Handler) {
 	if h == nil || !h.HasPermissionInvalidator() {
 		log.Fatal("MFA handler has no permission invalidator: MFA factor changes would leave cached permissions stale")
+	}
+	if !h.HasPermissionChangeNotifier() {
+		log.Fatal("MFA handler has no permission change notifier: " +
+			"MFA factor changes would not tell the user's clients to re-read their permissions")
 	}
 }
 
@@ -1007,8 +1013,10 @@ func NewRouter(
 	mfaHandler.SetLoginCompleter(authHandler)
 	mfaHandler.SetEmailService(emailSvc)
 	// A committed factor change bumps the user's permission generation (#3453):
-	// the MFA mask reads P1, so a cached value would otherwise outlive it.
+	// the MFA mask reads P1, so a cached value would otherwise outlive it. It
+	// then tells the user's own clients to re-read (#3456).
 	mfaHandler.SetPermissionInvalidator(rbacResolver)
+	mfaHandler.SetPermissionChangeNotifier(newPermissionChangeNotifier(hub, log))
 	requirePermissionInvalidatorWired(log, mfaHandler)
 	entCache := entitlements.NewCacheForInstance(redis, db, cfg.InstanceType)
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)

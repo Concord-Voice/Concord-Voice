@@ -9,12 +9,17 @@ import {
   type PrivacySettings,
 } from '../../stores/ui/privacyStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { apiFetch, API_BASE } from '../../services/system/apiClient';
 import {
   apiRequestContextIsCurrent,
   captureApiRequestContext,
 } from '../../services/system/requestContext';
 import { adaptSessionsRefusal, serverErrorText } from '../../services/system/stepUpRouteAdapters';
+import {
+  returnFromVerificationSetup,
+  verificationReturnLabel,
+} from '../../utils/ui/openVerificationSetup';
 import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import MFATierSelector, { WebAuthnCredential } from './MFATierSelector';
@@ -369,6 +374,26 @@ const BackupCodesCount: React.FC<{ remaining: number | undefined }> = ({ remaini
   </>
 );
 
+/**
+ * The one "Back to …" button (#3456 §3.6a): shown when verification setup was
+ * opened from somewhere (the pending return) and a TOTP or key setup has just
+ * finished here. Nothing else renders; the pending return is taken on use, so
+ * the button goes with it.
+ */
+const VerificationReturnButton: React.FC<{ setupCompleted: boolean }> = ({ setupCompleted }) => {
+  const target = useSettingsOverlayStore((s) => s.verificationReturn);
+  if (!setupCompleted || target === null) return null;
+  return (
+    <button
+      type="button"
+      className="btn btn-sm btn-secondary"
+      onClick={() => void returnFromVerificationSetup()}
+    >
+      {verificationReturnLabel(target)}
+    </button>
+  );
+};
+
 function permissionStatusBadge(status: OsPermissionStatus): {
   className: string;
   label: string;
@@ -679,6 +704,8 @@ const PrivacySecuritySection: React.FC = () => {
   const [webauthnCredentialType, setWebauthnCredentialType] = useState<'hardware' | 'platform'>(
     'hardware'
   );
+  // A TOTP or key setup finished in this visit: what lets "Back to …" appear.
+  const [mfaSetupCompleted, setMfaSetupCompleted] = useState(false);
 
   // Backup code reset modal
   const [showBackupReset, setShowBackupReset] = useState(false);
@@ -1199,6 +1226,7 @@ const PrivacySecuritySection: React.FC = () => {
           mfaActive={mfaMethods.length > 0}
           onComplete={() => {
             setMfaSetupMethod(null);
+            setMfaSetupCompleted(true);
             fetchMFAStatus();
           }}
           onCancel={() => setMfaSetupMethod(null)}
@@ -1443,6 +1471,8 @@ const PrivacySecuritySection: React.FC = () => {
         </div>
 
         {renderMfaSetupArea()}
+
+        <VerificationReturnButton setupCompleted={mfaSetupCompleted} />
 
         {renderBackupResetModal()}
       </CollapsibleSection>

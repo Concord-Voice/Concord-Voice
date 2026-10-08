@@ -21,6 +21,7 @@ import { getWebSocketService, ConnectionState } from '../../services/messaging/w
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import {
   apiFetchInContext,
+  apiRequestContextIsCurrent,
   captureApiRequestContext,
   type ApiRequestContext,
 } from '../../services/system/requestContext';
@@ -172,6 +173,13 @@ export interface DeleteRefusalState {
   messageId: string;
   view: DeleteRefusalView;
   openedAt: number;
+  /**
+   * The account and server the refused delete went out as (C82). The modal's
+   * retry and "Set up verification" work against it, never against a capture
+   * the factor hook takes when the stage mounts. A retry's refusal keeps the
+   * first one's: the retry was sent against it.
+   */
+  context: ApiRequestContext;
 }
 
 export interface SendOpts {
@@ -385,11 +393,15 @@ export function useChatController(ctx: ChatContext) {
   // keeps the slot as it is. Each fill is its own countdown anchor:
   // `Retry-After` is relative to the response that carried it.
   const fillRefusalSlot = useCallback(
-    (messageId: string, viewFor: (prior?: DeleteRefusalView) => DeleteRefusalView) => {
+    (
+      messageId: string,
+      viewFor: (prior?: DeleteRefusalView) => DeleteRefusalView,
+      context: ApiRequestContext
+    ) => {
       const openedAt = Date.now();
       setDeleteRefusal((cur) => {
         if (cur && cur.messageId !== messageId) return cur;
-        return { messageId, view: viewFor(cur?.view), openedAt };
+        return { messageId, view: viewFor(cur?.view), openedAt, context: cur?.context ?? context };
       });
     },
     []
@@ -406,13 +418,22 @@ export function useChatController(ctx: ChatContext) {
       inFlightDeleteIdsRef.current.add(messageId);
       const isRetry = step !== undefined;
       const sentFrom = ctx.id;
+      // One capture for the whole send, taken before it (C82): a retry brings
+      // the modal's, which is the refused delete's; a fresh delete takes its own.
+      const operation = context ?? captureApiRequestContext();
       // A success still removes the row from the chat it was sent from; only
       // the refusal slot belongs to the chat on screen. The mint round trip
       // (#3509) answers to the same rule: a mint refusal that lands after the
-      // chat changed is discarded with everything else.
+      // chat changed is discarded with everything else, and so is one that
+      // lands after the account or server changed: what it asks for belongs to
+      // the old one.
       const reportIfShowing = (viewFor: (prior?: DeleteRefusalView) => DeleteRefusalView) => {
-        if (isMountedRef.current && currentCtxIdRef.current === sentFrom) {
-          fillRefusalSlot(messageId, viewFor);
+        if (
+          isMountedRef.current &&
+          currentCtxIdRef.current === sentFrom &&
+          apiRequestContextIsCurrent(operation)
+        ) {
+          fillRefusalSlot(messageId, viewFor, operation);
         }
       };
 
@@ -422,8 +443,8 @@ export function useChatController(ctx: ChatContext) {
         // Only a password costs a round trip before the route; a fresh delete
         // or a code goes out in this same tick, as before.
         const retry = needsMint(step)
-          ? await mintedRetryBody(step.currentPassword, purpose, context)
-          : directRetryBody(step, context);
+          ? await mintedRetryBody(step.currentPassword, purpose, operation)
+          : directRetryBody(step, operation);
         // An exchange apiFetch refused to dispatch is the AbortError below.
         if ('notSent' in retry) return { kind: 'aborted' };
         if ('refusal' in retry) {

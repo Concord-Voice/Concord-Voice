@@ -4,6 +4,7 @@ import { PipSignalingProxy } from '../../services/voice/pipSignalingProxy';
 import { createResizeKeyHandler } from '../../utils/ui/resizeKeyboard';
 import ChannelList from '../Channels/ChannelList';
 import ServerActionBar from '../Channels/ServerActionBar';
+import MfaRestrictedNotice from '../Servers/MfaRestrictedNotice';
 import MainViewModals from './MainViewModals';
 import MainViewContextMenus from './MainViewContextMenus';
 import ServerE2eeIndicator from './ServerE2eeIndicator';
@@ -295,10 +296,17 @@ const MainView: React.FC = () => {
   };
 
   // ─── Channel panel header content ───
+  // The server name takes programmatic focus when the MFA notice under it is
+  // dismissed (tabIndex -1: reachable by script, not by Tab).
+  const serverNameRef = useRef<HTMLHeadingElement>(null);
   const channelHeader = (compact: boolean) => (
     <div className="channel-header-info">
       <div className="channel-header-name-row">
-        {!compact && <h3>{activeServer ? activeServer.name : 'Channels'}</h3>}
+        {!compact && (
+          <h3 ref={serverNameRef} tabIndex={-1}>
+            {activeServer ? activeServer.name : 'Channels'}
+          </h3>
+        )}
         {activeServer && <ServerE2eeIndicator />}
       </div>
       <ConnectionStatus compact={compact} />
@@ -395,16 +403,25 @@ const MainView: React.FC = () => {
   const renderChannelBody = (compact: boolean) => (
     <div className="channel-panel-content">
       {activeServer && (
-        <ServerActionBar
-          compact={compact}
-          server={activeServer}
-          onOpenCreateModal={() => setIsCreateChannelModalOpen(true)}
-          onOpenCreateCategoryModal={() => setIsCreateCategoryModalOpen(true)}
-          onOpenSettings={() =>
-            activeServer &&
-            useSettingsOverlayStore.getState().openSettings('server', { serverId: activeServer.id })
-          }
-        />
+        <>
+          <MfaRestrictedNotice
+            serverId={activeServer.id}
+            compact={compact}
+            returnFocusRef={serverNameRef}
+          />
+          <ServerActionBar
+            compact={compact}
+            server={activeServer}
+            onOpenCreateModal={() => setIsCreateChannelModalOpen(true)}
+            onOpenCreateCategoryModal={() => setIsCreateCategoryModalOpen(true)}
+            onOpenSettings={() =>
+              activeServer &&
+              useSettingsOverlayStore
+                .getState()
+                .openSettings('server', { serverId: activeServer.id })
+            }
+          />
+        </>
       )}
       <ChannelList
         compact={compact}

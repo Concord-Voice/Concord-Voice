@@ -1,0 +1,71 @@
+/* #3456: the dangerous-action step-up. StepUpCredentials styles its own fields
+   (MFAFactorPicker.css) and ErrorBanner its banner (MFA.css). No --danger and
+   no glyph on the buttons: the action was already confirmed by the host, and
+   --danger as label text fails AA in 9 of 30 scheme x theme pairs. */
+
+.dangerous-step-up {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.dangerous-step-up__intro {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.dangerous-step-up__actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.dangerous-step-up__cancel {
+  padding: 10px 20px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dangerous-step-up__cancel:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.dangerous-step-up__cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Told apart from Cancel by its accent border and weight, not an accent fill:
+   --on-accent on the accent measures 2.68:1 in :root (DeleteRefusalModal.css). */
+.dangerous-step-up__confirm {
+  padding: 10px 20px;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--accent-primary);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.dangerous-step-up__confirm:focus-visible,
+.dangerous-step-up__cancel:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}
+
+/* aria-disabled, not disabled: the primary stays focusable and its click says
+   what is missing. It reads as a disabled button does. */
+.dangerous-step-up__confirm[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

@@ -510,7 +510,9 @@ describe('purgeMessages soft-lock (#3455)', () => {
       expect(result.kind).not.toBe('softLockFailed');
     });
 
-    it('an enrolment 403 with no delete_rate_limited is #16’s purge D1 case: forbidden, unchanged', async () => {
+    // #3456 C-6: the D1 gate's enrolment refusal is the plain seam body. It was
+    // `forbidden`, a dead end with no way forward; it is a challenge now.
+    it('an enrolment 403 with no delete_rate_limited is the D1 gate’s dangerousChallenge', async () => {
       server.use(
         http.delete(path, () =>
           HttpResponse.json(
@@ -520,7 +522,8 @@ describe('purgeMessages soft-lock (#3455)', () => {
         )
       );
       expect(await purgeMessages({ context, scopeId, range: '7d' })).toEqual({
-        kind: 'forbidden',
+        kind: 'dangerousChallenge',
+        refusal: { kind: 'enrollmentRequired' },
       });
     });
 

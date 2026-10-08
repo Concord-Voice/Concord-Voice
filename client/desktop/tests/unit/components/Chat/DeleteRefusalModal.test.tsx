@@ -10,6 +10,7 @@ import DeleteRefusalModal, {
   type DeleteRefusalModalProps,
 } from '@/renderer/components/Chat/DeleteRefusalModal';
 import type { DeleteRefusalState } from '@/renderer/hooks/messaging/useChatController';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
 import type { StepUpSubmitOutcome } from '@/renderer/hooks/auth/useStepUpFactor';
 import type { DeleteRefusalView } from '@/renderer/services/messaging/deleteRefusal';
 import type { StepUpPurpose } from '@/renderer/components/Auth/stepUpPurpose';
@@ -42,7 +43,14 @@ function slot(
   view: DeleteRefusalView,
   extra: Partial<DeleteRefusalState> = {}
 ): DeleteRefusalState {
-  return { messageId: 'm1', view, openedAt: Date.now(), ...extra };
+  // The capture is the controller's, taken as the delete went out (C82).
+  return {
+    messageId: 'm1',
+    view,
+    openedAt: Date.now(),
+    context: captureApiRequestContext(),
+    ...extra,
+  };
 }
 
 const CONFIRM: DeleteRefusalView = { view: 'confirm', methods: ['totp'] };
@@ -328,14 +336,20 @@ describe('DeleteRefusalModal', () => {
       expect(onConfirm.mock.calls[0][0]).toEqual({ mfaCode: CODE });
     });
 
-    it('hands the controller the run’s request context with the code', async () => {
+    // Mutation: dropping `{ capture }` from the stage's stepUpActivation re-sends against the
+    // factor's own opening capture, not the refused delete's (red).
+    it('hands the controller the refused delete’s capture with the code', async () => {
       const onConfirm = okConfirm();
-      render(ui({ refusal: slot(CONFIRM), onConfirm }));
+      const refusal = slot(CONFIRM);
+      render(ui({ refusal, onConfirm }));
       await typeCode();
       await userEvent.setup().click(confirmButton());
 
       await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
-      expect(onConfirm.mock.calls[0][1], 'the capture the retry is admitted against').toBeDefined();
+      // The same capture, not an equal one: the stage never took its own.
+      expect(onConfirm.mock.calls[0][1], 'the capture the retry is admitted against').toBe(
+        refusal.context
+      );
     });
 
     it('editing a completed code makes Confirm inert again', async () => {

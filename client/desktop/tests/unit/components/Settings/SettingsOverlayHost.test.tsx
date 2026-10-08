@@ -89,6 +89,83 @@ describe('SettingsOverlayHost', () => {
     showModalOrder.length = 0;
   });
 
+  // #3456 §3.6a: "Back to chat" closes Settings after its invoker (a step-up dialog's
+  // link) has left the document, so the native focus return has nowhere to go.
+  describe('focus after a close whose invoker is gone', () => {
+    function ChatView({ composer = true }: Readonly<{ composer?: boolean }>) {
+      return (
+        <>
+          <div className="server-bar">
+            <button type="button">Home</button>
+          </div>
+          <div className="channel-list">
+            <button type="button">general</button>
+          </div>
+          {composer && <textarea className="message-input-textarea" aria-label="Message" />}
+        </>
+      );
+    }
+
+    async function openThenClose() {
+      act(() => {
+        useSettingsOverlayStore.getState().openSettings('app');
+      });
+      await screen.findByTestId('mock-settings-page');
+      (document.activeElement as HTMLElement | null)?.blur();
+      act(() => {
+        useSettingsOverlayStore.getState().close();
+      });
+    }
+
+    // Mutant: the close-time focus effect removed (focus stays on <body>).
+    it('lands on the composer', async () => {
+      render(
+        <>
+          <ChatView />
+          <SettingsOverlayHost />
+        </>
+      );
+      await openThenClose();
+
+      expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Message' }));
+    });
+
+    // Mutant: the fallback order dropped to the composer alone.
+    it('lands on the channel list when there is no composer', async () => {
+      render(
+        <>
+          <ChatView composer={false} />
+          <SettingsOverlayHost />
+        </>
+      );
+      await openThenClose();
+
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'general' }));
+    });
+
+    // Mutant: the effect focusing the composer whatever holds focus.
+    it('leaves focus where the native return put it', async () => {
+      render(
+        <>
+          <ChatView />
+          <button type="button">Opener</button>
+          <SettingsOverlayHost />
+        </>
+      );
+      act(() => {
+        useSettingsOverlayStore.getState().openSettings('app');
+      });
+      await screen.findByTestId('mock-settings-page');
+      const opener = screen.getByRole('button', { name: 'Opener' });
+      opener.focus();
+      act(() => {
+        useSettingsOverlayStore.getState().close();
+      });
+
+      expect(document.activeElement).toBe(opener);
+    });
+  });
+
   it('dialog is closed when open is null', () => {
     render(<SettingsOverlayHost />);
     const dlg = getDialog();

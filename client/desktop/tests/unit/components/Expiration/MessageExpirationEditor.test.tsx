@@ -15,12 +15,36 @@ import {
   useExpirationPolicy,
   type ExpirationPolicyControls,
 } from '@/renderer/hooks/messaging/useExpirationPolicy';
-import type {
-  ExpirationMutationResult,
+import {
+  updateExpirationPolicy,
+  type ExpirationMutationResult,
+  type ExpirationRequest,
   ExpirationPolicy,
   ExpirationPolicyReadResult,
   ExpirationScope,
 } from '@/renderer/services/messaging/expirationPolicyApi';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
+import {
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '@/renderer/services/system/requestContext';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
+import { FIRST_SEND_SESSION_CHANGED } from '@/renderer/services/system/dangerousActionRequest';
+import {
+  CODE_LABEL,
+  DIALOG_TITLE,
+  ENROLMENT_REQUIRED,
+  ENROLMENT_TEXT,
+  FIXTURE_OTP,
+  GATED_API_BASE,
+  MFA_REQUIRED,
+  SETUP_LINK,
+  stubStepUpRead,
+} from '../../../helpers/gatedRoute';
+import { stubGatedWrite, writeCodes } from '../../../helpers/gatedWriteRoute';
 import MessageExpirationEditor from '@/renderer/components/Expiration/MessageExpirationEditor';
 
 const policy: ExpirationPolicy = {
@@ -182,11 +206,14 @@ describe('MessageExpirationEditor', () => {
     expect(apply).toBeEnabled();
     await user.click(apply);
     await waitFor(() =>
-      expect(onApplyPolicy).toHaveBeenCalledWith({
-        mode: 'set',
-        window_seconds: 3600,
-        retroactive: 'new_only',
-      })
+      expect(onApplyPolicy).toHaveBeenCalledWith(
+        {
+          mode: 'set',
+          window_seconds: 3600,
+          retroactive: 'new_only',
+        },
+        expect.anything()
+      )
     );
   });
 
@@ -220,7 +247,10 @@ describe('MessageExpirationEditor', () => {
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Turn off timer' }));
     await waitFor(() =>
-      expect(onApplyPolicy).toHaveBeenCalledWith({ mode: 'clear', retroactive: 'clear_pending' })
+      expect(onApplyPolicy).toHaveBeenCalledWith(
+        { mode: 'clear', retroactive: 'clear_pending' },
+        expect.anything()
+      )
     );
   });
 
@@ -315,11 +345,14 @@ describe('MessageExpirationEditor', () => {
         await submit;
       });
       await waitFor(() =>
-        expect(apply).toHaveBeenCalledWith({
-          mode: 'set',
-          window_seconds: 3600,
-          retroactive: 'new_only',
-        })
+        expect(apply).toHaveBeenCalledWith(
+          {
+            mode: 'set',
+            window_seconds: 3600,
+            retroactive: 'new_only',
+          },
+          expect.anything()
+        )
       );
       expect(apply).toHaveBeenCalledOnce();
     } finally {
@@ -529,11 +562,14 @@ describe('MessageExpirationEditor', () => {
       await user.click(screen.getByRole('button', { name: 'Apply timer' }));
     });
     expect(refresh).toHaveBeenCalledTimes(2);
-    expect(apply).toHaveBeenCalledWith({
-      mode: 'set',
-      window_seconds: 3600,
-      retroactive: 'new_only',
-    });
+    expect(apply).toHaveBeenCalledWith(
+      {
+        mode: 'set',
+        window_seconds: 3600,
+        retroactive: 'new_only',
+      },
+      expect.anything()
+    );
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: 'Refresh policy' })).toBeNull();
   });
@@ -557,7 +593,7 @@ describe('MessageExpirationEditor', () => {
     await user.click(screen.getByRole('radio', { name: 'Apply to existing messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
-    await waitFor(() => expect(onApplyPolicy).toHaveBeenCalledWith(expected));
+    await waitFor(() => expect(onApplyPolicy).toHaveBeenCalledWith(expected, expect.anything()));
   });
 
   it('clears acknowledgement when the choice changes, supports new-only, and never patches until fresh read', async () => {
@@ -837,120 +873,168 @@ describe('MessageExpirationEditor', () => {
     }
   });
 
-  it.each([
-    [
-      'mismatched candidate',
-      6,
-      { window_seconds: 3600, updated_at: policy.updatedAt, revision: 5, backfill_pending: true },
-    ],
-    ['no candidate', 5, undefined],
-  ] as const)(
-    'does not enable automatic Resume for a real 503 %s',
-    async (_label, rereadRevision, candidate) => {
-      const user = userEvent.setup();
-      useAuthStore.getState().setAccessToken('mock-token');
-      useAuthStore.getState().setSessionId('session-1');
-      useChannelStore.setState({ currentServerId: 'server-1' });
-      usePermissionStore.setState({
-        channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
-      });
-      let reads = 0;
-      let patches = 0;
-      let patchBody: unknown;
-      let patchSeen: (() => void) | undefined;
-      const patchStarted = new Promise<void>((resolve) => {
-        patchSeen = resolve;
-      });
-      let explicitRead = false;
-      const pendingWire = {
-        window_seconds: rereadRevision === 6 ? 3600 : 3600,
-        updated_at: policy.updatedAt,
-        revision: rereadRevision,
-        backfill_pending: true,
-      };
-      server.use(
-        http.get('http://localhost:8080/api/v1/servers/server-1/channels', () => {
-          reads += 1;
-          const current = explicitRead
+  // Mutant: the 503 arm of `mutationResult` ignores the body's revision, so a candidate that is
+  // not the re-read policy no longer blocks automatic Resume.
+  it('does not enable automatic Resume for a real 503 with a mismatched candidate', async () => {
+    const rereadRevision = 6;
+    const candidate = {
+      window_seconds: 3600,
+      updated_at: policy.updatedAt,
+      revision: 5,
+      backfill_pending: true,
+    };
+    const user = userEvent.setup();
+    useAuthStore.getState().setAccessToken('mock-token');
+    useAuthStore.getState().setSessionId('session-1');
+    useChannelStore.setState({ currentServerId: 'server-1' });
+    usePermissionStore.setState({
+      channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
+    });
+    let reads = 0;
+    let patches = 0;
+    let patchBody: unknown;
+    let patchSeen: (() => void) | undefined;
+    const patchStarted = new Promise<void>((resolve) => {
+      patchSeen = resolve;
+    });
+    let explicitRead = false;
+    const pendingWire = {
+      window_seconds: 3600,
+      updated_at: policy.updatedAt,
+      revision: rereadRevision,
+      backfill_pending: true,
+    };
+    server.use(
+      http.get('http://localhost:8080/api/v1/servers/server-1/channels', () => {
+        reads += 1;
+        const current = explicitRead
+          ? pendingWire
+          : reads > 2
             ? pendingWire
-            : reads > 2
-              ? pendingWire
-              : {
-                  window_seconds: 86400,
-                  updated_at: policy.updatedAt,
-                  revision: 4,
-                  backfill_pending: false,
-                };
-          return HttpResponse.json({
-            channels: [
-              {
-                ...mockChannel,
-                expiration_window_seconds: current.window_seconds,
-                expiration_updated_at: current.updated_at,
-                expiration_revision: current.revision,
-                expiration_backfill_pending: current.backfill_pending,
-              },
-            ],
-          });
-        }),
-        http.patch(
-          'http://localhost:8080/api/v1/channels/channel-1/expiration',
-          async ({ request }) => {
-            patches += 1;
-            patchBody = await request.json();
-            patchSeen?.();
-            return candidate
-              ? HttpResponse.json(candidate, { status: 503 })
-              : HttpResponse.json({ malformed: true }, { status: 503 });
-          }
-        )
-      );
-      render(
-        <HookEditorFixture scope={{ kind: 'channel', id: 'channel-1' }} serverId="server-1" />
-      );
-      await waitFor(() =>
-        expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
-          'aria-pressed',
-          'true'
-        )
-      );
-      await user.click(screen.getByRole('button', { name: '1 hour' }));
-      // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
-      await user.click(screen.getByRole('button', { name: 'Apply' }));
-      await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
-      await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
-      await user.click(screen.getByRole('button', { name: 'Apply timer' }));
-      await patchStarted;
-      expect(patchBody).toEqual({ mode: 'set', window_seconds: 3600, retroactive: 'new_only' });
-      await waitFor(() =>
-        expect(screen.getByText('Still processing existing messages.')).toBeInTheDocument()
-      );
-      const resume = screen.queryByRole('button', { name: 'Resume processing' });
-      if (resume) expect(resume).toBeDisabled();
-      explicitRead = true;
-      const readsBeforeExplicitRefresh = reads;
-      await user.click(screen.getByRole('button', { name: 'Refresh policy' }));
-      await waitFor(() => expect(reads).toBeGreaterThan(readsBeforeExplicitRefresh));
-      await waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Resume processing' })).toBeEnabled()
-      );
-      expect(patches).toBe(1);
-      await user.click(screen.getByRole('button', { name: 'Resume processing' }));
-      const resumeDialog = screen.getByRole('dialog', {
-        name: 'Resume message expiration processing',
-      });
-      await user.click(
-        within(resumeDialog).getByRole('checkbox', { name: /cannot be recovered/i })
-      );
-      await user.click(within(resumeDialog).getByRole('button', { name: 'Resume processing' }));
-      await waitFor(() => expect(patches).toBe(2));
-      expect(patchBody).toEqual({ mode: 'resume', revision: rereadRevision });
-      expect(
-        useChannelStore.getState().channels.find((item) => item.id === 'channel-1')
-          ?.expirationPolicy?.revision
-      ).toBe(rereadRevision);
-    }
-  );
+            : {
+                window_seconds: 86400,
+                updated_at: policy.updatedAt,
+                revision: 4,
+                backfill_pending: false,
+              };
+        return HttpResponse.json({
+          channels: [
+            {
+              ...mockChannel,
+              expiration_window_seconds: current.window_seconds,
+              expiration_updated_at: current.updated_at,
+              expiration_revision: current.revision,
+              expiration_backfill_pending: current.backfill_pending,
+            },
+          ],
+        });
+      }),
+      http.patch(
+        'http://localhost:8080/api/v1/channels/channel-1/expiration',
+        async ({ request }) => {
+          patches += 1;
+          patchBody = await request.json();
+          patchSeen?.();
+          return HttpResponse.json(candidate, { status: 503 });
+        }
+      )
+    );
+    render(<HookEditorFixture scope={{ kind: 'channel', id: 'channel-1' }} serverId="server-1" />);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
+        'aria-pressed',
+        'true'
+      )
+    );
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
+    await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+    await patchStarted;
+    expect(patchBody).toEqual({ mode: 'set', window_seconds: 3600, retroactive: 'new_only' });
+    await waitFor(() =>
+      expect(screen.getByText('Still processing existing messages.')).toBeInTheDocument()
+    );
+    const resume = screen.queryByRole('button', { name: 'Resume processing' });
+    if (resume) expect(resume).toBeDisabled();
+    explicitRead = true;
+    const readsBeforeExplicitRefresh = reads;
+    await user.click(screen.getByRole('button', { name: 'Refresh policy' }));
+    await waitFor(() => expect(reads).toBeGreaterThan(readsBeforeExplicitRefresh));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Resume processing' })).toBeEnabled()
+    );
+    expect(patches).toBe(1);
+    await user.click(screen.getByRole('button', { name: 'Resume processing' }));
+    const resumeDialog = screen.getByRole('dialog', {
+      name: 'Resume message expiration processing',
+    });
+    await user.click(within(resumeDialog).getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(within(resumeDialog).getByRole('button', { name: 'Resume processing' }));
+    await waitFor(() => expect(patches).toBe(2));
+    expect(patchBody).toEqual({ mode: 'resume', revision: rereadRevision });
+    expect(
+      useChannelStore.getState().channels.find((item) => item.id === 'channel-1')?.expirationPolicy
+        ?.revision
+    ).toBe(rereadRevision);
+  });
+
+  // Mutant: the 503 arm of `mutationResult` returns `partial` for a body that is not a policy
+  // (the pre-#3456 mapping): the editor re-reads and blocks on an ordinary outage (F11, §3.2).
+  it('treats a real 503 whose body is not a policy as a retryable failure, with no re-read', async () => {
+    const user = userEvent.setup();
+    useAuthStore.getState().setAccessToken('mock-token');
+    useAuthStore.getState().setSessionId('session-1');
+    useChannelStore.setState({ currentServerId: 'server-1' });
+    usePermissionStore.setState({
+      channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
+    });
+    let reads = 0;
+    let readsAtPatch = -1;
+    let patches = 0;
+    server.use(
+      http.get('http://localhost:8080/api/v1/servers/server-1/channels', () => {
+        reads += 1;
+        return HttpResponse.json({
+          channels: [
+            {
+              ...mockChannel,
+              expiration_window_seconds: 86400,
+              expiration_updated_at: policy.updatedAt,
+              expiration_revision: 4,
+              expiration_backfill_pending: false,
+            },
+          ],
+        });
+      }),
+      http.patch('http://localhost:8080/api/v1/channels/channel-1/expiration', () => {
+        patches += 1;
+        // The pre-flight refresh before the PATCH is expected; a read after it is the re-read.
+        readsAtPatch = reads;
+        return HttpResponse.json({ malformed: true }, { status: 503 });
+      })
+    );
+    render(<HookEditorFixture scope={{ kind: 'channel', id: 'channel-1' }} serverId="server-1" />);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
+        'aria-pressed',
+        'true'
+      )
+    );
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
+    await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+
+    expect(await screen.findByText('This change could not be applied.')).toBeInTheDocument();
+    expect(patches).toBe(1);
+    expect(reads).toBe(readsAtPatch);
+    expect(screen.queryByText('Still processing existing messages.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Refresh the policy before continuing.')).not.toBeInTheDocument();
+  });
 
   it('shows the exact ambiguity copy and blocks further mutation after an uncertain result', async () => {
     const user = userEvent.setup();
@@ -1382,5 +1466,262 @@ describe('MessageExpirationEditor', () => {
       ).toBe(2592000)
     );
     expect(screen.getByRole('button', { name: '30 days' })).toHaveAttribute('aria-pressed', 'true');
+  });
+});
+
+// Shortening retention on a server that enforces MFA (#3456 §3.3/§3.4, D-5): the confirmation
+// gives way to DangerousActionStepUpDialog, one dialog at a time, and the frozen change is re-sent.
+describe('MessageExpirationEditor shortening step-up swap', () => {
+  const channelScope = { kind: 'channel' as const, id: 'channel-1' };
+  const channelRoute = `${GATED_API_BASE}/api/v1/channels/channel-1/expiration`;
+  const shortened = {
+    window_seconds: 3600,
+    updated_at: policy.updatedAt,
+    revision: 5,
+    backfill_pending: false,
+  };
+  const frozenSet = { mode: 'set', window_seconds: 3600, retroactive: 'new_only' };
+
+  // The real PATCH over mocked network, so the editor sees the typed results production does.
+  function ApiEditor({ scope }: { scope: ExpirationScope }) {
+    return (
+      <MessageExpirationEditor
+        {...props()}
+        scope={scope}
+        onApplyPolicy={(request, context) => updateExpirationPolicy(scope, request, context)}
+      />
+    );
+  }
+
+  async function confirmShortening(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await user.click(await screen.findByRole('radio', { name: 'Only new messages' }));
+    await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+  }
+
+  const stepUpDialog = () => screen.queryByRole('dialog', { name: DIALOG_TITLE });
+  const confirmation = () => screen.queryByRole('dialog', { name: 'Change message expiration' });
+
+  beforeEach(() => {
+    useAuthStore.getState().setAccessToken('mock-token');
+    stubStepUpRead();
+  });
+
+  // Mutant: the refusal not handed off (`handOff` unwired), or `isOpen` left `confirmationOpen`
+  // alone so the confirmation stays up beside the dialog.
+  it('swaps the confirmation for the dialog, one dialog at a time', async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({ method: 'patch', url: channelRoute, first: MFA_REQUIRED });
+    render(<ApiEditor scope={channelScope} />);
+    await confirmShortening(user);
+
+    expect(await screen.findByLabelText(CODE_LABEL)).toBeInTheDocument();
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    expect(stepUpDialog()).toBeInTheDocument();
+    expect(confirmation()).not.toBeInTheDocument();
+    // The first send is the editor's own code-less request.
+    expect(writes).toHaveLength(1);
+    expect(writes[0].json).toEqual(frozenSet);
+  });
+
+  // Mutant: `mfa_code` dropped or the frozen request rebuilt from the draft; or sent twice.
+  it('re-sends the frozen window with the typed code, once, and applies it', async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({
+      method: 'patch',
+      url: channelRoute,
+      first: MFA_REQUIRED,
+      retries: [{ status: 200, body: shortened }],
+    });
+    render(<ApiEditor scope={channelScope} />);
+    await confirmShortening(user);
+    await user.type(await screen.findByLabelText(CODE_LABEL), FIXTURE_OTP);
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+
+    await waitFor(() => expect(stepUpDialog()).not.toBeInTheDocument());
+    expect(writes).toHaveLength(2);
+    expect(writes[1].json).toEqual({ ...frozenSet, mfa_code: FIXTURE_OTP });
+    expect(writeCodes(writes)).toEqual([FIXTURE_OTP]);
+    expect(confirmation()).not.toBeInTheDocument();
+  });
+
+  // Mutant: the dialog's `onClose` also runs `closeConfirmation` (the staged draft dropped). Focus
+  // is restored by Modal itself here; `focusFallback` is reachable only with Apply unmounted.
+  it('Cancel keeps the staged window, sends nothing more, and focuses Apply, never body', async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({ method: 'patch', url: channelRoute, first: MFA_REQUIRED });
+    render(<ApiEditor scope={channelScope} />);
+    await confirmShortening(user);
+    await screen.findByLabelText(CODE_LABEL);
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => expect(stepUpDialog()).not.toBeInTheDocument());
+    expect(writes).toHaveLength(1);
+    // Still staged (Discard is offered); aria-pressed reports what is in force, not the draft.
+    expect(screen.getByRole('button', { name: 'Discard' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toHaveFocus());
+    expect(document.body).not.toHaveFocus();
+  });
+
+  // Mutant: the enrolment seed ignored (`stepUpSeed` returns null), so the code field mounts for
+  // an actor with no factor, or the refusal is shown inside the confirmation.
+  it('shows the enrolment state with the setup link, and sends nothing more', async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({
+      method: 'patch',
+      url: channelRoute,
+      first: ENROLMENT_REQUIRED,
+    });
+    render(<ApiEditor scope={channelScope} />);
+    await confirmShortening(user);
+
+    expect(await screen.findByText(ENROLMENT_TEXT)).toBeInTheDocument();
+    expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    await user.click(screen.getByRole('button', { name: SETUP_LINK }));
+    // Mutant: `onSetUpVerification` unwired, or `closeHost` dropped so the dialog outlives the trip.
+    await waitFor(() => expect(useSettingsOverlayStore.getState().open).toBe('app'));
+    expect(useSettingsOverlayStore.getState().verificationReturn).toEqual({ kind: 'chat' });
+    expect(stepUpDialog()).not.toBeInTheDocument();
+    expect(writes).toHaveLength(1);
+  });
+
+  // Mutant: the `scope.kind === 'channel'` guard dropped in `mutationResult`, so a DM route's
+  // 403 body is read as the gate and the DM shortening opens a dialog the DM route cannot satisfy.
+  it("never gates a DM-scope shortening: the refusal stays the editor's own", async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({
+      method: 'patch',
+      url: `${GATED_API_BASE}/api/v1/dm/conversations/conv-1/expiration`,
+      first: MFA_REQUIRED,
+    });
+    render(<ApiEditor scope={{ kind: 'dm', id: 'conv-1' }} />);
+    await confirmShortening(user);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The server refused this change.');
+    expect(stepUpDialog()).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+    expect(writes).toHaveLength(1);
+  });
+
+  // Mutant: `resendWithCode` drops the `context` the dialog passes, so the code-carrying PATCH is
+  // admitted against whatever is current at call time, not the capture the factor was proven under.
+  // Mutant: `confirmApply` sends the first PATCH with no capture (`onApplyPolicy(request)`).
+  // Mutant: `capture={stepUp?.context}` dropped from the dialog, so the re-send goes out under the
+  // dialog's own opening capture rather than the first send's (C82).
+  it('admits both sends against the capture the first send went out with', async () => {
+    const user = userEvent.setup();
+    const apply = vi
+      .fn<
+        (
+          request: ExpirationRequest,
+          context?: ApiRequestContext
+        ) => Promise<ExpirationMutationResult>
+      >()
+      .mockResolvedValueOnce({
+        kind: 'gated',
+        status: MFA_REQUIRED.status,
+        body: MFA_REQUIRED.body,
+      })
+      .mockResolvedValueOnce({
+        kind: 'ok',
+        policy: { ...policy, windowSeconds: 3600, revision: 5 },
+      });
+    render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
+    await confirmShortening(user);
+    await user.type(await screen.findByLabelText(CODE_LABEL), FIXTURE_OTP);
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+
+    await waitFor(() => expect(apply).toHaveBeenCalledTimes(2));
+    expect(apply.mock.calls[0][1]).toEqual(captureApiRequestContext());
+    expect(apply.mock.calls[1][0]).toEqual({ ...frozenSet, mfa_code: FIXTURE_OTP });
+    // The same capture, not an equal one: the dialog never took its own.
+    expect(apply.mock.calls[1][1]).toBe(apply.mock.calls[0][1]);
+  });
+
+  // Mutant: the `apiRequestContextIsCurrent(context)` check dropped from `confirmApply`, so a
+  // challenge answered after a server change opens a dialog that re-sends the old change there.
+  it('opens no dialog for a challenge that lands after a server change', async () => {
+    const user = userEvent.setup();
+    const apply = vi
+      .fn<
+        (
+          request: ExpirationRequest,
+          context?: ApiRequestContext
+        ) => Promise<ExpirationMutationResult>
+      >()
+      .mockImplementationOnce(async () => {
+        setRuntimeServerBase('https://other-server.example.test');
+        return { kind: 'gated', status: MFA_REQUIRED.status, body: MFA_REQUIRED.body };
+      });
+    try {
+      render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
+      await confirmShortening(user);
+
+      expect(await screen.findByText(FIRST_SEND_SESSION_CHANGED)).toBeInTheDocument();
+      expect(stepUpDialog()).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+      expect(apply).toHaveBeenCalledTimes(1);
+    } finally {
+      resetRuntimeServerBase();
+    }
+  });
+
+  // Mutant: the service ignores its `context`, or `aborted` is read as an answer to settle.
+  it('sends nothing when the account changes after the dialog proved the factor', async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({ method: 'patch', url: channelRoute, first: MFA_REQUIRED });
+    const outcomes: ExpirationMutationResult[] = [];
+    render(
+      <MessageExpirationEditor
+        {...props()}
+        scope={channelScope}
+        onApplyPolicy={async (request, context) => {
+          // The first send carries a capture too (C82); only the re-send carries a code.
+          if (!('mfa_code' in request))
+            return updateExpirationPolicy(channelScope, request, context);
+          // After the dialog's own gate, before the request leaves: the account moves.
+          useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 }));
+          const result = await updateExpirationPolicy(channelScope, request, context);
+          outcomes.push(result);
+          return result;
+        }}
+      />
+    );
+    await confirmShortening(user);
+    await user.type(await screen.findByLabelText(CODE_LABEL), FIXTURE_OTP);
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+
+    await waitFor(() => expect(outcomes).toEqual([{ kind: 'aborted' }]));
+    expect(writes).toHaveLength(1);
+  });
+
+  // Mutant: the `forbidden` branch of `resendWithCode` removed: the dialog keeps "The server
+  // refused this change." beside a live primary that sends the same change again.
+  it('ends the dialog on a plain 403 to the re-send: one alert, the editor locked, no live primary', async () => {
+    const user = userEvent.setup();
+    const writes = stubGatedWrite({
+      method: 'patch',
+      url: channelRoute,
+      first: MFA_REQUIRED,
+      retries: [{ status: 403, body: { error: 'forbidden' } }],
+    });
+    render(<ApiEditor scope={channelScope} />);
+    await confirmShortening(user);
+    await user.type(await screen.findByLabelText(CODE_LABEL), FIXTURE_OTP);
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+
+    await waitFor(() => expect(stepUpDialog()).not.toBeInTheDocument());
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getByRole('alert')).toHaveTextContent('The server refused this change.');
+    expect(screen.queryByRole('button', { name: 'Apply timer' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '30 days' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(confirmation()).not.toBeInTheDocument();
+    expect(writes).toHaveLength(2);
   });
 });

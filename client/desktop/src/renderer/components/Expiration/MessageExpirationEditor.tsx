@@ -1,5 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
+import DangerousActionStepUpDialog, {
+  type DangerousActionSendResult,
+} from '../Auth/DangerousActionStepUpDialog';
+import { focusTargetIn } from '../ui/focusTarget';
+import { useStepUpHandoff } from '../../hooks/auth/useStepUpHandoff';
+import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
 import {
   EXPIRATION_WINDOW_OPTIONS,
   type ExpirationMutationResult,
@@ -10,9 +16,20 @@ import {
   type ExpirationWindowSeconds,
 } from '../../services/messaging/expirationPolicyApi';
 import {
+  describeFailureWith,
+  FIRST_SEND_SESSION_CHANGED,
+} from '../../services/system/dangerousActionRequest';
+import {
   captureAuthLifecycle,
   isSameAuthLifecycle,
 } from '../../services/system/postLoginHydrationLifecycle';
+import {
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
+import { stepUpSeed } from '../../services/system/stepUpSeed';
+import { openVerificationSetup } from '../../utils/ui/openVerificationSetup';
 import { useAuthStore } from '../../stores/auth/authStore';
 import '../common/audioQualitySlider.css';
 import './messageExpiration.css';
@@ -24,7 +41,11 @@ export interface MessageExpirationEditorProps {
   canEdit: boolean;
   lockedDescription: string;
   onRefresh: () => Promise<ExpirationPolicyReadResult>;
-  onApplyPolicy: (request: ExpirationRequest) => Promise<ExpirationMutationResult>;
+  /** `context` is the capture the PATCH is admitted against: the first send's, on both sends. */
+  onApplyPolicy: (
+    request: ExpirationRequest,
+    context?: ApiRequestContext
+  ) => Promise<ExpirationMutationResult>;
   onClose: () => void;
 }
 
@@ -187,6 +208,35 @@ function requiresPolicyRefresh(result: ExpirationMutationResult): boolean {
   return result.kind === 'ambiguous' || result.kind === 'conflict';
 }
 
+type ShortenRequest = Extract<ExpirationRequest, { mode: 'set' }>;
+
+/** The refused change, frozen as the first send made it, while the verification dialog is up. */
+interface PendingShorten {
+  /** The re-send adds `mfa_code` to this and changes nothing else. */
+  request: ShortenRequest;
+  refusal: StepUpFactorRefusal;
+  /** The scope and account it was refused under: it is abandoned if either moves. */
+  sessionKey: string;
+  /**
+   * The account and server the first send went out as (C82), the dialog's `capture`: the
+   * re-send and "Set up verification" work against it, never one the dialog takes on mounting.
+   */
+  context: ApiRequestContext;
+}
+
+const describeShortenFailure = describeFailureWith('This change could not be applied.');
+
+/**
+ * What the dialog is told about an answer that is about verification: the gate's own, and a dead
+ * session. Null means it is the editor's to settle, as it is for the first send.
+ */
+function verificationAnswer(result: ExpirationMutationResult): DangerousActionSendResult | null {
+  if (result.kind === 'gated') return { kind: 'refused', status: result.status, body: result.body };
+  if (isRejectedReason(result, 'sessionExpired'))
+    return { kind: 'refused', status: 401, body: null };
+  return null;
+}
+
 export default function MessageExpirationEditor({
   scope,
   policy,
@@ -210,6 +260,8 @@ export default function MessageExpirationEditor({
   const [baseline, setBaseline] = useState<Baseline | null>(null);
   const operationRef = useRef(0);
   const mountedRef = useRef(true);
+  const stopsRef = useRef<HTMLDivElement>(null);
+  const applyRef = useRef<HTMLDivElement>(null);
   const scopeRef = useRef(scope);
   const authGenerationRef = useRef(authGeneration);
   const descriptionId = useId();
@@ -319,6 +371,19 @@ export default function MessageExpirationEditor({
     dismissConfirmation();
     setDraftWindow(undefined);
   };
+
+  // A shortening the server wants verified is handed to the verification dialog in place of the
+  // confirmation (#3456, D-5). Dismissing the dialog ends like the confirmation's own Cancel: the
+  // staged window stays staged. The change is frozen for the scope and account it was refused
+  // under; if either moves it is abandoned, not parked, so it cannot come back as a prompt to
+  // apply it when the user returns to that scope.
+  const sessionKey = `${scope.kind}:${scope.id}:${authGeneration}`;
+  const { pending, ending, handOff, confirmClosed, endStepUp } =
+    useStepUpHandoff<PendingShorten>(dismissConfirmation);
+  const stepUp = pending?.sessionKey === sessionKey ? pending : null;
+  useEffect(() => {
+    if (pending !== null && pending.sessionKey !== sessionKey) endStepUp();
+  }, [pending, sessionKey, endStepUp]);
   // Three distinct facts, deliberately not collapsed into one:
   //   appliedWindow  - what the server currently enforces (undefined while unknown)
   //   draftWindow    - what the user has staged, undefined when nothing is staged
@@ -402,6 +467,47 @@ export default function MessageExpirationEditor({
     return true;
   };
 
+  /** True while the component, scope, account and operation are still the ones the request began under. */
+  const isCurrent = (
+    operation: number,
+    capturedScope: string,
+    lifecycle: ReturnType<typeof captureAuthLifecycle>
+  ) =>
+    isCurrentOperation(
+      mountedRef.current,
+      operation,
+      operationRef.current,
+      scopeRef.current,
+      capturedScope,
+      lifecycle
+    );
+
+  /** Settles an answer to the change, or returns the sentence for a failure the user can retry. */
+  const settlePolicyResult = async (
+    result: ExpirationMutationResult,
+    operation: number,
+    capturedScope: string,
+    lifecycle: ReturnType<typeof captureAuthLifecycle>
+  ): Promise<string | null> => {
+    if (result.kind === 'ok') {
+      closeConfirmation();
+      return null;
+    }
+    if (result.kind === 'partial') {
+      const reread = await onRefresh();
+      if (!isCurrent(operation, capturedScope, lifecycle)) return null;
+      if (!(reread.kind === 'fresh' && matchesPartialPolicy(reread, result.candidate))) {
+        setMutationBlocked(true);
+        setNeedsRefresh(true);
+        setError('Refresh the policy before continuing.');
+      }
+      closeConfirmation();
+      return null;
+    }
+    if (handleRejectedPolicyChange(result)) return null;
+    return semanticError(result) ?? 'This change could not be applied.';
+  };
+
   const confirmPolicyChange = async () => {
     if (
       draftWindow === undefined ||
@@ -441,46 +547,56 @@ export default function MessageExpirationEditor({
       setError('The policy changed. Review the refreshed timer before continuing.');
       return;
     }
-    const result = await onApplyPolicy(policyRequest(draftWindow, choice));
-    if (
-      !isCurrentOperation(
-        mountedRef.current,
-        operation,
-        operationRef.current,
-        scopeRef.current,
-        capturedScope,
-        lifecycle
-      )
-    )
-      return;
-    if (result.kind === 'ok') {
-      closeConfirmation();
+    const request = policyRequest(draftWindow, choice);
+    // Captured before the send and sent against, so a challenge carries the account and server
+    // it asked (C82).
+    const context = captureApiRequestContext();
+    const result = await onApplyPolicy(request, context);
+    if (!isCurrent(operation, capturedScope, lifecycle)) return;
+    const refusal = result.kind === 'gated' ? stepUpSeed(result.status, result.body) : null;
+    if (refusal !== null && request.mode === 'set') {
+      // A challenge that lands after a server change belongs to the old server: no dialog.
+      if (!apiRequestContextIsCurrent(context)) throw new Error(FIRST_SEND_SESSION_CHANGED);
+      handOff({ request, refusal, sessionKey, context });
       return;
     }
-    if (result.kind === 'partial') {
-      const reread = await onRefresh();
-      if (
-        !isCurrentOperation(
-          mountedRef.current,
-          operation,
-          operationRef.current,
-          scopeRef.current,
-          capturedScope,
-          lifecycle
-        )
-      )
-        return;
-      if (!(reread.kind === 'fresh' && matchesPartialPolicy(reread, result.candidate))) {
-        setMutationBlocked(true);
-        setNeedsRefresh(true);
-        setError('Refresh the policy before continuing.');
-      }
+    const failure = await settlePolicyResult(result, operation, capturedScope, lifecycle);
+    if (failure !== null) throw new Error(failure);
+  };
+  /** The dialog's send: the frozen change again, with the proven code, admitted against `context`. */
+  const resendWithCode = async (
+    mfaCode: string | undefined,
+    context: ApiRequestContext
+  ): Promise<DangerousActionSendResult> => {
+    if (stepUp === null) return { kind: 'aborted' };
+    const operation = ++operationRef.current;
+    const capturedScope = `${scope.kind}:${scope.id}`;
+    const lifecycle = captureAuthLifecycle();
+    const { request } = stepUp;
+    const result = await onApplyPolicy(
+      mfaCode === undefined ? request : { ...request, mfa_code: mfaCode },
+      context
+    );
+    // `aborted` is the fence refusing a stale `context`: nothing was sent, so nothing is settled.
+    if (result.kind === 'aborted' || !isCurrent(operation, capturedScope, lifecycle))
+      return { kind: 'aborted' };
+    // A plain 403 locks the editor, and the dialog cannot say so: it would keep "The server
+    // refused this change." beside a live primary that sends the same change again. The dialog
+    // ends instead, and the editor's own alert is the one place the refusal is said.
+    if (isRejectedReason(result, 'forbidden')) {
+      setForbidden(true);
       closeConfirmation();
-      return;
+      setError(semanticError(result));
+      endStepUp();
+      return { kind: 'aborted' };
     }
-    if (handleRejectedPolicyChange(result)) return;
-    const message = semanticError(result) ?? 'This change could not be applied.';
-    throw new Error(message);
+    const answer = verificationAnswer(result);
+    if (answer !== null) return answer;
+    const failure = await settlePolicyResult(result, operation, capturedScope, lifecycle);
+    // No HTTP status: this is the editor's own sentence, worded for the dialog's banner.
+    return failure === null
+      ? { kind: 'ok' }
+      : { kind: 'refused', status: 0, body: { error: failure } };
   };
   const confirmResume = async () => {
     if (
@@ -678,7 +794,7 @@ export default function MessageExpirationEditor({
           was also tried and removed, because it mutates the accessible NAME that every
           consumer queries by. The staged choice needs no separate announcement: the user
           just activated the stop, so focus is on it when Apply appears. */}
-      <div className="settings-tier-labels message-expiration-stops">
+      <div ref={stopsRef} className="settings-tier-labels message-expiration-stops">
         {stops.map((stop) => (
           <button
             key={stop.label}
@@ -702,7 +818,7 @@ export default function MessageExpirationEditor({
         ))}
       </div>
       {hasPendingChange && (
-        <div className="message-expiration-apply">
+        <div ref={applyRef} className="message-expiration-apply">
           <button
             type="button"
             className="message-expiration-apply-button"
@@ -726,7 +842,7 @@ export default function MessageExpirationEditor({
       )}
       <ConfirmActionModal
         key={`policy:${confirmationIdentity}`}
-        isOpen={confirmationOpen}
+        isOpen={confirmationOpen && stepUp === null && !ending}
         title={draftWindow === null ? 'Turn off message expiration' : 'Change message expiration'}
         message={disclosure}
         confirmLabel={draftWindow === null ? 'Turn off timer' : 'Apply timer'}
@@ -747,7 +863,7 @@ export default function MessageExpirationEditor({
           baseline.backfillPending !== policy?.backfillPending
         }
         onConfirm={confirmPolicyChange}
-        onClose={dismissConfirmation}
+        onClose={confirmClosed}
       />
       <ConfirmActionModal
         key={`resume:${confirmationIdentity}`}
@@ -780,6 +896,25 @@ export default function MessageExpirationEditor({
         }
         onConfirm={confirmResume}
         onClose={dismissConfirmation}
+      />
+      <DangerousActionStepUpDialog
+        isOpen={stepUp !== null}
+        purpose="channels.expiration_shorten"
+        seed={stepUp?.refusal}
+        capture={stepUp?.context}
+        intro="This server asks you to verify before you shorten how long messages are kept."
+        primaryLabel="Apply timer"
+        busyLabel="Applying…"
+        send={resendWithCode}
+        describeFailure={describeShortenFailure}
+        onSuccess={endStepUp}
+        onClose={endStepUp}
+        onSetUpVerification={() => {
+          void openVerificationSetup({ returnTo: { kind: 'chat' }, closeHost: endStepUp });
+        }}
+        // The confirmation that had focus is gone: back to Apply while the window is still
+        // staged, else to the stops.
+        focusFallback={() => focusTargetIn(applyRef.current) ?? focusTargetIn(stopsRef.current)}
       />
     </section>
   );

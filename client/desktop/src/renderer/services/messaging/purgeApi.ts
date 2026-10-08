@@ -8,6 +8,7 @@
 import { apiFetch } from '../system/apiClient';
 import { captureApiRequestContext, type ApiRequestContext } from '../system/requestContext';
 import { classifyStepUpRefusal, isStepUpFactorRefusal } from '../system/stepUpRefusal';
+import { adaptDangerousActionRefusal } from '../system/stepUpRouteAdapters';
 import {
   mintRefusalView,
   toDeleteRefusalView,
@@ -171,6 +172,15 @@ export type SoftLockChallengeView = Extract<
   { view: 'confirm' | 'password' | 'enroll' }
 >;
 
+/**
+ * What a dangerous-action (D1) gate asks of a purge: a code, or enrolment
+ * because nothing this account could send would pass.
+ */
+export type DangerousChallengeRefusal = Extract<
+  StepUpFactorRefusal,
+  { kind: 'mfaRequired' | 'enrollmentRequired' }
+>;
+
 export type PurgeResult =
   | { kind: 'success'; deletedCount: number; hiddenCount: number }
   | { kind: 'rateLimited'; retryAfterSeconds?: number }
@@ -203,6 +213,13 @@ export type PurgeResult =
        */
       refusal: StepUpFactorRefusal | null;
     }
+  /**
+   * #3456 (C-6): a channel/server purge refused by its dangerous-action (D1)
+   * gate on an MFA-enforcing server. Nothing was purged. Not the soft-lock,
+   * which always carries `delete_rate_limited`: the modal routes it to its own
+   * MFA-only stage, and `refusal` seeds that stage's factor hook.
+   */
+  | { kind: 'dangerousChallenge'; refusal: DangerousChallengeRefusal }
   /** #3455: any other soft-lock 403. Nothing was purged. */
   | { kind: 'softLockFailed'; message?: string; retryAfterSeconds?: number }
   /**
@@ -242,10 +259,12 @@ export type StepUpPurgeResult = Extract<
 
 export type SoftLockChallengeResult = Extract<PurgeResult, { kind: 'softLockChallenge' }>;
 
+export type DangerousChallengeResult = Extract<PurgeResult, { kind: 'dangerousChallenge' }>;
+
 /** Everything the result stage can render. A purge that was not sent renders nothing. */
 export type TerminalPurgeResult = Exclude<
   PurgeResult,
-  StepUpPurgeResult | SoftLockChallengeResult | { kind: 'notSent' }
+  StepUpPurgeResult | SoftLockChallengeResult | DangerousChallengeResult | { kind: 'notSent' }
 >;
 
 export function isStepUpPurgeResult(result: PurgeResult): result is StepUpPurgeResult {
@@ -254,6 +273,12 @@ export function isStepUpPurgeResult(result: PurgeResult): result is StepUpPurgeR
 
 export function isSoftLockChallengeResult(result: PurgeResult): result is SoftLockChallengeResult {
   return result.kind === 'softLockChallenge';
+}
+
+export function isDangerousChallengeResult(
+  result: PurgeResult
+): result is DangerousChallengeResult {
+  return result.kind === 'dangerousChallenge';
 }
 
 function purgePath(context: PurgeContext, scopeId: string): string {
@@ -279,6 +304,57 @@ function routeChallenge(view: SoftLockChallengeView, payload: unknown): SoftLock
   return { kind: 'softLockChallenge', view, refusal };
 }
 
+/** True when the 403 body carries the delete-rate soft-lock's flag. */
+function isDeleteRateLimited(payload: unknown): boolean {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    (payload as { delete_rate_limited?: unknown }).delete_rate_limited === true
+  );
+}
+
+/**
+ * #3456 (C-6): the D1 gate's refusal of a channel/server purge. The gate writes
+ * the plain seam body (`mfaenforce.WriteError`), with no `delete_rate_limited`
+ * and no `Retry-After`, because waiting lifts nothing. Read by the D1 adapter,
+ * so only the two answers a code-less purge can draw are a challenge: a code to
+ * send, or enrolment. `null` for anything else, which the caller reads as it
+ * always did.
+ */
+function dangerousChallenge(payload: unknown): DangerousChallengeResult | null {
+  const refusal = adaptDangerousActionRefusal(403, payload);
+  if (refusal?.kind === 'mfaRequired' || refusal?.kind === 'enrollmentRequired') {
+    return { kind: 'dangerousChallenge', refusal };
+  }
+  return null;
+}
+
+/**
+ * A channel/server self-purge's own 403s, or `null` when it is neither. A
+ * `delete_rate_limited` body is the soft-lock (#3455); an unflagged one is
+ * the D1 gate (#3456). The DM/group routes carry neither: their own-rule fence
+ * is the older step-up, read by `mapForbidden`.
+ */
+function mapSelfPurgeForbidden(
+  payload: unknown,
+  args: PurgeArgs,
+  retryAfter: string | null
+): PurgeResult | null {
+  if (!isDeleteRateLimited(payload)) return dangerousChallenge(payload);
+  const view = toDeleteRefusalView(403, payload, retryAfter, args.softLockPrior);
+  if (view.view === 'confirm' || view.view === 'password' || view.view === 'enroll') {
+    return routeChallenge(view, payload);
+  }
+  if (view.view === 'failed') {
+    return {
+      kind: 'softLockFailed',
+      message: view.message,
+      retryAfterSeconds: view.retryAfterSeconds,
+    };
+  }
+  return null;
+}
+
 /**
  * A 403 from the purge route is either a step-up refusal — read by the shared
  * classifier (`services/system/stepUpRefusal.ts`), which owns the flag-first,
@@ -291,26 +367,9 @@ function routeChallenge(view: SoftLockChallengeView, payload: unknown): SoftLock
  * `code` field on those 403s, raised on PR #2743 for a decision.
  */
 function mapForbidden(payload: unknown, args: PurgeArgs, retryAfter: string | null): PurgeResult {
-  // #3455: on the channel and server routes a `delete_rate_limited` 403 is the
-  // self-purge soft-lock. The DM/group routes never carry it (their own-rule
-  // fence is the older step-up below), so the flag is only read here.
-  const isSelfPurgeRoute = args.context === 'channel' || args.context === 'server';
-  const flagged =
-    typeof payload === 'object' &&
-    payload !== null &&
-    (payload as { delete_rate_limited?: unknown }).delete_rate_limited === true;
-  if (isSelfPurgeRoute && flagged) {
-    const view = toDeleteRefusalView(403, payload, retryAfter, args.softLockPrior);
-    if (view.view === 'confirm' || view.view === 'password' || view.view === 'enroll') {
-      return routeChallenge(view, payload);
-    }
-    if (view.view === 'failed') {
-      return {
-        kind: 'softLockFailed',
-        message: view.message,
-        retryAfterSeconds: view.retryAfterSeconds,
-      };
-    }
+  if (args.context === 'channel' || args.context === 'server') {
+    const selfPurge = mapSelfPurgeForbidden(payload, args, retryAfter);
+    if (selfPurge !== null) return selfPurge;
   }
   const refusal = classifyStepUpRefusal(403, payload);
   return isStepUpFactorRefusal(refusal) ? refusal : { kind: 'forbidden' };

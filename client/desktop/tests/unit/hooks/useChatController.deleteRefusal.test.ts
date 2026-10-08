@@ -6,6 +6,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { deferred } from '../../helpers/deferred';
 import { confirmAndSettle, confirmInFlight } from '../../helpers/confirmDelete';
 import type { ChatContext } from '@/renderer/types/chat';
@@ -119,7 +120,12 @@ describe('useChatController delete refusal (#3455)', () => {
       });
 
       expect(mockApiFetch).toHaveBeenCalledTimes(1);
-      expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/messages/m1', { method: 'DELETE' });
+      // The first send goes out against its own capture (C82), still with no body.
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/messages/m1',
+        { method: 'DELETE' },
+        { context: expect.objectContaining({ authLifecycle: expect.anything() }) }
+      );
     });
 
     it('a retry with a code sends only mfa_code', async () => {
@@ -168,6 +174,7 @@ describe('useChatController delete refusal (#3455)', () => {
       expect(mockApiFetch.mock.calls[0]).toEqual([
         '/api/v1/dm/conversations/conv-1/messages/dm-m1',
         { method: 'DELETE' },
+        { context: expect.objectContaining({ authLifecycle: expect.anything() }) },
       ]);
 
       mockApiFetch.mockResolvedValueOnce(res(200, {}));
@@ -894,5 +901,66 @@ describe('useChatController delete refusal (#3455)', () => {
       });
       expect(mockApiFetch).toHaveBeenCalledTimes(3);
     });
+  });
+});
+
+// #3456 (C82): the refusal slot carries the account and server the refused
+// delete went out as, so the modal's retry and setup link work against it.
+describe('useChatController delete refusal capture (#3456)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApiFetch.mockReset();
+    resetAllStores();
+    useUserStore.setState({ user: mockUser });
+  });
+
+  function mount(id = 'm1') {
+    seed(channelCtx.id, id);
+    return renderHook(() => useChatController(channelCtx));
+  }
+
+  // Mutation: fillRefusalSlot stops recording the capture, or sendDelete sends the fresh delete
+  // with no capture of its own (red).
+  it('the refusal carries the capture the delete went out with', async () => {
+    mockApiFetch.mockResolvedValueOnce(res(403, CHALLENGE));
+    const hook = mount();
+    await act(async () => {
+      await hook.result.current.deleteMessage('m1');
+    });
+
+    const sent = (mockApiFetch.mock.calls[0][2] as { context: unknown }).context;
+    expect(sent).toBeDefined();
+    expect(hook.result.current.deleteRefusal?.context).toBe(sent);
+  });
+
+  // Mutation: fillRefusalSlot takes the newest send's capture over the one the slot holds (red).
+  it("a retry's refusal keeps the first refusal's capture", async () => {
+    mockApiFetch.mockResolvedValueOnce(res(403, CHALLENGE));
+    const hook = mount();
+    await act(async () => {
+      await hook.result.current.deleteMessage('m1');
+    });
+    const first = hook.result.current.deleteRefusal?.context;
+
+    mockApiFetch.mockResolvedValueOnce(res(403, { ...CHALLENGE, error: 'Invalid MFA code' }));
+    await confirmAndSettle(hook, { mfaCode: FIXTURE_OTP }, captureApiRequestContext());
+
+    expect(hook.result.current.deleteRefusal?.context).toBe(first);
+  });
+
+  // Mutation: dropping `apiRequestContextIsCurrent(operation)` from reportIfShowing opens the
+  // modal for whoever signed in while the delete was out (red).
+  it('a refusal that lands after the account changed fills no slot', async () => {
+    mockApiFetch.mockImplementationOnce(async () => {
+      useAuthStore.setState((s) => ({ authGeneration: s.authGeneration + 1 }));
+      return res(403, CHALLENGE);
+    });
+    const hook = mount();
+    await act(async () => {
+      await hook.result.current.deleteMessage('m1');
+    });
+
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.deleteRefusal).toBeNull();
   });
 });

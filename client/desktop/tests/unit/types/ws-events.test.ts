@@ -94,6 +94,9 @@ import {
   RolesReorderedSchema,
   RoleAssignedSchema,
   RoleUnassignedSchema,
+  // Permission refresh (#3456) (2)
+  ServerPermissionsChangedSchema,
+  PermissionsChangedSchema,
   // Union + scrubber
   WebSocketEventSchema,
   EntitlementsChangedSchema,
@@ -2383,9 +2386,91 @@ describe('Server role events (#2359)', () => {
     }
   });
 
-  it('WebSocketEventSchema has exactly 80 members', () => {
+  it('WebSocketEventSchema has exactly 82 members', () => {
     // Pins the count quoted in [internal]rules/frontend.md and in the ws-events.ts
     // header, so a future addition cannot silently drift the docs.
-    expect(WebSocketEventSchema.options).toHaveLength(80);
+    expect(WebSocketEventSchema.options).toHaveLength(82);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// Permission refresh events (#3456)
+// ════════════════════════════════════════════════════════════════════════
+
+describe('Permission refresh events (#3456)', () => {
+  // The exact frames the control plane writes: the Go tests pin these bytes
+  // (servers/mfa_enforcement_permissions_changed_test.go and
+  // api/permission_change_notifier_test.go), so parsing the same literals here
+  // is what keeps the two sides from drifting apart.
+  const SERVER_FRAME = `{"type":"server_permissions_changed","data":{"server_id":"${UUID_B}"}}`;
+  const USER_FRAME = '{"type":"permissions_changed","data":{}}';
+
+  // Kills: ServerPermissionsChangedSchema removed or its literal retyped.
+  it('ServerPermissionsChangedSchema accepts the frame the server emits', () => {
+    const result = ServerPermissionsChangedSchema.safeParse(JSON.parse(SERVER_FRAME));
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.data.server_id).toBe(UUID_B);
+  });
+
+  // Kills: server_id loosened from UUID to a bare string.
+  it('ServerPermissionsChangedSchema rejects a non-uuid server_id', () => {
+    const result = ServerPermissionsChangedSchema.safeParse({
+      type: 'server_permissions_changed',
+      data: { server_id: 'not-a-uuid' },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // Kills: server_id made optional.
+  it('ServerPermissionsChangedSchema rejects a missing server_id and a missing data envelope', () => {
+    expect(
+      ServerPermissionsChangedSchema.safeParse({ type: 'server_permissions_changed', data: {} })
+        .success
+    ).toBe(false);
+    expect(
+      ServerPermissionsChangedSchema.safeParse({ type: 'server_permissions_changed' }).success
+    ).toBe(false);
+  });
+
+  // Kills: PermissionsChangedSchema removed or its literal retyped.
+  it('PermissionsChangedSchema accepts the empty-object frame the server emits', () => {
+    const result = PermissionsChangedSchema.safeParse(JSON.parse(USER_FRAME));
+    expect(result.success).toBe(true);
+  });
+
+  // Kills: data widened to z.object({}).nullable() or z.any(): a server that
+  // regressed to "data":null would then pass here and fail nowhere.
+  it('PermissionsChangedSchema rejects data null and a missing data envelope', () => {
+    expect(
+      PermissionsChangedSchema.safeParse(JSON.parse('{"type":"permissions_changed","data":null}'))
+        .success
+    ).toBe(false);
+    expect(PermissionsChangedSchema.safeParse({ type: 'permissions_changed' }).success).toBe(false);
+  });
+
+  // Kills: either schema left out of WebSocketEventSchema (the dispatch
+  // boundary would then count every frame as a wire violation).
+  it('WebSocketEventSchema routes both frames to their schema', () => {
+    for (const frame of [SERVER_FRAME, USER_FRAME]) {
+      const envelope = JSON.parse(frame) as { type: string };
+      const result = WebSocketEventSchema.safeParse(envelope);
+      expect(result.success, `${envelope.type} must parse`).toBe(true);
+      if (result.success) expect(result.data.type).toBe(envelope.type);
+    }
+  });
+
+  // Kills: the two schemas sharing one discriminator literal.
+  it('WebSocketEventSchema keeps the two event types distinct', () => {
+    const asUser = WebSocketEventSchema.safeParse({
+      type: 'permissions_changed',
+      data: { server_id: UUID_B },
+    });
+    // z.object strips unknown keys, so this parses as the user event with an
+    // empty body; the server event's payload must not have been adopted.
+    expect(asUser.success).toBe(true);
+    if (asUser.success) expect(asUser.data.data).toEqual({});
+    expect(
+      WebSocketEventSchema.safeParse({ type: 'server_permissions_changed', data: {} }).success
+    ).toBe(false);
   });
 });

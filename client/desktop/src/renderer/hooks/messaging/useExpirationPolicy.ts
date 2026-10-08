@@ -16,6 +16,7 @@ import {
   captureAuthLifecycle,
   isSameAuthLifecycle,
 } from '../../services/system/postLoginHydrationLifecycle';
+import type { ApiRequestContext } from '../../services/system/requestContext';
 import { hasPermission, Permissions } from '../../utils/policy/permissions';
 
 export interface ExpirationPolicyControls {
@@ -24,7 +25,15 @@ export interface ExpirationPolicyControls {
   canEdit: boolean;
   lockedDescription: string;
   onRefresh: () => Promise<ExpirationPolicyReadResult>;
-  onApplyPolicy: (request: ExpirationRequest) => Promise<ExpirationMutationResult>;
+  /**
+   * `context` is the capture the PATCH is admitted against. The editor's first send passes its
+   * own, and the step-up re-send passes that same one back (C82). Omitted, the PATCH is its own
+   * operation.
+   */
+  onApplyPolicy: (
+    request: ExpirationRequest,
+    context?: ApiRequestContext
+  ) => Promise<ExpirationMutationResult>;
 }
 
 type View = {
@@ -249,7 +258,10 @@ export function useExpirationPolicy(
   }, [inactive, onRefresh]);
 
   const onApplyPolicy = useCallback(
-    async (request: ExpirationRequest): Promise<ExpirationMutationResult> => {
+    async (
+      request: ExpirationRequest,
+      context?: ApiRequestContext
+    ): Promise<ExpirationMutationResult> => {
       const captured: View = {
         scope: scopeKind && scopeId ? { kind: scopeKind, id: scopeId } : null,
         serverId,
@@ -266,7 +278,7 @@ export function useExpirationPolicy(
         return { kind: 'rejected', reason: 'unavailable' };
       const lifecycle = captureAuthLifecycle();
       const operation = ++mutationRef.current;
-      const result = await updateExpirationPolicy(captured.scope, request);
+      const result = await updateExpirationPolicy(captured.scope, request, context);
       if (!isCurrent(captured, lifecycle) || operation !== mutationRef.current)
         return { kind: 'ambiguous' };
       const next = mutationPolicy(result);

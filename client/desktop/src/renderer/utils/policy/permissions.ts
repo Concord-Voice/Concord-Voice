@@ -259,80 +259,6 @@ export function parseEffectivePermissions(permsStr: WireBitfield): bigint {
 }
 
 /**
- * Minimal structural shape of a channel permission override. Declared locally so
- * permissions.ts stays free of any store import (avoids a util→store cycle).
- * `ChannelOverride` from permissionStore is structurally assignable to this.
- */
-export interface PermissionOverride {
-  target_type: 'user' | 'role';
-  target_id: string;
-  allow: string;
-  deny: string;
-}
-
-/**
- * Compute the viewer's channel-effective permission bitmask by folding SBAC channel
- * overrides into a server-level base permission. Mirrors the control-plane resolver
- * (services/control-plane/internal/rbac/resolver.go `applyChannelOverrides`) exactly:
- *
- *   effective = ((base | role_allow) & ~role_deny | user_allow) & ~user_deny
- *
- * Owner/Administrator bypass — both are immune to channel overrides, but for DIFFERENT
- * reasons in the backend, so the frontend must mirror both:
- *   - OWNER: bypassed via an owner-id match in computeEffectivePermissions (resolver.go
- *     step 2) — returns OwnerPermissions and skips applyChannelOverrides entirely.
- *     OwnerPermissions does NOT carry PermAdministrator (types.go: "Owner does NOT get
- *     PermAdministrator by default"), so the ADMINISTRATOR-bit check below would MISS an
- *     owner. The caller passes `viewerIsOwner` (from the viewer's `ServerMember.role`).
- *   - ADMINISTRATOR: bypassed inside applyChannelOverrides when base carries
- *     PermAdministrator (resolver.go:162-163) — mirrored by the `& ADMINISTRATOR` check.
- * Role masks are OR-accumulated across ONLY the viewer's roles; the user override is final.
- *
- * @param basePerm      Server-level effective permission for the viewer (no channel overrides).
- * @param overrides     Channel overrides for the target channel, or undefined if not loaded.
- * @param viewerUserId  The viewer's user id (selects the user-target override).
- * @param viewerRoleIds The viewer's role ids in this server (selects role-target overrides).
- * @param viewerIsOwner True if the viewer is the server owner (owner-id bypass mirror).
- */
-export function resolveChannelPermissions(
-  basePerm: bigint,
-  overrides: readonly PermissionOverride[] | undefined,
-  viewerUserId: string,
-  viewerRoleIds: ReadonlySet<string>,
-  viewerIsOwner = false
-): bigint {
-  // Owner & Administrator are immune to channel overrides (see the two backend paths above).
-  if (viewerIsOwner || (basePerm & ADMINISTRATOR) !== 0n) return basePerm;
-  if (!overrides || overrides.length === 0) return basePerm;
-
-  let roleAllow = 0n;
-  let roleDeny = 0n;
-  let userAllow = 0n;
-  let userDeny = 0n;
-
-  for (const o of overrides) {
-    const isRole = o.target_type === 'role' && viewerRoleIds.has(o.target_id);
-    const isUser = o.target_type === 'user' && o.target_id === viewerUserId;
-    if (!isRole && !isUser) continue;
-    // Fail closed on a malformed override. Decoding it to 0n would be closed for
-    // an allow but OPEN for a deny: "no deny" widens the result (#3406 review).
-    const allow = decodeBitfield(o.allow);
-    const deny = decodeBitfield(o.deny);
-    if (allow === null || deny === null) return 0n;
-    if (isRole) {
-      roleAllow |= allow;
-      roleDeny |= deny;
-    } else {
-      userAllow |= allow;
-      userDeny |= deny;
-    }
-  }
-
-  // base → role allow → role deny → user allow → user deny (user deny = final authority).
-  return (((basePerm | roleAllow) & ~roleDeny) | userAllow) & ~userDeny;
-}
-
-/**
  * Permission metadata for the UI toggle grid.
  * Grouped by category for display.
  */
@@ -341,6 +267,12 @@ export interface PermissionInfo {
   bit: bigint;
   label: string;
   description: string;
+  /**
+   * Granting this bit on a server that enforces MFA for dangerous actions needs
+   * a verified second factor (#3456 §3.7). Which bits the server actually gates
+   * is its decision; this only lets the grid say so before a save is refused.
+   */
+  dangerous?: true;
 }
 
 export interface PermissionCategory {
@@ -545,18 +477,21 @@ export const PERMISSION_CATEGORIES: PermissionCategory[] = [
         bit: MANAGE_CRYPTO_ROTATION,
         label: 'Manage E2EE Keys',
         description: 'Manually rotate encryption keys',
+        dangerous: true,
       },
       {
         key: 'MANAGE_DEV_RESOURCES',
         bit: MANAGE_DEV_RESOURCES,
         label: 'Manage Developer Resources',
         description: 'Manage webhooks, API keys, and bot access for this server',
+        dangerous: true,
       },
       {
         key: 'ADMINISTRATOR',
         bit: ADMINISTRATOR,
         label: 'Administrator',
         description: 'Grants all permissions and bypasses channel overrides',
+        dangerous: true,
       },
     ],
   },

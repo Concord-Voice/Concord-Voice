@@ -1,8 +1,30 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Modal from './Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import { apiFetch } from '../../services/system/apiClient';
+import DangerousActionStepUpDialog, {
+  type DangerousActionSendResult,
+} from '../Auth/DangerousActionStepUpDialog';
+import type { StepUpPurpose } from '../Auth/stepUpPurpose';
+import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
+import {
+  describeFailureWith,
+  FIRST_SEND_SESSION_CHANGED,
+} from '../../services/system/dangerousActionRequest';
+import {
+  apiFetchInContext,
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
+import { serverErrorText } from '../../services/system/stepUpRouteAdapters';
+import { stepUpSeed } from '../../services/system/stepUpSeed';
 import './ImageCropEditor.css';
+
+/** The server image uploads the control plane gates (#3454): one purpose per route. */
+type ServerImagePurpose = Extract<
+  StepUpPurpose,
+  'media.server_icon_upload' | 'media.server_banner_upload'
+>;
 
 /** Configuration for uploading the cropped image to object storage. */
 export interface CropUploadConfig {
@@ -10,6 +32,111 @@ export interface CropUploadConfig {
   endpoint: string;
   /** Additional form fields to include (e.g. { server_id: '...' }) */
   extraFields?: Record<string, string>;
+  /**
+   * Set for an upload the server may ask to verify (#3456). A refusal then opens the
+   * verification dialog over this editor, and the same crop is sent again with `mfa_code`.
+   * Omitted (the avatar), nothing about the upload changes.
+   */
+  stepUpPurpose?: ServerImagePurpose;
+  /**
+   * Opens verification setup for the dialog's enrolment state, given the function that closes
+   * the dialog. Only the page that owns the surrounding form knows what leaving would discard.
+   */
+  onSetUpVerification?: (closeHost: () => void) => void;
+}
+
+/** Where an upload went and what rode with it: what the re-send repeats, not the live prop. */
+interface FrozenUploadTarget {
+  readonly endpoint: string;
+  readonly extraFields?: Readonly<Record<string, string>>;
+}
+
+/**
+ * The crop that was refused, kept as the first send made it for the re-send: the image, the
+ * route and fields it went to, and the account and server it went out as.
+ */
+interface PendingUpload {
+  blob: Blob;
+  refusal: StepUpFactorRefusal;
+  target: FrozenUploadTarget;
+  context: ApiRequestContext;
+}
+
+type UploadOutcome =
+  | { kind: 'uploaded'; url: string }
+  | {
+      kind: 'stepUp';
+      refusal: StepUpFactorRefusal;
+      target: FrozenUploadTarget;
+      context: ApiRequestContext;
+    };
+
+const UPLOAD_FAILED = 'Failed to upload image';
+const NO_URL_MESSAGE = 'Upload succeeded but response did not include image URL';
+const describeUploadFailure = describeFailureWith(UPLOAD_FAILED);
+
+const IMAGE_NOUN: Record<ServerImagePurpose, string> = {
+  'media.server_icon_upload': 'icon',
+  'media.server_banner_upload': 'banner',
+};
+
+/** The multipart body for one upload of `blob`. `mfaCode` is only on the re-send. */
+function uploadForm(blob: Blob, cfg: FrozenUploadTarget, mfaCode?: string): FormData {
+  const formData = new FormData();
+  const ext = blob.type === 'image/png' ? 'png' : 'jpg';
+  formData.append('file', blob, `cropped.${ext}`);
+
+  if (cfg.extraFields) {
+    for (const [key, value] of Object.entries(cfg.extraFields)) {
+      formData.append(key, value);
+    }
+  }
+  // An empty code reads to the server as a supplied, wrong one, and is charged as such.
+  if (mfaCode) formData.append('mfa_code', mfaCode);
+  return formData;
+}
+
+/** A response's JSON body, or null when it has none (a proxy's HTML page, an empty body). */
+async function readUploadBody(response: Response): Promise<unknown> {
+  return response.json().catch(() => null);
+}
+
+/**
+ * The stored image's URL from a successful upload, or null when the body names none. A 2xx
+ * whose body does not parse names none either: the server answered, so it is never a transport
+ * failure that "may have acted".
+ */
+async function uploadedUrl(response: Response): Promise<string | null> {
+  const data = await readUploadBody(response);
+  if (typeof data !== 'object' || data === null || !('url' in data)) return null;
+  const { url } = data;
+  return typeof url === 'string' && url.length > 0 ? url : null;
+}
+
+/** What re-sending a refused crop came to: the dialog's result, or the stored image's URL. */
+type ResendOutcome = DangerousActionSendResult | { kind: 'uploaded'; url: string };
+
+/** The refused crop again, to the route it first went to, with the proven code, admitted against `context`. */
+async function resendUpload(
+  pending: PendingUpload,
+  mfaCode: string | undefined,
+  context: ApiRequestContext
+): Promise<ResendOutcome> {
+  const { blob, target } = pending;
+  const response = await apiFetchInContext(
+    target.endpoint,
+    { method: 'POST', body: uploadForm(blob, target, mfaCode) },
+    context
+  );
+  if (!response.ok) {
+    return { kind: 'refused', status: response.status, body: await readUploadBody(response) };
+  }
+  const url = await uploadedUrl(response);
+  // A 2xx that stored nothing is a failure shown in the dialog, never an image to apply.
+  if (url === null) {
+    return { kind: 'refused', status: response.status, body: { error: NO_URL_MESSAGE } };
+  }
+  return { kind: 'uploaded', url };
 }
 
 export interface ImageCropEditorProps {
@@ -55,6 +182,9 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [isSmallImage, setIsSmallImage] = useState(false);
+  const [stepUp, setStepUp] = useState<PendingUpload | null>(null);
+  const applyRef = useRef<HTMLButtonElement>(null);
+  const uploadedUrlRef = useRef<string | null>(null);
 
   // Drag state stored in ref to avoid re-renders during drag
   const dragRef = useRef({
@@ -115,6 +245,7 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
     setZoom(1);
     setOffset({ x: 0, y: 0 });
     setIsSmallImage(false);
+    setStepUp(null);
     /* eslint-enable @eslint-react/set-state-in-effect -- re-enable after the clean-slate reset block above */
 
     const url = URL.createObjectURL(imageFile);
@@ -346,34 +477,36 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
     });
   }, [zoom, offset, cropDisplayWidth, cropDisplayHeight, output, cropShape.type]);
 
-  // Upload a cropped blob to object storage, return the proxy URL
-  const uploadBlob = useCallback(async (blob: Blob, cfg: CropUploadConfig): Promise<string> => {
-    const formData = new FormData();
-    const ext = blob.type === 'image/png' ? 'png' : 'jpg';
-    formData.append('file', blob, `cropped.${ext}`);
+  // Upload a cropped blob to object storage: the proxy URL, or the refusal that asks to verify.
+  // The route and fields are frozen here, with the account and server the send went out as.
+  const uploadBlob = useCallback(
+    async (blob: Blob, cfg: CropUploadConfig): Promise<UploadOutcome> => {
+      const target: FrozenUploadTarget = {
+        endpoint: cfg.endpoint,
+        extraFields: cfg.extraFields === undefined ? undefined : { ...cfg.extraFields },
+      };
+      const context = captureApiRequestContext();
+      const response = await apiFetchInContext(
+        target.endpoint,
+        { method: 'POST', body: uploadForm(blob, target) },
+        context
+      );
 
-    if (cfg.extraFields) {
-      for (const [key, value] of Object.entries(cfg.extraFields)) {
-        formData.append(key, value);
+      if (!response.ok) {
+        const data = await readUploadBody(response);
+        const refusal = cfg.stepUpPurpose === undefined ? null : stepUpSeed(response.status, data);
+        if (refusal === null) throw new Error(serverErrorText(data) ?? UPLOAD_FAILED);
+        // A refusal for an account or server no longer current belongs to the old one.
+        if (!apiRequestContextIsCurrent(context)) throw new Error(FIRST_SEND_SESSION_CHANGED);
+        return { kind: 'stepUp', refusal, target, context };
       }
-    }
 
-    const response = await apiFetch(cfg.endpoint, {
-      method: 'POST',
-      body: formData,
-    });
-
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({ error: 'Upload failed' }));
-      throw new Error(data.error || 'Failed to upload image');
-    }
-
-    const data = await response.json();
-    if (!data || typeof data.url !== 'string' || data.url.length === 0) {
-      throw new Error('Upload succeeded but response did not include image URL');
-    }
-    return data.url;
-  }, []);
+      const url = await uploadedUrl(response);
+      if (url === null) throw new Error(NO_URL_MESSAGE);
+      return { kind: 'uploaded', url };
+    },
+    []
+  );
 
   // Convert a blob to a data URL (legacy fallback)
   const blobToDataUrl = useCallback((blob: Blob): Promise<string> => {
@@ -394,14 +527,46 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
     setUploadError(null);
 
     try {
-      const url = upload ? await uploadBlob(blob, upload) : await blobToDataUrl(blob);
-      onConfirm(url);
+      if (!upload) {
+        onConfirm(await blobToDataUrl(blob));
+        return;
+      }
+      const outcome = await uploadBlob(blob, upload);
+      if (outcome.kind === 'uploaded') onConfirm(outcome.url);
+      else {
+        const { refusal, target, context } = outcome;
+        setStepUp({ blob, refusal, target, context });
+      }
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : 'Failed to upload image');
+      setUploadError(error instanceof Error ? error.message : UPLOAD_FAILED);
     } finally {
       setIsUploading(false);
     }
   }, [getCroppedBlob, upload, uploadBlob, blobToDataUrl, onConfirm]);
+
+  const closeStepUp = () => setStepUp(null);
+
+  /** The dialog's send. The URL waits in a ref for `onSuccess`, which the dialog fires only if still current. */
+  const sendCrop = async (
+    mfaCode: string | undefined,
+    context: ApiRequestContext
+  ): Promise<DangerousActionSendResult> => {
+    if (stepUp === null) return { kind: 'aborted' };
+    const sent = await resendUpload(stepUp, mfaCode, context);
+    if (sent.kind !== 'uploaded') return sent;
+    uploadedUrlRef.current = sent.url;
+    return { kind: 'ok' };
+  };
+
+  const finishStepUp = () => {
+    const url = uploadedUrlRef.current;
+    uploadedUrlRef.current = null;
+    closeStepUp();
+    if (url !== null) onConfirm(url);
+  };
+
+  const stepUpPurpose = upload?.stepUpPurpose;
+  const setUpVerification = upload?.onSetUpVerification;
 
   if (!isOpen) return null;
 
@@ -460,6 +625,7 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
               Cancel
             </button>
             <button
+              ref={applyRef}
               type="button"
               className="profile-save-btn"
               onClick={handleConfirm}
@@ -476,6 +642,23 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
             </button>
           </div>
         </>
+      )}
+      {stepUpPurpose !== undefined && (
+        <DangerousActionStepUpDialog
+          isOpen={stepUp !== null}
+          purpose={stepUpPurpose}
+          seed={stepUp?.refusal}
+          intro={`This server asks you to verify before you change its ${IMAGE_NOUN[stepUpPurpose]}.`}
+          primaryLabel={`Upload ${IMAGE_NOUN[stepUpPurpose]}`}
+          busyLabel="Uploading..."
+          send={sendCrop}
+          capture={stepUp?.context}
+          describeFailure={describeUploadFailure}
+          onSuccess={finishStepUp}
+          onClose={closeStepUp}
+          onSetUpVerification={setUpVerification && (() => setUpVerification(closeStepUp))}
+          focusFallback={() => applyRef.current}
+        />
       )}
     </Modal>
   );

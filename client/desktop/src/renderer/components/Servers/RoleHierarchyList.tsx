@@ -123,6 +123,13 @@ export interface RoleHierarchyListProps {
   selectedRoleId: string | null;
   onSelectRole: (roleId: string) => void;
   onCreateRole: () => void;
+  /**
+   * A role write is in flight or awaiting verification, and a second would
+   * replace it. `aria-disabled` plus a guard, not native `disabled`: the click
+   * that started the write left focus on this button, and `disabled` would drop
+   * it to `<body>`.
+   */
+  createDisabled?: boolean;
 }
 
 const RoleHierarchyList: React.FC<RoleHierarchyListProps> = ({
@@ -131,6 +138,7 @@ const RoleHierarchyList: React.FC<RoleHierarchyListProps> = ({
   selectedRoleId,
   onSelectRole,
   onCreateRole,
+  createDisabled = false,
 }) => {
   const viewer = usePermissionStore((s) => s.roleViewer[serverId] ?? UNKNOWN_VIEWER);
   const reorderRoles = usePermissionStore((s) => s.reorderRoles);
@@ -558,7 +566,13 @@ const RoleHierarchyList: React.FC<RoleHierarchyListProps> = ({
         </ul>
       )}
 
-      <button className="create-role-btn" onClick={onCreateRole}>
+      <button
+        className="create-role-btn"
+        aria-disabled={createDisabled || undefined}
+        onClick={() => {
+          if (!createDisabled) onCreateRole();
+        }}
+      >
         + Create Role
       </button>
 

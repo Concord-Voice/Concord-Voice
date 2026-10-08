@@ -12,6 +12,7 @@ import {
 import { apiFetch } from '../../services/system/apiClient';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
+import MfaRestrictedMenuItem from './MfaRestrictedMenuItem';
 import './ServerContextMenu.css';
 
 interface ServerContextMenuProps {
@@ -111,6 +112,10 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
           }}
         />
       )}
+
+      {/* Stands where Server Settings would be: a member whose MANAGE_SERVER the
+          server is withholding until they enrol never gets the item above (F5). */}
+      <MfaRestrictedMenuItem serverId={server.id} onClose={onClose} />
 
       {/* Invite to Server */}
       <ContextMenu.Item

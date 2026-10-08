@@ -13,6 +13,11 @@ import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore'
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { Permissions } from '@/renderer/utils/policy/permissions';
 import { useExpirationPolicy } from '@/renderer/hooks/messaging/useExpirationPolicy';
+import { captureApiRequestContext } from '@/renderer/services/system/requestContext';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
 
 const API = 'http://localhost:8080';
 const policy = {
@@ -740,6 +745,45 @@ describe('useExpirationPolicy', () => {
       await waitFor(() => expect(result.current.policy?.windowSeconds).toBe(2592000));
     } finally {
       setItem.mockRestore();
+    }
+  });
+
+  // #3456: the step-up re-send is admitted against the capture its factor was proven under.
+  // Mutant: `onApplyPolicy` drops its `context` argument (the PATCH goes out as whoever is current).
+  it('admits the PATCH against the capture it is given: a stale one sends nothing', async () => {
+    useChannelStore.setState({ currentServerId: 'server-1' });
+    usePermissionStore.setState({
+      channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
+    });
+    let patchCount = 0;
+    server.use(
+      http.get(`${API}/api/v1/servers/server-1/channels`, () =>
+        HttpResponse.json({ channels: [channelRow] })
+      ),
+      http.patch(`${API}/api/v1/channels/channel-1/expiration`, () => {
+        patchCount += 1;
+        return HttpResponse.json({ ...policy, revision: 5, window_seconds: 3600 });
+      })
+    );
+    const { result } = renderHook(() =>
+      useExpirationPolicy({ kind: 'channel', id: 'channel-1' }, 'server-1')
+    );
+    try {
+      await waitFor(() => expect(result.current.policy?.revision).toBe(4));
+      const request = { mode: 'set', window_seconds: 3600, retroactive: 'new_only' } as const;
+      const context = captureApiRequestContext();
+      setRuntimeServerBase('https://other-server.example.test');
+
+      let outcome: unknown;
+      await act(async () => {
+        outcome = await result.current.onApplyPolicy(request, context);
+      });
+
+      expect(outcome).toEqual({ kind: 'aborted' });
+      expect(patchCount).toBe(0);
+      expect(result.current.policy?.windowSeconds).toBe(86400);
+    } finally {
+      resetRuntimeServerBase();
     }
   });
 });

@@ -171,6 +171,14 @@ export function stepUpBanner(result: MfaStepUpResult | null): string | null {
 const SESSION_EXPIRED_BANNER = 'Your session has expired. Sign in again to continue.';
 
 /**
+ * The dangerous-action step-up's banner for a gate that could not decide (a busy
+ * lock, an unavailable budget) and for a request that was never sent: the code
+ * is not spent, and the same request may simply be tried again. One sentence
+ * for the dialog and the purge stage alike (#3456 §3.3).
+ */
+export const STEP_UP_RETRY_TEXT = "We couldn't confirm that right now. Try again.";
+
+/**
  * `stepUpBanner` for the one MFA-settings surface with no shared stage, the
  * password-only key revoke: no terminal state renders there, so the banner
  * says the session is gone.

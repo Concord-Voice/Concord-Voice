@@ -1,0 +1,48 @@
+/* #3456: the server's "require MFA for dangerous actions" switch. The row,
+   label, hint and switch take their look from SettingsPage.css, which Server
+   Settings loads; this sheet adds only what they do not have. No --danger text:
+   the inline error is ErrorBanner's glyph-plus---text-primary banner. */
+
+/* Why ON is unavailable, and the way to fix it, under the row that offers it. */
+.mfa-enforcement__note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding-bottom: 12px;
+}
+
+.mfa-enforcement__note p {
+  margin: 0;
+}
+
+/* The first read failed: the sentence and its Retry, side by side. Doubled
+   class, because .settings-row-info sets the column at equal specificity and
+   which sheet loads last is not ours to know. */
+.settings-row-info.mfa-enforcement__load-failed {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+/* Inline error under the row, on the section's own rhythm. */
+.mfa-enforcement__note + .mfa-setup-error-banner,
+.settings-row + .mfa-setup-error-banner {
+  margin-bottom: 12px;
+}
+
+/* A polite live region for the result of a change. Its text is the switch's new
+   state, which the switch already shows, so it is hidden from sight and not from
+   assistive technology. It stays in the layout tree: display:none regions are
+   not announced. */
+.mfa-enforcement__status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
