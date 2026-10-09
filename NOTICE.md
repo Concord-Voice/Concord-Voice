@@ -664,6 +664,13 @@ drift, which [`/weekly-deps`]([internal]skills/weekly-deps/SKILL.md) Phase 6.3
 clears weekly. A red guard is visible but does **not** block merge: only
 `Gitar` and `SonarCloud Code Analysis` are required status checks.
 
+CI checks npm workspaces independently. A workspace manifest or lockfile change
+checks that workspace only; NOTICE, workflow, selector-policy, or regenerator
+changes check all three. A Go source change also runs the Go license check,
+because imports can change the runtime dependency set without changing a module
+file. Scoped npm checks use `--check --scope npm --workspace <workspace>` and
+still validate the complete NOTICE summary and table counts.
+
 A Go upstream **relicence is structurally invisible** to the script. `go list`
 reports no licence, so each module's licence is carried forward from the table
 above rather than re-read; only npm licences are re-derived every run. The

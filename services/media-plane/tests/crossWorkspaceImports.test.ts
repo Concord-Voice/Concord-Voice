@@ -83,16 +83,23 @@ function crossWorkspaceImports(file: string): string[] {
  * that gates the TEST job.
  */
 function mediaPlaneTestFilterPaths(workflow: string): string[] {
-  const source = readFileSync(join(REPO_ROOT, workflow), 'utf8');
+  const usesExternalPolicy = workflow === '.github/workflows/pr-ci.yml';
+  const source = readFileSync(
+    join(REPO_ROOT, usesExternalPolicy ? '.github/ci/scan-relevance.yml' : workflow),
+    'utf8'
+  );
   const lines = source.split('\n');
-  const start = lines.findIndex((line) => /^\s{12}media-plane-tests:\s*$/.test(line));
-  expect(start, `no media-plane-tests filter block in ${workflow}`).toBeGreaterThan(-1);
+  const key = usesExternalPolicy ? 'media_plane_tests' : 'media-plane-tests';
+  const indent = usesExternalPolicy ? 0 : 12;
+  const itemIndent = usesExternalPolicy ? 2 : 14;
+  const start = lines.findIndex((line) => line === `${' '.repeat(indent)}${key}:`);
+  expect(start, `no ${key} filter block for ${workflow}`).toBeGreaterThan(-1);
 
   const paths: string[] = [];
   for (const line of lines.slice(start + 1)) {
     // The block ends at the next key at the same indentation.
-    if (/^\s{12}\S/.test(line)) break;
-    const match = /^\s+-\s+'([^']+)'\s*$/.exec(line);
+    if (line.startsWith(' '.repeat(indent)) && line[indent] !== ' ') break;
+    const match = new RegExp(`^ {${itemIndent}}- '([^']+)'\\s*$`).exec(line);
     if (match) paths.push(match[1]);
   }
   return paths;
@@ -201,7 +208,7 @@ describe('CI path filters cover this workspace real dependencies', () => {
 
     // Link 1-2: each workflow publishes the filter result as a job output.
     expect(build).toContain('media-plane-tests: ${{ steps.filter.outputs.media-plane-tests }}');
-    expect(prCi).toContain('media-plane-tests: ${{ steps.filter.outputs.media-plane-tests }}');
+    expect(prCi).toContain('media-plane-tests: ${{ steps.filter.outputs.media_plane_tests }}');
     // Link 3: build.yml accepts it as a precomputed input.
     expect(build).toContain('media-plane-tests-changed:');
     // Link 4: pr-ci.yml actually passes its own result into that input.

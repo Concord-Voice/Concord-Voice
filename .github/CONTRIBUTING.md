@@ -348,7 +348,7 @@ ioc --> build (changes --> desktop        (test + coverage + build)
 
 `pr-ci.yml` also runs the per-tool scanning workflows in parallel with `build`
 (`semgrep`, `eslint`, `codeql`, `govulncheck`, `secret-scanning`, `golangci-lint`,
-`unit-smoke`, `static-guards`, `workflow-lint`, `dry-run-deploys`).
+`unit-smoke`, `static-guards` (including staging dry runs), `workflow-lint`).
 
 The `sonar` job lives in `pr-ci.yml`, not in `build.yml`. It downloads coverage artifacts from the
 `build.yml` jobs and runs the scan.
