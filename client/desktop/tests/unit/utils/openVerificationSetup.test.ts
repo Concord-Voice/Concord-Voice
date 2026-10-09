@@ -382,3 +382,53 @@ describe('hasPendingDrafts', () => {
     expect(hasPendingDrafts(NO_DRAFTS)).toBe(false);
   });
 });
+
+describe('daily scan: verification return cancellation', () => {
+  it('keeps Settings dismissed if the permission refetch settles after Close', async () => {
+    const gate = deferred<void>();
+    const fetchServerPermissions = stubPermissionFetch(() => gate.promise);
+    await openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: 's2', section: 'roles' },
+    });
+
+    const returning = returnFromVerificationSetup();
+    expect(fetchServerPermissions).toHaveBeenCalledExactlyOnceWith('s2');
+    expect(overlay().open).toBe('app');
+    overlay().close();
+    expect(overlay().open).toBeNull();
+    gate.resolve();
+    await returning;
+
+    expect(overlay().open).toBeNull();
+  });
+
+  it('leaves a newer verification excursion in place when the old fetch settles', async () => {
+    const gate = deferred<void>();
+    const fetchServerPermissions = stubPermissionFetch(() => gate.promise);
+    await openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: 's2', section: 'roles' },
+    });
+
+    const returning = returnFromVerificationSetup();
+    expect(fetchServerPermissions).toHaveBeenCalledExactlyOnceWith('s2');
+    overlay().close();
+    await openVerificationSetup({
+      returnTo: { kind: 'serverSettings', serverId: 's3', section: 'members' },
+    });
+    expect(overlay().open).toBe('app');
+    expect(overlay().verificationReturn).toEqual({
+      kind: 'serverSettings',
+      serverId: 's3',
+      section: 'members',
+    });
+    gate.resolve();
+    await returning;
+
+    expect(overlay().open).toBe('app');
+    expect(overlay().verificationReturn).toEqual({
+      kind: 'serverSettings',
+      serverId: 's3',
+      section: 'members',
+    });
+  });
+});

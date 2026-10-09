@@ -1725,3 +1725,72 @@ describe('MessageExpirationEditor shortening step-up swap', () => {
     expect(writes).toHaveLength(2);
   });
 });
+
+describe('Daily scan: expiration step-up consent currency', () => {
+  it('does not revive a staged choice after it matches a newer policy', async () => {
+    const user = userEvent.setup();
+    const view = render(<MessageExpirationEditor {...props()} />);
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    expect(screen.getByRole('button', { name: 'Discard' })).toBeInTheDocument();
+
+    const matching: ExpirationPolicy = { ...policy, windowSeconds: 3600, revision: 5 };
+    view.rerender(<MessageExpirationEditor {...props()} policy={matching} />);
+    expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Discard' })).not.toBeInTheDocument();
+
+    const off: ExpirationPolicy = { ...matching, windowSeconds: null, revision: 6 };
+    view.rerender(<MessageExpirationEditor {...props()} policy={off} />);
+    expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Discard' })).not.toBeInTheDocument();
+  });
+
+  it('abandons the frozen shortening when the displayed policy changes during step-up', async () => {
+    useAuthStore.getState().setAccessToken('mock-token');
+    stubStepUpRead();
+    const user = userEvent.setup();
+    const channelRoute = `${GATED_API_BASE}/api/v1/channels/channel-1/expiration`;
+    const writes = stubGatedWrite({ method: 'patch', url: channelRoute, first: MFA_REQUIRED });
+    const view = render(
+      <MessageExpirationEditor
+        {...props()}
+        onApplyPolicy={(request, context) =>
+          updateExpirationPolicy({ kind: 'channel', id: 'channel-1' }, request, context)
+        }
+      />
+    );
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await user.click(await screen.findByRole('radio', { name: 'Only new messages' }));
+    await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+
+    expect(await screen.findByLabelText(CODE_LABEL)).toBeInTheDocument();
+    expect(writes).toHaveLength(1);
+
+    // Another administrator disabled expiration after the first request was refused.
+    const changed: ExpirationPolicy = { ...policy, windowSeconds: null, revision: 5 };
+    view.rerender(
+      <MessageExpirationEditor
+        {...props()}
+        policy={changed}
+        scope={{ kind: 'channel', id: 'channel-1' }}
+        onApplyPolicy={(request, context) =>
+          updateExpirationPolicy({ kind: 'channel', id: 'channel-1' }, request, context)
+        }
+      />
+    );
+
+    const code = screen.queryByLabelText(CODE_LABEL);
+    if (code) {
+      await user.type(code, FIXTURE_OTP);
+      await user.click(screen.getByRole('button', { name: 'Apply timer' }));
+    }
+    expect(writes).toHaveLength(1);
+    expect(screen.queryByLabelText(CODE_LABEL)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    const confirmation = await screen.findByRole('dialog', { name: 'Change message expiration' });
+    expect(confirmation).toHaveTextContent(/after 1 hour/);
+  });
+});

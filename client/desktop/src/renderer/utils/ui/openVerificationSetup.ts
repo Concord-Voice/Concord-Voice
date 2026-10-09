@@ -99,8 +99,11 @@ export async function returnFromVerificationSetup(): Promise<boolean> {
     return true;
   }
   const context = captureApiRequestContext();
+  const returningOverlay = useSettingsOverlayStore.getState();
   await usePermissionStore.getState().fetchServerPermissions(target.serverId);
   if (!apiRequestContextIsCurrent(context)) return false;
+  // Closing or replacing Settings cancels this return while its refetch is out.
+  if (useSettingsOverlayStore.getState() !== returningOverlay) return false;
   // The refetch is a wait: a change made during it holds the return as well.
   if (hasPendingDrafts(useDraftSettingsStore.getState().drafts)) {
     useSettingsOverlayStore.getState().setVerificationReturn(target);

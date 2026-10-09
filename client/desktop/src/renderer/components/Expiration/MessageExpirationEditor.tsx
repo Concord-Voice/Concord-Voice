@@ -300,17 +300,17 @@ export default function MessageExpirationEditor({
     },
     [authGeneration, scope.id, scope.kind]
   );
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- retain the staged choice unless the new policy already applies it
+    setDraftWindow((current) => (current === policy?.windowSeconds ? undefined : current));
+    return () => {
       setChoice(undefined);
       setAcknowledged(false);
-      setDraftWindow(undefined);
       setBaseline(null);
       setConfirmationOpen(false);
       setResumeOpen(false);
-    },
-    [policyBaselineIdentity]
-  );
+    };
+  }, [policyBaselineIdentity, policy?.windowSeconds]);
   const editable =
     canEdit &&
     !forbidden &&
@@ -374,10 +374,9 @@ export default function MessageExpirationEditor({
 
   // A shortening the server wants verified is handed to the verification dialog in place of the
   // confirmation (#3456, D-5). Dismissing the dialog ends like the confirmation's own Cancel: the
-  // staged window stays staged. The change is frozen for the scope and account it was refused
-  // under; if either moves it is abandoned, not parked, so it cannot come back as a prompt to
-  // apply it when the user returns to that scope.
-  const sessionKey = `${scope.kind}:${scope.id}:${authGeneration}`;
+  // staged window stays staged. The change is frozen for its scope, account, and policy baseline;
+  // if any moves it is abandoned, not parked, so it cannot come back as a prompt to apply it.
+  const sessionKey = `${scope.kind}:${scope.id}:${authGeneration}:${policyBaselineIdentity}`;
   const { pending, ending, handOff, confirmClosed, endStepUp } =
     useStepUpHandoff<PendingShorten>(dismissConfirmation);
   const stepUp = pending?.sessionKey === sessionKey ? pending : null;
