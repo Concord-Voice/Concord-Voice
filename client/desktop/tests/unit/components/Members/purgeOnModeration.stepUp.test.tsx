@@ -46,6 +46,17 @@ beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => mswServer.close());
 afterEach(() => mswServer.resetHandlers());
 
+// Opening a moderation dialog refreshes the server capabilities (#3552). No
+// handler answers that route and unhandled requests bypass MSW, so an
+// unstubbed open sends a real request that fails at some later time and sets
+// `serverCapabilities` to null, possibly in a later test. A pinned test that
+// had just set `purgeKeepsPinned` then opened its dialog on null and never got
+// the "Include pinned messages" checkbox: about 1 run in 12 locally, and CI on
+// #3713. Stub every test so none of them sends the request.
+beforeEach(() => {
+  answerCapabilityRefresh();
+});
+
 type Which = 'ban' | 'kick';
 
 interface Host {
