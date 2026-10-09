@@ -36,7 +36,7 @@ The control plane handles authentication, authorization, server/channel manageme
 
 ## Tech Stack
 
-- **Go** 1.26.8 (the supported toolchain, recorded in `go.mod`)
+- **Go** 1.26.9 (the supported toolchain, recorded in `go.mod`)
 - **Gin** - HTTP web framework
 - **PostgreSQL** 16
 - **Redis** 7 - Caching, rate limiting, ephemeral state
@@ -92,7 +92,7 @@ Run `ls internal/` for the current package set. The packages group as follows.
 
 ### Prerequisites
 
-- Go 1.26.8 (the supported toolchain, recorded in `go.mod`)
+- Go 1.26.9 (the supported toolchain, recorded in `go.mod`)
 - PostgreSQL 16
 - Redis 7+
 - NATS 2.x

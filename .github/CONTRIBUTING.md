@@ -37,7 +37,7 @@ See [GETTING_STARTED.md](../docs/GETTING_STARTED.md) for detailed setup instruct
 ### Prerequisites
 
 - Node.js 24.15+ (the highest `engines` floor across the Node workspaces)
-- Go 1.26.8 (the `go` directive in `services/control-plane/go.mod`; CI and both Docker builders match it)
+- Go 1.26.9 (the `go` directive in `services/control-plane/go.mod`; CI and both Docker builders match it)
 - Python 3
 - pre-commit (`pip install pre-commit` or `brew install pre-commit`)
 - Docker Desktop
