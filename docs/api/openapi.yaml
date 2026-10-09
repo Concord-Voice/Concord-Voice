@@ -16131,14 +16131,14 @@ paths:
                       is reauthorized before live or reconnect enqueue.'
                   server_voice_show_details:
                     type: boolean
-                    default: true
+                    default: false
                     description: Whether authorized Server Voice viewers receive
                       detailed rather than coarse minimized presence.
                   private_call_tier:
                     type: integer
                     minimum: 0
                     maximum: 2
-                    default: 0
+                    default: 1
                     description: 'Live Private Call audience policy: 0=call
                       participants only, 1=participants plus friends and opted-in
                       friends-of-friends, 2=those viewers plus shared-server peers.
@@ -16268,14 +16268,14 @@ paths:
                       suppress or reproject current authoritative activity as needed.'
                   server_voice_show_details:
                     type: boolean
-                    default: true
+                    default: false
                     description: Whether authorized Server Voice viewers receive
                       detailed rather than coarse minimized presence.
                   private_call_tier:
                     type: integer
                     minimum: 0
                     maximum: 2
-                    default: 0
+                    default: 1
                     description: 'Live Private Call audience policy: 0=call
                       participants only, 1=participants plus friends and opted-in
                       friends-of-friends, 2=those viewers plus shared-server peers.
@@ -17067,10 +17067,12 @@ paths:
     get:
       tags:
       - Users
-      summary: Search users by username
-      description: 'Search for users by username prefix. Minimum 2 characters required.
+      summary: Search users by username or display name
+      description: 'Search opted-in users by partial username or display name. Minimum 2 characters required.
 
-        Results are filtered by the target user''s privacy settings.
+        Only users with searchable_by_username enabled appear. A shared server
+        or mutual friend does not override that choice. Results also exclude
+        blocked pairs and the caller.
 
         Rate limit: 30 requests per minute (user-based).
 
@@ -17084,7 +17086,7 @@ paths:
         schema:
           type: string
           minLength: 2
-        description: Username search query
+        description: Username or display-name search query
       responses:
         '200':
           description: Matching users
@@ -18763,10 +18765,15 @@ components:
           format: int64
         allowAnimatedProfile:
           type: boolean
+        usernameChangeIntervalMonths:
+          type: integer
+          minimum: 1
+          description: Calendar months between username changes. The server uses this cadence to calculate when a username can change again.
         usernameChangeIntervalSeconds:
           type: integer
           format: int64
-          description: Minimum interval between username changes, in seconds
+          deprecated: true
+          description: Legacy fixed-day approximation for older clients. Use usernameChangeIntervalMonths or the profile's username_change_eligible_at date.
         maxServersCreated:
           type: integer
           description: Max servers a user may own; negative = unlimited (premium).
@@ -18795,6 +18802,7 @@ components:
       - maxAvatarBytes
       - maxBannerBytes
       - allowAnimatedProfile
+      - usernameChangeIntervalMonths
       - usernameChangeIntervalSeconds
       - maxServersCreated
       - messageHistorySearchDays
@@ -20003,6 +20011,14 @@ components:
           format: email
         username:
           type: string
+        username_changed_at:
+          type: string
+          format: date-time
+          description: Timestamp used to start the username change cooldown.
+        username_change_eligible_at:
+          type: string
+          format: date-time
+          description: Server-calculated date when this user can change their username again.
         display_name:
           type: string
           nullable: true
@@ -20933,13 +20949,14 @@ components:
             the server keeps in sync with this value.
         dm_friends_of_friends:
           type: boolean
-          description: Friends of friends can send DMs (default false)
+          default: true
+          description: Friends of friends can send DMs (default true). A saved choice is kept when the default changes.
         auto_accept_friend_codes:
           type: boolean
           description: Auto-accept friend codes (default false)
         searchable_by_username:
           type: boolean
-          description: Appear in username search (default false)
+          description: Appear in Add Friend username or display-name search (default false). Shared servers and mutual friends do not override this setting.
         searchable_by_email:
           type: boolean
           description: Searchable by email (default false)
@@ -20967,12 +20984,15 @@ components:
         allow_friend_requests_from:
           type: string
           enum: [everyone, mutual_servers, nobody]
+          default: mutual_servers
           description: >-
-            Who may send this user a friend request (default `everyone`).
-            `mutual_servers` restricts it to users who share at least one server;
-            `nobody` blocks all new incoming requests. It does not affect friend
-            requests already pending, nor existing friendships. A server that
-            predates #1240 omits this key entirely — treat absent as `everyone`.
+            Who may send this user a friend request (default `mutual_servers`).
+            `mutual_servers` permits a shared-server peer or a peer with an accepted
+            mutual friend; a valid friend-code claim also passes this setting.
+            `nobody` blocks all new incoming requests and friend-code claims.
+            The setting does not affect requests already pending or existing
+            friendships. Servers that predate this setting omit the key. The
+            desktop client interprets an absent key as `everyone` for compatibility.
         updated_at:
           type: string
           format: date-time

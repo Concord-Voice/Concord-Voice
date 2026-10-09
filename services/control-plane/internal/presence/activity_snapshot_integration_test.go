@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
@@ -207,7 +208,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 		assert.False(t, found)
 	})
 
-	t.Run("private call candidate includes asymmetric sender opted-in friend of friend", func(t *testing.T) {
+	t.Run("private call candidate uses sender default FoF but excludes direct block", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
 		require.NoError(t, redistest.Reset(ctx, redisClient))
 		senderID := testhelpers.CreateUser(t, db)
@@ -216,7 +217,6 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 		viewerID := testhelpers.CreateUser(t, db)
 		testhelpers.AddFriendship(t, db, senderID, mutualID)
 		testhelpers.AddFriendship(t, db, mutualID, viewerID)
-		testhelpers.SetFriendsOfFriends(t, db, senderID, true)
 		testhelpers.SetFriendsOfFriends(t, db, viewerID, false)
 		conversationID := uuid.New()
 		callID := uuid.New()
@@ -256,6 +256,20 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 		entry := snapshot[senderID][presence.CategoryPrivateCall]
 		assert.True(t, entry.Minimized)
 		assert.JSONEq(t, `{"call_type":"dm"}`, string(entry.Payload))
+
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO friendships (requester_id, addressee_id, status)
+			VALUES ($1, $2, 'blocked')
+		`, senderID, viewerID)
+		require.NoError(t, err)
+		require.NoError(t, dmblock.RecordBlockTx(ctx, tx, senderID.String(), viewerID.String(), uuid.NewString()))
+		require.NoError(t, tx.Commit())
+		snapshot, err = service.Snapshot(ctx, viewerID)
+		require.NoError(t, err)
+		assert.NotContains(t, snapshot, senderID,
+			"a direct block must veto the private-call FoF snapshot candidate")
 	})
 
 	t.Run("private tier off still includes current same-call stranger", func(t *testing.T) {

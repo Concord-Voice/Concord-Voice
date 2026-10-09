@@ -650,6 +650,10 @@ func TestClassifyAudienceCommitReadsPrimaryDatabaseEvidence(t *testing.T) {
 		tx := operationBeginTx(ctx, t, db)
 		operation, err := service.BeginAudienceOperation(ctx, tx, senderID, OrdinaryAudienceWrite)
 		require.NoError(t, err)
+		assert.False(t, operation.BeforeServerVoiceShowDetails,
+			"a missing settings row uses the new details default")
+		assert.Equal(t, 1, operation.BeforePrivateCallTier,
+			"a missing settings row uses the Friends audience default")
 		require.NoError(t, tx.Commit())
 		assert.Equal(t, CommitConfirmed, service.ClassifyAudienceCommit(ctx, operation))
 	})

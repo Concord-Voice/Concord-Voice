@@ -57,7 +57,7 @@ describe('privacyStore — identity fence across logout', () => {
     // 2. A logs out. resetService.gracefulReset() calls clearPrivacy().
     usePrivacyStore.getState().clearPrivacy();
     expect(usePrivacyStore.getState().loaded).toBe(false);
-    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('everyone');
+    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('mutual_servers');
 
     // 3. Account A's response finally lands, after the logout.
     release({ ok: true, status: 200, json: async () => ({ privacy: ACCOUNT_A_PRIVACY }) });
@@ -68,7 +68,7 @@ describe('privacyStore — identity fence across logout', () => {
     // EXPECTED (fenced): the clear stands. Account B, who logs in next on this
     // shared device, must never see A's posture presented as confirmed.
     expect(after.loaded).toBe(false);
-    expect(after.settings.allowFriendRequestsFrom).toBe('everyone');
+    expect(after.settings.allowFriendRequestsFrom).toBe('mutual_servers');
     expect(after.settings.searchableByEmail).toBe(false);
     expect(after.settings.searchableByPhone).toBe(false);
     expect(after.settings.dmPrivacyLevel).toBe(2);
@@ -91,7 +91,7 @@ describe('privacyStore — identity fence across logout', () => {
     release({ ok: true, status: 200, json: async () => ({ privacy: ACCOUNT_A_PRIVACY }) });
     await inFlight;
 
-    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('everyone');
+    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('mutual_servers');
     expect(usePrivacyStore.getState().settings.searchableByEmail).toBe(false);
   });
 });

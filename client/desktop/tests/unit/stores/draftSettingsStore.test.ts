@@ -529,6 +529,61 @@ describe('draftSettingsStore', () => {
   // ── stashAndSwapAudioMode ─────────────────────────────────────────────
 
   describe('stashAndSwapAudioMode', () => {
+    it.each([false, true])(
+      'keeps an Advanced FEC headroom choice of %s after applying a Basic tier',
+      async (savedHeadroom) => {
+        useAudioSettingsStore.setState({
+          advancedMode: true,
+          autoGainControl: false,
+          adaptivePtime: true,
+          fecHeadroom: savedHeadroom,
+        });
+        useDraftSettingsStore.getState().initialize();
+        useDraftSettingsStore.getState().stashAndSwapAudioMode(false, 'standard');
+        useAudioSettingsStore.getState().setAdvancedMode(false);
+        await useDraftSettingsStore.getState().apply();
+
+        expect(useAudioSettingsStore.getState()).toMatchObject({
+          autoGainControl: false,
+          adaptivePtime: true,
+          fecHeadroom: savedHeadroom,
+        });
+        // Reopening Advanced after saving Basic must not inherit tier FEC.
+        useDraftSettingsStore.getState().teardown();
+        useAudioSettingsStore.getState().setAdvancedMode(true);
+        useDraftSettingsStore.getState().initialize();
+        expect(useDraftSettingsStore.getState().snapshot?.audio.fecHeadroom).toBe(savedHeadroom);
+      }
+    );
+
+    // Advanced DTX (silenceDetection) is the user's Advanced preference. Basic mode
+    // resolves DTX from the tier at runtime (voiceService), so a Basic tier change
+    // must not also write it into the drafts. 'standard' has opusDtx: true.
+    it('drafts no silenceDetection when a Basic tier is applied', () => {
+      useAudioSettingsStore.setState({ advancedMode: true, silenceDetection: false });
+      useDraftSettingsStore.getState().initialize();
+
+      useDraftSettingsStore.getState().stashAndSwapAudioMode(false, 'standard');
+
+      expect(useDraftSettingsStore.getState().drafts.audio).not.toHaveProperty('silenceDetection');
+    });
+
+    it('keeps an Advanced DTX choice of off after a Basic tier with DTX is applied and saved', async () => {
+      useAudioSettingsStore.setState({ advancedMode: true, silenceDetection: false });
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().stashAndSwapAudioMode(false, 'standard');
+      useAudioSettingsStore.getState().setAdvancedMode(false);
+      await useDraftSettingsStore.getState().apply();
+      expect(useAudioSettingsStore.getState().silenceDetection).toBe(false);
+
+      // A new settings session, then back to Advanced: the saved choice survives.
+      useDraftSettingsStore.getState().teardown();
+      useAudioSettingsStore.getState().setAdvancedMode(true);
+      useDraftSettingsStore.getState().initialize();
+      expect(useDraftSettingsStore.getState().snapshot?.audio.silenceDetection).toBe(false);
+      expect(useAudioSettingsStore.getState().silenceDetection).toBe(false);
+    });
+
     it('stashes basic values when switching to advanced', () => {
       useDraftSettingsStore.getState().initialize();
 

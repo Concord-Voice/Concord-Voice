@@ -76,8 +76,9 @@ func friendsOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]
 	return out, nil
 }
 
-// friendsOfFriendsOf returns friends-of-friends IDs ONLY when the sender enabled
-// dm_friends_of_friends; otherwise an empty set. This opt-in gate (spec §6.6) is
+// friendsOfFriendsOf returns friends-of-friends IDs when the sender's
+// dm_friends_of_friends setting is enabled, including its no-row default.
+// Explicit Off yields an empty set. This gate (spec §6.6) is
 // shared by base presence and the rich-presence Friends/Servers tiers.
 func friendsOfFriendsOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
 	out := make(map[uuid.UUID]bool)
@@ -94,11 +95,20 @@ func friendsOfFriendsOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[u
 			FROM friendships
 			WHERE (requester_id = $1 OR addressee_id = $1) AND status = 'accepted'
 		)
-		SELECT CASE WHEN f.requester_id = sf.friend_id THEN f.addressee_id ELSE f.requester_id END AS fof_id
+		SELECT candidate.fof_id
 		FROM sender_friends sf
 		JOIN friendships f
 		  ON (f.requester_id = sf.friend_id OR f.addressee_id = sf.friend_id)
 		 AND f.status = 'accepted'
+		CROSS JOIN LATERAL (
+			SELECT CASE WHEN f.requester_id = sf.friend_id THEN f.addressee_id ELSE f.requester_id END AS fof_id
+		) candidate
+		WHERE NOT EXISTS (
+			SELECT 1 FROM friendships blocked
+			WHERE blocked.status = 'blocked'
+			  AND ((blocked.requester_id = $1 AND blocked.addressee_id = candidate.fof_id)
+			    OR (blocked.addressee_id = $1 AND blocked.requester_id = candidate.fof_id))
+		)
 	`, senderID)
 	if err != nil {
 		return nil, fmt.Errorf("presence audience: query fof: %w", err)
@@ -173,15 +183,15 @@ func serverMembersOf(ctx context.Context, db DBTX, serverID, senderID uuid.UUID)
 }
 
 // friendsOfFriendsEnabled reads the sender's dm_friends_of_friends flag from
-// privacy_settings; a missing row defaults to false.
+// privacy_settings; a missing row defaults to true.
 func friendsOfFriendsEnabled(ctx context.Context, db DBTX, userID uuid.UUID) (bool, error) {
 	var enabled bool
 	err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(dm_friends_of_friends, FALSE) FROM privacy_settings WHERE user_id = $1`,
+		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`,
 		userID,
 	).Scan(&enabled)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return true, nil
 	}
 	if err != nil {
 		return false, err

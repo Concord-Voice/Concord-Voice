@@ -1374,6 +1374,7 @@ const PrivacySecuritySection: React.FC = () => {
           localDmLevel={localDmLevel}
           setDmPrivacyLevel={setDmPrivacyLevel}
           saveError={dmSaveError}
+          isLoaded={privacyLoaded}
         />
 
         <FriendRequestPrivacyControls

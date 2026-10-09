@@ -1582,36 +1582,45 @@ export const PresenceOverridesUpdatedSchema = z.strictObject({
  */
 export const EntitlementsChangedSchema = z.object({
   type: z.literal('entitlements_changed'),
-  data: z.object({
-    tier: z.string(),
-    allowCustomScheme: z.boolean(),
-    allowedAudioTiers: z.array(z.string()),
-    minPtimeMs: z.number().int(),
-    allowMusicMode: z.boolean(),
-    maxAudioLastN: z.number().int(),
-    // Split video axes (#1602): screen-share (stream) vs webcam (camera), each
-    // res/fps/bitrate. A negative height/fps is the native/uncapped sentinel.
-    // streamMaxPixelRate (#2163) is the stream-axis tiered fps ceiling in px/s.
-    // Keep in lockstep with EntitlementDTO (dto.go) — 24 wire keys total.
-    streamMaxHeight: z.number().int(),
-    streamMaxFps: z.number().int(),
-    streamMaxPixelRate: z.number().int(),
-    streamMaxBitrate: z.number().int(),
-    cameraMaxHeight: z.number().int(),
-    cameraMaxFps: z.number().int(),
-    cameraMaxBitrate: z.number().int(),
-    maxManualBitrateBps: z.number().int(),
-    maxWebcamPublishers: z.number().int(),
-    maxScreensharePublishers: z.number().int(),
-    maxMessageChars: z.number().int(),
-    maxAttachmentBytes: z.number().int(),
-    maxAvatarBytes: z.number().int(),
-    maxBannerBytes: z.number().int(),
-    allowAnimatedProfile: z.boolean(),
-    usernameChangeIntervalSeconds: z.number().int(),
-    maxServersCreated: z.number().int(),
-    messageHistorySearchDays: z.number().int(),
-  }),
+  data: z
+    .object({
+      tier: z.string(),
+      allowCustomScheme: z.boolean(),
+      allowedAudioTiers: z.array(z.string()),
+      minPtimeMs: z.number().int(),
+      allowMusicMode: z.boolean(),
+      maxAudioLastN: z.number().int(),
+      // Split video axes (#1602): screen-share (stream) vs webcam (camera), each
+      // res/fps/bitrate. A negative height/fps is the native/uncapped sentinel.
+      // streamMaxPixelRate (#2163) is the stream-axis tiered fps ceiling in px/s.
+      // Current servers send both cadence keys during version overlap. Older
+      // servers send seconds only; either complete shape must remain readable.
+      streamMaxHeight: z.number().int(),
+      streamMaxFps: z.number().int(),
+      streamMaxPixelRate: z.number().int(),
+      streamMaxBitrate: z.number().int(),
+      cameraMaxHeight: z.number().int(),
+      cameraMaxFps: z.number().int(),
+      cameraMaxBitrate: z.number().int(),
+      maxManualBitrateBps: z.number().int(),
+      maxWebcamPublishers: z.number().int(),
+      maxScreensharePublishers: z.number().int(),
+      maxMessageChars: z.number().int(),
+      maxAttachmentBytes: z.number().int(),
+      maxAvatarBytes: z.number().int(),
+      maxBannerBytes: z.number().int(),
+      allowAnimatedProfile: z.boolean(),
+      usernameChangeIntervalMonths: z.number().int().positive().optional(),
+      usernameChangeIntervalSeconds: z.number().int().positive().optional(),
+      maxServersCreated: z.number().int(),
+      messageHistorySearchDays: z.number().int(),
+    })
+    .refine(
+      (data) =>
+        data.usernameChangeIntervalMonths !== undefined ||
+        data.usernameChangeIntervalSeconds !== undefined,
+      { message: 'A username-change cadence is required' }
+    ),
 });
 
 // ──────────── System + envelope (5 events) — Task A11 ─────────────────

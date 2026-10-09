@@ -60,6 +60,8 @@ const ACTIVITY_COPY: Record<ActivityCategory, ActivityCopy> = {
   },
 };
 
+const PRESENCE_LOADING_TEXT = 'Loading your setting…';
+
 const PRIVATE_CALL_WARNING =
   'Choosing Servers lets people who share a server with you learn that you are in a private call. It never shares participant names.';
 
@@ -74,6 +76,8 @@ function activityExample(category: ActivityCategory, tier: PresenceTier, details
 interface ActivityCardProps {
   category: ActivityCategory;
   settings: PresenceSettings;
+  /** False until the server confirms the settings: the placeholder must not read as a choice. */
+  confirmed: boolean;
   disabled: boolean;
   onChangeTier: (category: ActivityCategory, tier: PresenceTier) => void;
   onChangeDetails: (category: ActivityCategory, enabled: boolean) => void;
@@ -82,21 +86,30 @@ interface ActivityCardProps {
 const ActivityCard: React.FC<ActivityCardProps> = ({
   category,
   settings,
+  confirmed,
   disabled,
   onChangeTier,
   onChangeDetails,
 }) => {
   const copy = ACTIVITY_COPY[category];
-  const tier = category === 'serverVoice' ? settings.serverVoiceTier : settings.privateCallTier;
+  const savedTier =
+    category === 'serverVoice' ? settings.serverVoiceTier : settings.privateCallTier;
+  const tier = confirmed ? savedTier : null;
   const details =
-    category === 'serverVoice' ? settings.serverVoiceShowDetails : settings.privateCallShowDetails;
-  const audience = getPresenceActivityAudience(
-    category === 'serverVoice' ? 'server_voice' : 'private_call',
-    settings
-  );
-  const example = settings.masterEnabled
-    ? activityExample(category, tier, details)
-    : 'Nothing is broadcast.';
+    confirmed &&
+    (category === 'serverVoice'
+      ? settings.serverVoiceShowDetails
+      : settings.privateCallShowDetails);
+  const activityKind = category === 'serverVoice' ? 'server_voice' : 'private_call';
+  const audience = confirmed
+    ? getPresenceActivityAudience(activityKind, settings)
+    : PRESENCE_LOADING_TEXT;
+  let example = PRESENCE_LOADING_TEXT;
+  if (confirmed) {
+    example = settings.masterEnabled
+      ? activityExample(category, savedTier, details)
+      : 'Nothing is broadcast.';
+  }
   const detailsLabel = `${copy.title} show details`;
   const headingId = `presence-${category}-heading`;
 
@@ -179,8 +192,9 @@ const PresenceSettingsSection: React.FC = () => {
     if (authenticated) void hydrate();
   }, [authenticated, authGeneration, hydrate]);
 
-  const controlsDisabled = confirmedSettings === null || loading || saving;
-  const tier = settings.customTextTier;
+  const confirmed = confirmedSettings !== null;
+  const controlsDisabled = !confirmed || loading || saving;
+  const tier = confirmed ? settings.customTextTier : null;
   const activeHint = TIERS.find((option) => option.value === tier)?.hint ?? '';
 
   const handleChangeActivityTier = useCallback(
@@ -226,7 +240,7 @@ const PresenceSettingsSection: React.FC = () => {
         <ToggleSwitch
           label="Share Rich Presence"
           inputRole="switch"
-          checked={settings.masterEnabled}
+          checked={confirmed && settings.masterEnabled}
           disabled={controlsDisabled}
           onChange={(enabled) => void update({ masterEnabled: enabled })}
         />
@@ -240,6 +254,7 @@ const PresenceSettingsSection: React.FC = () => {
         <ActivityCard
           category="serverVoice"
           settings={settings}
+          confirmed={confirmed}
           disabled={controlsDisabled}
           onChangeTier={handleChangeActivityTier}
           onChangeDetails={handleChangeActivityDetails}
@@ -247,6 +262,7 @@ const PresenceSettingsSection: React.FC = () => {
         <ActivityCard
           category="privateCall"
           settings={settings}
+          confirmed={confirmed}
           disabled={controlsDisabled}
           onChangeTier={handleChangeActivityTier}
           onChangeDetails={handleChangeActivityDetails}

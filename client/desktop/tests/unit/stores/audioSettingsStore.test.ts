@@ -12,7 +12,7 @@ beforeEach(() => {
     advancedMode: false,
     noiseCancellation: true,
     echoCancellation: true,
-    autoGainControl: true,
+    autoGainControl: false,
     noiseGateMode: 'dynamic',
     noiseGateLevel: -50,
     musicMode: false,
@@ -22,7 +22,7 @@ beforeEach(() => {
     inlineFec: true,
     fecHeadroom: false,
     opusNack: false,
-    adaptivePtime: false,
+    adaptivePtime: true,
     audioPriority: 'off',
     inputVolume: 100,
     outputVolume: 100,
@@ -134,7 +134,9 @@ describe('audioSettingsStore', () => {
     expect(s.advancedMode).toBe(false);
     expect(s.noiseCancellation).toBe(true);
     expect(s.echoCancellation).toBe(true);
-    expect(s.autoGainControl).toBe(true);
+    expect(s.autoGainControl).toBe(false);
+    expect(s.adaptivePtime).toBe(true);
+    expect(s.fecHeadroom).toBe(false);
     expect(s.noiseGateMode).toBe('dynamic');
     expect(s.inputVolume).toBe(100);
     expect(s.outputVolume).toBe(100);
@@ -156,8 +158,29 @@ describe('audioSettingsStore', () => {
   });
 
   it('sets auto gain control', () => {
-    useAudioSettingsStore.getState().setAutoGainControl(false);
-    expect(useAudioSettingsStore.getState().autoGainControl).toBe(false);
+    useAudioSettingsStore.getState().setAutoGainControl(true);
+    expect(useAudioSettingsStore.getState().autoGainControl).toBe(true);
+  });
+
+  it('retains saved audio choices when new-user defaults change', async () => {
+    localStorage.setItem(
+      'concord:audio-advanced',
+      JSON.stringify({
+        state: { autoGainControl: true, adaptivePtime: false, fecHeadroom: true },
+        version: 2,
+      })
+    );
+    await (
+      useAudioSettingsStore as typeof useAudioSettingsStore & {
+        persist: { rehydrate: () => Promise<void> };
+      }
+    ).persist.rehydrate();
+
+    expect(useAudioSettingsStore.getState()).toMatchObject({
+      autoGainControl: true,
+      adaptivePtime: false,
+      fecHeadroom: true,
+    });
   });
 
   it('sets noise gate mode', () => {
@@ -255,7 +278,8 @@ describe('audioSettingsStore', () => {
       const hydrated = useAudioSettingsStore.getState();
       if ('noiseGateMode' in state) expect(hydrated.noiseGateMode).toBe('off');
       if ('noiseGateLevel' in state) expect(hydrated.noiseGateLevel).toBe(-50);
-      if ('autoGainControl' in state) expect(hydrated.autoGainControl).toBe(true);
+      // An invalid AGC value falls back to the fresh-install default (Off).
+      if ('autoGainControl' in state) expect(hydrated.autoGainControl).toBe(false);
       if ('musicMode' in state) expect(hydrated.musicMode).toBe(false);
     });
   });

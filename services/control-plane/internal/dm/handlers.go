@@ -664,7 +664,7 @@ func (h *Handler) fetchDMPrivacySettings(userID string) (int, bool, error) {
 		FROM privacy_settings WHERE user_id = $1
 	`, userID).Scan(&dmPrivacyLevel, &dmFriendsOfFriends)
 	if err == sql.ErrNoRows {
-		return 2, false, nil // Default: friends + server members
+		return 2, true, nil // Default: friends + server members, with friends of friends enabled
 	}
 	return dmPrivacyLevel, dmFriendsOfFriends, err
 }
@@ -703,6 +703,7 @@ func dmTopologyPermittedTx(ctx context.Context, q dmRowQuerier, senderID, target
 	err = q.QueryRowContext(ctx, `SELECT dm_privacy_level, dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`, targetID).Scan(&level, &fof)
 	if errors.Is(err, sql.ErrNoRows) {
 		level = dmPrivacyFriendsAndServer
+		fof = true
 	} else if err != nil {
 		return false, fmt.Errorf("recheck dm topology privacy: %w", err)
 	}

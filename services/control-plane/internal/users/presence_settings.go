@@ -54,7 +54,8 @@ func defaultPresenceSettingsResponse() presenceSettingsResponse {
 	return presenceSettingsResponse{
 		MasterEnabled:          true,
 		ServerVoiceTier:        1,
-		ServerVoiceShowDetails: true,
+		ServerVoiceShowDetails: false,
+		PrivateCallTier:        1,
 	}
 }
 

@@ -1619,13 +1619,14 @@ func (h *Handler) claimFriendCodeInTx(
 	// strangers, and an auto_accept code manufactured an ACCEPTED friendship —
 	// DM rights, presence audience, friends-of-friends visibility — with no
 	// action by the target. `mutual_servers` was defeated outright, since a
-	// published code reaches people who share no server.
+	// published code reaches people who share no server. A validated code is now
+	// an intentional exception to mutual_servers, while nobody still refuses.
 	//
 	// Read unconditionally and applied only after the conflict check, mirroring
 	// SendRequest exactly: same statement, same position relative to the
 	// friendship probe, same 403 body as the block path — so a privacy refusal
 	// on this route is indistinguishable from a block refusal here too.
-	eligible, eligErr := h.canReceiveFriendRequestFromQ(ctx, tx, fc.ownerID, userID)
+	eligible, eligErr := h.canReceiveFriendRequestFromQ(ctx, tx, fc.ownerID, userID, true)
 	if eligErr != nil {
 		// The owner is a friend_codes FK, so ErrNoRows here is impossible and
 		// means the row vanished mid-transaction. Fail closed, never open.

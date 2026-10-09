@@ -548,12 +548,16 @@ func serverSettingsCandidates(
 			  )
 		  ) OR EXISTS (
 			SELECT 1
-			FROM privacy_settings sender_privacy
-			JOIN friendships sender_friend
-			  ON sender_friend.status = 'accepted'
+			FROM friendships sender_friend
+			WHERE sender_friend.status = 'accepted'
 			 AND (sender_friend.requester_id = $1 OR sender_friend.addressee_id = $1)
-			WHERE sender_privacy.user_id = $1
-			  AND sender_privacy.dm_friends_of_friends
+			  AND COALESCE((SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1), TRUE)
+			  AND NOT EXISTS (
+			    SELECT 1 FROM friendships blocked
+			    WHERE blocked.status = 'blocked'
+			      AND ((blocked.requester_id = $1 AND blocked.addressee_id = member.user_id)
+			        OR (blocked.addressee_id = $1 AND blocked.requester_id = member.user_id))
+			  )
 			  AND EXISTS (
 			    SELECT 1
 			    FROM friendships friend_candidate
@@ -662,17 +666,8 @@ func privateSettingsRecipients(
 			WHERE $3 >= 1 AND direct.status = 'accepted'
 			  AND (direct.requester_id = $1 OR direct.addressee_id = $1)
 			UNION
-			SELECT CASE
-			         WHEN friend_candidate.requester_id = CASE
-			           WHEN sender_friend.requester_id = $1 THEN sender_friend.addressee_id
-			           ELSE sender_friend.requester_id END
-			         THEN friend_candidate.addressee_id
-			         ELSE friend_candidate.requester_id
-			       END
-			FROM privacy_settings sender_privacy
-			JOIN friendships sender_friend
-			  ON sender_friend.status = 'accepted'
-			 AND (sender_friend.requester_id = $1 OR sender_friend.addressee_id = $1)
+			SELECT fof.fof_id
+			FROM friendships sender_friend
 			JOIN friendships friend_candidate
 			  ON friend_candidate.status = 'accepted'
 			 AND (
@@ -683,8 +678,24 @@ func privateSettingsRecipients(
 			     WHEN sender_friend.requester_id = $1 THEN sender_friend.addressee_id
 			     ELSE sender_friend.requester_id END
 			 )
-			WHERE $3 >= 1 AND sender_privacy.user_id = $1
-			  AND sender_privacy.dm_friends_of_friends
+			CROSS JOIN LATERAL (
+			  SELECT CASE
+			         WHEN friend_candidate.requester_id = CASE
+			           WHEN sender_friend.requester_id = $1 THEN sender_friend.addressee_id
+			           ELSE sender_friend.requester_id END
+			         THEN friend_candidate.addressee_id
+			         ELSE friend_candidate.requester_id
+			       END AS fof_id
+			) fof
+			WHERE $3 >= 1 AND sender_friend.status = 'accepted'
+			 AND (sender_friend.requester_id = $1 OR sender_friend.addressee_id = $1)
+			  AND COALESCE((SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1), TRUE)
+			  AND NOT EXISTS (
+			    SELECT 1 FROM friendships blocked
+			    WHERE blocked.status = 'blocked'
+			      AND ((blocked.requester_id = $1 AND blocked.addressee_id = fof.fof_id)
+			        OR (blocked.addressee_id = $1 AND blocked.requester_id = fof.fof_id))
+			  )
 			UNION
 			SELECT peer.user_id
 			FROM server_members sender_member

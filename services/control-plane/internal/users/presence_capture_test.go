@@ -181,8 +181,8 @@ func TestUpdatePrivacySettingsCapturesOnlyOnActualFoFChange(t *testing.T) {
 		return w
 	}
 
-	// The column defaults to FALSE (migration 000032), so this is a real change.
-	require.Equal(t, http.StatusOK, patch(`{"dm_friends_of_friends":true}`).Code)
+	// The column defaults to TRUE (migration 000166), so Off is a real change.
+	require.Equal(t, http.StatusOK, patch(`{"dm_friends_of_friends":false}`).Code)
 	require.Len(t, capture.subjects, 1, "a real FoF change must reach the bridge")
 	assert.Equal(t, presencecapture.FamilyFriendsOfFriendsToggle, capture.subjects[0].Family)
 	assert.Equal(t, userID, capture.subjects[0].Principal)
@@ -203,7 +203,7 @@ func TestUpdatePrivacySettingsCapturesOnlyOnActualFoFChange(t *testing.T) {
 	// still taken, because it keys on the field being SUPPLIED — whether the
 	// value actually transitions is knowable only after the in-transaction read,
 	// which is far too late to acquire a gate that must precede BeginTx.
-	require.Equal(t, http.StatusOK, patch(`{"dm_friends_of_friends":true}`).Code)
+	require.Equal(t, http.StatusOK, patch(`{"dm_friends_of_friends":false}`).Code)
 	assert.Len(t, capture.subjects, 1, "a no-op FoF PATCH must not capture")
 	assert.Len(t, capture.gatedSubjects, 2,
 		"a supplied-but-unchanged value still takes the gate")
@@ -222,7 +222,7 @@ func TestFoFPrivacyPatchLocksUserBeforePrivacySettings(t *testing.T) {
 	db, cleanup := testdb.SetupTestDB(t)
 	t.Cleanup(cleanup)
 	userID := testdb.CreateUser(t, db)
-	_, err := db.Exec(`INSERT INTO privacy_settings (user_id) VALUES ($1)`, userID)
+	_, err := db.Exec(`INSERT INTO privacy_settings (user_id, dm_friends_of_friends) VALUES ($1, FALSE)`, userID)
 	require.NoError(t, err)
 
 	capture := &stubCapture{db: db}
@@ -321,12 +321,12 @@ func TestFoFPrivacyPatchLocksUserBeforePrivacySettings(t *testing.T) {
 	assert.True(t, final, "the requested FoF value must persist after capture")
 }
 
-// The FIRST-write half of the uncaptured-narrowing race (PR #2770 review,
+// The FIRST-write half of the uncaptured-transition race (PR #2770 review,
 // CodeRabbit). readPriorFoF locks with FOR UPDATE, which locks NOTHING when no
 // row exists — so with the read ordered first, two concurrent first writes both
-// saw the absent-row default and neither blocked. One set true; the other, having
-// read false and requesting false, found *req == oldFoF, captured nothing, and
-// narrowed visibility back with no viewer cleared.
+// saw the absent-row default and neither blocked. One set false; the other,
+// having read true and requesting true, found *req == oldFoF, captured nothing,
+// and widened visibility back without reconciliation.
 //
 // UpdatePrivacySettings now ensures the row BEFORE that read, and ON CONFLICT DO
 // NOTHING is the serializer: the loser blocks on the primary-key index until the
@@ -339,8 +339,8 @@ func TestFoFPrivacyPatchLocksUserBeforePrivacySettings(t *testing.T) {
 // pass was cleaning up. Instead the test holds the competing transaction open
 // and asserts on whether a CAPTURE fires, which is the behaviour that differs:
 // under the old ordering the handler reads sql.ErrNoRows immediately, sees
-// false == false, and captures NOTHING.
-func TestFirstWriteFoFRaceStillCapturesTheNarrowing(t *testing.T) {
+// true == true, and captures NOTHING.
+func TestFirstWriteFoFRaceStillCapturesTheTransition(t *testing.T) {
 	db, cleanup := testdb.SetupTestDB(t)
 	t.Cleanup(cleanup)
 	userID := testdb.CreateUser(t, db)
@@ -363,7 +363,7 @@ func TestFirstWriteFoFRaceStillCapturesTheNarrowing(t *testing.T) {
 	})
 	engine.PATCH("/users/me/privacy", h.UpdatePrivacySettings)
 
-	// The competing first write: claims the row and turns the flag ON, holding
+	// The competing first write: claims the row and turns the flag OFF, holding
 	// its transaction open so the handler below races it.
 	rival, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin rival")
@@ -373,17 +373,17 @@ func TestFirstWriteFoFRaceStillCapturesTheNarrowing(t *testing.T) {
 		userID)
 	require.NoError(t, err, "rival ensure")
 	_, err = rival.ExecContext(ctx,
-		`UPDATE privacy_settings SET dm_friends_of_friends = TRUE WHERE user_id = $1`, userID)
-	require.NoError(t, err, "rival turns the flag on")
+		`UPDATE privacy_settings SET dm_friends_of_friends = FALSE WHERE user_id = $1`, userID)
+	require.NoError(t, err, "rival turns the flag off")
 
-	// The handler asks for FALSE. Against the rival's committed TRUE that is a
-	// narrowing and must capture; against the absent-row default it looks like
+	// The handler asks for TRUE. Against the rival's committed FALSE that is a
+	// transition and must capture; against the absent-row default it looks like
 	// a no-op and captures nothing.
 	code := make(chan int, 1)
 	go func() {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPatch, "/users/me/privacy",
-			strings.NewReader(`{"dm_friends_of_friends":false}`))
+			strings.NewReader(`{"dm_friends_of_friends":true}`))
 		req.Header.Set("Content-Type", "application/json")
 		engine.ServeHTTP(w, req)
 		code <- w.Code
@@ -409,9 +409,9 @@ func TestFirstWriteFoFRaceStillCapturesTheNarrowing(t *testing.T) {
 	}
 
 	require.Len(t, capture.subjects, 1,
-		"true→false is a NARROWING and must be captured; capturing nothing here is "+
+		"false→true must be captured; capturing nothing here is "+
 			"the defect — the handler would have read the absent-row default, seen "+
-			"false == false, and disabled the setting with no viewer ever cleared")
+			"true == true, and enabled the setting without reconciliation")
 	assert.Equal(t, presencecapture.FamilyFriendsOfFriendsToggle, capture.subjects[0].Family)
 	assert.Equal(t, userID, capture.subjects[0].Principal)
 
@@ -419,7 +419,7 @@ func TestFirstWriteFoFRaceStillCapturesTheNarrowing(t *testing.T) {
 	require.NoError(t, db.QueryRow(
 		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`,
 		userID).Scan(&final), "read back")
-	assert.False(t, final, "and the requested value still lands")
+	assert.True(t, final, "and the requested value still lands")
 }
 
 // respondPresenceTerminal is the ONE place this handler turns a hooked
@@ -526,6 +526,8 @@ func TestUpdatePrivacySettingsAbandonsThePlanWhenTheWriteFails(t *testing.T) {
 	db, cleanup := testdb.SetupTestDB(t)
 	t.Cleanup(cleanup)
 	userID := testdb.CreateUser(t, db)
+	_, err := db.Exec(`INSERT INTO privacy_settings (user_id, dm_friends_of_friends) VALUES ($1, FALSE)`, userID)
+	require.NoError(t, err)
 
 	capture := &stubCapture{db: db, poisonTx: true}
 	h := &Handler{db: db, log: logger.New("test")}

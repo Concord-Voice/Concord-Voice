@@ -4,8 +4,10 @@ import (
 	"context"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,16 +62,34 @@ func TestComputeCustomTextAudience(t *testing.T) {
 		testhelpers.AddFriendship(t, db, friend, fof)
 		testhelpers.SetCustomTextTier(t, db, sender, 1)
 
-		// FoF off (default): fof not included.
+		// No privacy row: FoF is enabled by default.
 		aud, err := presence.ComputeCustomTextAudience(ctx, db, sender)
 		require.NoError(t, err)
-		require.False(t, aud[fof], "FoF excluded when dm_friends_of_friends is off")
+		require.True(t, aud[fof], "FoF included when no privacy row exists")
 
-		// FoF on: fof included.
-		testhelpers.SetFriendsOfFriends(t, db, sender, true)
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO friendships (requester_id, addressee_id, status)
+			VALUES ($1, $2, 'blocked')
+		`, sender, fof)
+		require.NoError(t, err)
+		require.NoError(t, dmblock.RecordBlockTx(ctx, tx, sender.String(), fof.String(), uuid.NewString()))
+		require.NoError(t, tx.Commit())
 		aud, err = presence.ComputeCustomTextAudience(ctx, db, sender)
 		require.NoError(t, err)
-		require.True(t, aud[fof], "FoF included when dm_friends_of_friends is on")
+		require.NotContains(t, aud, fof, "a direct block vetoes the default FoF path")
+		_, err = db.Exec(`
+			DELETE FROM friendships
+			WHERE requester_id = $1 AND addressee_id = $2 AND status = 'blocked'
+		`, sender, fof)
+		require.NoError(t, err)
+
+		// Explicit Off must still exclude FoF.
+		testhelpers.SetFriendsOfFriends(t, db, sender, false)
+		aud, err = presence.ComputeCustomTextAudience(ctx, db, sender)
+		require.NoError(t, err)
+		require.False(t, aud[fof], "FoF excluded when dm_friends_of_friends is off")
 	})
 
 	t.Run("tier 2 (Servers) includes shared-server peer", func(t *testing.T) {

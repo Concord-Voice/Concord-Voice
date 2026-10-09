@@ -37,6 +37,7 @@ const (
 	errMsgUnauthorized          = "Unauthorized"
 	errMsgFailedUpdateProfile   = "Failed to update profile"
 	errMsgFailedChangePassword  = "Failed to change password"
+	errMsgFailedSearchUsers     = "Failed to search users"
 	errMsgMFAVerificationFailed = "MFA verification failed"
 	dataImagePrefix             = "data:image/"
 )
@@ -233,7 +234,7 @@ func (h *Handler) GetMe(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"user": user.PublicUser(),
+		"user": user.PublicUser(entitlements.For(h.tiers.GetTier(c.Request.Context(), c.GetString("user_id"))).UsernameChangeIntervalMonths),
 	})
 }
 
@@ -600,13 +601,13 @@ type profileUpdateBuilder struct {
 	argIdx               int
 	profileSlotsToDelete []string
 	usernameChanged      bool
-	// usernameChangeInterval is the tier-resolved cadence (#1298). Set in
+	// usernameChangeIntervalMonths is the tier-resolved cadence. Set in
 	// validateUsername before usernameChanged is flipped true, and reused by
 	// executeProfileUpdate's SQL WHERE so the precheck and the authoritative
 	// double-enforcement use one identical value (no TOCTOU between reads).
-	usernameChangeInterval time.Duration
-	previousUsername       string
-	extraResponse          map[string]interface{} // additional fields to include in error responses
+	usernameChangeIntervalMonths int
+	previousUsername             string
+	extraResponse                map[string]interface{} // additional fields to include in error responses
 }
 
 func newProfileUpdateBuilder() *profileUpdateBuilder {
@@ -621,10 +622,9 @@ func (b *profileUpdateBuilder) addClause(column string, val interface{}) {
 }
 
 // usernameCadenceMsg renders the tier-aware username cooldown message (#1298).
-// The interval is tier-dependent (365d free / 91d premium), so the message can no
-// longer hardcode "once per year".
-func usernameCadenceMsg(interval time.Duration) string {
-	return fmt.Sprintf("You can only change your username once every %d days", int(interval/(24*time.Hour)))
+// The interval is tier-dependent (six calendar months free / three premium).
+func usernameCadenceMsg(months int) string {
+	return fmt.Sprintf("You can only change your username once every %d months", months)
 }
 
 // validateUsername checks cooldown, uniqueness, and appends the username clause.
@@ -658,12 +658,12 @@ func (h *Handler) validateUsername(b *profileUpdateBuilder, username string, use
 		return 0, ""
 	}
 
-	cooldownEnd := usernameChangedAt.Add(ent.UsernameChangeInterval)
+	cooldownEnd := models.UsernameChangeEligibleAt(usernameChangedAt, ent.UsernameChangeIntervalMonths)
 	if time.Now().Before(cooldownEnd) {
 		b.extraResponse = map[string]interface{}{
 			"username_change_eligible_at": cooldownEnd,
 		}
-		return http.StatusForbidden, usernameCadenceMsg(ent.UsernameChangeInterval)
+		return http.StatusForbidden, usernameCadenceMsg(ent.UsernameChangeIntervalMonths)
 	}
 
 	var count int
@@ -682,7 +682,7 @@ func (h *Handler) validateUsername(b *profileUpdateBuilder, username string, use
 	b.addClause("username", normalized)
 	b.setClauses = append(b.setClauses, "username_changed_at = NOW()")
 	b.previousUsername = currentUsername
-	b.usernameChangeInterval = ent.UsernameChangeInterval // SQL double-enforcement reuses this exact value
+	b.usernameChangeIntervalMonths = ent.UsernameChangeIntervalMonths // SQL double-enforcement reuses this value
 	b.usernameChanged = true
 	return 0, ""
 }
@@ -888,12 +888,12 @@ func (h *Handler) executeProfileUpdate(ctx context.Context, db *sql.Tx, b *profi
 
 	whereClause := fmt.Sprintf("WHERE id = $%d", b.argIdx)
 	if b.usernameChanged {
-		// Tier double-enforcement: the cadence is parameterized (no SQL literal),
-		// using $argIdx for the id and $argIdx+1 for the cadence in SECONDS appended
-		// below. Seconds (not days) keeps this authoritative SQL bound provably identical
-		// to the exact-Duration precheck for any interval granularity (#1298 review, Gitar).
+		// Tier double-enforcement: add calendar months to the stored UTC wall
+		// timestamp. PostgreSQL clamps month-end dates, matching
+		// models.UsernameChangeEligibleAt. Explicit UTC avoids session timezone
+		// and daylight-saving differences.
 		whereClause = fmt.Sprintf(
-			"WHERE id = $%d AND username_changed_at <= NOW() - make_interval(secs => $%d)",
+			"WHERE id = $%d AND (((username_changed_at AT TIME ZONE 'UTC') + make_interval(months => $%d::int)) AT TIME ZONE 'UTC') <= NOW()",
 			b.argIdx, b.argIdx+1,
 		)
 	}
@@ -907,9 +907,8 @@ func (h *Handler) executeProfileUpdate(ctx context.Context, db *sql.Tx, b *profi
 	)
 	b.args = append(b.args, userID)
 	if b.usernameChanged {
-		// $argIdx+1: tier cadence in whole seconds, matching make_interval(secs => $N)
-		// above and the exact-Duration precheck in validateUsername.
-		b.args = append(b.args, int64(b.usernameChangeInterval.Seconds()))
+		// $argIdx+1: tier cadence in calendar months, matching the precheck.
+		b.args = append(b.args, b.usernameChangeIntervalMonths)
 	}
 
 	var user models.User
@@ -924,7 +923,7 @@ func (h *Handler) executeProfileUpdate(ctx context.Context, db *sql.Tx, b *profi
 	}
 	if err == sql.ErrNoRows {
 		if b.usernameChanged {
-			return nil, http.StatusForbidden, usernameCadenceMsg(b.usernameChangeInterval)
+			return nil, http.StatusForbidden, usernameCadenceMsg(b.usernameChangeIntervalMonths)
 		}
 		return nil, http.StatusNotFound, errMsgUserNotFound
 	}
@@ -1066,7 +1065,7 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"user": user.PublicUser(),
+		"user": user.PublicUser(ent.UsernameChangeIntervalMonths),
 	})
 }
 
@@ -1786,7 +1785,9 @@ func (h *Handler) appendContinuationPair(c *gin.Context, response gin.H, uid, co
 	response["session_id"] = sessionID
 }
 
-// SearchUsers searches for users by username or display_name.
+// SearchUsers searches users who opted into username search by username or
+// display_name. Shared servers and mutual friends do not override this choice.
+// A blocked pair is never shown by this endpoint.
 // GET /users/search?q=...
 func (h *Handler) SearchUsers(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -1801,14 +1802,20 @@ func (h *Handler) SearchUsers(c *gin.Context) {
 		SELECT u.id, u.username, u.display_name, u.avatar_url
 		FROM users u
 		LEFT JOIN privacy_settings ps ON ps.user_id = u.id
-		WHERE (LOWER(u.username) LIKE $1 OR LOWER(COALESCE(u.display_name, '')) LIKE $1)
+		WHERE COALESCE(ps.searchable_by_username, FALSE)
+		  AND (LOWER(u.username) LIKE $1 OR LOWER(COALESCE(u.display_name, '')) LIKE $1)
 		  AND u.id != $2
-		  AND COALESCE(ps.searchable_by_username, FALSE) = TRUE
+		  AND NOT EXISTS (
+		    SELECT 1 FROM friendships blocked
+		    WHERE blocked.status = 'blocked'
+		      AND ((blocked.requester_id = u.id AND blocked.addressee_id = $2)
+		        OR (blocked.addressee_id = u.id AND blocked.requester_id = $2))
+		  )
 		LIMIT 20
 	`, pattern, userID)
 	if err != nil {
-		h.log.Error("Failed to search users", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to search users"})
+		h.log.Error(errMsgFailedSearchUsers, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSearchUsers})
 		return
 	}
 	defer func() { _ = rows.Close() }()
@@ -1824,9 +1831,16 @@ func (h *Handler) SearchUsers(c *gin.Context) {
 	for rows.Next() {
 		var r searchResult
 		if err := rows.Scan(&r.ID, &r.Username, &r.DisplayName, &r.AvatarURL); err != nil {
-			continue
+			h.log.Error("Failed to read user search result", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSearchUsers})
+			return
 		}
 		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		h.log.Error("Failed to finish user search", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSearchUsers})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"users": results})
@@ -2125,7 +2139,7 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 				MessagesFriendsOnly:                 true,
 				MessagesServerMembers:               true,
 				DMPrivacyLevel:                      2,
-				DMFriendsOfFriends:                  false,
+				DMFriendsOfFriends:                  true,
 				AutoAcceptFriendCodes:               false,
 				SearchableByUsername:                false,
 				SearchableByEmail:                   false,
@@ -2140,7 +2154,7 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 				// the toggle OFF for every user who has never PATCHed their settings while
 				// their purges kept 403-ing.
 				RequireAuthBeforePurge:  true,
-				AllowFriendRequestsFrom: "everyone",
+				AllowFriendRequestsFrom: "mutual_servers",
 			},
 		})
 		return
@@ -2287,8 +2301,8 @@ func dmPrivacyLegacySync(level int) []string {
 // readPriorFoF returns the user's dm_friends_of_friends flag as it stands
 // inside tx, before the settings UPDATE overwrites it.
 //
-// privacy_settings.dm_friends_of_friends is BOOLEAN NOT NULL DEFAULT FALSE
-// (migration 000032), so there is no NULL case. A missing row is the only
+// privacy_settings.dm_friends_of_friends is BOOLEAN NOT NULL DEFAULT TRUE
+// (migration 000166), so there is no NULL case. A missing row is the only
 // absent case and its effective value is that column default.
 // readPriorFoF reads the pre-mutation flag under a row lock.
 //
@@ -2317,7 +2331,7 @@ func readPriorFoF(ctx context.Context, tx *sql.Tx, userID string) (bool, error) 
 		userID,
 	).Scan(&fof)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return true, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("read prior friends-of-friends flag: %w", err)
@@ -2605,8 +2619,8 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		// order is load-bearing rather than incidental. readPriorFoF locks with
 		// FOR UPDATE, which locks nothing when no row exists — so with the read
 		// first, two concurrent FIRST writes both saw the absent-row default
-		// (false) and neither blocked. One would set true and the other, having
-		// read false and requesting false, saw *req == oldFoF, ran NO capture,
+		// (formerly false) and neither blocked. One would change the flag and the
+		// other, having read the old value, could run NO capture,
 		// and narrowed visibility back with no viewer cleared (PR #2770 review,
 		// CodeRabbit). That is the same uncaptured-narrowing defect the FOR
 		// UPDATE was added to close, surviving in the one case the lock could
@@ -2619,10 +2633,15 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		//
 		// Nothing is lost by reading second. sql.ErrNoRows no longer
 		// distinguishes a first-ever write, but the VALUE is identical either
-		// way — dm_friends_of_friends is NOT NULL DEFAULT FALSE, so an absent
-		// row and a freshly-inserted row both mean false, and no caller branches
-		// on the distinction.
-		if _, err := tx.ExecContext(ctx, `INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+		// way — this binary explicitly seeds its virtual defaults, so an absent
+		// row and a freshly-inserted row both mean true, and no caller branches
+		// on the distinction. A fleet-wide drain keeps older binaries from
+		// creating this row during the default cutover.
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO privacy_settings (user_id, dm_friends_of_friends, allow_friend_requests_from)
+			VALUES ($1, TRUE, 'mutual_servers')
+			ON CONFLICT (user_id) DO NOTHING
+		`, userID); err != nil {
 			return fmt.Errorf("ensure privacy settings row: %w", err)
 		}
 
@@ -3038,7 +3057,7 @@ func (h *Handler) restorePasswordFallbackAfterUnlink(ctx context.Context, tx *sq
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE users SET password_login_disabled = FALSE WHERE id = $1`, userID,
+		`UPDATE users SET password_login_disabled = FALSE WHERE id = $1`, userID, // pragma: allowlist secret
 	); err != nil {
 		return fmt.Errorf("restore password fallback after SSO unlink: %w", err)
 	}

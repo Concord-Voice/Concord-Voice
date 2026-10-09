@@ -2775,8 +2775,28 @@ describe('VoiceService', () => {
       expect(mc[0][0].codecOptions.opusStereo).toBe(true);
     });
 
-    it('DTX combines settings', async () => {
+    it('uses the Advanced DTX switch when enabled', async () => {
       useAudioSettingsStore.setState({ advancedMode: true, silenceDetection: true });
+      const { sendTransport } = await joinVoiceChannel();
+      const mc = sendTransport.produce.mock.calls.filter(
+        (c: any) => c[0].appData?.source === 'mic'
+      );
+      expect(mc[0][0].codecOptions.opusDtx).toBe(true);
+    });
+
+    it('keeps DTX off when the Advanced switch is off, even at Standard quality', async () => {
+      useVoiceStore.getState().setQualityTier('standard');
+      useAudioSettingsStore.setState({ advancedMode: true, silenceDetection: false });
+      const { sendTransport } = await joinVoiceChannel();
+      const mc = sendTransport.produce.mock.calls.filter(
+        (c: any) => c[0].appData?.source === 'mic'
+      );
+      expect(mc[0][0].codecOptions.opusDtx).toBe(false);
+    });
+
+    it('uses the Standard tier DTX default in Basic mode', async () => {
+      useVoiceStore.getState().setQualityTier('standard');
+      useAudioSettingsStore.setState({ advancedMode: false, silenceDetection: false });
       const { sendTransport } = await joinVoiceChannel();
       const mc = sendTransport.produce.mock.calls.filter(
         (c: any) => c[0].appData?.source === 'mic'
@@ -5420,6 +5440,29 @@ describe('VoiceService', () => {
   // ===== Live Settings Subscriptions =====
 
   describe('live settings subscriptions', () => {
+    it('applies Basic and Advanced DTX to the active mic producer on mode changes', async () => {
+      useVoiceStore.getState().setQualityTier('standard');
+      useAudioSettingsStore.setState({ advancedMode: false, silenceDetection: false });
+      const { sendTransport, micProducer } = await joinVoiceChannel();
+      const micCalls = () =>
+        sendTransport.produce.mock.calls.filter((call: any) => call[0].appData?.source === 'mic');
+      expect(micCalls()[0][0].codecOptions.opusDtx).toBe(true);
+
+      const advancedProducer = createMockProducer('prod-mic-advanced', 'mic');
+      sendTransport.produce.mockResolvedValueOnce(advancedProducer);
+      useAudioSettingsStore.getState().setAdvancedMode(true);
+      await vi.waitFor(() => expect(voiceService['producers'].get('mic')).toBe(advancedProducer));
+      expect(micProducer.close).toHaveBeenCalledOnce();
+      expect(micCalls()[1][0].codecOptions.opusDtx).toBe(false);
+
+      const basicProducer = createMockProducer('prod-mic-basic', 'mic');
+      sendTransport.produce.mockResolvedValueOnce(basicProducer);
+      useAudioSettingsStore.getState().setAdvancedMode(false);
+      await vi.waitFor(() => expect(voiceService['producers'].get('mic')).toBe(basicProducer));
+      expect(advancedProducer.close).toHaveBeenCalledOnce();
+      expect(micCalls()[2][0].codecOptions.opusDtx).toBe(true);
+    });
+
     it('logs the safe native category for a codec-triggered microphone capture failure', async () => {
       await joinVoiceChannel();
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

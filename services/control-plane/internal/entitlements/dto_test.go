@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestToDTO_FreeTier_MapsAllFieldsAndDurationToSeconds(t *testing.T) {
+func TestToDTO_FreeTier_MapsCalendarMonths(t *testing.T) {
 	dto := entitlements.ToDTO(entitlements.For(entitlements.TierFree))
 	assert.Equal(t, "free", dto.Tier)
 	assert.False(t, dto.AllowCustomScheme)
@@ -20,8 +20,8 @@ func TestToDTO_FreeTier_MapsAllFieldsAndDurationToSeconds(t *testing.T) {
 	assert.Equal(t, int64(33554432), dto.MaxAttachmentBytes)
 	assert.Equal(t, 5, dto.MaxServersCreated)
 	assert.Equal(t, 90, dto.MessageHistorySearchDays)
-	// 365 days in seconds
-	assert.Equal(t, int64(31536000), dto.UsernameChangeIntervalSeconds)
+	assert.Equal(t, 6, dto.UsernameChangeIntervalMonths)
+	assert.Equal(t, int64(365*24*60*60), dto.UsernameChangeIntervalSeconds)
 }
 
 func TestToDTO_PremiumTier(t *testing.T) {
@@ -32,7 +32,8 @@ func TestToDTO_PremiumTier(t *testing.T) {
 	assert.Equal(t, int64(268435456), dto.MaxAttachmentBytes)
 	assert.Equal(t, entitlements.ServerLimitUnlimited, dto.MaxServersCreated, "Supersonic: no cap on server creation")
 	assert.Equal(t, 180, dto.MessageHistorySearchDays)
-	assert.Equal(t, int64(91*24*3600), dto.UsernameChangeIntervalSeconds)
+	assert.Equal(t, 3, dto.UsernameChangeIntervalMonths)
+	assert.Equal(t, int64(91*24*60*60), dto.UsernameChangeIntervalSeconds)
 }
 
 func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
@@ -45,19 +46,20 @@ func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
 		"maxAudioLastN", "streamMaxHeight", "streamMaxFps", "streamMaxPixelRate", "streamMaxBitrate",
 		"cameraMaxHeight", "cameraMaxFps", "cameraMaxBitrate", "maxManualBitrateBps",
 		"maxWebcamPublishers", "maxScreensharePublishers", "maxMessageChars", "maxAttachmentBytes",
-		"maxAvatarBytes", "maxBannerBytes", "allowAnimatedProfile", "usernameChangeIntervalSeconds",
+		"maxAvatarBytes", "maxBannerBytes", "allowAnimatedProfile", "usernameChangeIntervalMonths",
+		"usernameChangeIntervalSeconds",
 		"maxServersCreated", "messageHistorySearchDays",
 	} {
 		_, ok := m[k]
 		assert.Truef(t, ok, "missing wire key %q", k)
 	}
-	// 23 (#1602) + streamMaxPixelRate (#2163) = 24.
-	assert.Len(t, m, 24, "DTO must serialize exactly 24 keys")
+	// 24 current keys plus one deprecated seconds field for older clients.
+	assert.Len(t, m, 25, "DTO must serialize exactly 25 keys")
 }
 
 func TestDTOToMap_RoundTripsKeys(t *testing.T) {
 	m, err := entitlements.DTOToMap(entitlements.ToDTO(entitlements.For(entitlements.TierPremium)))
 	require.NoError(t, err)
 	assert.Equal(t, "premium", m["tier"])
-	assert.Len(t, m, 24)
+	assert.Len(t, m, 25)
 }

@@ -15,7 +15,9 @@ const SearchVisibilityControls = () => {
         <div className="settings-row-info">
           <span className="settings-row-label">Searchable by Username</span>
           <span className="settings-row-hint">
-            Allow others to find you by searching your username
+            Show your profile in Add Friend search. When this is off, people in your servers can
+            still see you in member lists, and your existing friends can see you in their Friends
+            lists.
           </span>
         </div>
         <ToggleSwitch
@@ -24,25 +26,29 @@ const SearchVisibilityControls = () => {
         />
       </div>
 
-      <div className="settings-row">
+      <div className="settings-row settings-row-disabled">
         <div className="settings-row-info">
           <span className="settings-row-label">Searchable by Email</span>
-          <span className="settings-row-hint">Allow others to find you by email address</span>
+          <span className="settings-row-hint">Planned. Email search is not available yet.</span>
         </div>
         <ToggleSwitch
           checked={privacySettings.searchableByEmail}
-          onChange={(v) => updatePrivacy({ searchableByEmail: v })}
+          onChange={() => undefined}
+          disabled
         />
       </div>
 
-      <div className="settings-row">
+      <div className="settings-row settings-row-disabled">
         <div className="settings-row-info">
           <span className="settings-row-label">Searchable by Phone Number</span>
-          <span className="settings-row-hint">Allow others to find you by phone number</span>
+          <span className="settings-row-hint">
+            Planned. Phone number search is not available yet.
+          </span>
         </div>
         <ToggleSwitch
           checked={privacySettings.searchableByPhone}
-          onChange={(v) => updatePrivacy({ searchableByPhone: v })}
+          onChange={() => undefined}
+          disabled
         />
       </div>
     </>

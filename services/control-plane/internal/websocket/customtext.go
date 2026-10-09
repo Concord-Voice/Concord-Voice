@@ -768,12 +768,16 @@ func (h *Hub) readCustomTextSnapshotCandidate(
 		         )
 		         OR EXISTS (
 		           SELECT 1
-		           FROM privacy_settings sender_privacy
-		           JOIN friendships sender_friend
-		             ON sender_friend.status = 'accepted'
+		           FROM friendships sender_friend
+		           WHERE sender_friend.status = 'accepted'
 		            AND (sender_friend.requester_id = $1 OR sender_friend.addressee_id = $1)
-		           WHERE sender_privacy.user_id = $1
-		             AND sender_privacy.dm_friends_of_friends
+		             AND COALESCE((SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1), TRUE)
+		             AND NOT EXISTS (
+		               SELECT 1 FROM friendships blocked
+		               WHERE blocked.status = 'blocked'
+		                 AND ((blocked.requester_id = $1 AND blocked.addressee_id = $2)
+		                   OR (blocked.addressee_id = $1 AND blocked.requester_id = $2))
+		             )
 		             AND EXISTS (
 		               SELECT 1
 		               FROM friendships friend_viewer
@@ -895,15 +899,19 @@ func (h *Hub) customTextCandidates(
 		      )
 		      OR EXISTS (
 		          SELECT 1
-		          FROM privacy_settings sender_privacy
-		          JOIN friendships sender_friend
-		            ON sender_friend.status = 'accepted'
+		          FROM friendships sender_friend
+		          WHERE sender_friend.status = 'accepted'
 		           AND (
 		               sender_friend.requester_id = settings.user_id
 		               OR sender_friend.addressee_id = settings.user_id
 		           )
-		          WHERE sender_privacy.user_id = settings.user_id
-		            AND sender_privacy.dm_friends_of_friends
+		            AND COALESCE((SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = settings.user_id), TRUE)
+		            AND NOT EXISTS (
+		                SELECT 1 FROM friendships blocked
+		                WHERE blocked.status = 'blocked'
+		                  AND ((blocked.requester_id = settings.user_id AND blocked.addressee_id = $1)
+		                    OR (blocked.addressee_id = settings.user_id AND blocked.requester_id = $1))
+		            )
 		            AND EXISTS (
 		                SELECT 1
 		                FROM friendships friend_viewer

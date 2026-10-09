@@ -81,7 +81,7 @@ func TestPrivacyColumnEnumerationsKeepFriendRequestModeBeforeUpdatedAt(t *testin
 		},
 		{
 			name:    "row-less defaults literal",
-			pattern: `AllowFriendRequestsFrom:\s*"everyone"`,
+			pattern: `AllowFriendRequestsFrom:\s*"mutual_servers"`,
 			want:    1,
 			why: "privacy_settings rows are created lazily, so the sql.ErrNoRows branch is " +
 				"the majority path. Omitting the field there serves \"\" — which the client " +
@@ -202,14 +202,14 @@ func TestPatchPrivacyRoundTripsEachFriendRequestModeWithoutSwapping(t *testing.T
 	}
 }
 
-// TestGetPrivacyDefaultsFriendRequestModeToEveryoneWithNoRow covers the
+// TestGetPrivacyDefaultsFriendRequestModeToMutualServersWithNoRow covers the
 // sql.ErrNoRows branch — the majority state, since rows are created lazily.
 //
 // It is separate from the round-trip test because it exercises a code path with
 // NO SQL in it at all: a hand-written defaults literal. Omitting the field
 // there serves "" and the desktop client, which maps an unknown value to
 // nothing, renders no selection.
-func TestGetPrivacyDefaultsFriendRequestModeToEveryoneWithNoRow(t *testing.T) {
+func TestGetPrivacyDefaultsFriendRequestModeToMutualServersWithNoRow(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "frnorow")
 
@@ -223,8 +223,8 @@ func TestGetPrivacyDefaultsFriendRequestModeToEveryoneWithNoRow(t *testing.T) {
 	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
 
 	privacy := privacyBody(t, get.Body.Bytes())
-	assert.Equal(t, "everyone", privacy[friendRequestModeKey],
-		"a user with no row must read as 'everyone' — the schema default")
+	assert.Equal(t, "mutual_servers", privacy[friendRequestModeKey],
+		"a user with no row must read as 'mutual_servers' — the schema default")
 }
 
 // TestPatchPrivacyRejectsAnInvalidFriendRequestMode is the endpoint half of the

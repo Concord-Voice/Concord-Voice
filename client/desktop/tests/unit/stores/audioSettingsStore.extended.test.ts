@@ -9,7 +9,7 @@ beforeEach(() => {
     advancedMode: false,
     noiseCancellation: true,
     echoCancellation: true,
-    autoGainControl: true,
+    autoGainControl: false,
     noiseGateMode: 'dynamic',
     noiseGateLevel: -50,
     musicMode: false,
@@ -17,9 +17,9 @@ beforeEach(() => {
     silenceDetection: false,
     stereoOverride: null,
     inlineFec: true,
-    fecHeadroom: true,
+    fecHeadroom: false,
     opusNack: false,
-    adaptivePtime: false,
+    adaptivePtime: true,
     audioPriority: 'medium',
     inputVolume: 100,
     outputVolume: 100,
@@ -131,8 +131,8 @@ describe('audioSettingsStore — extended coverage', () => {
 
   describe('setAdaptivePtime', () => {
     it('sets adaptivePtime', () => {
-      useAudioSettingsStore.getState().setAdaptivePtime(true);
-      expect(useAudioSettingsStore.getState().adaptivePtime).toBe(true);
+      useAudioSettingsStore.getState().setAdaptivePtime(false);
+      expect(useAudioSettingsStore.getState().adaptivePtime).toBe(false);
     });
   });
 

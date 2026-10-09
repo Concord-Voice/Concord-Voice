@@ -487,9 +487,7 @@ function resolveOpusSettings(
 ) {
   const effectiveFec = adv.advancedMode ? adv.inlineFec : tierConfig.opusFec;
 
-  const effectiveDtx = adv.advancedMode
-    ? adv.silenceDetection || tierConfig.opusDtx
-    : tierConfig.opusDtx;
+  const effectiveDtx = adv.advancedMode ? adv.silenceDetection : tierConfig.opusDtx;
 
   const effectiveStereo =
     adv.advancedMode && adv.stereoOverride !== null ? adv.stereoOverride : tierConfig.opusStereo;
@@ -1887,6 +1885,7 @@ class VoiceService {
 
       // --- Re-produce: codec options changed ---
       const codecOptionFields = [
+        'advancedMode',
         'musicMode',
         'frameSize',
         'silenceDetection',

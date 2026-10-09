@@ -27,7 +27,8 @@ describe('privacyStore', () => {
     expect(settings.messagesFriendsOnly).toBe(true);
     expect(settings.messagesServerMembers).toBe(true);
     expect(settings.dmPrivacyLevel).toBe(2);
-    expect(settings.dmFriendsOfFriends).toBe(false);
+    expect(settings.dmFriendsOfFriends).toBe(true);
+    expect(settings.allowFriendRequestsFrom).toBe('mutual_servers');
     expect(settings.autoAcceptFriendCodes).toBe(false);
     expect(settings.searchableByUsername).toBe(false);
     expect(settings.searchableByEmail).toBe(false);
@@ -45,7 +46,7 @@ describe('privacyStore', () => {
             messages_friends_only: false,
             messages_server_members: false,
             dm_privacy_level: 1,
-            dm_friends_of_friends: true,
+            dm_friends_of_friends: false,
             auto_accept_friend_codes: true,
             searchable_by_username: true,
             searchable_by_email: true,
@@ -62,9 +63,52 @@ describe('privacyStore', () => {
     expect(error).toBeNull();
     expect(settings.messagesFriendsOnly).toBe(false);
     expect(settings.dmPrivacyLevel).toBe(1);
-    expect(settings.dmFriendsOfFriends).toBe(true);
+    expect(settings.dmFriendsOfFriends).toBe(false);
     expect(settings.searchableByUsername).toBe(true);
     expect(settings.allowEmbeddedContent).toBe(true);
+  });
+
+  it('uses the older server default when GET omits Friends-of-Friends', async () => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/users/me/privacy`, () =>
+        HttpResponse.json({
+          privacy: {
+            messages_friends_only: true,
+            messages_server_members: true,
+            dm_privacy_level: 2,
+          },
+        })
+      )
+    );
+
+    expect(usePrivacyStore.getState().settings.dmFriendsOfFriends).toBe(true);
+    await usePrivacyStore.getState().fetchPrivacy();
+    expect(usePrivacyStore.getState().settings.dmFriendsOfFriends).toBe(false);
+    expect(usePrivacyStore.getState().loaded).toBe(true);
+  });
+
+  it('uses the saved Friends-of-Friends setting sent by a current server', async () => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/users/me/privacy`, () =>
+        HttpResponse.json({ privacy: { dm_friends_of_friends: true } })
+      )
+    );
+
+    await usePrivacyStore.getState().fetchPrivacy();
+    expect(usePrivacyStore.getState().settings.dmFriendsOfFriends).toBe(true);
+    expect(usePrivacyStore.getState().loaded).toBe(true);
+  });
+
+  it('uses the older server default when PATCH echoes no Friends-of-Friends field', async () => {
+    server.use(
+      http.patch(`${API_BASE}/api/v1/users/me/privacy`, () =>
+        HttpResponse.json({ privacy: { searchable_by_username: true } })
+      )
+    );
+
+    await usePrivacyStore.getState().updatePrivacy({ searchableByUsername: true });
+    expect(usePrivacyStore.getState().settings.dmFriendsOfFriends).toBe(false);
+    expect(usePrivacyStore.getState().settings.searchableByUsername).toBe(true);
   });
 
   it('fetchPrivacy handles API errors', async () => {
@@ -134,8 +178,9 @@ describe('privacyStore', () => {
 // ── #1241: allow_friend_requests_from ────────────────────────────────────────
 
 describe('allowFriendRequestsFrom (#1241)', () => {
-  it('defaults to everyone before any fetch', () => {
-    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('everyone');
+  it('starts with the new-user Mutual Servers placeholder before any fetch', () => {
+    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('mutual_servers');
+    expect(usePrivacyStore.getState().loaded).toBe(false);
   });
 
   it('hydrates the value from GET /users/me/privacy', async () => {
@@ -156,6 +201,16 @@ describe('allowFriendRequestsFrom (#1241)', () => {
     );
     await usePrivacyStore.getState().fetchPrivacy();
     expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('everyone');
+  });
+
+  it('does not present an unknown mode as Everyone', async () => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/users/me/privacy`, () =>
+        HttpResponse.json({ privacy: { allow_friend_requests_from: 'unexpected_mode' } })
+      )
+    );
+    await usePrivacyStore.getState().fetchPrivacy();
+    expect(usePrivacyStore.getState().settings.allowFriendRequestsFrom).toBe('mutual_servers');
   });
 
   it('sends the snake_case wire field on PATCH', async () => {

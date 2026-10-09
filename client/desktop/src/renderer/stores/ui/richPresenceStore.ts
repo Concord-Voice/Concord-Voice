@@ -67,8 +67,8 @@ const PRESENCE_SETTINGS_ENDPOINT = '/api/v1/users/me/presence-settings';
 const INITIAL_PRESENCE_SETTINGS: PresenceSettings = {
   masterEnabled: true,
   serverVoiceTier: 1,
-  serverVoiceShowDetails: true,
-  privateCallTier: 0,
+  serverVoiceShowDetails: false,
+  privateCallTier: 1,
   privateCallShowDetails: false,
   customTextTier: 0,
 };

@@ -68,8 +68,8 @@ func TestGetPresenceSettingsDefaults(t *testing.T) {
 	requirePresenceSettingsBody(t, w, map[string]interface{}{
 		"master_enabled":            true,
 		"server_voice_tier":         float64(1),
-		"server_voice_show_details": true,
-		"private_call_tier":         float64(0),
+		"server_voice_show_details": false,
+		"private_call_tier":         float64(1),
 		"private_call_show_details": false,
 		"custom_text_tier":          float64(0),
 		"custom_text":               nil,
@@ -92,7 +92,7 @@ func TestGetPresenceSettingsReturnsPersistedRow(t *testing.T) {
 			user_id, master_enabled, server_voice_tier, server_voice_show_details,
 			private_call_tier, private_call_show_details,
 			custom_text_tier, custom_text, custom_text_emoji
-		) VALUES ($1, FALSE, 2, FALSE, 1, TRUE, 2, 'Heads down', '🎧')`,
+		) VALUES ($1, FALSE, 2, TRUE, 0, TRUE, 2, 'Heads down', '🎧')`,
 		user.ID,
 	)
 	require.NoError(t, err)
@@ -101,8 +101,8 @@ func TestGetPresenceSettingsReturnsPersistedRow(t *testing.T) {
 	requirePresenceSettingsBody(t, w, map[string]interface{}{
 		"master_enabled":            false,
 		"server_voice_tier":         float64(2),
-		"server_voice_show_details": false,
-		"private_call_tier":         float64(1),
+		"server_voice_show_details": true,
+		"private_call_tier":         float64(0),
 		"private_call_show_details": true,
 		"custom_text_tier":          float64(2),
 		"custom_text":               "Heads down",
@@ -263,13 +263,23 @@ func TestUpdatePresenceSettingsLegacyCustomTextOnly(t *testing.T) {
 	requirePresenceSettingsBody(t, w, map[string]interface{}{
 		"master_enabled":            true,
 		"server_voice_tier":         float64(1),
-		"server_voice_show_details": true,
-		"private_call_tier":         float64(0),
+		"server_voice_show_details": false,
+		"private_call_tier":         float64(1),
 		"private_call_show_details": false,
 		"custom_text_tier":          float64(0),
 		"custom_text":               "legacy client",
 		"custom_text_emoji":         nil,
 	})
+	var persistedDetails bool
+	var persistedPrivateTier int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT server_voice_show_details, private_call_tier
+		FROM user_presence_settings WHERE user_id = $1
+	`, user.ID).Scan(&persistedDetails, &persistedPrivateTier))
+	require.False(t, persistedDetails,
+		"a new Custom Status writer must persist its Server Voice details default")
+	require.Equal(t, 1, persistedPrivateTier,
+		"a new Custom Status writer must persist its Friends default")
 }
 
 func TestUpdatePresenceSettingsPreservesOmittedFields(t *testing.T) {

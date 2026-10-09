@@ -119,6 +119,28 @@ func TestDMTopologyPredicates_CoverRelationshipAndFailurePaths(t *testing.T) {
 	})
 }
 
+func TestDMTopologyFriendOfFriendDefaultWithoutPrivacyRow(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	users := seedTopologyUsers(t, db, 3)
+	ctx := context.Background()
+	addTopologyFriendship(t, db, users[0], users[1], "accepted")
+	addTopologyFriendship(t, db, users[1], users[2], "accepted")
+	h := NewHandler(HandlerDeps{DB: db})
+	level, fof, err := h.fetchDMPrivacySettings(users[2].String())
+	require.NoError(t, err)
+	assert.Equal(t, dmPrivacyFriendsAndServer, level)
+	assert.True(t, fof, "the ordinary DM path must use the same no-row default")
+
+	allowed, err := dmTopologyPermittedTx(ctx, db, users[0].String(), users[2].String())
+	require.NoError(t, err)
+	assert.True(t, allowed, "a fresh target accepts a mutual friend's DM")
+
+	setTopologyPrivacy(t, db, users[2], dmPrivacyFriendsAndServer, false)
+	allowed, err = dmTopologyPermittedTx(ctx, db, users[0].String(), users[2].String())
+	require.NoError(t, err)
+	assert.False(t, allowed, "a saved Off preference still denies the mutual friend")
+}
+
 func TestLockPreparedDMParticipants_DetectsMembershipMismatch(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	users := seedTopologyUsers(t, db, 2)

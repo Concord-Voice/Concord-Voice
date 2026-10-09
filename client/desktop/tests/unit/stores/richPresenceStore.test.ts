@@ -12,6 +12,7 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
 import { deferred } from '../../helpers/deferred';
+import { getPresenceActivityAudience } from '@/renderer/utils/ui/richPresencePresentation';
 
 const API_BASE = 'http://localhost:8080';
 const PRESENCE_SETTINGS_ENDPOINT = `${API_BASE}/api/v1/users/me/presence-settings`;
@@ -196,11 +197,14 @@ describe('presence settings contract (#2234)', () => {
     expect(settingsStore().presenceSettings).toEqual({
       masterEnabled: true,
       serverVoiceTier: 1,
-      serverVoiceShowDetails: true,
-      privateCallTier: 0,
+      serverVoiceShowDetails: false,
+      privateCallTier: 1,
       privateCallShowDetails: false,
       customTextTier: 0,
     });
+    expect(getPresenceActivityAudience('private_call', settingsStore().presenceSettings)).toBe(
+      'People currently in this call, plus your friends and eligible friends-of-friends.'
+    );
     expect(settingsStore().confirmedPresenceSettings).toBeNull();
     expect(settingsStore().presenceSettingsLoading).toBe(false);
   });
@@ -714,8 +718,8 @@ describe('presence settings contract (#2234)', () => {
     expect(settingsStore().presenceSettings).toEqual({
       masterEnabled: true,
       serverVoiceTier: 1,
-      serverVoiceShowDetails: true,
-      privateCallTier: 0,
+      serverVoiceShowDetails: false,
+      privateCallTier: 1,
       privateCallShowDetails: false,
       customTextTier: 0,
     });
@@ -779,8 +783,8 @@ describe('presence settings contract (#2234)', () => {
     expect(settingsStore().presenceSettings).toEqual({
       masterEnabled: true,
       serverVoiceTier: 1,
-      serverVoiceShowDetails: true,
-      privateCallTier: 0,
+      serverVoiceShowDetails: false,
+      privateCallTier: 1,
       privateCallShowDetails: false,
       customTextTier: 0,
     });

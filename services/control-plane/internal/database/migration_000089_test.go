@@ -50,8 +50,10 @@ func TestMigration000089_DefaultsConstraintsAndStructure(t *testing.T) {
 	))
 	assert.True(t, masterEnabled)
 	assert.Equal(t, int16(1), serverVoiceTier)
-	assert.True(t, serverVoiceShowDetails)
-	assert.Equal(t, int16(0), privateCallTier)
+	// The latest schema includes migration 000166. The isolated 000089 down/up
+	// exercise below still checks that migration's original defaults.
+	assert.False(t, serverVoiceShowDetails)
+	assert.Equal(t, int16(1), privateCallTier)
 	assert.False(t, privateCallShowDetails)
 
 	tierColumns := []struct {
@@ -92,16 +94,18 @@ func TestMigration000089_DownUpPreservesExistingState(t *testing.T) {
 	ctx := context.Background()
 	downSQL := migration000089SQL(t, "down")
 	upSQL := migration000089SQL(t, "up")
+	latestDefaultsSQL := migration000089SQL(t, "latest-defaults")
 
 	_, err := ts.DB.ExecContext(ctx, downSQL)
 	require.NoError(t, err, "down migration must remove the category settings extension")
 	migrationApplied := false
 	t.Cleanup(func() {
-		if migrationApplied {
-			return
+		if !migrationApplied {
+			_, cleanupErr := ts.DB.ExecContext(context.Background(), upSQL)
+			assert.NoError(t, cleanupErr, "restore migration 000089 after rollback test")
 		}
-		_, cleanupErr := ts.DB.ExecContext(context.Background(), upSQL)
-		assert.NoError(t, cleanupErr, "restore migration 000089 after rollback test")
+		_, cleanupErr := ts.DB.ExecContext(context.Background(), latestDefaultsSQL)
+		assert.NoError(t, cleanupErr, "restore the latest presence defaults after rollback test")
 	})
 
 	user := ts.CreateTestUser(t, "presence_category_legacy")
@@ -414,8 +418,9 @@ func migration000089SQL(t *testing.T, direction string) string {
 	t.Helper()
 
 	migrationFile, ok := map[string]string{
-		"up":   "000089_add_presence_category_settings.up.sql",
-		"down": "000089_add_presence_category_settings.down.sql",
+		"up":              "000089_add_presence_category_settings.up.sql",
+		"down":            "000089_add_presence_category_settings.down.sql",
+		"latest-defaults": "000166_align_presence_and_fof_defaults.up.sql",
 	}[direction]
 	require.True(t, ok, "unexpected migration direction %q", direction)
 

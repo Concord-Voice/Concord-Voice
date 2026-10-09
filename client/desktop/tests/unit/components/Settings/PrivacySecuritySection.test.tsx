@@ -510,6 +510,9 @@ describe('PrivacySecuritySection', () => {
     expect(screen.getByText('Searchable by Username')).toBeInTheDocument();
     expect(screen.getByText('Searchable by Email')).toBeInTheDocument();
     expect(screen.getByText('Searchable by Phone Number')).toBeInTheDocument();
+    expect(screen.getByText(/Show your profile in Add Friend search/)).toHaveTextContent(
+      /people in your servers can still see you in member lists/
+    );
   });
   it('renders content safety', async () => {
     render(<PrivacySecuritySection />);
@@ -526,29 +529,27 @@ describe('PrivacySecuritySection', () => {
     );
     expect(mockUpdatePrivacy).toHaveBeenCalledWith({ searchableByUsername: true });
   });
-  it('toggles searchable by email', async () => {
+  it('labels email search as planned and does not allow changing its stored choice', async () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('Searchable by Email')).toBeInTheDocument());
-    fireEvent.click(
-      screen
-        .getByText('Searchable by Email')
-        .closest('.settings-row')!
-        .querySelector('input[type="checkbox"]')!
-    );
-    expect(mockUpdatePrivacy).toHaveBeenCalledWith({ searchableByEmail: true });
+    const row = screen.getByText('Searchable by Email').closest('.settings-row')!;
+    expect(row).toHaveTextContent('Planned. Email search is not available yet.');
+    const toggle = row.querySelector('input[type="checkbox"]')!;
+    expect(toggle).toBeDisabled();
+    fireEvent.click(toggle);
+    expect(mockUpdatePrivacy).not.toHaveBeenCalledWith({ searchableByEmail: true });
   });
-  it('toggles searchable by phone', async () => {
+  it('labels phone search as planned and does not allow changing its stored choice', async () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() =>
       expect(screen.getByText('Searchable by Phone Number')).toBeInTheDocument()
     );
-    fireEvent.click(
-      screen
-        .getByText('Searchable by Phone Number')
-        .closest('.settings-row')!
-        .querySelector('input[type="checkbox"]')!
-    );
-    expect(mockUpdatePrivacy).toHaveBeenCalledWith({ searchableByPhone: true });
+    const row = screen.getByText('Searchable by Phone Number').closest('.settings-row')!;
+    expect(row).toHaveTextContent('Planned. Phone number search is not available yet.');
+    const toggle = row.querySelector('input[type="checkbox"]')!;
+    expect(toggle).toBeDisabled();
+    fireEvent.click(toggle);
+    expect(mockUpdatePrivacy).not.toHaveBeenCalledWith({ searchableByPhone: true });
   });
   it('toggles embedded content', async () => {
     render(<PrivacySecuritySection />);
@@ -3403,6 +3404,17 @@ describe('PrivacySecuritySection — friend-request write path (#1241)', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('describes mutual friends and friend codes in the Mutual Servers setting', async () => {
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() =>
+      expect(screen.getByText('Who Can Send You Friend Requests')).toBeInTheDocument()
+    );
+    const group = friendRequestGroup();
+    fireEvent.click(within(group).getByRole('button', { name: 'Mutual Servers' }));
+    expect(within(group).getByText(/share a server or a friend with you/)).toBeInTheDocument();
+    expect(within(group).getByText(/Someone with a valid friend code can too/)).toBeInTheDocument();
   });
 
   it('issues exactly one PATCH carrying the picked friend-request mode', async () => {

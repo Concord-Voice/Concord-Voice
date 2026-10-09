@@ -401,10 +401,10 @@ const AudioQualitySettings: React.FC<AudioQualitySettingsProps> = ({
       setQualityTier(tier);
       if (!useAudioSettingsStore.getState().advancedMode) {
         const config = AUDIO_QUALITY_TIERS[tier];
+        // Basic FEC headroom and DTX are resolved from the tier at runtime. Do not
+        // write the Advanced toggles here or a tier change can silently switch them on.
         batchSetAudioDrafts({
-          silenceDetection: config.opusDtx,
           inlineFec: config.opusFec,
-          fecHeadroom: config.opusFec,
           frameSize: 0,
           stereoOverride: null,
         });

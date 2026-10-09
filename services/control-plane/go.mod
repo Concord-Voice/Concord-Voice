@@ -1,6 +1,6 @@
 module github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/alicebob/miniredis/v2 v2.39.0
@@ -22,6 +22,7 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/crypto v0.57.0
 	golang.org/x/image v0.46.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sync v0.23.0
 )
 
@@ -72,7 +73,6 @@ require (
 	go.uber.org/atomic v1.12.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.31.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

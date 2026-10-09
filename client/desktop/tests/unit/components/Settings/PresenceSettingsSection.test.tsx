@@ -397,6 +397,63 @@ describe('PresenceSettingsSection', () => {
     await screen.findByRole('button', { name: 'Friends in server', pressed: true });
   });
 
+  // Before the server confirms, the store holds placeholder settings. Showing them
+  // as a pressed tier or an "on" switch presents a guess as the user's choice.
+  it('asserts no tier, switch, audience or example until the settings are confirmed', async () => {
+    let resolveGet!: (response: Response) => void;
+    const pendingGet = new Promise<Response>((resolve) => {
+      resolveGet = resolve;
+    });
+    mswServer.use(http.get(PRESENCE_PATH, () => pendingGet));
+    render(<PresenceSettingsSection />);
+
+    expect(useRichPresenceStore.getState().confirmedPresenceSettings).toBeNull();
+    const options = Array.from(document.querySelectorAll<HTMLElement>('.presence-tier-option'));
+    // Two activity cards and the Custom Status row, three options each.
+    expect(options).toHaveLength(9);
+    for (const option of options) {
+      expect(option).toHaveAttribute('aria-pressed', 'false');
+      expect(option).not.toHaveClass('active');
+    }
+    expect(screen.getByRole('switch', { name: 'Share Rich Presence' })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: /Server Voice.*details/i })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: /Private Call.*details/i })).not.toBeChecked();
+    // Audience and Example in both activity cards read as loading, not as the placeholder.
+    expect(screen.getAllByText('Loading your setting…')).toHaveLength(4);
+    expect(screen.queryByText(/Friends—and eligible friends-of-friends/)).not.toBeInTheDocument();
+    expect(screen.queryByText('In voice in #General on Concord')).not.toBeInTheDocument();
+
+    resolveGet(new Response(JSON.stringify(presenceSettingsResponse()), { status: 200 }));
+    await screen.findByRole('button', { name: 'Friends in server', pressed: true });
+    expect(screen.queryByText('Loading your setting…')).not.toBeInTheDocument();
+  });
+
+  it('renders the confirmed values once the settings arrive, including Private Call Friends', async () => {
+    mswServer.use(
+      http.get(PRESENCE_PATH, () =>
+        HttpResponse.json(
+          presenceSettingsResponse({ private_call_tier: 1, private_call_show_details: true })
+        )
+      )
+    );
+    render(<PresenceSettingsSection />);
+
+    const friends = within(privateCallScope()).getByRole('button', { name: 'Friends' });
+    await waitFor(() => expect(friends).toHaveAttribute('aria-pressed', 'true'));
+    expect(friends).toHaveClass('active');
+    expect(within(privateCallScope()).getByRole('button', { name: 'Off' })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+    expect(screen.getByRole('switch', { name: 'Share Rich Presence' })).toBeChecked();
+    expect(screen.getByRole('switch', { name: /Private Call.*details/i })).toBeChecked();
+    expect(
+      screen.getByText(
+        'People currently in this call, plus your friends and eligible friends-of-friends.'
+      )
+    ).toBeInTheDocument();
+  });
+
   it('offers one hydration retry after a failed or malformed GET', async () => {
     let attempts = 0;
     mswServer.use(

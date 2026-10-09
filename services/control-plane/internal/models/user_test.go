@@ -42,7 +42,7 @@ func TestPublicUserIncludesAllFields(t *testing.T) {
 	u := baseUser()
 	u.UsernameChangedAt = timePtr(time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
 
-	pub := u.PublicUser()
+	pub := u.PublicUser(3)
 
 	assert.Equal(t, testUserID, pub["id"])
 	assert.Equal(t, "test@example.com", pub["email"])
@@ -55,7 +55,7 @@ func TestPublicUserIncludesAllFields(t *testing.T) {
 	assert.Equal(t, "dark", pub["color_scheme"])
 	assert.NotNil(t, pub["links"])
 	assert.NotNil(t, pub["username_changed_at"])
-	assert.NotNil(t, pub["username_change_eligible_at"])
+	assert.Equal(t, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), pub["username_change_eligible_at"])
 	// Regression (#1648): the vestigial e2ee_preference field was removed from
 	// the User model and PublicUser serialization. The profile/login responses
 	// (which surface PublicUser) must never carry it again.
@@ -63,9 +63,38 @@ func TestPublicUserIncludesAllFields(t *testing.T) {
 	assert.False(t, hasE2EE, "e2ee_preference removed in #1648; must not appear in PublicUser")
 }
 
+func TestUsernameChangeEligibleAtClampsCalendarMonthEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		start  time.Time
+		months int
+		want   time.Time
+	}{
+		{
+			name:  "three months ends in February in a common year",
+			start: time.Date(2025, 11, 30, 16, 45, 0, 0, time.UTC), months: 3,
+			want: time.Date(2026, 2, 28, 16, 45, 0, 0, time.UTC),
+		},
+		{
+			name:  "six months ends in leap February",
+			start: time.Date(2023, 8, 31, 9, 15, 0, 0, time.UTC), months: 6,
+			want: time.Date(2024, 2, 29, 9, 15, 0, 0, time.UTC),
+		},
+		{
+			name:  "normal month keeps day and time",
+			start: time.Date(2026, 1, 15, 23, 59, 0, 0, time.UTC), months: 6,
+			want: time.Date(2026, 7, 15, 23, 59, 0, 0, time.UTC),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, UsernameChangeEligibleAt(tc.start, tc.months))
+		})
+	}
+}
+
 func TestPublicUserOmitsPasswordHash(t *testing.T) {
 	u := baseUser()
-	pub := u.PublicUser()
+	pub := u.PublicUser(6)
 
 	_, hasPassword := pub["password_hash"]
 	assert.False(t, hasPassword, "password_hash should not be in public user")
@@ -77,7 +106,7 @@ func TestPublicUserNilOptionalFields(t *testing.T) {
 		Email:    "bare@example.com",
 		Username: "bareuser",
 	}
-	pub := u.PublicUser()
+	pub := u.PublicUser(6)
 
 	assert.Equal(t, "user-456", pub["id"])
 	assert.Equal(t, "bareuser", pub["username"])

@@ -75,8 +75,7 @@ func setPrivacyMode(t *testing.T, ts *testhelpers.TestServer, userID, mode strin
 	require.NoError(t, err)
 }
 
-// joinSameServer puts both users in one freshly created server, which is the
-// only thing that makes mutual_servers evaluate true.
+// joinSameServer creates the shared-server relationship used by these fixtures.
 func joinSameServer(t *testing.T, ts *testhelpers.TestServer, ownerID, memberID string) {
 	t.Helper()
 	serverID := ts.CreateTestServer(t, ownerID, "privacy-gate-server")
@@ -344,6 +343,91 @@ func TestSendRequestGateHonoursMutualServers(t *testing.T) {
 	assert.Zero(t, friendshipRowCount(t, ts, requester.ID, stranger.ID))
 }
 
+// A mutual accepted friend is a relationship path, even when the users share
+// no server. A pending edge is not enough, and No One still refuses the request.
+func TestSendRequestGateHonoursMutualFriend(t *testing.T) {
+	ts := setupTS(t)
+	requester := ts.CreateTestUser(t, "fofrequester")
+	mutual := ts.CreateTestUser(t, "fofmutual")
+	target := ts.CreateTestUser(t, "foftarget")
+	stranger := ts.CreateTestUser(t, "fofstranger")
+	ts.CreateFriendship(t, requester.ID, mutual.ID, statusAccepted)
+	ts.CreateFriendship(t, mutual.ID, target.ID, statusAccepted)
+	ts.CreateFriendship(t, mutual.ID, stranger.ID, statusPending)
+	setPrivacyMode(t, ts, target.ID, wireModeMutualServers)
+	setPrivacyMode(t, ts, stranger.ID, wireModeMutualServers)
+
+	probe := probeEligibility(t, ts, requester, target.ID)
+	require.Equal(t, http.StatusOK, probe.Code, probe.Body.String())
+	assert.True(t, eligibleFlag(t, probe))
+	refused := sendFriendRequest(t, ts, requester, stranger.ID)
+	assert.Equal(t, http.StatusForbidden, refused.Code, refused.Body.String())
+	accepted := sendFriendRequest(t, ts, requester, target.ID)
+	assert.Equal(t, http.StatusCreated, accepted.Code, accepted.Body.String())
+
+	closed := ts.CreateTestUser(t, "fofclosed")
+	ts.CreateFriendship(t, mutual.ID, closed.ID, statusAccepted)
+	setPrivacyMode(t, ts, closed.ID, wireModeNobody)
+	closedProbe := probeEligibility(t, ts, requester, closed.ID)
+	require.Equal(t, http.StatusOK, closedProbe.Code, closedProbe.Body.String())
+	assert.False(t, eligibleFlag(t, closedProbe))
+	denied := sendFriendRequest(t, ts, requester, closed.ID)
+	assert.Equal(t, http.StatusForbidden, denied.Code, denied.Body.String())
+}
+
+// A valid friend code is an invitation from the owner, so mutual_servers may
+// accept a stranger who presents it. The ordinary username/user-ID request
+// remains blocked for the same pair.
+func TestFriendCodeClaimAllowsStrangerUnderMutualServers(t *testing.T) {
+	for _, autoAccept := range []bool{false, true} {
+		name := "pending"
+		wantStatus := statusPending
+		if autoAccept {
+			name = "auto-accept"
+			wantStatus = statusAccepted
+		}
+		t.Run(name, func(t *testing.T) {
+			ts := setupTS(t)
+			owner := ts.CreateTestUser(t, "codegateowner")
+			claimer := ts.CreateTestUser(t, "codegateclaimer")
+			setPrivacyMode(t, ts, owner.ID, wireModeMutualServers)
+
+			refused := sendFriendRequest(t, ts, claimer, owner.ID)
+			require.Equal(t, http.StatusForbidden, refused.Code, refused.Body.String())
+
+			code := "CODEGATE"
+			createFriendCode(t, ts, owner.ID, code, nil, nil, autoAccept)
+			claim := ts.DoRequest(http.MethodPost, pathFriendCodes+"/"+code+pathClaim,
+				nil, testhelpers.AuthHeaders(claimer.AccessToken))
+			require.Equal(t, http.StatusOK, claim.Code, claim.Body.String())
+
+			var body map[string]interface{}
+			require.NoError(t, json.Unmarshal(claim.Body.Bytes(), &body))
+			assert.Equal(t, wantStatus, body["status"])
+			assert.Equal(t, 1, friendshipRowCount(t, ts, owner.ID, claimer.ID))
+		})
+	}
+}
+
+// No One overrides even a valid, unexpired code. A rejected claim consumes
+// neither the code nor a friendship row.
+func TestFriendCodeClaimRejectsNobodyWithoutConsumingCode(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "codegateclosed")
+	claimer := ts.CreateTestUser(t, "codegateoutside")
+	setPrivacyMode(t, ts, owner.ID, wireModeNobody)
+	code := "CODESTOP"
+	codeID := createFriendCode(t, ts, owner.ID, code, nil, nil, true)
+
+	claim := ts.DoRequest(http.MethodPost, pathFriendCodes+"/"+code+pathClaim,
+		nil, testhelpers.AuthHeaders(claimer.AccessToken))
+	require.Equal(t, http.StatusForbidden, claim.Code, claim.Body.String())
+	assert.Zero(t, friendshipRowCount(t, ts, owner.ID, claimer.ID))
+	var uses int
+	require.NoError(t, ts.DB.QueryRow(`SELECT use_count FROM friend_codes WHERE id = $1`, codeID).Scan(&uses))
+	assert.Zero(t, uses)
+}
+
 // TestSendRequestPreExistingOutcomesSurviveTheEligibilityGate is the regression
 // half of the merge described in §6.3.
 //
@@ -437,6 +521,7 @@ func TestPendingRequestStaysAcceptableAfterTheAddresseeChoosesNobody(t *testing.
 	ts := setupTS(t)
 	requester := ts.CreateTestUser(t, "q1requester")
 	addressee := ts.CreateTestUser(t, "q1addressee")
+	setPrivacyMode(t, ts, addressee.ID, wireModeEveryone)
 
 	sent := sendFriendRequest(t, ts, requester, addressee.ID)
 	require.Equal(t, http.StatusCreated, sent.Code, sent.Body.String())

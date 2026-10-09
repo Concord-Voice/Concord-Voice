@@ -61,11 +61,11 @@ const UNSUPPORTED_LATCH_MS = 10 * 60_000;
 /**
  * How long a settled verdict may be trusted.
  *
- * Eligibility under `mutual_servers` is a function of shared-server membership,
- * which changes mid-session: a viewer told `ineligible`, who then joins a server
- * the target is in, would otherwise keep the affordance hidden until logout — a
- * hide no longer backed by a current authoritative `false`. Bounded staleness
- * beats unbounded.
+ * Eligibility under `mutual_servers` is a function of shared-server membership
+ * and accepted mutual friends. These can change mid-session: a viewer told
+ * `ineligible` who then gains a shared server or mutual friend would otherwise
+ * keep the affordance hidden until logout, even though the earlier `false` is
+ * stale. The cache bounds how long the old verdict can hide the action.
  */
 const VERDICT_TTL_MS = 5 * 60_000;
 

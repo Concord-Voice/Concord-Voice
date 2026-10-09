@@ -466,6 +466,22 @@
   gap: 4px;
 }
 
+.settings-member-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.settings-member-search:focus {
+  outline: 1px solid var(--state-focused);
+}
+
 /* Column headers */
 .settings-member-list-header {
   display: grid;

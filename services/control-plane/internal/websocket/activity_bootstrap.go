@@ -251,9 +251,13 @@ func (h *Hub) authorizeBasePresenceCandidates(
 		   )
 		   OR EXISTS (
 		       SELECT 1
-		       FROM privacy_settings sender_privacy
-		       WHERE sender_privacy.user_id = candidate.sender_id
-		         AND sender_privacy.dm_friends_of_friends
+		       WHERE COALESCE((SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = candidate.sender_id), TRUE)
+		         AND NOT EXISTS (
+		             SELECT 1 FROM friendships blocked
+		             WHERE blocked.status = 'blocked'
+		               AND ((blocked.requester_id = candidate.sender_id AND blocked.addressee_id = $1)
+		                 OR (blocked.addressee_id = candidate.sender_id AND blocked.requester_id = $1))
+		         )
 		         AND EXISTS (
 		             SELECT 1
 		             FROM friendships sender_friend
@@ -493,6 +497,15 @@ func (h *Hub) publishClientPresenceSnapshot(
 		return err
 	}
 	// Before publish, so it is in place for the live frames flushed after it.
+	setPresenceSnapshotCoverage(seed, refreshedBase, coverage)
+	return publish(snapshot)
+}
+
+func setPresenceSnapshotCoverage(
+	seed presenceSnapshotSeed,
+	refreshedBase map[uuid.UUID]string,
+	coverage func(omitted, covered map[uuid.UUID]struct{}),
+) {
 	if seed.truncated {
 		covered := make(map[uuid.UUID]struct{}, len(refreshedBase))
 		for id := range refreshedBase {
@@ -512,7 +525,6 @@ func (h *Hub) publishClientPresenceSnapshot(
 		}
 		coverage(dropped, nil)
 	}
-	return publish(snapshot)
 }
 
 func (h *Hub) refreshBasePresenceForPublication(

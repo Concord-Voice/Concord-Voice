@@ -150,11 +150,11 @@ func TestUpdatePresenceSettingsRunsActivityCleanupAfterCommitAndClaim(t *testing
 		SenderID: senderID,
 		Before: presence.ActivityPolicySettings{
 			MasterEnabled: true, ServerVoiceTier: presence.TierFriends,
-			ServerVoiceShowDetails: true, PrivateCallTier: presence.TierOff,
+			ServerVoiceShowDetails: false, PrivateCallTier: presence.TierFriends,
 		},
 		After: presence.ActivityPolicySettings{
 			MasterEnabled: false, ServerVoiceTier: presence.TierServers,
-			ServerVoiceShowDetails: true, PrivateCallTier: presence.TierFriends,
+			ServerVoiceShowDetails: false, PrivateCallTier: presence.TierFriends,
 		},
 		MasterEnabled:      false,
 		ServerVoiceTier:    presence.TierServers,
@@ -728,8 +728,8 @@ func TestUpdatePresenceSettingsOrdinarySameValueWriteCreatesNoCleanupWork(t *tes
 	response := invokePresenceSettingsPATCH(handler, senderID, map[string]interface{}{
 		"master_enabled":            true,
 		"server_voice_tier":         int(presence.TierFriends),
-		"server_voice_show_details": true,
-		"private_call_tier":         int(presence.TierOff),
+		"server_voice_show_details": false,
+		"private_call_tier":         int(presence.TierFriends),
 		"private_call_show_details": false,
 	})
 
@@ -808,6 +808,11 @@ func TestUpdatePresenceSettingsExpiredRetryStillCompletesDurableCleanup(t *testi
 func TestUpdatePresenceSettingsConfirmedCommitRunsCleanupAfterCustomDeliveryFailure(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	senderID := testhelpers.CreateUser(t, db)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (user_id, server_voice_show_details)
+		VALUES ($1, TRUE)
+	`, senderID)
+	require.NoError(t, err)
 	deliveryErr := errors.New("custom status delivery unavailable")
 	suppressor := &recordingActivitySettingsSuppressor{}
 	var logs strings.Builder

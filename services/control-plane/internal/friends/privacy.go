@@ -41,17 +41,17 @@ func sameUser(a, b string) bool {
 
 // canReceiveFriendRequestFrom reports whether targetID accepts a friend request from requesterID.
 //
-// SECURITY — the shared-server EXISTS is the CASE *condition*, not a CASE *arm*. Postgres evaluates
-// CASE conditions in order, so the join runs on every path; the enum subexpression appears in both
-// arms, so it too runs on every path. All three enum values therefore perform identical database
-// work for a fixed (requester, target) pair. Moving the EXISTS into an arm, or rewriting this with
+// SECURITY — the relationship checks are the first CASE *condition*, not a CASE *arm*. Their query shape
+// is independent of the target's enum value, and the enum subexpression appears in every result arm.
+// All three enum values therefore use the same statement for a fixed (requester, target, claim type).
+// Moving the EXISTS into an arm, or rewriting this with
 // AND/OR (whose operand evaluation order Postgres does not define), reopens the timing channel this
 // helper exists to close. Do not "simplify" it.
 //
-// Wraps sql.ErrNoRows when targetID does not exist; both call sites use errors.Is. The enum value itself never becomes a Go
+// Wraps sql.ErrNoRows when targetID does not exist; callers use errors.Is. The enum value itself never becomes a Go
 // value here, so it cannot be logged ([internal]rules/observability.md).
 func (h *Handler) canReceiveFriendRequestFrom(ctx context.Context, targetID, requesterID string) (bool, error) {
-	return h.canReceiveFriendRequestFromQ(ctx, h.db, targetID, requesterID)
+	return h.canReceiveFriendRequestFromQ(ctx, h.db, targetID, requesterID, false)
 }
 
 // rowQuerier is satisfied by both *sql.DB and *sql.Tx. RED-TEAM FIX RT-1: the
@@ -63,10 +63,13 @@ type rowQuerier interface {
 }
 
 // canReceiveFriendRequestFromQ is canReceiveFriendRequestFrom against an
-// explicit querier. The statement is byte-identical, so all three enum values
-// keep performing identical database work on every call site.
+// explicit querier. A validated friend-code claim may pass viaFriendCode=true:
+// that bearer code permits a stranger when the owner chose mutual_servers,
+// but nobody still refuses. Direct requests and the eligibility probe always
+// pass false. The statement shape is identical on every call site; no enum
+// value is returned to Go or logged.
 func (h *Handler) canReceiveFriendRequestFromQ(
-	ctx context.Context, q rowQuerier, targetID, requesterID string,
+	ctx context.Context, q rowQuerier, targetID, requesterID string, viaFriendCode bool,
 ) (bool, error) {
 	var eligible bool
 	err := q.QueryRowContext(ctx, `
@@ -76,14 +79,28 @@ func (h *Handler) canReceiveFriendRequestFromQ(
 		             FROM server_members sm1
 		             JOIN server_members sm2 ON sm1.server_id = sm2.server_id
 		             WHERE sm1.user_id = $1 AND sm2.user_id = $2
+		         ) OR EXISTS (
+		             SELECT 1
+		             FROM friendships target_friend
+		             JOIN friendships requester_friend
+		               ON requester_friend.status = 'accepted'
+		              AND (requester_friend.requester_id = $2 OR requester_friend.addressee_id = $2)
+		              AND (CASE WHEN target_friend.requester_id = $1
+		                        THEN target_friend.addressee_id ELSE target_friend.requester_id END)
+		                = (CASE WHEN requester_friend.requester_id = $2
+		                        THEN requester_friend.addressee_id ELSE requester_friend.requester_id END)
+		             WHERE target_friend.status = 'accepted'
+		               AND (target_friend.requester_id = $1 OR target_friend.addressee_id = $1)
 		         )
-		         THEN COALESCE(ps.allow_friend_requests_from, 'everyone') <> 'nobody'
-		         ELSE COALESCE(ps.allow_friend_requests_from, 'everyone') =  'everyone'
+		         THEN COALESCE(ps.allow_friend_requests_from, 'mutual_servers') <> 'nobody'
+		         WHEN $3::boolean
+		         THEN COALESCE(ps.allow_friend_requests_from, 'mutual_servers') <> 'nobody'
+		         ELSE COALESCE(ps.allow_friend_requests_from, 'mutual_servers') =  'everyone'
 		       END AS eligible
 		FROM users u
 		LEFT JOIN privacy_settings ps ON ps.user_id = u.id
 		WHERE u.id = $1
-	`, targetID, requesterID).Scan(&eligible)
+	`, targetID, requesterID, viaFriendCode).Scan(&eligible)
 	if err != nil {
 		return false, fmt.Errorf("check friend request eligibility: %w", err)
 	}
@@ -131,8 +148,9 @@ func (h *Handler) GetFriendRequestEligibility(c *gin.Context) {
 		return
 	}
 
-	// RED-TEAM FIX RT-2: the privacy statement above consults NO friendship
-	// state, so before this the endpoint answered `true` for a target who had
+	// RED-TEAM FIX RT-2: the privacy statement above checks shared accepted
+	// friends but does not reject blocked pairs, so before this the endpoint
+	// answered `true` for a target who had
 	// BLOCKED the caller — while POST /friends/request answered 403. Composing
 	// the two therefore separated privacy-blocked from user-blocked, the exact
 	// pair spec §2 declares indistinguishable, and falsified this route's own

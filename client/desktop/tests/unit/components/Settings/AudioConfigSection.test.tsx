@@ -24,7 +24,7 @@ let outputTestState = { isTesting: false, error: null as string | null };
 const defaultAudioSettings: Record<string, unknown> = {
   noiseCancellation: true,
   echoCancellation: true,
-  autoGainControl: true,
+  autoGainControl: false,
   noiseGateMode: 'dynamic',
   noiseGateLevel: -50,
   quietBoost: false,
@@ -554,11 +554,18 @@ describe('AudioConfigSection', () => {
     expect(mockSetQualityTier).toHaveBeenCalledWith('minimum');
     expect(batchSetAudioDrafts).toHaveBeenCalledWith(
       expect.objectContaining({
-        silenceDetection: true,
         inlineFec: true,
         frameSize: 0,
         stereoOverride: null,
       })
+    );
+    expect((batchSetAudioDrafts as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toHaveProperty(
+      'fecHeadroom'
+    );
+    // Advanced DTX is the user's Advanced preference; Basic resolves DTX from the tier
+    // at runtime, so a tier change must not write it ('minimum' has opusDtx: true).
+    expect((batchSetAudioDrafts as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toHaveProperty(
+      'silenceDetection'
     );
   });
 
@@ -812,7 +819,9 @@ describe('AudioConfigSection', () => {
 
   // ===== 10. Dynamic noise gate modes and status =====
 
-  it('offers Dynamic and Off when AGC is effective', () => {
+  it('offers Dynamic and Off when AGC is effective', async () => {
+    // Fresh installs default AGC off, so this case opts in explicitly.
+    await overrideDraftSettings({ autoGainControl: true });
     render(<AudioConfigSection />);
     const select = screen.getByRole('combobox', { name: 'Noise Gate' });
     expect(select).toHaveValue('dynamic');
@@ -1095,9 +1104,9 @@ describe('AudioConfigSection', () => {
     const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-    // Uncheck auto gain control (index 2)
+    // Enable auto gain control from its new-user Off default (index 2)
     fireEvent.click(checkboxes[2]);
-    expect(setDraftAudioSetting).toHaveBeenCalledWith('autoGainControl', false);
+    expect(setDraftAudioSetting).toHaveBeenCalledWith('autoGainControl', true);
   });
 
   it('does not call setDraftAudioSetting for processing toggles when musicMode is true', async () => {

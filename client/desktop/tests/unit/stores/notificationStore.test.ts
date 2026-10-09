@@ -1,5 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useNotificationStore } from '../../../src/renderer/stores/ui/notificationStore';
+import { applyContentPrivacy } from '../../../src/renderer/services/system/desktopNotificationService';
+
+const previewOptions = {
+  title: 'Message from Alice',
+  senderDisplayName: 'Alice',
+  body: 'Private message body',
+  targetType: 'dm' as const,
+  targetId: 'dm-1',
+  senderId: 'alice-1',
+};
 
 describe('notificationStore', () => {
   beforeEach(() => {
@@ -27,7 +37,7 @@ describe('notificationStore', () => {
       quietHoursEnabled: false,
       quietHoursStart: '22:00',
       quietHoursEnd: '08:00',
-      notificationContent: 'full',
+      notificationContent: 'sender_only',
     });
   });
 
@@ -98,7 +108,28 @@ describe('notificationStore', () => {
     expect(state.quietHoursEnabled).toBe(false);
     expect(state.quietHoursStart).toBe('22:00');
     expect(state.quietHoursEnd).toBe('08:00');
-    expect(state.notificationContent).toBe('full');
+    expect(state.notificationContent).toBe('sender_only');
+  });
+
+  it('shows the sender but hides the message in a new user desktop preview', () => {
+    expect(applyContentPrivacy(previewOptions)).toEqual({ title: 'Alice', body: '' });
+  });
+
+  it('keeps an existing full-preview choice after rehydration', async () => {
+    localStorage.setItem(
+      'concord:notification-sounds',
+      JSON.stringify({ state: { notificationContent: 'full' }, version: 0 })
+    );
+    await (
+      useNotificationStore as typeof useNotificationStore & {
+        persist: { rehydrate: () => Promise<void> };
+      }
+    ).persist.rehydrate();
+
+    expect(applyContentPrivacy(previewOptions)).toEqual({
+      title: 'Message from Alice',
+      body: 'Private message body',
+    });
   });
 
   it('sets notificationContent', () => {

@@ -659,6 +659,41 @@ activity_history_stop_control_plane() {
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 control-plane)
 }
 
+privacy_defaults_require_local_control_plane_drained() {
+  # Compose stop addresses only this project. A second project on the same
+  # daemon must not keep an old binary serving while startup applies the new
+  # privacy and presence defaults. This check cannot inspect another host.
+  activity_history_refresh_daemon_ids || return 1
+  if [[ ${#ACTIVITY_HISTORY_DAEMON_IDS[@]} -ne 0 ]]; then
+    echo "privacy-defaults: control-plane still runs on this Docker daemon; refusing startup migrations" >&2
+    return 1
+  fi
+}
+
+privacy_defaults_refuse_foreign_control_plane() {
+  # The drain check above is daemon-wide, so a control plane from another
+  # Compose project fails it only after this project's serving instance has
+  # stopped, leaving the service down. Refuse while ours still serves. The
+  # post-stop check stays: it covers one started after this preflight.
+  local own id line owned
+  activity_history_refresh_daemon_ids || return 1
+  if ! own="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q -- control-plane 2>/dev/null)"; then
+    echo "privacy-defaults: failed to inspect this project's control-plane" >&2
+    return 1
+  fi
+  for id in ${ACTIVITY_HISTORY_DAEMON_IDS[@]+"${ACTIVITY_HISTORY_DAEMON_IDS[@]}"}; do
+    # docker ps prints short IDs; compose ps -q prints full IDs.
+    owned=0
+    while IFS= read -r line; do
+      [[ -n "$line" && "$line" == "$id"* ]] && { owned=1; break; }
+    done <<<"$own"
+    if (( ! owned )); then
+      echo "privacy-defaults: another Compose project runs a control-plane on this Docker daemon; refusing before stopping this one" >&2
+      return 1
+    fi
+  done
+}
+
 activity_history_wait_control_plane() {
   local timeout="${ACTIVITY_HISTORY_HEALTH_TIMEOUT:-60}"
   local interval="${ACTIVITY_HISTORY_HEALTH_INTERVAL:-2}"
@@ -1154,6 +1189,14 @@ voice_enforcement_rollout_deploy() {
   # readiness because the rollout singleton is created by CP startup migration.
   echo "voice-enforcement-rollout: building the new control-plane image"
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane)
+  # Migrations 000165–000166 change privacy and presence defaults. Stop and
+  # drain the previous local binary before startup can apply them; older
+  # writers must not run beside the new policy. Multi-host deployments must
+  # drain the other replicas before invoking this rollout.
+  echo "voice-enforcement-rollout: draining the previous control-plane"
+  privacy_defaults_refuse_foreign_control_plane || return 1
+  activity_history_stop_control_plane || return 1
+  privacy_defaults_require_local_control_plane_drained || return 1
   echo "voice-enforcement-rollout: starting the control-plane in compatibility mode"
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
     --wait-timeout 180 control-plane)
@@ -1790,7 +1833,18 @@ else:
     # only when WaitTimeout > 0, so a bare --wait blocks forever and would hang
     # the deploy's SSH session with the stack in an indeterminate state.
     echo "Scope: ${REBUILD_SCOPE[*]} (--no-deps --wait)"
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
+    if [[ $_has_control_plane -eq 1 ]]; then
+      # Build while the previous control-plane is still serving. A slow or
+      # failed image build must not extend the migration drain or leave it down.
+      (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "${REBUILD_SCOPE[@]}") || exit 1
+      echo "rebuild: draining the previous control-plane before its startup migrations"
+      privacy_defaults_refuse_foreign_control_plane || exit 1
+      activity_history_stop_control_plane || exit 1
+      privacy_defaults_require_local_control_plane_drained || exit 1
+      cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
+    else
+      cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
+    fi
     selfhost_post_up_check || exit 1
     [[ $_rebuild_starts_coturn -eq 0 ]] || selfhost_tls_ready_gate || exit 1
     echo "Done."

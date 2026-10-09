@@ -37,12 +37,15 @@ interface DMPrivacyControlsProps {
   setDmPrivacyLevel: (level: DMPrivacyLevel) => void;
   /** #1241 / AC-19: a rejected PATCH reverts the slider and says so. */
   saveError?: string | null;
+  /** Until the server answers, the store holds placeholders, not the user's choices. */
+  isLoaded: boolean;
 }
 
 const DMPrivacyControls = ({
   localDmLevel,
   setDmPrivacyLevel,
   saveError = null,
+  isLoaded,
 }: DMPrivacyControlsProps) => {
   const privacySettings = usePrivacyStore((s) => s.settings);
   const updatePrivacy = usePrivacyStore((s) => s.updatePrivacy);
@@ -115,13 +118,13 @@ const DMPrivacyControls = ({
           </span>
         </div>
         <ToggleSwitch
-          checked={computeFofChecked(localDmLevel, privacySettings.dmFriendsOfFriends)}
+          checked={isLoaded && computeFofChecked(localDmLevel, privacySettings.dmFriendsOfFriends)}
           onChange={(v) => {
-            if (!isFofDisabled(localDmLevel)) {
+            if (isLoaded && !isFofDisabled(localDmLevel)) {
               updatePrivacy({ dmFriendsOfFriends: v });
             }
           }}
-          disabled={isFofDisabled(localDmLevel)}
+          disabled={!isLoaded || isFofDisabled(localDmLevel)}
         />
       </div>
 
@@ -133,8 +136,11 @@ const DMPrivacyControls = ({
           </span>
         </div>
         <ToggleSwitch
-          checked={privacySettings.autoAcceptFriendCodes}
-          onChange={(v) => updatePrivacy({ autoAcceptFriendCodes: v })}
+          checked={isLoaded && privacySettings.autoAcceptFriendCodes}
+          onChange={(v) => {
+            if (isLoaded) updatePrivacy({ autoAcceptFriendCodes: v });
+          }}
+          disabled={!isLoaded}
         />
       </div>
     </>

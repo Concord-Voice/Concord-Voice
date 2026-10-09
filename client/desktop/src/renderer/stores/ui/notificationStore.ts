@@ -135,7 +135,7 @@ export const useNotificationStore = wrapStore(
         desktopNotifyDMs: true,
         desktopNotifyMentions: true,
         desktopNotifyAllMessages: false,
-        notificationContent: 'full',
+        notificationContent: 'sender_only',
         doNotDisturb: false,
         quietHoursEnabled: false,
         quietHoursStart: '22:00',

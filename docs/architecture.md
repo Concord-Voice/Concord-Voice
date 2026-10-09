@@ -935,14 +935,16 @@ Logout or account switching invalidates the shared guard before it stops each se
 ### Rich Presence Settings
 
 Migration 000089 additively extends the `user_presence_settings` table created
-by 000074. `master_enabled` defaults to true and is the global disclosure gate.
+by 000074. Migration 000166 changes defaults for new rows without rewriting
+saved choices. `master_enabled` defaults to true and is the global disclosure gate.
 A false value suppresses every category, including Private Call participants,
 and erases no saved values.
 
 The `server_voice_tier` field defaults to 1 (Friends in the active server), and
-`server_voice_show_details` defaults to true. The `private_call_tier` field
-defaults to 0 (call participants only while the master gate is on), and
-`private_call_show_details` defaults to false. Both tiers accept 0..2. The four
+`server_voice_show_details` defaults to false. The `private_call_tier` field
+defaults to 1. This includes call participants, friends, and opted-in
+friends-of-friends while the master gate is on. `private_call_show_details`
+defaults to false. Both tiers accept 0..2. The four
 category-specific fields are policy inputs for #2231's authoritative Server
 Voice and Private Call production, minimized live delivery, and freshly
 authorized reconnect projection. The shipped Custom Status path also consumes

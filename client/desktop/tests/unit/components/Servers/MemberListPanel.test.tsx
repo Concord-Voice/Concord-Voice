@@ -156,6 +156,35 @@ describe('MemberListPanel', () => {
     expect(avatarDivs.length).toBe(2);
   });
 
+  it('autocompletes the management roster after three characters without changing role actions', () => {
+    const members = [
+      ...mockMembers,
+      { ...mockMembers[1], user_id: 'u3', username: 'alicez', display_name: 'Zed' },
+      { ...mockMembers[1], user_id: 'u4', username: 'other', display_name: 'Alicia' },
+    ];
+    const { rerender } = render(<MemberListPanel {...defaultProps} members={members} />);
+    const search = screen.getByRole('searchbox', { name: 'Search members' });
+
+    fireEvent.change(search, { target: { value: 'al' } });
+    expect(document.querySelectorAll('.member-row')).toHaveLength(4);
+
+    fireEvent.change(search, { target: { value: 'ALI' } });
+    expect(
+      Array.from(document.querySelectorAll('.member-row .member-name')).map(
+        (element) => element.textContent
+      )
+    ).toEqual(['Alice', 'Alicia', 'Zed']);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Moderator role' }));
+    expect(defaultProps.onToggleRole).toHaveBeenCalledWith('u1', 'role-1', true);
+
+    fireEvent.change(search, { target: { value: 'nomatch' } });
+    expect(screen.getByText('No matching members.')).toBeInTheDocument();
+
+    rerender(<MemberListPanel {...defaultProps} serverId="s2" members={members} />);
+    expect(search).toHaveValue('');
+    expect(document.querySelectorAll('.member-row')).toHaveLength(4);
+  });
+
   it('shows display_name when available, username otherwise', () => {
     render(<MemberListPanel {...defaultProps} />);
     const aliceName = screen.getByText('Alice');

@@ -82,11 +82,11 @@ const TTS_DRAFTABLE_KEYS: (keyof DraftableTTSSettings)[] = [
   'ttsVolume',
 ];
 
-// Audio fields that differ between Basic and Advanced modes (tier-controlled in Basic)
+// Audio fields that differ between Basic and Advanced modes (tier-controlled in Basic).
+// FEC headroom and DTX (silenceDetection) stay the user's Advanced preferences: Basic mode
+// reads both from the tier directly, so writing them here would overwrite the Advanced choice.
 const AUDIO_MODE_KEYS: (keyof DraftableAudioSettings)[] = [
-  'silenceDetection',
   'inlineFec',
-  'fecHeadroom',
   'frameSize',
   'stereoOverride',
 ];
@@ -149,9 +149,7 @@ function applyTierDefaultsToDrafts(
 ): void {
   const tc = AUDIO_QUALITY_TIERS[qualityTier];
   const tierDefaults: Partial<DraftableAudioSettings> = {
-    silenceDetection: tc.opusDtx,
     inlineFec: tc.opusFec,
-    fecHeadroom: tc.opusFec,
     frameSize: 0,
     stereoOverride: null,
   };

@@ -215,8 +215,8 @@ func TestUpdateMeUsernameChangeCooldown(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	// Free tier cadence is 365 days; the message is now interval-aware (#1298).
-	assert.Contains(t, body["error"], "once every 365 days")
+	// Free tier cadence is six calendar months; the response includes its end.
+	assert.Contains(t, body["error"], "once every 6 months")
 	assert.NotNil(t, body["username_change_eligible_at"])
 }
 
@@ -256,7 +256,8 @@ func grantPremium(t *testing.T, ts *testhelpers.TestServer, userID string) {
 }
 
 // TestUpdateMeUsernameChangePremiumFasterCadence: at 100 days since last change, a
-// premium user (91d cadence) is allowed where a free user (365d) would be blocked.
+// premium user (three-calendar-month cadence) is allowed where a free user
+// (six-calendar-month cadence) would be blocked.
 func TestUpdateMeUsernameChangePremiumFasterCadence(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "premcadence")
@@ -277,7 +278,7 @@ func TestUpdateMeUsernameChangePremiumFasterCadence(t *testing.T) {
 }
 
 // TestUpdateMeUsernameChangeFreeBlockedAt100Days: a free user at 100 days is still
-// blocked (365d cadence) — the fail-closed baseline when no subscription exists.
+// blocked (six-calendar-month cadence) — the fail-closed baseline when no subscription exists.
 func TestUpdateMeUsernameChangeFreeBlockedAt100Days(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "freecadence")
@@ -292,7 +293,7 @@ func TestUpdateMeUsernameChangeFreeBlockedAt100Days(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	assert.Contains(t, body["error"], "365 days")
+	assert.Contains(t, body["error"], "6 months")
 }
 
 // TestUpdateMeAvatarDataURLCappedAtFreeForAllTiers: inline data-URL avatars are

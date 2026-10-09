@@ -183,6 +183,50 @@ describe('MemberList', () => {
     expect(screen.getByText('Retry')).toBeInTheDocument();
   });
 
+  it('keeps the full sidebar roster before three characters and alphabetizes prefix matches', async () => {
+    const members = [
+      makeMember({ user_id: 'alice', username: 'alice', display_name: 'Alice' }),
+      makeMember({ user_id: 'bob', username: 'bob', display_name: 'Bob' }),
+      makeMember({ user_id: 'alicez', username: 'alicez', display_name: 'Zed' }),
+      makeMember({ user_id: 'alicia', username: 'other', display_name: 'Alicia' }),
+      makeMember({ user_id: 'xalice', username: 'xalice', display_name: 'Xalice' }),
+    ];
+    seedCompactMembers(
+      members,
+      members.map((member): [string, 'online'] => [member.user_id, 'online'])
+    );
+    // This assertion exercises the loaded search state. Let the mount fetch
+    // finish with the same roster instead of leaving isLoading true forever.
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ members }),
+    });
+    render(<MemberList />);
+
+    const search = screen.getByPlaceholderText('Search members (3+ characters)...');
+    fireEvent.change(search, { target: { value: 'al' } });
+    expect(screen.getByRole('button', { name: 'Online — 5' })).toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: 'ALI' } });
+    expect(screen.getByRole('button', { name: 'Matches — 3' })).toBeInTheDocument();
+    // Zed matches by username, but the list sorts by the name the user sees.
+    expect(
+      Array.from(document.querySelectorAll('.member-group .member-username')).map(
+        (element) => element.textContent
+      )
+    ).toEqual(['Alice', 'Alicia', 'Zed']);
+
+    fireEvent.change(search, { target: { value: 'nomatch' } });
+    expect(await screen.findByText('No members found')).toBeInTheDocument();
+
+    act(() => {
+      useServerStore.getState().addServer({ ...mockServer, id: 'other-server' });
+      useServerStore.getState().setActiveServer('other-server');
+    });
+    expect(search).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Online — 5' })).toBeInTheDocument();
+  });
+
   it('renders members grouped by role', async () => {
     mockApiFetch.mockResolvedValue({
       ok: true,
@@ -416,11 +460,11 @@ describe('MemberList', () => {
       await user.click(trigger);
       const search = screen.getByRole('region', { name: 'Search members' });
       expect(search).toHaveAttribute('data-placement', 'left');
-      const input = screen.getByPlaceholderText('Search members...');
+      const input = screen.getByPlaceholderText('Search members (3+ characters)...');
       expect(input).toHaveFocus();
 
       await user.type(input, 'Bob');
-      await user.click(screen.getByRole('button', { name: 'Online — 1' }));
+      await user.click(screen.getByRole('button', { name: 'Matches — 1' }));
       expect(screen.getByRole('button', { name: 'Bob — Online' })).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: 'Alice — Online' })).not.toBeInTheDocument();
     });

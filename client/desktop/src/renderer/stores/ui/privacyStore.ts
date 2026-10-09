@@ -35,9 +35,11 @@ const FRIEND_REQUEST_MODES: ReadonlySet<FriendRequestPrivacyMode> = new Set([
  * display and the announced value disagreeing on a privacy setting.
  */
 function asFriendRequestMode(value: unknown): FriendRequestPrivacyMode {
+  // An older control-plane omits this field and still defaults to Everyone.
+  if (value == null) return 'everyone';
   return FRIEND_REQUEST_MODES.has(value as FriendRequestPrivacyMode)
     ? (value as FriendRequestPrivacyMode)
-    : 'everyone';
+    : 'mutual_servers';
 }
 
 export interface PrivacySettings {
@@ -294,7 +296,9 @@ const defaultSettings: PrivacySettings = {
   messagesFriendsOnly: true,
   messagesServerMembers: true,
   dmPrivacyLevel: 2,
-  dmFriendsOfFriends: false,
+  // New-account placeholder only. A server response without this field is
+  // from an older version whose Friends-of-Friends default was off.
+  dmFriendsOfFriends: true,
   autoAcceptFriendCodes: false,
   searchableByUsername: false,
   searchableByEmail: false,
@@ -313,10 +317,9 @@ const defaultSettings: PrivacySettings = {
   // placeholder would show the toggle disabled while DM purges kept demanding
   // credentials.
   requireAuthBeforePurge: true,
-  // #1241: matches the column default. Permissive is correct here — a
-  // restrictive placeholder would hide the affordance for every user whose
-  // settings have not loaded yet, on a value the server has not yet spoken to.
-  allowFriendRequestsFrom: 'everyone',
+  // #1241: transient pre-fetch placeholder; server-confirmed settings replace it.
+  // New accounts default to Mutual Servers in the control plane.
+  allowFriendRequestsFrom: 'mutual_servers',
 };
 
 interface PrivacyState {
@@ -381,6 +384,8 @@ export const usePrivacyStore = wrapStore(
                 messagesFriendsOnly: p.messages_friends_only ?? true,
                 messagesServerMembers: p.messages_server_members ?? true,
                 dmPrivacyLevel: (p.dm_privacy_level ?? 2) as DMPrivacyLevel,
+                // Older control planes omit this field and default it off.
+                // Current servers send the saved value, including the new on default.
                 dmFriendsOfFriends: p.dm_friends_of_friends ?? false,
                 autoAcceptFriendCodes: p.auto_accept_friend_codes ?? false,
                 searchableByUsername: p.searchable_by_username ?? false,
@@ -393,8 +398,8 @@ export const usePrivacyStore = wrapStore(
                 // #1354: a missing key means an old control-plane. Fail closed —
                 // the server still requires step-up for DM purges.
                 requireAuthBeforePurge: p.require_auth_before_purge ?? true,
-                // #1241: an absent key is a pre-#1240 server, not a
-                // restrictive setting. Default open — the server still enforces.
+                // #1241: an absent key is a pre-#1240 server with the older
+                // Everyone default. New servers send their actual setting.
                 allowFriendRequestsFrom: asFriendRequestMode(p.allow_friend_requests_from),
               },
               isLoading: false,
@@ -473,6 +478,8 @@ export const usePrivacyStore = wrapStore(
               messagesFriendsOnly: p.messages_friends_only,
               messagesServerMembers: p.messages_server_members,
               dmPrivacyLevel: (p.dm_privacy_level ?? 2) as DMPrivacyLevel,
+              // Keep the same version-skew fallback as GET, including when an
+              // older server echoes a PATCH to another privacy setting.
               dmFriendsOfFriends: p.dm_friends_of_friends ?? false,
               autoAcceptFriendCodes: p.auto_accept_friend_codes,
               searchableByUsername: p.searchable_by_username,

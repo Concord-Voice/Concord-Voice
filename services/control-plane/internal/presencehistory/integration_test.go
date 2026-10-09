@@ -65,6 +65,16 @@ func TestSettingsEnableRequiresCurrentExplicitConsent(t *testing.T) {
 	require.NotNil(t, settings.ConsentedAt)
 	assert.Equal(t, int16(30), settings.RetentionDays)
 	assert.Zero(t, historyRowCount(t, ts.DB, userID), "enable must not backfill current Custom Status")
+	var serverDetails bool
+	var privateTier int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT server_voice_show_details, private_call_tier
+		FROM user_presence_settings WHERE user_id = $1
+	`, userID).Scan(&serverDetails, &privateTier))
+	assert.False(t, serverDetails,
+		"the history writer must seed the new Server Voice details default")
+	assert.Equal(t, 1, privateTier,
+		"the history writer must seed the new Private Call default")
 
 	for _, tc := range []struct {
 		name    string

@@ -1979,7 +1979,8 @@ const validEntitlements = {
     maxAvatarBytes: 5242880,
     maxBannerBytes: 5242880,
     allowAnimatedProfile: false,
-    usernameChangeIntervalSeconds: 31536000,
+    usernameChangeIntervalMonths: 6,
+    usernameChangeIntervalSeconds: 31_536_000,
     maxServersCreated: 5,
     messageHistorySearchDays: 90,
   },
@@ -1988,6 +1989,25 @@ const validEntitlements = {
 describe('EntitlementsChangedSchema', () => {
   it('accepts a valid full DTO', () => {
     expect(EntitlementsChangedSchema.safeParse(validEntitlements).success).toBe(true);
+  });
+  it('accepts the legacy seconds-only DTO from an older server', () => {
+    const { usernameChangeIntervalMonths, ...legacy } = validEntitlements.data;
+    const parsed = EntitlementsChangedSchema.safeParse({
+      type: 'entitlements_changed',
+      data: legacy,
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.data.usernameChangeIntervalMonths).toBeUndefined();
+  });
+  it('accepts a months-only DTO and rejects a DTO with neither cadence', () => {
+    const { usernameChangeIntervalSeconds, ...current } = validEntitlements.data;
+    expect(
+      EntitlementsChangedSchema.safeParse({ type: 'entitlements_changed', data: current }).success
+    ).toBe(true);
+    const { usernameChangeIntervalMonths, ...missing } = current;
+    expect(
+      EntitlementsChangedSchema.safeParse({ type: 'entitlements_changed', data: missing }).success
+    ).toBe(false);
   });
   it('rejects a missing required field', () => {
     const { maxMessageChars, ...rest } = validEntitlements.data;

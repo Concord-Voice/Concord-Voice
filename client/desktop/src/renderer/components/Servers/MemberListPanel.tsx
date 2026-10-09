@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { prefetchEligibility } from '../../services/system/friendEligibility';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { createPortal } from 'react-dom';
@@ -11,6 +11,7 @@ import UserProfileModal from '../Members/UserProfileModal';
 import { focusTargetIn } from '../ui/focusTarget';
 import { ModerationDialog } from '../Members/purgeOnModeration';
 import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
+import { memberAutocomplete } from '../Members/memberAutocomplete';
 
 interface MemberListPanelProps {
   members: ServerMember[];
@@ -175,7 +176,12 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   // ConfirmActionModal closes itself on success, so the purge outcome is
   // announced by this panel instead of inside the modal.
   const [moderationNotice, setModerationNotice] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
   const [renderedAtMs] = useState(() => Date.now());
+  const { isActive: isSearchActive, members: visibleMembers } = useMemo(
+    () => memberAutocomplete(members, searchQuery),
+    [members, searchQuery]
+  );
   const listRef = useRef<HTMLDivElement>(null);
   // The row that opened the ban or kick menu may be the member just removed, so
   // when verification closes with nothing to return to, focus goes to the list.
@@ -203,6 +209,8 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   useEffect(() => {
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- a server change invalidates the moderation notice, which describes a member of the previous server
     setModerationNotice('');
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- a server change invalidates a query against the previous server's roster
+    setSearchQuery('');
   }, [serverId]);
 
   const handleKeyDown = useCallback(
@@ -219,6 +227,16 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
 
   return (
     <div ref={listRef} className="members-list">
+      {members.length > 0 && (
+        <input
+          type="search"
+          className="settings-member-search"
+          aria-label="Search members"
+          placeholder="Search members (3+ characters)..."
+          value={searchQuery}
+          onChange={(event) => setSearchQuery(event.target.value)}
+        />
+      )}
       <div className="settings-member-list-header">
         <span>User</span>
         <span>Roles</span>
@@ -245,7 +263,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
         {moderationNotice}
       </output>
       <ul className="member-list">
-        {members.map((member) => {
+        {visibleMembers.map((member) => {
           const assignedRoles = assignableRoles.filter((role) =>
             member.roles.some((r) => r.role_id === role.id)
           );
@@ -352,9 +370,9 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
             </li>
           );
         })}
-        {members.length === 0 && (
+        {visibleMembers.length === 0 && (
           <li style={{ color: 'var(--text-secondary)', padding: '40px', textAlign: 'center' }}>
-            No members found.
+            {isSearchActive ? 'No matching members.' : 'No members found.'}
           </li>
         )}
       </ul>

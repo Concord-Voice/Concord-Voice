@@ -77,7 +77,8 @@ func defaultPolicySettings() policySettings {
 	return policySettings{
 		master:        true,
 		serverTier:    TierFriends,
-		serverDetails: true,
+		serverDetails: false,
+		privateTier:   TierFriends,
 	}
 }
 

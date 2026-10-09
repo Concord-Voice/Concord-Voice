@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/google/uuid"
@@ -212,6 +213,28 @@ func TestLoadBasePresenceSnapshot_UsesSenderOwnedInverseAudience(t *testing.T) {
 		serverPeerID: statusOnline,
 	}, base)
 	assert.NotContains(t, base, unrelatedID)
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO friendships (requester_id, addressee_id, status)
+		VALUES ($1, $2, 'blocked')
+	`, fofSenderID, viewerID)
+	require.NoError(t, err)
+	require.NoError(t, dmblock.RecordBlockTx(ctx, tx, fofSenderID.String(), viewerID.String(), uuid.NewString()))
+	require.NoError(t, tx.Commit())
+	base, err = hub.loadBasePresenceSnapshot(context.Background(), seed)
+	require.NoError(t, err)
+	assert.NotContains(t, base, fofSenderID,
+		"a direct block must veto the sender's enabled FoF path at reconnect")
+	assert.Contains(t, base, directID)
+	assert.Contains(t, base, serverPeerID)
+	_, err = db.Exec(`
+		DELETE FROM friendships
+		WHERE requester_id = $1 AND addressee_id = $2 AND status = 'blocked'
+	`, fofSenderID, viewerID)
+	require.NoError(t, err)
 
 	_, err = db.Exec(`
 		UPDATE privacy_settings

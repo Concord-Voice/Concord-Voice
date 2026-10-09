@@ -632,8 +632,8 @@ func lockAudienceOperationPrior(
 		return audienceOperationPrior{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO user_presence_settings (user_id)
-		VALUES ($1)
+		INSERT INTO user_presence_settings (user_id, server_voice_show_details, private_call_tier)
+		VALUES ($1, FALSE, 1)
 		ON CONFLICT (user_id) DO NOTHING
 	`, senderID); err != nil {
 		return audienceOperationPrior{}, fmt.Errorf("ensure audience operation settings: %w", err)
@@ -886,8 +886,8 @@ func (s *Service) readAudienceCommitState(
 		       settings.presence_settings_operation_id,
 		       COALESCE(settings.master_enabled, TRUE),
 		       COALESCE(settings.server_voice_tier, 1),
-		       COALESCE(settings.server_voice_show_details, TRUE),
-		       COALESCE(settings.private_call_tier, 0),
+		       COALESCE(settings.server_voice_show_details, FALSE),
+		       COALESCE(settings.private_call_tier, 1),
 		       COALESCE(settings.private_call_show_details, FALSE),
 		       COALESCE(settings.custom_text_tier, 0),
 		       settings.custom_text,

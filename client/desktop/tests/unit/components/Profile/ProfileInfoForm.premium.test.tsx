@@ -41,32 +41,20 @@ vi.mock('@/renderer/hooks/messaging/useImageUpload', () => ({
   }),
 }));
 
-// Entitlement: FREE floor.
-const entitlementOverrides: Record<string, unknown> = {};
-function freeEntitlement() {
-  return {
-    usernameChangeIntervalSeconds: 31_536_000,
-    maxAvatarBytes: 5_242_880,
-    maxBannerBytes: 5_242_880,
-    ...entitlementOverrides,
-  };
-}
-vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
-  useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
-    selector(freeEntitlement())
-  ),
-}));
-
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act } from '../../../test-utils';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import {
+  FREE_ENTITLEMENT,
+  useSubscriptionStore,
+  type Entitlement,
+} from '@/renderer/stores/auth/subscriptionStore';
 import { mockUser } from '../../../mocks/fixtures';
 import ProfileInfoForm from '@/renderer/components/Profile/ProfileInfoForm';
 
-function setEntitlement(overrides: Record<string, unknown>) {
-  for (const k of Object.keys(entitlementOverrides)) delete entitlementOverrides[k];
-  Object.assign(entitlementOverrides, overrides);
+function setEntitlement(overrides: Partial<Entitlement>) {
+  useSubscriptionStore.setState({ entitlement: { ...FREE_ENTITLEMENT, ...overrides } });
 }
 
 function makeFile(name: string, size: number): File {
@@ -78,7 +66,7 @@ function makeFile(name: string, size: number): File {
 beforeEach(() => {
   vi.clearAllMocks();
   imageUploadCalls = 0;
-  setEntitlement({});
+  useSubscriptionStore.setState({ entitlement: FREE_ENTITLEMENT, hydrated: true });
   useUserStore.setState({ user: { ...mockUser }, isLoading: false });
 });
 
@@ -88,6 +76,14 @@ describe('ProfileInfoForm — L8 username cadence', () => {
   it('free cadence: shows the "Premium: every 3 months" upsell note', () => {
     render(<ProfileInfoForm />);
     expect(screen.getByText(/Premium: every 3 months\./)).toBeInTheDocument();
+    expect(screen.getByText(/You can change your username every 6 months/)).toBeInTheDocument();
+  });
+
+  it('keeps the free upsell when its interval changes', () => {
+    setEntitlement({ usernameChangeIntervalMonths: 6 });
+    render(<ProfileInfoForm />);
+    expect(screen.getByText(/Premium: every 3 months\./)).toBeInTheDocument();
+    expect(screen.queryByText(/once per year/)).not.toBeInTheDocument();
   });
 
   it('on cooldown: still shows the premium cadence upsell next to the date note', () => {
@@ -104,9 +100,79 @@ describe('ProfileInfoForm — L8 username cadence', () => {
   });
 
   it('premium cadence (3-month interval): hides the premium upsell note', () => {
-    setEntitlement({ usernameChangeIntervalSeconds: 7_776_000 }); // ~90 days
+    setEntitlement({ tier: 'premium', usernameChangeIntervalMonths: 3 });
     render(<ProfileInfoForm />);
     expect(screen.queryByText(/Premium: every 3 months\./)).not.toBeInTheDocument();
+    expect(screen.getByText(/You can change your username every 3 months/)).toBeInTheDocument();
+  });
+
+  it('uses the server date and generic copy until the entitlement is hydrated', () => {
+    useSubscriptionStore.setState({ hydrated: false });
+    useUserStore.setState({
+      user: {
+        ...mockUser,
+        username_changed_at: new Date(Date.now() - 120 * 86_400_000).toISOString(),
+        username_change_eligible_at: new Date(Date.now() + 1 * 86_400_000).toISOString(),
+      },
+      isLoading: false,
+    });
+    render(<ProfileInfoForm />);
+    expect(screen.getByLabelText('Username')).toBeDisabled();
+    expect(
+      screen.getByText(/Your plan sets the wait between username changes/)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/every 6 months/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Premium: every 3 months/)).not.toBeInTheDocument();
+  });
+
+  it('uses legacy seconds when an older server sends no calendar-month field', () => {
+    const changedAt = new Date(Date.now() - 120 * 86_400_000).toISOString();
+    useUserStore.setState({
+      user: { ...mockUser, username_changed_at: changedAt },
+      isLoading: false,
+    });
+    const legacyFree: Entitlement = { ...FREE_ENTITLEMENT };
+    delete legacyFree.usernameChangeIntervalMonths;
+    useSubscriptionStore.setState({
+      entitlement: { ...legacyFree, usernameChangeIntervalSeconds: 365 * 86_400 },
+    });
+    render(<ProfileInfoForm />);
+    expect(screen.getByLabelText('Username')).toBeDisabled();
+    expect(screen.getByText(/every 365 days/)).toBeInTheDocument();
+    expect(screen.queryByText(/Premium: every 3 months/)).not.toBeInTheDocument();
+
+    act(() => {
+      useSubscriptionStore.setState({
+        entitlement: { ...legacyFree, tier: 'premium', usernameChangeIntervalSeconds: 91 * 86_400 },
+      });
+    });
+    expect(screen.getByLabelText('Username')).not.toBeDisabled();
+    expect(screen.getByText(/every 91 days/)).toBeInTheDocument();
+  });
+
+  it('recomputes the cooldown on a live tier change without refetching the profile', () => {
+    const changedAt = new Date(Date.now() - 120 * 86_400_000).toISOString();
+    useUserStore.setState({
+      user: {
+        ...mockUser,
+        username_changed_at: changedAt,
+        username_change_eligible_at: new Date(Date.now() + 60 * 86_400_000).toISOString(),
+      },
+      isLoading: false,
+    });
+    useSubscriptionStore.setState({ hydrated: true });
+    render(<ProfileInfoForm />);
+    expect(screen.getByLabelText('Username')).toBeDisabled();
+
+    act(() => {
+      setEntitlement({ tier: 'premium', usernameChangeIntervalMonths: 3 });
+    });
+    expect(screen.getByLabelText('Username')).not.toBeDisabled();
+
+    act(() => {
+      setEntitlement({ tier: 'free', usernameChangeIntervalMonths: 6 });
+    });
+    expect(screen.getByLabelText('Username')).toBeDisabled();
   });
 });
 

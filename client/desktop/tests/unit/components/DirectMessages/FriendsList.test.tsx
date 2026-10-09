@@ -1505,6 +1505,49 @@ describe('FriendsList search (#2653 item 2b)', () => {
     expect(screen.queryByText('Bob')).toBeNull();
   });
 
+  it('keeps the full list visible until the third character, then matches case-insensitive prefixes', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList />);
+    const input = screen.getByRole('textbox', { name: 'Search friends' });
+
+    await user.type(input, 'AL');
+    expect(screen.getByText('Alice')).toBeVisible();
+    expect(screen.getByText('Bob')).toBeVisible();
+
+    await user.type(input, 'I');
+    expect(screen.getByText('Alice')).toBeVisible();
+    expect(screen.queryByText('Bob')).toBeNull();
+  });
+
+  it('does not match text from the middle of a friend name', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'lic');
+
+    expect(screen.queryByText('Alice')).toBeNull();
+    expect(screen.getByText('No friends match "lic"')).toBeVisible();
+  });
+
+  it('sorts matching friends alphabetically within their section', async () => {
+    const user = userEvent.setup();
+    seed([
+      makeFriend({ id: 'f-4', userId: 'u-4', username: 'alicez', displayName: 'Zed' }),
+      makeFriend({ id: 'f-3', userId: 'u-3', username: 'alison', displayName: 'Alison' }),
+      makeFriend({ id: 'f-1', userId: 'u-1', username: 'aline', displayName: 'Aline' }),
+      makeFriend({ id: 'f-2', userId: 'u-2', username: 'alicia', displayName: 'Alicia' }),
+    ]);
+    const { container } = render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'ALI');
+
+    expect(
+      Array.from(container.querySelectorAll('.friend-item .member-username')).map(
+        (row) => row.textContent
+      )
+    ).toEqual(['Alicia', 'Aline', 'Alison', 'Zed']);
+  });
+
   it('matches on username as well as display name', async () => {
     const user = userEvent.setup();
     seed([alice, makeFriend({ id: 'f-3', userId: 'u-3', username: 'zephyr', displayName: 'Zed' })]);
@@ -1572,6 +1615,49 @@ describe('FriendsList search (#2653 item 2b)', () => {
 
     expect(screen.getByText('Bob')).toBeVisible();
     expect(screen.queryByText('Cara')).toBeNull();
+  });
+
+  it('keeps pending requests visible before three characters and filters from the start after that', async () => {
+    const user = userEvent.setup();
+    seed(
+      [],
+      [
+        makeRequest({ id: 'req-1', fromUsername: 'bob', fromDisplayName: 'Bob' }),
+        makeRequest({ id: 'req-2', fromUsername: 'cara', fromDisplayName: 'Cara' }),
+      ]
+    );
+    render(<FriendsList />);
+    const input = screen.getByRole('textbox', { name: 'Search friends' });
+
+    await user.type(input, 'BO');
+    expect(screen.getByText('Bob')).toBeVisible();
+    expect(screen.getByText('Cara')).toBeVisible();
+
+    await user.type(input, 'B');
+    expect(screen.getByText('Bob')).toBeVisible();
+    expect(screen.queryByText('Cara')).toBeNull();
+  });
+
+  it('sorts matching pending requests without hiding their response actions', async () => {
+    const user = userEvent.setup();
+    seed(
+      [],
+      [
+        makeRequest({ id: 'req-3', fromUsername: 'alicez', fromDisplayName: 'Zed' }),
+        makeRequest({ id: 'req-2', fromUsername: 'alina', fromDisplayName: 'Alina' }),
+        makeRequest({ id: 'req-1', fromUsername: 'alice', fromDisplayName: 'Alice' }),
+      ]
+    );
+    const { container } = render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'ali');
+
+    expect(
+      Array.from(container.querySelectorAll('.friend-request-item .member-username')).map(
+        (row) => row.textContent
+      )
+    ).toEqual(['Alice', 'Alina', 'Zed']);
+    expect(screen.getByRole('button', { name: 'Accept friend request from Alice' })).toBeVisible();
   });
 
   it('explains a zero-match term for a user with no friends at all', async () => {

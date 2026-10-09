@@ -779,6 +779,11 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 	t.Run("committed then error still claims before success", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
 		senderID := testhelpers.CreateUser(t, db)
+		_, err := db.Exec(`
+			INSERT INTO user_presence_settings (user_id, server_voice_show_details)
+			VALUES ($1, TRUE)
+		`, senderID)
+		require.NoError(t, err)
 		delivery := &task9Delivery{}
 		suppressor := &recordingActivitySettingsSuppressor{}
 		service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)

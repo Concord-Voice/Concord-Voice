@@ -42,7 +42,7 @@ export const FREE_ENTITLEMENT: Entitlement = {
   maxAvatarBytes: 5242880,
   maxBannerBytes: 5242880,
   allowAnimatedProfile: false,
-  usernameChangeIntervalSeconds: 31536000,
+  usernameChangeIntervalMonths: 6,
   maxServersCreated: 5,
   messageHistorySearchDays: 90,
 };

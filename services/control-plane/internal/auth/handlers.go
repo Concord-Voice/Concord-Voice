@@ -1553,7 +1553,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		"session_id":    tokenID,
 		"expires_in":    900,
 		"remember_me":   rememberMe,
-		"user":          user.PublicUser(),
+		"user":          user.PublicUser(entitlements.For(tier).UsernameChangeIntervalMonths),
 		"e2ee_keys": gin.H{
 			"wrapped_private_key": base64.StdEncoding.EncodeToString(keys.WrappedPrivateKey),
 			"key_derivation_salt": base64.StdEncoding.EncodeToString(keys.KeyDerivationSalt),

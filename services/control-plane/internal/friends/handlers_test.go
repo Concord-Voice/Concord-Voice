@@ -421,6 +421,7 @@ func TestSendRequest_Success(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "sender1")
 	user2 := ts.CreateTestUser(t, "receiver1")
+	setPrivacyMode(t, ts, user2.ID, wireModeEveryone)
 
 	w := ts.DoRequest("POST", pathFriendRequest, map[string]interface{}{
 		"user_id": user2.ID,
@@ -464,6 +465,7 @@ func TestSendRequest_ByUsername(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "sender3")
 	user2 := ts.CreateTestUser(t, "receiver3")
+	setPrivacyMode(t, ts, user2.ID, wireModeEveryone)
 
 	w := ts.DoRequest("POST", pathFriendRequest, map[string]interface{}{
 		"username": user2.Username,
@@ -479,6 +481,7 @@ func TestSendRequest_ByUsername_MixedCaseStored(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "sender3mixed")
 	user2 := ts.CreateTestUser(t, "receiver3mixed")
+	setPrivacyMode(t, ts, user2.ID, wireModeEveryone)
 
 	// Simulate legacy SSO storage (raw mixed-case), bypassing normalization.
 	_, err := ts.DB.Exec(`UPDATE users SET username = 'Receiver3Mixed' WHERE id = $1`, user2.ID)
@@ -576,6 +579,7 @@ func TestSendRequest_CreatesDBRow(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "senddb1")
 	user2 := ts.CreateTestUser(t, "senddb2")
+	setPrivacyMode(t, ts, user2.ID, wireModeEveryone)
 
 	w := ts.DoRequest("POST", pathFriendRequest, map[string]interface{}{
 		"user_id": user2.ID,
@@ -1695,6 +1699,7 @@ func TestFriendLifecycle_RequestAcceptRemove(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "lifecycle1")
 	user2 := ts.CreateTestUser(t, "lifecycle2")
+	setPrivacyMode(t, ts, user2.ID, wireModeEveryone)
 
 	// Step 1: Send request
 	w := ts.DoRequest("POST", pathFriendRequest, map[string]interface{}{
@@ -1744,6 +1749,7 @@ func TestFriendLifecycle_RequestDecline(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "lifecycled1")
 	user2 := ts.CreateTestUser(t, "lifecycled2")
+	setPrivacyMode(t, ts, user2.ID, wireModeEveryone)
 
 	// Send request
 	w := ts.DoRequest("POST", pathFriendRequest, map[string]interface{}{

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -861,14 +862,19 @@ func TestSearchUsersSuccess(t *testing.T) {
 		target.ID,
 	)
 	require.NoError(t, err)
+	_, err = ts.DB.Exec(`UPDATE users SET display_name = $1 WHERE id = $2`, "Visible Alias", target.ID)
+	require.NoError(t, err)
 
-	w := ts.DoRequest("GET", "/api/v1/users/search?q=searchable", nil, testhelpers.AuthHeaders(searcher.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	users := body["users"].([]interface{})
-	assert.GreaterOrEqual(t, len(users), 1)
+	for _, query := range []string{"searchable", "archab", "Visible Alias"} {
+		w := ts.DoRequest("GET", "/api/v1/users/search?q="+url.QueryEscape(query), nil,
+			testhelpers.AuthHeaders(searcher.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		users := body["users"].([]interface{})
+		require.Len(t, users, 1, "opted-in user should match %q", query)
+		assert.Equal(t, target.ID, users[0].(map[string]interface{})["id"])
+	}
 }
 
 func TestSearchUsersNotSearchable(t *testing.T) {
@@ -883,6 +889,58 @@ func TestSearchUsersNotSearchable(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	users := body["users"].([]interface{})
 	assert.Empty(t, users, "user with searchable_by_username=false should not appear")
+}
+
+func TestSearchUsersDoesNotRevealOptedOutRelationshipPeers(t *testing.T) {
+	ts := setupTS(t)
+	searcher := ts.CreateTestUser(t, "relsearcher")
+	serverPeer := ts.CreateTestUser(t, "relserverpeer")
+	mutual := ts.CreateTestUser(t, "relmutual")
+	fof := ts.CreateTestUser(t, "relfofpeer")
+	stranger := ts.CreateTestUser(t, "relstranger")
+	blocked := ts.CreateTestUser(t, "relblocked")
+	closed := ts.CreateTestUser(t, "relclosed")
+	serverID := ts.CreateTestServer(t, searcher.ID, "search-relations")
+	ts.AddMemberToServer(t, serverID, serverPeer.ID, "member")
+	ts.AddMemberToServer(t, serverID, blocked.ID, "member")
+	ts.AddMemberToServer(t, serverID, closed.ID, "member")
+	ts.CreateFriendship(t, searcher.ID, mutual.ID, "accepted")
+	ts.CreateFriendship(t, mutual.ID, fof.ID, "accepted")
+	ts.CreateFriendship(t, searcher.ID, blocked.ID, "blocked")
+	_, err := ts.DB.Exec(`INSERT INTO privacy_settings (user_id, allow_friend_requests_from) VALUES ($1, 'nobody')`, closed.ID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`INSERT INTO privacy_settings (user_id, searchable_by_username) VALUES ($1, TRUE)`, blocked.ID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`UPDATE users SET display_name = $1 WHERE id = $2`, "Rel Peer Label", serverPeer.ID)
+	require.NoError(t, err)
+
+	for _, query := range []string{
+		serverPeer.Username, strings.ToUpper(serverPeer.Username), mutual.Username,
+		fof.Username, stranger.Username, blocked.Username, closed.Username,
+		"serverpeer", "relfof", "Rel Peer Label", "relserver%", "relserver_eer",
+	} {
+		w := ts.DoRequest("GET", "/api/v1/users/search?q="+url.QueryEscape(query), nil,
+			testhelpers.AuthHeaders(searcher.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		users := body["users"].([]interface{})
+		assert.Empty(t, users, "%q must not reveal an opted-out or blocked account", query)
+	}
+
+	_, err = ts.DB.Exec(`INSERT INTO privacy_settings (user_id, searchable_by_username) VALUES ($1, TRUE)
+		ON CONFLICT (user_id) DO UPDATE SET searchable_by_username = TRUE`, serverPeer.ID)
+	require.NoError(t, err)
+	for _, query := range []string{serverPeer.Username, "serverpeer", "Rel Peer Label"} {
+		w := ts.DoRequest("GET", "/api/v1/users/search?q="+url.QueryEscape(query), nil,
+			testhelpers.AuthHeaders(searcher.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		users := body["users"].([]interface{})
+		require.Len(t, users, 1, "opted-in relationship peer should match %q", query)
+		assert.Equal(t, serverPeer.ID, users[0].(map[string]interface{})["id"])
+	}
 }
 
 func TestSearchUsersQueryTooShort(t *testing.T) {
@@ -1043,6 +1101,7 @@ func TestGetPrivacySettingsDefaults(t *testing.T) {
 	assert.Equal(t, true, priv["messages_friends_only"])
 	assert.Equal(t, true, priv["messages_server_members"])
 	assert.Equal(t, float64(2), priv["dm_privacy_level"])
+	assert.Equal(t, true, priv["dm_friends_of_friends"])
 	assert.Equal(t, false, priv["searchable_by_username"])
 	// #1766: no-row fallback must default load_gifs_automatically ON for new users.
 	assert.Equal(t, true, priv["load_gifs_automatically"])
@@ -1053,7 +1112,7 @@ func TestGetPrivacySettingsWithSavedSettings(t *testing.T) {
 	user := ts.CreateTestUser(t, "privsaved")
 
 	_, err := ts.DB.Exec(
-		`INSERT INTO privacy_settings (user_id, searchable_by_username, dm_privacy_level) VALUES ($1, TRUE, 3)`,
+		`INSERT INTO privacy_settings (user_id, searchable_by_username, dm_privacy_level, dm_friends_of_friends) VALUES ($1, TRUE, 3, FALSE)`,
 		user.ID,
 	)
 	require.NoError(t, err)
@@ -1066,6 +1125,7 @@ func TestGetPrivacySettingsWithSavedSettings(t *testing.T) {
 	priv := body["privacy"].(map[string]interface{})
 	assert.Equal(t, true, priv["searchable_by_username"])
 	assert.Equal(t, float64(3), priv["dm_privacy_level"])
+	assert.Equal(t, false, priv["dm_friends_of_friends"], "saved Off preference must remain Off")
 }
 
 // ── UpdatePrivacySettings ────────────────────────────────────────────────────
@@ -1091,11 +1151,16 @@ func TestUpdatePrivacySettingsSuccess(t *testing.T) {
 	assert.Equal(t, true, priv["searchable_by_username"], "response must reflect the submitted value")
 
 	// Verify the value actually persisted in the DB (not just echoed in the response).
-	var persisted bool
+	var persisted, persistedFoF bool
+	var persistedFriendRequests string
 	require.NoError(t, ts.DB.QueryRow(
-		`SELECT searchable_by_username FROM privacy_settings WHERE user_id = $1`, user.ID,
-	).Scan(&persisted))
+		`SELECT searchable_by_username, dm_friends_of_friends, allow_friend_requests_from
+		 FROM privacy_settings WHERE user_id = $1`, user.ID,
+	).Scan(&persisted, &persistedFoF, &persistedFriendRequests))
 	assert.True(t, persisted, "first PATCH must persist to the DB, not leave defaults")
+	assert.True(t, persistedFoF, "new writer must seed its Friends of Friends default")
+	assert.Equal(t, "mutual_servers", persistedFriendRequests,
+		"new writer must seed its friend-request default")
 }
 
 func TestUpdatePrivacySettingsDMPrivacyLevel(t *testing.T) {

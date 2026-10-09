@@ -560,12 +560,14 @@ test.describe('Rich Presence cross-stack privacy acceptance', () => {
       const settings = await apiJson<{
         master_enabled: boolean;
         server_voice_tier: number;
+        server_voice_show_details: boolean;
         private_call_tier: number;
         custom_text_tier: number;
       }>(page, 'GET', '/api/v1/users/me/presence-settings', session.accessToken, undefined, 200);
       expect(settings.master_enabled).toBe(true);
       expect(settings.server_voice_tier).toBe(1);
-      expect(settings.private_call_tier).toBe(0);
+      expect(settings.server_voice_show_details).toBe(false);
+      expect(settings.private_call_tier).toBe(1);
       expect(settings.custom_text_tier).toBe(0);
       await openSettings(page);
       const serverVoice = page.locator('.presence-activity-card-serverVoice');
@@ -576,10 +578,12 @@ test.describe('Rich Presence cross-stack privacy acceptance', () => {
           exact: true,
         })
       ).toHaveAttribute('aria-pressed', 'true');
-      await expect(privateCall.getByRole('button', { name: 'Off', exact: true })).toHaveAttribute(
-        'aria-pressed',
-        'true'
-      );
+      await expect(
+        privateCall.getByRole('button', { name: 'Friends', exact: true })
+      ).toHaveAttribute('aria-pressed', 'true');
+      await expect(
+        serverVoice.getByRole('switch', { name: 'Server Voice show details' })
+      ).not.toBeChecked();
       await expect(page.getByRole('switch', { name: 'Share Rich Presence' })).toBeChecked();
       await expect(
         page.getByRole('group', { name: 'Custom status visibility' }).getByRole('button', {

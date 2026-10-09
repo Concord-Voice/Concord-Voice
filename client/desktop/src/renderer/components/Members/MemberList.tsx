@@ -12,6 +12,7 @@ import { focusTargetIn } from '../ui/focusTarget';
 import { ModerationDialog } from './purgeOnModeration';
 import { Moon, Search, Users } from 'lucide-react';
 import { AttributedPopover } from '../Layout/AttributedPopover';
+import { memberAutocomplete } from './memberAutocomplete';
 import './MemberList.css';
 
 interface MemberListProps {
@@ -191,6 +192,8 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
     // No timed auto-clear: the notice must live long enough to be announced.
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- a server switch invalidates the moderation notice exactly as it invalidates the roster this effect refetches
     setModerationNotice('');
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- a server switch invalidates a search over the previous server's roster
+    setSearchQuery('');
     if (activeServerId) {
       if (memberFetchRef.current !== activeServerId) {
         memberFetchRef.current = activeServerId;
@@ -280,20 +283,18 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
     [getMemberStatus]
   );
 
-  // Filter members by search query
-  const filteredMembers = useMemo(() => {
-    if (!searchQuery.trim()) return members;
-    const q = searchQuery.toLowerCase();
-    return members.filter((m) => {
-      if (m.username.toLowerCase().includes(q)) return true;
-      if (m.display_name?.toLowerCase().includes(q)) return true;
-      if (m.roles?.some((r) => r.role_name.toLowerCase().includes(q))) return true;
-      return false;
-    });
-  }, [members, searchQuery]);
+  // Search only the roster already visible to this server member. A short query
+  // leaves the ordinary role/presence list in place until autocomplete starts.
+  const { isActive: isSearchActive, members: filteredMembers } = useMemo(
+    () => memberAutocomplete(members, searchQuery),
+    [members, searchQuery]
+  );
 
   // Build role-based groups using RBAC roles with display_separately
   const roleGroups = useMemo(() => {
+    if (isSearchActive) {
+      return [{ key: 'matches', label: 'Matches', members: filteredMembers }];
+    }
     const roles = activeServerId ? serverRoles[activeServerId] || [] : [];
 
     // Get roles with display_separately, sorted by position (highest first)
@@ -350,7 +351,7 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
 
     return groups;
     // eslint-disable-next-line @eslint-react/exhaustive-deps -- voice state (useVoiceStore) is read synchronously inside the computation but intentionally omitted from deps: member grouping recomputes on roster/role/server changes, and voice-presence badging is separately reactive through the store subscription on the rendered rows — including voice state here would re-run the entire grouping on every mic-unmute event
-  }, [filteredMembers, serverRoles, activeServerId, sortMembers]);
+  }, [filteredMembers, isSearchActive, serverRoles, activeServerId, sortMembers]);
 
   const renderGroup = (group: MemberGroup) => {
     if (group.members.length === 0) return null;
@@ -468,7 +469,7 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
               <input
                 type="text"
                 className="member-list-search-input"
-                placeholder="Search members..."
+                placeholder="Search members (3+ characters)..."
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
                 autoFocus
@@ -482,7 +483,7 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
           <input
             type="text"
             className="member-list-search-input"
-            placeholder="Search members..."
+            placeholder="Search members (3+ characters)..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
@@ -521,7 +522,7 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
       )}
 
       {/* Search empty state */}
-      {!isLoading && searchQuery && filteredMembers.length === 0 && members.length > 0 && (
+      {!isLoading && isSearchActive && filteredMembers.length === 0 && members.length > 0 && (
         <div className="member-list-empty">
           <p>No members found</p>
         </div>

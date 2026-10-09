@@ -358,34 +358,55 @@ const FriendsList: React.FC<FriendsListProps> = ({
   // "you have mail" signal, so a term must not make it appear to drop (#2653 item 2b, C9).
   const incomingCount = pendingRequests.filter((r) => r.direction === 'received').length;
 
-  // #2653 item 2b: filter BEFORE the section build so categories, the Online/Offline
-  // built-ins, pending, and the compact rail all inherit the term. Filtering after the
-  // build (or only at the rendered rows) leaves sections whose counts disagree with their
-  // contents. Mirrors MemberList's `filteredMembers` seam.
+  // Filter before building sections so the rows and section counts agree. Keep the full
+  // list visible until three characters are entered; then match from the start of either
+  // the visible name or username and sort each section by the label the row shows.
   const trimmedQuery = searchQuery.trim();
   const searchTerm = trimmedQuery.toLowerCase();
+  const activeSearchTerm = searchTerm.length >= 3 ? searchTerm : '';
 
   const filteredFriends = useMemo(() => {
-    if (!searchTerm) return friends;
-    return friends.filter(
-      (f) =>
-        f.username.toLowerCase().includes(searchTerm) ||
-        f.displayName?.toLowerCase().includes(searchTerm)
-    );
-  }, [friends, searchTerm]);
+    if (!activeSearchTerm) return friends;
+    return friends
+      .filter(
+        (friend) =>
+          friend.username.toLowerCase().startsWith(activeSearchTerm) ||
+          friend.displayName?.toLowerCase().startsWith(activeSearchTerm)
+      )
+      .sort(
+        (a, b) =>
+          (a.displayName || a.username).localeCompare(b.displayName || b.username, undefined, {
+            sensitivity: 'base',
+          }) || a.userId.localeCompare(b.userId)
+      );
+  }, [friends, activeSearchTerm]);
 
   const filteredPending = useMemo(() => {
-    if (!searchTerm) return pendingRequests;
-    return pendingRequests.filter((r) => {
-      // Match the counterparty — the name the row actually renders — not the local user.
-      const username = r.direction === 'received' ? r.fromUsername : r.toUsername;
-      const displayName = r.direction === 'received' ? r.fromDisplayName : r.toDisplayName;
-      return (
-        username.toLowerCase().includes(searchTerm) ||
-        displayName?.toLowerCase().includes(searchTerm)
+    if (!activeSearchTerm) return pendingRequests;
+    const visibleName = (request: (typeof pendingRequests)[number]) => {
+      const username = request.direction === 'received' ? request.fromUsername : request.toUsername;
+      const displayName =
+        request.direction === 'received' ? request.fromDisplayName : request.toDisplayName;
+      return displayName || username;
+    };
+    return pendingRequests
+      .filter((request) => {
+        // Match the counterparty, never the local user.
+        const username =
+          request.direction === 'received' ? request.fromUsername : request.toUsername;
+        const displayName =
+          request.direction === 'received' ? request.fromDisplayName : request.toDisplayName;
+        return (
+          username.toLowerCase().startsWith(activeSearchTerm) ||
+          displayName?.toLowerCase().startsWith(activeSearchTerm)
+        );
+      })
+      .sort(
+        (a, b) =>
+          visibleName(a).localeCompare(visibleName(b), undefined, { sensitivity: 'base' }) ||
+          a.id.localeCompare(b.id)
       );
-    });
-  }, [pendingRequests, searchTerm]);
+  }, [pendingRequests, activeSearchTerm]);
 
   const incomingRequests = filteredPending.filter((r) => r.direction === 'received');
   const outgoingRequests = filteredPending.filter((r) => r.direction === 'sent');
@@ -398,7 +419,7 @@ const FriendsList: React.FC<FriendsListProps> = ({
   const hasFilterableContent =
     friends.length > 0 || categoryList.length > 0 || pendingRequests.length > 0;
   const noMatches =
-    searchTerm !== '' &&
+    activeSearchTerm !== '' &&
     hasFilterableContent &&
     filteredFriends.length === 0 &&
     filteredPending.length === 0;
@@ -725,7 +746,7 @@ const FriendsList: React.FC<FriendsListProps> = ({
             <span
               className="conversation-unread-badge friends-header-badge"
               // While a term is active the badge can outnumber the visible rows; say why.
-              title={searchTerm ? `${incomingCount} pending — hidden by search` : undefined}
+              title={activeSearchTerm ? `${incomingCount} pending — hidden by search` : undefined}
             >
               {incomingCount}
             </span>

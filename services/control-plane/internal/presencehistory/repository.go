@@ -284,8 +284,8 @@ func lockUserAndSettings(
 		return SettingsRow{}, fmt.Errorf("lock activity history owner: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO user_presence_settings (user_id)
-		VALUES ($1)
+		INSERT INTO user_presence_settings (user_id, server_voice_show_details, private_call_tier)
+		VALUES ($1, FALSE, 1)
 		ON CONFLICT (user_id) DO NOTHING
 	`, userID); err != nil {
 		return SettingsRow{}, fmt.Errorf("ensure activity history settings: %w", err)

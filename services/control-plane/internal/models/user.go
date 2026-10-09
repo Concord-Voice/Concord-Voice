@@ -60,8 +60,9 @@ func (u *User) addOptionalProfileFields(result map[string]interface{}) {
 	}
 }
 
-// PublicUser returns user data safe for the authenticated user
-func (u *User) PublicUser() map[string]interface{} {
+// PublicUser returns user data safe for the authenticated user. The username
+// eligibility date uses the acting user's calendar-month entitlement.
+func (u *User) PublicUser(usernameChangeIntervalMonths int) map[string]interface{} {
 	result := map[string]interface{}{
 		"id":             u.ID,
 		"email":          u.Email,
@@ -73,9 +74,25 @@ func (u *User) PublicUser() map[string]interface{} {
 	u.addOptionalProfileFields(result)
 	if u.UsernameChangedAt != nil {
 		result["username_changed_at"] = *u.UsernameChangedAt
-		result["username_change_eligible_at"] = u.UsernameChangedAt.AddDate(0, 0, 365)
+		result["username_change_eligible_at"] = UsernameChangeEligibleAt(*u.UsernameChangedAt, usernameChangeIntervalMonths)
 	}
 	return result
+}
+
+// UsernameChangeEligibleAt adds calendar months in UTC, clamping the day to
+// the target month's last day. This matches PostgreSQL's timestamp + month
+// interval used by the authoritative update guard, including Jan 31 and leap
+// years. UTC keeps the result independent of the database session timezone.
+func UsernameChangeEligibleAt(changedAt time.Time, months int) time.Time {
+	utc := changedAt.UTC()
+	first := time.Date(utc.Year(), utc.Month()+time.Month(months), 1,
+		utc.Hour(), utc.Minute(), utc.Second(), utc.Nanosecond(), time.UTC)
+	lastDay := time.Date(first.Year(), first.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	day := utc.Day()
+	if day > lastDay {
+		day = lastDay
+	}
+	return first.AddDate(0, 0, day-1)
 }
 
 // ProfileForOthers returns user data safe for viewing by other users (no email or private fields)

@@ -858,7 +858,7 @@ func TestAuthorizeAndMinimize_PrivateCallRejectsStaleParticipantSetTypeAndCount(
 }
 
 func TestAuthorizeAndMinimize_MissingSettingsUsesCategoryDefaults(t *testing.T) {
-	t.Run("server voice defaults to friends with details", func(t *testing.T) {
+	t.Run("server voice defaults to friends without details", func(t *testing.T) {
 		db, ctx := setupPolicyDB(t)
 		senderID := testhelpers.CreateUser(t, db)
 		friendID := testhelpers.CreateUser(t, db)
@@ -869,19 +869,22 @@ func TestAuthorizeAndMinimize_MissingSettingsUsesCategoryDefaults(t *testing.T) 
 		decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 		require.NoError(t, err)
 		require.Equal(t, map[uuid.UUID]bool{friendID: true}, decision.Audience)
-		require.Contains(t, string(decision.Payload), `"channel_name":"General"`)
-		require.Contains(t, string(decision.Payload), `"server_name":`)
+		require.True(t, decision.Minimized)
+		require.NotContains(t, string(decision.Payload), `"channel_name"`)
+		require.NotContains(t, string(decision.Payload), `"server_name"`)
 	})
 
-	t.Run("private call defaults to participants with coarse payload", func(t *testing.T) {
+	t.Run("private call defaults to friends with coarse payload", func(t *testing.T) {
 		db, ctx := setupPolicyDB(t)
 		senderID := testhelpers.CreateUser(t, db)
 		participantID := testhelpers.CreateUser(t, db)
+		friendID := testhelpers.CreateUser(t, db)
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
+		testhelpers.AddFriendship(t, db, senderID, friendID)
 
 		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 		require.NoError(t, err)
-		require.Equal(t, map[uuid.UUID]bool{participantID: true}, decision.Audience)
+		require.Equal(t, map[uuid.UUID]bool{participantID: true, friendID: true}, decision.Audience)
 		require.NotContains(t, string(decision.Payload), "participant_count")
 	})
 }

@@ -72,7 +72,7 @@ func createServerWithMembers(t *testing.T, db *sql.DB, members ...uuid.UUID) uui
 // setFriendRequestMode materializes the target's privacy_settings row at the
 // given mode. Rows are created lazily, so calling this is what separates a
 // CONFIGURED target from the row-less majority exercised by
-// TestCanReceiveFriendRequestFromTreatsAMissingRowAsEveryone.
+// TestCanReceiveFriendRequestFromTreatsAMissingRowAsMutualServers.
 func setFriendRequestMode(t *testing.T, db *sql.DB, userID uuid.UUID, mode string) {
 	t.Helper()
 	_, err := db.Exec(
@@ -161,7 +161,7 @@ func TestCanReceiveFriendRequestFromIsDirectional(t *testing.T) {
 			"A false here means the two arguments are transposed somewhere")
 }
 
-// TestCanReceiveFriendRequestFromTreatsAMissingRowAsEveryone is spec T2, and it
+// TestCanReceiveFriendRequestFromTreatsAMissingRowAsMutualServers is spec T2, and it
 // is the #1354 trap in its exact original shape: privacy_settings rows are
 // created lazily, so "no row" is the MAJORITY state, not an edge case.
 //
@@ -171,9 +171,9 @@ func TestCanReceiveFriendRequestFromIsDirectional(t *testing.T) {
 // "User not found" for most of the user base. If the COALESCE were dropped,
 // the comparison would go NULL and the scan would fail.
 //
-// Both axes are covered because the two CASE arms COALESCE separately:
-// dropping it from only one arm breaks only one of these subtests.
-func TestCanReceiveFriendRequestFromTreatsAMissingRowAsEveryone(t *testing.T) {
+// Both axes are covered because the shared-server and ordinary stranger arms
+// COALESCE separately: dropping it from either arm breaks only one subtest.
+func TestCanReceiveFriendRequestFromTreatsAMissingRowAsMutualServers(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	h := NewHandler(db, logger.New("test"), nil)
 	ctx := context.Background()
@@ -202,9 +202,55 @@ func TestCanReceiveFriendRequestFromTreatsAMissingRowAsEveryone(t *testing.T) {
 
 			got, err := h.canReceiveFriendRequestFrom(ctx, target.String(), requester.String())
 			require.NoError(t, err)
-			assert.True(t, got,
-				"a target with no privacy_settings row must behave as 'everyone' via "+
+			assert.Equal(t, tc.sharesServer, got,
+				"a target with no privacy_settings row must behave as 'mutual_servers' via "+
 					"LEFT JOIN + COALESCE — not 404, and not a NULL scan error")
+
+			// The owner can still invite a stranger by handing them a valid code.
+			// The helper receives true only after the claim path locks and validates
+			// that code; no ordinary request or eligibility probe passes this flag.
+			viaCode, err := h.canReceiveFriendRequestFromQ(ctx, db,
+				target.String(), requester.String(), true)
+			require.NoError(t, err)
+			assert.True(t, viaCode, "a valid code admits a stranger under mutual_servers")
+		})
+	}
+}
+
+// The code exception applies to mutual_servers, never to nobody. Configured
+// choices remain authoritative regardless of whether the users share a server.
+func TestCanReceiveFriendRequestFromCodeTruthTable(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	h := NewHandler(db, logger.New("test"), nil)
+	ctx := context.Background()
+
+	cases := []struct {
+		name         string
+		sharesServer bool
+		mode         string
+		want         bool
+	}{
+		{"shared server, everyone", true, modeEveryone, true},
+		{"shared server, mutual_servers", true, modeMutualServers, true},
+		{"shared server, nobody", true, modeNobody, false},
+		{"stranger, everyone", false, modeEveryone, true},
+		{"stranger, mutual_servers", false, modeMutualServers, true},
+		{"stranger, nobody", false, modeNobody, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := dbtest.CreateUser(t, db)
+			requester := dbtest.CreateUser(t, db)
+			if tc.sharesServer {
+				createServerWithMembers(t, db, target, requester)
+			}
+			setFriendRequestMode(t, db, target, tc.mode)
+
+			got, err := h.canReceiveFriendRequestFromQ(ctx, db,
+				target.String(), requester.String(), true)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }

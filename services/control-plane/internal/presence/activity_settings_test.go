@@ -145,6 +145,61 @@ func TestActivitySettingsQueriesStayCandidateCorrelated(t *testing.T) {
 		"bounded settings cleanup must not materialize the global friendship graph")
 }
 
+func TestActivitySettingsRecipients_BlockVetoesDefaultFoF(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	sender := testdb.CreateUser(t, db)
+	mutual := testdb.CreateUser(t, db)
+	viewer := testdb.CreateUser(t, db)
+	_, err := db.Exec(`
+		INSERT INTO friendships (requester_id, addressee_id, status)
+		VALUES ($1, $2, 'accepted'), ($2, $3, 'accepted')
+	`, sender, mutual, viewer)
+	require.NoError(t, err)
+	serverID := uuid.New()
+	_, err = db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, $2, $3)`,
+		serverID, "fof-block-settings", sender)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO server_members (server_id, user_id, role)
+		VALUES ($1, $2, 'member'), ($1, $3, 'member')
+	`, serverID, sender, viewer)
+	require.NoError(t, err)
+
+	serverRecipients, err := serverSettingsCandidates(ctx, db, sender, serverID, TierFriends)
+	require.NoError(t, err)
+	require.Contains(t, serverRecipients, viewer, "no privacy row enables unblocked FoF")
+	privateRecipients, err := privateSettingsRecipients(ctx, db, sender, uuid.New(), TierFriends)
+	require.NoError(t, err)
+	require.Contains(t, privateRecipients, viewer)
+
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO friendships (requester_id, addressee_id, status)
+		VALUES ($1, $2, 'blocked')
+	`, viewer, sender)
+	require.NoError(t, err)
+	// This same-package test cannot import dmblock (which imports presence).
+	// Record the canonical pair's block evidence in the friendship transaction.
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO dm_block_reconciliations
+			(user_a_id, user_b_id, operation_id, remove_a, remove_b)
+		VALUES (LEAST($1::uuid, $2::uuid), GREATEST($1::uuid, $2::uuid), $3,
+			$1::uuid < $2::uuid, $1::uuid > $2::uuid)
+	`, viewer, sender, uuid.New())
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	serverRecipients, err = serverSettingsCandidates(ctx, db, sender, serverID, TierFriends)
+	require.NoError(t, err)
+	require.NotContains(t, serverRecipients, viewer)
+	privateRecipients, err = privateSettingsRecipients(ctx, db, sender, uuid.New(), TierFriends)
+	require.NoError(t, err)
+	require.NotContains(t, privateRecipients, viewer)
+	require.Contains(t, privateRecipients, mutual, "the unblocked direct friend remains eligible")
+}
+
 func TestQueryBoundedSettingsRecipients_AllowsExactLimitAndRejectsOverflow(t *testing.T) {
 	db, cleanup := testdb.SetupTestDB(t)
 	t.Cleanup(cleanup)

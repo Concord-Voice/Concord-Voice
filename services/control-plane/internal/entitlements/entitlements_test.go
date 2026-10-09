@@ -2,7 +2,6 @@ package entitlements_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/stretchr/testify/assert"
@@ -32,7 +31,7 @@ func TestFor_Free(t *testing.T) {
 	assert.Equal(t, int64(5_242_880), e.MaxAvatarBytes)
 	assert.Equal(t, int64(5_242_880), e.MaxBannerBytes)
 	assert.False(t, e.AllowAnimatedProfile)
-	assert.Equal(t, 365*24*time.Hour, e.UsernameChangeInterval)
+	assert.Equal(t, 6, e.UsernameChangeIntervalMonths)
 }
 
 func TestFor_Premium(t *testing.T) {
@@ -59,7 +58,7 @@ func TestFor_Premium(t *testing.T) {
 	assert.Equal(t, int64(8_388_608), e.MaxAvatarBytes)
 	assert.Equal(t, int64(8_388_608), e.MaxBannerBytes)
 	assert.True(t, e.AllowAnimatedProfile)
-	assert.Equal(t, 91*24*time.Hour, e.UsernameChangeInterval)
+	assert.Equal(t, 3, e.UsernameChangeIntervalMonths)
 }
 
 func TestFor_UnknownTierFailsClosedToFree(t *testing.T) {

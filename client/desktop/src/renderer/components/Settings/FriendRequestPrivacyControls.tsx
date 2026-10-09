@@ -20,7 +20,8 @@ const FR_TITLES: Record<FriendRequestPrivacyMode, string> = {
  */
 const FR_DESCRIPTIONS: Record<FriendRequestPrivacyMode, string> = {
   nobody: 'No one can send you a friend request.',
-  mutual_servers: 'Only people who share a server with you can send you a friend request.',
+  mutual_servers:
+    'People who share a server or a friend with you can send a request. Someone with a valid friend code can too.',
   everyone: 'Anyone can send you a friend request.',
 };
 
@@ -32,8 +33,8 @@ interface FriendRequestPrivacyControlsProps {
   saveError: string | null;
   /**
    * The server has confirmed the user's settings at least once. Until then the
-   * value shown would be the store's permissive default, not the user's choice,
-   * and presenting a wrong-and-more-permissive mode on a privacy control is a
+   * value shown would be the store's transient default, not the user's choice,
+   * and presenting the wrong mode on a privacy control is a
    * misrepresentation — briefly if the fetch is in flight, and indefinitely if
    * it failed.
    */
@@ -50,11 +51,11 @@ const FriendRequestPrivacyControls = ({
   // unreachable. If it ever is reached, clamping keeps the thumb, the tick and
   // aria-valuetext describing the SAME mode rather than disagreeing.
   const rawIndex = FR_MODES.indexOf(localMode);
-  const index = rawIndex === -1 ? FR_MODES.indexOf('everyone') : rawIndex;
+  const index = rawIndex === -1 ? FR_MODES.indexOf('mutual_servers') : rawIndex;
   const displayMode = FR_MODES[index];
   // Until the server confirms, NOTHING may be presented as selected. The choice
   // labels still render — they are the options, not an assertion about the
-  // user — but marking one active would advertise the store's permissive
+  // user — but marking one active would advertise the store's transient
   // default as though it were the user's own setting.
   const activeIndex = isLoaded ? index : -1;
 

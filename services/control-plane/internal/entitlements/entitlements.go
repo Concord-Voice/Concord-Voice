@@ -8,8 +8,6 @@
 // #1297 endpoint, #1303 redemption engine); this package only defines the values.
 package entitlements
 
-import "time"
-
 // Tier identifiers. The schema stores tier as VARCHAR for extensibility; these
 // are the values defined today.
 const (
@@ -77,7 +75,7 @@ type Entitlement struct {
 	AllowAnimatedProfile bool
 
 	// Account (Class 1 — server-enforced).
-	UsernameChangeInterval time.Duration
+	UsernameChangeIntervalMonths int
 	// MaxServersCreated caps servers currently OWNED (deleting one frees a
 	// slot). Negative = unlimited (ServerLimitUnlimited). Enforced at
 	// CreateServer (#1555).
@@ -91,57 +89,57 @@ type Entitlement struct {
 // freeEntitlement and premiumEntitlement are the ONE definition of the limits.
 var (
 	freeEntitlement = Entitlement{
-		Tier:                     TierFree,
-		AllowCustomScheme:        false,
-		AllowedAudioTiers:        []string{"minimum", "low", "moderate", "standard"},
-		MinPtimeMs:               20,
-		AllowMusicMode:           false,
-		MaxAudioLastN:            8,
-		StreamMaxHeight:          1080,
-		StreamMaxFps:             60,         // #2163: absolute ceiling; pixel-rate tiers it (720p60 ok, 1080p60 rejected)
-		StreamMaxPixelRate:       62_208_000, // #2163: = 1920*1080*30 (1080p30)
-		StreamMaxBitrate:         5_000_000,
-		CameraMaxHeight:          720,
-		CameraMaxFps:             60,
-		CameraMaxBitrate:         2_500_000,
-		MaxManualBitrateBps:      5_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
-		MaxWebcamPublishers:      8,
-		MaxScreensharePublishers: 8, // raised 1→8 for competitive parity (major comms platforms cap stream quality, not concurrency)
-		MaxMessageChars:          5120,
-		MaxAttachmentBytes:       33_554_432, // 32 MiB — mirrors the public Groundspeed per-file baseline
-		MaxAvatarBytes:           5_242_880,  // 5 MiB
-		MaxBannerBytes:           5_242_880,  // 5 MiB
-		AllowAnimatedProfile:     false,
-		UsernameChangeInterval:   365 * 24 * time.Hour,
-		MaxServersCreated:        5,
-		MessageHistorySearchDays: 90,
+		Tier:                         TierFree,
+		AllowCustomScheme:            false,
+		AllowedAudioTiers:            []string{"minimum", "low", "moderate", "standard"},
+		MinPtimeMs:                   20,
+		AllowMusicMode:               false,
+		MaxAudioLastN:                8,
+		StreamMaxHeight:              1080,
+		StreamMaxFps:                 60,         // #2163: absolute ceiling; pixel-rate tiers it (720p60 ok, 1080p60 rejected)
+		StreamMaxPixelRate:           62_208_000, // #2163: = 1920*1080*30 (1080p30)
+		StreamMaxBitrate:             5_000_000,
+		CameraMaxHeight:              720,
+		CameraMaxFps:                 60,
+		CameraMaxBitrate:             2_500_000,
+		MaxManualBitrateBps:          5_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
+		MaxWebcamPublishers:          8,
+		MaxScreensharePublishers:     8, // raised 1→8 for competitive parity (major comms platforms cap stream quality, not concurrency)
+		MaxMessageChars:              5120,
+		MaxAttachmentBytes:           33_554_432, // 32 MiB — mirrors the public Groundspeed per-file baseline
+		MaxAvatarBytes:               5_242_880,  // 5 MiB
+		MaxBannerBytes:               5_242_880,  // 5 MiB
+		AllowAnimatedProfile:         false,
+		UsernameChangeIntervalMonths: 6,
+		MaxServersCreated:            5,
+		MessageHistorySearchDays:     90,
 	}
 
 	premiumEntitlement = Entitlement{
-		Tier:                     TierPremium,
-		AllowCustomScheme:        true,
-		AllowedAudioTiers:        []string{"minimum", "low", "moderate", "standard", "high", "hifi", "studio"},
-		MinPtimeMs:               10,
-		AllowMusicMode:           true,
-		MaxAudioLastN:            16,
-		StreamMaxHeight:          ServerLimitUnlimited, // native (uncapped)
-		StreamMaxFps:             ServerLimitUnlimited,
-		StreamMaxPixelRate:       ServerLimitUnlimited, // #2163: native (no pixel-rate cap)
-		StreamMaxBitrate:         20_000_000,
-		CameraMaxHeight:          ServerLimitUnlimited, // native (uncapped)
-		CameraMaxFps:             ServerLimitUnlimited,
-		CameraMaxBitrate:         6_000_000,
-		MaxManualBitrateBps:      20_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
-		MaxWebcamPublishers:      25,
-		MaxScreensharePublishers: 16, // 2× the free cap (raised 3→16 alongside the free 1→8 parity bump)
-		MaxMessageChars:          10240,
-		MaxAttachmentBytes:       268_435_456, // 256 MiB — Supersonic's pinned 256 MB (512 MB is Mach 3 server-wide)
-		MaxAvatarBytes:           8_388_608,   // 8 MiB
-		MaxBannerBytes:           8_388_608,   // 8 MiB
-		AllowAnimatedProfile:     true,
-		UsernameChangeInterval:   91 * 24 * time.Hour,
-		MaxServersCreated:        ServerLimitUnlimited,
-		MessageHistorySearchDays: 180,
+		Tier:                         TierPremium,
+		AllowCustomScheme:            true,
+		AllowedAudioTiers:            []string{"minimum", "low", "moderate", "standard", "high", "hifi", "studio"},
+		MinPtimeMs:                   10,
+		AllowMusicMode:               true,
+		MaxAudioLastN:                16,
+		StreamMaxHeight:              ServerLimitUnlimited, // native (uncapped)
+		StreamMaxFps:                 ServerLimitUnlimited,
+		StreamMaxPixelRate:           ServerLimitUnlimited, // #2163: native (no pixel-rate cap)
+		StreamMaxBitrate:             20_000_000,
+		CameraMaxHeight:              ServerLimitUnlimited, // native (uncapped)
+		CameraMaxFps:                 ServerLimitUnlimited,
+		CameraMaxBitrate:             6_000_000,
+		MaxManualBitrateBps:          20_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
+		MaxWebcamPublishers:          25,
+		MaxScreensharePublishers:     16, // 2× the free cap (raised 3→16 alongside the free 1→8 parity bump)
+		MaxMessageChars:              10240,
+		MaxAttachmentBytes:           268_435_456, // 256 MiB — Supersonic's pinned 256 MB (512 MB is Mach 3 server-wide)
+		MaxAvatarBytes:               8_388_608,   // 8 MiB
+		MaxBannerBytes:               8_388_608,   // 8 MiB
+		AllowAnimatedProfile:         true,
+		UsernameChangeIntervalMonths: 3,
+		MaxServersCreated:            ServerLimitUnlimited,
+		MessageHistorySearchDays:     180,
 	}
 )
 

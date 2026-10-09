@@ -2,7 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { useUserStore, UpdateProfileData } from '../../stores/auth/userStore';
 import { useImageUpload } from '../../hooks/messaging/useImageUpload';
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
+import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { formatFileSize } from '../../utils/crypto/attachmentCrypto';
+import { addCalendarMonthsUTC, addElapsedSeconds } from '../../utils/time/calendarMonths';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
 import ImageCropEditor from '../ui/ImageCropEditor';
@@ -18,9 +20,39 @@ import {
 
 /** Premium uplift factor for the size-upsell copy (UX hint only). */
 const PREMIUM_IMAGE_MULTIPLIER = 2;
-/** Free username-change cadence (1 year) in seconds — when the entitlement
- *  matches this, the L8 note advertises the premium (3-month) cadence. */
-const FREE_USERNAME_INTERVAL_SECONDS = 31_536_000;
+
+function recomputeUsernameChangeEligibleAt(
+  changedAt: string | undefined,
+  entitlementHydrated: boolean,
+  intervalMonths: number | undefined,
+  legacyIntervalSeconds: number | undefined
+): Date | null {
+  if (entitlementHydrated && changedAt) {
+    if (typeof intervalMonths === 'number') {
+      return addCalendarMonthsUTC(changedAt, intervalMonths);
+    }
+    if (typeof legacyIntervalSeconds === 'number') {
+      return addElapsedSeconds(changedAt, legacyIntervalSeconds);
+    }
+  }
+  return null;
+}
+
+function getUsernameCadenceCopy(
+  entitlementHydrated: boolean,
+  intervalMonths: number | undefined,
+  legacyIntervalSeconds: number | undefined
+): string {
+  if (entitlementHydrated) {
+    if (typeof intervalMonths === 'number') {
+      return `You can change your username every ${intervalMonths} months.`;
+    }
+    if (typeof legacyIntervalSeconds === 'number' && legacyIntervalSeconds % 86_400 === 0) {
+      return `You can change your username every ${legacyIntervalSeconds / 86_400} days.`;
+    }
+  }
+  return 'Your plan sets the wait between username changes.';
+}
 
 const ProfileInfoForm: React.FC = () => {
   const user = useUserStore((state) => state.user);
@@ -29,15 +61,15 @@ const ProfileInfoForm: React.FC = () => {
   // L8/L9 (#1301): informational-only premium caps. The username-change cadence
   // and avatar/banner size limits are server-authoritative; these only drive UX
   // hints, never a hard client block.
-  const usernameChangeIntervalSeconds = useEntitlement((e) => e.usernameChangeIntervalSeconds);
+  const onFreeUsernameCadence = useEntitlement((e) => e.tier === 'free');
+  const usernameChangeIntervalMonths = useEntitlement((e) => e.usernameChangeIntervalMonths);
+  const legacyUsernameIntervalSeconds = useEntitlement((e) => e.usernameChangeIntervalSeconds);
+  const entitlementHydrated = useSubscriptionStore((s) => s.hydrated);
   const maxAvatarBytes = useEntitlement((e) => e.maxAvatarBytes);
   const maxBannerBytes = useEntitlement((e) => e.maxBannerBytes);
   // L9: a non-modal inline upsell banner for an over-limit avatar/banner pick.
   const [avatarUpsell, setAvatarUpsell] = useState<string | null>(null);
   const [bannerUpsell, setBannerUpsell] = useState<string | null>(null);
-  // Whether the free yearly cadence applies (drives the L8 premium upsell copy).
-  const onFreeUsernameCadence = usernameChangeIntervalSeconds >= FREE_USERNAME_INTERVAL_SECONDS;
-
   // Profile form state
   const [username, setUsername] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -63,10 +95,29 @@ const ProfileInfoForm: React.FC = () => {
     initialUrl: user?.header_image_url,
   });
 
-  // Username change cooldown
-  const usernameChangeEligibleAt = user?.username_change_eligible_at
-    ? new Date(user.username_change_eligible_at)
-    : null;
+  // A live tier push changes the cadence immediately, while the cached user
+  // response still carries an eligible_at computed for the previous tier.
+  // Before entitlement hydration, trust the server's profile date instead of
+  // applying the client-side Free floor to a Premium account.
+  const recomputedUsernameChangeEligibleAt = recomputeUsernameChangeEligibleAt(
+    user?.username_changed_at,
+    entitlementHydrated,
+    usernameChangeIntervalMonths,
+    legacyUsernameIntervalSeconds
+  );
+  const usernameChangeEligibleAt =
+    recomputedUsernameChangeEligibleAt ??
+    (user?.username_change_eligible_at ? new Date(user.username_change_eligible_at) : null);
+  // Before a successful entitlement hydrate, a Premium profile may already
+  // carry its correct server date while the store still holds the Free floor.
+  // Keep the copy generic until the actual plan arrives.
+  const usernameCadenceCopy = getUsernameCadenceCopy(
+    entitlementHydrated,
+    usernameChangeIntervalMonths,
+    legacyUsernameIntervalSeconds
+  );
+  const showPremiumCadenceUpsell =
+    entitlementHydrated && onFreeUsernameCadence && usernameChangeIntervalMonths !== undefined;
   /* eslint-disable @eslint-react/purity -- new Date() reads the current time to check cooldown; this is a pure computation with no observable side effect */
   const isUsernameOnCooldown = usernameChangeEligibleAt
     ? usernameChangeEligibleAt > new Date()
@@ -472,18 +523,18 @@ const ProfileInfoForm: React.FC = () => {
         {profileErrors.username && <span className="form-error">{profileErrors.username}</span>}
         {isUsernameOnCooldown && usernameChangeEligibleAt ? (
           <span className="form-hint form-hint-warning">
-            Username changes are limited to once per year. Change again on{' '}
+            {usernameCadenceCopy} Change again on{' '}
             {formatDate(usernameChangeEligibleAt.toISOString())}.
             {/* L8 (#1301): premium cadence upsell — informational note. */}
-            {onFreeUsernameCadence && (
+            {showPremiumCadenceUpsell && (
               <span className="username-cadence-upsell"> Premium: every 3 months.</span>
             )}
           </span>
         ) : (
           <span className="form-hint">
-            {username.trim().length}/{USERNAME_MAX} characters. Can be changed once per year.
+            {username.trim().length}/{USERNAME_MAX} characters. {usernameCadenceCopy}
             {/* L8 (#1301): premium cadence upsell — informational note. */}
-            {onFreeUsernameCadence && (
+            {showPremiumCadenceUpsell && (
               <span className="username-cadence-upsell"> Premium: every 3 months.</span>
             )}
           </span>
@@ -652,7 +703,7 @@ const ProfileInfoForm: React.FC = () => {
             <strong>{username.trim()}</strong>?
           </p>
           <p className="username-change-cooldown-notice">
-            You will not be able to change your username again for 365 days.
+            After you save, your plan sets when you can change your username again.
           </p>
           <div className="username-change-actions">
             <button

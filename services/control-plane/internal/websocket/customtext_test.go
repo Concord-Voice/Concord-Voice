@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/google/uuid"
@@ -583,6 +584,38 @@ func TestCustomTextCandidates_UsesSenderOwnedFoFAndFinalExclusions(t *testing.T)
 	candidates, err = hub.customTextCandidates(context.Background(), viewer)
 	require.NoError(t, err)
 	assert.NotContains(t, candidates, viewer)
+}
+
+func TestCustomTextSnapshot_BlockedFoFExcludedFromCandidateAndFinalAuthorization(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	sender := insertCTUser(t, db, "ctblockfofsender")
+	mutual := insertCTUser(t, db, "ctblockfofmutual")
+	viewer := insertCTUser(t, db, "ctblockfofviewer")
+	makeFriends(t, db, sender, mutual)
+	makeFriends(t, db, mutual, viewer)
+	setCustomText(t, db, sender, 1, "private status", "")
+	ctx := context.Background()
+
+	candidates, err := hub.customTextCandidates(ctx, viewer)
+	require.NoError(t, err)
+	require.Contains(t, candidates, sender, "missing privacy row enables unblocked FoF")
+
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO friendships (requester_id, addressee_id, status)
+		VALUES ($1, $2, 'blocked')
+	`, sender, viewer)
+	require.NoError(t, err)
+	require.NoError(t, dmblock.RecordBlockTx(ctx, tx, sender.String(), viewer.String(), uuid.NewString()))
+	require.NoError(t, tx.Commit())
+	candidates, err = hub.customTextCandidates(ctx, viewer)
+	require.NoError(t, err)
+	require.NotContains(t, candidates, sender, "a direct block vetoes the candidate FoF path")
+
+	viewerClient := connectClient(hub, viewer)
+	require.NoError(t, hub.sendCustomTextSnapshotForSender(ctx, viewerClient, sender))
+	assertNoMessage(t, viewerClient)
 }
 
 func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewMasterOffSender(t *testing.T) {
