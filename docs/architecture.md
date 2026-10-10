@@ -1386,6 +1386,17 @@ and exact-target controls. See [ADR-0041](adr/0041-nightwatch-security-operation
 
 Production runs the Docker Compose stack on a VM behind the Cloudflare proxy (`api.concordvoice.chat`). Cloudflare Pages serves the SPA bundle separately (`spa.concordvoice.chat`).
 
+Managed hosts use the reviewed policy source at
+`infrastructure/docker/iptables/docker-user-rules.sh` for Docker-forwarded IPv4
+traffic. It owns two child chains and one `DOCKER-USER` jump, preserves unrelated
+host rules, and installs a systemd replay unit ordered after Docker. A root-owned
+systemd pre-start drop-in runs a copy of that same reviewed asset to guard IPv4
+forwarding before Docker starts; the post-start replay verifies the owned filter
+policy before removing that temporary guard. An unresolved transaction or unsafe
+replay state prevents Docker startup and requires operator recovery. This guard
+does not filter host input or IPv6. UFW and provider firewalls remain separate
+controls.
+
 ```text
 Desktop client
    │

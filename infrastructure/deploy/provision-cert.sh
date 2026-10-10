@@ -506,8 +506,8 @@ mode_local() {
   local sans; sans="$(derive_sans "$host" "$ip")"
   replace_source_generation local "$host" "$days" "$sans"
 }
-# mode_letsencrypt --domain <d> --email <e> — behavior-preserving extraction of
-# the inline certbot flow from provision-production.sh. --reuse-key is
+# mode_letsencrypt --domain <d> --email <e> — issue through the HTTP webroot.
+# --reuse-key is
 # LOAD-BEARING (SPKI-pin stability, #658). DO NOT remove. certonly --webroot
 # (#881) avoids the in-place nginx ssl_certificate auto-edit. Suppress directory
 # hooks for this command only: complete_delivery below performs the required

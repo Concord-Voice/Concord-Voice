@@ -39,8 +39,8 @@ fi
 
 # Sanity check — cert files don't exist yet.
 #
-# Legitimate during initial provisioning: provision-production.sh invokes the
-# deploy hook manually before certbot has issued the first cert. Exit 0 is
+# During initial TLS provisioning, the deploy hook can run before certbot
+# has issued the first cert. Exit 0 is
 # correct (no error, nothing to do). The stderr line leaves a forensic trail
 # so an operator investigating "why did the cert renew but coturn still has
 # the old cert?" can grep journalctl and see WHY the hook short-circuited

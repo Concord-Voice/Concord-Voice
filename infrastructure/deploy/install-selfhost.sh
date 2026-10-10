@@ -935,9 +935,8 @@ provision_tls() {
     letsencrypt)
       # certbot --webroot needs DNS pointing here and /var/www/html served on port
       # 80, which nginx's stock default site does. Every mode runs before the vhost
-      # is installed (summary step 3): nginx -t needs the cert files. Unlike
-      # provision-production.sh, which bootstraps ufw/webroot/nginx-on-80 before
-      # delegating, the installer does not.
+      # is installed (summary step 3): nginx -t needs the cert files. The
+      # operator prepares the HTTP listener and firewall before issuance.
       echo -e "${YELLOW}⚠ letsencrypt: run as root once DNS points here and port 80 is open, before installing the vhost (steps below):${NC}" >&2
       say_root_cmd "sudo $(shq "$pc") letsencrypt --domain $(shq "$CFG_DOMAIN") --email $(shq "${CFG_SMTP_FROM:-admin@$CFG_DOMAIN}")"
       ;;
