@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useId } from 'react';
+import { useState, useEffect, useRef, useCallback, useId, useSyncExternalStore } from 'react';
 import { MessageSquare, Users, BookOpen, MessagesSquare, PenLine, Search } from 'lucide-react';
 import {
   useDMStore,
@@ -17,6 +17,16 @@ import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { E2EEKeyUnavailableError } from '../../services/e2ee/e2eeErrors';
 import { subscribeSearchScopeInvalidations } from '../../services/messaging/searchService';
+import { apiFetch } from '../../services/system/apiClient';
+import {
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
+  type ApiRequestContext,
+} from '../../services/system/requestContext';
+import {
+  captureRuntimeServerSelection,
+  onRuntimeServerSelectionChange,
+} from '../../services/system/runtimeServerBase';
 import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
@@ -46,6 +56,60 @@ interface ConversationAvatarProps {
   currentUserId: string;
   other?: DMParticipant;
   status: string;
+}
+
+interface GroupIconOwner {
+  conversationId: string;
+  source: string;
+  currentUserId: string;
+  context: ApiRequestContext;
+  controller: AbortController;
+  disposed: boolean;
+  objectUrl: string | null;
+}
+
+interface LoadedGroupIcon {
+  owner: GroupIconOwner;
+  url: string;
+}
+
+const supportedIconTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const normalizeIconType = (value: string) => value.split(';')[0].trim().toLowerCase();
+const readServerEpoch = () => captureRuntimeServerSelection().epoch;
+
+function disposeGroupIcon(owner: GroupIconOwner): void {
+  if (owner.disposed) return;
+  owner.disposed = true;
+  owner.controller.abort();
+  const url = owner.objectUrl;
+  owner.objectUrl = null;
+  if (url !== null) URL.revokeObjectURL(url);
+}
+
+function groupIconIdentityMatches(
+  owner: GroupIconOwner,
+  row: DMConversation | undefined,
+  userId: string
+): boolean {
+  return (
+    row?.id === owner.conversationId &&
+    row.isGroup &&
+    row.iconUrl === owner.source &&
+    userId === owner.currentUserId &&
+    apiRequestContextIsCurrent(owner.context)
+  );
+}
+
+function groupIconMatches(
+  owner: GroupIconOwner,
+  row: DMConversation | undefined,
+  userId: string
+): boolean {
+  return (
+    !owner.disposed &&
+    !owner.controller.signal.aborted &&
+    groupIconIdentityMatches(owner, row, userId)
+  );
 }
 
 /** Get display name for a conversation (other user's name for 1:1, group name for group) */
@@ -90,8 +154,127 @@ const ConversationAvatar: React.FC<ConversationAvatarProps> = ({
   status,
 }) => {
   const [failedAvatarUrl, setFailedAvatarUrl] = useState<string | null>(null);
-  const avatarSrc = resolveMediaUrl(conv.isGroup ? conv.iconUrl : other?.avatarUrl);
-  const showImage = avatarSrc && avatarSrc !== failedAvatarUrl;
+  const [groupImage, setGroupImage] = useState<LoadedGroupIcon | null>(null);
+  const [ownershipRevision, setOwnershipRevision] = useState(0);
+  const groupOwnerRef = useRef<GroupIconOwner | null>(null);
+  const authGeneration = useAuthStore((state) => state.authGeneration);
+  const accountUserId = useUserStore((state) => state.user?.id ?? '');
+  const serverEpoch = useSyncExternalStore(
+    onRuntimeServerSelectionChange,
+    readServerEpoch,
+    readServerEpoch
+  );
+  const conversationId = conv.id;
+  const isGroup = conv.isGroup;
+  const source = conv.iconUrl ?? '';
+
+  useEffect(() => {
+    if (!isGroup || !source || !currentUserId || currentUserId !== accountUserId) return;
+    const context = captureApiRequestContext();
+    if (!context.authLifecycle.accessToken) return;
+    const owner: GroupIconOwner = {
+      conversationId,
+      source,
+      currentUserId,
+      context,
+      controller: new AbortController(),
+      disposed: false,
+      objectUrl: null,
+    };
+    groupOwnerRef.current = owner;
+    const isIdentityCurrent = () =>
+      groupOwnerRef.current === owner &&
+      groupIconIdentityMatches(
+        owner,
+        useDMStore.getState().conversations.find((row) => row.id === owner.conversationId),
+        useUserStore.getState().user?.id ?? ''
+      );
+    const isCurrent = () =>
+      !owner.disposed && !owner.controller.signal.aborted && isIdentityCurrent();
+    let identityRetired = false;
+    const retireIfChanged = () => {
+      if (identityRetired || isIdentityCurrent()) return;
+      identityRetired = true;
+      disposeGroupIcon(owner);
+      setGroupImage((current) => (current?.owner === owner ? null : current));
+      // External transitions admit a fresh owner even after a failed request,
+      // and even when React batches source/group A to B to A into one render.
+      setOwnershipRevision((revision) => revision + 1);
+    };
+    const unsubscribeAuth = useAuthStore.subscribe(retireIfChanged);
+    const unsubscribeUser = useUserStore.subscribe(retireIfChanged);
+    const unsubscribeDM = useDMStore.subscribe(retireIfChanged);
+    const unsubscribeServer = onRuntimeServerSelectionChange(retireIfChanged);
+    void (async () => {
+      try {
+        const response = await apiFetch(
+          `/api/v1/media/dm-icons/${encodeURIComponent(conversationId)}`,
+          { signal: owner.controller.signal, cache: 'no-store' },
+          { context: owner.context }
+        );
+        if (!isCurrent()) return;
+        if (
+          !response.ok ||
+          !supportedIconTypes.has(normalizeIconType(response.headers.get('Content-Type') ?? ''))
+        ) {
+          disposeGroupIcon(owner);
+          return;
+        }
+        const blob = await response.blob();
+        if (!isCurrent()) return;
+        if (blob.size === 0 || !supportedIconTypes.has(normalizeIconType(blob.type))) {
+          disposeGroupIcon(owner);
+          return;
+        }
+        owner.objectUrl = URL.createObjectURL(blob);
+        if (!isCurrent()) {
+          disposeGroupIcon(owner);
+          return;
+        }
+        setGroupImage({ owner, url: owner.objectUrl });
+      } catch {
+        disposeGroupIcon(owner);
+        setGroupImage((current) => (current?.owner === owner ? null : current));
+      }
+    })();
+    return () => {
+      unsubscribeAuth();
+      unsubscribeUser();
+      unsubscribeDM();
+      unsubscribeServer();
+      if (groupOwnerRef.current === owner) groupOwnerRef.current = null;
+      disposeGroupIcon(owner);
+    };
+  }, [
+    conversationId,
+    isGroup,
+    source,
+    currentUserId,
+    accountUserId,
+    authGeneration,
+    serverEpoch,
+    ownershipRevision,
+  ]);
+
+  const displayedGroupImage =
+    groupImage &&
+    groupOwnerRef.current === groupImage.owner &&
+    currentUserId === accountUserId &&
+    groupIconMatches(groupImage.owner, conv, currentUserId)
+      ? groupImage
+      : null;
+  const avatarSrc = conv.isGroup ? displayedGroupImage?.url : resolveMediaUrl(other?.avatarUrl);
+  const showImage = Boolean(avatarSrc && (conv.isGroup || avatarSrc !== failedAvatarUrl));
+  const handleImageError = () => {
+    if (conv.isGroup) {
+      const owner = displayedGroupImage?.owner;
+      if (!owner) return;
+      disposeGroupIcon(owner);
+      setGroupImage((current) => (current?.owner === owner ? null : current));
+    } else if (avatarSrc) {
+      setFailedAvatarUrl(avatarSrc);
+    }
+  };
   const fallback = conv.isGroup ? (
     <Users size={18} />
   ) : (
@@ -107,10 +290,11 @@ const ConversationAvatar: React.FC<ConversationAvatarProps> = ({
     <div className={`conversation-avatar${conv.isGroup ? ' group' : ''}`}>
       {showImage ? (
         <img
+          key={conv.isGroup ? avatarSrc : undefined}
           src={avatarSrc}
           alt=""
           className="conversation-avatar-img"
-          onError={() => setFailedAvatarUrl(avatarSrc)}
+          onError={handleImageError}
         />
       ) : (
         fallback

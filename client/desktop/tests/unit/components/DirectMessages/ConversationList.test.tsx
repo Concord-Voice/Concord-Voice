@@ -1,4 +1,10 @@
-import { render, screen, fireEvent, waitFor, act, within } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, act, within, cleanup } from '../../../test-utils';
+import { render as bareRender } from '@testing-library/react';
+import { StrictMode, useLayoutEffect, useRef, useState } from 'react';
+import { BrowserRouter } from 'react-router';
+import { http, HttpResponse } from 'msw';
+import type { StoreApi } from 'zustand';
+import { server } from '../../../mocks/server';
 import {
   useDMStore,
   type DMConversation,
@@ -6,13 +12,26 @@ import {
 } from '@/renderer/stores/chat/dmStore';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { API_BASE } from '@/renderer/config';
-import { vi } from 'vitest';
+import { vi, type Mock, type MockInstance } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import {
+  configureRefreshFailureReset,
+  ensureMachineId,
+  _resetRefreshState,
+} from '@/renderer/services/system/apiClient';
+import { _resetClientVersionCache } from '@/renderer/utils/runtime/clientVersion';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
+import * as runtimeServerBase from '@/renderer/services/system/runtimeServerBase';
+import { ModalProvider } from '@/renderer/components/ui/ModalContext';
 
 // Mock e2eeService
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
@@ -68,6 +87,68 @@ const makeConversation = (overrides: Partial<DMConversation> = {}): DMConversati
   createdAt: '2025-01-01T00:00:00Z',
   ...overrides,
 });
+
+const iconId = '26260000-0000-4000-8000-000000000001';
+const pngBytes = Uint8Array.from(
+  atob(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhGUAAAAASUVORK5CYII='
+  ),
+  (character) => character.charCodeAt(0)
+);
+const pngResponse = () => new HttpResponse(pngBytes, { headers: { 'Content-Type': 'image/png' } });
+
+function installGroup(updates: Partial<DMConversation> = {}): void {
+  useDMStore.setState({
+    conversations: [
+      makeConversation({
+        id: iconId,
+        isGroup: true,
+        name: 'Crew',
+        iconUrl: 'source-one',
+        ...updates,
+      }),
+    ],
+  });
+}
+
+function patchGroup(patch: Partial<DMConversation>): void {
+  const row = useDMStore.getState().conversations[0];
+  if (!row) throw new Error('Missing group fixture');
+  useDMStore.setState({ conversations: [{ ...row, ...patch }] });
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  readonly settled: boolean;
+}
+
+function deferred<T>(): Deferred<T> {
+  let settled = false;
+  let resolve: (value: T) => void = () => {
+    throw new Error('Uninitialized deferred');
+  };
+  const promise = new Promise<T>((accept) => {
+    resolve = (value) => {
+      settled = true;
+      accept(value);
+    };
+  });
+  return {
+    promise,
+    resolve,
+    get settled() {
+      return settled;
+    },
+  };
+}
+
+// Only positive orchestration gates use waitFor. Completion gates are awaited
+// inside async act before inspecting DOM absence or resource non-allocation.
+async function awaitGate<T>(gate: Deferred<T>, description: string): Promise<T> {
+  await waitFor(() => expect(gate.settled, description).toBe(true));
+  return gate.promise;
+}
 
 const personalThread: DMConversation = {
   id: 'personal-1',
@@ -1239,57 +1320,834 @@ describe('ConversationList', () => {
     expect(groupAvatar).toBeInTheDocument();
   });
 
-  it('shows group conversation icons when set', () => {
-    useDMStore.setState({
-      conversations: [
-        makeConversation({
-          id: 'group-1',
-          isGroup: true,
-          name: 'Team',
-          iconUrl: '/api/v1/media/dm-icons/group-1.png',
-          participants: [
-            { userId: 'user-1', username: 'me' },
-            { userId: 'user-2', username: 'alice' },
-          ],
-        }),
-      ],
-      fetchConversations: vi.fn().mockResolvedValue(undefined),
+  describe('authenticated group icon ownership (#2626)', () => {
+    const originalElectron = globalThis.electron;
+    let create: MockInstance<typeof URL.createObjectURL>;
+    let revoke: MockInstance<typeof URL.revokeObjectURL>;
+    let requests: Request[];
+    let completedRequests: Request[];
+    let releasePending: Array<() => void>;
+
+    beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+    afterAll(() => server.close());
+
+    beforeEach(async () => {
+      // The outer beforeEach resets all stores and installs the real user/DM
+      // fixtures. Each icon case also owns its transport and bridge lifetime.
+      requests = [];
+      completedRequests = [];
+      releasePending = [];
+      resetRuntimeServerBase();
+      _resetRefreshState();
+      _resetClientVersionCache();
+      useAuthStore.getState().beginAuthLifecycle('test-token-2626', 'test-session-2626');
+      installGroup();
+      const bridge = {
+        ...window.electron,
+        getVersion: vi.fn().mockResolvedValue('0.2.48'),
+        getMachineId: vi.fn().mockResolvedValue('test-device-2626'),
+        refreshToken: vi.fn().mockResolvedValue({ status: 'error' }),
+        attestation: {
+          getToken: vi.fn().mockResolvedValue('test-attestation-2626'),
+          clearToken: vi.fn().mockResolvedValue(undefined),
+        },
+      };
+      // tests/setup.ts makes this property writable but non-configurable;
+      // stubGlobal would redefine it. Restore its original value in teardown.
+      globalThis.electron = bridge;
+      configureRefreshFailureReset({ gracefulReset: vi.fn(), nuclearReset: vi.fn() });
+      await ensureMachineId(API_BASE);
+      let urlSequence = 0;
+      create = vi
+        .spyOn(URL, 'createObjectURL')
+        .mockImplementation(() => `blob:2626-${++urlSequence}`);
+      revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+      server.events.on('request:start', ({ request }) => {
+        if (request.url.includes('/api/v1/media/dm-icons/')) requests.push(request);
+      });
+      server.events.on('request:end', ({ request }) => {
+        if (request.url.includes('/api/v1/media/dm-icons/')) completedRequests.push(request);
+      });
+      // A successor settles independently of the delayed predecessor.
+      server.use(
+        http.get(/\/api\/v1\/media\/dm-icons\//, () => new HttpResponse(null, { status: 404 }))
+      );
     });
-    const { container } = render(
-      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
-    );
 
-    expect(container.querySelector('.conversation-avatar-img')).toHaveAttribute(
-      'src',
-      `${API_BASE}/api/v1/media/dm-icons/group-1.png`
-    );
-  });
-
-  it('falls back to the group icon when a group image fails', async () => {
-    useDMStore.setState({
-      conversations: [
-        makeConversation({
-          id: 'group-1',
-          isGroup: true,
-          name: 'Team',
-          iconUrl: 'https://example.com/broken-group.png',
-          participants: [
-            { userId: 'user-1', username: 'me' },
-            { userId: 'user-2', username: 'alice' },
-          ],
-        }),
-      ],
-      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    afterEach(async () => {
+      cleanup();
+      releasePending.forEach((release) => release());
+      await act(async () => {});
+      server.resetHandlers();
+      server.events.removeAllListeners();
+      vi.restoreAllMocks();
+      globalThis.electron = originalElectron;
+      resetRuntimeServerBase();
+      _resetRefreshState();
+      _resetClientVersionCache();
     });
-    const { container } = render(
-      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
-    );
 
-    fireEvent.error(container.querySelector('.conversation-avatar-img') as HTMLImageElement);
+    function mount() {
+      return render(
+        <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+    }
 
-    await waitFor(() => {
+    async function ready(container: HTMLElement, url = 'blob:2626-1'): Promise<HTMLImageElement> {
+      await waitFor(() =>
+        expect(container.querySelector('.conversation-avatar-img')).toHaveAttribute('src', url)
+      );
+      const image = container.querySelector<HTMLImageElement>('.conversation-avatar-img');
+      if (!image) throw new Error('Missing ready icon');
+      return image;
+    }
+
+    function expectFallback(container: HTMLElement): void {
       expect(container.querySelector('.conversation-avatar-img')).not.toBeInTheDocument();
-      expect(container.querySelector('.conversation-avatar.group svg')).toBeInTheDocument();
+      if (useDMStore.getState().conversations[0]?.isGroup) {
+        expect(container.querySelector('.conversation-avatar.group svg')).toBeInTheDocument();
+      } else {
+        expect(container.querySelector('.conversation-avatar-initial')).toBeInTheDocument();
+      }
+    }
+
+    async function settleSuccessor(name: string, completedCount: number): Promise<void> {
+      if (['source removal', 'group replacement', 'logout', 'unmount'].includes(name)) return;
+      await act(async () => {
+        await waitFor(() =>
+          expect(completedRequests.length, 'the successor 404 reached the response boundary').toBe(
+            completedCount
+          )
+        );
+      });
+    }
+
+    function gateBody(marker = 'yes') {
+      const started = deferred<void>();
+      const release = deferred<void>();
+      const returned = deferred<void>();
+      const realBlob = Response.prototype.blob;
+      vi.spyOn(Response.prototype, 'blob').mockImplementation(async function (this: Response) {
+        const blob = await realBlob.call(this);
+        if (this.headers.get('X-Icon-Body-Gate') === marker) {
+          started.resolve(undefined);
+          await release.promise;
+          returned.resolve(undefined);
+        }
+        return blob;
+      });
+      releasePending.push(() => release.resolve(undefined));
+      return { started, release, returned };
+    }
+
+    const mutations: Array<[string, () => void]> = [
+      ['source replacement', () => patchGroup({ iconUrl: 'source-two' })],
+      ['source removal', () => patchGroup({ iconUrl: undefined })],
+      [
+        'conversation replacement',
+        () => patchGroup({ id: '26260000-0000-4000-8000-000000000002' }),
+      ],
+      ['group replacement', () => patchGroup({ isGroup: false })],
+      [
+        'user replacement',
+        () =>
+          useUserStore.setState((state) => ({
+            user: state.user ? { ...state.user, id: 'user-2' } : null,
+          })),
+      ],
+      [
+        'auth replacement',
+        () => {
+          useAuthStore
+            .getState()
+            .beginAuthLifecycle('test-successor-token', 'test-successor-session');
+        },
+      ],
+      ['logout', () => useAuthStore.getState().clearAccessToken()],
+      [
+        'runtime ABA',
+        () => {
+          setRuntimeServerBase('https://other-api.example');
+          resetRuntimeServerBase();
+        },
+      ],
+    ];
+    const lifecycleCases: Array<[string, (() => void) | null]> = [...mutations, ['unmount', null]];
+
+    it('fetches the canonical group route with API headers and owns its Blob URL', async () => {
+      const observed = deferred<Request>();
+      installGroup({ iconUrl: 'https://untrusted.example/private.png' });
+      server.use(
+        http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, ({ request }) => {
+          observed.resolve(request);
+          return pngResponse();
+        })
+      );
+      create.mockReturnValue('blob:2626-ready');
+      const { container, unmount } = mount();
+      await ready(container, 'blob:2626-ready');
+      const request = await awaitGate(observed, 'the canonical API request reached MSW');
+      expect(request.url).toBe(`${API_BASE}/api/v1/media/dm-icons/${iconId}`);
+      expect(request.headers.get('Authorization')).toBe('Bearer test-token-2626');
+      expect(request.headers.get('X-Session-ID')).toBe('test-session-2626');
+      expect(request.headers.get('X-Attestation-Token')).toBe('test-attestation-2626');
+      expect(request.headers.get('X-Machine-Id')).toBe('test-device-2626');
+      expect(request.cache).toBe('no-store');
+      expect(request.credentials).toBe('include');
+      expect(create.mock.calls[0]?.[0]).toMatchObject({
+        type: 'image/png',
+        size: pngBytes.byteLength,
+      });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('.conversation-avatar-img')).toHaveAttribute('alt', '');
+      expect(container.innerHTML).not.toContain('test-token-2626');
+      expect(container.innerHTML).not.toContain('test-session-2626');
+      expect(container.innerHTML).not.toContain('test-attestation-2626');
+      expect(container.innerHTML).not.toContain('untrusted.example');
+      unmount();
+      expect(revoke.mock.calls.filter(([url]) => url === 'blob:2626-ready')).toHaveLength(1);
+    });
+
+    it.each(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])(
+      'owns a nonempty supported %s response',
+      async (type) => {
+        server.use(
+          http.get(
+            `${API_BASE}/api/v1/media/dm-icons/${iconId}`,
+            () => new HttpResponse(pngBytes, { headers: { 'Content-Type': type } })
+          )
+        );
+        const { container, unmount } = mount();
+        await ready(container);
+        expect(create.mock.calls[0]?.[0]).toMatchObject({ type, size: pngBytes.byteLength });
+        unmount();
+        expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:2626-1');
+      }
+    );
+
+    it('uses the selected runtime origin for the authenticated icon request', async () => {
+      const selectedBase = 'https://selected-api.example';
+      setRuntimeServerBase(selectedBase);
+      await ensureMachineId(selectedBase);
+      server.use(http.get(`${selectedBase}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container } = mount();
+      await ready(container);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe(`${selectedBase}/api/v1/media/dm-icons/${iconId}`);
+      expect(requests[0]?.headers.get('Authorization')).toBe('Bearer test-token-2626');
+      expect(requests[0]?.headers.get('X-Machine-Id')).toBe('test-device-2626');
+    });
+
+    it('encodes the complete conversation ID as one canonical route segment', async () => {
+      const conversationId = 'group/with?segments';
+      installGroup({ id: conversationId });
+      server.use(http.get(/\/api\/v1\/media\/dm-icons\//, () => pngResponse()));
+      const { container } = mount();
+      await ready(container);
+      expect(requests[0]?.url).toBe(
+        `${API_BASE}/api/v1/media/dm-icons/${encodeURIComponent(conversationId)}`
+      );
+      expect(new URL(requests[0]?.url ?? API_BASE).search).toBe('');
+    });
+
+    it('shows the existing Users fallback while the icon response is pending', async () => {
+      const started = deferred<void>();
+      const release = deferred<void>();
+      const returned = deferred<void>();
+      releasePending.push(() => release.resolve(undefined));
+      server.use(
+        http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, async () => {
+          started.resolve(undefined);
+          await release.promise;
+          returned.resolve(undefined);
+          return pngResponse();
+        })
+      );
+      const { container } = mount();
+      await awaitGate(started, 'the deferred authenticated icon request started');
+      expectFallback(container);
+      expect(create).not.toHaveBeenCalled();
+      await act(async () => {
+        release.resolve(undefined);
+        await returned.promise;
+      });
+      await ready(container);
+    });
+
+    const failures = [
+      ['401', () => new HttpResponse(null, { status: 401 })],
+      ['403', () => new HttpResponse(null, { status: 403 })],
+      ['404', () => new HttpResponse(null, { status: 404 })],
+      ['500', () => new HttpResponse(null, { status: 500 })],
+      ['network', () => HttpResponse.error()],
+      ['empty', () => new HttpResponse(null, { headers: { 'Content-Type': 'image/png' } })],
+      ['non-image', () => HttpResponse.text('unavailable')],
+      [
+        'unsupported-image',
+        () => new HttpResponse('<svg/>', { headers: { 'Content-Type': 'image/svg+xml' } }),
+      ],
+    ] as const;
+
+    it.each(failures)(
+      'disposes a %s response into the group fallback without retrying',
+      async (_name, response) => {
+        server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => response()));
+        const { container } = mount();
+        // The aborted signal positively establishes that the consumer completed
+        // its failure path; an empty initial DOM cannot establish this.
+        await act(async () => {
+          await waitFor(() =>
+            expect(completedRequests.length, 'MSW completed the failure response').toBe(1)
+          );
+          await waitFor(() =>
+            expect(requests[0]?.signal.aborted, 'the failed icon owner was disposed').toBe(true)
+          );
+        });
+        expectFallback(container);
+        expect(create).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        expect(requests).toHaveLength(1);
+        await act(async () => {
+          patchGroup({
+            name: 'Crew renamed',
+            unreadCount: 3,
+            lastMessage: {
+              content: '',
+              userId: 'user-2',
+              username: 'alice',
+              createdAt: '2026-10-13T00:00:00Z',
+            },
+          });
+        });
+        expectFallback(container);
+        expect(requests).toHaveLength(1);
+        expect(create).not.toHaveBeenCalled();
+      }
+    );
+
+    it('disposes a body-consumption failure without allocating or retrying', async () => {
+      const bodyConsumed = deferred<void>();
+      const realBlob = Response.prototype.blob;
+      vi.spyOn(Response.prototype, 'blob').mockImplementation(async function (this: Response) {
+        const blob = await realBlob.call(this);
+        if (this.headers.get('X-Icon-Body-Gate') === 'fail') {
+          bodyConsumed.resolve(undefined);
+          throw new Error('Icon body unavailable');
+        }
+        return blob;
+      });
+      server.use(
+        http.get(
+          `${API_BASE}/api/v1/media/dm-icons/${iconId}`,
+          () =>
+            new HttpResponse(pngBytes, {
+              headers: { 'Content-Type': 'image/png', 'X-Icon-Body-Gate': 'fail' },
+            })
+        )
+      );
+      const { container } = mount();
+      await act(async () => {
+        await awaitGate(bodyConsumed, 'the real response body was consumed before its failure');
+        await waitFor(() => expect(requests[0]?.signal.aborted).toBe(true));
+      });
+      expectFallback(container);
+      expect(create).not.toHaveBeenCalled();
+      expect(requests).toHaveLength(1);
+    });
+
+    it('disposes object-URL creation failure into the fallback without retrying', async () => {
+      create.mockImplementation(() => {
+        throw new Error('Icon URL unavailable');
+      });
+      server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container } = mount();
+      await act(async () => {
+        await waitFor(() => expect(requests[0]?.signal.aborted).toBe(true));
+      });
+      expect(create).toHaveBeenCalledTimes(1);
+      expectFallback(container);
+      expect(revoke).not.toHaveBeenCalled();
+      expect(requests).toHaveLength(1);
+    });
+
+    it('releases a decoded-image error once and keeps the group fallback without retrying', async () => {
+      server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container, unmount } = mount();
+      const image = await ready(container);
+      fireEvent.error(image);
+      expectFallback(container);
+      expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:2626-1');
+      expect(requests).toHaveLength(1);
+      unmount();
+      expect(revoke).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [
+        'source marker',
+        () => {
+          patchGroup({ iconUrl: 'source-two' });
+          patchGroup({ iconUrl: 'source-one' });
+        },
+      ],
+      [
+        'group eligibility',
+        () => {
+          patchGroup({ isGroup: false });
+          patchGroup({ isGroup: true });
+        },
+      ],
+    ] as const)(
+      'permits a fresh attempt after a failed owner and batched %s A to B to A transition',
+      async (_name, restore) => {
+        let responseNumber = 0;
+        server.use(
+          http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () =>
+            ++responseNumber === 1 ? new HttpResponse(null, { status: 404 }) : pngResponse()
+          )
+        );
+        const { container, unmount } = mount();
+        await act(async () => {
+          await waitFor(() => expect(requests[0]?.signal.aborted).toBe(true));
+        });
+        expectFallback(container);
+        act(restore);
+        await ready(container);
+        expect(requests).toHaveLength(2);
+        expect(create).toHaveBeenCalledTimes(1);
+        unmount();
+        expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:2626-1');
+      }
+    );
+    it.each(lifecycleCases)(
+      'aborts a pending response on %s and rejects its late result',
+      async (name, mutate) => {
+        const started = deferred<Request>();
+        const release = deferred<void>();
+        const returned = deferred<void>();
+        releasePending.push(() => release.resolve(undefined));
+        let firstRequest = true;
+        server.use(
+          http.get(/\/api\/v1\/media\/dm-icons\//, async ({ request }) => {
+            if (!firstRequest) return new HttpResponse(null, { status: 404 });
+            firstRequest = false;
+            started.resolve(request);
+            await release.promise;
+            returned.resolve(undefined);
+            return pngResponse();
+          })
+        );
+        const view = mount();
+        const request = await awaitGate(started, 'the predecessor fetch reached MSW');
+        act(() => {
+          if (mutate) mutate();
+          else view.unmount();
+        });
+        expect(request.signal.aborted).toBe(true);
+        await settleSuccessor(name, 1);
+        await act(async () => {
+          release.resolve(undefined);
+          await awaitGate(returned, 'the delayed handler returned its predecessor response');
+        });
+        expect(create).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        if (mutate) expectFallback(view.container);
+        else expect(view.container).toBeEmptyDOMElement();
+      }
+    );
+
+    it.each(lifecycleCases)(
+      'aborts a consumed body on %s and rejects its late Blob',
+      async (name, mutate) => {
+        const body = gateBody();
+        let firstRequest = true;
+        server.use(
+          http.get(/\/api\/v1\/media\/dm-icons\//, () => {
+            if (!firstRequest) return new HttpResponse(null, { status: 404 });
+            firstRequest = false;
+            return new HttpResponse(pngBytes, {
+              headers: { 'Content-Type': 'image/png', 'X-Icon-Body-Gate': 'yes' },
+            });
+          })
+        );
+        const view = mount();
+        await awaitGate(body.started, 'the predecessor consumed its real Blob before waiting');
+        const request = requests[0];
+        expect(request).toBeDefined();
+        act(() => {
+          if (mutate) mutate();
+          else view.unmount();
+        });
+        expect(request?.signal.aborted).toBe(true);
+        await settleSuccessor(name, 2);
+        await act(async () => {
+          body.release.resolve(undefined);
+          await awaitGate(
+            body.returned,
+            'the consumed predecessor Blob resumed after supersession'
+          );
+        });
+        expect(create).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        if (mutate) expectFallback(view.container);
+        else expect(view.container).toBeEmptyDOMElement();
+      }
+    );
+
+    it.each(lifecycleCases)(
+      'releases the displayed predecessor exactly once on %s',
+      async (name, mutate) => {
+        let firstRequest = true;
+        server.use(
+          http.get(/\/api\/v1\/media\/dm-icons\//, () => {
+            if (!firstRequest) return new HttpResponse(null, { status: 404 });
+            firstRequest = false;
+            return pngResponse();
+          })
+        );
+        const view = mount();
+        await ready(view.container);
+        const request = requests[0];
+        act(() => {
+          if (mutate) mutate();
+          else view.unmount();
+        });
+        expect(request?.signal.aborted).toBe(true);
+        await settleSuccessor(name, 2);
+        expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:2626-1');
+        expect(create).toHaveBeenCalledTimes(1);
+        if (mutate) expectFallback(view.container);
+        else expect(view.container).toBeEmptyDOMElement();
+        view.unmount();
+        expect(revoke).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    it('does not let a retained predecessor image error revoke its successful successor', async () => {
+      server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container, unmount } = mount();
+      const predecessor = await ready(container);
+      // Detached DOM events no longer reach React's predecessor handler. Retain
+      // the actual callback before replacement to exercise its closed-over owner.
+      const propsKey = Object.keys(predecessor).find((key) => key.startsWith('__reactProps$'));
+      if (!propsKey) throw new Error('React callback capture is unavailable');
+      const reactProps: unknown = Reflect.get(predecessor, propsKey);
+      if (
+        !reactProps ||
+        typeof reactProps !== 'object' ||
+        !('onError' in reactProps) ||
+        typeof reactProps.onError !== 'function'
+      ) {
+        throw new Error('The predecessor has no image error callback');
+      }
+      const retainedError = reactProps.onError;
+      act(() => patchGroup({ iconUrl: 'source-two' }));
+      const successor = await ready(container, 'blob:2626-2');
+      expect(successor).not.toBe(predecessor);
+      expect(revoke.mock.calls.filter(([url]) => url === 'blob:2626-1')).toHaveLength(1);
+      act(() => {
+        retainedError();
+        retainedError();
+      });
+      expect(container.querySelector('.conversation-avatar-img')).toBe(successor);
+      expect(successor).toHaveAttribute('src', 'blob:2626-2');
+      expect(revoke.mock.calls.filter(([url]) => url === 'blob:2626-2')).toHaveLength(0);
+      unmount();
+      expect(revoke.mock.calls.filter(([url]) => url === 'blob:2626-2')).toHaveLength(1);
+      expect(revoke.mock.calls.filter(([url]) => url === 'blob:2626-1')).toHaveLength(1);
+    });
+
+    it('gives a batched source A to B to A restoration a fresh owner despite equal final values', async () => {
+      const predecessor = {
+        started: deferred<void>(),
+        release: deferred<void>(),
+        returned: deferred<void>(),
+      };
+      const successor = {
+        started: deferred<void>(),
+        release: deferred<void>(),
+        returned: deferred<void>(),
+      };
+      const realBlob = Response.prototype.blob;
+      vi.spyOn(Response.prototype, 'blob').mockImplementation(async function (this: Response) {
+        const blob = await realBlob.call(this);
+        const marker = this.headers.get('X-Icon-Body-Gate');
+        if (marker !== 'predecessor' && marker !== 'successor') return blob;
+        const gate = marker === 'predecessor' ? predecessor : successor;
+        gate.started.resolve(undefined);
+        await gate.release.promise;
+        gate.returned.resolve(undefined);
+        return blob;
+      });
+      releasePending.push(
+        () => predecessor.release.resolve(undefined),
+        () => successor.release.resolve(undefined)
+      );
+      let responseNumber = 0;
+      server.use(
+        http.get(
+          `${API_BASE}/api/v1/media/dm-icons/${iconId}`,
+          () =>
+            new HttpResponse(pngBytes, {
+              headers: {
+                'Content-Type': 'image/png',
+                'X-Icon-Body-Gate': ++responseNumber === 1 ? 'predecessor' : 'successor',
+              },
+            })
+        )
+      );
+      const { container, unmount } = mount();
+      await awaitGate(predecessor.started, 'the first A owner consumed its body');
+      act(() => {
+        patchGroup({ iconUrl: 'source-two' });
+        patchGroup({ iconUrl: 'source-one' });
+      });
+      expect(requests[0]?.signal.aborted).toBe(true);
+      await awaitGate(successor.started, 'the restored A owner started a new body');
+      await act(async () => {
+        successor.release.resolve(undefined);
+        await successor.returned.promise;
+      });
+      await ready(container);
+      await act(async () => {
+        predecessor.release.resolve(undefined);
+        await predecessor.returned.promise;
+      });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('.conversation-avatar-img')).toHaveAttribute(
+        'src',
+        'blob:2626-1'
+      );
+      expect(revoke).not.toHaveBeenCalled();
+      unmount();
+      expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:2626-1');
+    });
+    const stableUpdates: Array<[string, () => void]> = [
+      [
+        'ordinary bearer and session rotation',
+        () => {
+          const generation = useAuthStore.getState().authGeneration;
+          useAuthStore
+            .getState()
+            .rotateAuthCredentials(generation, 'test-rotated-token', 'test-rotated-session');
+          expect(useAuthStore.getState().authGeneration).toBe(generation);
+        },
+      ],
+      [
+        'message, unread, name, draft and presence updates',
+        () => {
+          patchGroup({
+            name: 'Crew renamed',
+            unreadCount: 3,
+            lastMessage: {
+              content: '',
+              userId: 'user-2',
+              username: 'alice',
+              createdAt: '2026-10-13T00:00:00Z',
+            },
+          });
+          useDraftMessageStore.getState().setDraft(iconId, { text: 'unsent draft', updatedAt: 1 });
+          useFriendStore.setState({
+            friends: [
+              {
+                id: 'friendship-1',
+                userId: 'user-2',
+                username: 'alice',
+                displayName: 'Alice',
+                status: 'online',
+              },
+            ],
+          });
+        },
+      ],
+    ];
+    it.each(stableUpdates)('retains the owned image through %s', async (_name, update) => {
+      server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container } = mount();
+      const image = await ready(container);
+      const generation = useAuthStore.getState().authGeneration;
+      await act(async () => {
+        update();
+      });
+      expect(container.querySelector('.conversation-avatar-img')).toBe(image);
+      expect(image).toHaveAttribute('src', 'blob:2626-1');
+      expect(useAuthStore.getState().authGeneration).toBe(generation);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(revoke).not.toHaveBeenCalled();
+      expect(requests).toHaveLength(1);
+    });
+
+    it.each(
+      mutations.filter(([name]) =>
+        ['source replacement', 'user replacement', 'auth replacement'].includes(name)
+      )
+    )('hides the primitive-owner mismatch on %s before passive cleanup', async (_name, mutate) => {
+      let firstRequest = true;
+      server.use(
+        http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => {
+          if (!firstRequest) return new HttpResponse(null, { status: 404 });
+          firstRequest = false;
+          return pngResponse();
+        })
+      );
+      const observations: Array<{ src: string | null; fallback: boolean }> = [];
+      let observeNextRender = () => {
+        throw new Error('Observer has not rendered');
+      };
+      function Observer() {
+        const host = useRef<HTMLDivElement>(null);
+        const [revision, setRevision] = useState(0);
+        observeNextRender = () => setRevision((value) => value + 1);
+        // Parent layout effects run after child DOM mutations and before
+        // passive cleanup, exposing the otherwise hidden predecessor frame.
+        useLayoutEffect(() => {
+          observations.push({
+            src:
+              host.current?.querySelector('img.conversation-avatar-img')?.getAttribute('src') ??
+              null,
+            fallback: Boolean(host.current?.querySelector('.conversation-avatar.group svg')),
+          });
+        }, [revision]);
+        return (
+          <div ref={host}>
+            <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+          </div>
+        );
+      }
+      const { container } = bareRender(
+        <BrowserRouter>
+          <ModalProvider>
+            <Observer />
+          </ModalProvider>
+        </BrowserRouter>
+      );
+      await ready(container);
+      act(observeNextRender);
+      expect(observations.at(-1)?.src).toBe('blob:2626-1');
+      act(() => {
+        mutate();
+        observeNextRender();
+      });
+      expect(observations.at(-1)).toEqual({ src: null, fallback: true });
+    });
+
+    it('preserves compact row naming, selection and a decorative owned image', async () => {
+      const profiles = useLayoutStore.getState().sidebarProfiles;
+      useLayoutStore.setState({
+        sidebarLayoutsDecoupled: true,
+        sidebarProfiles: {
+          ...profiles,
+          dm: { ...profiles.dm, left: { width: 56, pinned: false } },
+        },
+      });
+      server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container } = render(
+        <DockOverlayProvider>
+          <DockShell
+            context="dm"
+            side="left"
+            label="Threads"
+            header={<span>DMs</span>}
+            renderBody={(compact) => (
+              <ConversationList
+                compact={compact}
+                selectedThreadId={iconId}
+                onSelectThread={mockOnSelectThread}
+              />
+            )}
+          />
+        </DockOverlayProvider>
+      );
+      await ready(container);
+      fireEvent.click(screen.getByRole('button', { name: 'Open Threads sidebar' }));
+      const row = screen.getByRole('button', { name: 'Crew' });
+      expect(row).toHaveClass('conversation-item--compact', 'active');
+      expect(row.querySelector('img')).toHaveAttribute('alt', '');
+      expect(container.querySelector('.conversation-list--compact')).toBeInTheDocument();
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+      fireEvent.click(row);
+      expect(mockOnSelectThread).toHaveBeenCalledWith(iconId);
+    });
+
+    it.each([
+      ['missing icon marker', () => patchGroup({ iconUrl: undefined })],
+      ['missing access token', () => useAuthStore.getState().clearAccessToken()],
+      ['missing current user', () => useUserStore.setState({ user: null })],
+    ] as const)(
+      'keeps the group fallback without acquisition for %s',
+      async (_name, invalidate) => {
+        installGroup({ iconUrl: 'https://untrusted.example/private.png' });
+        invalidate();
+        let container: HTMLElement | undefined;
+        await act(async () => {
+          container = mount().container;
+        });
+        expect(screen.getByRole('button', { name: 'Crew' })).toBeInTheDocument();
+        if (!container) throw new Error('Missing ineligible icon render');
+        expectFallback(container);
+        expect(requests).toHaveLength(0);
+        expect(create).not.toHaveBeenCalled();
+      }
+    );
+
+    function trackSubscriptions<T>(store: StoreApi<T>) {
+      const originalSubscribe = store.subscribe;
+      const releases: Array<Mock<() => void>> = [];
+      const subscribe = vi.spyOn(store, 'subscribe').mockImplementation((listener) => {
+        const unsubscribe = originalSubscribe(listener);
+        const release = vi.fn(() => unsubscribe());
+        releases.push(release);
+        return release;
+      });
+      return { subscribe, releases };
+    }
+
+    it('replays topmost StrictMode ownership and releases every lease and subscription on unmount', async () => {
+      const auth = trackSubscriptions(useAuthStore);
+      const user = trackSubscriptions(useUserStore);
+      const dm = trackSubscriptions(useDMStore);
+      const runtimeReleases: Array<Mock<() => void>> = [];
+      const originalRuntimeSubscribe = runtimeServerBase.onRuntimeServerSelectionChange;
+      const runtimeSubscribe = vi
+        .spyOn(runtimeServerBase, 'onRuntimeServerSelectionChange')
+        .mockImplementation((listener) => {
+          const unsubscribe = originalRuntimeSubscribe(listener);
+          const release = vi.fn(() => unsubscribe());
+          runtimeReleases.push(release);
+          return release;
+        });
+      const abort = vi.spyOn(AbortController.prototype, 'abort');
+      server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
+      const { container, unmount } = bareRender(
+        <StrictMode>
+          <BrowserRouter>
+            <ModalProvider>
+              <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+            </ModalProvider>
+          </BrowserRouter>
+        </StrictMode>
+      );
+      await ready(container);
+      // The first setup may abort in apiFetch's asynchronous pre-dispatch
+      // fence, so request count is deliberately not fixed at two.
+      expect(abort).toHaveBeenCalled();
+      expect(runtimeSubscribe.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(runtimeReleases.some((release) => release.mock.calls.length === 1)).toBe(true);
+      expect(requests.length).toBeGreaterThanOrEqual(1);
+      unmount();
+      const acquiredUrls = create.mock.results.map((result) => result.value as string);
+      expect(acquiredUrls.length).toBeGreaterThanOrEqual(1);
+      for (const url of acquiredUrls) {
+        expect(revoke.mock.calls.filter(([released]) => released === url)).toHaveLength(1);
+      }
+      expect(revoke.mock.calls).toHaveLength(acquiredUrls.length);
+      for (const tracked of [auth, user, dm]) {
+        expect(tracked.releases.length).toBeGreaterThan(0);
+        expect(tracked.releases).toHaveLength(tracked.subscribe.mock.calls.length);
+        for (const release of tracked.releases) expect(release).toHaveBeenCalledTimes(1);
+      }
+      expect(runtimeReleases).toHaveLength(runtimeSubscribe.mock.calls.length);
+      for (const release of runtimeReleases) expect(release).toHaveBeenCalledTimes(1);
     });
   });
 
