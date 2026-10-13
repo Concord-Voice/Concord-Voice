@@ -98,6 +98,12 @@
       "resolved": "10.2.6"
     },
     {
+      "consumer": "node_modules/global-agent",
+      "dep": "roarr",
+      "range": "^2.15.3",
+      "resolved": "3.3.0"
+    },
+    {
       "consumer": "node_modules/http-proxy-agent",
       "dep": "@tootallnate/once",
       "range": "2",
