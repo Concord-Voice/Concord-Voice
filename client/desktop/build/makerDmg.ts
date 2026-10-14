@@ -10,7 +10,7 @@ export interface MakerDmgConfig {
 }
 
 /**
- * Forge 7 maker producing a DMG through the already-pinned app-builder-lib.
+ * Forge maker producing a DMG through the already-pinned app-builder-lib.
  * The Forge package's older electron-installer-dmg chain pulls appdmg and its
  * vulnerable image-size parser; app-builder-lib already owns the maintained
  * dmg-builder implementation used here.

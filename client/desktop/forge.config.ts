@@ -38,7 +38,6 @@ const macSigning: Pick<
         // APPLE_API_KEY here is a filesystem PATH to the .p8 key file —
         // CI writes it to a temp file in a darwin-only setup step; the
         // raw .p8 contents live in the GHA secret of the same name.
-        tool: 'notarytool',
         appleApiKey: process.env.APPLE_API_KEY,
         appleApiKeyId: process.env.APPLE_API_KEY_ID,
         appleApiIssuer: process.env.APPLE_API_ISSUER,
@@ -153,11 +152,13 @@ const config: ForgeConfig = {
       // any secrets or logic embedded in it. That exclusion is `ignore` below;
       // this block is about what stays OUTSIDE the archive.
       //
-      // NEVER SET `unpack` OR `unpackDir` HERE. The blocker below is PERMANENT —
-      // it is not waiting on a fix, and #3194 routed around it rather than
-      // clearing it. (Full route ruling in the block further down.)
-      // Both options are currently NON-FUNCTIONAL in this repo, and the failure is
-      // a packaging crash rather than a silent no-op:
+      // NEVER SET `unpack` OR `unpackDir` HERE. #3194 ships the native addon
+      // through `extraResource` (full route ruling further down); an unpack glob
+      // would add a second payload directory, `app.asar.unpacked`, that nothing
+      // in verify-asar-payload.sh or the PR smoke build inspects.
+      //
+      // HISTORY: until Forge 8 (PR #3794) both options were also NON-FUNCTIONAL
+      // in this repo, and the failure was a packaging crash, not a silent no-op:
       //
       //     TypeError: (0 , minimatch_1.default) is not a function
       //         at shouldUnpackPath (@electron/asar/lib/asar.js:147)   // via `unpack`
@@ -174,7 +175,9 @@ const config: ForgeConfig = {
       // minimatch dropped the default export at 9 — it exports { minimatch }. So
       // `shouldUnpackPath` throws for any non-empty glob. The code path is only
       // reached when one of these options is set, which is why nothing noticed:
-      // both have been `undefined` for the life of the override.
+      // both have been `undefined` for the life of the override. Forge 8 removed
+      // the crash: @electron/packager@20.3.0 ships @electron/asar@4.3.1, which
+      // declares minimatch ^10.0.1 and imports the named export.
       //
       // The minimatch override is NOT the thing to change. It is security-
       // validated (see the //overrides_security note in package.json — it clears
@@ -194,18 +197,19 @@ const config: ForgeConfig = {
       // Rejected, and CLOSED rather than pending:
       //   1. Override @electron/asar to ^4.3.0 (declares minimatch ^10.0.1). Fixes
       //      it at the source and the skew is upward — but @electron/packager@18.4.4
-      //      declares ^3.2.13, so it forces a MAJOR onto the release packaging path
-      //      to buy what extraResource already provides.
-      //   3. Wait for @electron/packager to move to asar 4 — no owner, and it would
-      //      block the whole epic indefinitely.
+      //      declared ^3.2.13, so it forced a MAJOR onto the release packaging path
+      //      to buy what extraResource already provides. Moot since Forge 8.
+      //   3. Wait for @electron/packager to move to asar 4 — no owner at the time,
+      //      and it would have blocked the whole epic. It moved with Forge 8, after
+      //      #3194 shipped; the extraResource route stands on its own reasons.
       //   4. Forge's plugin-auto-unpack-natives — it writes this same `asar.unpack`
-      //      key, so it hits the identical crash. Also not installed, making it a
-      //      new dependency against D1's own supply-chain reasoning.
+      //      key, which this block forbids. Also not installed, making it a new
+      //      dependency against D1's own supply-chain reasoning.
       //
       // Electron's own asar docs name `--unpack *.node` as the canonical way to ship
-      // a native module. We deliberately diverge, because in THIS repo it does not
-      // run. Recorded so the next reader does not find those docs, reach for
-      // `unpack`, and rediscover the crash above.
+      // a native module. We deliberately diverge: extraResource already puts the
+      // .node on disk without an unpack glob. Recorded so the next reader does not
+      // find those docs and reach for `unpack`.
       unpackDir: undefined,
     },
     // Only four things belong in the archive: `dist/` (built main, preload and
@@ -381,7 +385,7 @@ const config: ForgeConfig = {
     // electron-updater, which is what we use to deliver updates.
     //
     // MakerNsis is local (build/makerNsis.ts) because the published
-    // electron-forge-maker-nsis is Forge-5-era and throws under Forge 7.
+    // electron-forge-maker-nsis is Forge-5-era and throws under Forge 7 and 8.
     new MakerNsis({
       appId: 'com.concordvoice.desktop',
       productName: 'Concord Voice',

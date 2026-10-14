@@ -9,14 +9,14 @@ export interface MakerNsisConfig {
 }
 
 /**
- * Forge 7 maker producing an NSIS installer via app-builder-lib.
+ * Forge maker producing an NSIS installer via app-builder-lib.
  *
  * The published `electron-forge-maker-nsis` package CANNOT be used: it exports the
  * Forge-5 interface (module-level `isSupportedOnCurrentPlatform` + a default-export
- * function) and throws under Forge 7, which discriminates class makers on
- * `__isElectronForgeMaker` (@electron-forge/core/dist/api/make.js:38) and then does
- * `new MakerClass(...)` at :98 — applying `new` to a function that returns a Promise,
- * leaving `maker.platforms` undefined and throwing TypeError at :99.
+ * function) and throws under Forge 7 and 8, which discriminate class makers on
+ * `__isElectronForgeMaker` (@electron-forge/core@8.0.1 dist/api/make.js:31) and then do
+ * `new MakerClass(...)` at :94 — applying `new` to a function that returns a Promise,
+ * leaving `maker.platforms` undefined and throwing TypeError at :95.
  *
  * We also do NOT use app-builder-lib's `buildForge()` helper: it spreads caller options
  * AFTER setting `config.directories.output` (out/forge-maker.js:12-21), so passing our

@@ -2,12 +2,6 @@
   "//": "Accepted override-range skews — see scripts/security/override-range-lint.mjs. Each row is a consumer that resolves OUTSIDE the range it declares, because an `overrides` entry forces it there. Rows are matched on the full tuple, so a new consumer or a changed range/resolution is reported even for a package already listed here. Prune a row when the lint reports it as no longer occurring. Regenerate: node scripts/security/override-range-lint.mjs --dir <pkg> --update-baseline",
   "accepted": [
     {
-      "consumer": "node_modules/@electron/asar",
-      "dep": "minimatch",
-      "range": "^3.0.4",
-      "resolved": "10.2.6"
-    },
-    {
       "consumer": "node_modules/@electron/node-gyp",
       "dep": "tar",
       "range": "^6.2.1",
@@ -17,18 +11,6 @@
       "consumer": "node_modules/@electron/node-gyp/node_modules/glob",
       "dep": "minimatch",
       "range": "^5.0.1",
-      "resolved": "10.2.6"
-    },
-    {
-      "consumer": "node_modules/@electron/rebuild",
-      "dep": "tar",
-      "range": "^6.0.5",
-      "resolved": "7.5.22"
-    },
-    {
-      "consumer": "node_modules/@electron/universal",
-      "dep": "minimatch",
-      "range": "^9.0.3",
       "resolved": "10.2.6"
     },
     {
@@ -47,6 +29,36 @@
       "consumer": "node_modules/@microsoft/eslint-formatter-sarif/node_modules/eslint",
       "dep": "minimatch",
       "range": "^3.1.2",
+      "resolved": "10.2.6"
+    },
+    {
+      "consumer": "node_modules/@reforged/maker-appimage/node_modules/@electron/asar",
+      "dep": "minimatch",
+      "range": "^3.0.4",
+      "resolved": "10.2.6"
+    },
+    {
+      "consumer": "node_modules/@reforged/maker-appimage/node_modules/@electron/rebuild",
+      "dep": "tar",
+      "range": "^6.0.5",
+      "resolved": "7.5.22"
+    },
+    {
+      "consumer": "node_modules/@reforged/maker-appimage/node_modules/@electron/universal",
+      "dep": "minimatch",
+      "range": "^9.0.3",
+      "resolved": "10.2.6"
+    },
+    {
+      "consumer": "node_modules/app-builder-lib/node_modules/@electron/asar",
+      "dep": "minimatch",
+      "range": "^3.0.4",
+      "resolved": "10.2.6"
+    },
+    {
+      "consumer": "node_modules/app-builder-lib/node_modules/@electron/universal",
+      "dep": "minimatch",
+      "range": "^9.0.3",
       "resolved": "10.2.6"
     },
     {
@@ -74,16 +86,22 @@
       "resolved": "10.2.6"
     },
     {
+      "consumer": "node_modules/electron-installer-common/node_modules/@electron/asar",
+      "dep": "minimatch",
+      "range": "^3.0.4",
+      "resolved": "10.2.6"
+    },
+    {
+      "consumer": "node_modules/electron-winstaller/node_modules/@electron/asar",
+      "dep": "minimatch",
+      "range": "^3.0.4",
+      "resolved": "10.2.6"
+    },
+    {
       "consumer": "node_modules/engine.io-client",
       "dep": "ws",
       "range": "~8.20.1",
       "resolved": "8.21.3"
-    },
-    {
-      "consumer": "node_modules/external-editor",
-      "dep": "tmp",
-      "range": "^0.0.33",
-      "resolved": "0.2.7"
     },
     {
       "consumer": "node_modules/filelist",

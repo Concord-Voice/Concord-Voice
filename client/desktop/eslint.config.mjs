@@ -87,7 +87,7 @@ export default [
             'vite.config.ts',
             'forge.config.ts',
             'playwright.config.ts',
-            // #2402: the Forge 7 NSIS maker. Lives in build/ (excluded from
+            // #2402: the local Forge NSIS maker. Lives in build/ (excluded from
             // tsconfig.json's include, like forge.config.ts above) because it is
             // build tooling, not app source — so it belongs to no TS project and
             // projectService cannot parse it without this entry.

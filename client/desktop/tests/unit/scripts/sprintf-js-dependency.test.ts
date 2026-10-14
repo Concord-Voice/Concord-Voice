@@ -20,8 +20,12 @@ const fakeProxyCredentials = {
   password: ['fake-fixture', ':with/slash'].join(''),
 };
 const desktopRequire = createRequire(path.resolve(__dirname, '../../../package.json'));
+// The copy app-builder-lib loads. Since Forge 8 the hoisted @electron/get is
+// 5.x, which proxies through undici and has no global-agent; the 3.x copy
+// nested here is the remaining loaded consumer of global-agent and its roarr.
+const electronGetRequire = createRequire(desktopRequire.resolve('app-builder-lib/package.json'));
 const globalAgentPackage = desktopRequire.resolve('global-agent/package.json', {
-  paths: [desktopRequire.resolve('@electron/get/package.json')],
+  paths: [electronGetRequire.resolve('@electron/get/package.json')],
 });
 const globalAgentRequire = createRequire(globalAgentPackage);
 const roarrPackage = globalAgentRequire.resolve('roarr/package.json');
@@ -81,7 +85,7 @@ function runDownload(input: {
   noProxy?: string;
   extraCaCert?: string;
 }): Promise<{ status: number | null; stdout: string; stderr: string }> {
-  const electronGetEntry = desktopRequire.resolve('@electron/get');
+  const electronGetEntry = electronGetRequire.resolve('@electron/get');
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['-e', downloadChild], {
       env: {
