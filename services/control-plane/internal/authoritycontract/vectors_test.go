@@ -20,26 +20,65 @@ type vectorFile struct {
 }
 
 type vector struct {
-	Name     string       `json:"name"`
-	Type     string       `json:"type"`
-	BytesB64 string       `json:"bytes_b64"`
-	Input    vectorInput  `json:"input"`
-	Expect   vectorExpect `json:"expect"`
+	Name           string       `json:"name"`
+	Type           string       `json:"type"`
+	BytesB64       string       `json:"bytes_b64"`
+	Input          vectorInput  `json:"input"`
+	Expect         vectorExpect `json:"expect"`
+	Anchors        string       `json:"anchors"`
+	Trust          []string     `json:"trust"`
+	HW             vectorHW     `json:"hw"`
+	PrevHead       string       `json:"prev_head"`
+	Bundles        []string     `json:"bundles"`
+	Fix            string       `json:"fix"`
+	Mem            vectorMem    `json:"mem"`
+	NowMs          uint64       `json:"now_ms"`
+	Use            string       `json:"use"`
+	DeviceBundles  []string     `json:"device_bundles"`
+	DeviceStatus   string       `json:"device_status"`
+	PrevDeviceHead string       `json:"prev_device_head"`
+	RecipientDkxD  string       `json:"recipient_dkx_d"`
+	Statuses       []string     `json:"statuses"`
 }
 
 type vectorExpect struct {
-	Reason       string `json:"reason"`
-	Verdict      string `json:"verdict"`
-	ReencodedB64 string `json:"reencoded_b64"`
-	TextB64      string `json:"text_b64"`
-	DigestB64    string `json:"digest_b64"`
-	DeviceID     string `json:"device_id"`
-	SafetyNumber string `json:"safety_number"`
+	Reason        string `json:"reason"`
+	Verdict       string `json:"verdict"`
+	ReencodedB64  string `json:"reencoded_b64"`
+	TextB64       string `json:"text_b64"`
+	DigestB64     string `json:"digest_b64"`
+	DeviceID      string `json:"device_id"`
+	SafetyNumber  string `json:"safety_number"`
+	HeadB64       string `json:"head_b64"`
+	DeviceHeadB64 string `json:"device_head_b64"`
+	SetB64        string `json:"set_b64"`
+	Refusal       string `json:"refusal"`
+	WrapUse       string `json:"wrap_use"`
 }
 
 type vectorRecord struct {
 	AccountID         string `json:"account_id"`
 	LegacyEKDigestB64 string `json:"legacy_ek_digest_b64"`
+}
+
+type vectorHW struct {
+	Gen      uint64 `json:"gen"`
+	Serial   uint64 `json:"serial"`
+	MinValid uint64 `json:"min_valid"`
+}
+
+type vectorMem struct {
+	Pin          string `json:"pin"`
+	EverEnrolled uint64 `json:"everEnrolled"`
+	AcceptedPin  string `json:"acceptedPin"`
+}
+
+type vectorHead struct {
+	State           string `json:"state"`
+	Seq             uint64 `json:"seq"`
+	EntryDigestB64  string `json:"entry_digest_b64"`
+	RootDigestB64   string `json:"root_digest_b64"`
+	ForceUnverified bool   `json:"force_unverified"`
 }
 
 type vectorInput struct {
@@ -68,6 +107,31 @@ type vectorInput struct {
 	Records                []vectorRecord `json:"records"`
 	Layout                 string         `json:"layout"`
 	Fields                 []string       `json:"fields"`
+	// A2 (authority-function, pattern and P1 vectors).
+	Tag            string     `json:"tag"`
+	Op             string     `json:"op"`
+	Actor          string     `json:"actor"`
+	NewDev         string     `json:"new_dev"`
+	Removed        []string   `json:"removed"`
+	BindB64        string     `json:"bind_b64"`
+	BindWait       string     `json:"bind_wait"`
+	PriorSig       bool       `json:"prior_sig"`
+	RootForm       bool       `json:"root_form"`
+	Head           vectorHead `json:"head"`
+	Outcome        string     `json:"outcome"`
+	ProposingAnbMs uint64     `json:"proposing_anb_ms"`
+	DeltaMs        uint64     `json:"delta_ms"`
+	Activate       bool       `json:"activate"`
+	BurnRecovery   bool       `json:"burn_recovery"`
+	CompleteSlot   bool       `json:"complete_slot"`
+	ClearPending   bool       `json:"clear_pending"`
+	EmptySlot      bool       `json:"empty_slot"`
+	PinB64         string     `json:"pin_b64"`
+	OtherB64       string     `json:"other_b64"`
+	Mode           string     `json:"mode"`
+	Pop            bool       `json:"pop"`
+	RootCancels    bool       `json:"root_cancels"`
+	CandidateB64   string     `json:"candidate_b64"`
 }
 
 func loadVectors(t *testing.T) vectorFile {

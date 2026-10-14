@@ -42,12 +42,15 @@ var allowedKeys = map[string]bool{
 func TestVectorsHygiene(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("testdata", "vectors.json"))
 	require.NoError(t, err)
-	require.LessOrEqual(t, len(raw), 4<<20, "keep vectors.json well under check-added-large-files --maxkb=5000")
+	// 8 MiB is PR-A2's recorded budget (contract doc, "As built — PR-A2").
+	// .pre-commit-config.yaml excludes the file from check-added-large-files
+	// (5000 KB), so this test is its only size bound.
+	require.LessOrEqual(t, len(raw), 8<<20, "vectors.json over its 8 MiB budget: stop and report, never trim")
 	var doc any
 	require.NoError(t, json.Unmarshal(raw, &doc))
 	require.Empty(t, unknownKeys(doc, nil), "closed field-name set")
 	require.Empty(t, nonPlainStrings(doc, "", nil), "every string uses the plain alphabet")
-	require.Empty(t, privateKeyFindings(doc), "vectors hold public keys and signatures only")
+	require.Empty(t, privateKeyFindings(doc), "no private key in clear (the wraps' are checked by vectors_wrap_hygiene_test.go)")
 }
 
 func TestAllowedKeysHaveOnePrivateName(t *testing.T) {
