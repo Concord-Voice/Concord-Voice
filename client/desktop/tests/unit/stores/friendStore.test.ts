@@ -372,15 +372,19 @@ describe('friendStore', () => {
     });
 
     it('handles network errors gracefully', async () => {
+      let hit = false;
       server.use(
         http.get(`${API_BASE}/api/v1/friends`, () => {
+          hit = true;
           return HttpResponse.error();
         })
       );
 
       await useFriendStore.getState().fetchFriends();
-      // Network errors produce the native fetch error message
-      expect(useFriendStore.getState().error).toBe('Failed to fetch');
+      expect(hit).toBe(true);
+      // HttpResponse.error() under MSW 3 rejects the real undici fetch ("fetch failed");
+      // Chromium's renderer says "Failed to fetch". The store surfaces either verbatim.
+      expect(useFriendStore.getState().error).toBe('fetch failed');
     });
 
     it('does not fetch if already loading (deduplication guard)', async () => {

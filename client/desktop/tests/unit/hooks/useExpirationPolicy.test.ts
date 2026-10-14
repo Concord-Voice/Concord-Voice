@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { StrictMode } from 'react';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { deferred } from '../../helpers/deferred';
@@ -69,7 +69,7 @@ const dmRow = (overrides: Partial<DMRow> = {}): DMRow => ({
   ...overrides,
 });
 
-const personalConversation = {
+const personalConversation: DMConversation = {
   id: 'personal-1',
   isGroup: false,
   isPersonal: true,
@@ -78,7 +78,7 @@ const personalConversation = {
   lastMessage: null,
   unreadCount: 0,
   createdAt: policy.updated_at,
-} satisfies DMConversation;
+};
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => server.close());
@@ -640,10 +640,19 @@ describe('useExpirationPolicy', () => {
         { user_id: 'user-2', username: 'alex', role: 'member' },
       ],
     });
+    // Settle point: under MSW 3 a GET still in flight at test end reaches the next
+    // test's handler, so the test ends only once every fetch has been answered.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    onTestFinished(() => fetchSpy.mockRestore());
+    const sent = () =>
+      fetchSpy.mock.calls.filter(([input]) => String(input).includes('/api/v1/dm/conversations'))
+        .length;
+    let answered = 0;
     server.use(
-      http.get(`${API}/api/v1/dm/conversations`, () =>
-        HttpResponse.json({ conversations: [group, dmRow()] })
-      )
+      http.get(`${API}/api/v1/dm/conversations`, () => {
+        answered += 1;
+        return HttpResponse.json({ conversations: [group, dmRow()] });
+      })
     );
     const admin = renderHook(() => useExpirationPolicy({ kind: 'dm', id: 'group-1' }));
     await waitFor(() => expect(admin.result.current.policy?.revision).toBe(4));
@@ -660,6 +669,7 @@ describe('useExpirationPolicy', () => {
     await waitFor(() => expect(nonmember.result.current.policy?.revision).toBe(4));
     expect(nonmember.result.current.canEdit).toBe(false);
     nonmember.unmount();
+    await waitFor(() => expect(answered).toBe(sent()));
   });
 
   it('waits for the requested DM GET before returning a fresh policy', async () => {

@@ -414,11 +414,12 @@ describe('message expiration host entry points', () => {
         onClose={() => undefined}
       />
     );
-    const stop = await screen.findByRole('button', { name: '7 days' });
-    expect(stop).toHaveAttribute('aria-disabled', 'true');
+    // The hint renders once the policy read lands; the stops exist (and are
+    // disabled) before it, so they cannot gate the assertions below.
     expect(
-      screen.getByText('Only group administrators can change this timer.')
+      await screen.findByText('Only group administrators can change this timer.')
     ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '7 days' })).toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
       'aria-pressed',
       'true'

@@ -318,6 +318,9 @@ describe('PurgeMessagesModal — step-up gate', () => {
     await reachStepUp(user);
 
     expect(heading()).toBeInTheDocument();
+    // purgeSpy is the caller seam: MSW 3 sees a sent DELETE turns later, so the
+    // bodies list alone could still be empty when one went out.
+    expect(purgeSpy).not.toHaveBeenCalled();
     expect(bodies).toHaveLength(0);
   });
 
@@ -331,6 +334,9 @@ describe('PurgeMessagesModal — step-up gate', () => {
     await reachStepUp(user);
 
     expect(heading()).toBeInTheDocument();
+    // purgeSpy is the caller seam: MSW 3 sees a sent DELETE turns later, so the
+    // bodies list alone could still be empty when one went out.
+    expect(purgeSpy).not.toHaveBeenCalled();
     expect(bodies).toHaveLength(0);
   });
 
@@ -394,6 +400,8 @@ describe('PurgeMessagesModal — step-up gate', () => {
 
   it('reads nothing while the dialog is closed', async () => {
     const reads = readReturns(TOTP_READ);
+    // MSW 3 sees a request turns after fetch(); count at the fetch seam too.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
     render(
       <PurgeMessagesModal
         context="dm"
@@ -404,6 +412,9 @@ describe('PurgeMessagesModal — step-up gate', () => {
       />
     );
     await act(async () => {});
+    expect(
+      fetchSpy.mock.calls.filter(([input]) => String(input).includes('/api/v1/mfa/step-up'))
+    ).toHaveLength(0);
     expect(reads.count()).toBe(0);
   });
 
@@ -485,6 +496,7 @@ describe('PurgeMessagesModal — what the read decides', () => {
     expect(screen.queryByLabelText('Authenticator app code')).not.toBeInTheDocument();
     expect(primary()).toHaveAttribute('aria-disabled', 'true');
     await user.click(primary());
+    expect(purgeSpy).not.toHaveBeenCalled();
     expect(bodies).toHaveLength(0);
   });
 

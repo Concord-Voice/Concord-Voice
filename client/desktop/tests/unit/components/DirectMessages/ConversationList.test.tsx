@@ -1324,6 +1324,7 @@ describe('ConversationList', () => {
     const originalElectron = globalThis.electron;
     let create: MockInstance<typeof URL.createObjectURL>;
     let revoke: MockInstance<typeof URL.revokeObjectURL>;
+    let fetchSpy: MockInstance<typeof fetch>;
     let requests: Request[];
     let completedRequests: Request[];
     let releasePending: Array<() => void>;
@@ -1362,6 +1363,8 @@ describe('ConversationList', () => {
         .spyOn(URL, 'createObjectURL')
         .mockImplementation(() => `blob:2626-${++urlSequence}`);
       revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+      // Wraps MSW's own fetch patch (installed in beforeAll) and calls through.
+      fetchSpy = vi.spyOn(globalThis, 'fetch');
       server.events.on('request:start', ({ request }) => {
         if (request.url.includes('/api/v1/media/dm-icons/')) requests.push(request);
       });
@@ -1391,6 +1394,18 @@ describe('ConversationList', () => {
       return render(
         <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
       );
+    }
+
+    /**
+     * The init the component handed to `fetch` for its nth icon request. MSW 3
+     * rebuilds a handler's Request from the bytes on the wire, so its `cache`,
+     * `credentials` and `signal` are defaults rather than what the caller set.
+     * Those are asserted here, at the call that sets them.
+     */
+    function iconFetchInit(): RequestInit | undefined {
+      return fetchSpy.mock.calls.filter(([input]) =>
+        String(input).includes('/api/v1/media/dm-icons/')
+      )[0]?.[1];
     }
 
     async function ready(container: HTMLElement, url = 'blob:2626-1'): Promise<HTMLImageElement> {
@@ -1492,8 +1507,8 @@ describe('ConversationList', () => {
       expect(request.headers.get('X-Session-ID')).toBe('test-session-2626');
       expect(request.headers.get('X-Attestation-Token')).toBe('test-attestation-2626');
       expect(request.headers.get('X-Machine-Id')).toBe('test-device-2626');
-      expect(request.cache).toBe('no-store');
-      expect(request.credentials).toBe('include');
+      expect(iconFetchInit()?.cache).toBe('no-store');
+      expect(iconFetchInit()?.credentials).toBe('include');
       expect(create.mock.calls[0]?.[0]).toMatchObject({
         type: 'image/png',
         size: pngBytes.byteLength,
@@ -1600,7 +1615,9 @@ describe('ConversationList', () => {
             expect(completedRequests.length, 'MSW completed the failure response').toBe(1)
           );
           await waitFor(() =>
-            expect(requests[0]?.signal.aborted, 'the failed icon owner was disposed').toBe(true)
+            expect(iconFetchInit()?.signal?.aborted, 'the failed icon owner was disposed').toBe(
+              true
+            )
           );
         });
         expectFallback(container);
@@ -1648,7 +1665,7 @@ describe('ConversationList', () => {
       const { container } = mount();
       await act(async () => {
         await awaitGate(bodyConsumed, 'the real response body was consumed before its failure');
-        await waitFor(() => expect(requests[0]?.signal.aborted).toBe(true));
+        await waitFor(() => expect(iconFetchInit()?.signal?.aborted).toBe(true));
       });
       expectFallback(container);
       expect(create).not.toHaveBeenCalled();
@@ -1662,7 +1679,7 @@ describe('ConversationList', () => {
       server.use(http.get(`${API_BASE}/api/v1/media/dm-icons/${iconId}`, () => pngResponse()));
       const { container } = mount();
       await act(async () => {
-        await waitFor(() => expect(requests[0]?.signal.aborted).toBe(true));
+        await waitFor(() => expect(iconFetchInit()?.signal?.aborted).toBe(true));
       });
       expect(create).toHaveBeenCalledTimes(1);
       expectFallback(container);
@@ -1708,7 +1725,7 @@ describe('ConversationList', () => {
         );
         const { container, unmount } = mount();
         await act(async () => {
-          await waitFor(() => expect(requests[0]?.signal.aborted).toBe(true));
+          await waitFor(() => expect(iconFetchInit()?.signal?.aborted).toBe(true));
         });
         expectFallback(container);
         act(restore);
@@ -1738,12 +1755,12 @@ describe('ConversationList', () => {
           })
         );
         const view = mount();
-        const request = await awaitGate(started, 'the predecessor fetch reached MSW');
+        await awaitGate(started, 'the predecessor fetch reached MSW');
         act(() => {
           if (mutate) mutate();
           else view.unmount();
         });
-        expect(request.signal.aborted).toBe(true);
+        expect(iconFetchInit()?.signal?.aborted).toBe(true);
         await settleSuccessor(name, 1);
         await act(async () => {
           release.resolve(undefined);
@@ -1772,13 +1789,12 @@ describe('ConversationList', () => {
         );
         const view = mount();
         await awaitGate(body.started, 'the predecessor consumed its real Blob before waiting');
-        const request = requests[0];
-        expect(request).toBeDefined();
+        expect(requests[0]).toBeDefined();
         act(() => {
           if (mutate) mutate();
           else view.unmount();
         });
-        expect(request?.signal.aborted).toBe(true);
+        expect(iconFetchInit()?.signal?.aborted).toBe(true);
         await settleSuccessor(name, 2);
         await act(async () => {
           body.release.resolve(undefined);
@@ -1807,12 +1823,11 @@ describe('ConversationList', () => {
         );
         const view = mount();
         await ready(view.container);
-        const request = requests[0];
         act(() => {
           if (mutate) mutate();
           else view.unmount();
         });
-        expect(request?.signal.aborted).toBe(true);
+        expect(iconFetchInit()?.signal?.aborted).toBe(true);
         await settleSuccessor(name, 2);
         expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:2626-1');
         expect(create).toHaveBeenCalledTimes(1);
@@ -1902,7 +1917,7 @@ describe('ConversationList', () => {
         patchGroup({ iconUrl: 'source-two' });
         patchGroup({ iconUrl: 'source-one' });
       });
-      expect(requests[0]?.signal.aborted).toBe(true);
+      expect(iconFetchInit()?.signal?.aborted).toBe(true);
       await awaitGate(successor.started, 'the restored A owner started a new body');
       await act(async () => {
         successor.release.resolve(undefined);

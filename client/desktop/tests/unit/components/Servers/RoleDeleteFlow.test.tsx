@@ -195,7 +195,8 @@ describe('RoleDeleteFlow', () => {
     const refused = refusedWith(MFA_REQUIRED);
     onDelete.mockResolvedValueOnce(refused);
     await reachStepUp();
-    await userEvent.type(screen.getByLabelText(CODE_LABEL), FIXTURE_OTP);
+    // The code field renders once the factor read lands, which MSW 3 answers late.
+    await userEvent.type(await screen.findByLabelText(CODE_LABEL), FIXTURE_OTP);
     await userEvent.click(within(stepUpDialog()).getByRole('button', { name: 'Delete Role' }));
     await waitFor(() => expect(onEnd).toHaveBeenCalledTimes(1));
     expect(onDeleted).toHaveBeenCalledTimes(1);
@@ -230,7 +231,8 @@ describe('RoleDeleteFlow', () => {
       .mockResolvedValueOnce(refusedWith(MFA_REQUIRED))
       .mockResolvedValueOnce(refusedWith(INVALID_CODE));
     await reachStepUp();
-    await userEvent.type(screen.getByLabelText(CODE_LABEL), FIXTURE_OTP);
+    // The code field renders once the factor read lands, which MSW 3 answers late.
+    await userEvent.type(await screen.findByLabelText(CODE_LABEL), FIXTURE_OTP);
     await userEvent.click(within(stepUpDialog()).getByRole('button', { name: 'Delete Role' }));
     expect(await within(stepUpDialog()).findByRole('alert')).toBeInTheDocument();
     expect(onDelete).toHaveBeenCalledTimes(2);

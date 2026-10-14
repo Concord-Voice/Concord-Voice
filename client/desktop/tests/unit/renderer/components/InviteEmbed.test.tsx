@@ -166,8 +166,9 @@ describe('InviteEmbed', () => {
         <InviteEmbed code="BBBBBBBB" />
       </>
     );
-    const buttons = await screen.findAllByRole('button', { name: /join/i });
-    expect(buttons).toHaveLength(2);
+    // Each card resolves its own preview, so wait for both, not the first.
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /join/i })).toHaveLength(2));
+    const buttons = screen.getAllByRole('button', { name: /join/i });
     fireEvent.click(buttons[0]);
     fireEvent.click(buttons[1]);
 

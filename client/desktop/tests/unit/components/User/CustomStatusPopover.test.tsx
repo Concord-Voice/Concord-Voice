@@ -478,7 +478,7 @@ describe('CustomStatusPopover', () => {
       if (action === 'Save') fireEvent.change(getInput(), { target: { value: 'request' } });
       fireEvent.click(action === 'Save' ? getSaveBtn() : getClearBtn());
 
-      expect(await screen.findByText(/save uncertain|Failed to fetch/)).toBeInTheDocument();
+      expect(await screen.findByText(/save uncertain|fetch failed/)).toBeInTheDocument();
       await waitFor(() => expect(gets).toBe(1));
       expect(onClose).not.toHaveBeenCalled();
       await waitFor(() =>
@@ -965,6 +965,9 @@ describe('CustomStatusPopover', () => {
       const actionButton = action === 'Save' ? getSaveBtn() : getClearBtn();
       fireEvent.click(actionButton);
       await waitFor(() => expect(actionButton).toBeDisabled());
+      // MSW 3 sees a request several turns after fetch(); wait for the direct PATCH to
+      // arrive so it, not the category PATCH, takes the first deferred response.
+      await waitFor(() => expect(patchCount).toBe(1));
 
       const categoryMutation = useRichPresenceStore
         .getState()
@@ -972,6 +975,7 @@ describe('CustomStatusPopover', () => {
       await waitFor(() =>
         expect(useRichPresenceStore.getState().presenceSettingsSaving).toBe(true)
       );
+      await waitFor(() => expect(patchCount).toBe(2));
       directResponse.resolve(
         new Response(
           JSON.stringify(

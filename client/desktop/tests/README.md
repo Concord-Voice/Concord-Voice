@@ -14,7 +14,7 @@ tests/
 ├── setup.ts                # Global test setup (jest-dom, crypto polyfill, window.electron mock)
 ├── test-utils.tsx          # Custom render() with BrowserRouter, re-exports Testing Library
 ├── helpers/                # resetAllStores(), crypto stubs, WS/BroadcastChannel mocks, deferred
-├── mocks/                  # MSW v2 handlers, setupServer(), typed fixtures
+├── mocks/                  # MSW 3 handlers, setupServer(), typed fixtures
 ├── __mocks__/              # Vitest automock directory
 ├── fixtures/               # Static test data
 ├── integration/            # Cross-module tests (fan-out, pinning, preload sandbox contract)
@@ -75,7 +75,7 @@ npx playwright test
 | **@testing-library/react**      | Component rendering and querying                         |
 | **@testing-library/jest-dom**   | Custom DOM matchers (`toBeInTheDocument`, etc.)          |
 | **@testing-library/user-event** | Realistic user interaction simulation                    |
-| **MSW v2**                      | API mocking for store tests (Mock Service Worker)        |
+| **MSW 3**                       | API mocking for store tests (Mock Service Worker)        |
 | **jsdom**                       | Browser environment simulation                           |
 | **@vitest/coverage-istanbul**   | Istanbul-based code coverage (avoids OOM vs v8 provider) |
 | **Playwright**                  | E2E browser testing                                      |
@@ -94,7 +94,7 @@ Store tests call actions directly and assert state changes. MSW intercepts API c
 
 - **`vi.mock()`** for module mocks (crypto, e2eeService, preferencesSync)
 - **`vi.stubGlobal('fetch', mockFetch)`** for direct fetch mocking in component submission tests
-- **MSW** for store-level API mocking (avoids `credentials: 'include'` hang in jsdom)
+- **MSW** for store-level API mocking (avoids `credentials: 'include'` hang in jsdom). Since MSW 3 a handler's `request` is rebuilt from the wire; see `[internal]rules/tests.md` § "MSW 3 answers at the socket, not at `fetch`".
 - **`vi.fn()`** for callback props and function mocks
 
 ### Known Limitations

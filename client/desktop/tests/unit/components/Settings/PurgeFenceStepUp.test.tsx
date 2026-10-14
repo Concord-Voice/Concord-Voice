@@ -634,9 +634,10 @@ describe('PurgeFenceStepUpDialog — tightening is never gated (#2765)', () => {
     );
 
     render(<PrivacySecuritySection />);
-    const control = await screen.findByRole('switch', { name: TOGGLE_LABEL });
-    expect(control).not.toBeChecked();
-    await userEvent.click(control);
+    // The store starts with the fence ON, so the switch renders checked until
+    // the read lands. Waiting for unchecked waits for the server's OFF.
+    await waitFor(() => expect(toggle()).not.toBeChecked());
+    await userEvent.click(toggle());
 
     // The asymmetry is the whole point of the issue: raising a protection must
     // never cost the user more than lowering it.

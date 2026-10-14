@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act } from '../../../test-utils';
+import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { usePermissionStore, type ChannelOverride } from '@/renderer/stores/chat/permissionStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
@@ -682,17 +682,19 @@ describe('CategorySettingsModal — V6-V7 regression (#3406)', () => {
       fireEvent.click(screen.getByText('Save Override'));
     });
 
-    expect(bodies[0]).toMatchObject({ allow: '4611686018427387905', deny: '0' });
-    expect(screen.getByText('Editing: Moderator')).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent(
+    // MSW 3 answers several turns after the click, so the alert gates the reads.
+    expect(await screen.findByRole('alert')).toHaveTextContent(
       'Failed to save permission override. Your changes are still here — try again.'
     );
+    expect(bodies[0]).toMatchObject({ allow: '4611686018427387905', deny: '0' });
+    expect(screen.getByText('Editing: Moderator')).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByText('Save Override'));
     });
 
-    expect(screen.queryByText('Editing: Moderator')).not.toBeInTheDocument();
+    // Present until the accepted retry lands, so waiting for its removal is a real gate.
+    await waitFor(() => expect(screen.queryByText('Editing: Moderator')).not.toBeInTheDocument());
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -722,19 +724,21 @@ describe('CategorySettingsModal — V6-V7 regression (#3406)', () => {
       fireEvent.click(screen.getByLabelText('Delete override'));
     });
 
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Failed to remove permission override. Try again.'
+    );
     expect(
       screen.getByText('Moderator', { selector: '.override-target-name' })
     ).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent(
-      'Failed to remove permission override. Try again.'
-    );
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Delete override'));
     });
 
-    expect(
-      screen.queryByText('Moderator', { selector: '.override-target-name' })
-    ).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Moderator', { selector: '.override-target-name' })
+      ).not.toBeInTheDocument()
+    );
   });
 });

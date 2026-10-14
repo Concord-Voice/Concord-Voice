@@ -42,6 +42,31 @@ import { cleanup } from '@testing-library/react';
 import { afterEach, vi } from 'vitest';
 import { useSettingsCollapsibleStore } from '../src/renderer/stores/ui/settingsCollapsibleStore';
 
+// MSW 3 lets the real undici fetch run and intercepts at the socket. undici keeps
+// sockets alive and schedules their timers on whatever clock is installed, so a
+// socket opened under vi.useFakeTimers() hangs the next request made on it once
+// that clock is advanced, jumped or uninstalled. Tests never need connection reuse.
+{
+  // Node 24 (undici 7) puts one Agent in both slots. Node 26 (undici 8) keeps it in
+  // slot 2, which fetch reads, and puts a wrapper around it in slot 1.
+  const v1 = Symbol.for('undici.globalDispatcher.1');
+  const v2 = Symbol.for('undici.globalDispatcher.2');
+  type Installed = { constructor: new (arg: unknown) => unknown } | undefined;
+  const slot = globalThis as unknown as Record<symbol, Installed>;
+  // Node loads its bundled undici lazily, and undici installs the Agent as it loads,
+  // so a node-environment file may not have one yet. A data: URL never touches the
+  // network but loads undici synchronously.
+  if (!slot[v1] && !slot[v2]) void fetch('data:,').catch(() => undefined);
+  // ponytail: no undici import; the installed classes build the replacements.
+  const agent = slot[v2] ?? slot[v1];
+  if (!agent) throw new Error('tests/setup.ts: undici global dispatcher not found');
+  const noReuse = new agent.constructor({ pipelining: 0 });
+  const old1 = slot[v1];
+  const wrapped = old1 && slot[v2] && old1 !== slot[v2];
+  if (slot[v2]) slot[v2] = noReuse as never;
+  if (old1) slot[v1] = (wrapped ? new old1.constructor(noReuse) : noReuse) as never;
+}
+
 // Auto-cleanup after each test. useRealTimers() mirrors client/admin's setup: without
 // it, a test whose assertion throws before its own useRealTimers() leaks fake timers
 // into every later test in the file.

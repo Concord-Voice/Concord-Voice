@@ -855,17 +855,20 @@ describe('ChannelSettingsModal — V6-V7 regression (#3406)', () => {
       fireEvent.click(screen.getByText('Save Override'));
     });
 
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Failed to save permission override. Your changes are still here — try again.'
+    );
     // The body is a decimal string, exact through BigInt, not a number.
     expect(bodies[0]).toMatchObject({ allow: '4611686018427387905', deny: '0' });
     expect(screen.getByText('Editing: Moderator')).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent(
-      'Failed to save permission override. Your changes are still here — try again.'
-    );
 
     await act(async () => {
       fireEvent.click(screen.getByText('Save Override'));
     });
 
+    // The Add Override section renders only once no override is selected, so it
+    // gates on the accepted retry rather than on the click.
+    await screen.findByText('Add Override', { selector: '.section-header' });
     expect(screen.queryByText('Editing: Moderator')).not.toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
@@ -896,17 +899,19 @@ describe('ChannelSettingsModal — V6-V7 regression (#3406)', () => {
       fireEvent.click(screen.getByLabelText('Delete override'));
     });
 
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Failed to remove permission override. Try again.'
+    );
     expect(
       screen.getByText('Moderator', { selector: '.override-target-name' })
     ).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent(
-      'Failed to remove permission override. Try again.'
-    );
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Delete override'));
     });
 
+    // The empty state renders only once the last override is gone.
+    await screen.findByText('No permission overrides configured for this channel.');
     expect(
       screen.queryByText('Moderator', { selector: '.override-target-name' })
     ).not.toBeInTheDocument();

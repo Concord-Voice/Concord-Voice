@@ -690,15 +690,19 @@ describe('dmStore', () => {
     });
 
     it('handles network error', async () => {
+      let hit = false;
       server.use(
         http.get(`${API_BASE}/api/v1/dm/conversations`, () => {
+          hit = true;
           return HttpResponse.error();
         })
       );
 
       await useDMStore.getState().fetchConversations();
-      // Network errors produce the native fetch error message
-      expect(useDMStore.getState().error).toBe('Failed to fetch');
+      expect(hit).toBe(true);
+      // HttpResponse.error() under MSW 3 rejects the real undici fetch ("fetch failed");
+      // Chromium's renderer says "Failed to fetch". The store surfaces either verbatim.
+      expect(useDMStore.getState().error).toBe('fetch failed');
     });
 
     it('handles empty conversations list', async () => {

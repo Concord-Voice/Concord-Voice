@@ -1,4 +1,14 @@
-import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  beforeAll,
+  afterAll,
+  afterEach,
+  onTestFinished,
+  vi,
+} from 'vitest';
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { server as mswServer } from '../../../mocks/server';
@@ -8,7 +18,10 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
-import { clearMutualServersCache } from '@/renderer/services/system/mutualServers';
+import {
+  clearMutualServersCache,
+  getMutualServers,
+} from '@/renderer/services/system/mutualServers';
 import {
   ADMIN_PERMISSIONS,
   ADMINISTRATOR,
@@ -295,13 +308,19 @@ describe('InviteServerPicker — already-a-member greying', () => {
   // would grey.
   it('does not grey a server only SOME group-DM recipients are in', async () => {
     seedConversation(['friend-a', 'friend-b']);
-    mockMutual({ 'friend-a': ['s1'], 'friend-b': [] });
+    mockMutual({ 'friend-a': ['s1', 's2'], 'friend-b': ['s2'] });
 
     render(<InviteServerPicker conversationId="conv-1" onPick={vi.fn()} onClose={vi.fn()} />);
 
     // Settle the probes before asserting an absence, or this passes on the first
-    // poll whether or not the intersection ever ran.
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Beta' })).toBeEnabled());
+    // poll whether or not the intersection ever ran. Beta, which EVERY recipient
+    // shares, greys only once both answers are in, so it is the settle signal.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /Beta — already a member/i })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      )
+    );
     expect(screen.getByRole('button', { name: 'Alpha' })).toBeEnabled();
   });
 
@@ -341,8 +360,12 @@ describe('InviteServerPicker — already-a-member greying', () => {
 
     render(<InviteServerPicker conversationId="conv-1" onPick={vi.fn()} onClose={vi.fn()} />);
 
-    const alpha = await screen.findByRole('button', { name: 'Alpha' });
-    expect(alpha).toBeEnabled();
+    // Ungreyed is also the state before any answer. The probe is deduped, so
+    // this awaits the picker's own request and the 404 lands inside this test.
+    await act(async () => {
+      await getMutualServers('friend');
+    });
+    expect(screen.getByRole('button', { name: 'Alpha' })).toBeEnabled();
   });
 
   // No conversation means no recipient to ask about — the picker must not probe
@@ -356,10 +379,17 @@ describe('InviteServerPicker — already-a-member greying', () => {
       })
     );
 
+    // Alpha renders before any probe could answer, so count probes at the fetch
+    // seam as well: MSW 3 would see one sent at mount only turns later.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    onTestFinished(() => fetchSpy.mockRestore());
     render(<InviteServerPicker onPick={vi.fn()} onClose={vi.fn()} />);
 
     const alpha = await screen.findByRole('button', { name: 'Alpha' });
     expect(alpha).toBeEnabled();
+    expect(
+      fetchSpy.mock.calls.filter(([input]) => String(input).includes('/mutual-servers'))
+    ).toHaveLength(0);
     expect(probed).toBe(0);
   });
 });

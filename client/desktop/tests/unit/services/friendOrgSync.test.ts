@@ -310,17 +310,34 @@ describe('friendOrgSyncService', () => {
           )
         );
 
+        // Under MSW 3 the real undici fetch runs its own socket timers on the fake
+        // clock, so vi.getTimerCount() no longer counts only this service's timers.
+        // Track the owned handle instead.
+        const ownedTimer = () =>
+          (
+            friendOrgSyncService as unknown as {
+              remoteApplyResetTimer: ReturnType<typeof setTimeout> | null;
+            }
+          ).remoteApplyResetTimer;
+        const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+        onTestFinished(() => clearSpy.mockRestore());
+
         friendOrgSyncService.startWatching();
         await friendOrgSyncService.fetchAndApply();
-        expect(vi.getTimerCount()).toBe(1);
+        const first = ownedTimer();
+        expect(first).not.toBeNull();
 
         // A second remote apply replaces the owned reset timer instead of
         // leaving an untracked prior-account callback behind.
         await friendOrgSyncService.fetchAndApply();
-        expect(vi.getTimerCount()).toBe(1);
+        const second = ownedTimer();
+        expect(second).not.toBeNull();
+        expect(second).not.toBe(first);
+        expect(clearSpy).toHaveBeenCalledWith(first);
 
         friendOrgSyncService.stopWatching();
-        expect(vi.getTimerCount()).toBe(0);
+        expect(ownedTimer()).toBeNull();
+        expect(clearSpy).toHaveBeenCalledWith(second);
 
         friendOrgSyncService.startWatching();
         useFriendOrgStore.getState().createCategory('New account', '', null);

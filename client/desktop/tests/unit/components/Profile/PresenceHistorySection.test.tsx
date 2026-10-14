@@ -9,6 +9,7 @@ import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { clientConfigService } from '@/renderer/services/system/clientConfigService';
 import PresenceHistorySection from '@/renderer/components/Profile/PresenceHistorySection';
 import { deferred } from '../../../helpers/deferred';
+import type { MockInstance } from 'vitest';
 
 const API_BASE = 'http://localhost:8080';
 const HISTORY_ENDPOINT = `${API_BASE}/api/v1/users/me/presence-history`;
@@ -647,10 +648,28 @@ describe('PresenceHistorySection errors and pagination', () => {
   });
 });
 
+/**
+ * Under MSW 3 a handler's request.signal is rebuilt from the wire and never aborts,
+ * so these tests read the AbortSignal the component handed to fetch.
+ */
+function callerSignals(
+  spy: MockInstance<typeof fetch>,
+  match: (url: URL) => boolean
+): AbortSignal[] {
+  return spy.mock.calls.flatMap(([input, init]) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    return match(url) && signal ? [signal] : [];
+  });
+}
+const isSettings = (url: URL) => url.pathname.endsWith('/presence-history/settings');
+const isPage = (url: URL) => url.pathname.endsWith('/presence-history');
+
 describe('PresenceHistorySection account-scoped request lifetime', () => {
   it('retains rows and in-flight pagination when supported capability becomes stale', async () => {
     const nextPageResponse = deferred<HttpResponse>();
-    let loadMoreSignal: AbortSignal | null = null;
+    let loadMoreArrived = false;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
     server.use(
       http.get(SETTINGS_ENDPOINT, () => HttpResponse.json(enabledSettings())),
       http.get(HISTORY_ENDPOINT, ({ request }) => {
@@ -658,7 +677,7 @@ describe('PresenceHistorySection account-scoped request lifetime', () => {
         if (before === null) {
           return HttpResponse.json(historyPage([supportedItem('Still visible')], 'next-page'));
         }
-        loadMoreSignal = request.signal;
+        loadMoreArrived = true;
         return nextPageResponse.promise;
       })
     );
@@ -666,7 +685,12 @@ describe('PresenceHistorySection account-scoped request lifetime', () => {
     render(<PresenceHistorySection userId={USER_A} />);
     await screen.findByText('Still visible');
     fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
-    await waitFor(() => expect(loadMoreSignal).not.toBeNull());
+    await waitFor(() => expect(loadMoreArrived).toBe(true));
+    const [loadMoreSignal] = callerSignals(
+      fetchSpy,
+      (url) => isPage(url) && url.searchParams.get('before') === 'next-page'
+    );
+    expect(loadMoreSignal).toBeDefined();
 
     act(() => {
       useClientConfigStore.getState().setActivityHistoryCapability({
@@ -692,35 +716,31 @@ describe('PresenceHistorySection account-scoped request lifetime', () => {
   it('aborts account-A initial requests and ignores their late completion after account B loads', async () => {
     const aSettings = deferred<HttpResponse>();
     const aPage = deferred<HttpResponse>();
-    const aSignals: AbortSignal[] = [];
     let settingsCalls = 0;
     let pageCalls = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
     server.use(
-      http.get(SETTINGS_ENDPOINT, ({ request }) => {
+      http.get(SETTINGS_ENDPOINT, () => {
         settingsCalls += 1;
-        if (settingsCalls === 1) {
-          aSignals.push(request.signal);
-          return aSettings.promise;
-        }
+        if (settingsCalls === 1) return aSettings.promise;
         return HttpResponse.json(enabledSettings());
       }),
-      http.get(HISTORY_ENDPOINT, ({ request }) => {
+      http.get(HISTORY_ENDPOINT, () => {
         pageCalls += 1;
-        if (pageCalls === 1) {
-          aSignals.push(request.signal);
-          return aPage.promise;
-        }
+        if (pageCalls === 1) return aPage.promise;
         return HttpResponse.json(historyPage([supportedItem('Account B')]));
       })
     );
 
     const { rerender } = render(<PresenceHistorySection userId={USER_A} />);
-    await waitFor(() => expect(aSignals).toHaveLength(2));
+    await waitFor(() => expect([settingsCalls, pageCalls]).toEqual([1, 1]));
+    const aSignals = [callerSignals(fetchSpy, isSettings)[0], callerSignals(fetchSpy, isPage)[0]];
+    expect(aSignals.every((signal) => signal?.aborted === false)).toBe(true);
 
     rerender(<PresenceHistorySection userId={USER_B} />);
 
     expect(await screen.findByText('Account B')).toBeInTheDocument();
-    await waitFor(() => expect(aSignals.every((signal) => signal.aborted)).toBe(true));
+    await waitFor(() => expect(aSignals.every((signal) => signal?.aborted)).toBe(true));
     act(() => {
       aSettings.resolve(HttpResponse.json(enabledSettings()));
       aPage.resolve(HttpResponse.json(historyPage([supportedItem('Stale Account A')])));
@@ -733,26 +753,27 @@ describe('PresenceHistorySection account-scoped request lifetime', () => {
     const loadMoreResponse = deferred<HttpResponse>();
     const bSettingsResponse = deferred<HttpResponse>();
     const bPageResponse = deferred<HttpResponse>();
-    let loadMoreSignal: AbortSignal | null = null;
-    const bSignals: AbortSignal[] = [];
+    let loadMoreArrived = false;
+    let bArrivals = 0;
     let settingsCalls = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
     server.use(
-      http.get(SETTINGS_ENDPOINT, ({ request }) => {
+      http.get(SETTINGS_ENDPOINT, () => {
         settingsCalls += 1;
         if (settingsCalls === 1) return HttpResponse.json(enabledSettings());
-        bSignals.push(request.signal);
+        bArrivals += 1;
         return bSettingsResponse.promise;
       }),
       http.get(HISTORY_ENDPOINT, ({ request }) => {
         const before = new URL(request.url).searchParams.get('before');
         if (before === 'more-a') {
-          loadMoreSignal = request.signal;
+          loadMoreArrived = true;
           return loadMoreResponse.promise;
         }
         if (settingsCalls <= 1) {
           return HttpResponse.json(historyPage([supportedItem('Account A row')], 'more-a'));
         }
-        bSignals.push(request.signal);
+        bArrivals += 1;
         return bPageResponse.promise;
       })
     );
@@ -760,16 +781,27 @@ describe('PresenceHistorySection account-scoped request lifetime', () => {
     const { rerender, unmount } = render(<PresenceHistorySection userId={USER_A} />);
     await screen.findByText('Account A row');
     fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
-    await waitFor(() => expect(loadMoreSignal).not.toBeNull());
+    await waitFor(() => expect(loadMoreArrived).toBe(true));
+    const [loadMoreSignal] = callerSignals(
+      fetchSpy,
+      (url) => isPage(url) && url.searchParams.get('before') === 'more-a'
+    );
+    expect(loadMoreSignal?.aborted).toBe(false);
 
     rerender(<PresenceHistorySection userId={USER_B} />);
 
     expect(screen.queryByText('Account A row')).not.toBeInTheDocument();
     expect(screen.getByText(/loading activity history/i)).toBeInTheDocument();
     await waitFor(() => expect(loadMoreSignal?.aborted).toBe(true));
-    await waitFor(() => expect(bSignals).toHaveLength(2));
+    await waitFor(() => expect(bArrivals).toBe(2));
+    // Account B's initial pair: the second settings read and the second first-page read.
+    const bSignals = [
+      callerSignals(fetchSpy, isSettings)[1],
+      callerSignals(fetchSpy, (url) => isPage(url) && !url.searchParams.has('before'))[1],
+    ];
+    expect(bSignals.every((signal) => signal?.aborted === false)).toBe(true);
 
     unmount();
-    expect(bSignals.every((signal) => signal.aborted)).toBe(true);
+    expect(bSignals.every((signal) => signal?.aborted)).toBe(true);
   });
 });
