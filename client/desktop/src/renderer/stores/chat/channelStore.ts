@@ -52,6 +52,7 @@ function mapChannel(row: Record<string, unknown>): Channel {
     expiration_updated_at: _expirationUpdatedAt,
     expiration_revision: _expirationRevision,
     expiration_backfill_pending: _expirationBackfillPending,
+    expiration_include_pinned: _expirationIncludePinned,
     ...channel
   } = row;
   const mapped = channel as unknown as Channel;

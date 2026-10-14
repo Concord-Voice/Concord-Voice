@@ -107,6 +107,57 @@ describe('PinnedMessagesPanel', () => {
     expect(container.querySelector('.pinned-panel-backdrop')).not.toBeInTheDocument();
   });
 
+  // #3459: the static "pins are kept" note. It is a retention claim, so it appears only from a
+  // server-sent `includePinned === false` under a window and is silent for every unknown.
+  describe('pins-are-kept note (#3459)', () => {
+    const NOTE =
+      "Pinned messages are kept. Unpinning one puts it back on the timer, and it's deleted within minutes if its time has already run out.";
+    const keptPolicy = {
+      windowSeconds: 86400 as const,
+      updatedAt: null,
+      revision: 3,
+      backfillPending: false,
+      includePinned: false,
+    };
+
+    it('shows the note when a window is set and pins are kept', () => {
+      render(
+        <PinnedMessagesPanel
+          {...defaultProps}
+          expirationPolicy={keptPolicy}
+          expirationPolicyState="ready"
+        />
+      );
+      expect(screen.getByText(NOTE)).toBeInTheDocument();
+    });
+
+    it.each([
+      ['pins expire too', { ...keptPolicy, includePinned: true }, 'ready'],
+      [
+        'the field is absent (a server that predates #3459)',
+        { ...keptPolicy, includePinned: undefined },
+        'ready',
+      ],
+      ['no window is set', { ...keptPolicy, windowSeconds: null }, 'ready'],
+      ['the policy could not be read', keptPolicy, 'unavailable'],
+    ] as const)('says nothing about retention when %s', (_name, policy, state) => {
+      render(
+        <PinnedMessagesPanel
+          {...defaultProps}
+          expirationPolicy={policy}
+          expirationPolicyState={state}
+        />
+      );
+      expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
+      expect(document.querySelector('.pinned-panel-note')).toBeNull();
+    });
+
+    it('says nothing when the owner passes no policy at all', () => {
+      render(<PinnedMessagesPanel {...defaultProps} />);
+      expect(document.querySelector('.pinned-panel-note')).toBeNull();
+    });
+  });
+
   it('constrains pinned attachment media to the card width', () => {
     const css = readFileSync(
       resolve(__dirname, '../../../../src/renderer/components/Chat/PinnedMessagesPanel.css'),

@@ -287,11 +287,14 @@ func TestService_ZeroEffectBatchProbesEligibilityForChannelAndConversation(t *te
 	channelPolicy := startChannel(t, f, Request{Mode: "set", WindowSeconds: &window, Retroactive: "apply"})
 
 	noOpChannelScope := channelScope
+	// The batch statement binds $4 (keep, #3459) since pin-aware expiry, so the
+	// no-op stand-in names it too; the driver refuses a surplus argument.
 	noOpChannelScope.applyBatchSQL = `
 UPDATE messages
 SET expires_at = expires_at
 WHERE channel_id = $1 AND created_at <= $2 AND false
-  AND expires_at IS DISTINCT FROM (created_at + make_interval(secs => $3))`
+  AND expires_at IS DISTINCT FROM (created_at + make_interval(secs => $3))
+  AND $4::boolean IS NOT NULL`
 	probeErrorChannelScope := noOpChannelScope
 	probeErrorChannelScope.applyEligibleSQL = `SELECT invalid_expiration_probe`
 	got, err := NewService(f.db).runBatches(context.Background(), probeErrorChannelScope, f.channel.String(), channelPolicy.Revision)

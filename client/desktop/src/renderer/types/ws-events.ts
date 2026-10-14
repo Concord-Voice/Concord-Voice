@@ -1830,6 +1830,25 @@ const ExpirationEventWindow = z
 
 const ExpirationEventKind = z.enum(['set', 'changed', 'cleared']);
 
+/** The #3459 pin-retention fields, shared by both event schemas so they cannot drift.
+ *
+ *  All three are `.optional()`: an event from a server that predates #3459 omits them, and
+ *  `z.object` (non-strict) means a renderer that predates THIS schema strips them, so neither
+ *  direction of version skew drops a row. The `kind` enum above is deliberately UNCHANGED: a
+ *  pins-only change reuses `changed`, because an older renderer's closed enum would drop a new
+ *  kind and bump `wireViolationCount` on every bundled client.
+ *
+ *  - `include_pinned`: the policy's effective value, present on every event from a current server
+ *    so the merge can advance it in the same tick the row renders.
+ *  - `previous_include_pinned`, `previous_window_seconds`: `changed` only. The previous window is
+ *    what lets the row tell a pins-only change (same window) from a window change, which the
+ *    wire did not carry before. */
+const ExpirationEventPinFields = {
+  include_pinned: z.boolean().optional(),
+  previous_include_pinned: z.boolean().optional(),
+  previous_window_seconds: ExpirationEventWindow.optional(),
+};
+
 export const ExpirationEventSchema = z.object({
   type: z.literal('expiration_event'),
   data: z.object({
@@ -1852,6 +1871,7 @@ export const ExpirationEventSchema = z.object({
     revision: z.number().int().nonnegative(),
     updated_at: ISOTimestamp.nullable(),
     backfill_pending: z.boolean(),
+    ...ExpirationEventPinFields,
   }),
 });
 
@@ -1877,6 +1897,7 @@ export const DMExpirationEventSchema = z.object({
     revision: z.number().int().nonnegative(),
     updated_at: ISOTimestamp.nullable(),
     backfill_pending: z.boolean(),
+    ...ExpirationEventPinFields,
   }),
 });
 

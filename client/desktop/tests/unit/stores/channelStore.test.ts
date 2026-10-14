@@ -616,6 +616,63 @@ describe('channelStore expiration policy contract', () => {
     });
   });
 
+  it('reads expiration_include_pinned off a list row into the policy and keeps it off the channel (#3459)', async () => {
+    useChannelStore.setState({ currentServerId: 'server-1' });
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () =>
+        HttpResponse.json({
+          channels: [
+            {
+              ...mockChannel,
+              expiration_window_seconds: 86400,
+              expiration_updated_at: '2026-09-08T05:00:00Z',
+              expiration_revision: 4,
+              expiration_backfill_pending: false,
+              expiration_include_pinned: false,
+            },
+          ],
+        })
+      )
+    );
+    await useChannelStore.getState().fetchChannels('server-1');
+    const channel = useChannelStore.getState().channels.find((item) => item.id === mockChannel.id);
+    expect(channel?.expirationPolicy).toStrictEqual({
+      windowSeconds: 86400,
+      updatedAt: '2026-09-08T05:00:00Z',
+      revision: 4,
+      backfillPending: false,
+      includePinned: false,
+    });
+    // The wire field is consumed by the parser and must not leak onto the Channel itself.
+    expect(channel).not.toHaveProperty('expiration_include_pinned');
+  });
+
+  it('a row with a malformed expiration_include_pinned reads as an unavailable policy (#3459)', async () => {
+    useChannelStore.setState({ currentServerId: 'server-1', activeChannelId: mockChannel.id });
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () =>
+        HttpResponse.json({
+          channels: [
+            {
+              ...mockChannel,
+              expiration_window_seconds: 86400,
+              expiration_updated_at: '2026-09-08T05:00:00Z',
+              expiration_revision: 4,
+              expiration_backfill_pending: false,
+              expiration_include_pinned: 'yes',
+            },
+          ],
+        })
+      )
+    );
+    await expect(
+      useChannelStore.getState().fetchChannels('server-1', {
+        targetId: mockChannel.id,
+        lifecycle: captureAuthLifecycle(),
+      })
+    ).resolves.toEqual({ kind: 'unavailable' });
+  });
+
   it.each([
     ['missing target', { channels: [{ ...mockChannel, id: 'channel-2' }] }, 'missing'],
     [

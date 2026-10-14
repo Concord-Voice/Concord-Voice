@@ -2,6 +2,8 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { X } from 'lucide-react';
 import { getPins, unpinMessage } from '../../services/messaging/pinService';
 import { PinContent, decryptPins, type DecryptedPin } from '../Chat/pinnedMessageUtils';
+import PinnedKeptNote from '../Expiration/PinnedKeptNote';
+import type { ExpirationPolicy } from '../../services/messaging/expirationPolicyApi';
 import '../Chat/PinnedMessagesPanel.css';
 
 export interface DMPinnedMessagesPanelProps {
@@ -11,6 +13,10 @@ export interface DMPinnedMessagesPanelProps {
   onScrollToMessage: (messageId: string) => void;
   canPin?: boolean;
   onUnpin?: () => void;
+  /** The conversation's expiration policy, for the "pins are kept" note (#3459). Passed in
+   *  rather than read here, as in the channel panel. Omitted, the panel says nothing. */
+  expirationPolicy?: ExpirationPolicy | null;
+  expirationPolicyState?: 'loading' | 'ready' | 'unavailable';
 }
 
 const DMPinnedMessagesPanel: React.FC<DMPinnedMessagesPanelProps> = ({
@@ -20,6 +26,8 @@ const DMPinnedMessagesPanel: React.FC<DMPinnedMessagesPanelProps> = ({
   onScrollToMessage,
   canPin,
   onUnpin,
+  expirationPolicy,
+  expirationPolicyState,
 }) => {
   const [pins, setPins] = useState<DecryptedPin[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -108,6 +116,8 @@ const DMPinnedMessagesPanel: React.FC<DMPinnedMessagesPanelProps> = ({
             <X size={18} />
           </button>
         </div>
+
+        <PinnedKeptNote policy={expirationPolicy} policyState={expirationPolicyState} />
 
         <div className="pinned-panel-content">
           {isLoading && <div className="pinned-panel-loading">Loading...</div>}

@@ -1,9 +1,11 @@
 package channels
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
@@ -18,15 +20,24 @@ import (
 const maxExpirationRequestBytes = 1024
 
 // UpdateExpiration changes a channel's shared message-expiration policy. A
-// change that shortens retention is a dangerous action (#3454): on a server
-// that enforces MFA on dangerous actions it asks for an inline factor under
-// the gate's locks (see dangerous_gates.go).
+// change that shortens retention, or turns pinned-message expiry on (#3459
+// D-B), is a dangerous action (#3454): on a server that enforces MFA on
+// dangerous actions it asks for an inline factor under the gate's locks (see
+// dangerous_gates.go).
 func (h *Handler) UpdateExpiration(c *gin.Context) {
-	userID, channelID := c.GetString("user_id"), c.Param("id")
-	if _, err := uuid.Parse(channelID); err != nil {
+	started := time.Now()
+	userID := c.GetString("user_id")
+	parsedChannelID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelID})
 		return
 	}
+	// Canonicalize once, here (#3362's rule): the id reaches SQL, which folds every uuid
+	// spelling onto one row, AND the expiration_event frame, which clients match by exact
+	// string. Forwarding the raw spelling let an UPPERCASE id change the policy while
+	// every other client dropped the event, so their composer kept claiming pins are kept
+	// after pins began to expire (#3459 red-team F2).
+	channelID := parsedChannelID.String()
 
 	var request channelExpirationRequest
 	if !bindStrictJSONBody(c, &request, maxExpirationRequestBytes) {
@@ -41,8 +52,8 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 	if !ok {
 		return
 	}
-	// Only a request that sets a window can shorten retention.
-	confirm, ok := h.chargeChannelGate(c, serverID, userID, request.MFACode, request.WindowSeconds != nil)
+	// Only a request that sets a window or include_pinned can fire the gate.
+	confirm, ok := h.chargeChannelGate(c, serverID, userID, request.MFACode, expirationGateMayFire(request.Request))
 	if !ok {
 		return
 	}
@@ -94,15 +105,25 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, policy)
 		return
 	}
+	// After a clean commit, in this order (#3459 §8): settle the gate, announce
+	// the policy change, delete the pins that were already due when the
+	// context stopped keeping them, then resume any backfill. The deletion's
+	// server_purged therefore reaches clients after the system row it follows.
 	h.settleChannelGate(c.Request.Context(), outcome, confirm, userID)
 	if staged.Present {
 		h.broadcastChannelExpirationEvent(channelID, staged.MessageID, userID, staged.Payload, policy)
 	}
+	// The deletion and the backfill share one deadline measured from the
+	// handler's start, so the response still goes out inside the server's
+	// write timeout however long the steps before them took.
+	answerCtx, cancel := context.WithDeadline(c.Request.Context(), h.responseDeadline(started))
+	defer cancel()
+	h.expireDuePinnedMessages(answerCtx, channelID, serverID, transition)
 	if !policy.BackfillPending {
 		c.JSON(http.StatusOK, policy)
 		return
 	}
-	h.respondChannelExpirationBackfill(c, service, channelID, policy)
+	h.respondChannelExpirationBackfill(answerCtx, c, service, channelID, policy)
 }
 
 // resolveChannelExpirationServer reads the channel's server WITHOUT a lock, so
@@ -131,7 +152,8 @@ func (h *Handler) resolveChannelExpirationServer(c *gin.Context, channelID strin
 //
 // Order: the gate's locks (lockChannelExpirationGateTx), the channel lock,
 // the channel-scope ManageChannels check (I7), the channel-type check, then
-// Require when the request shortens retention against the window read under
+// Require when the request shortens retention or turns pinned expiry on,
+// judged against the window and the effective include_pinned value read under
 // the channel lock. Require precedes every write, so a refusal writes nothing.
 func (h *Handler) authorizeChannelExpirationTx(
 	c *gin.Context,
@@ -170,7 +192,7 @@ func (h *Handler) authorizeChannelExpirationTx(
 		return mfaenforce.Unconfirmed, false
 	}
 	outcome, err := h.requireChannelGate(ctx, tx, g, userID, stepup.PurposeChannelExpirationShorten, confirm,
-		shortensRetention(locked.window, request.WindowSeconds, request.Retroactive))
+		expirationGateFires(locked, request))
 	if err != nil {
 		h.respondChannelExpirationError(c, err)
 		return mfaenforce.Unconfirmed, false
@@ -216,11 +238,17 @@ type lockedExpirationChannel struct {
 	channelType string
 	// window is the policy before this mutation; NULL means never expire.
 	window sql.NullInt64
+	// includePinned is the policy's EFFECTIVE include_pinned value before this
+	// mutation (E = window IS NOT NULL AND expiration_include_pinned, #3459
+	// X3), read under the same lock as window.
+	includePinned bool
 }
 
 // lockChannelExpirationScopeTx locks the channel FOR NO KEY UPDATE, scoped to
 // the server the gate locked (I-CHANNEL-SCOPE), and reads the prior window
-// under that lock. Zero rows is the route's existing 404: the channel is gone,
+// and effective include_pinned value under that lock (#3459 §7): read any
+// earlier, a concurrent toggle-off could land between the read and the lock
+// and turn a gated false->true into one the gate judges true->true. Zero rows is the route's existing 404: the channel is gone,
 // or moved to another server since the unlocked read, which would otherwise
 // be authorized against the server it used to be on.
 func (h *Handler) lockChannelExpirationScopeTx(
@@ -228,9 +256,11 @@ func (h *Handler) lockChannelExpirationScopeTx(
 ) (lockedExpirationChannel, bool) {
 	var locked lockedExpirationChannel
 	err := tx.QueryRowContext(c.Request.Context(),
-		`SELECT type, expiration_window_seconds FROM channels WHERE id = $1 AND server_id = $2 FOR NO KEY UPDATE`,
+		`SELECT type, expiration_window_seconds,
+		        expiration_window_seconds IS NOT NULL AND expiration_include_pinned
+		   FROM channels WHERE id = $1 AND server_id = $2 FOR NO KEY UPDATE`,
 		channelID, serverID,
-	).Scan(&locked.channelType, &locked.window)
+	).Scan(&locked.channelType, &locked.window, &locked.includePinned)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeChannelNotFound(c)
 		return locked, false
@@ -272,12 +302,13 @@ func (h *Handler) stageChannelExpirationEvent(
 // the response. ErrBackfillPending is the expected outcome of a bounded batch
 // that has more to do, so it is not logged as a failure.
 func (h *Handler) respondChannelExpirationBackfill(
+	ctx context.Context,
 	c *gin.Context,
 	service *expiration.Service,
 	channelID string,
 	policy expiration.Policy,
 ) {
-	resumed, resumeErr := service.ResumeChannel(c.Request.Context(), channelID, policy.Revision)
+	resumed, resumeErr := service.ResumeChannel(ctx, channelID, policy.Revision)
 	resumed, status := expiration.NormalizeResume(policy, resumed, resumeErr)
 	if status == http.StatusServiceUnavailable && !errors.Is(resumeErr, expiration.ErrBackfillPending) {
 		h.log.Error("Failed to resume channel expiration backfill", "error", resumeErr)
@@ -297,4 +328,15 @@ func (h *Handler) writeExpirationStartError(c *gin.Context, err error) {
 		message = errMsgChannelNotFound
 	}
 	c.JSON(status, gin.H{"error": message})
+}
+
+// responseDeadline is when the work after a policy commit must stop so the
+// response can still be written: start plus expiration.ResponseBudget, or the
+// budget a test set on the handler.
+func (h *Handler) responseDeadline(start time.Time) time.Time {
+	budget := h.responseBudget
+	if budget <= 0 {
+		budget = expiration.ResponseBudget
+	}
+	return start.Add(budget)
 }

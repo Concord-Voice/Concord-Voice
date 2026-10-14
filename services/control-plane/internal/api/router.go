@@ -1109,6 +1109,8 @@ func NewRouter(
 		ActivePlans: activePlanRail,
 	})
 	requireMessageDeleteGuardWired(log, messagesHandler, dmHandler)
+	wirePinnedExpiry(lifecycleCtx, log, purgeEngine, hub, channelsHandler, dmHandler)
+	requirePinnedExpiryWired(log, channelsHandler, dmHandler)
 	// Wire DM voice ring cleanup-on-disconnect (#1209 plan task B7 Part 2).
 	// When a user's last WS connection drops, the hub invokes
 	// HandleUserDisconnect to cancel any rings they initiated.

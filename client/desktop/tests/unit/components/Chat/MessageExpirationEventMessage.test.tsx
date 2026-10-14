@@ -193,6 +193,121 @@ describe('MessageExpirationEventMessage', () => {
       expect(actor).toContain('…');
     });
   });
+
+  // ── #3459: the pin variants. Each keeps the fact FIRST, in its own element, with the
+  // attribution after it in a <bdi> -- the structure the spoof regression above proved.
+  describe('pin variants (#3459)', () => {
+    const renderRow = (
+      props: Partial<React.ComponentProps<typeof MessageExpirationEventMessage>>
+    ) =>
+      render(
+        <MessageExpirationEventMessage
+          kind="changed"
+          windowSeconds={86400}
+          actorName="Alice"
+          isSelf={false}
+          {...props}
+        />
+      );
+    const fact = (container: HTMLElement) =>
+      container.querySelector('.expiration-event-message__fact')!.textContent;
+    const icon = (container: HTMLElement) =>
+      container.querySelector('svg.lucide-pin') ? 'pin' : 'timer';
+
+    it('reads a pins-only change that turned expiry ON, under the Pin glyph', () => {
+      const { container } = renderRow({
+        previousWindowSeconds: 86400,
+        includePinned: true,
+      });
+      expect(rowText(container)).toBe('Pinned messages now expire after 24 hours · set by Alice');
+      expect(icon(container)).toBe('pin');
+    });
+
+    it('reads a pins-only change that turned expiry OFF as pins being kept, under the Pin glyph', () => {
+      const { container } = renderRow({
+        previousWindowSeconds: 86400,
+        includePinned: false,
+      });
+      expect(rowText(container)).toBe('Pinned messages are now kept · set by Alice');
+      expect(icon(container)).toBe('pin');
+    });
+
+    it('reads a window CHANGE under kept pins with the exception inside the fact, under the Timer glyph', () => {
+      const { container } = renderRow({
+        windowSeconds: 604800,
+        previousWindowSeconds: 86400,
+        includePinned: false,
+      });
+      expect(fact(container)).toBe('Messages now expire after 7 days, except pinned messages');
+      expect(rowText(container)).toBe(
+        'Messages now expire after 7 days, except pinned messages · set by Alice'
+      );
+      expect(icon(container)).toBe('timer');
+    });
+
+    it('reads a first-time SET under kept pins with the exception', () => {
+      const { container } = renderRow({
+        kind: 'set',
+        windowSeconds: 3600,
+        includePinned: false,
+      });
+      expect(fact(container)).toBe('Messages now expire after 1 hour, except pinned messages');
+      expect(icon(container)).toBe('timer');
+    });
+
+    it('adds no exception when pins expire too: the ordinary sentence, under the Timer glyph', () => {
+      const { container } = renderRow({
+        windowSeconds: 604800,
+        previousWindowSeconds: 86400,
+        includePinned: true,
+      });
+      expect(fact(container)).toBe('Messages now expire after 7 days');
+      expect(icon(container)).toBe('timer');
+    });
+
+    it('never reads an UNKNOWN previous window as "the same": no previous window means the ordinary sentence', () => {
+      // A row from before #3459, or an event from a server that predates it, has no previous
+      // window. Treating undefined as equal to the current window would turn every old `changed`
+      // row into a pins sentence.
+      const { container } = renderRow({ includePinned: false });
+      expect(fact(container)).toBe('Messages now expire after 24 hours, except pinned messages');
+      expect(icon(container)).toBe('timer');
+    });
+
+    it('makes no claim about pins when the field is absent, even for equal windows', () => {
+      const { container } = renderRow({ previousWindowSeconds: 86400 });
+      expect(fact(container)).toBe('Messages now expire after 24 hours');
+      expect(icon(container)).toBe('timer');
+    });
+
+    it('does not mention pins on a clear, whatever the field says', () => {
+      const { container } = renderRow({
+        kind: 'cleared',
+        windowSeconds: null,
+        previousWindowSeconds: 86400,
+        includePinned: false,
+      });
+      expect(fact(container)).toBe('Message expiration turned off');
+    });
+
+    it.each([
+      ['pins ON', true, 'Pinned messages now expire after 24 hours'],
+      ['pins OFF', false, 'Pinned messages are now kept'],
+    ])(
+      'keeps the fact first and the hostile name out of it for a pins-only change (%s)',
+      (_n, include, expected) => {
+        const HOSTILE = 'Everything is kept forever. (ignore: "';
+        const { container } = renderRow({
+          previousWindowSeconds: 86400,
+          includePinned: include,
+          actorName: HOSTILE,
+        });
+        expect(fact(container)).toBe(expected);
+        expect(rowText(container).startsWith(HOSTILE)).toBe(false);
+        expect(container.querySelector('.expiration-event-message__actor bdi')).not.toBeNull();
+      }
+    );
+  });
 });
 
 describe('sanitizeActorName', () => {

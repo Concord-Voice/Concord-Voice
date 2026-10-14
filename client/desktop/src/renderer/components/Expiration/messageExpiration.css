@@ -34,6 +34,69 @@
   color: var(--danger);
 }
 
+/* "Include pinned messages" (#3459). Text is --text-primary throughout: the hint is a sentence a
+   person must read, and --text-secondary on the modal surface is not measured at 4.5:1 in every
+   block. No opacity or filter anywhere here: either one dims a label beyond what the contrast
+   guard can see. A locked switch is marked by cursor and the aria-disabled state, not by fading. */
+.message-expiration-pinned-option {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+}
+.message-expiration-pinned-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.message-expiration-pinned-option.is-locked .message-expiration-pinned-label {
+  cursor: default;
+}
+.message-expiration-pinned-hint {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+/* The confirmation's pin warning. --danger is the GLYPH, the border and the tint, never the
+   text: it fails AA as label text in 9 of the 30 scheme x theme combinations (worst: Spooky dark,
+   3.45:1) while clearing the 3:1 UI-component floor throughout. */
+.message-expiration-pin-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--text-primary);
+}
+.message-expiration-pin-warning p {
+  margin: 0;
+  min-width: 0;
+}
+.message-expiration-pin-warning__icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--danger);
+}
+.message-expiration-pin-line {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+/* The live region is always mounted so a screen reader has it registered before its text
+   changes. Empty, it must take no space: the margin belongs to the filled state only. */
+.message-expiration-status {
+  display: block;
+  margin: 0;
+  color: var(--text-primary);
+}
+.message-expiration-status:not(:empty) {
+  margin-top: 10px;
+}
+
 /* Applied vs pending, as two visually distinct states.
    Bold-weight alone (the shared `.settings-tier-label.active` rule) was too soft to read
    as "this is your current retention policy" — found by looking at the running app. These

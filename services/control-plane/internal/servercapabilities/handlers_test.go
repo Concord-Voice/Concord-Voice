@@ -463,3 +463,23 @@ func TestGetCapabilities_OAuthDeploymentPolicy(t *testing.T) {
 		}
 	}
 }
+
+// TestGetCapabilities_ExpirationPinnedPolicySupported: the desktop offers
+// "Include pinned messages" on a timer only when this key is not
+// confirmed-false (#3459 §6.5, X12). Constant true and never omitted, on both
+// instance types.
+func TestGetCapabilities_ExpirationPinnedPolicySupported(t *testing.T) {
+	for _, instance := range []string{"saas", "self-hosted"} {
+		t.Run(instance, func(t *testing.T) {
+			w, c := newTestContext()
+			servercapabilities.NewHandler(&config.Config{InstanceType: instance}).GetCapabilities(c)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+			features, ok := body["features"].(map[string]any)
+			require.True(t, ok, "features object missing")
+			assert.Equal(t, true, features["expirationPinnedPolicySupported"])
+		})
+	}
+}

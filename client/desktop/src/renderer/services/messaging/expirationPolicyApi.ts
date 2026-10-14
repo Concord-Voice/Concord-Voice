@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { apiFetchInContext, isAbortError, type ApiRequestContext } from '../system/requestContext';
 import { adaptDangerousActionRefusal } from '../system/stepUpRouteAdapters';
+import type { AuthLifecycleSnapshot } from '../system/postLoginHydrationLifecycle';
 
 const expirationWindowSchema = z.union([
   z.literal(3600),
@@ -39,6 +40,17 @@ export interface ExpirationPolicy {
   updatedAt: string | null;
   revision: number;
   backfillPending: boolean;
+  /**
+   * Whether pinned messages expire with the rest (#3459). The server's EFFECTIVE value: `false`
+   * is the only state that claims pins are kept, and it is meaningful only under a non-null
+   * window (the server reports `false` for a context with no timer).
+   *
+   * `undefined` means the server did not say (one that predates #3459), which is NOT the same
+   * fact as `true`: nothing may be claimed about pins from it. Every reader treats absence as
+   * "say nothing", and `mergeExpirationPolicy` never lets a stale `false` outlive a read that
+   * could not repeat it.
+   */
+  includePinned?: boolean;
 }
 
 export type ExpirationRequest =
@@ -46,6 +58,12 @@ export type ExpirationRequest =
       mode: 'set';
       window_seconds: ExpirationWindowSeconds;
       retroactive: 'apply' | 'new_only';
+      /**
+       * Sent ONLY when the person changed the switch (#3459). Omitted, the server keeps an existing
+       * timer's value and stores `false` for a new one, which is also what an older server (whose
+       * closed schema would refuse the key) needs. Never `null`, and never on `clear` or `resume`.
+       */
+      include_pinned?: boolean;
       /**
        * Confirms a shortening on a server that enforces MFA on dangerous actions (#3456). Sent
        * only on the re-send after a channel's `gated` answer, never on the first request.
@@ -88,7 +106,7 @@ export type ExpirationMutationResult =
 
 export interface ExpirationPolicyReadRequest {
   targetId: string;
-  lifecycle: import('../system/postLoginHydrationLifecycle').AuthLifecycleSnapshot;
+  lifecycle: AuthLifecycleSnapshot;
 }
 
 export type ExpirationPolicyReadResult =
@@ -106,6 +124,11 @@ const policyResponseSchema = z.object({
   updated_at: z.string().datetime({ offset: true }).nullable(),
   revision: z.number().int().nonnegative().refine(Number.isSafeInteger),
   backfill_pending: z.boolean(),
+  // Optional, never nullable: absence is a server that predates #3459 and is a valid answer,
+  // while `null` or a non-boolean is a malformed one and fails the whole policy like every
+  // other field. Deliberately not `.default(...)`: a default would turn "the server did not
+  // say" into a claim about pins.
+  include_pinned: z.boolean().optional(),
 });
 
 const expirationRequestSchema = z.discriminatedUnion('mode', [
@@ -113,6 +136,9 @@ const expirationRequestSchema = z.discriminatedUnion('mode', [
     mode: z.literal('set'),
     window_seconds: expirationWindowSchema,
     retroactive: z.enum(['apply', 'new_only']),
+    // Never nullable (the server answers a raw `null` with 400), and absent from the other two
+    // modes, whose strict objects refuse it.
+    include_pinned: z.boolean().optional(),
     mfa_code: z.string().min(1).max(256).optional(),
   }),
   z.strictObject({
@@ -128,12 +154,16 @@ const expirationRequestSchema = z.discriminatedUnion('mode', [
 export function parseExpirationPolicyResponse(raw: unknown): ExpirationPolicy | undefined {
   const parsed = policyResponseSchema.safeParse(raw);
   if (!parsed.success) return undefined;
-  return {
+  const policy: ExpirationPolicy = {
     windowSeconds: parsed.data.window_seconds,
     updatedAt: parsed.data.updated_at,
     revision: parsed.data.revision,
     backfillPending: parsed.data.backfill_pending,
   };
+  // Present only when the server said so: an absent key must stay absent on the policy, not
+  // become `includePinned: undefined`, so "the server did not say" is one shape everywhere.
+  if (parsed.data.include_pinned !== undefined) policy.includePinned = parsed.data.include_pinned;
+  return policy;
 }
 
 export function parseExpirationPolicyFromListRow(raw: unknown): ExpirationPolicy | undefined {
@@ -144,6 +174,7 @@ export function parseExpirationPolicyFromListRow(raw: unknown): ExpirationPolicy
     updated_at: row.expiration_updated_at,
     revision: row.expiration_revision,
     backfill_pending: row.expiration_backfill_pending,
+    include_pinned: row.expiration_include_pinned,
   });
 }
 
@@ -153,10 +184,23 @@ export function hasMalformedExpirationPolicyListRow(raw: unknown): boolean {
     'expiration_window_seconds' in raw ||
     'expiration_updated_at' in raw ||
     'expiration_revision' in raw ||
-    'expiration_backfill_pending' in raw;
+    'expiration_backfill_pending' in raw ||
+    'expiration_include_pinned' in raw;
   return hasPolicyField && !parseExpirationPolicyFromListRow(raw);
 }
 
+/**
+ * Whole policies are ordered by revision. At an EQUAL revision the held policy stands, with two
+ * exceptions: a pending backfill is superseded by its completed form, and (#3459, X14) a read
+ * that cannot repeat the pin claim erases it.
+ *
+ * The second is drop-only on purpose. After a rollback an older server answers at the SAME
+ * revision without `include_pinned`, and a held "except pinned messages" would then outlive the
+ * binary that deletes newly pinned rows: an over-claim of retention, which is the unsafe
+ * direction. Presence is never ADDED at an equal revision, so after a re-upgrade the claim comes
+ * back with the next revision rather than being resurrected by a replay; until then the surface
+ * says nothing about pins, or over-states their deletion, both of which are safe.
+ */
 export function mergeExpirationPolicy(
   current: ExpirationPolicy | undefined,
   incoming: ExpirationPolicy | undefined
@@ -164,7 +208,25 @@ export function mergeExpirationPolicy(
   if (!incoming) return current;
   if (!current || incoming.revision > current.revision) return incoming;
   if (incoming.revision < current.revision) return current;
-  return current.backfillPending ? incoming : current;
+  // The completion exception is applied with the presence rule, never before it: a pending policy
+  // read from an older server carries no pin claim, and taking the completed form whole would add
+  // one at an equal revision (#3459 Codex review).
+  if (current.backfillPending) {
+    return current.includePinned === undefined ? withoutPinClaim(incoming) : incoming;
+  }
+  // Drop only the claim: the rest of the held policy stands. Taking the incoming read whole would
+  // also take a stale `backfillPending: true` over a completion already held, locking the editor
+  // on "still processing" until the next read (#3459 Codex review).
+  if (current.includePinned !== undefined && incoming.includePinned === undefined) {
+    return withoutPinClaim(current);
+  }
+  return current;
+}
+
+function withoutPinClaim(policy: ExpirationPolicy): ExpirationPolicy {
+  if (policy.includePinned === undefined) return policy;
+  const { includePinned: _claim, ...rest } = policy;
+  return rest;
 }
 
 function expirationPath(scope: ExpirationScope): string {

@@ -218,13 +218,17 @@ func TestSelectBatch_NullAndEmptyKeptSetStillSelect(t *testing.T) {
 	}
 }
 
-// Expiry still deletes pinned rows: it is not pin-aware until #3459. The Clear
-// reap follows #3458 §18.2: a pin survives every Clear while any participant
-// remains, because each of them can still see it
-// (TestRunClearReapBatchKeepsPinnedMessagesBelowWatermark); with no participant
-// left nobody can, and it goes with the rest.
+// Expiry's keep is not an engine predicate (#3459, C-SWEEP): a pin the policy
+// keeps carries no expiry stamp (its would-be stamp is parked in
+// held_expires_at), so it is never a candidate. A pin that IS stamped and due,
+// because pins expire with the context or because it was pinned after it came
+// due (D-C), is deleted like any other row, and the audit row says so
+// (include_pinned TRUE, §9). The Clear reap follows #3458 §18.2: a pin survives
+// every Clear while any participant remains, because each of them can still see
+// it (TestRunClearReapBatchKeepsPinnedMessagesBelowWatermark); with no
+// participant left nobody can, and it goes with the rest.
 func TestPurge_SystemPathsStillDeletePins(t *testing.T) {
-	t.Run("expiry deletes a pinned expired message", func(t *testing.T) {
+	t.Run("expiry deletes a stamped pinned message and records that it did", func(t *testing.T) {
 		f := seedEngineFixture(t)
 		cutoff := time.Now().UTC().Truncate(time.Microsecond)
 		var id string
@@ -240,6 +244,28 @@ func TestPurge_SystemPathsStillDeletePins(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, res.DeletedCount)
 		require.False(t, f.messageExists(t, id))
+		// No window is set here, so the context's own include-pinned value is
+		// false: only the deleted pin itself can make the row read TRUE.
+		require.True(t, f.auditIncludePinned(t), "an expiry that deleted a pin must not claim it kept them")
+	})
+
+	t.Run("expiry never deletes a kept pin, which has no stamp to be due", func(t *testing.T) {
+		f := seedEngineFixture(t)
+		cutoff := time.Now().UTC().Truncate(time.Microsecond)
+		var id string
+		require.NoError(t, f.db.QueryRow(`
+			INSERT INTO messages (channel_id, user_id, content, held_expires_at, pinned_at, pinned_by)
+			VALUES ($1, $2, 'kept-pin', $3, NOW(), $2) RETURNING id`,
+			f.channelID, f.authorID, cutoff.Add(-time.Second)).Scan(&id))
+
+		res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{
+			ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID,
+			CandidateIDs: []string{id}, ExpiresBefore: cutoff,
+		})
+		require.NoError(t, err)
+		require.Zero(t, res.DeletedCount)
+		require.True(t, f.messageExists(t, id), "a held stamp that has passed is not an expiry stamp")
+		require.False(t, f.auditIncludePinned(t), "no pin was deleted, so the row reads FALSE")
 	})
 
 	t.Run("the clear reap deletes a pinned message when no participant remains", func(t *testing.T) {

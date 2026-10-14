@@ -10,6 +10,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
@@ -104,6 +105,31 @@ const (
 	errMsgFetchPinsFailed = "Failed to fetch pinned messages"
 	errMsgPinLimitReached = "Maximum of 50 pinned messages per channel"
 	maxPinsPerChannel     = 50
+)
+
+// The channel pin and unpin statements are package constants: the pin-aware
+// expiry fragments are compile-time constants, so each statement is one
+// constant expression with no call-site concatenation (#3459 §5). Each embeds
+// its fragment in the SET list of the same UPDATE that writes pinned_at, so the
+// stamp moves in the same statement as the pin state and the 000168 CHECK sees
+// a consistent row. Both run only after lockChannelMessageMutationTx has taken
+// the channel FOR SHARE, which the pin fragment's unlocked read of the policy
+// relies on. TestPinnedAtWritersEmbedTheirExpiryFragment fails the build for any
+// pinned_at writer under internal/, cmd/ or pkg/ that omits the matching one.
+const (
+	pinChannelMessageSQL = `
+		UPDATE messages
+		SET pinned_at = NOW(), pinned_by = $1, updated_at = NOW(),
+		    ` + expiration.ChannelPinHoldAssignments + `
+		WHERE id = $2 AND pinned_at IS NULL
+		  AND (SELECT COUNT(*) FROM messages WHERE channel_id = $3 AND pinned_at IS NOT NULL) < $4
+		RETURNING pinned_at, pinned_by
+	`
+	unpinChannelMessageSQL = `
+		UPDATE messages SET pinned_at = NULL, pinned_by = NULL, updated_at = NOW(),
+		    ` + expiration.UnpinReleaseAssignments + `
+		WHERE id = $1 AND pinned_at IS NOT NULL
+	`
 )
 
 // lockChannelMessageMutationTx is the common write fence for channel pins and
@@ -255,13 +281,8 @@ func (h *Handler) PinMessage(c *gin.Context) {
 	channelID = lockedChannelID
 	var pinnedAt time.Time
 	var pinnedBy string
-	err = tx.QueryRowContext(c.Request.Context(), `
-		UPDATE messages
-		SET pinned_at = NOW(), pinned_by = $1, updated_at = NOW()
-		WHERE id = $2 AND pinned_at IS NULL
-		  AND (SELECT COUNT(*) FROM messages WHERE channel_id = $3 AND pinned_at IS NOT NULL) < $4
-		RETURNING pinned_at, pinned_by
-	`, userID, messageID, channelID, maxPinsPerChannel).Scan(&pinnedAt, &pinnedBy)
+	err = tx.QueryRowContext(c.Request.Context(), pinChannelMessageSQL,
+		userID, messageID, channelID, maxPinsPerChannel).Scan(&pinnedAt, &pinnedBy)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		h.respondChannelPinNotApplied(c, tx, messageID)
@@ -303,7 +324,8 @@ func (h *Handler) pinDMMessage(c *gin.Context, messageID, userID, conversationID
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		err := tx.QueryRowContext(c.Request.Context(), `
 		UPDATE dm_messages dm
-		SET pinned_at = NOW(), pinned_by = $1, updated_at = NOW()
+		SET pinned_at = NOW(), pinned_by = $1, updated_at = NOW(),
+		    `+expiration.ConversationPinHoldAssignments+`
 		WHERE dm.id = $2 AND dm.conversation_id = $3 AND dm.pinned_at IS NULL
 		  AND EXISTS (
 			  SELECT 1 FROM dm_participants dp
@@ -424,10 +446,7 @@ func (h *Handler) UnpinMessage(c *gin.Context) {
 		return
 	}
 	channelID = lockedChannelID
-	result, err := tx.ExecContext(c.Request.Context(), `
-		UPDATE messages SET pinned_at = NULL, pinned_by = NULL, updated_at = NOW()
-		WHERE id = $1 AND pinned_at IS NOT NULL
-	`, messageID)
+	result, err := tx.ExecContext(c.Request.Context(), unpinChannelMessageSQL, messageID)
 	if err != nil {
 		h.log.Error(errMsgUnpinFailed, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgUnpinFailed})
@@ -484,7 +503,8 @@ func (h *Handler) unpinDMMessage(c *gin.Context, messageID, conversationID strin
 		//nolint:gosec // G202: HiddenRangeFilter is a compile-time SQL fragment; values are parameterized.
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		result, err := tx.ExecContext(c.Request.Context(), `
-		UPDATE dm_messages dm SET pinned_at = NULL, pinned_by = NULL, updated_at = NOW()
+		UPDATE dm_messages dm SET pinned_at = NULL, pinned_by = NULL, updated_at = NOW(),
+		    `+expiration.UnpinReleaseAssignments+`
 		WHERE dm.id = $1 AND dm.conversation_id = $3 AND dm.pinned_at IS NOT NULL
 		  AND EXISTS (
 			  SELECT 1 FROM dm_participants dp

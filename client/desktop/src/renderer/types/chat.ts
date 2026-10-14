@@ -33,6 +33,11 @@ export interface ExpirationEventMessagePayload {
   /** Null for kind === 'cleared'. */
   window_seconds: number | null;
   previous_window_seconds?: number | null;
+  /** Whether pinned messages expire under the window this row announces (#3459). Absent on rows
+   *  written before #3459 and on `cleared` rows; absence claims nothing about pins. */
+  include_pinned?: boolean;
+  /** `changed` rows only: the value before this change. */
+  previous_include_pinned?: boolean;
   changed_at: string;
 }
 

@@ -56,3 +56,53 @@ describe('expirationClause', () => {
     expect(expirationClause(policy({ windowSeconds: 12345 as never }), 'ready')).toBeNull();
   });
 });
+
+// #3459: pinned messages are a qualifier on the SAME sentence, never a second one.
+describe('expirationClause pin qualifier (#3459)', () => {
+  const SENTENCE = 'Messages are Encrypted End-to-End';
+
+  it('appends ", except pinned messages" only for a server-sent includePinned === false', () => {
+    expect(expirationClause(policy({ includePinned: false }), 'ready')).toBe(
+      ' and expire after 24 hours, except pinned messages'
+    );
+  });
+
+  it.each([
+    ['true', policy({ includePinned: true })],
+    ['absent (a server that predates #3459)', policy()],
+  ])('adds nothing when includePinned is %s', (_name, p) => {
+    expect(expirationClause(p, 'ready')).toBe(' and expire after 24 hours');
+  });
+
+  it('stays ONE sentence: the whole composer string has a single terminal clause and no extra period', () => {
+    const text = `${SENTENCE}${expirationClause(policy({ includePinned: false }), 'ready') ?? ''}`;
+    expect(text).toBe(
+      'Messages are Encrypted End-to-End and expire after 24 hours, except pinned messages'
+    );
+    // The issue's example ("... Pinned messages are kept.") was a second sentence; this is not.
+    expect(text).not.toMatch(/\./);
+  });
+
+  it('keeps the backfill qualifier LAST, after the pin exception', () => {
+    expect(expirationClause(policy({ includePinned: false, backfillPending: true }), 'ready')).toBe(
+      ' and expire after 24 hours, except pinned messages · still processing older messages'
+    );
+  });
+
+  it('says nothing about pins when there is no window to except them from', () => {
+    expect(expirationClause(policy({ windowSeconds: null, includePinned: false }), 'ready')).toBe(
+      ' and never expire'
+    );
+  });
+
+  it('says NOTHING about retention for an unreadable policy, whatever it last claimed about pins', () => {
+    expect(expirationClause(policy({ includePinned: false }), 'unavailable')).toBeNull();
+    expect(expirationClause(null, 'unavailable')).toBeNull();
+  });
+
+  it('keeps the last known pin exception while a refresh is in flight', () => {
+    expect(expirationClause(policy({ includePinned: false }), 'loading')).toBe(
+      ' and expire after 24 hours, except pinned messages'
+    );
+  });
+});

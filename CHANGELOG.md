@@ -29,7 +29,8 @@ history now asks only for what your account uses. An account without an
 authenticator app or security key no longer sees a code box it cannot fill, a
 passkey or security key works in one step, and the prompt opens on the method
 you used most recently. Server owners can require MFA for dangerous actions
-from Server Settings, and members who need it are told how to set it up.
+from Server Settings, and members who need it are told how to set it up. A message
+expiration timer can now keep pinned messages, and says so.
 
 ### Added
 
@@ -42,6 +43,25 @@ from Server Settings, and members who need it are told how to set it up.
   kick and ban bodies accept `include_pinned` (default `false`), and `GET /server/capabilities` reports
   `features.purgeKeepsPinned: true` on a server that honours it. Clearing a chat's history no longer
   hides its pinned messages either, and unpinning one hides it again.
+- **Message expiration can now keep pinned messages** (internal development reference omitted) —
+  the timer editor has an "Include pinned messages" switch for each channel and conversation. With it
+  off, pinned messages are kept for as long as they stay pinned, and unpinning one puts it back on the
+  timer. Turning it on asks you to confirm, then deletes the pinned messages that are already past the
+  window right away, before the change completes (any it cannot finish are deleted within minutes). On a server that
+  requires MFA for dangerous actions, turning it on asks for a code, like shortening a timer does.
+  Turning it off does not rescue a pinned message that is already past its window. Anyone who can pin
+  and unpin messages can unpin someone else's kept pin, and if that pin is already past its window it
+  is deleted within minutes and pinning it again does not bring it back. Timers that exist
+  today keep expiring pinned messages; a new timer keeps them by default. The message box reads "…expire
+  after 24 hours, except pinned messages", the pinned-messages panel says pins are kept, and the
+  system message in the chat states the pin fact first. These strings differ from the issue's examples
+  on purpose: the exception is part of the one sentence about encryption and retention instead of a
+  second sentence, and the system message leads with what changed, with who changed it after it.
+  **Older desktop versions** do not send the switch, so against an updated server their text says
+  messages expire without mentioning pins, which over-states what is deleted when a timer keeps pins.
+  **API clients:** both expiration `PATCH` bodies accept `include_pinned` on `set` (not `null`, not on
+  `clear` or `resume`), the policy and the channel and conversation lists report it, and
+  `GET /server/capabilities` reports `features.expirationPinnedPolicySupported: true`.
 - **Servers that require MFA for dangerous actions now ask for a code before they do them** (internal development reference omitted). When an owner turns on "Enforce MFA on dangerous actions", a member must confirm with an authenticator code, a backup code or a security key before they edit the server, upload its icon or banner, delete it, delete a channel, shorten a channel's message expiration or apply an expiration window to messages already sent, ban a member, kick a member and purge their messages, purge a channel or server of other people's messages, delete a role, or grant Administrator, Manage Developer Resources or Manage E2EE Keys by creating or editing a role or by setting a channel or category permission override. Creating or editing a role, or setting an override, that grants none of those three is not asked for a code. A refused request changes nothing. After you confirm one action, the same session needs no code for another action that needs the same permission for 10 minutes; deleting a server, turning enforcement off and granting a dangerous permission always ask again. An owner with no authenticator is held to the same limits as any other member who has none, and is told to set one up. A server without the setting behaves as before. **API clients:** send `mfa_code` as a JSON field (multipart for the two image uploads; an optional JSON body on the channel, role and server DELETE routes) only on a retry after a 403 with `mfa_required`. The refusals are 403 `mfa_required`, 403 `Invalid MFA code`, 403 `mfa_enrollment_required`, 429 `step_up_budget_exhausted`, 503 `step_up_budget_unavailable` and 503 `lock_conflict` with `Retry-After: 1`. A request that carries a code counts against the attempt budget even on a server that does not enforce, and while Redis is down a request with a code gets the 503. `GET /api/v1/servers/{id}/permissions` now reports `mfa_restricted: true` when enforcement is withholding a permission from you, and `GET /api/v1/server/capabilities` reports `features.mfaEnforcedDangerousActions`. The server icon, server banner and group DM icon uploads no longer delete the live image when recording a new one fails.
 - **Server owners can require MFA for dangerous actions from Server Settings** (internal development reference omitted, internal development reference omitted) — owners and Administrators see a "Require MFA for dangerous actions" switch under Security in General. Turning it on needs your own authenticator app or security key first, and turning it off asks you to confirm with a code or security key. On a server that requires MFA, each dangerous action now asks for a code or security key in a "Confirm it's you" dialog, and it carries out exactly what you had chosen once you confirm. This covers deleting a channel, a server or a role, banning a member, kicking a member and purging their messages, shortening message expiration, saving server settings, uploading a server icon or banner, saving a role or a channel or category override that grants a dangerous permission, and purging a channel or server. A member whose account has no authenticator app or security key sees a notice under the server name and a "Set up verification" item in the server, channel and member menus. Those open Security, and "Back to chat" or "Back to Server Settings" returns you when setup is done. Permissions that the server withholds come back without a reload once you finish setup. The role editor marks Administrator, Manage Developer Resources and Manage E2EE Keys as needing MFA on these servers. Desktop builds from before this release do not show these prompts: a moderator on one gets the old generic error until they update.
 - **Delete Role asks you to confirm** (internal development reference omitted) — the button used to delete the role on one click. It now names the role and says members who hold it lose its permissions. The role list also keeps your selection when the delete does not go through.

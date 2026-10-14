@@ -552,46 +552,19 @@ func runControlPlane() (runErr error) {
 			return fmt.Errorf("bind restricted admin operations metrics reader: %w", err)
 		}
 	}
+	// One notifier for every expiry announcement (#3459 §8): the sweeper here
+	// and NewRouter's pinned-expiry ContextExpirer build it from the same
+	// constructor, so a client cannot tell which of them deleted a row.
+	expiryPurgeNotifier, notifierErr := expiration.NewHubPurgeNotifier(hub, log)
+	if notifierErr != nil {
+		return fmt.Errorf("initialize expiration purge notifier: %w", notifierErr)
+	}
 	expirySweeper, err = expiration.NewSweeper(expiration.SweeperDeps{
-		DB:             db,
-		RunExpiryBatch: purgeEngine.RunExpiryBatch,
-		EmitDMPurged: func(ctx context.Context, conversationID string, cutoff time.Time) {
-			conversation, parseErr := uuid.Parse(conversationID)
-			if parseErr != nil {
-				log.Warn("expiration DM purge notification suppressed", "scope", "dm")
-				return
-			}
-			if delivered := hub.BroadcastToDMParticipantsContext(ctx, conversation, websocket.OutgoingMessage{
-				Type: "dm_purged",
-				Data: map[string]interface{}{
-					"conversation_id": conversationID,
-					"reason":          "expiry",
-					"purged_by":       nil,
-					"expires_before":  cutoff.UTC().Truncate(time.Microsecond),
-				},
-			}); !delivered && ctx.Err() == nil {
-				log.Warn("expiration DM purge notification suppressed", "scope", "dm")
-			}
-		},
-		EmitServerPurged: func(ctx context.Context, serverID string, cutoff time.Time) {
-			server, parseErr := uuid.Parse(serverID)
-			if parseErr != nil {
-				log.Warn("expiration server purge notification suppressed", "scope", "server")
-				return
-			}
-			if delivered := hub.BroadcastToServerContext(ctx, server, websocket.OutgoingMessage{
-				Type: "server_purged",
-				Data: map[string]interface{}{
-					"server_id":      serverID,
-					"reason":         "expiry",
-					"purged_by":      nil,
-					"expires_before": cutoff.UTC().Truncate(time.Microsecond),
-				},
-			}); !delivered && ctx.Err() == nil {
-				log.Warn("expiration server purge notification suppressed", "scope", "server")
-			}
-		},
-		Log: log,
+		DB:               db,
+		RunExpiryBatch:   purgeEngine.RunExpiryBatch,
+		EmitDMPurged:     expiryPurgeNotifier.EmitDMPurged,
+		EmitServerPurged: expiryPurgeNotifier.EmitServerPurged,
+		Log:              log,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize expiration sweeper: %w", err)

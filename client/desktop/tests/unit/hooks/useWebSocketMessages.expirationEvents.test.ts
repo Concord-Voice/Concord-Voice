@@ -249,4 +249,123 @@ describe('useWebSocketMessages — expiration system rows', () => {
     expect(conversation?.expirationPolicy?.windowSeconds).toBeNull();
     expect(conversation?.expirationPolicy?.revision).toBe(6);
   });
+
+  // ── #3459: the pin fields reach BOTH the row and the policy, from the same event ──
+  describe('pin fields (#3459)', () => {
+    const CHANNEL = '33333333-3333-4333-8333-333333333333';
+    const ROW = '11111111-1111-4111-8111-111111111111';
+    const policyOf = () =>
+      useChannelStore.getState().channels.find((item) => item.id === CHANNEL)?.expirationPolicy;
+
+    it('copies the three fields onto the row so MessageList can tell a pins-only change apart', () => {
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      act(() =>
+        ws.handlers.get('expiration_event')!(
+          channelEvent({
+            kind: 'changed',
+            include_pinned: false,
+            previous_include_pinned: true,
+            previous_window_seconds: 86400,
+          })
+        )
+      );
+      expect(rowFor(CHANNEL, ROW)?.expiration_event_payload).toEqual({
+        kind: 'changed',
+        actor_user_id: '66666666-6666-4666-8666-666666666666',
+        window_seconds: 86400,
+        previous_window_seconds: 86400,
+        include_pinned: false,
+        previous_include_pinned: true,
+        changed_at: '2026-09-16T12:00:00.000Z',
+      });
+    });
+
+    it('advances the policy WITH the claim in the same tick (so the composer cannot lag the row)', () => {
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      act(() => ws.handlers.get('expiration_event')!(channelEvent({ include_pinned: false })));
+      expect(policyOf()).toStrictEqual({
+        windowSeconds: 86400,
+        updatedAt: '2026-09-16T12:00:00.000Z',
+        revision: 5,
+        backfillPending: false,
+        includePinned: false,
+      });
+    });
+
+    it('leaves every pin key ABSENT for an event from a server that predates #3459', () => {
+      // An explicit `includePinned: undefined` would be a second shape for "the server did not
+      // say", and the equal-revision merge reads absence.
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      act(() => ws.handlers.get('expiration_event')!(channelEvent()));
+      expect(policyOf()).not.toHaveProperty('includePinned');
+      const payload = rowFor(CHANNEL, ROW)?.expiration_event_payload;
+      expect(payload).not.toHaveProperty('include_pinned');
+      expect(payload).not.toHaveProperty('previous_include_pinned');
+      expect(payload).not.toHaveProperty('previous_window_seconds');
+    });
+
+    it('a REPLAYED event at the same revision cannot re-add a claim the policy lost (X14)', () => {
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      // A claim arrives, then an older server answers at the SAME revision without it.
+      act(() => ws.handlers.get('expiration_event')!(channelEvent({ include_pinned: false })));
+      expect(policyOf()?.includePinned).toBe(false);
+      act(() => ws.handlers.get('expiration_event')!(channelEvent({ id: 'rollback' })));
+      expect(policyOf()).not.toHaveProperty('includePinned');
+      // Presence is never added at an equal revision: replaying the claimed event does nothing.
+      act(() => ws.handlers.get('expiration_event')!(channelEvent({ include_pinned: false })));
+      expect(policyOf()).not.toHaveProperty('includePinned');
+      // The NEXT revision carries it again.
+      act(() =>
+        ws.handlers.get('expiration_event')!(channelEvent({ revision: 6, include_pinned: false }))
+      );
+      expect(policyOf()?.includePinned).toBe(false);
+    });
+
+    it('carries the same fields on the DM scope', () => {
+      useDMStore.setState({
+        conversations: [
+          {
+            id: '44444444-4444-4444-8444-444444444444',
+            name: 'Alice',
+            isGroup: false,
+            isPersonal: false,
+            participants: [],
+            expirationPolicy: {
+              windowSeconds: 86400,
+              updatedAt: '2026-09-15T12:00:00.000Z',
+              revision: 5,
+              backfillPending: false,
+              includePinned: true,
+            },
+          } as never,
+        ],
+      });
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      act(() =>
+        ws.handlers.get('dm_expiration_event')!(
+          dmEvent({
+            kind: 'changed',
+            window_seconds: 86400,
+            revision: 6,
+            include_pinned: false,
+            previous_include_pinned: true,
+            previous_window_seconds: 86400,
+          })
+        )
+      );
+      const conversation = useDMStore
+        .getState()
+        .conversations.find((item) => item.id === '44444444-4444-4444-8444-444444444444');
+      expect(conversation?.expirationPolicy?.includePinned).toBe(false);
+      expect(
+        rowFor('44444444-4444-4444-8444-444444444444', '22222222-2222-4222-8222-222222222222')
+          ?.expiration_event_payload
+      ).toMatchObject({ include_pinned: false, previous_include_pinned: true });
+    });
+  });
 });

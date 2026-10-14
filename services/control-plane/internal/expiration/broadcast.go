@@ -56,3 +56,24 @@ func UpdatedAtRFC3339(policy Policy) interface{} {
 	}
 	return policy.UpdatedAt.UTC().Format(time.RFC3339)
 }
+
+// AddPinnedEventFields adds the #3459 pin-retention fields to a live
+// expiration_event / dm_expiration_event frame (§6.4). Both broadcast paths
+// call it so the two cannot drift:
+//
+//   - include_pinned: the policy's effective value E, on EVERY event, so the
+//     receiving client's merge can advance its indicator in the same tick;
+//   - previous_include_pinned and previous_window_seconds: on a "changed"
+//     event only. The previous window is what lets a client tell a pins-only
+//     change from a window change; the durable row already carried it, the
+//     live frame did not.
+func AddPinnedEventFields(data map[string]interface{}, payload EventPayload, policy Policy) {
+	data["include_pinned"] = policy.IncludePinned
+	if payload.Kind != EventKindChanged {
+		return
+	}
+	if payload.PreviousIncludePinned != nil {
+		data["previous_include_pinned"] = *payload.PreviousIncludePinned
+	}
+	data["previous_window_seconds"] = payload.PreviousWindowSeconds
+}

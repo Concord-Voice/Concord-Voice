@@ -17,6 +17,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -134,6 +135,12 @@ type Handler struct {
 	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
 	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
 	mfaVerifier stepup.MFATxCodeVerifier
+	// pinnedExpirer deletes already-due pinned messages when a policy stops
+	// keeping pins (#3459 §8). Wired via SetPinnedExpirer (pinned_expiry.go).
+	pinnedExpirer *expiration.ContextExpirer
+	// responseBudget overrides expiration.ResponseBudget for the expiration
+	// PATCH; zero means the default. Only tests set it.
+	responseBudget time.Duration
 }
 
 // SetAuthorityHandler wires the RBAC authority coordinator used only for
@@ -253,7 +260,8 @@ func (h *Handler) ListChannels(c *gin.Context) {
 func (h *Handler) queryVisibleChannels(serverID string, visibleSet map[string]bool) ([]models.Channel, error) {
 	rows, err := h.db.Query(
 		`SELECT id, server_id, name, type, description, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
-		        expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at
+		        expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL,
+		          expiration_window_seconds IS NOT NULL AND expiration_include_pinned, created_at, updated_at
 		FROM channels
 		WHERE server_id = $1
 		ORDER BY position ASC, created_at ASC`,
@@ -292,7 +300,7 @@ func scanChannel(rows *sql.Rows) (models.Channel, error) {
 		&ch.ID, &ch.ServerID, &ch.Name, &ch.Type, &ch.Description,
 		&ch.Emoji, &ch.AudioQualityTier, &ch.GroupID,
 		&ch.LinkedVoiceChannelID, &ch.SyncPermissions, &ch.Position,
-		&ch.ExpirationWindowSeconds, &ch.ExpirationUpdatedAt, &ch.ExpirationRevision, &ch.ExpirationBackfillPending,
+		&ch.ExpirationWindowSeconds, &ch.ExpirationUpdatedAt, &ch.ExpirationRevision, &ch.ExpirationBackfillPending, &ch.ExpirationIncludePinned,
 		&ch.CreatedAt, &ch.UpdatedAt,
 	)
 	return ch, err
@@ -1075,6 +1083,7 @@ func channelToMap(ch models.Channel) map[string]interface{} {
 		"expiration_updated_at":       ch.ExpirationUpdatedAt,
 		"expiration_revision":         ch.ExpirationRevision,
 		"expiration_backfill_pending": ch.ExpirationBackfillPending,
+		"expiration_include_pinned":   ch.ExpirationIncludePinned,
 		"created_at":                  ch.CreatedAt,
 		"updated_at":                  ch.UpdatedAt,
 	}
@@ -1110,7 +1119,8 @@ func (h *Handler) GetChannel(c *gin.Context) {
 	// Get channel and check if user is a member of the server
 	query := `
 		SELECT c.id, c.server_id, c.name, c.type, c.description, c.emoji, c.audio_quality_tier, c.group_id, c.linked_voice_channel_id, c.sync_permissions, c.position,
-		       c.expiration_window_seconds, c.expiration_updated_at, c.expiration_revision, c.expiration_backfill_mode IS NOT NULL, c.created_at, c.updated_at
+		       c.expiration_window_seconds, c.expiration_updated_at, c.expiration_revision, c.expiration_backfill_mode IS NOT NULL,
+		       c.expiration_window_seconds IS NOT NULL AND c.expiration_include_pinned, c.created_at, c.updated_at
 		FROM channels c
 		INNER JOIN server_members sm ON c.server_id = sm.server_id
 		WHERE c.id = $1 AND sm.user_id = $2
@@ -1132,7 +1142,7 @@ func (h *Handler) GetChannel(c *gin.Context) {
 		&channel.ExpirationWindowSeconds,
 		&channel.ExpirationUpdatedAt,
 		&channel.ExpirationRevision,
-		&channel.ExpirationBackfillPending,
+		&channel.ExpirationBackfillPending, &channel.ExpirationIncludePinned,
 		&channel.CreatedAt,
 		&channel.UpdatedAt,
 	)
@@ -1446,13 +1456,14 @@ func (h *Handler) executeOrdinaryChannelUpdate(ctx context.Context, serverID, us
 		SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, updated_at = NOW()
 		WHERE id = $5 AND server_id = $6
 		RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
-		          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
+		          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL,
+		          expiration_window_seconds IS NOT NULL AND expiration_include_pinned, created_at, updated_at`,
 		req.Name, req.Type, req.Emoji, req.AudioQualityTier, channelID, serverID,
 	).Scan(
 		&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier,
 		&channel.GroupID, &channel.LinkedVoiceChannelID, &channel.SyncPermissions,
 		&channel.Position, &channel.ExpirationWindowSeconds, &channel.ExpirationUpdatedAt,
-		&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt,
+		&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.ExpirationIncludePinned, &channel.CreatedAt, &channel.UpdatedAt,
 	)
 	if err != nil {
 		if err != sql.ErrNoRows {
@@ -1672,21 +1683,23 @@ func updateSyncedChannelTx(ctx context.Context, tx *sql.Tx, request syncedChanne
 				sync_permissions = FALSE, updated_at = NOW()
 			WHERE id = $5 AND server_id = $6
 			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
-			          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
+			          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL,
+		          expiration_window_seconds IS NOT NULL AND expiration_include_pinned, created_at, updated_at`,
 			request.update.Name, request.update.Type, request.update.Emoji, request.update.AudioQualityTier, request.channelID, request.serverID,
 		).Scan(&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier, &channel.GroupID,
 			&channel.LinkedVoiceChannelID, &channel.SyncPermissions, &channel.Position, &channel.ExpirationWindowSeconds,
-			&channel.ExpirationUpdatedAt, &channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt)
+			&channel.ExpirationUpdatedAt, &channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.ExpirationIncludePinned, &channel.CreatedAt, &channel.UpdatedAt)
 	}
 	return tx.QueryRowContext(ctx, `
 		UPDATE channels SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, group_id = $5, updated_at = NOW()
 		WHERE id = $6 AND server_id = $7
 		RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
-		          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
+		          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL,
+		          expiration_window_seconds IS NOT NULL AND expiration_include_pinned, created_at, updated_at`,
 		request.update.Name, request.update.Type, request.update.Emoji, request.update.AudioQualityTier, resolveGroupIDParam(request.target.groupID), request.channelID, request.serverID,
 	).Scan(&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier, &channel.GroupID,
 		&channel.LinkedVoiceChannelID, &channel.SyncPermissions, &channel.Position, &channel.ExpirationWindowSeconds,
-		&channel.ExpirationUpdatedAt, &channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt)
+		&channel.ExpirationUpdatedAt, &channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.ExpirationIncludePinned, &channel.CreatedAt, &channel.UpdatedAt)
 }
 
 func (h *Handler) broadcastChannelUpdated(channel models.Channel) {

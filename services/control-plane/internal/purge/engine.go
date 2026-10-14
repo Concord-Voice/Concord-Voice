@@ -159,12 +159,26 @@ func validateIdentifiers(s DeleteSpec) error {
 }
 
 type deleteQuerySet struct {
-	selectBatch         string
-	selectPinned        string
-	selectExpiry        string
-	selectOne           string
-	selectAttachedMedia string
-	deleteParents       string
+	selectBatch  string
+	selectPinned string
+	// selectExpiry locks the due candidates and reports, per victim, whether it
+	// is pinned: the expiry audit row records include_pinned from that flag
+	// (#3459 §9).
+	selectExpiry string
+	// lockParentIncludesPinned locks the parent context FOR SHARE and reads its
+	// effective include-pinned value E (a window is set AND pins expire with
+	// it). It runs BEFORE the victims are locked: a keep-pins PATCH holds the
+	// parent FOR NO KEY UPDATE while it parks future-stamped pins, so the lock
+	// orders the batch wholly before or wholly after that PATCH. Locking the
+	// victims first let a batch take a pin the PATCH was about to park, and
+	// delete it after the PATCH had accepted keep-pins (#3459 Codex review).
+	// The order parent then message is every writer's order, so no new lock
+	// edge exists. A missing parent row is handled by the caller as TRUE, the
+	// direction that never claims a pin was kept.
+	lockParentIncludesPinned string
+	selectOne                string
+	selectAttachedMedia      string
+	deleteParents            string
 }
 
 // PostgreSQL cannot bind identifiers, so each allowed table has one fixed query
@@ -187,13 +201,16 @@ WHERE channel_id = $1
   AND ($3::uuid IS NULL OR user_id = $3)
   AND ($4::uuid[] IS NULL OR id = ANY($4::uuid[]))
   AND pinned_at IS NOT NULL`,
-		selectExpiry: `SELECT id FROM messages
+		selectExpiry: `SELECT id, pinned_at IS NOT NULL FROM messages
 WHERE id = ANY($1::uuid[])
   AND channel_id = $2
   AND expires_at < $3::timestamptz
 ORDER BY expires_at, id
 LIMIT $4
 FOR UPDATE`,
+		lockParentIncludesPinned: `SELECT expiration_window_seconds IS NOT NULL AND expiration_include_pinned
+FROM channels WHERE id = $1
+FOR SHARE`,
 		selectOne: `SELECT id FROM messages WHERE id = $1 AND channel_id = $2 FOR UPDATE`,
 		selectAttachedMedia: `SELECT mf.id
 FROM media_files mf
@@ -224,13 +241,16 @@ WHERE conversation_id = $1
   AND ($3::uuid IS NULL OR user_id = $3)
   AND ($4::uuid[] IS NULL OR id = ANY($4::uuid[]))
   AND pinned_at IS NOT NULL`,
-		selectExpiry: `SELECT id FROM dm_messages
+		selectExpiry: `SELECT id, pinned_at IS NOT NULL FROM dm_messages
 WHERE id = ANY($1::uuid[])
   AND conversation_id = $2
   AND expires_at < $3::timestamptz
 ORDER BY expires_at, id
 LIMIT $4
 FOR UPDATE`,
+		lockParentIncludesPinned: `SELECT expiration_window_seconds IS NOT NULL AND expiration_include_pinned
+FROM dm_conversations WHERE id = $1
+FOR SHARE`,
 		selectOne: `SELECT id FROM dm_messages WHERE id = $1 AND conversation_id = $2 FOR UPDATE`,
 		selectAttachedMedia: `SELECT mf.id
 FROM media_files mf
@@ -269,6 +289,11 @@ type Engine struct {
 	// afterBatchHook runs after each committed purge batch (#3458 tests). Nil in
 	// production.
 	afterBatchHook func()
+	// afterExpirySelectHook runs in an expiry batch after its parent and its
+	// victims are locked and before the audit row is written, so a test can try
+	// to change the policy at exactly that point (#3459 §9 tests). Nil in
+	// production.
+	afterExpirySelectHook func()
 }
 
 // NewEngine constructs a purge engine. maxBatch is the batched-delete stride.
@@ -339,28 +364,34 @@ func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
 	return Result{PurgeID: purgeID, DeletedCount: total}, nil
 }
 
-// RunExpiryBatch writes one expiry audit, rechecks the discovered candidates
-// under row locks, deletes at most one configured batch, and completes the
+// RunExpiryBatch rechecks the discovered candidates under row locks, writes one
+// expiry audit row, deletes at most one configured batch, and completes the
 // audit. The recheck is authoritative: discovery may be stale by the time the
 // transaction acquires its locks.
+//
+// The audit row is written INSIDE the batch transaction (#3459 §9), under an id
+// generated here, so it commits with the deletes it describes or not at all. A
+// failure before COMMIT therefore leaves neither a row nor a deletion, and the
+// Result carries no PurgeID: there is no row to salvage a count onto. A COMMIT
+// that reports an error is settled by reading that known id back
+// (reconcileExpiryCommit).
 func (e *Engine) RunExpiryBatch(ctx context.Context, p ExpiryPlan) (Result, error) {
 	p, ds, err := normalizeExpiryPlan(p)
 	if err != nil {
 		return Result{}, err
 	}
 
-	purgeID, err := e.writeExpiryAuditInProgress(ctx, p)
-	if err != nil {
-		return Result{}, err
-	}
-
+	purgeID := uuid.NewString()
 	queries := deleteQueries[ds.MessagesTable]
 	limit := min(e.maxBatch, MaxExpiryCandidateIDs, len(p.CandidateIDs))
 
 	affected, refs, err := e.deleteExpiryBatch(ctx, purgeID, p, ds, queries, limit)
 	if err != nil {
-		total := e.recoverPartialCount(ctx, purgeID, affected)
-		return Result{PurgeID: purgeID, DeletedCount: total}, fmt.Errorf("purge expiry batch: %w", err)
+		var commitErr *batchCommitError
+		if errors.As(err, &commitErr) {
+			return e.reconcileExpiryCommit(ctx, purgeID, err)
+		}
+		return Result{}, fmt.Errorf("purge expiry batch: %w", err)
 	}
 
 	e.EnqueueBlobDeletes(refs)
@@ -371,6 +402,88 @@ func (e *Engine) RunExpiryBatch(ctx context.Context, p ExpiryPlan) (Result, erro
 	return Result{PurgeID: purgeID, DeletedCount: affected}, nil
 }
 
+// reconcileExpiryCommit settles an expiry batch whose COMMIT reported an error.
+// The error alone cannot say whether the transaction committed: an
+// acknowledgement lost with the connection arrives after the server applied it.
+// The audit row was inserted in that transaction under the known id, so reading
+// it back decides, on the pool, detached from ctx (whose end may be what failed
+// the COMMIT) and bounded by partialCountSalvageTimeout:
+//
+//   - the row is there: the batch committed, the deletes with it. The row stays
+//     in_progress with its durable count, the same record an interrupted purge
+//     leaves, and the count is returned so the caller still announces it;
+//   - the row is absent: nothing committed, so no PurgeID is returned;
+//   - the read fails: neither is provable, so the outcome is reported unknown
+//     and no PurgeID is claimed.
+//
+// A COMMIT the client gave up on (its context ended, the connection dropped)
+// can still be applying on the server when the first read runs, so an absent
+// row is read again until the salvage budget ends (#3459 Codex review). A
+// COMMIT the server itself refused (a *pq.Error) rolled back, and is read once.
+func (e *Engine) reconcileExpiryCommit(ctx context.Context, purgeID string, commitErr error) (Result, error) {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialCountSalvageTimeout)
+	defer cancel()
+	var serverRefused *pq.Error
+	settled := errors.As(commitErr, &serverRefused)
+	var deleted int
+	err := e.readExpiryAudit(readCtx, purgeID, &deleted)
+	for errors.Is(err, sql.ErrNoRows) && !settled {
+		select {
+		case <-readCtx.Done():
+			settled = true
+		case <-time.After(expiryReconcileRetryInterval):
+			err = e.readExpiryAudit(readCtx, purgeID, &deleted)
+		}
+	}
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Result{}, fmt.Errorf("purge expiry batch: %w", commitErr)
+	case err != nil:
+		return Result{}, fmt.Errorf("purge expiry batch: commit outcome unknown: %w; reconcile: %w", commitErr, err)
+	default:
+		e.log.Warn("purge: expiry batch committed although its COMMIT reported an error", "error", commitErr)
+		return Result{PurgeID: purgeID, DeletedCount: deleted}, fmt.Errorf("purge expiry batch: %w", commitErr)
+	}
+}
+
+// expiryReconcileRetryInterval spaces the re-reads of an expiry audit row whose
+// COMMIT outcome is unknown.
+const expiryReconcileRetryInterval = 100 * time.Millisecond
+
+func (e *Engine) readExpiryAudit(ctx context.Context, purgeID string, deleted *int) error {
+	return e.db.QueryRowContext(ctx,
+		`SELECT deleted_count FROM message_purges WHERE id = $1`, purgeID).Scan(deleted)
+}
+
+// insertExpiryAuditQuery writes the in_progress expiry audit row inside the
+// batch transaction. It records the system-owned action without a synthetic
+// actor and stays separate from Plan so manual callers cannot opt into the
+// expiry-only audit shape. include_pinned is ALWAYS written: omitting it falls
+// back to the column DEFAULT TRUE, which would record every K-context expiry as
+// having deleted pins.
+const insertExpiryAuditQuery = `
+	INSERT INTO message_purges
+	    (id, actor_id, context_type, context_id, server_id, target_user_id, range_from, range_to, reason, include_pinned, status)
+	VALUES ($1, NULL, $2, $3, $4, NULL, NULL, $5, $6, $7, 'in_progress')`
+
+func insertExpiryAudit(ctx context.Context, tx *sql.Tx, purgeID string, p ExpiryPlan, includePinned bool) error {
+	if _, err := tx.ExecContext(ctx, insertExpiryAuditQuery,
+		purgeID, string(p.ContextType), p.ContextID, p.ServerID, p.ExpiresBefore, ExpiryReason, includePinned,
+	); err != nil {
+		return fmt.Errorf("purge: write expiry in_progress audit: %w", err)
+	}
+	return nil
+}
+
+// deleteExpiryBatch locks the due victims, writes the audit row, deletes them and
+// commits, in one transaction. Any error it returns before COMMIT has rolled
+// everything back; a COMMIT error is a *batchCommitError.
+//
+// The parent is locked FOR SHARE first (see lockParentIncludesPinned), then the
+// victims FOR UPDATE. include_pinned is E OR any pinned victim, where E is the
+// parent's effective include-pinned value read under that lock, so a policy
+// change can neither land between the E read and the delete nor make a victim
+// the batch already locked look kept (#3459 §9).
 func (e *Engine) deleteExpiryBatch(
 	ctx context.Context,
 	purgeID string,
@@ -389,26 +502,20 @@ func (e *Engine) deleteExpiryBatch(
 		}
 	}()
 
-	rows, err := tx.QueryContext(ctx, queries.selectExpiry, pq.Array(p.CandidateIDs), ds.ScopeID, p.ExpiresBefore, limit)
+	parentIncludesPinned, err := lockExpiryParent(ctx, tx, queries, ds.ScopeID)
 	if err != nil {
-		return 0, nil, fmt.Errorf("purge: select expiry victims: %w", err)
+		return 0, nil, err
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			e.log.Warn("purge: failed to close expiry victim rows", "error", closeErr)
-		}
-	}()
+	messageIDs, anyPinned, err := e.selectExpiryVictims(ctx, tx, queries, p, ds, limit)
+	if err != nil {
+		return 0, nil, err
+	}
+	if e.afterExpirySelectHook != nil {
+		e.afterExpirySelectHook()
+	}
 
-	messageIDs := make([]string, 0, limit)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return 0, nil, fmt.Errorf("purge: scan expiry victim: %w", err)
-		}
-		messageIDs = append(messageIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, nil, fmt.Errorf("purge: iterate expiry victims: %w", err)
+	if err := insertExpiryAudit(ctx, tx, purgeID, p, parentIncludesPinned || anyPinned); err != nil {
+		return 0, nil, err
 	}
 
 	affected, refs, err := e.deleteMessagesTx(ctx, tx, queries, messageIDs)
@@ -419,6 +526,59 @@ func (e *Engine) deleteExpiryBatch(
 		return 0, nil, err
 	}
 	return affected, refs, nil
+}
+
+// lockExpiryParent locks the batch's parent context and returns its effective
+// include-pinned value E. A parent that no longer exists reads TRUE: its
+// messages are going with it, and TRUE never claims a pin was kept.
+func lockExpiryParent(ctx context.Context, tx *sql.Tx, queries deleteQuerySet, scopeID string) (bool, error) {
+	var includesPinned bool
+	err := tx.QueryRowContext(ctx, queries.lockParentIncludesPinned, scopeID).Scan(&includesPinned)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("purge: lock expiry context: %w", err)
+	default:
+		return includesPinned, nil
+	}
+}
+
+// selectExpiryVictims locks the batch's due victims and reports whether any of
+// them is pinned.
+func (e *Engine) selectExpiryVictims(
+	ctx context.Context,
+	tx *sql.Tx,
+	queries deleteQuerySet,
+	p ExpiryPlan,
+	ds DeleteSpec,
+	limit int,
+) ([]string, bool, error) {
+	rows, err := tx.QueryContext(ctx, queries.selectExpiry, pq.Array(p.CandidateIDs), ds.ScopeID, p.ExpiresBefore, limit)
+	if err != nil {
+		return nil, false, fmt.Errorf("purge: select expiry victims: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close expiry victim rows", "error", closeErr)
+		}
+	}()
+
+	messageIDs := make([]string, 0, limit)
+	anyPinned := false
+	for rows.Next() {
+		var id string
+		var pinned bool
+		if err := rows.Scan(&id, &pinned); err != nil {
+			return nil, false, fmt.Errorf("purge: scan expiry victim: %w", err)
+		}
+		messageIDs = append(messageIDs, id)
+		anyPinned = anyPinned || pinned
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("purge: iterate expiry victims: %w", err)
+	}
+	return messageIDs, anyPinned, nil
 }
 
 func normalizeExpiryPlan(p ExpiryPlan) (ExpiryPlan, DeleteSpec, error) {
@@ -695,10 +855,25 @@ func recordBatchAndCommit(ctx context.Context, tx *sql.Tx, purgeID string, affec
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("purge: commit %s tx: %w", label, err)
+		return &batchCommitError{label: label, err: err}
 	}
 	return nil
 }
+
+// batchCommitError is a batch COMMIT that reported an error. The error alone
+// cannot say whether PostgreSQL applied the transaction, so a caller that must
+// know settles it from the committed state; every error returned before COMMIT
+// is a proven rollback and is not this type.
+type batchCommitError struct {
+	label string
+	err   error
+}
+
+func (e *batchCommitError) Error() string {
+	return fmt.Sprintf("purge: commit %s tx: %v", e.label, e.err)
+}
+
+func (e *batchCommitError) Unwrap() error { return e.err }
 
 // deleteMessagesTx locks attached media before deleting messages. This parent →
 // media order serializes attachment linking with retirement.
@@ -978,24 +1153,6 @@ func insertAuditInProgress(ctx context.Context, q rowQuerier, p Plan) (string, e
 	).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("purge: write in_progress audit: %w", err)
-	}
-	return id, nil
-}
-
-// writeExpiryAuditInProgress records the system-owned expiry action without a
-// synthetic actor. It remains separate from Plan so manual callers cannot opt
-// into the expiry-only audit shape.
-func (e *Engine) writeExpiryAuditInProgress(ctx context.Context, p ExpiryPlan) (string, error) {
-	var id string
-	err := e.db.QueryRowContext(ctx, `
-		INSERT INTO message_purges
-		    (actor_id, context_type, context_id, server_id, target_user_id, range_from, range_to, reason, status)
-		VALUES (NULL, $1, $2, $3, NULL, NULL, $4, $5, 'in_progress')
-		RETURNING id`,
-		string(p.ContextType), p.ContextID, p.ServerID, p.ExpiresBefore, ExpiryReason,
-	).Scan(&id)
-	if err != nil {
-		return "", fmt.Errorf("purge: write expiry in_progress audit: %w", err)
 	}
 	return id, nil
 }

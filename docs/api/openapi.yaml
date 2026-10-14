@@ -3898,6 +3898,7 @@ paths:
                     - entitlementMode
                     - chunkedAttachmentUpload
                     - purgeKeepsPinned
+                    - expirationPinnedPolicySupported
                     - mfaEnforcedDangerousActions
                     properties:
                       voiceTiersSupported:
@@ -3936,6 +3937,15 @@ paths:
                           messages lacks the key, so clients MUST offer the
                           "include pinned messages" choice only on an explicit
                           true.
+                      expirationPinnedPolicySupported:
+                        type: boolean
+                        description: >-
+                          Whether the expiration PATCH routes accept
+                          `include_pinned` and keep pinned messages under a
+                          timer by default (#3459). Always true on a server that
+                          has the field and never omitted. A UX gate, not a
+                          safety gate: an older server refuses the field with a
+                          400 and mutates nothing.
                       mfaEnforcedDangerousActions:
                         type: boolean
                         description: >-
@@ -19618,6 +19628,14 @@ components:
           type: string
           enum: [apply, new_only]
           description: Apply the window to eligible existing messages, or stamp only new messages.
+        include_pinned:
+          type: boolean
+          description: >-
+            Whether the window also expires pinned messages (#3459). Admitted on `set` only;
+            JSON null is a 400. Omitted keeps an existing timer's value, and a new timer stores
+            false (pinned messages are kept). Turning it on deletes pinned messages already past
+            their stamp before the response. Older servers refuse the field with a 400 and
+            mutate nothing; gate on `features.expirationPinnedPolicySupported`.
     ClearExpirationRequest:
       type: object
       additionalProperties: false
@@ -19676,6 +19694,14 @@ components:
           type: string
           enum: [apply, new_only]
           description: Apply the window to eligible existing messages, or stamp only new messages.
+        include_pinned:
+          type: boolean
+          description: >-
+            Whether the window also expires pinned messages (#3459). Admitted on `set` only;
+            JSON null is a 400. Omitted keeps an existing timer's value, and a new timer stores
+            false (pinned messages are kept). Turning it on deletes pinned messages already past
+            their stamp before the response. Older servers refuse the field with a 400 and
+            mutate nothing. On a server that enforces MFA on dangerous actions, turning it on over an effective false needs `mfa_code`; gate on `features.expirationPinnedPolicySupported`.
         mfa_code:
           $ref: '#/components/schemas/DangerousActionMFACode'
     ChannelClearExpirationRequest:
@@ -19709,7 +19735,7 @@ components:
           $ref: '#/components/schemas/DangerousActionMFACode'
     ExpirationPolicy:
       type: object
-      required: [window_seconds, updated_at, revision, backfill_pending]
+      required: [window_seconds, updated_at, revision, backfill_pending, include_pinned]
       properties:
         window_seconds:
           type: integer
@@ -19726,6 +19752,11 @@ components:
         backfill_pending:
           type: boolean
           description: True while a bounded retroactive operation remains resumable.
+        include_pinned:
+          type: boolean
+          description: >-
+            The EFFECTIVE pinned-expiry value (#3459): window_seconds is not null and the window
+            also expires pinned messages. Always false while window_seconds is null.
     CreateChannelRequest:
       type: object
       required:
@@ -20241,6 +20272,11 @@ components:
         expiration_backfill_pending:
           type: boolean
           description: Whether retroactive expiry work remains pending.
+        expiration_include_pinned:
+          type: boolean
+          description: >-
+            Effective pinned-expiry value (#3459): expiration_window_seconds is not null and
+            the window also expires pinned messages. Absent on older servers.
     Message:
       type: object
       properties:
@@ -20785,6 +20821,11 @@ components:
         expiration_backfill_pending:
           type: boolean
           description: Whether retroactive expiry work remains pending.
+        expiration_include_pinned:
+          type: boolean
+          description: >-
+            Effective pinned-expiry value (#3459): expiration_window_seconds is not null and
+            the window also expires pinned messages. Absent on older servers.
     DMMessage:
       type: object
       properties:

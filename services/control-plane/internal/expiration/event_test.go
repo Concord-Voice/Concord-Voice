@@ -1,8 +1,12 @@
 package expiration
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEventKindForTransition(t *testing.T) {
@@ -60,6 +64,35 @@ func TestEventKindForTransition(t *testing.T) {
 			request:    Request{Mode: "set", WindowSeconds: &otherWindow, Retroactive: "apply"},
 			transition: Transition{Previous: Policy{WindowSeconds: &window}, Current: Policy{WindowSeconds: &otherWindow}},
 			wantKind:   EventKindChanged,
+			wantOK:     true,
+		},
+		{
+			// #3459: a pins-only change moves the policy and is recorded as
+			// "changed" (X8), never as a new kind old clients would drop.
+			name:       "same window with include_pinned turned ON reports changed",
+			request:    Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(true)},
+			transition: Transition{Previous: Policy{WindowSeconds: &window}, Current: Policy{WindowSeconds: &window, IncludePinned: true}},
+			wantKind:   EventKindChanged,
+			wantOK:     true,
+		},
+		{
+			name:       "same window with include_pinned turned OFF reports changed",
+			request:    Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(false)},
+			transition: Transition{Previous: Policy{WindowSeconds: &window, IncludePinned: true}, Current: Policy{WindowSeconds: &window}},
+			wantKind:   EventKindChanged,
+			wantOK:     true,
+		},
+		{
+			name:       "same window and same include_pinned is NOT an event",
+			request:    Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(true)},
+			transition: Transition{Previous: Policy{WindowSeconds: &window, IncludePinned: true}, Current: Policy{WindowSeconds: &window, IncludePinned: true}},
+			wantOK:     false,
+		},
+		{
+			name:       "first window that includes pins still reports set",
+			request:    Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(true)},
+			transition: Transition{Previous: Policy{}, Current: Policy{WindowSeconds: &window, IncludePinned: true}},
+			wantKind:   EventKindSet,
 			wantOK:     true,
 		},
 		{
@@ -177,4 +210,59 @@ func TestEventFor(t *testing.T) {
 			t.Errorf("WindowSeconds = %v, want nil after a clear", payload.WindowSeconds)
 		}
 	})
+}
+
+// TestEventFor_IncludePinnedFieldsFollowTheKind pins #3459 §6.4: set carries
+// include_pinned, changed carries both, cleared carries neither, and an absent
+// field is absent on the wire rather than null.
+func TestEventFor_IncludePinnedFieldsFollowTheKind(t *testing.T) {
+	window := 86400
+	stamped := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name         string
+		request      Request
+		transition   Transition
+		wantKind     EventKind
+		wantInclude  *bool
+		wantPrevious *bool
+	}{
+		{
+			name:        "set carries the new effective value",
+			request:     Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only"},
+			transition:  Transition{Current: Policy{WindowSeconds: &window, UpdatedAt: &stamped}},
+			wantKind:    EventKindSet,
+			wantInclude: ptr(false),
+		},
+		{
+			name:         "pins-only change carries both values",
+			request:      Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(true)},
+			transition:   Transition{Previous: Policy{WindowSeconds: &window}, Current: Policy{WindowSeconds: &window, IncludePinned: true, UpdatedAt: &stamped}},
+			wantKind:     EventKindChanged,
+			wantInclude:  ptr(true),
+			wantPrevious: ptr(false),
+		},
+		{
+			name:       "cleared carries neither",
+			request:    Request{Mode: "clear", Retroactive: "leave_pending"},
+			transition: Transition{Previous: Policy{WindowSeconds: &window, IncludePinned: true}, Current: Policy{UpdatedAt: &stamped}},
+			wantKind:   EventKindCleared,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, ok := EventFor(tc.request, tc.transition, "user-1")
+			require.True(t, ok)
+			assert.Equal(t, tc.wantKind, payload.Kind)
+			assert.Equal(t, tc.wantInclude, payload.IncludePinned)
+			assert.Equal(t, tc.wantPrevious, payload.PreviousIncludePinned)
+
+			body, err := json.Marshal(payload)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(body, &fields))
+			_, hasInclude := fields["include_pinned"]
+			_, hasPrevious := fields["previous_include_pinned"]
+			assert.Equal(t, tc.wantInclude != nil, hasInclude)
+			assert.Equal(t, tc.wantPrevious != nil, hasPrevious)
+		})
+	}
 }

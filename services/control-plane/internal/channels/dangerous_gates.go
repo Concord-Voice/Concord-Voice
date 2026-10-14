@@ -159,6 +159,33 @@ func shortensRetention(prior sql.NullInt64, window *int, retroactive string) boo
 	return !prior.Valid || int64(*window) < prior.Int64 || retroactive == retroactiveApply
 }
 
+// enablesPinnedExpiry is the expiration gate's second predicate (#3459 §7,
+// D-B): the request turns include_pinned ON over a policy whose effective
+// value was false, so pinned messages the context kept become deletable, and
+// any already past their stamp are deleted before the PATCH answers. prior is
+// the effective value read under the channel lock. Turning it off, omitting
+// it, or re-affirming true keeps at least as much as before and is ungated.
+func enablesPinnedExpiry(prior bool, include *bool) bool {
+	return include != nil && *include && !prior
+}
+
+// expirationGateFires is the expiration route's whole gate predicate, judged
+// against the channel row read under the transaction's channel lock.
+func expirationGateFires(locked lockedExpirationChannel, request expiration.Request) bool {
+	return shortensRetention(locked.window, request.WindowSeconds, request.Retroactive) ||
+		enablesPinnedExpiry(locked.includePinned, request.IncludePinned)
+}
+
+// expirationGateMayFire decides, before the transaction, whether the gate's
+// grace read is worth a Redis call: only a request carrying a window or an
+// include_pinned value can fire it. Validate admits include_pinned on "set"
+// alone and "set" requires a window, so the second operand adds no request
+// today; it is explicit so a later relaxation of Validate cannot skip the
+// grace read for a request that turns pinned expiry on (#3459 X5).
+func expirationGateMayFire(request expiration.Request) bool {
+	return request.WindowSeconds != nil || request.IncludePinned != nil
+}
+
 // retroactiveApply is the expiration set mode that stamps existing messages.
 const retroactiveApply = "apply"
 

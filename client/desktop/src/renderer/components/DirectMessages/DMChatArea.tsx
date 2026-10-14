@@ -29,7 +29,7 @@ import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
 import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
 import { expirationClause, expirationControlLabel } from '../Chat/MessageExpirationIndicator';
 import { useHoverIntent } from '../../hooks/ui/useHoverIntent';
-import type { ChatContext } from '../../types/chat';
+import type { AttachmentSummary, ChatContext } from '../../types/chat';
 import type { DMThreadRemovalTarget } from './DMThreadRemovalDialog';
 import './DirectMessages.css';
 
@@ -369,7 +369,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
       mentionMeta?: string,
       replyToId?: string,
       attachmentIds?: string[],
-      attachments?: import('../../types/chat').AttachmentSummary[],
+      attachments?: AttachmentSummary[],
       gifSlug?: string
     ) => {
       if (!selectedThreadId) return;
@@ -650,6 +650,8 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
         onScrollToMessage={handleScrollToMessage}
         canPin={true}
         onUnpin={() => setPinnedCount((c) => Math.max(0, c - 1))}
+        expirationPolicy={expiration.policy}
+        expirationPolicyState={expiration.policyState}
       />
 
       {expirationScope && (

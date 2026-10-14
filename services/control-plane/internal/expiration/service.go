@@ -3,6 +3,7 @@
 package expiration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -32,11 +33,17 @@ var (
 
 // Request is the JSON body for a policy mutation. Validate rejects every
 // field combination other than the three documented operation shapes.
+//
+// IncludePinned is admitted on "set" only (#3459 C-SCHEMA). nil means the
+// field was omitted: an existing timer keeps its value and a new timer keeps
+// pinned messages (see updatePolicySQL). A JSON null is refused by
+// UnmarshalJSON, because a *bool cannot tell null from absent once decoded.
 type Request struct {
 	Mode          string `json:"mode"`
 	WindowSeconds *int   `json:"window_seconds"`
 	Retroactive   string `json:"retroactive"`
 	Revision      *int64 `json:"revision"`
+	IncludePinned *bool  `json:"include_pinned"`
 }
 
 // UnmarshalJSON rejects fields outside the expiration request contract before
@@ -56,6 +63,11 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 	if !hasExactRequestFields(fields, mode) {
 		return ErrInvalidRequest
 	}
+	// A null include_pinned would decode to nil, which reads as "omitted" and
+	// silently applies a default. Refuse it before the typed decode can lose it.
+	if raw, ok := fields["include_pinned"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return ErrInvalidRequest
+	}
 
 	var decoded requestAlias
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -66,50 +78,75 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 }
 
 func hasExactRequestFields(fields map[string]json.RawMessage, mode string) bool {
-	var expected []string
+	var required, optional []string
 	switch mode {
 	case "set":
-		expected = []string{"mode", "window_seconds", "retroactive"}
+		required = []string{"mode", "window_seconds", "retroactive"}
+		optional = []string{"include_pinned"}
 	case "clear":
-		expected = []string{"mode", "retroactive"}
+		required = []string{"mode", "retroactive"}
 	case "resume":
-		expected = []string{"mode", "revision"}
+		required = []string{"mode", "revision"}
 	default:
 		return false
 	}
-	if len(fields) != len(expected) {
-		return false
-	}
-	for _, name := range expected {
+	for _, name := range required {
 		if _, ok := fields[name]; !ok {
 			return false
 		}
 	}
-	return true
+	admitted := len(required)
+	for _, name := range optional {
+		if _, ok := fields[name]; ok {
+			admitted++
+		}
+	}
+	return len(fields) == admitted
 }
 
 // Validate checks the complete operation shape before any policy row changes.
 func (r Request) Validate() error {
 	switch r.Mode {
 	case "set":
-		if r.WindowSeconds == nil || r.Revision != nil || (r.Retroactive != "apply" && r.Retroactive != "new_only") {
-			return ErrInvalidRequest
-		}
-		if !allowedWindow(*r.WindowSeconds) {
-			return ErrInvalidWindow
-		}
+		return r.validateSet()
 	case "clear":
-		if r.WindowSeconds != nil || r.Revision != nil || (r.Retroactive != "clear_pending" && r.Retroactive != "leave_pending") {
-			return ErrInvalidRequest
-		}
+		return validWhen(r.validClear())
 	case "resume":
-		if r.WindowSeconds != nil || r.Retroactive != "" || r.Revision == nil || *r.Revision < 0 {
-			return ErrInvalidRequest
-		}
+		return validWhen(r.validResume())
 	default:
 		return ErrInvalidRequest
 	}
+}
+
+func (r Request) validateSet() error {
+	if r.WindowSeconds == nil || r.Revision != nil || (r.Retroactive != "apply" && r.Retroactive != "new_only") {
+		return ErrInvalidRequest
+	}
+	if !allowedWindow(*r.WindowSeconds) {
+		return ErrInvalidWindow
+	}
 	return nil
+}
+
+func (r Request) validClear() bool {
+	if r.WindowSeconds != nil || r.Revision != nil || r.IncludePinned != nil {
+		return false
+	}
+	return r.Retroactive == "clear_pending" || r.Retroactive == "leave_pending"
+}
+
+func (r Request) validResume() bool {
+	if r.WindowSeconds != nil || r.Retroactive != "" || r.IncludePinned != nil {
+		return false
+	}
+	return r.Revision != nil && *r.Revision >= 0
+}
+
+func validWhen(ok bool) error {
+	if ok {
+		return nil
+	}
+	return ErrInvalidRequest
 }
 
 func allowedWindow(window int) bool {
@@ -123,11 +160,24 @@ func allowedWindow(window int) bool {
 
 // Policy is the public durable policy state. BackfillPending is true exactly
 // while the parent row retains a backfill marker.
+//
+// IncludePinned is the EFFECTIVE value E = window IS NOT NULL AND
+// expiration_include_pinned, never the raw column (#3459 X3): the raw column
+// can read true under a null window, and a client seeded from it would turn
+// pinned expiry on by accident with its next set. It is always present.
 type Policy struct {
 	WindowSeconds   *int       `json:"window_seconds"`
 	UpdatedAt       *time.Time `json:"updated_at"`
 	Revision        int64      `json:"revision"`
 	BackfillPending bool       `json:"backfill_pending"`
+	IncludePinned   bool       `json:"include_pinned"`
+}
+
+// KeepsPins reports whether this policy keeps pinned messages: a window is in
+// force and pinned messages are excluded from it ("K" in the #3459 design).
+// A policy with no window keeps nothing, because nothing expires.
+func (p Policy) KeepsPins() bool {
+	return p.WindowSeconds != nil && !p.IncludePinned
 }
 
 // Service executes post-commit backfill batches through its own transactions.
@@ -149,9 +199,17 @@ func NewService(db *sql.DB) *Service {
 // a different row version than the one this mutation actually overwrote,
 // were a concurrent policy change to land between the two reads. Resume (no
 // mutation) reports its single locked state as both Previous and Current.
+//
+// DuePinnedIDs lists pinned messages whose stamp had already passed the
+// accepted cutoff (Current.UpdatedAt) when a context stopped keeping pins
+// (#3459 §5 "due collect"). It is collected after the reconcile, in the same
+// transaction, and is empty for every other transition. The caller hands it to
+// ContextExpirer after COMMIT; the expirer rechecks every id under row locks,
+// so a stale or edited list can delete nothing that is not due.
 type Transition struct {
-	Previous Policy
-	Current  Policy
+	Previous     Policy
+	Current      Policy
+	DuePinnedIDs []string
 }
 
 // StartChannelTransition validates and records a channel policy in the caller's
@@ -186,6 +244,9 @@ func (s *Service) ResumeConversation(ctx context.Context, conversationID string,
 // A marker's revision, mode, and cutoff are its identity. Every batch locks and
 // rechecks all three before it changes rows. Clearing any part early would let a
 // later setter race an unfinished batch and resurrect rows at the old cutoff.
+//
+// The pinned-row statements (reconcileApplySQL through duePinnedSQL) are the
+// #3459 state machine; pinned.go states its invariants and what breaks them.
 type scope struct {
 	name             string
 	lockSQL          string
@@ -196,52 +257,75 @@ type scope struct {
 	applyEligibleSQL string
 	clearEligibleSQL string
 	clearMarkerSQL   string
+
+	reconcileApplySQL string
+	holdPinnedSQL     string
+	releaseHeldSQL    string
+	dropHeldSQL       string
+	duePinnedSQL      string
 }
+
+// policyColumns is every policy read's column list, in scanPolicy's order. The
+// last column is the effective include value E, never the raw column.
+const policyColumns = `expiration_window_seconds, expiration_updated_at, expiration_revision,
+       expiration_backfill_mode, expiration_backfill_cutoff,
+       expiration_window_seconds IS NOT NULL AND expiration_include_pinned`
+
+// policyReturning is policyColumns for updatePolicySQL's RETURNING, where c.
+// names the row as written.
+const policyReturning = `c.expiration_window_seconds, c.expiration_updated_at, c.expiration_revision,
+          c.expiration_backfill_mode, c.expiration_backfill_cutoff,
+          c.expiration_window_seconds IS NOT NULL AND c.expiration_include_pinned`
+
+// policyUpdateAssignments is updatePolicySQL's SET list, shared by both scopes.
+// $2 window, $3 backfill mode, $4 requested include (NULL when omitted), $5
+// true for a set. On a set the include rule is ONE expression (#3459 §6.2): an
+// omitted field keeps the old effective value, which is false for a context
+// that had no window, so a new timer keeps pins and an existing one keeps what
+// it had. The right-hand side reads the OLD row. A clear leaves the column as
+// it is; every reader reports E, which is false under a null window anyway.
+const policyUpdateAssignments = `expiration_window_seconds = $2,
+    expiration_include_pinned = CASE WHEN $5::boolean
+        THEN COALESCE($4::boolean, c.expiration_window_seconds IS NOT NULL AND c.expiration_include_pinned)
+        ELSE c.expiration_include_pinned END,
+    expiration_updated_at = accepted.cutoff,
+    expiration_revision = c.expiration_revision + 1,
+    expiration_backfill_mode = $3,
+    expiration_backfill_cutoff = CASE WHEN $3::text IS NULL THEN NULL ELSE accepted.cutoff END`
 
 var channelScope = scope{
 	name: "channel",
 	lockSQL: `
-SELECT expiration_window_seconds, expiration_updated_at, expiration_revision,
-       expiration_backfill_mode, expiration_backfill_cutoff
+SELECT ` + policyColumns + `
 FROM channels
 WHERE id = $1
 FOR NO KEY UPDATE`,
 	readSQL: `
-SELECT expiration_window_seconds, expiration_updated_at, expiration_revision,
-       expiration_backfill_mode, expiration_backfill_cutoff
+SELECT ` + policyColumns + `
 FROM channels
 WHERE id = $1`,
 	updatePolicySQL: `
 WITH accepted AS (SELECT clock_timestamp() AS cutoff)
 UPDATE channels AS c
-SET expiration_window_seconds = $2,
-    expiration_updated_at = accepted.cutoff,
-    expiration_revision = c.expiration_revision + 1,
-    expiration_backfill_mode = $3,
-    expiration_backfill_cutoff = CASE WHEN $3::text IS NULL THEN NULL ELSE accepted.cutoff END
+SET ` + policyUpdateAssignments + `
 FROM accepted
 WHERE c.id = $1
-RETURNING c.expiration_window_seconds, c.expiration_updated_at, c.expiration_revision,
-          c.expiration_backfill_mode, c.expiration_backfill_cutoff`,
+RETURNING ` + policyReturning,
 	applyBatchSQL: `
 WITH batch AS (
   SELECT ctid FROM messages
-  WHERE channel_id = $1 AND created_at <= $2
-    AND (expires_at IS NULL OR expires_at > $2)
-    AND expires_at IS DISTINCT FROM
-        (created_at + make_interval(secs => $3))
+  WHERE channel_id = $1
+    AND ` + applyEligible + `
   LIMIT 5000
 )
 UPDATE messages m
-SET expires_at = m.created_at + make_interval(secs => $3)
+SET ` + applyAssignments + `
 FROM batch WHERE m.ctid = batch.ctid`,
 	applyEligibleSQL: `
 SELECT EXISTS (
   SELECT 1 FROM messages
-  WHERE channel_id = $1 AND created_at <= $2
-    AND (expires_at IS NULL OR expires_at > $2)
-    AND expires_at IS DISTINCT FROM
-        (created_at + make_interval(secs => $3))
+  WHERE channel_id = $1
+    AND ` + applyEligible + `
 )`,
 	clearBatchSQL: `
 WITH batch AS (
@@ -264,52 +348,63 @@ WHERE id = $1
   AND expiration_revision = $2
   AND expiration_backfill_mode = $3
   AND expiration_backfill_cutoff = $4`,
+	reconcileApplySQL: `
+UPDATE messages
+SET ` + applyAssignments + `
+WHERE channel_id = $1 AND pinned_at IS NOT NULL
+  AND ` + applyEligible,
+	holdPinnedSQL: `
+UPDATE messages
+SET held_expires_at = expires_at, expires_at = NULL
+WHERE channel_id = $1 AND pinned_at IS NOT NULL AND expires_at > $2`,
+	releaseHeldSQL: `
+UPDATE messages
+SET expires_at = held_expires_at, held_expires_at = NULL
+WHERE channel_id = $1 AND pinned_at IS NOT NULL AND held_expires_at IS NOT NULL`,
+	dropHeldSQL: `
+UPDATE messages
+SET held_expires_at = NULL
+WHERE channel_id = $1 AND pinned_at IS NOT NULL AND held_expires_at IS NOT NULL`,
+	duePinnedSQL: `
+SELECT id FROM messages
+WHERE channel_id = $1 AND pinned_at IS NOT NULL AND expires_at < $2
+ORDER BY expires_at, id
+LIMIT $3`,
 }
 
 var conversationScope = scope{
 	name: "conversation",
 	lockSQL: `
-SELECT expiration_window_seconds, expiration_updated_at, expiration_revision,
-       expiration_backfill_mode, expiration_backfill_cutoff
+SELECT ` + policyColumns + `
 FROM dm_conversations
 WHERE id = $1
 FOR NO KEY UPDATE`,
 	readSQL: `
-SELECT expiration_window_seconds, expiration_updated_at, expiration_revision,
-       expiration_backfill_mode, expiration_backfill_cutoff
+SELECT ` + policyColumns + `
 FROM dm_conversations
 WHERE id = $1`,
 	updatePolicySQL: `
 WITH accepted AS (SELECT clock_timestamp() AS cutoff)
 UPDATE dm_conversations AS c
-SET expiration_window_seconds = $2,
-    expiration_updated_at = accepted.cutoff,
-    expiration_revision = c.expiration_revision + 1,
-    expiration_backfill_mode = $3,
-    expiration_backfill_cutoff = CASE WHEN $3::text IS NULL THEN NULL ELSE accepted.cutoff END
+SET ` + policyUpdateAssignments + `
 FROM accepted
 WHERE c.id = $1
-RETURNING c.expiration_window_seconds, c.expiration_updated_at, c.expiration_revision,
-          c.expiration_backfill_mode, c.expiration_backfill_cutoff`,
+RETURNING ` + policyReturning,
 	applyBatchSQL: `
 WITH batch AS (
   SELECT ctid FROM dm_messages
-  WHERE conversation_id = $1 AND created_at <= $2
-    AND (expires_at IS NULL OR expires_at > $2)
-    AND expires_at IS DISTINCT FROM
-        (created_at + make_interval(secs => $3))
+  WHERE conversation_id = $1
+    AND ` + applyEligible + `
   LIMIT 5000
 )
 UPDATE dm_messages m
-SET expires_at = m.created_at + make_interval(secs => $3)
+SET ` + applyAssignments + `
 FROM batch WHERE m.ctid = batch.ctid`,
 	applyEligibleSQL: `
 SELECT EXISTS (
   SELECT 1 FROM dm_messages
-  WHERE conversation_id = $1 AND created_at <= $2
-    AND (expires_at IS NULL OR expires_at > $2)
-    AND expires_at IS DISTINCT FROM
-        (created_at + make_interval(secs => $3))
+  WHERE conversation_id = $1
+    AND ` + applyEligible + `
 )`,
 	clearBatchSQL: `
 WITH batch AS (
@@ -332,6 +427,28 @@ WHERE id = $1
   AND expiration_revision = $2
   AND expiration_backfill_mode = $3
   AND expiration_backfill_cutoff = $4`,
+	reconcileApplySQL: `
+UPDATE dm_messages
+SET ` + applyAssignments + `
+WHERE conversation_id = $1 AND pinned_at IS NOT NULL
+  AND ` + applyEligible,
+	holdPinnedSQL: `
+UPDATE dm_messages
+SET held_expires_at = expires_at, expires_at = NULL
+WHERE conversation_id = $1 AND pinned_at IS NOT NULL AND expires_at > $2`,
+	releaseHeldSQL: `
+UPDATE dm_messages
+SET expires_at = held_expires_at, held_expires_at = NULL
+WHERE conversation_id = $1 AND pinned_at IS NOT NULL AND held_expires_at IS NOT NULL`,
+	dropHeldSQL: `
+UPDATE dm_messages
+SET held_expires_at = NULL
+WHERE conversation_id = $1 AND pinned_at IS NOT NULL AND held_expires_at IS NOT NULL`,
+	duePinnedSQL: `
+SELECT id FROM dm_messages
+WHERE conversation_id = $1 AND pinned_at IS NOT NULL AND expires_at < $2
+ORDER BY expires_at, id
+LIMIT $3`,
 }
 
 type policyState struct {
@@ -365,12 +482,34 @@ func (s *Service) start(ctx context.Context, tx *sql.Tx, scope scope, id string,
 		return Transition{Previous: current.policy, Current: current.policy}, ErrBackfillPending
 	}
 
-	window, mode := policyUpdate(request)
-	updated, err := updatePolicy(ctx, tx, scope, id, window, mode)
+	change := policyChange{}
+	change.window, change.mode = policyUpdate(request)
+	change.include, change.includeSet = includeUpdate(request)
+	updated, err := updatePolicy(ctx, tx, scope, id, change)
 	if err != nil {
 		return Transition{Previous: current.policy, Current: current.policy}, err
 	}
-	return Transition{Previous: current.policy, Current: updated.policy}, nil
+	transition := Transition{Previous: current.policy, Current: updated.policy}
+	// Same transaction, after the update, still under lockPolicy's parent lock:
+	// a caller that reaches COMMIT has the policy and its pinned rows in step,
+	// or neither (I-HELD).
+	due, err := reconcilePinnedRows(ctx, tx, scope, id, request, transition)
+	if err != nil {
+		return Transition{Previous: current.policy, Current: current.policy}, err
+	}
+	transition.DuePinnedIDs = due
+	return transition, nil
+}
+
+// includeUpdate maps a request to updatePolicySQL's $4 and $5: the requested
+// include value (nil when omitted) and whether the request is a set, the only
+// mode that writes the column.
+func includeUpdate(request Request) (any, bool) {
+	var include any
+	if request.IncludePinned != nil {
+		include = *request.IncludePinned
+	}
+	return include, request.Mode == "set"
 }
 
 func policyUpdate(request Request) (any, any) {
@@ -503,8 +642,10 @@ func hasEligibleBackfillRow(ctx context.Context, tx *sql.Tx, scope scope, id str
 		if current.policy.WindowSeconds == nil {
 			return false, ErrBackfillNotFound
 		}
+		// keep is re-read under this batch's lock. It cannot change while the
+		// marker stands: every other set and clear returns ErrBackfillPending.
 		query = scope.applyEligibleSQL
-		args = []any{id, current.cutoff.Time, *current.policy.WindowSeconds}
+		args = []any{id, current.cutoff.Time, *current.policy.WindowSeconds, current.policy.KeepsPins()}
 	case "clear":
 		query = scope.clearEligibleSQL
 		args = []any{id, current.cutoff.Time}
@@ -525,7 +666,7 @@ func executeBackfillBatch(ctx context.Context, tx *sql.Tx, scope scope, id strin
 		if current.policy.WindowSeconds == nil {
 			return nil, ErrBackfillNotFound
 		}
-		result, err := tx.ExecContext(ctx, scope.applyBatchSQL, id, current.cutoff.Time, *current.policy.WindowSeconds)
+		result, err := tx.ExecContext(ctx, scope.applyBatchSQL, id, current.cutoff.Time, *current.policy.WindowSeconds, current.policy.KeepsPins())
 		if err != nil {
 			return nil, fmt.Errorf("apply %s expiration backfill batch: %w", scope.name, err)
 		}
@@ -552,8 +693,14 @@ func lockPolicy(ctx context.Context, tx *sql.Tx, scope scope, id string) (policy
 	return state, nil
 }
 
-func updatePolicy(ctx context.Context, tx *sql.Tx, scope scope, id string, window, mode any) (policyState, error) {
-	state, err := scanPolicy(tx.QueryRowContext(ctx, scope.updatePolicySQL, id, window, mode))
+// policyChange carries updatePolicySQL's bind values after the scope id, in order.
+type policyChange struct {
+	window, mode, include any
+	includeSet            bool
+}
+
+func updatePolicy(ctx context.Context, tx *sql.Tx, scope scope, id string, change policyChange) (policyState, error) {
+	state, err := scanPolicy(tx.QueryRowContext(ctx, scope.updatePolicySQL, id, change.window, change.mode, change.include, change.includeSet))
 	if errors.Is(err, sql.ErrNoRows) {
 		return policyState{}, ErrScopeNotFound
 	}
@@ -578,7 +725,7 @@ func scanPolicy(row *sql.Row) (policyState, error) {
 	var window sql.NullInt64
 	var updatedAt sql.NullTime
 	var state policyState
-	if err := row.Scan(&window, &updatedAt, &state.policy.Revision, &state.mode, &state.cutoff); err != nil {
+	if err := row.Scan(&window, &updatedAt, &state.policy.Revision, &state.mode, &state.cutoff, &state.policy.IncludePinned); err != nil {
 		return policyState{}, err
 	}
 	if window.Valid {

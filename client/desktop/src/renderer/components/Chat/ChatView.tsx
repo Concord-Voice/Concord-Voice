@@ -32,7 +32,7 @@ import {
   MANAGE_OWN_MESSAGES,
   hasPermission,
 } from '../../utils/policy/permissions';
-import type { ChatContext, MessageWithStatus } from '../../types/chat';
+import type { AttachmentSummary, ChatContext, MessageWithStatus } from '../../types/chat';
 import './ChatView.css';
 
 interface ChannelPurgeTarget {
@@ -200,7 +200,7 @@ const ChatView: React.FC = () => {
       mentionMeta?: string,
       replyToId?: string,
       attachmentIds?: string[],
-      attachments?: import('../../types/chat').AttachmentSummary[],
+      attachments?: AttachmentSummary[],
       gifSlug?: string
     ) => {
       if (!activeChannelId) return;
@@ -431,6 +431,8 @@ const ChatView: React.FC = () => {
         onClose={() => setShowPinnedPanel(false)}
         onScrollToMessage={handleScrollToMessage}
         canPin={canPin}
+        expirationPolicy={expiration.policy}
+        expirationPolicyState={expiration.policyState}
       />
 
       <SearchPanel

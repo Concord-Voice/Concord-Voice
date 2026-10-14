@@ -18,8 +18,11 @@ const (
 	// EventKindSet marks the first time a scope (channel or DM conversation)
 	// gets a non-null expiration window.
 	EventKindSet EventKind = "set"
-	// EventKindChanged marks a window replacing a different, previously
-	// non-null window.
+	// EventKindChanged marks a set over a previously non-null window that
+	// moved the window, the effective include_pinned value, or both. A
+	// pins-only change reuses this kind rather than minting a new one (#3459
+	// X8): old clients validate kind against a closed enum and would drop a
+	// new value as a wire violation.
 	EventKindChanged EventKind = "changed"
 	// EventKindCleared marks a previously non-null window being turned off.
 	EventKindCleared EventKind = "cleared"
@@ -47,6 +50,14 @@ type EventPayload struct {
 	// an already-null state (unreachable in practice: EventKindForTransition
 	// never classifies that case as an event at all).
 	PreviousWindowSeconds *int `json:"previous_window_seconds,omitempty"`
+	// IncludePinned is the policy's effective include_pinned value (E) after
+	// this mutation. Present for EventKindSet and EventKindChanged, absent for
+	// EventKindCleared, whose policy has no window for pins to expire under.
+	IncludePinned *bool `json:"include_pinned,omitempty"`
+	// PreviousIncludePinned is E immediately before this mutation, captured
+	// under the same lock. Present for EventKindChanged only: it is what lets a
+	// reader tell a pins-only change from a window change.
+	PreviousIncludePinned *bool `json:"previous_include_pinned,omitempty"`
 	// ChangedAt is the same timestamp the policy mutation itself recorded
 	// (Transition.Current.UpdatedAt), so the system row's displayed time and
 	// the policy's accepted time never diverge.
@@ -56,10 +67,11 @@ type EventPayload struct {
 // EventKindForTransition classifies a completed policy mutation for the
 // durable system-message row. ok is false for a request shape that produces
 // no event: "resume", which continues a backfill and is not itself a policy
-// change, and any mutation that did not actually move the window — a clear
-// against an already-null policy, or a set re-affirming the window already in
-// force. A durable row is a record that something CHANGED; a no-op has nothing
-// to record, and the cleared arm's row is permanent by construction.
+// change, and any mutation that did not actually move the policy — a clear
+// against an already-null policy, or a set re-affirming the window AND the
+// effective include_pinned value already in force. A durable row is a record
+// that something CHANGED; a no-op has nothing to record, and the cleared arm's
+// row is permanent by construction.
 func EventKindForTransition(request Request, transition Transition) (EventKind, bool) {
 	switch request.Mode {
 	case "clear":
@@ -78,9 +90,11 @@ func EventKindForTransition(request Request, transition Transition) (EventKind, 
 			return EventKindSet, true
 		}
 		if transition.Current.WindowSeconds != nil &&
-			*transition.Previous.WindowSeconds == *transition.Current.WindowSeconds {
-			// Re-setting the window already in force is the same no-op one arm up: it
-			// would record "changed" over a policy that did not move.
+			*transition.Previous.WindowSeconds == *transition.Current.WindowSeconds &&
+			transition.Previous.IncludePinned == transition.Current.IncludePinned {
+			// Re-setting the policy already in force is the same no-op one arm up: it
+			// would record "changed" over a policy that did not move. A same-window
+			// set that flips include_pinned did move it, and falls through.
 			return "", false
 		}
 		return EventKindChanged, true
@@ -111,14 +125,24 @@ func EventFor(request Request, transition Transition, actorUserID string) (Event
 	if transition.Current.UpdatedAt != nil {
 		changedAt = *transition.Current.UpdatedAt
 	}
-	return EventPayload{
+	payload := EventPayload{
 		Kind:                  kind,
 		ActorUserID:           actorUserID,
 		WindowSeconds:         transition.Current.WindowSeconds,
 		PreviousWindowSeconds: transition.Previous.WindowSeconds,
 		ChangedAt:             changedAt,
-	}, true
+	}
+	switch kind {
+	case EventKindSet:
+		payload.IncludePinned = boolPointer(transition.Current.IncludePinned)
+	case EventKindChanged:
+		payload.IncludePinned = boolPointer(transition.Current.IncludePinned)
+		payload.PreviousIncludePinned = boolPointer(transition.Previous.IncludePinned)
+	}
+	return payload, true
 }
+
+func boolPointer(value bool) *bool { return &value }
 
 // StagedEvent is a durable system row that has been written on the caller's
 // transaction but not yet broadcast. Present is false when the transition

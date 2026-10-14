@@ -85,8 +85,12 @@ type Channel struct {
 	ExpirationUpdatedAt       *time.Time `json:"expiration_updated_at" db:"expiration_updated_at"`
 	ExpirationRevision        int64      `json:"expiration_revision" db:"expiration_revision"`
 	ExpirationBackfillPending bool       `json:"expiration_backfill_pending" db:"-"`
-	CreatedAt                 time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt                 time.Time  `json:"updated_at" db:"updated_at"`
+	// ExpirationIncludePinned is the EFFECTIVE include_pinned value E
+	// (window IS NOT NULL AND expiration_include_pinned, #3459 X3), never the
+	// raw column, which can read true under a NULL window.
+	ExpirationIncludePinned bool      `json:"expiration_include_pinned" db:"-"`
+	CreatedAt               time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // ChannelKey represents a channel symmetric key wrapped for a specific user

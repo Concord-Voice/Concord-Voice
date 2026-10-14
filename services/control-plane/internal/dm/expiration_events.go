@@ -86,31 +86,30 @@ func (h *Handler) broadcastDMExpirationEvent(conversationID, messageID uuid.UUID
 	nameCtx, cancelName := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelName()
 	actorUsername, actorDisplayName := expiration.ActorName(nameCtx, h.db, actorUserID)
+	data := map[string]interface{}{
+		"id":                 messageID.String(),
+		"conversation_id":    conversationID.String(),
+		"actor_user_id":      actorUserID,
+		"actor_username":     actorUsername,
+		"actor_display_name": actorDisplayName,
+		"kind":               payload.Kind,
+		"window_seconds":     payload.WindowSeconds,
+		"created_at":         payload.ChangedAt.UTC().Format(time.RFC3339),
+		// The policy's own revision travels with the event so the receiving
+		// client can advance its composer indicator in the same tick it renders
+		// the system row. Without it the row would announce a new window beside
+		// a bar still showing the old one until the next fetch. mergeExpirationPolicy
+		// fences on revision, so an out-of-order or replayed event is ignored
+		// rather than regressing the indicator.
+		"revision":         policy.Revision,
+		"updated_at":       expiration.UpdatedAtRFC3339(policy),
+		"backfill_pending": policy.BackfillPending,
+	}
+	expiration.AddPinnedEventFields(data, payload, policy)
 	h.hub.BroadcastToDMMessageAllParticipants(
 		conversationID,
 		websocket.NewDMMessageVisibilitySource(messageID),
 		uuid.Nil,
-		websocket.OutgoingMessage{
-			Type: wsDMExpirationEvent,
-			Data: map[string]interface{}{
-				"id":                 messageID.String(),
-				"conversation_id":    conversationID.String(),
-				"actor_user_id":      actorUserID,
-				"actor_username":     actorUsername,
-				"actor_display_name": actorDisplayName,
-				"kind":               payload.Kind,
-				"window_seconds":     payload.WindowSeconds,
-				"created_at":         payload.ChangedAt.UTC().Format(time.RFC3339),
-				// The policy's own revision travels with the event so the receiving
-				// client can advance its composer indicator in the same tick it renders
-				// the system row. Without it the row would announce a new window beside
-				// a bar still showing the old one until the next fetch. mergeExpirationPolicy
-				// fences on revision, so an out-of-order or replayed event is ignored
-				// rather than regressing the indicator.
-				"revision":         policy.Revision,
-				"updated_at":       expiration.UpdatedAtRFC3339(policy),
-				"backfill_pending": policy.BackfillPending,
-			},
-		},
+		websocket.OutgoingMessage{Type: wsDMExpirationEvent, Data: data},
 	)
 }

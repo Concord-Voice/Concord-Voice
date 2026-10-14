@@ -102,6 +102,63 @@ describe('DMPinnedMessagesPanel', () => {
     expect(container.querySelector('.pinned-panel-backdrop')).not.toBeInTheDocument();
   });
 
+  // #3459: mirror of the channel panel's note; the two share one component and one rule.
+  describe('pins-are-kept note (#3459)', () => {
+    const NOTE =
+      "Pinned messages are kept. Unpinning one puts it back on the timer, and it's deleted within minutes if its time has already run out.";
+    const keptPolicy = {
+      windowSeconds: 604800 as const,
+      updatedAt: null,
+      revision: 2,
+      backfillPending: false,
+      includePinned: false,
+    };
+
+    it('shows the note when a window is set and pins are kept', () => {
+      render(
+        <DMPinnedMessagesPanel
+          {...defaultProps}
+          expirationPolicy={keptPolicy}
+          expirationPolicyState="ready"
+        />
+      );
+      expect(screen.getByText(NOTE)).toBeInTheDocument();
+    });
+
+    it('keeps the last known note while a refresh is in flight', () => {
+      render(
+        <DMPinnedMessagesPanel
+          {...defaultProps}
+          expirationPolicy={keptPolicy}
+          expirationPolicyState="loading"
+        />
+      );
+      expect(screen.getByText(NOTE)).toBeInTheDocument();
+    });
+
+    it.each([
+      ['pins expire too', { ...keptPolicy, includePinned: true }, 'ready'],
+      ['the field is absent', { ...keptPolicy, includePinned: undefined }, 'ready'],
+      ['no window is set', { ...keptPolicy, windowSeconds: null }, 'ready'],
+      ['the policy could not be read', keptPolicy, 'unavailable'],
+    ] as const)('says nothing about retention when %s', (_name, policy, state) => {
+      render(
+        <DMPinnedMessagesPanel
+          {...defaultProps}
+          expirationPolicy={policy}
+          expirationPolicyState={state}
+        />
+      );
+      expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
+      expect(document.querySelector('.pinned-panel-note')).toBeNull();
+    });
+
+    it('says nothing when the owner passes no policy at all', () => {
+      render(<DMPinnedMessagesPanel {...defaultProps} />);
+      expect(document.querySelector('.pinned-panel-note')).toBeNull();
+    });
+  });
+
   it('fetches pins with the DM conversation id', async () => {
     await setE2EEInitialized(true);
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);

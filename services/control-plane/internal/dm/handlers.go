@@ -18,6 +18,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	messagehandlers "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -127,6 +128,12 @@ type Handler struct {
 	purgeEngine *purge.Engine      // bulk message purge (#1352)
 	mfaVerifier stepup.MFAVerifier // step-up auth for DM/group purge and history clear
 	activePlans ActivePlanRail     // durable active-category reconciliation (#2448)
+	// pinnedExpirer deletes already-due pinned messages when a conversation's
+	// policy stops keeping pins (#3459 §8). Wired via SetPinnedExpirer.
+	pinnedExpirer *expiration.ContextExpirer
+	// responseBudget overrides expiration.ResponseBudget for the expiration
+	// PATCH; zero means the default. Only tests set it.
+	responseBudget time.Duration
 
 	// Test seams for deleteGroupData's ordering, nil in production. The three
 	// windows they open — after private-voice scopes, between the candidate read
@@ -310,7 +317,9 @@ type conversationResponse struct {
 	ExpirationUpdatedAt       *string               `json:"expiration_updated_at"`
 	ExpirationRevision        int64                 `json:"expiration_revision"`
 	ExpirationBackfillPending bool                  `json:"expiration_backfill_pending"`
-	CreatedAt                 string                `json:"created_at"`
+	// ExpirationIncludePinned is the effective include_pinned value E (#3459).
+	ExpirationIncludePinned bool   `json:"expiration_include_pinned"`
+	CreatedAt               string `json:"created_at"`
 }
 
 type participantResponse struct {
@@ -370,7 +379,8 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	query := `
 		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by,
-		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL, dc.created_at,
+		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL,
+		       dc.expiration_window_seconds IS NOT NULL AND dc.expiration_include_pinned, dc.created_at,
 		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload, dm.key_version,
 		       att.file_type, att.mime_type,
 		       (SELECT COUNT(*) FROM dm_messages m
@@ -426,7 +436,7 @@ func (h *Handler) scanConversationRow(rows *sql.Rows) (conversationResponse, err
 	var lm lastMessageRow
 	if err := rows.Scan(
 		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy,
-		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.CreatedAt,
+		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.ExpirationIncludePinned, &conv.CreatedAt,
 		&lm.content, &lm.expiresAt, &lm.createdAt, &lm.userID, &lm.msgType, &lm.callEventPayload, &lm.keyVersion,
 		&lm.attachmentType, &lm.attachmentMime,
 		&conv.UnreadCount,
@@ -3185,7 +3195,8 @@ func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversati
 	var lm lastMessageRow
 	err := h.db.QueryRow(`
 		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by,
-		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL, dc.created_at,
+		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL,
+		       dc.expiration_window_seconds IS NOT NULL AND dc.expiration_include_pinned, dc.created_at,
 		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload, dm.key_version,
 		       att.file_type, att.mime_type
 		FROM dm_conversations dc
@@ -3205,7 +3216,7 @@ func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversati
 		WHERE dc.id = $1
 	`, convID, viewerID).Scan(
 		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy,
-		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.CreatedAt,
+		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.ExpirationIncludePinned, &conv.CreatedAt,
 		&lm.content, &lm.expiresAt, &lm.createdAt, &lm.userID, &lm.msgType, &lm.callEventPayload, &lm.keyVersion,
 		&lm.attachmentType, &lm.attachmentMime,
 	)

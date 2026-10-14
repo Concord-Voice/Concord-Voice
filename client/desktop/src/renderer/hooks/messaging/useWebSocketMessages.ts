@@ -1249,16 +1249,31 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           kind: data.kind,
           actor_user_id: data.actor_user_id,
           window_seconds: data.window_seconds,
+          // The same three fields the durable row carries (#3459), copied only when the event
+          // sent them so a live row and a fetched one are the same shape. `previous_*` are what
+          // let MessageExpirationEventMessage tell a pins-only change from a window change.
+          ...(data.previous_window_seconds === undefined
+            ? {}
+            : { previous_window_seconds: data.previous_window_seconds }),
+          ...(data.include_pinned === undefined ? {} : { include_pinned: data.include_pinned }),
+          ...(data.previous_include_pinned === undefined
+            ? {}
+            : { previous_include_pinned: data.previous_include_pinned }),
           changed_at: data.created_at,
         },
         created_at: data.created_at,
         updated_at: data.created_at,
       });
+      // `includePinned` is spread in only when sent, so an event from a server that predates
+      // #3459 yields a policy with the key ABSENT rather than `includePinned: undefined`: the
+      // merge's equal-revision drop rule reads absence, and an explicit undefined would be a
+      // second shape for the same fact.
       applyPolicy({
         windowSeconds: data.window_seconds,
         updatedAt: data.updated_at,
         revision: data.revision,
         backfillPending: data.backfill_pending,
+        ...(data.include_pinned === undefined ? {} : { includePinned: data.include_pinned }),
       });
     };
 

@@ -425,6 +425,83 @@ describe('DMChatArea', () => {
     expect(screen.queryByRole('dialog', { name: 'Message expiration' })).not.toBeInTheDocument();
   });
 
+  // #3459 at the CALLER: each half is unit-tested, but only the owner can fail to hand the panel
+  // the policy. One input varies (includePinned) through the real hook, store and row parser.
+  describe.each([
+    [
+      'kept',
+      false as boolean | undefined,
+      'Messages are Encrypted End-to-End and expire after 24 hours, except pinned messages',
+      true,
+    ],
+    ['expiring', true, 'Messages are Encrypted End-to-End and expire after 24 hours', false],
+    [
+      'unsaid (a server that predates #3459)',
+      undefined,
+      'Messages are Encrypted End-to-End and expire after 24 hours',
+      false,
+    ],
+  ])('pin retention when pins are %s (#3459)', (_name, includePinned, sentence, noteShown) => {
+    it('reaches the composer sentence and the pinned panel note', async () => {
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            expirationPolicy: {
+              windowSeconds: 86400,
+              updatedAt: '2026-09-08T05:00:00.000Z',
+              revision: 4,
+              backfillPending: false,
+              ...(includePinned === undefined ? {} : { includePinned }),
+            },
+          }),
+        ],
+      });
+      mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+        if (String(input).includes('/dm/conversations')) {
+          return {
+            ok: true,
+            json: async () => ({
+              conversations: [
+                {
+                  id: 'conv-1',
+                  is_group: false,
+                  is_personal: false,
+                  name: null,
+                  participants: [
+                    { user_id: 'user-1', username: 'me' },
+                    { user_id: 'user-2', username: 'alice' },
+                  ],
+                  last_message: null,
+                  unread_count: 0,
+                  created_at: '2025-01-01T00:00:00Z',
+                  expiration_window_seconds: 86400,
+                  expiration_updated_at: '2026-09-08T05:00:00.000Z',
+                  expiration_revision: 4,
+                  expiration_backfill_pending: false,
+                  ...(includePinned === undefined
+                    ? {}
+                    : { expiration_include_pinned: includePinned }),
+                },
+              ],
+            }),
+          } as Response;
+        }
+        return { ok: true, json: async () => ({ messages: [] }) } as Response;
+      });
+      render(<DMChatArea selectedThreadId="conv-1" />);
+      await screen.findByText(sentence);
+
+      fireEvent.click(screen.getByLabelText('Pinned messages'));
+      const note = /Pinned messages are kept\. Unpinning one puts it back on the timer/;
+      if (noteShown) {
+        expect(await screen.findByText(note)).toBeInTheDocument();
+      } else {
+        await screen.findByRole('heading', { name: 'Pinned Messages' });
+        expect(screen.queryByText(note)).not.toBeInTheDocument();
+      }
+    });
+  });
+
   it('keeps a successor DM editor isolated from a held timer save', async () => {
     const policyA = {
       windowSeconds: 86400 as const,

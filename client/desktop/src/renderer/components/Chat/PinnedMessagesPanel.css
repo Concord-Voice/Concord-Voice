@@ -56,6 +56,18 @@
   color: var(--text-primary);
 }
 
+/* The static "pins are kept" note (#3459), shared by the channel and DM panels. A sentence the
+   person must read, so --text-primary on the panel surface and no opacity: the empty-state hint
+   below dims with opacity, which is exactly what a retention promise must not do. */
+.pinned-panel-note {
+  margin: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
 .pinned-panel-content {
   flex: 1;
   overflow-y: auto;

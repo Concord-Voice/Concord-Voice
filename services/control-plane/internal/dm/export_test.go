@@ -88,3 +88,7 @@ func SetDMVoiceActivationHookForTest(h *Handler, hook func(context.Context, uuid
 func BeginDMTopologyEffectForTest(ctx context.Context, h *Handler, convID string, extras []uuid.UUID) (*sql.Tx, error) {
 	return h.beginDMTopologyEffect(ctx, convID, extras)
 }
+
+// SetResponseBudgetForTest overrides the expiration PATCH's response budget,
+// so a test can show the handler hands its deadline to the work after commit.
+func (h *Handler) SetResponseBudgetForTest(d time.Duration) { h.responseBudget = d }

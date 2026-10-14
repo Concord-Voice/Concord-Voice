@@ -1071,6 +1071,94 @@ describe('ws-events schemas — happy path (one per event)', () => {
     ).toBe(false);
   });
 
+  // ── #3459: include_pinned, previous_include_pinned, previous_window_seconds ──
+  describe('pin fields on the expiration events (#3459)', () => {
+    const { channel_id: _channel, ...dmBase } = expirationData;
+    const dmData = { ...dmBase, conversation_id: UUID_B };
+    const pinFields = {
+      include_pinned: false,
+      previous_include_pinned: true,
+      previous_window_seconds: 86400,
+    };
+    type Body = { type: string; data: Record<string, unknown> };
+    const parseData = (event: Body) => {
+      const result = WebSocketEventSchema.safeParse(event);
+      return result.success ? (result.data as Body).data : null;
+    };
+    const envelopes: Array<[string, (extra: Record<string, unknown>) => Body]> = [
+      [
+        'expiration_event',
+        (extra) => ({ type: 'expiration_event', data: { ...expirationData, ...extra } }),
+      ],
+      [
+        'dm_expiration_event',
+        (extra) => ({ type: 'dm_expiration_event', data: { ...dmData, ...extra } }),
+      ],
+    ];
+
+    it.each(envelopes)('%s accepts all three fields and passes them through', (_n, build) => {
+      const data = parseData(build({ kind: 'changed', ...pinFields }));
+      expect(data).toMatchObject(pinFields);
+    });
+
+    it.each(envelopes)(
+      '%s still accepts an event with none of them (an older server)',
+      (_n, build) => {
+        const data = parseData(build({}));
+        expect(data).not.toBeNull();
+        expect(data).not.toHaveProperty('include_pinned');
+        expect(data).not.toHaveProperty('previous_include_pinned');
+        expect(data).not.toHaveProperty('previous_window_seconds');
+      }
+    );
+
+    it.each(envelopes)(
+      '%s accepts the fields independently (set carries include_pinned alone)',
+      (_n, build) => {
+        expect(parseData(build({ include_pinned: true }))).toMatchObject({ include_pinned: true });
+        expect(parseData(build({ previous_window_seconds: 3600 }))).toMatchObject({
+          previous_window_seconds: 3600,
+        });
+      }
+    );
+
+    it.each(envelopes)(
+      '%s rejects a malformed include_pinned (null or non-boolean) rather than guessing',
+      (_n, build) => {
+        for (const bad of [null, 'false', 0]) {
+          expect(parseData(build({ include_pinned: bad }))).toBeNull();
+          expect(parseData(build({ previous_include_pinned: bad }))).toBeNull();
+        }
+      }
+    );
+
+    it.each(envelopes)(
+      '%s rejects a previous_window_seconds outside the closed window set',
+      (_n, build) => {
+        expect(parseData(build({ previous_window_seconds: 999 }))).toBeNull();
+      }
+    );
+
+    it.each(envelopes)(
+      '%s keeps the kind enum UNCHANGED: a pins-only change rides `changed`',
+      (_n, build) => {
+        // A new kind would be dropped by an older renderer's closed enum and bump
+        // wireViolationCount on every bundled client, so the kind set must not grow.
+        expect(parseData(build({ kind: 'changed', ...pinFields }))).not.toBeNull();
+        expect(parseData(build({ kind: 'pins_changed', ...pinFields }))).toBeNull();
+      }
+    );
+
+    it('strips unknown keys (z.object, not strictObject), so a future field cannot drop the row', () => {
+      const data = parseData({
+        type: 'expiration_event',
+        data: { ...expirationData, future_field: 1 },
+      });
+      expect(data).not.toBeNull();
+      expect(data).not.toHaveProperty('future_field');
+    });
+  });
+
   // ──────────── Message purge (#1352) (3) ──────────────────────────────
 
   it('ChannelPurgedSchema accepts a canonical channel_purged envelope', () => {

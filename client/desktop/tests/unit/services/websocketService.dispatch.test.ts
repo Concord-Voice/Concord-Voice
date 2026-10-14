@@ -291,4 +291,60 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
 
     expect(useConnectionStore.getState().wireViolationCount).toBe(0);
   });
+
+  // #3459: the live expiration frames carry `previous_window_seconds`, validated against the same
+  // closed window-literal set as `window_seconds`. A value outside it is not coerced or stripped:
+  // the whole event is dropped at the boundary and counts as a wire violation, so a server that
+  // starts emitting a new window length is visible as drift rather than rendering a wrong row.
+  describe.each([
+    ['expiration_event', { channel_id: UUID_A }],
+    ['dm_expiration_event', { conversation_id: UUID_A }],
+  ] as const)('%s previous_window_seconds', (type, scope) => {
+    const frame = (previous: unknown) => ({
+      type,
+      data: {
+        id: UUID_B,
+        ...scope,
+        actor_user_id: UUID_B,
+        actor_username: 'alice',
+        actor_display_name: 'Alice',
+        kind: 'changed',
+        window_seconds: 86400,
+        created_at: '2026-10-09T00:00:00Z',
+        revision: 5,
+        updated_at: '2026-10-09T00:00:00Z',
+        backfill_pending: false,
+        include_pinned: true,
+        previous_include_pinned: false,
+        previous_window_seconds: previous,
+      },
+    });
+
+    // Mutant killed: `previous_window_seconds` widened from the window-literal set to any number.
+    it('outside the window-literal set → event dropped, handler not invoked, counter += 1', () => {
+      const handler = vi.fn();
+      svc.on(type, handler);
+
+      fire(frame(7200));
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(useConnectionStore.getState().wireViolationCount).toBe(1);
+    });
+
+    // Control: the same frame with a member of the set is delivered, so the rejection above is
+    // attributable to the previous window and to nothing else in the fixture.
+    it.each([3600, 86400, 604800, 2592000, null])(
+      'a member of the set (%s) → delivered, counter unchanged',
+      (previous) => {
+        const handler = vi.fn();
+        svc.on(type, handler);
+
+        fire(frame(previous));
+
+        expect(handler).toHaveBeenCalledTimes(1);
+        expect(handler.mock.calls[0][0].data.previous_window_seconds).toBe(previous);
+        expect(useConnectionStore.getState().wireViolationCount).toBe(0);
+      }
+    );
+  });
 });

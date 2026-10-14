@@ -1,4 +1,10 @@
-import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { act, renderHook } from '@testing-library/react';
+import {
+  ServerCapabilitiesSchema,
+  isExpirationPinnedPolicyUnsupported,
+  useClientConfigStore,
+  useExpirationPinnedPolicyUnsupported,
+} from '@/renderer/stores/ui/clientConfigStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {
@@ -120,5 +126,57 @@ describe('clientConfigStore', () => {
     const state = useClientConfigStore.getState();
     expect(state.configRequestRevision).toBe(requestRevision);
     expect(state.acceptedConfigRevision).toBe(0);
+  });
+});
+
+// #3459: the capability behind the "Include pinned messages" option. It is a UX gate, so the
+// whole question is which states count as CONFIRMED unsupported (hide) versus not told (show).
+describe('expirationPinnedPolicySupported capability (#3459)', () => {
+  const caps = (features: Record<string, unknown>) =>
+    ServerCapabilitiesSchema.parse({ auth: { oauthProviders: [] }, features });
+
+  it('survives parsing: zod strips an undeclared key, which would make it permanently unreadable', () => {
+    // The exact trap chunkedAttachmentUpload fell into: a flag the schema does not declare is
+    // stripped, reads as undefined forever, and the control it gates never appears.
+    expect(caps({ expirationPinnedPolicySupported: true }).features).toMatchObject({
+      expirationPinnedPolicySupported: true,
+    });
+    expect(caps({ expirationPinnedPolicySupported: false }).features).toMatchObject({
+      expirationPinnedPolicySupported: false,
+    });
+  });
+
+  it('is confirmed-unsupported only for a payload that parsed and does not say true', () => {
+    expect(isExpirationPinnedPolicyUnsupported(caps({}))).toBe(true);
+    expect(
+      isExpirationPinnedPolicyUnsupported(caps({ expirationPinnedPolicySupported: false }))
+    ).toBe(true);
+    expect(
+      isExpirationPinnedPolicyUnsupported(caps({ expirationPinnedPolicySupported: true }))
+    ).toBe(false);
+  });
+
+  it('fails OPEN when capabilities are not known (loading or a failed fetch)', () => {
+    // A transient /server/capabilities blip nulls the object; hiding a safe control behind it
+    // would be worse than showing it.
+    expect(isExpirationPinnedPolicyUnsupported(null)).toBe(false);
+  });
+
+  it('the selector tracks the store through load, support, withdrawal and a failed re-fetch', () => {
+    const { result } = renderHook(() => useExpirationPinnedPolicyUnsupported());
+    expect(result.current).toBe(false); // loading
+
+    act(() =>
+      useClientConfigStore
+        .getState()
+        .setServerCapabilities(caps({ expirationPinnedPolicySupported: true }))
+    );
+    expect(result.current).toBe(false); // supported
+
+    act(() => useClientConfigStore.getState().setServerCapabilities(caps({})));
+    expect(result.current).toBe(true); // a server that predates it
+
+    act(() => useClientConfigStore.getState().setServerCapabilities(null));
+    expect(result.current).toBe(false); // the fetch failed: not told, so open again
   });
 });

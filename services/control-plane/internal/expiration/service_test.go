@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +120,66 @@ func TestRequestJSONContract_UsesExactFieldNamesAndPreservesReceiverOnError(t *t
 		assert.Error(t, json.Unmarshal([]byte(body), &received))
 		assert.Equal(t, sentinel, received)
 	}
+}
+
+// TestRequestJSONContract_IncludePinned is AC5's unit table (#3459 §6.1,
+// C-SCHEMA): include_pinned is admitted on set only, a JSON null is refused
+// rather than read as "omitted", and a non-boolean is a decode error. Each
+// refusal maps to a 400 through StartErrorStatus or the binder, before any
+// policy row is touched.
+func TestRequestJSONContract_IncludePinned(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		want    *bool
+		wantErr error
+	}{
+		{name: "set true", body: `{"mode":"set","window_seconds":86400,"retroactive":"new_only","include_pinned":true}`, want: ptr(true)},
+		{name: "set false", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","include_pinned":false}`, want: ptr(false)},
+		{name: "set omitted", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply"}`},
+		{name: "set null", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","include_pinned":null}`, wantErr: ErrInvalidRequest},
+		{name: "set null with whitespace", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","include_pinned": null }`, wantErr: ErrInvalidRequest},
+		{name: "set string", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","include_pinned":"true"}`},
+		{name: "set number", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","include_pinned":1}`},
+		{name: "set object", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","include_pinned":{}}`},
+		{name: "clear true", body: `{"mode":"clear","retroactive":"leave_pending","include_pinned":true}`, wantErr: ErrInvalidRequest},
+		{name: "clear null", body: `{"mode":"clear","retroactive":"clear_pending","include_pinned":null}`, wantErr: ErrInvalidRequest},
+		{name: "resume false", body: `{"mode":"resume","revision":7,"include_pinned":false}`, wantErr: ErrInvalidRequest},
+		{name: "wrong case", body: `{"mode":"set","window_seconds":86400,"retroactive":"apply","Include_Pinned":true}`, wantErr: ErrInvalidRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request Request
+			err := json.Unmarshal([]byte(tc.body), &request)
+			switch {
+			case tc.wantErr != nil:
+				require.ErrorIs(t, err, tc.wantErr)
+				assert.Equal(t, http.StatusBadRequest, StartErrorStatus(err))
+				assert.Equal(t, Request{}, request, "a refused body assigns nothing")
+			case strings.Contains(tc.name, "string"), strings.Contains(tc.name, "number"), strings.Contains(tc.name, "object"):
+				var typeErr *json.UnmarshalTypeError
+				require.ErrorAs(t, err, &typeErr, "a non-boolean is a decode error, answered 400 by the binder")
+				assert.Equal(t, Request{}, request, "a refused body assigns nothing")
+			default:
+				require.NoError(t, err)
+				require.NoError(t, request.Validate())
+				assert.Equal(t, tc.want, request.IncludePinned)
+			}
+		})
+	}
+}
+
+// TestRequestValidate_RefusesIncludePinnedOutsideSet is C-SCHEMA's
+// defence in depth for a Request built in Go rather than decoded.
+func TestRequestValidate_RefusesIncludePinnedOutsideSet(t *testing.T) {
+	for _, request := range []Request{
+		{Mode: "clear", Retroactive: "leave_pending", IncludePinned: ptr(false)},
+		{Mode: "clear", Retroactive: "clear_pending", IncludePinned: ptr(true)},
+		{Mode: "resume", Revision: ptr(int64(1)), IncludePinned: ptr(true)},
+	} {
+		assert.ErrorIs(t, request.Validate(), ErrInvalidRequest)
+	}
+	window := 3600
+	require.NoError(t, Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(true)}.Validate())
 }
 
 func TestPolicyUpdate_MapsOnlyRetroactiveOperationsToMarkers(t *testing.T) {

@@ -1152,6 +1152,8 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                             ? null
                             : (payload.window_seconds as ExpirationWindowSeconds)
                         }
+                        previousWindowSeconds={payload.previous_window_seconds}
+                        includePinned={payload.include_pinned}
                         actorName={message.display_name || message.username}
                         isSelf={payload.actor_user_id === currentUserId}
                       />

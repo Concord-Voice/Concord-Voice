@@ -567,11 +567,12 @@ func TestEngineRunExpiryBatch_CommitFailureRollsBackAndDoesNotEnqueue(t *testing
 	})
 	require.Error(t, err)
 	assert.Zero(t, res.DeletedCount)
-	var status string
-	var deleted int
-	require.NoError(t, f.db.QueryRow(`SELECT status, deleted_count FROM message_purges WHERE id = $1`, res.PurgeID).Scan(&status, &deleted))
-	assert.Equal(t, "in_progress", status)
-	assert.Zero(t, deleted)
+	// The audit row is inserted in the batch transaction (#3459 §9), so a COMMIT
+	// that rolls back takes it along: nothing to name, nothing to salvage.
+	assert.Empty(t, res.PurgeID, "a rolled-back batch has no audit row to name")
+	var audits int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_purges WHERE context_id = $1`, f.channelID).Scan(&audits))
+	assert.Zero(t, audits, "the audit row rolls back with the batch it describes")
 	var messageCount, bridgeCount int
 	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messageCount))
 	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_attachments WHERE message_id = $1`, messageID).Scan(&bridgeCount))

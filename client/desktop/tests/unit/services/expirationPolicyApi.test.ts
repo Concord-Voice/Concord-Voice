@@ -8,10 +8,12 @@ import {
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
 import {
+  hasMalformedExpirationPolicyListRow,
   mergeExpirationPolicy,
   parseExpirationPolicyFromListRow,
   parseExpirationPolicyResponse,
   updateExpirationPolicy,
+  type ExpirationPolicy,
 } from '@/renderer/services/messaging/expirationPolicyApi';
 
 const API_BASE = 'http://localhost:8080';
@@ -87,6 +89,213 @@ describe('expiration policy wire contract', () => {
       ...completed,
       revision: 5,
     });
+  });
+});
+
+// ── #3459: pin-aware expiry ────────────────────────────────────────────────
+describe('include_pinned on the policy wire contract (#3459)', () => {
+  const listRow = {
+    expiration_window_seconds: 86400,
+    expiration_updated_at: policyWire.updated_at,
+    expiration_revision: 4,
+    expiration_backfill_pending: false,
+  };
+
+  it.each([true, false])('maps include_pinned %s on a response and on a list row', (value) => {
+    expect(parseExpirationPolicyResponse({ ...policyWire, include_pinned: value })).toEqual(
+      expect.objectContaining({ includePinned: value })
+    );
+    expect(
+      parseExpirationPolicyFromListRow({ ...listRow, expiration_include_pinned: value })
+    ).toEqual(expect.objectContaining({ includePinned: value }));
+  });
+
+  it('keeps an ABSENT field absent: "the server did not say" is one shape, not includePinned: undefined', () => {
+    // toStrictEqual distinguishes a missing key from an explicit undefined, which toEqual would not.
+    expect(parseExpirationPolicyResponse(policyWire)).toStrictEqual({
+      windowSeconds: 86400,
+      updatedAt: policyWire.updated_at,
+      revision: 4,
+      backfillPending: false,
+    });
+    expect(parseExpirationPolicyFromListRow(listRow)).toStrictEqual({
+      windowSeconds: 86400,
+      updatedAt: policyWire.updated_at,
+      revision: 4,
+      backfillPending: false,
+    });
+  });
+
+  it.each([null, 'true', 1, {}])(
+    'rejects a non-boolean include_pinned %j on a response, a list row, and as a malformed row',
+    (value) => {
+      expect(
+        parseExpirationPolicyResponse({ ...policyWire, include_pinned: value })
+      ).toBeUndefined();
+      expect(
+        parseExpirationPolicyFromListRow({ ...listRow, expiration_include_pinned: value })
+      ).toBeUndefined();
+      expect(
+        hasMalformedExpirationPolicyListRow({ ...listRow, expiration_include_pinned: value })
+      ).toBe(true);
+    }
+  );
+
+  it('treats a row carrying ONLY a malformed include field as malformed, and a valid one as not', () => {
+    // The field must be in the "has a policy field" set, or a row whose only policy field is a bad
+    // include would read as "no policy on this row" instead of a failure.
+    expect(hasMalformedExpirationPolicyListRow({ expiration_include_pinned: 'yes' })).toBe(true);
+    expect(
+      hasMalformedExpirationPolicyListRow({ ...listRow, expiration_include_pinned: false })
+    ).toBe(false);
+    expect(hasMalformedExpirationPolicyListRow({ name: 'no policy fields at all' })).toBe(false);
+  });
+});
+
+describe('mergeExpirationPolicy at an equal revision (#3459, X14)', () => {
+  const base: ExpirationPolicy = {
+    windowSeconds: 86400,
+    updatedAt: policyWire.updated_at,
+    revision: 4,
+    backfillPending: false,
+  };
+  const kept = { ...base, includePinned: false };
+  const expiring = { ...base, includePinned: true };
+
+  it('DROPS the pin claim when the incoming read cannot repeat it', () => {
+    // After a rollback an older server answers at the SAME revision without the field. A held
+    // "except pinned messages" would then outlive the binary that deletes newly pinned rows.
+    expect(mergeExpirationPolicy(kept, base)).toStrictEqual(base);
+    expect(mergeExpirationPolicy(expiring, base)).toStrictEqual(base);
+  });
+
+  it('drops ONLY the claim: a stale pending read does not undo a held completion', () => {
+    // An older server's delayed read at the same revision can still report the backfill pending.
+    // The claim goes; the completion held already stands.
+    const stalePending = { ...base, backfillPending: true };
+    expect(mergeExpirationPolicy(kept, stalePending)).toStrictEqual(base);
+    expect(mergeExpirationPolicy(expiring, stalePending)).toStrictEqual(base);
+  });
+
+  it('never ADDS the claim at an equal revision', () => {
+    expect(mergeExpirationPolicy(base, kept)).toStrictEqual(base);
+    expect(mergeExpirationPolicy(base, expiring)).toStrictEqual(base);
+  });
+
+  it('keeps a held claim against an incoming one at the same revision (no churn)', () => {
+    expect(mergeExpirationPolicy(kept, expiring)).toStrictEqual(kept);
+    expect(mergeExpirationPolicy(kept, { ...kept })).toStrictEqual(kept);
+  });
+
+  it('lets a completed backfill supersede a pending one that carried the claim', () => {
+    const pendingKept = { ...kept, backfillPending: true };
+    expect(mergeExpirationPolicy(pendingKept, kept)).toStrictEqual(kept);
+    expect(mergeExpirationPolicy(pendingKept, expiring)).toStrictEqual(expiring);
+    expect(mergeExpirationPolicy(pendingKept, base)).toStrictEqual(base);
+  });
+
+  it('takes a completion over a pending read that had no claim, without ADDING one', () => {
+    // The pending policy came from a server that predates #3459 (a rollback, or an out-of-order
+    // read). Taking the completed form whole would bring "except pinned messages" back at the same
+    // revision while that older server may still be the one deleting pins.
+    const pending = { ...base, backfillPending: true };
+    expect(mergeExpirationPolicy(pending, kept)).toStrictEqual(base);
+    expect(mergeExpirationPolicy(pending, expiring)).toStrictEqual(base);
+    expect(mergeExpirationPolicy(pending, base)).toStrictEqual(base);
+  });
+
+  it('leaves the revision ordering alone: a newer revision wins with or without the field', () => {
+    expect(mergeExpirationPolicy(kept, { ...base, revision: 5 })).toStrictEqual({
+      ...base,
+      revision: 5,
+    });
+    expect(mergeExpirationPolicy(base, { ...expiring, revision: 5 })).toStrictEqual({
+      ...expiring,
+      revision: 5,
+    });
+    expect(mergeExpirationPolicy(kept, { ...base, revision: 3 })).toStrictEqual(kept);
+  });
+});
+
+describe('updateExpirationPolicy include_pinned (#3459)', () => {
+  const channelPath = `${API_BASE}/api/v1/channels/channel-1/expiration`;
+
+  async function sendAndCapture(request: Parameters<typeof updateExpirationPolicy>[1]) {
+    let body: unknown;
+    server.use(
+      http.patch(channelPath, async ({ request: req }) => {
+        body = await req.json();
+        return HttpResponse.json({ ...policyWire, include_pinned: false, revision: 5 });
+      })
+    );
+    const result = await updateExpirationPolicy({ kind: 'channel', id: 'channel-1' }, request);
+    return { body, result };
+  }
+
+  it.each([true, false])(
+    'puts include_pinned %s on the wire when the caller sent it',
+    async (v) => {
+      const { body, result } = await sendAndCapture({
+        mode: 'set',
+        window_seconds: 86400,
+        retroactive: 'new_only',
+        include_pinned: v,
+      });
+      expect(body).toEqual({
+        mode: 'set',
+        window_seconds: 86400,
+        retroactive: 'new_only',
+        include_pinned: v,
+      });
+      // And the answer's claim reaches the caller, so the OUTCOME of the field is observable.
+      expect(result).toMatchObject({ kind: 'ok', policy: { includePinned: false, revision: 5 } });
+    }
+  );
+
+  it('puts NO include_pinned key on the wire when the caller omitted it (old-server skew)', async () => {
+    const { body } = await sendAndCapture({
+      mode: 'set',
+      window_seconds: 86400,
+      retroactive: 'new_only',
+    });
+    expect(Object.keys(body as object)).not.toContain('include_pinned');
+  });
+
+  it.each([
+    ['null', { mode: 'set', window_seconds: 86400, retroactive: 'new_only', include_pinned: null }],
+    [
+      'a non-boolean',
+      { mode: 'set', window_seconds: 86400, retroactive: 'new_only', include_pinned: 'true' },
+    ],
+    ['on clear', { mode: 'clear', retroactive: 'leave_pending', include_pinned: true }],
+    ['on resume', { mode: 'resume', revision: 4, include_pinned: true }],
+  ])('refuses include_pinned %s before dispatch, sending nothing', async (_name, request) => {
+    let called = false;
+    server.use(
+      http.patch(channelPath, () => {
+        called = true;
+        return HttpResponse.json(policyWire);
+      })
+    );
+    await expect(
+      updateExpirationPolicy({ kind: 'channel', id: 'channel-1' }, request as never)
+    ).resolves.toEqual({ kind: 'rejected', reason: 'invalidRequest' });
+    expect(called).toBe(false);
+  });
+
+  it('sends include_pinned on the DM route too', async () => {
+    let body: unknown;
+    server.use(
+      http.patch(`${API_BASE}/api/v1/dm/conversations/conv-1/expiration`, async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json(policyWire);
+      })
+    );
+    await updateExpirationPolicy(
+      { kind: 'dm', id: 'conv-1' },
+      { mode: 'set', window_seconds: 3600, retroactive: 'apply', include_pinned: true }
+    );
+    expect(body).toMatchObject({ include_pinned: true });
   });
 });
 

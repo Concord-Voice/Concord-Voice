@@ -25,6 +25,22 @@ import {
  *  `loading` deliberately keeps the last known policy instead of blanking: `onRefresh` sets
  *  `loading` before EVERY fetch including the one `connection-recovered` triggers, so a
  *  state-gated clause would blink the retention claim out and back on every reconnect.
+ *
+ *  PINNED MESSAGES (#3459) are a qualifier on the window, appended to the SAME clause:
+ *  "…expire after 24 hours, except pinned messages". They are not a second sentence. One
+ *  fact about what happens to what you are about to send is one sentence, and a second one
+ *  would give a single variant a terminal period no other variant has (the issue's own
+ *  "Pinned messages are kept." example was an "e.g.", and this wording deliberately differs).
+ *
+ *  The qualifier is claimed ONLY from a server-sent `includePinned === false`. `true`, an
+ *  absent field (a server that predates #3459, or a policy the equal-revision merge stripped
+ *  after a rollback) and a missing window all add nothing: pins are never described as kept
+ *  from an unknown, for the same reason `unavailable` never becomes "never expire". It also
+ *  needs a window, because with no timer there is nothing for pins to be excepted from.
+ *
+ *  Ordering is part of the contract: the qualifier follows the window, and the backfill
+ *  qualifier stays LAST ("…, except pinned messages · still processing older messages"),
+ *  because it qualifies the whole claim, including the pin exception.
  */
 export function expirationClause(
   policy: ExpirationPolicy | null,
@@ -40,11 +56,13 @@ export function expirationClause(
   const label = EXPIRATION_WINDOW_LABELS[policy.windowSeconds as ExpirationWindowSeconds];
   if (!label) return null;
 
+  const pins = policy.includePinned === false ? ', except pinned messages' : '';
+
   // `backfillPending` is additive rather than a separate row for the same reason the two
   // rows merged: it is a qualifier on the retention claim, not an independent fact.
   return policy.backfillPending
-    ? ` and expire after ${label} · still processing older messages`
-    : ` and expire after ${label}`;
+    ? ` and expire after ${label}${pins} · still processing older messages`
+    : ` and expire after ${label}${pins}`;
 }
 
 /** The header control's accessible name, and whether its glyph should read as lit.

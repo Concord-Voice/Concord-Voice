@@ -279,7 +279,9 @@ func TestChannelGate_ToggleOffNoCodeIsUnchanged(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var policy map[string]any
 	testhelpers.ParseJSON(t, w, &policy)
-	assert.ElementsMatch(t, []string{"window_seconds", "updated_at", "revision", "backfill_pending"}, slices.Collect(maps.Keys(policy)))
+	// include_pinned is the policy's own field since #3459 (§6.3, always
+	// present); the gate still adds nothing to the body.
+	assert.ElementsMatch(t, []string{"window_seconds", "updated_at", "revision", "backfill_pending", "include_pinned"}, slices.Collect(maps.Keys(policy)))
 	assert.Equal(t, "absent", chanGateBudget(t, ts, f.mod.ID))
 
 	w = ts.DoRequest(http.MethodDelete, pathChannelsPrefix+f.channelID, nil, auth)

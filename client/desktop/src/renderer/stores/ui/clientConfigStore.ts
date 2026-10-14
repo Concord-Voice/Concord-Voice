@@ -55,6 +55,11 @@ export const ServerCapabilitiesSchema = z.object({
      *  `include_pinned` (#3458). Absent on older servers, which delete pins;
      *  the purge dialogs then hide the option and say nothing about pins. */
     purgeKeepsPinned: z.boolean().optional(),
+    /** Whether message-expiration policies carry `include_pinned` (#3459). The
+     *  server always sends it; absent means a server that predates it, which
+     *  400s the field under its closed request schema and mutates nothing. A UX
+     *  gate for the "Include pinned messages" option, not a safety gate. */
+    expirationPinnedPolicySupported: z.boolean().optional(),
   }),
 });
 
@@ -182,4 +187,26 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set, get) 
  *  server, a failed fetch, not yet loaded) reads false. */
 export function usePurgeKeepsPinned(): boolean {
   return useClientConfigStore((s) => s.serverCapabilities?.features.purgeKeepsPinned === true);
+}
+
+/** Whether the connected server is CONFIRMED not to take `include_pinned` on a
+ *  message-expiration policy (#3459): a capabilities payload that parsed and does
+ *  not state `expirationPinnedPolicySupported: true`.
+ *
+ *  Named for the unsafe-to-guess state, not the safe one, and it fails OPEN: a
+ *  capabilities fetch still in flight or failed leaves `serverCapabilities`
+ *  null, which is "we have not been told", so this reads false and the option
+ *  stays available. Reading it the other way (`=== true` to show) would hide a
+ *  safe control behind a transient /server/capabilities blip. It is a UX gate
+ *  only: an older server refuses the field and mutates nothing, and the option
+ *  also needs the policy itself to carry `include_pinned`. Follows the
+ *  `mfaEnforcementCapability` precedent without adding store state. */
+export function isExpirationPinnedPolicyUnsupported(
+  capabilities: ServerCapabilities | null
+): boolean {
+  return capabilities !== null && capabilities.features.expirationPinnedPolicySupported !== true;
+}
+
+export function useExpirationPinnedPolicyUnsupported(): boolean {
+  return useClientConfigStore((s) => isExpirationPinnedPolicyUnsupported(s.serverCapabilities));
 }

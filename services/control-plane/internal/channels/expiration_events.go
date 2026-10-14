@@ -90,26 +90,25 @@ func (h *Handler) broadcastChannelExpirationEvent(channelID string, messageID uu
 	nameCtx, cancelName := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelName()
 	actorUsername, actorDisplayName := expiration.ActorName(nameCtx, h.db, actorUserID)
-	h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
-		Type: wsExpirationEvent,
-		Data: map[string]interface{}{
-			"id":                 messageID.String(),
-			"channel_id":         channelID,
-			"actor_user_id":      actorUserID,
-			"actor_username":     actorUsername,
-			"actor_display_name": actorDisplayName,
-			"kind":               payload.Kind,
-			"window_seconds":     payload.WindowSeconds,
-			"created_at":         payload.ChangedAt.UTC().Format(time.RFC3339),
-			// The policy's own revision travels with the event so the receiving
-			// client can advance its composer indicator in the same tick it renders
-			// the system row. Without it the row would announce a new window beside
-			// a bar still showing the old one until the next fetch. mergeExpirationPolicy
-			// fences on revision, so an out-of-order or replayed event is ignored
-			// rather than regressing the indicator.
-			"revision":         policy.Revision,
-			"updated_at":       expiration.UpdatedAtRFC3339(policy),
-			"backfill_pending": policy.BackfillPending,
-		},
-	})
+	data := map[string]interface{}{
+		"id":                 messageID.String(),
+		"channel_id":         channelID,
+		"actor_user_id":      actorUserID,
+		"actor_username":     actorUsername,
+		"actor_display_name": actorDisplayName,
+		"kind":               payload.Kind,
+		"window_seconds":     payload.WindowSeconds,
+		"created_at":         payload.ChangedAt.UTC().Format(time.RFC3339),
+		// The policy's own revision travels with the event so the receiving
+		// client can advance its composer indicator in the same tick it renders
+		// the system row. Without it the row would announce a new window beside
+		// a bar still showing the old one until the next fetch. mergeExpirationPolicy
+		// fences on revision, so an out-of-order or replayed event is ignored
+		// rather than regressing the indicator.
+		"revision":         policy.Revision,
+		"updated_at":       expiration.UpdatedAtRFC3339(policy),
+		"backfill_pending": policy.BackfillPending,
+	}
+	expiration.AddPinnedEventFields(data, payload, policy)
+	h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{Type: wsExpirationEvent, Data: data})
 }

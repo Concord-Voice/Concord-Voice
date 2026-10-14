@@ -13,6 +13,11 @@
    depend on the text being dimmer than a real message. */
 .expiration-event-message {
   display: flex;
+  /* The pin variants (#3459) lengthen the fact ("Messages now expire after 30 days, except
+     pinned messages"), and the fact used to refuse to shrink, so at a narrow width or 200%
+     scale the attribution was pushed out of the row. Wrapping lets the attribution drop to its
+     own line instead of being clipped or forcing a horizontal scroll. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
@@ -38,7 +43,17 @@
    Do not merge these back into one node, and do not let the actor span outrank the fact. */
 .expiration-event-message__fact {
   font-weight: 600;
-  flex-shrink: 0;
+  /* May shrink and wrap its own text (was `flex-shrink: 0`), with `min-width: 0` so a long
+     fact yields to the container instead of overflowing it. The fact still leads the row in
+     DOM and visual order, which is the anti-spoof property above; wrapping changes how many
+     lines the row takes, never which element comes first. */
+  /* A zero basis, not `auto`: under `flex-wrap` a line breaks on each item's hypothetical
+     size, and with `auto` that was the whole unwrapped sentence (~330px for the longest pin
+     variant), so in a narrow chat column the fact wrapped as a block under the icon and left
+     the icon alone on line one. With a zero basis the icon and the fact always share the
+     first line, the fact wraps its own text, and only the attribution can drop below. */
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .expiration-event-message__actor {

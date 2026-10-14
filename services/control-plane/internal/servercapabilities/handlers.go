@@ -105,6 +105,11 @@ type FeaturesInfo struct {
 	// (#3458). Always true on this build; NOT omitempty, so a client reads its
 	// absence as an older server that deletes pins, and hides the option.
 	PurgeKeepsPinned bool `json:"purgeKeepsPinned"`
+	// Whether the expiration PATCH routes accept include_pinned and a timer
+	// keeps pinned messages by default (#3459 §6.5). Always true on this build;
+	// NOT omitempty. A UX gate, not a safety gate: an older server refuses the
+	// field under its closed schema and mutates nothing.
+	ExpirationPinnedPolicySupported bool `json:"expirationPinnedPolicySupported"`
 	// Whether a server's "Enforce MFA On Dangerous Actions" setting actually
 	// gates the dangerous actions (#3454). NOT omitempty, for the reason
 	// ChunkedAttachmentUpload gives: a server without the gates says false
@@ -173,14 +178,15 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			SAMLEnabled:               false,
 		},
 		Features: FeaturesInfo{
-			VoiceTiersSupported:         instanceType == config.InstanceTypeSaaS,
-			E2EEEnforcedEverywhere:      true,
-			MaxMembersPerServer:         maxMembersPerServer,
-			EntitlementMode:             entitlementMode,
-			ActivityHistorySupported:    activityHistorySupported(h.cfg),
-			ChunkedAttachmentUpload:     h.chunkedAttachmentUpload,
-			PurgeKeepsPinned:            true,
-			MFAEnforcedDangerousActions: h.mfaEnforcedDangerousActions,
+			VoiceTiersSupported:             instanceType == config.InstanceTypeSaaS,
+			E2EEEnforcedEverywhere:          true,
+			MaxMembersPerServer:             maxMembersPerServer,
+			EntitlementMode:                 entitlementMode,
+			ActivityHistorySupported:        activityHistorySupported(h.cfg),
+			ChunkedAttachmentUpload:         h.chunkedAttachmentUpload,
+			PurgeKeepsPinned:                true,
+			ExpirationPinnedPolicySupported: true,
+			MFAEnforcedDangerousActions:     h.mfaEnforcedDangerousActions,
 		},
 		PolicyVersion: policyVersion,
 	}

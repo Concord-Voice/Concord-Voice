@@ -24,6 +24,7 @@ const (
 
 // UpdateExpiration changes a DM conversation's shared message-expiration policy.
 func (h *Handler) UpdateExpiration(c *gin.Context) {
+	started := time.Now()
 	userID, conversationID := c.GetString("user_id"), c.Param("id")
 	conversationUUID, err := uuid.Parse(conversationID)
 	if err != nil {
@@ -54,7 +55,8 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		return
 	}
 
-	if !h.authorizeDMExpirationTx(mutationCtx, c, tx, conversationUUID, userID) {
+	isGroup, ok := h.authorizeDMExpirationTx(mutationCtx, c, tx, conversationUUID, userID)
+	if !ok {
 		return
 	}
 
@@ -76,15 +78,28 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, policy)
 		return
 	}
+	// After a clean commit, in this order (#3459 §8): announce the policy
+	// change, delete the pins that were already due when the conversation
+	// stopped keeping them, then resume any backfill. The deletion runs on the
+	// REQUEST context, never mutationCtx: that 3-second budget bounds the write
+	// transaction, and the expirer bounds its own run.
 	if staged.Present {
 		h.hub.PublishDMRespawn(conversationUUID, respawned)
 		h.broadcastDMExpirationEvent(conversationUUID, staged.MessageID, userID, staged.Payload, policy)
+	}
+	// The deletion and the backfill share one deadline measured from the
+	// handler's start, so the response still goes out inside the server's
+	// write timeout however long the steps before them took.
+	answerCtx, cancel := context.WithDeadline(c.Request.Context(), h.responseDeadline(started))
+	defer cancel()
+	if len(transition.DuePinnedIDs) > 0 {
+		h.pinnedExpirer.ExpireConversationPins(answerCtx, conversationID, isGroup, transition)
 	}
 	if !policy.BackfillPending {
 		c.JSON(http.StatusOK, policy)
 		return
 	}
-	h.respondDMExpirationBackfill(c, service, conversationID, policy)
+	h.respondDMExpirationBackfill(answerCtx, c, service, conversationID, policy)
 }
 
 // bindExpirationRequest applies the byte cap and the strict full-document read
@@ -124,29 +139,31 @@ func (h *Handler) bindExpirationRequest(c *gin.Context) (expiration.Request, boo
 //
 // A non-participant and a missing conversation deliberately return the same
 // 404: distinguishing them would tell a stranger that a conversation exists.
+// It also returns is_group, read under the conversation lock, which names the
+// purge context type a pinned-expiry deletion is audited under.
 func (h *Handler) authorizeDMExpirationTx(
 	ctx context.Context,
 	c *gin.Context,
 	tx *sql.Tx,
 	conversationID uuid.UUID,
 	userID string,
-) bool {
+) (isGroupConversation bool, ok bool) {
 	var isGroup bool
 	if err := tx.QueryRowContext(ctx,
 		`SELECT is_group FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, conversationID,
 	).Scan(&isGroup); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
-			return false
+			return false, false
 		}
 		h.log.Error("Failed to lock DM expiration scope", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
-		return false
+		return false, false
 	}
 	if err := dmvisibility.LockParticipantsForWrite(ctx, tx, conversationID); err != nil {
 		h.log.Error("Failed to lock DM expiration participant visibility", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
-		return false
+		return false, false
 	}
 	var role string
 	if err := tx.QueryRowContext(ctx,
@@ -154,17 +171,17 @@ func (h *Handler) authorizeDMExpirationTx(
 	).Scan(&role); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
-			return false
+			return false, false
 		}
 		h.log.Error("Failed to lock DM expiration participant", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
-		return false
+		return false, false
 	}
 	if isGroup && role != "admin" {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotAdmin})
-		return false
+		return false, false
 	}
-	return true
+	return isGroup, true
 }
 
 // stageDMExpirationEvent writes the durable system row on the SAME transaction
@@ -198,12 +215,13 @@ func (h *Handler) stageDMExpirationEvent(
 // that 3-second budget bounds the write transaction, and the batch runs after
 // the commit.
 func (h *Handler) respondDMExpirationBackfill(
+	ctx context.Context,
 	c *gin.Context,
 	service *expiration.Service,
 	conversationID string,
 	policy expiration.Policy,
 ) {
-	resumed, resumeErr := service.ResumeConversation(c.Request.Context(), conversationID, policy.Revision)
+	resumed, resumeErr := service.ResumeConversation(ctx, conversationID, policy.Revision)
 	resumed, status := expiration.NormalizeResume(policy, resumed, resumeErr)
 	if status == http.StatusServiceUnavailable && !errors.Is(resumeErr, expiration.ErrBackfillPending) {
 		h.log.Error("Failed to resume DM expiration backfill", "error", resumeErr)
@@ -223,4 +241,24 @@ func (h *Handler) writeExpirationStartError(c *gin.Context, err error) {
 		message = errMsgConversationNotFound
 	}
 	c.JSON(status, gin.H{"error": message})
+}
+
+// SetPinnedExpirer wires the terminal that deletes a conversation's
+// already-due pinned messages when its policy stops keeping pins (#3459 §8).
+// The router's requirePinnedExpiryWired refuses to boot without it.
+func (h *Handler) SetPinnedExpirer(e *expiration.ContextExpirer) { h.pinnedExpirer = e }
+
+// HasPinnedExpiryRunner reports whether SetPinnedExpirer was called with a
+// non-nil expirer.
+func (h *Handler) HasPinnedExpiryRunner() bool { return h != nil && h.pinnedExpirer != nil }
+
+// responseDeadline is when the work after a policy commit must stop so the
+// response can still be written: start plus expiration.ResponseBudget, or the
+// budget a test set on the handler.
+func (h *Handler) responseDeadline(start time.Time) time.Time {
+	budget := h.responseBudget
+	if budget <= 0 {
+		budget = expiration.ResponseBudget
+	}
+	return start.Add(budget)
 }

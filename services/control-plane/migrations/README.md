@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000167)
+## Existing Migrations (000001–000168)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -273,10 +273,11 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000161 | version_voice_pending_admissions | Add exact admission and socket identity columns to pending admissions |
 | 000162 | add_step_up_tokens | `step_up_tokens` — single-use, purpose-bound password and WebAuthn step-up tokens, stored as SHA-256 only and spent in the consumer's transaction (#3455, PR #3509) |
 | 000163 | trusted_device_recovery_v2 | `recovery_requests` — hash-only JTI and bound v2 offer/approval/completion context; drain ephemeral ceremonies and guard rollback while live v2 requests remain (#2550, #2621, #2622) |
-| 000164 | message_purges_include_pinned | `message_purges.include_pinned` — whether a purge included pinned messages; DEFAULT TRUE (every earlier purge deleted pins, and expiry still does); the clear reap writes it explicitly, FALSE for a watermark-bounded batch and TRUE for a zero-participant one. An AFTER INSERT trigger mirrors each keep-pins purge into `message_purges_kept_pins`, so the down drops only the column and a re-up restores FALSE from that table (#3458) |
+| 000164 | message_purges_include_pinned | `message_purges.include_pinned` — whether a purge included pinned messages; DEFAULT TRUE (every earlier purge deleted pins); since #3459 the expiry writer writes it explicitly inside its batch transaction, TRUE when the context lets pins expire or a pinned row is among the victims; the clear reap writes it explicitly, FALSE for a watermark-bounded batch and TRUE for a zero-participant one. An AFTER INSERT trigger mirrors each keep-pins purge into `message_purges_kept_pins`, so the down drops only the column and a re-up restores FALSE from that table (#3458) |
 | 000165 | default_friend_requests_mutual_servers | Default future `privacy_settings` rows to Mutual Servers without changing stored choices; drain old control-plane binaries before migration (see deploy runbook) |
 | 000166 | align_presence_and_fof_defaults | Default future Server Voice details to Off, Private Call audience to Friends, and Friends of Friends to On without changing stored choices; same drain and rollback gate |
 | 000167 | add_voice_command_transport | Permanent singleton transport generation and immutable broker provisioning proof; down refuses a provisioned receipt |
+| 000168 | pin_aware_message_expiry | `channels.expiration_include_pinned` and `dm_conversations.expiration_include_pinned` (NOT NULL DEFAULT TRUE, so every existing timer keeps expiring pins), and nullable, unindexed `messages.held_expires_at` / `dm_messages.held_expires_at`: a pinned row in a context that keeps pins carries its would-be stamp there instead of in `expires_at`, so the sweeper never sees it. A permanently NOT VALID CHECK enforces the held shape on new writes; two evidence tables let a down then up restore keep-pins contexts and held stamps without relabelling a context whose policy moved (#3459) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use

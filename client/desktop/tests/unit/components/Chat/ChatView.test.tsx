@@ -807,6 +807,77 @@ describe('ChatView', () => {
     expect(searchBtn).toHaveAttribute('aria-expanded', 'true');
   });
 
+  // #3459 at the CALLER: the clause helper and the panel note are each unit-tested, but only the
+  // owner can fail to hand them the policy. Both cells vary the one input (includePinned) through
+  // the real hook, store and list-row parser.
+  describe.each([
+    [
+      'kept',
+      { expiration_include_pinned: false },
+      'Messages are Encrypted End-to-End and expire after 24 hours, except pinned messages',
+      true,
+    ],
+    [
+      'expiring',
+      { expiration_include_pinned: true },
+      'Messages are Encrypted End-to-End and expire after 24 hours',
+      false,
+    ],
+    [
+      'unsaid (a server that predates #3459)',
+      {},
+      'Messages are Encrypted End-to-End and expire after 24 hours',
+      false,
+    ],
+  ])('pin retention when pins are %s (#3459)', (_name, rowFields, sentence, noteShown) => {
+    it('reaches the composer sentence and the pinned panel note', async () => {
+      const row = {
+        ...mockChannel,
+        expiration_window_seconds: 86400,
+        expiration_updated_at: '2026-09-08T05:00:00.000Z',
+        expiration_revision: 4,
+        expiration_backfill_pending: false,
+        ...rowFields,
+      };
+      useChannelStore.setState({
+        channels: [
+          {
+            ...mockChannel,
+            expirationPolicy: {
+              windowSeconds: 86400 as const,
+              updatedAt: '2026-09-08T05:00:00.000Z',
+              revision: 4,
+              backfillPending: false,
+              ...('expiration_include_pinned' in rowFields
+                ? { includePinned: rowFields.expiration_include_pinned }
+                : {}),
+            },
+          },
+        ],
+        activeChannelId: mockChannel.id,
+      });
+      mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+        if (String(input).includes('/servers/server-1/channels')) {
+          return { ok: true, json: async () => ({ channels: [row] }) } as Response;
+        }
+        return { ok: true, json: async () => ({ messages: [] }) } as Response;
+      });
+      render(<ChatView />);
+      const user = userEvent.setup();
+      await screen.findByText(sentence);
+
+      await user.click(screen.getByRole('button', { name: 'Pinned messages' }));
+      const note = /Pinned messages are kept\. Unpinning one puts it back on the timer/;
+      if (noteShown) {
+        expect(await screen.findByText(note)).toBeInTheDocument();
+      } else {
+        // Gate the negative on the panel having rendered, so "absent" is not "not rendered yet".
+        await screen.findByRole('heading', { name: 'Pinned Messages' });
+        expect(screen.queryByText(note)).not.toBeInTheDocument();
+      }
+    });
+  });
+
   it('opens the header editor for a channel manager and survives a held reopen read', async () => {
     const channel = {
       ...mockChannel,

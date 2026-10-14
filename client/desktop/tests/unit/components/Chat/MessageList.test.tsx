@@ -351,6 +351,51 @@ describe('MessageList', () => {
     };
   }
 
+  // #3459 at the CALLER: the row component is unit-tested with its props handed in by hand, but
+  // only MessageList can fail to read them off the payload. Each cell varies one payload field.
+  describe('expiration system rows carry the pin fields (#3459)', () => {
+    const row = (payload: Record<string, unknown>) => ({
+      ...mockMessage,
+      id: 'evt-1',
+      user_id: 'user-2',
+      content: '',
+      username: 'alice',
+      display_name: 'Alice',
+      type: 'expiration_event',
+      expiration_event_payload: {
+        kind: 'changed',
+        actor_user_id: 'user-2',
+        window_seconds: 86400,
+        changed_at: '2026-09-16T12:00:00.000Z',
+        ...payload,
+      },
+    });
+
+    it.each([
+      [
+        'a pins-only change that keeps pins',
+        { previous_window_seconds: 86400, include_pinned: false },
+        'Pinned messages are now kept',
+      ],
+      [
+        'a pins-only change that lets them expire',
+        { previous_window_seconds: 86400, include_pinned: true },
+        'Pinned messages now expire after 24 hours',
+      ],
+      [
+        'a window change under kept pins',
+        { window_seconds: 604800, previous_window_seconds: 86400, include_pinned: false },
+        'Messages now expire after 7 days, except pinned messages',
+      ],
+      ['a row written before #3459', {}, 'Messages now expire after 24 hours'],
+    ])('renders %s', (_name, payload, fact) => {
+      const { container } = render(
+        <MessageList messages={[row(payload) as never]} currentUserId="user-1" />
+      );
+      expect(container.querySelector('.expiration-event-message__fact')?.textContent).toBe(fact);
+    });
+  });
+
   describe('scroll position preservation', () => {
     let restoreLayout: () => void = () => {};
     // 200px viewport over ten 100px rows: 1000px of content, bottom at 800.
