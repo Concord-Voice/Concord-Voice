@@ -1,8 +1,6 @@
 import React, { useState } from 'react';
 import { Hash, Volume2, Pin, Eraser } from 'lucide-react';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
-import { useServerStore } from '../../stores/chat/serverStore';
-import { hasUnmutedChannel } from '../../stores/ui/notificationPrefsStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import {
   MANAGE_ALL_MESSAGES,
@@ -112,15 +110,8 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
         onClick={() => {
           useUnreadStore.getState().clearUnread(channel.id);
           apiFetch(`/api/v1/channels/${channel.id}/read`, { method: 'POST' }).catch(() => {});
-          // Clear the server dot only when no UNMUTED channel unread remains.
-          // A plain `size === 0` check would leave the dot lit when the only
-          // remaining unreads are muted channels (#84 / epic #1029 close
-          // audit, P2 follow-up).
-          const { unreadCounts } = useUnreadStore.getState();
-          const activeServerId = useServerStore.getState().activeServerId;
-          if (activeServerId && !hasUnmutedChannel(unreadCounts.keys(), activeServerId)) {
-            useUnreadStore.getState().clearServerUnread(activeServerId);
-          }
+          // clearUnread owns the server reconciliation, including eligible
+          // cross-server rows absent from an older retained per-server snapshot.
           onClose();
         }}
       />

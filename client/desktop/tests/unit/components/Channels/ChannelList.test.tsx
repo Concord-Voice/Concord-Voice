@@ -1,4 +1,5 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act } from '../../../test-utils';
+import { renderHook } from '@testing-library/react';
 import ChannelList, {
   parseGapSlot,
   buildGapDropUpdates,
@@ -10,11 +11,23 @@ import { API_BASE } from '@/renderer/config';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
+import {
+  isServerUnreadVisible,
+  useNotificationPrefsStore,
+} from '@/renderer/stores/ui/notificationPrefsStore';
+import { apiFetch } from '@/renderer/services/system/apiClient';
+import { useServerChannelSubscriptions } from '@/renderer/hooks/messaging/useServerChannelSubscriptions';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { mockChannel, mockEncryptedChannel } from '../../../mocks/fixtures';
+import {
+  mockChannel,
+  mockEncryptedChannel,
+  mockServer,
+  mockServer2,
+} from '../../../mocks/fixtures';
 import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/policy/permissions';
 import { vi } from 'vitest';
 import type { Channel, ChannelGroup } from '@/renderer/types/chat';
@@ -23,6 +36,10 @@ import type { Channel, ChannelGroup } from '@/renderer/types/chat';
 vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({ ok: true }),
   API_BASE: 'http://localhost:3001',
+}));
+
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
+  getWebSocketService: () => ({ subscribeServer: vi.fn(), unsubscribeServer: vi.fn() }),
 }));
 
 const mockVoiceChannel: Channel = {
@@ -392,7 +409,8 @@ describe('ChannelList', () => {
         new Map([
           ['channel-1', 5],
           ['channel-2', 3],
-        ])
+        ]),
+        'server-1'
       );
       useUnreadStore.getState().markServerUnread('server-1');
       useNotificationPrefsStore.getState().setMute('channel', 'channel-2', true, null);
@@ -416,7 +434,8 @@ describe('ChannelList', () => {
         new Map([
           ['channel-1', 5],
           ['channel-2', 3],
-        ])
+        ]),
+        'server-1'
       );
       useUnreadStore.getState().markServerUnread('server-1');
       // channel-2 stays unread and unmuted → the dot survives.
@@ -1038,4 +1057,180 @@ describe('buildOldGroupUpdates', () => {
     expect(updates.length).toBe(2);
     expect(updates.every((u) => u.group_id === null)).toBe(true);
   });
+});
+
+describe('ChannelList caller regression (#3773)', () => {
+  beforeEach(() => {
+    useChannelStore.setState(useChannelStore.getInitialState(), true);
+    useUnreadStore.setState(useUnreadStore.getInitialState(), true);
+    resetAllStores();
+    vi.clearAllMocks();
+    vi.mocked(apiFetch).mockReset();
+    useAuthStore.getState().setAccessToken('test-caller-unread-token');
+    useChatStore.setState({ isConnected: true });
+    useChannelStore.setState({
+      fetchChannels: vi.fn(async () => undefined),
+      clearChannelView: vi.fn(),
+    });
+  });
+
+  it.each([false, true])(
+    'keeps eligible A2 visible after the real active-channel read effect (bulk before read: %s)',
+    async (bulkBeforeRead) => {
+      useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: 'server-1' });
+      useChannelStore.setState({ channels: [mockChannel], activeChannelId: null });
+      useUnreadStore.getState().setInitialChannelUnreads([
+        { channelId: 'channel-1', serverId: 'server-1', count: 1 },
+        { channelId: 'channel-b1', serverId: 'server-2', count: 2 },
+      ]);
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerUnread('server-2', true);
+      const bulkData = {
+        server_ids: ['server-1', 'server-2'],
+        channels: [
+          { channel_id: 'channel-1', server_id: 'server-1', unread_count: 1 },
+          { channel_id: 'channel-a2', server_id: 'server-1', unread_count: 3 },
+          { channel_id: 'channel-b1', server_id: 'server-2', unread_count: 2 },
+          { channel_id: 'channel-b-control', server_id: 'server-2', unread_count: 4 },
+        ],
+      };
+      let resolveBulk!: (response: Response) => void;
+      let resolveA!: (response: Response) => void;
+      let resolveB!: (response: Response) => void;
+      const bulk = new Promise<Response>((resolve) => {
+        resolveBulk = resolve;
+      });
+      const serverA = new Promise<Response>((resolve) => {
+        resolveA = resolve;
+      });
+      const serverB = new Promise<Response>((resolve) => {
+        resolveB = resolve;
+      });
+      vi.mocked(apiFetch).mockImplementation((path) => {
+        if (path === '/api/v1/servers/unread-status') return bulk;
+        if (path === '/api/v1/servers/server-1/unread') return serverA;
+        if (path === '/api/v1/servers/server-2/unread') return serverB;
+        if (path === '/api/v1/channels/channel-1/read') return Promise.resolve(new Response('{}'));
+        throw new Error(`Unexpected caller endpoint: ${path}`);
+      });
+      const hook = renderHook(() => useServerChannelSubscriptions());
+      let view: ReturnType<typeof render> | undefined;
+      const visible = (serverId: string) => {
+        const state = useUnreadStore.getState();
+        return isServerUnreadVisible(
+          serverId,
+          state.serverUnreadSet,
+          state.serverUnreadPreciseSet,
+          useNotificationPrefsStore.getState().mutedServers
+        );
+      };
+      try {
+        if (bulkBeforeRead) {
+          await act(async () => {
+            resolveBulk(new Response(JSON.stringify(bulkData)));
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-a2')).toEqual({
+            serverId: 'server-1',
+            count: 3,
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-b-control')).toEqual({
+            serverId: 'server-2',
+            count: 4,
+          });
+          expect(visible('server-1')).toBe(true);
+        }
+        await act(async () => {
+          resolveA(
+            new Response(
+              JSON.stringify({ unreads: [{ channel_id: 'channel-1', unread_count: 1 }] })
+            )
+          );
+        });
+        expect(useUnreadStore.getState().unreadCounts.get('channel-1')).toBe(1);
+        expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+        view = render(
+          <ChannelList
+            onContextMenu={vi.fn()}
+            onEmptyContextMenu={vi.fn()}
+            onCategoryContextMenu={vi.fn()}
+          />
+        );
+        fireEvent.click(screen.getByText('general'));
+        expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
+        expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+        if (bulkBeforeRead) {
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-a2')).toEqual({
+            serverId: 'server-1',
+            count: 3,
+          });
+          expect
+            .soft(
+              visible('server-1'),
+              'ChannelList’s actual read effect must immediately preserve the dot for already known eligible A2'
+            )
+            .toBe(true);
+        } else {
+          expect(visible('server-1')).toBe(false);
+        }
+        expect(apiFetch).toHaveBeenCalledWith('/api/v1/channels/channel-1/read', {
+          method: 'POST',
+        });
+
+        act(() => {
+          useChannelStore.setState({
+            activeChannelId: null,
+            channels: [{ ...mockChannel, id: 'channel-b1', server_id: 'server-2' }],
+          });
+          useServerStore.setState({ activeServerId: 'server-2' });
+        });
+        await act(async () => {
+          resolveB(
+            new Response(
+              JSON.stringify({ unreads: [{ channel_id: 'channel-b1', unread_count: 2 }] })
+            )
+          );
+        });
+        expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-2');
+        expect(visible('server-2')).toBe(true);
+        if (!bulkBeforeRead) {
+          await act(async () => {
+            resolveBulk(new Response(JSON.stringify(bulkData)));
+          });
+        }
+        expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-a2')).toEqual({
+          serverId: 'server-1',
+          count: 3,
+        });
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-b1')).toEqual({
+          serverId: 'server-2',
+          count: 2,
+        });
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-b-control')).toEqual({
+          serverId: 'server-2',
+          count: 4,
+        });
+        expect(visible('server-2')).toBe(true);
+        expect(
+          vi
+            .mocked(apiFetch)
+            .mock.calls.filter(([path]) => path === '/api/v1/servers/unread-status')
+        ).toHaveLength(1);
+        expect(
+          visible('server-1'),
+          bulkBeforeRead
+            ? 'ChannelList’s actual read effect must keep already known eligible A2’s server dot after reading A1'
+            : 'ChannelList’s actual read effect must preserve late eligible A2’s server dot after reading A1'
+        ).toBe(true);
+      } finally {
+        view?.unmount();
+        hook.unmount();
+        await act(async () => {
+          resolveBulk(new Response('{}'));
+          resolveA(new Response('{}'));
+          resolveB(new Response('{}'));
+        });
+      }
+    }
+  );
 });

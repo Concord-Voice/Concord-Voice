@@ -76,8 +76,7 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
         }
         label="Mark All as Read"
         onClick={() => {
-          useUnreadStore.getState().clearAll();
-          useUnreadStore.getState().clearServerUnread(server.id);
+          useUnreadStore.getState().markServerRead(server.id);
           apiFetch(`/api/v1/servers/${server.id}/read`, { method: 'POST' }).catch(() => {});
           onClose();
         }}

@@ -49,6 +49,7 @@ from Server Settings, and members who need it are told how to set it up.
 
 ### Fixed
 
+- **Reading a server's channels clears its unread indicator** (internal development reference omitted) — it stays clear when unread status arrives after a server switch. Mark All as Read clears the selected server; other servers keep their genuine unread indicators.
 - **Voice disconnects wait for media cleanup** (internal development reference omitted, internal development reference omitted) — session authority is released only after the exact native transports are gone or the media worker has stopped. The media service also gains a serial durable-command consumer that retries unfinished enforcement before acknowledging delivery.
 - **Group-DM icons load through authenticated desktop requests** (internal development reference omitted) — Image resources are released when the icon, account, server or view changes.
 - **Verification setup cancels stale returns and confirmations** (internal development reference omitted) — Closing or replacing Settings cancels a pending return from verification setup. A message timer that changes while verification is open now abandons the old confirmation, so it cannot apply a choice made for the previous timer. The staged timer stays available for fresh confirmation unless the new policy already applies it.

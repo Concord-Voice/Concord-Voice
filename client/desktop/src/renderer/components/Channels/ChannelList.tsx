@@ -7,7 +7,6 @@ import { useUnreadStore } from '../../stores/chat/unreadStore';
 import {
   useNotificationPrefsStore,
   isChannelMutedInMaps,
-  hasUnmutedChannel,
 } from '../../stores/ui/notificationPrefsStore';
 import {
   useVoiceStore,
@@ -555,14 +554,8 @@ const ChannelList: React.FC<ChannelListProps> = ({
     clearUnread(activeChannelId);
     apiFetch(`/api/v1/channels/${activeChannelId}/read`, { method: 'POST' }).catch(() => {});
 
-    // If no UNMUTED channel unread remains, clear the server dot too. Checking
-    // `size === 0` alone would leave the dot lit when the only remaining
-    // unreads are muted channels, which must not light the server icon
-    // (#84 / epic #1029 close audit, P2 follow-up).
-    const { unreadCounts: currentCounts } = useUnreadStore.getState();
-    if (activeServerId && !hasUnmutedChannel(currentCounts.keys(), activeServerId)) {
-      useUnreadStore.getState().clearServerUnread(activeServerId);
-    }
+    // clearUnread reconciles the owning server from complete owned data and
+    // newer cross-server counts; the retained generic map can belong elsewhere.
   }, [activeChannelId, activeServerId, clearUnread]);
 
   const handleContextMenu = useCallback(

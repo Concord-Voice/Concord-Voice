@@ -1,5 +1,21 @@
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import {
+  isServerUnreadVisible,
+  useNotificationPrefsStore,
+} from '@/renderer/stores/ui/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
+import { mockServer, mockServer2 } from '../../mocks/fixtures';
+
+function visibleServerUnread(serverId: string): boolean {
+  const { serverUnreadSet, serverUnreadPreciseSet } = useUnreadStore.getState();
+  return isServerUnreadVisible(
+    serverId,
+    serverUnreadSet,
+    serverUnreadPreciseSet,
+    useNotificationPrefsStore.getState().mutedServers
+  );
+}
 
 describe('unreadStore', () => {
   beforeEach(() => {
@@ -53,6 +69,335 @@ describe('unreadStore', () => {
       useUnreadStore.getState().setUnreadCount('channel-1', 5);
       useUnreadStore.getState().clearUnread('channel-1');
       expect(useUnreadStore.getState().unreadCounts.has('channel-1')).toBe(false);
+    });
+
+    it('clears the owning server indicator when its last eligible channel is read (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 3]]), 'server-1');
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerUnread('server-2', true);
+      expect(visibleServerUnread('server-1')).toBe(true);
+
+      useUnreadStore.getState().clearUnread('channel-1');
+
+      expect(useUnreadStore.getState().unreadCounts.has('channel-1')).toBe(false);
+      expect(visibleServerUnread('server-2')).toBe(true);
+      expect(
+        visibleServerUnread('server-1'),
+        'reading the last eligible channel must clear its owning server unread indicator'
+      ).toBe(false);
+    });
+
+    it('keeps the owning indicator when another eligible channel is unread (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(
+        new Map([
+          ['channel-1', 3],
+          ['channel-2', 2],
+        ]),
+        'server-1'
+      );
+      useUnreadStore.getState().markServerUnread('server-1', true);
+
+      useUnreadStore.getState().clearUnread('channel-1');
+
+      expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+      expect(visibleServerUnread('server-1')).toBe(true);
+    });
+
+    it('retains muted residual counts without lighting the owning indicator (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(
+        new Map([
+          ['channel-1', 3],
+          ['channel-2', 2],
+        ]),
+        'server-1'
+      );
+      useNotificationPrefsStore.getState().setMute('channel', 'channel-2', true, null);
+      useUnreadStore.getState().markServerUnread('server-1', true);
+
+      useUnreadStore.getState().clearUnread('channel-1');
+
+      expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+      expect(
+        visibleServerUnread('server-1'),
+        'muted-only residual counts must not keep the read server unread indicator lit'
+      ).toBe(false);
+    });
+
+    it('keeps an explicitly unmuted residual channel visible under server mute (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(
+        new Map([
+          ['channel-1', 3],
+          ['channel-2', 2],
+        ]),
+        'server-1'
+      );
+      useNotificationPrefsStore.getState().setMute('server', 'server-1', true, null);
+      useNotificationPrefsStore.getState().setMute('channel', 'channel-2', false, null);
+      useUnreadStore.getState().markServerUnread('server-1', true, true);
+
+      useUnreadStore.getState().clearUnread('channel-1');
+
+      expect(visibleServerUnread('server-1')).toBe(true);
+      expect(useUnreadStore.getState().serverUnreadChannelWinsSet.has('server-1')).toBe(true);
+      expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+    });
+
+    it('does not clear either server from a channel snapshot with unknown ownership (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-unknown', 1]]));
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerUnread('server-2', true);
+
+      useUnreadStore.getState().clearUnread('channel-unknown');
+
+      expect(visibleServerUnread('server-1')).toBe(true);
+      expect(visibleServerUnread('server-2')).toBe(true);
+    });
+
+    describe('Phase-8 review fixes (#3773)', () => {
+      it.each([false, true])(
+        'keeps a positively owned read conservative without a completed detailed seed (pending: %s)',
+        (seedPending) => {
+          useServerStore.setState({
+            servers: [mockServer, mockServer2],
+            activeServerId: 'server-1',
+          });
+          useUnreadStore.getState().setInitialUnreads(new Map([['channel-b1', 2]]), 'server-2');
+          if (seedPending) useUnreadStore.getState().beginChannelUnreadSeed();
+          // A live positive row establishes A1's owner, but says nothing about
+          // other unread channels in A. B's complete snapshot cannot fill that gap.
+          useUnreadStore.getState().bumpChannelUnread('channel-a1', 'server-1');
+          useUnreadStore.getState().markServerUnread('server-1', true);
+          useUnreadStore.getState().markServerMention('server-1');
+          useUnreadStore.getState().markServerUnread('server-2', true);
+          useUnreadStore.getState().markServerMention('server-2');
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-a1')).toEqual({
+            serverId: 'server-1',
+            count: 1,
+          });
+          expect(visibleServerUnread('server-1')).toBe(true);
+
+          useUnreadStore.getState().clearUnread('channel-a1');
+
+          expect(useUnreadStore.getState().allUnreadCounts.has('channel-a1')).toBe(false);
+          expect(
+            visibleServerUnread('server-1'),
+            'a positive owner without complete A data must not clear A’s unread indicator'
+          ).toBe(true);
+          expect(
+            useUnreadStore.getState().serverMentionSet.has('server-1'),
+            'a positive owner without complete A data must not clear A’s mention indicator'
+          ).toBe(true);
+          expect(useUnreadStore.getState().unreadCounts.get('channel-b1')).toBe(2);
+          expect(visibleServerUnread('server-2')).toBe(true);
+          expect(useUnreadStore.getState().serverMentionSet.has('server-2')).toBe(true);
+        }
+      );
+    });
+
+    it('does not use a departing channel to clear another server owning the active snapshot (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-2', 2]]), 'server-2');
+      useUnreadStore.getState().setInitialChannelUnreads([
+        { channelId: 'channel-1', serverId: 'server-1', count: 1 },
+        { channelId: 'channel-2', serverId: 'server-2', count: 2 },
+      ]);
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerUnread('server-2', true);
+
+      useUnreadStore.getState().clearUnread('channel-1');
+
+      expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-2');
+      expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+      expect(visibleServerUnread('server-2')).toBe(true);
+    });
+
+    it('preserves the retained snapshot owner when a newly active server channel is read (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map(), 'server-1');
+      // B is active while its snapshot is pending. A's older snapshot remains,
+      // and the live active-channel increment does not change that ownership.
+      useServerStore.setState({ activeServerId: 'server-2' });
+      useUnreadStore.getState().bumpChannelUnread('channel-a2', 'server-1');
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerMention('server-1');
+      useUnreadStore.getState().bumpChannelUnread('channel-b2', 'server-2');
+      useUnreadStore.getState().incrementUnread('channel-b2');
+      expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+      expect(useUnreadStore.getState().unreadCounts.get('channel-b2')).toBe(1);
+      expect(visibleServerUnread('server-1')).toBe(true);
+      expect(useUnreadStore.getState().serverMentionSet.has('server-1')).toBe(true);
+
+      useUnreadStore.getState().clearUnread('channel-b2');
+
+      expect(useUnreadStore.getState().allUnreadCounts.has('channel-b2')).toBe(false);
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-a2')).toEqual({
+        serverId: 'server-1',
+        count: 1,
+      });
+      expect
+        .soft(
+          visibleServerUnread('server-1'),
+          'reading newly active B must not erase the retained snapshot owner A unread indicator'
+        )
+        .toBe(true);
+      expect
+        .soft(
+          useUnreadStore.getState().serverMentionSet.has('server-1'),
+          'reading newly active B must not erase unread mentions in the retained snapshot owner A'
+        )
+        .toBe(true);
+    });
+
+    it('does not assign an unscoped count to the retained snapshot owner when it is read (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map(), 'server-1');
+      // This generic writer has no server argument, and the old snapshot never
+      // contained the channel. Its later presence supplies no ownership proof.
+      useUnreadStore.getState().setUnreadCount('channel-unknown', 1);
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerMention('server-1');
+      expect(useUnreadStore.getState().allUnreadCounts.has('channel-unknown')).toBe(false);
+      expect(visibleServerUnread('server-1')).toBe(true);
+
+      useUnreadStore.getState().clearUnread('channel-unknown');
+
+      expect(useUnreadStore.getState().unreadCounts.has('channel-unknown')).toBe(false);
+      expect
+        .soft(
+          visibleServerUnread('server-1'),
+          'reading an unscoped channel must not erase the retained snapshot owner unread indicator'
+        )
+        .toBe(true);
+      expect
+        .soft(
+          useUnreadStore.getState().serverMentionSet.has('server-1'),
+          'reading an unscoped channel must not erase the retained snapshot owner unread mentions'
+        )
+        .toBe(true);
+    });
+
+    it('keeps newer background unread in the same server when its older snapshot channel is read (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-a1', 1]]), 'server-1');
+      useUnreadStore
+        .getState()
+        .setInitialChannelUnreads([{ channelId: 'channel-a1', serverId: 'server-1', count: 1 }]);
+      useServerStore.setState({ activeServerId: 'server-2' });
+      useUnreadStore.getState().bumpChannelUnread('channel-a2', 'server-1');
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerMention('server-1');
+      expect(useUnreadStore.getState().unreadCounts.has('channel-a2')).toBe(false);
+      expect(visibleServerUnread('server-1')).toBe(true);
+
+      useUnreadStore.getState().clearUnread('channel-a1');
+
+      expect(useUnreadStore.getState().unreadCounts.size).toBe(0);
+      expect(useUnreadStore.getState().allUnreadCounts.has('channel-a1')).toBe(false);
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-a2')).toEqual({
+        serverId: 'server-1',
+        count: 1,
+      });
+      expect
+        .soft(
+          visibleServerUnread('server-1'),
+          'reading an older snapshot channel must retain newer same-server background unread visibility'
+        )
+        .toBe(true);
+      expect
+        .soft(
+          useUnreadStore.getState().serverMentionSet.has('server-1'),
+          'reading an older snapshot channel must retain newer same-server background unread mentions'
+        )
+        .toBe(true);
+    });
+
+    it('clears the owned server when its last unread exists only in cross-server counts (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map(), 'server-1');
+      // A's authoritative empty snapshot remains while B's fetch is pending.
+      // A's background arrival is positively tagged, without a generic count.
+      useServerStore.setState({ activeServerId: 'server-2' });
+      useUnreadStore.getState().bumpChannelUnread('channel-a2', 'server-1');
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerMention('server-1');
+      useUnreadStore.getState().bumpChannelUnread('channel-b1', 'server-2');
+      useUnreadStore.getState().incrementUnread('channel-b1');
+      useUnreadStore.getState().markServerUnread('server-2', true);
+      useUnreadStore.getState().incrementMention('channel-b1');
+      useUnreadStore.getState().markServerMention('server-2');
+      expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+      expect(useUnreadStore.getState().unreadCounts.has('channel-a2')).toBe(false);
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-a2')).toEqual({
+        serverId: 'server-1',
+        count: 1,
+      });
+      expect(visibleServerUnread('server-1')).toBe(true);
+      expect(visibleServerUnread('server-2')).toBe(true);
+      expect(useUnreadStore.getState().serverMentionSet.has('server-1')).toBe(true);
+
+      useUnreadStore.getState().clearUnread('channel-a2');
+
+      expect(useUnreadStore.getState().allUnreadCounts.has('channel-a2')).toBe(false);
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-b1')).toEqual({
+        serverId: 'server-2',
+        count: 1,
+      });
+      expect(useUnreadStore.getState().unreadCounts.get('channel-b1')).toBe(1);
+      expect(useUnreadStore.getState().mentionCounts.get('channel-b1')).toBe(1);
+      expect(visibleServerUnread('server-2')).toBe(true);
+      expect(useUnreadStore.getState().serverMentionSet.has('server-2')).toBe(true);
+      expect
+        .soft(
+          visibleServerUnread('server-1'),
+          'reading the last positively owned cross-server count must clear its server indicator'
+        )
+        .toBe(false);
+      expect
+        .soft(
+          useUnreadStore.getState().serverMentionSet.has('server-1'),
+          'reading the last positively owned cross-server count must clear its server mention indicator'
+        )
+        .toBe(false);
+    });
+
+    it('clears the read server despite a foreign live channel in its retained snapshot map (#3773)', () => {
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-a1', 1]]), 'server-1');
+      useUnreadStore
+        .getState()
+        .setInitialChannelUnreads([{ channelId: 'channel-a1', serverId: 'server-1', count: 1 }]);
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().incrementMention('channel-a1');
+      useUnreadStore.getState().markServerMention('server-1');
+
+      // B's live channel enters the generic map before B's owning fetch lands.
+      // Its cross-server entry positively identifies it as foreign to A.
+      useServerStore.setState({ activeServerId: 'server-2' });
+      useUnreadStore.getState().bumpChannelUnread('channel-b1', 'server-2');
+      useUnreadStore.getState().incrementUnread('channel-b1');
+      useUnreadStore.getState().markServerUnread('server-2', true);
+      expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+      expect(useUnreadStore.getState().unreadCounts.get('channel-b1')).toBe(1);
+      expect(visibleServerUnread('server-1')).toBe(true);
+      expect(visibleServerUnread('server-2')).toBe(true);
+      expect(useUnreadStore.getState().serverMentionSet.has('server-1')).toBe(true);
+
+      useUnreadStore.getState().clearUnread('channel-a1');
+
+      expect(useUnreadStore.getState().allUnreadCounts.has('channel-a1')).toBe(false);
+      expect(useUnreadStore.getState().mentionCounts.has('channel-a1')).toBe(false);
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-b1')).toEqual({
+        serverId: 'server-2',
+        count: 1,
+      });
+      expect(useUnreadStore.getState().unreadCounts.get('channel-b1')).toBe(1);
+      expect(visibleServerUnread('server-2')).toBe(true);
+      expect
+        .soft(
+          visibleServerUnread('server-1'),
+          'a positively identified foreign unread channel must not keep the read server indicator lit'
+        )
+        .toBe(false);
+      expect
+        .soft(
+          useUnreadStore.getState().serverMentionSet.has('server-1'),
+          'a positively identified foreign unread channel must not retain the read server mention indicator'
+        )
+        .toBe(false);
     });
   });
 

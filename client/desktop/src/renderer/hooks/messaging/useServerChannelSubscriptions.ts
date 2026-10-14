@@ -110,7 +110,7 @@ export function useServerChannelSubscriptions() {
   // Server subscriptions are long-lived (persist until WS disconnect or server leave).
   // The ref-based diffing handles additions/removals without full unsubscribe cycles.
   // No cleanup unsubscribe — WS reconnect resubscribes via resubscribeChannels(),
-  // and logout disconnects the WS entirely. Removing cleanup prevents StrictMode
+  // and logout disconnects the WS entirely. Retaining subscriptions prevents StrictMode
   // double-mount from causing 3x subscribe/unsubscribe thrashing (~60 events → ~17).
   const unreadsFetchedRef = useRef(false);
   // Generation fence for the bulk seed. `unreadsFetchedRef` is a latch, not an
@@ -121,6 +121,17 @@ export function useServerChannelSubscriptions() {
   // `channelUnreadDirty`, after which the newer one overwrites every local
   // change the fence existed to protect. Only the newest request may commit.
   const unreadSeedGenerationRef = useRef(0);
+
+  // End HTTP continuations on unmount without ending the retained WS rooms.
+  // This cleanup is independent of membership-effect reruns. StrictMode also
+  // replays it, so release the latch to let its next setup start a live request.
+  useEffect(
+    () => () => {
+      unreadSeedGenerationRef.current += 1;
+      unreadsFetchedRef.current = false;
+    },
+    []
+  );
 
   useEffect(() => {
     if (!isConnected || servers.length === 0) {
@@ -156,9 +167,11 @@ export function useServerChannelSubscriptions() {
       // unread_notify that lands, while this is in flight is fresher than the
       // snapshot the server is computing, and must survive the seed.
       const seedGeneration = (unreadSeedGenerationRef.current += 1);
-      useUnreadStore.getState().beginChannelUnreadSeed();
+      const seedId = useUnreadStore.getState().beginChannelUnreadSeed(currentServerIds);
       (async () => {
-        const isCurrentSeed = () => seedGeneration === unreadSeedGenerationRef.current;
+        const isCurrentSeed = () =>
+          seedGeneration === unreadSeedGenerationRef.current &&
+          seedId === useUnreadStore.getState().channelUnreadSeedRequest?.id;
         try {
           const res = await apiFetch('/api/v1/servers/unread-status');
           if (!isCurrentSeed()) return;
@@ -207,7 +220,7 @@ export function useServerChannelSubscriptions() {
               unreadsFetchedRef.current = false;
               return;
             }
-            useUnreadStore.getState().setInitialChannelUnreads(seedRows, true);
+            useUnreadStore.getState().setInitialChannelUnreads(seedRows, true, knownServerIds);
           }
           // KNOWN CEILING (#84 / epic #1029 close audit): the server does not
           // filter /servers/unread-status by mute, so a background server whose
@@ -221,9 +234,14 @@ export function useServerChannelSubscriptions() {
           // through isChannelMutedInMaps at compute time. What remains is that
           // `server_ids` — this line's input — is still a mute-unaware boolean
           // per server. So the ceiling now bites the DOT only, not the badge.
-          // Deriving the dot from `channels` here would close it for real, and is
+          // Deriving EVERY dot from `channels` would close it for real, and is
           // deliberately out of scope: it changes #84's behaviour, not #2403's.
-          setInitialServerUnreads(data.server_ids || []);
+          // The store reconsiders only pending channel reads from complete merged
+          // detail, so an A1 read cannot hide untouched eligible A2 (#3773).
+          // Keep the mutation fence for the active correction below too:
+          // retained counts must not undo a newer local read or arrival.
+          const locallyChangedServers = useUnreadStore.getState().serverUnreadDirty;
+          setInitialServerUnreads(data.server_ids || [], true);
 
           // Reconcile the ACTIVE server against its own per-channel data.
           // This bulk seed is mute-UNAWARE and races the active server's
@@ -237,7 +255,11 @@ export function useServerChannelSubscriptions() {
           // (#84 / epic #1029 close audit, P2 review follow-up).
           const activeId = useServerStore.getState().activeServerId;
           const { unreadCounts, unreadCountsServerId } = useUnreadStore.getState();
-          if (activeId && unreadCountsServerId === activeId) {
+          if (
+            activeId &&
+            unreadCountsServerId === activeId &&
+            !locallyChangedServers.has(activeId)
+          ) {
             if (hasUnmutedChannel(unreadCounts.keys(), activeId)) {
               useUnreadStore.getState().markServerUnread(activeId, true);
             } else {
@@ -280,14 +302,27 @@ export function useServerChannelSubscriptions() {
 
     // Guard against stale responses from rapid server switches or WS reconnects.
     let aborted = false;
+    // A whole-server read retires requests begun before it even after the bulk
+    // seed consumes its row fence. Capture this server's read authority and the
+    // global reset identity independently of unrelated bulk windows/retries.
+    const { unreadResetId, serverReadVersions } = useUnreadStore.getState();
+    const serverReadVersion = serverReadVersions.get(activeServerId);
+    const isCurrentRead = () => {
+      const state = useUnreadStore.getState();
+      return (
+        !aborted &&
+        state.unreadResetId === unreadResetId &&
+        state.serverReadVersions.get(activeServerId) === serverReadVersion
+      );
+    };
 
     const fetchUnreads = async () => {
       try {
         const res = await apiFetch(`/api/v1/servers/${activeServerId}/unread`);
-        if (aborted) return;
+        if (!isCurrentRead()) return;
         if (res.ok) {
           const data = await res.json();
-          if (aborted) return;
+          if (!isCurrentRead()) return;
           const counts = new Map<string, number>();
 
           // Filter out the currently active channel — user is already viewing it,

@@ -1,10 +1,16 @@
-import { renderHook, act } from '@testing-library/react';
+import { StrictMode, createElement, useEffect } from 'react';
+import { render as bareRender, renderHook, act } from '@testing-library/react';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
-import { mockServer, mockServer2 } from '../../mocks/fixtures';
+import {
+  isServerUnreadVisible,
+  useNotificationPrefsStore,
+} from '@/renderer/stores/ui/notificationPrefsStore';
+import { resetAllStores } from '../../helpers/store-helpers';
+import { mockChannel, mockServer, mockServer2 } from '../../mocks/fixtures';
 
 // Mock websocketService
 const mockSubscribeServer = vi.fn();
@@ -24,20 +30,32 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
 
 import { useServerChannelSubscriptions } from '@/renderer/hooks/messaging/useServerChannelSubscriptions';
 
+function visibleServerUnread(serverId: string): boolean {
+  const { serverUnreadSet, serverUnreadPreciseSet } = useUnreadStore.getState();
+  return isServerUnreadVisible(
+    serverId,
+    serverUnreadSet,
+    serverUnreadPreciseSet,
+    useNotificationPrefsStore.getState().mutedServers
+  );
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((fulfill) => {
+    resolve = fulfill;
+  });
+  return { promise, resolve };
+}
+
 describe('useServerChannelSubscriptions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useServerStore.setState({ servers: [], activeServerId: null });
-    useChatStore.setState({ isConnected: false });
-    useChannelStore.setState({ activeChannelId: null });
-    useUnreadStore.setState({
-      unreadCounts: new Map(),
-      unreadCountsServerId: null,
-      serverUnreadSet: new Set(),
-      serverUnreadPreciseSet: new Set(),
-      serverUnreadChannelWinsSet: new Set(),
-    });
-    useNotificationPrefsStore.getState().clearAll();
+    mockApiFetch.mockReset();
+    // Older cases replace store actions with spies; clearing their call history
+    // does not restore the real actions needed by the behavioral regressions.
+    useUnreadStore.setState(useUnreadStore.getInitialState(), true);
+    resetAllStores();
     mockApiFetch.mockResolvedValue({
       ok: true,
       json: async () => ({ server_ids: [], unreads: [] }),
@@ -622,5 +640,812 @@ describe('useServerChannelSubscriptions', () => {
     expect(setInitialChannelUnreads).toHaveBeenCalledTimes(1);
     const [rows] = setInitialChannelUnreads.mock.calls[0];
     expect(rows).toEqual([{ channelId: 'channel-1', serverId: 'server-1', count: 4 }]);
+  });
+
+  describe('Phase-8 review fixes (#3773)', () => {
+    const staleSeed = {
+      server_ids: ['server-1'],
+      channels: [
+        { channel_id: 'channel-1', server_id: 'server-1', unread_count: 9 },
+        { channel_id: 'channel-ended-only', server_id: 'server-1', unread_count: 7 },
+      ],
+    };
+    const currentSeed = {
+      server_ids: ['server-1', 'server-2'],
+      channels: [
+        { channel_id: 'channel-1', server_id: 'server-1', unread_count: 1 },
+        { channel_id: 'channel-2', server_id: 'server-2', unread_count: 2 },
+        { channel_id: 'channel-current-control', server_id: 'server-2', unread_count: 4 },
+      ],
+    };
+
+    function seedLocalUnreads(withSnapshot = true) {
+      if (withSnapshot) {
+        useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 1]]), 'server-1');
+      }
+      useUnreadStore.getState().setInitialChannelUnreads([
+        { channelId: 'channel-1', serverId: 'server-1', count: 1 },
+        { channelId: 'channel-2', serverId: 'server-2', count: 2 },
+      ]);
+      useUnreadStore.getState().markServerUnread('server-1', true);
+      useUnreadStore.getState().markServerUnread('server-2', true);
+    }
+
+    it('clears A’s last eligible unread after a complete bulk seed while B’s snapshot is retained', async () => {
+      useChatStore.setState({ isConnected: true });
+      useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: 'server-2' });
+      useChannelStore.setState({
+        activeChannelId: 'channel-viewed-2',
+        channels: [
+          { ...mockChannel, id: 'channel-2', server_id: 'server-2' },
+          { ...mockChannel, id: 'channel-viewed-2', server_id: 'server-2' },
+        ],
+      });
+      const bulk = deferred<unknown>();
+      const firstServer = deferred<unknown>();
+      const firstServerBody = vi.fn(async () => ({ unreads: [] }));
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path === '/api/v1/servers/unread-status') return bulk.promise;
+        if (path === '/api/v1/servers/server-1/unread') return firstServer.promise;
+        if (path === '/api/v1/servers/server-2/unread') {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ unreads: [{ channel_id: 'channel-2', unread_count: 2 }] }),
+          });
+        }
+        throw new Error(`Unexpected unread endpoint: ${path}`);
+      });
+      const { unmount } = renderHook(() => useServerChannelSubscriptions());
+      try {
+        await vi.waitFor(() => {
+          expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+          expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-2');
+        });
+        await act(async () => {
+          bulk.resolve({ ok: true, json: async () => currentSeed });
+        });
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-1')).toEqual({
+          serverId: 'server-1',
+          count: 1,
+        });
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-current-control')).toEqual({
+          serverId: 'server-2',
+          count: 4,
+        });
+        expect(visibleServerUnread('server-1')).toBe(true);
+        expect(visibleServerUnread('server-2')).toBe(true);
+
+        act(() => {
+          useUnreadStore.getState().incrementMention('channel-1');
+          useUnreadStore.getState().markServerMention('server-1');
+          useUnreadStore.getState().incrementMention('channel-2');
+          useUnreadStore.getState().markServerMention('server-2');
+          useServerStore.setState({ activeServerId: 'server-1' });
+          useChannelStore.setState({
+            activeChannelId: 'channel-viewed-1',
+            channels: [mockChannel, { ...mockChannel, id: 'channel-viewed-1' }],
+          });
+        });
+        expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/servers/server-1/unread');
+        expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-2');
+        expect(firstServerBody).not.toHaveBeenCalled();
+        act(() => {
+          useUnreadStore.getState().clearUnread('channel-1');
+        });
+
+        expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+        expect(useUnreadStore.getState().mentionCounts.has('channel-1')).toBe(false);
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-2')).toEqual({
+          serverId: 'server-2',
+          count: 2,
+        });
+        expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+        expect(useUnreadStore.getState().mentionCounts.get('channel-2')).toBe(1);
+        expect(visibleServerUnread('server-2')).toBe(true);
+        expect(useUnreadStore.getState().serverMentionSet.has('server-2')).toBe(true);
+        expect
+          .soft(
+            visibleServerUnread('server-1'),
+            'reading A’s last eligible unread after a complete seed must clear A’s dot while B owns the snapshot'
+          )
+          .toBe(false);
+        expect
+          .soft(
+            useUnreadStore.getState().serverMentionSet.has('server-1'),
+            'reading A’s last eligible unread after a complete seed must clear A’s mention while B owns the snapshot'
+          )
+          .toBe(false);
+      } finally {
+        unmount();
+        await act(async () => {
+          firstServer.resolve({ ok: true, json: firstServerBody });
+        });
+      }
+    });
+
+    it.each(['response', 'JSON body'])(
+      'retires a bulk continuation on unmount during its %s without a successor request',
+      async (awaitBoundary) => {
+        useChatStore.setState({ isConnected: true });
+        useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: null });
+        seedLocalUnreads();
+        const response = deferred<unknown>();
+        const body = deferred<unknown>();
+        const parseBody = vi.fn(() => body.promise);
+        mockApiFetch.mockReturnValue(response.promise);
+        const { unmount } = renderHook(() => useServerChannelSubscriptions());
+        if (awaitBoundary === 'JSON body') {
+          await act(async () => {
+            response.resolve({ ok: true, json: parseBody });
+          });
+          expect(parseBody).toHaveBeenCalledTimes(1);
+        }
+        unmount();
+        expect(mockUnsubscribeServer).not.toHaveBeenCalled();
+
+        await act(async () => {
+          response.resolve({ ok: true, json: async () => staleSeed });
+          body.resolve(staleSeed);
+        });
+
+        expect(mockApiFetch).toHaveBeenCalledTimes(1);
+        expect
+          .soft(
+            useUnreadStore.getState().allUnreadCounts.has('channel-ended-only'),
+            'an unmounted bulk continuation must not write a channel seed without a successor request'
+          )
+          .toBe(false);
+        expect
+          .soft(
+            useUnreadStore.getState().allUnreadCounts.get('channel-2'),
+            'an unmounted bulk continuation must preserve B’s genuine unread count'
+          )
+          .toEqual({ serverId: 'server-2', count: 2 });
+        expect
+          .soft(
+            visibleServerUnread('server-2'),
+            'an unmounted bulk continuation must not replace the surviving server seed'
+          )
+          .toBe(true);
+      }
+    );
+
+    it.each(['ended-first', 'current-first'])(
+      'preserves the current bulk request’s local-read fence across remount (%s)',
+      async (responseOrder) => {
+        useChatStore.setState({ isConnected: true });
+        useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: null });
+        seedLocalUnreads();
+        const ended = deferred<unknown>();
+        const current = deferred<unknown>();
+        mockApiFetch.mockReturnValueOnce(ended.promise).mockReturnValueOnce(current.promise);
+        const oldHook = renderHook(() => useServerChannelSubscriptions());
+        oldHook.unmount();
+        expect(mockUnsubscribeServer).not.toHaveBeenCalled();
+        const currentHook = renderHook(() => useServerChannelSubscriptions());
+        expect(mockApiFetch).toHaveBeenCalledTimes(2);
+        act(() => {
+          useUnreadStore.getState().clearUnread('channel-1');
+        });
+        expect(visibleServerUnread('server-1')).toBe(false);
+        expect(visibleServerUnread('server-2')).toBe(true);
+        try {
+          for (const request of responseOrder === 'ended-first'
+            ? ['ended', 'current']
+            : ['current', 'ended']) {
+            await act(async () => {
+              if (request === 'ended') ended.resolve({ ok: true, json: async () => staleSeed });
+              else current.resolve({ ok: true, json: async () => currentSeed });
+            });
+            if (request === 'current') {
+              expect(
+                useUnreadStore.getState().allUnreadCounts.get('channel-current-control'),
+                'the current bulk response must commit before checking for a stale overwrite'
+              ).toEqual({ serverId: 'server-2', count: 4 });
+            }
+            expect
+              .soft(
+                useUnreadStore.getState().allUnreadCounts.has('channel-ended-only'),
+                'a remounted bulk owner must reject the ended instance’s channel seed in either response order'
+              )
+              .toBe(false);
+            expect
+              .soft(
+                visibleServerUnread('server-2'),
+                'a remounted bulk owner must reject the ended instance’s server seed in either response order'
+              )
+              .toBe(true);
+          }
+          expect
+            .soft(
+              useUnreadStore.getState().allUnreadCounts.has('channel-1'),
+              'the ended request must not consume the surviving request’s read fence or resurrect A1'
+            )
+            .toBe(false);
+          expect
+            .soft(
+              visibleServerUnread('server-1'),
+              'the ended request must not consume the surviving request’s read fence or resurrect A’s dot'
+            )
+            .toBe(false);
+          expect
+            .soft(
+              useUnreadStore.getState().allUnreadCounts.get('channel-current-control'),
+              'the current request must commit its positive channel control after remount'
+            )
+            .toEqual({ serverId: 'server-2', count: 4 });
+          expect
+            .soft(useUnreadStore.getState().allUnreadCounts.get('channel-2'))
+            .toEqual({ serverId: 'server-2', count: 2 });
+        } finally {
+          currentHook.unmount();
+          await act(async () => {
+            ended.resolve({ ok: true, json: async () => staleSeed });
+            current.resolve({ ok: true, json: async () => currentSeed });
+          });
+        }
+      }
+    );
+
+    it.each(['unread reset while mounted', 'account transition after unmount'])(
+      'rejects pre-reset unread metadata after %s',
+      async (transition) => {
+        useAuthStore.getState().setAccessToken('test-account-a-token');
+        useChatStore.setState({ isConnected: true });
+        useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: null });
+        seedLocalUnreads();
+        const ended = deferred<unknown>();
+        const current = deferred<unknown>();
+        mockApiFetch.mockReturnValueOnce(ended.promise).mockReturnValueOnce(current.promise);
+        const oldHook = renderHook(() => useServerChannelSubscriptions());
+        act(() => {
+          useUnreadStore.getState().clearAll();
+        });
+        if (transition === 'account transition after unmount') {
+          oldHook.unmount();
+          act(() => {
+            useAuthStore.getState().setAccessToken('test-account-b-token');
+          });
+        }
+        // No connection or membership change and no successor request: clearAll
+        // itself must retire the old request, including while this hook is mounted.
+        expect(mockApiFetch).toHaveBeenCalledTimes(1);
+        expect(useUnreadStore.getState().allUnreadCounts.size).toBe(0);
+        await act(async () => {
+          ended.resolve({ ok: true, json: async () => staleSeed });
+        });
+        expect
+          .soft(
+            useUnreadStore.getState().allUnreadCounts.has('channel-ended-only'),
+            'a pre-reset bulk request must not restore prior-account channel metadata after clearAll'
+          )
+          .toBe(false);
+        expect
+          .soft(
+            visibleServerUnread('server-1'),
+            'a pre-reset bulk request must not restore prior-account server unread metadata after clearAll'
+          )
+          .toBe(false);
+
+        oldHook.unmount();
+        const currentHook = renderHook(() => useServerChannelSubscriptions());
+        try {
+          await act(async () => {
+            current.resolve({ ok: true, json: async () => currentSeed });
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-current-control')).toEqual({
+            serverId: 'server-2',
+            count: 4,
+          });
+          expect(visibleServerUnread('server-1')).toBe(true);
+          expect(visibleServerUnread('server-2')).toBe(true);
+          expect(mockUnsubscribeServer).not.toHaveBeenCalled();
+        } finally {
+          currentHook.unmount();
+        }
+      }
+    );
+
+    it('commits the surviving bulk response under actual StrictMode replay and retains subscriptions', async () => {
+      useChatStore.setState({ isConnected: true });
+      useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: null });
+      seedLocalUnreads();
+      const requests: Array<ReturnType<typeof deferred>> = [];
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path !== '/api/v1/servers/unread-status') {
+          throw new Error(`Unexpected unread endpoint: ${path}`);
+        }
+        const request = deferred<unknown>();
+        requests.push(request);
+        return request.promise;
+      });
+      const replay: string[] = [];
+      function Probe() {
+        useServerChannelSubscriptions();
+        useEffect(() => {
+          replay.push('setup');
+          return () => {
+            replay.push('cleanup');
+          };
+        }, []);
+        return null;
+      }
+      const { unmount } = bareRender(createElement(StrictMode, null, createElement(Probe)));
+      try {
+        expect(
+          replay,
+          'the fixture must execute setup, cleanup, setup under top-level StrictMode'
+        ).toEqual(['setup', 'cleanup', 'setup']);
+        expect(requests.length).toBeGreaterThan(0);
+        act(() => {
+          useUnreadStore.getState().clearUnread('channel-1');
+        });
+        await act(async () => {
+          for (const request of requests.slice(0, -1)) {
+            request.resolve({ ok: true, json: async () => staleSeed });
+          }
+          requests[requests.length - 1].resolve({ ok: true, json: async () => currentSeed });
+        });
+        expect(
+          useUnreadStore.getState().allUnreadCounts.get('channel-current-control'),
+          'StrictMode cleanup must leave a surviving bulk response able to commit'
+        ).toEqual({ serverId: 'server-2', count: 4 });
+        expect(useUnreadStore.getState().allUnreadCounts.has('channel-ended-only')).toBe(false);
+        expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+        expect(visibleServerUnread('server-1')).toBe(false);
+        expect(visibleServerUnread('server-2')).toBe(true);
+        expect(mockSubscribeServer).toHaveBeenCalledWith('server-1');
+        expect(mockSubscribeServer).toHaveBeenCalledWith('server-2');
+        expect(mockUnsubscribeServer).not.toHaveBeenCalled();
+      } finally {
+        unmount();
+      }
+      expect(mockUnsubscribeServer).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { mute: 'unmuted', expectedVisible: true },
+      { mute: 'muted-only', expectedVisible: false },
+      { mute: 'explicitly unmuted under server mute', expectedVisible: true },
+    ])(
+      'shows untouched A2 discovered after reading A1 and switching to B ($mute)',
+      async ({ mute, expectedVisible }) => {
+        useChatStore.setState({ isConnected: true });
+        useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: 'server-1' });
+        useChannelStore.setState({
+          activeChannelId: 'channel-viewed-1',
+          channels: [mockChannel, { ...mockChannel, id: 'channel-viewed-1' }],
+        });
+        seedLocalUnreads(false);
+        if (mute === 'muted-only') {
+          useNotificationPrefsStore.getState().setMute('channel', 'channel-new-a2', true, null);
+        } else if (mute === 'explicitly unmuted under server mute') {
+          useNotificationPrefsStore.getState().setMute('server', 'server-1', true, null);
+          useNotificationPrefsStore.getState().setMute('channel', 'channel-1', false, null);
+          useNotificationPrefsStore.getState().setMute('channel', 'channel-new-a2', false, null);
+        }
+        const bulk = deferred<unknown>();
+        mockApiFetch.mockImplementation((path: string) => {
+          if (path === '/api/v1/servers/unread-status') return bulk.promise;
+          if (path === '/api/v1/servers/server-1/unread') {
+            return Promise.resolve({
+              ok: true,
+              json: async () => ({ unreads: [{ channel_id: 'channel-1', unread_count: 1 }] }),
+            });
+          }
+          if (path === '/api/v1/servers/server-2/unread') {
+            return Promise.resolve({
+              ok: true,
+              json: async () => ({ unreads: [{ channel_id: 'channel-2', unread_count: 2 }] }),
+            });
+          }
+          throw new Error(`Unexpected unread endpoint: ${path}`);
+        });
+        const { unmount } = renderHook(() => useServerChannelSubscriptions());
+        try {
+          await vi.waitFor(() => {
+            expect(useUnreadStore.getState().unreadCounts.get('channel-1')).toBe(1);
+          });
+          expect(visibleServerUnread('server-1')).toBe(true);
+          expect(useUnreadStore.getState().allUnreadCounts.has('channel-new-a2')).toBe(false);
+          act(() => {
+            useUnreadStore.getState().clearUnread('channel-1');
+            useServerStore.setState({ activeServerId: 'server-2' });
+            useChannelStore.setState({
+              activeChannelId: 'channel-viewed-2',
+              channels: [
+                { ...mockChannel, id: 'channel-2', server_id: 'server-2' },
+                { ...mockChannel, id: 'channel-viewed-2', server_id: 'server-2' },
+              ],
+            });
+          });
+          expect(visibleServerUnread('server-1')).toBe(false);
+          await vi.waitFor(() => {
+            expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-2');
+            expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+          });
+          await act(async () => {
+            bulk.resolve({
+              ok: true,
+              json: async () => ({
+                server_ids: ['server-1', 'server-2'],
+                channels: [
+                  ...currentSeed.channels,
+                  { channel_id: 'channel-new-a2', server_id: 'server-1', unread_count: 3 },
+                ],
+              }),
+            });
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-new-a2')).toEqual({
+            serverId: 'server-1',
+            count: 3,
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-current-control')).toEqual({
+            serverId: 'server-2',
+            count: 4,
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-2')).toEqual({
+            serverId: 'server-2',
+            count: 2,
+          });
+          expect(visibleServerUnread('server-2')).toBe(true);
+          expect(
+            visibleServerUnread('server-1'),
+            'a local read of A1 must preserve A2’s eligible unread indicator when valid detail first discovers A2'
+          ).toBe(expectedVisible);
+        } finally {
+          unmount();
+          await act(async () => {
+            bulk.resolve({ ok: true, json: async () => currentSeed });
+          });
+        }
+      }
+    );
+  });
+
+  describe('late bulk snapshots after a local read (#3773)', () => {
+    it.each([
+      {
+        scenario:
+          'keeps the read server clear when its retained map contains a foreign live unread',
+        initialUnreads: [{ channel_id: 'channel-1', unread_count: 1 }],
+        arrivalChannel: 'channel-2',
+        arrivalServer: 'server-2',
+        expectedVisible: false,
+      },
+      {
+        scenario: 'keeps a background arrival visible when its retained owned snapshot is empty',
+        initialUnreads: [],
+        arrivalChannel: 'channel-new-1',
+        arrivalServer: 'server-1',
+        expectedVisible: true,
+      },
+    ])(
+      '$scenario while the returned-to server fetch is pending',
+      async ({ initialUnreads, arrivalChannel, arrivalServer, expectedVisible }) => {
+        useChatStore.setState({ isConnected: true });
+        useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: 'server-1' });
+        useChannelStore.setState({
+          activeChannelId: 'channel-viewed-1',
+          channels: [mockChannel, { ...mockChannel, id: 'channel-viewed-1' }],
+        });
+        if (initialUnreads.length > 0) {
+          useUnreadStore
+            .getState()
+            .setInitialChannelUnreads([{ channelId: 'channel-1', serverId: 'server-1', count: 1 }]);
+        }
+
+        let resolveBulk!: (response: unknown) => void;
+        let resolveSecondServer!: (response: unknown) => void;
+        let resolveReturnedServer!: (response: unknown) => void;
+        const bulk = new Promise((resolve) => {
+          resolveBulk = resolve;
+        });
+        const secondServer = new Promise((resolve) => {
+          resolveSecondServer = resolve;
+        });
+        const returnedServer = new Promise((resolve) => {
+          resolveReturnedServer = resolve;
+        });
+        const returnedBody = vi.fn(async () => ({ unreads: [] }));
+        let firstServerFetches = 0;
+        mockApiFetch.mockImplementation((path: string) => {
+          if (path === '/api/v1/servers/unread-status') return bulk;
+          if (path === '/api/v1/servers/server-2/unread') return secondServer;
+          if (path === '/api/v1/servers/server-1/unread') {
+            firstServerFetches += 1;
+            return firstServerFetches === 1
+              ? Promise.resolve({ ok: true, json: async () => ({ unreads: initialUnreads }) })
+              : returnedServer;
+          }
+          throw new Error(`Unexpected unread endpoint: ${path}`);
+        });
+
+        const { unmount } = renderHook(() => useServerChannelSubscriptions());
+        try {
+          await vi.waitFor(() => {
+            expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+          });
+          expect(visibleServerUnread('server-1')).toBe(!expectedVisible);
+          if (!expectedVisible) {
+            act(() => {
+              useUnreadStore.getState().clearUnread('channel-1');
+            });
+            expect(visibleServerUnread('server-1')).toBe(false);
+          }
+
+          act(() => {
+            useServerStore.setState({ activeServerId: 'server-2' });
+            useChannelStore.setState({
+              activeChannelId: 'channel-viewed-2',
+              channels: [
+                { ...mockChannel, id: 'channel-2', server_id: 'server-2' },
+                { ...mockChannel, id: 'channel-viewed-2', server_id: 'server-2' },
+              ],
+            });
+          });
+          expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/servers/server-2/unread');
+          act(() => {
+            // Mirror the real live actions: only an active-server arrival also
+            // enters the generic map, which still retains server-1 ownership.
+            if (arrivalServer === 'server-2') {
+              useUnreadStore.getState().incrementUnread(arrivalChannel);
+            }
+            useUnreadStore.getState().bumpChannelUnread(arrivalChannel, arrivalServer);
+            useUnreadStore.getState().markServerUnread(arrivalServer, true);
+            useServerStore.setState({ activeServerId: 'server-1' });
+            useChannelStore.setState({
+              activeChannelId: 'channel-viewed-1',
+              channels: [
+                mockChannel,
+                { ...mockChannel, id: 'channel-new-1' },
+                { ...mockChannel, id: 'channel-viewed-1' },
+              ],
+            });
+          });
+          expect(firstServerFetches).toBe(2);
+          expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+          expect([...useUnreadStore.getState().unreadCounts]).toEqual(
+            expectedVisible ? [] : [['channel-2', 1]]
+          );
+          expect(visibleServerUnread('server-1')).toBe(expectedVisible);
+          expect(visibleServerUnread(arrivalServer)).toBe(true);
+
+          await act(async () => {
+            resolveBulk({
+              ok: true,
+              json: async () => ({
+                server_ids: expectedVisible ? ['server-2'] : ['server-1', 'server-2'],
+                channels: [
+                  ...(!expectedVisible
+                    ? [{ channel_id: 'channel-1', server_id: 'server-1', unread_count: 1 }]
+                    : []),
+                  { channel_id: 'channel-bulk-control', server_id: 'server-2', unread_count: 4 },
+                ],
+              }),
+            });
+          });
+
+          // These controls prove the bulk committed while the fresh owning
+          // response could not have repaired either stale-snapshot decision.
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-bulk-control')).toEqual({
+            serverId: 'server-2',
+            count: 4,
+          });
+          expect(returnedBody).not.toHaveBeenCalled();
+          expect(useUnreadStore.getState().allUnreadCounts.get(arrivalChannel)).toEqual({
+            serverId: arrivalServer,
+            count: 1,
+          });
+          expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+          expect(visibleServerUnread('server-2')).toBe(true);
+          expect(
+            visibleServerUnread('server-1'),
+            'the bulk active correction must preserve the fresher owned read or background arrival'
+          ).toBe(expectedVisible);
+        } finally {
+          unmount();
+          await act(async () => {
+            resolveBulk({ ok: true, json: async () => ({ server_ids: [], channels: [] }) });
+            resolveSecondServer({ ok: true, json: async () => ({ unreads: [] }) });
+            resolveReturnedServer({ ok: true, json: returnedBody });
+          });
+        }
+      }
+    );
+
+    it.each([
+      { destination: 'server-2', channelDetail: true },
+      { destination: 'server-2-then-server-1', channelDetail: true },
+      { destination: 'direct-messages', channelDetail: true },
+      { destination: 'server-2', channelDetail: false },
+    ])(
+      'keeps the previously read server clear after switching to $destination (channels: $channelDetail)',
+      async ({ destination, channelDetail }) => {
+        useChatStore.setState({ isConnected: true });
+        useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: 'server-1' });
+        useChannelStore.setState({
+          activeChannelId: 'channel-viewed-1',
+          channels: [mockChannel, { ...mockChannel, id: 'channel-viewed-1' }],
+        });
+        useUnreadStore.getState().setInitialChannelUnreads([
+          { channelId: 'channel-1', serverId: 'server-1', count: 1 },
+          { channelId: 'channel-2', serverId: 'server-2', count: 2 },
+        ]);
+        useUnreadStore.getState().markServerUnread('server-1', true);
+        useUnreadStore.getState().markServerUnread('server-2', true);
+
+        let resolveBulk!: (response: unknown) => void;
+        let hasReadFirstChannel = false;
+        const bulk = new Promise((resolve) => {
+          resolveBulk = resolve;
+        });
+        mockApiFetch.mockImplementation((path: string) => {
+          if (path === '/api/v1/servers/unread-status') return bulk;
+          if (path === '/api/v1/servers/server-1/unread') {
+            return Promise.resolve({
+              ok: true,
+              json: async () => ({
+                unreads: hasReadFirstChannel ? [] : [{ channel_id: 'channel-1', unread_count: 1 }],
+              }),
+            });
+          }
+          if (path === '/api/v1/servers/server-2/unread') {
+            return Promise.resolve({
+              ok: true,
+              json: async () => ({ unreads: [{ channel_id: 'channel-2', unread_count: 2 }] }),
+            });
+          }
+          throw new Error(`Unexpected unread endpoint: ${path}`);
+        });
+
+        renderHook(() => useServerChannelSubscriptions());
+        await vi.waitFor(() => {
+          expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+          expect(useUnreadStore.getState().unreadCounts.get('channel-1')).toBe(1);
+        });
+        expect(visibleServerUnread('server-1')).toBe(true);
+        expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/servers/unread-status');
+
+        act(() => {
+          useUnreadStore.getState().clearUnread('channel-1');
+          hasReadFirstChannel = true;
+          // Existing channel-list read reconciliation clears the dot separately.
+          // Use its real action so this case isolates resurrection by the seed.
+          useUnreadStore.getState().clearServerUnread('server-1');
+          useServerStore.setState({
+            activeServerId: destination === 'direct-messages' ? null : 'server-2',
+          });
+          useChannelStore.setState({
+            activeChannelId: destination === 'direct-messages' ? null : 'channel-viewed-2',
+            channels:
+              destination === 'direct-messages'
+                ? []
+                : [
+                    { ...mockChannel, id: 'channel-2', server_id: 'server-2' },
+                    { ...mockChannel, id: 'channel-viewed-2', server_id: 'server-2' },
+                  ],
+          });
+        });
+        expect(visibleServerUnread('server-1')).toBe(false);
+        if (destination !== 'direct-messages') {
+          await vi.waitFor(() => {
+            expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-2');
+            expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(2);
+          });
+        }
+        if (destination === 'server-2-then-server-1') {
+          act(() => {
+            useServerStore.setState({ activeServerId: 'server-1' });
+            useChannelStore.setState({ activeChannelId: 'channel-1', channels: [mockChannel] });
+          });
+          // Positive navigation control: the new owning response after the read
+          // is empty; it must not clear B while reconciling the returned-to A.
+          await vi.waitFor(() => {
+            expect(useUnreadStore.getState().unreadCountsServerId).toBe('server-1');
+            expect(useUnreadStore.getState().unreadCounts.size).toBe(0);
+          });
+          expect(visibleServerUnread('server-2')).toBe(true);
+        }
+
+        // The extra row is a positive control proving the bulk continuation committed.
+        const data = {
+          server_ids: ['server-1', 'server-2'],
+          ...(channelDetail
+            ? {
+                channels: [
+                  { channel_id: 'channel-1', server_id: 'server-1', unread_count: 1 },
+                  { channel_id: 'channel-2', server_id: 'server-2', unread_count: 2 },
+                  { channel_id: 'channel-bulk-control', server_id: 'server-2', unread_count: 4 },
+                ],
+              }
+            : {}),
+        };
+        const readBody = vi.fn(async () => data);
+        await act(async () => {
+          resolveBulk({ ok: true, json: readBody });
+        });
+
+        expect(readBody).toHaveBeenCalledTimes(1);
+        expect(useUnreadStore.getState().allUnreadCounts.has('channel-1')).toBe(false);
+        expect(useUnreadStore.getState().allUnreadCounts.get('channel-2')).toEqual({
+          serverId: 'server-2',
+          count: 2,
+        });
+        if (channelDetail) {
+          expect(useUnreadStore.getState().allUnreadCounts.get('channel-bulk-control')).toEqual({
+            serverId: 'server-2',
+            count: 4,
+          });
+        }
+        expect(visibleServerUnread('server-2')).toBe(true);
+        expect(
+          visibleServerUnread('server-1'),
+          'the previously read server unread indicator must not be resurrected by a late bulk snapshot'
+        ).toBe(false);
+      }
+    );
+
+    it('keeps a new live unread visible when the older snapshot omits its server', async () => {
+      useChatStore.setState({ isConnected: true });
+      useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: null });
+      let resolveBulk!: (response: unknown) => void;
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path !== '/api/v1/servers/unread-status') {
+          throw new Error(`Unexpected unread endpoint: ${path}`);
+        }
+        return new Promise((resolve) => {
+          resolveBulk = resolve;
+        });
+      });
+      renderHook(() => useServerChannelSubscriptions());
+
+      act(() => {
+        useUnreadStore.getState().bumpChannelUnread('channel-2', 'server-2');
+        useUnreadStore.getState().markServerUnread('server-2', true);
+      });
+      expect(visibleServerUnread('server-2')).toBe(true);
+
+      await act(async () => {
+        resolveBulk({
+          ok: true,
+          json: async () => ({
+            server_ids: ['server-1'],
+            channels: [{ channel_id: 'channel-1', server_id: 'server-1', unread_count: 3 }],
+          }),
+        });
+      });
+
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-1')).toEqual({
+        serverId: 'server-1',
+        count: 3,
+      });
+      expect(useUnreadStore.getState().allUnreadCounts.get('channel-2')).toEqual({
+        serverId: 'server-2',
+        count: 1,
+      });
+      expect(visibleServerUnread('server-1')).toBe(true);
+      expect(
+        visibleServerUnread('server-2'),
+        'a live unread arriving during the bulk request must keep its server indicator visible'
+      ).toBe(true);
+    });
+
+    it('preserves the approximate fallback when an older snapshot omits channel detail', async () => {
+      useChatStore.setState({ isConnected: true });
+      useServerStore.setState({ servers: [mockServer, mockServer2], activeServerId: null });
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ server_ids: ['server-2'] }),
+      });
+      renderHook(() => useServerChannelSubscriptions());
+      await vi.waitFor(() => {
+        expect(visibleServerUnread('server-2')).toBe(true);
+      });
+
+      expect(useUnreadStore.getState().serverUnreadPreciseSet.has('server-2')).toBe(false);
+      expect(useUnreadStore.getState().allUnreadCounts.size).toBe(0);
+    });
   });
 });
