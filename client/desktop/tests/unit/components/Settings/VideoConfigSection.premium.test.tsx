@@ -570,8 +570,8 @@ describe('VideoConfigSection — L5 manual STREAM bitrate clamp', () => {
     openDetails();
     fireEvent.click(document.querySelector('.settings-bitrate-ghost-zone') as HTMLElement);
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 

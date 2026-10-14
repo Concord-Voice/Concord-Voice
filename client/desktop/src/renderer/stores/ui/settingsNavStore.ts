@@ -8,7 +8,7 @@ export type SettingsSection =
   | 'appearance'
   | 'privacy'
   | 'account'
-  | 'subscriptions'
+  | 'security'
   | 'notifications'
   | 'voice'
   | 'accessibility'

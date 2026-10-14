@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, within } from '../../../test-utils';
+import { render, screen, fireEvent, within, act } from '../../../test-utils';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -128,9 +128,9 @@ describe('SettingsPage', () => {
   it('renders navigation items', () => {
     render(<SettingsPage />);
     expect(screen.getByText('Appearance')).toBeInTheDocument();
-    expect(screen.getByText('Privacy & Security')).toBeInTheDocument();
+    expect(screen.getByText('Privacy')).toBeInTheDocument();
     expect(screen.getByText('Account')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Subscriptions' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Security' })).toBeInTheDocument();
     expect(screen.getByText('Notifications')).toBeInTheDocument();
     expect(screen.getByText('Audio & Video')).toBeInTheDocument();
     expect(screen.getByText('Accessibility')).toBeInTheDocument();
@@ -218,9 +218,9 @@ describe('SettingsPage', () => {
 
   it('switches to privacy section on nav click', () => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
-    // "Active Sessions" appears in both nav tree and content section title
-    const els = screen.getAllByText('Active Sessions');
+    fireEvent.click(screen.getByText('Privacy'));
+    // The Privacy controls belong to the selected pane.
+    const els = screen.getAllByText('Privacy Controls');
     expect(els.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -302,18 +302,31 @@ describe('SettingsPage', () => {
     expect(nav!.querySelector('.settings-page-title')).toBeInTheDocument();
   });
 
-  it('privacy section shows all 4 subsections in nav tree', () => {
+  it('Privacy and Security list their subsections under the owning parent', () => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Privacy'));
     // Sub-trees now render for every pane (#1743), so the global first
     // `.settings-nav-tree-item` is Appearance's "Color Scheme" — scope to the
-    // Privacy & Security nav group instead.
+    // Privacy nav group instead.
     const privacyGroup = Array.from(document.querySelectorAll('.settings-nav-group')).find((g) =>
-      g.querySelector('.settings-nav-item')?.textContent?.includes('Privacy & Security')
+      g.querySelector('.settings-nav-item')?.textContent?.includes('Privacy')
     )!;
     expect(privacyGroup).toBeTruthy();
-    expect(privacyGroup.querySelector('.settings-nav-tree-item')!.textContent).toBe('Privacy');
-    expect(screen.getByText('Multi-Factor Auth')).toBeInTheDocument();
+    expect(
+      Array.from(privacyGroup.querySelectorAll('.settings-nav-tree-item')).map(
+        (button) => button.textContent
+      )
+    ).toEqual(['Privacy Controls', 'Rich Presence', 'Activity History']);
+    const securityGroup = screen
+      .getByRole('button', { name: 'Security', exact: true })
+      .closest('li');
+    expect(securityGroup).not.toBeNull();
+    expect(
+      within(securityGroup as HTMLLIElement).getByRole('button', {
+        name: 'Multi-Factor Authentication',
+      })
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Security', exact: true }));
     // "Active Sessions" and "Past Sessions" appear in both nav tree and content
     const activeSessionEls = screen.getAllByText('Active Sessions');
     expect(activeSessionEls.length).toBeGreaterThanOrEqual(2); // nav tree + content
@@ -380,9 +393,9 @@ describe('SettingsPage', () => {
     expect(activeItem).toHaveClass('active');
   });
 
-  it('privacy section shows session loading state initially', async () => {
+  it('security section shows session loading state initially', async () => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Security'));
     // "Active Sessions" appears in nav tree + content — verify content section exists
     const els = screen.getAllByText('Active Sessions');
     expect(els.length).toBeGreaterThanOrEqual(1);
@@ -411,7 +424,7 @@ describe('SettingsPage', () => {
     });
 
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Security'));
 
     // Wait for sessions to load
     await vi.waitFor(() => {
@@ -430,8 +443,8 @@ describe('SettingsPage', () => {
   it('switches between appearance and privacy sections', () => {
     render(<SettingsPage />);
     // Switch to privacy
-    fireEvent.click(screen.getByText('Privacy & Security'));
-    const privacyEls = screen.getAllByText('Active Sessions');
+    fireEvent.click(screen.getByText('Privacy'));
+    const privacyEls = screen.getAllByText('Privacy Controls');
     expect(privacyEls.length).toBeGreaterThanOrEqual(1);
     // Switch back to appearance
     fireEvent.click(screen.getByText('Appearance'));
@@ -602,10 +615,10 @@ describe('SettingsPage', () => {
 
   it('clicking a new section changes active state', () => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Privacy'));
     const activeItems = document.querySelectorAll('.settings-nav-item.active');
     expect(activeItems.length).toBe(1);
-    expect(activeItems[0].textContent).toContain('Privacy & Security');
+    expect(activeItems[0].textContent).toContain('Privacy');
   });
 
   // ─── Disabled items ──────────────────────────────────────────────────
@@ -647,19 +660,19 @@ describe('SettingsPage', () => {
 
   // ─── Sub-nav reachability from the top-level nav (#1743) ─────────────────
 
-  it('System Permissions sub-nav is reachable without first opening Privacy (#1743)', () => {
+  it('System Permissions sub-nav is reachable without first opening About (#1743)', () => {
     render(<SettingsPage />);
-    // Default pane is Appearance; the privacy sub-tree (incl. System Permissions)
+    // Default pane is Appearance; the About sub-tree (incl. System Permissions)
     // now renders regardless of which pane is active.
     expect(screen.getByText('System Permissions')).toBeInTheDocument();
   });
 
-  it('clicking the System Permissions sub-nav switches to the Privacy pane (#1743)', async () => {
+  it('clicking the System Permissions sub-nav switches to the About pane (#1743)', async () => {
     render(<SettingsPage />);
     fireEvent.click(screen.getByText('System Permissions'));
     await vi.waitFor(() => {
       const active = document.querySelector('.settings-nav-item.active');
-      expect(active?.textContent).toContain('Privacy & Security');
+      expect(active?.textContent).toContain('About & Updates');
     });
   });
 });
@@ -680,7 +693,7 @@ describe('SettingsPage — content protection pending changes (#2468)', () => {
         })
     );
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Privacy'));
     const toggle = await screen.findByRole('switch', {
       name: 'Protect Concord windows from screen capture',
     });
@@ -694,13 +707,10 @@ describe('SettingsPage — content protection pending changes (#2468)', () => {
     expect(screen.getByRole('button', { name: 'Appearance' })).toBeDisabled();
     expect(document.querySelector('.settings-content')).toHaveAttribute('inert');
     fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
-    expect(document.querySelector('.settings-nav-item.active')).toHaveTextContent(
-      'Privacy & Security'
-    );
-    resolveSetter?.(true);
-    await vi.waitFor(() =>
-      expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument()
-    );
+    expect(document.querySelector('.settings-nav-item.active')).toHaveTextContent('Privacy');
+    await act(async () => resolveSetter?.(true));
+    expect(screen.getByRole('button', { name: 'Appearance' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
   });
 
   it('renders the exact alert when content-protection Apply fails', async () => {
@@ -712,7 +722,7 @@ describe('SettingsPage — content protection pending changes (#2468)', () => {
     electron.getContentProtection = vi.fn().mockResolvedValue(false);
     electron.setContentProtection = vi.fn().mockResolvedValue(false);
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Privacy'));
     fireEvent.click(
       await screen.findByRole('switch', {
         name: 'Protect Concord windows from screen capture',
@@ -739,7 +749,7 @@ describe('SettingsPage — content protection pending changes (#2468)', () => {
     electron.getContentProtection = vi.fn().mockResolvedValue(false);
     electron.setContentProtection = vi.fn().mockResolvedValue(true);
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(screen.getByText('Privacy'));
     fireEvent.click(
       await screen.findByRole('switch', {
         name: 'Protect Concord windows from screen capture',

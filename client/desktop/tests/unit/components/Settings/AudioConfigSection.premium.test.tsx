@@ -229,8 +229,8 @@ describe('AudioConfigSection — L1 audio tier clamp', () => {
     fireEvent.click(tierLabel('Studio'));
     fireEvent.click(premiumChip());
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 });

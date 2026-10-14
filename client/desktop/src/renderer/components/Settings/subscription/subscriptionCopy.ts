@@ -1,17 +1,16 @@
-// Marketing tier names + display copy for the subscription page (#1304).
+// Marketing tier names + display copy for Account's Subscription section.
 // The WIRE tier is 'free' | 'premium' (the entitlement contract); the USER sees
 // the marketing names Sonic / Supersonic. This map is the single translation
 // point — never render the raw wire tier in the UI.
 
-// Wire tier → marketing display name. Unknown tiers fall back to the free name
-// (least surprise; a drifted tier never shows a scary blank).
+// Wire tier → marketing display name. Unknown tiers never establish free access.
 const TIER_DISPLAY_NAME: Record<string, string> = {
   free: 'Sonic',
   premium: 'Supersonic',
 };
 
 export function tierDisplayName(tier: string): string {
-  return TIER_DISPLAY_NAME[tier] ?? TIER_DISPLAY_NAME.free;
+  return Object.hasOwn(TIER_DISPLAY_NAME, tier) ? TIER_DISPLAY_NAME[tier] : 'Plan unavailable';
 }
 
 // Wire subscription source → human sentence for the PlanCard "how you got this".

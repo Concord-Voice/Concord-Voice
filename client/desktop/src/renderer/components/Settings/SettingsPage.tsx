@@ -1,15 +1,18 @@
-import React, { useState, useEffect, useRef, useTransition, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useTransition, useMemo } from 'react';
 import { useDraftSettingsLifecycle, useDraftActions } from '../../hooks/ui/useDraftSettings';
 import { useSectionObserver } from '../../hooks/ui/useSectionObserver';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { useSettingsNavStore, type SettingsSection } from '../../stores/ui/settingsNavStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import AppearanceSection from './AppearanceSection';
-import PrivacySecuritySection from './PrivacySecuritySection';
+import PrivacySection from './PrivacySection';
+import SecuritySection from './SecuritySection';
 import VoiceAudioSection from './VoiceAudioSection';
 import AccessibilitySection from './AccessibilitySection';
 import AccountSection from './AccountSection';
-import SubscriptionSection from './subscription/SubscriptionSection';
+import { NAV_SUBSECTIONS } from './settingsSections';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
+import { useSettingsCollapsibleStore } from '../../stores/ui/settingsCollapsibleStore';
 import NotificationSection from './NotificationSection';
 import AboutUpdateSection from './AboutUpdateSection';
 import ExpandCollapseAllButton from './ExpandCollapseAllButton';
@@ -22,12 +25,6 @@ interface NavItem {
   label: string;
   icon: React.ReactNode;
   enabled: boolean;
-}
-
-interface NavSubsection {
-  id: string;
-  label: string;
-  focusControlId?: string;
 }
 
 const navItems: NavItem[] = [
@@ -49,7 +46,7 @@ const navItems: NavItem[] = [
   },
   {
     id: 'privacy',
-    label: 'Privacy & Security',
+    label: 'Privacy',
     enabled: true,
     icon: (
       <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
@@ -80,13 +77,19 @@ const navItems: NavItem[] = [
     ),
   },
   {
-    id: 'subscriptions',
-    label: 'Subscriptions',
+    id: 'security',
+    label: 'Security',
     enabled: true,
     icon: (
       <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-        <rect x="2" y="4" width="14" height="10" rx="2" stroke="currentColor" strokeWidth="1.5" />
-        <path d="M2 7h14" stroke="currentColor" strokeWidth="1.5" />
+        <path
+          d="M9 1.5 15 4v4.5c0 4.1-6 7.5-6 7.5s-6-3.4-6-7.5V4l6-2.5Z"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinejoin="round"
+        />
+        <circle cx="9" cy="7.5" r="1.5" stroke="currentColor" strokeWidth="1.5" />
+        <path d="M9 9v3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
       </svg>
     ),
   },
@@ -164,55 +167,6 @@ const navItems: NavItem[] = [
   },
 ];
 
-const NAV_SUBSECTIONS: Record<string, NavSubsection[]> = {
-  appearance: [
-    { id: 'color-scheme', label: 'Color Scheme' },
-    { id: 'theme', label: 'Theme' },
-  ],
-  privacy: [
-    { id: 'privacy-settings', label: 'Privacy' },
-    { id: 'presence-settings', label: 'Rich Presence' },
-    { id: 'system-permissions', label: 'System Permissions' },
-    { id: 'mfa', label: 'Multi-Factor Auth' },
-    {
-      id: 'presence-history',
-      label: 'Activity History',
-      focusControlId: 'presence-history-heading',
-    },
-    { id: 'active-sessions', label: 'Active Sessions' },
-    { id: 'past-sessions', label: 'Past Sessions' },
-  ],
-  account: [
-    { id: 'profile', label: 'Profile Information' },
-    { id: 'password', label: 'Change Password' },
-    { id: 'nsfw-content', label: 'NSFW Content Access' },
-  ],
-  subscriptions: [
-    { id: 'current-plan', label: 'Current Plan' },
-    { id: 'personal-plans', label: 'Personal Plans' },
-    { id: 'group-plans', label: 'Group Plans' },
-    { id: 'server-plans', label: 'Server Plans' },
-    { id: 'redeem-code', label: 'Redeem a Code' },
-  ],
-  notifications: [
-    { id: 'desktop-notifications', label: 'Desktop Notifications' },
-    { id: 'notification-sounds', label: 'Sounds' },
-    { id: 'quiet-hours', label: 'Quiet Hours' },
-  ],
-  voice: [
-    { id: 'audio-config', label: 'Audio Configuration' },
-    { id: 'video-screen', label: 'Video Configuration' },
-  ],
-  accessibility: [
-    { id: 'display', label: 'Display' },
-    { id: 'tts', label: 'Text-to-Speech' },
-  ],
-  about: [
-    { id: 'client-info', label: 'Client Info' },
-    { id: 'update-settings', label: 'Update Settings' },
-  ],
-};
-
 // ─── Settings Page ──────────────────────────────────────────────────────────
 
 const SettingsPage: React.FC = () => {
@@ -220,14 +174,28 @@ const SettingsPage: React.FC = () => {
   const activityHistoryCapability = useClientConfigStore(
     (state) => state.activityHistoryCapability
   );
+  // Unsupported activation can still expose retained history during a drain.
+  // Offer its navigation once the pane confirms a real destination.
+  const [activityHistoryDestinationAvailable, setActivityHistoryDestinationAvailable] =
+    useState(false);
   const hiddenSubsectionId =
-    activityHistoryCapability.status === 'confirmed-unsupported' ? 'presence-history' : null;
+    activityHistoryCapability.status === 'confirmed-unsupported' &&
+    !activityHistoryDestinationAvailable
+      ? 'presence-history'
+      : null;
   const [activeSection, setActiveSection] = useState<SettingsSection>('appearance');
   const [isPending, startTransition] = useTransition();
   const [activeSubsection, setActiveSubsection] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  // Sub-section to scroll to after a pane switch triggered by a sub-nav click (#1743).
-  const pendingScrollRef = useRef<string | null>(null);
+  const reduceAnimations = useSettingsStore((state) => state.appearance.reduceAnimations);
+  const requestFocus = useSettingsNavStore((state) => state.requestFocus);
+  const observedIds = useMemo(
+    () =>
+      NAV_SUBSECTIONS[activeSection]
+        .filter((sub) => sub.id !== hiddenSubsectionId)
+        .map((sub) => sub.targetId),
+    [activeSection, hiddenSubsectionId]
+  );
 
   // Draft settings lifecycle
   useDraftSettingsLifecycle();
@@ -245,51 +213,12 @@ const SettingsPage: React.FC = () => {
   const [blobFading, setBlobFading] = useState(false);
 
   // Scroll-spy: track which section is in view and highlight tree nav (#484).
-  useSectionObserver(contentRef, activeSection, setActiveSubsection);
-
-  const scrollToSection = useCallback((sectionId: string) => {
-    const el = document.getElementById(`section-${sectionId}`);
-    if (!el) return;
-    // Auto-expand collapsed sections when navigating via sidebar
-    if (el instanceof HTMLDetailsElement && !el.open) {
-      el.open = true;
-    }
-    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }, []);
-
-  // Sub-nav click (#1743): sub-trees now render for every pane, so a clicked
-  // sub-section may belong to a pane that isn't active yet. If so, switch to its
-  // pane first and defer the scroll until it mounts (same post-commit delay the
-  // focusRequest effect uses); otherwise scroll immediately.
-  const handleSubNavClick = useCallback(
-    (paneId: SettingsSection, subId: string, focusControlId?: string) => {
-      if (focusControlId) {
-        pendingScrollRef.current = null;
-        useSettingsNavStore.getState().requestFocus(paneId, focusControlId);
-        return;
-      }
-      if (activeSection === paneId) {
-        scrollToSection(subId);
-        return;
-      }
-      pendingScrollRef.current = subId;
-      startTransition(() => setActiveSection(paneId));
-    },
-    [activeSection, scrollToSection]
-  );
-
-  useEffect(() => {
-    if (!pendingScrollRef.current) return;
-    const subId = pendingScrollRef.current;
-    pendingScrollRef.current = null;
-    const timer = setTimeout(() => scrollToSection(subId), 60);
-    return () => clearTimeout(timer);
-  }, [activeSection, scrollToSection]);
+  useSectionObserver(contentRef, activeSection, setActiveSubsection, observedIds);
 
   // Cross-section focus (#1644): the locked Appearance font picker's back-link
   // requests focus on the Accessibility dyslexic toggle. Switch to the target
-  // pane, then focus the control once it mounts (deferred past the React commit,
-  // matching the 50ms the IntersectionObserver effect uses for the same reason).
+  // pane, then focus the control once it mounts. The first attempt waits for the
+  // React commit; conditional targets can arrive later with their server response.
   const focusRequest = useSettingsNavStore((s) => s.focusRequest);
   const clearFocusRequest = useSettingsNavStore((s) => s.clearFocusRequest);
 
@@ -299,22 +228,59 @@ const SettingsPage: React.FC = () => {
       startTransition(() => setActiveSection(focusRequest.section));
       return; // re-runs on activeSection change once the pane mounts
     }
-    const timer = setTimeout(() => {
+    const root = contentRef.current;
+    let targetObserver: MutationObserver | null = null;
+    const focusWhenReady = () => {
+      // A later link or explicit pane selection owns navigation now.
+      if (useSettingsNavStore.getState().focusRequest !== focusRequest) return true;
       const el = document.getElementById(focusRequest.controlId);
-      if (el) {
+      if (el && root?.contains(el) && !el.closest('[hidden]')) {
         const focusTarget =
           el instanceof HTMLDetailsElement
             ? (el.querySelector<HTMLElement>(':scope > summary') ?? el)
             : el;
-        const details = focusTarget.closest('details');
-        if (details instanceof HTMLDetailsElement && !details.open) details.open = true;
-        focusTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        focusTarget.focus();
+        for (
+          let ancestor: HTMLElement | null = focusTarget;
+          ancestor;
+          ancestor = ancestor.parentElement
+        ) {
+          if (ancestor instanceof HTMLDetailsElement) {
+            useSettingsCollapsibleStore.getState().setSectionOpen(ancestor.id, true);
+            ancestor.open = true;
+          }
+        }
+        const subsection = NAV_SUBSECTIONS[activeSection].find(
+          (sub) => sub.targetId === focusTarget.closest('.settings-collapsible')?.id
+        );
+        if (subsection) setActiveSubsection(subsection.id);
+        const behavior: ScrollBehavior =
+          reduceAnimations || globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+            ? 'auto'
+            : 'smooth';
+        focusTarget.scrollIntoView({ behavior, block: 'center' });
+        focusTarget.focus({ preventScroll: true });
+        clearFocusRequest();
+        return true;
       }
-      clearFocusRequest();
+      return false;
+    };
+    const timer = setTimeout(() => {
+      if (focusWhenReady() || !root) return;
+      targetObserver = new MutationObserver(() => {
+        if (focusWhenReady()) targetObserver?.disconnect();
+      });
+      targetObserver.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['hidden'],
+      });
     }, 50);
-    return () => clearTimeout(timer);
-  }, [focusRequest, activeSection, clearFocusRequest]);
+    return () => {
+      clearTimeout(timer);
+      targetObserver?.disconnect();
+    };
+  }, [focusRequest, activeSection, clearFocusRequest, reduceAnimations]);
 
   // Drop ANY pending cross-section focus request when Settings unmounts (closes) —
   // unconditionally, regardless of which branch the focus effect above was in
@@ -343,11 +309,15 @@ const SettingsPage: React.FC = () => {
       case 'appearance':
         return <AppearanceSection />;
       case 'privacy':
-        return <PrivacySecuritySection />;
+        return (
+          <PrivacySection
+            onActivityHistoryAvailabilityChange={setActivityHistoryDestinationAvailable}
+          />
+        );
       case 'account':
         return <AccountSection />;
-      case 'subscriptions':
-        return <SubscriptionSection />;
+      case 'security':
+        return <SecuritySection />;
       case 'notifications':
         return <NotificationSection />;
       case 'voice':
@@ -367,7 +337,7 @@ const SettingsPage: React.FC = () => {
         <div className="settings-page-inner">
           <div className="settings-layout">
             {/* Left sidebar: back button, title, and navigation */}
-            <nav className="settings-nav">
+            <nav className="settings-nav" aria-label="Settings">
               <div className="settings-nav-scroll">
                 <button
                   className={`settings-back-btn${hasPendingChanges ? ' settings-back-btn--blocked' : ''}`}
@@ -402,51 +372,59 @@ const SettingsPage: React.FC = () => {
 
                 <h1 className="settings-page-title">Settings</h1>
 
-                {navItems.map((item) => {
-                  const isActive = activeSection === item.id;
-                  // Render every pane's sub-tree so sub-sections (e.g. System
-                  // Permissions) are reachable from the top-level nav (#1743).
-                  const subs = NAV_SUBSECTIONS[item.id]?.filter(
-                    (sub) => sub.id !== hiddenSubsectionId
-                  );
+                <ul className="settings-nav-list">
+                  {navItems.map((item) => {
+                    const isActive = activeSection === item.id;
+                    // Render every pane's sub-tree so sub-sections (e.g. System
+                    // Permissions) are reachable from the top-level nav (#1743).
+                    const subs = NAV_SUBSECTIONS[item.id]?.filter(
+                      (sub) => sub.id !== hiddenSubsectionId
+                    );
 
-                  return (
-                    <div key={item.id} className="settings-nav-group">
-                      <button
-                        className={`settings-nav-item ${isActive ? 'active' : ''}`}
-                        onClick={() =>
-                          item.enabled && startTransition(() => setActiveSection(item.id))
-                        }
-                        disabled={!item.enabled || contentProtectionApplying}
-                      >
-                        <span className="settings-nav-item-icon">{item.icon}</span>
-                        {item.label}
-                        {!item.enabled && <span className="settings-nav-badge">Soon</span>}
-                      </button>
+                    return (
+                      <li key={item.id} className="settings-nav-group">
+                        <button
+                          className={`settings-nav-item ${isActive ? 'active' : ''}`}
+                          aria-current={isActive ? 'page' : undefined}
+                          onClick={() => {
+                            if (!item.enabled) return;
+                            clearFocusRequest();
+                            startTransition(() => setActiveSection(item.id));
+                          }}
+                          disabled={!item.enabled || contentProtectionApplying}
+                        >
+                          <span className="settings-nav-item-icon">{item.icon}</span>
+                          {item.label}
+                          {!item.enabled && <span className="settings-nav-badge">Soon</span>}
+                        </button>
 
-                      {subs && subs.length > 0 && (
-                        <div className="settings-nav-tree">
-                          {subs.map((sub, i) => (
-                            <div
-                              key={sub.id}
-                              className={`settings-nav-tree-item-wrapper${i === subs.length - 1 ? ' settings-nav-tree-item-wrapper--last' : ''}`}
-                            >
-                              <button
-                                className={`settings-nav-tree-item${activeSubsection === sub.id ? ' active' : ''}`}
-                                onClick={() =>
-                                  handleSubNavClick(item.id, sub.id, sub.focusControlId)
-                                }
-                                disabled={contentProtectionApplying}
+                        {subs && subs.length > 0 && (
+                          <ul className="settings-nav-tree">
+                            {subs.map((sub, i) => (
+                              <li
+                                key={sub.id}
+                                className={`settings-nav-tree-item-wrapper${i === subs.length - 1 ? ' settings-nav-tree-item-wrapper--last' : ''}`}
                               >
-                                {sub.label}
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+                                <button
+                                  className={`settings-nav-tree-item${isActive && activeSubsection === sub.id ? ' active' : ''}`}
+                                  aria-current={
+                                    isActive && activeSubsection === sub.id ? 'location' : undefined
+                                  }
+                                  onClick={() =>
+                                    requestFocus(item.id, sub.focusControlId ?? sub.targetId)
+                                  }
+                                  disabled={contentProtectionApplying}
+                                >
+                                  {sub.label}
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
               </div>
 
               {/* Pending changes blob */}

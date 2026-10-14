@@ -141,7 +141,7 @@ function clearErrorText(result: ClearHistoryResult): string | null {
     case 'notFound':
       return 'This thread is no longer available.';
     case 'stepUpImpossible':
-      return 'Set a password, enable MFA, or turn off purge protection in Privacy & Security.';
+      return 'Set a password or enable MFA in Security, or turn off purge protection in Privacy.';
     case 'refused':
       return 'History could not be cleared.';
     case 'pinClaimUnconfirmed':

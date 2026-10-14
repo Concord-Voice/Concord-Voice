@@ -2,6 +2,8 @@ import { render, screen } from '../../../test-utils';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { http, HttpResponse } from 'msw';
+import { server } from '../../../mocks/server';
 
 vi.mock('@/renderer/hooks/ui/useAgeStatus', () => ({
   useAgeStatus: () => ({ state: 'unverified' }),
@@ -15,10 +17,19 @@ vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
 
 import AccountSection from '@/renderer/components/Settings/AccountSection';
 
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterAll(() => server.close());
+afterEach(() => server.resetHandlers());
+
 describe('AccountSection', () => {
   beforeEach(() => {
     resetAllStores();
     useAuthStore.getState().setAccessToken('mock-token');
+    server.use(
+      http.get('http://localhost:8080/api/v1/subscriptions/me', () =>
+        HttpResponse.json({ tier: 'free', status: 'none' })
+      )
+    );
   });
 
   it('renders the NSFW Content Access collapsible section containing the gate', () => {
@@ -27,25 +38,27 @@ describe('AccountSection', () => {
     expect(screen.getByRole('button', { name: /verify age/i })).toBeInTheDocument();
   });
 
-  it('renders profile, password, and NSFW content as distinct ordered sections', () => {
+  it('renders profile, subscription, and NSFW content as distinct ordered sections', () => {
     render(<AccountSection />);
     const account = document.getElementById('section-profile')!;
-    const password = document.getElementById('section-password')!;
+    const subscription = document.getElementById('section-subscription')!;
     const nsfw = document.getElementById('section-nsfw-content')!;
     expect(account).not.toBeNull();
-    expect(password).not.toBeNull();
+    expect(subscription).not.toBeNull();
     expect(nsfw).not.toBeNull();
     expect(
-      account.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING
+      account.compareDocumentPosition(subscription) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy();
-    expect(password.compareDocumentPosition(nsfw) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(document.getElementById('section-subscription')).toBeNull();
+    expect(
+      subscription.compareDocumentPosition(nsfw) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    expect(document.getElementById('section-password')).toBeNull();
     expect(screen.queryByLabelText('Self Activity History')).not.toBeInTheDocument();
   });
 
   it('renders every section collapsed on first visit (#2365)', () => {
     render(<AccountSection />);
-    const ids = ['section-profile', 'section-password', 'section-nsfw-content'];
+    const ids = ['section-profile', 'section-subscription', 'section-nsfw-content'];
     for (const id of ids) {
       expect(document.getElementById(id), `${id} should be rendered`).not.toBeNull();
     }

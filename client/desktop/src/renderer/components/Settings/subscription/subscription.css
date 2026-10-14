@@ -4,17 +4,54 @@
   gap: 20px;
 }
 
-/* Subscription page (#1304) — Settings ▸ Subscriptions.
+/* Settings ▸ Account ▸ Subscription.
    Uses the shared theme tokens so it inherits every scheme/dark-light variant. */
 
+.subscription-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
 .subscription-disclaimer {
-  margin: 0 0 24px;
-  padding: 12px 14px;
-  border-left: 3px solid var(--accent-primary);
-  border-radius: 8px;
-  background: var(--bg-secondary);
+  margin: 0 0 8px;
   color: var(--text-secondary);
   line-height: 1.5;
+}
+
+.subscription-planned-options,
+.subscription-redeem {
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.subscription-planned-options a,
+.settings-content .subscription-planned-options a[target='_blank'],
+.settings-content .subscription-planned-options a[target='_blank']:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.subscription-planned-options a:focus-visible,
+.subscription-benefits-summary:focus-visible,
+.subscription-plan-retry:focus-visible,
+.subscription-redeem-submit:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 3px;
+}
+
+.subscription-benefits-summary {
+  min-height: 36px;
+  padding: 8px 0;
+  color: var(--text-primary);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.subscription-benefits[open] .subscription-feature-grid {
+  margin-top: 8px;
 }
 
 /* ── Plan card ─────────────────────────────────────────────────────────── */
@@ -29,26 +66,22 @@
   display: flex;
   align-items: baseline;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
 }
 
 .subscription-plan-name {
+  margin: 0;
   font-family: var(--font-display-stack);
-  font-size: 1.35rem;
+  font-size: var(--text-display-md);
   font-weight: 700;
   color: var(--text-primary);
 }
 
 .subscription-plan-state {
-  font-size: 0.85rem;
+  font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.subscription-plan-card[data-tier='premium'] .subscription-plan-state {
-  color: var(--accent-primary);
+  color: var(--text-primary);
 }
 
 .subscription-plan-details {
@@ -60,11 +93,12 @@
 
 .subscription-plan-source,
 .subscription-plan-expiry,
-.subscription-plan-blurb {
+.subscription-plan-blurb,
+.subscription-plan-known-access {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 0.92rem;
-  line-height: 1.4;
+  font-size: calc(15px * var(--font-scale, 1));
+  line-height: 1.5;
 }
 
 .subscription-plan-source {
@@ -72,7 +106,30 @@
   font-weight: 600;
 }
 
+.subscription-plan-known-access {
+  margin-top: 8px;
+}
+
+.subscription-plan-retry {
+  margin-top: 12px;
+  min-height: 36px;
+  padding: 8px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-weight: 600;
+  cursor: pointer;
+}
+
 /* ── Redeem form ───────────────────────────────────────────────────────── */
+.subscription-redeem-title {
+  margin: 0 0 12px;
+  color: var(--text-primary);
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
 .subscription-redeem-form {
   display: flex;
   flex-direction: column;
@@ -82,11 +139,12 @@
 .subscription-redeem-label {
   font-weight: 600;
   color: var(--text-primary);
-  font-size: 0.95rem;
+  font-size: calc(15px * var(--font-scale, 1));
 }
 
 .subscription-redeem-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -99,7 +157,7 @@
   background: var(--bg-primary);
   color: var(--text-primary);
   font-family: inherit;
-  font-size: 0.95rem;
+  font-size: calc(15px * var(--font-scale, 1));
 }
 
 .subscription-redeem-input:focus {
@@ -110,20 +168,21 @@
 .subscription-redeem-submit {
   flex: 0 0 auto;
   padding: 9px 18px;
-  border: none;
+  border: 1px solid var(--border-color);
   border-radius: 8px;
-  background: var(--accent-fill);
-  color: var(--on-accent);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
   font-weight: 600;
   cursor: pointer;
 }
 
 .subscription-redeem-submit:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: var(--bg-secondary);
 }
 
 .subscription-redeem-submit:disabled {
-  opacity: 0.6;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
   cursor: not-allowed;
 }
 
@@ -131,14 +190,14 @@
 .subscription-redeem-status {
   padding: 8px 12px;
   border-radius: 8px;
-  font-size: 0.9rem;
+  font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.4;
 }
 
 .subscription-redeem-alert {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   border: 1px solid var(--danger);
-  color: var(--danger);
+  color: var(--text-primary);
 }
 
 .subscription-redeem-status {
@@ -154,14 +213,13 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
   overflow: hidden;
 }
 
 .subscription-feature-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 11px 14px;
   border-top: 1px solid var(--border-color);
@@ -178,13 +236,13 @@
 }
 
 .subscription-feature-row.is-granted .subscription-feature-mark[data-state='granted'] {
-  color: var(--accent-primary);
+  color: var(--text-primary);
 }
 
 .subscription-feature-label {
   flex: 1 1 auto;
   color: var(--text-primary);
-  font-size: 0.92rem;
+  font-size: calc(15px * var(--font-scale, 1));
 }
 
 .subscription-feature-row.is-locked .subscription-feature-label {
@@ -193,7 +251,7 @@
 
 .subscription-feature-status {
   flex: 0 0 auto;
-  font-size: 0.75rem;
+  font-size: calc(12px * var(--font-scale, 1));
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.03em;
@@ -201,7 +259,7 @@
 }
 
 .subscription-feature-row.is-granted .subscription-feature-status {
-  color: var(--accent-primary);
+  color: var(--text-primary);
 }
 
 /* ── Planned catalog ───────────────────────────────────────────────────── */

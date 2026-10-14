@@ -11,12 +11,12 @@ beforeEach(() => {
 });
 
 describe('openSubscriptionPage', () => {
-  it('opens app settings and navigates to Subscriptions ▸ Current Plan', () => {
+  it('opens app settings and navigates to Account ▸ Subscription', () => {
     openSubscriptionPage();
     expect(useSettingsOverlayStore.getState().open).toBe('app');
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 
@@ -24,7 +24,7 @@ describe('openSubscriptionPage', () => {
     const spy = vi.spyOn(useSettingsNavStore.getState(), 'requestFocus');
     openSubscriptionPage('audio-tier');
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith('subscriptions', 'section-current-plan');
+    expect(spy).toHaveBeenCalledWith('account', 'section-subscription');
     spy.mockRestore();
   });
 

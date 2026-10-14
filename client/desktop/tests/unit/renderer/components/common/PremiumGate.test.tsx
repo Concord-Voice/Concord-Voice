@@ -101,8 +101,8 @@ describe('PremiumGate — locked state (a11y O1)', () => {
     expect(controlClick).not.toHaveBeenCalled();
     // …and the Subscription navigation DID.
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 
@@ -122,8 +122,8 @@ describe('PremiumGate — locked state (a11y O1)', () => {
     await userEvent.keyboard('{Enter}');
     expect(controlClick).not.toHaveBeenCalled();
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 
@@ -133,8 +133,8 @@ describe('PremiumGate — locked state (a11y O1)', () => {
     const chip = screen.getByRole('button', { name: /Premium/ });
     await userEvent.click(chip);
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 

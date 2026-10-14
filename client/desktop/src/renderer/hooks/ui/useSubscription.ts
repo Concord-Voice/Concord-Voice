@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 
-// Subscription status for the Settings subscription page (#1304). Reads
+// Subscription status for Settings ▸ Account ▸ Subscription. Reads
 // GET /api/v1/subscriptions/me (the read-only status companion to the
 // entitlement set) on mount and exposes tier/status/source/expiry so the
 // PlanCard can render the active plan's neutral source and optional expiry.
@@ -13,20 +13,11 @@ import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 // updates immediately (the server ALSO pushes entitlements_changed, which
 // updates the store's tier live — this hook re-reads the richer status shape).
 //
-// Never blocks the page: on any fetch error the hook falls back to the
+// Never blocks the page: on any fetch or malformed-response error the hook falls back to the
 // subscriptionStore's tier (itself fail-closed to free) with status 'unknown'
-// and surfaces `error`, so the page still renders a valid plan state.
+// and surfaces `error`. Cached entitlement access is separate from verified status.
 
 export type SubscriptionSource = 'code' | 'stripe';
-
-// Wire shape of GET /api/v1/subscriptions/me (snake_case; mirrors the Go
-// StatusDTO). All fields optional to stay resilient to a partial/drifted 200.
-interface SubscriptionStatusResponse {
-  tier?: string;
-  status?: string;
-  source?: string;
-  current_period_end?: string;
-}
 
 export interface SubscriptionInfo {
   tier: string;
@@ -38,7 +29,7 @@ export interface SubscriptionInfo {
   refetch: () => void;
 }
 
-function normalizeSource(source: string | undefined): SubscriptionSource | undefined {
+function normalizeSource(source: unknown): SubscriptionSource | undefined {
   return source === 'code' || source === 'stripe' ? source : undefined;
 }
 
@@ -58,12 +49,28 @@ export function useSubscription(): SubscriptionInfo {
     try {
       const res = await apiFetch('/api/v1/subscriptions/me');
       if (!res.ok) throw new Error(`subscriptions/me ${res.status}`);
-      const data = await safeJson<SubscriptionStatusResponse>(res);
+      const data = await safeJson<unknown>(res);
+      // A successful HTTP response is not proof of access when required status
+      // fields are missing. Never synthesize free/none from a partial payload.
+      if (
+        !data ||
+        typeof data !== 'object' ||
+        Array.isArray(data) ||
+        !('tier' in data) ||
+        typeof data.tier !== 'string' ||
+        !('status' in data) ||
+        typeof data.status !== 'string'
+      ) {
+        throw new Error('Invalid subscription status response');
+      }
       setState({
-        tier: data?.tier ?? storeTier,
-        status: data?.status ?? 'none',
-        source: normalizeSource(data?.source),
-        expiry: data?.current_period_end,
+        tier: data.tier,
+        status: data.status,
+        source: normalizeSource('source' in data ? data.source : undefined),
+        expiry:
+          'current_period_end' in data && typeof data.current_period_end === 'string'
+            ? data.current_period_end
+            : undefined,
         loading: false,
         error: false,
       });

@@ -3,14 +3,11 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 
-vi.mock('@/renderer/components/Settings/PrivacySecuritySection', () => ({
+vi.mock('@/renderer/components/Settings/PrivacySection', () => ({
   default: () => (
     <>
       <details id="section-privacy-settings">
-        <summary>Privacy</summary>
-      </details>
-      <details id="section-mfa">
-        <summary>Multi-Factor Authentication</summary>
+        <summary>Privacy Controls</summary>
       </details>
       <details id="section-presence-history">
         <summary>Activity History</summary>
@@ -18,18 +15,7 @@ vi.mock('@/renderer/components/Settings/PrivacySecuritySection', () => ({
           Activity History
         </h3>
       </details>
-      <details id="section-active-sessions">
-        <summary>Active Sessions</summary>
-      </details>
     </>
-  ),
-}));
-
-vi.mock('@/renderer/components/Settings/subscription/SubscriptionSection', () => ({
-  default: () => (
-    <details id="section-current-plan">
-      <summary>Current Plan</summary>
-    </details>
   ),
 }));
 
@@ -37,7 +23,9 @@ vi.mock('@/renderer/components/Settings/AccountSection', () => ({
   default: () => (
     <>
       <section id="section-profile" />
-      <section id="section-password" />
+      <details id="section-subscription">
+        <summary>Subscription</summary>
+      </details>
       <section id="section-nsfw-content" />
     </>
   ),
@@ -61,7 +49,7 @@ afterEach(() => {
 });
 
 describe('SettingsPage Activity History focus integration', () => {
-  it('routes the Privacy sidebar item through the persistent history heading focus target', () => {
+  it('routes the Privacy sidebar item through the Activity History disclosure summary', () => {
     useClientConfigStore.getState().setActivityHistoryCapability({ status: 'supported' });
     render(<SettingsPage />);
 
@@ -70,10 +58,11 @@ describe('SettingsPage Activity History focus integration', () => {
       vi.advanceTimersByTime(60);
     });
 
-    const heading = document.getElementById('presence-history-heading');
-    expect(heading).not.toBeNull();
-    expect(document.activeElement).toBe(heading);
-    expect(heading?.closest('details')).toHaveAttribute('open');
+    const section = document.getElementById('section-presence-history');
+    const summary = section?.querySelector(':scope > summary');
+    expect(summary).not.toBeNull();
+    expect(document.activeElement).toBe(summary);
+    expect(section).toHaveAttribute('open');
     expect(useSettingsNavStore.getState().focusRequest).toBeNull();
   });
 
@@ -90,14 +79,14 @@ describe('SettingsPage Activity History focus integration', () => {
     expect(screen.getByRole('button', { name: 'Activity History' })).toBeInTheDocument();
   });
 
-  it('hides only unsupported Activity History navigation and preserves ordinary Privacy subsections', () => {
+  it('keeps other Privacy destinations discoverable without an unprobed unsupported History child', () => {
     useClientConfigStore
       .getState()
       .setActivityHistoryCapability({ status: 'confirmed-unsupported' });
     render(<SettingsPage />);
 
-    expect(screen.queryByRole('button', { name: 'Activity History' })).not.toBeInTheDocument();
-    const privacyButton = screen.getByRole('button', { name: 'Privacy' });
+    expect(screen.queryByRole('button', { name: 'Activity History' })).toBeNull();
+    const privacyButton = screen.getByRole('button', { name: 'Privacy Controls' });
     expect(screen.getByRole('button', { name: 'Active Sessions' })).toBeInTheDocument();
 
     fireEvent.click(privacyButton);
@@ -108,7 +97,7 @@ describe('SettingsPage Activity History focus integration', () => {
     expect(document.getElementById('section-privacy-settings')).not.toBeNull();
     expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
       behavior: 'smooth',
-      block: 'start',
+      block: 'center',
     });
   });
 
@@ -127,17 +116,17 @@ describe('SettingsPage Activity History focus integration', () => {
     expect(heading?.closest('details')).toHaveAttribute('open');
     expect(useSettingsNavStore.getState().focusRequest).toBeNull();
   });
-  it('focuses the summary when a deep-link targets a <details> (subscriptions deep-link)', () => {
+  it('focuses the summary when a deep-link targets the Account Subscription disclosure', () => {
     render(<SettingsPage />);
 
     act(() => {
-      useSettingsNavStore.getState().requestFocus('subscriptions', 'section-current-plan');
+      useSettingsNavStore.getState().requestFocus('account', 'section-subscription');
     });
     act(() => {
       vi.advanceTimersByTime(60);
     });
 
-    const details = document.getElementById('section-current-plan');
+    const details = document.getElementById('section-subscription');
     expect(details).not.toBeNull();
     // focus() on a <details> is a no-op, so the effect must redirect to its <summary>.
     // Without that redirect this silently lands nowhere and clearFocusRequest() still

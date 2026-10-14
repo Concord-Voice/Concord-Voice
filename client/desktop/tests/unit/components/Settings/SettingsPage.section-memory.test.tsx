@@ -6,6 +6,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { useSettingsCollapsibleStore } from '@/renderer/stores/ui/settingsCollapsibleStore';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { openProfilePage } from '@/renderer/utils/ui/openProfilePage';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
@@ -63,6 +64,11 @@ function openCollapsibleIds(): string[] {
   return Array.from(document.querySelectorAll('details.settings-collapsible[open]')).map(
     (el) => el.id || '(no id)'
   );
+}
+
+function SettingsMemorySurface() {
+  const open = useSettingsOverlayStore((state) => state.open);
+  return open === 'app' ? <SettingsPage /> : null;
 }
 
 describe('SettingsPage section memory (#2365)', () => {
@@ -126,17 +132,18 @@ describe('SettingsPage section memory (#2365)', () => {
     expect(sectionEl('client-behavior')).not.toHaveAttribute('open');
   });
 
-  it('I3 section state survives closing and reopening Settings (#2365)', async () => {
-    const first = render(<SettingsPage />);
+  it('I3 section state survives a short close and reopen through the real Settings overlay (#2365)', async () => {
+    render(<SettingsMemorySurface />);
+    act(() => useSettingsOverlayStore.getState().openSettings('app'));
     expect(sectionEl('section-theme').open).toBe(false);
 
     clickSummary('section-theme');
     await waitFor(() => expect(storeOpen('section-theme')).toBe(true));
 
-    first.unmount();
+    act(() => useSettingsOverlayStore.getState().close());
     expect(document.getElementById('section-theme')).toBeNull();
 
-    render(<SettingsPage />);
+    act(() => useSettingsOverlayStore.getState().openSettings('app'));
     expect(sectionEl('section-theme')).toHaveAttribute('open');
     expect(sectionEl('section-color-scheme')).not.toHaveAttribute('open');
   });
@@ -179,7 +186,7 @@ describe('SettingsPage section memory (#2365)', () => {
     clickNavItem('Account');
     await waitFor(() => expect(document.getElementById('section-profile')).not.toBeNull());
     expect(sectionEl('section-profile').open).toBe(false);
-    expect(sectionEl('section-password').open).toBe(false);
+    expect(sectionEl('section-nsfw-content').open).toBe(false);
 
     // Leave the pane, then deep-link in: the focus-request effect switches pane, opens
     // the target through `details.open = true`, and focuses its summary.
@@ -200,7 +207,6 @@ describe('SettingsPage section memory (#2365)', () => {
     clickNavItem('Account');
     await waitFor(() => expect(document.getElementById('section-profile')).not.toBeNull());
     expect(sectionEl('section-profile')).toHaveAttribute('open');
-    expect(sectionEl('section-password')).not.toHaveAttribute('open');
     expect(sectionEl('section-nsfw-content')).not.toHaveAttribute('open');
   });
 
@@ -219,5 +225,37 @@ describe('SettingsPage section memory (#2365)', () => {
     render(<SettingsPage />);
     expect(sectionEl('section-theme')).toHaveAttribute('open');
     expect(sectionEl('section-color-scheme')).not.toHaveAttribute('open');
+  });
+
+  it('I7 the actual Messages font disclosure restores expansion after a pane pivot', async () => {
+    useSettingsStore.setState({
+      appearance: {
+        ...useSettingsStore.getInitialState().appearance,
+        fontMode: 'area',
+      },
+    });
+    render(<SettingsPage />);
+    clickSummary('section-fonts');
+    await waitFor(() => expect(sectionEl('section-fonts')).toHaveAttribute('open'));
+    const messageDetails = () => {
+      const node = within(sectionEl('section-fonts'))
+        .getByText('Messages', { selector: '.font-area-name' })
+        .closest('details');
+      if (!(node instanceof HTMLDetailsElement))
+        throw new Error('Messages font disclosure missing');
+      return node;
+    };
+    expect(messageDetails()).not.toHaveAttribute('open');
+    const summary = messageDetails().querySelector('summary');
+    if (!summary) throw new Error('Messages font summary missing');
+    fireEvent.click(summary);
+    await waitFor(() => expect(messageDetails()).toHaveAttribute('open'));
+
+    clickNavItem('Account');
+    await waitFor(() => expect(document.getElementById('section-profile')).not.toBeNull());
+    clickNavItem('Appearance');
+    await waitFor(() => expect(sectionEl('section-fonts')).toHaveAttribute('open'));
+
+    expect(messageDetails()).toHaveAttribute('open');
   });
 });

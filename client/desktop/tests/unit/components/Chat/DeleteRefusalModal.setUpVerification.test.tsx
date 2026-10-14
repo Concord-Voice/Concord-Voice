@@ -128,7 +128,7 @@ describe('DeleteRefusalModal set up verification (#3456 §3.6a)', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(useSettingsOverlayStore.getState().verificationReturn).toEqual({ kind: 'chat' });
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'privacy',
+      section: 'security',
       controlId: 'section-mfa',
     });
     // Mutation: have the link call onConfirm (retry the delete) -> red here.

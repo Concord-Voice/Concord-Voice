@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup } from '@testing-library/react';
+import { render, cleanup, screen } from '../../test-utils';
 import { useRef } from 'react';
 import { useSectionObserver } from '@/renderer/hooks/ui/useSectionObserver';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 interface CapturedInstance {
   callback: IntersectionObserverCallback;
@@ -71,10 +72,95 @@ function HarnessNoRoot({ onActiveSubsection }: { onActiveSubsection: (id: string
   );
 }
 
+const APP_DESTINATIONS = ['section-profile', 'section-subscription', 'section-presence-history'];
+
+function AppHarness({
+  onActiveSubsection,
+  explicit = true,
+}: {
+  onActiveSubsection: (id: string) => void;
+  explicit?: boolean;
+}) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  useSectionObserver(
+    contentRef,
+    'account',
+    onActiveSubsection,
+    explicit ? APP_DESTINATIONS : undefined
+  );
+  return (
+    <>
+      <button type="button">Outside Settings</button>
+      <div className="settings-page-content">
+        <div ref={contentRef}>
+          <details id="section-profile">
+            <summary>Profile Information</summary>
+          </details>
+          <details id="section-subscription" open>
+            <summary>Subscription</summary>
+          </details>
+          <details id="section-presence-history" open>
+            <summary>Activity History</summary>
+            <h3 id="presence-history-heading" tabIndex={-1}>
+              History records
+            </h3>
+          </details>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function focusedDestinationFixture(
+  destination: 'section-subscription' | 'section-presence-history',
+  onActiveSubsection: (id: string) => void,
+  explicit = true
+) {
+  render(<AppHarness onActiveSubsection={onActiveSubsection} explicit={explicit} />);
+  vi.advanceTimersByTime(50);
+  const viewport = document.querySelector<HTMLElement>('.settings-page-content');
+  const section = document.getElementById(destination);
+  const focusTarget =
+    destination === 'section-presence-history'
+      ? screen.getByRole('heading', { name: 'History records' })
+      : section?.querySelector<HTMLElement>('summary');
+  if (!viewport || !section || !focusTarget)
+    throw new Error('Focused destination fixture is missing');
+  // Geometry is supplied at the native layout boundary: a short collapsed
+  // Profile row is fully visible above a taller, partly visible destination,
+  // whose heading/summary is still visible within the actual scroll viewport.
+  const bounds = new DOMRect(0, 100, 800, 400);
+  vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(bounds);
+  const focusBounds = vi
+    .spyOn(focusTarget, 'getBoundingClientRect')
+    .mockReturnValue(new DOMRect(20, 250, 300, 32));
+  focusTarget.focus();
+  expect(focusTarget).toHaveFocus();
+  const profileEntry: IntersectionObserverEntry = {
+    ...makeEntry('section-profile', true, 120),
+    boundingClientRect: new DOMRect(20, 120, 760, 32),
+    intersectionRect: new DOMRect(20, 120, 760, 32),
+    rootBounds: bounds,
+    intersectionRatio: 1,
+  };
+  const destinationEntry: IntersectionObserverEntry = {
+    ...makeEntry(destination, true, 180),
+    boundingClientRect: new DOMRect(20, 180, 760, 640),
+    intersectionRect: new DOMRect(20, 180, 760, 320),
+    rootBounds: bounds,
+    intersectionRatio: 0.5,
+  };
+  const observer = instances[0];
+  const notify = (entry = destinationEntry) =>
+    observer.callback([profileEntry, entry], {} as IntersectionObserver);
+  return { focusTarget, focusBounds, notify, destinationEntry };
+}
+
 describe('useSectionObserver', () => {
   let originalIO: typeof IntersectionObserver;
 
   beforeEach(() => {
+    resetAllStores();
     instances = [];
     originalIO = globalThis.IntersectionObserver;
     (globalThis as unknown as { IntersectionObserver: unknown }).IntersectionObserver =
@@ -84,6 +170,7 @@ describe('useSectionObserver', () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.useRealTimers();
     (globalThis as unknown as { IntersectionObserver: unknown }).IntersectionObserver = originalIO;
   });
@@ -147,6 +234,31 @@ describe('useSectionObserver', () => {
     expect(onActiveSubsection).toHaveBeenLastCalledWith('a');
   });
 
+  it('preserves the last destination when all observed sections leave the viewport', () => {
+    const onActiveSubsection = vi.fn();
+    render(<Harness onActiveSubsection={onActiveSubsection} />);
+    vi.advanceTimersByTime(50);
+    const inst = instances[0];
+    inst.callback(
+      [makeEntry('section-a', true, 100), makeEntry('section-b', true, 20)],
+      {} as IntersectionObserver
+    );
+    // A positive report first proves the observer is live before the empty
+    // viewport asks it to leave the current destination unchanged.
+    expect(onActiveSubsection).toHaveBeenCalledTimes(1);
+    expect(onActiveSubsection).toHaveBeenLastCalledWith('b');
+
+    expect(() =>
+      inst.callback(
+        [makeEntry('section-a', false, -100), makeEntry('section-b', false, -200)],
+        {} as IntersectionObserver
+      )
+    ).not.toThrow();
+
+    expect(onActiveSubsection).toHaveBeenCalledTimes(1);
+    expect(onActiveSubsection).toHaveBeenLastCalledWith('b');
+  });
+
   it('clears the timer and disconnects the observer on unmount without throwing', () => {
     const onActiveSubsection = vi.fn();
     const { unmount } = render(<Harness onActiveSubsection={onActiveSubsection} />);
@@ -173,5 +285,64 @@ describe('useSectionObserver', () => {
 
     expect(instances).toHaveLength(0);
     expect(onActiveSubsection).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['section-subscription', 'subscription'],
+    ['section-presence-history', 'presence-history'],
+  ] as const)(
+    'keeps the visible focused %s current despite a shorter fully visible section',
+    (destination, current) => {
+      const onActiveSubsection = vi.fn();
+      const { notify } = focusedDestinationFixture(destination, onActiveSubsection);
+      notify();
+
+      expect(onActiveSubsection).toHaveBeenLastCalledWith(current);
+    }
+  );
+
+  it('uses normal scroll selection once focus moves outside the Settings viewport', () => {
+    const onActiveSubsection = vi.fn();
+    const { notify } = focusedDestinationFixture('section-subscription', onActiveSubsection);
+    const outside = screen.getByRole('button', { name: 'Outside Settings' });
+    outside.focus();
+    expect(outside).toHaveFocus();
+    notify();
+
+    expect(onActiveSubsection).toHaveBeenLastCalledWith('profile');
+  });
+
+  it('uses normal scroll selection when the focused control scrolls outside the viewport', () => {
+    const onActiveSubsection = vi.fn();
+    const { notify, focusTarget, focusBounds } = focusedDestinationFixture(
+      'section-subscription',
+      onActiveSubsection
+    );
+    // The larger section still intersects, while its focused summary has moved
+    // above the viewport; document focus alone must not pin the old destination.
+    focusBounds.mockReturnValue(new DOMRect(20, 20, 300, 32));
+    expect(focusTarget).toHaveFocus();
+    notify();
+
+    expect(onActiveSubsection).toHaveBeenLastCalledWith('profile');
+  });
+
+  it('uses normal scroll selection when the focused section is no longer intersecting', () => {
+    const onActiveSubsection = vi.fn();
+    const { notify, destinationEntry } = focusedDestinationFixture(
+      'section-presence-history',
+      onActiveSubsection
+    );
+    notify({ ...destinationEntry, isIntersecting: false, intersectionRatio: 0 });
+
+    expect(onActiveSubsection).toHaveBeenLastCalledWith('profile');
+  });
+
+  it('preserves the default three-argument server observer even with focus on a visible control', () => {
+    const onActiveSubsection = vi.fn();
+    const { notify } = focusedDestinationFixture('section-subscription', onActiveSubsection, false);
+    notify();
+
+    expect(onActiveSubsection).toHaveBeenLastCalledWith('profile');
   });
 });

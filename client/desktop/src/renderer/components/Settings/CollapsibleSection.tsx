@@ -1,5 +1,5 @@
 import React from 'react';
-import { useSettingsCollapsibleStore } from '../../stores/ui/settingsCollapsibleStore';
+import RememberedDisclosure from './RememberedDisclosure';
 
 interface CollapsibleSectionProps {
   id: string;
@@ -13,8 +13,8 @@ interface CollapsibleSectionProps {
  * A Settings section with a native `<details>`/`<summary>` disclosure. Collapsed by default,
  * with no per-site override (#2365).
  *
- * Open state is remembered for the renderer session in `useSettingsCollapsibleStore`, keyed
- * by `id`, through a two-way binding: `open` renders from the store and `onToggle` writes the
+ * Open state is remembered while Settings is active and for 30 minutes after leaving,
+ * keyed by `id`, through RememberedDisclosure: `open` renders from the store and `onToggle` writes the
  * DOM truth back. The native `toggle` event fires for script-driven `el.open = …` writes as
  * well as clicks, so Expand/Collapse all, the sub-nav scroll, a focus request and the update
  * indicator reach the store with no store call of their own. React rewrites the `open`
@@ -33,43 +33,35 @@ const CollapsibleSection: React.FC<CollapsibleSectionProps> = ({
   children,
   onCollapse,
 }) => {
-  const open = useSettingsCollapsibleStore((s) => s.openSections[id] === true);
-  const setSectionOpen = useSettingsCollapsibleStore((s) => s.setSectionOpen);
-
-  const handleToggle = (event: React.SyntheticEvent<HTMLDetailsElement>) => {
-    if (event.target !== event.currentTarget) return;
-    const isOpen = event.currentTarget.open;
-    setSectionOpen(id, isOpen);
-    if (!isOpen) onCollapse?.();
-  };
-
   return (
-    <details
+    <RememberedDisclosure
       className="settings-section settings-collapsible"
       id={id}
-      open={open}
-      onToggle={handleToggle}
+      onCollapse={onCollapse}
+      summaryClassName="settings-collapsible-header"
+      summary={
+        <>
+          <h2 className="settings-section-title">{title}</h2>
+          <svg
+            className="settings-collapsible-chevron"
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            fill="none"
+          >
+            <path
+              d="M4 6l4 4 4-4"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </>
+      }
     >
-      <summary className="settings-collapsible-header">
-        <h2 className="settings-section-title">{title}</h2>
-        <svg
-          className="settings-collapsible-chevron"
-          width="16"
-          height="16"
-          viewBox="0 0 16 16"
-          fill="none"
-        >
-          <path
-            d="M4 6l4 4 4-4"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </summary>
       <div className="settings-collapsible-body">{children}</div>
-    </details>
+    </RememberedDisclosure>
   );
 };
 

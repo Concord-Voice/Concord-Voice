@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 const resetOrder = vi.hoisted(() => [] as string[]);
 
@@ -88,6 +88,9 @@ import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/messagi
 import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
+import { useSettingsCollapsibleStore } from '@/renderer/stores/ui/settingsCollapsibleStore';
+import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { mockServer } from '../../mocks/fixtures';
@@ -121,6 +124,160 @@ beforeEach(() => {
 });
 
 describe('resetService', () => {
+  describe('Settings visit retention on account reset', () => {
+    const accountResets = [
+      ['gracefulReset', gracefulReset],
+      ['nuclearReset', nuclearReset],
+    ] as const;
+    const thirtyMinutes = 30 * 60 * 1000;
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-14T12:00:00Z'));
+    });
+
+    afterEach(() => {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    });
+
+    it.each(accountResets)(
+      '%s closes an active visit despite Apply and retains expansion only for 30 minutes',
+      (_name, reset) => {
+        useSettingsOverlayStore.getState().openSettings('app');
+        useSettingsCollapsibleStore.getState().setSectionOpen('section-theme', true);
+        useDraftSettingsStore.setState({ contentProtectionApplying: true });
+
+        // Ordinary dismissal remains blocked while Apply is in flight.
+        useSettingsOverlayStore.getState().close();
+        expect(useSettingsOverlayStore.getState().open).toBe('app');
+        expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+
+        reset();
+
+        expect(useSettingsOverlayStore.getState().open).toBeNull();
+        expect(useSettingsCollapsibleStore.getState().visitActive).toBe(false);
+        expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBe(
+          Date.now() + thirtyMinutes
+        );
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({
+          'section-theme': true,
+        });
+        vi.advanceTimersByTime(thirtyMinutes - 1);
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({
+          'section-theme': true,
+        });
+        vi.advanceTimersByTime(1);
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({});
+        expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+      }
+    );
+
+    it.each(accountResets)('%s preserves an already closed visit deadline', (_name, reset) => {
+      useSettingsOverlayStore.getState().openSettings('app');
+      useSettingsCollapsibleStore.getState().setSectionOpen('section-theme', true);
+      useSettingsOverlayStore.getState().close();
+      const deadline = Date.now() + thirtyMinutes;
+      vi.advanceTimersByTime(5 * 60 * 1000);
+
+      reset();
+
+      expect(useSettingsOverlayStore.getState().open).toBeNull();
+      expect(useSettingsCollapsibleStore.getState().visitActive).toBe(false);
+      expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBe(deadline);
+      vi.advanceTimersByTime(25 * 60 * 1000 - 1);
+      expect(useSettingsCollapsibleStore.getState().openSections).toEqual({
+        'section-theme': true,
+      });
+      vi.advanceTimersByTime(1);
+      expect(useSettingsCollapsibleStore.getState().openSections).toEqual({});
+    });
+
+    it.each(accountResets)('%s discards the ending account server context', (_name, reset) => {
+      useSettingsOverlayStore.getState().openSettings('server', {
+        serverId: 'prior-server',
+        section: 'roles',
+      });
+      useSettingsOverlayStore.getState().setVerificationReturn({
+        kind: 'serverSettings',
+        serverId: 'prior-server',
+        section: 'roles',
+      });
+      expect(useSettingsOverlayStore.getState().payload?.serverId).toBe('prior-server');
+
+      reset();
+
+      expect(useSettingsOverlayStore.getState().open).toBeNull();
+      expect(useSettingsOverlayStore.getState().payload).toBeNull();
+      expect(useSettingsOverlayStore.getState().verificationReturn).toBeNull();
+    });
+
+    it.each(accountResets)(
+      '%s permits a fresh visit that suspends expiry until the next close',
+      (_name, reset) => {
+        useSettingsOverlayStore.getState().openSettings('app');
+        useSettingsCollapsibleStore.getState().setSectionOpen('section-theme', true);
+        reset();
+        expect(useSettingsCollapsibleStore.getState().visitActive).toBe(false);
+        vi.advanceTimersByTime(5 * 60 * 1000);
+
+        useSettingsOverlayStore.getState().openSettings('app');
+        expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+        expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+        vi.advanceTimersByTime(thirtyMinutes);
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({
+          'section-theme': true,
+        });
+
+        useSettingsOverlayStore.getState().close();
+        expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBe(
+          Date.now() + thirtyMinutes
+        );
+        vi.advanceTimersByTime(thirtyMinutes);
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({});
+      }
+    );
+
+    it.each(accountResets)(
+      '%s drops expired expansion synchronously on reopen when its timer was delayed',
+      (_name, reset) => {
+        useSettingsOverlayStore.getState().openSettings('app');
+        useSettingsCollapsibleStore.getState().setSectionOpen('section-theme', true);
+        reset();
+        expect(useSettingsCollapsibleStore.getState().visitActive).toBe(false);
+
+        // Changing wall-clock time does not execute the queued expiry callback.
+        vi.setSystemTime(Date.now() + thirtyMinutes);
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({
+          'section-theme': true,
+        });
+        useSettingsOverlayStore.getState().openSettings('app');
+
+        expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+        expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+        expect(useSettingsCollapsibleStore.getState().openSections).toEqual({});
+      }
+    );
+
+    it('same-account recovery preserves an active visit and its dismiss blocker', () => {
+      useSettingsOverlayStore.getState().openSettings('app');
+      useSettingsCollapsibleStore.getState().setSectionOpen('section-theme', true);
+      useDraftSettingsStore.setState({ contentProtectionApplying: true });
+
+      recoveryReset();
+      vi.advanceTimersByTime(2 * thirtyMinutes);
+
+      expect(useSettingsOverlayStore.getState().open).toBe('app');
+      expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+      expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+      expect(useSettingsCollapsibleStore.getState().openSections).toEqual({
+        'section-theme': true,
+      });
+      useSettingsOverlayStore.getState().close();
+      expect(useSettingsOverlayStore.getState().open).toBe('app');
+    });
+  });
+
   // Only nuclearReset() clears NSFW intent. gracefulReset() must NOT: softRestart()
   // calls it on a same-account Recovery-B reload, and clearing there would revoke the
   // user's opt-in and persist it to disk on any transport blip (#2199).

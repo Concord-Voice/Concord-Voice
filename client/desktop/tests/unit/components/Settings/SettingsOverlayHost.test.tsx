@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
+import { useSettingsCollapsibleStore } from '@/renderer/stores/ui/settingsCollapsibleStore';
 import { openForeignModal } from '../../../helpers/foreignModal';
 
 vi.mock('@/renderer/components/Settings/SettingsPage', async () => {
@@ -203,18 +204,65 @@ describe('SettingsOverlayHost', () => {
     expect(screen.queryByTestId('mock-server-settings-page')).toBeNull();
   });
 
-  it('closes the store when the dialog fires its close event (ESC)', async () => {
+  it('ends the visit when the native dialog closes before firing its close event', async () => {
     render(<SettingsOverlayHost />);
     act(() => {
       useSettingsOverlayStore.getState().openSettings('app');
     });
     await screen.findByTestId('mock-settings-page');
 
-    act(() => {
-      getDialog().dispatchEvent(new Event('close'));
-    });
+    const dlg = getDialog();
+    await waitFor(() => expect(dlg).toHaveAttribute('open'));
+    expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+    expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+
+    act(() => dlg.close());
 
     expect(useSettingsOverlayStore.getState().open).toBeNull();
+    expect(dlg).not.toHaveAttribute('open');
+    expect(useSettingsCollapsibleStore.getState().visitActive).toBe(false);
+    expect(useSettingsCollapsibleStore.getState().retentionDeadline).not.toBeNull();
+  });
+
+  it('keeps a reopened Settings visit active when the prior native close event arrives late', async () => {
+    render(<SettingsOverlayHost />);
+    act(() => useSettingsOverlayStore.getState().openSettings('app'));
+    await screen.findByTestId('mock-settings-page');
+    const dlg = getDialog();
+    await waitFor(() => expect(dlg).toHaveAttribute('open'));
+
+    const pendingNativeCloseEvents: Event[] = [];
+    // Chromium removes `open` immediately but queues its `close` event. Delay
+    // only that native boundary so the previous visit's event can arrive after
+    // the real overlay close/reopen actions have opened a new visit.
+    const nativeClose = vi.spyOn(dlg, 'close').mockImplementation(() => {
+      dlg.removeAttribute('open');
+      pendingNativeCloseEvents.push(new Event('close'));
+    });
+    try {
+      act(() => useSettingsOverlayStore.getState().close());
+      expect(useSettingsOverlayStore.getState().open).toBeNull();
+      expect(dlg).not.toHaveAttribute('open');
+      expect(pendingNativeCloseEvents).toHaveLength(1);
+      expect(useSettingsCollapsibleStore.getState().visitActive).toBe(false);
+      expect(useSettingsCollapsibleStore.getState().retentionDeadline).not.toBeNull();
+
+      act(() => useSettingsOverlayStore.getState().openSettings('app'));
+      await screen.findByTestId('mock-settings-page');
+      await waitFor(() => expect(dlg).toHaveAttribute('open'));
+      expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+      expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+
+      act(() => dlg.dispatchEvent(pendingNativeCloseEvents[0]));
+
+      expect(useSettingsOverlayStore.getState().open).toBe('app');
+      expect(dlg).toHaveAttribute('open');
+      expect(screen.getByTestId('mock-settings-page')).toBeInTheDocument();
+      expect(useSettingsCollapsibleStore.getState().visitActive).toBe(true);
+      expect(useSettingsCollapsibleStore.getState().retentionDeadline).toBeNull();
+    } finally {
+      nativeClose.mockRestore();
+    }
   });
 
   it('closes the store when Escape is pressed while open', async () => {

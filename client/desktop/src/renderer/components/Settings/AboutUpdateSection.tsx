@@ -1,10 +1,36 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { ExternalLink } from 'lucide-react';
 import CollapsibleSection from './CollapsibleSection';
 import ToggleSwitch from './ToggleSwitch';
+import RememberedDisclosure from './RememberedDisclosure';
+import LegalDocumentContent from './LegalDocumentContent';
+import SystemPermissionsSection from './SystemPermissionsSection';
+import SafeLink from '../Markdown/SafeLink';
+import { legalDisclosureId } from './legalDocumentLinks';
 import { SPA_VERSION } from '../../config';
-import { LEGAL_DOCUMENTS } from '../../legalDocuments';
+import { LEGAL_DOCUMENTS, type LegalDocument } from '../../legalDocuments';
+import { useSettingsCollapsibleStore } from '../../stores/ui/settingsCollapsibleStore';
 import { compactSpaHash } from '../../utils/runtime/clientVersion';
 import './AboutUpdateSection.css';
+
+interface LegalDocumentDisclosureProps {
+  document: LegalDocument;
+}
+
+const LegalDocumentDisclosure: React.FC<LegalDocumentDisclosureProps> = ({ document }) => {
+  const id = legalDisclosureId(document);
+  const open = useSettingsCollapsibleStore((state) => state.openSections[id] === true);
+  return (
+    <RememberedDisclosure
+      className="about-legal-document"
+      summaryClassName="about-legal-summary"
+      id={id}
+      summary={document.label}
+    >
+      {open && <LegalDocumentContent document={document} />}
+    </RememberedDisclosure>
+  );
+};
 
 type UpdateStatus =
   'idle' | 'checking' | 'up-to-date' | 'available' | 'downloading' | 'downloaded' | 'error';
@@ -398,46 +424,28 @@ const AboutUpdateSection: React.FC = () => {
           )}
         </div>
 
-        <div className="about-third-party">
-          <div className="about-third-party-title">Third-party services</div>
-          <div className="about-third-party-item">
-            <strong>KLIPY</strong> &mdash; GIF search and delivery. Concord Voice is independently
-            developed and not affiliated with or endorsed by KLIPY.
-          </div>
-        </div>
-
         <div className="about-legal">
-          <div className="about-legal-title">Legal and attribution</div>
+          <h3 className="about-legal-title">Legal &amp; Attribution</h3>
           <div className="about-legal-list">
             {LEGAL_DOCUMENTS.map((doc) => (
-              <details className="about-legal-document" key={doc.sourcePath}>
-                <summary className="about-legal-summary">
-                  <span>{doc.label}</span>
-                  <span className="about-legal-source">{doc.sourcePath}</span>
-                </summary>
-                <pre className="about-legal-content">{doc.content}</pre>
-              </details>
+              <LegalDocumentDisclosure key={doc.sourcePath} document={doc} />
             ))}
           </div>
         </div>
-      </CollapsibleSection>
 
-      {/* Developer (TEMPORARY — remove before BETA) */}
-      <CollapsibleSection id="section-developer" title="Developer">
-        <div className="about-setting-row">
-          <div className="about-setting-info">
-            <span className="about-setting-label">Developer Mode</span>
-            <span className="about-setting-description">
-              Enables Chromium DevTools (Cmd/Ctrl+Opt+I) for inspecting the renderer. Toggling this
-              opens or closes DevTools immediately and persists across restarts. Intended for
-              Alpha-phase debugging only.
-            </span>
+        <div className="about-third-party">
+          <h3 className="about-third-party-title">Third-Party Services</h3>
+          <div className="about-third-party-item">
+            <strong>Powered by KLIPY</strong>
+            <p>KLIPY provides GIF search and delivery.</p>
+            <p>
+              Concord Voice is independently developed and not affiliated with or endorsed by KLIPY.
+            </p>
+            <SafeLink href="https://klipy.com/support/privacy-policy">
+              KLIPY Privacy Policy
+              <ExternalLink size={13} className="settings-external-link-icon" aria-hidden="true" />
+            </SafeLink>
           </div>
-          <ToggleSwitch
-            checked={developerMode}
-            onChange={handleDeveloperModeToggle}
-            label="Developer Mode"
-          />
         </div>
       </CollapsibleSection>
 
@@ -580,6 +588,27 @@ const AboutUpdateSection: React.FC = () => {
             )}
           </div>
         )}
+      </CollapsibleSection>
+
+      <SystemPermissionsSection />
+
+      {/* Developer (TEMPORARY — remove before BETA) */}
+      <CollapsibleSection id="section-developer" title="Developer">
+        <div className="about-setting-row">
+          <div className="about-setting-info">
+            <span className="about-setting-label">Developer Mode</span>
+            <span className="about-setting-description">
+              Enables Chromium DevTools (Cmd/Ctrl+Opt+I) for inspecting the renderer. Toggling this
+              opens or closes DevTools immediately and persists across restarts. Intended for
+              Alpha-phase debugging only.
+            </span>
+          </div>
+          <ToggleSwitch
+            checked={developerMode}
+            onChange={handleDeveloperModeToggle}
+            label="Developer Mode"
+          />
+        </div>
       </CollapsibleSection>
     </>
   );

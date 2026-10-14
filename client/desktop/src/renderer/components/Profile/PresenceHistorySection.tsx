@@ -20,6 +20,7 @@ import './PresenceHistorySection.css';
 export interface PresenceHistorySectionProps {
   readonly userId: string | null;
   readonly onVisibilityChange?: (visible: boolean) => void;
+  readonly onAvailabilityChange?: (available: boolean) => void;
 }
 
 type LoadMoreState = 'idle' | 'loading' | 'error';
@@ -78,6 +79,10 @@ const historyDateFormatter = new Intl.DateTimeFormat(undefined, {
 
 function emptyFeedState(ownerId: string | null): PresenceHistoryFeedState {
   return { ownerId, status: 'idle' };
+}
+
+function hasConfirmedHistoryFeed(state: PresenceHistoryFeedState): boolean {
+  return state.status === 'ready' || (state.status === 'error' && state.confirmed !== null);
 }
 
 function itemElementId(itemId: string): string {
@@ -201,13 +206,12 @@ interface EmptyHistoryProps {
 
 function EmptyHistory({ settings }: EmptyHistoryProps) {
   let title = 'Activity History is off';
-  let description =
-    'Turn it on in Privacy & Security. History begins with your next Custom Status change.';
+  let description = 'Turn it on in Privacy. History begins with your next Custom Status change.';
 
   if (settings.reconsentRequired) {
     title = 'Recording is paused';
     description =
-      'Review the updated terms in Privacy & Security. When recording resumes, history begins again with your next Custom Status change.';
+      'Review the updated terms in Privacy. When recording resumes, history begins again with your next Custom Status change.';
   } else if (settings.enabled) {
     title = 'No activity recorded yet';
     description = 'History begins with your next Custom Status change.';
@@ -370,6 +374,7 @@ function ReadyHistoryFeed({ state, onLoadMore }: ReadyHistoryFeedProps) {
 export default function PresenceHistorySection({
   userId,
   onVisibilityChange,
+  onAvailabilityChange,
 }: PresenceHistorySectionProps) {
   const capability = useClientConfigStore((state) => state.activityHistoryCapability);
   const staleSupported = capability.status === 'error' && capability.lastConfirmedSupported;
@@ -580,6 +585,7 @@ export default function PresenceHistorySection({
   }, [feedState, userId]);
 
   const currentState = feedState.ownerId === userId ? feedState : emptyFeedState(userId);
+  const available = hasConfirmedHistoryFeed(currentState);
   const visible = !(
     capability.status === 'confirmed-unsupported' &&
     (currentState.status === 'idle' ||
@@ -594,6 +600,10 @@ export default function PresenceHistorySection({
     // the cleanup a section that unmounts while visible leaves an empty collapsible.
     return () => onVisibilityChange?.(false);
   }, [onVisibilityChange, visible]);
+  useEffect(() => {
+    onAvailabilityChange?.(available);
+    return () => onAvailabilityChange?.(false);
+  }, [onAvailabilityChange, available]);
   if (!visible) {
     return null;
   }

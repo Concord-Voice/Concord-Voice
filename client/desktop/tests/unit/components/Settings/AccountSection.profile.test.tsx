@@ -2,6 +2,9 @@ import { render, screen, fireEvent, within } from '../../../test-utils';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { http, HttpResponse } from 'msw';
+import { server } from '../../../mocks/server';
 
 // Mock PasswordStrength
 vi.mock('@/renderer/components/Auth/PasswordStrength', () => ({
@@ -25,15 +28,55 @@ vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
 }));
 
 import AccountSection from '@/renderer/components/Settings/AccountSection';
+import SecuritySection from '@/renderer/components/Settings/SecuritySection';
 
-// Profile/password form behavior, exercised through their host AccountSection (#1773).
+// Profile behavior remains under Account; password behavior exercises its Security destination.
 // Was tests/unit/components/Profile/ProfilePage.test.tsx before the
 // standalone page was removed; retained here so ProfileInfoForm + PasswordChangeForm
 // (an OWASP A07 surface) coverage does not regress during the move.
-describe('AccountSection profile and password forms', () => {
+const API_BASE = 'http://localhost:8080/api/v1';
+const readHandlers = [
+  http.get(`${API_BASE}/subscriptions/me`, () =>
+    HttpResponse.json({ tier: 'free', status: 'none' })
+  ),
+  http.get(`${API_BASE}/sessions`, () =>
+    HttpResponse.json({ sessions: [], past_sessions: [], revocation_mode: 'secure' })
+  ),
+  http.get(`${API_BASE}/mfa/status`, () =>
+    HttpResponse.json({
+      methods: [],
+      recovery_only_methods: [],
+      recovery_hardened: false,
+      backup_codes_remaining: 0,
+      backup_email: '',
+    })
+  ),
+  http.get(`${API_BASE}/mfa/webauthn/credentials`, () => HttpResponse.json({ credentials: [] })),
+  http.get(`${API_BASE}/mfa/recovery-key`, () => HttpResponse.json({ enabled: false })),
+  http.get(`${API_BASE}/mfa/trusted-devices`, () => HttpResponse.json({ devices: [] })),
+  http.get(`${API_BASE}/mfa/recovery-circle`, () => HttpResponse.json({ members: [] })),
+  http.get(`${API_BASE}/mfa/recovery-requests`, () => HttpResponse.json({ requests: [] })),
+  http.get(`${API_BASE}/users/me/security`, () =>
+    HttpResponse.json({ password_login_disabled: false, trust_sso_security: false })
+  ),
+  http.get(`${API_BASE}/users/me/sso-identities`, () => HttpResponse.json({ identities: [] })),
+];
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterAll(() => {
+  server.resetHandlers();
+  server.close();
+});
+// Keep valid read fixtures installed while late child reads drain across cleanup.
+// No case overrides these reads; replacing them with the same fixtures preserves isolation.
+afterEach(() => server.resetHandlers(...readHandlers));
+
+describe('Account profile and Security password forms', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    useAuthStore.getState().setAccessToken('mock-token');
+    server.resetHandlers(...readHandlers);
     useUserStore.setState({
       user: {
         ...mockUser,
@@ -99,24 +142,24 @@ describe('AccountSection profile and password forms', () => {
   });
 
   it('renders password change section', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     const passwordSection = document.getElementById('section-password');
     expect(passwordSection).not.toBeNull();
     expect(passwordSection?.querySelector('summary')).toHaveTextContent('Change Password');
   });
 
   it('renders current password field', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     expect(screen.getByPlaceholderText('Enter your current password')).toBeInTheDocument();
   });
 
   it('renders new password field', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     expect(screen.getByPlaceholderText('Enter your new password')).toBeInTheDocument();
   });
 
   it('renders confirm password field', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     expect(screen.getByPlaceholderText('Confirm your new password')).toBeInTheDocument();
   });
 
@@ -188,28 +231,28 @@ describe('AccountSection profile and password forms', () => {
   });
 
   it('updates current password on input change', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     const input = screen.getByPlaceholderText('Enter your current password');
     fireEvent.change(input, { target: { value: 'mypassword' } });
     expect(screen.getByDisplayValue('mypassword')).toBeInTheDocument();
   });
 
   it('updates new password on input change', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     const input = screen.getByPlaceholderText('Enter your new password');
     fireEvent.change(input, { target: { value: 'newpass123456' } });
     expect(screen.getByDisplayValue('newpass123456')).toBeInTheDocument();
   });
 
   it('updates confirm password on input change', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     const input = screen.getByPlaceholderText('Confirm your new password');
     fireEvent.change(input, { target: { value: 'newpass123456' } });
     expect(screen.getByDisplayValue('newpass123456')).toBeInTheDocument();
   });
 
   it('shows password strength indicator', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     const input = screen.getByPlaceholderText('Enter your new password');
     fireEvent.change(input, { target: { value: 'newpass123456' } });
     expect(screen.getByTestId('password-strength')).toBeInTheDocument();
@@ -278,7 +321,7 @@ describe('AccountSection profile and password forms', () => {
   });
 
   it('validates password required fields on submit', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     // Find the password Change Password submit button (it's a button, not submit in a separate form)
     const changePwdButtons = screen.getAllByText('Change Password');
     // The last one is the submit button
@@ -288,7 +331,7 @@ describe('AccountSection profile and password forms', () => {
   });
 
   it('validates password mismatch on submit', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     fireEvent.change(screen.getByPlaceholderText('Enter your current password'), {
       target: { value: 'oldpass123456' },
     });
@@ -305,7 +348,7 @@ describe('AccountSection profile and password forms', () => {
   });
 
   it('validates short new password', () => {
-    render(<AccountSection />);
+    render(<SecuritySection />);
     fireEvent.change(screen.getByPlaceholderText('Enter your current password'), {
       target: { value: 'oldpass123456' },
     });
@@ -331,7 +374,7 @@ describe('AccountSection profile and password forms', () => {
       .fn()
       .mockResolvedValue({ success: false, error: 'Current password is incorrect' });
     useUserStore.setState({ changePassword } as never);
-    render(<AccountSection />);
+    render(<SecuritySection />);
     fireEvent.change(screen.getByPlaceholderText('Enter your current password'), {
       target: { value: 'oldpass123456' },
     });

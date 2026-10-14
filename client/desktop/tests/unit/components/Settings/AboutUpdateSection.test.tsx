@@ -139,32 +139,71 @@ describe('AboutUpdateSection', () => {
   });
   it('renders legal document entries for all canonical source documents', () => {
     render(<AboutUpdateSection />);
-    expect(screen.getAllByText('LICENSE').length).toBeGreaterThan(0);
-    expect(screen.getByText('Privacy Policy')).toBeInTheDocument();
-    expect(screen.getByText('Terms of Service')).toBeInTheDocument();
-    expect(screen.getAllByText('NOTICE.md').length).toBeGreaterThan(0);
+    expect(screen.getByText('License', { selector: 'summary' })).toBeInTheDocument();
+    expect(screen.getByText('Privacy Policy', { selector: 'summary' })).toBeInTheDocument();
+    expect(screen.getByText('Terms of Service', { selector: 'summary' })).toBeInTheDocument();
+    expect(
+      screen.getByText('Third-Party Software Disclosure', { selector: 'summary' })
+    ).toBeInTheDocument();
   });
 
-  it('opens Privacy Policy content with the source draft marker preserved', () => {
+  it('opens Privacy Policy content with the source draft marker preserved', async () => {
     render(<AboutUpdateSection />);
-    const summary = screen.getByText('Privacy Policy');
+    const summary = screen.getByText('Privacy Policy', { selector: 'summary' });
     const details = summary.closest('details') as HTMLDetailsElement;
     fireEvent.click(summary);
     expect(details.open).toBe(true);
-    expect(details.querySelector('.about-legal-content')?.textContent).toContain(
-      'TO BE SET ON PUBLICATION — currently 2026-05-30 in draft'
+    await vi.waitFor(() =>
+      expect(details.querySelector('.about-legal-content')?.textContent).toContain(
+        'TO BE SET ON PUBLICATION — currently 2026-05-30 in draft'
+      )
     );
   });
 
-  it('opens Terms of Service content with the source draft marker preserved', () => {
+  it('opens Terms of Service content with the source draft marker preserved', async () => {
     render(<AboutUpdateSection />);
-    const summary = screen.getByText('Terms of Service');
+    const summary = screen.getByText('Terms of Service', { selector: 'summary' });
     const details = summary.closest('details') as HTMLDetailsElement;
     fireEvent.click(summary);
     expect(details.open).toBe(true);
-    expect(details.querySelector('.about-legal-content')?.textContent).toContain(
-      'Last Updated:** _[TO BE SET ON PUBLICATION]_'
+    await vi.waitFor(() =>
+      expect(details.querySelector('.about-legal-content')?.textContent).toContain(
+        '[TO BE SET ON PUBLICATION]'
+      )
     );
+  });
+
+  it('places Legal and Attribution before services and shows KLIPY privacy transparency', async () => {
+    render(<AboutUpdateSection />);
+    await userEvent.setup().click(screen.getByText('Client Info'));
+    const legal = screen.getByText(/Legal (?:and|&) Attribution/i);
+    const services = screen.getByText(/Third-party services/i);
+    expect(legal.compareDocumentPosition(services) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole('link', { name: /KLIPY.*privacy|privacy.*KLIPY/i })).toHaveAttribute(
+      'href',
+      'https://klipy.com/support/privacy-policy'
+    );
+    expect(screen.getByText(/Powered by KLIPY/i)).toBeInTheDocument();
+  });
+
+  it('shows owning-source privacy Markdown as headings rather than raw preformatted text', async () => {
+    render(<AboutUpdateSection />);
+    const user = userEvent.setup();
+    await user.click(screen.getByText('Client Info'));
+    await user.click(screen.getByText('Privacy Policy', { selector: 'summary' }));
+    const details = screen
+      .getByText('Privacy Policy', { selector: 'summary' })
+      .closest('details') as HTMLDetailsElement;
+    expect(within(details).getAllByRole('heading').length).toBeGreaterThan(0);
+    expect(details.querySelector('pre.about-legal-content')).toBeNull();
+  });
+
+  it('includes System Permissions as an About subsection', () => {
+    render(<AboutUpdateSection />);
+    expect(document.getElementById('section-system-permissions')).toBeInstanceOf(
+      HTMLDetailsElement
+    );
+    expect(screen.getByText('System Permissions')).toBeInTheDocument();
   });
 
   it('shortens full SPA build hashes in Client Info', () => {

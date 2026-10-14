@@ -373,6 +373,7 @@ paths:
         Account locks after 5 failed attempts (escalating: 15m, 30m, 60m).
 
         '
+      security: []
       requestBody:
         required: true
         content:
@@ -1268,6 +1269,7 @@ paths:
         Rate limit: 5 requests per 15 minutes (IP-based).
 
         '
+      security: []
       requestBody:
         required: true
         content:
@@ -3621,6 +3623,8 @@ paths:
         The request body is capped at 4 KiB. This endpoint never mutates session-registry
         rows or settles DM-block or credential-epoch parent obligations.'
       operationId: bootstrapVoiceEnforcementHealth
+      security:
+      - VoiceEnforcementProofAuth: []
       parameters:
       - name: X-Concord-Voice-Enforcement-Timestamp
         in: header
@@ -3674,6 +3678,8 @@ paths:
         the matching registry row. A missing row is idempotent success; a mismatched row is a
         conflict and remains pending. The JSON body is capped at 4 KiB.'
       operationId: releaseVoiceEnforcementSession
+      security:
+      - VoiceEnforcementProofAuth: []
       parameters:
       - name: X-Concord-Voice-Enforcement-Timestamp
         in: header
@@ -7071,6 +7077,32 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+    delete:
+      tags:
+      - FriendCodes
+      summary: Revoke a friend code
+      description: 'Revoke a friend code so it can no longer be used.
+
+        Rate limit: 10 requests per minute (user-based).
+
+        '
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Friend code UUID from the code list, not the 8-character preview code.
+      responses:
+        '200':
+          description: Friend code revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
   /friends/codes/{code}/claim:
     post:
       tags:
@@ -7120,33 +7152,6 @@ paths:
                       avatar_url:
                         type: string
                         nullable: true
-  /friends/codes/{id}:
-    delete:
-      tags:
-      - FriendCodes
-      summary: Revoke a friend code
-      description: 'Revoke a friend code so it can no longer be used.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
-      security:
-      - BearerAuth: []
-      parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Friend code UUID
-      responses:
-        '200':
-          description: Friend code revoked
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuccessMessage'
   /friends/request:
     post:
       tags:
@@ -12889,9 +12894,9 @@ paths:
 
 
         When the user has no live subscription row the free-default shape is returned
-        (`{tier: "free", status: "none"}`). Fails closed to that same free default on
-        any DB error (never a fabricated premium), so this endpoint always returns 200
-        with a valid shape.
+        with 200 (`{tier: "free", status: "none"}`). Query or scan failures return
+        503 with `{error: "subscription status unavailable"}` without confirming
+        a tier.
 
 
         Rate limit: 30 requests per minute.
@@ -12909,6 +12914,14 @@ paths:
                 $ref: '#/components/schemas/SubscriptionStatus'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Subscription status unavailable because its metadata could not be read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: subscription status unavailable
   /servers/{id}/audit-log:
     get:
       tags:
@@ -17501,6 +17514,10 @@ paths:
         and unknown fields in either `data` object are rejected.
 
         '
+      security:
+      - WebSocketTicketAuth: []
+      - WebSocketTokenAuth: []
+      - BearerAuth: []
       parameters:
       - $ref: '#/components/parameters/ClientVersionQuery'
       - name: activity_rich_presence
@@ -17527,6 +17544,28 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: JWT access token (15-minute expiry)
+    WebSocketTicketAuth:
+      type: apiKey
+      in: query
+      name: ticket
+      description: Single-use 30-second WebSocket ticket from POST /auth/ws-ticket; preferred over JWT fallback.
+    WebSocketTokenAuth:
+      type: apiKey
+      in: query
+      name: token
+      description: JWT access token for the WebSocket compatibility fallback; subject to the same live account and credential-epoch checks as bearer authentication.
+    VoiceEnforcementProofAuth:
+      type: apiKey
+      in: header
+      name: X-Concord-Voice-Enforcement-Proof
+      description: >-
+        Per-request hex HMAC-SHA256 proof, not a static API key or user bearer token.
+        Derive the signing key from the shared JWT secret using the endpoint's
+        domain-separated context, and sign its version, timestamp, and canonical
+        request fields. The required X-Concord-Voice-Enforcement-Timestamp header
+        must be within 30 seconds of the verifier's clock. Health bootstrap binds
+        node boot ID, nonce, method, and request URI; release binds every immutable session
+        field. Proofs from one endpoint cannot authenticate the other.
     RecoveryBearerAuth:
       type: http
       scheme: bearer
@@ -19862,9 +19901,12 @@ components:
           type: string
           nullable: true
         audio_quality_tier:
-          allOf:
-          - $ref: '#/components/schemas/AudioQualityTier'
+          type: string
           nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/AudioQualityTier'
+          - enum:
+            - null
           description: 'Voice-channel audio standard. Null means Personal (each member uses their own tier). Groundspeed servers allow up to standard; Mach servers allow up to studio.'
     DistributeKeysRequest:
       type: object
@@ -20168,9 +20210,12 @@ components:
           type: string
           nullable: true
         audio_quality_tier:
-          allOf:
-          - $ref: '#/components/schemas/AudioQualityTier'
+          type: string
           nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/AudioQualityTier'
+          - enum:
+            - null
           description: 'Voice-channel audio standard. Null means Personal; non-null tiers are bounded by the server_tier ceiling.'
         position:
           type: integer
@@ -20492,9 +20537,12 @@ components:
               type: string
               format: uuid
             audio_quality_tier:
-              allOf:
-              - $ref: '#/components/schemas/AudioQualityTier'
+              type: string
               nullable: true
+              oneOf:
+              - $ref: '#/components/schemas/AudioQualityTier'
+              - enum:
+                - null
         media_entitlements:
           $ref: '#/components/schemas/MediaEntitlements'
     DMVoiceJoinResponse:

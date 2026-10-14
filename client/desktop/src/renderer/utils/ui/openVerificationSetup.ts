@@ -12,7 +12,7 @@ import {
 
 /**
  * The control `requestFocus` lands on: the Multi-Factor Authentication
- * `<details>` in Privacy & Security. `SettingsPage` focuses its `<summary>` and
+ * `<details>` in Security. `SettingsPage` focuses its `<summary>` and
  * expands it, as `openProfilePage` does for `section-profile`.
  */
 const MFA_SECTION_ID = 'section-mfa';
@@ -58,7 +58,7 @@ export async function openVerificationSetup({
   const overlay = useSettingsOverlayStore.getState();
   overlay.openSettings('app');
   overlay.setVerificationReturn(returnTo);
-  useSettingsNavStore.getState().requestFocus('privacy', MFA_SECTION_ID);
+  useSettingsNavStore.getState().requestFocus('security', MFA_SECTION_ID);
   return true;
 }
 

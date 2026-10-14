@@ -18,6 +18,11 @@
   margin: 0 auto;
 }
 
+.settings-content .settings-external-link-icon {
+  margin-inline-start: 4px;
+  vertical-align: -2px;
+}
+
 /* Back button */
 .settings-back-btn {
   background: none;
@@ -91,6 +96,26 @@
   cursor: pointer;
   transition: all 0.15s ease;
   text-align: left;
+}
+
+.settings-nav-list,
+.settings-nav-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.settings-nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-item:focus-visible,
+.settings-nav-tree-item:focus-visible,
+.settings-collapsible-header:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
 }
 
 .settings-nav-item:hover:not(:disabled) {
@@ -2034,7 +2059,8 @@
 .settings-nav-tree-item {
   display: block;
   width: 100%;
-  padding: 6px 8px 6px 20px;
+  padding: 8px 8px 8px 20px;
+  min-height: 34px;
   background: none;
   border: none;
   color: var(--text-secondary);
@@ -2061,12 +2087,14 @@
 }
 
 .settings-nav-tree-item:hover {
-  color: var(--text-secondary);
+  color: var(--text-primary);
 }
 
 .settings-nav-tree-item.active {
-  color: var(--accent-primary);
+  color: var(--text-primary);
   font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 /* ─── Slider Value Above Bar ─────────────────────────────────────── */

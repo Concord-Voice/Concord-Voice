@@ -99,6 +99,7 @@ interface ActivityHistoryCardController {
 
 interface ActivityHistoryCardProps {
   onVisibilityChange?: (visible: boolean) => void;
+  onAvailabilityChange?: (available: boolean) => void;
 }
 
 const STALE_CAPABILITY_ANNOUNCEMENT = 'Availability not refreshed.';
@@ -1096,8 +1097,12 @@ const ActivityHistoryCardView: React.FC<ControllerProps> = ({ controller }) => {
   );
 };
 
-const ActivityHistoryCard: React.FC<ActivityHistoryCardProps> = ({ onVisibilityChange }) => {
+const ActivityHistoryCard: React.FC<ActivityHistoryCardProps> = ({
+  onVisibilityChange,
+  onAvailabilityChange,
+}) => {
   const controller = useActivityHistoryCardController();
+  const available = settingsFromState(controller.requestState) !== null;
   const visible = !(
     controller.capability.status === 'confirmed-unsupported' &&
     (controller.requestState.status === 'loading' ||
@@ -1111,6 +1116,10 @@ const ActivityHistoryCard: React.FC<ActivityHistoryCardProps> = ({ onVisibilityC
     // the cleanup a section that unmounts while visible leaves an empty collapsible.
     return () => onVisibilityChange?.(false);
   }, [onVisibilityChange, visible]);
+  useEffect(() => {
+    onAvailabilityChange?.(available);
+    return () => onAvailabilityChange?.(false);
+  }, [onAvailabilityChange, available]);
   if (!visible) {
     return null;
   }

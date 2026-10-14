@@ -1,5 +1,6 @@
 import { createStore } from '../../utils/runtime/createStore';
 import { useDraftSettingsStore } from './draftSettingsStore';
+import { useSettingsCollapsibleStore } from './settingsCollapsibleStore';
 
 /**
  * Settings Overlay Store
@@ -29,7 +30,7 @@ export interface SettingsOverlayPayload {
 }
 
 /**
- * Where the "Back to …" button in Privacy & Security goes once verification
+ * Where the "Back to …" button in Security goes once verification
  * setup is done (#3456 §3.6a): the chat that was never navigated away from, or
  * the Server Settings section the setup was opened from.
  */
@@ -55,6 +56,8 @@ interface SettingsOverlayState {
   dismissedMfaNotices: Record<string, true>;
   openSettings: (kind: SettingsOverlayKind, payload?: SettingsOverlayPayload) => void;
   close: () => void;
+  /** Logout ends the visit even when an applying draft blocks ordinary dismissal. */
+  closeForLogout: () => void;
   setVerificationReturn: (target: VerificationReturn) => void;
   /** Reads the pending return and clears it, so it is acted on at most once. */
   takeVerificationReturn: () => VerificationReturn | null;
@@ -68,14 +71,22 @@ export const useSettingsOverlayStore = createStore<SettingsOverlayState>()((set,
   payload: null,
   verificationReturn: null,
   dismissedMfaNotices: {},
-  openSettings: (kind, payload) => set({ open: kind, payload: payload ?? null }),
-  close: () =>
-    set((state) => {
-      if (isSettingsOverlayDismissBlocked(state.open)) {
-        return state;
-      }
-      return { open: null, payload: null, verificationReturn: null };
-    }),
+  openSettings: (kind, payload) => {
+    const previous = get().open;
+    if (previous === 'app' && kind !== 'app') useSettingsCollapsibleStore.getState().endVisit();
+    if (kind === 'app' && previous !== 'app') useSettingsCollapsibleStore.getState().beginVisit();
+    set({ open: kind, payload: payload ?? null });
+  },
+  close: () => {
+    const state = get();
+    if (isSettingsOverlayDismissBlocked(state.open)) return;
+    if (state.open === 'app') useSettingsCollapsibleStore.getState().endVisit();
+    set({ open: null, payload: null, verificationReturn: null });
+  },
+  closeForLogout: () => {
+    useSettingsCollapsibleStore.getState().endVisit();
+    set({ open: null, payload: null, verificationReturn: null });
+  },
   setVerificationReturn: (target) => set({ verificationReturn: target }),
   takeVerificationReturn: () => {
     const target = get().verificationReturn;

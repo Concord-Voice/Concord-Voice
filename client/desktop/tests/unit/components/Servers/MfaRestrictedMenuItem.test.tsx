@@ -75,7 +75,7 @@ describe('MfaRestrictedMenuItem', () => {
     expect(useSettingsOverlayStore.getState().open).toBe('app');
     expect(useSettingsOverlayStore.getState().verificationReturn).toEqual({ kind: 'chat' });
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'privacy',
+      section: 'security',
       controlId: 'section-mfa',
     });
     expect(onClose).toHaveBeenCalledTimes(1);

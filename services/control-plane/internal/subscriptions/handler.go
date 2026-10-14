@@ -35,9 +35,8 @@ type StatusDTO struct {
 	CurrentPeriodEnd *string `json:"current_period_end,omitempty"`
 }
 
-// freeDefault is the fail-closed shape returned when there is no live row OR any
-// DB error occurs — never a fabricated premium (least privilege; mirrors
-// entitlements.ResolveTier's degrade-don't-fail-open posture).
+// freeDefault is returned when there is no live subscription row. A failed
+// lookup cannot confirm this status and returns an unavailable response instead.
 func freeDefault() StatusDTO {
 	return StatusDTO{Tier: entitlements.TierFree, Status: statusNone}
 }
@@ -59,12 +58,10 @@ func NewHandler(db *sql.DB, log *logger.Logger) *Handler {
 
 // GetMe handles GET /api/v1/subscriptions/me. It returns the acting user's live
 // subscription status (tier/status/source/expiry) or the free-default shape when
-// no live row exists. It always returns 200 with a valid shape — a DB error
-// degrades to the free default (never a 500 that would leave the page unable to
-// render, and never a fabricated premium).
+// no live row exists. Query or scan errors return 503 without confirming a tier.
 //
 // The query mirrors entitlements.ResolveTier's live-row predicate exactly, so
-// the status view and the tier the enforcement path resolves can never disagree.
+// successful status reads use the same live-row criteria as tier enforcement.
 // The partial unique index idx_subscriptions_user_active guarantees at most one
 // matching row, so LIMIT 1 is exact.
 func (h *Handler) GetMe(c *gin.Context) {
@@ -87,11 +84,11 @@ func (h *Handler) GetMe(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		// Degrade, don't fail open. %q quoting is injection-safe for the userID
+		// Report unavailability without confirming a tier. %q is safe for userID
 		// (observability.md: %q-escaped values need no further sanitization). No
 		// row values are logged — PII-safe.
 		h.log.Error("subscriptions: status read failed", "user_id", sanitizeID(userID), "error", err.Error())
-		c.JSON(http.StatusOK, freeDefault())
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "subscription status unavailable"})
 		return
 	}
 

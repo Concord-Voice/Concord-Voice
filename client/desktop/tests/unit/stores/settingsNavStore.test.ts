@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('settingsNavStore', () => {
-  beforeEach(() => useSettingsNavStore.getState().clearFocusRequest());
+  beforeEach(() => resetAllStores());
 
   it('starts with no focus request', () => {
     expect(useSettingsNavStore.getState().focusRequest).toBeNull();

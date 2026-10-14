@@ -187,9 +187,10 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // session it was recorded in (MFA factor picker, S2a privacy).
   useTotpAcceptedStore.getState().reset();
 
-  // A pending "Back to …" from verification setup names the ending account's
-  // chat or server (#3456 §3.6a), so it must not reach whoever signs in next.
-  useSettingsOverlayStore.getState().clearVerificationReturn();
+  // End the Settings visit despite any ordinary draft-dismissal blocker. This
+  // starts the device-chrome retention window and drops the ending account's
+  // overlay payload and pending verification return (#3456 §3.6a).
+  useSettingsOverlayStore.getState().closeForLogout();
 
   // Which servers' MFA notices were dismissed is per account too (#3456 §3.6):
   // server ids are not secret, but a dismissal the next account never made

@@ -19,7 +19,7 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('SettingsPage cross-section focus (#1644)', () => {
-  it('focuses the Current Plan summary when a subscription gate opens Settings', () => {
+  it('focuses the Subscription summary under Account when a subscription gate opens Settings', () => {
     render(<SettingsPage />);
 
     act(() => openSubscriptionPage());
@@ -27,8 +27,8 @@ describe('SettingsPage cross-section focus (#1644)', () => {
       vi.advanceTimersByTime(60);
     });
 
-    const summary = document.querySelector('#section-current-plan > summary');
-    expect(summary).toHaveTextContent('Current Plan');
+    const summary = document.querySelector('#section-subscription > summary');
+    expect(summary).toHaveTextContent('Subscription');
     expect(summary).toHaveFocus();
   });
 

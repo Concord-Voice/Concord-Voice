@@ -111,8 +111,6 @@ src/renderer/components/Settings/SettingsPage.css	.settings-estimated-bitrate	2.
 src/renderer/components/Settings/SettingsPage.css	.settings-notification-permission-btn	2.68
 src/renderer/components/Settings/SettingsPage.css	.settings-pending-blob-apply	2.68
 src/renderer/components/Settings/SettingsPage.css	.settings-rotate-id-btn:hover:not(:disabled)	2.46
-src/renderer/components/Settings/subscription/subscription.css	.subscription-redeem-submit	2.68
-src/renderer/components/Settings/subscription/subscription.css	.subscription-redeem-submit:hover:not(:disabled)	2.14
 src/renderer/components/Settings/SubscriptionResetModal.css	.subscription-reset-modal__primary	2.46
 src/renderer/components/ui/ConnectionLostOverlay.css	.connection-lost-btn.primary	2.68
 src/renderer/components/ui/ForceUpdateOverlay.css	.force-update-btn.primary	2.68

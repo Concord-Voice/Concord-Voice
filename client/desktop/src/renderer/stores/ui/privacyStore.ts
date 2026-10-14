@@ -4,6 +4,8 @@ import { wrapStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
 import {
   apiFetchInContext,
+  apiRequestContextIsCurrent,
+  captureApiRequestContext,
   isAbortError,
   type ApiRequestContext,
 } from '../../services/system/requestContext';
@@ -252,13 +254,79 @@ export class PrivacyUpdateError extends Error {
  *    clicking, since the access-token effect refires `fetchPrivacy` on every
  *    token refresh.
  *
- * This is the same remedy as the generation fence in
- * `services/system/friendEligibility.ts`. Any handler that writes `settings` must take
- * a ticket BEFORE its await and gate the write on it.
+ * Requests retain an identity ticket before awaiting. Full reads are ordered
+ * by that ticket; mutations own only their specified fields, so independent
+ * writes cannot discard or overwrite each other's confirmed values.
  */
 let privacyIdentity = 0;
 let privacyIssued = 0;
 let privacySettled = 0;
+type PrivacyField = keyof PrivacySettings;
+const PRIVACY_FIELDS = Object.keys(PRIVACY_WIRE_FIELDS) as PrivacyField[];
+
+interface PrivacyFieldOwner {
+  readonly identity: number;
+}
+
+let privacyFieldOwners: Partial<Record<PrivacyField, PrivacyFieldOwner>> = {};
+let privacyFieldConfirmations: Partial<Record<PrivacyField, number>> = {};
+
+interface PrivacyMutation {
+  ticket: PrivacyWriteTicket;
+  context: ApiRequestContext;
+  fields: PrivacyField[];
+  owners: Partial<Record<PrivacyField, PrivacyFieldOwner>>;
+  confirmations: Partial<Record<PrivacyField, number>>;
+}
+
+let privacyMutationFailure: { mutation: PrivacyMutation; fields: PrivacyField[] } | null = null;
+
+// These two queues belong to the account, not the mounted Settings pane.
+// Replacing a selection supersedes only its own field, including an older
+// request whose response arrives during the replacement's debounce window.
+interface PrivacyTierSelection {
+  identity: number;
+  context: ApiRequestContext;
+  owner: PrivacyFieldOwner;
+}
+
+let dmPrivacySelection: PrivacyTierSelection | null = null;
+let friendRequestSelection: PrivacyTierSelection | null = null;
+let dmPrivacyTimer: ReturnType<typeof setTimeout> | null = null;
+let friendRequestTimer: ReturnType<typeof setTimeout> | null = null;
+
+// A current direct write to a tier is a successor selection too. Bind a
+// queued request to its owner, or retire that field's queued predecessor.
+// An expired context owns no current queue and must leave it untouched.
+function bindDMPrivacyWrite(
+  level: DMPrivacyLevel | undefined,
+  context: ApiRequestContext | undefined
+): PrivacyTierSelection | null {
+  if (level === undefined) return null;
+  const selection = dmPrivacySelection;
+  if (selection?.context === context) return selection;
+  if (!selection || (context && !apiRequestContextIsCurrent(context))) return null;
+  dmPrivacySelection = null;
+  if (dmPrivacyTimer !== null) clearTimeout(dmPrivacyTimer);
+  dmPrivacyTimer = null;
+  usePrivacyStore.setState({ pendingDmPrivacyLevel: null, dmSaveError: null });
+  return null;
+}
+
+function bindFriendRequestPrivacyWrite(
+  mode: FriendRequestPrivacyMode | undefined,
+  context: ApiRequestContext | undefined
+): PrivacyTierSelection | null {
+  if (mode === undefined) return null;
+  const selection = friendRequestSelection;
+  if (selection?.context === context) return selection;
+  if (!selection || (context && !apiRequestContextIsCurrent(context))) return null;
+  friendRequestSelection = null;
+  if (friendRequestTimer !== null) clearTimeout(friendRequestTimer);
+  friendRequestTimer = null;
+  usePrivacyStore.setState({ pendingFriendRequestMode: null, friendRequestError: null });
+  return null;
+}
 
 interface PrivacyWriteTicket {
   identity: number;
@@ -271,25 +339,108 @@ function beginPrivacyWrite(): PrivacyWriteTicket {
 }
 
 /**
- * True only for the newest request of the CURRENT account to settle. Records
- * the advance, so it is a one-shot per request.
- *
- * Success and refusal are both outcomes and share the one watermark: whichever
- * request settles last is the one the store describes. A superseded refusal is
- * stale by definition — the user's newer choice already landed — so surfacing
- * it would report a failure about a selection they have since replaced (#2903
- * AC-2). Zustand's own `persist` middleware fences its rehydrate error path the
- * same way, on the same counter it uses for the success path.
- *
- * This gates only what is WRITTEN to the store. `updatePrivacy` still throws
- * for the caller awaiting it whether or not its refusal was recorded, so a
- * component that wants to react to its own superseded failure still can.
+ * Orders full reads and the first full confirmation for the current account.
+ * Loaded mutations instead settle their own fields: a newer unrelated write
+ * cannot retire an older field's accepted result or refusal.
  */
 function maySettle(ticket: PrivacyWriteTicket): boolean {
   if (ticket.identity !== privacyIdentity) return false;
   if (ticket.seq <= privacySettled) return false;
   privacySettled = ticket.seq;
   return true;
+}
+
+function beginPrivacyMutation(
+  updates: Partial<PrivacySettings>,
+  context: ApiRequestContext | undefined
+): PrivacyMutation {
+  const requestContext = context ?? captureApiRequestContext();
+  // An expired explicit context must not displace a live selection, even
+  // while apiFetch's own asynchronous admission has not run yet.
+  if (!apiRequestContextIsCurrent(requestContext)) {
+    throw new DOMException('Request lifecycle changed before dispatch', 'AbortError');
+  }
+  const ticket = beginPrivacyWrite();
+  const confirmations = { ...privacyFieldConfirmations };
+  const fields = PRIVACY_FIELDS.filter((field) => updates[field] !== undefined);
+  const tierOwners: Partial<Record<PrivacyField, PrivacyFieldOwner>> = {
+    dmPrivacyLevel: dmPrivacySelection?.context === context ? dmPrivacySelection?.owner : undefined,
+    allowFriendRequestsFrom:
+      friendRequestSelection?.context === context ? friendRequestSelection?.owner : undefined,
+  };
+  const owners: Partial<Record<PrivacyField, PrivacyFieldOwner>> = {};
+  for (const field of fields) {
+    const owner = tierOwners[field] ?? ticket;
+    owners[field] = owner;
+    privacyFieldOwners[field] = owner;
+  }
+  // Claim before notifications: a subscriber's successor action must retain
+  // ownership rather than being overwritten when this older call resumes.
+  if (privacyFieldOwners.dmPrivacyLevel === owners.dmPrivacyLevel) {
+    bindDMPrivacyWrite(updates.dmPrivacyLevel, context);
+  }
+  if (privacyFieldOwners.allowFriendRequestsFrom === owners.allowFriendRequestsFrom) {
+    bindFriendRequestPrivacyWrite(updates.allowFriendRequestsFrom, context);
+  }
+  if (ticket.identity !== privacyIdentity || !apiRequestContextIsCurrent(requestContext)) {
+    throw new DOMException('Request lifecycle changed before dispatch', 'AbortError');
+  }
+  return { ticket, context: requestContext, fields, owners, confirmations };
+}
+
+function ownedPrivacyMutationFields(mutation: PrivacyMutation): PrivacyField[] {
+  if (mutation.ticket.identity !== privacyIdentity || !apiRequestContextIsCurrent(mutation.context))
+    return [];
+  return mutation.fields.filter((field) => mutation.owners[field] === privacyFieldOwners[field]);
+}
+
+function mergePrivacyFields(
+  current: PrivacySettings,
+  incoming: PrivacySettings,
+  fields: PrivacyField[]
+): PrivacySettings {
+  let merged = current;
+  for (const field of fields) merged = { ...merged, [field]: incoming[field] };
+  return merged;
+}
+
+function privacyMutationFailureIsCurrent(): boolean {
+  const failure = privacyMutationFailure;
+  if (!failure) return false;
+  const owned = ownedPrivacyMutationFields(failure.mutation);
+  return failure.fields.some((field) => owned.includes(field));
+}
+
+function publishPrivacyMutation(mutation: PrivacyMutation, incoming: PrivacySettings): void {
+  const fields = ownedPrivacyMutationFields(mutation);
+  if (fields.length === 0) return;
+  const current = usePrivacyStore.getState();
+  const hydrated = !current.loaded && maySettle(mutation.ticket);
+  let settings = current.settings;
+  if (hydrated) {
+    const protectedFields = PRIVACY_FIELDS.filter(
+      (field) => mutation.confirmations[field] !== privacyFieldConfirmations[field]
+    );
+    settings = mergePrivacyFields(incoming, settings, protectedFields);
+  }
+  settings = mergePrivacyFields(settings, incoming, fields);
+  for (const field of fields) {
+    privacyFieldConfirmations[field] = (privacyFieldConfirmations[field] ?? 0) + 1;
+  }
+  const keepFailure = privacyMutationFailureIsCurrent();
+  if (!keepFailure) privacyMutationFailure = null;
+  usePrivacyStore.setState({
+    settings,
+    loaded: current.loaded || hydrated,
+    error: keepFailure ? current.error : null,
+  });
+}
+
+function publishPrivacyMutationFailure(mutation: PrivacyMutation, message: string): void {
+  const fields = ownedPrivacyMutationFields(mutation);
+  if (fields.length === 0) return;
+  privacyMutationFailure = { mutation, fields };
+  usePrivacyStore.setState({ error: message });
 }
 
 const defaultSettings: PrivacySettings = {
@@ -339,8 +490,14 @@ interface PrivacyState {
    */
   loaded: boolean;
   error: string | null;
+  pendingDmPrivacyLevel: DMPrivacyLevel | null;
+  pendingFriendRequestMode: FriendRequestPrivacyMode | null;
+  dmSaveError: string | null;
+  friendRequestError: string | null;
 
   fetchPrivacy: () => Promise<void>;
+  scheduleDMPrivacy: (level: DMPrivacyLevel) => void;
+  scheduleFriendRequestPrivacy: (mode: FriendRequestPrivacyMode) => void;
   updatePrivacy: (
     updates: Partial<PrivacySettings>,
     credentials?: PrivacyStepUpCredentials,
@@ -366,9 +523,99 @@ export const usePrivacyStore = wrapStore(
         isLoading: false,
         loaded: false,
         error: null,
+        pendingDmPrivacyLevel: null,
+        pendingFriendRequestMode: null,
+        dmSaveError: null,
+        friendRequestError: null,
+
+        scheduleDMPrivacy: (level) => {
+          if (dmPrivacyTimer !== null) clearTimeout(dmPrivacyTimer);
+          const selection = {
+            identity: privacyIdentity,
+            context: captureApiRequestContext(),
+            owner: { identity: privacyIdentity },
+          };
+          dmPrivacySelection = selection;
+          privacyFieldOwners.dmPrivacyLevel = selection.owner;
+          dmPrivacyTimer = setTimeout(() => {
+            if (dmPrivacySelection !== selection || selection.identity !== privacyIdentity) return;
+            dmPrivacyTimer = null;
+            // Check before updatePrivacy issues a write ticket. A cancelled
+            // selection must neither dispatch nor supersede a current write.
+            if (!apiRequestContextIsCurrent(selection.context)) {
+              dmPrivacySelection = null;
+              set({ pendingDmPrivacyLevel: null });
+              return;
+            }
+            void get()
+              .updatePrivacy({ dmPrivacyLevel: level }, undefined, selection.context)
+              .then(() => {
+                if (dmPrivacySelection !== selection || selection.identity !== privacyIdentity)
+                  return;
+                dmPrivacySelection = null;
+                set({ pendingDmPrivacyLevel: null });
+              })
+              .catch((error: unknown) => {
+                if (dmPrivacySelection !== selection || selection.identity !== privacyIdentity)
+                  return;
+                dmPrivacySelection = null;
+                const message = error instanceof Error ? error.message : GENERIC_UPDATE_FAILURE;
+                set({
+                  pendingDmPrivacyLevel: null,
+                  dmSaveError: apiRequestContextIsCurrent(selection.context) ? message : null,
+                });
+              });
+          }, 300);
+          set({ pendingDmPrivacyLevel: level, dmSaveError: null });
+        },
+
+        scheduleFriendRequestPrivacy: (mode) => {
+          if (friendRequestTimer !== null) clearTimeout(friendRequestTimer);
+          const selection = {
+            identity: privacyIdentity,
+            context: captureApiRequestContext(),
+            owner: { identity: privacyIdentity },
+          };
+          friendRequestSelection = selection;
+          privacyFieldOwners.allowFriendRequestsFrom = selection.owner;
+          friendRequestTimer = setTimeout(() => {
+            if (friendRequestSelection !== selection || selection.identity !== privacyIdentity)
+              return;
+            friendRequestTimer = null;
+            if (!apiRequestContextIsCurrent(selection.context)) {
+              friendRequestSelection = null;
+              set({ pendingFriendRequestMode: null });
+              return;
+            }
+            void get()
+              .updatePrivacy({ allowFriendRequestsFrom: mode }, undefined, selection.context)
+              .then(() => {
+                if (friendRequestSelection !== selection || selection.identity !== privacyIdentity)
+                  return;
+                friendRequestSelection = null;
+                set({ pendingFriendRequestMode: null });
+              })
+              .catch((error: unknown) => {
+                if (friendRequestSelection !== selection || selection.identity !== privacyIdentity)
+                  return;
+                friendRequestSelection = null;
+                const message = error instanceof Error ? error.message : GENERIC_UPDATE_FAILURE;
+                set({
+                  pendingFriendRequestMode: null,
+                  friendRequestError: apiRequestContextIsCurrent(selection.context)
+                    ? message
+                    : null,
+                });
+              });
+          }, 300);
+          set({ pendingFriendRequestMode: mode, friendRequestError: null });
+        },
 
         fetchPrivacy: async () => {
           const ticket = beginPrivacyWrite();
+          const confirmations = { ...privacyFieldConfirmations };
+          const context = captureApiRequestContext();
+          privacyMutationFailure = null;
           set({ isLoading: true, error: null });
           try {
             const response = await apiFetch('/api/v1/users/me/privacy');
@@ -378,37 +625,42 @@ export const usePrivacyStore = wrapStore(
             }
             const data = await response.json();
             const p = data.privacy;
-            if (!maySettle(ticket)) return;
-            set({
-              settings: {
-                messagesFriendsOnly: p.messages_friends_only ?? true,
-                messagesServerMembers: p.messages_server_members ?? true,
-                dmPrivacyLevel: (p.dm_privacy_level ?? 2) as DMPrivacyLevel,
-                // Older control planes omit this field and default it off.
-                // Current servers send the saved value, including the new on default.
-                dmFriendsOfFriends: p.dm_friends_of_friends ?? false,
-                autoAcceptFriendCodes: p.auto_accept_friend_codes ?? false,
-                searchableByUsername: p.searchable_by_username ?? false,
-                searchableByEmail: p.searchable_by_email ?? false,
-                searchableByPhone: p.searchable_by_phone ?? false,
-                allowEmbeddedContent: p.allow_embedded_content ?? false,
-                loadGifsAutomatically: p.load_gifs_automatically ?? false,
-                sharePersonalizationWithGifProvider:
-                  p.share_personalization_with_gif_provider ?? true,
-                // #1354: a missing key means an old control-plane. Fail closed —
-                // the server still requires step-up for DM purges.
-                requireAuthBeforePurge: p.require_auth_before_purge ?? true,
-                // #1241: an absent key is a pre-#1240 server with the older
-                // Everyone default. New servers send their actual setting.
-                allowFriendRequestsFrom: asFriendRequestMode(p.allow_friend_requests_from),
-              },
+            if (!apiRequestContextIsCurrent(context) || !maySettle(ticket)) return;
+            const incoming: PrivacySettings = {
+              messagesFriendsOnly: p.messages_friends_only ?? true,
+              messagesServerMembers: p.messages_server_members ?? true,
+              dmPrivacyLevel: (p.dm_privacy_level ?? 2) as DMPrivacyLevel,
+              // Older control planes omit this field and default it off.
+              // Current servers send the saved value, including the new on default.
+              dmFriendsOfFriends: p.dm_friends_of_friends ?? false,
+              autoAcceptFriendCodes: p.auto_accept_friend_codes ?? false,
+              searchableByUsername: p.searchable_by_username ?? false,
+              searchableByEmail: p.searchable_by_email ?? false,
+              searchableByPhone: p.searchable_by_phone ?? false,
+              allowEmbeddedContent: p.allow_embedded_content ?? false,
+              loadGifsAutomatically: p.load_gifs_automatically ?? false,
+              sharePersonalizationWithGifProvider:
+                p.share_personalization_with_gif_provider ?? true,
+              // #1354: a missing key means an old control-plane. Fail closed —
+              // the server still requires step-up for DM purges.
+              requireAuthBeforePurge: p.require_auth_before_purge ?? true,
+              // #1241: an absent key is a pre-#1240 server with the older
+              // Everyone default. New servers send their actual setting.
+              allowFriendRequestsFrom: asFriendRequestMode(p.allow_friend_requests_from),
+            };
+            const protectedFields = PRIVACY_FIELDS.filter(
+              (field) => confirmations[field] !== privacyFieldConfirmations[field]
+            );
+            set((state) => ({
+              settings: mergePrivacyFields(incoming, state.settings, protectedFields),
               isLoading: false,
               // Only here. The catch below deliberately leaves it as-is: a
               // failed fetch means the settings on screen are still defaults.
               loaded: true,
-            });
+            }));
           } catch (error) {
-            if (!maySettle(ticket)) return;
+            if (!apiRequestContextIsCurrent(context) || !maySettle(ticket)) return;
+            privacyMutationFailure = null;
             set({
               error: error instanceof Error ? error.message : 'Failed to load privacy settings',
               isLoading: false,
@@ -421,65 +673,43 @@ export const usePrivacyStore = wrapStore(
           credentials?: PrivacyStepUpCredentials,
           context?: ApiRequestContext
         ) => {
-          const ticket = beginPrivacyWrite();
+          const mutation = beginPrivacyMutation(updates, context);
           const body: Record<string, boolean | number | string> = {};
           for (const [field, wireField] of Object.entries(PRIVACY_WIRE_FIELDS)) {
             const value = updates[field as keyof PrivacySettings];
             if (value !== undefined) body[wireField] = value;
           }
-          // #2765: the factors travel only when the caller actually holds them.
-          // An absent factor must not go out as an empty string — the server
-          // reads that as a supplied-and-wrong one.
+          // Factors remain request arguments, never state or persistence.
           if (credentials?.currentPassword) body.current_password = credentials.currentPassword;
           if (credentials?.mfaCode) body.mfa_code = credentials.mfaCode;
 
-          // With a context, the PATCH is admitted only for the account and
-          // server the caller captured it for (#2: the step-up run's capture).
-          const response = await apiFetchInContext(
-            '/api/v1/users/me/privacy',
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-            },
-            context
-          );
-
-          if (!response.ok) {
-            // A non-JSON failure (proxy HTML 502, empty 400) must not reject
-            // with a SyntaxError — the caller renders this message verbatim.
-            //
-            // Annotate the variable rather than asserting the fallback: `json()`
-            // resolves to `any`, so an `as` on the catch value asserts into a
-            // position that already accepts it (SonarQube S4325) while leaving
-            // `data` untyped either way. The annotation types BOTH branches.
-            const data: PrivacyErrorBody = await response.json().catch(() => ({}));
-            // #1354 skew and the #2765 step-up shapes are both decided by the
-            // classifier, so the two clients of this endpoint cannot drift.
-            // The message is recorded on the store either way, so a caller that
-            // only awaits cannot swallow the failure silently.
-            const refusal = classifyPrivacyRefusal(
-              response.status,
-              data,
-              Object.keys(updates) as (keyof PrivacySettings)[]
+          try {
+            const response = await apiFetchInContext(
+              '/api/v1/users/me/privacy',
+              {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+              },
+              context
             );
-            // Still throws for the awaiting caller, but a previous account's
-            // failure — or one a newer request has already superseded — must
-            // not be recorded on the store.
-            if (maySettle(ticket)) set({ error: refusal.message });
-            throw new PrivacyUpdateError(refusal);
-          }
-
-          const data = await response.json();
-          const p = data.privacy;
-          if (!maySettle(ticket)) return;
-          set({
-            settings: {
+            if (!response.ok) {
+              // Proxy HTML or an empty failure still uses the classified,
+              // user-facing refusal rather than exposing a JSON SyntaxError.
+              const data: PrivacyErrorBody = await response.json().catch(() => ({}));
+              const refusal = classifyPrivacyRefusal(
+                response.status,
+                data,
+                Object.keys(updates) as (keyof PrivacySettings)[]
+              );
+              throw new PrivacyUpdateError(refusal);
+            }
+            const data = await response.json();
+            const p = data.privacy;
+            const incoming: PrivacySettings = {
               messagesFriendsOnly: p.messages_friends_only,
               messagesServerMembers: p.messages_server_members,
               dmPrivacyLevel: (p.dm_privacy_level ?? 2) as DMPrivacyLevel,
-              // Keep the same version-skew fallback as GET, including when an
-              // older server echoes a PATCH to another privacy setting.
               dmFriendsOfFriends: p.dm_friends_of_friends ?? false,
               autoAcceptFriendCodes: p.auto_accept_friend_codes,
               searchableByUsername: p.searchable_by_username,
@@ -489,21 +719,18 @@ export const usePrivacyStore = wrapStore(
               loadGifsAutomatically: p.load_gifs_automatically ?? false,
               sharePersonalizationWithGifProvider:
                 p.share_personalization_with_gif_provider ?? true,
-              // #1354: same fail-closed read as fetchPrivacy — an echo without
-              // the key is an old server, not an OFF setting.
+              // Missing on an older server: retain the fail-closed purge floor.
               requireAuthBeforePurge: p.require_auth_before_purge ?? true,
-              // #1241: an absent key is a pre-#1240 server, not a
-              // restrictive setting. Default open — the server still enforces.
               allowFriendRequestsFrom: asFriendRequestMode(p.allow_friend_requests_from),
-            },
-            // A successful PATCH echoes the full authoritative object, so it
-            // confirms the settings just as a GET does. Without this, a failed
-            // initial fetch followed by any successful write left the control
-            // disabled on "Loading your setting…" indefinitely while the store
-            // already held real server data.
-            loaded: true,
-            error: null,
-          });
+            };
+            publishPrivacyMutation(mutation, incoming);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : GENERIC_UPDATE_FAILURE;
+            publishPrivacyMutationFailure(mutation, message);
+            // Awaiting callers retain the original refusal/AbortError contract,
+            // even when this operation no longer owns any visible state.
+            throw error;
+          }
         },
 
         disablePurgeFence: async (
@@ -533,7 +760,24 @@ export const usePrivacyStore = wrapStore(
           // still in flight can write after this point.
           privacyIdentity += 1;
           privacySettled = privacyIssued;
-          set({ settings: { ...defaultSettings }, loaded: false, error: null });
+          privacyFieldOwners = {};
+          privacyFieldConfirmations = {};
+          privacyMutationFailure = null;
+          dmPrivacySelection = null;
+          friendRequestSelection = null;
+          if (dmPrivacyTimer !== null) clearTimeout(dmPrivacyTimer);
+          if (friendRequestTimer !== null) clearTimeout(friendRequestTimer);
+          dmPrivacyTimer = null;
+          friendRequestTimer = null;
+          set({
+            settings: { ...defaultSettings },
+            loaded: false,
+            error: null,
+            pendingDmPrivacyLevel: null,
+            pendingFriendRequestMode: null,
+            dmSaveError: null,
+            friendRequestError: null,
+          });
         },
       }),
       { name: 'PrivacyStore' }

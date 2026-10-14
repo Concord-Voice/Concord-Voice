@@ -80,8 +80,8 @@ describe('SubscriptionResetModal', () => {
     expect(focusDuringAcknowledge).toBeNull();
     expect(useSettingsOverlayStore.getState().open).toBe('app');
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 

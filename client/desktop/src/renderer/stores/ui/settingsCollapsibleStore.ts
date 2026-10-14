@@ -3,18 +3,15 @@ import { createStore } from '../../utils/runtime/createStore';
 /**
  * Settings Collapsible Store (#2365)
  *
- * Remembers, for the life of the renderer, which Settings `CollapsibleSection`s the
- * user has expanded. Every section is collapsed on first visit; a section the user
- * expands — or that a script-driven opener expands for them (Expand all, the sub-nav
- * scroll, a focus request, the update indicator) — stays expanded across pane switches
- * and Settings close/reopen, because `CollapsibleSection` reads its `open` state from
- * here and writes every change back from the native `toggle` event.
+ * Remembers main and nested disclosure expansion throughout a Settings visit and
+ * for 30 minutes after leaving. Real overlay transitions call beginVisit/endVisit;
+ * pane switches and React effect replay do not end a visit. Native toggle events
+ * capture clicks, bulk actions, and intentional navigation through the same binding.
  *
- * Deliberately in-memory. The reporter asked for "at least the current session", and
- * `persist` is reserved for state that must survive an app restart (frontend.md
- * § State Management), so a renderer reload starts collapsed again. Nothing resets this
- * store in production: section layout is UI chrome, not account data, so it stays out
- * of `resetService`; tests reset it through `getInitialState()`.
+ * Deliberately in-memory: a renderer reload starts collapsed. An absolute close
+ * deadline is checked again on entry because sleeping or throttled renderers can
+ * delay the purge timer. Returning before expiry cancels the timer; an active
+ * visit never expires. This is layout memory, not account or draft persistence.
  *
  * Keys are `CollapsibleSection` ids — one global namespace across every surface that
  * renders one (today, only the app Settings panes). Two sections sharing an id would
@@ -23,6 +20,10 @@ import { createStore } from '../../utils/runtime/createStore';
 export interface SettingsCollapsibleState {
   /** Section id → last observed open state this renderer session. Absent ⇒ collapsed. */
   openSections: Readonly<Record<string, boolean>>;
+  retentionDeadline: number | null;
+  visitActive: boolean;
+  beginVisit: () => void;
+  endVisit: () => void;
   /**
    * Record a section's open state. A write that matches the current state returns the
    * same state object, so Zustand skips notifying subscribers — closing a section the
@@ -31,8 +32,41 @@ export interface SettingsCollapsibleState {
   setSectionOpen: (id: string, open: boolean) => void;
 }
 
-export const useSettingsCollapsibleStore = createStore<SettingsCollapsibleState>()((set) => ({
+export const SETTINGS_EXPANSION_RETENTION_MS = 30 * 60 * 1000;
+
+let retentionTimer: ReturnType<typeof setTimeout> | null = null;
+
+export const useSettingsCollapsibleStore = createStore<SettingsCollapsibleState>()((set, get) => ({
   openSections: {},
+  retentionDeadline: null,
+  visitActive: false,
+  beginVisit: () => {
+    if (retentionTimer !== null) clearTimeout(retentionTimer);
+    retentionTimer = null;
+    set((state) => {
+      if (state.visitActive) return state;
+      const expired = state.retentionDeadline !== null && Date.now() >= state.retentionDeadline;
+      return {
+        visitActive: true,
+        retentionDeadline: null,
+        openSections: expired ? {} : state.openSections,
+      };
+    });
+  },
+  endVisit: () => {
+    if (!get().visitActive) return;
+    if (retentionTimer !== null) clearTimeout(retentionTimer);
+    const deadline = Date.now() + SETTINGS_EXPANSION_RETENTION_MS;
+    set({ visitActive: false, retentionDeadline: deadline });
+    retentionTimer = setTimeout(() => {
+      retentionTimer = null;
+      set((state) =>
+        !state.visitActive && state.retentionDeadline === deadline && Date.now() >= deadline
+          ? { openSections: {}, retentionDeadline: null }
+          : state
+      );
+    }, SETTINGS_EXPANSION_RETENTION_MS);
+  },
   setSectionOpen: (id, open) =>
     set((state) =>
       // `=== true` rather than `?? false`: an absent entry behaves exactly like `false`,

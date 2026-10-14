@@ -1,5 +1,9 @@
 import { render, screen } from '../../../test-utils';
 import { vi } from 'vitest';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
 
 // ── MFA action-handler coverage (#1516) ──────────────────────────────────────
 // PrivacySecuritySection passes six MFA management callbacks to <MFATierSelector>
@@ -322,6 +326,28 @@ describe('PrivacySecuritySection — MFA action handlers (#1516)', () => {
       expect.objectContaining({ rpId: 'localhost', userId: expect.anything() })
     );
     vi.unstubAllGlobals();
+  });
+
+  it('signals the selected server authenticator after credential revocation', async () => {
+    const signal = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('PublicKeyCredential', { signalAllAcceptedCredentialIds: signal });
+    setRuntimeServerBase('https://voice.example.test');
+    try {
+      const h = await renderAndCaptureHandlers();
+      mockApiFetch.mockResolvedValueOnce(
+        ok({ remaining_credential_ids: ['AAEC'], user_id: 'user-uuid-123' })
+      );
+      await expect(
+        h.onRevokeWebAuthnKey('cred-selected', 'pw', undefined, ctx())
+      ).resolves.toMatchObject({ kind: 'accepted' });
+      expect(signal).toHaveBeenCalledWith(expect.objectContaining({ rpId: 'voice.example.test' }));
+      expect(lastBodyFor('/api/v1/mfa/webauthn/credentials/cred-selected')).toEqual({
+        password: 'pw',
+      }); // pragma: allowlist secret
+    } finally {
+      resetRuntimeServerBase();
+      vi.unstubAllGlobals();
+    }
   });
 
   it('onRevokeWebAuthnKey skips the Signal API when no remaining ids are returned', async () => {

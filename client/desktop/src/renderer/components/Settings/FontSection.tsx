@@ -14,6 +14,7 @@ import {
 } from '../../utils/ui/effectiveFont';
 import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
 import CollapsibleSection from './CollapsibleSection';
+import RememberedDisclosure from './RememberedDisclosure';
 import './FontSection.css';
 
 // Self-hosted, license-cleared application fonts (see public/branding/Concord-Voice/
@@ -253,19 +254,26 @@ interface FontAreaRowProps {
 
 // `name` makes the rows an exclusive group natively: opening one closes the others.
 const FontAreaRow: React.FC<FontAreaRowProps> = ({ name, helper, current, locked, children }) => (
-  <details className="font-area-row" name="font-areas">
-    <summary className="font-area-summary">
-      <span className="font-area-name">{name}</span>
-      <span className="font-area-helper">{helper}</span>
-      <span
-        className="font-area-current"
-        style={{ fontFamily: locked ? LOCKED_FAMILY : current.family }}
-      >
-        {locked ? 'OpenDyslexic · Locked' : current.label}
-      </span>
-    </summary>
+  <RememberedDisclosure
+    id={`font-area-${name.toLowerCase()}`}
+    className="font-area-row"
+    name="font-areas"
+    summaryClassName="font-area-summary"
+    summary={
+      <>
+        <span className="font-area-name">{name}</span>
+        <span className="font-area-helper">{helper}</span>
+        <span
+          className="font-area-current"
+          style={{ fontFamily: locked ? LOCKED_FAMILY : current.family }}
+        >
+          {locked ? 'OpenDyslexic · Locked' : current.label}
+        </span>
+      </>
+    }
+  >
     <div className="font-area-body">{children}</div>
-  </details>
+  </RememberedDisclosure>
 );
 
 const FontSection: React.FC = () => {

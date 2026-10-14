@@ -3,7 +3,7 @@ import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { onTestFinished, vi } from 'vitest';
-import { deferred } from '../../../helpers/deferred';
+import { deferred, type Deferred } from '../../../helpers/deferred';
 
 const gifIdMock = vi.hoisted(() => ({
   currentId: 'mock-customer-id-123' as string | null,
@@ -445,7 +445,7 @@ describe('PrivacySecuritySection', () => {
 
   it('renders privacy section heading', async () => {
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Privacy')).toBeInTheDocument());
+    await vi.waitFor(() => expect(screen.getByText('Privacy Controls')).toBeInTheDocument());
   });
   it('places Activity History immediately before Active Sessions', async () => {
     render(<PrivacySecuritySection />);
@@ -1289,7 +1289,7 @@ describe('PrivacySecuritySection', () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('Past Sessions')).toBeInTheDocument());
-    expect(screen.getByText('Revoked')).toBeInTheDocument();
+    expect(await screen.findByText('Revoked')).toBeInTheDocument();
   });
 
   // ── Session revoke flow (non-current) ───────────────────────────────────
@@ -1819,17 +1819,6 @@ describe('PrivacySecuritySection', () => {
 
   // ── DM level click interaction ─────────────────────────────────────────
 
-  it('changes DM level when clicking a tier label', async () => {
-    render(<PrivacySecuritySection />);
-    // #1241 added a second tier control to this section, so both "No One"
-    // buttons exist. Scope to the DM group by its accessible name rather than
-    // by DOM order, which would silently follow a reorder.
-    const dmGroup = await screen.findByRole('group', { name: /who can dm you/i });
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'No One' }));
-    // The local level changes — verify the description updates
-    await vi.waitFor(() => expect(screen.getByText(/Hermit mode/)).toBeInTheDocument());
-  });
-
   // ── Relative time formatting ───────────────────────────────────────────
 
   it('formats session times', async () => {
@@ -2007,7 +1996,7 @@ describe('PrivacySecuritySection', () => {
   // typing into it (X dropped, Y revoked).
   // Mutant: `openStepUp` replacing an open dialog's action.
   it('a second Revoke refused while the first dialog is open does not re-point it', async () => {
-    const held: Record<string, ReturnType<typeof deferred<Reply>>> = {};
+    const held: Record<string, Deferred<Reply>> = {};
     serveSection({
       // An older s3, so the list order (s2 first) does not hang on a clock tick.
       sessions: [sessionRow('s2', false), { ...sessionRow('s3', false), last_used: '2020-01-01' }],
@@ -2158,14 +2147,6 @@ describe('PrivacySecuritySection', () => {
   });
 
   // ── DM slider interaction ──────────────────────────────────────────────
-
-  it('changes DM level via slider', async () => {
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Who Can DM You')).toBeInTheDocument());
-    const slider = screen.getByRole('slider', { name: /who can dm you/i });
-    fireEvent.change(slider, { target: { value: '0' } });
-    await vi.waitFor(() => expect(screen.getByText(/Hermit mode/)).toBeInTheDocument());
-  });
 
   // ── Embedded content description ───────────────────────────────────────
 
@@ -2624,21 +2605,6 @@ describe('PrivacySecuritySection', () => {
 
   // ── DM privacy slider debounce ─────────────────────────────────────────
 
-  it('debounces DM privacy level API call', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Who Can DM You')).toBeInTheDocument());
-    // Click the DM group's "No One" (#1241 added a second one to this section)
-    const dmGroup = screen.getByRole('group', { name: /who can dm you/i });
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'No One' }));
-    // The API call should not happen immediately
-    expect(mockUpdatePrivacy).not.toHaveBeenCalledWith({ dmPrivacyLevel: 0 });
-    // Advance timers past the 300ms debounce
-    vi.advanceTimersByTime(350);
-    expect(mockUpdatePrivacy).toHaveBeenCalledWith({ dmPrivacyLevel: 0 });
-    vi.useRealTimers();
-  });
-
   // ── Session revoke general 403 (unknown error code) ────────────────────
 
   it('throws error for unrecognized 403 on session revoke', async () => {
@@ -3063,7 +3029,9 @@ describe('PrivacySecuritySection', () => {
   // ─── SSO Security toggles (issue #270) ─────────────────────────────
   it('renders SSO Security controls as provider-generic switches', async () => {
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
+    expect(
+      await screen.findByRole('switch', { name: /Trust SSO provider verification/i })
+    ).toBeInTheDocument();
 
     expect(screen.getByText('Trust SSO provider verification')).toBeInTheDocument();
     expect(screen.getByText('Require SSO for sign-in')).toBeInTheDocument();
@@ -3090,7 +3058,9 @@ describe('PrivacySecuritySection', () => {
     });
 
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
+    expect(
+      await screen.findByRole('switch', { name: /Trust SSO provider verification/i })
+    ).toBeInTheDocument();
 
     // Click the trust-SSO switch
     const trustToggle = screen.getByRole('switch', {
@@ -3129,7 +3099,9 @@ describe('PrivacySecuritySection', () => {
     });
 
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
+    expect(
+      await screen.findByRole('switch', { name: /Trust SSO provider verification/i })
+    ).toBeInTheDocument();
 
     const pwToggle = screen.getByRole('switch', {
       name: /Require SSO for sign-in/i,
@@ -3161,7 +3133,9 @@ describe('PrivacySecuritySection', () => {
     });
 
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
+    expect(
+      await screen.findByRole('switch', { name: /Trust SSO provider verification/i })
+    ).toBeInTheDocument();
 
     const trustToggle = screen.getByRole('switch', {
       name: /Trust SSO provider verification/i,
@@ -3176,175 +3150,8 @@ describe('PrivacySecuritySection', () => {
   });
 });
 
-// ── #1241: a superseded tier PATCH must not act on its own outcome ───────────
-//
-// CodeRabbit on PR #2888. The 300 ms debounce coalesces rapid clicks, but two
-// selections further apart put two PATCHes in flight, and a slow rejection of
-// the FIRST would otherwise revert the user's newer choice and surface an error
-// for a request they had already replaced.
-describe('PrivacySecuritySection — superseded tier mutations (#1241)', () => {
-  // Earlier tests in this file install permanent mockImplementation overrides on
-  // usePrivacyStore (see ~line 885 onward), so a block at the end of the file
-  // inherits whichever one ran last — none of which carry `loaded`. Install a
-  // complete store shape here rather than depending on file ordering. Without
-  // `loaded: true` the friend-request control renders disabled, its clicks are
-  // no-ops, and the cross-control test below passes for the wrong reason.
-  beforeEach(() => {
-    drainOnceQueues();
-    vi.mocked(usePrivacyStore).mockImplementation((s: (st: unknown) => unknown) =>
-      s({
-        settings: {
-          messagesFriendsOnly: true,
-          messagesServerMembers: true,
-          dmPrivacyLevel: 2 as const,
-          dmFriendsOfFriends: false,
-          autoAcceptFriendCodes: false,
-          searchableByUsername: false,
-          searchableByEmail: false,
-          searchableByPhone: false,
-          allowEmbeddedContent: false,
-          loadGifsAutomatically: true,
-          sharePersonalizationWithGifProvider: true,
-          allowFriendRequestsFrom: 'everyone' as const,
-        },
-        loaded: true,
-        fetchPrivacy: mockFetchPrivacy,
-        updatePrivacy: mockUpdatePrivacy,
-      })
-    );
-  });
-
-  // POSITIVE CONTROL. Without this, the negative test below cannot be trusted:
-  // if the error can never render in this harness, "no error appeared" passes
-  // whether or not the guard exists.
-  it('surfaces the error when a tier PATCH rejects and is NOT superseded', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    mockUpdatePrivacy.mockRejectedValueOnce(new Error('lonely failure'));
-
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Who Can DM You')).toBeInTheDocument());
-    const dmGroup = screen.getByRole('group', { name: /who can dm you/i });
-
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'No One' }));
-    await act(async () => {
-      vi.advanceTimersByTime(350);
-    });
-
-    expect(await screen.findByText('lonely failure')).toBeInTheDocument();
-    vi.useRealTimers();
-  });
-
-  it('ignores a stale rejection once a newer tier selection has been issued', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let rejectFirst!: (e: Error) => void;
-    mockUpdatePrivacy
-      .mockReturnValueOnce(
-        new Promise((_res, rej) => {
-          rejectFirst = rej as (e: Error) => void;
-        })
-      )
-      .mockResolvedValueOnce(undefined);
-
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Who Can DM You')).toBeInTheDocument());
-    const dmGroup = screen.getByRole('group', { name: /who can dm you/i });
-
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'No One' }));
-    vi.advanceTimersByTime(350);
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'Everyone' }));
-    vi.advanceTimersByTime(350);
-
-    // The FIRST request now fails, after the second has superseded it.
-    await act(async () => {
-      rejectFirst(new Error('stale failure'));
-    });
-
-    // No error surfaced for the abandoned request.
-    expect(screen.queryByText('stale failure')).not.toBeInTheDocument();
-    vi.useRealTimers();
-  });
-});
-
-// ── Cross-control supersession must NOT occur (#1241) ────────────────────────
-//
-// Gitar and CodeRabbit both caught this independently on PR #2888. Both tier
-// controls route through commitPrivacyTier, so a single shared generation
-// counter let one supersede the other: selecting a friend-request mode while a
-// DM PATCH was in flight marked the DM rejection "superseded", swallowing its
-// error and skipping its revert.
-//
-// The same-control test above cannot detect this — it only ever supersedes a DM
-// update with another DM update. That shared blind spot is why the bug survived
-// falsification of that test.
-describe('PrivacySecuritySection — cross-control supersession (#1241)', () => {
-  // Earlier tests in this file install permanent mockImplementation overrides on
-  // usePrivacyStore (see ~line 885 onward), so a block at the end of the file
-  // inherits whichever one ran last — none of which carry `loaded`. Install a
-  // complete store shape here rather than depending on file ordering. Without
-  // `loaded: true` the friend-request control renders disabled, its clicks are
-  // no-ops, and the cross-control test below passes for the wrong reason.
-  beforeEach(() => {
-    drainOnceQueues();
-    vi.mocked(usePrivacyStore).mockImplementation((s: (st: unknown) => unknown) =>
-      s({
-        settings: {
-          messagesFriendsOnly: true,
-          messagesServerMembers: true,
-          dmPrivacyLevel: 2 as const,
-          dmFriendsOfFriends: false,
-          autoAcceptFriendCodes: false,
-          searchableByUsername: false,
-          searchableByEmail: false,
-          searchableByPhone: false,
-          allowEmbeddedContent: false,
-          loadGifsAutomatically: true,
-          sharePersonalizationWithGifProvider: true,
-          allowFriendRequestsFrom: 'everyone' as const,
-        },
-        loaded: true,
-        fetchPrivacy: mockFetchPrivacy,
-        updatePrivacy: mockUpdatePrivacy,
-      })
-    );
-  });
-
-  it('a friend-request selection does NOT suppress a failing DM save', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let rejectDm!: (e: Error) => void;
-    mockUpdatePrivacy
-      .mockReturnValueOnce(
-        new Promise((_res, rej) => {
-          rejectDm = rej as (e: Error) => void;
-        })
-      )
-      .mockResolvedValueOnce(undefined);
-
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Who Can DM You')).toBeInTheDocument());
-
-    // 1. Start a DM save (left in flight).
-    const dmGroup = screen.getByRole('group', { name: /who can dm you/i });
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'No One' }));
-    vi.advanceTimersByTime(350);
-
-    // 2. Change an UNRELATED control while the DM PATCH is still outstanding.
-    const frGroup = screen.getByRole('group', { name: /who can send you friend requests/i });
-    // Guard the harness: if this control is disabled the click is a no-op and the
-    // test passes for the wrong reason — it must actually issue a second PATCH.
-    expect(within(frGroup).getByRole('button', { name: 'No One' })).not.toBeDisabled();
-    fireEvent.click(within(frGroup).getByRole('button', { name: 'No One' }));
-    vi.advanceTimersByTime(350);
-
-    // 3. The DM PATCH now fails. It was never superseded by a newer DM write,
-    //    so its error MUST surface.
-    await act(async () => {
-      rejectDm(new Error('dm save rejected'));
-    });
-
-    expect(await screen.findByText('dm save rejected')).toBeInTheDocument();
-    vi.useRealTimers();
-  });
-});
+// Tier-save behavior uses the real store and MSW in PrivacySection.pane-pivot.test.tsx
+// and privacyStore.pending-owner.test.ts; this suite retains presentation fixtures.
 
 // ── #1241: the friend-request WRITE path ─────────────────────────────────────
 //
@@ -3393,165 +3200,6 @@ function friendRequestGroup() {
   return screen.getByRole('group', { name: /who can send you friend requests/i });
 }
 
-describe('PrivacySecuritySection — friend-request write path (#1241)', () => {
-  beforeEach(() => {
-    drainOnceQueues();
-    vi.clearAllMocks();
-    mockUpdatePrivacy.mockReset();
-    mockUpdatePrivacy.mockResolvedValue(undefined);
-    installPrivacyStoreMock(true);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('describes mutual friends and friend codes in the Mutual Servers setting', async () => {
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() =>
-      expect(screen.getByText('Who Can Send You Friend Requests')).toBeInTheDocument()
-    );
-    const group = friendRequestGroup();
-    fireEvent.click(within(group).getByRole('button', { name: 'Mutual Servers' }));
-    expect(within(group).getByText(/share a server or a friend with you/)).toBeInTheDocument();
-    expect(within(group).getByText(/Someone with a valid friend code can too/)).toBeInTheDocument();
-  });
-
-  it('issues exactly one PATCH carrying the picked friend-request mode', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() =>
-      expect(screen.getByText('Who Can Send You Friend Requests')).toBeInTheDocument()
-    );
-
-    const noOne = within(friendRequestGroup()).getByRole('button', { name: 'No One' });
-    // Guard the harness: a disabled control makes the click a no-op.
-    expect(noOne).not.toBeDisabled();
-    fireEvent.click(noOne);
-
-    // Debounced — nothing may go out before the window closes.
-    expect(mockUpdatePrivacy).not.toHaveBeenCalled();
-
-    vi.advanceTimersByTime(350);
-
-    expect(mockUpdatePrivacy).toHaveBeenCalledTimes(1);
-    expect(mockUpdatePrivacy).toHaveBeenCalledWith({ allowFriendRequestsFrom: 'nobody' });
-  });
-
-  it('coalesces rapid picks into ONE PATCH carrying the LAST mode', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() =>
-      expect(screen.getByText('Who Can Send You Friend Requests')).toBeInTheDocument()
-    );
-
-    // Re-query between clicks: each pick re-renders the control.
-    fireEvent.click(within(friendRequestGroup()).getByRole('button', { name: 'No One' }));
-    fireEvent.click(within(friendRequestGroup()).getByRole('button', { name: 'Everyone' }));
-    fireEvent.click(within(friendRequestGroup()).getByRole('button', { name: 'Mutual Servers' }));
-
-    vi.advanceTimersByTime(350);
-
-    expect(mockUpdatePrivacy).toHaveBeenCalledTimes(1);
-    expect(mockUpdatePrivacy).toHaveBeenCalledWith({ allowFriendRequestsFrom: 'mutual_servers' });
-  });
-});
-
-// ── #1241 / AC-19: a rejected PATCH must REVERT the control ──────────────────
-//
-// The positive control only asserted that the error text renders. Deleting the
-// `revert(...)` call left the suite green while the slider kept advertising a
-// protection level the server had refused — which on a privacy control is the
-// misrepresentation AC-19 exists to prevent.
-describe('PrivacySecuritySection — rejected tier PATCH reverts the control (#1241, AC-19)', () => {
-  beforeEach(() => {
-    drainOnceQueues();
-    vi.clearAllMocks();
-    mockUpdatePrivacy.mockReset();
-    installPrivacyStoreMock(true);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('returns the DM slider to the last server-confirmed level', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let rejectDm!: (e: Error) => void;
-    mockUpdatePrivacy.mockReturnValueOnce(
-      new Promise((_res, rej) => {
-        rejectDm = rej as (e: Error) => void;
-      })
-    );
-
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Who Can DM You')).toBeInTheDocument());
-
-    const dmGroup = screen.getByRole('group', { name: /who can dm you/i });
-    fireEvent.click(within(dmGroup).getByRole('button', { name: 'No One' }));
-    // Optimistic: the control shows the level-0 copy before the server answers.
-    expect(within(dmGroup).getByText(/Hermit mode/)).toBeInTheDocument();
-
-    vi.advanceTimersByTime(350);
-    await act(async () => {
-      rejectDm(new Error('dm save rejected'));
-    });
-
-    expect(await screen.findByText('dm save rejected')).toBeInTheDocument();
-    // The store's confirmed value is level 2, so the control must go back to it.
-    expect(within(dmGroup).queryByText(/Hermit mode/)).not.toBeInTheDocument();
-    expect(within(dmGroup).getByText(/The social butterfly/)).toBeInTheDocument();
-    expect(within(dmGroup).getByRole('button', { name: 'Friends + Server' })).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    );
-  });
-
-  it('returns the friend-request control to the last server-confirmed mode', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let rejectFr!: (e: Error) => void;
-    mockUpdatePrivacy.mockReturnValueOnce(
-      new Promise((_res, rej) => {
-        rejectFr = rej as (e: Error) => void;
-      })
-    );
-
-    render(<PrivacySecuritySection />);
-    await vi.waitFor(() =>
-      expect(screen.getByText('Who Can Send You Friend Requests')).toBeInTheDocument()
-    );
-
-    fireEvent.click(within(friendRequestGroup()).getByRole('button', { name: 'No One' }));
-    expect(
-      within(friendRequestGroup()).getByText('No one can send you a friend request.')
-    ).toBeInTheDocument();
-
-    vi.advanceTimersByTime(350);
-    await act(async () => {
-      rejectFr(new Error('friend request save rejected'));
-    });
-
-    expect(await screen.findByText('friend request save rejected')).toBeInTheDocument();
-    // getState() reports a confirmed 'everyone', so the control must go back.
-    expect(
-      within(friendRequestGroup()).queryByText('No one can send you a friend request.')
-    ).not.toBeInTheDocument();
-    expect(
-      within(friendRequestGroup()).getByText('Anyone can send you a friend request.')
-    ).toBeInTheDocument();
-    expect(within(friendRequestGroup()).getByRole('button', { name: 'Everyone' })).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    );
-  });
-});
-
-// ── #1241: the SECTION must forward `loaded`, not a literal ──────────────────
-//
-// privacyStore's own `loaded` transitions are covered in
-// tests/unit/stores/ui/privacyStore.test.ts. What survived mutation was the WIRING:
-// hardcoding `isLoaded={true}` at the FriendRequestPrivacyControls call site
-// left the suite green, so nothing proved the section forwards the store flag.
 describe('PrivacySecuritySection — friend-request control awaits `loaded` (#1241)', () => {
   beforeEach(() => {
     drainOnceQueues();
@@ -3656,7 +3304,7 @@ describe('PrivacySecuritySection — screen-capture protection (#2468)', () => {
   it('does not render the protection toggle on Linux', async () => {
     electron().getPlatform = vi.fn().mockResolvedValue('linux');
     render(<PrivacySecuritySection />);
-    await screen.findByText('Privacy');
+    await screen.findByText('Privacy Controls');
     expect(
       screen.queryByRole('switch', {
         name: 'Protect Concord windows from screen capture',

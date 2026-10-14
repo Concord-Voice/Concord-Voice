@@ -146,24 +146,3 @@ func TestGetMe_ActivePremiumFromStripe(t *testing.T) {
 	require.NotNil(t, resp.CurrentPeriodEnd)
 	assert.Equal(t, periodEnd.Format("2006-01-02T15:04:05Z07:00"), *resp.CurrentPeriodEnd)
 }
-
-// TestGetMe_DBErrorDegradesToFree: a closed DB handle forces a query error; the
-// handler degrades to the free default (200) rather than fabricating premium or
-// returning 500.
-func TestGetMe_DBErrorDegradesToFree(t *testing.T) {
-	db, cleanup := testhelpers.SetupTestDB(t)
-	cleanup() // close the pool so the query errors
-	h := subscriptions.NewHandler(db, logger.New("test"))
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	user := uuid.New()
-
-	r.GET("/subscriptions/me", authAs(user), h.GetMe)
-	w := doGet(r, "/subscriptions/me")
-
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	var resp subscriptions.StatusDTO
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, "free", resp.Tier)
-	assert.Equal(t, "none", resp.Status)
-}

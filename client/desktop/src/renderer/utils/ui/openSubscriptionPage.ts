@@ -24,12 +24,12 @@ export type SubscriptionDeepLink =
  * by SettingsPage's focus effect (switch pane → focus control).
  *
  * `section` is a best-effort deep-link hint (#1304); it is accepted but unused
- * today. The navigation target is always Subscriptions ▸ Current Plan.
+ * today. The navigation target is always Account ▸ Subscription.
  */
 export function openSubscriptionPage(_section?: SubscriptionDeepLink): void {
   // `_section` is intentionally accepted-but-unused today (the leading `_`
   // satisfies no-unused-vars); it keeps the signature honest for #1304 callers,
   // which will route to the matching feature row once the destination ships.
   useSettingsOverlayStore.getState().openSettings('app');
-  useSettingsNavStore.getState().requestFocus('subscriptions', 'section-current-plan');
+  useSettingsNavStore.getState().requestFocus('account', 'section-subscription');
 }

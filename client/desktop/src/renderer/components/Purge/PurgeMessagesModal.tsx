@@ -958,7 +958,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
     // while SettingsPage is mounted — and this card is reachable only from a
     // DM/group entry point, with Settings closed. So open the overlay first,
     // exactly as utils/ui/openProfilePage.ts and openSubscriptionPage.ts do.
-    // 'privacy' is the Privacy & Security pane's id in the SettingsSection
+    // 'privacy' is the Privacy pane's id in the SettingsSection
     // union; the control id is the toggle Task 7 adds, and the deck's dead-end
     // copy names that toggle verbatim so the user finds the words they were told.
     openSettings('app');

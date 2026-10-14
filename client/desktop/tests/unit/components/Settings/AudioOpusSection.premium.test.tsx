@@ -117,8 +117,8 @@ describe('AudioOpusSection — L3 Music Mode lock', () => {
     fireEvent.click(checkbox);
     expect(mockSetDraftAudioSetting).not.toHaveBeenCalledWith('musicMode', expect.anything());
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 

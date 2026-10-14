@@ -166,7 +166,9 @@ The personal information we collect may include the following:
 - usernames
 - display names
 - passwords (stored as Argon2id hashes; we never store plaintext passwords)
-- phone numbers (only if you choose to enable SMS multi-factor authentication)
+- phone numbers (only if you choose to enable SMS multi-factor authentication;
+  SMS enrollment is not
+  currently available in the hosted service)
 - contact preferences
 - billing addresses (only if you subscribe to a paid plan)
 - contact or authentication data (for example, multi-factor-authentication setup)
@@ -628,7 +630,7 @@ functions on our behalf:
 | Service Provider     | Purpose                                                                                                                                     | Privacy Policy                                                                                            |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | **Stripe**           | Payment processing for paid subscriptions                                                                                                   | [stripe.com/privacy](https://stripe.com/privacy)                                                          |
-| **KLIPY**            | GIF search and delivery via privacy proxy (we proxy your search to KLIPY to prevent direct contact between your device and KLIPY's servers) | _See KLIPY privacy policy_                                                                                |
+| **KLIPY**            | GIF search and delivery via privacy proxy (we proxy your search to KLIPY to prevent direct contact between your device and KLIPY's servers) | [KLIPY privacy policy](https://klipy.com/support/privacy-policy)                                             |
 | **NVIDIA Broadcast** | Opt-in AI audio/video enhancement (RTX-Series GPU required); see [Section 7](#7-do-we-offer-artificial-intelligence-based-products)         | [nvidia.com/en-us/about-nvidia/privacy-policy](https://www.nvidia.com/en-us/about-nvidia/privacy-policy/) |
 | **Google**           | Single Sign-On (if you use Google to sign in); push notifications via FCM                                                                   | [policies.google.com/privacy](https://policies.google.com/privacy)                                        |
 | **Apple**            | Single Sign-On (if you use Sign in with Apple); push notifications via APNs                                                                 | [apple.com/legal/privacy](https://www.apple.com/legal/privacy/)                                           |
@@ -962,13 +964,16 @@ any personal information we process. These include:
 - **TLS 1.3** for all data in transit between your device and our
   servers
 - **Argon2id** password hashing (OWASP-recommended parameters)
-- **Multi-factor authentication** support (TOTP, SMS, hardware tokens
-  via WebAuthn)
+- **Multi-factor authentication** support (TOTP and hardware/platform
+  authenticators via WebAuthn). SMS enrollment is not currently available.
 - **Rate limiting and abuse detection** at the API gateway
 - **Encrypted storage** for sensitive data at rest
 - **Regular security audits and penetration testing**
 - **Pre-commit security scanning** (TruffleHog, detect-secrets,
   Gitleaks, Semgrep, SonarQube AI-Code Assurance) on all code changes
+
+Manage available sign-in and recovery methods in **Settings → Security →
+Multi-Factor Authentication**.
 
 However, despite our safeguards and efforts to secure your information,
 no electronic transmission over the Internet or information storage
@@ -1035,21 +1040,19 @@ processing before its withdrawal nor, when applicable law allows, will
 it affect the processing of your personal information conducted in
 reliance on lawful processing grounds other than consent.
 
-For Activity History, use **Delete history and turn off** in the Activity History
-settings. This idempotent action withdraws consent, deletes the active-database
+For Activity History, use **Delete history and turn off** in **Settings → Privacy
+→ Activity History**. This idempotent action withdraws consent, deletes the active-database
 history, and prevents new recording until you opt in again. There is no Activity
 History export endpoint.
 
 ### Opting out of marketing and promotional communications
 
 You can unsubscribe from our marketing and promotional communications
-at any time by:
+at any time by contacting us using the details provided in
+[Section 20](#20-how-can-you-contact-us-about-this-notice).
 
-- In the app, go to Settings → Notifications to update your preferences.
-- In the app, go to Settings → Privacy & Security to manage SMS
-  multi-factor authentication enrollment.
-- Contacting us using the details provided in
-  [Section 20](#20-how-can-you-contact-us-about-this-notice).
+Desktop alerts and chat sounds are managed separately in **Settings →
+Notifications**.
 
 You will then be removed from any marketing lists. However, we may
 still communicate with you — for example, to send you service-related
@@ -1071,8 +1074,8 @@ your account or terminate your account, you can:
 
 - Log into the application, select **Settings → Account**, and update
   your user account.
-- Submit an account-deletion request via **Settings → Privacy & Security
-  → Delete Account**.
+- Request account deletion using the contact details in
+  [Section 20](#20-how-can-you-contact-us-about-this-notice).
 
 Upon your request to terminate your account, we will deactivate or
 delete your account and information from our active databases within

@@ -1262,8 +1262,8 @@ func NewRouter(
 
 	// Subscription-status read handler (#1304). Read-only companion to the
 	// entitlement set: exposes the live subscription's status/source/expiry that
-	// the Settings subscription page renders. Fails closed to the free default on
-	// any DB error (never a fabricated premium).
+	// the Settings subscription page renders. An absent live row returns the free
+	// default; query or scan errors return 503 without confirming a tier.
 	subscriptionsHandler := subscriptions.NewHandler(db, log)
 
 	// Redemption engine + issuer (#1303). The first LIVE caller of the
@@ -1676,8 +1676,8 @@ func NewRouter(
 
 			// Subscription status (Settings subscription page; #1304). Read-only,
 			// auth-required, pending-OK (mirrors /entitlements so the page renders
-			// before email verification). Always 200; fails closed to the free
-			// default on any DB error.
+			// before email verification). No live row returns the free default;
+			// query or scan errors return 503 without confirming a tier.
 			authRequired.GET("/subscriptions/me",
 				middleware.RateLimitByUser(redis, 30, 1*time.Minute),
 				subscriptionsHandler.GetMe,

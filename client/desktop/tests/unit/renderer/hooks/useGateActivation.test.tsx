@@ -22,8 +22,8 @@ describe('useGateActivation', () => {
     const { result } = renderHook(() => useGateActivation('audio-tier'));
     act(() => result.current.onActivate());
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'subscriptions',
-      controlId: 'section-current-plan',
+      section: 'account',
+      controlId: 'section-subscription',
     });
   });
 

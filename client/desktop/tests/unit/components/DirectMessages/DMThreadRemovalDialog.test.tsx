@@ -817,7 +817,7 @@ describe('DMThreadRemovalDialog', () => {
         [{ kind: 'notFound' }, 'This thread is no longer available.'],
         [
           { kind: 'stepUpImpossible' },
-          'Set a password, enable MFA, or turn off purge protection in Privacy & Security.',
+          'Set a password or enable MFA in Security, or turn off purge protection in Privacy.',
         ],
         [{ kind: 'refused' }, 'History could not be cleared.'],
       ] as const)('keeps the dialog open and says %j', async (result, text) => {

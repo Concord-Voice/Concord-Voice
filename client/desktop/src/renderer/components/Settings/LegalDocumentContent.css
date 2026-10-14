@@ -1,0 +1,123 @@
+.legal-document-content {
+  max-width: 70ch;
+  min-width: 0;
+  margin-inline: auto;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.legal-document-content > * + * {
+  margin-top: 12px;
+}
+
+.legal-document-content :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--font-display-stack);
+  line-height: 1.4;
+  margin-block: 24px 12px;
+  scroll-margin-top: 16px;
+}
+
+.legal-document-content h1 {
+  font-size: calc(22px * var(--font-scale, 1));
+}
+
+.legal-document-content h2 {
+  font-size: calc(18px * var(--font-scale, 1));
+}
+
+.legal-document-content :is(h3, h4, h5, h6) {
+  font-size: calc(16px * var(--font-scale, 1));
+}
+
+.legal-document-content :is(ul, ol) {
+  padding-left: 24px;
+}
+
+.legal-document-content li + li,
+.legal-document-content li > p + p {
+  margin-top: 8px;
+}
+
+.legal-document-content blockquote {
+  border-left: 3px solid var(--border-color);
+  padding-left: 12px;
+  color: var(--text-secondary);
+}
+
+.legal-document-content a,
+.settings-content .legal-document-content a[target='_blank'],
+.settings-content .legal-document-content a[target='_blank']:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.legal-document-content a:focus-visible,
+.legal-document-table:focus-visible,
+.legal-document-content :is(h1, h2, h3, h4, h5, h6):focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 3px;
+}
+
+.legal-document-content :is(pre, code) {
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  font-size: 0.9em;
+  background: var(--bg-tertiary);
+}
+
+.legal-document-content code {
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+
+.legal-document-content pre {
+  max-width: 100%;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  overflow-wrap: normal;
+}
+
+.legal-document-content pre code {
+  padding: 0;
+}
+
+.legal-document-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.legal-document-content table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.legal-document-content :is(th, td) {
+  min-width: 10ch;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  text-align: left;
+  vertical-align: top;
+}
+
+.legal-document-content th {
+  background: var(--bg-tertiary);
+}
+
+.legal-document-content :is(th, td)[align='center'] {
+  text-align: center;
+}
+
+.legal-document-content :is(th, td)[align='right'] {
+  text-align: right;
+}
+
+.legal-document-content hr {
+  border: 0;
+  border-top: 1px solid var(--border-color);
+  margin-block: 24px;
+}

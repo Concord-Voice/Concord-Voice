@@ -105,7 +105,7 @@ describe('openVerificationSetup', () => {
     expect(opened).toBe(true);
     expect(order).toEqual(['close:null']);
     expect(overlay().open).toBe('app');
-    expect(nav().focusRequest).toEqual({ section: 'privacy', controlId: 'section-mfa' });
+    expect(nav().focusRequest).toEqual({ section: 'security', controlId: 'section-mfa' });
   });
 
   // Mutant: setVerificationReturn not called, or called with a fixed `{ kind: 'chat' }`.

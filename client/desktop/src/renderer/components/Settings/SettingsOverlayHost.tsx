@@ -126,6 +126,9 @@ const SettingsOverlayHost: React.FC = () => {
       if (dismissBlocked()) e.preventDefault();
     };
     const handleClose = () => {
+      // Native close events are queued. A previous visit's event can arrive
+      // after showModal has reopened the dialog for a new visit.
+      if (dlg.open) return;
       if (dismissBlocked()) {
         dlg.showModal();
         return;
