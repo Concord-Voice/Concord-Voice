@@ -13,7 +13,7 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 398 third-party software components across its four
+Concord Voice distributes 397 third-party software components across its four
 CVSL application artifact families:
 
 - **59** Go modules linked into the control-plane runtime binaries. The image
@@ -22,7 +22,7 @@ CVSL application artifact families:
   is the union of what all three link. The image also carries the admin portal
   bundle below, so it is not Go-only.
 - **188** npm packages in the desktop client production bundle (plus Electron and its bundled components)
-- **147** npm packages in the media-plane production bundle
+- **146** npm packages in the media-plane production bundle
 - **4** npm packages in the admin portal production bundle (`client/admin`),
   compiled by the `admin-ui-builder` stage and copied into the control-plane
   runtime image at `/admin-ui` (`services/control-plane/Dockerfile:8,66`)
@@ -37,9 +37,9 @@ Application-dependency license distribution:
 
 | License family | Share | Compatible with CVSL 1.0 + AGPL-3.0 |
 |---|---|---|
-| MIT | 82.4% (328) | ✓ |
+| MIT | 82.6% (328) | ✓ |
 | ISC | 6.3% (25) | ✓ |
-| Apache-2.0 | 4.5% (18) | ✓ |
+| Apache-2.0 | 4.3% (17) | ✓ |
 | BSD-3-Clause | 3.8% (15) | ✓ |
 | BSD-2-Clause | 1.3% (5) | ✓ |
 | BlueOak-1.0.0 | 1.3% (5) | ✓ |
@@ -48,9 +48,9 @@ Application-dependency license distribution:
 | MPL-2.0 (build-time only) | not in the count above | ✓ |
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | not in the count above | ✓ (attribution required) |
 
-Shares are exact counts over the 398 components tabulated below, not estimates.
+Shares are exact counts over the 397 components tabulated below, not estimates.
 The final two rows cover build-time and build-data dependencies, which are not
-part of that 398 and therefore carry no share of it; see
+part of that 397 and therefore carry no share of it; see
 [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 for their treatment.
 
@@ -58,7 +58,7 @@ No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the four
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 398-component count.
+recorded separately below; it is not part of the 397-component count.
 
 ## License Texts
 
@@ -427,11 +427,11 @@ bundle (services/media-plane):
 | @colors/colors | 1.6.0 | MIT | https://github.com/DABH/colors.js |
 | @dabh/diagnostics | 2.0.8 | MIT | https://github.com/DABH/diagnostics |
 | @isaacs/fs-minipass | 4.0.1 | ISC | https://github.com/npm/fs-minipass |
-| @redis/bloom | 6.2.1 | MIT | https://github.com/redis/node-redis |
-| @redis/client | 6.2.1 | MIT | https://github.com/redis/node-redis |
-| @redis/json | 6.2.1 | MIT | https://github.com/redis/node-redis |
-| @redis/search | 6.2.1 | MIT | https://github.com/redis/node-redis |
-| @redis/time-series | 6.2.1 | MIT | https://github.com/redis/node-redis |
+| @redis/bloom | 6.3.0 | MIT | https://github.com/redis/node-redis |
+| @redis/client | 6.3.0 | MIT | https://github.com/redis/node-redis |
+| @redis/json | 6.3.0 | MIT | https://github.com/redis/node-redis |
+| @redis/search | 6.3.0 | MIT | https://github.com/redis/node-redis |
+| @redis/time-series | 6.3.0 | MIT | https://github.com/redis/node-redis |
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
@@ -447,7 +447,6 @@ bundle (services/media-plane):
 | call-bind-apply-helpers | 1.0.2 | MIT | https://github.com/ljharb/call-bind-apply-helpers |
 | call-bound | 1.0.4 | MIT | https://github.com/ljharb/call-bound |
 | chownr | 3.0.0 | BlueOak-1.0.0 | https://github.com/isaacs/chownr |
-| cluster-key-slot | 1.1.2 | Apache-2.0 | https://github.com/Salakar/cluster-key-slot |
 | color-convert | 3.1.3 | MIT | https://github.com/Qix-/color-convert |
 | color-name | 2.1.0 | MIT | https://github.com/colorjs/color-name |
 | color-string | 2.1.4 | MIT | https://github.com/Qix-/color-string |
@@ -535,7 +534,7 @@ bundle (services/media-plane):
 | range-parser | 1.2.1 | MIT | https://github.com/jshttp/range-parser |
 | raw-body | 3.0.2 | MIT | https://github.com/stream-utils/raw-body |
 | readable-stream | 3.6.2 | MIT | https://github.com/nodejs/readable-stream |
-| redis | 6.2.1 | MIT | https://github.com/redis/node-redis |
+| redis | 6.3.0 | MIT | https://github.com/redis/node-redis |
 | router | 2.2.0 | MIT | https://github.com/pillarjs/router |
 | safe-buffer | 5.2.1 | MIT | https://github.com/feross/safe-buffer |
 | safe-stable-stringify | 2.5.0 | MIT | https://github.com/BridgeAR/safe-stable-stringify |
