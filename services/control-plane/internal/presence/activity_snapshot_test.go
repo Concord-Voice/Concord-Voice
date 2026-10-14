@@ -103,6 +103,9 @@ func (h *activitySnapshotPipelineHook) ProcessPipelineHook(
 	next redis.ProcessPipelineHook,
 ) redis.ProcessPipelineHook {
 	return func(ctx context.Context, commands []redis.Cmder) error {
+		if isConnectionInitBatch(commands) {
+			return next(ctx, commands)
+		}
 		names := make([]string, len(commands))
 		for index, command := range commands {
 			names[index] = command.Name()
@@ -116,6 +119,24 @@ func (h *activitySnapshotPipelineHook) ProcessPipelineHook(
 		}
 		return next(ctx, commands)
 	}
+}
+
+// isConnectionInitBatch reports a go-redis connection-init pipeline. Since
+// v9.23.0 each Client has a dedicated pipeline pool that dials on demand, and
+// a new connection's init (HELLO/AUTH/SELECT/CLIENT SETINFO) runs through
+// ProcessPipelineHook. The hook counts only batches the code under test sends.
+func isConnectionInitBatch(commands []redis.Cmder) bool {
+	if len(commands) == 0 {
+		return false
+	}
+	for _, command := range commands {
+		switch command.Name() {
+		case "hello", "auth", "select", "client":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func TestLoadActivitySnapshotStatesUsesBoundedExactGetPipelines(t *testing.T) {
