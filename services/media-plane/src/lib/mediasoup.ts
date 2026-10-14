@@ -14,7 +14,179 @@ export type RoomConsumerCountsProvider = () => ReadonlyMap<string, number>;
 /** A room's router plus the index of the worker hosting it. */
 type RouterAssignment = { router: Router; workerIndex: number };
 
+export interface NativeTerminationTarget {
+  readonly worker: Worker;
+  readonly router: Router;
+  readonly routerId: string;
+  readonly transportIds: readonly string[] | undefined;
+}
+
+interface NativeWorkerClosure {
+  observed: boolean;
+  closed: Promise<void>;
+}
+
+function nativeTerminationUnavailable(): Error {
+  return new Error('Native media termination unavailable');
+}
+
+export async function awaitNativeDeadline<T>(
+  operation: () => Promise<T>,
+  deadlineMs: number
+): Promise<T> {
+  const remaining = deadlineMs - performance.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) throw nativeTerminationUnavailable();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(nativeTerminationUnavailable()), remaining);
+    });
+    const result = await Promise.race([operation(), deadline]);
+    if (performance.now() >= deadlineMs) throw nativeTerminationUnavailable();
+    return result;
+  } catch {
+    throw nativeTerminationUnavailable();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export class MediasoupService {
+  private readonly routerWorkers = new WeakMap<Router, Worker>();
+  private readonly nativeWorkers = new Map<Worker, NativeWorkerClosure>();
+  private routerCreations = 0;
+  private routerCreationVersion = 0;
+  private closing = false;
+
+  private trackNativeWorker(worker: Worker): NativeWorkerClosure {
+    const existing = this.nativeWorkers.get(worker);
+    if (existing) return existing;
+    let resolve: () => void = () => undefined;
+    const closure: NativeWorkerClosure = {
+      observed: false,
+      closed: new Promise<void>((complete) => {
+        resolve = complete;
+      }),
+    };
+    this.nativeWorkers.set(worker, closure);
+    const closed = () => {
+      closure.observed = true;
+      resolve();
+    };
+    worker.once('subprocessclose', closed);
+    if (worker.subprocessClosed) closed();
+    return closure;
+  }
+
+  private workerStopped(worker: Worker): boolean {
+    const closure = this.nativeWorkers.get(worker);
+    if (!closure) throw nativeTerminationUnavailable();
+    return closure.observed || worker.subprocessClosed;
+  }
+
+  captureNativeTermination(
+    router: Router,
+    transportIds?: readonly string[]
+  ): NativeTerminationTarget {
+    const worker = this.routerWorkers.get(router);
+    if (
+      !worker ||
+      !this.nativeWorkers.has(worker) ||
+      !router.id ||
+      transportIds?.some((id) => typeof id !== 'string' || !id)
+    )
+      throw nativeTerminationUnavailable();
+    return Object.freeze({
+      worker,
+      router,
+      routerId: router.id,
+      transportIds:
+        transportIds === undefined ? undefined : Object.freeze([...new Set(transportIds)]),
+    });
+  }
+
+  private async nativeRouterAbsent(
+    target: NativeTerminationTarget,
+    deadlineMs: number
+  ): Promise<boolean> {
+    if (this.workerStopped(target.worker)) return true;
+    const dump = await awaitNativeDeadline(() => target.worker.dump(), deadlineMs);
+    if (this.workerStopped(target.worker)) return true;
+    if (dump.pid !== target.worker.pid || !Array.isArray(dump.routerIds))
+      throw nativeTerminationUnavailable();
+    return !dump.routerIds.includes(target.routerId);
+  }
+
+  async confirmNativeTermination(
+    target: NativeTerminationTarget,
+    deadlineMs: number
+  ): Promise<void> {
+    if (
+      this.routerWorkers.get(target.router) !== target.worker ||
+      target.router.id !== target.routerId
+    ) {
+      throw nativeTerminationUnavailable();
+    }
+    if (await this.nativeRouterAbsent(target, deadlineMs)) return;
+    if (target.transportIds === undefined) throw nativeTerminationUnavailable();
+    if (target.transportIds.length === 0) return;
+    let dump;
+    try {
+      // Pinned Router.dump still issues a Worker-channel request after JS close.
+      dump = await awaitNativeDeadline(() => target.router.dump(), deadlineMs);
+    } catch {
+      // A concurrent native router removal may reject its dump. Rejection alone
+      // is never absence: obtain a fresh, successful worker proof instead.
+      if (await this.nativeRouterAbsent(target, deadlineMs)) return;
+      throw nativeTerminationUnavailable();
+    }
+    if (this.workerStopped(target.worker)) return;
+    if (
+      dump.id !== target.routerId ||
+      !Array.isArray(dump.transportIds) ||
+      target.transportIds.some((id) => dump.transportIds.includes(id))
+    )
+      throw nativeTerminationUnavailable();
+  }
+
+  async confirmAllRoutersClosed(deadlineMs: number): Promise<void> {
+    const version = this.routerCreationVersion;
+    if (this.routerCreations !== 0) throw nativeTerminationUnavailable();
+    await Promise.all(
+      this.workers.map(async (worker) => {
+        if (this.workerStopped(worker)) return;
+        const dump = await awaitNativeDeadline(() => worker.dump(), deadlineMs);
+        if (this.workerStopped(worker)) return;
+        if (
+          dump.pid !== worker.pid ||
+          !Array.isArray(dump.routerIds) ||
+          dump.routerIds.length !== 0
+        ) {
+          throw nativeTerminationUnavailable();
+        }
+      })
+    );
+    // Catch a router created on a worker whose earlier dump was already empty.
+    if (this.routerCreations !== 0 || this.routerCreationVersion !== version)
+      throw nativeTerminationUnavailable();
+  }
+
+  async close(deadlineMs: number): Promise<void> {
+    this.closing = true;
+    const workers = [...this.workers];
+    const closures = workers.map((worker) => this.trackNativeWorker(worker));
+    logger.info('Closing mediasoup service');
+    // Every subprocess listener is installed before the first close request.
+    for (const worker of workers) worker.close();
+    await awaitNativeDeadline(
+      () => Promise.all(closures.map((closure) => closure.closed)),
+      deadlineMs
+    );
+    if (closures.some((closure) => !closure.observed)) throw nativeTerminationUnavailable();
+    this.workers = [];
+    this.routers.clear();
+  }
+
   private workers: Worker[] = [];
   private readonly routers: Map<string, RouterAssignment> = new Map();
   private roomConsumerCounts: RoomConsumerCountsProvider | null = null;
@@ -32,13 +204,15 @@ export class MediasoupService {
     });
 
     for (let i = 0; i < config.mediasoup.numWorkers; i++) {
+      const logTags: mediasoup.types.WorkerLogTag[] = config.mediasoup.worker.logTags;
       const worker = await mediasoup.createWorker({
         logLevel: config.mediasoup.worker.logLevel,
-        logTags: config.mediasoup.worker.logTags satisfies mediasoup.types.WorkerLogTag[],
+        logTags,
         rtcMinPort: config.mediasoup.worker.rtcMinPort,
         rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
       });
 
+      this.trackNativeWorker(worker);
       worker.on('died', () => {
         try {
           this.emitSecurityEvent?.({
@@ -133,15 +307,26 @@ export class MediasoupService {
     const workerIndex = selectLeastLoadedWorkerIndex(this.workers.length, load, rooms);
     const worker = this.workers[workerIndex];
 
-    const router = await worker.createRouter({
-      mediaCodecs: config.mediasoup.router.mediaCodecs satisfies RouterRtpCodecCapability[],
-    });
-
-    this.routers.set(roomId, { router, workerIndex });
-
-    logger.info('Created router for room', { roomId, workerId: worker.pid, workerIndex });
-
-    return router;
+    if (this.closing) throw nativeTerminationUnavailable();
+    this.routerCreations++;
+    this.routerCreationVersion++;
+    try {
+      const mediaCodecs: RouterRtpCodecCapability[] = config.mediasoup.router.mediaCodecs;
+      const router = await worker.createRouter({
+        mediaCodecs,
+      });
+      this.routerWorkers.set(router, worker);
+      if (this.closing) {
+        router.close();
+        throw nativeTerminationUnavailable();
+      }
+      this.routers.set(roomId, { router, workerIndex });
+      logger.info('Created media router', { workerIndex });
+      return router;
+    } finally {
+      this.routerCreations--;
+      this.routerCreationVersion++;
+    }
   }
 
   /** Remove a cached router (called when a room is destroyed) */
@@ -151,16 +336,5 @@ export class MediasoupService {
 
   getWorkerCount(): number {
     return this.workers.length;
-  }
-
-  async close() {
-    logger.info('Closing mediasoup service');
-
-    for (const worker of this.workers) {
-      worker.close();
-    }
-
-    this.workers = [];
-    this.routers.clear();
   }
 }

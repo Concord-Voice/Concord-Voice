@@ -92,8 +92,10 @@ describe('media policer wiring contract (#2153)', () => {
       "process.on('SIGTERM'"
     );
     const stoppedAt = shutdown.indexOf('mediaPolicerTick.stop()');
+    const closedAt = shutdown.search(/\broomManager\.closeAll\(\s*(?:shutdownNativeDeadline\s*)?\)/);
     expect(stoppedAt).toBeGreaterThanOrEqual(0);
-    expect(shutdown.indexOf('roomManager.closeAll()')).toBeGreaterThan(stoppedAt);
+    expect(closedAt, 'missing roomManager.closeAll call').toBeGreaterThanOrEqual(0);
+    expect(closedAt).toBeGreaterThan(stoppedAt);
   });
 
   it('routes the client close-producer handler through the final-sample path', () => {

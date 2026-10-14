@@ -80,7 +80,7 @@ Expected output:
 Checking migration version...
 Building migrate tool...
 ./bin/migrate -command=version
-Current version: 161 (clean)
+Current version: 167 (clean)
 ```
 
 The number is the highest migration in `migrations/`. Run `ls migrations/*.up.sql | tail -1` to
@@ -90,7 +90,34 @@ Migration 000160 creates the bounded pending channel-admission table and expiry 
 Migration 000161 adds the exact admission and socket identity columns. The positive
 authorization-revision sequence is owned by migration 000159; do not recreate or drop it.
 
+Migration 000167 creates the permanent `voice_command_transport` singleton. Before
+starting the server or its bootstrap worker, test an unprovisioned up/down/up on
+the disposable database. Verify that `provisioned_at`, `stream_created_at`,
+`owner_store_created_at` and `initializing_revision` are all null. After bootstrap
+against an isolated JetStream broker, all four must be present. The creation
+fingerprints are canonical UTC RFC3339Nano text; check that nanoseconds survive
+without timestamp rounding and that the database rejects a partial proof or a
+change to generation, creation time or committed proof.
+
+```sql
+SELECT generation, provisioned_at, stream_created_at,
+       owner_store_created_at, initializing_revision
+FROM voice_command_transport;
+```
+
+Test the guarded down separately after provisioning: it must refuse without
+removing the singleton or changing its receipt. golang-migrate can then record
+166 dirty despite PostgreSQL rolling the schema back to its intact 167 state.
+Inspect that exact schema and receipt before repairing the recorded version to
+clean 167; never force 166 and continue downs. This refusal is the expected
+result. See [the migration contract](README.md) and the
+[transport recovery runbook](../../../[internal]voice-command-transport.md).
+
 #### Test Rollback
+
+This success example requires an unprovisioned 000167 receipt. Starting the
+control plane against JetStream can provision it and make this down refuse.
+
 ```bash
 make migrate-down
 ```
@@ -110,7 +137,7 @@ make migrate-version
 
 Expected output:
 ```
-Current version: 160 (clean)
+Current version: 166 (clean)
 ```
 
 The version is one lower than the value from the previous step.
@@ -185,15 +212,15 @@ Creating migration: add_test_field
 Building migrate tool...
 ./bin/migrate -command=create -name=add_test_field
 Created migration files:
-  - migrations/000162_add_test_field.up.sql
-  - migrations/000162_add_test_field.down.sql
+  - migrations/000168_add_test_field.up.sql
+  - migrations/000168_add_test_field.down.sql
 ```
 
 The number is the next one after the highest migration in `migrations/`.
 
 Verify files were created:
 ```bash
-ls -l migrations/000162_*
+ls -l migrations/000168_*
 ```
 
 ### 6. Test Server Startup with Auto-Migration
@@ -313,7 +340,7 @@ make migrate-up
 
 ✅ All migration commands work without errors
 ✅ Version tracking is accurate
-✅ Rollbacks successfully reverse changes
+✅ Unprovisioned rollbacks reverse changes; a provisioned 000167 down refuses and preserves its receipt
 ✅ Server starts with auto-migration
 ✅ All expected tables exist with correct schema
 ✅ Foreign key constraints are properly enforced

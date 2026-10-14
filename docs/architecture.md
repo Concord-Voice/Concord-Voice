@@ -794,6 +794,110 @@ Receive consumers are scoped to the active media-session generation. Once a cons
 The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `server_deafened`. Voice quality tiers apply client-side through producer `codecOptions`, not through a Socket.IO event.
 `close-recv-transport` validates a non-empty transport ID, derives ownership from authenticated socket state, and closes only the caller's mapped receive transport. Retries and non-owned IDs receive an acknowledgement that reveals no resource existence.
 
+#### Durable voice command consumption
+
+The media plane consumes versioned moderation and disconnect commands through
+one serial JetStream pull consumer. `RoomManager` remains authoritative for
+participant mutation and media teardown. This consumer and its control-plane
+transport bootstrap are installed before the separate transactional publisher;
+existing moderation APIs still publish through the compatibility subjects until
+that publisher is deployed. Installing the consumer alone does not make those
+API writes durably delivered.
+
+| Resource | Contract |
+| --- | --- |
+| Command stream | `VOICE_COMMANDS_V1`, subject `voice.commands.v1` |
+| Storage and retention | File, one replica, Limits retention, DiscardNew, no age expiry |
+| Bounds | 67,108,864 bytes; 50,000 messages; 4,096 bytes per message; 120-second duplicate window |
+| Pull consumer | Stable durable `voice-enforcement-v1`; explicit ack; DeliverAll on initial creation; one pending acknowledgement; 30-second AckWait; unlimited deliveries |
+| Owner store | File-backed `VOICE_COMMAND_OWNER_V1`, key `authoritative`; history one; one replica; no TTL |
+| Frozen defaults | Synchronous persistence; no compression, placement, template owner or initial sequence offset; counter, scheduled, atomic and batched publishing disabled |
+
+The control plane commits one immutable `voice_command_transport` receipt after
+verifying the broker resources. It binds the transport generation, both broker
+resource creation identities, and the original initializing KV revision. Broker
+creation identities are stored as canonical UTC RFC3339Nano text so PostgreSQL
+cannot round away nanoseconds. Only the committed proof can release initial
+ownership. After provisioning, a missing or changed command stream, owner store,
+or owner key is continuity loss; startup does not create an empty replacement.
+
+One media process acquires ownership by a compare-and-set from `released` to
+`held`. Ownership has no expiry-based takeover. The process renews every two
+seconds, bounds each broker request to two seconds, and accepts local authority
+for at most five seconds from the request's start. A second boot cannot replace
+a held predecessor merely because it is old or unreachable: that predecessor's
+media workers could still forward audio. Uncertain ownership or consumer
+continuity closes admission and readiness, stops fetching and acknowledging,
+expires the signed enforcement lease, and terminalizes local media through the
+existing quarantine fence.
+
+Commands freeze the exact session generation, node boot, socket and credential
+epoch before publication. A delayed command cannot act on a same-user successor.
+Complete persistent moderation snapshots carry a monotonic authorization
+revision; desired flags immediately gate publish/resume, while an independent
+effect-completed revision advances only after required audio pauses finish.
+Redelivery of an equal unfinished revision retries those pauses. Clearing server
+moderation does not resume media against the participant's own mute/deafen
+choices.
+
+A command is acknowledged with broker confirmation only after its authoritative
+effects and server fanout complete. A failed pause, disconnect, fanout or
+confirmation leaves the delivery obligation pending. Fanout completion records
+the Socket.IO server emit, not receipt by every client. The dispatcher retains
+completion for the active command so a fanout retry does not repeat an already
+applied transient action. New-format compatibility copies cannot run ahead of
+the durable stream; legacy commands retain their established handling.
+
+Startup awaits the required durable consumer before accepting connections.
+`/readyz` keeps its exact existing responses: HTTP 200 with
+`{"ready":true,"voiceEnforcementProtocol":3}` only while signed enforcement,
+owner and consumer continuity are healthy; HTTP 503 with `{"ready":false}`
+otherwise. The compatibility subjects remain installed. Removing them and
+completing all existing subscription startup guarantees are separate cutover
+work.
+
+Graceful shutdown terminalizes local media and completes exact registry releases
+before releasing ownership; it preserves the durable consumer. Incomplete
+teardown retains `held`. After an unclean exit, replacement requires an operator
+to prove the predecessor container and all its media workers are stopped and
+cannot restart, then recover the exact held revision without changing its
+proof. Recovery supports intact resources only. Ordinary broker snapshot restore
+can change a stream's creation identity even when messages and KV revisions are
+preserved, so restoring a snapshot alone does not restore authority. Missing
+history or changed resource identities require complete generation reconciliation
+before restart; automatic proof rebinding is unsupported.
+
+Native termination is a completion boundary for enforcement. mediasoup's
+JavaScript `close()` calls can return while the worker is still processing a
+transport or router close. A `.closed` flag, cleared participant map, observer
+close event or `Worker.died` event does not prove forwarding stopped.
+`MediasoupService` captures each exact router, worker and transport set before
+cleanup. A successful `worker.dump()` proves router absence; otherwise a
+successful captured `router.dump()` must show every targeted transport absent.
+A rejected dump must be followed by a successful worker dump proving router
+absence, or by actual worker subprocess closure. Timeout, IPC loss or a failed
+dump leaves termination unconfirmed.
+
+`RoomManager` retains pending native-close proofs by exact room, user, socket and
+session identity through leave, replacement and failed-join cleanup. A retry
+cannot turn a cleared local map into proof of target absence or act on a
+successor that reused the socket. Durable completion, signed exact-session
+ejection replies and authenticated registry releases all await the relevant
+proof. Every direct and queued registry release receives a required native
+session verifier; there is no missing-local-state fallback. Credential-epoch
+acknowledgements also await retained proofs for the superseded epoch while
+preserving newer sessions.
+
+Quarantine and recovery require successful dumps proving every live worker has
+no native routers, including routers absent from JavaScript caches; in-flight
+router creation blocks that proof. Native-proof failure immediately invalidates
+owner authority and the admission lease. During graceful shutdown, exact registry
+releases finish first, then `MediasoupService.close()` awaits actual
+`subprocessClosed` / `subprocessclose` for every captured worker before ownership
+is released. These steps share the existing 35-second deadline and retain the
+ten-second HTTP-close reserve. Unconfirmed native or subprocess closure keeps
+the owner held and commands pending.
+
 #### Media E2EE (frame encryption)
 
 Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates _at_ the SFU). Implementation: `client/desktop/src/renderer/services/e2ee/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
@@ -1223,7 +1327,7 @@ The subscriber **keeps the action proportional to the claim**, which is what mak
 
 Delivery is **core NATS, at-most-once**. The named residual: a replica that misses the publish *and* holds a viewer connected continuously never re-derives. Every other path self-heals, because after erasure there is nothing left to re-derive against. `internal/attestation` accepts the same semantics for `attestation.registry.revoked`.
 
-Moderation mute/deafen is enforced in the media plane but driven by the control plane over NATS. The control-plane `voice` package publishes `voice.enforce.mute` / `voice.enforce.deafen`. The media-plane NATS subscriber (`src/index.ts`) calls `RoomManager.serverMuteUser` / `serverDeafenUser`, which pause the participant's audio producers (and, for deafen, audio consumers) and set `serverMuted` / `serverDeafened` flags. The flags also block `resume-producer` / `resume-consumer` so a client cannot self-unmute. State changes broadcast `server-mute-changed` / `server-deafen-changed` to the room.
+Moderation mute/deafen is enforced in the media plane and driven by the control plane over NATS. The existing `voice.enforce.mute` / `voice.enforce.deafen` subjects remain the API publication path during the durable-consumer rollout. Both legacy complete snapshots and durable versioned snapshots use the same retry-safe RoomManager enforcement: restrictive flags gate audio publish/resume immediately, required pauses must finish before their revision is marked complete, and equal unfinished revisions retry. State changes broadcast `server-mute-changed` / `server-deafen-changed` to the room. The [durable consumer](#durable-voice-command-consumption) adds retained delivery and exact-session targeting for new-format commands; transactional API publishing follows separately.
 
 ### E2EE Key-Epoch Rotation
 

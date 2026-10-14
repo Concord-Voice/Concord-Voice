@@ -12,6 +12,9 @@ export class VoiceEnforcementLease {
   renew(): void {
     this.renewedAt = this.now();
   }
+  expire(): void {
+    this.renewedAt = Number.NEGATIVE_INFINITY;
+  }
   valid(): boolean {
     return this.now() - this.renewedAt <= this.ttlMs;
   }

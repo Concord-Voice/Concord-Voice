@@ -78,12 +78,15 @@ export interface ForceDisconnectRoomManager {
   getProvisionalParticipant: RoomManager['getProvisionalParticipant'];
   leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
+  awaitNativeTermination: RoomManager['awaitNativeTermination'];
 }
 
 export interface CredentialEpochEvictionRoomManager {
   getSupersededCredentialEpochSessions: RoomManager['getSupersededCredentialEpochSessions'];
   leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
+  awaitNativeTermination: RoomManager['awaitNativeTermination'];
+  awaitNativeTerminationForCredentialEpoch: RoomManager['awaitNativeTerminationForCredentialEpoch'];
 }
 
 export interface VoiceEnforcementSessionRoomManager {
@@ -91,6 +94,7 @@ export interface VoiceEnforcementSessionRoomManager {
   getProvisionalParticipant: RoomManager['getProvisionalParticipant'];
   leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
+  awaitNativeTermination: RoomManager['awaitNativeTermination'];
 }
 
 /**
@@ -211,6 +215,19 @@ function sameVoiceEnforcementSession(
   );
 }
 
+function isExactVoiceEnforcementParticipant(
+  participant: ReturnType<RoomManager['getProvisionalParticipant']>,
+  socketId: string,
+  credentialEpoch: string,
+  sessionGeneration: string
+): boolean {
+  return (
+    participant?.socketId === socketId &&
+    participant.credentialEpoch === credentialEpoch &&
+    participant.voiceEnforcementSessionGeneration === sessionGeneration
+  );
+}
+
 async function removeExactVoiceEnforcementSession(
   roomManager: VoiceEnforcementSessionRoomManager,
   io: ForceDisconnectIO,
@@ -218,21 +235,30 @@ async function removeExactVoiceEnforcementSession(
 ): Promise<boolean> {
   const { roomId, userId, socketId, credentialEpoch, sessionGeneration } = session;
   const provisional = roomManager.getProvisionalParticipant(roomId, userId);
-  const provisionalExact =
-    provisional?.socketId === socketId &&
-    provisional.credentialEpoch === credentialEpoch &&
-    provisional.voiceEnforcementSessionGeneration === sessionGeneration;
+  const provisionalExact = isExactVoiceEnforcementParticipant(
+    provisional,
+    socketId,
+    credentialEpoch,
+    sessionGeneration
+  );
   const socket = io.sockets.sockets.get(socketId);
   const locallyOwned = socket?.data?.voiceEnforcementSession;
+  const capturedSocketState = {
+    userId: socket?.data?.userId,
+    credentialEpoch: socket?.data?.credentialEpoch,
+    roomId: socket?.data?.roomId,
+  };
   if (socket && !sameVoiceEnforcementSession(locallyOwned, session) && !provisionalExact) {
     return false;
   }
 
   const admitted = roomManager.getParticipant(roomId, userId);
-  const admittedExact =
-    admitted?.socketId === socketId &&
-    admitted.credentialEpoch === credentialEpoch &&
-    admitted.voiceEnforcementSessionGeneration === sessionGeneration;
+  const admittedExact = isExactVoiceEnforcementParticipant(
+    admitted,
+    socketId,
+    credentialEpoch,
+    sessionGeneration
+  );
   // A missing socket is only proof of absence when no local participant still
   // names it. Otherwise retaining the row is safer than acknowledging a
   // session whose ownership the process cannot establish.
@@ -245,10 +271,16 @@ async function removeExactVoiceEnforcementSession(
     terminallyAbsent = await roomManager.removeProvisionalParticipantForEnforcement(
       roomId,
       userId,
-      socketId
+      socketId,
+      sessionGeneration
     );
   } else if (admittedExact) {
-    terminallyAbsent = await roomManager.leaveRoomIfSocketOwned(roomId, userId, socketId);
+    terminallyAbsent = await roomManager.leaveRoomIfSocketOwned(
+      roomId,
+      userId,
+      socketId,
+      sessionGeneration
+    );
   } else if (
     sameVoiceEnforcementSession(locallyOwned, session) &&
     provisional?.socketId !== socketId &&
@@ -265,8 +297,31 @@ async function removeExactVoiceEnforcementSession(
   }
 
   if (!terminallyAbsent) return false;
-  socket?.emit('force-disconnect', { channelId: roomId, reason: 'authority_revoked' });
-  socket?.disconnect(true);
+  await roomManager.awaitNativeTermination(roomId, userId, socketId, sessionGeneration);
+  const currentAdmitted = roomManager.getParticipant(roomId, userId);
+  const currentProvisional = roomManager.getProvisionalParticipant(roomId, userId);
+  const successorOwnsSocket = [currentAdmitted, currentProvisional].some(
+    (current) =>
+      current?.socketId === socketId &&
+      current.voiceEnforcementSessionGeneration !== sessionGeneration
+  );
+  const stillRegisteringCapturedCandidate =
+    provisionalExact &&
+    locallyOwned === undefined &&
+    socket?.data?.voiceEnforcementSession === undefined &&
+    socket?.data?.userId === capturedSocketState.userId &&
+    socket?.data?.credentialEpoch === capturedSocketState.credentialEpoch &&
+    socket?.data?.roomId === capturedSocketState.roomId;
+  if (
+    socket &&
+    io.sockets.sockets.get(socketId) === socket &&
+    !successorOwnsSocket &&
+    (sameVoiceEnforcementSession(socket.data?.voiceEnforcementSession, session) ||
+      stillRegisteringCapturedCandidate)
+  ) {
+    socket.emit('force-disconnect', { channelId: roomId, reason: 'authority_revoked' });
+    socket.disconnect(true);
+  }
   return true;
 }
 
@@ -330,7 +385,14 @@ async function handleVoiceEnforcementSessionEjection(
 
   // The exact session has been removed before the transport is closed, or no
   // local state named it. Only then may this node release the durable row.
-  await releaseVoiceEnforcementSession(session);
+  await releaseVoiceEnforcementSession(session, (target) =>
+    roomManager.awaitNativeTermination(
+      target.roomId,
+      target.userId,
+      target.socketId,
+      target.sessionGeneration
+    )
+  );
   return createVoiceEnforcementSessionAcknowledgement(command, sharedSecret);
 }
 
@@ -566,6 +628,74 @@ function sessionsForCall(
   };
 }
 
+type CapturedForceDisconnectSocket = {
+  socket: ReturnType<ForceDisconnectIO['sockets']['sockets']['get']>;
+  session: VoiceEnforcementSession | undefined;
+  userId: unknown;
+  credentialEpoch: unknown;
+  roomId: unknown;
+  sessionGeneration: string | undefined;
+  admissionId: string | undefined;
+};
+
+function matchesCapturedSocket(
+  io: ForceDisconnectIO,
+  socketId: string,
+  captured: CapturedForceDisconnectSocket | undefined
+): boolean {
+  const socket = captured?.socket;
+  if (
+    !socket ||
+    io.sockets.sockets.get(socketId) !== socket ||
+    socket.data?.userId !== captured.userId ||
+    socket.data?.credentialEpoch !== captured.credentialEpoch ||
+    (socket.data?.roomId !== undefined && socket.data.roomId !== captured.roomId)
+  ) {
+    return false;
+  }
+  const currentSession = socket.data?.voiceEnforcementSession;
+  if (currentSession === captured.session) return true;
+  // A1 records this generation before the registration response installs the
+  // socket session. Only that exact pending registration may complete here.
+  return (
+    captured.session === undefined &&
+    captured.sessionGeneration !== undefined &&
+    currentSession?.sessionGeneration === captured.sessionGeneration &&
+    currentSession.socketId === socketId &&
+    currentSession.userId === captured.userId &&
+    currentSession.credentialEpoch === captured.credentialEpoch &&
+    currentSession.roomId === captured.roomId
+  );
+}
+
+function disconnectCapturedSocket(
+  roomManager: ForceDisconnectRoomManager,
+  io: ForceDisconnectIO,
+  socketId: string,
+  captured: CapturedForceDisconnectSocket | undefined,
+  channelId: string,
+  userId: string,
+  payload: ForceDisconnectPayload
+): void {
+  if (!matchesCapturedSocket(io, socketId, captured)) return;
+  const successorOwnsSocket = [
+    roomManager.getParticipant(channelId, userId),
+    roomManager.getProvisionalParticipant(channelId, userId),
+  ].some(
+    (current) =>
+      current?.socketId === socketId &&
+      (current.voiceEnforcementSessionGeneration !== captured?.sessionGeneration ||
+        current.admissionId !== captured?.admissionId)
+  );
+  if (successorOwnsSocket) {
+    return;
+  }
+  const socket = captured?.socket;
+  if (!socket) return;
+  socket.emit('force-disconnect', payload);
+  socket.disconnect(true);
+}
+
 /**
  * Evicts a peer from one room: `voice.enforce.disconnect` from the control
  * plane (#487 P3, reason `access_revoked`) or the media policer's repeat-offender
@@ -609,7 +739,7 @@ export async function handleForceDisconnect(
   if (!exact.valid) return;
   const { participant: exactParticipant, provisional: exactProvisional } = exact;
   if (!exactParticipant && !exactProvisional) {
-    // Already gone — nothing to evict. Idempotent.
+    await roomManager.awaitNativeTermination(channelId, userId, options.socketId);
     return;
   }
 
@@ -619,12 +749,32 @@ export async function handleForceDisconnect(
   // a room that was already pending-only: silently without admitted history, or
   // through normal terminal lifecycle with history. Exact ownership prevents
   // this command from deleting a successor session.
+  const capturedSockets = new Map(
+    [exactParticipant, exactProvisional]
+      .filter((target) => target !== undefined)
+      .map((target) => {
+        const socket = io.sockets.sockets.get(target.socketId);
+        return [
+          target.socketId,
+          {
+            socket,
+            session: socket?.data?.voiceEnforcementSession,
+            userId: socket?.data?.userId,
+            credentialEpoch: socket?.data?.credentialEpoch,
+            roomId: channelId,
+            sessionGeneration: target.voiceEnforcementSessionGeneration,
+            admissionId: target.admissionId,
+          },
+        ] as const;
+      })
+  );
   let changed = false;
   if (exactProvisional) {
     changed = await roomManager.removeProvisionalParticipantForEnforcement(
       channelId,
       userId,
-      exactProvisional.socketId
+      exactProvisional.socketId,
+      exactProvisional.voiceEnforcementSessionGeneration
     );
   }
 
@@ -633,8 +783,23 @@ export async function handleForceDisconnect(
   // erase exact ownership before this authoritative RoomManager call can run.
   if (exactParticipant) {
     changed =
-      (await roomManager.leaveRoomIfSocketOwned(channelId, userId, exactParticipant.socketId)) ||
-      changed;
+      (await roomManager.leaveRoomIfSocketOwned(
+        channelId,
+        userId,
+        exactParticipant.socketId,
+        exactParticipant.voiceEnforcementSessionGeneration
+      )) || changed;
+  }
+
+  for (const target of [exactProvisional, exactParticipant].filter(
+    (target): target is NonNullable<typeof target> => Boolean(target)
+  )) {
+    await roomManager.awaitNativeTermination(
+      channelId,
+      userId,
+      target.socketId,
+      target.voiceEnforcementSessionGeneration
+    );
   }
 
   // Tell every admitted/provisional session to leave, then force each socket
@@ -643,10 +808,15 @@ export async function handleForceDisconnect(
   if (exactParticipant) socketIds.add(exactParticipant.socketId);
   if (exactProvisional) socketIds.add(exactProvisional.socketId);
   for (const socketId of socketIds) {
-    const socket = io.sockets.sockets.get(socketId);
-    if (!socket) continue;
-    socket.emit('force-disconnect', resolved.payload);
-    socket.disconnect(true);
+    disconnectCapturedSocket(
+      roomManager,
+      io,
+      socketId,
+      capturedSockets.get(socketId),
+      channelId,
+      userId,
+      resolved.payload
+    );
   }
 
   if (changed) {
@@ -787,32 +957,71 @@ async function handleCredentialEpochEviction(
     userId,
     supersededCredentialEpoch
   );
+  const capturedSockets = [...io.sockets.sockets]
+    .filter(
+      ([, socket]) =>
+        socket.data?.userId === userId && socket.data.credentialEpoch === supersededCredentialEpoch
+    )
+    .map(([socketId, socket]) => {
+      const matchingTargets = sessions.filter((session) => session.socketId === socketId);
+      const target = matchingTargets.length === 1 ? matchingTargets[0] : undefined;
+      return {
+        socketId,
+        socket,
+        session: socket.data?.voiceEnforcementSession,
+        userId: socket.data?.userId,
+        credentialEpoch: socket.data?.credentialEpoch,
+        roomId:
+          target?.roomId ?? socket.data?.voiceEnforcementSession?.roomId ?? socket.data?.roomId,
+        sessionGeneration: target?.sessionGeneration,
+        admissionId: undefined,
+      };
+    });
   for (const session of sessions) {
     if (session.provisional) {
       await roomManager.removeProvisionalParticipantForEnforcement(
         session.roomId,
         userId,
-        session.socketId
+        session.socketId,
+        session.sessionGeneration
       );
     }
   }
-  const socketRooms = new Map(sessions.map((session) => [session.socketId, session.roomId]));
-  for (const [socketId, socket] of io.sockets.sockets) {
-    if (
-      socket.data?.userId === userId &&
-      socket.data.credentialEpoch === supersededCredentialEpoch
-    ) {
-      socketRooms.set(socketId, typeof socket.data.roomId === 'string' ? socket.data.roomId : '');
-    }
-  }
-  for (const [socketId, roomId] of socketRooms) {
-    const socket = io.sockets.sockets.get(socketId);
-    socket?.emit('force-disconnect', { channelId: roomId, reason: 'credential_rotated' });
-    socket?.disconnect(true);
-  }
   for (const session of sessions) {
     if (!session.provisional) {
-      await roomManager.leaveRoomIfSocketOwned(session.roomId, userId, session.socketId);
+      await roomManager.leaveRoomIfSocketOwned(
+        session.roomId,
+        userId,
+        session.socketId,
+        session.sessionGeneration
+      );
     }
+    await roomManager.awaitNativeTermination(
+      session.roomId,
+      userId,
+      session.socketId,
+      session.sessionGeneration
+    );
+  }
+  await roomManager.awaitNativeTerminationForCredentialEpoch(userId, supersededCredentialEpoch);
+  const remainingSessions = roomManager.getSupersededCredentialEpochSessions(
+    userId,
+    supersededCredentialEpoch
+  );
+  for (const captured of capturedSockets) {
+    const { socket, socketId } = captured;
+    if (
+      !matchesCapturedSocket(io, socketId, captured) ||
+      remainingSessions.some(
+        (current) =>
+          current.socketId === socketId &&
+          (current.roomId !== captured.roomId ||
+            current.sessionGeneration !== captured.sessionGeneration)
+      )
+    )
+      continue;
+    const roomId = typeof captured.roomId === 'string' ? captured.roomId : '';
+    socket.emit('force-disconnect', { channelId: roomId, reason: 'credential_rotated' });
+    socket.disconnect(true);
   }
 }

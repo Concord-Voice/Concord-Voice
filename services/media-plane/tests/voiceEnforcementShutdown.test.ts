@@ -18,9 +18,12 @@ import {
   VoiceEnforcementLease,
 } from '../src/lib/voiceEnforcementLease.js';
 
+const nativeVerifier = vi.fn().mockResolvedValue(undefined);
+
 describe('voice-enforcement shutdown release', () => {
   beforeEach(() => {
     release.mockReset();
+    nativeVerifier.mockReset().mockResolvedValue(undefined);
   });
 
   it('attempts every terminally closed exact session and retains failures', async () => {
@@ -34,11 +37,11 @@ describe('voice-enforcement shutdown release', () => {
       { data: { voiceEnforcementSession: first } },
       { data: { voiceEnforcementSession: second } },
       { data: {} },
-    ] as never);
+    ] as never, new VoiceEnforcementSessionReleaseQueue(nativeVerifier));
 
     expect(release).toHaveBeenCalledTimes(3);
-    expect(release).toHaveBeenCalledWith(first);
-    expect(release).toHaveBeenCalledWith(second);
+    expect(release).toHaveBeenCalledWith(first, nativeVerifier);
+    expect(release).toHaveBeenCalledWith(second, nativeVerifier);
     expect(retained).toBe(1);
   });
 
@@ -52,7 +55,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: 'socket-a',
     };
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
 
     expect(queue.enqueue(session)).toBe(true);
     expect(queue.enqueue({ ...session, socketId: 'replacement-socket' })).toBe(true);
@@ -60,16 +63,16 @@ describe('voice-enforcement shutdown release', () => {
     await queue.retryPending();
 
     expect(release).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledWith({ ...session, socketId: 'replacement-socket' });
+    expect(release).toHaveBeenCalledWith({ ...session, socketId: 'replacement-socket' }, nativeVerifier);
     expect(queue.outstandingCount()).toBe(0);
 
-    const heldQueue = new VoiceEnforcementSessionReleaseQueue();
+    const heldQueue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     heldQueue.holdAll([session]);
     heldQueue.holdAll([{ ...session, socketId: 'ignored-socket' }]);
     heldQueue.promoteHeld();
     await heldQueue.retryPending();
     expect(release).toHaveBeenCalledTimes(2);
-    expect(release).toHaveBeenLastCalledWith(session);
+    expect(release).toHaveBeenLastCalledWith(session, nativeVerifier);
     expect(heldQueue.outstandingCount()).toBe(0);
   });
 
@@ -83,7 +86,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: 'socket-a',
     };
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     queue.enqueue(session);
     let rejectRelease!: (error: Error) => void;
     const releaseAttempt = new Promise<void>((_, reject) => {
@@ -107,7 +110,7 @@ describe('voice-enforcement shutdown release', () => {
     const lease = new VoiceEnforcementLease(() => now, 30_000);
     lease.renew();
     now = 30_001;
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     let terminallyClosed = false;
     const fence = new VoiceEnforcementExpiryFence(lease, async () => {
       terminallyClosed = true;
@@ -132,7 +135,7 @@ describe('voice-enforcement shutdown release', () => {
     expect(release).toHaveBeenLastCalledWith({
       sessionGeneration: 'session-a',
       nodeBootId: 'boot-a',
-    });
+    }, nativeVerifier);
     expect(queue.pendingCount()).toBe(0);
   });
 
@@ -146,7 +149,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: `socket-${index}`,
     }));
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     let releaseBatch!: () => void;
     const batchReleased = new Promise<void>((resolve) => {
       releaseBatch = resolve;
@@ -176,7 +179,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: 'socket-a',
     };
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     queue.holdAll([session]);
     release.mockResolvedValue(undefined);
 
@@ -185,7 +188,7 @@ describe('voice-enforcement shutdown release', () => {
 
     queue.promoteHeld();
     await queue.retryPending();
-    expect(release).toHaveBeenCalledWith(session);
+    expect(release).toHaveBeenCalledWith(session, nativeVerifier);
     expect(queue.heldCount()).toBe(0);
     expect(queue.pendingCount()).toBe(0);
   });
@@ -200,7 +203,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: 'socket-a',
     };
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     queue.holdAll([session]);
 
     const outstanding = await releaseVoiceEnforcementSessionsAfterClose([], queue);
@@ -232,7 +235,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: 'socket-a',
     };
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     release.mockRejectedValueOnce(new Error('control plane unavailable'));
 
     await queue.releaseAfterTerminalClose(session);
@@ -250,7 +253,7 @@ describe('voice-enforcement shutdown release', () => {
       userId: 'user-a',
       credentialEpoch: 'epoch-a',
       socketId: 'socket-a',
-    });
+    }, nativeVerifier);
     expect(queue.pendingCount()).toBe(0);
   });
 
@@ -264,7 +267,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: `socket-${index}`,
     }));
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     release.mockResolvedValue(undefined);
     queue.enqueueAll(sessions);
 
@@ -284,7 +287,7 @@ describe('voice-enforcement shutdown release', () => {
       credentialEpoch: 'epoch-a',
       socketId: `socket-${index}`,
     }));
-    const queue = new VoiceEnforcementSessionReleaseQueue();
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier);
     release.mockRejectedValue(new Error('control plane unavailable'));
     queue.enqueueAll(sessions);
 
@@ -308,7 +311,7 @@ describe('voice-enforcement shutdown release', () => {
       })
     );
     const onSaturated = vi.fn();
-    const queue = new VoiceEnforcementSessionReleaseQueue(onSaturated);
+    const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier, onSaturated);
     queue.enqueueAll(sessions);
     queue.holdAll([sessions[0]]);
 

@@ -11,7 +11,12 @@ import type {
 } from 'mediasoup/types';
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
-import { MediasoupService } from './mediasoup.js';
+import {
+  MediasoupService,
+  awaitNativeDeadline,
+  type NativeTerminationTarget,
+} from './mediasoup.js';
+import type { ExactVoiceCommandTarget } from './voiceCommand.js';
 import type { MetricsSample } from './mediaMetrics.js';
 import { ActiveSpeakerSet } from './activeSpeakerSet.js';
 import type { ActiveSpeakerDelta } from './activeSpeakerSet.js';
@@ -330,8 +335,10 @@ export interface Participant {
   authorizationRevision?: bigint;
   /** Revision that supplied enforcedPermissions, when newer than A2. */
   enforcedAuthorizationRevision?: bigint;
-  /** Revision of the complete server mute/deafen snapshot on this session. */
+  /** Revision of the desired server mute/deafen snapshot on this session. */
   serverEnforcementRevision?: bigint;
+  /** Revision whose required server mute/deafen media pauses completed. */
+  serverEnforcementAppliedRevision?: bigint;
   /** Exact server-authorized A1 candidate identity for channel promotion. */
   admissionId?: string;
   /** Media E2EE frame crypto format this participant joined with. */
@@ -1445,6 +1452,42 @@ function registerProvisionalDMParticipant(
   });
 }
 
+function findSocketOwnedParticipant(
+  participants: Array<Participant | undefined>,
+  socketId: string,
+  sessionGeneration: string | undefined
+): Participant | undefined {
+  return participants.find(
+    (participant): participant is Participant =>
+      participant?.socketId === socketId &&
+      (sessionGeneration === undefined ||
+        participant.voiceEnforcementSessionGeneration === sessionGeneration)
+  );
+}
+
+function acceptsServerEnforcementRevision(
+  participant: Participant | undefined,
+  authorizationRevision: bigint
+): participant is Participant {
+  if (!participant) return false;
+  return authorizationRevision > (participant.serverEnforcementRevision ?? 0n);
+}
+
+function captureCredentialEpochSession(
+  roomId: string,
+  participant: Participant,
+  provisional: boolean
+): { roomId: string; socketId: string; provisional: boolean; sessionGeneration?: string } {
+  return {
+    roomId,
+    socketId: participant.socketId,
+    provisional,
+    ...(participant.voiceEnforcementSessionGeneration
+      ? { sessionGeneration: participant.voiceEnforcementSessionGeneration }
+      : {}),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // RoomManager
 //
@@ -1457,7 +1500,213 @@ function registerProvisionalDMParticipant(
 //   - Event emission for NATS/Redis integration
 // ---------------------------------------------------------------------------
 
+interface NativeCloseRecord {
+  readonly key: string;
+  readonly roomId: string;
+  readonly userId?: string;
+  readonly socketId?: string;
+  readonly sessionGeneration?: string;
+  readonly credentialEpoch?: string;
+  readonly participants: Set<Participant>;
+  readonly targets: Set<NativeTerminationTarget>;
+}
+
+/** Frozen local identity for a durable user action across authority awaits. */
+interface ExactUserModerationCapture {
+  readonly room: Room;
+  readonly participant: Participant;
+  readonly target: ExactVoiceCommandTarget;
+}
+
 export class RoomManager {
+  private readonly pendingNativeClose = new Map<string, NativeCloseRecord>();
+  private readonly nativeTransportCreations = new WeakMap<Participant, Set<Promise<void>>>();
+  private readonly nativeRecvClosures = new WeakMap<Participant, Set<NativeTerminationTarget>>();
+  private enforcementAuthorityGate: (() => void) | undefined;
+  private nativeTerminationFailureHandler: (() => void) | undefined;
+
+  setEnforcementAuthorityGate(gate: () => void): void {
+    this.enforcementAuthorityGate = gate;
+  }
+
+  setNativeTerminationFailureHandler(handler: () => void): void {
+    this.nativeTerminationFailureHandler = handler;
+  }
+
+  private nativeTerminationFailure(): Error {
+    try {
+      this.nativeTerminationFailureHandler?.();
+    } catch {
+      /* Observer failure cannot turn an unknown native state into absence. */
+    }
+    return new Error('Native media termination unavailable');
+  }
+
+  private retainNativeTermination(
+    room: Room,
+    participant?: Participant,
+    ids?: readonly string[]
+  ): { record: NativeCloseRecord; target: NativeTerminationTarget } {
+    try {
+      const transportIds = participant
+        ? (ids ?? [
+            ...(participant.sendTransport ? [participant.sendTransport.id] : []),
+            ...participant.recvTransports.keys(),
+          ])
+        : undefined;
+      const target = this.mediasoup.captureNativeTermination(room.router, transportIds);
+      const key = JSON.stringify([
+        room.id,
+        participant?.userId ?? null,
+        participant?.socketId ?? null,
+        participant?.voiceEnforcementSessionGeneration ?? null,
+      ]);
+      let record = this.pendingNativeClose.get(key);
+      if (!record) {
+        record = {
+          key,
+          roomId: room.id,
+          userId: participant?.userId,
+          socketId: participant?.socketId,
+          sessionGeneration: participant?.voiceEnforcementSessionGeneration,
+          credentialEpoch: participant?.credentialEpoch,
+          participants: new Set(),
+          targets: new Set(),
+        };
+        this.pendingNativeClose.set(key, record);
+      }
+      if (participant) record.participants.add(participant);
+      record.targets.add(target);
+      return { record, target };
+    } catch {
+      throw this.nativeTerminationFailure();
+    }
+  }
+
+  private retainRecvNativeTermination(
+    room: Room,
+    participant: Participant,
+    transportId: string
+  ): { record: NativeCloseRecord; target: NativeTerminationTarget } {
+    const retained = this.retainNativeTermination(room, participant, [transportId]);
+    let pending = this.nativeRecvClosures.get(participant);
+    if (!pending) {
+      pending = new Set();
+      this.nativeRecvClosures.set(participant, pending);
+    }
+    pending.add(retained.target);
+    return retained;
+  }
+
+  private retireNativeTarget(record: NativeCloseRecord, target: NativeTerminationTarget): void {
+    record.targets.delete(target);
+    for (const participant of record.participants)
+      this.nativeRecvClosures.get(participant)?.delete(target);
+  }
+
+  private async drainOrdinaryNativeClose(
+    record: NativeCloseRecord,
+    target: NativeTerminationTarget
+  ): Promise<void> {
+    try {
+      await this.mediasoup.confirmNativeTermination(target, performance.now() + 10_000);
+      this.retireNativeTarget(record, target);
+      // An unfinished create may still return an orphan for this exact
+      // participant. Keep its witness even when this close is already proven.
+      const creating = [...record.participants].some(
+        (participant) => (this.nativeTransportCreations.get(participant)?.size ?? 0) > 0
+      );
+      if (
+        !creating &&
+        record.targets.size === 0 &&
+        this.pendingNativeClose.get(record.key) === record
+      )
+        this.pendingNativeClose.delete(record.key);
+    } catch {
+      // The synchronous owned-close API cannot await proof. Retain the target
+      // for terminal retry and immediately fail closed on unconfirmed absence.
+      this.nativeTerminationFailure();
+    }
+  }
+
+  private trackNativeTransportCreation(participant: Participant): () => void {
+    let finish: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    let pending = this.nativeTransportCreations.get(participant);
+    if (!pending) {
+      pending = new Set();
+      this.nativeTransportCreations.set(participant, pending);
+    }
+    pending.add(promise);
+    return () => {
+      pending.delete(promise);
+      finish();
+    };
+  }
+
+  private async confirmNativeRecords(
+    records: NativeCloseRecord[],
+    deadlineMs: number
+  ): Promise<void> {
+    try {
+      for (const record of records) {
+        // A transport created for a retired participant can return after local
+        // cleanup. Wait for its failure path to capture and close that orphan.
+        const creations = [...record.participants].flatMap((participant) => [
+          ...(this.nativeTransportCreations.get(participant) ?? []),
+        ]);
+        if (creations.length) await awaitNativeDeadline(() => Promise.all(creations), deadlineMs);
+        while (record.targets.size > 0) {
+          const target = record.targets.values().next().value;
+          if (!target) throw this.nativeTerminationFailure();
+          await this.mediasoup.confirmNativeTermination(target, deadlineMs);
+          this.retireNativeTarget(record, target);
+        }
+        if (this.pendingNativeClose.get(record.key) === record)
+          this.pendingNativeClose.delete(record.key);
+      }
+    } catch {
+      throw this.nativeTerminationFailure();
+    }
+  }
+
+  async awaitNativeTermination(
+    roomId: string,
+    userId: string,
+    socketId?: string,
+    sessionGeneration?: string
+  ): Promise<void> {
+    const records = [...this.pendingNativeClose.values()].filter(
+      (record) =>
+        record.roomId === roomId &&
+        (record.userId === undefined ||
+          (record.userId === userId &&
+            (socketId === undefined || record.socketId === socketId) &&
+            (sessionGeneration === undefined || record.sessionGeneration === sessionGeneration)))
+    );
+    await this.confirmNativeRecords(records, performance.now() + 10_000);
+  }
+
+  async awaitNativeTerminationForCredentialEpoch(
+    userId: string,
+    credentialEpoch: string
+  ): Promise<void> {
+    const records = [...this.pendingNativeClose.values()];
+    const matching = records.filter(
+      (record) => record.userId === userId && record.credentialEpoch === credentialEpoch
+    );
+    const rooms = new Set(matching.map((record) => record.roomId));
+    await this.confirmNativeRecords(
+      records.filter(
+        (record) =>
+          matching.includes(record) || (record.userId === undefined && rooms.has(record.roomId))
+      ),
+      performance.now() + 10_000
+    );
+  }
+
   private readonly rooms: Map<string, Room> = new Map();
   private readonly roomCreationGates: Map<string, Promise<void>> = new Map();
   private readonly closedDMCallIds: Map<string, number> = new Map();
@@ -1801,6 +2050,14 @@ export class RoomManager {
   ): Promise<void> {
     const room = this.rooms.get(roomId);
     if (!room || (expectedRoom && room !== expectedRoom)) return;
+
+    this.retainNativeTermination(room);
+    for (const participant of [
+      ...room.participants.values(),
+      ...room.pendingChannelParticipants.values(),
+      ...[...room.pendingDMParticipants.values()].map((pending) => pending.participant),
+    ])
+      this.retainNativeTermination(room, participant);
 
     const hasAdmittedDMHistory = room.roomKind === 'dm' && room.callParticipantHistory.size > 0;
     if (hasAdmittedDMHistory && room.callId) {
@@ -2255,8 +2512,11 @@ export class RoomManager {
   /** Remove a participant from a room. Cleans up all their transports, producers, consumers. */
   async leaveRoom(roomId: string, userId: string): Promise<void> {
     const room = this.rooms.get(roomId);
-    if (!room) return;
-
+    const participant = room?.participants.get(userId);
+    if (!room || !participant) {
+      await this.awaitNativeTermination(roomId, userId);
+      return;
+    }
     if (!this.removeParticipantSession(room, roomId, userId)) return;
 
     // Tear down room if empty
@@ -2267,21 +2527,36 @@ export class RoomManager {
     ) {
       await this.closeRoom(roomId, room);
     }
+    await this.awaitNativeTermination(
+      roomId,
+      userId,
+      participant.socketId,
+      participant.voiceEnforcementSessionGeneration
+    );
   }
 
   /** Remove an exact A1 candidate without creating authoritative lifecycle. */
   async removeProvisionalParticipantIfSocketOwned(
     roomId: string,
     userId: string,
-    socketId: string
+    socketId: string,
+    sessionGeneration?: string
   ): Promise<boolean> {
     const room = this.rooms.get(roomId);
     const pendingDM = room?.pendingDMParticipants.get(userId);
     const pendingChannel = room?.pendingChannelParticipants.get(userId);
-    if (!room) return false;
-    if (pendingDM?.participant.socketId === socketId) room.pendingDMParticipants.delete(userId);
-    else if (pendingChannel?.socketId === socketId) room.pendingChannelParticipants.delete(userId);
-    else return false;
+    const participant = findSocketOwnedParticipant(
+      [pendingDM?.participant, pendingChannel],
+      socketId,
+      sessionGeneration
+    );
+    if (!room || !participant) {
+      await this.awaitNativeTermination(roomId, userId, socketId, sessionGeneration);
+      return false;
+    }
+    this.retainNativeTermination(room, participant);
+    if (pendingDM?.participant === participant) room.pendingDMParticipants.delete(userId);
+    else room.pendingChannelParticipants.delete(userId);
     if (
       room.participants.size === 0 &&
       room.pendingDMParticipants.size === 0 &&
@@ -2290,6 +2565,12 @@ export class RoomManager {
     ) {
       await this.closeRoom(roomId, room, false);
     }
+    await this.awaitNativeTermination(
+      roomId,
+      userId,
+      socketId,
+      participant.voiceEnforcementSessionGeneration
+    );
     return true;
   }
 
@@ -2302,15 +2583,24 @@ export class RoomManager {
   async removeProvisionalParticipantForEnforcement(
     roomId: string,
     userId: string,
-    socketId: string
+    socketId: string,
+    sessionGeneration?: string
   ): Promise<boolean> {
     const room = this.rooms.get(roomId);
     const pendingDM = room?.pendingDMParticipants.get(userId);
     const pendingChannel = room?.pendingChannelParticipants.get(userId);
-    if (!room) return false;
-    if (pendingDM?.participant.socketId === socketId) room.pendingDMParticipants.delete(userId);
-    else if (pendingChannel?.socketId === socketId) room.pendingChannelParticipants.delete(userId);
-    else return false;
+    const participant = findSocketOwnedParticipant(
+      [pendingDM?.participant, pendingChannel],
+      socketId,
+      sessionGeneration
+    );
+    if (!room || !participant) {
+      await this.awaitNativeTermination(roomId, userId, socketId, sessionGeneration);
+      return false;
+    }
+    this.retainNativeTermination(room, participant);
+    if (pendingDM?.participant === participant) room.pendingDMParticipants.delete(userId);
+    else room.pendingChannelParticipants.delete(userId);
     if (
       room.participants.size === 0 &&
       room.pendingDMParticipants.size === 0 &&
@@ -2322,6 +2612,12 @@ export class RoomManager {
         room.roomKind === 'dm' ? room.callParticipantHistory.size > 0 : room.e2eeEpoch > 0
       );
     }
+    await this.awaitNativeTermination(
+      roomId,
+      userId,
+      socketId,
+      participant.voiceEnforcementSessionGeneration
+    );
     return true;
   }
 
@@ -2334,20 +2630,28 @@ export class RoomManager {
   }
 
   /** Exact-socket rollback for a staged channel candidate or admitted session. */
-  async leaveRoomIfSocketOwned(roomId: string, userId: string, socketId: string): Promise<boolean> {
+  async leaveRoomIfSocketOwned(
+    roomId: string,
+    userId: string,
+    socketId: string,
+    sessionGeneration?: string
+  ): Promise<boolean> {
     const room = this.rooms.get(roomId);
-    const pendingChannel = room?.pendingChannelParticipants.get(userId);
-    if (!room) return false;
-    if (pendingChannel?.socketId === socketId) room.pendingChannelParticipants.delete(userId);
-    else {
-      const participant = room.participants.get(userId);
-      if (
-        participant?.socketId !== socketId ||
-        !this.removeParticipantSession(room, roomId, userId)
-      ) {
-        return false;
-      }
+    const pending = room?.pendingChannelParticipants.get(userId);
+    const admitted = room?.participants.get(userId);
+    const participant = findSocketOwnedParticipant(
+      [pending, admitted],
+      socketId,
+      sessionGeneration
+    );
+    if (!room || !participant) {
+      await this.awaitNativeTermination(roomId, userId, socketId, sessionGeneration);
+      return false;
     }
+    if (participant === pending) {
+      this.retainNativeTermination(room, participant);
+      room.pendingChannelParticipants.delete(userId);
+    } else if (!this.removeParticipantSession(room, roomId, userId)) return false;
     if (
       room.participants.size === 0 &&
       room.pendingDMParticipants.size === 0 &&
@@ -2355,6 +2659,12 @@ export class RoomManager {
     ) {
       await this.closeRoom(roomId, room, room.roomKind === 'dm' ? undefined : room.e2eeEpoch > 0);
     }
+    await this.awaitNativeTermination(
+      roomId,
+      userId,
+      socketId,
+      participant.voiceEnforcementSessionGeneration
+    );
     return true;
   }
 
@@ -2423,6 +2733,7 @@ export class RoomManager {
     roomId: string,
     participant: Participant
   ): boolean {
+    this.retainNativeTermination(room, participant);
     this.clearParticipantCameraLayerDemands(room, participant);
     this.clearParticipantScreenLayerDemands(room, participant);
     // Clean up the leaver's own state as a SHARER (#1924 fix "B"): drop any
@@ -2544,6 +2855,9 @@ export class RoomManager {
     // with no intervening await, the #1539 TOCTOU-safe shape — otherwise N
     // concurrent create-transport calls all pass a stale pre-await count.
     if (direction === 'recv') {
+      await this.drainClosedRecvTransports(room, participant);
+      if (room.participants.get(userId) !== participant)
+        throw new Error('Participant left during transport creation');
       this.guardSecurityDecision(
         () => this.reserveRecvTransportSlot(participant),
         'structural_limit_exceeded'
@@ -2564,71 +2878,77 @@ export class RoomManager {
       );
     }
 
-    let transport: WebRtcTransport;
+    const finishNativeCreation = this.trackNativeTransportCreation(participant);
     try {
-      transport = await room.router.createWebRtcTransport({
-        listenIps: config.mediasoup.webRtcTransport.listenIps,
-        enableUdp: config.mediasoup.webRtcTransport.enableUdp,
-        enableTcp: config.mediasoup.webRtcTransport.enableTcp,
-        preferUdp: config.mediasoup.webRtcTransport.preferUdp,
-        initialAvailableOutgoingBitrate:
-          config.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
-      });
-    } catch (err) {
-      // A failed create must not consume a slot for the rest of the session.
-      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
-      throw err;
-    }
+      let transport: WebRtcTransport;
+      try {
+        transport = await room.router.createWebRtcTransport({
+          listenIps: config.mediasoup.webRtcTransport.listenIps,
+          enableUdp: config.mediasoup.webRtcTransport.enableUdp,
+          enableTcp: config.mediasoup.webRtcTransport.enableTcp,
+          preferUdp: config.mediasoup.webRtcTransport.preferUdp,
+          initialAvailableOutgoingBitrate:
+            config.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
+        });
+      } catch (err) {
+        // A failed create must not consume a slot for the rest of the session.
+        if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+        throw err;
+      }
 
-    // The send transport may carry camera, screen, mic, and screen audio at
-    // once. `maxManualBitrateBps` is a single-source ceiling, so using it as a
-    // transport-wide REMB advisory would throttle a legitimate Free user's
-    // concurrent sources. Reuse the policer's simultaneous-source envelope:
-    // it includes bounded RTP/E2EE overhead, audio FEC headroom, and the T0
-    // aggregate tolerance. Individual producer limits remain the entitlement
-    // boundary. The recv transport keeps the global incoming advisory because
-    // it carries no client uploads.
-    //
-    // This is a BWE/congestion-control advisory, not a hard RTP policer. A
-    // patched client can ignore REMB; the observed-ingress policer (#2153)
-    // enforces the producer limits separately. If the advisory cannot be
-    // installed, refuse the send transport before admission.
-    const incomingBitrateCap = this.incomingBitrateCapForParticipant(participant, direction);
-    try {
-      await this.applyIncomingBitrateCap(transport, incomingBitrateCap, {
+      // The send transport may carry camera, screen, mic, and screen audio at
+      // once. `maxManualBitrateBps` is a single-source ceiling, so using it as a
+      // transport-wide REMB advisory would throttle a legitimate Free user's
+      // concurrent sources. Reuse the policer's simultaneous-source envelope:
+      // it includes bounded RTP/E2EE overhead, audio FEC headroom, and the T0
+      // aggregate tolerance. Individual producer limits remain the entitlement
+      // boundary. The recv transport keeps the global incoming advisory because
+      // it carries no client uploads.
+      //
+      // This is a BWE/congestion-control advisory, not a hard RTP policer. A
+      // patched client can ignore REMB; the observed-ingress policer (#2153)
+      // enforces the producer limits separately. If the advisory cannot be
+      // installed, refuse the send transport before admission.
+      const incomingBitrateCap = this.incomingBitrateCapForParticipant(participant, direction);
+      try {
+        await this.applyIncomingBitrateCap(transport, incomingBitrateCap, {
+          roomId,
+          userId,
+          direction,
+        });
+      } catch (error) {
+        this.retainNativeTermination(room, participant, [transport.id]);
+        transport.close();
+        if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+        throw error;
+      }
+
+      // The participant may have left — or reconnected onto a FRESH Participant
+      // object — while the router call was in flight. Storing here would attach
+      // the transport to a detached object that nothing ever closes and that the
+      // recv cap cannot see. Close the orphan and fail closed (#2032).
+      this.assertTransportParticipantCurrent(room, participant, userId, transport, direction);
+
+      this.commitTransportToParticipant(room, participant, transport, direction);
+
+      this.attachTransportDiagnostics(transport, roomId, userId, direction);
+
+      logger.debug('Transport created', {
+        transportId: transport.id,
         roomId,
         userId,
         direction,
       });
-    } catch (error) {
-      transport.close();
-      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
-      throw error;
+
+      return {
+        id: transport.id,
+        iceParameters: transport.iceParameters,
+        iceCandidates: transport.iceCandidates,
+        dtlsParameters: transport.dtlsParameters,
+      };
+    } finally {
+      finishNativeCreation();
     }
-
-    // The participant may have left — or reconnected onto a FRESH Participant
-    // object — while the router call was in flight. Storing here would attach
-    // the transport to a detached object that nothing ever closes and that the
-    // recv cap cannot see. Close the orphan and fail closed (#2032).
-    this.assertTransportParticipantCurrent(room, participant, userId, transport, direction);
-
-    this.commitTransportToParticipant(participant, transport, direction);
-
-    this.attachTransportDiagnostics(transport, roomId, userId, direction);
-
-    logger.debug('Transport created', {
-      transportId: transport.id,
-      roomId,
-      userId,
-      direction,
-    });
-
-    return {
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-    };
   }
 
   private incomingBitrateCapForParticipant(
@@ -2651,6 +2971,7 @@ export class RoomManager {
   ): void {
     if (room.participants.get(userId) === participant) return;
     this.counterHooks.onIceTerminalWithoutConnect?.();
+    this.retainNativeTermination(room, participant, [transport.id]);
     if (!transport.closed) transport.close();
     if (direction === 'recv') this.releaseRecvTransportReservation(participant);
     throw new Error('Participant left during transport creation');
@@ -2756,9 +3077,11 @@ export class RoomManager {
     const transport = participant.recvTransports.get(transportId);
     if (!transport) return false;
 
+    const { record, target } = this.retainRecvNativeTermination(room, participant, transport.id);
     // Delete first so a retry or re-entrant close cannot close the transport twice.
     participant.recvTransports.delete(transportId);
     if (!transport.closed) transport.close();
+    void this.drainOrdinaryNativeClose(record, target);
     logger.debug('Receive transport closed', { transportId, roomId, userId });
     return true;
   }
@@ -4198,14 +4521,20 @@ export class RoomManager {
   /** Pause all audio producers for a participant */
   private async pauseAudioProducers(participant: Participant): Promise<void> {
     for (const [, entry] of participant.producers) {
-      if (entry.kind === 'audio') await entry.producer.pause();
+      if (entry.kind === 'audio') {
+        this.enforcementAuthorityGate?.();
+        await entry.producer.pause();
+      }
     }
   }
 
   /** Pause all audio consumers for a participant */
   private async pauseAudioConsumers(participant: Participant): Promise<void> {
     for (const [, consumer] of participant.consumers) {
-      if (consumer.kind === 'audio') await consumer.pause();
+      if (consumer.kind === 'audio') {
+        this.enforcementAuthorityGate?.();
+        await consumer.pause();
+      }
     }
   }
 
@@ -4350,31 +4679,94 @@ export class RoomManager {
     serverDeafened: boolean,
     authorizationRevision: bigint
   ): Promise<boolean> {
+    return this.applyServerEnforcementSnapshotTargets(
+      roomId,
+      userId,
+      serverMuted,
+      serverDeafened,
+      authorizationRevision
+    );
+  }
+
+  async applyExactServerEnforcementSnapshot(
+    roomId: string,
+    userId: string,
+    target: ExactVoiceCommandTarget,
+    serverMuted: boolean,
+    serverDeafened: boolean,
+    authorizationRevision: bigint
+  ): Promise<boolean> {
+    return this.applyServerEnforcementSnapshotTargets(
+      roomId,
+      userId,
+      serverMuted,
+      serverDeafened,
+      authorizationRevision,
+      target
+    );
+  }
+
+  private async applyServerEnforcementSnapshotTargets(
+    roomId: string,
+    userId: string,
+    serverMuted: boolean,
+    serverDeafened: boolean,
+    authorizationRevision: bigint,
+    target?: ExactVoiceCommandTarget
+  ): Promise<boolean> {
+    this.enforcementAuthorityGate?.();
     const room = this.rooms.get(roomId);
     if (!room) return false;
-    const channelPending = room.pendingChannelParticipants.get(userId);
-    const dmPending = room.pendingDMParticipants.get(userId)?.participant;
-    const participant = room.participants.get(userId);
+    const accepts = (participant: Participant | undefined): Participant | undefined => {
+      if (!target) return participant;
+      return participant?.socketId === target.socketId &&
+        participant.voiceEnforcementSessionGeneration === target.sessionGeneration &&
+        participant.credentialEpoch === target.credentialEpoch
+        ? participant
+        : undefined;
+    };
+    const channelPending = accepts(room.pendingChannelParticipants.get(userId));
+    const dmPending = accepts(room.pendingDMParticipants.get(userId)?.participant);
+    const participant = accepts(room.participants.get(userId));
     let applied = false;
 
     for (const pending of [channelPending, dmPending]) {
-      if (pending && authorizationRevision > (pending.serverEnforcementRevision ?? 0n)) {
+      if (acceptsServerEnforcementRevision(pending, authorizationRevision)) {
         pending.serverMuted = serverMuted;
         pending.serverDeafened = serverDeafened;
         pending.serverEnforcementRevision = authorizationRevision;
+        // Provisional candidates have no media effects to await.
+        pending.serverEnforcementAppliedRevision = authorizationRevision;
         applied = true;
       }
     }
 
-    if (participant && authorizationRevision > (participant.serverEnforcementRevision ?? 0n)) {
-      const shouldPauseAudio = serverMuted;
-      const shouldPauseConsumers = serverDeafened;
+    if (acceptsServerEnforcementRevision(participant, authorizationRevision)) {
       participant.serverMuted = serverMuted;
       participant.serverDeafened = serverDeafened;
       participant.serverEnforcementRevision = authorizationRevision;
+    }
+
+    if (
+      participant &&
+      authorizationRevision > 0n &&
+      participant.serverEnforcementRevision === authorizationRevision &&
+      participant.serverEnforcementAppliedRevision !== authorizationRevision
+    ) {
+      // Retry unfinished effects using the recorded desired flags.
+      const shouldPauseAudio = participant.serverMuted;
+      const shouldPauseConsumers = participant.serverDeafened;
       if (shouldPauseAudio) await this.pauseAudioProducers(participant);
       if (shouldPauseConsumers) await this.pauseAudioConsumers(participant);
-      applied = true;
+      // An awaited pause may outlive this room, session, or snapshot.
+      if (
+        this.rooms.get(roomId) === room &&
+        room.participants.get(userId) === participant &&
+        participant.serverEnforcementRevision === authorizationRevision
+      ) {
+        participant.serverEnforcementAppliedRevision = authorizationRevision;
+        applied = true;
+      }
     }
 
     if (applied) {
@@ -4410,22 +4802,69 @@ export class RoomManager {
   }
 
   /** User-level mute: pause all audio producers without setting server flags */
-  async userMuteParticipant(roomId: string, userId: string): Promise<void> {
-    const participant = this.getParticipant(roomId, userId);
+  async userMuteParticipant(
+    roomId: string,
+    userId: string,
+    exact?: ExactUserModerationCapture
+  ): Promise<void> {
+    const participant = exact?.participant ?? this.getParticipant(roomId, userId);
     if (!participant) return;
 
-    await this.pauseAudioProducers(participant);
+    if (exact) {
+      if (!(await this.pauseExactUserAudio(roomId, userId, exact, false))) return;
+    } else {
+      await this.pauseAudioProducers(participant);
+    }
     logger.info('User-level mute applied', { roomId, userId });
   }
 
   /** User-level deafen: pause all audio producers and consumers without setting server flags */
-  async userDeafenParticipant(roomId: string, userId: string): Promise<void> {
-    const participant = this.getParticipant(roomId, userId);
+  async userDeafenParticipant(
+    roomId: string,
+    userId: string,
+    exact?: ExactUserModerationCapture
+  ): Promise<void> {
+    const participant = exact?.participant ?? this.getParticipant(roomId, userId);
     if (!participant) return;
 
-    await this.pauseAudioProducers(participant);
-    await this.pauseAudioConsumers(participant);
+    if (exact) {
+      if (!(await this.pauseExactUserAudio(roomId, userId, exact, true))) return;
+    } else {
+      await this.pauseAudioProducers(participant);
+      await this.pauseAudioConsumers(participant);
+    }
     logger.info('User-level deafen applied', { roomId, userId });
+  }
+
+  private async pauseExactUserAudio(
+    roomId: string,
+    userId: string,
+    exact: ExactUserModerationCapture,
+    deafen: boolean
+  ): Promise<boolean> {
+    const { room, participant, target } = exact;
+    const current = () =>
+      this.rooms.get(roomId) === room &&
+      room.participants.get(userId) === participant &&
+      participant.socketId === target.socketId &&
+      participant.credentialEpoch === target.credentialEpoch &&
+      participant.voiceEnforcementSessionGeneration === target.sessionGeneration;
+    if (!current()) return false;
+    for (const [, entry] of participant.producers) {
+      if (entry.kind !== 'audio') continue;
+      this.enforcementAuthorityGate?.();
+      if (!current()) return false;
+      await entry.producer.pause();
+    }
+    if (deafen) {
+      for (const [, consumer] of participant.consumers) {
+        if (consumer.kind !== 'audio') continue;
+        this.enforcementAuthorityGate?.();
+        if (!current()) return false;
+        await consumer.pause();
+      }
+    }
+    return current();
   }
 
   // ─── Query methods ───────────────────────────────────────────────────
@@ -4646,20 +5085,25 @@ export class RoomManager {
   getSupersededCredentialEpochSessions(
     userId: string,
     supersededCredentialEpoch: string
-  ): Array<{ roomId: string; socketId: string; provisional: boolean }> {
-    const sessions: Array<{ roomId: string; socketId: string; provisional: boolean }> = [];
+  ): Array<{ roomId: string; socketId: string; provisional: boolean; sessionGeneration?: string }> {
+    const sessions: Array<{
+      roomId: string;
+      socketId: string;
+      provisional: boolean;
+      sessionGeneration?: string;
+    }> = [];
     for (const [roomId, room] of this.rooms) {
       const provisional = room.pendingDMParticipants.get(userId)?.participant;
       if (provisional?.credentialEpoch === supersededCredentialEpoch) {
-        sessions.push({ roomId, socketId: provisional.socketId, provisional: true });
+        sessions.push(captureCredentialEpochSession(roomId, provisional, true));
       }
       const channelProvisional = room.pendingChannelParticipants.get(userId);
       if (channelProvisional?.credentialEpoch === supersededCredentialEpoch) {
-        sessions.push({ roomId, socketId: channelProvisional.socketId, provisional: true });
+        sessions.push(captureCredentialEpochSession(roomId, channelProvisional, true));
       }
       const participant = room.participants.get(userId);
       if (participant?.credentialEpoch === supersededCredentialEpoch) {
-        sessions.push({ roomId, socketId: participant.socketId, provisional: false });
+        sessions.push(captureCredentialEpochSession(roomId, participant, false));
       }
     }
     return sessions;
@@ -4868,11 +5312,20 @@ export class RoomManager {
   }
 
   /** Close all rooms (graceful shutdown) */
-  async closeAll(): Promise<void> {
+  async closeAll(deadlineMs = performance.now() + 10_000): Promise<void> {
     logger.info('Closing all rooms', { count: this.rooms.size });
-    const roomIds = Array.from(this.rooms.keys());
-    for (const roomId of roomIds) {
-      await this.closeRoom(roomId);
+    try {
+      const roomIds = Array.from(this.rooms.keys());
+      for (const roomId of roomIds) await this.closeRoom(roomId);
+      const records = [...this.pendingNativeClose.values()];
+      await this.mediasoup.confirmAllRoutersClosed(deadlineMs);
+      for (const record of records) {
+        for (const target of record.targets) this.retireNativeTarget(record, target);
+        if (this.pendingNativeClose.get(record.key) === record)
+          this.pendingNativeClose.delete(record.key);
+      }
+    } catch {
+      throw this.nativeTerminationFailure();
     }
   }
 
@@ -5185,12 +5638,14 @@ export class RoomManager {
    * send transport (and its producers) out from under its own owner.
    */
   private commitTransportToParticipant(
+    room: Room,
     participant: Participant,
     transport: WebRtcTransport,
     direction: 'send' | 'recv'
   ): void {
     if (direction === 'send') {
       if (participant.sendTransport && !participant.sendTransport.closed) {
+        this.retainNativeTermination(room, participant, [transport.id]);
         if (!transport.closed) transport.close();
         throw new Error('Participant already has an active send transport');
       }
@@ -5268,25 +5723,31 @@ export class RoomManager {
    * intervening await, committed count DERIVED from the authoritative
    * `recvTransports` map so only the pending delta needs a release path.
    *
-   * The live count PRUNES already-closed entries in the same synchronous pass.
-   * A transport torn down by ICE/DTLS failure emits no `routerclose` (that fires
-   * only when the ROUTER closes), so its map entry survives its own death —
-   * without this prune those corpses would hold the cap for the rest of the
-   * session and a legitimate PiP reopen would be refused. Check and cleanup are
-   * deliberately one code path: a separate sweep could drift out of step.
+   * Unproven receive closes still consume a slot after their map entry is
+   * removed. Only authoritative native absence retires that reservation.
    */
   private reserveRecvTransportSlot(participant: Participant): void {
-    for (const [id, transport] of participant.recvTransports) {
-      if (transport.closed) participant.recvTransports.delete(id);
-    }
-
-    const live = participant.recvTransports.size + participant.pendingRecvTransports;
+    const live =
+      participant.recvTransports.size +
+      participant.pendingRecvTransports +
+      (this.nativeRecvClosures.get(participant)?.size ?? 0);
     if (live >= MAX_RECV_TRANSPORTS_PER_PARTICIPANT) {
       throw new Error(
         `Receive transport limit reached (max ${MAX_RECV_TRANSPORTS_PER_PARTICIPANT})`
       );
     }
     participant.pendingRecvTransports += 1;
+  }
+
+  private async drainClosedRecvTransports(room: Room, participant: Participant): Promise<void> {
+    const proofs: Promise<void>[] = [];
+    for (const [id, transport] of participant.recvTransports) {
+      if (!transport.closed) continue;
+      const { record, target } = this.retainRecvNativeTermination(room, participant, id);
+      participant.recvTransports.delete(id);
+      proofs.push(this.drainOrdinaryNativeClose(record, target));
+    }
+    await Promise.all(proofs);
   }
 
   /** Release a receive-transport reservation. */

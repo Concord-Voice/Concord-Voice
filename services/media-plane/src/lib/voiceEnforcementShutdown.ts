@@ -1,5 +1,5 @@
 import { releaseVoiceEnforcementSession } from './voiceEnforcementSession.js';
-import type { VoiceEnforcementSession } from './voiceEnforcementSession.js';
+import type { NativeSessionVerifier, VoiceEnforcementSession } from './voiceEnforcementSession.js';
 import type { AuthenticatedSocketData } from '../middleware/auth.js';
 import { MAX_SERVER_VOICE_PARTICIPANTS } from './roomManager.js';
 
@@ -24,7 +24,10 @@ export class VoiceEnforcementSessionReleaseQueue {
   private queueSaturated = false;
   private overflowedCount = 0;
 
-  constructor(private readonly onSaturated?: (capacity: number, overflowedCount: number) => void) {}
+  constructor(
+    private readonly verifyNative: NativeSessionVerifier,
+    private readonly onSaturated?: (capacity: number, overflowedCount: number) => void
+  ) {}
 
   enqueue(session: VoiceEnforcementSession): boolean {
     if (this.held.has(session.sessionGeneration)) return true;
@@ -63,7 +66,7 @@ export class VoiceEnforcementSessionReleaseQueue {
   async releaseAfterTerminalClose(session: VoiceEnforcementSession): Promise<void> {
     if (this.held.has(session.sessionGeneration)) return;
     try {
-      await releaseVoiceEnforcementSession(session);
+      await releaseVoiceEnforcementSession(session, this.verifyNative);
       this.pending.delete(session.sessionGeneration);
     } catch {
       this.enqueue(session);
@@ -135,7 +138,7 @@ export class VoiceEnforcementSessionReleaseQueue {
     await Promise.all(
       batch.map(async (session) => {
         try {
-          await releaseVoiceEnforcementSession(session);
+          await releaseVoiceEnforcementSession(session, this.verifyNative);
           if (this.held.has(session.sessionGeneration)) return;
           this.pending.delete(session.sessionGeneration);
           released += 1;
@@ -166,7 +169,7 @@ export function snapshotVoiceEnforcementSessions(
 // through its bounded shutdown deadline.
 export async function releaseVoiceEnforcementSessionsAfterClose(
   sockets: Iterable<ShutdownSocket>,
-  releaseQueue = new VoiceEnforcementSessionReleaseQueue()
+  releaseQueue: VoiceEnforcementSessionReleaseQueue
 ): Promise<number> {
   releaseQueue.enqueueAll(snapshotVoiceEnforcementSessions(sockets));
   await releaseQueue.retryPending();

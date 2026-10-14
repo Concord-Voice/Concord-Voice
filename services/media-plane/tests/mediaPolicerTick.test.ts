@@ -141,6 +141,7 @@ function makeHarness(options: HarnessOptions = {}) {
   });
   const leaveRoomIfSocketOwned = vi.fn(async () => true);
   const roomManager = {
+    awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
     collectProducerIngressSample,
     settleIngressSample,
     latchPolicedProducer,
@@ -424,7 +425,7 @@ describe('media policer tick ordering (#2153 latch-before-await)', () => {
     expect(h.ownerEmit.mock.calls).toStrictEqual([
       ['force-disconnect', { channelId: ROOM, reason: 'media_policy', retryAfterSec: 900 }],
     ]);
-    expect(h.leaveRoomIfSocketOwned.mock.calls).toStrictEqual([[ROOM, USER, SOCKET]]);
+    expect(h.leaveRoomIfSocketOwned.mock.calls).toStrictEqual([[ROOM, USER, SOCKET, undefined]]);
     expect(h.securityEmit.mock.calls).toStrictEqual([[EVICT_EVENT]]);
     expect(vi.mocked(logger.warn).mock.calls).toStrictEqual([
       [
@@ -459,7 +460,7 @@ describe('media policer tick ordering (#2153 latch-before-await)', () => {
     await h.tick.runOnce();
 
     expect(h.ownerEmit).not.toHaveBeenCalled();
-    expect(h.leaveRoomIfSocketOwned.mock.calls).toStrictEqual([[ROOM_2, USER, SOCKET_2]]);
+    expect(h.leaveRoomIfSocketOwned.mock.calls).toStrictEqual([[ROOM_2, USER, SOCKET_2, undefined]]);
     expect(h.ownerEmit2.mock.calls).toStrictEqual([
       ['force-disconnect', { channelId: ROOM_2, reason: 'media_policy', retryAfterSec: 900 }],
     ]);
@@ -485,8 +486,8 @@ describe('media policer tick ordering (#2153 latch-before-await)', () => {
     await h.tick.runOnce();
 
     expect(h.leaveRoomIfSocketOwned.mock.calls).toStrictEqual([
-      [ROOM, USER, SOCKET],
-      [ROOM_2, USER, SOCKET_2],
+      [ROOM, USER, SOCKET, undefined],
+      [ROOM_2, USER, SOCKET_2, undefined],
     ]);
   });
 
@@ -877,7 +878,7 @@ describe('media policer tick outcomes', () => {
 
     await h.tick.runOnce();
     expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledTimes(1);
-    expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledWith(ROOM, USER, SOCKET);
+    expect(h.leaveRoomIfSocketOwned).toHaveBeenCalledWith(ROOM, USER, SOCKET, undefined);
     expect(h.ownerEmit).toHaveBeenCalledWith('force-disconnect', {
       channelId: ROOM,
       reason: 'stats_unavailable',

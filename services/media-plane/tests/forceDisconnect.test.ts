@@ -63,6 +63,7 @@ function makeRoomManager(
   const removeProvisionalParticipantIfSocketOwned = vi.fn().mockResolvedValue(true);
   return {
     rm: {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getParticipant,
       getProvisionalParticipant,
       getRoom,
@@ -114,7 +115,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     });
     expect(disconnect).toHaveBeenCalledWith(true);
     // Reuses RoomManager.leaveRoom for authoritative teardown (emits user-left -> voice.left).
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
   });
 
   it('is a no-op when the user is not in the room (idempotent)', async () => {
@@ -126,6 +127,63 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
     expect(disconnect).not.toHaveBeenCalled();
+  });
+
+  it('disconnects the captured socket when its exact enforcement registration completes during native termination', async () => {
+    let completeTermination!: () => void;
+    const termination = new Promise<void>((resolve) => { completeTermination = resolve; });
+    const voiceEnforcementSession = {
+      sessionGeneration: '11111111-1111-4111-8111-111111111111',
+      nodeBootId: '22222222-2222-4222-8222-222222222222',
+      roomId: CHANNEL_ID,
+      roomKind: 'channel' as const,
+      userId: USER_ID,
+      credentialEpoch: '',
+      socketId: SOCKET_ID,
+    };
+    const socket = {
+      emit: vi.fn(),
+      disconnect: vi.fn(),
+      data: { userId: USER_ID, credentialEpoch: '', roomId: CHANNEL_ID } as Record<string, unknown>,
+    };
+    const roomManager = {
+      getParticipant: vi.fn(() => ({ socketId: SOCKET_ID, voiceEnforcementSessionGeneration: voiceEnforcementSession.sessionGeneration })),
+      getProvisionalParticipant: vi.fn(),
+      getRoom: vi.fn(),
+      leaveRoomIfSocketOwned: vi.fn().mockResolvedValue(true),
+      removeProvisionalParticipantForEnforcement: vi.fn(),
+      awaitNativeTermination: vi.fn(async () => {
+        socket.data.voiceEnforcementSession = voiceEnforcementSession;
+        await termination;
+      }),
+    };
+    const operation = handleForceDisconnect(
+      roomManager as unknown as ForceDisconnectRoomManager,
+      { sockets: { sockets: new Map([[SOCKET_ID, socket]]) } } as unknown as ForceDisconnectIO,
+      CHANNEL_ID,
+      USER_ID,
+      undefined,
+      REVOKED
+    );
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(roomManager.awaitNativeTermination).toHaveBeenCalledWith(
+        CHANNEL_ID,
+        USER_ID,
+        SOCKET_ID,
+        voiceEnforcementSession.sessionGeneration
+      );
+      completeTermination();
+      await operation;
+      expect(socket.emit, 'the same captured socket must be disconnected after its exact registration completes during native termination').toHaveBeenCalledWith('force-disconnect', {
+        channelId: CHANNEL_ID,
+        reason: 'access_revoked',
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+    } finally {
+      completeTermination();
+      await operation.catch(() => undefined);
+    }
   });
 
   it('leaves admitted and provisional successor call B connected after delayed call A revocation', async () => {
@@ -173,7 +231,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(
       leaveRoomIfSocketOwned,
       'a matching call revocation must evict the participant'
-    ).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    ).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
     expect(disconnect).toHaveBeenCalledWith(true);
 
     const { rm: unscopedRM, leaveRoomIfSocketOwned: unscopedLeave } = makeRoomManager({
@@ -216,7 +274,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(
       removeProvisionalParticipantIfSocketOwned,
       'matching call B revocation must remove its pending candidate'
-    ).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, 'socket-b-provisional');
+    ).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, 'socket-b-provisional', undefined);
     expect(disconnect).toHaveBeenCalledWith(true);
   });
 
@@ -229,7 +287,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
 
     await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
   });
 
   it('disconnects and silently removes an in-flight DM candidate (#2407)', async () => {
@@ -249,7 +307,8 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(removeProvisionalParticipantIfSocketOwned).toHaveBeenCalledWith(
       CHANNEL_ID,
       USER_ID,
-      pendingSocketId
+      pendingSocketId,
+      undefined
     );
     expect(leaveRoom).not.toHaveBeenCalled();
   });
@@ -267,9 +326,10 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(removeProvisionalParticipantIfSocketOwned).toHaveBeenCalledWith(
       CHANNEL_ID,
       USER_ID,
-      pendingSocketId
+      pendingSocketId,
+      undefined
     );
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
   });
 
   it('tears down exact admitted state before synchronous socket disconnect cleanup (#2407)', async () => {
@@ -290,6 +350,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
       return true;
     });
     const rm = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getParticipant: vi.fn(() => (admitted ? { socketId: SOCKET_ID } : undefined)),
       getProvisionalParticipant: vi.fn(() =>
         provisional ? { socketId: pendingSocketId } : undefined
@@ -324,7 +385,8 @@ describe('handleForceDisconnect (#487 P3)', () => {
     expect(removeProvisionalParticipantIfSocketOwned).toHaveBeenCalledWith(
       CHANNEL_ID,
       USER_ID,
-      pendingSocketId
+      pendingSocketId,
+      undefined
     );
     expect(oldDisconnect).toHaveBeenCalledWith(true);
     expect(pendingDisconnect).toHaveBeenCalledWith(true);
@@ -350,6 +412,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
       return true;
     });
     const rm = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getParticipant: vi.fn(() => (admitted ? { socketId: SOCKET_ID } : undefined)),
       getProvisionalParticipant: vi.fn(() => undefined),
       leaveRoomIfSocketOwned,
@@ -365,7 +428,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
 
     await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit, REVOKED);
 
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
     expect(disconnect).toHaveBeenCalledWith(true);
     expect(emit).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledWith(
@@ -403,6 +466,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
   it('does not remove a provisional successor with the same socket and a newer admission', async () => {
     const remove = vi.fn();
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getParticipant: vi.fn(() => undefined),
       getProvisionalParticipant: vi.fn(() => ({
         socketId: SOCKET_ID,
@@ -439,7 +503,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
         REVOKED
       )
     ).resolves.toBeUndefined();
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
   });
 });
 
@@ -458,7 +522,7 @@ describe('handleForceDisconnect reasons (#2153)', () => {
       ['force-disconnect', { channelId: CHANNEL_ID, reason: 'media_policy', retryAfterSec: 900 }],
     ]);
     expect(disconnect).toHaveBeenCalledWith(true);
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
   });
 
   it('closes only the exact unmeterable send transport without an abuse cooldown', async () => {
@@ -483,7 +547,7 @@ describe('handleForceDisconnect reasons (#2153)', () => {
       sendTransportId: 'send-current',
     });
     expect(getParticipant).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
-    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID, undefined);
     expect(emit).toHaveBeenCalledWith('force-disconnect', {
       channelId: CHANNEL_ID,
       reason: 'stats_unavailable',
@@ -691,6 +755,7 @@ describe('durable exact-session ejection', () => {
   it('tears down a provisional session before disconnect when registration races its response', async () => {
     const remove = vi.fn().mockResolvedValue(true);
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(() => ({
         socketId: SOCKET_ID,
         credentialEpoch: '',
@@ -715,7 +780,7 @@ describe('durable exact-session ejection', () => {
       ok: true,
       sessionGeneration: ids.session,
     });
-    expect(remove).toHaveBeenCalledWith(ids.room, ids.user, SOCKET_ID);
+    expect(remove).toHaveBeenCalledWith(ids.room, ids.user, SOCKET_ID, ids.session);
     expect(disconnect).toHaveBeenCalledWith(true);
     expect(releaseVoiceEnforcementSession).toHaveBeenCalledOnce();
   });
@@ -723,6 +788,7 @@ describe('durable exact-session ejection', () => {
   it('retains an ambiguous reused socket rather than acknowledging a stale generation', async () => {
     const remove = vi.fn();
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(() => ({
         socketId: SOCKET_ID,
         credentialEpoch: '',
@@ -752,6 +818,7 @@ describe('durable exact-session ejection', () => {
   it('does not tear down an admitted reused socket without the exact generation', async () => {
     const leave = vi.fn();
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(() => undefined),
       getParticipant: vi.fn(() => ({
         socketId: SOCKET_ID,
@@ -800,6 +867,7 @@ describe('durable exact-session ejection', () => {
     const successorSocketID = 'socket-successor';
     const successorGeneration = '66666666-6666-4666-8666-666666666666';
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(() => undefined),
       getParticipant: vi.fn(() => ({
         socketId: successorSocketID,
@@ -845,8 +913,51 @@ describe('durable exact-session ejection', () => {
     await expect(handler(command())).resolves.toMatchObject({ ok: true });
     expect(oldDisconnect).toHaveBeenCalledWith(true);
     expect(successorDisconnect).not.toHaveBeenCalled();
-    expect(releaseVoiceEnforcementSession).toHaveBeenCalledWith(exactOldSession);
+    expect(releaseVoiceEnforcementSession).toHaveBeenCalledWith(exactOldSession, expect.any(Function));
   });
+
+  it.each(['absent', 'successor'] as const)(
+    'waits for old-session native proof before acknowledging an %s target',
+    async (localState) => {
+      let completeProof!: () => void;
+      const proof = new Promise<void>((resolve) => { completeProof = resolve; });
+      const verify = vi.fn(() => proof);
+      const successor = { socketId: 'socket-successor', credentialEpoch: '', voiceEnforcementSessionGeneration: ids.parent };
+      const roomManager = {
+        awaitNativeTermination: verify,
+        getParticipant: vi.fn(() => localState === 'successor' ? successor : undefined),
+        getProvisionalParticipant: vi.fn(() => undefined),
+        removeProvisionalParticipantForEnforcement: vi.fn().mockResolvedValue(true),
+        leaveRoomIfSocketOwned: vi.fn().mockResolvedValue(true),
+      };
+      const disconnect = vi.fn();
+      const io = {
+        sockets: { sockets: new Map(localState === 'successor' ? [
+          ['socket-successor', { emit: vi.fn(), disconnect, data: {} }],
+        ] : []) },
+      };
+      const handler = createVoiceEnforcementSessionEjectionHandler(roomManager, io, signingKey, ids.boot);
+      let settled = false;
+      const acknowledgement = handler(command());
+      void acknowledgement.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        expect(verify).toHaveBeenCalledWith(ids.room, ids.user, SOCKET_ID, ids.session);
+        expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+        expect(roomManager.leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+        expect(roomManager.removeProvisionalParticipantForEnforcement).not.toHaveBeenCalled();
+        expect(disconnect).not.toHaveBeenCalled();
+        completeProof();
+        await expect(acknowledgement).resolves.toMatchObject({ ok: true, sessionGeneration: ids.session });
+        expect(disconnect).not.toHaveBeenCalled();
+        if (localState === 'successor') expect(roomManager.getParticipant()).toBe(successor);
+      } finally {
+        completeProof();
+        await acknowledgement.catch(() => undefined);
+      }
+    }
+  );
 
   it('fences expired media before a late valid health command can renew admission', async () => {
     let now = 0;
@@ -855,6 +966,7 @@ describe('durable exact-session ejection', () => {
     now = 30_001;
     const order: string[] = [];
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(),
       getParticipant: vi.fn(),
       removeProvisionalParticipantForEnforcement: vi.fn(),
@@ -884,6 +996,7 @@ describe('durable exact-session ejection', () => {
     lease.renew();
     const fence = vi.fn();
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(),
       getParticipant: vi.fn(),
       removeProvisionalParticipantForEnforcement: vi.fn(),
@@ -922,6 +1035,7 @@ describe('durable exact-session ejection', () => {
     // A1/A2 while closeAll still owns its room snapshot.
     const watchdog = fenceExpired.enforce();
     const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
       getProvisionalParticipant: vi.fn(),
       getParticipant: vi.fn(),
       removeProvisionalParticipantForEnforcement: vi.fn(),
@@ -994,8 +1108,8 @@ describe('credential-epoch ejection', () => {
       { roomId: 'room-missing', socketId: 'socket-missing', provisional: false },
     ];
     const sockets = new Map([
-      ['socket-pending', { emit: vi.fn(), disconnect: vi.fn(), data: {} }],
-      ['socket-admitted', { emit: vi.fn(), disconnect: vi.fn(), data: {} }],
+      ['socket-pending', { emit: vi.fn(), disconnect: vi.fn(), data: { userId, credentialEpoch: supersededCredentialEpoch, roomId: 'room-pending' } }],
+      ['socket-admitted', { emit: vi.fn(), disconnect: vi.fn(), data: { userId, credentialEpoch: supersededCredentialEpoch, roomId: 'room-admitted' } }],
       [
         'socket-live-only',
         {
@@ -1015,6 +1129,8 @@ describe('credential-epoch ejection', () => {
     ]);
     const handler = createCredentialEpochEjectionAckHandler(
       {
+        awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+        awaitNativeTerminationForCredentialEpoch: vi.fn().mockResolvedValue(undefined),
         getSupersededCredentialEpochSessions: vi.fn(() => sessions),
         removeProvisionalParticipantForEnforcement: removeProvisional,
         leaveRoomIfSocketOwned: leaveRoom,
@@ -1028,9 +1144,9 @@ describe('credential-epoch ejection', () => {
       userId,
       supersededCredentialEpoch,
     });
-    expect(removeProvisional).toHaveBeenCalledWith('room-pending', userId, 'socket-pending');
-    expect(leaveRoom).toHaveBeenCalledWith('room-admitted', userId, 'socket-admitted');
-    expect(leaveRoom).toHaveBeenCalledWith('room-missing', userId, 'socket-missing');
+    expect(removeProvisional).toHaveBeenCalledWith('room-pending', userId, 'socket-pending', undefined);
+    expect(leaveRoom).toHaveBeenCalledWith('room-admitted', userId, 'socket-admitted', undefined);
+    expect(leaveRoom).toHaveBeenCalledWith('room-missing', userId, 'socket-missing', undefined);
     expect(sockets.get('socket-pending')?.emit).toHaveBeenCalledWith('force-disconnect', {
       channelId: 'room-pending',
       reason: 'credential_rotated',
@@ -1040,10 +1156,194 @@ describe('credential-epoch ejection', () => {
     expect(sockets.get('socket-current')?.disconnect).not.toHaveBeenCalled();
   });
 
+  it('waits for superseded-epoch native proof after local absence and preserves the current successor', async () => {
+    let completeProof!: () => void;
+    const proof = new Promise<void>((resolve) => { completeProof = resolve; });
+    const verify = vi.fn(() => proof);
+    const roomManager = {
+      awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+      awaitNativeTerminationForCredentialEpoch: verify,
+      getSupersededCredentialEpochSessions: vi.fn(() => []),
+      removeProvisionalParticipantForEnforcement: vi.fn().mockResolvedValue(true),
+      leaveRoomIfSocketOwned: vi.fn().mockResolvedValue(true),
+    };
+    const currentSocket = {
+      emit: vi.fn(),
+      disconnect: vi.fn(),
+      data: { userId, credentialEpoch, roomId: 'current-room' },
+    };
+    const handler = createCredentialEpochEjectionAckHandler(
+      roomManager,
+      { sockets: { sockets: new Map([['current-socket', currentSocket]]) } },
+      signingValue
+    );
+    let settled = false;
+    const acknowledgement = handler(command());
+    void acknowledgement.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(verify).toHaveBeenCalledWith(userId, supersededCredentialEpoch);
+      expect(roomManager.removeProvisionalParticipantForEnforcement).not.toHaveBeenCalled();
+      expect(roomManager.leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+      expect(currentSocket.emit).not.toHaveBeenCalled();
+      expect(currentSocket.disconnect).not.toHaveBeenCalled();
+      completeProof();
+      await expect(acknowledgement).resolves.toMatchObject({ ok: true, userId, supersededCredentialEpoch });
+      expect(currentSocket.emit).not.toHaveBeenCalled();
+      expect(currentSocket.disconnect).not.toHaveBeenCalled();
+    } finally {
+      completeProof();
+      await acknowledgement.catch(() => undefined);
+    }
+  });
+
+  it('disconnects the captured superseded credential session when registration completes during native proof', async () => {
+    let completeProof!: () => void;
+    const proof = new Promise<void>((resolve) => { completeProof = resolve; });
+    const socket = {
+      emit: vi.fn(),
+      disconnect: vi.fn(),
+      data: { userId, credentialEpoch: supersededCredentialEpoch, roomId: 'room-pending' } as Record<string, unknown>,
+    };
+    const registeredSession = {
+      sessionGeneration: '11111111-1111-4111-8111-111111111111',
+      nodeBootId: '22222222-2222-4222-8222-222222222222',
+      roomId: 'room-pending',
+      roomKind: 'channel' as const,
+      userId,
+      credentialEpoch: supersededCredentialEpoch,
+      socketId: 'socket-pending',
+    };
+    const verify = vi.fn(async () => {
+      socket.data.voiceEnforcementSession = registeredSession;
+      await proof;
+    });
+    const handler = createCredentialEpochEjectionAckHandler(
+      {
+        awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+        awaitNativeTerminationForCredentialEpoch: verify,
+        getSupersededCredentialEpochSessions: vi.fn(() => [
+          { roomId: 'room-pending', socketId: 'socket-pending', provisional: true, sessionGeneration: registeredSession.sessionGeneration },
+        ]),
+        removeProvisionalParticipantForEnforcement: vi.fn().mockResolvedValue(true),
+        leaveRoomIfSocketOwned: vi.fn().mockResolvedValue(true),
+      },
+      { sockets: { sockets: new Map([['socket-pending', socket]]) } },
+      signingValue
+    );
+
+    const acknowledgement = handler(command());
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(socket.data.voiceEnforcementSession).toBe(registeredSession);
+      completeProof();
+      await expect(acknowledgement).resolves.toMatchObject({ ok: true, userId, supersededCredentialEpoch });
+      expect(socket.emit, 'the same captured socket with unchanged user and superseded credential epoch must be disconnected after its exact registration completes during native proof').toHaveBeenCalledWith('force-disconnect', {
+        channelId: 'room-pending',
+        reason: 'credential_rotated',
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+    } finally {
+      completeProof();
+      await acknowledgement.catch(() => undefined);
+    }
+  });
+
+  it('rejects terminal success when superseded-epoch native proof fails', async () => {
+    const proofFailure = new Error('native proof rejected');
+    const handler = createCredentialEpochEjectionAckHandler(
+      {
+        awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+        awaitNativeTerminationForCredentialEpoch: vi.fn().mockRejectedValue(proofFailure),
+        getSupersededCredentialEpochSessions: vi.fn(() => []),
+        removeProvisionalParticipantForEnforcement: vi.fn(),
+        leaveRoomIfSocketOwned: vi.fn(),
+      },
+      { sockets: { sockets: new Map() } },
+      signingValue
+    );
+
+    await expect(handler(command())).rejects.toBe(proofFailure);
+  });
+
+  it('preserves a captured socket whose identity advances to the current credential epoch during proof', async () => {
+    const oldSocket = { emit: vi.fn(), disconnect: vi.fn(), data: { userId, credentialEpoch: supersededCredentialEpoch } };
+    const successorSocket = { emit: vi.fn(), disconnect: vi.fn(), data: { userId, credentialEpoch } };
+    const sockets = new Map([['socket-reused', oldSocket]]);
+    const handler = createCredentialEpochEjectionAckHandler(
+      {
+        awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+        awaitNativeTerminationForCredentialEpoch: vi.fn(async () => {
+          sockets.set('socket-reused', successorSocket);
+        }),
+        getSupersededCredentialEpochSessions: vi.fn(() => []),
+        removeProvisionalParticipantForEnforcement: vi.fn(),
+        leaveRoomIfSocketOwned: vi.fn(),
+      },
+      { sockets: { sockets } },
+      signingValue
+    );
+
+    await expect(handler(command())).resolves.toMatchObject({ ok: true, userId, supersededCredentialEpoch });
+    expect(oldSocket.disconnect).not.toHaveBeenCalled();
+    expect(successorSocket.emit).not.toHaveBeenCalled();
+    expect(successorSocket.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('preserves the same socket when its provisional session advances to a different generation during proof', async () => {
+    const supersededSessionGeneration = '11111111-1111-4111-8111-111111111111';
+    const successorSessionGeneration = '22222222-2222-4222-8222-222222222222';
+    const socket = {
+      emit: vi.fn(),
+      disconnect: vi.fn(),
+      data: {
+        userId,
+        credentialEpoch: supersededCredentialEpoch,
+      } as Record<string, unknown>,
+    };
+    const successorSession = {
+      sessionGeneration: successorSessionGeneration,
+      nodeBootId: '33333333-3333-4333-8333-333333333333',
+      roomId: 'room-pending',
+      roomKind: 'channel' as const,
+      userId,
+      credentialEpoch: supersededCredentialEpoch,
+      socketId: 'socket-pending',
+    };
+    const handler = createCredentialEpochEjectionAckHandler(
+      {
+        awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+        awaitNativeTerminationForCredentialEpoch: vi.fn(async () => {
+          socket.data.voiceEnforcementSession = successorSession;
+        }),
+        getSupersededCredentialEpochSessions: vi.fn(() => [
+          {
+            roomId: 'room-pending',
+            socketId: 'socket-pending',
+            provisional: true,
+            sessionGeneration: supersededSessionGeneration,
+          },
+        ]),
+        removeProvisionalParticipantForEnforcement: vi.fn().mockResolvedValue(true),
+        leaveRoomIfSocketOwned: vi.fn().mockResolvedValue(true),
+      },
+      { sockets: { sockets: new Map([['socket-pending', socket]]) } },
+      signingValue
+    );
+
+    await expect(handler(command())).resolves.toMatchObject({ ok: true, userId, supersededCredentialEpoch });
+    expect(socket.data.voiceEnforcementSession).toBe(successorSession);
+    expect(socket.emit).not.toHaveBeenCalled();
+    expect(socket.disconnect).not.toHaveBeenCalled();
+  });
+
   it('rejects malformed or same-epoch commands before touching room state', async () => {
     const getSessions = vi.fn(() => []);
     const handler = createCredentialEpochEjectionAckHandler(
       {
+        awaitNativeTermination: vi.fn().mockResolvedValue(undefined),
+        awaitNativeTerminationForCredentialEpoch: vi.fn().mockResolvedValue(undefined),
         getSupersededCredentialEpochSessions: getSessions,
         removeProvisionalParticipantForEnforcement: vi.fn(),
         leaveRoomIfSocketOwned: vi.fn(),

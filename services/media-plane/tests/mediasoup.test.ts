@@ -240,7 +240,7 @@ describe('MediasoupService', () => {
     });
 
     it('throws a typed error when the worker pool is empty', async () => {
-      await service.close();
+      await service.close(performance.now() + 1000);
 
       await expect(service.getOrCreateRouter('room-a')).rejects.toThrow(NoWorkersAvailableError);
     });
@@ -381,7 +381,7 @@ describe('MediasoupService', () => {
       mockCreateWorker.mockResolvedValueOnce(worker1).mockResolvedValueOnce(worker2);
       await service.init();
 
-      await service.close();
+      await service.close(performance.now() + 1000);
 
       expect(worker1.close).toHaveBeenCalled();
       expect(worker2.close).toHaveBeenCalled();

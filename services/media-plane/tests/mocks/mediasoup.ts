@@ -19,6 +19,14 @@ function createEventEmitter() {
       if (!events.has(event)) events.set(event, []);
       events.get(event)!.push(handler);
     }),
+    once: vi.fn((event: string, handler: (...args: any[]) => void) => {
+      const once = (...args: any[]) => {
+        events.set(event, (events.get(event) ?? []).filter((candidate) => candidate !== once));
+        handler(...args);
+      };
+      if (!events.has(event)) events.set(event, []);
+      events.get(event)!.push(once);
+    }),
     emit(event: string, ...args: any[]) {
       const handlers = events.get(event);
       if (handlers) handlers.forEach((h) => h(...args));
@@ -127,21 +135,45 @@ export function createMockRouter(overrides: Record<string, unknown> = {}) {
 
 export function createMockWorker(overrides: Record<string, unknown> = {}) {
   const emitter = createEventEmitter();
-  return {
-    pid: Math.floor(Math.random() * 100000),
+  const routers = new Map<string, ReturnType<typeof createMockRouter>>();
+  const pid = typeof overrides.pid === 'number' ? overrides.pid : Math.floor(Math.random() * 100000);
+  const worker = {
+    pid,
     closed: false,
+    subprocessClosed: false,
     // Real mediasoup mints a NEW Router per createRouter() call. This used to
     // return one shared instance, which made "created a fresh router"
     // assertions pass only when placement happened to move the room to a
     // DIFFERENT worker — so they were really asserting worker rotation. Least
     // -loaded placement (#3149) can legitimately re-place a room on the same
     // worker, which exposed it.
-    createRouter: vi.fn(() => Promise.resolve(createMockRouter())),
-    close: vi.fn(),
+    createRouter: vi.fn(async () => {
+      const router = createMockRouter();
+      routers.set(router.id, router);
+      router.close.mockImplementation(() => {
+        router.closed = true;
+        routers.delete(router.id);
+      });
+      return router;
+    }),
+    dump: vi.fn(async () => ({
+      pid,
+      webRtcServerIds: [],
+      routerIds: [...routers.values()].filter((router) => !router.closed).map((router) => router.id),
+      channelMessageHandlers: { channelRequestHandlers: [], channelNotificationHandlers: [] },
+    })),
+    close: vi.fn((): void => {
+      worker.closed = true;
+      worker.subprocessClosed = true;
+      routers.clear();
+      emitter.emit('subprocessclose');
+    }),
     on: emitter.on,
+    once: emitter.once,
     _emit: emitter.emit,
     ...overrides,
   };
+  return worker;
 }
 
 export function createRtpCapabilities(videoCodecs: string[] = ['video/VP8', 'video/VP9']) {

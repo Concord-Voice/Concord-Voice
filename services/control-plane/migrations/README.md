@@ -59,7 +59,7 @@ make migrate-version
 1. **Always create both UP and DOWN migrations** - Every migration must be reversible
 2. **Test rollbacks** - Make sure your down migration properly reverses the up migration
 3. **One logical change per migration** - Do not mix unrelated schema changes
-4. **Know the runner's transaction boundary** - The v4.19.1 PostgreSQL driver executes each migration file as one `Exec` call. Most files therefore run atomically, but `CREATE INDEX CONCURRENTLY` cannot run inside an explicit transaction. Put each concurrent index in its own dedicated, one-statement migration file; do not combine it with schema changes.
+4. **Know the runner's transaction boundary** - The runner uses golang-migrate v4.20.1 with the default PostgreSQL driver configuration. Each file is sent as one simple-query `Exec`; PostgreSQL wraps a multi-statement query in one implicit transaction. Put each `CREATE INDEX CONCURRENTLY` in its own one-statement file, because it cannot run inside a transaction block.
 5. **Avoid data migrations in schema migrations** - Consider separate data migration scripts
 6. **Never modify committed migrations** - Create new migrations to fix issues
 
@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000166)
+## Existing Migrations (000001–000167)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -276,6 +276,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000164 | message_purges_include_pinned | `message_purges.include_pinned` — whether a purge included pinned messages; DEFAULT TRUE (every earlier purge deleted pins, and expiry still does); the clear reap writes it explicitly, FALSE for a watermark-bounded batch and TRUE for a zero-participant one. An AFTER INSERT trigger mirrors each keep-pins purge into `message_purges_kept_pins`, so the down drops only the column and a re-up restores FALSE from that table (#3458) |
 | 000165 | default_friend_requests_mutual_servers | Default future `privacy_settings` rows to Mutual Servers without changing stored choices; drain old control-plane binaries before migration (see deploy runbook) |
 | 000166 | align_presence_and_fof_defaults | Default future Server Voice details to Off, Private Call audience to Friends, and Friends of Friends to On without changing stored choices; same drain and rollback gate |
+| 000167 | add_voice_command_transport | Permanent singleton transport generation and immutable broker provisioning proof; down refuses a provisioned receipt |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -370,6 +371,34 @@ Schema rollback must preserve v1 refusal and never restore the old vulnerable
 approval binary. Stage schema/control plane before desktop rollout; older
 clients need update/restart and a fresh request. See the
 [trusted-recovery protocol and release checklist](../../../docs/design/trusted-device-recovery.md).
+
+Migration 000167 creates the singleton `voice_command_transport` receipt before
+command transport bootstrap starts. Its generation never changes. Bootstrap
+commits `provisioned_at`, `stream_created_at`, `owner_store_created_at` and
+`initializing_revision` together; the row requires these four values to be all
+absent or all present. A trigger protects generation/creation time and refuses
+changes to a committed provisioning proof. The two broker creation fingerprints
+are canonical UTC RFC3339Nano `TEXT`, preserving nanoseconds that `TIMESTAMPTZ`
+would round; ordinary database event times remain `TIMESTAMPTZ`.
+
+The down migration locks the singleton in the connection's current schema and
+refuses while `provisioned_at` is present. An unprovisioned down removes only the
+receipt and protection function in that schema. A rollback retains this additive
+schema and uses a compatible binary
+that embeds migration 000167. An older image that lacks this migration can fail
+golang-migrate's version-existence check before startup: `internal/migrationrunner.Run`
+calls `m.Up()`, and v4.20.1's `readUp` requires the current recorded version to
+exist in the image's migration source. Do not erase the receipt
+or reset broker state to make such an image start. Unprovisioned up/down/up is
+reversible; a provisioned receipt requires explicit transport reconciliation
+before removal.
+
+If this guarded down was attempted and refused, golang-migrate can report
+**version 166 dirty** even though the transaction rolled back and the schema
+remains at 167. Inspect the actual singleton, constraints and receipt first. Only
+after verifying that exact state, repair the migration metadata to **clean 167**;
+never force 166 and continue downs. A dirty marker from a different migration or
+an uncertain schema requires its own investigation.
 
 ## Troubleshooting
 

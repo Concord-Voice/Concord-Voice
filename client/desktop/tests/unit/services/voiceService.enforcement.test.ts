@@ -610,6 +610,104 @@ describe('VoiceService enforcement guards', () => {
   });
 
   // =========================================================================
+  // Durable moderation fanout snapshots — regression for PR #3778 / #4267429065
+  // =========================================================================
+  describe('moderation snapshot socket listeners', () => {
+    function registerModerationListeners() {
+      svc.socket = mockSocket;
+      svc.setupSocketListeners();
+    }
+
+    it('atomically applies both authoritative flags from a mute snapshot when it preserves deafen', () => {
+      addParticipant('user-2', { serverMuted: true, serverDeafened: false });
+      registerModerationListeners();
+
+      const observedFlags: Array<{ serverMuted: boolean; serverDeafened: boolean }> = [];
+      const unsubscribe = useVoiceStore.subscribe((state) => {
+        const participant = state.participants['user-2'];
+        if (participant) {
+          observedFlags.push({
+            serverMuted: participant.serverMuted,
+            serverDeafened: participant.serverDeafened,
+          });
+        }
+      });
+
+      const handler = socketListeners['server-mute-changed']?.at(-1);
+      expect(handler, 'server-mute-changed listener must be registered').toBeDefined();
+      handler?.({ userId: 'user-2', serverMuted: false, serverDeafened: true });
+      unsubscribe();
+
+      expect(useVoiceStore.getState().participants['user-2']).toMatchObject({
+        serverMuted: false,
+        serverDeafened: true,
+      });
+      expect(
+        observedFlags,
+        'the callback must publish the complete snapshot in one state update'
+      ).toEqual([{ serverMuted: false, serverDeafened: true }]);
+    });
+
+    it('atomically applies both authoritative flags from a deafen snapshot when it preserves mute', () => {
+      addParticipant('user-2', { serverMuted: false, serverDeafened: true });
+      registerModerationListeners();
+
+      const observedFlags: Array<{ serverMuted: boolean; serverDeafened: boolean }> = [];
+      const unsubscribe = useVoiceStore.subscribe((state) => {
+        const participant = state.participants['user-2'];
+        if (participant) {
+          observedFlags.push({
+            serverMuted: participant.serverMuted,
+            serverDeafened: participant.serverDeafened,
+          });
+        }
+      });
+
+      const handler = socketListeners['server-deafen-changed']?.at(-1);
+      expect(handler, 'server-deafen-changed listener must be registered').toBeDefined();
+      handler?.({ userId: 'user-2', serverMuted: true, serverDeafened: false });
+      unsubscribe();
+
+      expect(useVoiceStore.getState().participants['user-2']).toMatchObject({
+        serverMuted: true,
+        serverDeafened: false,
+      });
+      expect(
+        observedFlags,
+        'the callback must publish the complete snapshot in one state update'
+      ).toEqual([{ serverMuted: true, serverDeafened: false }]);
+    });
+
+    it('keeps legacy one-field mute events from changing the existing deafen flag', () => {
+      addParticipant('user-2', { serverMuted: true, serverDeafened: true });
+      registerModerationListeners();
+
+      const handler = socketListeners['server-mute-changed']?.at(-1);
+      expect(handler, 'server-mute-changed listener must be registered').toBeDefined();
+      handler?.({ userId: 'user-2', serverMuted: false });
+
+      expect(useVoiceStore.getState().participants['user-2']).toMatchObject({
+        serverMuted: false,
+        serverDeafened: true,
+      });
+    });
+
+    it('keeps legacy one-field deafen events using the existing deafen-implies-mute behavior', () => {
+      addParticipant('user-2', { serverMuted: false, serverDeafened: false });
+      registerModerationListeners();
+
+      const handler = socketListeners['server-deafen-changed']?.at(-1);
+      expect(handler, 'server-deafen-changed listener must be registered').toBeDefined();
+      handler?.({ userId: 'user-2', serverDeafened: true });
+
+      expect(useVoiceStore.getState().participants['user-2']).toMatchObject({
+        serverMuted: true,
+        serverDeafened: true,
+      });
+    });
+  });
+
+  // =========================================================================
   // joinChannel — setEffectivePermissions and setGroupDMInfo
   // =========================================================================
   describe('joinChannel permissions and DM info', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createMockRouter, createMockTransport, createMockProducer } from './mocks/mediasoup.js';
+import { createMockRouter, createMockTransport, createMockProducer, createMockWorker } from './mocks/mediasoup.js';
 import './mocks/logger.js';
 
 // Mock mediasoup native module (same as roomManager.test.ts — prevents native
@@ -80,9 +80,18 @@ function createFakeIo(socketId: string) {
 describe('media policer integration (#2153 real RoomManager + MediaPolicer + tick)', () => {
   it('pauses a free participant’s mic once its observed rate sustains well above the free limit', async () => {
     const mockRouter = createMockRouter();
+    const worker = createMockWorker();
     const mockMediasoup = {
       getOrCreateRouter: vi.fn().mockResolvedValue(mockRouter),
       removeRouter: vi.fn(),
+      captureNativeTermination: vi.fn((router, transportIds?: readonly string[]) => ({
+        worker,
+        router,
+        routerId: router.id,
+        transportIds: transportIds === undefined ? undefined : [...transportIds],
+      })),
+      confirmNativeTermination: vi.fn().mockResolvedValue(undefined),
+      confirmAllRoutersClosed: vi.fn().mockResolvedValue(undefined),
     };
     const manager = new RoomManager(
       mockMediasoup as unknown as ConstructorParameters<typeof RoomManager>[0]

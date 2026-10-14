@@ -537,8 +537,11 @@ func TestDangerousGate_DeleteServerCrossOwnerPairDoesNotDeadlock(t *testing.T) {
 	spy, routerDB := openSQLStateSpyDB(t)
 	env := setupMFAEnforcementEnvWithDB(t, routerDB)
 	ts := env.ts
-	a := newGateFixture(t, env, false, true)
-	b := newGateFixture(t, env, false, true)
+	// Distinct sender-gate stripes let the second deletion reach PostgreSQL
+	// while the first is paused. Random owners can share a stripe and queue
+	// in Go instead, outside the SQL-only lock-wait observer below.
+	a := newCrossOwnerGateFixture(t, env, "10000000-0000-4000-8000-000000000001", "pair-owner-a")
+	b := newCrossOwnerGateFixture(t, env, "10000000-0000-4000-8000-000000000002", "pair-owner-b")
 	requireSpyCountsADeadlock(t, spy, routerDB, ts.DB, a.owner.ID, b.owner.ID)
 	baseline := spy.count(sqlStateDeadlock)
 
@@ -570,4 +573,26 @@ func TestDangerousGate_DeleteServerCrossOwnerPairDoesNotDeadlock(t *testing.T) {
 	del.requireOKBody(t, first.await(t, "the first deletion"), "first")
 	del.requireOKBody(t, second.await(t, "the second deletion"), "second")
 	assert.Equal(t, baseline, spy.count(sqlStateDeadlock), "the cross-owner pair deadlocked (40P01)")
+}
+
+// newCrossOwnerGateFixture gives this SQL lock-order proof stable owner IDs
+// without duplicating the sender-gate hash implementation.
+func newCrossOwnerGateFixture(t *testing.T, env *mfaEnv, ownerID, username string) gateFixture {
+	t.Helper()
+	owner := testhelpers.TestUser{
+		ID: ownerID, Username: username, Email: username + "@test.concord.chat",
+		Password: testhelpers.TestAuthPlaintext,
+	}
+	_, err := env.ts.DB.Exec(`
+		INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		VALUES ($1, $2, $3, $4, TRUE, TRUE)`,
+		owner.ID, owner.Email, owner.Username, testhelpers.TestAuthHash)
+	require.NoError(t, err)
+	owner.AccessToken, err = auth.GenerateAccessToken(owner.ID, testhelpers.TestJWTSecret, true, "", "")
+	require.NoError(t, err)
+	f := gateFixture{owner: owner}
+	f.serverID = env.ts.CreateTestServer(t, owner.ID, "Gate "+username)
+	enrollMFATOTP(t, env, owner.ID)
+	setMFAFlag(t, env, f.serverID, false)
+	return f
 }

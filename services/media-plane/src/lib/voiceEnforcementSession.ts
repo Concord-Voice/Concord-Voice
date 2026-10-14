@@ -24,6 +24,8 @@ export interface VoiceEnforcementSession {
   socketId: string;
 }
 
+export type NativeSessionVerifier = (session: VoiceEnforcementSession) => Promise<void>;
+
 // A boot identifier is intentionally process-local. It is an exact routing
 // address, not a node lease: a crashed process leaves its durable rows pending.
 export { voiceEnforcementNodeBootId } from './voiceEnforcementIdentity.js';
@@ -101,8 +103,10 @@ export async function registerVoiceEnforcementSession(
 // The release proof is independent of a user JWT. A credential-epoch ejection
 // may invalidate that JWT before the target node can tear down the socket.
 export async function releaseVoiceEnforcementSession(
-  session: VoiceEnforcementSession
+  session: VoiceEnforcementSession,
+  verifyNative: NativeSessionVerifier
 ): Promise<void> {
+  await verifyNative(session);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const proof = releaseProof(session, timestamp);
   if (!proof) throw new Error('Unable to sign voice-enforcement release');

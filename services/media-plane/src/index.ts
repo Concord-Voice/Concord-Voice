@@ -41,6 +41,7 @@ import {
 } from './middleware/auth.js';
 import type { AuthenticatedSocketData } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
+import { VoiceCommandDispatcher } from './lib/voiceCommandDispatcher.js';
 import { createChannelAdmissionActivationHandler } from './lib/channelAdmissionActivation.js';
 import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
 import { RedisService } from './lib/redis.js';
@@ -1067,6 +1068,7 @@ async function main() {
       shuttingDown ||
       voiceEnforcementReleaseQueue.saturated() ||
       !voiceEnforcementLease.valid() ||
+      !natsService.voiceCommandReady() ||
       !voiceEnforcementSubscriptionReady ||
       !natsService.isRequestSubscriptionHealthy(voiceEnforcementSubject)
     ) {
@@ -1132,6 +1134,13 @@ async function main() {
     // decompression-amplification vector. Do not enable it for "performance".
   });
   const voiceEnforcementReleaseQueue = new VoiceEnforcementSessionReleaseQueue(
+    (session) =>
+      roomManager.awaitNativeTermination(
+        session.roomId,
+        session.userId,
+        session.socketId,
+        session.sessionGeneration
+      ),
     (capacity, overflowedCount) => {
       logger.error('Voice enforcement release queue saturated; operator recovery required', {
         capacity,
@@ -1157,6 +1166,67 @@ async function main() {
       }
     }
   );
+
+  const quarantineVoiceCommands = async (_reason: string): Promise<void> => {
+    voiceEnforcementLease.expire();
+    await voiceEnforcementExpiryFence.enforce();
+  };
+  const voiceCommandOwner = await natsService.createVoiceCommandOwner({
+    nodeBootId: voiceEnforcementNodeBootId,
+    onInvalidated: () => {
+      voiceEnforcementLease.expire();
+      void voiceEnforcementExpiryFence.enforce().catch(() => {
+        logger.error('Voice command authority quarantine failed', {
+          error: 'voice_command_quarantine_failed',
+        });
+      });
+    },
+  });
+  roomManager.setNativeTerminationFailureHandler(() => {
+    voiceEnforcementLease.expire();
+    voiceCommandOwner.invalidate();
+  });
+  const legacyVoiceCommands = new WeakMap<Record<string, unknown>, () => Promise<void>>();
+  const voiceCommandDispatcher = new VoiceCommandDispatcher({
+    roomManager,
+    io,
+    nodeBootId: voiceEnforcementNodeBootId,
+    streamGeneration: voiceCommandOwner.streamGeneration,
+    ensureAuthority: async () => {
+      natsService.requireVoiceCommandAuthority();
+      const ownerEpoch = voiceCommandOwner.authorityEpoch();
+      try {
+        await natsService.confirmVoiceCommandContinuity();
+        natsService.requireVoiceCommandAuthority();
+        if (voiceCommandOwner.authorityEpoch() !== ownerEpoch)
+          throw new Error('Voice command authority unavailable');
+      } catch {
+        voiceCommandOwner.invalidate();
+        await quarantineVoiceCommands('continuity_unavailable');
+        throw new Error('Voice command authority unavailable');
+      }
+    },
+    handleLegacy: async (data) => {
+      const handler = legacyVoiceCommands.get(data);
+      if (!handler) throw new Error('Voice command compatibility handler unavailable');
+      await handler();
+    },
+    emitSecurityEvent: (event) => securityEvents.emit(event),
+  });
+  roomManager.setEnforcementAuthorityGate(() => natsService.requireVoiceCommandAuthority());
+  const subscribeVoiceCompatibility = (
+    subject: string,
+    handler: (data: Record<string, unknown>) => Promise<void>
+  ): void => {
+    natsService.subscribe(subject, async (data) => {
+      legacyVoiceCommands.set(data, () => handler(data));
+      try {
+        await voiceCommandDispatcher.handleCompatibility(data);
+      } finally {
+        legacyVoiceCommands.delete(data);
+      }
+    });
+  };
 
   // Socket.IO JWT authentication middleware (A2)
   io.use(createAuthMiddleware((event) => securityEvents.emit(event)));
@@ -1198,7 +1268,7 @@ async function main() {
     eventName: string,
     eventField: string
   ) {
-    natsService.subscribe(subject, async (natsData) => {
+    subscribeVoiceCompatibility(subject, async (natsData) => {
       let cmd: { channelId?: string; userId?: string; action?: string } = {};
       try {
         await handleNatsEnforcementCommand(
@@ -1256,7 +1326,7 @@ async function main() {
     subject: string,
     applyFn: (roomId: string, userId: string) => void | Promise<void>
   ) {
-    natsService.subscribe(subject, async (natsData) => {
+    subscribeVoiceCompatibility(subject, async (natsData) => {
       let cmd: { channelId?: string; userId?: string } = {};
       try {
         await handleNatsEnforcementCommand(
@@ -1296,7 +1366,7 @@ async function main() {
   // Control plane publishes voice.enforce.disconnect {channelId, userId} when a
   // moved user's temporary channel access is revoked. We evict the live peer via
   // RoomManager.leaveRoom (which emits user-left -> voice.left over NATS).
-  natsService.subscribe('voice.enforce.disconnect', async (natsData) => {
+  subscribeVoiceCompatibility('voice.enforce.disconnect', async (natsData) => {
     let cmd: { channelId?: string; userId?: string } = {};
     try {
       await handleNatsEnforcementCommand(
@@ -1341,6 +1411,10 @@ async function main() {
         // A late valid command cannot revive a process that crossed expiry
         // without first terminalizing all local media state.
         await fenceExpiredVoiceEnforcementLease();
+        if (!shuttingDown && !natsService.voiceCommandReady()) {
+          await natsService.recoverVoiceCommandConsumerAfterTeardown();
+        }
+        await natsService.confirmVoiceCommandContinuity();
         voiceEnforcementLease.renew();
         // This is only a retry trigger after a verified same-subscriber health
         // round trip; it never treats the timer expiry itself as settlement.
@@ -1465,7 +1539,10 @@ async function main() {
       emitSecurityEvent: emitSocketSecurityEvent,
       withRateLimit,
       isShuttingDown: () =>
-        shuttingDown || voiceEnforcementReleaseQueue.saturated() || !voiceEnforcementLease.valid(),
+        shuttingDown ||
+        voiceEnforcementReleaseQueue.saturated() ||
+        !voiceEnforcementLease.valid() ||
+        !natsService.voiceCommandReady(),
     });
 
     // ── update-rtp-capabilities ─────────────────────────────────────
@@ -1999,11 +2076,12 @@ async function main() {
     const socketData = socket.data as AuthenticatedSocketData;
     const roomId = socketData.roomId;
     const userId = socketData.userId;
+    const enforcementSession = socketData.voiceEnforcementSession;
 
     if (!roomId || !userId) return;
 
     const releaseEnforcementSession = async () => {
-      const session = socketData.voiceEnforcementSession;
+      const session = enforcementSession;
       if (!session) return;
       try {
         await voiceEnforcementReleaseQueue.releaseAfterTerminalClose(session);
@@ -2022,7 +2100,12 @@ async function main() {
     // Without this check, the old socket's cleanup would remove the
     // participant that the new socket just added.
     const participant = roomManager.getParticipant(roomId, userId);
-    if (participant && participant.socketId !== socket.id) {
+    if (
+      participant &&
+      (participant.socketId !== socket.id ||
+        (enforcementSession &&
+          participant.voiceEnforcementSessionGeneration !== enforcementSession.sessionGeneration))
+    ) {
       logger.info('Skipping cleanup — participant reconnected on a newer socket', {
         roomId,
         userId,
@@ -2038,7 +2121,12 @@ async function main() {
     }
 
     // Clean up via RoomManager (closes transports, producers, consumers)
-    await roomManager.leaveRoom(roomId, userId);
+    await roomManager.leaveRoomIfSocketOwned(
+      roomId,
+      userId,
+      socket.id,
+      enforcementSession?.sessionGeneration
+    );
     try {
       await releaseEnforcementSession();
     } finally {
@@ -2147,6 +2235,13 @@ async function main() {
     }
   }, 30_000);
 
+  // Ownership and the required durable consumer are established before listen.
+  await natsService.startVoiceCommandConsumer({
+    owner: voiceCommandOwner,
+    dispatcher: voiceCommandDispatcher,
+    quarantine: quarantineVoiceCommands,
+  });
+
   // Start server
   const port = config.port;
   httpServer.listen(port, () => {
@@ -2178,15 +2273,31 @@ async function main() {
   // supervisor kill can discard the only live node_boot_id target.
   const shutdownReleaseDrainTimeoutMs = 35_000;
 
+  const failShutdown = (): void => {
+    logger.error('Voice command shutdown retained permanent ownership', {
+      error: 'voice_command_shutdown_failed',
+    });
+    process.exit(1);
+  };
+  let shutdownTerminalDeadline: ReturnType<typeof setTimeout> | undefined;
+  let shutdownNativeDeadline: number | undefined;
   const completeShutdown = async () => {
+    if (shutdownNativeDeadline === undefined)
+      throw new Error('Native shutdown deadline unavailable');
+    // Keep exact subscribers alive through registry release and actual child exit.
+    await mediasoupService.close(shutdownNativeDeadline);
+    await natsService.stopVoiceCommandRenewal();
+    if (performance.now() + 2000 >= shutdownNativeDeadline) {
+      throw new Error('Native shutdown deadline exhausted');
+    }
+    await voiceCommandOwner.release();
+    if (shutdownTerminalDeadline) clearTimeout(shutdownTerminalDeadline);
     clearInterval(voiceEnforcementHealthInterval);
 
     // Close inter-service connections
     await natsService.close();
     await redisService.close();
 
-    // Close mediasoup workers
-    await mediasoupService.close();
     // Close last so preceding shutdown work remains observable.
     if (!(await securityEvents.close())) {
       logger.error('Security event sink retained records during shutdown');
@@ -2209,24 +2320,32 @@ async function main() {
   const shutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
-      const shutdownStartedAt = Date.now();
+      const shutdownStartedAt = performance.now();
+      shutdownNativeDeadline = shutdownStartedAt + shutdownReleaseDrainTimeoutMs;
       // Reject A1/A2 work before closeAll so no registry row can race teardown.
       shuttingDown = true;
+      shutdownTerminalDeadline = setTimeout(() => {
+        logger.error('Voice command shutdown retained permanent ownership', {
+          error: 'voice_command_shutdown_deadline',
+        });
+        process.exit(1);
+      }, shutdownReleaseDrainTimeoutMs);
       logger.info('Shutting down gracefully');
       clearInterval(epochSyncInterval);
       clearInterval(roomHeartbeatInterval);
       mediaPolicerTick.stop();
       clearInterval(voiceEnforcementLeaseInterval);
       await opsMetricsPublisher.stop();
+      await natsService.stopVoiceCommandConsumer();
 
       // Close all rooms first (notifies participants, publishes NATS events)
-      await roomManager.closeAll();
+      await roomManager.closeAll(shutdownNativeDeadline);
       const retainedReleases = await releaseVoiceEnforcementSessionsAfterClose(
         io.sockets.sockets.values(),
         voiceEnforcementReleaseQueue
       );
       const remainingReleaseDrainMs =
-        shutdownReleaseDrainTimeoutMs - (Date.now() - shutdownStartedAt);
+        shutdownReleaseDrainTimeoutMs - (performance.now() - shutdownStartedAt);
       if (remainingReleaseDrainMs <= 0) {
         // RoomManager teardown has completed, so failing here cannot leave media
         // forwarding. Exit visibly instead of consuming the final HTTP-close
@@ -2255,13 +2374,13 @@ async function main() {
           if (voiceEnforcementReleaseQueue.outstandingCount() !== 0) return;
           clearInterval(awaitRetainedReleases);
           clearTimeout(shutdownReleaseDeadline);
-          void completeShutdown();
+          void completeShutdown().catch(failShutdown);
         }, 1_000);
         return;
       }
 
       await completeShutdown();
-    })();
+    })().catch(failShutdown);
     return shutdownPromise;
   };
 
@@ -2272,7 +2391,7 @@ async function main() {
 // Start the application
 try {
   await main();
-} catch (error) {
-  logger.error('Fatal error during startup', { error });
+} catch {
+  logger.error('Fatal error during startup', { error: 'media_startup_failed' });
   process.exit(1);
 }

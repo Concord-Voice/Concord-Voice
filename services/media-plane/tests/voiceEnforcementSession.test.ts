@@ -22,6 +22,7 @@ const session: VoiceEnforcementSession = {
   credentialEpoch: 'epoch-a',
   socketId: 'socket-a',
 };
+const nativeVerifier = vi.fn(async (_session: VoiceEnforcementSession): Promise<void> => undefined);
 
 function response(ok: boolean, status = ok ? 200 : 409): Response {
   return { ok, status } as Response;
@@ -30,6 +31,7 @@ function response(ok: boolean, status = ok ? 200 : 409): Response {
 describe('voice enforcement session control-plane calls', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    nativeVerifier.mockReset().mockResolvedValue(undefined);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(true)));
   });
 
@@ -68,7 +70,7 @@ describe('voice enforcement session control-plane calls', () => {
   });
 
   it('releases an exact session without using the user JWT', async () => {
-    await releaseVoiceEnforcementSession(session);
+    await releaseVoiceEnforcementSession(session, nativeVerifier);
 
     const [url, init] = vi.mocked(fetch).mock.calls[0];
     expect(url).toBe('http://localhost:8080/api/v1/internal/voice/enforcement-sessions/release');
@@ -86,12 +88,40 @@ describe('voice enforcement session control-plane calls', () => {
 
   it('rejects failed release and refuses newline-delimited session fields', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(response(false, 503));
-    await expect(releaseVoiceEnforcementSession(session)).rejects.toThrow('release (503)');
+    await expect(releaseVoiceEnforcementSession(session, nativeVerifier)).rejects.toThrow('release (503)');
 
     await expect(
-      releaseVoiceEnforcementSession({ ...session, userId: 'user\n-a' })
+      releaseVoiceEnforcementSession({ ...session, userId: 'user\n-a' }, nativeVerifier)
     ).rejects.toThrow('Unable to sign voice-enforcement release');
     expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it('waits for native proof before sending the release HTTP request', async () => {
+    let completeProof!: () => void;
+    const proof = new Promise<void>((resolve) => { completeProof = resolve; });
+    const verify = vi.fn(() => proof);
+    let settled = false;
+    const release = releaseVoiceEnforcementSession(session, verify);
+    void release.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(fetch).not.toHaveBeenCalled();
+      expect(settled).toBe(false);
+      expect(verify).toHaveBeenCalledWith(session);
+      completeProof();
+      await release;
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally {
+      completeProof();
+      await release.catch(() => undefined);
+    }
+  });
+
+  it('retains the release obligation without HTTP when native proof fails', async () => {
+    const verify = vi.fn().mockRejectedValue(new Error('native proof unavailable'));
+    await expect(releaseVoiceEnforcementSession(session, verify)).rejects.toThrow('native proof unavailable');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(verify).toHaveBeenCalledWith(session);
   });
 
   it('polls health with a fresh nonce and rejects failed health checks', async () => {

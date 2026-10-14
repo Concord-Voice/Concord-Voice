@@ -3471,10 +3471,11 @@ class VoiceService {
     }
     if (roomJoined.e2eeEpoch && this.mediaEncryption) {
       if (this.e2eeWorker) {
-        this.e2eeWorker.postMessage({
+        const workerMessage: E2EEWorkerMessage = {
           type: 'catchUpToEpoch',
           targetEpoch: roomJoined.e2eeEpoch,
-        } satisfies E2EEWorkerMessage);
+        };
+        this.e2eeWorker.postMessage(workerMessage);
       }
       await this.mediaEncryption.catchUpToEpoch(roomJoined.e2eeEpoch);
     }
@@ -9224,10 +9225,11 @@ class VoiceService {
             await this.addDecryptKeysForActiveParticipantsAtEpoch(channelId, epoch);
           }
           if (this.e2eeWorker) {
-            this.e2eeWorker.postMessage({
+            const workerMessage: E2EEWorkerMessage = {
               type: 'catchUpToEpoch',
               targetEpoch: epoch,
-            } satisfies E2EEWorkerMessage);
+            };
+            this.e2eeWorker.postMessage(workerMessage);
           }
           await this.mediaEncryption.catchUpToEpoch(epoch);
         } catch (err) {
@@ -9341,50 +9343,43 @@ class VoiceService {
       console.error('Media plane error:', message);
     });
 
-    // Server-enforced mute/deafen
-    this.socket.on(
-      'server-mute-changed',
-      ({ userId, serverMuted }: { userId: string; serverMuted: boolean }) => {
-        const store = useVoiceStore.getState();
-        store.updateParticipant(userId, { serverMuted });
+    // Both versioned moderation events carry the complete server snapshot. Older
+    // servers send one field; retain the historical deafen-implies-mute fallback.
+    const applyServerModeration = ({
+      userId,
+      serverMuted,
+      serverDeafened,
+    }: {
+      userId: string;
+      serverMuted?: boolean;
+      serverDeafened?: boolean;
+    }) => {
+      const muted = serverMuted ?? serverDeafened;
+      const update: { serverMuted?: boolean; serverDeafened?: boolean } = {};
+      if (muted !== undefined) update.serverMuted = muted;
+      if (serverDeafened !== undefined) update.serverDeafened = serverDeafened;
+      const store = useVoiceStore.getState();
+      store.updateParticipant(userId, update);
 
-        const localUserId = useUserStore.getState().user?.id;
-        if (userId === localUserId && serverMuted) {
-          // Enforce locally — pause mic producer
-          const micProducer = this.producers.get('mic');
-          if (micProducer && !micProducer.paused) {
-            micProducer.pause();
-            this.socket?.emit('pause-producer', { producerId: micProducer.id });
-          }
-          store.setMuted(true);
+      if (userId !== useUserStore.getState().user?.id) return;
+      if (serverDeafened) {
+        for (const [, consumer] of this.consumers) {
+          if (consumer.kind === 'audio') consumer.pause();
         }
+        store.setDeafened(true);
       }
-    );
-
-    this.socket.on(
-      'server-deafen-changed',
-      ({ userId, serverDeafened }: { userId: string; serverDeafened: boolean }) => {
-        const store = useVoiceStore.getState();
-        store.updateParticipant(userId, { serverDeafened, serverMuted: serverDeafened });
-
-        const localUserId = useUserStore.getState().user?.id;
-        if (userId === localUserId && serverDeafened) {
-          // Enforce locally — pause all audio consumers and mic
-          for (const [, consumer] of this.consumers) {
-            if (consumer.kind === 'audio') {
-              consumer.pause();
-            }
-          }
-          const micProducer = this.producers.get('mic');
-          if (micProducer && !micProducer.paused) {
-            micProducer.pause();
-            this.socket?.emit('pause-producer', { producerId: micProducer.id });
-          }
-          store.setMuted(true);
-          store.setDeafened(true);
+      if (muted) {
+        const micProducer = this.producers.get('mic');
+        if (micProducer && !micProducer.paused) {
+          micProducer.pause();
+          this.socket?.emit('pause-producer', { producerId: micProducer.id });
         }
+        store.setMuted(true);
       }
-    );
+    };
+
+    this.socket.on('server-mute-changed', applyServerModeration);
+    this.socket.on('server-deafen-changed', applyServerModeration);
   }
 
   // ─── Decoder Budget Profiling (IGNIS insight) ─────────────────
@@ -10098,12 +10093,13 @@ class VoiceService {
       candidateMediaEncryption.setKeyVersion(keyVersion);
       if (currentTransformPath() === 'script-transform') {
         candidateWorker = this.createE2EEWorker();
-        candidateWorker.postMessage({
+        const workerMessage: E2EEWorkerMessage = {
           type: 'init',
           encryptKey,
           currentKeyId: 0,
           keyVersion,
-        } satisfies E2EEWorkerMessage);
+        };
+        candidateWorker.postMessage(workerMessage);
       }
 
       // This is the last check before the synchronous shared-state commit.
@@ -10193,12 +10189,13 @@ class VoiceService {
       // Advance the local encrypt key + stamped version together.
       context.mediaEncryption.initFromKey(newEncryptKey, 0);
       context.mediaEncryption.setKeyVersion(context.keyVersion);
-      context.e2eeWorker?.postMessage({
+      const workerMessage: E2EEWorkerMessage = {
         type: 'init',
         encryptKey: newEncryptKey,
         currentKeyId: 0,
         keyVersion: context.keyVersion,
-      } satisfies E2EEWorkerMessage);
+      };
+      context.e2eeWorker?.postMessage(workerMessage);
       console.debug('E2EE: sender re-based encrypt key on CSK rotation', {
         channelId: context.channelId,
         keyVersion: context.keyVersion,
@@ -10353,7 +10350,8 @@ class VoiceService {
   /** Destroy one Worker without consulting or mutating the shared Worker slot. */
   private destroyE2EEWorkerInstance(worker: Worker): void {
     try {
-      worker.postMessage({ type: 'destroy' } satisfies E2EEWorkerMessage);
+      const workerMessage: E2EEWorkerMessage = { type: 'destroy' };
+      worker.postMessage(workerMessage);
     } catch {
       /* still terminate a failed Worker */
     }
@@ -10463,10 +10461,11 @@ class VoiceService {
     if (e2eeEpoch <= localEpoch) return;
 
     try {
-      this.e2eeWorker?.postMessage({
+      const workerMessage: E2EEWorkerMessage = {
         type: 'catchUpToEpoch',
         targetEpoch: e2eeEpoch,
-      } satisfies E2EEWorkerMessage);
+      };
+      this.e2eeWorker?.postMessage(workerMessage);
       await mediaEncryption.catchUpToEpoch(e2eeEpoch);
     } catch (err) {
       console.error('E2EE: leave epoch catch-up failed — decrypt may fail until rejoin', {
@@ -10506,7 +10505,8 @@ class VoiceService {
       this.rotationDeadline = 0;
       if (!this.rotationPending || !this.e2eeWorker) return;
       this.rotationPending = false;
-      this.e2eeWorker.postMessage({ type: 'rotateKeys' } satisfies E2EEWorkerMessage);
+      const workerMessage: E2EEWorkerMessage = { type: 'rotateKeys' };
+      this.e2eeWorker.postMessage(workerMessage);
     }, delay);
   }
 
@@ -10563,13 +10563,14 @@ class VoiceService {
     this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
 
     if (e2eeWorker) {
-      e2eeWorker.postMessage({
+      const workerMessage: E2EEWorkerMessage = {
         type: 'addDecryptKey',
         senderUserId: userId,
         keyVersion,
         keyId,
         key,
-      } satisfies E2EEWorkerMessage);
+      };
+      e2eeWorker.postMessage(workerMessage);
     }
 
     console.debug('E2EE: decrypt key added', {
@@ -10867,13 +10868,14 @@ class VoiceService {
         );
         this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
         if (currentTransformPath() === 'script-transform' && e2eeWorker) {
-          e2eeWorker.postMessage({
+          const workerMessage: E2EEWorkerMessage = {
             type: 'addDecryptKey',
             senderUserId,
             keyVersion,
             keyId,
             key,
-          } satisfies E2EEWorkerMessage);
+          };
+          e2eeWorker.postMessage(workerMessage);
         }
       } catch (err) {
         // Fail-closed: getChannelKeyByVersion rate-limits and the Worker caps
@@ -11040,10 +11042,11 @@ class VoiceService {
       const worker = this.e2eeWorker;
       if (!consumer || consumer.closed || !worker) return;
       this.bypassProbes.set(consumerId, { senderUserId, phase, attempt });
-      worker.postMessage({
+      const workerMessage: E2EEWorkerMessage = {
         type: 'queryDecryptStats',
         probeId: consumerId,
-      } satisfies E2EEWorkerMessage);
+      };
+      worker.postMessage(workerMessage);
     }, delayMs);
   }
 
@@ -11114,12 +11117,13 @@ class VoiceService {
           // window where ciphertext flows to the decoder by design
           // (CodeRabbit, PR #2865 / CWE-693). A single assignment is the
           // defined dynamic update.
-          receiver.transform = new RTCRtpScriptTransform(worker, {
+          const transformOptions: E2EETransformOptions = {
             role: 'decrypt',
             senderUserId: probe.senderUserId,
             codecFamily: codecFamilyFromRtpParameters(consumer.rtpParameters),
             probeId: consumerId,
-          } satisfies E2EETransformOptions);
+          };
+          receiver.transform = new RTCRtpScriptTransform(worker, transformOptions);
           this.scheduleBypassProbe(consumerId, probe.senderUserId, 'reattached', 1);
         } catch (err) {
           this.closeConsumerAfterDecryptTransformFailure(

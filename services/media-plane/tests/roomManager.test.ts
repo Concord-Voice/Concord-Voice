@@ -4,6 +4,7 @@ import {
   createMockTransport,
   createMockProducer,
   createMockConsumer,
+  createMockWorker,
   createRtpCapabilities,
   createRtpParameters,
 } from './mocks/mediasoup.js';
@@ -91,9 +92,18 @@ import {
 // ---------------------------------------------------------------------------
 
 function createMockMediasoupService(router = createMockRouter()) {
+  const worker = createMockWorker();
   return {
     getOrCreateRouter: vi.fn().mockResolvedValue(router),
     removeRouter: vi.fn(),
+    captureNativeTermination: vi.fn((targetRouter, transportIds?: readonly string[]) => ({
+      worker,
+      router: targetRouter,
+      routerId: targetRouter.id,
+      transportIds: transportIds === undefined ? undefined : [...transportIds],
+    })),
+    confirmNativeTermination: vi.fn().mockResolvedValue(undefined),
+    confirmAllRoutersClosed: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -4972,14 +4982,17 @@ describe('RoomManager', () => {
 
     it('closes the orphan and fails closed when the participant left mid-create', async () => {
       const orphan = createMockTransport();
+      let leaving!: Promise<void>;
       mockRouter.createWebRtcTransport.mockImplementationOnce(async () => {
-        await manager.leaveRoom('room-1', 'u-1');
+        // Local deletion precedes native proof, which waits for this creation.
+        leaving = manager.leaveRoom('room-1', 'u-1');
         return orphan;
       });
 
       await expect(manager.createTransport('room-1', 'u-1', 'recv')).rejects.toThrow(
         /Participant left during transport creation/
       );
+      await leaving;
       expect(orphan.close).toHaveBeenCalled();
     });
 
@@ -7415,6 +7428,112 @@ describe('RoomManager', () => {
       return { recvTransport, consumer, result };
     }
 
+    // Regression for #2624: recorded desired state must not suppress unfinished media effects.
+    describe('same-revision snapshot redelivery', () => {
+      async function setupSnapshotMedia() {
+        const roomId = 'room-snapshot-redelivery';
+        await joinRoomWithSupportedCrypto(manager, roomId, 'u-source', 'sock-source', {
+          username: 'source',
+        });
+        const { info } = await setupProducer(manager, mockRouter, roomId, 'u-source');
+        await joinRoomWithSupportedCrypto(
+          manager,
+          roomId,
+          'u-target',
+          'sock-target',
+          { username: 'target' },
+          createRtpCapabilities() as any
+        );
+        const { producer } = await setupProducer(manager, mockRouter, roomId, 'u-target');
+        const { consumer } = await setupConsumer(
+          manager,
+          mockRouter,
+          roomId,
+          'u-target',
+          info.producerId
+        );
+        const pausedProducer = Object.assign(producer, { paused: false });
+        const pausedConsumer = Object.assign(consumer, { paused: false });
+        // Fresh boundary mocks have no queued failures or setup calls to satisfy assertions.
+        producer.pause.mockReset().mockImplementation(async () => {
+          pausedProducer.paused = true;
+        });
+        consumer.pause.mockReset().mockImplementation(async () => {
+          pausedConsumer.paused = true;
+        });
+        producer.resume.mockReset();
+        consumer.resume.mockReset();
+        return { roomId, producer: pausedProducer, consumer: pausedConsumer };
+      }
+
+      it.each([
+        { failedPause: 'producer', initialConsumerPauses: 0, initialProducerPaused: false },
+        { failedPause: 'consumer', initialConsumerPauses: 1, initialProducerPaused: true },
+      ] as const)(
+        'retries an unfinished $failedPause pause at the same revision while retaining restrictions',
+        async ({ failedPause, initialConsumerPauses, initialProducerPaused }) => {
+          const { roomId, producer, consumer } = await setupSnapshotMedia();
+          const pause = failedPause === 'producer' ? producer.pause : consumer.pause;
+          pause.mockRejectedValueOnce(new Error(`${failedPause} pause failed`));
+
+          await expect(
+            manager.applyServerEnforcementSnapshot(roomId, 'u-target', true, true, 10n)
+          ).rejects.toThrow(`${failedPause} pause failed`);
+          // These calls prove the real snapshot path reached the mediasoup boundary.
+          expect(producer.pause).toHaveBeenCalledTimes(1);
+          expect(consumer.pause).toHaveBeenCalledTimes(initialConsumerPauses);
+          expect(producer.paused).toBe(initialProducerPaused);
+          expect(consumer.paused).toBe(false);
+          expect(manager.getParticipant(roomId, 'u-target')).toMatchObject({
+            serverMuted: true,
+            serverDeafened: true,
+          });
+
+          const applied = await manager.applyServerEnforcementSnapshot(
+            roomId,
+            'u-target',
+            true,
+            true,
+            10n
+          );
+          expect(producer.paused).toBe(true);
+          expect(consumer.paused).toBe(true);
+          expect(pause).toHaveBeenCalledTimes(2);
+          expect(applied).toBe(true);
+          expect(manager.getParticipant(roomId, 'u-target')).toMatchObject({
+            serverMuted: true,
+            serverDeafened: true,
+          });
+          expect(producer.resume).not.toHaveBeenCalled();
+          expect(consumer.resume).not.toHaveBeenCalled();
+        }
+      );
+
+      it('leaves a fully completed equal revision inert', async () => {
+        const { roomId, producer, consumer } = await setupSnapshotMedia();
+
+        await expect(
+          manager.applyServerEnforcementSnapshot(roomId, 'u-target', true, true, 10n)
+        ).resolves.toBe(true);
+        expect(producer.paused).toBe(true);
+        expect(consumer.paused).toBe(true);
+        expect(producer.pause).toHaveBeenCalledTimes(1);
+        expect(consumer.pause).toHaveBeenCalledTimes(1);
+
+        await expect(
+          manager.applyServerEnforcementSnapshot(roomId, 'u-target', true, true, 10n)
+        ).resolves.toBe(false);
+        expect(producer.paused).toBe(true);
+        expect(consumer.paused).toBe(true);
+        expect(producer.pause).toHaveBeenCalledTimes(1);
+        expect(consumer.pause).toHaveBeenCalledTimes(1);
+        expect(manager.getParticipant(roomId, 'u-target')).toMatchObject({
+          serverMuted: true,
+          serverDeafened: true,
+        });
+      });
+    });
+
     it('retries a failed mute pause when a newer snapshot remains muted', async () => {
       await joinRoomWithSupportedCrypto(manager, 'room-snapshot-retry', 'u-1', 'sock-1', {
         username: 'alice',
@@ -7724,7 +7843,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
    */
   async function setupRoomWithAudioConsumer(): Promise<{
     rm: RoomManager;
-    room: import('../src/lib/roomManager.js').Room;
+    room: Room;
     userId: string;
     consumer: ReturnType<typeof createMockConsumer>;
   }> {
@@ -7772,7 +7891,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
   }
 
   function getConsumer(
-    room: import('../src/lib/roomManager.js').Room,
+    room: Room,
     userId: string,
     consumerId: string
   ) {
@@ -7786,7 +7905,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
    * pauses/resumes consumers. In a room at/under N last-N is a no-op — that path
    * has its own dedicated suite (`audio last-N small-room no-op (#1742)`).
    */
-  function makeRoomOverCap(room: import('../src/lib/roomManager.js').Room): void {
+  function makeRoomOverCap(room: Room): void {
     while (room.micProducerIds.size <= resolveAudioLastN(room)) {
       room.micProducerIds.add(`filler-${room.micProducerIds.size}`);
     }
@@ -7935,7 +8054,7 @@ describe('audio last-N small-room no-op (#1742)', () => {
    */
   async function setupSmallRoom(opts: { overCap?: boolean } = {}): Promise<{
     rm: RoomManager;
-    room: import('../src/lib/roomManager.js').Room;
+    room: Room;
     router: ReturnType<typeof createMockRouter>;
     consumer: ReturnType<typeof createMockConsumer>;
   }> {
@@ -8603,10 +8722,11 @@ describe('ICE outcome counters (#3104)', () => {
     const departedParticipant = manager.getParticipant('room-1', 'u-1')!;
     const creation = manager.createTransport('room-1', 'u-1', 'recv');
     await bitrateCapEntered;
-    await manager.leaveRoom('room-1', 'u-1');
+    const leaving = manager.leaveRoom('room-1', 'u-1');
     releaseBitrateCap();
 
     await expect(creation).rejects.toThrow(/Participant left during transport creation/);
+    await leaving;
     expect(departedParticipant.pendingRecvTransports).toBe(0);
     expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
     expect(orphan.close).toHaveBeenCalledTimes(1);
@@ -8641,7 +8761,7 @@ describe('ICE outcome counters (#3104)', () => {
     const departedParticipant = manager.getParticipant('room-1', 'u-1')!;
     const creation = manager.createTransport('room-1', 'u-1', 'recv');
     await bitrateCapEntered;
-    await manager.leaveRoom('room-1', 'u-1');
+    const leaving = manager.leaveRoom('room-1', 'u-1');
     // Model mediasoup's router-close path winning the race while the cap call
     // is still awaiting: the orphan is already closed by the time cleanup
     // reaches the participant-identity check.
@@ -8649,6 +8769,7 @@ describe('ICE outcome counters (#3104)', () => {
     releaseBitrateCap();
 
     await expect(creation).rejects.toThrow(/Participant left during transport creation/);
+    await leaving;
     expect(departedParticipant.pendingRecvTransports).toBe(0);
     expect(orphan.close).not.toHaveBeenCalled();
     expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);

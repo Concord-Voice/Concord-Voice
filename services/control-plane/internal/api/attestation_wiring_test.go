@@ -3,6 +3,9 @@ package api
 
 import (
 	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -207,11 +210,27 @@ func TestBuildOIDCVerifier_DisabledReturnsNil(t *testing.T) {
 }
 
 // TestBuildOIDCVerifier_DisabledValidIssuerReturnsVerifier covers the success
-// branch of the helper. With a reachable issuer (GitHub's canonical URL), the
-// helper returns a non-nil verifier without firing either log path.
+// branch of the helper using real discovery against a test-owned local issuer.
+// The document's issuer must match the configured URL exactly.
 func TestBuildOIDCVerifier_DisabledValidIssuerReturnsVerifier(t *testing.T) {
+	mux := http.NewServeMux()
+	issuer := httptest.NewServer(mux)
+	t.Cleanup(issuer.Close)
+	discovery, err := json.Marshal(map[string]any{
+		"issuer":                                issuer.URL,
+		"jwks_uri":                              issuer.URL + "/jwks",
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+	})
+	require.NoError(t, err)
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write(discovery); err != nil {
+			t.Errorf("write OIDC discovery document: %v", err)
+		}
+	})
+
 	cfg := newDisabledAttestationConfig()
-	cfg.OIDCIssuer = "https://token.actions.githubusercontent.com"
+	cfg.OIDCIssuer = issuer.URL
 	log := logger.New("test")
 	v := buildOIDCVerifier(t.Context(), cfg, log)
 	require.NotNil(t, v, "valid issuer on disabled path must return non-nil verifier")

@@ -60,6 +60,7 @@ type controlPlaneSubcommandRunners struct {
 	activityHistory         func([]string) int
 	storageProbe            func([]string) int
 	voiceEnforcementRollout func([]string) int
+	voiceCommandOwner       func([]string) int
 }
 
 func dispatchControlPlaneSubcommand(args []string) (int, bool) {
@@ -68,6 +69,7 @@ func dispatchControlPlaneSubcommand(args []string) (int, bool) {
 		activityHistory:         presencehistory.RunAdminCtl,
 		storageProbe:            probe.Run,
 		voiceEnforcementRollout: runVoiceEnforcementRollout,
+		voiceCommandOwner:       runVoiceCommandOwnerRecovery,
 	})
 }
 
@@ -87,13 +89,15 @@ func dispatchControlPlaneSubcommandWithRunners(
 		return runners.storageProbe(args[2:]), true
 	case "voice-enforcement-rollout":
 		return runners.voiceEnforcementRollout(args[2:]), true
+	case "voice-command-owner":
+		return runners.voiceCommandOwner(args[2:]), true
 	case "serve":
 		return 0, false
 	default:
 		if args[1] == "" {
 			return 0, false
 		}
-		fmt.Fprintln(os.Stderr, "usage: control-plane [admin|activity-history|storage-probe|voice-enforcement-rollout] ...")
+		fmt.Fprintln(os.Stderr, "usage: control-plane [admin|activity-history|storage-probe|voice-enforcement-rollout|voice-command-owner] ...")
 		return 64, true
 	}
 }
@@ -317,6 +321,11 @@ func runControlPlane() (runErr error) {
 	router := runtime.router
 	hub := runtime.hub
 	natsClient := runtime.natsClient
+	waitVoiceCommandTransport := startVoiceCommandTransportWorker(cleanupCtx, db, cfg.NATSUrl, log)
+	defer func() {
+		cleanupCancel()
+		waitVoiceCommandTransport()
+	}()
 	var expirySweeper *expiration.Sweeper
 	var expirationWorkers sync.WaitGroup
 	waitActivityHistoryWorkers := runtime.waitWorkers
@@ -325,6 +334,7 @@ func runControlPlane() (runErr error) {
 		expirationWorkers.Wait()
 		waitActivityHistoryWorkers()
 		waitTier1ErasureReclaimer()
+		waitVoiceCommandTransport()
 		if voicePermissionEnforcer != nil {
 			voicePermissionEnforcer.Close()
 		}

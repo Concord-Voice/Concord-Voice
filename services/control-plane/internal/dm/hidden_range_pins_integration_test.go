@@ -80,7 +80,7 @@ func TestInsertHiddenRange_ReinsertRoundTripsBounds(t *testing.T) {
 
 	rows, err := db.Query(`
 		SELECT hidden_from::text, hidden_to, includes_own FROM dm_message_hidden_ranges
-		WHERE user_id = $1 AND conversation_id = $2 ORDER BY hidden_from`, alice, convID)
+		WHERE user_id = $1 AND conversation_id = $2 ORDER BY dm_message_hidden_ranges.hidden_from`, alice, convID)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rows.Close()) }()
 	type stored struct {
