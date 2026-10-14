@@ -273,6 +273,9 @@ type Handler struct {
 	// tier1UploadCommit is a package-test seam for definite versus ambiguous
 	// profile-upload metadata commits. Production uses tx.Commit.
 	tier1UploadCommit func(*sql.Tx) error
+	// dmIconCommit is a package-test seam for private icon read completion.
+	// Production uses tx.Commit.
+	dmIconCommit func(*sql.Tx) error
 	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
 	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
 	mfaVerifier stepup.MFATxCodeVerifier
@@ -880,17 +883,36 @@ func (h *Handler) ProxyServerBanner(c *gin.Context) {
 
 // ProxyDMIcon serves a group DM's icon through the control plane.
 // GET /api/v1/media/dm-icons/:conversationId
-// Public: the unguessable UUID is the only identifier. Members already
-// know it; non-members can't enumerate it. Membership check removed so
-// plain <img> tags can render without an Authorization header.
+// Current membership is locked through complete retrieval, before HTTP writing.
 func (h *Handler) ProxyDMIcon(c *gin.Context) {
-	conversationID := c.Param("conversationId")
-	if _, err := uuid.Parse(conversationID); err != nil {
+	c.Header(headerCacheControl, "private, no-store")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), dmIconReadTimeout)
+	defer cancel()
+
+	viewerID, err := uuid.Parse(c.GetString("user_id"))
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+	conversationID, err := uuid.Parse(c.Param("conversationId"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid conversation ID"})
 		return
 	}
 
-	h.proxyTier1Media(c, fmt.Sprintf("dm-icons/%s", conversationID), true)
+	image, err := h.loadDMIcon(ctx, viewerID, conversationID)
+	if err != nil {
+		switch {
+		case errors.Is(err, errDMIconNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+		case errors.Is(err, errDMIconStorageUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalServer})
+		}
+		return
+	}
+	c.Data(http.StatusOK, image.contentType, image.body)
 }
 
 // ProxyFeedbackScreenshot serves a bug-report screenshot through the control plane.

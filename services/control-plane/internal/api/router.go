@@ -62,6 +62,8 @@ import (
 // It runs off the hub Run goroutine, so this bounds the worker, not the loop.
 const richPresenceSuppressTimeout = 5 * time.Second
 
+const headerCacheControl = "Cache-Control"
+
 // Route path constants — extracted to satisfy go:S1192 (no duplicate string literals).
 const (
 	routeTransferOwnership = "/:id/transfer-ownership"
@@ -297,6 +299,13 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 	// response status has been changed to 500.
 	router.Use(gin.Recovery())
 	return counters
+}
+
+func privateDMIconCacheControl(c *gin.Context) {
+	if c.Request.Method == http.MethodGet && c.FullPath() == "/api/v1/media/dm-icons/:conversationId" {
+		c.Header(headerCacheControl, "private, no-store")
+	}
+	c.Next()
 }
 
 func normalizeLifecycleContext(ctx context.Context) context.Context {
@@ -757,6 +766,23 @@ func wireMediaHandler(
 	}
 }
 
+// selectDMIconReadHandler preserves the nil signal used by other media wiring.
+func selectDMIconReadHandler(
+	mediaHandler *media.Handler,
+	db *sql.DB,
+	log *logger.Logger,
+	cfg *config.Config,
+	resolver *rbac.Resolver,
+	tiers entitlements.TierResolver,
+	serverTiers entitlements.ServerTierResolver,
+) *media.Handler {
+	dmIconReadHandler := mediaHandler
+	if dmIconReadHandler == nil {
+		dmIconReadHandler = media.NewHandler(db, nil, log, cfg, resolver, tiers, serverTiers)
+	}
+	return dmIconReadHandler
+}
+
 func newHubWithSecurityEvents(db *sql.DB, redis *redis.Client, counters *opsmetrics.Counters, events securityevent.Emitter) *websocket.Hub {
 	hub := websocket.NewHub(db, redis, counters)
 	hub.SetSecurityEvents(events)
@@ -839,6 +865,7 @@ func NewRouter(
 
 	// Middleware
 	opsCounters := configureOpsMetricsAndRecovery(router, cfg.OpsMetrics.Enabled)
+	router.Use(privateDMIconCacheControl)
 	router.Use(middleware.RequestID())
 	router.Use(nightwatchSecurityObserver(securityEvents))
 	router.Use(middleware.Logger(log))
@@ -1320,7 +1347,7 @@ func NewRouter(
 	}
 	// API v1 routes
 	noStore := func(c *gin.Context) {
-		c.Header("Cache-Control", "no-store")
+		c.Header(headerCacheControl, "no-store")
 		c.Next()
 	}
 	v1 := router.Group("/api/v1")
@@ -1550,10 +1577,8 @@ func NewRouter(
 		// Uploads + deletes remain authenticated. Rate-limited per IP since
 		// there is no user context.
 		//
-		// server-icons, server-banners, and dm-icons are also public Tier 1
-		// media: the unguessable UUID is the only identifier and they need to
-		// render via plain <img> tags without an Authorization header.
-		// Membership checks have been removed from their handlers.
+		// Server icons and server banners are also public Tier 1 assets.
+		// DM icons are registered in the protected media group below.
 		if mediaHandler != nil {
 			v1.GET("/media/avatars/:user_id",
 				noStore,
@@ -1573,10 +1598,6 @@ func NewRouter(
 				middleware.RateLimitByIP(redis, 120, 1*time.Minute),
 				mediaHandler.ProxyServerBanner,
 			)
-			v1.GET("/media/dm-icons/:conversationId",
-				middleware.RateLimitByIP(redis, 60, 1*time.Minute),
-				mediaHandler.ProxyDMIcon,
-			)
 			// Public so GitHub's camo image proxy can fetch screenshots embedded
 			// in filed bug-report issues without an Authorization header (#1747).
 			v1.GET("/media/feedback-screenshots/:id",
@@ -1588,14 +1609,13 @@ func NewRouter(
 			// Match the protected fallback below so misconfiguration fails
 			// with a clear 503 instead of a 404 for all public Tier 1 routes.
 			mediaUnavailable := func(c *gin.Context) {
-				c.Header("Cache-Control", "no-store")
+				c.Header(headerCacheControl, "no-store")
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "media storage not configured"})
 			}
 			v1.GET("/media/avatars/:user_id", mediaUnavailable)
 			v1.GET("/media/banners/:user_id", mediaUnavailable)
 			v1.GET("/media/server-icons/:server_id", mediaUnavailable)
 			v1.GET("/media/server-banners/:server_id", mediaUnavailable)
-			v1.GET("/media/dm-icons/:conversationId", mediaUnavailable)
 			v1.GET("/media/feedback-screenshots/:id", feedbackHandler.RequireEnabled, mediaUnavailable)
 		}
 
@@ -3048,12 +3068,15 @@ func NewRouter(
 		}
 
 		// Media routes (object storage uploads, proxy, presigned URLs)
-		// Only registered when storage is configured (nil in tests without MinIO).
-		// The misconfig fallback lives on the public v1 group above so a single
-		// `/api/v1/media/*path` wildcard handles every method/path consistently
-		// (registering it on both v1 and protected would collide on the engine
-		// route tree).
+		// DM icon reads retain membership admission when storage is unavailable.
+		// Other media routes use explicit 503 fallbacks when storage is nil;
+		// public asset GET fallbacks are registered on v1 above.
 		mediaRoutes := protected.Group("/media")
+		dmIconReadHandler := selectDMIconReadHandler(mediaHandler, db, log, cfg, rbacResolver, entCache, serverEntCache)
+		mediaRoutes.GET("/dm-icons/:conversationId",
+			middleware.RateLimitByIP(redis, 60, 1*time.Minute),
+			dmIconReadHandler.ProxyDMIcon,
+		)
 		if mediaHandler != nil {
 			// Tier 1 uploads (authenticated, server-processed)
 			mediaRoutes.POST("/upload/avatar",

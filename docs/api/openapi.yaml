@@ -8366,12 +8366,28 @@ paths:
       - Media
       summary: Get a group DM's icon image
       operationId: mediaProxyDMIcon
-      description: 'Public Tier 1 image proxy — the unguessable conversation UUID is the only identifier.
+      description: >-
+        Bearer-authenticated read for a current participant in the conversation.
+        Existing global controls and bearer authentication run before the inherited
+        client-version, enabled attestation, and verified-email policies; those
+        policies run before the membership lookup. Hidden current participants
+        remain members.
 
-        Rate limit: 60 requests per minute (IP-based).
+        Every matched GET response, including early middleware refusals, carries
+        Cache-Control: private, no-store. Unknown conversations, nonmembers,
+        removed participants, and missing icons return the same generic 404.
 
-        '
-      security: []
+        Rate limit: 60 requests per minute, keyed by IP, method, and route template.
+        All conversation IDs share that budget. Authentication and policy
+        refusals do not reach this route limiter.
+
+        A successful read returns the complete stored bytes and content type
+        after checked retrieval and transaction completion, with a 5 MiB size
+        ceiling and a request-derived five-second operation context. A read
+        admitted before participant removal may finish after that removal;
+        participant locks are released before HTTP output.
+      security:
+      - BearerAuth: []
       parameters:
       - name: conversationId
         in: path
@@ -8382,33 +8398,126 @@ paths:
         description: DM conversation UUID
       responses:
         '200':
-          description: Group DM icon image stream (content type from storage)
+          description: 'Complete group DM icon bytes (content type from storage)'
           headers:
             Cache-Control:
-              description: public, max-age=3600, must-revalidate
+              description: Applies to every matched DM-icon GET response
               schema:
                 type: string
+                enum:
+                - private, no-store
           content:
             image/*:
               schema:
                 type: string
                 format: binary
         '400':
-          description: Invalid conversation ID (not a UUID)
+          description: 'Invalid conversation ID or an existing global request-header rejection'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: 'Missing or invalid bearer authentication'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: 'Bearer account-state refusal or inherited client-version, attestation, or verified-email policy refusal'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/AccountDisabledError'
         '404':
-          description: No icon stored for this conversation
+          description: 'Uniform Not found for an unknown conversation, nonmember, removed participant, or missing icon'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          description: 'Too many requests: the shared 60-per-minute IP route budget is exhausted'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
+            Retry-After:
+              description: Seconds until the route window resets
+              schema:
+                type: integer
+            X-RateLimit-Limit:
+              description: Maximum requests allowed in the window
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining (zero on this response)
+              schema:
+                type: integer
+                example: 0
+            X-RateLimit-Reset:
+              description: Unix timestamp when the route window resets
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateLimitError'
+        '500':
+          description: 'Generic internal error during membership, storage retrieval, read, Close, size, cancellation, or transaction completion; no icon bytes'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
-          description: Media storage not configured
+          description: 'An inherited authentication or attestation dependency is unavailable, or object storage is absent after successful member admission'
+          headers:
+            Cache-Control:
+              description: Applies to every matched DM-icon GET response
+              schema:
+                type: string
+                enum:
+                - private, no-store
           content:
             application/json:
               schema:

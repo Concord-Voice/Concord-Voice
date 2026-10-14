@@ -2335,24 +2335,20 @@ func TestUploadDMIconMissingConversationID(t *testing.T) {
 	assert.Contains(t, resp["error"], "conversation_id")
 }
 
-// TestProxyDMIconPublic asserts dm-icons are now a public Tier 1 route. Group
-// DM members already know the conversation UUID; non-members can't enumerate
-// it. Membership-based 403s were removed in commit b31f591 to fix #571 #12.
-func TestProxyDMIconPublic(t *testing.T) {
+// TestProxyDMIconNonmember denies a known group UUID with a stored icon.
+func TestProxyDMIconNonmember(t *testing.T) {
 	ts := setupMediaTest(t)
 	admin := ts.createTestUser(t, "proxydmadm")
 	member := ts.createTestUser(t, "proxydmmem")
 	outsider := ts.createTestUser(t, "proxydmout")
 	convID := ts.createTestGroupDM(t, admin, member)
-
-	// Put an icon in the store
 	key := fmt.Sprintf(fmtDMIconsKey, convID)
-	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
-
-	// Outsider can fetch the icon — public route, only the unguessable UUID gates discovery.
-	w := ts.doJSON(ts.handler.ProxyDMIcon, "GET", "/api/v1/media/dm-icons/"+convID, outsider, gin.Params{{Key: "conversationId", Value: convID}})
-
-	assert.Equal(t, http.StatusOK, w.Code)
+	require.NoError(t, ts.store.PutObject(context.Background(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
+	w := ts.doJSON(ts.handler.ProxyDMIcon, http.MethodGet, "/api/v1/media/dm-icons/"+convID, outsider, gin.Params{{Key: "conversationId", Value: convID}})
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.JSONEq(t, `{"error":"Not found"}`, w.Body.String())
+	assert.Zero(t, ts.store.GetObjectCalls())
+	assert.Equal(t, "private, no-store", w.Header().Get("Cache-Control"))
 }
 
 func TestUploadDMIconSuccess(t *testing.T) {
@@ -2413,8 +2409,8 @@ func TestProxyDMIconSuccess(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
-	assert.Contains(t, w.Header().Get("Cache-Control"), "max-age=3600")
-	assert.NotEmpty(t, w.Body.Bytes(), "response body should contain image data")
+	assert.Equal(t, "private, no-store", w.Header().Get("Cache-Control"))
+	assert.Equal(t, pngData, w.Body.Bytes())
 }
 
 func TestUploadDMIconInvalidConversationID(t *testing.T) {

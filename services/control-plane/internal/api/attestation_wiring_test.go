@@ -177,12 +177,29 @@ func TestBuildAttestationHandler_DisabledAcceptsNilRedis(t *testing.T) {
 	require.NotNil(t, h, "nil rdb must be tolerated on the disabled path")
 }
 
+// wiringOIDCDiscovery serves the metadata needed by the real OIDC constructor.
+// These wiring tests do not verify publisher tokens or fetch signing keys.
+func wiringOIDCDiscovery(t *testing.T) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"issuer": server.URL, "jwks_uri": server.URL + "/jwks",
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		}); err != nil {
+			t.Errorf("encode local OIDC discovery: %v", err)
+		}
+	})
+	return server.URL
+}
+
 // TestBuildAttestationHandler_DisabledWithValidOIDCIssuer covers the OIDC
-// verifier success branch (the previous tests cover the empty-issuer failure
-// branch). Uses the real production issuer URL — coreos/go-oidc's discovery
-// hits GitHub's .well-known endpoint. If the network is unreachable, the
-// wiring still returns a non-nil Handler via the warning path; this test
-// asserts construction succeeds without panic in either outcome.
+// verifier success branch using local discovery (the previous tests cover
+// the empty-issuer failure branch). It asserts construction succeeds without
+// panic and returns a non-nil Handler.
 //
 // Marked t.Parallel() candidate? No — Cache.Start spawns a goroutine that
 // reads ctx via context.Background(), shared across the test process.
@@ -191,7 +208,7 @@ func TestBuildAttestationHandler_DisabledWithValidOIDCIssuer(t *testing.T) {
 	db := openWiringTestDB(t)
 	log := logger.New("test")
 	cfg := newDisabledAttestationConfig()
-	cfg.OIDCIssuer = "https://token.actions.githubusercontent.com"
+	cfg.OIDCIssuer = wiringOIDCDiscovery(t)
 
 	require.NotPanics(t, func() {
 		h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
@@ -213,24 +230,8 @@ func TestBuildOIDCVerifier_DisabledReturnsNil(t *testing.T) {
 // branch of the helper using real discovery against a test-owned local issuer.
 // The document's issuer must match the configured URL exactly.
 func TestBuildOIDCVerifier_DisabledValidIssuerReturnsVerifier(t *testing.T) {
-	mux := http.NewServeMux()
-	issuer := httptest.NewServer(mux)
-	t.Cleanup(issuer.Close)
-	discovery, err := json.Marshal(map[string]any{
-		"issuer":                                issuer.URL,
-		"jwks_uri":                              issuer.URL + "/jwks",
-		"id_token_signing_alg_values_supported": []string{"RS256"},
-	})
-	require.NoError(t, err)
-	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(discovery); err != nil {
-			t.Errorf("write OIDC discovery document: %v", err)
-		}
-	})
-
 	cfg := newDisabledAttestationConfig()
-	cfg.OIDCIssuer = issuer.URL
+	cfg.OIDCIssuer = wiringOIDCDiscovery(t)
 	log := logger.New("test")
 	v := buildOIDCVerifier(t.Context(), cfg, log)
 	require.NotNil(t, v, "valid issuer on disabled path must return non-nil verifier")

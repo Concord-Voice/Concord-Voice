@@ -14,10 +14,11 @@ import (
 
 // mockStore is an in-memory ObjectStore implementation for testing.
 type mockStore struct {
-	mu      sync.Mutex
-	objects map[string]*mockObject
-	putErr  error // if non-nil, PutObject returns this error
-	getErr  error // if non-nil, GetObject returns this error (see friend_avatar_outage_test.go)
+	mu       sync.Mutex
+	objects  map[string]*mockObject
+	putErr   error // if non-nil, PutObject returns this error
+	getCalls int
+	getErr   error // if non-nil, GetObject returns this error (see friend_avatar_outage_test.go)
 	// getPartial, when non-nil, makes GetObject SUCCEED and hand back a reader
 	// that yields these bytes and then fails — a connection dropped mid-transfer.
 	// The pre-read and mid-read failures are the same defect at two moments.
@@ -67,6 +68,7 @@ func (m *mockStore) PutObject(_ context.Context, key string, reader io.Reader, _
 func (m *mockStore) GetObject(_ context.Context, key string) (io.ReadCloser, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.getCalls++
 	if m.getPartial != nil {
 		return &partialReader{data: m.getPartial}, "image/png", nil
 	}
@@ -154,4 +156,11 @@ func (m *mockStore) ListIncompleteUploads(
 	_ context.Context, _ time.Time,
 ) ([]storage.IncompleteUpload, error) {
 	return nil, errMockStoreNoMultipart
+}
+
+// GetObjectCalls records every acquisition attempt, including missing objects.
+func (m *mockStore) GetObjectCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.getCalls
 }

@@ -49,10 +49,28 @@ The response bodies, security alternatives, header requirements, and error
 shapes are canonical in [openapi.yaml](./openapi.yaml). Keep client integrations
 bound to those operation definitions rather than duplicating them here.
 
+### Private DM Icon Reads
+
+`GET /media/dm-icons/{conversationId}` requires Bearer authentication and current
+conversation membership, after the inherited client-version, enabled attestation,
+and verified-email gates. Hidden current participants remain members. Unknown
+conversations, nonmembers, removed participants, and missing icons return the same
+generic `404`. An admitted member receives `503` when object storage is absent.
+
+Every matched GET response carries `Cache-Control: private, no-store`, including
+middleware refusals. Successful reads return complete bytes only after bounded
+retrieval, checked reader Close, and transaction Commit. A GET admitted before
+removal may finish afterward; membership locks are released before HTTP output.
+See `mediaProxyDMIcon` in [openapi.yaml](./openapi.yaml) for the full response,
+size, deadline, and rate-limit contract. Public image reads and upload authorization
+keep their existing policies. The path and operation ID remain unchanged, so this
+protection does not add an operation to the inventory.
+
 ## Endpoint Groups
 
-The rows below are the OpenAPI **tags** declared in [openapi.yaml](./openapi.yaml),
-one row per tag, with representative paths. **This table is a hand-maintained
+The public rows below are the OpenAPI **tags used by operations** in
+[openapi.yaml](./openapi.yaml), followed by the admin metrics tag. Not every used
+tag appears in the public spec's top-level `tags` list. **This table is a hand-maintained
 orientation aid, not the inventory.** For the authoritative list, run the extractor:
 
 ```bash
@@ -63,26 +81,27 @@ It prints the union of supported operations from both surfaces and the
 `verify-openapi-coverage` CI job checks it against the router in both drift
 directions, so it cannot fall behind the way this table can.
 
-Counts as of 2026-09-19: 27 tags and 277 operations in `openapi.yaml`, plus 4
-`Admin Metrics` operations in `admin-metrics.openapi.yaml`.
+Counts measured on 2026-10-13: 287 operations use 27 tags in `openapi.yaml`
+(24 tags are declared in its top-level list), plus 4 `Admin Metrics` operations
+in `admin-metrics.openapi.yaml`: 291 supported operations across both surfaces.
 
 | Tag | Ops | Representative paths | Auth |
 | --- | ---: | --- | --- |
-| Auth | 24 | `/auth/{register,login,refresh,logout,ws-ticket}`, `/auth/register/*`, `/auth/recovery/*`, `/auth/sso/{provider}/*`, `/auth/mfa/{verify,email/send}` | Mixed — public (rate-limited), refresh cookie or `X-Refresh-Token`, MFA challenge token, Bearer for `ws-ticket` |
-| MFA | 34 | `/mfa/{status,totp/*,webauthn/*,backup-codes/*,trusted-devices/*,recovery-*,backup-email,email-sms/*}` | Bearer |
-| Users | 19 | `/users/me`, `/users/me/{keys,password,preferences,security,saved-gifs,sso-identities,friend-organization}`, `/users/search`, `/users/{user_id}/{profile,public-key,friend-request-eligibility}` | Bearer |
+| Auth | 26 | `/auth/{register,login,refresh,logout,ws-ticket}`, `/auth/register/*`, `/auth/recovery/*`, `/auth/sso/{provider}/*`, `/auth/mfa/{verify,email/send}` | Mixed — public (rate-limited), refresh cookie or `X-Refresh-Token`, MFA challenge token, Bearer for `ws-ticket` |
+| MFA | 35 | `/mfa/{status,totp/*,webauthn/*,backup-codes/*,trusted-devices/*,recovery-*,backup-email,email-sms/*}` | Bearer |
+| Users | 20 | `/users/me`, `/users/me/{keys,password,preferences,security,saved-gifs,sso-identities,friend-organization}`, `/users/search`, `/users/{user_id}/{profile,public-key,friend-request-eligibility}` | Bearer |
 | Sessions | 4 | `/sessions`, `/sessions/{id}`, `/sessions/{revoke-all,revocation-mode}` | Bearer |
-| Servers | 20 | `/servers`, `/servers/{id}`, `/servers/unread-status`, `/servers/{id}/{roles,roles/{role_id},roles/reorder,permissions,audit-log,entitlements,mute-states,transfer-ownership}`, `/ownership/reverse/{token}` | Bearer |
+| Servers | 22 | `/servers`, `/servers/{id}`, `/servers/unread-status`, `/servers/{id}/{roles,roles/{role_id},roles/reorder,permissions,audit-log,entitlements,mute-states,transfer-ownership}`, `/ownership/reverse/{token}` | Bearer |
 | Members | 12 | `/servers/{id}/members`, `/servers/{id}/members/{userId}`, `/servers/{id}/bans`, `/servers/{id}/member-public-keys` | Bearer |
 | Invites | 7 | `/servers/{id}/invites`, `/invites/join`, `/invites/{code}`, `/invites/{code}/{icon,preview}` | Mixed — preview/icon public, the rest Bearer |
-| Channels | 13 | `/channels`, `/channels/{id}`, `/channels/{id}/{read,overrides}` | Bearer |
+| Channels | 14 | `/channels`, `/channels/{id}`, `/channels/{id}/{read,overrides}` | Bearer |
 | ChannelGroups | 8 | `/servers/{id}/channel-groups`, `/categories/{id}/overrides`, `/categories/{id}/overrides/{override_id}` | Bearer |
 | Messages | 13 | `/channels/{id}/messages`, `/channels/{id}/messages/bulk`, `/channels/{id}/pins`, `/messages/{id}` | Bearer |
-| DM | 30 | `/dm/conversations`, `/dm/conversations/{personal,group}`, `/dm/conversations/{id}/{hide,clear}`, `/dm/conversations/{id}/{messages,members,keys,read}` | Bearer |
+| DM | 31 | `/dm/conversations`, `/dm/conversations/{personal,group}`, `/dm/conversations/{id}/{hide,clear}`, `/dm/conversations/{id}/{messages,members,keys,read}` | Bearer |
 | Direct Messages | 2 | `/dm/conversations/{id}/members/{userId}` | Bearer — a stray tag spelling of `DM` in the spec, listed so the row count reconciles |
 | E2EE | 9 | `/e2ee/pending-keys`, `/channels/{id}/keys`, `/channels/{id}/rotate-key`, `/dm/conversations/{id}/rotate-key` | Bearer |
-| Voice | 24 | `/channels/{id}/voice/{join,participants,authorize-action}`, `/servers/{id}/voice/{userId}/{mute,deafen,move,disconnect,temp-access}`, `/dm/conversations/{id}/voice/{join,ring,decline,cancel,participants}` | Bearer |
-| Media | 17 | `/media/{file_id}`, `/media/{attachments,avatars,banners,server-icons,server-banners,dm-icons}/…`, `/media/upload/{avatar,banner,attachment,server-icon,server-banner,dm-icon}`, `/media/upload/attachment/session/*` (chunked upload, #2157) | Mixed — reads public where the asset is, uploads Bearer |
+| Voice | 27 | `/channels/{id}/voice/{join,participants,authorize-action}`, `/servers/{id}/voice/{userId}/{mute,deafen,move,disconnect,temp-access}`, `/dm/conversations/{id}/voice/{join,ring,decline,cancel,participants}` | Bearer |
+| Media | 19 | `/media/{file_id}`, `/media/{attachments,avatars,banners,server-icons,server-banners,dm-icons}/…`, `/media/upload/{avatar,banner,attachment,server-icon,server-banner,dm-icon}`, `/media/upload/attachment/session/*` (chunked upload, #2157) | Mixed — DM-icon reads Bearer + current membership; public image reads remain public, uploads Bearer |
 | Friends | 6 | `/friends`, `/friends/request`, `/friends/request/{id}` | Bearer |
 | FriendCodes | 7 | `/friends/codes`, `/friends/codes/{code}`, `/friends/codes/{code}/{avatar,preview,claim}` | Mixed — preview/avatar public, the rest Bearer |
 | Presence | 8 | `/users/me/presence-history`, `/users/me/presence-history/settings` (Activity History), `/users/me/presence-overrides/{category}` (Custom Status) | Bearer; authenticated subject only |
@@ -153,6 +172,7 @@ timestamp. These events are invalidation signals; clients refetch current data.
 | --- | --- |
 | Auth endpoints | 5–30 requests / 15 min |
 | Read operations | 30 requests / min |
+| DM-icon reads | 60 requests / min per IP, method, and route template (all conversation IDs share the bucket) |
 | Write operations | 10 requests / min |
 | Destructive operations | 5 requests / min |
 
@@ -176,7 +196,7 @@ Activity History handler errors instead use a stable code and may include the cu
 
 Its bearer-token and rate-limit failures still use the existing `error` envelope. Global header validation, account state, email verification, and client-attestation gates retain their own documented shapes. See each OpenAPI operation for its exact response schema. The Activity History routes do not expose Custom Status delivery or quarantine error codes.
 
-Common status codes: `200 OK`, `201 Created`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `429 Too Many Requests`, `500 Internal Server Error`.
+Common status codes: `200 OK`, `201 Created`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `429 Too Many Requests`, `500 Internal Server Error`, `503 Service Unavailable`.
 
 ## Postman Collection
 
