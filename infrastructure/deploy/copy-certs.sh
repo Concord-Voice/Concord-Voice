@@ -167,7 +167,7 @@ state = value
 if isinstance(name, str) and name.startswith("/"):
     name = name[1:]
 if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", expected_project) or
-    name != "concordvoice-coturn" or image != "coturn/coturn:4.6.3-alpine" or
+    name != "concordvoice-coturn" or image != "coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e" or
     project != expected_project or service != "coturn" or not isinstance(state, dict)):
     sys.exit(3)
 status = state.get("Status")

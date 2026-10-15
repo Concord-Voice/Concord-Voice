@@ -16,7 +16,7 @@ import sys
 import time
 
 
-IMAGE = "coturn/coturn:4.6.3-alpine"
+IMAGE = "coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e"
 CERT_ROOT = "/opt/concord/certs/coturn"
 CERT_TARGET = "/etc/coturn/certs"
 CERT_PATH = CERT_TARGET + "/cert.pem"
@@ -97,7 +97,8 @@ def validate_model(model):
               _command_values(command, "-c") == [CONFIG_TARGET],
               "self-host TLS model refused")
         _need(_command_values(command, "--cert") == [CERT_PATH]
-              and _command_values(command, "--pkey") == [KEY_PATH],
+              and _command_values(command, "--pkey") == [KEY_PATH]
+              and not _command_values(command, "--cli"),
               "self-host TLS model refused")
         volumes = _required(service, "volumes", "self-host TLS model refused")
         _need(isinstance(volumes, list), "self-host TLS model refused")
@@ -200,7 +201,8 @@ def validate_container(container, project):
               and command and command[0] == "turnserver"
               and _command_values(command, "-c") == [CONFIG_TARGET]
               and _command_values(command, "--cert") == [CERT_PATH]
-              and _command_values(command, "--pkey") == [KEY_PATH],
+              and _command_values(command, "--pkey") == [KEY_PATH]
+              and not _command_values(command, "--cli"),
               "self-host TLS consumer refused")
         state = _required(container, "State", "self-host TLS consumer refused")
         _need(_required(state, "Status", "self-host TLS consumer refused") == "running"
