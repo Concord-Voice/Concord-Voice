@@ -324,8 +324,10 @@ func TestLedgerParseDevRefusals(t *testing.T) {
 
 // TestLedgerParseDevBoundsWorkBeforeSplit pins that the 319-character bound is
 // checked before strings.Split: ParseDev is exported, and splitting a long
-// string of separators would allocate about 16 MiB for it.
+// string of separators would allocate about 16 MiB for it. It stays serial,
+// for the reason allocDuring gives.
 func TestLedgerParseDevBoundsWorkBeforeSplit(t *testing.T) {
+	mustStaySerial(t)
 	long := strings.Repeat(".", 1<<20)
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)

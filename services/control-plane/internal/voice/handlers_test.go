@@ -699,8 +699,10 @@ func TestUserMute(t *testing.T) {
 
 		// UserMute is a moderation action, so a lower-ranked moderator cannot
 		// target a higher-ranked administrator.
+		seedOutboxVoiceSession(t, ts, channelID, admin.ID)
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, admin.ID, pathUserMute), nil, testhelpers.AuthHeaders(mod.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
+		requireNoServerOutboxCommands(t, ts.DB)
 	})
 
 	t.Run("TargetNotInVoice", func(t *testing.T) {
@@ -733,8 +735,10 @@ func TestUserMute(t *testing.T) {
 		require.NoError(t, err)
 
 		// actor has only base permissions (no MuteMembers)
+		seedOutboxVoiceSession(t, ts, channelID, target.ID)
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathUserMute), nil, testhelpers.AuthHeaders(actor.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
+		requireNoServerOutboxCommands(t, ts.DB)
 	})
 }
 
@@ -755,8 +759,10 @@ func TestUserDeafen(t *testing.T) {
 		_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, admin.ID)
 		require.NoError(t, err)
 
+		seedOutboxVoiceSession(t, ts, channelID, admin.ID)
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, admin.ID, pathUserDeafen), nil, testhelpers.AuthHeaders(mod.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
+		requireNoServerOutboxCommands(t, ts.DB)
 	})
 
 	t.Run("Success", func(t *testing.T) {
@@ -770,8 +776,13 @@ func TestUserDeafen(t *testing.T) {
 		_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, target.ID)
 		require.NoError(t, err)
 
+		seedOutboxVoiceSession(t, ts, channelID, target.ID)
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathUserDeafen), nil, testhelpers.AuthHeaders(owner.AccessToken))
-		assert.Equal(t, http.StatusOK, w.Code)
+		requireOutboxQueued(t, w, http.StatusAccepted)
+		command := readServerOutboxCommand(t, ts.DB, target.ID)
+		assert.Equal(t, "user_moderation", command.Kind)
+		assert.Equal(t, "deafen", command.Action)
+		assertServerOutboxTarget(t, command)
 	})
 
 	t.Run("TargetNotInVoice", func(t *testing.T) {
@@ -798,8 +809,10 @@ func TestUserDeafen(t *testing.T) {
 		_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, target.ID)
 		require.NoError(t, err)
 
+		seedOutboxVoiceSession(t, ts, channelID, target.ID)
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathUserDeafen), nil, testhelpers.AuthHeaders(actor.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
+		requireNoServerOutboxCommands(t, ts.DB)
 	})
 }
 

@@ -40,6 +40,7 @@ var allowedKeys = map[string]bool{
 }
 
 func TestVectorsHygiene(t *testing.T) {
+	t.Parallel()
 	raw, err := os.ReadFile(filepath.Join("testdata", "vectors.json"))
 	require.NoError(t, err)
 	// 8 MiB is PR-A2's recorded budget (contract doc, "As built — PR-A2").

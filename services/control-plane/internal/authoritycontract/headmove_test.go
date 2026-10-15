@@ -24,6 +24,7 @@ func TestInsertB48OrdersByText(t *testing.T) {
 // E3-08: a head over HEAD_BLOB_MAX is refused, never returned. 130 100
 // seq_index records of 129 characters encode above 16 777 216 bytes.
 func TestVerifyChainRefusesAHeadOverHeadBlobMax(t *testing.T) {
+	t.Parallel()
 	r := newTestRealm(t)
 	r.addDel(1, nil) // the status is signed under (gen 0, serial 1)
 	tr := r.trust(t)
@@ -93,6 +94,7 @@ func ekFiller(t *testing.T, n int) [][]byte {
 // measured: the largest padding whose resulting head still fits is accepted,
 // and one more entry (the previous head itself still within the cap) is refused.
 func TestVerifyBundleRefusesAHeadOverHeadBlobMax(t *testing.T) {
+	t.Parallel()
 	v := vectorNamed(t, "row/07/suspend-user")
 	require.Empty(t, v.Fix, "the padding below bypasses the fix wiring of checkBundleVerifyVector")
 	tr, r := trustOf(t, v)

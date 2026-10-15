@@ -111,6 +111,7 @@ func TestVoiceEffects_CommitAcknowledgementFailureSuppressesDispatch(t *testing.
 	t.Run("disconnect NATS command", func(t *testing.T) {
 		db, redisClient, ownerID, memberID, serverID, fromChannelID, _ := commitFailureVoiceEffectFixture(t)
 		insertCommitFailureVoiceParticipant(t, db, fromChannelID, memberID)
+		seedCommitOutboxSession(t, db, fromChannelID, memberID)
 
 		var effects atomic.Int32
 		h := newCommitFailureVoiceEffectHandler(t, db, redisClient, &effects)

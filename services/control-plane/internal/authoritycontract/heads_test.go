@@ -110,6 +110,7 @@ func TestRecordShapes(t *testing.T) {
 
 // HEAD_BLOB_MAX is runtime-only (16 MiB cannot go into vectors.json).
 func TestHeadBlobMax(t *testing.T) {
+	t.Parallel()
 	_, err := ParseChainHead(make([]byte, HeadBlobMax+1))
 	require.ErrorIs(t, err, ErrMalformed)
 	h := GenesisHead(newID(), newID())

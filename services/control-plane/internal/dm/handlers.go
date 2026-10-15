@@ -25,6 +25,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voicecommand"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -77,7 +78,6 @@ const (
 	errMsgTargetNotParticipant       = "Target is not a participant"
 	errMsgCannotUnmuteWhileDeafened  = "Cannot unmute while server-deafened — remove deafen first"
 	dmVoiceDisconnectSubject         = "voice.enforce.disconnect"
-	voiceEnforcementSnapshotVersion  = 1
 )
 
 // dm_privacy_level enum values (matches migration 000032_dm_privacy_level.up.sql).
@@ -1784,6 +1784,8 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	newCreatorID, maxVersion, err := h.removeMemberTx(c.Request.Context(), convID, targetUserID, userID, middleware.TokenCredentialEpoch(c))
 	deliveryIncomplete := errors.Is(err, activepresence.ErrDeliveryIncomplete)
 	switch {
+	case respondDMVoiceCommandQueueFull(c, err):
+		return
 	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
 		h.respondGuardTxError(c, err, errMsgFailedRemoveMember)
 		return
@@ -1799,13 +1801,6 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	// Membership revocation is also an immediate media-plane revocation. Publish
-	// unconditionally after the transaction commits: the media plane may have
-	// provisionally registered the peer before its voice-presence row exists.
-	h.dmPublishEnforcementUnconditionally(
-		convID, targetUserID, "voice.enforce.disconnect", "disconnect", uuid.Nil,
-	)
-
 	// Broadcast events
 	h.broadcastMemberRemoved(convID, targetUserID, userID, isSelfLeave, newCreatorID, maxVersion)
 
@@ -1815,7 +1810,7 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Member removed"})
+	c.JSON(http.StatusOK, gin.H{"message": "Member removed", "enforcement_status": "queued"})
 }
 
 // removeMemberTx removes a participant and handles creator transfer in a transaction.
@@ -2068,6 +2063,13 @@ func (h *Handler) removeMemberRowsTx(
 	if err != nil {
 		return "", 0, nil, err
 	}
+	// Capture before domain deletion so provisional registrations remain exact
+	// obligations even when no voice-presence row has arrived.
+	voiceCommands, err := captureDMVoiceCommandSpecsTx(ctx, tx, convID, targetID.String(),
+		voicecommand.CommandSpec{Kind: "disconnect", Action: "disconnect", Reason: "membership_removed"}, true)
+	if err != nil {
+		return "", 0, nil, err
+	}
 
 	var keys []activepresence.PlanKey
 	if activeNow {
@@ -2090,6 +2092,10 @@ func (h *Handler) removeMemberRowsTx(
 	}
 	if err := dmblock.ValidateConversationResolvedTx(ctx, tx, convID); err != nil {
 		return "", 0, nil, err
+	}
+	// No domain locks or writes may follow the global command counter lock.
+	if err := enqueueDMVoiceCommandsTx(ctx, tx, voiceCommands, callerUserID); err != nil {
+		return "", 0, nil, fmt.Errorf("enqueue DM member removal: %w", err)
 	}
 	return newCreatorID, maxVersion, keys, nil
 }
@@ -3804,30 +3810,6 @@ func dmVoiceEnforcementSnapshotTx(
 	return snapshot, nil
 }
 
-func (h *Handler) dmPublishEnforcementSnapshot(
-	convID, targetID, subject, action string, snapshot VoiceEnforcementSnapshot,
-) {
-	if h.nats == nil {
-		return
-	}
-	if err := h.nats.Publish(subject, map[string]interface{}{
-		"channelId":             convID,
-		"userId":                targetID,
-		"action":                action,
-		"serverMuted":           snapshot.ServerMuted,
-		"serverDeafened":        snapshot.ServerDeafened,
-		"authorizationRevision": strconv.FormatInt(snapshot.AuthorizationRevision, 10),
-		"version":               voiceEnforcementSnapshotVersion,
-	}); err != nil {
-		// Keep logs free of user-controlled conversation/member identifiers and
-		// broker error strings; the fixed subject/action classify the failed path.
-		h.log.Error("Failed to publish DM enforcement",
-			"failure_class", "delivery",
-			"subject", subject,
-			"action", action)
-	}
-}
-
 // dmBroadcastVoiceState sends a dm_voice_state_update WS event to DM participants.
 func (h *Handler) dmBroadcastVoiceState(convID, targetID, action string) {
 	convUUID, _ := uuid.Parse(convID)
@@ -3851,7 +3833,7 @@ func (h *Handler) respondDMVoiceTopologyEffectError(c *gin.Context, err error, l
 	}
 }
 
-// DMUserMute soft-mutes a participant in a DM voice call (user can undo).
+// DMUserMute queues a soft mute for exact sessions of an in-call participant.
 // POST /dm/conversations/:id/voice/:userId/user-mute
 func (h *Handler) DMUserMute(c *gin.Context) {
 	actorID := c.GetString("user_id")
@@ -3914,30 +3896,41 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTargetNotInVoice})
 		return
 	}
-	if h.nats != nil {
-		if err := h.nats.Publish("voice.user_mute", map[string]interface{}{"channelId": convID, "userId": targetID}); err != nil {
-			h.log.Error("Failed to publish DM user mute", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
+	specs, err := captureDMVoiceCommandSpecsTx(c.Request.Context(), tx, convID, targetID,
+		voicecommand.CommandSpec{Kind: "user_moderation", Action: "mute"}, false)
+	if err != nil {
+		h.log.Error("Failed to capture DM user mute", "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
+		return
+	}
+	if len(specs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTargetNotInVoice})
+		return
+	}
+	if err := enqueueDMVoiceCommandsTx(c.Request.Context(), tx, specs, actorID); err != nil {
+		if respondDMVoiceCommandQueueFull(c, err) {
 			return
 		}
+		h.log.Error("Failed to enqueue DM user mute", "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
+		return
 	}
 	if err := h.commitDMTopologyEffect(tx); err != nil {
 		h.log.Error(errMsgFailedCheckParticipation, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	c.JSON(http.StatusAccepted, gin.H{"success": true, "message": "User mute command queued", "enforcement_status": "queued"})
 }
 
 // dmVoiceEnforcementChange describes one hard mute/deafen state transition:
-// the enforcement flag UPDATE plus the NATS command and WS broadcast that
-// announce it. updateSQL values are compile-time constants — never build
+// the enforcement flag UPDATE plus the durable command and saved-policy WS
+// broadcast. updateSQL values are compile-time constants — never build
 // them dynamically.
 type dmVoiceEnforcementChange struct {
 	updateSQL      string
 	failLog        string
 	failErrMsg     string
-	subject        string
 	action         string
 	broadcastState string
 }
@@ -3959,6 +3952,30 @@ func revalidateDMVoiceEnforcementAuthority(ctx context.Context, tx *sql.Tx, conv
 		return dmblock.ErrUnavailable
 	}
 	return nil
+}
+
+// guardDMVoiceUnmuteTx repeats the preflight refusal while the target participant
+// is already locked FOR SHARE. A deafen committed before that lock prevents unmute.
+func (h *Handler) guardDMVoiceUnmuteTx(c *gin.Context, tx *sql.Tx, convID, targetID string) bool {
+	var serverDeafened bool
+	err := tx.QueryRowContext(c.Request.Context(), `
+		SELECT server_deafened FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+	`, convID, targetID).Scan(&serverDeafened)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
+		return false
+	}
+	if err != nil {
+		h.log.Error("Failed to recheck DM deafen state", "failure_class", "voice_command_sql_retry")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckParticipation})
+		return false
+	}
+	if serverDeafened {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgCannotUnmuteWhileDeafened})
+		return false
+	}
+	return true
 }
 
 // applyDMVoiceEnforcement runs the shared tail of the four DM hard-mute/deafen
@@ -4000,6 +4017,9 @@ func (h *Handler) applyDMVoiceEnforcement(c *gin.Context, convID, targetID strin
 		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
 		return
 	}
+	if change.action == "unmute" && !h.guardDMVoiceUnmuteTx(c, tx, convID, targetID) {
+		return
+	}
 	result, err := tx.ExecContext(c.Request.Context(), change.updateSQL, convID, targetID)
 	if err != nil {
 		h.log.Error(change.failLog, "error", err)
@@ -4022,16 +4042,23 @@ func (h *Handler) applyDMVoiceEnforcement(c *gin.Context, convID, targetID strin
 		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
 		return
 	}
+	if err := enqueueDMVoiceSnapshotTx(c.Request.Context(), tx, convID, targetID, actor.String(), change.action, snapshot); err != nil {
+		if respondDMVoiceCommandQueueFull(c, err) {
+			return
+		}
+		h.log.Error(change.failLog, "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return
+	}
 	if err := h.commitDMTopologyEffect(tx); err != nil {
 		h.log.Error(change.failLog, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
 		return
 	}
 
-	h.dmPublishEnforcementSnapshot(convID, targetID, change.subject, change.action, snapshot)
 	h.dmBroadcastVoiceState(convID, targetID, change.broadcastState)
 
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "DM voice moderation policy saved; enforcement queued", "enforcement_status": "queued"})
 }
 
 // DMHardMute server-mutes a participant in a group DM (admin only, user cannot undo).
@@ -4046,7 +4073,6 @@ func (h *Handler) DMHardMute(c *gin.Context) {
 		updateSQL:      `UPDATE dm_participants SET server_muted = true WHERE conversation_id = $1 AND user_id = $2`,
 		failLog:        "Failed to set DM server_muted",
 		failErrMsg:     errMsgFailedApplyEnforcement,
-		subject:        "voice.enforce.mute",
 		action:         "mute",
 		broadcastState: "server_muted",
 	})
@@ -4081,7 +4107,6 @@ func (h *Handler) DMHardUnmute(c *gin.Context) {
 		updateSQL:      `UPDATE dm_participants SET server_muted = false WHERE conversation_id = $1 AND user_id = $2`,
 		failLog:        "Failed to clear DM server_muted",
 		failErrMsg:     errMsgFailedRemoveEnforcement,
-		subject:        "voice.enforce.mute",
 		action:         "unmute",
 		broadcastState: "server_unmuted",
 	})
@@ -4099,7 +4124,6 @@ func (h *Handler) DMHardDeafen(c *gin.Context) {
 		updateSQL:      `UPDATE dm_participants SET server_muted = true, server_deafened = true WHERE conversation_id = $1 AND user_id = $2`,
 		failLog:        "Failed to set DM server_deafened",
 		failErrMsg:     errMsgFailedApplyEnforcement,
-		subject:        "voice.enforce.deafen",
 		action:         "deafen",
 		broadcastState: "server_deafened",
 	})
@@ -4117,7 +4141,6 @@ func (h *Handler) DMHardUndeafen(c *gin.Context) {
 		updateSQL:      `UPDATE dm_participants SET server_muted = false, server_deafened = false WHERE conversation_id = $1 AND user_id = $2`,
 		failLog:        "Failed to clear DM server_deafened",
 		failErrMsg:     errMsgFailedRemoveEnforcement,
-		subject:        "voice.enforce.deafen",
 		action:         "undeafen",
 		broadcastState: "server_undeafened",
 	})

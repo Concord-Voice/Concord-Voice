@@ -96,6 +96,7 @@ func TestVoiceNATSEffectRejectsModeratorDemotedAfterPreflight(t *testing.T) {
 	channelID := ts.CreateVoiceChannel(t, serverID, "room")
 	_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, target.ID)
 	require.NoError(t, err)
+	seedOutboxVoiceSession(t, ts, channelID, target.ID)
 	observer, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = observer.Close() })
@@ -117,6 +118,7 @@ func TestVoiceNATSEffectRejectsModeratorDemotedAfterPreflight(t *testing.T) {
 		t.Fatal("demoted moderator published voice.user_mute")
 	case <-time.After(250 * time.Millisecond):
 	}
+	requireNoServerOutboxCommands(t, ts.DB)
 }
 
 func TestVoiceMoveGrantRejectsModeratorDemotedAfterPreflight(t *testing.T) {
@@ -235,12 +237,14 @@ func TestStaleCredential_ServerDisconnectDoesNotIssueNATSEnforcement(t *testing.
 	channelID := ts.CreateVoiceChannel(t, serverID, "stale disconnect room")
 	_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, target.ID)
 	require.NoError(t, err)
+	seedOutboxVoiceSession(t, ts, channelID, target.ID)
 
 	staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
 	w := ts.DoRequest(http.MethodPost,
 		"/api/v1/servers/"+serverID+"/voice/"+target.ID+"/disconnect",
 		nil, testhelpers.AuthHeaders(staleToken))
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireNoServerOutboxCommands(t, ts.DB)
 }
 
 func TestStaleCredential_RevokeTempAccessDoesNotIssueAuthority(t *testing.T) {
@@ -343,11 +347,12 @@ func TestCredentialEpoch_UserMuteLinearizesBeforeConcurrentReset(t *testing.T) {
 	channelID := ts.CreateVoiceChannel(t, serverID, "stale user mute race room")
 	_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, target.ID)
 	require.NoError(t, err)
+	seedOutboxVoiceSession(t, ts, channelID, target.ID)
 
 	barrier, err := ts.DB.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	defer func() { _ = barrier.Rollback() }()
-	_, err = barrier.Exec(`LOCK TABLE voice_participants IN ACCESS EXCLUSIVE MODE`)
+	_, err = barrier.Exec(`LOCK TABLE voice_enforcement_sessions IN ACCESS EXCLUSIVE MODE`)
 	require.NoError(t, err)
 	result := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -357,13 +362,13 @@ func TestCredentialEpoch_UserMuteLinearizesBeforeConcurrentReset(t *testing.T) {
 	}()
 	for attempt := 0; attempt < 1000; attempt++ {
 		var waiting bool
-		err = ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid JOIN pg_class c ON c.oid = l.relation WHERE a.wait_event_type = 'Lock' AND NOT l.granted AND c.relname = 'voice_participants')`).Scan(&waiting)
+		err = ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid JOIN pg_class c ON c.oid = l.relation WHERE a.wait_event_type = 'Lock' AND NOT l.granted AND c.relname = 'voice_enforcement_sessions')`).Scan(&waiting)
 		require.NoError(t, err)
 		if waiting {
 			break
 		}
 		if attempt == 999 {
-			t.Fatal("user mute request did not wait on voice_participants table lock")
+			t.Fatal("user mute request did not wait on the exact-session registry table lock")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -385,6 +390,10 @@ func TestCredentialEpoch_UserMuteLinearizesBeforeConcurrentReset(t *testing.T) {
 	}, 100*time.Millisecond, 10*time.Millisecond)
 	require.NoError(t, barrier.Commit())
 	w := <-result
-	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	requireOutboxQueued(t, w, http.StatusAccepted)
 	<-resetDone
+	command := readServerOutboxCommand(t, ts.DB, target.ID)
+	assert.Equal(t, "user_moderation", command.Kind)
+	assert.Equal(t, "mute", command.Action)
+	assertServerOutboxTarget(t, command)
 }

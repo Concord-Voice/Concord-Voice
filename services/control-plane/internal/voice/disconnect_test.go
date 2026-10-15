@@ -12,7 +12,7 @@ import (
 const pathDisconnect = "/disconnect"
 
 // TestServerDisconnect_WithPermission: a MOVE_MEMBERS holder disconnecting a
-// lower-ranked member who IS in voice → 200 {disconnected:true}.
+// lower-ranked member with an exact registered session → 202 queued.
 func TestServerDisconnect_WithPermission(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "dc_perm_owner")
@@ -27,14 +27,20 @@ func TestServerDisconnect_WithPermission(t *testing.T) {
 
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-dc-perm")
 	joinVoice(t, ts, channelID, target.ID)
+	seedOutboxVoiceSession(t, ts, channelID, target.ID)
 
 	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathDisconnect),
 		nil, testhelpers.AuthHeaders(mover.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
+	requireOutboxQueued(t, w, http.StatusAccepted)
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, true, body["disconnected"])
+	assert.Equal(t, "queued", body["enforcement_status"])
+	assert.NotEqual(t, true, body["disconnected"])
+	command := readServerOutboxCommand(t, ts.DB, target.ID)
+	assert.Equal(t, "disconnect", command.Kind)
+	assert.Equal(t, "disconnect", command.Action)
+	assertServerOutboxTarget(t, command)
 }
 
 // TestServerDisconnect_NoPermission: a base member without MOVE_MEMBERS → 403.
@@ -48,10 +54,12 @@ func TestServerDisconnect_NoPermission(t *testing.T) {
 	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-dc-np")
 	joinVoice(t, ts, channelID, target.ID)
+	seedOutboxVoiceSession(t, ts, channelID, target.ID)
 
 	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathDisconnect),
 		nil, testhelpers.AuthHeaders(actor.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+	requireNoServerOutboxCommands(t, ts.DB)
 }
 
 // TestServerDisconnect_HierarchyBlocked: disconnect RESPECTS hierarchy (unlike
@@ -73,10 +81,12 @@ func TestServerDisconnect_HierarchyBlocked(t *testing.T) {
 
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-dc-hier")
 	joinVoice(t, ts, channelID, target.ID)
+	seedOutboxVoiceSession(t, ts, channelID, target.ID)
 
 	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathDisconnect),
 		nil, testhelpers.AuthHeaders(mover.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code, "disconnect enforces hierarchy (no ADR-0023 exception)")
+	requireNoServerOutboxCommands(t, ts.DB)
 }
 
 // TestServerDisconnect_TargetNotInVoice: target is a member but not in any voice
@@ -96,23 +106,25 @@ func TestServerDisconnect_TargetNotInVoice(t *testing.T) {
 // TestServerDisconnect_Self: the self-target guard does NOT apply to disconnect
 // (requireHierarchy=true path), but the owner disconnecting themselves still hits
 // the hierarchy check against themselves (CheckHierarchy passes for self) and a
-// real in-voice row, so the owner CAN disconnect themselves → 200. The relevant
+// exact registered session, so the owner CAN queue their own disconnect → 202. The relevant
 // security property is that a non-self moderator cannot exceed hierarchy; for self
-// the action is harmless. This documents the self path returns 200 when in voice.
+// the action is harmless. This documents durable acceptance for the self path.
 func TestServerDisconnect_Self(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "dc_self_owner")
 	serverID := ts.CreateTestServer(t, owner.ID, "Disconnect Self")
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-dc-self")
 	joinVoice(t, ts, channelID, owner.ID)
+	seedOutboxVoiceSession(t, ts, channelID, owner.ID)
 
 	w := ts.DoRequest("POST", voiceEnforcePath(serverID, owner.ID, pathDisconnect),
 		nil, testhelpers.AuthHeaders(owner.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code, "owner may disconnect self (in voice)")
+	requireOutboxQueued(t, w, http.StatusAccepted)
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, true, body["disconnected"])
+	assert.Equal(t, "queued", body["enforcement_status"])
+	assert.NotEqual(t, true, body["disconnected"])
 }
 
 // TestServerDisconnect_InvalidUUID: non-UUID path params → 400 before any work.

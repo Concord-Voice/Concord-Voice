@@ -256,6 +256,10 @@ func truncateAllTablesOnce(db *sql.DB) error {
 		dm_block_voice_ejections,
 		credential_epoch_voice_ejections,
 		server_voice_terminal_outbox,
+		voice_command_admission,
+		voice_command_retirement,
+		voice_command_sequence,
+		voice_command_outbox,
 		users,
 		user_keys,
 		public_keys,
@@ -299,6 +303,21 @@ func truncateAllTablesOnce(db *sql.DB) error {
 		code_redemptions,
 		user_presence_settings
 	CASCADE`)
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(`
+		INSERT INTO voice_command_sequence (id) VALUES (TRUE)
+	`); err != nil {
+		return err
+	}
+	// Transport tests may remove their unprovisioned receipt. Restore only an
+	// absent test fixture; an existing generation and its birth proof stay intact.
+	_, err = db.Exec(`
+		INSERT INTO voice_command_transport (id, generation)
+		VALUES (TRUE, gen_random_uuid())
+		ON CONFLICT (id) DO NOTHING
+	`)
 	return err
 }
 

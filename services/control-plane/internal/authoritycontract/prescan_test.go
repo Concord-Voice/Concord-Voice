@@ -171,11 +171,31 @@ func specFields(m Message) []field {
 // the decoder with prescan accepts exactly what the decoder without it
 // accepted, and decodes each accept to the same message.
 func TestPrescanRefusesOnlyWhatTheDecoderRefuses(t *testing.T) {
+	// Parallel, like this package's other heavy tests. Under CI's -race with
+	// atomic coverage this test alone takes about three minutes, most of it in
+	// the decoder's coverage counters, and running the others beside it rather
+	// than after it keeps the package inside go test's 10-minute default.
+	// Splitting this test over goroutines instead made it slower: they contend
+	// for those same counters. go test starts parallel tests only after every
+	// serial one has finished, so a test that writes registry or table, or
+	// counts allocations, stays serial and is never overlapped: each one calls
+	// mustStaySerial.
+	t.Parallel()
 	st := differential(t, 3587, 20_000)
 	require.Positive(t, st.accepts, "the generator must reach accepts")
 	require.Positive(t, st.acceptsAtMaxN, "including arrays at exactly maxN")
 	require.Positive(t, st.byStep[5]+st.byStep[6], "and refusals after step 4")
 	require.NotEmpty(t, st.byPrescan, "and refusals prescan makes first")
+}
+
+// mustStaySerial fails t if it is ever marked t.Parallel, in either order:
+// testing panics on t.Setenv in a parallel test, and on t.Parallel after
+// t.Setenv. -race is no substitute: a registry writer marked parallel passed
+// under it, because the parallel reader beside it reached the registry only
+// after the writer had finished.
+func mustStaySerial(t *testing.T) {
+	t.Helper()
+	t.Setenv("AUTHORITYCONTRACT_MUST_STAY_SERIAL", "1")
 }
 
 // inputGen builds decoder inputs from the vectors: positives parsed as trees

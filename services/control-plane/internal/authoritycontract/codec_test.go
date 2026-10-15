@@ -498,8 +498,10 @@ func TestDecodeUnknownTag(t *testing.T) {
 // register has no production caller until the layout files land, and the
 // registry is a package global: this test registers test-only layouts and
 // removes them again, because the registry must hold exactly the production
-// tags when the completeness test counts them.
+// tags when the completeness test counts them. It stays serial, so it never
+// runs beside the parallel tests that read the registry.
 func TestRegisterDecodeMarshalAndTags(t *testing.T) {
+	mustStaySerial(t)
 	testTag, _ := (&testMsg{}).spec()
 	tinyTags := []string{"test-tiny-zz", "test-tiny-bb", "test-tiny-mm", "test-tiny-aa", "test-tiny-qq", "test-tiny-kk"}
 	all := append([]string{testTag}, tinyTags...)
@@ -597,7 +599,9 @@ func (m plainErrMsg) Encode() []byte { return encode(&m) }
 
 // EN5 says any failure is malformed, and A2 maps errors.Is(err, ErrMalformed)
 // to Reason malformed. The engine, not each layout author, must guarantee it.
+// It registers a layout, so it stays serial.
 func TestEveryHookFailureIsMalformedAndEchoesNothing(t *testing.T) {
+	mustStaySerial(t)
 	const tag = "test-plain-err"
 	require.NotContains(t, registry, tag, "another test left its layout behind")
 	register(func() Message { return &plainErrMsg{} })

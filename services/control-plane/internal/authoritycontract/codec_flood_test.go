@@ -59,8 +59,10 @@ func floods() []flood {
 	}
 }
 
-// allocDuring is the heap allocated while f runs. The package runs no
-// t.Parallel, so nothing else allocates in the window.
+// allocDuring is the heap allocated while f runs. Its callers call
+// mustStaySerial, and go test starts the package's parallel tests only after
+// every serial test has finished, so nothing else allocates in the window. A
+// caller run in parallel would count its neighbours' allocations too.
 func allocDuring(f func()) uint64 {
 	runtime.GC()
 	var before, after runtime.MemStats
@@ -73,6 +75,7 @@ func allocDuring(f func()) uint64 {
 // TestRefusedFloodsAllocateLittle is M1's regression test (CWE-789/400): a
 // refused message must not cost the decoder a multiple of its own size.
 func TestRefusedFloodsAllocateLittle(t *testing.T) {
+	mustStaySerial(t)
 	for _, f := range floods() {
 		require.LessOrEqual(t, len(f.b), capOfTag(f.tag), "%s fits its cap, so step 1 does not refuse it", f.name)
 		var err error

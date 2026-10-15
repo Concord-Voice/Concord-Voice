@@ -202,3 +202,98 @@ func TestChannelExpiration_PinDeletionRunsInsideTheResponseBudget(t *testing.T) 
 	assert.True(t, runner.deadlines[0].Before(sent.Add(3*time.Second)),
 		"the run ends inside the 3 s budget (got %s after the request)", runner.deadlines[0].Sub(sent))
 }
+
+// heldExpiryRunner stands in for the purge engine and holds its first batch
+// until Release, so a test can look at everything the handler did BEFORE the
+// deletion while the deletion is still running.
+type heldExpiryRunner struct {
+	entered chan struct{}
+	release chan struct{}
+	enter   sync.Once
+	let     sync.Once
+}
+
+func newHeldExpiryRunner() *heldExpiryRunner {
+	return &heldExpiryRunner{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *heldExpiryRunner) Release() { r.let.Do(func() { close(r.release) }) }
+
+func (r *heldExpiryRunner) RunExpiryBatch(ctx context.Context, plan purge.ExpiryPlan) (purge.Result, error) {
+	r.enter.Do(func() { close(r.entered) })
+	select {
+	case <-r.release:
+		return purge.Result{DeletedCount: len(plan.CandidateIDs)}, nil
+	case <-ctx.Done():
+		return purge.Result{}, ctx.Err()
+	}
+}
+
+// #3459 §8 orders what the handler ISSUES: announce the policy change, then
+// delete the due pins, so a slow best-effort deletion (up to 10 s) cannot hold
+// the announcement back. The frame test does not assert which frame a client
+// receives first, because the hub delivers them on separate lanes, so this is
+// where the issue order is pinned: with the deletion held in flight, the policy
+// frame has already reached the observer.
+//
+// Mutant killed: UpdateExpiration broadcasting the policy after
+// expireDuePinnedMessages instead of before it.
+func TestChannelExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld(t *testing.T) {
+	ts := setupTS(t)
+	f := newChanGateFixture(t, ts)
+	log := logger.NewWithWriter(&bytes.Buffer{})
+	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
+	handler := channels.NewHandler(ts.DB, log, ts.Hub, resolver, ts.Redis)
+	handler.SetMFAVerifier(&testhelpers.FakeMFAVerifier{})
+	runner := newHeldExpiryRunner()
+	expirer, err := expiration.NewContextExpirer(context.Background(), runner, &countingPurgeNotifier{}, log)
+	require.NoError(t, err)
+	handler.SetPinnedExpirer(expirer)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", f.mod.ID)
+		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": uuid.NewString()})
+		c.Next()
+	})
+	router.PATCH("/api/v1/channels/:id/expiration", handler.UpdateExpiration)
+	patch := func(body map[string]any) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/channels/"+f.channelID+"/expiration", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	tap := dialChannelFrameObserver(t, ts, f.owner, f.serverID, f.channelID)
+	require.Equal(t, http.StatusOK, patch(pinnedSetBody(86400, nil, "")).Code)
+	require.Eventually(t, func() bool { return len(tap.ofTypes("expiration_event")) == 1 }, 3*time.Second, 20*time.Millisecond)
+	tap.reset()
+
+	past := time.Now().Add(-time.Hour)
+	insertPinnedChannelMessage(t, ts, f.channelID, f.owner.ID, nil, &past)
+
+	var toggled *httptest.ResponseRecorder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		toggled = patch(pinnedSetBody(86400, boolRef(true), ""))
+	}()
+	t.Cleanup(func() {
+		runner.Release()
+		<-done
+	})
+
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the due pin never reached the expirer, so there is no held deletion to look past")
+	}
+	require.Eventually(t, func() bool { return len(tap.ofTypes("expiration_event")) == 1 }, 5*time.Second, 20*time.Millisecond,
+		"the policy frame must reach the observer while the deletion is still running (§8: announce first)")
+
+	runner.Release()
+	<-done
+	assert.Equal(t, http.StatusOK, toggled.Code, toggled.Body.String())
+}

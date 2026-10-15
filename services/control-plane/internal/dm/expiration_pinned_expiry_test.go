@@ -167,3 +167,109 @@ RETURNING id`, convID, alice.ID).Scan(&duePin))
 	assert.True(t, runner.deadlines[0].Before(sent.Add(3*time.Second)),
 		"the run ends inside the 3 s budget (got %s after the request)", runner.deadlines[0].Sub(sent))
 }
+
+// dmHeldRunner stands in for the purge engine and holds its first batch until
+// Release, so a test can look at everything the handler did BEFORE the deletion
+// while the deletion is still running.
+type dmHeldRunner struct {
+	entered chan struct{}
+	release chan struct{}
+	enter   sync.Once
+	let     sync.Once
+}
+
+func newDMHeldRunner() *dmHeldRunner {
+	return &dmHeldRunner{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *dmHeldRunner) Release() { r.let.Do(func() { close(r.release) }) }
+
+func (r *dmHeldRunner) RunExpiryBatch(ctx context.Context, plan purge.ExpiryPlan) (purge.Result, error) {
+	r.enter.Do(func() { close(r.entered) })
+	select {
+	case <-r.release:
+		return purge.Result{DeletedCount: len(plan.CandidateIDs)}, nil
+	case <-ctx.Done():
+		return purge.Result{}, ctx.Err()
+	}
+}
+
+// #3459 §8 orders what the handler ISSUES: announce the policy change, then
+// delete the due pins, so a slow best-effort deletion (up to 10 s) cannot hold
+// the announcement back. The frame test does not assert which frame a client
+// receives first, because the hub delivers them on separate lanes, so this is
+// where the issue order is pinned: with the deletion held in flight, the policy
+// frame has already reached the observer.
+//
+// Mutant killed: UpdateExpiration broadcasting the policy after
+// ExpireConversationPins instead of before it.
+func TestDMExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "pin_held_alice")
+	bob := ts.CreateTestUser(t, "pin_held_bob")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+
+	log := logger.NewWithWriter(&bytes.Buffer{})
+	handler := dm.NewHandler(dm.HandlerDeps{
+		DB:       ts.DB,
+		Log:      log,
+		Hub:      ts.Hub,
+		Cfg:      &config.Config{MediaPlaneURL: "http://media.test"},
+		Redis:    ts.Redis,
+		EntCache: entitlements.NewCache(ts.Redis, ts.DB),
+	})
+	runner := newDMHeldRunner()
+	expirer, err := expiration.NewContextExpirer(context.Background(), runner, dmNoopPurgeNotifier{}, log)
+	require.NoError(t, err)
+	handler.SetPinnedExpirer(expirer)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", alice.ID)
+		c.Next()
+	})
+	router.PATCH("/api/v1/dm/conversations/:id/expiration", handler.UpdateExpiration)
+	patch := func(body map[string]any) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPatch, dmExpirationPath+convID+"/expiration", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	tap := tapDMFrames(t, dialDMObserver(t, ts, bob.ID, convID))
+	w := patch(map[string]any{"mode": "set", "window_seconds": 86400, "retroactive": "new_only"})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Eventually(t, func() bool { return len(tap.ofTypes("dm_expiration_event")) == 1 }, 3*time.Second, 20*time.Millisecond)
+	tap.reset()
+
+	_, err = ts.DB.Exec(`
+INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at)
+VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour')`,
+		convID, alice.ID)
+	require.NoError(t, err)
+
+	var toggled *httptest.ResponseRecorder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		toggled = patch(map[string]any{"mode": "set", "window_seconds": 86400, "retroactive": "new_only", "include_pinned": true})
+	}()
+	t.Cleanup(func() {
+		runner.Release()
+		<-done
+	})
+
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the due pin never reached the expirer, so there is no held deletion to look past")
+	}
+	require.Eventually(t, func() bool { return len(tap.ofTypes("dm_expiration_event")) == 1 }, 5*time.Second, 20*time.Millisecond,
+		"the policy frame must reach the observer while the deletion is still running (§8: announce first)")
+
+	runner.Release()
+	<-done
+	assert.Equal(t, http.StatusOK, toggled.Code, toggled.Body.String())
+}

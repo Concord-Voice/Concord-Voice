@@ -119,6 +119,7 @@ func stepBytes(t *testing.T, tr *Trust, hw HighWater, prev ChainHead, bundle []b
 // re-encoded the whole after-head, so the 100k step allocated about a hundred
 // times what the 1k step did.
 func TestVerifyChainStepWorkIsIndependentOfHeadSize(t *testing.T) {
+	mustStaySerial(t)
 	tr, hw, bundle, prev0 := stepFixture(t)
 	small, big := paddedPrev(t, prev0, 1_000), paddedPrev(t, prev0, 100_000)
 	require.Greater(t, len(big.Bytes()), 6_000_000, "the large head is several MiB")
@@ -150,6 +151,7 @@ func BenchmarkVerifyChainStep(b *testing.B) {
 // refuses one more entry, exactly as the whole-head encoding does, and the
 // index length it carries forward is the after-head's real one.
 func TestVerifyChainStepRefusesAHeadOverHeadBlobMax(t *testing.T) {
+	t.Parallel()
 	tr, hw, bundle, prev0 := stepFixture(t)
 
 	after0, got := VerifyBundle(tr, hw, prev0, bundle, nil)
@@ -176,6 +178,7 @@ func TestVerifyChainStepRefusesAHeadOverHeadBlobMax(t *testing.T) {
 // step of every chain vector, the index length carried forward equals the
 // after-head's measured one, and the after-head encodes.
 func TestVerifyChainIndexAccountingMatchesEveryChainVector(t *testing.T) {
+	t.Parallel()
 	steps := 0
 	for _, v := range loadVectors(t).Vectors {
 		if v.Type != "chain" {
@@ -209,6 +212,7 @@ func TestVerifyChainIndexAccountingMatchesEveryChainVector(t *testing.T) {
 // bundle: same Reason, same after-head bytes, and the carried index length is
 // the after-head's.
 func TestVerifyChainStepMeasuredAgreesWithEncodingOnEveryBundleVector(t *testing.T) {
+	t.Parallel()
 	n := 0
 	for _, v := range loadVectors(t).Vectors {
 		if v.Type != "bundle-verify" || v.Fix != "" {
@@ -305,6 +309,7 @@ func requireUntouched(t *testing.T, name string, got, want ChainHead) {
 // and not the spare capacity past its length, on every committed bundle and
 // chain (VerifyBundle, VerifyChain), accepted or refused.
 func TestVerifyChainLeavesTheCallersHeadUntouched(t *testing.T) {
+	t.Parallel()
 	for _, v := range loadVectors(t).Vectors {
 		switch v.Type {
 		case "bundle-verify":

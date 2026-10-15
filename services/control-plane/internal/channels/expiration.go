@@ -107,8 +107,12 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 	}
 	// After a clean commit, in this order (#3459 §8): settle the gate, announce
 	// the policy change, delete the pins that were already due when the
-	// context stopped keeping them, then resume any backfill. The deletion's
-	// server_purged therefore reaches clients after the system row it follows.
+	// context stopped keeping them, then resume any backfill. That is the order
+	// the calls are ISSUED in, so a slow deletion cannot hold the announcement
+	// back. It is not the order a client receives the two frames in: the hub
+	// delivers the policy broadcast and server_purged on separate lanes, and
+	// either can arrive first. The issue order is pinned by
+	// TestChannelExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld.
 	h.settleChannelGate(c.Request.Context(), outcome, confirm, userID)
 	if staged.Present {
 		h.broadcastChannelExpirationEvent(channelID, staged.MessageID, userID, staged.Payload, policy)

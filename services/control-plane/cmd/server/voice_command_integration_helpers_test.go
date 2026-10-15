@@ -87,7 +87,15 @@ func mainVoiceReceiptDatabase(t *testing.T) (*sql.DB, uuid.UUID) {
 	generation := uuid.New()
 	_, err = db.Exec(`INSERT INTO voice_command_transport (id,generation) VALUES (TRUE,$1)`, generation)
 	require.NoError(t, err)
-	t.Cleanup(func() { _, cleanupErr := db.Exec(`DELETE FROM voice_command_transport`); assert.NoError(t, cleanupErr) })
+	t.Cleanup(func() {
+		_, cleanupErr := db.Exec(`TRUNCATE voice_command_admission, voice_command_retirement,
+			voice_command_outbox, voice_command_sequence`)
+		assert.NoError(t, cleanupErr)
+		_, cleanupErr = db.Exec(`INSERT INTO voice_command_sequence (id) VALUES (TRUE)`)
+		assert.NoError(t, cleanupErr)
+		_, cleanupErr = db.Exec(`DELETE FROM voice_command_transport`)
+		assert.NoError(t, cleanupErr)
+	})
 	return db, generation
 }
 

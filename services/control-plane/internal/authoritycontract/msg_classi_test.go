@@ -59,6 +59,7 @@ func TestClassITypeColumn(t *testing.T) {
 // Boundaries too large for vectors.json (> 128 KiB), so runtime-only here and
 // in the generator's self-check (Task 13).
 func TestClassIRuntimeBoundaries(t *testing.T) {
+	t.Parallel()
 	rows := make([]string, 8192, 8193) // one spare slot for the over-cap append below
 	for i := range rows {
 		rows[i] = legacyRow(i)

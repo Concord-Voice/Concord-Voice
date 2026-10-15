@@ -6,8 +6,23 @@ package dm_test
 //
 //   - the dm_expiration_event frame carries include_pinned on EVERY event, and
 //     previous_include_pinned + previous_window_seconds on a "changed" event only;
-//   - the policy broadcast reaches a participant BEFORE the dm_purged that the
-//     immediate pinned deletion announces (§8 ordering).
+//   - the immediate pinned deletion announces exactly one dm_purged beside it.
+//
+// Which of those two frames arrives first is deliberately NOT asserted. §8 orders
+// what the handler ISSUES (broadcast, then deletion), not what a client receives,
+// and the hub has nothing that could carry the second promise. The policy frame
+// is a message-derived delivery: a worker goroutine resolves its audience inside a
+// transaction (enqueueDMMessageDelivery -> deliverDMMessageDelivery), because each
+// participant's hidden-history ranges decide who may see the row. dm_purged takes
+// the other lane, BroadcastToDMParticipantsContext -> userBroadcast: one
+// participant lookup and no transaction. Two lanes with no shared FIFO, so
+// whichever finishes first is delivered first, and under CPU load the purge wins
+// often enough to fail an order assertion. No client depends on the order either:
+// the policy merge is fenced by revision, the system row is deduplicated by id,
+// and dm_purged only clears the scope and refetches (the renderer's
+// useWebSocketMessages.purge.test.ts pins every arrival order). The issue order
+// itself is pinned in expiration_pinned_expiry_test.go, by
+// TestDMExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld.
 
 import (
 	"encoding/json"
@@ -102,12 +117,9 @@ func tapDMFrames(t *testing.T, conn *gorillaWS.Conn) *dmFrameTap {
 	return tap
 }
 
-// Mutants killed:
-//   - the expiration broadcast moved after the expirer in the DM UpdateExpiration
-//     (dm_purged arrives first);
-//   - AddPinnedEventFields dropping include_pinned, previous_include_pinned or
-//     previous_window_seconds from the live frame.
-func TestDMExpiration_PinnedToggleFramesCarryPinFieldsAndPrecedeThePurge(t *testing.T) {
+// Mutant killed: AddPinnedEventFields dropping include_pinned,
+// previous_include_pinned or previous_window_seconds from the live frame.
+func TestDMExpiration_PinnedToggleFramesCarryPinFields(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	alice := ts.CreateTestUser(t, "pin_frames_alice")
 	bob := ts.CreateTestUser(t, "pin_frames_bob")
@@ -150,15 +162,18 @@ RETURNING id`, convID, alice.ID).Scan(&duePin))
 	require.Eventually(t, func() bool { return len(tap.ofTypes("dm_expiration_event", "dm_purged")) >= 2 }, 3*time.Second, 20*time.Millisecond)
 	tap.settle(t, 500*time.Millisecond)
 	frames := tap.ofTypes("dm_expiration_event", "dm_purged")
-	require.Len(t, frames, 2, "one policy broadcast and one purge announcement, nothing else")
-
-	// §8 ordering: the policy broadcast first, the purge announcement second.
-	assert.Equal(t, "dm_expiration_event", frames[0].Type, "the policy broadcast precedes the purge event")
-	assert.Equal(t, "dm_purged", frames[1].Type)
-	assert.Equal(t, convID, frames[1].Data["conversation_id"])
+	types := make([]string, 0, len(frames))
+	dataOf := make(map[string]map[string]interface{}, len(frames))
+	for _, frame := range frames {
+		types = append(types, frame.Type)
+		dataOf[frame.Type] = frame.Data
+	}
+	require.ElementsMatch(t, []string{"dm_expiration_event", "dm_purged"}, types,
+		"one policy broadcast and one purge announcement, nothing else, in either order")
+	assert.Equal(t, convID, dataOf["dm_purged"]["conversation_id"])
 
 	// §6.4: a pins-only change is a "changed" event carrying the whole pin story.
-	changed := frames[0].Data
+	changed := dataOf["dm_expiration_event"]
 	assert.Equal(t, "changed", changed["kind"])
 	assert.Equal(t, true, changed["include_pinned"])
 	assert.Equal(t, false, changed["previous_include_pinned"])
@@ -167,8 +182,8 @@ RETURNING id`, convID, alice.ID).Scan(&duePin))
 	assert.EqualValues(t, 86400, changed["window_seconds"])
 }
 
-// Converse of the ordering case: a toggle with nothing due announces the policy
-// and NO purge, so the ordering assertion above is not satisfiable by a purge
+// Converse of the case above: a toggle with nothing due announces the policy and
+// NO purge, so that case's "one purge announcement" is not satisfiable by a purge
 // that fires unconditionally.
 //
 // Mutant killed: the expirer announcing a purge when DuePinnedIDs is empty.

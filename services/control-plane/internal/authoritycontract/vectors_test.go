@@ -167,6 +167,7 @@ var codecChecks = map[string]func(*testing.T, vector){
 // TestVectors is DoR §3.1's cross-language check: Go verifies the committed
 // Node vectors and byte-equals its own re-encode.
 func TestVectors(t *testing.T) {
+	t.Parallel()
 	for _, v := range loadVectors(t).Vectors {
 		t.Run(v.Name, func(t *testing.T) {
 			want, known := verdictOf[v.Expect.Reason]

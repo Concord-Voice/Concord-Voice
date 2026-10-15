@@ -80,9 +80,14 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 	}
 	// After a clean commit, in this order (#3459 §8): announce the policy
 	// change, delete the pins that were already due when the conversation
-	// stopped keeping them, then resume any backfill. The deletion runs on the
-	// REQUEST context, never mutationCtx: that 3-second budget bounds the write
-	// transaction, and the expirer bounds its own run.
+	// stopped keeping them, then resume any backfill. That is the order the
+	// calls are ISSUED in, so a slow deletion cannot hold the announcement
+	// back. It is not the order a client receives the two frames in: the hub
+	// delivers the policy broadcast and dm_purged on separate lanes, and either
+	// can arrive first. The issue order is pinned by
+	// TestDMExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld. The
+	// deletion runs on the REQUEST context, never mutationCtx: that 3-second
+	// budget bounds the write transaction, and the expirer bounds its own run.
 	if staged.Present {
 		h.hub.PublishDMRespawn(conversationUUID, respawned)
 		h.broadcastDMExpirationEvent(conversationUUID, staged.MessageID, userID, staged.Payload, policy)

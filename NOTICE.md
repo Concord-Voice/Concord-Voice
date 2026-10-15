@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-10-06
+**Generated:** 2026-10-14
 **MinIO distribution addendum updated:** 2026-09-27
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -161,7 +161,7 @@ current tree rather than a guarantee.
 | github.com/cespare/xxhash/v2 | v2.3.0 | MIT |
 | github.com/coreos/go-oidc/v3 | v3.21.0 | Apache-2.0 |
 | github.com/dustin/go-humanize | v1.1.0 | MIT |
-| github.com/fxamacker/cbor/v2 | v2.9.4 | MIT |
+| github.com/fxamacker/cbor/v2 | v2.9.6 | MIT |
 | github.com/gabriel-vasile/mimetype | v1.4.15 | MIT |
 | github.com/gin-contrib/sse | v1.1.2 | MIT |
 | github.com/gin-gonic/gin | v1.12.0 | MIT |
@@ -179,7 +179,7 @@ current tree rather than a guarantee.
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause |
 | github.com/gorilla/websocket | v1.5.3 | BSD-2-Clause |
 | github.com/joho/godotenv | v1.5.1 | MIT |
-| github.com/klauspost/compress | v1.20.1 | MIT |
+| github.com/klauspost/compress | v1.20.3 | MIT |
 | github.com/klauspost/cpuid/v2 | v2.4.0 | MIT |
 | github.com/klauspost/crc32 | v1.3.0 | BSD-3-Clause |
 | github.com/leodido/go-urn | v1.5.0 | MIT |
@@ -187,7 +187,7 @@ current tree rather than a guarantee.
 | github.com/mattn/go-isatty | v0.0.24 | MIT |
 | github.com/minio/crc64nvme | v1.1.1 | Apache-2.0 |
 | github.com/minio/md5-simd | v1.1.2 | Apache-2.0 |
-| github.com/minio/minio-go/v7 | v7.3.0 | Apache-2.0 |
+| github.com/minio/minio-go/v7 | v7.4.1 | Apache-2.0 |
 | github.com/nats-io/nats.go | v1.54.0 | Apache-2.0 |
 | github.com/nats-io/nkeys | v0.4.16 | Apache-2.0 |
 | github.com/nats-io/nuid | v1.0.1 | Apache-2.0 |
@@ -196,24 +196,24 @@ current tree rather than a guarantee.
 | github.com/pquerna/otp | v1.5.0 | Apache-2.0 |
 | github.com/quic-go/qpack | v0.6.0 | MIT |
 | github.com/quic-go/quic-go | v0.63.0 | MIT |
-| github.com/redis/go-redis/v9 | v9.22.0 | BSD-2-Clause |
+| github.com/redis/go-redis/v9 | v9.23.0 | BSD-2-Clause |
 | github.com/rs/xid | v1.6.0 | MIT |
-| github.com/tinylib/msgp | v1.6.4 | MIT |
+| github.com/tinylib/msgp | v1.6.5 | MIT |
 | github.com/ugorji/go/codec | v1.3.2 | MIT |
 | github.com/vmihailenco/msgpack/v5 | v5.4.1 | BSD-2-Clause |
 | github.com/vmihailenco/tagparser/v2 | v2.0.0 | BSD-2-Clause |
 | github.com/x448/float16 | v0.8.4 | MIT |
 | github.com/zeebo/xxh3 | v1.1.0 | BSD-2-Clause |
-| go.mongodb.org/mongo-driver/v2 | v2.9.1 | Apache-2.0 |
+| go.mongodb.org/mongo-driver/v2 | v2.9.2 | Apache-2.0 |
 | go.uber.org/atomic | v1.12.0 | MIT |
 | go.yaml.in/yaml/v3 | v3.0.5 | MIT |
-| golang.org/x/crypto | v0.57.0 | BSD-3-Clause |
-| golang.org/x/image | v0.46.0 | BSD-3-Clause |
-| golang.org/x/net | v0.60.0 | BSD-3-Clause |
+| golang.org/x/crypto | v0.58.0 | BSD-3-Clause |
+| golang.org/x/image | v0.47.0 | BSD-3-Clause |
+| golang.org/x/net | v0.61.0 | BSD-3-Clause |
 | golang.org/x/oauth2 | v0.37.0 | BSD-3-Clause |
-| golang.org/x/sync | v0.23.0 | BSD-3-Clause |
-| golang.org/x/sys | v0.48.0 | BSD-3-Clause |
-| golang.org/x/text | v0.42.0 | BSD-3-Clause |
+| golang.org/x/sync | v0.24.0 | BSD-3-Clause |
+| golang.org/x/sys | v0.49.0 | BSD-3-Clause |
+| golang.org/x/text | v0.43.0 | BSD-3-Clause |
 | google.golang.org/protobuf | v1.36.12 | BSD-3-Clause |
 | gopkg.in/ini.v1 | v1.67.3 | Apache-2.0 |
 
@@ -307,7 +307,7 @@ bundle (client/desktop):
 | lodash.isequal | 4.5.0 | MIT | https://github.com/lodash/lodash |
 | longest-streak | 3.1.0 | MIT | https://github.com/wooorm/longest-streak |
 | lowlight | 3.3.0 | MIT | https://github.com/wooorm/lowlight |
-| lucide-react | 1.48.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.52.0 | ISC | https://github.com/lucide-icons/lucide |
 | markdown-table | 3.0.4 | MIT | https://github.com/wooorm/markdown-table |
 | mdast-util-find-and-replace | 3.0.2 | MIT | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | mdast-util-from-markdown | 2.0.3 | MIT | https://github.com/syntax-tree/mdast-util-from-markdown |
@@ -324,7 +324,7 @@ bundle (client/desktop):
 | mdast-util-to-hast | 13.2.1 | MIT | https://github.com/syntax-tree/mdast-util-to-hast |
 | mdast-util-to-markdown | 2.1.2 | MIT | https://github.com/syntax-tree/mdast-util-to-markdown |
 | mdast-util-to-string | 4.0.0 | MIT | https://github.com/syntax-tree/mdast-util-to-string |
-| mediasoup-client | 3.24.1 | ISC | https://github.com/versatica/mediasoup-client |
+| mediasoup-client | 3.24.4 | ISC | https://github.com/versatica/mediasoup-client |
 | micromark-core-commonmark | 2.0.3 | MIT | https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark |
 | micromark-extension-gfm-autolink-literal | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-autolink-literal |
 | micromark-extension-gfm-footnote | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-footnote |
@@ -435,7 +435,7 @@ bundle (services/media-plane):
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/node | 26.6.3 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/node | 26.6.4 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/triple-beam | 1.3.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |

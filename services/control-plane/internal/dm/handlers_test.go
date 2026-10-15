@@ -3045,6 +3045,7 @@ func TestDMUserMuteRetriesAfterParticipantSnapshotDrift(t *testing.T) {
 	convID := ts.CreateDMConversation(t, actor.ID, target.ID)
 	seedDMVoiceParticipant(t, ts, convID, actor.ID)
 	seedDMVoiceParticipant(t, ts, convID, target.ID)
+	seedDMOutboxSession(t, ts, convID, target.ID)
 
 	blocker, err := ts.DB.Begin()
 	require.NoError(t, err)
@@ -3085,7 +3086,7 @@ func TestDMUserMuteRetriesAfterParticipantSnapshotDrift(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("soft mute request did not finish")
 	}
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	requireDMOutboxQueued(t, w, http.StatusAccepted)
 }
 
 func TestAddMemberWaitsForPendingVoiceEjection(t *testing.T) {
@@ -3332,14 +3333,14 @@ func TestRemoveMemberRejectsStaleCredentialEpoch(t *testing.T) {
 	assert.Zero(t, revocationCount, "stale removal must not rotate DM keys")
 }
 
-func TestRemoveMemberAdminImmediatelyDisconnectsActiveDMVoiceTarget(t *testing.T) {
-	messages := subscribeDMVoiceDisconnect(t)
+func TestRemoveMemberAdminQueuesActiveDMVoiceTarget(t *testing.T) {
 	ts := setupTS(t)
 	admin := ts.CreateTestUser(t, "rmvoiceadmin")
 	member := ts.CreateTestUser(t, "rmvoicemember")
 	target := ts.CreateTestUser(t, "rmvoicetarget")
 	convID := createTestGroup(t, ts, admin, member, target)
 	seedDMVoiceParticipant(t, ts, convID, target.ID)
+	seedDMOutboxSession(t, ts, convID, target.ID)
 
 	response := ts.DoRequest(
 		"DELETE",
@@ -3347,19 +3348,17 @@ func TestRemoveMemberAdminImmediatelyDisconnectsActiveDMVoiceTarget(t *testing.T
 		nil,
 		testhelpers.AuthHeaders(admin.AccessToken),
 	)
-	require.Equal(t, http.StatusOK, response.Code)
-	payload := waitDMVoiceEnforcement(t, messages, target.ID)
-	assert.Equal(t, convID, payload["channelId"])
-	assert.Equal(t, "disconnect", payload["action"])
+	requireDMOutboxQueued(t, response, http.StatusOK)
+	assertDMRemovalOutboxCommand(t, ts, convID, target.ID)
 }
 
-func TestRemoveMemberAdminDisconnectsBeforeDMVoicePresenceRow(t *testing.T) {
-	messages := subscribeDMVoiceDisconnect(t)
+func TestRemoveMemberAdminQueuesBeforeDMVoicePresenceRow(t *testing.T) {
 	ts := setupTS(t)
 	admin := ts.CreateTestUser(t, "rmvoiceraceadmin")
 	member := ts.CreateTestUser(t, "rmvoiceracemember")
 	target := ts.CreateTestUser(t, "rmvoiceracetarget")
 	convID := createTestGroup(t, ts, admin, member, target)
+	seedDMOutboxSession(t, ts, convID, target.ID)
 
 	response := ts.DoRequest(
 		"DELETE",
@@ -3367,20 +3366,18 @@ func TestRemoveMemberAdminDisconnectsBeforeDMVoicePresenceRow(t *testing.T) {
 		nil,
 		testhelpers.AuthHeaders(admin.AccessToken),
 	)
-	require.Equal(t, http.StatusOK, response.Code)
-	payload := waitDMVoiceEnforcement(t, messages, target.ID)
-	assert.Equal(t, convID, payload["channelId"])
-	assert.Equal(t, "disconnect", payload["action"])
+	requireDMOutboxQueued(t, response, http.StatusOK)
+	assertDMRemovalOutboxCommand(t, ts, convID, target.ID)
 }
 
-func TestRemoveMemberSelfLeaveImmediatelyDisconnectsActiveDMVoiceTarget(t *testing.T) {
-	messages := subscribeDMVoiceDisconnect(t)
+func TestRemoveMemberSelfLeaveQueuesActiveDMVoiceTarget(t *testing.T) {
 	ts := setupTS(t)
 	admin := ts.CreateTestUser(t, "rmvoiceselfadmin")
 	member := ts.CreateTestUser(t, "rmvoiceselfmember")
 	leaver := ts.CreateTestUser(t, "rmvoiceselftarget")
 	convID := createTestGroup(t, ts, admin, member, leaver)
 	seedDMVoiceParticipant(t, ts, convID, leaver.ID)
+	seedDMOutboxSession(t, ts, convID, leaver.ID)
 
 	response := ts.DoRequest(
 		"DELETE",
@@ -3388,10 +3385,8 @@ func TestRemoveMemberSelfLeaveImmediatelyDisconnectsActiveDMVoiceTarget(t *testi
 		nil,
 		testhelpers.AuthHeaders(leaver.AccessToken),
 	)
-	require.Equal(t, http.StatusOK, response.Code)
-	payload := waitDMVoiceEnforcement(t, messages, leaver.ID)
-	assert.Equal(t, convID, payload["channelId"])
-	assert.Equal(t, "disconnect", payload["action"])
+	requireDMOutboxQueued(t, response, http.StatusOK)
+	assertDMRemovalOutboxCommand(t, ts, convID, leaver.ID)
 }
 
 func TestRemoveMemberCannotRemoveCreator(t *testing.T) {
@@ -4191,12 +4186,13 @@ func TestDMUserMute(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		seedDMOutboxSession(t, ts, convID, userB.ID)
 		w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+userB.ID+pathUserMute, nil, testhelpers.AuthHeaders(userA.AccessToken))
-		assert.Equal(t, http.StatusOK, w.Code)
+		requireDMOutboxQueued(t, w, http.StatusAccepted)
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		assert.Equal(t, true, body["success"])
+		assert.Equal(t, "queued", body["enforcement_status"])
 	})
 
 	t.Run("NotParticipant", func(t *testing.T) {
@@ -5184,28 +5180,22 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 		ring.Body.String())
 }
 
-func TestDMHardMutePublishesCompleteEnforcementSnapshotWithoutVoiceParticipant(t *testing.T) {
-	messages := subscribeDMVoiceEnforcement(t, "voice.enforce.mute")
+func TestDMHardMuteQueuesCompleteEnforcementSnapshotWithoutVoiceParticipant(t *testing.T) {
 	ts := setupTS(t)
 	admin := ts.CreateTestUser(t, "snapshotmuteadmin")
 	target := ts.CreateTestUser(t, "snapshotmutetarget")
 	convID := createTestGroup(t, ts, admin, target)
+	seedDMOutboxSession(t, ts, convID, target.ID)
 
 	response := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+pathMute,
 		nil, testhelpers.AuthHeaders(admin.AccessToken))
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-
-	payload := waitDMVoiceEnforcement(t, messages, target.ID)
-	assert.Equal(t, convID, payload["channelId"])
-	assert.Equal(t, "mute", payload["action"])
-	assert.Equal(t, true, payload["serverMuted"])
-	assert.Equal(t, false, payload["serverDeafened"])
-	assert.Equal(t, float64(1), payload["version"])
-	revision, ok := payload["authorizationRevision"].(string)
-	require.True(t, ok, "authorizationRevision should be a decimal string")
-	parsedRevision, err := strconv.ParseInt(revision, 10, 64)
-	require.NoError(t, err)
-	assert.Positive(t, parsedRevision)
+	requireDMOutboxQueued(t, response, http.StatusOK)
+	command := readDMOutboxCommand(t, ts.DB, target.ID)
+	assert.Equal(t, "dm", command.Scope)
+	assert.Equal(t, sql.NullString{String: convID, Valid: true}, command.ChannelID)
+	assert.False(t, command.ServerID.Valid)
+	assertDMOutboxTarget(t, command)
+	assertDMSnapshotFields(t, command, "mute", true, false)
 
 	var voiceRows int
 	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_voice_participants WHERE conversation_id = $1`, convID).Scan(&voiceRows))

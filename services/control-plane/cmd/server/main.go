@@ -322,8 +322,10 @@ func runControlPlane() (runErr error) {
 	hub := runtime.hub
 	natsClient := runtime.natsClient
 	waitVoiceCommandTransport := startVoiceCommandTransportWorker(cleanupCtx, db, cfg.NATSUrl, log)
+	waitVoiceCommandOutbox := startVoiceCommandOutboxWorker(cleanupCtx, db, cfg.NATSUrl, log)
 	defer func() {
 		cleanupCancel()
+		waitVoiceCommandOutbox()
 		waitVoiceCommandTransport()
 	}()
 	var expirySweeper *expiration.Sweeper
@@ -334,6 +336,7 @@ func runControlPlane() (runErr error) {
 		expirationWorkers.Wait()
 		waitActivityHistoryWorkers()
 		waitTier1ErasureReclaimer()
+		waitVoiceCommandOutbox()
 		waitVoiceCommandTransport()
 		if voicePermissionEnforcer != nil {
 			voicePermissionEnforcer.Close()

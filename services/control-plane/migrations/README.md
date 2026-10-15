@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000168)
+## Existing Migrations (000001–000170)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -278,6 +278,8 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000166 | align_presence_and_fof_defaults | Default future Server Voice details to Off, Private Call audience to Friends, and Friends of Friends to On without changing stored choices; same drain and rollback gate |
 | 000167 | add_voice_command_transport | Permanent singleton transport generation and immutable broker provisioning proof; down refuses a provisioned receipt |
 | 000168 | pin_aware_message_expiry | `channels.expiration_include_pinned` and `dm_conversations.expiration_include_pinned` (NOT NULL DEFAULT TRUE, so every existing timer keeps expiring pins), and nullable, unindexed `messages.held_expires_at` / `dm_messages.held_expires_at`: a pinned row in a context that keeps pins carries its would-be stamp there instead of in `expires_at`, so the sweeper never sees it. A permanently NOT VALID CHECK enforces the held shape on new writes; two evidence tables let a down then up restore keep-pins contexts and held stamps without relabelling a context whose policy moved (#3459) |
+| 000169 | add_voice_command_outbox | Typed immutable enforcement commands, transactional allocation/publication cursors and leased delivery receipts; down refuses commands or nonzero cursors |
+| 000170 | add_voice_command_capacity | Recorded consumer-acknowledged prefix retirement and bounded outstanding actor admission; backfills pending targets without dropping over-limit queues; down refuses retirement or admission evidence |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -400,6 +402,21 @@ remains at 167. Inspect the actual singleton, constraints and receipt first. Onl
 after verifying that exact state, repair the migration metadata to **clean 167**;
 never force 166 and continue downs. A dirty marker from a different migration or
 an uncertain schema requires its own investigation.
+
+Migration 000169 adds `voice_command_outbox` and the singleton
+`voice_command_sequence` allocation/publication cursors. Commands retain typed,
+immutable envelope fields independently of account, room and session cleanup;
+only delivery lease, retry and receipt fields can change. The command counter
+is updated in the authoritative transaction, so rollback restores allocation
+and committed batches remain gap-free. Publication records a verified broker
+sequence and advances the published cursor in one transaction.
+
+Its down migration takes the publisher's lock order and refuses if any command
+row or nonzero cursor remains. A binary rollback retains this additive schema
+and uses a compatible image that embeds migration 000169. Do not erase commands,
+reset cursors or force an older schema version to bypass that refusal. See the
+[voice command transport runbook](../../../[internal]voice-command-transport.md)
+for delivery diagnostics and preservation of continuity evidence.
 
 ## Troubleshooting
 

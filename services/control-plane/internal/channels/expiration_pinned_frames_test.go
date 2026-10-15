@@ -6,9 +6,23 @@ package channels_test
 //
 //   - the expiration_event frame carries include_pinned on EVERY event, and
 //     previous_include_pinned + previous_window_seconds on a "changed" event only;
-//   - the policy broadcast reaches the client BEFORE the server_purged that the
-//     immediate pinned deletion announces (§8 ordering: a client that saw the
-//     purge first would refetch history while still holding the old policy).
+//   - the immediate pinned deletion announces exactly one server_purged beside it.
+//
+// Which of those two frames arrives first is deliberately NOT asserted. §8 orders
+// what the handler ISSUES (broadcast, then deletion), not what a client receives,
+// and the hub has nothing that could carry the second promise. The policy frame
+// is a BroadcastToChannelAuthorized: the run loop hands it to a worker goroutine
+// that checks each recipient's view permission against the database
+// (dispatchChannelDelivery -> checkChannelDeliveryPermissions). server_purged
+// takes the other lane, BroadcastToServerContext -> serverBroadcast, which the
+// run loop delivers inline. Two lanes with no shared FIFO, so whichever finishes
+// first is delivered first, and under CPU load the purge wins often enough to
+// fail an order assertion. A client that sees the purge first loses nothing: its
+// refetch returns server truth, and the policy event, fenced by revision, lands
+// moments later (the renderer's useWebSocketMessages.purge.test.ts pins every
+// arrival order). The issue order itself is pinned in
+// expiration_pinned_expiry_test.go, by
+// TestChannelExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld.
 
 import (
 	"encoding/json"
@@ -164,12 +178,9 @@ RETURNING id`, channelID, authorID).Scan(&id))
 	return id
 }
 
-// Mutants killed:
-//   - the expiration broadcast moved after the expirer in UpdateExpiration
-//     (server_purged arrives first);
-//   - AddPinnedEventFields dropping include_pinned, previous_include_pinned or
-//     previous_window_seconds from the live frame.
-func TestChannelExpiration_PinnedToggleFramesCarryPinFieldsAndPrecedeThePurge(t *testing.T) {
+// Mutant killed: AddPinnedEventFields dropping include_pinned,
+// previous_include_pinned or previous_window_seconds from the live frame.
+func TestChannelExpiration_PinnedToggleFramesCarryPinFields(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	owner := ts.CreateTestUser(t, "pin_frames_owner")
 	serverID := ts.CreateTestServer(t, owner.ID, "pin-frames-server")
@@ -208,15 +219,18 @@ func TestChannelExpiration_PinnedToggleFramesCarryPinFieldsAndPrecedeThePurge(t 
 	require.Eventually(t, func() bool { return len(tap.ofTypes("expiration_event", "server_purged")) >= 2 }, 3*time.Second, 20*time.Millisecond)
 	tap.settle(t, 500*time.Millisecond)
 	frames := tap.ofTypes("expiration_event", "server_purged")
-	require.Len(t, frames, 2, "one policy broadcast and one purge announcement, nothing else")
-
-	// §8 ordering: the policy broadcast first, the purge announcement second.
-	assert.Equal(t, "expiration_event", frames[0].Type, "the policy broadcast precedes the purge event")
-	assert.Equal(t, "server_purged", frames[1].Type)
-	assert.Equal(t, serverID, frames[1].Data["server_id"])
+	types := make([]string, 0, len(frames))
+	dataOf := make(map[string]map[string]interface{}, len(frames))
+	for _, frame := range frames {
+		types = append(types, frame.Type)
+		dataOf[frame.Type] = frame.Data
+	}
+	require.ElementsMatch(t, []string{"expiration_event", "server_purged"}, types,
+		"one policy broadcast and one purge announcement, nothing else, in either order")
+	assert.Equal(t, serverID, dataOf["server_purged"]["server_id"])
 
 	// §6.4: a pins-only change is a "changed" event carrying the whole pin story.
-	changed := frames[0].Data
+	changed := dataOf["expiration_event"]
 	assert.Equal(t, "changed", changed["kind"])
 	assert.Equal(t, true, changed["include_pinned"])
 	assert.Equal(t, false, changed["previous_include_pinned"])
@@ -225,8 +239,8 @@ func TestChannelExpiration_PinnedToggleFramesCarryPinFieldsAndPrecedeThePurge(t 
 	assert.EqualValues(t, 86400, changed["window_seconds"])
 }
 
-// Converse of the ordering case: a toggle with nothing due announces the policy
-// and NO purge, so the ordering assertion above is not satisfiable by a purge
+// Converse of the case above: a toggle with nothing due announces the policy and
+// NO purge, so that case's "one purge announcement" is not satisfiable by a purge
 // that fires unconditionally.
 //
 // Mutant killed: the expirer announcing a purge when DuePinnedIDs is empty.

@@ -261,12 +261,24 @@ func signedRemoveMemberWSToken(t *testing.T, userID uuid.UUID, jwtSecret string)
 	return signed
 }
 
-func TestRemoveMemberDeliveryFailureStillEnforcesAndBroadcasts(t *testing.T) {
+func TestRemoveMemberDeliveryFailureStillQueuesEnforcementAndBroadcasts(t *testing.T) {
 	db, convID, creator, successor, h, _ := seedMemberRemovalFixture(t, true)
 	target := creator
 	_, err := db.Exec(`INSERT INTO dm_voice_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, target)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`, convID, target, []byte("key"))
+	require.NoError(t, err)
+	const sessionGeneration = "26230000-0000-4000-8000-000000000031"
+	const nodeBootID = "26230000-0000-4000-8000-000000000032"
+	const socketID = "delivery-failure-outbox-test-socket"
+	t.Cleanup(func() {
+		_, cleanupErr := db.Exec(`DELETE FROM voice_enforcement_sessions WHERE session_generation = $1 AND node_boot_id = $2`, sessionGeneration, nodeBootID)
+		require.NoError(t, cleanupErr)
+	})
+	_, err = db.Exec(`
+		INSERT INTO voice_enforcement_sessions (session_generation, node_boot_id, room_id, room_kind, user_id, credential_epoch, socket_id)
+		VALUES ($1, $2, $3, 'dm', $4, '', $5)
+	`, sessionGeneration, nodeBootID, convID, target, socketID)
 	require.NoError(t, err)
 
 	natsURL := os.Getenv("NATS_URL")
@@ -276,18 +288,6 @@ func TestRemoveMemberDeliveryFailureStillEnforcesAndBroadcasts(t *testing.T) {
 	bus, err := natsclient.Connect(natsURL)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = bus.Close() })
-	enforcement := make(chan map[string]interface{}, 8)
-	subscription, err := bus.Subscribe("voice.enforce.disconnect", func(data []byte) {
-		var payload map[string]interface{}
-		if decodeErr := json.Unmarshal(data, &payload); decodeErr != nil {
-			t.Errorf("decode DM voice enforcement: %v", decodeErr)
-			return
-		}
-		enforcement <- payload
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, subscription.Unsubscribe()) })
-	require.NoError(t, bus.Flush())
 
 	wsRedis := redistest.Client(t)
 	hub := websocket.NewHub(db, wsRedis)
@@ -313,22 +313,17 @@ func TestRemoveMemberDeliveryFailureStillEnforcesAndBroadcasts(t *testing.T) {
 
 	r := invokeRemoveMember(t, h, convID, creator.String(), target.String())
 	require.Equal(t, 503, r.Code)
-	disconnectTimer := time.NewTimer(3 * time.Second)
-	defer disconnectTimer.Stop()
-	disconnectObserved := false
-	for !disconnectObserved {
-		select {
-		case payload := <-enforcement:
-			if payload["userId"] != target.String() {
-				continue
-			}
-			require.Equal(t, convID, payload["channelId"])
-			require.Equal(t, "disconnect", payload["action"])
-			disconnectObserved = true
-		case <-disconnectTimer.C:
-			t.Fatal("missing unconditional voice disconnect for removed member")
-		}
-	}
+	require.Equal(t, 1, countRows(t, db, `SELECT COUNT(*) FROM voice_command_outbox`))
+	require.Equal(t, 1, countRows(t, db, `
+		SELECT COUNT(*) FROM voice_command_outbox
+		WHERE scope = 'dm' AND kind = 'disconnect' AND action = 'disconnect'
+			AND reason = 'membership_removed' AND envelope_version = 1
+			AND channel_id = $1 AND user_id = $2 AND server_id IS NULL
+			AND session_generation = $3 AND node_boot_id = $4 AND socket_id = $5 AND credential_epoch = ''
+			AND authorization_revision IS NULL AND server_muted IS NULL AND server_deafened IS NULL
+			AND stream_generation = (SELECT generation FROM voice_command_transport WHERE id = TRUE)
+			AND published_at IS NULL AND broker_sequence IS NULL
+	`, convID, target, sessionGeneration, nodeBootID, socketID))
 
 	seen := map[string]map[string]interface{}{}
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))

@@ -36,6 +36,7 @@ func TestReinstallsRootOnEveryInstallingRow(t *testing.T) {
 // produce (guardHolds reads only the fields varied here), against every
 // presence pattern, half pairs included.
 func TestSelectRowIsUniqueOverEveryFromAndPattern(t *testing.T) {
+	t.Parallel()
 	samples := selectRowSignatures()
 	codes := map[FromCode]bool{}
 	for _, p := range samples {
@@ -130,8 +131,10 @@ func bitBytes(on bool, s string) []byte {
 }
 
 // Sec-N2: two rows admitting one bundle is a table defect, refused rather
-// than settled by table order. A duplicate of row 16 makes it reachable.
+// than settled by table order. A duplicate of row 16 makes it reachable. It
+// replaces table, which parallel tests read, so it stays serial.
 func TestSelectRowRefusesASecondMatch(t *testing.T) {
+	mustStaySerial(t)
 	f := pub{State: StatePending, Prior: StateActive, Root: []byte("root"), PendRoot: []byte("cand"), Susp: []string{}}
 	row, r := selectRow(f, OpRevokeRoot, ActorOperator, pOperator)
 	require.Equal(t, ReasonOK, r, "control: the real table admits it once")

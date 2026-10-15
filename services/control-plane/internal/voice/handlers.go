@@ -1006,24 +1006,6 @@ func findVoiceChannelTx(ctx context.Context, tx *sql.Tx, serverID, targetID stri
 	return channelID, nil
 }
 
-// publishEnforcement publishes a NATS enforcement message if the target is in voice.
-func (h *Handler) publishEnforcement(subject, channelID, targetID, action string) {
-	if channelID == "" {
-		return
-	}
-	if h.beforeVoiceEffectForTest != nil {
-		h.beforeVoiceEffectForTest()
-	}
-	if h.nats == nil {
-		return
-	}
-	if pubErr := h.nats.Publish(subject, map[string]interface{}{
-		"channelId": channelID, "userId": targetID, "action": action,
-	}); pubErr != nil {
-		h.log.Error("Failed to publish NATS enforcement", "error", pubErr, "subject", subject, "action", action)
-	}
-}
-
 type serverEnforcementSnapshot struct {
 	serverMuted     bool
 	serverDeafened  bool
@@ -1064,6 +1046,11 @@ func serverEnforcementSnapshotTx(
 			FROM voice_pending_admissions AS pending
 			JOIN channels AS channel ON channel.id = pending.channel_id
 			WHERE channel.server_id = $1 AND pending.user_id = $2
+			UNION ALL
+			SELECT session.room_id AS channel_id, 2 AS source_priority
+			FROM voice_enforcement_sessions AS session
+			JOIN channels AS channel ON channel.id = session.room_id
+			WHERE session.room_kind = 'channel' AND channel.server_id = $1 AND session.user_id = $2
 		) AS voice_channels
 		GROUP BY channel_id
 		ORDER BY MIN(source_priority), channel_id
@@ -1087,30 +1074,6 @@ func serverEnforcementSnapshotTx(
 		return serverEnforcementSnapshot{}, fmt.Errorf("iterate server enforcement channels: %w", err)
 	}
 	return snapshot, nil
-}
-
-// publishServerEnforcementSnapshot sends the complete moderator-owned state to
-// each established or staged channel session. The subject remains action-scoped
-// for compatibility; fields are a control-plane snapshot, never client input.
-func (h *Handler) publishServerEnforcementSnapshot(
-	subject, targetID, action string, snapshot serverEnforcementSnapshot,
-) {
-	if h.nats == nil {
-		return
-	}
-	for _, channelID := range snapshot.channelIDs {
-		if pubErr := h.nats.Publish(subject, map[string]interface{}{
-			"channelId":             channelID,
-			"userId":                targetID,
-			"action":                action,
-			"serverMuted":           snapshot.serverMuted,
-			"serverDeafened":        snapshot.serverDeafened,
-			"authorizationRevision": strconv.FormatInt(snapshot.authorizationID, 10),
-			"version":               enforcementSnapshotSchemaVersion,
-		}); pubErr != nil {
-			h.log.Error("Failed to publish NATS enforcement", "error", pubErr, "subject", subject, "action", action)
-		}
-	}
 }
 
 func firstEnforcementChannel(snapshot serverEnforcementSnapshot) string {
@@ -1142,16 +1105,16 @@ func (h *Handler) broadcastVoiceStateUpdate(serverID, targetID, channelID, actio
 
 // enforcementParams groups the per-action strings for applyServerEnforcement.
 type enforcementParams struct {
-	query       string // SQL UPDATE statement
-	permission  rbac.Permission
-	natsSubject string // NATS subject to publish on
-	natsAction  string // action field in NATS payload
-	wsAction    string // action field in WS broadcast
-	successMsg  string // HTTP 200 message
-	failMsg     string // HTTP 500 / log message
+	query      string // SQL UPDATE statement
+	permission rbac.Permission
+	action     string // action field in the durable command
+	wsAction   string // action field in WS broadcast
+	successMsg string // HTTP 200 message
+	failMsg    string // HTTP 500 / log message
 }
 
-// applyServerEnforcement executes the SQL update, finds voice channel, publishes NATS, broadcasts WS.
+// applyServerEnforcement saves policy and its exact enforcement obligations in
+// one transaction, then broadcasts the saved policy after confirmed commit.
 func (h *Handler) applyServerEnforcement(c *gin.Context, ctx *voiceModContext, p enforcementParams) {
 	tx, err := h.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -1189,18 +1152,25 @@ func (h *Handler) applyServerEnforcement(c *gin.Context, ctx *voiceModContext, p
 		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
 		return
 	}
+	if err := enqueueServerVoiceSnapshotTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID, c.GetString("user_id"), p.action, snapshot); err != nil {
+		if respondVoiceCommandQueueFull(c, err) {
+			return
+		}
+		h.log.Error(p.failMsg, "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		h.log.Error(p.failMsg, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": p.failMsg})
 		return
 	}
-	h.publishServerEnforcementSnapshot(p.natsSubject, ctx.targetID, p.natsAction, snapshot)
 	h.broadcastVoiceStateUpdate(ctx.serverID, ctx.targetID, firstEnforcementChannel(snapshot), p.wsAction)
-	c.JSON(http.StatusOK, gin.H{"message": p.successMsg})
+	c.JSON(http.StatusOK, gin.H{"message": p.successMsg, "enforcement_status": "queued"})
 }
 
-// userLevelAction sends a real-time user-level enforcement command via NATS.
-func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, natsSubject, natsAction, successMsg, failMsg string) {
+// userLevelAction commits exact session commands before accepting queued work.
+func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, action, successMsg, failMsg string) {
 	if c.GetString("user_id") == c.Param("userId") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCannotTargetSelf})
 		return
@@ -1224,23 +1194,24 @@ func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, natsSubj
 		return
 	}
 
-	channelID, findErr := findVoiceChannelTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID)
-	if findErr != nil {
-		h.log.Error("Failed to find voice channel", "error", findErr, "server_id", ctx.serverID, "target_id", ctx.targetID)
+	specs, err := captureServerVoiceCommandSpecsTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID, "user_moderation", action, "")
+	if err != nil {
+		h.log.Error(failMsg, "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return
 	}
-	if channelID == "" {
+	if len(specs) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTargetNotInVoice})
 		return
 	}
 
-	if h.nats != nil {
-		if pubErr := h.nats.Publish(natsSubject, map[string]interface{}{
-			"channelId": channelID, "userId": ctx.targetID, "action": natsAction,
-		}); pubErr != nil {
-			h.log.Error(failMsg, "error", pubErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+	if err := enqueueServerVoiceCommandsTx(c.Request.Context(), tx, specs, c.GetString("user_id")); err != nil {
+		if respondVoiceCommandQueueFull(c, err) {
 			return
 		}
+		h.log.Error(failMsg, "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return
 	}
 	if err := tx.Commit(); err != nil {
 		h.log.Error(failMsg, "error", err)
@@ -1248,7 +1219,7 @@ func (h *Handler) userLevelAction(c *gin.Context, perm rbac.Permission, natsSubj
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": successMsg})
+	c.JSON(http.StatusAccepted, gin.H{"message": successMsg, "enforcement_status": "queued"})
 }
 
 // ServerMute applies a persistent server-level mute to a member.
@@ -1260,8 +1231,8 @@ func (h *Handler) ServerMute(c *gin.Context) {
 	}
 	h.applyServerEnforcement(c, ctx, enforcementParams{
 		query: `UPDATE server_members SET server_muted = true WHERE server_id = $1 AND user_id = $2`, permission: rbac.PermMuteMembers,
-		natsSubject: "voice.enforce.mute", natsAction: "mute", wsAction: "server_muted",
-		successMsg: "Member server-muted", failMsg: "Failed to mute member",
+		action: "mute", wsAction: "server_muted",
+		successMsg: "Server mute policy saved; enforcement queued", failMsg: "Failed to mute member",
 	})
 }
 
@@ -1318,15 +1289,22 @@ func (h *Handler) ServerUnmute(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
 		return
 	}
+	if err := enqueueServerVoiceSnapshotTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID, c.GetString("user_id"), "unmute", snapshot); err != nil {
+		if respondVoiceCommandQueueFull(c, err) {
+			return
+		}
+		h.log.Error(errMsgFailedUnmuteMember, "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit server-unmute", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnmuteMember})
 		return
 	}
-	h.publishServerEnforcementSnapshot("voice.enforce.mute", ctx.targetID, "unmute", snapshot)
 	h.broadcastVoiceStateUpdate(ctx.serverID, ctx.targetID, firstEnforcementChannel(snapshot), "server_unmuted")
 
-	c.JSON(http.StatusOK, gin.H{"message": "Member server-unmuted"})
+	c.JSON(http.StatusOK, gin.H{"message": "Server unmute policy saved; enforcement queued", "enforcement_status": "queued"})
 }
 
 // ServerDeafen applies a persistent server-level deafen (implies mute) to a member.
@@ -1338,8 +1316,8 @@ func (h *Handler) ServerDeafen(c *gin.Context) {
 	}
 	h.applyServerEnforcement(c, ctx, enforcementParams{
 		query: `UPDATE server_members SET server_muted = true, server_deafened = true WHERE server_id = $1 AND user_id = $2`, permission: rbac.PermDeafenMembers,
-		natsSubject: "voice.enforce.deafen", natsAction: "deafen", wsAction: "server_deafened",
-		successMsg: "Member server-deafened", failMsg: "Failed to deafen member",
+		action: "deafen", wsAction: "server_deafened",
+		successMsg: "Server deafen policy saved; enforcement queued", failMsg: "Failed to deafen member",
 	})
 }
 
@@ -1352,23 +1330,23 @@ func (h *Handler) ServerUndeafen(c *gin.Context) {
 	}
 	h.applyServerEnforcement(c, ctx, enforcementParams{
 		query: `UPDATE server_members SET server_deafened = false, server_muted = false WHERE server_id = $1 AND user_id = $2`, permission: rbac.PermDeafenMembers,
-		natsSubject: "voice.enforce.deafen", natsAction: "undeafen", wsAction: "server_undeafened",
-		successMsg: "Member server-undeafened", failMsg: "Failed to undeafen member",
+		action: "undeafen", wsAction: "server_undeafened",
+		successMsg: "Server undeafen policy saved; enforcement queued", failMsg: "Failed to undeafen member",
 	})
 }
 
-// UserMute sends a real-time user-level mute command to the media plane.
-// No persistent DB state — requires the target to be in voice.
+// UserMute queues a user-level mute for exact registered voice sessions.
+// It changes no persistent moderation policy.
 // POST /servers/:id/voice/:userId/user-mute
 func (h *Handler) UserMute(c *gin.Context) {
-	h.userLevelAction(c, rbac.PermMuteMembers, "voice.user_mute", "mute", "User mute command sent", "Failed to mute user")
+	h.userLevelAction(c, rbac.PermMuteMembers, "mute", "User mute command queued", "Failed to mute user")
 }
 
-// UserDeafen sends a real-time user-level deafen command to the media plane.
-// No persistent DB state — requires the target to be in voice.
+// UserDeafen queues a user-level deafen for exact registered voice sessions.
+// It changes no persistent moderation policy.
 // POST /servers/:id/voice/:userId/user-deafen
 func (h *Handler) UserDeafen(c *gin.Context) {
-	h.userLevelAction(c, rbac.PermDeafenMembers, "voice.user_deafen", "deafen", "User deafen command sent", "Failed to deafen user")
+	h.userLevelAction(c, rbac.PermDeafenMembers, "deafen", "User deafen command queued", "Failed to deafen user")
 }
 
 // --- Force-disconnect (#487 P3) ---
@@ -1377,9 +1355,9 @@ func (h *Handler) UserDeafen(c *gin.Context) {
 // are currently in within the server. Unlike /move (the single ADR-0023
 // hierarchy exception), disconnect RESPECTS hierarchy: a moderator cannot
 // disconnect a member with an equal-or-higher role position. It requires the
-// Move Members permission and the target must currently be in a voice channel
-// in this server (else 409). The action publishes voice.enforce.disconnect so
-// the media plane closes the peer's transports; the resulting voice.left NATS
+// Move Members permission and an exact registered voice session in this server
+// (else 409). The committed command later closes those exact transports;
+// the resulting voice.left NATS
 // event drives the composite temp-grant cleanup automatically, so
 // this handler does NOT duplicate that cleanup.
 //
@@ -1404,31 +1382,33 @@ func (h *Handler) ServerDisconnect(c *gin.Context) {
 		return
 	}
 
-	channelID, findErr := findVoiceChannelTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID)
-	if findErr != nil {
-		h.log.Error("disconnect: find current voice channel", "error", findErr, "server_id", ctx.serverID, "target_id", ctx.targetID)
+	specs, err := captureServerVoiceCommandSpecsTx(c.Request.Context(), tx, ctx.serverID, ctx.targetID, "disconnect", "disconnect", "moderator_request")
+	if err != nil {
+		h.log.Error("disconnect: capture exact sessions", "failure_class", "voice_command_enqueue_failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisconnectMember})
 		return
 	}
-	if channelID == "" {
+	if len(specs) == 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgTargetNotInVoice})
 		return
 	}
 
-	// The successful guard transaction commit is the authorization decision
-	// point. Publish only afterwards: a failed or ambiguous commit must not close
-	// transports before the guard decision is confirmed.
+	if err := enqueueServerVoiceCommandsTx(c.Request.Context(), tx, specs, c.GetString("user_id")); err != nil {
+		if respondVoiceCommandQueueFull(c, err) {
+			return
+		}
+		h.log.Error("disconnect: enqueue command", "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisconnectMember})
+		return
+	}
+	// The authority decision and exact delivery obligations share one commit.
+	// A failed or ambiguous commit is not confirmed queue acceptance.
 	if err := h.commitVoiceEffectTx(tx); err != nil {
 		h.log.Error("disconnect: commit transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDisconnectMember})
 		return
 	}
-	// The media plane closes the peer's transports and emits voice.left, which
-	// (via the NATSSubscriber) updates DB state and triggers the composite
-	// temp-grant cleanup — no duplicate cleanup here.
-	h.publishEnforcement(natsSubjectEnforceDisconnect, channelID, ctx.targetID, "disconnect")
-
-	c.JSON(http.StatusOK, gin.H{"disconnected": true})
+	c.JSON(http.StatusAccepted, gin.H{"message": "Disconnect command queued", "enforcement_status": "queued"})
 }
 
 // --- Moderator temp-grant revoke (#487 Scope C) ---
@@ -1710,43 +1690,44 @@ func (h *Handler) prepareModeratedMove(c *gin.Context, serverID, actorID, target
 		return false
 	}
 	canJoin := perms.Has(rbac.PermViewVoiceChannels) && perms.Has(rbac.PermJoinVoice)
-	if !canJoin {
-		granted, grantErr := h.tempGrant.grantTemporaryChannelAccessWithCredential(
-			reqCtx, serverID, targetChannelID, targetID,
-			temporaryGrantAuthorization{
-				actorID:                 actorID,
-				credentialEpoch:         middleware.TokenCredentialEpoch(c),
-				expectedSourceChannelID: sourceChannelID,
-				guardCredential:         true,
-				authority: func(txCtx context.Context, tx *sql.Tx) error {
-					return revalidateVoiceModAuthorityTx(txCtx, tx, h.resolver, &voiceModContext{serverID: serverID, targetID: targetID}, actorID, rbac.PermMoveMembers, false)
-				},
+	if canJoin {
+		return true
+	}
+	granted, grantErr := h.tempGrant.grantTemporaryChannelAccessWithCredential(
+		reqCtx, serverID, targetChannelID, targetID,
+		temporaryGrantAuthorization{
+			actorID:                 actorID,
+			credentialEpoch:         middleware.TokenCredentialEpoch(c),
+			expectedSourceChannelID: sourceChannelID,
+			guardCredential:         true,
+			authority: func(txCtx context.Context, tx *sql.Tx) error {
+				return revalidateVoiceModAuthorityTx(txCtx, tx, h.resolver, &voiceModContext{serverID: serverID, targetID: targetID}, actorID, rbac.PermMoveMembers, false)
 			},
-		)
-		if grantErr != nil {
-			if errors.Is(grantErr, credepoch.ErrEpochMismatch) || errors.Is(grantErr, credepoch.ErrBlocked) {
-				h.respondVoiceGuardTxError(c, grantErr, errMsgMovePrep)
-				return false
-			}
-			if errors.Is(grantErr, errTemporaryGrantSourceChanged) {
-				c.JSON(http.StatusConflict, gin.H{"error": errMsgTargetNotInVoice})
-				return false
-			}
-			if errors.Is(grantErr, errVoiceModActorNotMember) || errors.Is(grantErr, errVoiceModPermission) || errors.Is(grantErr, errVoiceModHierarchy) {
-				h.respondVoiceModAuthorityTxError(c, grantErr, errMsgMovePrep)
-				return false
-			}
-			h.log.Error("move: temp grant", "error", grantErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		},
+	)
+	if grantErr != nil {
+		if errors.Is(grantErr, credepoch.ErrEpochMismatch) || errors.Is(grantErr, credepoch.ErrBlocked) {
+			h.respondVoiceGuardTxError(c, grantErr, errMsgMovePrep)
 			return false
 		}
-		// A permanent user override makes the locked upsert a no-op. The preflight
-		// already established that the target lacks at least one required voice bit,
-		// so fail closed rather than signal a move that AuthorizeJoin will refuse.
-		if !granted {
-			c.JSON(http.StatusConflict, gin.H{"error": errMsgMoveTargetBlocked})
+		if errors.Is(grantErr, errTemporaryGrantSourceChanged) {
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgTargetNotInVoice})
 			return false
 		}
+		if errors.Is(grantErr, errVoiceModActorNotMember) || errors.Is(grantErr, errVoiceModPermission) || errors.Is(grantErr, errVoiceModHierarchy) {
+			h.respondVoiceModAuthorityTxError(c, grantErr, errMsgMovePrep)
+			return false
+		}
+		h.log.Error("move: temp grant", "error", grantErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+		return false
+	}
+	// A permanent user override makes the locked upsert a no-op. The preflight
+	// already established that the target lacks at least one required voice bit,
+	// so fail closed rather than signal a move that AuthorizeJoin will refuse.
+	if !granted {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgMoveTargetBlocked})
+		return false
 	}
 
 	return true

@@ -39,6 +39,10 @@ func TestVoiceTransportRollback_RespectsCurrentSchema(t *testing.T) {
 				t.Cleanup(func() { require.NoError(t, tx.Rollback()) })
 				var current string
 				require.NoError(t, tx.QueryRow(`SELECT current_schema()`).Scan(&current))
+				// SetupTestDB installs the latest public schema. Restore this
+				// historical 167 fixture inside the outer rollback transaction:
+				// empty 169/170 additive FKs must not decide the 167 rollback outcome.
+				voiceTransportHistorical167Boundary(t, tx)
 				if schema == "public" {
 					require.Equal(t, "public", current)
 				} else {
@@ -103,6 +107,35 @@ func TestVoiceTransportRollback_RespectsCurrentSchema(t *testing.T) {
 			})
 		}
 	}
+}
+
+// This fixture removes only migrations 170 and 169's empty additive objects,
+// using their actual guarded down files. The public 167 receipt remains unchanged, and the
+// original search_path is restored before the schema-specific regression runs.
+// The caller's outer rollback restores the latest shared schema after each cell.
+func voiceTransportHistorical167Boundary(t *testing.T, tx *sql.Tx) {
+	t.Helper()
+	var schemaBefore, searchPathBefore, publicReceiptBefore string
+	require.NoError(t, tx.QueryRow(`SELECT current_schema(), current_setting('search_path')`).Scan(&schemaBefore, &searchPathBefore))
+	require.NoError(t, tx.QueryRow(`SELECT to_jsonb(receipt)::text FROM public.voice_command_transport AS receipt WHERE id = TRUE`).Scan(&publicReceiptBefore))
+	_, err := tx.Exec(`SET LOCAL search_path TO public`)
+	require.NoError(t, err)
+	dir := strings.TrimPrefix(controlPlaneMigrations(t), "file://")
+	for _, name := range []string{"000170_add_voice_command_capacity.down.sql", "000169_add_voice_command_outbox.down.sql"} {
+		contents, readErr := fs.ReadFile(os.DirFS(dir), name)
+		require.NoError(t, readErr)
+		require.NotEmpty(t, contents, "historical setup must execute the actual guarded migration")
+		_, err = tx.Exec(string(contents))
+		require.NoError(t, err, "the historical fixture requires empty evidence and never-used cursors")
+	}
+	var publicReceiptAfter string
+	require.NoError(t, tx.QueryRow(`SELECT to_jsonb(receipt)::text FROM public.voice_command_transport AS receipt WHERE id = TRUE`).Scan(&publicReceiptAfter))
+	assert.Equal(t, publicReceiptBefore, publicReceiptAfter, "historical setup must preserve every public 167 receipt field")
+	_, err = tx.Exec(`SELECT set_config('search_path', $1, true)`, searchPathBefore)
+	require.NoError(t, err)
+	var schemaAfter string
+	require.NoError(t, tx.QueryRow(`SELECT current_schema()`).Scan(&schemaAfter))
+	require.Equal(t, schemaBefore, schemaAfter, "historical setup must restore the active schema")
 }
 
 func voiceTransportMigrationSQL(t *testing.T, direction string) string {

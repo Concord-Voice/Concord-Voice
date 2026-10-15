@@ -4521,39 +4521,71 @@ paths:
       description: Target participant user ID
     delete:
       tags:
-      - Direct Messages
+        - Direct Messages
       summary: Remove a member from a group DM (or leave when targeting yourself)
-      description: 'Group conversations only. Admins may remove other members; any participant may remove
-        themselves (self-leave). The group creator can only be removed via self-leave. After the membership
-        commit, the control plane unconditionally publishes a target disconnect; successful DM heartbeats
-        retry disconnects for media-reported users who are no longer members. Rate limit: 10 requests/min
-        per user.'
+      description: >-
+        Group conversations only. Admins may remove other members; any participant may leave. The creator can only be removed by self-leave. Membership removal and exact-session disconnect obligations commit in one transaction. HTTP 200 confirms removal and durable queue acceptance with enforcement_status queued; live transport closure is asynchronous. Existing presence reconciliation and DM heartbeat ejection remain active. Rate limit: 10 requests per minute per user.
       operationId: removeDMGroupMember
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       responses:
-        '200':
-          description: Member removed
+        "200":
+          description: Membership removed; exact-session media enforcement queued
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
                   message:
                     type: string
-                    example: Member removed
-        '400':
+        "400":
           description: Invalid conversation/user ID, not a group conversation, or target is not a participant
           content:
             application/json:
               schema: &id001
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Caller is not a participant, is not an admin (when removing others), or attempted
+                $ref: "#/components/schemas/Error"
+        "403":
+          description:
+            Caller is not a participant, is not an admin (when removing others), or attempted
             to remove the group creator
           content:
             application/json:
               schema: *id001
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: >-
+            A full enforcement queue returns voice_command_queue_full and Retry-After: 30;
+            membership and all related mutations roll back. A presence-delivery failure
+            has no error_code: membership removal and enforcement were committed,
+            but the presence update remains pending. Refresh membership before retrying.
+          headers:
+            Retry-After:
+              description: Seconds before retrying a queue-full refusal; absent for the post-commit presence error.
+              schema:
+                type: integer
+                enum: [30]
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  error_code:
+                    type: string
+                    enum: [voice_command_queue_full]
     patch:
       tags:
       - Direct Messages
@@ -5862,321 +5894,341 @@ paths:
   /dm/conversations/{id}/voice/{userId}/deafen:
     post:
       tags:
-      - DM
-      - Voice
+        - DM
+        - Voice
       summary: Server-deafen a group DM participant
-      description: 'Apply a persistent server-deafen to a group DM participant (sets both `server_deafened`
-
-        and `server_muted` — deafen implies mute; the target cannot undo it). Group DMs only;
-
-        admin role required. If the target is currently in the DM voice call, an enforcement
-
-        command is published to the media plane and a `dm_voice_state_update` WebSocket event
-
-        (`action: server_deafened`) is broadcast to participants.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Requires group DM admin authority. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
       operationId: dmVoiceHardDeafen
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Conversation UUID
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Conversation UUID
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Participant server-deafened
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
                   success:
                     type: boolean
-        '400':
+        "400":
           description: Invalid conversation/user ID, or conversation is not a group DM
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a participant, or not a group admin
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '404':
+                $ref: "#/components/schemas/Error"
+        "404":
           description: Target is not a participant
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
     delete:
       tags:
-      - DM
-      - Voice
+        - DM
+        - Voice
       summary: Remove a server deafen from a group DM participant
-      description: 'Remove a persistent server-deafen from a group DM participant (clears both
-
-        `server_deafened` and `server_muted`). Group DMs only; admin role required. If the target
-
-        is currently in the DM voice call, an undeafen enforcement command is published to the
-
-        media plane and a `dm_voice_state_update` WebSocket event (`action: server_undeafened`)
-
-        is broadcast.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Requires group DM admin authority. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
       operationId: dmVoiceHardUndeafen
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Conversation UUID
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Conversation UUID
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Participant server-undeafened
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
                   success:
                     type: boolean
-        '400':
+        "400":
           description: Invalid conversation/user ID, or conversation is not a group DM
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a participant, or not a group admin
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '404':
+                $ref: "#/components/schemas/Error"
+        "404":
           description: Target is not a participant
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /dm/conversations/{id}/voice/{userId}/mute:
     post:
       tags:
-      - DM
-      - Voice
+        - DM
+        - Voice
       summary: Server-mute a group DM participant
-      description: 'Apply a persistent server-mute to a group DM participant (sets `server_muted` on the
-
-        participant row; the target cannot undo it). Group DMs only; the caller must hold the
-
-        `admin` role in the conversation. If the target is currently in the DM voice call, an
-
-        enforcement command is published to the media plane and a `dm_voice_state_update`
-
-        WebSocket event (`action: server_muted`) is broadcast to participants.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Requires group DM admin authority. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
       operationId: dmVoiceHardMute
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Conversation UUID
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Conversation UUID
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Participant server-muted
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
                   success:
                     type: boolean
-        '400':
+        "400":
           description: Invalid conversation/user ID, or conversation is not a group DM
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a participant, or not a group admin
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '404':
+                $ref: "#/components/schemas/Error"
+        "404":
           description: Target is not a participant
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
     delete:
       tags:
-      - DM
-      - Voice
+        - DM
+        - Voice
       summary: Remove a server mute from a group DM participant
-      description: 'Remove a persistent server-mute from a group DM participant. Rejected with 409 while
-        the
-
-        participant is server-deafened — remove the deafen first. Group DMs only; admin role
-
-        required. If the target is currently in the DM voice call, an unmute enforcement command is
-
-        published to the media plane and a `dm_voice_state_update` WebSocket event
-
-        (`action: server_unmuted`) is broadcast.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Requires group DM admin authority. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
       operationId: dmVoiceHardUnmute
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Conversation UUID
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Conversation UUID
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Participant server-unmuted
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
                   success:
                     type: boolean
-        '400':
+        "400":
           description: Invalid conversation/user ID, or conversation is not a group DM
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a participant, or not a group admin
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '404':
+                $ref: "#/components/schemas/Error"
+        "404":
           description: Target is not a participant
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '409':
+                $ref: "#/components/schemas/Error"
+        "409":
           description: Cannot unmute while server-deafened — remove deafen first
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /dm/conversations/{id}/voice/{userId}/user-mute:
     post:
       tags:
-      - DM
-      - Voice
+        - DM
+        - Voice
       summary: Request user-level mute of a DM voice participant
-      description: 'Ask the media-plane (via NATS voice.user_mute) to user-mute another participant
-
-        currently in the DM voice call. Cannot target yourself.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Durably queue user-level moderation for exact registered voice sessions in this scope. Cannot target yourself; existing membership, permission and hierarchy checks apply. The participant can undo this user-level action. HTTP 202 with enforcement_status queued confirms durable acceptance, not media application. Rate limit: 10 requests per minute per user.
       operationId: dmVoiceUserMute
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Conversation UUID
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Conversation UUID
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Mute request published
+        "202":
+          description: Exact-session moderation accepted and queued; application is asynchronous
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
                   success:
                     type: boolean
-        '400':
+        "400":
           description: Invalid conversation/user ID, cannot target self, or target not in voice
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a participant
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /e2ee/keys/{context_id}:
     get:
       tags:
@@ -15014,171 +15066,187 @@ paths:
   /servers/{id}/voice/{userId}/deafen:
     post:
       tags:
-      - Voice
+        - Voice
       summary: Server-deafen a member
-      description: 'Apply a persistent server-level deafen to a member (sets both `server_deafened` and
-
-        `server_muted` — deafen implies mute). If the target is currently in a voice channel, a
-
-        real-time enforcement command is published to the media plane and a `voice_state_update`
-
-        WebSocket event (`action: server_deafened`) is broadcast to all server members.
-
-        Requires the Deafen Members permission; hierarchy check applies.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Existing moderation permission and role hierarchy checks apply. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
       operationId: voiceServerDeafen
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Member server-deafened
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuccessMessage'
-        '400':
-          description: Invalid server or user ID
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Not a member of this server, insufficient permissions, or hierarchy violation
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Target user is not a member of this server
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-    delete:
-      tags:
-      - Voice
-      summary: Remove a server deafen from a member
-      description: 'Remove a persistent server-level deafen from a member (clears both `server_deafened`
-        and
-
-        `server_muted`). If the target is currently in a voice channel, an undeafen enforcement
-
-        command is published to the media plane and a `voice_state_update` WebSocket event
-
-        (`action: server_undeafened`) is broadcast.
-
-        Requires the Deafen Members permission; hierarchy check applies.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
-      operationId: voiceServerUndeafen
-      security:
-      - BearerAuth: []
-      parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
-      responses:
-        '200':
-          description: Member server-undeafened
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuccessMessage'
-        '400':
-          description: Invalid server or user ID
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Not a member of this server, insufficient permissions, or hierarchy violation
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Target user is not a member of this server
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-  /servers/{id}/voice/{userId}/disconnect:
-    post:
-      tags:
-      - Voice
-      summary: Force-disconnect a member from voice
-      description: 'Force-disconnect a member from whatever voice channel they are currently in
-        within the server. A `voice.enforce.disconnect` command is published to the media plane,
-        which closes the peer''s transports; the resulting `voice.left` event drives any temporary
-        SBAC grant cleanup automatically.
-
-        Unlike `/move`, disconnect ENFORCES role hierarchy: it requires the Move Members
-        permission AND the target must be strictly lower in role position than the caller. The
-        target must currently be in a voice channel in this server.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
-      operationId: voiceServerDisconnect
-      security:
-      - BearerAuth: []
-      parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
-      responses:
-        '200':
-          description: Member disconnected
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - enforcement_status
                 properties:
-                  disconnected:
-                    type: boolean
-        '400':
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
           description: Invalid server or user ID
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Not a member of this server, insufficient permissions (Move Members required),
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not a member of this server, insufficient permissions, or hierarchy violation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Target user is not a member of this server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
+    delete:
+      tags:
+        - Voice
+      summary: Remove a server deafen from a member
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Existing moderation permission and role hierarchy checks apply. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
+      operationId: voiceServerUndeafen
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
+      responses:
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - enforcement_status
+                properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
+          description: Invalid server or user ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not a member of this server, insufficient permissions, or hierarchy violation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Target user is not a member of this server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
+  /servers/{id}/voice/{userId}/disconnect:
+    post:
+      tags:
+        - Voice
+      summary: Force-disconnect a member from voice
+      description: >-
+        Durably queue disconnect commands for exact registered voice sessions in this server, including staged sessions. Requires Move Members and role hierarchy. No registered target returns 409. HTTP 202 with enforcement_status queued confirms durable acceptance, not transport closure. Applied disconnects emit voice.left, which drives temporary SBAC grant cleanup. Rate limit: 10 requests per minute per user.
+      operationId: voiceServerDisconnect
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
+      responses:
+        "202":
+          description: Exact-session disconnect accepted and queued; application is asynchronous
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - enforcement_status
+                properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
+          description: Invalid server or user ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description:
+            Not a member of this server, insufficient permissions (Move Members required),
             or hierarchy violation (target has equal or higher role position)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '409':
+                $ref: "#/components/schemas/Error"
+        "409":
           description: Target user is not currently in a voice channel
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /servers/{id}/voice/{userId}/move:
     post:
       tags:
@@ -15255,114 +15323,126 @@ paths:
   /servers/{id}/voice/{userId}/mute:
     post:
       tags:
-      - Voice
+        - Voice
       summary: Server-mute a member
-      description: 'Apply a persistent server-level mute to a member (sets `server_muted` on the membership
-        row).
-
-        If the target is currently in a voice channel, a real-time enforcement command is published to
-
-        the media plane and a `voice_state_update` WebSocket event (`action: server_muted`) is broadcast
-
-        to all server members. Requires the Mute Members permission; the target must be strictly lower
-
-        in role hierarchy than the caller.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Existing moderation permission and role hierarchy checks apply. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
       operationId: voiceServerMute
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
       responses:
-        '200':
-          description: Member server-muted
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
-        '400':
+                type: object
+                required:
+                  - enforcement_status
+                properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
           description: Invalid server or user ID
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Not a member of this server, insufficient permissions, or hierarchy violation (target
+                $ref: "#/components/schemas/Error"
+        "403":
+          description:
+            Not a member of this server, insufficient permissions, or hierarchy violation (target
             has equal or higher role position)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '404':
+                $ref: "#/components/schemas/Error"
+        "404":
           description: Target user is not a member of this server
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-    delete:
-      tags:
-      - Voice
-      summary: Remove a server mute from a member
-      description: 'Remove a persistent server-level mute from a member. Rejected while the member is
-
-        server-deafened — the deafen must be removed first. If the target is currently in a voice
-
-        channel, an unmute enforcement command is published to the media plane and a
-
-        `voice_state_update` WebSocket event (`action: server_unmuted`) is broadcast.
-
-        Requires the Mute Members permission; hierarchy check applies.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
-      operationId: voiceServerUnmute
-      security:
-      - BearerAuth: []
-      parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-        description: Target user UUID
-      responses:
-        '200':
-          description: Member server-unmuted
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
-        '400':
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
+    delete:
+      tags:
+        - Voice
+      summary: Remove a server mute from a member
+      description: >-
+        Save the complete moderator-owned mute/deafen policy and exact-session enforcement commands in one transaction. Existing moderation permission and role hierarchy checks apply. Both flags and an authorization revision are frozen before commit; offline policy records a null-target marker. HTTP 200 with enforcement_status queued confirms saved policy and durable queue acceptance, not media application. Deafen implies mute; unmute requires undeafen first. Rate limit: 10 requests per minute per user.
+      operationId: voiceServerUnmute
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Target user UUID
+      responses:
+        "200":
+          description: Moderation policy saved; exact-session media enforcement queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - enforcement_status
+                properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
           description: Invalid server or user ID, or member is server-deafened (undeafen first)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a member of this server, insufficient permissions, or hierarchy violation
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '404':
+                $ref: "#/components/schemas/Error"
+        "404":
           description: Target user is not a member of this server
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /servers/{id}/voice/{userId}/temp-access:
     delete:
       tags:
@@ -15436,89 +15516,111 @@ paths:
   /servers/{id}/voice/{userId}/user-deafen:
     post:
       tags:
-      - Voice
+        - Voice
       summary: Send a user-level deafen command
-      description: 'Send a real-time deafen command for a voice participant to the media plane (no persistent
-        state).
-
-        Requires the Deafen Members permission; target must be in voice and cannot be yourself.
-
-        Rate limit: 10 requests per minute.
-
-        '
+      description: >-
+        Durably queue user-level moderation for exact registered voice sessions in this scope. Cannot target yourself; existing membership, permission and hierarchy checks apply. The participant can undo this user-level action. HTTP 202 with enforcement_status queued confirms durable acceptance, not media application. Rate limit: 10 requests per minute per user.
       operationId: voiceUserDeafen
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
-        '200':
-          description: User deafen command sent
+        "202":
+          description: Exact-session moderation accepted and queued; application is asynchronous
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
-        '400':
+                type: object
+                required:
+                  - enforcement_status
+                properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
           description: Invalid IDs, self-target, or target is not in a voice channel
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a member of this server or insufficient permissions
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /servers/{id}/voice/{userId}/user-mute:
     post:
       tags:
-      - Voice
+        - Voice
       summary: Send a user-level mute command
-      description: 'Send a real-time mute command for a voice participant to the media plane (no persistent
-        state).
-
-        Requires the Mute Members permission; target must be in voice and cannot be yourself.
-
-        Rate limit: 10 requests per minute.
-
-        '
+      description: >-
+        Durably queue user-level moderation for exact registered voice sessions in this scope. Cannot target yourself; existing membership, permission and hierarchy checks apply. The participant can undo this user-level action. HTTP 202 with enforcement_status queued confirms durable acceptance, not media application. Rate limit: 10 requests per minute per user.
       operationId: voiceUserMute
       security:
-      - BearerAuth: []
+        - BearerAuth: []
       parameters:
-      - $ref: '#/components/parameters/ServerId'
-      - name: userId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+        - $ref: "#/components/parameters/ServerId"
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
-        '200':
-          description: User mute command sent
+        "202":
+          description: Exact-session moderation accepted and queued; application is asynchronous
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
-        '400':
+                type: object
+                required:
+                  - enforcement_status
+                properties:
+                  enforcement_status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+        "400":
           description: Invalid IDs, self-target, or target is not in a voice channel
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-        '403':
+                $ref: "#/components/schemas/Error"
+        "403":
           description: Not a member of this server or insufficient permissions
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Queue acceptance could not be confirmed; a commit error may have an unknown durable outcome. No media application is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        '503':
+          $ref: '#/components/responses/VoiceCommandQueueFull'
   /sessions:
     get:
       tags:
@@ -17804,6 +17906,26 @@ components:
         pattern: ^[a-zA-Z0-9-]{1,100}$
       description: KLIPY GIF slug (1-100 characters of [a-zA-Z0-9-])
   responses:
+    VoiceCommandQueueFull:
+      description: Enforcement queue capacity is exhausted. The mutation rolls back; retry after the stated delay.
+      headers:
+        Retry-After:
+          description: Seconds before retrying the operation.
+          schema:
+            type: integer
+            enum: [30]
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, error_code]
+            properties:
+              error:
+                type: string
+                example: Voice command queue is full; retry shortly
+              error_code:
+                type: string
+                enum: [voice_command_queue_full]
     BadRequest:
       description: Validation error
       content:

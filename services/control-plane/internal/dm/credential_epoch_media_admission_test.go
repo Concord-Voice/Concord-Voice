@@ -112,6 +112,7 @@ func TestStaleCredential_DMHardMuteDoesNotApplyEnforcement(t *testing.T) {
 		convID, target.ID,
 	).Scan(&muted))
 	assert.False(t, muted, "stale credentials must not apply DM hard mute")
+	requireNoDMOutboxCommands(t, ts.DB)
 }
 
 func TestStaleCredential_DMUserMuteDoesNotPublishEnforcement(t *testing.T) {
@@ -121,12 +122,14 @@ func TestStaleCredential_DMUserMuteDoesNotPublishEnforcement(t *testing.T) {
 	convID := ts.CreateDMConversation(t, actor.ID, target.ID)
 	_, err := ts.DB.Exec(`INSERT INTO dm_voice_participants (conversation_id, user_id, is_muted, is_deafened, is_video_on, is_screen_sharing) VALUES ($1, $2, false, false, false, false)`, convID, target.ID)
 	require.NoError(t, err)
+	seedDMOutboxSession(t, ts, convID, target.ID)
 
 	staleToken := ts.SimulateStaleEpochWindow(t, actor.ID)
 	w := ts.DoRequest(http.MethodPost,
 		pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+"/user-mute",
 		nil, testhelpers.AuthHeaders(staleToken))
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireNoDMOutboxCommands(t, ts.DB)
 }
 
 func TestStaleCredential_RingDoesNotCreatePendingCall(t *testing.T) {

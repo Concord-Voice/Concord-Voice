@@ -598,3 +598,154 @@ describe('purge placeholder settlement', () => {
     expect(surviving?.map((message) => message.id)).toEqual([messageId]);
   });
 });
+
+/**
+ * #3459 §8. The server ISSUES the expiration-policy broadcast before it deletes the due pins, but
+ * the hub delivers the two frames on separate lanes (see the Go frame tests' headers), so a client
+ * can receive the purge first. Every arrival order, and wherever the purge's refetch lands, has to
+ * end in the same place: the new policy applied once and the system row present once.
+ */
+describe('expiration policy and expiry purge frames in any arrival order (#3459 §8)', () => {
+  const ACTOR = '66666666-6666-4666-8666-666666666666';
+  const ROW = '22222222-2222-4222-8222-222222222222';
+  const SERVER = '55555555-5555-4555-8555-555555555555';
+  const CHANGED_AT = '2026-10-14T12:00:00.000Z';
+  const OLD_POLICY = {
+    windowSeconds: 86400,
+    updatedAt: '2026-10-13T12:00:00.000Z',
+    revision: 5,
+    backfillPending: false,
+    includePinned: false,
+  };
+  const NEW_POLICY = {
+    windowSeconds: 86400,
+    updatedAt: CHANGED_AT,
+    revision: 6,
+    backfillPending: false,
+    includePinned: true,
+  };
+  // What the server sends for a pins-only change, and what the purge's refetch returns for it.
+  const pinChange = {
+    kind: 'changed' as const,
+    window_seconds: 86400,
+    previous_window_seconds: 86400,
+    include_pinned: true,
+    previous_include_pinned: false,
+  };
+  const expiryPurge = { reason: 'expiry', purged_by: null, expires_before: CHANGED_AT };
+  const durableRow = (scopeId: string) => ({
+    ...mockMessage,
+    id: ROW,
+    channel_id: scopeId,
+    user_id: ACTOR,
+    content: '',
+    type: 'expiration_event' as const,
+    expiration_event_payload: {
+      kind: pinChange.kind,
+      actor_user_id: ACTOR,
+      window_seconds: pinChange.window_seconds,
+      previous_window_seconds: pinChange.previous_window_seconds,
+      include_pinned: pinChange.include_pinned,
+      previous_include_pinned: pinChange.previous_include_pinned,
+      changed_at: CHANGED_AT,
+    },
+    created_at: CHANGED_AT,
+    updated_at: CHANGED_AT,
+  });
+  const policyFields = {
+    id: ROW,
+    actor_user_id: ACTOR,
+    actor_username: 'alice',
+    actor_display_name: 'Alice',
+    ...pinChange,
+    created_at: CHANGED_AT,
+    revision: NEW_POLICY.revision,
+    updated_at: CHANGED_AT,
+    backfill_pending: false,
+  };
+
+  const SCOPES = [
+    {
+      name: 'DM',
+      scopeId: '44444444-4444-4444-8444-444444444444',
+      policyType: 'dm_expiration_event',
+      purgeType: 'dm_purged',
+      seed(scopeId: string) {
+        useDMStore.setState({
+          conversations: [
+            {
+              id: scopeId,
+              name: 'Alice',
+              isGroup: false,
+              isPersonal: false,
+              participants: [],
+              expirationPolicy: OLD_POLICY,
+            } as never,
+          ],
+        });
+      },
+      policyData: (scopeId: string) => ({ ...policyFields, conversation_id: scopeId }),
+      purgeData: (scopeId: string) => ({ ...expiryPurge, conversation_id: scopeId }),
+      policyOf: (scopeId: string) =>
+        useDMStore.getState().conversations.find((item) => item.id === scopeId)?.expirationPolicy,
+    },
+    {
+      name: 'channel',
+      scopeId: '33333333-3333-4333-8333-333333333333',
+      policyType: 'expiration_event',
+      purgeType: 'server_purged',
+      seed(scopeId: string) {
+        useChannelStore.getState().addChannel({
+          ...mockChannel,
+          id: scopeId,
+          server_id: SERVER,
+          expirationPolicy: OLD_POLICY,
+        });
+      },
+      policyData: (scopeId: string) => ({ ...policyFields, channel_id: scopeId }),
+      purgeData: () => ({ ...expiryPurge, server_id: SERVER }),
+      policyOf: (scopeId: string) =>
+        useChannelStore.getState().channels.find((item) => item.id === scopeId)?.expirationPolicy,
+    },
+  ];
+
+  // `refetch` is what useMessageFetch does after messages-purged: replace the scope with the
+  // server's page, which includes the system row because the policy transaction committed it first.
+  const ORDERS = [
+    ['policy, purge, refetch', ['policy', 'purge', 'refetch']],
+    ['purge, policy, refetch', ['purge', 'policy', 'refetch']],
+    ['purge, refetch, policy', ['purge', 'refetch', 'policy']],
+  ] as const;
+
+  describe.each(SCOPES)('$name scope', (scope) => {
+    it.each(ORDERS)('%s ends on the new policy and one system row', (_order, steps) => {
+      scope.seed(scope.scopeId);
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const run = {
+        policy: () =>
+          requireHandler(
+            ws,
+            scope.policyType
+          )({ type: scope.policyType, data: scope.policyData(scope.scopeId) }),
+        purge: () =>
+          requireHandler(
+            ws,
+            scope.purgeType
+          )({ type: scope.purgeType, data: scope.purgeData(scope.scopeId) }),
+        refetch: () =>
+          useChatStore.getState().setMessages(scope.scopeId, [durableRow(scope.scopeId)]),
+      };
+
+      for (const step of steps) act(run[step]);
+
+      expect(scope.policyOf(scope.scopeId)).toEqual(NEW_POLICY);
+      const rows = useChatStore
+        .getState()
+        .messagesByChannel.get(scope.scopeId)
+        ?.filter((message) => message.id === ROW);
+      expect(rows).toHaveLength(1);
+      expect(rows?.[0]?.type).toBe('expiration_event');
+    });
+  });
+});
