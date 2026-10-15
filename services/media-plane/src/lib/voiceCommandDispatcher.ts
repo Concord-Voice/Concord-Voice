@@ -239,8 +239,6 @@ export class VoiceCommandDispatcher {
       return false;
     }
     const manager = this.options.roomManager;
-    const currentRoom = manager.getRoom(roomId);
-    if (currentRoom && currentRoom !== captured.room) return false;
     if (
       [
         manager.getParticipant(roomId, command.userId),
@@ -411,7 +409,11 @@ export class VoiceCommandDispatcher {
       getProvisionalParticipant: () => (captured.provisional ? captured.participant : undefined),
       removeProvisionalParticipantForEnforcement: async () => {
         await this.options.ensureAuthority();
-        const current = manager.getProvisionalParticipant(roomId, command.userId);
+        const admitted = manager.getParticipant(roomId, command.userId);
+        const current =
+          admitted !== undefined && admitted === captured.participantRef
+            ? admitted
+            : manager.getProvisionalParticipant(roomId, command.userId);
         if (
           manager.getRoom(roomId) !== captured.room ||
           current?.socketId !== captured.participant.socketId ||
@@ -420,6 +422,14 @@ export class VoiceCommandDispatcher {
             captured.participant.voiceEnforcementSessionGeneration
         ) {
           return false;
+        }
+        if (current === admitted) {
+          return manager.leaveRoomIfSocketOwned(
+            roomId,
+            command.userId,
+            captured.participant.socketId,
+            captured.participant.voiceEnforcementSessionGeneration
+          );
         }
         return manager.removeProvisionalParticipantForEnforcement(
           roomId,
