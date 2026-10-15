@@ -173,9 +173,8 @@ describe('MFAMethodPicker', () => {
 });
 
 // The two glyphs moved out of this file into `icons/` so the step-up picker can
-// share them. The extraction must be invisible: the markup below is the JSX the
-// picker carried before it, copied verbatim, and the picker's own rendering must
-// still equal it.
+// share them. Preserve the original geometry below while requiring the glyphs
+// to be decorative: the adjacent option labels already name their meaning.
 describe('MFAMethodPicker extracted icons', () => {
   const ORIGINAL_KEY = (
     <svg
@@ -207,27 +206,38 @@ describe('MFAMethodPicker extracted icons', () => {
     return render(node).container.innerHTML;
   }
 
+  function decorativeIconGeometry(svg: SVGSVGElement | null): string {
+    expect(svg).toHaveAttribute('aria-hidden', 'true');
+    const geometry = svg?.cloneNode(true) as SVGSVGElement;
+    geometry.removeAttribute('aria-hidden');
+    return geometry.outerHTML;
+  }
+
+  function iconGeometry(node: ReactElement): string {
+    return decorativeIconGeometry(render(node).container.querySelector('svg'));
+  }
+
   function pickerIconHtml(label: string): string {
     const view = render(
       <MFAMethodPicker methods={['webauthn', 'totp']} currentMethod="totp" onSelect={vi.fn()} />
     );
     const button = view.getByText(label).closest('button');
-    return button?.querySelector('.mfa-method-picker-icon')?.innerHTML ?? '';
+    return decorativeIconGeometry(button?.querySelector('svg') ?? null);
   }
 
-  it('KeyIcon renders the markup the picker carried before the extraction', () => {
-    expect(markupOf(<KeyIcon />)).toBe(markupOf(ORIGINAL_KEY));
+  it('KeyIcon is decorative and preserves the original key geometry', () => {
+    expect(iconGeometry(<KeyIcon />)).toBe(markupOf(ORIGINAL_KEY));
   });
 
-  it('PhoneIcon renders the markup the picker carried before the extraction', () => {
-    expect(markupOf(<PhoneIcon />)).toBe(markupOf(ORIGINAL_PHONE));
+  it('PhoneIcon is decorative and preserves the original phone geometry', () => {
+    expect(iconGeometry(<PhoneIcon />)).toBe(markupOf(ORIGINAL_PHONE));
   });
 
-  it('the picker still shows the security-key glyph on the Security Key option', () => {
+  it('the Security Key option keeps the original key glyph decorative', () => {
     expect(pickerIconHtml('Security Key / Biometrics')).toBe(markupOf(ORIGINAL_KEY));
   });
 
-  it('the picker still shows the phone glyph on the Authenticator App option', () => {
+  it('the Authenticator App option keeps the original phone glyph decorative', () => {
     expect(pickerIconHtml('Authenticator App')).toBe(markupOf(ORIGINAL_PHONE));
   });
 

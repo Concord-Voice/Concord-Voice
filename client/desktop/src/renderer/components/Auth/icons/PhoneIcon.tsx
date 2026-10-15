@@ -3,6 +3,7 @@ import React from 'react';
 /** The authenticator-app glyph, extracted from `MFAMethodPicker` so the markup has one home. */
 const PhoneIcon: React.FC = () => (
   <svg
+    aria-hidden="true"
     width="20"
     height="20"
     viewBox="0 0 24 24"

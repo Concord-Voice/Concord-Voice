@@ -82,6 +82,8 @@ expiration timer can now keep pinned messages, and says so.
   queued enforcement, so accepting a disconnect no longer claims the live connection
   has already closed (internal development reference omitted).
 
+- **Decorative security icons** (internal development reference omitted) — Screen readers now skip decorative icons beside labeled MFA choices, device sessions, security keys, and backup codes.
+
 - **Reading a server's channels clears its unread indicator** (internal development reference omitted) — it stays clear when unread status arrives after a server switch. Mark All as Read clears the selected server; other servers keep their genuine unread indicators.
 - **Voice disconnects wait for media cleanup** (internal development reference omitted, internal development reference omitted) — session authority is released only after the exact native transports are gone or the media worker has stopped. The media service also gains a serial durable-command consumer that retries unfinished enforcement before acknowledging delivery.
 - **Group-DM icons load through authenticated desktop requests** (internal development reference omitted) — Image resources are released when the icon, account, server or view changes.

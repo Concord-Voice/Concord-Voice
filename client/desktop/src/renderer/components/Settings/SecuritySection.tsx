@@ -459,7 +459,7 @@ const SessionCard: React.FC<SessionCardProps> = ({
 }) => (
   <div className={`session-card ${session.is_current ? 'current' : ''}`}>
     <div className="session-card-icon">
-      <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+      <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none">
         <rect x="2" y="3" width="16" height="12" rx="2" stroke="currentColor" strokeWidth="1.5" />
         <path d="M7 19h6M10 15v4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
       </svg>
@@ -587,7 +587,7 @@ const PastSessionsContent: React.FC<PastSessionsContentProps> = ({
       {sessions.map((session) => (
         <div key={session.id} className="session-card past">
           <div className="session-card-icon past">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none">
               <rect
                 x="2"
                 y="3"
@@ -1125,6 +1125,7 @@ const SecuritySection: React.FC = () => {
           <div className="mfa-status-bar">
             <div className="mfa-status-item">
               <svg
+                aria-hidden="true"
                 width="16"
                 height="16"
                 viewBox="0 0 24 24"
@@ -1141,6 +1142,7 @@ const SecuritySection: React.FC = () => {
             </div>
             <div className="mfa-status-item mfa-status-item-right">
               <svg
+                aria-hidden="true"
                 width="16"
                 height="16"
                 viewBox="0 0 24 24"
