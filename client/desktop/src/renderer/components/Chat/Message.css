@@ -255,18 +255,43 @@
   border-color: var(--state-focused);
 }
 
-/* A save that did not reach the server (#1959). Text colour, not a red: the sentence carries
-   the signal, and --error-color fails 4.5:1 in 9 of the 30 scheme x theme blocks (#3455). */
+/* A save that did not reach the server (#1959) and an edit over the character limit (#3857).
+   Text colour, not a red: the sentence carries the signal, and --error-color fails 4.5:1 in 9 of
+   the 30 scheme x theme blocks (#3455). */
 .message-edit-error {
+  display: block;
   margin: calc(6px * var(--sp, 1)) 0 0;
   color: var(--text-primary);
   font-size: calc(13px * var(--font-scale, 1));
+}
+
+.message-edit-error:empty {
+  margin: 0;
 }
 
 .message-edit-actions {
   display: flex;
   gap: calc(8px * var(--sp, 1));
   margin-top: calc(8px * var(--sp, 1));
+}
+
+/* n/max once the draft reaches 75% of the character limit (#3857). Levels use the same tokens as
+   the composer's counter (MessageInput.css .counter.warn / .counter.error) and the figure sits at
+   the end of the actions row, away from Cancel and Save. */
+.message-edit-counter {
+  margin-left: auto;
+  align-self: center;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.message-edit-counter-warn {
+  color: var(--text-warning-strong, var(--warning, #c27800));
+}
+
+.message-edit-counter-error {
+  color: var(--text-error-strong);
+  font-weight: 600;
 }
 
 .btn-edit-cancel,

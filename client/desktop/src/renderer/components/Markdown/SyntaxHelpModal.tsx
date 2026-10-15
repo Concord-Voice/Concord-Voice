@@ -1,7 +1,6 @@
 import React, { useEffect, useRef } from 'react';
-import { useEntitlement } from '../../hooks/ui/useEntitlement';
+import { useMessageCharLimit } from '../../hooks/messaging/useMessageCharLimit';
 import { useDialogSync } from '../../hooks/ui/useDialogSync';
-import { clampMessageCharsForTier } from '../../utils/policy/entitlementLimits';
 import './SyntaxHelpModal.css';
 import { keyTargetsForeignModal } from '../../utils/ui/keyTargetsForeignModal';
 
@@ -53,11 +52,9 @@ interface Props {
 
 const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
-  // Show the user's actual per-message cap (free 5120 / premium 10240), matching
-  // the entitlement-driven limit MessageInput now enforces (#1299).
-  const entitlementTier = useEntitlement((e) => e.tier);
-  const maxMessageChars = useEntitlement((e) => e.maxMessageChars);
-  const messageLimit = clampMessageCharsForTier(entitlementTier, maxMessageChars);
+  // Show the user's actual per-message cap (free 5120 / premium 10240) — the same hook the
+  // composer and the inline edit box read, so the three cannot disagree (#1299, #3857).
+  const messageLimit = useMessageCharLimit();
 
   // Fallback Escape handler — only installed when the runtime cannot rely on
   // <dialog>'s native cancel event (i.e., under jsdom). In Electron/Chrome

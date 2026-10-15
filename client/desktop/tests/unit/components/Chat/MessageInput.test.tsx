@@ -390,12 +390,14 @@ describe('MessageInput', () => {
 
   // ── Character counter ──
 
-  it('does not show counter below 80% of maxLength', async () => {
+  it('shows the counter from 75% of maxLength and not below it', async () => {
     const user = userEvent.setup();
-    render(<MessageInput onSendMessage={onSendMessage} maxLength={100} />);
+    render(<MessageInput onSendMessage={onSendMessage} maxLength={20} />);
     const textarea = screen.getByRole('textbox');
-    await user.type(textarea, 'short');
-    expect(screen.queryByText('95')).not.toBeInTheDocument();
+    await user.type(textarea, '12345678901234');
+    expect(screen.queryByText('14/20')).not.toBeInTheDocument();
+    await user.type(textarea, '5');
+    expect(screen.getByText('15/20')).toBeInTheDocument();
   });
 
   it('shows warn class at or above 95% of max length', async () => {
@@ -787,7 +789,7 @@ describe('MessageInput cap reduction + overflow', () => {
     // Use fireEvent to set long content (userEvent.type is too slow for 5k chars)
     fireEvent.change(textarea, { target: { value: 'x'.repeat(5121) } });
 
-    // Trigger send via Enter key (send button is disabled while content > maxLength)
+    // Trigger send via Enter key; over the limit the message goes out as a .md attachment
     fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter' });
 
     await vi.waitFor(() => {

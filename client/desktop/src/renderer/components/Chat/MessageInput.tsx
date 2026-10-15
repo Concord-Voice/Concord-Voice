@@ -24,6 +24,7 @@ import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
 import { useFileUpload, type AttachmentRejection } from '../../hooks/messaging/useFileUpload';
 import { useDraftMessage } from '../../hooks/messaging/useDraftMessage';
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
+import { useMessageCharLimit } from '../../hooks/messaging/useMessageCharLimit';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useInviteStore } from '../../stores/chat/inviteStore';
@@ -33,26 +34,18 @@ import AttachmentUploadPreview from './AttachmentUploadPreview';
 import ReplyPreviewBar from './ReplyPreviewBar';
 import { composeMarkdownOverflow } from '../../utils/messaging/overflowToMarkdown';
 import { MAX_ATTACHMENTS } from '../../utils/crypto/attachmentCrypto';
-import { clampMessageCharsForTier } from '../../utils/policy/entitlementLimits';
+import {
+  DOS_PROTECTION_LIMIT,
+  getCounterAnnouncement,
+  getCounterClass,
+  isCounterVisible,
+} from '../../utils/messaging/messageCharLimit';
 import AttachmentNotice from './AttachmentNotice';
 import './MessageInput.css';
 
 /** Premium raises the free message limit by this factor (UX hint copy only —
- *  the server is the authority on the real premium caps). */
+ *  the real limits come from the entitlement, via useMessageCharLimit). */
 const PREMIUM_MULTIPLIER = 2;
-/** Counter announcement thresholds (a11y U1): announce ONLY at 75% / 90% /
- *  at-limit — never per keystroke. */
-const COUNTER_ANNOUNCE_RATIOS = [0.75, 0.9, 1] as const;
-/** Renderer-side DoS ceiling: paste/typing beyond this is silently discarded.
- *  Content between the active entitlement limit (maxLength) and
- *  DOS_PROTECTION_LIMIT reaches handleSend intact so the overflow path can
- *  synthesize a .md attachment. */
-const DOS_PROTECTION_LIMIT = 1_048_576; // 1 MiB plaintext
-// Counter visibility and warn thresholds are expressed as ratios of the
-// active limit (maxLength), so the same 75%/95% behaviour holds at any tier
-// (e.g. free 5120: 3840/5120 = 0.75, 4864/5120 = 0.95; premium 10240 scales).
-const COUNTER_VISIBLE_RATIO = 0.75;
-const COUNTER_WARN_RATIO = 0.95;
 
 /**
  * Determines whether content exceeds maxLength and, if so, synthesizes the
@@ -118,12 +111,6 @@ async function tryUploadAttachments(
   }
 }
 
-function getCounterClass(charCount: number, limit: number): string {
-  if (charCount > limit) return 'counter error';
-  if (charCount >= Math.floor(limit * COUNTER_WARN_RATIO)) return 'counter warn';
-  return 'counter';
-}
-
 function insertCappedText(
   currentContent: string,
   insertedText: string,
@@ -138,23 +125,6 @@ function insertCappedText(
     content,
     cursorPosition: Math.min(selectionStart + insertedText.length, content.length),
   };
-}
-
-function getCounterAnnouncement(charCount: number, maxLength: number): string {
-  const announceRatio = [...COUNTER_ANNOUNCE_RATIOS]
-    .reverse()
-    .find((ratio) => charCount >= Math.floor(maxLength * ratio));
-
-  if (announceRatio === 1) {
-    return `Message at the ${maxLength}-character limit. Longer messages send as a .md attachment.`;
-  }
-  if (announceRatio === 0.9) {
-    return `Approaching the ${maxLength}-character limit.`;
-  }
-  if (announceRatio === 0.75) {
-    return `Message has reached 75% of the ${maxLength}-character limit.`;
-  }
-  return '';
 }
 
 function getCtrlShortcutAction(
@@ -261,16 +231,15 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const leftPinned = useLayoutStore(
     (state) => selectSidebarDock(state, sidebarContext, 'left').pinned
   );
-  // L7/L9 (#1301): informational-only premium caps. The message char-limit and
-  // attachment-size limit are server-authoritative; these only drive UX hints —
-  // NEVER a hard client block (the server re-checks every send/upload).
+  // L7/L9 (#1301): the tier drives the premium-uplift hint and the attachment notice copy.
   const entitlementTier = useEntitlement((e) => e.tier);
-  const maxMessageChars = useEntitlement((e) => e.maxMessageChars);
   // The plaintext char split is client-authoritative (server sees only
-  // ciphertext under E2EE). Source it from the live entitlement so the counter
-  // and the .md overflow react to free (5120) / premium (10240) without a
-  // reload; the `maxLength` prop remains a test/override seam.
-  const maxLength = maxLengthProp ?? clampMessageCharsForTier(entitlementTier, maxMessageChars);
+  // ciphertext under E2EE). `useMessageCharLimit` sources it from the live
+  // entitlement so the counter and the .md overflow react to free (5120) /
+  // premium (10240) without a reload; the `maxLength` prop remains a
+  // test/override seam.
+  const entitlementCharLimit = useMessageCharLimit();
+  const maxLength = maxLengthProp ?? entitlementCharLimit;
   const [content, setContent] = useState('');
   // L9: a non-modal inline banner for an over-limit attachment attempt.
   const [rejections, setRejections] = useState<AttachmentRejection[]>([]);
@@ -950,9 +919,9 @@ const MessageInput: React.FC<MessageInputProps> = ({
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     // Allow input slightly above the policy cap (maxLength + 1000) so the
-    // counter enters the `error` state and the send button is disabled for
-    // the over-limit UX — the overflow path then handles large content on
-    // send. Clipboard pastes are bounded by DOS_PROTECTION_LIMIT (1 MiB),
+    // counter enters the `error` state for the over-limit UX — the overflow
+    // path then sends the excess as a .md attachment. Clipboard pastes are
+    // bounded by DOS_PROTECTION_LIMIT (1 MiB),
     // which is enforced by handlePasteFromMenu and the native-paste handler.
     const HARD_CAP = maxLength + 1000;
     if (e.target.value.length <= HARD_CAP) {
@@ -1000,7 +969,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   }, []);
 
   const charCount = content.length;
-  const counterVisible = charCount >= Math.floor(maxLength * COUNTER_VISIBLE_RATIO);
+  const counterVisible = isCounterVisible(charCount, maxLength);
   const counterClass = getCounterClass(charCount, maxLength);
   const atLimit = charCount >= maxLength;
   const showPremiumLimitHint = entitlementTier !== 'premium';

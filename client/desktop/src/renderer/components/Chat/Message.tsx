@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useId, useMemo, useRef } from 'react';
 import { LockKeyhole, KeyRound } from 'lucide-react';
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
 import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore';
@@ -31,6 +31,14 @@ import GifEmbed from './GifEmbed';
 import { InviteEmbed } from './InviteEmbed';
 import { messageInviteCodes } from '@/renderer/utils/messaging/inviteUrl';
 import { useMessageProfileCard } from '../../hooks/messaging/useMessageProfileCard';
+import { useMessageCharLimit } from '../../hooks/messaging/useMessageCharLimit';
+import {
+  DOS_PROTECTION_LIMIT,
+  evaluateEdit,
+  getCounterLevel,
+  getOverLimitReason,
+  isCounterVisible,
+} from '../../utils/messaging/messageCharLimit';
 import MessageProfileCardHost from './MessageProfileCardHost';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
@@ -101,13 +109,17 @@ function placeCaretAtEnd(el: HTMLTextAreaElement | null): void {
  *  and the row gives the draft back instead of losing it. */
 type EditHandler = (messageId: string, newContent: string) => void | Promise<boolean | void>;
 
-/** Inline edit box with save/cancel actions. */
+/**
+ * Inline edit box with save/cancel actions. `evaluateEdit` is the one guard behind both the Save
+ * button and the Enter key: it measures the trimmed draft against the character limit, and the
+ * text it hands to `onSubmit` is that same trimmed draft. An over-limit edit is never truncated
+ * or discarded; it stays open, with the reason beside it, until the user shortens it.
+ */
 function MessageEditBox({
   content,
   originalContent,
   saveFailed,
   onChange,
-  onKeyDown,
   onSubmit,
   onCancel,
 }: Readonly<{
@@ -115,22 +127,34 @@ function MessageEditBox({
   originalContent: string;
   saveFailed: boolean;
   onChange: (value: string) => void;
-  onKeyDown: (e: React.KeyboardEvent) => void;
-  onSubmit: () => void;
+  onSubmit: (trimmed: string) => void;
   onCancel: () => void;
 }>) {
+  const limit = useMessageCharLimit();
+  const reasonId = useId();
+  const verdict = evaluateEdit(content, originalContent, limit);
+  const submit = () => {
+    if (verdict.canSave) onSubmit(verdict.trimmed);
+  };
   return (
     <div className="message-edit-box">
       <textarea
         className="message-edit-input"
         aria-label="Edit message"
+        aria-describedby={verdict.overLimit ? reasonId : undefined}
         ref={placeCaretAtEnd}
         value={content}
-        onChange={(e) => onChange(e.target.value)}
-        onKeyDown={onKeyDown}
+        onChange={(e) => {
+          if (e.target.value.length <= DOS_PROTECTION_LIMIT) onChange(e.target.value);
+        }}
+        onKeyDown={(e) => handleEditKeyDown(e, submit, onCancel)}
         autoFocus
         rows={3}
       />
+      {/* Always mounted, so screen readers announce the reason when it appears. */}
+      <output id={reasonId} className="message-edit-error">
+        {verdict.overLimit ? getOverLimitReason(limit) : null}
+      </output>
       {saveFailed && (
         <p className="message-edit-error" role="alert">
           Couldn&apos;t save your edit. Try again.
@@ -140,13 +164,16 @@ function MessageEditBox({
         <button className="btn-edit-cancel" onClick={onCancel}>
           Cancel
         </button>
-        <button
-          className="btn-edit-save"
-          onClick={onSubmit}
-          disabled={!content.trim() || content === originalContent}
-        >
+        <button className="btn-edit-save" onClick={submit} disabled={!verdict.canSave}>
           Save
         </button>
+        {isCounterVisible(verdict.length, limit) && (
+          <span
+            className={`message-edit-counter message-edit-counter-${getCounterLevel(verdict.length, limit)}`}
+          >
+            {verdict.length}/{limit}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -217,16 +244,14 @@ function MessageHeader({
   );
 }
 
-/** Submits an edit if the content has meaningfully changed. Returns null when nothing was
- *  submitted, otherwise the submitted text and the handler's result. */
+/** Hands an edit the box has already approved (`evaluateEdit`) to the row's handler. Returns null
+ *  when the row has no handler, otherwise the submitted text and the handler's result. */
 function trySubmitEdit(
-  editContent: string,
-  originalContent: string,
+  trimmed: string,
   messageId: string,
   onEdit?: EditHandler
 ): { trimmed: string; result: void | Promise<boolean | void> } | null {
-  const trimmed = editContent.trim();
-  if (!trimmed || trimmed === originalContent || !onEdit) return null;
+  if (!onEdit) return null;
   return { trimmed, result: onEdit(messageId, trimmed) };
 }
 
@@ -674,28 +699,25 @@ const Message: React.FC<MessageProps> = ({
     [setIsEditing, surfaceId]
   );
 
-  const handleEditSubmit = useCallback(() => {
-    const submitted = trySubmitEdit(editContent, message.content, message.id, onEdit);
-    if (!submitted) return;
-    setSaveFailed(false);
-    setIsEditing(false);
-    focusSurfaceComposer(surfaceId);
-    if (!(submitted.result instanceof Promise)) return;
-    submitted.result.then(
-      (saved) => {
-        if (saved !== true) restoreFailedEdit(submitted.trimmed);
-      },
-      () => restoreFailedEdit(submitted.trimmed)
-    );
-  }, [
-    editContent,
-    message.content,
-    message.id,
-    onEdit,
-    restoreFailedEdit,
-    setIsEditing,
-    surfaceId,
-  ]);
+  // `trimmed` is the text the edit box measured against the limit and compared with the
+  // original, so what is sent is exactly what was checked.
+  const handleEditSubmit = useCallback(
+    (trimmed: string) => {
+      const submitted = trySubmitEdit(trimmed, message.id, onEdit);
+      if (!submitted) return;
+      setSaveFailed(false);
+      setIsEditing(false);
+      focusSurfaceComposer(surfaceId);
+      if (!(submitted.result instanceof Promise)) return;
+      submitted.result.then(
+        (saved) => {
+          if (saved !== true) restoreFailedEdit(submitted.trimmed);
+        },
+        () => restoreFailedEdit(submitted.trimmed)
+      );
+    },
+    [message.id, onEdit, restoreFailedEdit, setIsEditing, surfaceId]
+  );
 
   const handleEditCancel = useCallback(() => {
     setEditContent(message.content);
@@ -703,11 +725,6 @@ const Message: React.FC<MessageProps> = ({
     setIsEditing(false);
     focusSurfaceComposer(surfaceId);
   }, [message.content, setIsEditing, surfaceId]);
-
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => handleEditKeyDown(e, handleEditSubmit, handleEditCancel),
-    [handleEditSubmit, handleEditCancel]
-  );
 
   // Shared profile-card state for this message — the avatar and the username
   // both open the same card (which carries the Send Friend Request action, #226).
@@ -762,7 +779,6 @@ const Message: React.FC<MessageProps> = ({
             originalContent={message.content}
             saveFailed={saveFailed}
             onChange={setEditContent}
-            onKeyDown={handleKeyDown}
             onSubmit={handleEditSubmit}
             onCancel={handleEditCancel}
           />
