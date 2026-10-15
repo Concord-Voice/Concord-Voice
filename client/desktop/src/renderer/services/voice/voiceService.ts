@@ -10700,9 +10700,10 @@ class VoiceService {
         try {
           this.applyEncryptTransform(sender, codecFamily, source, micStream);
         } catch (err) {
-          // mediasoup invokes this before createOffer(), but does not roll back the
-          // just-created transceiver when the callback throws. Detach the track and
-          // close the transport so a failed sender cannot survive into a later offer.
+          // mediasoup invokes this before createOffer(). Since 3.24.4 it also rolls
+          // back the just-created transceiver when the callback throws; detaching the
+          // track and closing the transport stays as the authoritative backstop, so a
+          // failed sender cannot survive into a later offer on any version.
           try {
             sender.replaceTrack(null).catch(() => undefined);
           } catch {

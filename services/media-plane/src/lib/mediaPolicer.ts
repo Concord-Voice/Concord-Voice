@@ -27,7 +27,7 @@ import type { MediaSource } from './roomManager.js';
 
 /** Tick period. */
 export const POLICER_INTERVAL_MS = 5_000;
-/** Bound on each getStats() read; mediasoup 3.26's Channel has no request timeout. */
+/** Bound on each getStats() read; mediasoup's Channel (3.26 through 3.28) has no request timeout. */
 export const POLICER_READ_TIMEOUT_MS = 1_000;
 /** Flat FEC allowance. Mirrors the client's FEC_MAX_HEADROOM_PERCENT (+50%); parity-tested. */
 export const FEC_HEADROOM = 1.5;

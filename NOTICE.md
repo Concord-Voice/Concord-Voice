@@ -508,7 +508,7 @@ bundle (services/media-plane):
 | logform | 2.7.0 | MIT | https://github.com/winstonjs/logform |
 | math-intrinsics | 1.1.0 | MIT | https://github.com/es-shims/math-intrinsics |
 | media-typer | 1.1.0 | MIT | https://github.com/jshttp/media-typer |
-| mediasoup | 3.26.0 | ISC | https://github.com/versatica/mediasoup |
+| mediasoup | 3.28.0 | ISC | https://github.com/versatica/mediasoup |
 | merge-descriptors | 2.0.0 | MIT | https://github.com/sindresorhus/merge-descriptors |
 | mime-db | 1.52.0 | MIT | https://github.com/jshttp/mime-db |
 | mime-db | 1.54.0 | MIT | https://github.com/jshttp/mime-db |

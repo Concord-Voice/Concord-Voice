@@ -245,7 +245,7 @@ const mediaCodecs: RouterRtpCodecCapability[] = [
   // NOTE: H265/HEVC is deliberately absent here. Policy is ADR-0044
   // ([internal]0044-codec-admission-policy.md): Concord admits HARDWARE HEVC
   // and never ships, vendors, or writes a software implementation. It is not
-  // routable yet either -- mediasoup 3.26.0's supportedRtpCapabilities lists
+  // routable yet either -- mediasoup 3.28.0's supportedRtpCapabilities lists
   // only AV1, H264, VP8, and VP9, with no H265 worker codec class. #3241 adds
   // one behind a router flag and #3242 adds the HEVC arm of media frame
   // crypto v5; both must land before an entry belongs in this list.
@@ -344,7 +344,7 @@ function parseWorkerCountEnv(raw: string | undefined, fallback: number): number 
  * fatal-exit branch here.
  *
  * Opening this gate binds a real TCP listener per live WebRTC transport
- * (mediasoup 3.26.0 worker/src/RTC/WebRtcTransport.cpp:154-187), so it must
+ * (mediasoup 3.28.0 worker/src/RTC/WebRtcTransport.cpp:157-193), so it must
  * not be opened unless the RTC port range is published in compose AND allowed
  * on both firewall surfaces. No deployed environment does that today.
  */
@@ -625,6 +625,4 @@ export function announcedIpAdvisory(
   );
 }
 
-// Re-export mediasoup types for convenience
 import * as mediasoup from 'mediasoup';
-export type * as mediasoupTypes from 'mediasoup';

@@ -855,7 +855,7 @@ const READ_FAILED = Object.freeze({ ok: false, reason: 'outstanding' } as const)
 /**
  * Issue one `getStats()`. The executor turns a synchronous throw, or a
  * non-promise return, into a rejection, so a read can never throw past the
- * policer. mediasoup 3.26's Channel has no request timeout (spec F4), which is
+ * policer. mediasoup's Channel (3.26 through 3.28) has no request timeout (spec F4), which is
  * why every caller races the result against `POLICER_READ_TIMEOUT_MS`.
  */
 function startStatsRead<T>(target: { getStats(): Promise<T> }): Promise<T> {
@@ -3952,7 +3952,7 @@ export class RoomManager {
 
   /**
    * Pause a latched producer (#2153 spec §5.3 step C). Never rejects, and
-   * always settles within `POLICER_READ_TIMEOUT_MS`: mediasoup 3.26 channel
+   * always settles within `POLICER_READ_TIMEOUT_MS`: the mediasoup (3.26 through 3.28) channel
    * requests never time out (spec F4) and the tick awaits this call, so an
    * unbounded pause on a wedged worker would stop enforcement silently — the
    * failure R8 closed for reads. A timeout is treated exactly like a
