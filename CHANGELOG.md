@@ -69,6 +69,10 @@ expiration timer can now keep pinned messages, and says so.
 
 ### Fixed
 
+- **Voice enforcement readiness** (internal development reference omitted) — Voice service startup now waits for all enforcement subscriptions. If enforcement
+  becomes unavailable, new voice joins stop immediately and remaining calls close
+  within 30 seconds; reconnecting requires authentication again.
+
 - **Voice moderation survives delivery outages** (internal development reference omitted) — voice moderation and group DM member removal now save enforcement commands with the
   accepted action and retry delivery after broker outages. Acknowledged commands free
   broker capacity, and a full queue refuses new actions before changing saved state. Moderation responses identify

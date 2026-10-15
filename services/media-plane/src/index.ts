@@ -41,6 +41,7 @@ import {
 } from './middleware/auth.js';
 import type { AuthenticatedSocketData } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
+import { EnforcementAvailability } from './lib/enforcementAvailability.js';
 import { VoiceCommandDispatcher } from './lib/voiceCommandDispatcher.js';
 import { createChannelAdmissionActivationHandler } from './lib/channelAdmissionActivation.js';
 import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
@@ -991,11 +992,7 @@ async function main() {
   let shuttingDown = false;
   const voiceEnforcementSubject = `voice.enforce.session.${voiceEnforcementNodeBootId}`;
   natsService.setSecurityEventEmitter((event) => securityEvents.emit(event));
-  try {
-    await natsService.connect();
-  } catch {
-    logger.warn('NATS connection failed — running without inter-service messaging');
-  }
+  await natsService.connect();
 
   // Initialize Redis (room state)
   const redisService = new RedisService();
@@ -1067,6 +1064,7 @@ async function main() {
     if (
       shuttingDown ||
       voiceEnforcementReleaseQueue.saturated() ||
+      !enforcementAvailable() ||
       !voiceEnforcementLease.valid() ||
       !natsService.voiceCommandReady() ||
       !voiceEnforcementSubscriptionReady ||
@@ -1083,39 +1081,44 @@ async function main() {
   // handled in each socket-event try/catch and logged via logger.error.
   app.use(createExpressErrorHandler(logger));
 
-  // Initialize Socket.IO
+  const socketAdmissionGate = createAdmissionGate({
+    trustedProxies: config.trustedProxies,
+    onReject: () => {
+      mediaMetrics.incrementAdmissionRejected();
+      securityEvents.emit({
+        eventType: 'media_admission',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'admission_rejected',
+        routeTemplate: 'socket.join',
+      });
+    },
+    // Startup-only configuration warnings (empty/invalid TRUSTED_PROXIES).
+    warn: (message) => {
+      logger.warn(message);
+      if (message.startsWith('Admission gate INACTIVE:')) {
+        securityEvents.emit({
+          eventType: 'security_control',
+          outcome: 'degraded',
+          severity: 'high',
+          reasonCode: 'admission_gate_inactive',
+        });
+      }
+    },
+  });
+  // Initialize Socket.IO. Availability composes with the existing rate gate.
   const io = new SocketIOServer(httpServer, {
     cors: {
       origin: createOriginGate(config.allowedOrigins, (event) => securityEvents.emit(event)),
       credentials: true,
     },
-    // #2032 admission layer — bounds what per-socket budgets structurally
-    // cannot: connection establishment, message size, and idle half-joins.
-    allowRequest: createAdmissionGate({
-      trustedProxies: config.trustedProxies,
-      onReject: () => {
-        mediaMetrics.incrementAdmissionRejected();
-        securityEvents.emit({
-          eventType: 'media_admission',
-          outcome: 'denied',
-          severity: 'medium',
-          reasonCode: 'admission_rejected',
-          routeTemplate: 'socket.join',
-        });
-      },
-      // Startup-only configuration warnings (empty/invalid TRUSTED_PROXIES).
-      warn: (message) => {
-        logger.warn(message);
-        if (message.startsWith('Admission gate INACTIVE:')) {
-          securityEvents.emit({
-            eventType: 'security_control',
-            outcome: 'degraded',
-            severity: 'high',
-            reasonCode: 'admission_gate_inactive',
-          });
-        }
-      },
-    }),
+    allowRequest: (request, callback) => {
+      if (!enforcementAvailable()) {
+        callback('Voice enforcement unavailable', false);
+        return;
+      }
+      socketAdmissionGate(request, callback);
+    },
     // 256 KB. Measured against production 2026-08-19: the largest inbound
     // frame is `update-rtp-capabilities` at 4,505 B. `join-room` does NOT
     // carry rtpCapabilities — it sends `undefined` and the client emits them
@@ -1166,6 +1169,26 @@ async function main() {
       }
     }
   );
+
+  const enforcementAvailability = new EnforcementAvailability(async () => {
+    voiceEnforcementLease.expire();
+    const terminalization = voiceEnforcementExpiryFence.enforce();
+    // The socket deadline must not wait for a pending native termination proof.
+    // Hold exact releases first; disconnection never proves native completion.
+    const sessions = snapshotVoiceEnforcementSessions(io.sockets.sockets.values());
+    voiceEnforcementReleaseQueue.holdAll(sessions);
+    for (const socket of io.sockets.sockets.values()) {
+      socket.data.voiceEnforcementSession = undefined;
+      socket.disconnect(true);
+    }
+    await terminalization;
+  });
+  const stopObservingRequiredSubscriptions = natsService.observeRequiredSubscriptions((ready) => {
+    enforcementAvailability.setAvailable(ready);
+  });
+  function enforcementAvailable(): boolean {
+    return natsService.requiredSubscriptionsReady() && enforcementAvailability.isReady();
+  }
 
   const quarantineVoiceCommands = async (_reason: string): Promise<void> => {
     voiceEnforcementLease.expire();
@@ -1218,18 +1241,28 @@ async function main() {
     subject: string,
     handler: (data: Record<string, unknown>) => Promise<void>
   ): void => {
-    natsService.subscribe(subject, async (data) => {
-      legacyVoiceCommands.set(data, () => handler(data));
-      try {
-        await voiceCommandDispatcher.handleCompatibility(data);
-      } finally {
-        legacyVoiceCommands.delete(data);
-      }
-    });
+    natsService.subscribe(
+      subject,
+      async (data) => {
+        legacyVoiceCommands.set(data, () => handler(data));
+        try {
+          await voiceCommandDispatcher.handleCompatibility(data);
+        } finally {
+          legacyVoiceCommands.delete(data);
+        }
+      },
+      { required: true }
+    );
   };
 
   // Socket.IO JWT authentication middleware (A2)
+  const requireEnforcementAvailability = (_socket: Socket, next: (error?: Error) => void): void => {
+    next(enforcementAvailable() ? undefined : new Error('Voice enforcement unavailable'));
+  };
+  io.use(requireEnforcementAvailability);
   io.use(createAuthMiddleware((event) => securityEvents.emit(event)));
+  // Recheck after asynchronous authentication, before namespace admission.
+  io.use(requireEnforcementAvailability);
 
   // ── Media-rate policer (#2153) ────────────────────────────────────────
   // Installed before the first socket can connect, so no join or produce is
@@ -1394,11 +1427,13 @@ async function main() {
   // issued only after the existing RoomManager teardown has completed.
   natsService.subscribeRequest(
     'voice.enforce.disconnect.ack',
-    createDMBlockDisconnectAckHandler(roomManager, io, config.jwtSecret)
+    createDMBlockDisconnectAckHandler(roomManager, io, config.jwtSecret),
+    { required: true }
   );
   natsService.subscribeRequest(
     'voice.enforce.credential_epoch.ack',
-    createCredentialEpochEjectionAckHandler(roomManager, io, config.jwtSecret)
+    createCredentialEpochEjectionAckHandler(roomManager, io, config.jwtSecret),
+    { required: true }
   );
   voiceEnforcementSubscriptionReady = natsService.subscribeRequest(
     voiceEnforcementSubject,
@@ -1408,6 +1443,13 @@ async function main() {
       config.jwtSecret,
       voiceEnforcementNodeBootId,
       async () => {
+        if (shuttingDown) {
+          if (!natsService.requiredSubscriptionsReady())
+            throw new Error('Voice enforcement unavailable');
+        } else {
+          await natsService.confirmRequiredSubscriptions();
+        }
+        await enforcementAvailability.awaitTeardown();
         // A late valid command cannot revive a process that crossed expiry
         // without first terminalizing all local media state.
         await fenceExpiredVoiceEnforcementLease();
@@ -1415,13 +1457,19 @@ async function main() {
           await natsService.recoverVoiceCommandConsumerAfterTeardown();
         }
         await natsService.confirmVoiceCommandContinuity();
+        if (
+          !natsService.requiredSubscriptionsReady() ||
+          (!shuttingDown && !enforcementAvailability.isReady())
+        )
+          throw new Error('Voice enforcement unavailable');
         voiceEnforcementLease.renew();
         // This is only a retry trigger after a verified same-subscriber health
         // round trip; it never treats the timer expiry itself as settlement.
         voiceEnforcementReleaseQueue.promoteHeld();
         void voiceEnforcementReleaseQueue.retryPending();
       }
-    )
+    ),
+    { required: true }
   );
   voiceEnforcementSubscriptionReady =
     voiceEnforcementSubscriptionReady &&
@@ -1457,7 +1505,8 @@ async function main() {
       roomManager,
       config.jwtSecret,
       (socketId) => io.sockets.sockets.get(socketId)?.connected === true
-    )
+    ),
+    { required: true }
   );
 
   // ── Mid-session permission push (CV-CAN-007 review P1) ────────────────
@@ -1467,15 +1516,19 @@ async function main() {
   // goes through the same strict fail-closed parser; a malformed payload is
   // ignored (the join-time snapshot stays — enforcement never fails open, and
   // a bad message never strips a legitimate peer).
-  natsService.subscribe('voice.enforce.permissions', async (natsData) => {
-    try {
-      await handleEnforcePermissionsMessage(roomManager, io, natsData, (event) =>
-        securityEvents.emit(event)
-      );
-    } catch (err) {
-      logger.error('Failed to handle voice.enforce.permissions', { error: err });
-    }
-  });
+  natsService.subscribe(
+    'voice.enforce.permissions',
+    async (natsData) => {
+      try {
+        await handleEnforcePermissionsMessage(roomManager, io, natsData, (event) =>
+          securityEvents.emit(event)
+        );
+      } catch (err) {
+        logger.error('Failed to handle voice.enforce.permissions', { error: err });
+      }
+    },
+    { required: true }
+  );
 
   // ─── Socket.IO connection handling ───────────────────────────────────
 
@@ -1542,7 +1595,8 @@ async function main() {
         shuttingDown ||
         voiceEnforcementReleaseQueue.saturated() ||
         !voiceEnforcementLease.valid() ||
-        !natsService.voiceCommandReady(),
+        !natsService.voiceCommandReady() ||
+        !enforcementAvailable(),
     });
 
     // ── update-rtp-capabilities ─────────────────────────────────────
@@ -2235,6 +2289,9 @@ async function main() {
     }
   }, 30_000);
 
+  // Confirm every core/request enforcement subscriber before acquiring the
+  // durable owner and binding HTTP. Partial installation is a startup failure.
+  await natsService.confirmRequiredSubscriptions();
   // Ownership and the required durable consumer are established before listen.
   await natsService.startVoiceCommandConsumer({
     owner: voiceCommandOwner,
@@ -2324,6 +2381,9 @@ async function main() {
       shutdownNativeDeadline = shutdownStartedAt + shutdownReleaseDrainTimeoutMs;
       // Reject A1/A2 work before closeAll so no registry row can race teardown.
       shuttingDown = true;
+      enforcementAvailability.stop();
+      stopObservingRequiredSubscriptions();
+      natsService.stopRequiredSubscriptionRecovery();
       shutdownTerminalDeadline = setTimeout(() => {
         logger.error('Voice command shutdown retained permanent ownership', {
           error: 'voice_command_shutdown_deadline',

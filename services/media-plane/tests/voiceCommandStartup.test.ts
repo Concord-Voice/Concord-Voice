@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer as httpServer, type IncomingMessage } from 'node:http';
 import { createServer as tcpServer, type Socket as NetworkSocket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -74,16 +74,51 @@ async function unusedPort() {
   return address.port;
 }
 
-async function isolatedBroker() {
+async function isolatedBroker(deniedSubject?: string) {
   const port = await unusedPort();
   const directory = await mkdtemp(join(tmpdir(), 'concord-startup-broker-'));
-  const child = spawn(
-    brokerBinary,
-    ['-js', '-sd', directory, '-a', '127.0.0.1', '-p', String(port)],
-    {
-      stdio: 'ignore',
-    }
-  );
+  const password = randomBytes(32).toString('hex');
+  const configPath = join(directory, 'server.conf');
+  async function writeConfig(subject?: string) {
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        no_auth_user: 'fixture-application',
+        authorization: {
+          users: [
+            { user: 'fixture-provisioner', password },
+            {
+              user: 'fixture-application',
+              password,
+              permissions: {
+                publish: '>',
+                subscribe: { allow: ['>'], deny: subject ? [subject] : [] },
+              },
+            },
+          ],
+        },
+      })
+    );
+  }
+  await writeConfig(deniedSubject);
+  const arguments_ = [
+    '-js',
+    '-sd',
+    directory,
+    '-a',
+    '127.0.0.1',
+    '-p',
+    String(port),
+    '-c',
+    configPath,
+  ];
+  const child = spawn(brokerBinary, arguments_, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let output = '';
+  child.stderr.on('data', (data: Buffer) => {
+    output = (output + data.toString()).slice(-16_384);
+  });
   const exited = new Promise<void>((resolve, reject) => {
     child.once('error', reject);
     child.once('exit', () => resolve());
@@ -96,6 +131,8 @@ async function isolatedBroker() {
           servers: `nats://127.0.0.1:${port}`,
           reconnect: false,
           timeout: 100,
+          user: 'fixture-provisioner',
+          pass: password,
         });
       },
       { timeout: 5000, interval: 20 }
@@ -103,6 +140,19 @@ async function isolatedBroker() {
     return {
       connection: connection!,
       url: `nats://127.0.0.1:${port}`,
+      deniedSubscriptionObserved() {
+        return (
+          deniedSubject !== undefined &&
+          output.includes('Subscription Violation') &&
+          output.includes(`Subject "${deniedSubject}"`)
+        );
+      },
+      async setDeniedSubject(subject?: string) {
+        await writeConfig(subject);
+        deniedSubject = subject;
+        output = '';
+        child.kill('SIGHUP');
+      },
       async close() {
         await connection?.close();
         child.kill('SIGINT');
@@ -247,7 +297,7 @@ function proof(context: string, fields: string[]) {
 
 async function signedHealth(connection: NatsConnection, boot: string) {
   const timestamp = Math.floor(Date.now() / 1000).toString();
-  const challenge = '0123456789abcdef'.repeat(4);
+  const challenge = randomBytes(32).toString('hex');
   const request = {
     version: 2,
     kind: 'health',
@@ -445,6 +495,25 @@ async function alive(pid: number) {
   }
 }
 
+async function processState(pid: number): Promise<string> {
+  const child = spawn('ps', ['-o', 'state=', '-p', String(pid)], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 2000,
+  });
+  let output = '';
+  child.stdout.on('data', (data: Buffer) => {
+    output += data.toString();
+  });
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) => {
+      if (code !== 0) reject(new Error('Owned native worker state unavailable'));
+      // BSD ps can append state flags; the first character is the process state.
+      else resolve(output.trim().charAt(0));
+    });
+  });
+}
+
 async function application(natsUrl: string, redisUrl: string, controlPlaneUrl: string) {
   const directory = await mkdtemp(join(tmpdir(), 'concord-startup-app-'));
   const port = await unusedPort();
@@ -570,6 +639,26 @@ async function pollingPeer(base: string) {
   expect(accepted.some((packet) => packet.startsWith('40'))).toBe(true);
   let id = 0;
   return {
+    async waitForServerDisconnect(timeoutMs: number) {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
+        const response = await fetch(endpoint, { signal: AbortSignal.timeout(remaining) });
+        if (response.status === 400) {
+          expect(await response.json()).toMatchObject({ code: 1 });
+          return 'unknown_session';
+        }
+        expect(response.status).toBe(200);
+        for (const packet of (await response.text()).split('\x1e')) {
+          if (packet === '2') await post('3');
+          if (packet === '1') return packet;
+        }
+      }
+      throw new Error('Server did not close the owned polling session before its deadline');
+    },
+    async transportStatus() {
+      return (await fetch(endpoint, { signal: AbortSignal.timeout(2000) })).status;
+    },
     async join() {
       const ackId = id++;
       await post(
@@ -591,8 +680,8 @@ async function pollingPeer(base: string) {
   };
 }
 
-async function runtime() {
-  const broker = await isolatedBroker();
+async function runtime(deniedSubject?: string) {
+  const broker = await isolatedBroker(deniedSubject);
   const redis = await redisFixture();
   const cp = await controlPlane(broker.connection);
   const resources = await provision(broker.connection);
@@ -637,6 +726,33 @@ describe('actual index voice-command runtime boundaries', () => {
     }
   }, 15_000);
 
+  it('becomes ready on a fresh process restart after the initial broker connection failed', async () => {
+    const f = await runtime();
+    const deadPort = await unusedPort();
+    const failed = await application(`nats://127.0.0.1:${deadPort}`, f.redis.url, f.cp.url);
+    try {
+      await vi.waitFor(() => expect(failed.result?.code, failed.output).toBe(1), {
+        timeout: 10_000,
+      });
+      expect(failed.output).toContain('Failed to connect to NATS');
+      expect(failed.output).not.toContain('Media Plane server started');
+      expect((await f.resources.owner()).phase).toBe('released');
+
+      const restarted = await f.start();
+      await restarted.listening();
+      const owner = await f.resources.owner();
+      expect(owner.phase).toBe('held');
+      await signedHealth(f.broker.connection, owner.nodeBootId);
+      expect(await restarted.ready()).toEqual({
+        status: 200,
+        body: { ready: true, voiceEnforcementProtocol: 3 },
+      });
+    } finally {
+      await failed.close();
+      await f.close();
+    }
+  }, 20_000);
+
   it('fails required durable initialization before listen with invalid consumer configuration', async () => {
     const f = await runtime();
     try {
@@ -662,6 +778,174 @@ describe('actual index voice-command runtime boundaries', () => {
       await f.close();
     }
   }, 15_000);
+
+  it.each(['voice.enforce.permissions', 'voice.admission.activate'])(
+    'fails before listen when broker refuses required subscription %s',
+    async (deniedSubject) => {
+      const f = await runtime(deniedSubject);
+      try {
+        const app = await f.start();
+        await vi.waitFor(
+          () => {
+            expect(f.broker.deniedSubscriptionObserved()).toBe(true);
+            expect(
+              app.result !== undefined || app.output.includes('Media Plane server started')
+            ).toBe(true);
+          },
+          { timeout: 10_000 }
+        );
+        expect(app.result?.code, app.output).toBe(1);
+        expect(app.output).toContain('Fatal error during startup');
+        expect(app.output).toContain('Connected to NATS');
+        expect(f.broker.deniedSubscriptionObserved()).toBe(true);
+        expect(app.output).not.toContain('Media Plane server started');
+        expect((await f.resources.owner()).phase).toBe('released');
+        await expect(
+          fetch(`${app.url}/health`, { signal: AbortSignal.timeout(500) })
+        ).rejects.toThrow();
+      } finally {
+        await f.close();
+      }
+    },
+    15_000
+  );
+
+  it('gates live admission and restores the same authenticated peer after required subscription recovery', async () => {
+    const f = await runtime();
+    try {
+      f.cp.setHealth(true);
+      const app = await f.start();
+      await app.listening();
+      const owner = await f.resources.owner();
+      await signedHealth(f.broker.connection, owner.nodeBootId);
+      expect(await app.ready()).toEqual({
+        status: 200,
+        body: { ready: true, voiceEnforcementProtocol: 3 },
+      });
+      const peer = await pollingPeer(app.url);
+      expect((await peer.join()).error).toBeDefined();
+      expect(f.cp.authorizations).toBe(1);
+
+      await f.broker.setDeniedSubject('voice.enforce.permissions');
+      await vi.waitFor(
+        async () => {
+          expect(f.broker.deniedSubscriptionObserved()).toBe(true);
+          expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+        },
+        { timeout: 5000, interval: 20 }
+      );
+      const refused = await fetch(`${app.url}/socket.io/?EIO=4&transport=polling`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      expect(refused.status).toBe(403);
+      expect(await peer.join()).toEqual({ error: 'Voice service is shutting down' });
+      expect(f.cp.authorizations).toBe(1);
+
+      await f.broker.setDeniedSubject(undefined);
+      await vi.waitFor(
+        async () => {
+          await signedHealth(f.broker.connection, owner.nodeBootId);
+          expect(await app.ready()).toEqual({
+            status: 200,
+            body: { ready: true, voiceEnforcementProtocol: 3 },
+          });
+        },
+        { timeout: 8000, interval: 100 }
+      );
+      expect(await f.resources.owner()).toEqual(owner);
+      expect((await peer.join()).error).toBeDefined();
+      expect(f.cp.authorizations).toBe(2);
+    } finally {
+      await f.close();
+    }
+  }, 25_000);
+
+  it('disconnects admitted and idle sockets within the outage ceiling while native termination proof is pending', async () => {
+    const f = await runtime();
+    const pausedWorkers = new Set<number>();
+    try {
+      f.cp.setAuthorize(true);
+      f.cp.setHealth(true);
+      const app = await f.start();
+      await app.listening();
+      const owner = await f.resources.owner();
+      await signedHealth(f.broker.connection, owner.nodeBootId);
+      const admitted = await pollingPeer(app.url);
+      expect((await admitted.join()).rtpCapabilities).toBeDefined();
+      const idle = await pollingPeer(app.url);
+      expect(f.cp.registrations.size).toBe(1);
+      const workers = await app.workers();
+      expect(workers).toHaveLength(1);
+      for (const pid of workers) {
+        process.kill(pid, 'SIGSTOP');
+        pausedWorkers.add(pid);
+      }
+      await vi.waitFor(async () => {
+        for (const pid of pausedWorkers) expect(await processState(pid)).toBe('T');
+      });
+      const closures = Promise.all([
+        admitted.waitForServerDisconnect(35_000),
+        idle.waitForServerDisconnect(35_000),
+      ]);
+      const began = performance.now();
+      await f.broker.setDeniedSubject('voice.enforce.permissions');
+      await vi.waitFor(
+        async () => {
+          expect(f.broker.deniedSubscriptionObserved()).toBe(true);
+          expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+        },
+        { timeout: 5000, interval: 20 }
+      );
+      expect(await closures).toHaveLength(2);
+      expect(performance.now() - began).toBeLessThan(32_000);
+      await vi.waitFor(async () => {
+        expect(await admitted.transportStatus()).toBe(400);
+        expect(await idle.transportStatus()).toBe(400);
+      });
+      const health = (await (await fetch(`${app.url}/health`)).json()) as {
+        totalParticipants: number;
+      };
+      expect(health.totalParticipants).toBe(0);
+      expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+      expect(await f.resources.owner()).toEqual(owner);
+      expect(f.cp.registrations.size).toBe(1);
+      expect(f.cp.releaseAttempts).toBe(0);
+      for (const pid of pausedWorkers) {
+        expect(await alive(pid)).toBe(true);
+        expect(await processState(pid)).toBe('T');
+      }
+
+      // Socket closure must precede native proof. Resume only after proving
+      // the worker is still stopped and exact ownership/release evidence held.
+      for (const pid of pausedWorkers) process.kill(pid, 'SIGCONT');
+      pausedWorkers.clear();
+
+      await f.broker.setDeniedSubject(undefined);
+      await vi.waitFor(
+        async () => {
+          await signedHealth(f.broker.connection, owner.nodeBootId);
+          expect(await app.ready()).toEqual({
+            status: 200,
+            body: { ready: true, voiceEnforcementProtocol: 3 },
+          });
+        },
+        { timeout: 8000, interval: 100 }
+      );
+      expect(await admitted.transportStatus()).toBe(400);
+      expect(await idle.transportStatus()).toBe(400);
+      const fresh = await pollingPeer(app.url);
+      expect((await fresh.join()).rtpCapabilities).toBeDefined();
+    } finally {
+      for (const pid of pausedWorkers) {
+        try {
+          process.kill(pid, 'SIGCONT');
+        } catch {
+          /* Owned worker already exited during failed-test cleanup. */
+        }
+      }
+      await f.close();
+    }
+  }, 48_000);
 
   it('keeps exact readyz bodies and refuses admission/revival after owner-key loss', async () => {
     const f = await runtime();

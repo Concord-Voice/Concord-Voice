@@ -17,6 +17,7 @@ import type {
   KV,
   NatsConnection,
   StreamInfo,
+  Subscription,
 } from 'nats';
 import { isCanonicalEnforcementUUID } from './enforcementCommand.js';
 import { decodeVoiceCommand, type VoiceCommand } from './voiceCommand.js';
@@ -31,6 +32,7 @@ import { config } from '../config/index.js';
 import { logger } from './logger.js';
 import type { RoomEvent, RoomEventHandler } from './roomManager.js';
 import type { EmitSecurityEvent } from './securityEvent.js';
+import { RequiredNatsSubscriptions } from './requiredNatsSubscriptions.js';
 
 // ---------------------------------------------------------------------------
 // NATS client — publishes voice events for the control plane to consume.
@@ -610,13 +612,49 @@ export class NatsService {
 
   private nc: NatsConnection | null = null;
   private connected = false;
-  private readonly subscriptions: Array<{ unsubscribe(): void }> = [];
+  private readonly subscriptions = new Set<Subscription>();
   private lastVoiceLifecycleMicroseconds = 0n;
   private emitSecurityEvent: EmitSecurityEvent | undefined;
   private securityDegraded = false;
   private readonly failedSubscriptions = new Set<string>();
-  private readonly requestSubscriptions = new Set<string>();
+  private readonly requestSubscriptions = new Map<string, Subscription>();
   private closing = false;
+  private connectionEpoch = 0;
+  private cancelConnect?: () => void;
+  private requiredSubscriptions = this.newRequiredSubscriptions();
+  private hasRequiredSubscriptions = false;
+
+  private newRequiredSubscriptions(): RequiredNatsSubscriptions {
+    const subscriptions = new RequiredNatsSubscriptions(
+      () => this.isConnected(),
+      () => {
+        if (!this.nc || !this.isConnected()) throw commandUnavailable();
+        return this.nc.flush();
+      }
+    );
+    subscriptions.observe((ready) => {
+      if (this.closing || !this.hasRequiredSubscriptions) return;
+      if (ready) this.restored();
+      else this.degraded();
+    });
+    return subscriptions;
+  }
+
+  confirmRequiredSubscriptions(): Promise<void> {
+    return this.requiredSubscriptions.confirm();
+  }
+
+  requiredSubscriptionsReady(): boolean {
+    return this.requiredSubscriptions.ready();
+  }
+
+  observeRequiredSubscriptions(observer: (ready: boolean) => void): () => void {
+    return this.requiredSubscriptions.observe(observer);
+  }
+
+  stopRequiredSubscriptionRecovery(): void {
+    this.requiredSubscriptions.stop();
+  }
 
   private observe(event: Parameters<EmitSecurityEvent>[0]): void {
     try {
@@ -635,7 +673,8 @@ export class NatsService {
   }
 
   isRequestSubscriptionHealthy(subject: string): boolean {
-    return this.isConnected() && this.requestSubscriptions.has(subject);
+    const sub = this.requestSubscriptions.get(subject);
+    return this.isConnected() && !!sub && !sub.isClosed();
   }
 
   private security(
@@ -664,6 +703,7 @@ export class NatsService {
     if (
       !this.connected ||
       this.failedSubscriptions.size > 0 ||
+      (this.hasRequiredSubscriptions && !this.requiredSubscriptionsReady()) ||
       !this.securityDegraded ||
       (this.voiceCommands && !this.voiceCommandReady())
     )
@@ -694,64 +734,80 @@ export class NatsService {
   }
 
   async connect(): Promise<void> {
+    const epoch = ++this.connectionEpoch;
+    this.closing = false;
     try {
-      this.closing = false;
-      this.nc = await connect({
+      const pending = connect({
         servers: config.natsUrl,
         name: 'media-plane',
         reconnect: true,
-        maxReconnectAttempts: -1, // retry forever
+        maxReconnectAttempts: -1,
         reconnectTimeWait: 2000,
       });
+      // Cancellation settles startup even if the underlying first dial is still
+      // pending; a late connection is immediately closed without being adopted.
+      void pending.then(
+        (nc) => {
+          if (this.closing || epoch !== this.connectionEpoch)
+            void nc.close().catch(() => undefined);
+        },
+        () => undefined
+      );
+      const nc = await new Promise<NatsConnection>((resolve, reject) => {
+        this.cancelConnect = () => reject(commandUnavailable());
+        pending.then(resolve, reject);
+      });
+      if (this.closing || epoch !== this.connectionEpoch) throw commandUnavailable();
+      this.cancelConnect = undefined;
+      this.nc = nc;
       this.connected = true;
       this.restored();
-
       logger.info('Connected to NATS');
 
-      // Monitor connection status. A completed or failed iterator cannot leave
-      // the last connected state asserted: only connect/reconnect confirms it.
-      const nc = this.nc;
       void (async () => {
         try {
           for await (const status of nc.status()) {
+            if (this.nc !== nc || this.closing) return;
             if (status.type === 'disconnect' || status.type === 'reconnecting') {
-              this.connected = false;
-              void this.invalidateVoiceCommands('connection_unavailable').catch(() => undefined);
-              this.degraded();
-            } else if (status.type === 'reconnect') {
+              this.connectionUnavailable();
+            } else if (status.type === 'reconnect' && !this.connected) {
               this.connected = true;
+              this.requiredSubscriptions.connectionChanged();
               this.restored();
             }
             logger.info('NATS status', { type: status.type });
           }
           if (this.nc === nc && this.connected) {
-            this.connected = false;
-            void this.invalidateVoiceCommands('connection_unavailable').catch(() => undefined);
-            this.degraded();
+            this.connectionUnavailable();
             logger.error('NATS status iterator ended');
           }
         } catch {
-          if (this.nc === nc && this.connected) {
-            this.connected = false;
-            void this.invalidateVoiceCommands('connection_unavailable').catch(() => undefined);
-            this.degraded();
-          }
+          if (this.nc === nc && this.connected) this.connectionUnavailable();
           logger.error('NATS status iterator failed', { error: 'nats_status_iterator_failed' });
         }
       })();
     } catch (err) {
-      this.connected = false;
-      this.degraded();
+      if (epoch === this.connectionEpoch) {
+        this.cancelConnect = undefined;
+        this.connectionUnavailable();
+      }
       logger.error('Failed to connect to NATS', { error: 'nats_connect_failed' });
       throw err;
     }
+  }
+
+  private connectionUnavailable(): void {
+    this.connected = false;
+    this.requiredSubscriptions.connectionChanged();
+    void this.invalidateVoiceCommands('connection_unavailable').catch(() => undefined);
+    this.degraded();
   }
 
   /** Publish a JSON message to a NATS subject */
   publish(subject: string, data: Record<string, unknown>): boolean {
     if (!this.nc || !this.connected || this.nc.isClosed()) {
       this.degraded();
-      logger.warn('NATS not connected, dropping message', { subject });
+      logger.warn('NATS not connected, dropping message');
       return false;
     }
 
@@ -761,7 +817,7 @@ export class NatsService {
       return true;
     } catch {
       this.degraded();
-      logger.error('Failed to publish NATS message', { subject, error: 'nats_publish_failed' });
+      logger.error('Failed to publish NATS message', { error: 'nats_publish_failed' });
       return false;
     }
   }
@@ -836,114 +892,140 @@ export class NatsService {
     };
   }
 
-  /** Subscribe to a NATS subject and call handler with decoded JSON payload */
+  /** Subscribe to a NATS subject and call handler with decoded JSON payload. */
   subscribe(
     subject: string,
-    handler: (data: Record<string, unknown>) => void | Promise<void>
+    handler: (data: Record<string, unknown>) => void | Promise<void>,
+    options: { required?: boolean } = {}
   ): void {
+    if (options.required && (this.closing || !this.isConnected())) throw commandUnavailable();
     if (!this.nc) {
       this.degraded();
-      logger.warn('NATS not connected, cannot subscribe', { subject });
+      logger.warn('NATS not connected, cannot subscribe');
       return;
     }
-    const nc = this.nc;
-    const sub = nc.subscribe(subject);
-    this.subscriptions.push(sub);
-    if (this.failedSubscriptions.delete(subject)) this.restored();
-    void (async () => {
-      for await (const msg of sub) {
-        let decoded: Record<string, unknown>;
-        try {
-          const value = jsonCodec.decode(msg.data);
-          if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-            throw new TypeError('NATS message must decode to an object');
+    const install = (): Subscription => {
+      const nc = this.nc;
+      if (!nc) throw commandUnavailable();
+      const sub = nc.subscribe(subject);
+      this.subscriptions.add(sub);
+      if (this.failedSubscriptions.delete(subject)) this.restored();
+      const ended = () => {
+        this.subscriptions.delete(sub);
+        if (this.closing || this.nc !== nc) return;
+        if (options.required) {
+          if (!this.requiredSubscriptions.ended(subject, sub)) return;
+        } else this.failedSubscriptions.add(subject);
+        this.degraded();
+        logger.error('NATS subscription ended', { error: 'nats_subscription_ended' });
+      };
+      void (async () => {
+        for await (const msg of sub) {
+          if (options.required && sub.isClosed()) break;
+          let decoded: Record<string, unknown>;
+          try {
+            const value = jsonCodec.decode(msg.data);
+            if (typeof value !== 'object' || value === null || Array.isArray(value))
+              throw new TypeError('NATS message must decode to an object');
+            decoded = value as Record<string, unknown>;
+          } catch {
+            this.observe({
+              eventType: 'media_integrity',
+              outcome: 'denied',
+              severity: 'medium',
+              reasonCode: 'media_schema_rejected',
+            });
+            logger.warn('Rejected malformed NATS message');
+            continue;
           }
-          decoded = value as Record<string, unknown>;
-        } catch {
-          this.observe({
-            eventType: 'media_integrity',
-            outcome: 'denied',
-            severity: 'medium',
-            reasonCode: 'media_schema_rejected',
-          });
-          logger.warn('Rejected malformed NATS message', { subject });
-          continue;
+          try {
+            await handler(decoded);
+          } catch {
+            logger.error('NATS message handler failed', { error: 'nats_handler_failed' });
+          }
         }
-        try {
-          await handler(decoded);
-        } catch {
-          logger.error('NATS message handler failed', { subject, error: 'nats_handler_failed' });
-        }
-      }
-      if (!this.closing && this.nc === nc) {
-        this.failedSubscriptions.add(subject);
-        this.degraded();
-        logger.error('NATS subscription ended', { subject });
-      }
-    })().catch(() => {
-      if (!this.closing && this.nc === nc) {
-        this.failedSubscriptions.add(subject);
-        this.degraded();
-        logger.error('NATS subscription error', { subject, error: 'nats_subscription_failed' });
-      }
-    });
+        ended();
+      })().catch(() => {
+        ended();
+        logger.error('NATS subscription error', { error: 'nats_subscription_failed' });
+      });
+      if (options.required) void sub.closed.then(ended, ended);
+      return sub;
+    };
+    if (options.required) {
+      this.hasRequiredSubscriptions = true;
+      this.requiredSubscriptions.register(subject, install);
+    } else install();
   }
 
-  /**
-   * Subscribe to a JSON request and reply only after the handler confirms its
-   * terminal effect. A thrown handler deliberately sends no reply, so the
-   * requester retains its durable obligation for retry.
-   */
+  /** Reply only after a handler confirms its terminal effect; failure retains the obligation. */
   subscribeRequest(
     subject: string,
     handler: (
       data: Record<string, unknown>
-    ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>
+    ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>,
+    options: { required?: boolean } = {}
   ): boolean {
+    if (options.required && (this.closing || !this.isConnected())) throw commandUnavailable();
     if (!this.nc) {
       this.degraded();
-      logger.warn('NATS not connected, cannot subscribe', { subject });
+      logger.warn('NATS not connected, cannot subscribe');
       return false;
     }
-    const nc = this.nc;
-    const sub = nc.subscribe(subject);
-    this.subscriptions.push(sub);
-    this.requestSubscriptions.add(subject);
-    (async () => {
-      for await (const msg of sub) {
-        try {
-          if (!msg.reply) continue;
-          const decoded = jsonCodec.decode(msg.data) as Record<string, unknown>;
-          const response = await handler(decoded);
-          if (response !== undefined) msg.respond(jsonCodec.encode(response));
-        } catch {
-          logger.error('Failed to handle NATS request', {
-            subject,
-            error: 'nats_request_handler_failed',
-          });
+    const install = (): Subscription => {
+      const nc = this.nc;
+      if (!nc) throw commandUnavailable();
+      const sub = nc.subscribe(subject);
+      this.subscriptions.add(sub);
+      this.requestSubscriptions.set(subject, sub);
+      const ended = () => {
+        this.subscriptions.delete(sub);
+        if (this.requestSubscriptions.get(subject) === sub)
+          this.requestSubscriptions.delete(subject);
+        if (this.closing || this.nc !== nc) return;
+        if (options.required && !this.requiredSubscriptions.ended(subject, sub)) return;
+        this.degraded();
+        logger.error('NATS request subscription ended', {
+          error: 'nats_request_subscription_ended',
+        });
+      };
+      void (async () => {
+        for await (const msg of sub) {
+          if (options.required && sub.isClosed()) break;
+          try {
+            if (!msg.reply) continue;
+            const decoded = jsonCodec.decode(msg.data) as Record<string, unknown>;
+            const response = await handler(decoded);
+            if (response !== undefined && (!options.required || !sub.isClosed()))
+              msg.respond(jsonCodec.encode(response));
+          } catch {
+            logger.error('Failed to handle NATS request', { error: 'nats_request_handler_failed' });
+          }
         }
-      }
-      if (!this.closing && this.nc === nc) {
-        this.requestSubscriptions.delete(subject);
-        this.degraded();
-        logger.error('NATS request subscription ended', { subject });
-      }
-    })().catch(() => {
-      if (!this.closing && this.nc === nc) {
-        this.requestSubscriptions.delete(subject);
-        this.degraded();
-      }
-      logger.error('NATS request subscription error', {
-        subject,
-        error: 'nats_request_subscription_failed',
+        ended();
+      })().catch(() => {
+        ended();
+        logger.error('NATS request subscription error', {
+          error: 'nats_request_subscription_failed',
+        });
       });
-    });
+      if (options.required) void sub.closed.then(ended, ended);
+      return sub;
+    };
+    if (options.required) {
+      this.hasRequiredSubscriptions = true;
+      this.requiredSubscriptions.register(subject, install);
+    } else install();
     return true;
   }
 
   async close(): Promise<void> {
     this.closing = true;
+    this.connectionEpoch++;
+    this.cancelConnect?.();
+    this.cancelConnect = undefined;
     this.connected = false;
+    this.requiredSubscriptions.close();
     await this.stopVoiceCommandRenewal();
     await this.stopVoiceCommandConsumer();
     // Drain subscriptions before closing
@@ -954,7 +1036,7 @@ export class NatsService {
         /* already closed */
       }
     }
-    this.subscriptions.length = 0;
+    this.subscriptions.clear();
     this.failedSubscriptions.clear();
     this.requestSubscriptions.clear();
 
@@ -963,5 +1045,7 @@ export class NatsService {
       logger.info('NATS connection closed');
       this.nc = null;
     }
+    this.requiredSubscriptions = this.newRequiredSubscriptions();
+    this.hasRequiredSubscriptions = false;
   }
 }

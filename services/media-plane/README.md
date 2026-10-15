@@ -460,6 +460,21 @@ For larger deployments:
 
 ## Monitoring
 
+Startup requires the first NATS connection, every core/request enforcement
+subscription and the durable voice consumer before the HTTP listener opens.
+Initial failure exits for the orchestrator to restart once dependencies recover.
+
+Use `/readyz` for admission readiness: HTTP 200
+`{"ready":true,"voiceEnforcementProtocol":3}` or HTTP 503 `{"ready":false}`.
+The local `/health` endpoint remains the aggregate operations surface.
+Loss of any required subscription immediately denies new connections and room
+joins. Existing sockets have a maximum 30-second outage grace, then are forcibly
+disconnected and must authenticate and obtain admission again. Durable authority
+loss retains its existing immediate quarantine, which can disconnect earlier.
+Recovery requires all required subscriptions and existing signed/owner proofs;
+network reconnection alone is insufficient. See the
+[transport runbook](../../[internal]voice-command-transport.md).
+
 Key metrics to monitor:
 
 - Active workers

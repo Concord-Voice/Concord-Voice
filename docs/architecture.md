@@ -888,13 +888,25 @@ completion for the active command so a fanout retry does not repeat an already
 applied transient action. New-format compatibility copies cannot run ahead of
 the durable stream; legacy commands retain their established handling.
 
-Startup awaits the required durable consumer before accepting connections.
+Startup awaits the first NATS connection, broker-confirmed installation of all
+required core/request enforcement subscribers, and the required durable consumer
+before accepting connections. Required subjects include compatibility moderation,
+permission pushes, exact-session/credential/disconnect acknowledgements and
+admission activation. Optional operations publishing does not control readiness.
+Reconnect confirms retained live subscriptions and recreates only ended required
+handles, with bounded, serialized verification qualified by connection epoch.
+
 `/readyz` keeps its exact existing responses: HTTP 200 with
 `{"ready":true,"voiceEnforcementProtocol":3}` only while signed enforcement,
-owner and consumer continuity are healthy; HTTP 503 with `{"ready":false}`
-otherwise. The compatibility subjects remain installed. Removing them and
-completing all existing subscription startup guarantees are separate cutover
-work.
+the full required subscriber set, owner and consumer continuity are healthy;
+HTTP 503 with `{"ready":false}` otherwise. Required-subscriber loss immediately
+denies new handshakes, namespace connections and room admission. The approved
+maximum grace for existing sockets is 30 seconds; recovery can cancel it only
+after the complete required set is confirmed. Existing immediate quarantine on
+durable authority loss remains stricter. Deadline disconnection holds exact
+release obligations and never substitutes socket closure for native termination
+proof. The compatibility subjects remain installed; removing them is a separate
+change and is not necessary for durable delivery.
 
 Graceful shutdown terminalizes local media and completes exact registry releases
 before releasing ownership; it preserves the durable consumer. Incomplete

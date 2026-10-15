@@ -336,6 +336,21 @@ describe('NatsService', () => {
   });
 
   describe('subscribeRequest', () => {
+    it('throws for a required request subscription when not connected', () => {
+      const handler = vi.fn().mockResolvedValue({ version: 2, ok: true });
+
+      expect(() =>
+        Reflect.apply(service.subscribeRequest, service, [
+          'voice.enforce.disconnect.ack',
+          handler,
+          { required: true },
+        ])
+      ).toThrow();
+
+      expect(mockNc.subscribe).not.toHaveBeenCalled();
+      expect(handler).not.toHaveBeenCalled();
+    });
+
     it('responds only after the awaited handler completes', async () => {
       await service.connect();
       let complete!: () => void;
@@ -404,6 +419,21 @@ describe('NatsService', () => {
   });
 
   describe('subscribe', () => {
+    it('throws for a required subscription when not connected', () => {
+      const handler = vi.fn();
+
+      expect(() =>
+        Reflect.apply(service.subscribe, service, [
+          'voice.enforcement',
+          handler,
+          { required: true },
+        ])
+      ).toThrow();
+
+      expect(mockNc.subscribe).not.toHaveBeenCalled();
+      expect(handler).not.toHaveBeenCalled();
+    });
+
     it('does not restore dependency health when a handler finishes while disconnected', async () => {
       mockNc.status.mockReturnValueOnce({
         async *[Symbol.asyncIterator]() {
