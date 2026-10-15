@@ -69,9 +69,8 @@ const SCREEN_FPS_OPTIONS = [5, 15, 30, 60] as const;
 export const AUDIO_PILL_LABEL: Readonly<Record<ScreenAudioVerdict, string>> = {
   none: 'Off',
   'system-loopback': 'Desktop',
-  // Written and exhaustive, but UNREACHABLE in this PR -- every `canCarryScreenAudio`
-  // call site passes two arguments, so `'per-process'` never returns. Declared, not
-  // incidental (#3198 PR 2 body, [internal]); PR 3 wires the seam that reaches it.
+  // Reachable since #3198 PR 3, which passes the machine capability as the third
+  // `canCarryScreenAudio` argument (see `[internal]as-built-ledger.md`).
   'per-process': 'App',
 };
 

@@ -3,10 +3,11 @@
  *
  * It runs in every test run. That is deliberate: an opt-in detector nobody
  * invokes is the failure class this repo has already recorded twice (see
- * [internal] on #3198's `status()`, "computed on every callback and observed by
- * nobody", and #3195 deleting an unwired watchdog rather than shipping it
- * inert). Measured cost at introduction: within run-to-run noise on a 697-file
- * suite, and zero false positives across 15,469 tests.
+ * [internal]as-built-ledger.md on #3198's `status()`, "computed on every
+ * callback and observed by nobody", and #3195 deleting an unwired watchdog
+ * rather than shipping it inert). Measured cost at introduction: within
+ * run-to-run noise on a 697-file suite, and zero false positives across 15,469
+ * tests.
  *
  * `vi.clearAllMocks()` clears call history but does not drain the queue that
  * `mockResolvedValueOnce` and friends push onto, and `clearMocks` is pinned
