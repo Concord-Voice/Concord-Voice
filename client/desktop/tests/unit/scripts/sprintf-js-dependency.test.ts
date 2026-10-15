@@ -77,6 +77,11 @@ async function close(server: HttpServer | HttpsServer): Promise<void> {
   );
 }
 
+function ignoreTeardownError(): void {
+  // Teardown EPIPE/ECONNRESET on the proxy sockets after the download completes is expected, and
+  // unhandled it fails the whole vitest run. The assertions are on the child process result.
+}
+
 function runDownload(input: {
   cache: string;
   mirror: string;
@@ -249,6 +254,8 @@ describe('@electron/get proxy behavior after removing sprintf-js', () => {
       }
       const upstream = connectNet(originPort, '127.0.0.1');
       proxySockets.push(upstream, client);
+      upstream.on('error', ignoreTeardownError);
+      client.on('error', ignoreTeardownError);
       upstream.once('connect', () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (head.length) upstream.write(head);
@@ -371,6 +378,8 @@ describe('@electron/get proxy behavior after removing sprintf-js', () => {
       connects.push(request.url ?? '');
       const upstream = connectNet(originPort, '127.0.0.1');
       proxySockets.push(upstream, client);
+      upstream.on('error', ignoreTeardownError);
+      client.on('error', ignoreTeardownError);
       upstream.once('connect', () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (head.length) upstream.write(head);

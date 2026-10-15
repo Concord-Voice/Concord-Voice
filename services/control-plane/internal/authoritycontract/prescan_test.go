@@ -140,8 +140,9 @@ func differential(t *testing.T, seed uint64, n int) diffStats {
 		if atMaxN(b, specFields(got)) {
 			st.acceptsAtMaxN++
 		}
-		require.Equal(t, b, got.Encode(), "an accept re-encodes to its input")
-		require.Equal(t, want.Encode(), got.Encode(), "both decoders decoded the same message")
+		enc := got.Encode()
+		require.Equal(t, b, enc, "an accept re-encodes to its input")
+		require.Equal(t, want.Encode(), enc, "both decoders decoded the same message")
 	}
 	return st
 }

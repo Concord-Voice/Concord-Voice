@@ -314,8 +314,15 @@ var quotedToken = regexp.MustCompile(`"([^"\\]*)"`)
 // pemPrivateKey matches the header of every PEM private-key block: PKCS#8
 // ("PRIVATE KEY"), encrypted PKCS#8, SEC1 ("EC PRIVATE KEY"), PKCS#1 ("RSA
 // PRIVATE KEY") and OpenSSH ("OPENSSH PRIVATE KEY").
-// A PuTTY key file header ("PuTTY-User-Key-File-3: ...") is matched the same way.
-var pemPrivateKey = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|PuTTY-User-Key-File-[0-9]+:`)
+// puttyKeyFile matches a PuTTY key file header ("PuTTY-User-Key-File-3: ...").
+// They are two expressions rather than one alternation because each then has a
+// literal prefix, which regexp finds with a substring search; the alternation
+// had none and was backtracked from every offset of every string, a fifth of
+// the scan under -race.
+var (
+	pemPrivateKey = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`)
+	puttyKeyFile  = regexp.MustCompile(`PuTTY-User-Key-File-[0-9]+:`)
+)
 
 // opensshMagic opens a raw openssh-key-v1 container, the bytes inside an
 // OPENSSH PRIVATE KEY PEM block.
@@ -339,7 +346,7 @@ func privateKeyFindings(v any) []string {
 		}
 	}
 	inspect = func(s string, b []byte, depth int) {
-		if looksPrivate(b) || pemPrivateKey.Match(b) || isJSONObject(b) {
+		if looksPrivate(b) || pemPrivateKey.Match(b) || puttyKeyFile.Match(b) || isJSONObject(b) {
 			out = append(out, s[:min(len(s), 16)]+"…")
 			return
 		}
@@ -380,7 +387,7 @@ func privateKeyFindings(v any) []string {
 				walk(e, depth)
 			}
 		case string:
-			if pemPrivateKey.MatchString(x) {
+			if pemPrivateKey.MatchString(x) || puttyKeyFile.MatchString(x) {
 				out = append(out, "PEM private key")
 			}
 			scan(x, depth)
@@ -457,6 +464,14 @@ func isJSONObject(b []byte) bool {
 func looksPrivate(b []byte) bool {
 	if bytes.HasPrefix(b, opensshMagic) {
 		return true
+	}
+	// Every parser below opens with asn1.Unmarshal into a struct, which takes
+	// only a SEQUENCE tag, and asn1 refuses a non-minimal tag form, so the first
+	// byte must be 0x30. Anything else is refused by all of them, but only after
+	// each x509 parser has retried it as the other two formats and formatted an
+	// error for every attempt: a quarter of the scan under -race.
+	if len(b) == 0 || b[0] != 0x30 {
+		return false
 	}
 	if _, err := x509.ParsePKCS8PrivateKey(b); err == nil {
 		return true
