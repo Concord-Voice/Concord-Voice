@@ -276,9 +276,10 @@ was **split, not doubled**: adding the pump target did not lengthen the job.
 to print and continue, which exits 0 and reports a green job while having found the
 defect. Nothing downstream re-checks this, so a job that exits green already
 holding the answer is the one outcome worth engineering against. Note these legs
-are visible, not merge-blocking — only `Gitar` and `SonarCloud Code Analysis` are
-in the ruleset's required contexts (ADR-0043 § Verification explains why adding
-these is not a one-line follow-up).
+are visible, not merge-blocking — the org baseline ruleset (`17153062`) requires only
+`Gitar` and `SonarCloud Code Analysis`, and the Alpha-only `24957423` adds
+`Required PR build result` (ADR-0043 § Verification explains why adding these is not
+a one-line follow-up).
 
 ### The tests were falsified, and two results are worth carrying forward
 

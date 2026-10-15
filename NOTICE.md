@@ -662,8 +662,10 @@ FAILS on an attribution defect — a shipped component with no row, a row for
 something no longer shipped, a changed licence (**npm only**, see below), or a
 stated count that disagrees with its own table — and merely warns on version
 drift, which [`/weekly-deps`]([internal]skills/weekly-deps/SKILL.md) Phase 6.3
-clears weekly. A red guard is visible but does **not** block merge: only
-`Gitar` and `SonarCloud Code Analysis` are required status checks.
+clears weekly. A red guard is visible but does **not** block merge: it is not a
+required status check (the org baseline ruleset requires `Gitar` and
+`SonarCloud Code Analysis`, and the Alpha-only ruleset adds
+`Required PR build result`).
 
 CI checks npm workspaces independently. A workspace manifest or lockfile change
 checks that workspace only; NOTICE, workflow, selector-policy, or regenerator
