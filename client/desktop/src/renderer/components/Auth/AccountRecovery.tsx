@@ -1,4 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { z } from 'zod';
+import { useMFAChallengeStore } from '../../stores/auth/mfaChallengeStore';
+import { recordChallengeIssuer } from '../../services/system/challengeIssuer';
+import { methodsForOptions, webauthnOptionsOrNull } from '../../utils/webauthnOptions';
 import {
   unwrapWithRecoveryKey,
   generateRegistrationKeys,
@@ -16,6 +20,7 @@ import {
 import {
   apiUrl,
   captureRuntimeServerSelection,
+  onRuntimeServerSelectionChange,
   runtimeServerSelectionIsCurrent,
 } from '../../services/system/runtimeServerBase';
 import {
@@ -26,6 +31,7 @@ import {
   captureAuthLifecycle,
   isSameAuthLifecycle,
 } from '../../services/system/postLoginHydrationLifecycle';
+import { useAuthStore } from '../../stores/auth/authStore';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import DeviceRecoveryFingerprint from './DeviceRecoveryFingerprint';
 import { assertValidUUID, isValidUUID } from '../../utils/runtime/uuid';
@@ -47,6 +53,29 @@ interface AccountRecoveryProps {
   onComplete: () => void; // Navigate back to login on success
 }
 
+const RecoveryResponseSchema = z
+  .object({
+    recovery_token: z.string().min(1),
+    has_recovery_key: z.boolean(),
+    has_trusted_devices: z.boolean(),
+    has_recovery_circle: z.boolean(),
+    recovery_wrapped_private_key: z.string().optional(),
+    recovery_key_salt: z.string().optional(),
+    recovery_wrapped_prefs_key: z.string().optional(),
+    recovery_prefs_key_salt: z.string().optional(),
+  })
+  .refine(
+    (data) =>
+      !data.has_recovery_key ||
+      Boolean(data.recovery_wrapped_private_key?.trim() && data.recovery_key_salt?.trim())
+  );
+const RecoveryChallengeSchema = z.object({
+  mfa_required: z.literal(true),
+  mfa_challenge_token: z.string().min(1),
+  methods: z.array(z.enum(['totp', 'webauthn'])).min(1),
+  webauthn_options: z.unknown().optional(),
+});
+
 const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete }) => {
   const [step, setStep] = useState<RecoveryStep>('email');
   const [email, setEmail] = useState('');
@@ -62,6 +91,8 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
   const deviceAttemptRef = useRef<RequesterDeviceRecoveryAttempt | null>(null);
   const deviceStartingRef = useRef(false);
   const mountedRef = useRef(true);
+  const recoveryChallengeRef = useRef<string | null>(null);
+  const issuanceRef = useRef<(() => boolean) | null>(null);
   const plaintextRef = useRef<ArrayBuffer | null>(null);
   const [deviceView, setDeviceView] = useState<DeviceRecoveryView | null>(null);
   const [recoveryData, setRecoveryData] = useState<{
@@ -78,8 +109,17 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState('');
+  const loadingAttemptRef = useRef(0);
+  const startLoading = () => {
+    const attempt = ++loadingAttemptRef.current;
+    setLoading(true);
+    return attempt;
+  };
+  const finishLoading = (attempt: number) => {
+    if (mountedRef.current && loadingAttemptRef.current === attempt) setLoading(false);
+  };
 
-  const retainRecoveredPkcs8 = (bytes: ArrayBuffer | null) => {
+  const retainRecoveredPkcs8 = useCallback((bytes: ArrayBuffer | null) => {
     if (!mountedRef.current) {
       if (bytes) new Uint8Array(bytes).fill(0);
       return;
@@ -88,26 +128,76 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       new Uint8Array(plaintextRef.current).fill(0);
     plaintextRef.current = bytes;
     setRecoveredPkcs8(bytes);
-  };
-  const cancelDeviceRecovery = () => {
+  }, []);
+  const cancelDeviceRecovery = useCallback(() => {
     deviceAttemptRef.current?.dispose();
     deviceAttemptRef.current = null;
     setDeviceView(null);
+  }, []);
+  const recoveryIsCurrent = useCallback(
+    (issued = issuanceRef.current) => {
+      if (!mountedRef.current || issued !== issuanceRef.current) return false;
+      if (issuanceRef.current?.()) return true;
+      issuanceRef.current = null;
+      const challengeToken = recoveryChallengeRef.current;
+      if (challengeToken) {
+        recoveryChallengeRef.current = null;
+        useMFAChallengeStore.getState().completeChallenge({ verified: false }, challengeToken);
+      }
+      cancelDeviceRecovery();
+      retainRecoveredPkcs8(null);
+      setRecoveryToken('');
+      setRecoveryData({});
+      setHasRecoveryKey(false);
+      setHasTrustedDevices(false);
+      setHasRecoveryCircle(false);
+      setSocialRequestId('');
+      setSocialThreshold(0);
+      setSocialSharesReceived(0);
+      setEcdhKeyPair(null);
+      setRecoveryKeyInput('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setAcknowledgeDataLoss(false);
+      setCode('');
+      setStep('email');
+      loadingAttemptRef.current++;
+      setLoading(false);
+      setError('Recovery context changed. Start again.');
+      return false;
+    },
+    [cancelDeviceRecovery, retainRecoveredPkcs8]
+  );
+  const continueRecovery = (next: RecoveryStep) => {
+    if (recoveryIsCurrent()) setStep(next);
   };
   useEffect(() => {
     mountedRef.current = true;
+    const invalidate = () => {
+      if (issuanceRef.current) recoveryIsCurrent();
+    };
+    const unsubscribeAuth = useAuthStore.subscribe(invalidate);
+    const unsubscribeServer = onRuntimeServerSelectionChange(invalidate);
     return () => {
+      unsubscribeAuth();
+      unsubscribeServer();
       mountedRef.current = false;
+      issuanceRef.current = null;
+      if (recoveryChallengeRef.current) {
+        useMFAChallengeStore
+          .getState()
+          .completeChallenge({ verified: false }, recoveryChallengeRef.current);
+      }
       deviceAttemptRef.current?.dispose();
       deviceAttemptRef.current = null;
       if (plaintextRef.current) new Uint8Array(plaintextRef.current).fill(0);
       plaintextRef.current = null;
     };
-  }, []);
+  }, [recoveryIsCurrent]);
 
   // Step 1: Send recovery code
   const handleSendCode = async () => {
-    setLoading(true);
+    const loadingAttempt = startLoading();
     setError('');
     try {
       const res = await fetch(apiUrl('/api/v1/auth/recovery/begin'), {
@@ -123,22 +213,90 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send code');
     } finally {
-      setLoading(false);
+      finishLoading(loadingAttempt);
     }
+  };
+
+  const completeRecoveryChallenge = async (
+    challenge: z.infer<typeof RecoveryChallengeSchema>,
+    selection: ReturnType<typeof captureRuntimeServerSelection>,
+    assertCurrent: () => void
+  ) => {
+    const { mfa_challenge_token: token, methods, webauthn_options: options } = challenge;
+    const webauthn = webauthnOptionsOrNull(options, selection.apiBase);
+    const offered = methodsForOptions(methods, webauthn);
+    if (offered.length === 0 || (offered.includes('webauthn') && !webauthn)) {
+      setCode('');
+      setStep('email');
+      throw new Error('Recovery verification is unavailable. Request a new email code.');
+    }
+    recordChallengeIssuer(token, selection);
+    recoveryChallengeRef.current = token;
+    const result = await useMFAChallengeStore
+      .getState()
+      .showChallenge(token, offered, 'recovery', [], undefined, webauthn);
+    recoveryChallengeRef.current = null;
+    assertCurrent();
+    return result;
+  };
+
+  const handleVerificationError = (err: unknown, issued: () => boolean, proofConsumed: boolean) => {
+    if (issuanceRef.current !== issued) return;
+    issuanceRef.current = null;
+    if (proofConsumed) {
+      const challengeToken = recoveryChallengeRef.current;
+      if (challengeToken) {
+        recoveryChallengeRef.current = null;
+        useMFAChallengeStore.getState().completeChallenge({ verified: false }, challengeToken);
+      }
+      setCode('');
+      setStep('email');
+    }
+    setError(err instanceof Error ? err.message : 'Verification failed');
   };
 
   // Step 2: Verify code
   const handleVerifyCode = async () => {
-    setLoading(true);
+    const loadingAttempt = startLoading();
     setError('');
+    const selection = captureRuntimeServerSelection();
+    const lifecycle = captureAuthLifecycle();
+    const issued = () =>
+      runtimeServerSelectionIsCurrent(selection) && isSameAuthLifecycle(lifecycle);
+    issuanceRef.current = issued;
+    let proofConsumed = false;
+    const assertCurrent = () => {
+      if (!mountedRef.current || !issued()) {
+        throw new Error('Recovery context changed. Start again.');
+      }
+    };
     try {
-      const res = await fetch(apiUrl('/api/v1/auth/recovery/verify-code'), {
+      const res = await fetch(`${selection.apiBase}/api/v1/auth/recovery/verify-code`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, code }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Invalid code');
+      proofConsumed = res.ok;
+      let payload: unknown = await res.json();
+      assertCurrent();
+      if (!res.ok) {
+        const failure = z.object({ error: z.string() }).safeParse(payload);
+        throw new Error(failure.success ? failure.data.error : 'Invalid code');
+      }
+      const challenge = RecoveryChallengeSchema.safeParse(payload);
+      if (challenge.success) {
+        const result = await completeRecoveryChallenge(challenge.data, selection, assertCurrent);
+        if (!result.verified || !('payload' in result)) {
+          issuanceRef.current = null;
+          setCode('');
+          setStep('email');
+          return;
+        }
+        payload = result.payload;
+      }
+      const verified = RecoveryResponseSchema.safeParse(payload);
+      if (!verified.success) throw new Error('Recovery verification is incomplete. Start again.');
+      const data = verified.data;
 
       setRecoveryToken(data.recovery_token);
       setHasRecoveryKey(data.has_recovery_key || false);
@@ -157,15 +315,17 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         setStep('reset-warning');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Verification failed');
+      handleVerificationError(err, issued, proofConsumed);
     } finally {
-      setLoading(false);
+      finishLoading(loadingAttempt);
     }
   };
 
   // Step 3a: Verify recovery key
   const handleRecoveryKeySubmit = async () => {
-    setLoading(true);
+    const issued = issuanceRef.current;
+    if (!recoveryIsCurrent(issued)) return;
+    const loadingAttempt = startLoading();
     setError('');
     try {
       const wrappedKey = recoveryData.recovery_wrapped_private_key;
@@ -174,24 +334,30 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         throw new Error('Recovery key material missing from server response');
       }
       const pkcs8Bytes = await unwrapWithRecoveryKey(wrappedKey, salt, recoveryKeyInput);
+      if (!recoveryIsCurrent(issued)) {
+        new Uint8Array(pkcs8Bytes).fill(0);
+        return;
+      }
       retainRecoveredPkcs8(pkcs8Bytes);
       setStep('new-password');
     } catch {
-      setError('Invalid recovery key. Please check and try again.');
+      if (recoveryIsCurrent(issued)) setError('Invalid recovery key. Please check and try again.');
     } finally {
-      setLoading(false);
+      finishLoading(loadingAttempt);
     }
   };
 
   // A service-owned attempt pins local context, the offer, consent, and completion acknowledgement.
   const handleDeviceRecovery = async () => {
+    if (!recoveryIsCurrent()) return;
     if (deviceStartingRef.current) return;
     deviceStartingRef.current = true;
     cancelDeviceRecovery();
-    setLoading(true);
+    const loadingAttempt = startLoading();
     setError('');
     const attempt = new RequesterDeviceRecoveryAttempt(recoveryToken, (view) => {
       if (!mountedRef.current || deviceAttemptRef.current !== attempt) return;
+      if (!recoveryIsCurrent()) return;
       setDeviceView(view);
       setError(view.error);
       if (view.status === 'complete') {
@@ -207,18 +373,24 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     setStep('device-waiting');
     await attempt.start();
     deviceStartingRef.current = false;
-    if (mountedRef.current) setLoading(false);
+    finishLoading(loadingAttempt);
   };
 
   // Step 3c: Initiate social recovery
   const handleSocialRecovery = async () => {
-    setLoading(true);
+    const issued = issuanceRef.current;
+    if (!recoveryIsCurrent(issued)) return;
+    const loadingAttempt = startLoading();
     setError('');
+    setSocialThreshold(0);
+    setSocialSharesReceived(0);
     try {
       const keyPair = await generateECDHKeyPair();
+      if (!recoveryIsCurrent(issued)) return;
       setEcdhKeyPair(keyPair);
       const pubKeyBase64 = await exportECDHPublicKey(keyPair.publicKey);
 
+      if (!recoveryIsCurrent(issued)) return;
       const res = await fetch(apiUrl('/api/v1/auth/recovery/social-request'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -228,6 +400,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         }),
       });
       const data = await res.json();
+      if (!recoveryIsCurrent(issued)) return;
       if (!res.ok) throw new Error(data.error || 'Failed');
 
       // Upfront validation mirroring handleDeviceRecovery — see that comment
@@ -241,9 +414,9 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       setSocialThreshold(data.threshold_k);
       setStep('social-waiting');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed');
+      if (recoveryIsCurrent(issued)) setError(err instanceof Error ? err.message : 'Failed');
     } finally {
-      setLoading(false);
+      finishLoading(loadingAttempt);
     }
   };
 
@@ -251,44 +424,56 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
   useEffect(() => {
     if (step !== 'social-waiting' || !socialRequestId) return;
 
+    const issued = issuanceRef.current;
+    let active = true;
+    const recoverSocialShares = async (responses: Array<{ encrypted_share: string }>) => {
+      const { combine } = await import('../../utils/crypto/shamir');
+      if (!active || !recoveryIsCurrent(issued)) return;
+      const shares: Array<{ index: number; data: Uint8Array }> = [];
+      try {
+        for (const resp of responses) {
+          // Each response contains a JSON payload with ephemeral_public_key, encrypted_data, share_index
+          const payloadStr = atob(resp.encrypted_share);
+          const payload = JSON.parse(payloadStr);
+
+          // Derive shared secret with responder's ECDH key
+          if (!ecdhKeyPair) {
+            throw new Error('social recovery: ECDH key pair was not generated before polling');
+          }
+          const responderKey = await importECDHPublicKey(payload.ephemeral_public_key);
+          if (!active || !recoveryIsCurrent(issued)) return;
+          const sharedKey = await deriveSharedSecret(ecdhKeyPair.privateKey, responderKey);
+          if (!active || !recoveryIsCurrent(issued)) return;
+          const shareBytes = await decryptWithSharedSecret(sharedKey, payload.encrypted_data);
+
+          // share_index is embedded in the encrypted payload by the contact
+          const shareIndex: number = payload.share_index;
+          shares.push({ index: shareIndex, data: new Uint8Array(shareBytes) });
+        }
+
+        // Reconstruct PKCS8
+        if (!active || !recoveryIsCurrent(issued)) return;
+        const reconstructed = combine(shares);
+        retainRecoveredPkcs8(reconstructed.buffer as ArrayBuffer);
+        setStep('new-password');
+      } finally {
+        for (const share of shares) share.data.fill(0);
+      }
+    };
     const pollSocial = async () => {
       try {
+        if (!active || !recoveryIsCurrent(issued)) return;
         const safeId = encodeURIComponent(assertValidUUID(socialRequestId, 'socialRequestId'));
         const res = await fetch(apiUrl(`/api/v1/auth/recovery/social-request/${safeId}`), {
           headers: { Authorization: `Bearer ${recoveryToken}` },
         });
         const data = await res.json();
-        if (!res.ok) return;
+        if (!active || !recoveryIsCurrent(issued) || !res.ok) return;
 
         setSocialSharesReceived(data.shares_received || 0);
 
         if (data.status === 'complete' && data.responses) {
-          // Reconstruct from shares
-          const { combine } = await import('../../utils/crypto/shamir');
-          const shares: Array<{ index: number; data: Uint8Array }> = [];
-
-          for (const resp of data.responses) {
-            // Each response contains a JSON payload with ephemeral_public_key, encrypted_data, share_index
-            const payloadStr = atob(resp.encrypted_share);
-            const payload = JSON.parse(payloadStr);
-
-            // Derive shared secret with responder's ECDH key
-            if (!ecdhKeyPair) {
-              throw new Error('social recovery: ECDH key pair was not generated before polling');
-            }
-            const responderKey = await importECDHPublicKey(payload.ephemeral_public_key);
-            const sharedKey = await deriveSharedSecret(ecdhKeyPair.privateKey, responderKey);
-            const shareBytes = await decryptWithSharedSecret(sharedKey, payload.encrypted_data);
-
-            // share_index is embedded in the encrypted payload by the contact
-            const shareIndex: number = payload.share_index;
-            shares.push({ index: shareIndex, data: new Uint8Array(shareBytes) });
-          }
-
-          // Reconstruct PKCS8
-          const reconstructed = combine(shares);
-          retainRecoveredPkcs8(reconstructed.buffer as ArrayBuffer);
-          setStep('new-password');
+          await recoverSocialShares(data.responses);
         }
       } catch {
         // Ignore poll errors silently — the next poll tick retries (mirrors
@@ -300,11 +485,16 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     };
 
     const interval = setInterval(pollSocial, 5000); // Poll every 5 seconds
-    return () => clearInterval(interval);
-  }, [step, socialRequestId, recoveryToken, ecdhKeyPair]);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [step, socialRequestId, recoveryToken, ecdhKeyPair, recoveryIsCurrent, retainRecoveredPkcs8]);
 
   // Step 4: Set new password
   const handleSetPassword = async () => {
+    const issued = issuanceRef.current;
+    if (!recoveryIsCurrent(issued)) return;
     if (newPassword !== confirmPassword) {
       setError('Passwords do not match');
       return;
@@ -314,7 +504,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       return;
     }
 
-    setLoading(true);
+    const loadingAttempt = startLoading();
     setError('');
     try {
       const auth = captureAuthLifecycle();
@@ -323,7 +513,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       const currentAttempt = deviceAttemptRef.current;
       const assertCurrent = () => {
         if (
-          !mountedRef.current ||
+          !recoveryIsCurrent(issued) ||
           !isSameAuthLifecycle(auth) ||
           !runtimeServerSelectionIsCurrent(server) ||
           e2eeService.wasTornDownSince(keyEpoch)
@@ -390,9 +580,9 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       cancelDeviceRecovery();
       setSuccess('Password reset successfully. Please sign in with your new password.');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Reset failed');
+      if (recoveryIsCurrent(issued)) setError(err instanceof Error ? err.message : 'Reset failed');
     } finally {
-      setLoading(false);
+      finishLoading(loadingAttempt);
     }
   };
 
@@ -567,7 +757,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
               <button
                 type="button"
                 className="mfa-choose-another"
-                onClick={() => setStep('reset-warning')}
+                onClick={() => continueRecovery('reset-warning')}
                 style={{ marginTop: 8 }}
               >
                 I don&apos;t have my recovery key
@@ -621,7 +811,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                     deviceView.status === 'completing'
                   }
                   onClick={() => {
-                    void deviceAttemptRef.current?.confirmMatch();
+                    if (recoveryIsCurrent()) void deviceAttemptRef.current?.confirmMatch();
                   }}
                 >
                   {deviceView?.confirmed ? 'Fingerprints confirmed' : 'These fingerprints match'}
@@ -630,6 +820,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                   type="button"
                   className="mfa-choose-another"
                   onClick={() => {
+                    if (!recoveryIsCurrent()) return;
                     cancelDeviceRecovery();
                     retainRecoveredPkcs8(null);
                     setStep(hasRecoveryKey ? 'recovery-key' : 'reset-warning');
@@ -666,6 +857,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 type="button"
                 className="mfa-choose-another"
                 onClick={() => {
+                  if (!recoveryIsCurrent()) return;
                   setStep(hasRecoveryKey ? 'recovery-key' : 'reset-warning');
                   setError('');
                 }}
@@ -712,7 +904,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 type="button"
                 className={`login-submit-btn${acknowledgeDataLoss ? ' login-submit-btn--danger' : ''}`}
                 disabled={!acknowledgeDataLoss}
-                onClick={() => setStep('new-password')}
+                onClick={() => continueRecovery('new-password')}
               >
                 Continue with Account Reset
               </button>
@@ -720,7 +912,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 <button
                   type="button"
                   className="mfa-choose-another"
-                  onClick={() => setStep('recovery-key')}
+                  onClick={() => continueRecovery('recovery-key')}
                   style={{ marginTop: 8 }}
                 >
                   I found my recovery key

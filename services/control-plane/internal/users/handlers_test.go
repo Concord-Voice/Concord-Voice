@@ -296,31 +296,6 @@ func TestUpdateMeUsernameChangeFreeBlockedAt100Days(t *testing.T) {
 	assert.Contains(t, body["error"], "6 months")
 }
 
-// TestUpdateMeAvatarDataURLCappedAtFreeForAllTiers: inline data-URL avatars are
-// broadcast verbatim to every client (UpdateMe -> BroadcastToAll), so the inline cap is
-// the FREE value (5 MiB) for ALL tiers — a >5 MiB data-URL is rejected even for premium.
-// Premium's 8 MiB allowance applies on the MinIO upload path (covered in media tests),
-// which broadcasts a storage key, not the blob (#1298 review — Gitar amplification guard).
-func TestUpdateMeAvatarDataURLCappedAtFreeForAllTiers(t *testing.T) {
-	ts := setupTS(t)
-	// Encoded data URL over the free inline string-length cap.
-	big := oversizedFreeAvatarDataURL()
-
-	freeUser := ts.CreateTestUser(t, "freeavatardata")
-	wFree := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
-		"avatar_url": big,
-	}, testhelpers.AuthHeaders(freeUser.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, wFree.Code, "free rejects >5 MiB inline data-URL")
-
-	premUser := ts.CreateTestUser(t, "premavatardata")
-	grantPremium(t, ts, premUser.ID)
-	wPrem := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
-		"avatar_url": big,
-	}, testhelpers.AuthHeaders(premUser.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, wPrem.Code,
-		"premium inline data-URL ALSO capped at free (broadcast-amplification guard)")
-}
-
 func TestUpdateMeUsernameChangeSameUsername(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "sameusername")

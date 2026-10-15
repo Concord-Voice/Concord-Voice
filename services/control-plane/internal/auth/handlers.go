@@ -46,10 +46,17 @@ type SessionDisconnector interface {
 
 // RecoveryClaims contains the user_id extracted from a validated recovery token.
 type RecoveryClaims struct {
-	UserID    string
-	JTI       string
-	ExpiresAt time.Time // Verified JWT expiry; only the device ceremony uses this lifetime.
+	RecoveryFactor string // Set only from a verified recovery-purpose JWT.
+	UserID         string
+	JTI            string
+	ExpiresAt      time.Time // Verified JWT expiry; only the device ceremony uses this lifetime.
 }
+
+// ErrRecoveryPolicyUnavailable means current recovery policy could not be evaluated.
+var ErrRecoveryPolicyUnavailable = errors.New("recovery policy unavailable")
+
+// ErrRecoveryProofInvalid rejects a verified factor that no longer meets current policy.
+var ErrRecoveryProofInvalid = errors.New("recovery proof does not satisfy policy")
 
 // MFAChecker checks if a user has MFA enabled and returns their methods.
 // Defined as an interface to avoid circular imports (mfa imports auth).
@@ -58,6 +65,9 @@ type MFAChecker interface {
 	GetEnabledMethods(ctx context.Context, userID string) ([]string, error)
 	// GetLoginMethods returns methods eligible for login (excludes recovery-only methods).
 	GetLoginMethods(ctx context.Context, userID string) ([]string, error)
+	// GetRecoveryMethods returns additional reserved factors after email proof.
+	GetRecoveryMethods(ctx context.Context, userID string) ([]string, error)
+	GenerateRecoveryChallenge(ctx context.Context, userID string) (token string, jti string, err error)
 	// GenerateLoginChallenge creates a challenge token for the two-step login flow.
 	// Returns the signed JWT and the JTI. Stores remember_me in Redis keyed by JTI.
 	// credEpoch is the user's durable credential epoch at authorization time (#2418);
@@ -74,9 +84,10 @@ type MFAChecker interface {
 	// Returns nil options if user has no WebAuthn credentials.
 	BeginWebAuthnLogin(ctx context.Context, userID string, jti string) (options interface{}, err error)
 	// GenerateRecoveryToken creates a recovery-purpose JWT with a 25-hour TTL.
-	GenerateRecoveryToken(userID string) (token string, jti string, err error)
+	GenerateRecoveryToken(userID, verifiedFactor string) (token string, jti string, err error)
 	// ValidateRecoveryToken validates a recovery-purpose JWT and returns the claims.
-	ValidateRecoveryToken(tokenString string) (*RecoveryClaims, error)
+	ValidateRecoveryToken(ctx context.Context, tokenString string) (*RecoveryClaims, error)
+	ValidateRecoveryClaimsTx(ctx context.Context, tx *sql.Tx, claims *RecoveryClaims) error
 }
 
 const (
@@ -92,15 +103,16 @@ const (
 	errMsgInvalidCredentials     = "Invalid credentials"   //nolint:gosec // G101 false positive: error message text, not a credential
 	errMsgInvalidRefreshToken    = "Invalid refresh token" //nolint:gosec // G101 false positive: error message text, not a credential
 
-	errFailedCommitTransaction     = "Failed to commit transaction"
-	errInvalidExpiredRecoveryCode  = "Invalid or expired recovery code"
-	errRecoveryVerificationFailed  = "Recovery verification failed"
-	errRecoveryNotConfigured       = "Recovery not configured"
-	errInvalidExpiredRecoveryToken = "Invalid or expired recovery token" //nolint:gosec // G101 false positive: error message, not a credential
-	errFailedResetPwd              = "Failed to reset password"          //nolint:gosec // G101 false positive: error message, not a credential
-	errFailedResetAccount          = "Failed to reset account"
-	errFailedCreateRecoveryRequest = "Failed to create recovery request"
-	bearerPrefix                   = "Bearer "
+	errFailedCommitTransaction           = "Failed to commit transaction"
+	errInvalidExpiredRecoveryCode        = "Invalid or expired recovery code"
+	errRecoveryVerificationFailed        = "Recovery verification failed"
+	errRecoveryNotConfigured             = "Recovery not configured"
+	errInvalidExpiredRecoveryToken       = "Invalid or expired recovery token" //nolint:gosec // G101 false positive: error message, not a credential
+	errFailedResetPwd                    = "Failed to reset password"          //nolint:gosec // G101 false positive: error message, not a credential
+	errFailedResetAccount                = "Failed to reset account"
+	errFailedCreateRecoveryRequest       = "Failed to create recovery request"
+	errFailedCreateSocialRecoveryRequest = "Failed to create social recovery request"
+	bearerPrefix                         = "Bearer "
 
 	// HTTP header names
 	headerMachineID  = "X-Machine-Id"
@@ -2782,12 +2794,12 @@ func commitRecoveryCodeAttempt(ctx context.Context, tx *redis.Tx, redisKey, code
 }
 
 // buildVerifyCodeResponse constructs the response for a successful recovery code verification.
-func (h *Handler) buildVerifyCodeResponse(recoveryToken, userID string) (gin.H, error) {
+func (h *Handler) buildVerifyCodeResponse(ctx context.Context, tx *sql.Tx, recoveryToken, userID string) (gin.H, error) {
 	resp := gin.H{"recovery_token": recoveryToken}
 
 	var recoveryWrappedPrivateKey, recoveryKeySalt []byte
 	var recoveryWrappedPrefsKey, recoveryPrefsKeySalt []byte
-	err := h.db.QueryRow(
+	err := tx.QueryRowContext(ctx,
 		`SELECT recovery_wrapped_private_key, recovery_key_salt, recovery_wrapped_prefs_key, recovery_prefs_key_salt
 		 FROM user_recovery_keys WHERE user_id = $1`, userID,
 	).Scan(&recoveryWrappedPrivateKey, &recoveryKeySalt, &recoveryWrappedPrefsKey, &recoveryPrefsKeySalt)
@@ -2807,6 +2819,11 @@ func (h *Handler) buildVerifyCodeResponse(recoveryToken, userID string) (gin.H, 
 		return nil, err
 	}
 
+	return resp, nil
+}
+
+// addVerifyCodeHints retains advisory reads outside the protected transaction.
+func (h *Handler) addVerifyCodeHints(resp gin.H, userID string) {
 	// Trusted devices (table may not exist yet — non-fatal)
 	var trustedDeviceCount int
 	if err := h.db.QueryRow(`SELECT COUNT(*) FROM trusted_recovery_devices WHERE user_id = $1`, userID).Scan(&trustedDeviceCount); err != nil {
@@ -2823,7 +2840,6 @@ func (h *Handler) buildVerifyCodeResponse(recoveryToken, userID string) (gin.H, 
 		resp["has_recovery_circle"] = recoveryCircleCount > 0
 	}
 
-	return resp, nil
 }
 
 // RecoveryVerifyCode validates the recovery code and returns a recovery token plus recovery key data.
@@ -2861,28 +2877,82 @@ func (h *Handler) RecoveryVerifyCode(c *gin.Context) {
 		return
 	}
 
-	// Generate recovery JWT token
 	if h.mfaChecker == nil {
 		h.log.Error("MFA checker not configured for recovery token generation")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
 		return
 	}
-	recoveryToken, _, err := h.mfaChecker.GenerateRecoveryToken(record.UserID)
+	methods, err := h.mfaChecker.GetRecoveryMethods(ctx, record.UserID)
+	if err != nil {
+		h.log.Error("Failed to read recovery policy", "error_class", "recovery_policy")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errRecoveryVerificationFailed})
+		return
+	}
+	if len(methods) > 0 {
+		h.issueRecoveryChallenge(ctx, c, record.UserID, methods)
+		return
+	}
+	h.CompleteRecovery(c, record.UserID, "email")
+}
+
+// CompleteRecovery is called only after the recovery policy's required proofs.
+func (h *Handler) CompleteRecovery(c *gin.Context, userID, verifiedFactor string) bool {
+	if h.mfaChecker == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
+		return false
+	}
+	// The email or MFA verifier supplies this proof before final token issuance.
+	tx := h.beginRecoveryPolicyTx(c, &RecoveryClaims{UserID: userID, RecoveryFactor: verifiedFactor})
+	if tx == nil {
+		return false
+	}
+	defer h.rollbackRecoveryPolicyTx(tx)
+
+	recoveryToken, _, err := h.mfaChecker.GenerateRecoveryToken(userID, verifiedFactor)
 	if err != nil {
 		h.log.Error("Failed to generate recovery token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
-		return
+		return false
 	}
 
-	resp, err := h.buildVerifyCodeResponse(recoveryToken, record.UserID)
+	resp, err := h.buildVerifyCodeResponse(c.Request.Context(), tx, recoveryToken, userID)
 	if err != nil {
-		h.log.Error("Failed to load recovery key data", "error", err, "user_id", record.UserID)
+		h.log.Error("Failed to load recovery key data", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
+		return false
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errRecoveryVerificationFailed})
+		return false
+	}
+	h.addVerifyCodeHints(resp, userID)
+
+	h.log.Info("Recovery verified, token issued", "user_id", userID)
+	event := securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRecoveryVerified, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryVerifyCode}
+	if c.FullPath() == "/api/v1/auth/mfa/verify" {
+		event.RouteTemplate = securityevent.RouteAuthMFAVerify
+	}
+	h.emitHTTPEvent(c, event)
+	c.JSON(http.StatusOK, resp)
+	return true
+}
+
+func (h *Handler) issueRecoveryChallenge(ctx context.Context, c *gin.Context, userID string, methods []string) {
+	token, jti, err := h.mfaChecker.GenerateRecoveryChallenge(ctx, userID)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
 		return
 	}
-
-	h.log.Info("Recovery code verified, token issued", "user_id", record.UserID)
-	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRecoveryVerified, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryVerifyCode})
+	offered, options, err := h.webAuthnLoginOffer(ctx, userID, jti, methods)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgMFAUnavailable})
+		return
+	}
+	resp := gin.H{"mfa_required": true, "mfa_challenge_token": token, "methods": offered}
+	if options != nil {
+		resp["webauthn_options"] = options
+	}
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -2894,7 +2964,10 @@ func (h *Handler) validateAndConsumeRecoveryToken(c *gin.Context, tokenStr strin
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryNotConfigured})
 		return nil, ""
 	}
-	claims, err := h.mfaChecker.ValidateRecoveryToken(tokenStr)
+	claims, err := h.mfaChecker.ValidateRecoveryToken(c.Request.Context(), tokenStr)
+	if writeRecoveryPolicyError(c, err) {
+		return nil, ""
+	}
 	if err != nil {
 		if recordAuthFailure {
 			middleware.MarkAuthFailureOutcome(c, middleware.RecordAuthFailure(c.Request.Context(), h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig()))
@@ -2999,8 +3072,14 @@ func recoveryPresenceOverrideResetOps(userID string) []recoveryTxOp {
 	}
 }
 
-func (h *Handler) recoveryWork(senderID uuid.UUID, fenceOp *credepoch.Op, ops []recoveryTxOp) recoveryWork {
+func (h *Handler) recoveryWork(senderID uuid.UUID, fenceOp *credepoch.Op, ops []recoveryTxOp, claims *RecoveryClaims) recoveryWork {
 	return func(ctx context.Context, tx *sql.Tx) (recoveryPresenceResult, error) {
+		if h.mfaChecker == nil {
+			return recoveryPresenceResult{}, ErrRecoveryPolicyUnavailable
+		}
+		if err := h.mfaChecker.ValidateRecoveryClaimsTx(ctx, tx, claims); err != nil {
+			return recoveryPresenceResult{}, err
+		}
 		if fenceOp == nil {
 			return recoveryPresenceResult{}, errors.New("recovery credential fence unavailable")
 		}
@@ -3060,7 +3139,9 @@ func (h *Handler) execRecoveryTx(
 		if fenceOp != nil {
 			fenceOp.Rollback(ctx) // definite: commit was never attempted
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		if !writeRecoveryPolicyError(c, err) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		}
 		return result, err
 	}
 	completion := h.presenceHistory.CompleteForcedSecurityClear(
@@ -3128,6 +3209,7 @@ func (h *Handler) executeRecoveryTransaction(
 	errMsg string,
 	fenceOp *credepoch.Op,
 	ops []recoveryTxOp,
+	claims *RecoveryClaims,
 ) error {
 	if h.presenceHistory == nil {
 		h.redis.Del(c.Request.Context(), recoveryUsedKey)
@@ -3142,7 +3224,7 @@ func (h *Handler) executeRecoveryTransaction(
 		c.Request.Context(), senderID, presencehistory.ForcedSecurityClear, func() error {
 			workStarted = true
 			_, workErr := h.execRecoveryTx(
-				c.Request.Context(), c, recoveryUsedKey, errMsg, fenceOp, h.recoveryWork(senderID, fenceOp, ops),
+				c.Request.Context(), c, recoveryUsedKey, errMsg, fenceOp, h.recoveryWork(senderID, fenceOp, ops, claims),
 			)
 			return workErr
 		})
@@ -3332,7 +3414,7 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 		[]interface{}{claims.UserID}, "Failed to revoke refresh tokens"})
 
 	if err := h.executeRecoveryTransaction(
-		c, senderID, recoveryUsedKey, errFailedResetPwd, fenceOp, ops,
+		c, senderID, recoveryUsedKey, errFailedResetPwd, fenceOp, ops, claims,
 	); err != nil {
 		return
 	}
@@ -3424,7 +3506,7 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 	})
 
 	if err := h.executeRecoveryTransaction(
-		c, senderID, recoveryUsedKey, errFailedResetAccount, fenceOp, ops,
+		c, senderID, recoveryUsedKey, errFailedResetAccount, fenceOp, ops, claims,
 	); err != nil {
 		return
 	}
@@ -3435,6 +3517,28 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 }
 
 // ── Trusted Device Recovery Endpoints ───────────────────────────────────────
+
+// writeRecoveryPolicyError classifies policy failures before any protected response.
+func writeRecoveryPolicyError(c *gin.Context, err error) bool {
+	if errors.Is(err, ErrRecoveryPolicyUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Recovery policy is temporarily unavailable"})
+		return true
+	}
+	if errors.Is(err, ErrRecoveryProofInvalid) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryToken})
+		return true
+	}
+	return false
+}
+
+func (h *Handler) recoveryGuard(claims *RecoveryClaims) devicerecovery.RecoveryGuard {
+	return func(ctx context.Context, tx *sql.Tx) error {
+		if h.mfaChecker == nil {
+			return ErrRecoveryPolicyUnavailable
+		}
+		return h.mfaChecker.ValidateRecoveryClaimsTx(ctx, tx, claims)
+	}
+}
 
 // CreateDeviceRecoveryRequest accepts only the complete v2 requester context.
 func (h *Handler) CreateDeviceRecoveryRequest(c *gin.Context) {
@@ -3447,8 +3551,11 @@ func (h *Handler) CreateDeviceRecoveryRequest(c *gin.Context) {
 	if claims == nil {
 		return
 	}
-	row, err := devicerecovery.Create(c.Request.Context(), h.db, claims.UserID, claims.JTI, claims.ExpiresAt, req)
+	row, err := devicerecovery.Create(c.Request.Context(), h.db, claims.UserID, claims.JTI, claims.ExpiresAt, req, h.recoveryGuard(claims))
 	if err != nil {
+		if writeRecoveryPolicyError(c, err) {
+			return
+		}
 		devicerecovery.WriteError(c, err)
 		return
 	}
@@ -3466,7 +3573,10 @@ func (h *Handler) validateDeviceRecoveryToken(c *gin.Context, token string) *Rec
 		devicerecovery.WriteError(c, errors.New("recovery unavailable"))
 		return nil
 	}
-	claims, err := h.mfaChecker.ValidateRecoveryToken(token)
+	claims, err := h.mfaChecker.ValidateRecoveryToken(c.Request.Context(), token)
+	if writeRecoveryPolicyError(c, err) {
+		return nil
+	}
 	if err != nil || claims == nil || !devicerecovery.CanonicalUUID(claims.UserID) || claims.JTI == "" || claims.ExpiresAt.IsZero() {
 		devicerecovery.WriteError(c, devicerecovery.ErrUnauthorized)
 		return nil
@@ -3503,7 +3613,10 @@ func (h *Handler) validateRecoveryTokenParam(c *gin.Context) *RecoveryClaims {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryNotConfigured})
 		return nil
 	}
-	claims, err := h.mfaChecker.ValidateRecoveryToken(recoveryToken)
+	claims, err := h.mfaChecker.ValidateRecoveryToken(c.Request.Context(), recoveryToken)
+	if writeRecoveryPolicyError(c, err) {
+		return nil
+	}
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryToken})
 		return nil
@@ -3517,8 +3630,11 @@ func (h *Handler) PollDeviceRecoveryRequest(c *gin.Context) {
 	if claims == nil {
 		return
 	}
-	row, err := devicerecovery.Poll(c.Request.Context(), h.db, claims.UserID, claims.JTI, c.Param("id"))
+	row, err := devicerecovery.Poll(c.Request.Context(), h.db, claims.UserID, claims.JTI, c.Param("id"), h.recoveryGuard(claims))
 	if err != nil {
+		if writeRecoveryPolicyError(c, err) {
+			return
+		}
 		devicerecovery.WriteError(c, err)
 		return
 	}
@@ -3536,12 +3652,40 @@ func (h *Handler) CompleteDeviceRecoveryRequest(c *gin.Context) {
 	if claims == nil {
 		return
 	}
-	result, err := devicerecovery.Complete(c.Request.Context(), h.db, claims.UserID, claims.JTI, c.Param("id"), req)
+	result, err := devicerecovery.Complete(c.Request.Context(), h.db, claims.UserID, claims.JTI, c.Param("id"), req, h.recoveryGuard(claims))
 	if err != nil {
+		if writeRecoveryPolicyError(c, err) {
+			return
+		}
 		devicerecovery.WriteError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// beginRecoveryPolicyTx holds policy authority through the protected work.
+func (h *Handler) beginRecoveryPolicyTx(c *gin.Context, claims *RecoveryClaims) *sql.Tx {
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		writeRecoveryPolicyError(c, ErrRecoveryPolicyUnavailable)
+		return nil
+	}
+	if err := h.mfaChecker.ValidateRecoveryClaimsTx(c.Request.Context(), tx, claims); err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Recovery policy transaction rollback failed", "error_class", "rollback")
+		}
+		if !writeRecoveryPolicyError(c, err) {
+			writeRecoveryPolicyError(c, ErrRecoveryPolicyUnavailable)
+		}
+		return nil
+	}
+	return tx
+}
+
+func (h *Handler) rollbackRecoveryPolicyTx(tx *sql.Tx) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		h.log.Error("Recovery policy transaction rollback failed", "error_class", "rollback")
+	}
 }
 
 // ── Social Recovery Request Endpoints ────────────────────────────────────────
@@ -3563,18 +3707,26 @@ func (h *Handler) CreateSocialRecoveryRequest(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryNotConfigured})
 		return
 	}
-	claims, err := h.mfaChecker.ValidateRecoveryToken(req.RecoveryToken)
+	claims, err := h.mfaChecker.ValidateRecoveryToken(c.Request.Context(), req.RecoveryToken)
+	if writeRecoveryPolicyError(c, err) {
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryToken})
 		return
 	}
 
 	ctx := c.Request.Context()
+	tx := h.beginRecoveryPolicyTx(c, claims)
+	if tx == nil {
+		return
+	}
+	defer h.rollbackRecoveryPolicyTx(tx)
 
 	// Find user's recovery circle
 	var circleID string
 	var thresholdK int
-	err = h.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT id, threshold_k FROM recovery_circles WHERE user_id = $1`, claims.UserID,
 	).Scan(&circleID, &thresholdK)
 	if err != nil {
@@ -3591,17 +3743,21 @@ func (h *Handler) CreateSocialRecoveryRequest(c *gin.Context) {
 
 	// Insert social recovery request with 24-hour expiry
 	var requestID string
-	err = h.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		INSERT INTO recovery_circle_requests (circle_id, user_id, recovery_token_jti, ephemeral_public_key, expires_at)
 		VALUES ($1, $2, $3, $4, NOW() + INTERVAL '24 hours')
 		RETURNING id
 	`, circleID, claims.UserID, claims.JTI, ephPubKey).Scan(&requestID)
 	if err != nil {
-		h.log.Error("Failed to create social recovery request", "error", err, "user_id", claims.UserID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create social recovery request"})
+		h.log.Error(errFailedCreateSocialRecoveryRequest, "error", err, "user_id", claims.UserID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateSocialRecoveryRequest})
 		return
 	}
 
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedCreateSocialRecoveryRequest})
+		return
+	}
 	h.log.Info("Social recovery request created", "user_id", claims.UserID, "request_id", requestID, "threshold_k", thresholdK)
 	c.JSON(http.StatusOK, gin.H{"request_id": requestID, "threshold_k": thresholdK})
 }
@@ -3613,8 +3769,8 @@ type socialRecoveryResponseEntry struct {
 }
 
 // fetchSocialRecoveryResponses loads all guardian share responses for a completed request.
-func (h *Handler) fetchSocialRecoveryResponses(ctx context.Context, requestID string) ([]socialRecoveryResponseEntry, error) {
-	rows, err := h.db.QueryContext(ctx, `
+func (h *Handler) fetchSocialRecoveryResponses(ctx context.Context, tx *sql.Tx, requestID string) (responses []socialRecoveryResponseEntry, returnErr error) {
+	rows, err := tx.QueryContext(ctx, `
 		SELECT contact_id, encrypted_share
 		FROM recovery_circle_responses
 		WHERE request_id = $1
@@ -3622,15 +3778,18 @@ func (h *Handler) fetchSocialRecoveryResponses(ctx context.Context, requestID st
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if err := rows.Close(); err != nil && returnErr == nil {
+			responses = nil
+			returnErr = fmt.Errorf("close social recovery responses: %w", err)
+		}
+	}()
 
-	var responses []socialRecoveryResponseEntry
 	for rows.Next() {
 		var r socialRecoveryResponseEntry
 		var encShare []byte
 		if err := rows.Scan(&r.ContactID, &encShare); err != nil {
-			h.log.Error("Failed to scan social recovery response", "error", err)
-			continue
+			return nil, fmt.Errorf("scan social recovery response: %w", err)
 		}
 		r.EncryptedShare = base64.StdEncoding.EncodeToString(encShare)
 		responses = append(responses, r)
@@ -3652,12 +3811,17 @@ func (h *Handler) PollSocialRecoveryRequest(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	tx := h.beginRecoveryPolicyTx(c, claims)
+	if tx == nil {
+		return
+	}
+	defer h.rollbackRecoveryPolicyTx(tx)
 
 	// Fetch the social recovery request (JTI-scoped to prevent cross-token access)
 	var status string
 	var sharesReceived, thresholdK int
 	var expiresAt time.Time
-	err := h.db.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT rr.status, rr.shares_received, rc.threshold_k, rr.expires_at
 		FROM recovery_circle_requests rr
 		JOIN recovery_circles rc ON rc.id = rr.circle_id
@@ -3680,7 +3844,7 @@ func (h *Handler) PollSocialRecoveryRequest(c *gin.Context) {
 	}
 
 	if status == "complete" {
-		responses, err := h.fetchSocialRecoveryResponses(ctx, requestID)
+		responses, err := h.fetchSocialRecoveryResponses(ctx, tx, requestID)
 		if err != nil {
 			h.log.Error("Failed to load social recovery responses", "error", err, "request_id", requestID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load recovery responses"})
@@ -3689,6 +3853,10 @@ func (h *Handler) PollSocialRecoveryRequest(c *gin.Context) {
 		response["responses"] = responses
 	}
 
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load recovery responses"})
+		return
+	}
 	c.JSON(http.StatusOK, response)
 }
 

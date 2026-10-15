@@ -2,6 +2,7 @@ package mfa_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"testing"
@@ -25,7 +26,7 @@ func recoveryV2Fixture(t *testing.T, ts *testhelpers.TestServer, userID string) 
 	require.NoError(t, json.Unmarshal(b, &v))
 	_, err = ts.DB.Exec(`INSERT INTO trusted_recovery_devices(user_id,device_name,machine_id) VALUES($1,'device',$2)`, userID, uuid.NewString())
 	require.NoError(t, err)
-	r, err := devicerecovery.Create(context.Background(), ts.DB, userID, "public-jti", time.Now().Add(time.Hour), devicerecovery.CreateBody{ProtocolVersion: 2, ServerOrigin: v.Context.ServerOrigin, AccountBinding: devicerecovery.AccountBinding(userID), RequesterNonce: v.Context.RequesterNonce, RequesterPublicKey: v.Context.RequesterPublicKey})
+	r, err := devicerecovery.Create(context.Background(), ts.DB, userID, "public-jti", time.Now().Add(time.Hour), devicerecovery.CreateBody{ProtocolVersion: 2, ServerOrigin: v.Context.ServerOrigin, AccountBinding: devicerecovery.AccountBinding(userID), RequesterNonce: v.Context.RequesterNonce, RequesterPublicKey: v.Context.RequesterPublicKey}, func(context.Context, *sql.Tx) error { return nil })
 	require.NoError(t, err)
 	_, hash, err := devicerecovery.Transcript(r.Context, v.Offer)
 	require.NoError(t, err)

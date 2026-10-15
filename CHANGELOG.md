@@ -33,6 +33,8 @@ from Server Settings, and members who need it are told how to set it up. A messa
 expiration timer can now keep pinned messages, and says so. Every account can create
 any number of servers, search as far back as a subscriber can, and use full theme
 colour customization.
+Account recovery now asks for an authenticator you reserved for recovery after
+you verify your email.
 
 ### Added
 
@@ -70,6 +72,8 @@ colour customization.
 - **Up Arrow edits your last message** (internal development reference omitted) — in an empty message box, Up Arrow opens your most recent message for editing, in channels, direct messages and voice text chat. It keeps its usual cursor behaviour while the box holds text, a reply or an attached file, while an input method is composing, and with Shift, Ctrl, Alt or Cmd held. When your newest message is still sending, failed to send or cannot be read, Up Arrow does nothing rather than opening an older message. Any message edit now opens with the cursor at the end of the text, saving or cancelling it returns focus to the message box you were using, and the edit box has an accessible name. If an edit cannot be saved, the edit box opens again with your text. An edit you leave open closes when you switch channels, and a message that cannot be read offers Delete but not Edit.
 
 ### Fixed
+
+- **Account recovery now checks your reserved authenticator** (internal development reference omitted) — if you reserved an authenticator app or security key for recovery, proving access to your email alone no longer permits a reset or device or social recovery. Recovery asks for that factor before continuing. If you began recovery before this update, request a new email code and start again. A recovery policy that requires an unsupported verification method blocks recovery.
 
 - **Editing a message is held to the character limit** (internal development reference omitted, internal development reference omitted) — an edit could be saved longer than a new message is allowed to be. Over the limit, Save is disabled, Enter does nothing, and the box stays open with your text and says what the limit is. A counter appears as you near it.
 - **Direct messages authenticate unexpected message types** (internal development reference omitted) — participant messages are always stored as ordinary encrypted messages, and only validated call and expiration events can use the system-event history path.
@@ -131,6 +135,7 @@ colour customization.
 
 ### Security
 
+- **Animated avatars, banners and server icons now follow the tier rules everywhere** (internal development reference omitted, internal development reference omitted) — two routes stored an image embedded in the request as-is, which let a free account set an animated image that the upload routes would have refused. Profile updates now refuse a new embedded avatar or banner on every plan and point to the upload route. Re-sending your current image still works. Creating or editing a server checks an embedded icon or banner for animation (animated GIF, APNG or animated WebP). An animated icon is refused for every server, and an animated banner is refused unless the server's boost level allows it. A file the server cannot read as a PNG, JPEG, GIF or WebP is refused. Static images, including the ones the desktop app sends when you create a server, are unaffected. Images already saved are not changed.
 - **Voice refuses a microphone stream that does not declare its packet time or bitrate** (internal development reference omitted, internal development reference omitted) — the server already refused a microphone stream that declared more than your plan allows, but a modified client could skip that check by declaring nothing. It also refuses a microphone stream that carries a video codec. The desktop app declares both values and sends only audio on every call, so normal calls are unaffected. A client that declares an allowed value and sends more is still limited by the server's rate policer.
 - **Group-DM icon requests require sign-in and current membership** (internal development reference omitted, internal development reference omitted) — People outside the conversation and former participants receive no icon. A read admitted before removal may finish afterward.
 - **Control plane built with Go 1.26.9 and `golang.org/x/net` 0.60.0** (internal development reference omitted) — closes the standard-library and HTTP/2 advisories published on 2026-10-08, including HTTP/2 server memory exhaustion from trailer headers, an HPACK encoder race that can crash the server, unbounded Range header parsing, and HTTP/1 connection desynchronization after a rejected CONNECT.

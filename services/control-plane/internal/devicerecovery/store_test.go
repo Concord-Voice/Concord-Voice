@@ -64,7 +64,7 @@ func newRequest(t *testing.T, db *sql.DB, id string) Row {
 	t.Helper()
 	b := createBody(t)
 	b.AccountBinding = AccountBinding(id)
-	r, err := Create(context.Background(), db, id, "public-jti", time.Now().Add(time.Hour), b)
+	r, err := Create(context.Background(), db, id, "public-jti", time.Now().Add(time.Hour), b, allowRecovery)
 	require.NoError(t, err)
 	return r
 }
@@ -86,11 +86,11 @@ func TestDatabaseHappyPathOwnershipEpochAndCompletion(t *testing.T) {
 	r := newRequest(t, db, id)
 	o := offerBody(t, r)
 	other := dbtest.CreateUser(t, db).String()
-	_, err := Poll(ctx, db, other, "public-jti", r.RequestID)
+	_, err := Poll(ctx, db, other, "public-jti", r.RequestID, allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = Poll(ctx, db, id, "other-jti", r.RequestID)
+	_, err = Poll(ctx, db, id, "other-jti", r.RequestID, allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = Poll(ctx, db, id, "public-jti", "NOT-A-UUID")
+	_, err = Poll(ctx, db, id, "public-jti", "NOT-A-UUID", allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = Respond(ctx, db, other, "", r.RequestID, o)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -104,14 +104,14 @@ func TestDatabaseHappyPathOwnershipEpochAndCompletion(t *testing.T) {
 	require.NoError(t, err)
 	_, err = Respond(ctx, db, id, "", r.RequestID, o)
 	require.ErrorIs(t, err, ErrConflict)
-	polled, err := Poll(ctx, db, id, "public-jti", r.RequestID)
+	polled, err := Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
 	require.Equal(t, "offered", polled.Status)
 	require.Equal(t, o.TranscriptHash, polled.TranscriptHash)
 	listed, err := List(ctx, db, id)
 	require.NoError(t, err)
 	require.Len(t, listed, 1)
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 	require.ErrorIs(t, err, ErrConflict)
 	a := approveBody(t, o)
 	bad = a
@@ -127,16 +127,16 @@ func TestDatabaseHappyPathOwnershipEpochAndCompletion(t *testing.T) {
 	listed, err = List(ctx, db, id)
 	require.NoError(t, err)
 	require.Empty(t, listed)
-	_, err = Complete(ctx, db, id, "other-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+	_, err = Complete(ctx, db, id, "other-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, Encode(Hash("wrong"))})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, Encode(Hash("wrong"))}, allowRecovery)
 	require.ErrorIs(t, err, ErrConflict)
 	// The requester has no credential epoch, even after the account's epoch rotates.
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 	require.NoError(t, err)
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 	require.ErrorIs(t, err, ErrConflict)
-	polled, err = Poll(ctx, db, id, "public-jti", r.RequestID)
+	polled, err = Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
 	require.Nil(t, polled.Payload)
 	require.Equal(t, "complete", polled.Status)
@@ -180,10 +180,10 @@ func TestDatabaseConflictingWritersAndExactCAS(t *testing.T) {
 	_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
 	require.NoError(t, err)
 	runRace(t, func() error {
-		_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+		_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 		return e
 	}, func() error {
-		_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+		_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 		return e
 	})
 	// An altered immutable snapshot can never produce an acknowledged write.
@@ -206,7 +206,7 @@ func TestDatabaseLockWaitExpiresApprovedAndWithholdsCiphertext(t *testing.T) {
 	// Preserve valid creation/expiry constraints while arranging a short deadline.
 	_, err := db.Exec(`UPDATE recovery_requests SET created_at=clock_timestamp()-interval '1 minute', expires_at=clock_timestamp()+interval '700 milliseconds' WHERE id=$1`, r.RequestID)
 	require.NoError(t, err)
-	r, err = Poll(ctx, db, id, "public-jti", r.RequestID)
+	r, err = Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
 	o := offerBody(t, r)
 	_, err = Respond(ctx, db, id, "", r.RequestID, o)
@@ -218,7 +218,7 @@ func TestDatabaseLockWaitExpiresApprovedAndWithholdsCiphertext(t *testing.T) {
 	require.NoError(t, lockUser(ctx, tx, id))
 	result := make(chan Row, 1)
 	failure := make(chan error, 1)
-	go func() { p, e := Poll(ctx, db, id, "public-jti", r.RequestID); result <- p; failure <- e }()
+	go func() { p, e := Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery); result <- p; failure <- e }()
 	select {
 	case <-result:
 		t.Fatal("poll passed a held owner lock")
@@ -230,7 +230,7 @@ func TestDatabaseLockWaitExpiresApprovedAndWithholdsCiphertext(t *testing.T) {
 	require.Equal(t, "expired", p.Status)
 	require.Nil(t, p.Payload)
 	require.NotContains(t, marshal(t, p.Wire()), "encrypted_payload")
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 	require.ErrorIs(t, err, ErrConflict)
 	_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
 	require.ErrorIs(t, err, ErrConflict)
@@ -248,27 +248,27 @@ func TestDatabaseExpiryListCreateAndDependencyErrors(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT status FROM recovery_requests WHERE id=$1`, r.RequestID).Scan(&status))
 	require.Equal(t, "expired", status)
 	b := createBody(t)
-	_, err = Create(ctx, db, id, "public-jti", time.Now().Add(time.Hour), b)
+	_, err = Create(ctx, db, id, "public-jti", time.Now().Add(time.Hour), b, allowRecovery)
 	require.Error(t, err)
 	b.AccountBinding = AccountBinding(id)
-	_, err = Create(ctx, db, id, "public-jti", time.Time{}, b)
+	_, err = Create(ctx, db, id, "public-jti", time.Time{}, b, allowRecovery)
 	require.ErrorIs(t, err, ErrUnauthorized)
-	_, err = Create(ctx, db, id, "public-jti", time.Now().Add(-time.Hour), b)
+	_, err = Create(ctx, db, id, "public-jti", time.Now().Add(-time.Hour), b, allowRecovery)
 	require.ErrorIs(t, err, ErrUnauthorized)
 	short := time.Now().Add(time.Minute).Truncate(time.Second)
-	r, err = Create(ctx, db, id, "public-jti", short, b)
+	r, err = Create(ctx, db, id, "public-jti", short, b, allowRecovery)
 	require.NoError(t, err)
 	require.Equal(t, short.UnixMilli(), r.ExpiresAt)
 	_, err = db.Exec(`DELETE FROM trusted_recovery_devices WHERE user_id=$1`, id)
 	require.NoError(t, err)
-	_, err = Create(ctx, db, id, "public-jti", time.Now().Add(time.Hour), b)
+	_, err = Create(ctx, db, id, "public-jti", time.Now().Add(time.Hour), b, allowRecovery)
 	var api *APIError
 	require.ErrorAs(t, err, &api)
 	require.Equal(t, 400, api.Status)
 	closed, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	require.NoError(t, err)
 	require.NoError(t, closed.Close())
-	_, err = Poll(ctx, closed, id, "jti", r.RequestID)
+	_, err = Poll(ctx, closed, id, "jti", r.RequestID, allowRecovery)
 	require.Error(t, err)
 	require.False(t, errors.Is(err, ErrNotFound))
 }
@@ -281,7 +281,7 @@ func TestDatabaseRequestLockExpiryPreventsOfferAndComplete(t *testing.T) {
 			r := newRequest(t, db, id)
 			_, err := db.Exec(`UPDATE recovery_requests SET created_at=clock_timestamp()-interval '1 minute',expires_at=clock_timestamp()+interval '600 milliseconds' WHERE id=$1`, r.RequestID)
 			require.NoError(t, err)
-			r, err = Poll(ctx, db, id, "public-jti", r.RequestID)
+			r, err = Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 			require.NoError(t, err)
 			o := offerBody(t, r)
 			if action == "complete" {
@@ -300,7 +300,7 @@ func TestDatabaseRequestLockExpiryPreventsOfferAndComplete(t *testing.T) {
 					_, e := Respond(ctx, db, id, "", r.RequestID, o)
 					done <- e
 				} else {
-					_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash})
+					_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 					done <- e
 				}
 			}()
@@ -311,7 +311,7 @@ func TestDatabaseRequestLockExpiryPreventsOfferAndComplete(t *testing.T) {
 			}
 			require.NoError(t, tx.Commit())
 			require.ErrorIs(t, <-done, ErrConflict)
-			p, err := Poll(ctx, db, id, "public-jti", r.RequestID)
+			p, err := Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 			require.NoError(t, err)
 			require.Equal(t, "expired", p.Status)
 			require.Nil(t, p.Payload)
@@ -325,7 +325,7 @@ func TestDatabaseRejectedWireAndUnsupportedVersions(t *testing.T) {
 	r := newRequest(t, db, id)
 	_, err := Respond(ctx, db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 2})
 	require.NoError(t, err)
-	p, err := Poll(ctx, db, id, "public-jti", r.RequestID)
+	p, err := Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
 	require.Equal(t, "rejected", p.Status)
 	require.NotContains(t, marshal(t, p.Wire()), "transcript_hash")
@@ -333,25 +333,47 @@ func TestDatabaseRejectedWireAndUnsupportedVersions(t *testing.T) {
 	require.ErrorIs(t, err, ErrConflict)
 	_, err = Respond(ctx, db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 1})
 	require.Error(t, err)
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{1, fixture(t).Hash})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{1, fixture(t).Hash}, allowRecovery)
 	require.Error(t, err)
-	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{2, "AA=="})
+	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{2, "AA=="}, allowRecovery)
 	require.Error(t, err)
 	b := createBody(t)
 	b.AccountBinding = AccountBinding(id)
 	b.ProtocolVersion = 1
-	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b)
+	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b, allowRecovery)
 	require.Error(t, err)
 	b.ProtocolVersion = 2
 	b.ServerOrigin = "https://example.test/"
-	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b)
+	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b, allowRecovery)
 	require.Error(t, err)
 	b.ServerOrigin = fixture(t).Context.ServerOrigin
 	b.RequesterNonce = "AA=="
-	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b)
+	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b, allowRecovery)
 	require.Error(t, err)
 	b.RequesterNonce = fixture(t).Context.RequesterNonce
 	b.RequesterPublicKey = "AA=="
-	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b)
+	_, err = Create(ctx, db, id, "jti", time.Now().Add(time.Hour), b, allowRecovery)
 	require.Error(t, err)
+}
+
+func allowRecovery(context.Context, *sql.Tx) error { return nil }
+
+func TestDatabaseRecoveryGuardIsRequiredBeforeProtectedAccess(t *testing.T) {
+	db, id := setupDB(t)
+	row := newRequest(t, db, id)
+	body := createBody(t)
+	body.AccountBinding = AccountBinding(id)
+	ctx := context.Background()
+	_, err := Create(ctx, db, id, "public-jti", time.Now().Add(time.Hour), body, nil)
+	require.ErrorIs(t, err, ErrUnauthorized)
+	_, err = Poll(ctx, db, id, "public-jti", row.RequestID, nil)
+	require.ErrorIs(t, err, ErrUnauthorized)
+	_, err = Complete(ctx, db, id, "public-jti", row.RequestID, CompleteBody{Version, fixture(t).Hash}, nil)
+	require.ErrorIs(t, err, ErrUnauthorized)
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM recovery_requests WHERE user_id=$1`, id).Scan(&count))
+	require.Equal(t, 1, count)
+	var status string
+	require.NoError(t, db.QueryRow(`SELECT status FROM recovery_requests WHERE id=$1`, row.RequestID).Scan(&status))
+	require.Equal(t, "pending", status)
 }

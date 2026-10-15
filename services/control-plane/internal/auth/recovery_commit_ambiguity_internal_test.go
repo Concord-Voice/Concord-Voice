@@ -78,11 +78,17 @@ func (*ambiguousRecoveryMFAChecker) BeginWebAuthnLogin(context.Context, string, 
 	return nil, nil
 }
 
-func (*ambiguousRecoveryMFAChecker) GenerateRecoveryToken(string) (string, string, error) {
+func (*ambiguousRecoveryMFAChecker) GenerateRecoveryToken(string, string) (string, string, error) {
+	return "", "", nil
+}
+func (*ambiguousRecoveryMFAChecker) GetRecoveryMethods(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+func (*ambiguousRecoveryMFAChecker) GenerateRecoveryChallenge(context.Context, string) (string, string, error) {
 	return "", "", nil
 }
 
-func (c *ambiguousRecoveryMFAChecker) ValidateRecoveryToken(string) (*RecoveryClaims, error) {
+func (c *ambiguousRecoveryMFAChecker) ValidateRecoveryToken(context.Context, string) (*RecoveryClaims, error) {
 	return c.claims, nil
 }
 
@@ -771,7 +777,8 @@ func TestRecoveryForcedClearStatementFailureReleasesTokenAndRollsBack(t *testing
 	service := newRecoveryForcedService(t, db, &recoveryCommitDelivery{})
 	handler := &Handler{
 		db: db, redis: rdb, log: logger.NewWithWriter(io.Discard), presenceHistory: service,
-		credFence: credepoch.New(db, rdb, logger.NewWithWriter(io.Discard)),
+		mfaChecker: &ambiguousRecoveryMFAChecker{},
+		credFence:  credepoch.New(db, rdb, logger.NewWithWriter(io.Discard)),
 	}
 	evictions := &recoveryCredentialEpochEvictionRecorder{}
 	evictions.bind(t, handler)
@@ -785,7 +792,7 @@ func TestRecoveryForcedClearStatementFailureReleasesTokenAndRollsBack(t *testing
 		query: `UPDATE recovery_table_that_does_not_exist SET value = $1`,
 		args:  []interface{}{1},
 		desc:  "forced statement failure",
-	}})
+	}}, &RecoveryClaims{UserID: senderID.String()})
 
 	require.Error(t, err)
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
@@ -942,4 +949,8 @@ func assertRecoveryCredentialEpochRollback(
 		`SELECT COUNT(*) FROM credential_epoch_voice_ejections WHERE user_id = $1`, senderID,
 	).Scan(&outboxRows))
 	assert.Zero(t, outboxRows, "rolled-back rotation must not leave a durable media eviction")
+}
+
+func (*ambiguousRecoveryMFAChecker) ValidateRecoveryClaimsTx(context.Context, *sql.Tx, *RecoveryClaims) error {
+	return nil
 }

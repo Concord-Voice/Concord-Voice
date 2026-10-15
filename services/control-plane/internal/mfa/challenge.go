@@ -19,7 +19,9 @@ const (
 	PurposeLogin             ChallengePurpose = "login"
 	PurposeSuspiciousRefresh ChallengePurpose = "suspicious_refresh"
 	PurposeMFAUpgrade        ChallengePurpose = "mfa_upgrade"
-	PurposeRecovery          ChallengePurpose = "recovery"
+	// Versioned so pre-policy email-only recovery tokens cannot authorize resets.
+	PurposeRecovery          ChallengePurpose = "recovery_v2"
+	PurposeRecoveryChallenge ChallengePurpose = "recovery_challenge"
 )
 
 // ChallengeTokenIssuer is the `iss` claim on every MFA-family token. Named for the
@@ -38,6 +40,8 @@ type ChallengeClaims struct {
 	jwt.RegisteredClaims
 	UserID  string           `json:"user_id"`
 	Purpose ChallengePurpose `json:"purpose"`
+	// RecoveryFactor is the server-verified factor authorizing final recovery.
+	RecoveryFactor string `json:"recovery_factor,omitempty"`
 	// CredentialEpoch is the durable users.credential_epoch in effect when this
 	// challenge was issued (#2418). Redemption compares it against the epoch current
 	// at mint time, so a challenge issued before a destructive reset cannot complete
@@ -80,10 +84,6 @@ type CredEpoch string
 // to a bare string.
 type JWTSecret string
 
-// RefreshSessionID prevents the upgrade target from being transposed with other
-// adjacent string arguments while constructing signed challenge claims.
-type RefreshSessionID string
-
 // GenerateChallengeToken creates a short-lived, purpose-bound JWT for MFA challenges.
 // credEpoch is the issuing user's durable credential epoch, or "" for purposes that
 // never mint a session.
@@ -91,34 +91,27 @@ func GenerateChallengeToken(userID string, purpose ChallengePurpose, jwtSecret J
 	if purpose == PurposeLogin {
 		return "", "", fmt.Errorf("login challenges require Handler.GenerateLoginChallenge")
 	}
-	return generateChallengeTokenWithTTL(userID, purpose, jwtSecret, credEpoch, "", "", challengeTTL)
+	return generateChallengeTokenWithTTL(ChallengeClaims{UserID: userID, Purpose: purpose, CredentialEpoch: string(credEpoch)}, jwtSecret, challengeTTL)
 }
 
-// GenerateRecoveryToken creates a recovery-purpose JWT with a longer TTL (25 hours).
+// GenerateRecoveryToken creates email-proved recovery authority with a 25-hour TTL.
 // Recovery tokens authorize a destructive reset rather than a session mint, so they
 // carry no epoch — binding one to a pre-reset epoch would be incoherent.
 func GenerateRecoveryToken(userID string, jwtSecret JWTSecret) (string, string, error) {
-	return generateChallengeTokenWithTTL(userID, PurposeRecovery, jwtSecret, "", "", "", recoveryTTL)
+	return generateChallengeTokenWithTTL(ChallengeClaims{UserID: userID, Purpose: PurposeRecovery, RecoveryFactor: "email"}, jwtSecret, recoveryTTL)
 }
 
 // generateChallengeTokenWithTTL creates a purpose-bound JWT with a configurable TTL.
-func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtSecret JWTSecret, credEpoch CredEpoch, primaryAuthMethod securityevent.AuthMethod, refreshSessionID RefreshSessionID, ttl time.Duration) (string, string, error) {
+func generateChallengeTokenWithTTL(claims ChallengeClaims, jwtSecret JWTSecret, ttl time.Duration) (string, string, error) {
 	jti := uuid.New().String()
 	now := time.Now()
 
-	claims := ChallengeClaims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        jti,
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
-			NotBefore: jwt.NewNumericDate(now),
-			Issuer:    ChallengeTokenIssuer,
-		},
-		UserID:            userID,
-		Purpose:           purpose,
-		CredentialEpoch:   string(credEpoch),
-		PrimaryAuthMethod: primaryAuthMethod,
-		RefreshSessionID:  string(refreshSessionID),
+	claims.RegisteredClaims = jwt.RegisteredClaims{
+		ID:        jti,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		NotBefore: jwt.NewNumericDate(now),
+		Issuer:    ChallengeTokenIssuer,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

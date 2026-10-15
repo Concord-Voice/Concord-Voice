@@ -283,19 +283,112 @@ func (h *Handler) ListServers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"servers": servers})
 }
 
+// mediaRefusal is a refused icon/banner: the HTTP status and the JSON body to
+// send. A nil *mediaRefusal means the value is acceptable.
+type mediaRefusal struct {
+	status int
+	body   gin.H
+}
+
+func (r *mediaRefusal) respond(c *gin.Context) {
+	c.JSON(r.status, r.body)
+}
+
+func badMediaRequest(msg string) *mediaRefusal {
+	return &mediaRefusal{status: http.StatusBadRequest, body: gin.H{"error": msg}}
+}
+
+// animatedPolicy says what an inline image that animates gets. An inline
+// `data:image/` value is stored verbatim and never passes through the upload
+// pipeline's frame check, so without this gate it would sidestep the upload
+// routes' animation entitlements (#3856).
+type animatedPolicy struct {
+	allowed bool
+	code    string
+	message string
+}
+
+// iconAnimatedPolicy refuses an animated icon at every tier — no upload route
+// allows one — with the upload route's "not supported" body.
+func iconAnimatedPolicy() animatedPolicy {
+	return animatedPolicy{
+		code:    media.CodeAnimatedNotSupported,
+		message: media.MsgAnimatedNotSupported,
+	}
+}
+
+// bannerAnimatedPolicy allows an animated banner only where the server tier
+// grants it, and otherwise answers with the upload route's Mach upsell body.
+func bannerAnimatedPolicy(ent entitlements.ServerEntitlement) animatedPolicy {
+	return animatedPolicy{
+		allowed: ent.AllowAnimatedServerBanner,
+		code:    media.CodeAnimatedServerBannerMach,
+		message: media.MsgAnimatedServerBannerMach,
+	}
+}
+
+// checkInlineImage decodes an inline `data:image/` URL and applies the
+// animation policy. Animation is detected from the decoded bytes, never the
+// declared MIME type. A URL that is not base64 or declares a type other than
+// PNG/JPEG/GIF/WebP, or whose bytes media.IsAnimatedImage cannot classify, is a
+// 400 (fail closed: an image the server cannot classify cannot be proven
+// static); an animated image the policy refuses is a 403, matching the upload
+// routes.
+func checkInlineImage(dataURL, label string, policy animatedPolicy) *mediaRefusal {
+	raw, ok := decodeInlineImage(dataURL)
+	if !ok {
+		return badMediaRequest(label + " must be a base64-encoded PNG, JPEG, GIF, or WebP data URL")
+	}
+	animated, err := media.IsAnimatedImage(raw)
+	if err != nil {
+		return badMediaRequest(label + " is not a valid PNG, JPEG, GIF, or WebP image")
+	}
+	if animated && !policy.allowed {
+		return &mediaRefusal{
+			status: http.StatusForbidden,
+			body:   gin.H{"error": policy.message, "code": policy.code},
+		}
+	}
+	return nil
+}
+
+// inlineImageMeta is every declared type an inline image may carry. A browser
+// picks the decoder from the declared type, so an SVG declaration (which can
+// animate in <img>) is refused whatever the bytes are.
+var inlineImageMeta = map[string]bool{
+	"image/png;base64":  true,
+	"image/jpeg;base64": true,
+	"image/gif;base64":  true,
+	"image/webp;base64": true,
+}
+
+// decodeInlineImage extracts the bytes of a `data:<mime>;base64,<payload>` URL
+// whose declared type is one of inlineImageMeta.
+func decodeInlineImage(dataURL string) ([]byte, bool) {
+	meta, payload, found := strings.Cut(strings.TrimPrefix(dataURL, "data:"), ",")
+	if !found || !inlineImageMeta[meta] {
+		return nil, false
+	}
+	raw, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
 // validateCreateDataURL validates an image data URL for CreateServer.
-// Returns an error string if invalid, or empty string if valid.
-func validateCreateDataURL(url *string, maxLen int, label, sizeHint string) string {
+// Returns nil if valid (or absent), or the refusal to send.
+func validateCreateDataURL(url *string, maxLen int, label, sizeHint string, policy func() animatedPolicy) *mediaRefusal {
 	if url == nil || *url == "" {
-		return ""
+		return nil
 	}
 	if !strings.HasPrefix(*url, dataImagePrefix) {
-		return label + " must be a valid image data URL (use UpdateServer for uploaded media URLs)"
+		return badMediaRequest(label + " must be a valid image data URL (use UpdateServer for uploaded media URLs)")
 	}
 	if len(*url) > maxLen {
-		return label + " image too large (max " + sizeHint + ")"
+		return badMediaRequest(label + " image too large (max " + sizeHint + ")")
 	}
-	return ""
+	return checkInlineImage(*url, label, policy())
 }
 
 func maxDataURLLen(maxBytes int64) int {
@@ -388,13 +481,19 @@ func (h *Handler) CreateServer(c *gin.Context) {
 		return
 	}
 
+	serverID := uuid.New().String()
 	groundspeed := entitlements.ForServer(entitlements.TierGroundspeed)
-	if errMsg := validateCreateDataURL(req.IconURL, maxDataURLLen(groundspeed.MaxServerIconBytes), "Icon", "5MB"); errMsg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+	if refusal := validateCreateDataURL(req.IconURL, maxDataURLLen(groundspeed.MaxServerIconBytes), "Icon", "5MB", iconAnimatedPolicy); refusal != nil {
+		refusal.respond(c)
 		return
 	}
-	if errMsg := validateCreateDataURL(req.BannerURL, maxDataURLLen(groundspeed.MaxServerBannerBytes), "Banner", "5MB"); errMsg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+	// The animated-banner allowance is the new server's own starting tier:
+	// Groundspeed on a managed instance, the self-host tier on a self-hosted one.
+	bannerPolicy := func() animatedPolicy {
+		return bannerAnimatedPolicy(entitlements.ForServer(h.serverTiers.GetServerTier(c.Request.Context(), serverID)))
+	}
+	if refusal := validateCreateDataURL(req.BannerURL, maxDataURLLen(groundspeed.MaxServerBannerBytes), "Banner", "5MB", bannerPolicy); refusal != nil {
+		refusal.respond(c)
 		return
 	}
 
@@ -432,7 +531,6 @@ func (h *Handler) CreateServer(c *gin.Context) {
 		return
 	}
 
-	serverID := uuid.New().String()
 	server := models.Server{
 		ID:                   serverID,
 		Name:                 req.Name,
@@ -617,23 +715,27 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 	// to server subscribers, so they stay pinned to the Groundspeed floor; the
 	// per-tier allowance applies on the uploaded-media path, which broadcasts keys.
 	inlineEnt := entitlements.ForServer(entitlements.TierGroundspeed)
-	iconURLProvided, iconURL, iconErr := parseMediaURL(req.IconURL)
+	iconURLProvided, iconURL, iconErr := h.parseServerImageField(c.Request.Context(), serverID, "icon_url", req.IconURL)
 	if iconErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid icon_url format"})
 		return
 	}
-	if err := validateMediaURL(iconURL, fmt.Sprintf("/api/v1/media/server-icons/%s", serverID), maxDataURLLen(inlineEnt.MaxServerIconBytes), "Icon"); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if refusal := validateMediaURL(iconURL, fmt.Sprintf("/api/v1/media/server-icons/%s", serverID), maxDataURLLen(inlineEnt.MaxServerIconBytes), "Icon", iconAnimatedPolicy); refusal != nil {
+		refusal.respond(c)
 		return
 	}
 
-	bannerURLProvided, bannerURL, bannerErr := parseMediaURL(req.BannerURL)
+	bannerURLProvided, bannerURL, bannerErr := h.parseServerImageField(c.Request.Context(), serverID, "banner_url", req.BannerURL)
 	if bannerErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid banner_url format"})
 		return
 	}
-	if err := validateMediaURL(bannerURL, fmt.Sprintf("/api/v1/media/server-banners/%s", serverID), maxDataURLLen(inlineEnt.MaxServerBannerBytes), "Banner"); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// The tier lookup runs only for an inline banner that passed the size cap.
+	bannerPolicy := func() animatedPolicy {
+		return bannerAnimatedPolicy(entitlements.ForServer(h.serverTiers.GetServerTier(c.Request.Context(), serverID)))
+	}
+	if refusal := validateMediaURL(bannerURL, fmt.Sprintf("/api/v1/media/server-banners/%s", serverID), maxDataURLLen(inlineEnt.MaxServerBannerBytes), "Banner", bannerPolicy); refusal != nil {
+		refusal.respond(c)
 		return
 	}
 
@@ -695,19 +797,65 @@ func parseMediaURL(raw json.RawMessage) (provided bool, url *string, err error) 
 	return true, &s, nil
 }
 
-// validateMediaURL validates a media URL (icon or banner) against allowed patterns and size limits.
-// Returns nil if valid or the URL was nil/empty; returns a descriptive error otherwise.
-func validateMediaURL(url *string, expectedPath string, maxDataLen int, label string) error {
+// inlineResendMatchQueries compare a submitted value with the stored column.
+// The column names are fixed here, never taken from input.
+var inlineResendMatchQueries = map[string]string{
+	"icon_url":   `SELECT icon_url IS NOT DISTINCT FROM $2 FROM servers WHERE id = $1`,
+	"banner_url": `SELECT banner_url IS NOT DISTINCT FROM $2 FROM servers WHERE id = $1`,
+}
+
+// maxStoredInlineImageLen bounds the re-send comparison: the inline cap is the
+// Groundspeed one for both columns, so a longer value cannot be a stored one.
+var maxStoredInlineImageLen = maxDataURLLen(max(
+	entitlements.ForServer(entitlements.TierGroundspeed).MaxServerIconBytes,
+	entitlements.ForServer(entitlements.TierGroundspeed).MaxServerBannerBytes,
+))
+
+// parseServerImageField parses an icon_url / banner_url field. An inline value
+// identical to the one the server already stores is reported as not provided:
+// the re-send is a no-op, as on PATCH /users/me, so a value stored before #3856
+// can be echoed back with another edit without passing today's inline checks.
+func (h *Handler) parseServerImageField(ctx context.Context, serverID, column string, raw json.RawMessage) (bool, *string, error) {
+	provided, url, err := parseMediaURL(raw)
+	if err != nil || !h.isStoredInlineImage(ctx, serverID, column, url) {
+		return provided, url, err
+	}
+	return false, nil, nil
+}
+
+// isStoredInlineImage reports whether url is an inline value equal to the
+// server's stored column. It fails closed: a database error means "not stored",
+// so the value goes through the inline checks like any other.
+func (h *Handler) isStoredInlineImage(ctx context.Context, serverID, column string, url *string) bool {
+	if url == nil || !strings.HasPrefix(*url, dataImagePrefix) ||
+		len(*url) > maxStoredInlineImageLen || strings.IndexByte(*url, 0) >= 0 {
+		return false
+	}
+	var matches bool
+	if err := h.db.QueryRowContext(ctx, inlineResendMatchQueries[column], serverID, *url).Scan(&matches); err != nil {
+		h.log.Warn("Failed to compare inline server image", "error", err, "server_id", serverID)
+		return false
+	}
+	return matches
+}
+
+// validateMediaURL validates a media URL (icon or banner) against allowed patterns, size limits,
+// and — for an inline data URL — the animation policy, which it resolves only then.
+// Returns nil if valid or the URL was nil/empty; returns the refusal to send otherwise.
+func validateMediaURL(url *string, expectedPath string, maxDataLen int, label string, policy func() animatedPolicy) *mediaRefusal {
 	if url == nil || *url == "" {
 		return nil
 	}
 	if *url != expectedPath && !strings.HasPrefix(*url, dataImagePrefix) {
-		return fmt.Errorf("%s must be an uploaded %s URL for this server or an image data URL", label, strings.ToLower(label))
+		return badMediaRequest(fmt.Sprintf("%s must be an uploaded %s URL for this server or an image data URL", label, strings.ToLower(label)))
 	}
-	if strings.HasPrefix(*url, dataImagePrefix) && len(*url) > maxDataLen {
-		return fmt.Errorf("%s image too large", label)
+	if !strings.HasPrefix(*url, dataImagePrefix) {
+		return nil
 	}
-	return nil
+	if len(*url) > maxDataLen {
+		return badMediaRequest(label + " image too large")
+	}
+	return checkInlineImage(*url, label, policy())
 }
 
 // buildUpdateClauses constructs the SET clauses, args, and media cleanup keys for UpdateServer.

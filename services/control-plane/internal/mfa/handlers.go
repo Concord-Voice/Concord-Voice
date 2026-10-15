@@ -103,6 +103,7 @@ const (
 	errMsgFailedLoadMFAStatus        = "Failed to load MFA status"
 	errMsgFailedUpdateBackupEmail    = "Failed to update backup email"
 	errMsgFailedStoreRecoveryKey     = "Failed to store recovery key"
+	errMsgFailedUpdateSettings       = "Failed to update settings"
 	msgRecoveryKeyStored             = "Recovery key stored"
 	errMsgFailedDisableEmailSms      = "Failed to disable Email/SMS MFA methods"
 
@@ -147,18 +148,19 @@ type PermissionChangeNotifier interface {
 
 // Handler implements MFA API endpoints and the Verifier interface.
 type Handler struct {
-	db             *sql.DB
-	redis          *redis.Client
-	log            *logger.Logger
-	keyring        *Keyring // versioned AES keys for TOTP secret encryption (#2307)
-	jwtSecret      string
-	webauthn       *WebAuthnService
-	loginCompleter LoginCompleter
-	emailSvc       *email.Service
-	environment    string // "development", "staging", "production"
-	securityEvents securityevent.Emitter
-	permissions    PermissionInvalidator
-	permNotifier   PermissionChangeNotifier
+	db                *sql.DB
+	redis             *redis.Client
+	log               *logger.Logger
+	keyring           *Keyring // versioned AES keys for TOTP secret encryption (#2307)
+	jwtSecret         string
+	webauthn          *WebAuthnService
+	loginCompleter    LoginCompleter
+	recoveryCompleter RecoveryCompleter
+	emailSvc          *email.Service
+	environment       string // "development", "staging", "production"
+	securityEvents    securityevent.Emitter
+	permissions       PermissionInvalidator
+	permNotifier      PermissionChangeNotifier
 }
 
 // Ensure Handler implements Verifier at compile time.
@@ -522,7 +524,9 @@ func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rem
 	if err != nil {
 		return "", "", err
 	}
-	token, jti, err := generateChallengeTokenWithTTL(userID, PurposeLogin, JWTSecret(h.jwtSecret), CredEpoch(credEpoch), primaryAuthMethod, "", challengeTTL)
+	token, jti, err := generateChallengeTokenWithTTL(ChallengeClaims{
+		UserID: userID, Purpose: PurposeLogin, CredentialEpoch: credEpoch, PrimaryAuthMethod: primaryAuthMethod,
+	}, JWTSecret(h.jwtSecret), challengeTTL)
 	if err != nil {
 		return "", "", err
 	}
@@ -549,7 +553,9 @@ func (h *Handler) GenerateUpgradeChallenge(_ context.Context, userID, refreshSes
 	if refreshSessionID == "" {
 		return "", "", errors.New("MFA upgrade challenge requires a refresh session")
 	}
-	return generateChallengeTokenWithTTL(userID, PurposeMFAUpgrade, JWTSecret(h.jwtSecret), "", "", RefreshSessionID(refreshSessionID), challengeTTL)
+	return generateChallengeTokenWithTTL(ChallengeClaims{
+		UserID: userID, Purpose: PurposeMFAUpgrade, RefreshSessionID: refreshSessionID,
+	}, JWTSecret(h.jwtSecret), challengeTTL)
 }
 
 // BeginWebAuthnLogin starts a WebAuthn assertion ceremony for login.
@@ -1988,7 +1994,12 @@ func (h *Handler) Verify(c *gin.Context) {
 		h.verifyDependencyFailed(c, claims.UserID, err)
 		return
 	}
-	restricted, err := h.recoveryOnlyMethods(ctx, claims.UserID)
+	var restricted []string
+	if purpose == PurposeRecoveryChallenge {
+		restricted, err = h.GetRecoveryMethods(ctx, claims.UserID)
+	} else {
+		restricted, err = h.recoveryOnlyMethods(ctx, claims.UserID)
+	}
 	if err != nil {
 		h.verifyDependencyFailed(c, claims.UserID, err)
 		return
@@ -2000,11 +2011,15 @@ func (h *Handler) Verify(c *gin.Context) {
 		return
 	}
 
-	verified, matchedMethod, responded := h.verifyByMethod(ctx, c, req, claims, containsStr(restricted, "totp"))
+	if purpose == PurposeRecoveryChallenge && !containsStr(restricted, recoveryFactor(req.Method)) {
+		h.refuseWrongCode(ctx, c, req.Method, claims.UserID, lockoutKey, attempt)
+		return
+	}
+	verified, matchedMethod, responded := h.verifyByMethod(ctx, c, req, claims, purpose != PurposeRecoveryChallenge && containsStr(restricted, "totp"))
 	if responded {
 		return // Early return already sent a response (e.g. bad request)
 	}
-	if verified && containsStr(restricted, answeredFactor(req.Method, matchedMethod)) {
+	if verified && purpose != PurposeRecoveryChallenge && containsStr(restricted, answeredFactor(req.Method, matchedMethod)) {
 		// A recovery-only method cannot answer this challenge. It is refused
 		// exactly as a wrong code is, so the answer never confirms the code.
 		verified = false
@@ -2019,10 +2034,9 @@ func (h *Handler) Verify(c *gin.Context) {
 }
 
 // recoveryOnlyMethods returns the user's recovery-only methods, which may not
-// answer a sign-in challenge. Every challenge Verify and SendEmailMFACode
-// accept is a sign-in challenge (parseChallengeToken admits no recovery
-// purpose). The login response already leaves these methods out of the offered
-// ones; this is where the server holds to it.
+// answer a sign-in challenge. Recovery challenges use GetRecoveryMethods instead.
+// The login response already leaves these methods out of the offered ones;
+// this is where the server holds to it.
 func (h *Handler) recoveryOnlyMethods(ctx context.Context, userID string) ([]string, error) {
 	var methods, restricted []string
 	if err := h.db.QueryRowContext(ctx,
@@ -2253,7 +2267,7 @@ func (h *Handler) completeVerifiedChallenge(ctx context.Context, c *gin.Context,
 	// A stale count only brings the next lockout closer.
 	h.delBestEffort(ctx, "Failed to clear MFA verification attempt counter", claims.UserID, attemptsKey)
 	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
-	if h.completeVerifyPurpose(ctx, c, claims, purpose, rememberMe) {
+	if h.completeVerifyPurpose(ctx, c, claims, purpose, rememberMe, method) {
 		h.emitHTTPEvent(c, mfaChallengeVerifiedEvent(method))
 	}
 }
@@ -2305,7 +2319,7 @@ func mfaChallengeVerifiedEvent(method string) securityevent.Event {
 // incorrectly signed, or purpose-bound token is invalid, not expired.
 func (h *Handler) parseChallengeToken(tokenStr string) (*ChallengeClaims, ChallengePurpose, bool) {
 	expired := true
-	for _, p := range []ChallengePurpose{PurposeLogin, PurposeSuspiciousRefresh, PurposeMFAUpgrade} {
+	for _, p := range []ChallengePurpose{PurposeLogin, PurposeSuspiciousRefresh, PurposeMFAUpgrade, PurposeRecoveryChallenge} {
 		if parsed, err := ValidateChallengeToken(tokenStr, h.jwtSecret, p); err == nil {
 			if p == PurposeMFAUpgrade && parsed.RefreshSessionID == "" {
 				expired = false
@@ -2456,8 +2470,15 @@ func isValidEmailCode(code string) bool {
 }
 
 // completeVerifyPurpose performs the action associated with the MFA challenge purpose.
-func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, claims *ChallengeClaims, purpose ChallengePurpose, rememberMe bool) bool {
+func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, claims *ChallengeClaims, purpose ChallengePurpose, rememberMe bool, verifiedMethod string) bool {
 	switch purpose {
+	case PurposeRecoveryChallenge:
+		if h.recoveryCompleter == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+			return false
+		}
+		return h.recoveryCompleter.CompleteRecovery(c, claims.UserID, recoveryFactor(verifiedMethod))
+
 	case PurposeLogin:
 		if h.loginCompleter == nil {
 			h.log.Error("MFA login verified with no login completer wired", "user_id", claims.UserID)
@@ -2517,9 +2538,9 @@ func (h *Handler) SendEmailMFACode(c *gin.Context) {
 		return
 	}
 
-	// The token encodes its purpose; Verify accepts the same set.
-	claims, _, _ := h.parseChallengeToken(req.ChallengeToken)
-	if claims == nil {
+	// Recovery has already proved email ownership and needs its reserved factor.
+	claims, purpose, _ := h.parseChallengeToken(req.ChallengeToken)
+	if claims == nil || purpose == PurposeRecoveryChallenge {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired challenge token"})
 		return
 	}
@@ -2968,7 +2989,18 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 		req.Methods = []string{}
 	}
 
-	enabledMethods, err := h.GetEnabledMethods(ctx, userID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSettings})
+		return
+	}
+	defer h.rollbackQuietly(tx)
+	if err := lockUserForMFAWriteTx(ctx, tx, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch MFA status"})
+		return
+	}
+	var enabledMethods []string
+	err = tx.QueryRowContext(ctx, `SELECT mfa_methods FROM users WHERE id=$1`, userID).Scan(pq.Array(&enabledMethods))
 	if err != nil {
 		h.log.Error("Failed to read MFA methods for recovery-only update", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch MFA status"})
@@ -2998,12 +3030,16 @@ func (h *Handler) SetRecoveryOnly(c *gin.Context) {
 		query = `UPDATE users SET recovery_only_methods = $1, recovery_hardened = TRUE WHERE id = $2 RETURNING recovery_hardened`
 	}
 	var recoveryHardened bool
-	if err := h.db.QueryRowContext(ctx, query, pq.Array(validRecoveryOnly), userID).Scan(&recoveryHardened); err != nil {
+	if err := tx.QueryRowContext(ctx, query, pq.Array(validRecoveryOnly), userID).Scan(&recoveryHardened); err != nil {
 		h.log.Error("Failed to update recovery_only_methods", "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update settings"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSettings})
 		return
 	}
 
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSettings})
+		return
+	}
 	h.clearStepUpAfterSuccess(c, userID)
 	c.JSON(http.StatusOK, gin.H{
 		"recovery_only_methods": validRecoveryOnly,
@@ -3037,7 +3073,7 @@ func (h *Handler) SetRecoveryHardened(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("Failed to update recovery_hardened", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update settings"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSettings})
 		return
 	}
 
@@ -3686,13 +3722,18 @@ func isValidEmail(email string) bool {
 
 // GenerateRecoveryToken creates a recovery-purpose JWT with a 25-hour TTL.
 // Implements auth.MFAChecker interface.
-func (h *Handler) GenerateRecoveryToken(userID string) (string, string, error) {
-	return GenerateRecoveryToken(userID, JWTSecret(h.jwtSecret))
+func (h *Handler) GenerateRecoveryToken(userID, verifiedFactor string) (string, string, error) {
+	if verifiedFactor != "email" && verifiedFactor != "totp" && verifiedFactor != "webauthn" {
+		return "", "", errors.New("invalid recovery proof")
+	}
+	return generateChallengeTokenWithTTL(ChallengeClaims{
+		UserID: userID, Purpose: PurposeRecovery, RecoveryFactor: verifiedFactor,
+	}, JWTSecret(h.jwtSecret), recoveryTTL)
 }
 
 // ValidateRecoveryToken validates a recovery-purpose JWT and returns the claims.
 // Implements auth.MFAChecker interface.
-func (h *Handler) ValidateRecoveryToken(tokenString string) (*auth.RecoveryClaims, error) {
+func (h *Handler) ValidateRecoveryToken(ctx context.Context, tokenString string) (*auth.RecoveryClaims, error) {
 	claims, err := ValidateChallengeToken(tokenString, h.jwtSecret, PurposeRecovery)
 	if err != nil {
 		return nil, err
@@ -3700,7 +3741,17 @@ func (h *Handler) ValidateRecoveryToken(tokenString string) (*auth.RecoveryClaim
 	if claims.ExpiresAt == nil {
 		return nil, errors.New("recovery expiry missing")
 	}
-	return &auth.RecoveryClaims{UserID: claims.UserID, JTI: claims.ID, ExpiresAt: claims.ExpiresAt.Time}, nil
+	if claims.RecoveryFactor != "email" && claims.RecoveryFactor != "totp" && claims.RecoveryFactor != "webauthn" {
+		return nil, errors.New("recovery proof missing")
+	}
+	methods, err := h.GetRecoveryMethods(ctx, claims.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", auth.ErrRecoveryPolicyUnavailable, err)
+	}
+	if len(methods) > 0 && !containsStr(methods, claims.RecoveryFactor) {
+		return nil, errors.New("recovery proof no longer satisfies policy")
+	}
+	return &auth.RecoveryClaims{RecoveryFactor: claims.RecoveryFactor, UserID: claims.UserID, JTI: claims.ID, ExpiresAt: claims.ExpiresAt.Time}, nil
 }
 
 // ── Recovery Key Endpoints ──────────────────────────────────────────────────

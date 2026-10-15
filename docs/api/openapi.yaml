@@ -559,7 +559,7 @@ paths:
       - Auth
       summary: Verify an MFA challenge
       description: 'Validate a TOTP, backup code, WebAuthn assertion, or email code against an MFA challenge
-        token issued at login.
+        token issued at login or after recovery email verification.
 
         Identity comes from the challenge token (single-use). Per-user lockout after 5 failed attempts
         (15 minutes).
@@ -580,7 +580,10 @@ paths:
           description: 'MFA verified. For a login-purpose challenge the full login response is returned
             (with refresh cookie);
 
-            for other purposes a `{verified, purpose, user_id}` acknowledgement is returned.
+            a recovery_challenge returns the recovery_token and recovery key metadata described
+            by /auth/recovery/verify-code after a currently reserved TOTP/backup code or WebAuthn
+            proof. Recovery challenges never issue login sessions. Other purposes return a
+            `{verified, purpose, user_id}` acknowledgement.
 
             '
           content:
@@ -614,7 +617,39 @@ paths:
                     e2ee_keys:
                       $ref: '#/components/schemas/E2EEKeys'
                 - type: object
-                  description: Non-login purposes (e.g. mfa_upgrade)
+                  description: Recovery completion (purpose = recovery_challenge)
+                  required:
+                  - recovery_token
+                  - has_recovery_key
+                  - has_trusted_devices
+                  - has_recovery_circle
+                  properties:
+                    recovery_token:
+                      type: string
+                    has_recovery_key:
+                      type: boolean
+                    recovery_wrapped_private_key:
+                      type: string
+                      format: byte
+                    recovery_key_salt:
+                      type: string
+                      format: byte
+                    recovery_wrapped_prefs_key:
+                      type: string
+                      format: byte
+                    recovery_prefs_key_salt:
+                      type: string
+                      format: byte
+                    has_trusted_devices:
+                      type: boolean
+                    has_recovery_circle:
+                      type: boolean
+                - type: object
+                  description: Other non-login purposes (e.g. mfa_upgrade)
+                  required:
+                  - verified
+                  - purpose
+                  - user_id
                   properties:
                     verified:
                       type: boolean
@@ -661,6 +696,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: A dependency failed. Before the code is judged (reuse marker, lockout, remember-me state, recovery-only methods, attempt count) nothing is spent and a right code answers like a wrong one, so retry while the challenge is valid. After an accepted code (the challenge claim, session issuance, the MFA-upgrade bypass) the challenge and the code are spent; start again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Recovery completion could not confirm current policy or commit after a reserved factor was accepted. The recovery challenge is spent; restart at email verification.
           content:
             application/json:
               schema:
@@ -763,6 +804,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/device-request/{id}:
     get:
       tags:
@@ -827,6 +874,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/reset-account:
     post:
       tags:
@@ -878,6 +931,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Recovery policy or presence readiness unavailable before reset work starts leaves the token unconsumed and records no authentication failure. A quarantined forced-security clear after reset work returns 503 with the token consumed; check account state and start a new recovery flow instead of retrying that token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/reset-password:
     post:
       tags:
@@ -927,6 +986,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Recovery policy or presence readiness unavailable before reset work starts leaves the token unconsumed and records no authentication failure. A quarantined forced-security clear after reset work returns 503 with the token consumed; check account state and start a new recovery flow instead of retrying that token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/device-request/{id}/complete:
     post:
       tags:
@@ -999,6 +1064,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/social-request:
     post:
       tags:
@@ -1046,6 +1117,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/social-request/{id}:
     get:
       tags:
@@ -1120,13 +1197,30 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/recovery/verify-code:
     post:
       tags:
       - Auth
       summary: Verify a recovery code
-      description: 'Validate the emailed recovery code (single-use, max 5 attempts) and return a recovery
-        token plus recovery key material.
+      description: 'Validate the emailed recovery code (single-use, max 5 attempts). When a reserved
+        authenticator app or security key is enabled, return a five-minute recovery_challenge MFA
+        token and offered methods, without recovery authority or key material. Complete that challenge
+        through /auth/mfa/verify. Backup codes satisfy a reserved authenticator app. Email ownership
+        alone satisfies a reserved email factor; one additional reserved inline factor is required
+        when configured. Factor availability is read from actual enrollment state, and the policy is
+        rechecked at MFA verification. Unknown policy or an enrolled SMS requirement fails closed;
+        hardened mode remains dormant without enrolled SMS, which has no recovery verifier yet.
+        Accounts needing no additional factor receive the existing recovery token and wrapped key data.
+        Final tokens use purpose recovery_v2 and carry signed recovery_factor provenance; legacy
+        recovery tokens must restart email verification. Final issuance rechecks current policy
+        under the user lock before returning a token or wrapped keys; every recovery-token consumer
+        rechecks it again, so email-only authority cannot bypass a subsequently reserved inline factor.
 
         Rate limit: 5 requests per 15 minutes (IP-based).
 
@@ -1151,12 +1245,52 @@ paths:
                   description: 6-digit recovery code
       responses:
         '200':
-          description: Code verified — recovery token issued
+          description: Email verified — reserved-factor challenge or final recovery token issued
           content:
             application/json:
               schema:
                 type: object
+                oneOf:
+                - required: [mfa_required, mfa_challenge_token, methods]
+                  anyOf:
+                  - properties:
+                      methods:
+                        not:
+                          items:
+                            type: string
+                            enum: [webauthn]
+                  - required: [webauthn_options]
+                - required: [recovery_token, has_recovery_key, has_trusted_devices, has_recovery_circle]
                 properties:
+                  mfa_required:
+                    type: boolean
+                    description: True when an additional reserved-factor proof is required
+                  mfa_challenge_token:
+                    type: string
+                    description: recovery_challenge purpose; cannot authorize recovery operations
+                  methods:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                      enum: [totp, webauthn]
+                  webauthn_options:
+                    type: object
+                    description: Required when WebAuthn is the only offered method. The client also binds publicKey.rpId to the selected server.
+                    required: [publicKey]
+                    properties:
+                      publicKey:
+                        type: object
+                        required: [challenge, rpId]
+                        properties:
+                          challenge:
+                            type: string
+                            minLength: 1
+                            maxLength: 1024
+                          rpId:
+                            type: string
+                            minLength: 1
+                            maxLength: 253
                   recovery_token:
                     type: string
                   has_recovery_key:
@@ -1164,11 +1298,11 @@ paths:
                   recovery_wrapped_private_key:
                     type: string
                     format: byte
-                    description: Present when has_recovery_key is true
+                    description: Required and nonempty when has_recovery_key is true
                   recovery_key_salt:
                     type: string
                     format: byte
-                    description: Present when has_recovery_key is true
+                    description: Required and nonempty when has_recovery_key is true
                   recovery_wrapped_prefs_key:
                     type: string
                     format: byte
@@ -1194,6 +1328,12 @@ paths:
                     type: integer
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Recovery policy unavailable, unsupported, or no reserved factor can be challenged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/refresh:
     post:
       tags:
@@ -12634,7 +12774,25 @@ paths:
                     type: string
                     example: owner
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: >-
+            Validation error. Includes an inline `icon_url` or `banner_url` that is over the size
+            limit, is not a base64 `data:image/` URL declaring PNG, JPEG, GIF or WebP, or whose
+            bytes are not one of those formats. Animation is detected from the decoded bytes, not
+            the declared MIME type, and an image the server cannot classify is refused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: >-
+            An inline `icon_url` or `banner_url` that animates (a multi-frame GIF, an APNG or an
+            animated WebP) (#3856). A new server starts below Mach, so an animated banner is always
+            refused here, and an animated icon is refused at every tier. Static inline images are
+            accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnimatedMediaRefusedError'
         '429':
           description: 'Either the per-minute rate limit or the daily create quota.
             Only the quota carries `code: server_create_quota`; the account has
@@ -12903,16 +13061,26 @@ paths:
             `mfa_enrollment_required: true` when the actor has no inline MFA factor. None of them
             carries `delete_rate_limited` or `Retry-After`, because waiting does not lift a refusal.
             Nothing was changed. Route on the body flag, never the message text.
+
+
+            The same status also refuses an inline `data:image/` icon or banner that animates (#3856):
+            `animated_not_supported` for an icon at every tier, `animated_server_banner_mach` for a
+            banner on a server whose tier lacks animated banners. Static inline images are accepted.
           content:
             application/json:
               schema:
                 anyOf:
                 - $ref: '#/components/schemas/DangerousActionMFAForbiddenError'
+                - $ref: '#/components/schemas/AnimatedMediaRefusedError'
                 - $ref: '#/components/schemas/Error'
         '400':
           description: >-
             Invalid server ID, an unreadable or invalid request body (including an `mfa_code` over
-            256 characters), or an invalid `icon_url`.
+            256 characters), an invalid `icon_url` or `banner_url`, or an inline `data:image/` icon
+            or banner that is over the size limit, is not a base64 URL declaring PNG, JPEG, GIF or
+            WebP, or whose bytes are not one of those formats (#3856). Animation is detected from
+            the decoded bytes, not the declared MIME type, and an image the server cannot classify
+            is refused.
           content:
             application/json:
               schema:
@@ -15944,11 +16112,17 @@ paths:
       tags:
       - Users
       summary: Update current user profile
-      description: 'Update profile fields. All fields are optional.
+      description: >-
+        Update profile fields. All fields are optional.
 
         Rate limit: 10 requests per minute.
 
-        '
+
+        **Profile images are uploaded, never inlined (#3856).** Set an avatar or banner with
+        `POST /api/v1/media/upload/avatar` or `POST /api/v1/media/upload/banner`, then send the
+        canonical proxy URL here. A new `data:image/` value for `avatar_url` or `header_image_url`
+        is refused with a 400 carrying `code: inline_profile_image_unsupported`, on every tier.
+        Re-sending the exact value already stored is a no-op. An empty string clears the image.
       security:
       - BearerAuth: []
       requestBody:
@@ -15968,7 +16142,16 @@ paths:
                   user:
                     $ref: '#/components/schemas/User'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: >-
+            Validation error. A new inline `data:image/` avatar or banner returns
+            `code: inline_profile_image_unsupported` with a message that names the upload route.
+            The refusal rolls back the whole request, so no other field in it is applied.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/InlineProfileImageError'
+                - $ref: '#/components/schemas/Error'
         '409':
           description: Username already taken
           content:
@@ -19196,6 +19379,44 @@ components:
       required:
       - error
       - code
+    InlineProfileImageError:
+      type: object
+      additionalProperties: false
+      description: >-
+        A new inline `data:image/` avatar or banner on PATCH /users/me (#3856). The `error` text
+        names the upload route to use.
+      properties:
+        error:
+          type: string
+          example: Upload avatars with POST /api/v1/media/upload/avatar
+        code:
+          type: string
+          enum:
+          - inline_profile_image_unsupported
+      required:
+      - error
+      - code
+    AnimatedMediaRefusedError:
+      type: object
+      additionalProperties: false
+      description: >-
+        An inline server icon or banner that animates and the server may not use (#3856). The
+        codes and messages are the ones the upload routes return when they refuse animated media.
+      properties:
+        error:
+          type: string
+          example: Animated server banners require a Mach server boost
+        code:
+          type: string
+          description: >-
+            `animated_not_supported` for an icon (no tier may animate one);
+            `animated_server_banner_mach` for a banner on a server below Mach.
+          enum:
+          - animated_not_supported
+          - animated_server_banner_mach
+      required:
+      - error
+      - code
     ActivityHistoryRequiredConsent:
       type: object
       additionalProperties: false
@@ -19612,7 +19833,19 @@ components:
         avatar_url:
           type: string
           nullable: true
-          description: Data URL (max 500KB) or null to remove
+          description: >-
+            The canonical avatar proxy URL for this user (`/api/v1/media/avatars/{user_id}`), set
+            after an upload through `POST /api/v1/media/upload/avatar`. An empty string removes the
+            avatar; `null` leaves it unchanged. A new `data:image/` value is refused with a 400
+            (`inline_profile_image_unsupported`). Re-sending the stored value is a no-op.
+        header_image_url:
+          type: string
+          nullable: true
+          description: >-
+            The canonical banner proxy URL for this user (`/api/v1/media/banners/{user_id}`), set
+            after an upload through `POST /api/v1/media/upload/banner`. An empty string removes the
+            banner; `null` leaves it unchanged. A new `data:image/` value is refused with a 400
+            (`inline_profile_image_unsupported`). Re-sending the stored value is a no-op.
         links:
           type: array
           items:
@@ -19853,7 +20086,16 @@ components:
         icon_url:
           type: string
           nullable: true
-          description: Data URL (max 500KB)
+          description: >-
+            Static `data:image/` URL (PNG, JPEG, GIF or WebP, max 5 MiB). An animated icon is
+            refused with a 403.
+        banner_url:
+          type: string
+          nullable: true
+          description: >-
+            Static `data:image/` URL (PNG, JPEG, GIF or WebP, max 5 MiB). An animated banner is
+            refused with a 403 unless the new server's starting tier allows animated banners (a
+            self-hosted instance's tier does; Groundspeed does not).
     UpdateServerRequest:
       type: object
       required:
@@ -19866,7 +20108,17 @@ components:
         icon_url:
           type: string
           nullable: true
-          description: Data URL or null to remove
+          description: >-
+            The server's uploaded icon URL, a `data:image/` URL, or null to remove. An animated
+            inline icon is refused with a 403 at every tier. Re-sending the inline value the server
+            already stores is a no-op.
+        banner_url:
+          type: string
+          nullable: true
+          description: >-
+            The server's uploaded banner URL, a `data:image/` URL, or null to remove. An animated
+            inline banner is refused with a 403 unless the server's tier allows animated banners.
+            Re-sending the inline value the server already stores is a no-op.
         mfa_code:
           $ref: '#/components/schemas/DangerousActionMFACode'
     ExpirationRequest:

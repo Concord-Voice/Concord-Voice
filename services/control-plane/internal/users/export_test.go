@@ -33,3 +33,6 @@ func ReclaimErasedMediaForTest(
 ) {
 	s.reclaimErasedMedia(ctx, "", false, erasedMedia{tier1: tier1, tier2: tier2})
 }
+
+// MaxInlineResendLen exposes the inline re-send length bound to the boundary test.
+var MaxInlineResendLen = maxInlineResendLen

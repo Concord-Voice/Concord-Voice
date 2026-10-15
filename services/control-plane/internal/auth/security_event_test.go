@@ -356,7 +356,7 @@ func TestLogoutEmitsOnlyAfterCommittedRevoke(t *testing.T) {
 
 type recoveryTokenFailureChecker struct{ ambiguousRecoveryMFAChecker }
 
-func (recoveryTokenFailureChecker) GenerateRecoveryToken(string) (string, string, error) {
+func (recoveryTokenFailureChecker) GenerateRecoveryToken(string, string) (string, string, error) {
 	return "", "", errors.New("recovery token issuer failed")
 }
 
@@ -476,3 +476,78 @@ type noRows struct{}
 func (noRows) Columns() []string         { return []string{"id"} }
 func (noRows) Close() error              { return nil }
 func (noRows) Next([]driver.Value) error { return io.EOF }
+
+func TestRecoveryVerificationAttributesServerRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := sql.OpenDB(recoveryIssuanceConnector{})
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	for _, route := range []securityevent.RouteTemplate{securityevent.RouteRecoveryVerifyCode, securityevent.RouteAuthMFAVerify} {
+		t.Run(string(route), func(t *testing.T) {
+			recorder := &securityEventRecorder{}
+			h := &Handler{db: db, mfaChecker: &ambiguousRecoveryMFAChecker{}, log: logger.NewWithWriter(io.Discard)}
+			h.SetSecurityEvents(recorder)
+			path := strings.TrimPrefix(string(route), "POST ")
+			router := gin.New()
+			router.POST(path, func(c *gin.Context) { h.CompleteRecovery(c, "user", "totp") })
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+			require.Equal(t, http.StatusOK, response.Code)
+			require.Len(t, recorder.events, 1)
+			require.Equal(t, securityevent.ReasonRecoveryVerified, recorder.events[0].ReasonCode)
+			require.Equal(t, route, recorder.events[0].RouteTemplate)
+		})
+	}
+}
+
+type recoveryIssuancePolicyChecker struct {
+	ambiguousRecoveryMFAChecker
+	err error
+}
+
+func (s *recoveryIssuancePolicyChecker) ValidateRecoveryClaimsTx(context.Context, *sql.Tx, *RecoveryClaims) error {
+	return s.err
+}
+
+func TestRecoveryIssuanceRejectsChangedOrUnavailablePolicy(t *testing.T) {
+	db := sql.OpenDB(recoveryIssuanceConnector{})
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"changed", ErrRecoveryProofInvalid, http.StatusUnauthorized},
+		{"unavailable", ErrRecoveryPolicyUnavailable, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &securityEventRecorder{}
+			h := &Handler{db: db, mfaChecker: &recoveryIssuancePolicyChecker{err: tc.err}, log: logger.NewWithWriter(io.Discard)}
+			h.SetSecurityEvents(recorder)
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/recovery/verify-code", nil)
+			require.False(t, h.CompleteRecovery(c, "user", "email"))
+			require.Equal(t, tc.status, response.Code)
+			require.NotContains(t, response.Body.String(), "recovery_token")
+			require.NotContains(t, response.Body.String(), "recovery_wrapped_private_key")
+			require.Empty(t, recorder.events)
+		})
+	}
+}
+
+type recoveryIssuanceConnector struct{ noRowsConnector }
+
+func (recoveryIssuanceConnector) Connect(context.Context) (driver.Conn, error) {
+	return recoveryIssuanceConn{}, nil
+}
+
+type recoveryIssuanceConn struct{ noRowsConn }
+
+func (recoveryIssuanceConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return recoveryIssuanceTx{}, nil
+}
+
+type recoveryIssuanceTx struct{}
+
+func (recoveryIssuanceTx) Commit() error   { return nil }
+func (recoveryIssuanceTx) Rollback() error { return nil }

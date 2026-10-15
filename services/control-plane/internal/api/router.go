@@ -1038,6 +1038,7 @@ func NewRouter(
 	// spec §2). A setter, not an import: internal/stepup imports internal/auth.
 	authHandler.SetDefaultMethodReader(stepup.DefaultMethodReader(db))
 	mfaHandler.SetLoginCompleter(authHandler)
+	mfaHandler.SetRecoveryCompleter(authHandler)
 	mfaHandler.SetEmailService(emailSvc)
 	// A committed factor change bumps the user's permission generation (#3453):
 	// the MFA mask reads P1, so a cached value would otherwise outlive it. It

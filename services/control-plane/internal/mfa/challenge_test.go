@@ -4,10 +4,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/golang-jwt/jwt/v5"
 )
 
 const testJWTSecret = "test-secret-for-mfa-challenges" // #nosec G101
+
+func TestChallengeTokenPreservesAuthorityClaims(t *testing.T) {
+	want := ChallengeClaims{
+		UserID: "user-123", Purpose: PurposeLogin, CredentialEpoch: "epoch-abc",
+		PrimaryAuthMethod: securityevent.AuthMethod("password"), RefreshSessionID: "session-123", RecoveryFactor: "totp",
+	}
+	token, jti, err := generateChallengeTokenWithTTL(want, testJWTSecret, challengeTTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ValidateChallengeToken(token, testJWTSecret, want.Purpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserID != want.UserID || got.Purpose != want.Purpose || got.CredentialEpoch != want.CredentialEpoch ||
+		got.PrimaryAuthMethod != want.PrimaryAuthMethod || got.RefreshSessionID != want.RefreshSessionID || got.RecoveryFactor != want.RecoveryFactor {
+		t.Fatal("token lost authority claims")
+	}
+	if got.ID != jti || got.Issuer != ChallengeTokenIssuer || time.Until(got.ExpiresAt.Time) > challengeTTL || time.Until(got.ExpiresAt.Time) < challengeTTL-time.Minute {
+		t.Fatal("token has invalid registered claims")
+	}
+}
 
 func TestGenerateChallengeToken(t *testing.T) {
 	token, jti, err := GenerateChallengeToken("user-123", PurposeMFAUpgrade, testJWTSecret, "")

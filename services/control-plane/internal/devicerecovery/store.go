@@ -235,8 +235,11 @@ func expire(ctx context.Context, tx *sql.Tx, r Row, now time.Time) (Row, error) 
 	return after, nil
 }
 
+// RecoveryGuard rechecks signed recovery authority while the owner lock is held.
+type RecoveryGuard func(context.Context, *sql.Tx) error
+
 // Create fixes the requester context and database-bounded lifetime.
-func Create(ctx context.Context, db *sql.DB, userID, jti string, tokenExpiry time.Time, body CreateBody) (row Row, err error) {
+func Create(ctx context.Context, db *sql.DB, userID, jti string, tokenExpiry time.Time, body CreateBody, guard RecoveryGuard) (row Row, err error) {
 	if !CanonicalUUID(userID) || jti == "" || tokenExpiry.IsZero() {
 		return row, ErrUnauthorized
 	}
@@ -261,6 +264,12 @@ func Create(ctx context.Context, db *sql.DB, userID, jti string, tokenExpiry tim
 	}
 	defer func() { checkRollback(tx.Rollback(), &err) }()
 	if err = lockUser(ctx, tx, userID); err != nil {
+		return row, err
+	}
+	if guard == nil {
+		return row, ErrUnauthorized
+	}
+	if err = guard(ctx, tx); err != nil {
 		return row, err
 	}
 	var count int
@@ -302,13 +311,19 @@ func Create(ctx context.Context, db *sql.DB, userID, jti string, tokenExpiry tim
 }
 
 // Poll scopes reads to the verified requester and expires ciphertext after locks.
-func Poll(ctx context.Context, db *sql.DB, userID, jti, requestID string) (row Row, err error) {
+func Poll(ctx context.Context, db *sql.DB, userID, jti, requestID string, guard RecoveryGuard) (row Row, err error) {
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return row, fmt.Errorf("begin recovery read: %w", err)
 	}
 	defer func() { checkRollback(tx.Rollback(), &err) }()
 	if err = lockUser(ctx, tx, userID); err != nil {
+		return row, err
+	}
+	if guard == nil {
+		return row, ErrUnauthorized
+	}
+	if err = guard(ctx, tx); err != nil {
 		return row, err
 	}
 	row, err = lockRequest(ctx, tx, userID, requestID, Encode(Hash(jti)))
@@ -476,7 +491,7 @@ func respondTransition(row Row, body RespondBody, now time.Time) (Row, error) {
 }
 
 // Complete acknowledges the approved transcript without consuming the reset token.
-func Complete(ctx context.Context, db *sql.DB, userID, jti, requestID string, body CompleteBody) (result ResponseResult, err error) {
+func Complete(ctx context.Context, db *sql.DB, userID, jti, requestID string, body CompleteBody, guard RecoveryGuard) (result ResponseResult, err error) {
 	if body.ProtocolVersion != Version {
 		return result, &APIError{http.StatusBadRequest, UpdateMessage}
 	}
@@ -489,6 +504,12 @@ func Complete(ctx context.Context, db *sql.DB, userID, jti, requestID string, bo
 	}
 	defer func() { checkRollback(tx.Rollback(), &err) }()
 	if err = lockUser(ctx, tx, userID); err != nil {
+		return result, err
+	}
+	if guard == nil {
+		return result, ErrUnauthorized
+	}
+	if err = guard(ctx, tx); err != nil {
 		return result, err
 	}
 	row, err := lockRequest(ctx, tx, userID, requestID, Encode(Hash(jti)))

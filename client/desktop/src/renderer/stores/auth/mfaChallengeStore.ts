@@ -7,7 +7,7 @@ import type { SSOCompletionResult, SSOProvider } from '../../services/system/sso
  * Purpose discriminates which interceptor / flow is awaiting the MFA result.
  * This is a client-side routing label only — the backend's challenge token
  * encodes its own purpose (PurposeLogin, PurposeSuspiciousRefresh,
- * PurposeMFAUpgrade per `services/control-plane/internal/mfa/handlers.go`)
+ * PurposeMFAUpgrade, PurposeRecoveryChallenge per `services/control-plane/internal/mfa/handlers.go`)
  * and never sees this discriminator. The client uses 'sso_login' to route the
  * SSO post-verify flow even though the underlying challenge is PurposeLogin
  * on the wire.
@@ -17,6 +17,8 @@ import type { SSOCompletionResult, SSOProvider } from '../../services/system/sso
  * - 'sso_login': SSO sign-in surfaced an mfa_required response from the
  *   provider callback; useSSOFlow awaits the verified result before flipping
  *   the SSO store to idle and rehydrating E2EE.
+ * - 'recovery': email ownership is proved; a reserved factor must complete
+ *   before the server returns recovery authority and wrapped recovery keys.
  *
  * MFAChallengeModal renders the same UI for both purposes but branches on it at
  * verification (#2424): 'suspicious_refresh' POSTs /api/v1/auth/mfa/verify from
@@ -24,7 +26,7 @@ import type { SSOCompletionResult, SSOProvider } from '../../services/system/sso
  * `sso:completeMFA` main handler so the SSO refresh token never crosses IPC. The
  * SSO branch requires `ssoContext` (provider + reserved owner) to be present.
  */
-type MFAChallengePurpose = 'suspicious_refresh' | 'sso_login';
+type MFAChallengePurpose = 'suspicious_refresh' | 'sso_login' | 'recovery';
 
 /**
  * SSO-only routing context (#2424). Present on the store ONLY for the
@@ -46,6 +48,7 @@ export interface MFASSOContext {
  *   user, e2ee_keys, remember_me. SSO MFA challenges use this purpose.
  * - PurposeSuspiciousRefresh / PurposeMFAUpgrade → only { verified, purpose,
  *   user_id }. None of the fields below will be present.
+ * - PurposeRecoveryChallenge → recovery_token and recovery key metadata.
  *
  * MFAChallengeModal forwards res.json() to completeChallenge unconditionally,
  * so a suspicious_refresh response WILL land in this type with everything
@@ -55,6 +58,15 @@ export interface MFASSOContext {
  * access — it is not typed against this interface.
  */
 export interface MFAVerifyResponse {
+  /** Recovery challenges return recovery authority, never a signed-in session. */
+  recovery_token?: string;
+  has_recovery_key?: boolean;
+  recovery_wrapped_private_key?: string;
+  recovery_key_salt?: string;
+  recovery_wrapped_prefs_key?: string;
+  recovery_prefs_key_salt?: string;
+  has_trusted_devices?: boolean;
+  has_recovery_circle?: boolean;
   access_token?: string;
   refresh_token?: string;
   session_id?: string;

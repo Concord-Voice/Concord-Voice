@@ -357,10 +357,16 @@ func (s *stubMFAChecker) GenerateUpgradeChallenge(_ context.Context, _, _ string
 func (s *stubMFAChecker) BeginWebAuthnLogin(_ context.Context, _ string, _ string) (interface{}, error) {
 	return s.WebAuthnOptions, s.WebAuthnErr
 }
-func (s *stubMFAChecker) GenerateRecoveryToken(_ string) (string, string, error) {
+func (s *stubMFAChecker) GenerateRecoveryToken(_, _ string) (string, string, error) {
 	return s.RecoveryTokenStub, s.RecoveryTokenJTI, nil
 }
-func (s *stubMFAChecker) ValidateRecoveryToken(_ string) (*auth.RecoveryClaims, error) {
+func (*stubMFAChecker) GetRecoveryMethods(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+func (*stubMFAChecker) GenerateRecoveryChallenge(context.Context, string) (string, string, error) {
+	return "", "", nil
+}
+func (s *stubMFAChecker) ValidateRecoveryToken(_ context.Context, _ string) (*auth.RecoveryClaims, error) {
 	return nil, nil //nolint:nilnil // deliberate stub
 }
 
@@ -614,4 +620,8 @@ func TestNormalizeUsername_LowercasesViaAdapter(t *testing.T) {
 	rig := newAdapterRig(t)
 	assert.Equal(t, "mixedcase", rig.Handler.NormalizeUsername("MixedCase"))
 	assert.Equal(t, "alllower", rig.Handler.NormalizeUsername("alllower"))
+}
+
+func (*stubMFAChecker) ValidateRecoveryClaimsTx(context.Context, *sql.Tx, *auth.RecoveryClaims) error {
+	return nil
 }

@@ -86,10 +86,18 @@ func (s *mfaMethodsStub) GenerateUpgradeChallenge(_ context.Context, _, refreshS
 func (s *mfaMethodsStub) BeginWebAuthnLogin(context.Context, string, string) (interface{}, error) {
 	return nil, nil
 }
-func (s *mfaMethodsStub) GenerateRecoveryToken(string) (string, string, error) {
+func (s *mfaMethodsStub) GenerateRecoveryToken(string, string) (string, string, error) {
 	return "", "", nil
 }
-func (s *mfaMethodsStub) ValidateRecoveryToken(string) (*RecoveryClaims, error) { return nil, nil }
+func (*mfaMethodsStub) GetRecoveryMethods(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+func (*mfaMethodsStub) GenerateRecoveryChallenge(context.Context, string) (string, string, error) {
+	return "", "", nil
+}
+func (s *mfaMethodsStub) ValidateRecoveryToken(context.Context, string) (*RecoveryClaims, error) {
+	return nil, nil
+}
 
 func newMFAChallengeRecorder() (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)
@@ -505,5 +513,9 @@ func (r *suspiciousEpochRows) Next(dest []driver.Value) error {
 	}
 	r.returned = true
 	dest[0] = "epoch-fixture"
+	return nil
+}
+
+func (*mfaMethodsStub) ValidateRecoveryClaimsTx(context.Context, *sql.Tx, *RecoveryClaims) error {
 	return nil
 }

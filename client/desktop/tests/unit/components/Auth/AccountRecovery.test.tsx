@@ -1,8 +1,12 @@
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { deferred } from '../../../helpers/deferred';
+import MFAChallengeModal from '@/renderer/components/Auth/MFAChallengeModal';
+import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
+import { apiUrl } from '@/renderer/services/system/runtimeServerBase';
 
 // Queue API responses at the HTTP boundary; retain real fetch.
 const mockApiResponse = vi.fn();
@@ -76,8 +80,213 @@ describe('AccountRecovery', () => {
 
   beforeEach(() => {
     resetAllStores();
+    server.resetHandlers();
     vi.clearAllMocks();
     mockApiResponse.mockReset();
+  });
+
+  it('waits for the reserved factor through the real MFA dialog before offering reset', async () => {
+    let proof: unknown;
+    server.use(
+      http.post(apiUrl('/api/v1/auth/recovery/begin'), () => HttpResponse.json({})),
+      http.post(apiUrl('/api/v1/auth/recovery/verify-code'), () =>
+        HttpResponse.json({
+          mfa_required: true,
+          mfa_challenge_token: 'recovery-challenge-test',
+          methods: ['totp'],
+        })
+      ),
+      http.post(apiUrl('/api/v1/auth/mfa/verify'), async ({ request }) => {
+        proof = await request.json();
+        return HttpResponse.json({
+          recovery_token: 'completed-recovery-test',
+          has_recovery_key: false,
+          has_trusted_devices: false,
+          has_recovery_circle: false,
+        });
+      })
+    );
+    render(
+      <>
+        <AccountRecovery onBack={onBack} onComplete={onComplete} />
+        <MFAChallengeModal />
+      </>
+    );
+    fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
+      target: { value: 'test@example.com' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
+    await screen.findByLabelText('Verification Code');
+    fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Verify Code' }));
+    await screen.findByRole('dialog', { name: 'Verify Your Identity' });
+    expect(useMFAChallengeStore.getState().purpose).toBe('recovery');
+    expect(screen.queryByText('No recovery key found')).not.toBeInTheDocument();
+    fireEvent.paste(screen.getByRole('textbox', { name: 'Digit 1' }), {
+      clipboardData: { getData: () => '654321' },
+    });
+    await screen.findByText('No recovery key found');
+    expect(proof).toEqual({
+      mfa_challenge_token: 'recovery-challenge-test',
+      method: 'totp',
+      code: '654321',
+    });
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it('keeps recovery closed when the reserved-factor prompt is cancelled', async () => {
+    server.use(
+      http.post(apiUrl('/api/v1/auth/recovery/begin'), () => HttpResponse.json({})),
+      http.post(apiUrl('/api/v1/auth/recovery/verify-code'), () =>
+        HttpResponse.json({
+          mfa_required: true,
+          mfa_challenge_token: 'cancelled-recovery-test',
+          methods: ['totp'],
+        })
+      )
+    );
+    render(
+      <>
+        <AccountRecovery onBack={onBack} onComplete={onComplete} />
+        <MFAChallengeModal />
+      </>
+    );
+    fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
+      target: { value: 'test@example.com' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
+    await screen.findByLabelText('Verification Code');
+    fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Verify Code' }));
+    await screen.findByRole('dialog', { name: 'Verify Your Identity' });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Send Recovery Code' })).toBeEnabled();
+    expect(screen.queryByText('No recovery key found')).not.toBeInTheDocument();
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it.each(['auth', 'server'])(
+    'cancels a pending recovery challenge on %s change',
+    async (change) => {
+      const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+      const { setRuntimeServerBase, resetRuntimeServerBase } =
+        await import('@/renderer/services/system/runtimeServerBase');
+      server.use(
+        http.post(apiUrl('/api/v1/auth/recovery/begin'), () => HttpResponse.json({})),
+        http.post(apiUrl('/api/v1/auth/recovery/verify-code'), () =>
+          HttpResponse.json({
+            mfa_required: true,
+            mfa_challenge_token: 'pending-recovery-test',
+            methods: ['totp'],
+          })
+        )
+      );
+      try {
+        render(
+          <>
+            <AccountRecovery onBack={onBack} onComplete={onComplete} />
+            <MFAChallengeModal />
+          </>
+        );
+        fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
+          target: { value: 'test@example.com' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
+        await screen.findByLabelText('Verification Code');
+        fireEvent.change(screen.getByLabelText('Verification Code'), {
+          target: { value: '123456' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Verify Code' }));
+        await screen.findByRole('dialog', { name: 'Verify Your Identity' });
+        act(() => {
+          if (change === 'auth') {
+            useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 });
+          } else {
+            setRuntimeServerBase('https://other-recovery.example');
+          }
+        });
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
+        expect(screen.getByText('Recovery context changed. Start again.')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Send Recovery Code' })).toBeEnabled();
+      } finally {
+        resetRuntimeServerBase();
+      }
+    }
+  );
+
+  it('releases a stale social request without clearing a newer code-send spinner', async () => {
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+    await advanceToRecoveryKeyStep();
+    const socialStarted = deferred<void>();
+    const socialReply = deferred<void>();
+    const beginStarted = deferred<void>();
+    const beginReply = deferred<void>();
+    server.use(
+      http.post(apiUrl('/api/v1/auth/recovery/social-request'), async () => {
+        socialStarted.resolve();
+        await socialReply.promise;
+        return HttpResponse.json({
+          request_id: '22222222-2222-2222-2222-222222222222',
+          threshold_k: 3,
+        });
+      }),
+      http.post(apiUrl('/api/v1/auth/recovery/begin'), async () => {
+        beginStarted.resolve();
+        await beginReply.promise;
+        return HttpResponse.json({});
+      })
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Recover via Recovery Circle' }));
+    await socialStarted.promise;
+    act(() =>
+      useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
+    );
+    expect(screen.getByRole('button', { name: 'Send Recovery Code' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
+    await beginStarted.promise;
+    expect(screen.getByText('Sending...')).toBeInTheDocument();
+    await act(async () => socialReply.resolve());
+    expect(screen.getByText('Sending...')).toBeInTheDocument();
+    await act(async () => beginReply.resolve());
+    await screen.findByLabelText('Verification Code');
+  });
+
+  it('restarts after a reserved factor returns incomplete recovery data', async () => {
+    server.use(
+      http.post(apiUrl('/api/v1/auth/recovery/begin'), () => HttpResponse.json({})),
+      http.post(apiUrl('/api/v1/auth/recovery/verify-code'), () =>
+        HttpResponse.json({
+          mfa_required: true,
+          mfa_challenge_token: 'incomplete-recovery-test',
+          methods: ['totp'],
+        })
+      ),
+      http.post(apiUrl('/api/v1/auth/mfa/verify'), () =>
+        HttpResponse.json({ recovery_token: 'incomplete-recovery-test' })
+      )
+    );
+    render(
+      <>
+        <AccountRecovery onBack={onBack} onComplete={onComplete} />
+        <MFAChallengeModal />
+      </>
+    );
+    fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
+      target: { value: 'test@example.com' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
+    await screen.findByLabelText('Verification Code');
+    fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Verify Code' }));
+    await screen.findByRole('dialog', { name: 'Verify Your Identity' });
+    fireEvent.paste(screen.getByRole('textbox', { name: 'Digit 1' }), {
+      clipboardData: { getData: () => '654321' },
+    });
+    await screen.findByText('Recovery verification is incomplete. Start again.');
+    expect(screen.getByRole('button', { name: 'Send Recovery Code' })).toBeEnabled();
+    expect(screen.queryByLabelText('Verification Code')).not.toBeInTheDocument();
   });
 
   // --- Step 1: Email ---
@@ -208,6 +417,110 @@ describe('AccountRecovery', () => {
       expect(screen.getByText('Enter the 6-digit code sent to your email')).toBeInTheDocument();
     });
   }
+
+  it.each([
+    { recovery_token: 'token-only' },
+    {
+      recovery_token: 'missing-material',
+      has_recovery_key: true,
+      has_trusted_devices: false,
+      has_recovery_circle: false,
+    },
+  ])('rejects incomplete recovery capability data %j', async (payload) => {
+    await advanceToVerifyStep();
+    mockApiResponse.mockResolvedValueOnce({ ok: true, json: async () => payload });
+    fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '123456' } });
+    fireEvent.click(screen.getByText('Verify Code'));
+    await screen.findByText('Recovery verification is incomplete. Start again.');
+    expect(screen.getByRole('button', { name: 'Send Recovery Code' })).toBeEnabled();
+    expect(screen.queryByLabelText('Verification Code')).not.toBeInTheDocument();
+    expect(screen.queryByText('No recovery key found')).not.toBeInTheDocument();
+    expect(screen.queryByText('Recover Account')).not.toBeInTheDocument();
+  });
+
+  it.each([undefined, { challenge: 'invalid' }])(
+    'rejects unusable WebAuthn-only recovery options %j',
+    async (options) => {
+      await advanceToVerifyStep();
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          mfa_required: true,
+          mfa_challenge_token: 'unavailable-challenge',
+          methods: ['webauthn'],
+          webauthn_options: options,
+        }),
+      });
+      fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '123456' } });
+      fireEvent.click(screen.getByText('Verify Code'));
+      await screen.findByText('Recovery verification is unavailable. Request a new email code.');
+      expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
+      expect(screen.getByText('Send Recovery Code')).toBeEnabled();
+    }
+  );
+
+  it.each([
+    'Recover Account',
+    'Recover from trusted device instead',
+    'Recover via Recovery Circle',
+  ])('refuses stale issued recovery before %s', async (action) => {
+    const crypto = await import('@/renderer/utils/crypto/crypto');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+    await advanceToRecoveryKeyStep();
+    fireEvent.change(screen.getByLabelText('Recovery Key'), { target: { value: 'key' } });
+    useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 });
+    fireEvent.click(screen.getByText(action));
+    await screen.findByText('Recovery context changed. Start again.');
+    expect(crypto.unwrapWithRecoveryKey).not.toHaveBeenCalled();
+    expect(crypto.generateECDHKeyPair).not.toHaveBeenCalled();
+    expect(mockApiResponse).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('Send Recovery Code')).toBeEnabled();
+  });
+
+  it('clears issued material after a server change and refuses a pending unwrap result', async () => {
+    const crypto = await import('@/renderer/utils/crypto/crypto');
+    const { setRuntimeServerBase, resetRuntimeServerBase } =
+      await import('@/renderer/services/system/runtimeServerBase');
+    let finish: (bytes: ArrayBuffer) => void = () => {};
+    vi.mocked(crypto.unwrapWithRecoveryKey).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    await advanceToRecoveryKeyStep();
+    fireEvent.change(screen.getByLabelText('Recovery Key'), { target: { value: 'key' } });
+    fireEvent.click(screen.getByText('Recover Account'));
+    const bytes = new Uint8Array([1, 2, 3]);
+    await act(async () => {
+      setRuntimeServerBase('https://other-recovery.example');
+      finish(bytes.buffer);
+    });
+    expect(bytes).toEqual(new Uint8Array(3));
+    expect(screen.getByText('Send Recovery Code')).toBeEnabled();
+    expect(screen.queryByLabelText('New Password')).not.toBeInTheDocument();
+    expect(mockApiResponse).toHaveBeenCalledTimes(2);
+    resetRuntimeServerBase();
+  });
+
+  it('clears recovered key bytes when auth changes before password reset', async () => {
+    const crypto = await import('@/renderer/utils/crypto/crypto');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+    const bytes = new Uint8Array([1, 2, 3]);
+    vi.mocked(crypto.unwrapWithRecoveryKey).mockResolvedValueOnce(bytes.buffer);
+    await advanceToRecoveryKeyStep();
+    fireEvent.change(screen.getByLabelText('Recovery Key'), { target: { value: 'key' } });
+    fireEvent.click(screen.getByText('Recover Account'));
+    await screen.findByLabelText('New Password');
+    act(() =>
+      useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
+    );
+    expect(bytes).toEqual(new Uint8Array(3));
+    expect(screen.queryByText('Reset Password')).not.toBeInTheDocument();
+    expect(screen.getByText('Send Recovery Code')).toBeEnabled();
+    expect(crypto.rewrapRecoveryAccountKey).not.toHaveBeenCalled();
+    expect(mockApiResponse).toHaveBeenCalledTimes(2);
+  });
 
   it('renders verification code input', async () => {
     await advanceToVerifyStep();
@@ -474,6 +787,8 @@ describe('AccountRecovery', () => {
         has_recovery_key: true,
         has_trusted_devices: false,
         has_recovery_circle: false,
+        recovery_wrapped_private_key: 'mock-wrapped',
+        recovery_key_salt: 'mock-salt',
       }),
     });
     fireEvent.change(screen.getByPlaceholderText('000000'), {
@@ -872,6 +1187,119 @@ describe('AccountRecovery', () => {
     await waitFor(() => {
       expect(screen.getByText('0 / 3 shares received')).toBeInTheDocument();
     });
+  });
+
+  it('starts a new social ceremony at zero after the account lifecycle changes', async () => {
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    try {
+      await advanceToRecoveryKeyStep();
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 3 }),
+      });
+      fireEvent.click(screen.getByText('Recover via Recovery Circle'));
+      await screen.findByText('0 / 3 shares received');
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: 'pending', shares_received: 2 }),
+      });
+      const poll = interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+      if (typeof poll !== 'function') throw new Error('Social recovery poll was not started');
+      await act(async () => {
+        await poll();
+      });
+      expect(screen.getByText('2 / 3 shares received')).toBeInTheDocument();
+      act(() =>
+        useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
+      );
+      mockApiResponse.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+      fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
+      await screen.findByLabelText('Verification Code');
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          recovery_token: 'new-ceremony-token',
+          has_recovery_key: true,
+          has_trusted_devices: false,
+          has_recovery_circle: true,
+          recovery_wrapped_private_key: 'mock-wrapped',
+          recovery_key_salt: 'mock-salt',
+        }),
+      });
+      fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '654321' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Verify Code' }));
+      await screen.findByText('Enter your recovery key to restore your encrypted data');
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ request_id: '33333333-3333-3333-3333-333333333333', threshold_k: 4 }),
+      });
+      fireEvent.click(screen.getByText('Recover via Recovery Circle'));
+      await screen.findByText('0 / 4 shares received');
+    } finally {
+      interval.mockRestore();
+    }
+  });
+
+  it('wipes decrypted social shares when auth changes during the final decrypt', async () => {
+    const crypto = await import('@/renderer/utils/crypto/crypto');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+    const firstShare = new Uint8Array([1, 2, 3]);
+    const secondShare = new Uint8Array([4, 5, 6]);
+    const secondStarted = deferred();
+    const secondDecrypt = deferred<ArrayBuffer>();
+    vi.mocked(crypto.decryptWithSharedSecret)
+      .mockResolvedValueOnce(firstShare.buffer)
+      .mockImplementationOnce(() => {
+        secondStarted.resolve();
+        return secondDecrypt.promise;
+      });
+    const encryptedShare = (index: number) =>
+      btoa(
+        JSON.stringify({ ephemeral_public_key: 'mock', encrypted_data: 'mock', share_index: index })
+      );
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    try {
+      await advanceToRecoveryKeyStep();
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 2 }),
+      });
+      mockApiResponse.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'complete',
+          shares_received: 2,
+          responses: [
+            { encrypted_share: encryptedShare(1) },
+            { encrypted_share: encryptedShare(2) },
+          ],
+        }),
+      });
+      fireEvent.click(screen.getByText('Recover via Recovery Circle'));
+      await screen.findByText('Waiting for Recovery Circle approval');
+      const poll = interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+      if (typeof poll !== 'function') throw new Error('Social recovery poll was not started');
+      let pollPromise: Promise<void> | undefined;
+      await act(async () => {
+        pollPromise = poll() as Promise<void>;
+        await secondStarted.promise;
+      });
+      expect(firstShare).toEqual(new Uint8Array([1, 2, 3]));
+      act(() =>
+        useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
+      );
+      await act(async () => {
+        secondDecrypt.resolve(secondShare.buffer);
+        await pollPromise;
+      });
+      expect(firstShare).toEqual(new Uint8Array(3));
+      expect(secondShare).toEqual(new Uint8Array(3));
+      expect(screen.queryByLabelText('New Password')).not.toBeInTheDocument();
+      expect(screen.getByText('Send Recovery Code')).toBeEnabled();
+    } finally {
+      interval.mockRestore();
+    }
   });
 
   // --- Back to Login always visible ---

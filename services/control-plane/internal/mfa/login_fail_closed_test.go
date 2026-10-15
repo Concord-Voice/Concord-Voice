@@ -879,7 +879,7 @@ func TestMFAUpgradeReportsABypassItCouldNotWrite(t *testing.T) {
 			}
 			c, response := enrollRequest("/api/v1/auth/mfa/verify", "", "")
 
-			completed := h.completeVerifyPurpose(context.Background(), c, claims, PurposeMFAUpgrade, false)
+			completed := h.completeVerifyPurpose(context.Background(), c, claims, PurposeMFAUpgrade, false, "")
 
 			require.Equal(t, tc.status, response.Code, response.Body.String())
 			require.Equal(t, !tc.fail, completed)
@@ -1922,7 +1922,7 @@ func TestCompleteVerifyPurposeFailsWithNoLoginCompleterWired(t *testing.T) {
 	claims := &ChallengeClaims{UserID: enrollUser, RegisteredClaims: jwt.RegisteredClaims{ID: "jti-fixture"}}
 	c, response := enrollRequest("/api/v1/auth/mfa/verify", "", "")
 
-	ok := h.completeVerifyPurpose(context.Background(), c, claims, PurposeLogin, false)
+	ok := h.completeVerifyPurpose(context.Background(), c, claims, PurposeLogin, false, "")
 
 	require.False(t, ok)
 	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
@@ -1942,7 +1942,7 @@ func TestCompleteVerifyPurposeLogsWhenTheRememberKeyCannotBeCleared(t *testing.T
 	claims := &ChallengeClaims{UserID: enrollUser, RegisteredClaims: jwt.RegisteredClaims{ID: "jti-fixture"}}
 	c, response := enrollRequest("/api/v1/auth/mfa/verify", "", "")
 
-	ok := h.completeVerifyPurpose(context.Background(), c, claims, PurposeLogin, false)
+	ok := h.completeVerifyPurpose(context.Background(), c, claims, PurposeLogin, false, "")
 
 	require.True(t, ok)
 	require.True(t, completer.called)

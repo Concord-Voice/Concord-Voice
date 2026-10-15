@@ -127,7 +127,7 @@ func TestCompleteVerifyPurposePreservesSignedPrimaryAuthMethod(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", nil)
 			claims := &ChallengeClaims{UserID: "test-user", Purpose: PurposeLogin, PrimaryAuthMethod: test.method, RegisteredClaims: jwt.RegisteredClaims{ID: "test-challenge-" + test.name}}
 
-			ok := h.completeVerifyPurpose(c.Request.Context(), c, claims, PurposeLogin, false)
+			ok := h.completeVerifyPurpose(c.Request.Context(), c, claims, PurposeLogin, false, "")
 			require.Equal(t, test.wantOK, ok)
 			require.Equal(t, test.wantOK, completer.called)
 			if test.wantOK {

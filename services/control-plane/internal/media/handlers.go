@@ -1328,7 +1328,7 @@ func (h *Handler) processGIFTier1Image(c *gin.Context, file multipart.File, job 
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
 		return nil, false
 	}
-	if len(g.Image) <= 1 {
+	if !isAnimatedGIF(g) {
 		// Static GIF keeps the flatten path for every tier (#1302 decision 5).
 		return h.processStaticTier1Image(c, bytes.NewReader(raw), job)
 	}
@@ -1344,6 +1344,20 @@ func (h *Handler) processGIFTier1Image(c *gin.Context, file multipart.File, job 
 	return processed, true
 }
 
+// Typed refusal codes and messages for animated media (#1522 pattern). The
+// server pairs are exported so the inline server icon/banner gate in
+// internal/servers answers with the same bodies as the upload routes (#3856);
+// the profile pair is exported alongside them so the set stays in one place.
+const (
+	CodeAnimatedProfilePremium   = "animated_profile_premium"
+	CodeAnimatedServerBannerMach = "animated_server_banner_mach"
+	CodeAnimatedNotSupported     = "animated_not_supported"
+
+	MsgAnimatedProfilePremium   = "Animated avatars and banners require a premium subscription"
+	MsgAnimatedServerBannerMach = "Animated server banners require a Mach server boost"
+	MsgAnimatedNotSupported     = "Animated images are not supported for this upload type"
+)
+
 // authorizeAnimatedUpload enforces the animated-media entitlements (#1302):
 // user axis (AllowAnimatedProfile) for avatar/banner, server axis
 // (AllowAnimatedServerBanner) for server banners, rejected for every other
@@ -1355,8 +1369,8 @@ func (h *Handler) authorizeAnimatedUpload(c *gin.Context, userID, purpose, serve
 		ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
 		if !ent.AllowAnimatedProfile {
 			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Animated avatars and banners require a premium subscription",
-				"code":  "animated_profile_premium",
+				"error": MsgAnimatedProfilePremium,
+				"code":  CodeAnimatedProfilePremium,
 			})
 			return false
 		}
@@ -1364,15 +1378,15 @@ func (h *Handler) authorizeAnimatedUpload(c *gin.Context, userID, purpose, serve
 		serverEnt := entitlements.ForServer(h.serverTier(c.Request.Context(), serverID))
 		if !serverEnt.AllowAnimatedServerBanner {
 			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Animated server banners require a Mach server boost",
-				"code":  "animated_server_banner_mach",
+				"error": MsgAnimatedServerBannerMach,
+				"code":  CodeAnimatedServerBannerMach,
 			})
 			return false
 		}
 	default:
 		c.JSON(http.StatusForbidden, gin.H{
-			"error": "Animated images are not supported for this upload type",
-			"code":  "animated_not_supported",
+			"error": MsgAnimatedNotSupported,
+			"code":  CodeAnimatedNotSupported,
 		})
 		return false
 	}

@@ -608,6 +608,23 @@ type profileUpdateBuilder struct {
 	usernameChangeIntervalMonths int
 	previousUsername             string
 	extraResponse                map[string]interface{} // additional fields to include in error responses
+	// pendingInlineResends are inline data:image/ avatar/banner values the request
+	// carried. A new inline value is always refused (#3856), but an exact re-send of
+	// the value already stored is a no-op, and that can only be decided against the
+	// stored column under the row lock — so the validators record the value here and
+	// executeProfileUpdateTransaction resolves it.
+	pendingInlineResends []inlineProfileResend
+}
+
+// inlineProfileResend is one inline profile-image value awaiting comparison with
+// the stored column.
+type inlineProfileResend struct {
+	// matchQuery is a fixed statement comparing the stored column to $2 for user $1
+	// (never built from input; one per column).
+	matchQuery string
+	value      string
+	// uploadHint is the 400 message when the value is not the stored one.
+	uploadHint string
 }
 
 func newProfileUpdateBuilder() *profileUpdateBuilder {
@@ -715,65 +732,107 @@ func validateBio(b *profileUpdateBuilder, bio string) (int, string) {
 	return 0, ""
 }
 
-// dataURLHeaderSlack budgets the "data:image/<type>;base64," prefix length.
-const dataURLHeaderSlack = 64
+// inlineProfileImageCode is the typed 400 code for a new inline data:image/ avatar
+// or banner (#3856). The inline path stored the bytes verbatim, so a free account
+// could set an animated GIF that every client renders with <img> — bypassing the
+// Supersonic-only upload gate (animated_profile_premium). Refusing every NEW
+// inline value, at every tier, closes it; the upload routes are the only way in.
+const inlineProfileImageCode = "inline_profile_image_unsupported"
 
-// maxDataURLLen converts an entitlement byte limit into a data-URL string-length
-// bound (base64 inflates ~4/3). Both the inline data-URL caps below and the MinIO
-// upload path derive from the entitlements source, so neither is a magic number (#1298).
-func maxDataURLLen(maxBytes int64) int {
-	return base64.StdEncoding.EncodedLen(int(maxBytes)) + dataURLHeaderSlack
-}
+const (
+	errMsgAvatarURL       = "Avatar must be an uploaded avatar URL for this user"
+	errMsgHeaderImageURL  = "Header image must be an uploaded banner URL for this user"
+	avatarUploadHint      = "Upload avatars with POST /api/v1/media/upload/avatar"
+	headerImageUploadHint = "Upload banners with POST /api/v1/media/upload/banner"
 
-// Inline data-URL profile images are broadcast VERBATIM to every connected client
-// (UpdateMe -> hub.BroadcastToAll embeds avatar_url/header_image_url), so the inline
-// size ceiling is pinned to the FREE entitlement for ALL tiers. A premium user's larger
-// allowance is honored only on the MinIO upload path (UploadAvatar/UploadBanner), which
-// broadcasts a storage KEY rather than the blob. Pinning the inline cap closes the
-// broadcast-amplification surface a per-tier inline cap would open (#1298 review, Gitar).
-var (
-	inlineDataURLAvatarMax = entitlements.For(entitlements.TierFree).MaxAvatarBytes
-	inlineDataURLBannerMax = entitlements.For(entitlements.TierFree).MaxBannerBytes
+	// Fixed comparisons of a stored profile-image column with a re-sent value
+	// ($2) for user $1. IS NOT DISTINCT FROM keeps a NULL column a plain "no
+	// match" instead of an unknown that could pass as a match.
+	avatarResendMatchQuery = `SELECT avatar_url IS NOT DISTINCT FROM $2 FROM users WHERE id = $1`
+	headerResendMatchQuery = `SELECT header_image_url IS NOT DISTINCT FROM $2 FROM users WHERE id = $1`
 )
 
-// validateAvatarURL validates and appends the avatar_url clause.
+// retiredInlineHeaderSlack is the "data:image/<type>;base64," allowance the
+// retired inline cap added on top of the encoded bytes.
+const retiredInlineHeaderSlack = 64
+
+// maxInlineResendLen bounds an inline value before it reaches the database. It
+// is the retired inline cap: the free tier's limit, base64-encoded, plus the
+// header slack. Both columns had the same limit, so one bound covers both, and a
+// longer value cannot be a stored one.
+var maxInlineResendLen = base64.StdEncoding.EncodedLen(int(max(
+	entitlements.For(entitlements.TierFree).MaxAvatarBytes,
+	entitlements.For(entitlements.TierFree).MaxBannerBytes,
+))) + retiredInlineHeaderSlack
+
+// queueInlineResend records an inline value for the stored-value comparison, or
+// refuses it at once when it cannot be the stored value: too long, or carrying a
+// NUL byte, which a Postgres text column never holds (sending one would fail
+// the comparison query as a database error).
+func queueInlineResend(b *profileUpdateBuilder, matchQuery, value, uploadHint string) (int, string) {
+	if len(value) > maxInlineResendLen || strings.IndexByte(value, 0) >= 0 {
+		b.extraResponse = map[string]interface{}{"code": inlineProfileImageCode}
+		return http.StatusBadRequest, uploadHint
+	}
+	b.pendingInlineResends = append(b.pendingInlineResends, inlineProfileResend{
+		matchQuery: matchQuery, value: value, uploadHint: uploadHint,
+	})
+	return 0, ""
+}
+
+// validateAvatarURL validates and appends the avatar_url clause. An inline
+// data:image/ value adds no clause: it is only ever accepted as an exact re-send
+// of the stored value, which executeProfileUpdateTransaction decides.
 func validateAvatarURL(b *profileUpdateBuilder, avatarURL string, userID interface{}) (int, string) {
 	if avatarURL == "" {
 		b.addClause("avatar_url", nil)
 		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotAvatar)
 		return 0, ""
 	}
-	expectedAvatarURL := fmt.Sprintf("/api/v1/media/avatars/%s", userID)
-	if avatarURL != expectedAvatarURL && !strings.HasPrefix(avatarURL, dataImagePrefix) {
-		return http.StatusBadRequest, "Avatar must be an uploaded avatar URL for this user or an image data URL"
+	if strings.HasPrefix(avatarURL, dataImagePrefix) {
+		return queueInlineResend(b, avatarResendMatchQuery, avatarURL, avatarUploadHint)
 	}
-	if strings.HasPrefix(avatarURL, dataImagePrefix) && len(avatarURL) > maxDataURLLen(inlineDataURLAvatarMax) {
-		return http.StatusBadRequest, "Inline avatar image too large — upload larger images via the avatar upload endpoint"
+	if avatarURL != fmt.Sprintf("/api/v1/media/avatars/%s", userID) {
+		return http.StatusBadRequest, errMsgAvatarURL
 	}
 	b.addClause("avatar_url", avatarURL)
-	if avatarURL != expectedAvatarURL {
-		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotAvatar)
-	}
 	return 0, ""
 }
 
-// validateHeaderImageURL validates and appends the header_image_url clause.
+// validateHeaderImageURL validates and appends the header_image_url clause. An
+// inline data:image/ value is handled as in validateAvatarURL.
 func validateHeaderImageURL(b *profileUpdateBuilder, headerImageURL string, userID interface{}) (int, string) {
 	if headerImageURL == "" {
 		b.addClause("header_image_url", nil)
 		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotBanner)
 		return 0, ""
 	}
-	expectedBannerURL := fmt.Sprintf("/api/v1/media/banners/%s", userID)
-	if headerImageURL != expectedBannerURL && !strings.HasPrefix(headerImageURL, dataImagePrefix) {
-		return http.StatusBadRequest, "Header image must be an uploaded banner URL for this user or an image data URL"
+	if strings.HasPrefix(headerImageURL, dataImagePrefix) {
+		return queueInlineResend(b, headerResendMatchQuery, headerImageURL, headerImageUploadHint)
 	}
-	if strings.HasPrefix(headerImageURL, dataImagePrefix) && len(headerImageURL) > maxDataURLLen(inlineDataURLBannerMax) {
-		return http.StatusBadRequest, "Inline header image too large — upload larger images via the banner upload endpoint"
+	if headerImageURL != fmt.Sprintf("/api/v1/media/banners/%s", userID) {
+		return http.StatusBadRequest, errMsgHeaderImageURL
 	}
 	b.addClause("header_image_url", headerImageURL)
-	if headerImageURL != expectedBannerURL {
-		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotBanner)
+	return 0, ""
+}
+
+// resolveInlineProfileResends settles every pending inline value against the
+// stored columns. It runs inside the profile transaction AFTER the row lock, so the
+// comparison cannot race a concurrent write to the same columns. A match is a
+// no-op; anything else is refused with the typed code, and the whole PATCH rolls
+// back. Fail closed: a database error is a 500, never a pass.
+func (h *Handler) resolveInlineProfileResends(ctx context.Context, tx *sql.Tx, b *profileUpdateBuilder, userID string) (int, string) {
+	for _, resend := range b.pendingInlineResends {
+		var matches bool
+		if err := tx.QueryRowContext(ctx, resend.matchQuery, userID, resend.value).Scan(&matches); err != nil {
+			h.log.Error("Failed to compare inline profile image", "error", err, "failure_class", "database")
+			return http.StatusInternalServerError, errMsgFailedUpdateProfile
+		}
+		if !matches {
+			b.extraResponse = map[string]interface{}{"code": inlineProfileImageCode}
+			return http.StatusBadRequest, resend.uploadHint
+		}
 	}
 	return 0, ""
 }
@@ -963,6 +1022,10 @@ func (h *Handler) executeProfileUpdateTransaction(ctx context.Context, req *Upda
 		return nil, http.StatusInternalServerError, errMsgFailedUpdateProfile
 	}
 
+	if status, msg := h.resolveInlineProfileResends(ctx, tx, b, userID); status != 0 {
+		return nil, status, msg
+	}
+
 	if status, msg := h.validateCanonicalProfileMediaURLs(ctx, req, userID, tx); status != 0 {
 		return nil, status, msg
 	}
@@ -987,6 +1050,18 @@ func (h *Handler) executeProfileUpdateTransaction(ctx context.Context, req *Upda
 	return user, 0, ""
 }
 
+// respondProfileError writes a failed profile update, merging the builder's extra
+// fields (the username cooldown timestamp, the inline-image code) into the body.
+// Both the validator stage and the transaction stage use it, so a refusal decided
+// under the row lock carries the same typed fields as one decided up front.
+func respondProfileError(c *gin.Context, b *profileUpdateBuilder, status int, msg string) {
+	resp := gin.H{"error": msg}
+	for k, v := range b.extraResponse {
+		resp[k] = v
+	}
+	c.JSON(status, resp)
+}
+
 // UpdateMe updates the current user's profile
 func (h *Handler) UpdateMe(c *gin.Context) {
 	userID, exists := c.Get("user_id")
@@ -1007,11 +1082,7 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 	// to free on any cache/DB error) and thread it through the field validators (#1298).
 	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), c.GetString("user_id")))
 	if status, msg := h.buildProfileFields(b, &req, userID, ent); status != 0 {
-		resp := gin.H{"error": msg}
-		for k, v := range b.extraResponse {
-			resp[k] = v
-		}
-		c.JSON(status, resp)
+		respondProfileError(c, b, status, msg)
 		return
 	}
 	userIDString, ok := userID.(string)
@@ -1020,14 +1091,18 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateProfile})
 		return
 	}
-	if len(b.setClauses) == 0 {
+	// A pending inline re-send is not an empty update: it still has to be checked
+	// against the stored value, and a lone matching re-send is a 200 no-op.
+	if len(b.setClauses) == 0 && len(b.pendingInlineResends) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No fields to update"})
 		return
 	}
 
+	// Captured before the transaction, which appends updated_at to setClauses.
+	changesProfile := len(b.setClauses) > 0
 	user, status, msg := h.executeProfileUpdateTransaction(c.Request.Context(), &req, b, userIDString)
 	if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
+		respondProfileError(c, b, status, msg)
 		return
 	}
 
@@ -1049,8 +1124,9 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 
 	h.log.Info("Profile updated", "user_id", userID)
 
-	// Broadcast profile update to all connected clients in real time
-	if h.hub != nil {
+	// Broadcast profile update to all connected clients in real time. A lone
+	// matching inline re-send changed nothing, so it has nothing to broadcast.
+	if h.hub != nil && changesProfile {
 		h.hub.BroadcastToAll(websocket.OutgoingMessage{
 			Type: "profile_updated",
 			Data: map[string]interface{}{
@@ -1070,8 +1146,9 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 }
 
 // validateCanonicalProfileMediaURLs keeps a canonical profile proxy URL from
-// becoming publication authority on its own. Data URLs and clears are handled
-// by the normal profile validators and retain their existing behavior.
+// becoming publication authority on its own. Inline data URLs (refused or
+// matched as a re-send by resolveInlineProfileResends) and clears are handled
+// elsewhere.
 func (h *Handler) validateCanonicalProfileMediaURLs(ctx context.Context, req *UpdateProfileRequest, userID string, db media.RowQuerier) (int, string) {
 	for _, candidate := range []struct {
 		url         *string
@@ -1083,13 +1160,13 @@ func (h *Handler) validateCanonicalProfileMediaURLs(ctx context.Context, req *Up
 			url:         req.AvatarURL,
 			profileSlot: media.ProfileSlotAvatar,
 			expected:    fmt.Sprintf("/api/v1/media/avatars/%s", userID),
-			message:     "Avatar must be an uploaded avatar URL for this user or an image data URL",
+			message:     errMsgAvatarURL,
 		},
 		{
 			url:         req.HeaderImageURL,
 			profileSlot: media.ProfileSlotBanner,
 			expected:    fmt.Sprintf("/api/v1/media/banners/%s", userID),
-			message:     "Header image must be an uploaded banner URL for this user or an image data URL",
+			message:     errMsgHeaderImageURL,
 		},
 	} {
 		if candidate.url == nil || *candidate.url != candidate.expected {

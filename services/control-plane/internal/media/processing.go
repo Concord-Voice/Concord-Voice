@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
@@ -239,11 +240,179 @@ func safeDecodeGIF(r io.Reader) (*gif.GIF, error) {
 	return g, nil
 }
 
+// isAnimatedGIF is the upload path's definition of "animated" for a decoded
+// GIF: more than one frame. gif.DecodeAll yields one frame per image
+// descriptor, so isAnimatedGIFStructure (the inline check) counts the same thing
+// without decoding.
+func isAnimatedGIF(g *gif.GIF) bool {
+	return len(g.Image) > 1
+}
+
+// IsAnimatedImage reports whether raw is an image a browser would animate in an
+// <img> element: a multi-frame GIF, an APNG (a PNG with an acTL chunk ahead of
+// its first IDAT), or an animated WebP (a VP8X animation flag, or an ANIM/ANMF
+// chunk). Detection reads the bytes and never a declared MIME type, so a GIF
+// labelled image/png is still caught.
+//
+// It is the inline-image counterpart of the upload path's frame check: the
+// server icon/banner routes accept `data:image/` values that never pass
+// through the upload pipeline, and this lets them apply the same entitlement
+// gate (#3856). Nothing is decoded: every format is classified by walking its
+// container structure, so a small payload cannot make the server allocate frames.
+//
+// It is a classifier, not a validator. Formats are recognized by signature; the
+// PNG, GIF and WebP containers are walked only as far as the answer needs, and a
+// JPEG is static by signature alone. It fails closed on what it does read: a
+// signature it does not know, or a container that is truncated or overruns its
+// data, returns an error rather than "static", because an unclassifiable image
+// cannot be proven not to animate. Errors name bounds and structure only, never
+// payload bytes.
+func IsAnimatedImage(raw []byte) (bool, error) {
+	switch {
+	case bytes.HasPrefix(raw, []byte("GIF87a")), bytes.HasPrefix(raw, []byte("GIF89a")):
+		return isAnimatedGIFStructure(raw)
+	case bytes.HasPrefix(raw, pngSignature):
+		return isAnimatedPNG(raw)
+	case isRIFFWebP(raw):
+		return isAnimatedWebP(raw)
+	case bytes.HasPrefix(raw, jpegSignature):
+		// JPEG has no animation in <img>; it is classified static by signature.
+		return false, nil
+	default:
+		return false, fmt.Errorf("media: unrecognized image format")
+	}
+}
+
+var (
+	pngSignature  = []byte("\x89PNG\r\n\x1a\n")
+	jpegSignature = []byte{0xFF, 0xD8, 0xFF}
+)
+
+// isAnimatedGIFStructure walks the GIF block list without decoding any pixels
+// and calls the image animated once its second frame parses. It stops there,
+// so the upload pipeline's frame and pixel budgets never apply: a 500-frame GIF
+// is animated, not malformed. A truncated block, an unknown block, or a
+// trailer with no image ahead of it is malformed.
+func isAnimatedGIFStructure(raw []byte) (bool, error) {
+	pos, err := skipGIFHeaderAndGCT(raw)
+	if err != nil {
+		return false, err
+	}
+	frames := 0
+	for pos < len(raw) {
+		block := raw[pos]
+		pos++
+		switch block {
+		case gifTrailer:
+			if frames == 0 {
+				return false, fmt.Errorf("media: malformed gif: no image data")
+			}
+			return false, nil
+		case gifExtension:
+			// A graphic control block is 4 bytes by spec. Some browser decoders
+			// read at least 4 whatever its size byte says, and this walk reads
+			// the size byte, so any other size could hide a frame from one of
+			// them. Chromium's decoder refuses it too.
+			if pos+1 < len(raw) && raw[pos] == gifGraphicControlLabel && raw[pos+1] != 4 {
+				return false, fmt.Errorf("media: malformed gif: graphic control block is not 4 bytes")
+			}
+			pos, err = scanGIFExtension(raw, pos)
+		case gifImageDescriptor:
+			// Parse the frame before counting it: a truncated second frame is
+			// malformed, not animated.
+			pos, _, _, err = scanGIFImageDescriptor(raw, pos)
+			if frames++; err == nil && frames > 1 {
+				return true, nil
+			}
+		default:
+			return false, fmt.Errorf("media: malformed gif: unknown block 0x%02X", block)
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	return false, fmt.Errorf("media: malformed gif: missing trailer")
+}
+
+// isAnimatedPNG walks the PNG chunk list. acTL (animation control) before the
+// first IDAT makes it an APNG; reaching IDAT first makes it static. A chunk that
+// overruns the data, or an IEND ahead of any IDAT, is malformed.
+func isAnimatedPNG(raw []byte) (bool, error) {
+	const chunkHeaderLen, chunkCRCLen = 8, 4
+	pos := int64(len(pngSignature))
+	total := int64(len(raw))
+	for {
+		if total-pos < chunkHeaderLen {
+			return false, fmt.Errorf("media: malformed png: no image data")
+		}
+		length := int64(binary.BigEndian.Uint32(raw[pos : pos+4]))
+		// Bounds first: a chunk that overruns the data is malformed whatever its type.
+		next := pos + chunkHeaderLen + length + chunkCRCLen
+		if next > total {
+			return false, fmt.Errorf("media: malformed png: chunk overruns data")
+		}
+		switch string(raw[pos+4 : pos+8]) {
+		case "acTL":
+			return true, nil
+		case "IDAT":
+			return false, nil
+		case "IEND":
+			return false, fmt.Errorf("media: malformed png: no image data")
+		}
+		pos = next
+	}
+}
+
+// riffHeaderLen is "RIFF" + a 4-byte size + "WEBP".
+const riffHeaderLen = 12
+
+func isRIFFWebP(raw []byte) bool {
+	return len(raw) >= riffHeaderLen && bytes.Equal(raw[0:4], []byte("RIFF")) && bytes.Equal(raw[8:12], []byte("WEBP"))
+}
+
+// vp8xAnimationFlag is the animation bit in the VP8X header's flags byte.
+const vp8xAnimationFlag = 0x02
+
+// isAnimatedWebP walks the RIFF chunk list of a WebP. The animation flag in the
+// VP8X header, or any ANIM/ANMF chunk, makes it animated; the whole container is
+// walked so a late ANIM chunk behind a static-looking header is still caught.
+// A chunk that overruns the data, or a container with no chunk at all, is
+// malformed.
+func isAnimatedWebP(raw []byte) (bool, error) {
+	const chunkHeaderLen = 8
+	pos := int64(riffHeaderLen)
+	total := int64(len(raw))
+	animated, chunks := false, 0
+	for total-pos >= chunkHeaderLen {
+		size := int64(binary.LittleEndian.Uint32(raw[pos+4 : pos+8]))
+		payload := pos + chunkHeaderLen
+		if payload+size > total {
+			return false, fmt.Errorf("media: malformed webp: chunk overruns data")
+		}
+		switch string(raw[pos : pos+4]) {
+		case "VP8X":
+			if size >= 1 && raw[payload]&vp8xAnimationFlag != 0 {
+				animated = true
+			}
+		case "ANIM", "ANMF":
+			animated = true
+		}
+		chunks++
+		pos = payload + size + size&1 // chunks are padded to an even length
+	}
+	if chunks == 0 {
+		return false, fmt.Errorf("media: malformed webp: no chunks")
+	}
+	return animated, nil
+}
+
 // GIF block-introducer bytes (GIF89a grammar).
 const (
 	gifImageDescriptor byte = 0x2C
 	gifExtension       byte = 0x21
 	gifTrailer         byte = 0x3B
+
+	gifGraphicControlLabel byte = 0xF9
 )
 
 // scanGIFFrameBudget walks the GIF byte structure and enforces the frame-count

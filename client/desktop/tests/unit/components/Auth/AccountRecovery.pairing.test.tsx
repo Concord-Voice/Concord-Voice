@@ -74,6 +74,7 @@ beforeEach(async () => {
       HttpResponse.json({
         recovery_token: token,
         has_trusted_devices: true,
+        has_recovery_circle: false,
         has_recovery_key: false,
       })
     ),
@@ -180,7 +181,7 @@ it('locks early approval until requester consent then acknowledges completion an
   confirm();
   await screen.findByLabelText('New Password');
   expect(requests.map((request) => request.path)).toEqual(['device-request', 'complete']);
-  const password = 'new-local-test-password';
+  const password = 'new-local-test-password'; // pragma: allowlist secret
   fireEvent.change(screen.getByLabelText('New Password'), { target: { value: password } });
   fireEvent.change(screen.getByLabelText('Confirm Password'), { target: { value: password } });
   fireEvent.click(screen.getByRole('button', { name: 'Reset Password' }));
@@ -387,6 +388,7 @@ it.each(['recovery-key', 'account-reset'] as const)(
           HttpResponse.json({
             recovery_token: token,
             has_trusted_devices: true,
+            has_recovery_circle: false,
             has_recovery_key: true,
             recovery_wrapped_private_key: wrapped.wrappedKey,
             recovery_key_salt: wrapped.salt,
@@ -428,7 +430,7 @@ it.each(['recovery-key', 'account-reset'] as const)(
       fireEvent.click(screen.getByRole('button', { name: 'Continue with Account Reset' }));
     }
     await screen.findByLabelText('New Password', undefined, { timeout: 6000 });
-    const password = 'synthetic-alternative-password';
+    const password = 'synthetic-alternative-password'; // pragma: allowlist secret
     fireEvent.change(screen.getByLabelText('New Password'), { target: { value: password } });
     fireEvent.change(screen.getByLabelText('Confirm Password'), { target: { value: password } });
     fireEvent.click(screen.getByRole('button', { name: 'Reset Password' }));
