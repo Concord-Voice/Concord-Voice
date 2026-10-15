@@ -7,7 +7,6 @@ import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subsc
 const PREMIUM_ENTITLEMENT: Entitlement = {
   ...FREE_ENTITLEMENT,
   tier: 'premium',
-  allowCustomScheme: true,
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
   allowMusicMode: true,
   streamMaxHeight: -1,

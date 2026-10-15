@@ -112,7 +112,7 @@ func buildSoftLockHarness(t *testing.T, ts *testhelpers.TestServer, db *sql.DB, 
 	log := logger.NewWithWriter(logs)
 	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(ts.Redis), log)
 	engine := purge.NewEngine(db, log, purge.NewReaper(db, log, nil), 0)
-	h := messages.NewHandler(db, log, ts.Hub, resolver, nil, engine)
+	h := messages.NewHandler(db, log, ts.Hub, resolver, engine)
 	verifier := &softLockVerifier{}
 	h.SetMFAVerifier(verifier)
 	h.SetRedis(rdb)

@@ -7,12 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -87,8 +87,7 @@ type Handler struct {
 	log         *logger.Logger
 	hub         *websocket.Hub
 	resolver    *rbac.Resolver
-	tiers       entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
-	purgeEngine *purge.Engine             // bulk message purge (#1352)
+	purgeEngine *purge.Engine // bulk message purge (#1352)
 	ops         OpsCounter
 	redis       *redis.Client            // delete-rate soft-lock counter + its MFA confirmation's attempt budget (#3455)
 	mfaVerifier stepup.MFATxCodeVerifier // step-up auth for the delete-rate soft-lock's MFA confirmation (#3455)
@@ -121,13 +120,12 @@ type messageChannelAuthorization struct {
 // NewHandler creates a new message handler. purgeEngine backs the bulk-purge
 // endpoints (#1352); opsCounters stays variadic (main's #1689 shape) so it
 // remains optional for callers that do not report aggregate metrics.
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, purgeEngine *purge.Engine, opsCounters ...OpsCounter) *Handler {
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, purgeEngine *purge.Engine, opsCounters ...OpsCounter) *Handler {
 	handler := &Handler{
 		db:          db,
 		log:         log,
 		hub:         hub,
 		resolver:    resolver,
-		tiers:       tiers,
 		purgeEngine: purgeEngine,
 	}
 	if len(opsCounters) > 0 {
@@ -269,18 +267,7 @@ func (h *Handler) GetMessagesBulk(c *gin.Context) {
 		return
 	}
 
-	// #1555 search-depth gate: bound the backfill window by the requesting
-	// user's entitlement (free 90d / premium 180d; negative = unlimited).
-	// This bounds ONLY the bulk backfill path — history ACCESS (GetMessages)
-	// is never gated (privacy stance; E2EE search is client-side).
-	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
-	var cutoff *time.Time
-	if d := ent.MessageHistorySearchDays; d >= 0 {
-		t := time.Now().UTC().AddDate(0, 0, -d)
-		cutoff = &t
-	}
-
-	messages, err := h.queryMessagesBounded(channelID, before, limit, cutoff)
+	messages, err := h.queryMessages(channelID, before, limit)
 	if err != nil {
 		h.log.Error("Failed to query messages (bulk)", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMessages})
@@ -289,16 +276,10 @@ func (h *Handler) GetMessagesBulk(c *gin.Context) {
 
 	h.enrichMessages(messages, userID)
 
-	resp := gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"messages": messages,
 		"count":    len(messages),
-	}
-	if cutoff != nil {
-		// Self-describing contract: tell the client how deep the backfill
-		// reached so search UX can surface the bound. Omitted when unlimited.
-		resp["search_depth_days"] = ent.MessageHistorySearchDays
-	}
-	c.JSON(http.StatusOK, resp)
+	})
 }
 
 // enrichMessages batch-loads reactions and replied-to summaries onto messages (non-fatal on failure).
@@ -394,19 +375,9 @@ func (h *Handler) GetMessages(c *gin.Context) {
 }
 
 // queryMessages fetches messages for a channel with optional cursor-based
-// pagination. It delegates to queryMessagesBounded with no time bound, so the
-// non-bulk history paths (GetMessages — never depth-gated, privacy stance) are
-// provably unchanged by the #1555 search-depth gate.
+// pagination. Placeholders are fixed literals ($1 channel, $2 limit, $3 the
+// optional cursor) — every value is parameterized (no interpolation).
 func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.MessageWithUser, error) {
-	return h.queryMessagesBounded(channelID, before, limit, nil)
-}
-
-// queryMessagesBounded fetches messages for a channel with optional
-// cursor-based pagination and an optional lower created_at bound (inclusive).
-// A nil cutoff means unbounded. Placeholders are fixed literals ($1 channel,
-// $2 limit, $3/$4 the optional arms in args order) — every operand is a
-// constant string, every value is parameterized (no interpolation).
-func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cutoff *time.Time) ([]models.MessageWithUser, error) {
 	query := `
 		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
 		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
@@ -417,20 +388,12 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 		WHERE m.channel_id = $1`
 	args := []interface{}{channelID, limit}
 
-	switch {
-	case before != "" && cutoff != nil:
+	if before != "" {
+		// Scoped to $1 so a cursor naming another channel's message reads as
+		// unknown rather than leaking its existence and timestamp.
 		query += `
-		  AND m.created_at < (SELECT created_at FROM messages WHERE id = $3)
-		  AND m.created_at >= $4`
-		args = append(args, before, *cutoff)
-	case before != "":
-		query += `
-		  AND m.created_at < (SELECT created_at FROM messages WHERE id = $3)`
+		  AND m.created_at < (SELECT created_at FROM messages WHERE id = $3 AND channel_id = $1)`
 		args = append(args, before)
-	case cutoff != nil:
-		query += `
-		  AND m.created_at >= $3`
-		args = append(args, *cutoff)
 	}
 	query += `
 		ORDER BY m.created_at DESC
@@ -468,9 +431,10 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 			&msg.DisplayName,
 			&msg.AvatarURL,
 		)
+		// A skipped row would answer 200 with a gap the cursor then steps
+		// over for good, and the search backfill would never index it.
 		if scanErr != nil {
-			h.log.Error("Failed to scan message row", "error", scanErr)
-			continue
+			return nil, fmt.Errorf("scan message row: %w", scanErr)
 		}
 		if len(expirationEventRaw) > 0 {
 			msg.ExpirationEventPayload = json.RawMessage(expirationEventRaw)

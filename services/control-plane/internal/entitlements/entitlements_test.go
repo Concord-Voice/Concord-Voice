@@ -10,7 +10,6 @@ import (
 func TestFor_Free(t *testing.T) {
 	e := entitlements.For(entitlements.TierFree)
 	assert.Equal(t, "free", e.Tier)
-	assert.False(t, e.AllowCustomScheme)
 	assert.Equal(t, []string{"minimum", "low", "moderate", "standard"}, e.AllowedAudioTiers)
 	assert.Equal(t, 20, e.MinPtimeMs)
 	assert.False(t, e.AllowMusicMode)
@@ -37,7 +36,6 @@ func TestFor_Free(t *testing.T) {
 func TestFor_Premium(t *testing.T) {
 	e := entitlements.For(entitlements.TierPremium)
 	assert.Equal(t, "premium", e.Tier)
-	assert.True(t, e.AllowCustomScheme)
 	assert.Equal(t, []string{"minimum", "low", "moderate", "standard", "high", "hifi", "studio"}, e.AllowedAudioTiers)
 	assert.Equal(t, 10, e.MinPtimeMs)
 	assert.True(t, e.AllowMusicMode)
@@ -112,18 +110,6 @@ func TestFor_Deterministic(t *testing.T) {
 func TestUploadValues_PricingConformance(t *testing.T) {
 	assert.Equal(t, int64(33_554_432), entitlements.For(entitlements.TierFree).MaxAttachmentBytes)
 	assert.Equal(t, int64(268_435_456), entitlements.For(entitlements.TierPremium).MaxAttachmentBytes)
-}
-
-// #1555 gates: server-creation cap + search-depth. Pricing-pinned (Sonic "up to
-// five servers" / Supersonic "no cap"); free search depth 90d is the founder
-// decision of 2026-07-03, premium 180d is page-pinned.
-func TestServerCapAndSearchDepthValues(t *testing.T) {
-	free := entitlements.For(entitlements.TierFree)
-	premium := entitlements.For(entitlements.TierPremium)
-	assert.Equal(t, 5, free.MaxServersCreated)
-	assert.Equal(t, entitlements.ServerLimitUnlimited, premium.MaxServersCreated, "Supersonic: no cap on server creation")
-	assert.Equal(t, 90, free.MessageHistorySearchDays)
-	assert.Equal(t, 180, premium.MessageHistorySearchDays)
 }
 
 func TestEffectiveAttachmentBytes(t *testing.T) {

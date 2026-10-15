@@ -27,9 +27,6 @@ const (
 type Entitlement struct {
 	Tier string
 
-	// Cosmetic (Class 4 — client-only).
-	AllowCustomScheme bool
-
 	// Audio (Class 3 — media-plane).
 	AllowedAudioTiers []string
 	MinPtimeMs        int
@@ -76,21 +73,12 @@ type Entitlement struct {
 
 	// Account (Class 1 — server-enforced).
 	UsernameChangeIntervalMonths int
-	// MaxServersCreated caps servers currently OWNED (deleting one frees a
-	// slot). Negative = unlimited (ServerLimitUnlimited). Enforced at
-	// CreateServer (#1555).
-	MaxServersCreated int
-	// MessageHistorySearchDays bounds the search-BACKFILL window (bulk fetch
-	// path only — GET /channels/:id/messages/bulk). History ACCESS is never
-	// gated (privacy stance; E2EE search is client-side). Negative = unlimited.
-	MessageHistorySearchDays int
 }
 
 // freeEntitlement and premiumEntitlement are the ONE definition of the limits.
 var (
 	freeEntitlement = Entitlement{
 		Tier:                         TierFree,
-		AllowCustomScheme:            false,
 		AllowedAudioTiers:            []string{"minimum", "low", "moderate", "standard"},
 		MinPtimeMs:                   20,
 		AllowMusicMode:               false,
@@ -111,13 +99,10 @@ var (
 		MaxBannerBytes:               5_242_880,  // 5 MiB
 		AllowAnimatedProfile:         false,
 		UsernameChangeIntervalMonths: 6,
-		MaxServersCreated:            5,
-		MessageHistorySearchDays:     90,
 	}
 
 	premiumEntitlement = Entitlement{
 		Tier:                         TierPremium,
-		AllowCustomScheme:            true,
 		AllowedAudioTiers:            []string{"minimum", "low", "moderate", "standard", "high", "hifi", "studio"},
 		MinPtimeMs:                   10,
 		AllowMusicMode:               true,
@@ -138,8 +123,6 @@ var (
 		MaxBannerBytes:               8_388_608,   // 8 MiB
 		AllowAnimatedProfile:         true,
 		UsernameChangeIntervalMonths: 3,
-		MaxServersCreated:            ServerLimitUnlimited,
-		MessageHistorySearchDays:     180,
 	}
 )
 

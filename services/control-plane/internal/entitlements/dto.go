@@ -13,7 +13,7 @@ import (
 // to parse the full entitlement set during version overlap.
 type EntitlementDTO struct {
 	Tier                         string   `json:"tier"`
-	AllowCustomScheme            bool     `json:"allowCustomScheme"`
+	AllowCustomScheme            bool     `json:"allowCustomScheme"` // Deprecated: always true, see ToDTO
 	AllowedAudioTiers            []string `json:"allowedAudioTiers"`
 	MinPtimeMs                   int      `json:"minPtimeMs"`
 	AllowMusicMode               bool     `json:"allowMusicMode"`
@@ -37,15 +37,20 @@ type EntitlementDTO struct {
 	// Deprecated: older clients require this field but use the profile's
 	// server-computed eligible_at for the actual username cooldown.
 	UsernameChangeIntervalSeconds int64 `json:"usernameChangeIntervalSeconds"`
-	MaxServersCreated             int   `json:"maxServersCreated"`
-	MessageHistorySearchDays      int   `json:"messageHistorySearchDays"`
+	// Deprecated: no server cap or search-depth limit exists any more (founder
+	// un-gating, 2026-10-15). Released desktop clients still require these keys,
+	// so they stay on the wire pinned to the unlimited sentinel.
+	MaxServersCreated        int `json:"maxServersCreated"`
+	MessageHistorySearchDays int `json:"messageHistorySearchDays"`
 }
 
 // ToDTO maps the internal capability set to its wire shape. Pure (no I/O).
 func ToDTO(e Entitlement) EntitlementDTO {
 	return EntitlementDTO{
-		Tier:                          e.Tier,
-		AllowCustomScheme:             e.AllowCustomScheme,
+		Tier: e.Tier,
+		// Custom colour schemes are free for everyone (#1971, founder un-gating
+		// 2026-10-15); the key stays for released clients that still read it.
+		AllowCustomScheme:             true,
 		AllowedAudioTiers:             e.AllowedAudioTiers,
 		MinPtimeMs:                    e.MinPtimeMs,
 		AllowMusicMode:                e.AllowMusicMode,
@@ -67,8 +72,8 @@ func ToDTO(e Entitlement) EntitlementDTO {
 		AllowAnimatedProfile:          e.AllowAnimatedProfile,
 		UsernameChangeIntervalMonths:  e.UsernameChangeIntervalMonths,
 		UsernameChangeIntervalSeconds: legacyUsernameIntervalSeconds(e.Tier),
-		MaxServersCreated:             e.MaxServersCreated,
-		MessageHistorySearchDays:      e.MessageHistorySearchDays,
+		MaxServersCreated:             ServerLimitUnlimited,
+		MessageHistorySearchDays:      ServerLimitUnlimited,
 	}
 }
 

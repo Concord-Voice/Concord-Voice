@@ -1582,10 +1582,12 @@ export const PresenceOverridesUpdatedSchema = z.strictObject({
  */
 export const EntitlementsChangedSchema = z.object({
   type: z.literal('entitlements_changed'),
+  // The server still sends allowCustomScheme, maxServersCreated and
+  // messageHistorySearchDays for released clients; all three are free for
+  // everyone now (founder un-gating, 2026-10-15), so z.object strips them.
   data: z
     .object({
       tier: z.string(),
-      allowCustomScheme: z.boolean(),
       allowedAudioTiers: z.array(z.string()),
       minPtimeMs: z.number().int(),
       allowMusicMode: z.boolean(),
@@ -1612,8 +1614,6 @@ export const EntitlementsChangedSchema = z.object({
       allowAnimatedProfile: z.boolean(),
       usernameChangeIntervalMonths: z.number().int().positive().optional(),
       usernameChangeIntervalSeconds: z.number().int().positive().optional(),
-      maxServersCreated: z.number().int(),
-      messageHistorySearchDays: z.number().int(),
     })
     .refine(
       (data) =>

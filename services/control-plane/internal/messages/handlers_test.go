@@ -50,7 +50,7 @@ func exerciseOpsMessageHandler(t *testing.T, ts *testhelpers.TestServer, counter
 	t.Helper()
 	log := logger.New("test")
 	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
-	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, nil, counter)
+	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, counter)
 	router := gin.New()
 	router.POST("/messages", func(c *gin.Context) {
 		c.Set("user_id", userID)
@@ -358,7 +358,7 @@ func TestDeleteMessage_FailsClosedWithoutPurgeEngine(t *testing.T) {
 	ts, user, _, _, msgID := setupWithMessage(t)
 	log := logger.New("test")
 	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
-	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, nil)
+	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil)
 	router := gin.New()
 	router.DELETE("/api/v1/messages/:id", func(c *gin.Context) {
 		c.Set("user_id", user.ID)

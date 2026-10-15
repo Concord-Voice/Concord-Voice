@@ -8,8 +8,9 @@ import type { Entitlement } from '../../../stores/auth/subscriptionStore';
 // entitlement fields the server enforces. Custom colour schemes are NOT listed
 // here: #1971 made them free for all users, so they are no longer a Supersonic
 // upsell (do not re-add an allowCustomScheme-gated row; see the matrix §5
-// "Custom colour schemes" note). Content is a static
-// list cited here — NOT duplicated; each row's ✓/lock is computed live
+// "Custom colour schemes" note). Server creation and message search are free
+// and unlimited for everyone too (#3855), so they have no row either. Content
+// is a static list cited here — NOT duplicated; each row's ✓/lock is computed live
 // from the current entitlement set via a predicate over the SAME fields the
 // server enforces, so the grid can never claim a capability the user lacks.
 //
@@ -23,8 +24,8 @@ interface FeatureRow {
   granted: (e: Entitlement) => boolean;
 }
 
-// Negative height/fps/servers are the "native"/"unlimited" sentinels
-// (ServerLimitUnlimited). Free values are the floor in FREE_ENTITLEMENT.
+// A negative height is the "native" sentinel (ServerLimitUnlimited). Free
+// values are the floor in FREE_ENTITLEMENT.
 const FEATURES: readonly FeatureRow[] = [
   {
     label: 'Portable audio quality (High · Hi-Fi · Studio) in DMs and group calls',
@@ -41,14 +42,6 @@ const FEATURES: readonly FeatureRow[] = [
   {
     label: 'Animated GIF avatar & banner',
     granted: (e) => e.allowAnimatedProfile,
-  },
-  {
-    label: '180-day message search (up from 90 days)',
-    granted: (e) => e.messageHistorySearchDays < 0 || e.messageHistorySearchDays > 90,
-  },
-  {
-    label: 'No cap on server creation',
-    granted: (e) => e.maxServersCreated < 0,
   },
 ];
 

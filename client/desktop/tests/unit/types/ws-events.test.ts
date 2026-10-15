@@ -2047,7 +2047,7 @@ const validEntitlements = {
   type: 'entitlements_changed',
   data: {
     tier: 'free',
-    allowCustomScheme: false,
+    allowCustomScheme: true,
     allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
     minPtimeMs: 20,
     allowMusicMode: false,
@@ -2069,8 +2069,8 @@ const validEntitlements = {
     allowAnimatedProfile: false,
     usernameChangeIntervalMonths: 6,
     usernameChangeIntervalSeconds: 31_536_000,
-    maxServersCreated: 5,
-    messageHistorySearchDays: 90,
+    maxServersCreated: -1,
+    messageHistorySearchDays: -1,
   },
 };
 
@@ -2107,10 +2107,22 @@ describe('EntitlementsChangedSchema', () => {
       EntitlementsChangedSchema.safeParse({ ...validEntitlements, type: 'nope' }).success
     ).toBe(false);
   });
-  it('rejects when the #1555 gate fields are missing (DTO lockstep)', () => {
-    const { maxServersCreated, messageHistorySearchDays, ...rest } = validEntitlements.data;
-    const bad = { type: 'entitlements_changed', data: rest };
-    expect(EntitlementsChangedSchema.safeParse(bad).success).toBe(false);
+  // Founder un-gating (2026-10-15): the server keeps sending these three keys for
+  // released clients, but they gate nothing any more. The schema strips them, and
+  // a DTO without them still parses.
+  it('strips the retired un-gated keys and accepts a DTO without them', () => {
+    const parsed = EntitlementsChangedSchema.safeParse(validEntitlements);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.data).not.toHaveProperty('allowCustomScheme');
+      expect(parsed.data.data).not.toHaveProperty('maxServersCreated');
+      expect(parsed.data.data).not.toHaveProperty('messageHistorySearchDays');
+    }
+    const { allowCustomScheme, maxServersCreated, messageHistorySearchDays, ...rest } =
+      validEntitlements.data;
+    expect(
+      EntitlementsChangedSchema.safeParse({ type: 'entitlements_changed', data: rest }).success
+    ).toBe(true);
   });
   it('rejects when the #1602 split video-axis fields are missing (DTO lockstep)', () => {
     const {

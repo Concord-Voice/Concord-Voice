@@ -128,7 +128,7 @@ func TestPinMessageAlreadyPinnedUsesOpenTransactionConnection(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(redis), logger.New("test"))
-	handler := messages.NewHandler(db, logger.New("test"), nil, resolver, nil, nil)
+	handler := messages.NewHandler(db, logger.New("test"), nil, resolver, nil)
 
 	request := func(ctx context.Context) *httptest.ResponseRecorder {
 		response := httptest.NewRecorder()

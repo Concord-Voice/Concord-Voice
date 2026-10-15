@@ -28,7 +28,7 @@ func TestMessageAuthorityFencesFailClosedOnMissingRowsAndDatabaseErrors(t *testi
 	db, cleanup := dbtest.SetupTestDB(t)
 	defer cleanup()
 
-	h := NewHandler(db, logger.New("test"), nil, rbac.NewResolver(db, nil, logger.New("test")), nil, nil)
+	h := NewHandler(db, logger.New("test"), nil, rbac.NewResolver(db, nil, logger.New("test")), nil)
 	missing := uuid.NewString()
 
 	t.Run("missing channel is forbidden", func(t *testing.T) {
@@ -170,7 +170,7 @@ func TestChannelMessageMutationFenceTakesMessageWriteLock(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, created_at, updated_at) VALUES ($1, $2, $3, 'content', 1, FALSE, NOW(), NOW())`, messageID, channelID, owner)
 	require.NoError(t, err)
 
-	h := NewHandler(db, logger.New("test"), nil, rbac.NewResolver(db, nil, logger.New("test")), nil, nil)
+	h := NewHandler(db, logger.New("test"), nil, rbac.NewResolver(db, nil, logger.New("test")), nil)
 	tx, err := db.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
@@ -234,7 +234,7 @@ func TestPreflightMessageDeleteFailClosedPaths(t *testing.T) {
 	require.NoError(t, err)
 
 	redisClient := redistest.Client(t)
-	h := NewHandler(db, log, nil, rbac.NewResolver(db, rbac.NewPermissionCache(redisClient), log), nil, nil)
+	h := NewHandler(db, log, nil, rbac.NewResolver(db, rbac.NewPermissionCache(redisClient), log), nil)
 
 	t.Run("missing message returns not found", func(t *testing.T) {
 		c, w := authorityFenceContext()
@@ -248,7 +248,7 @@ func TestPreflightMessageDeleteFailClosedPaths(t *testing.T) {
 		failedDB, err := sql.Open("postgres", "postgres://localhost:5432/unused?sslmode=disable")
 		require.NoError(t, err)
 		require.NoError(t, failedDB.Close())
-		failed := NewHandler(failedDB, log, nil, h.resolver, nil, nil)
+		failed := NewHandler(failedDB, log, nil, h.resolver, nil)
 		c, w := authorityFenceContext()
 		_, ok := failed.preflightMessageDelete(c, messageID, actor.String())
 		assert.False(t, ok)

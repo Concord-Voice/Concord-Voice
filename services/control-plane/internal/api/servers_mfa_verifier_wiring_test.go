@@ -37,7 +37,7 @@ const (
 )
 
 func wiredServersHandler(verifier, rdb bool) *servers.Handler {
-	h := servers.NewHandler(nil, logger.New("test"), nil, nil, nil, nil)
+	h := servers.NewHandler(nil, logger.New("test"), nil, nil, nil)
 	if verifier {
 		h.SetMFAVerifier(stubServersMFAVerifier{})
 	}

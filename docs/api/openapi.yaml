@@ -12606,7 +12606,10 @@ paths:
       summary: Create a server
       description: 'Create a new server. The creator becomes the owner.
 
-        Rate limit: 10 requests per minute.
+        Rate limit: 10 requests per minute. Fair-use quota: an account may create at
+        most 10 servers per rolling 24 hours, on every tier. The count follows the
+        creating account, so transferring a server away does not free a slot and
+        receiving one does not use a slot. Deleting a server frees its slot.
 
         '
       security:
@@ -12632,6 +12635,31 @@ paths:
                     example: owner
         '400':
           $ref: '#/components/responses/BadRequest'
+        '429':
+          description: 'Either the per-minute rate limit or the daily create quota.
+            Only the quota carries `code: server_create_quota`; the account has
+            created 10 servers in the last 24 hours, and `Retry-After` gives the
+            seconds until the oldest of those leaves the window.'
+          headers:
+            Retry-After:
+              description: Seconds until a create is allowed again (quota refusals).
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Server creation limit reached for today
+                  code:
+                    type: string
+                    enum:
+                    - server_create_quota
+                  limit:
+                    type: integer
+                    example: 10
   /servers/unread-status:
     get:
       tags:
@@ -18993,7 +19021,8 @@ components:
           example: free
         allowCustomScheme:
           type: boolean
-          description: Whether the user may select a custom color scheme
+          deprecated: true
+          description: Always true. Custom color schemes are free for every account; kept for older clients.
         allowedAudioTiers:
           type: array
           items:
@@ -19063,10 +19092,12 @@ components:
           description: Legacy fixed-day approximation for older clients. Use usernameChangeIntervalMonths or the profile's username_change_eligible_at date.
         maxServersCreated:
           type: integer
-          description: Max servers a user may own; negative = unlimited (premium).
+          deprecated: true
+          description: Always -1 (unlimited). Server creation is uncapped for every account; kept for older clients.
         messageHistorySearchDays:
           type: integer
-          description: Search-backfill window in days (free 90 / premium 180).
+          deprecated: true
+          description: Always -1 (unlimited). Message history is never depth-limited; kept for older clients.
       required:
       - tier
       - allowCustomScheme

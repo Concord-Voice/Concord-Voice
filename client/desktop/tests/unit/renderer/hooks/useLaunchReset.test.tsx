@@ -14,7 +14,6 @@ import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStor
 const PREMIUM_ENTITLEMENT: Entitlement = {
   ...FREE_ENTITLEMENT,
   tier: 'premium',
-  allowCustomScheme: true,
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
   allowMusicMode: true,
   streamMaxHeight: -1,

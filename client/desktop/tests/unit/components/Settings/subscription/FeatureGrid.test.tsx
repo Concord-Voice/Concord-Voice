@@ -17,8 +17,6 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   maxAttachmentBytes: 268435456,
   cameraMaxHeight: -1,
   allowAnimatedProfile: true,
-  messageHistorySearchDays: 180,
-  maxServersCreated: -1,
 };
 
 describe('FeatureGrid (#1304)', () => {
@@ -57,5 +55,15 @@ describe('FeatureGrid (#1304)', () => {
     expect(animatedRow).toHaveClass('is-granted');
     const uploadsRow = screen.getByText(/256 MB file uploads/i).closest('li');
     expect(uploadsRow).toHaveClass('is-locked');
+  });
+
+  it('lists no row for features that are free for everyone (#3855)', () => {
+    useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+    render(<FeatureGrid />);
+    // Positive control: the list rendered, so the absences below are real.
+    expect(screen.getByText(/256 MB file uploads/i)).toBeInTheDocument();
+    expect(screen.queryByText(/message search/i)).toBeNull();
+    expect(screen.queryByText(/server creation/i)).toBeNull();
+    expect(screen.queryByText(/colour scheme|color scheme/i)).toBeNull();
   });
 });

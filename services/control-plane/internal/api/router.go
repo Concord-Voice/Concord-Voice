@@ -1057,7 +1057,7 @@ func NewRouter(
 	usersHandler.SetPresenceHistory(presenceHistoryService)
 	usersHandler.SetActivitySettingsSuppressor(activityService)
 	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)
-	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
+	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, serverEntCache)
 	serversHandler.SetMFAVerifier(mfaHandler)
 	serversHandler.SetRedis(redis)
 	serversHandler.SetSecurityEvents(securityEvents)
@@ -1085,7 +1085,7 @@ func NewRouter(
 	}
 
 	purgeRateLimit, purgeRateWindow := resolvePurgeRateLimit(cfg)
-	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache, purgeEngine, opsCounters)
+	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, purgeEngine, opsCounters)
 	// #3455: the delete-rate soft-lock's MFA confirmation, wired the same way as
 	// serversHandler's above. requireMessageDeleteGuardWired below checks both
 	// this and the dmHandler side once dmHandler exists.

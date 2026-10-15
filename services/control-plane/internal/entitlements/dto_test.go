@@ -12,14 +12,11 @@ import (
 func TestToDTO_FreeTier_MapsCalendarMonths(t *testing.T) {
 	dto := entitlements.ToDTO(entitlements.For(entitlements.TierFree))
 	assert.Equal(t, "free", dto.Tier)
-	assert.False(t, dto.AllowCustomScheme)
 	assert.Equal(t, []string{"minimum", "low", "moderate", "standard"}, dto.AllowedAudioTiers)
 	assert.Equal(t, 20, dto.MinPtimeMs)
 	assert.Equal(t, 8, dto.MaxAudioLastN)
 	assert.Equal(t, 5120, dto.MaxMessageChars)
 	assert.Equal(t, int64(33554432), dto.MaxAttachmentBytes)
-	assert.Equal(t, 5, dto.MaxServersCreated)
-	assert.Equal(t, 90, dto.MessageHistorySearchDays)
 	assert.Equal(t, 6, dto.UsernameChangeIntervalMonths)
 	assert.Equal(t, int64(365*24*60*60), dto.UsernameChangeIntervalSeconds)
 }
@@ -30,10 +27,20 @@ func TestToDTO_PremiumTier(t *testing.T) {
 	assert.True(t, dto.AllowMusicMode)
 	assert.Equal(t, 16, dto.MaxAudioLastN)
 	assert.Equal(t, int64(268435456), dto.MaxAttachmentBytes)
-	assert.Equal(t, entitlements.ServerLimitUnlimited, dto.MaxServersCreated, "Supersonic: no cap on server creation")
-	assert.Equal(t, 180, dto.MessageHistorySearchDays)
 	assert.Equal(t, 3, dto.UsernameChangeIntervalMonths)
 	assert.Equal(t, int64(91*24*60*60), dto.UsernameChangeIntervalSeconds)
+}
+
+// Founder un-gating (2026-10-15): custom schemes, server creation and search
+// depth are free for everyone. Released clients still require these keys, so
+// they stay on the wire pinned to their free values on every tier.
+func TestToDTO_UngatedKeysPinnedForEveryTier(t *testing.T) {
+	for _, tier := range []string{entitlements.TierFree, entitlements.TierPremium} {
+		dto := entitlements.ToDTO(entitlements.For(tier))
+		assert.True(t, dto.AllowCustomScheme, tier)
+		assert.Equal(t, entitlements.ServerLimitUnlimited, dto.MaxServersCreated, tier)
+		assert.Equal(t, entitlements.ServerLimitUnlimited, dto.MessageHistorySearchDays, tier)
+	}
 }
 
 func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
@@ -53,7 +60,7 @@ func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
 		_, ok := m[k]
 		assert.Truef(t, ok, "missing wire key %q", k)
 	}
-	// 24 current keys plus one deprecated seconds field for older clients.
+	// 21 current keys plus four deprecated fields kept for older clients.
 	assert.Len(t, m, 25, "DTO must serialize exactly 25 keys")
 }
 

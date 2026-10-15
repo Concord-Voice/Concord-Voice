@@ -30,7 +30,9 @@ authenticator app or security key no longer sees a code box it cannot fill, a
 passkey or security key works in one step, and the prompt opens on the method
 you used most recently. Server owners can require MFA for dangerous actions
 from Server Settings, and members who need it are told how to set it up. A message
-expiration timer can now keep pinned messages, and says so.
+expiration timer can now keep pinned messages, and says so. Every account can create
+any number of servers, search as far back as a subscriber can, and use full theme
+colour customization.
 
 ### Added
 
@@ -106,6 +108,7 @@ expiration timer can now keep pinned messages, and says so.
 
 ### Changed
 
+- **Unlimited servers, message search and theme colours for everyone** (internal development reference omitted) — the free plan no longer limits how many servers you can create, message search reaches as far back for free accounts as for subscribers, and full theme colour customization is free for every account. To prevent abuse, one account can create up to 10 servers in any 24 hours.
 - **Settings has clearer homes for account, privacy, and security controls** (internal development reference omitted) — Account shows a compact Subscription summary, optional benefits, and code redemption. Security contains password, verification, SSO, and sessions; Privacy keeps audience, content, and activity-history choices. About & Updates includes System Permissions, formatted legal documents with familiar names, and KLIPY attribution plus its privacy policy. Subsections appear beneath their parent in navigation. Open and closed sections, including nested details, are remembered while you use Settings and for 30 minutes after you leave; after that window or an interface reload they start collapsed again, and a deliberate subsection link opens its destination.
 - **New-account privacy defaults** — Friend requests start at Mutual Servers, Server Voice details start off, Private Call presence starts at Friends, and notifications show the sender without message text. Existing saved choices remain unchanged.
 - **Friend discovery and username changes** — Under Mutual Servers, people who share a server or mutual friend with you can request you, and someone with a valid friend code can too. No One and blocks still stop requests. Username changes use six calendar months on Free and three on Premium.

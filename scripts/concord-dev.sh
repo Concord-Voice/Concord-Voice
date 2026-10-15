@@ -298,10 +298,10 @@ udp_port_in_use() {
         ;;
       n*)
         value="${field#n}"
-        local_endpoint="${value%%->*}"
+        local_endpoint="${value%%-\>*}"
         [[ "$local_endpoint" =~ $endpoint_re ]] || return 2
         if [[ "$value" == *"->"* ]]; then
-          remote_endpoint="${value#*->}"
+          remote_endpoint="${value#*-\>}"
           [[ "$remote_endpoint" =~ $endpoint_re ]] || return 2
         fi
         saw_endpoint=1
@@ -758,7 +758,7 @@ registered_worktree_contains() {
   fi
   while IFS= read -r line; do
     case "$line" in
-      worktree\ *)
+      'worktree '*)
         [[ "$root" == "$expected_root" && $prunable -eq 0 ]] && matched=1
         root="${line#worktree }"
         root=$(cd "$root" 2>/dev/null && pwd -P) || root=""
@@ -1332,6 +1332,16 @@ verb_up() {
   _up_summary "$skip_client" "$num_clients"
 }
 
+# Account-authority test databases (#3587 PR-B1, DoR §3.2.3). Idempotent; the
+# SQL refuses nothing that already exists. A failure warns rather than aborting
+# `up`: the harness skips locally and names the missing database.
+_bootstrap_authority_test_db() {
+  if ! compose exec -T postgres psql -U concord -d postgres -v ON_ERROR_STOP=1 \
+      < "$PROJECT_ROOT/services/control-plane/scripts/authority-test-bootstrap.sql" >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠${NC} Account-authority test databases were not created; run services/control-plane/scripts/authority-test-bootstrap.sql by hand" >&2
+  fi
+}
+
 _up_infra() {
   local reset_db="$1"
 
@@ -1362,6 +1372,7 @@ _up_infra() {
     healthy=$(compose ps --format json 2>/dev/null | grep -c '"Health":"healthy"' || true)
     if [[ $healthy -ge 4 ]]; then
       [[ "$QUIET" -eq 0 ]] && echo -e "${GREEN}✓${NC} All infrastructure healthchecks green (4 services + minio)"
+      _bootstrap_authority_test_db
       return 0
     fi
     sleep 1

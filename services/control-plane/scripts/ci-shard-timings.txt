@@ -18,7 +18,11 @@
 # A measured package runtime is a balancing weight, not a wall-time guarantee;
 # compilation and job setup add overhead. No test, tag, race/coverage flag,
 # serialization, runner, timeout or quality gate is changed by these weights.
-# internal/migrationrunner was added 2026-10-08 from a local -race -cover run (#3587 PR-0), pending the next CI refresh.
+# internal/migrationrunner, internal/authority/* and internal/testhelpers/authoritydb were refreshed 2026-10-15
+# from Required PR build run 38779965936, head 6aa893d55 (#3587 PR-B1): shard 1 job 116584857773,
+# shard 2 job 116584857642 (internal/authority/store).
+# internal/authoritycontract was added 2026-10-15 from nightly run 38526580881, head a19c54a3a,
+# shard 1 job 115728676196. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
 #
 # Packages without test files remain absent and use the default weight.
 cmd/issue-codes                   1.030
@@ -31,6 +35,11 @@ internal/age                      9.444
 internal/api                      16.740
 internal/attestation              25.129
 internal/auth                     186.080
+internal/authority/authoritytest  1.983
+internal/authority/policy         1.244
+internal/authority/signer         1.249
+internal/authority/store          56.451
+internal/authoritycontract        297.396
 internal/cfkv                     1.031
 internal/channels                 103.708
 internal/clientconfig             3.178
@@ -56,7 +65,7 @@ internal/messages                 105.020
 internal/mfa                      173.508
 internal/mfaenforce               4.076
 internal/middleware               29.316
-internal/migrationrunner          2.394
+internal/migrationrunner          4.898
 internal/models                   1.019
 internal/notifications            8.169
 internal/oauth                    18.939
@@ -79,6 +88,7 @@ internal/storage                  1.015
 internal/storage/probe            4.228
 internal/subscriptions            5.229
 internal/testhelpers              2.497
+internal/testhelpers/authoritydb  1.265
 internal/testhelpers/redistest    2.761
 internal/testhelpers/stmthook     1.289
 internal/updates                  1.014

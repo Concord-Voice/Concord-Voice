@@ -47,7 +47,7 @@ const (
 )
 
 func wiredMessagesHandlerForDeleteGuard(verifier, rdb bool) *messages.Handler {
-	h := messages.NewHandler(nil, logger.New("test"), nil, nil, nil, nil)
+	h := messages.NewHandler(nil, logger.New("test"), nil, nil, nil)
 	if verifier {
 		h.SetMFAVerifier(stubMessageDeleteMFAVerifier{})
 	}

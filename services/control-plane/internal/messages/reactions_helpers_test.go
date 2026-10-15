@@ -25,7 +25,7 @@ func newReactionHelperHandler(t *testing.T) *Handler {
 
 	db, _ := testdb.SetupTestDB(t)
 
-	return NewHandler(db, logger.New("test"), nil, nil, nil, nil)
+	return NewHandler(db, logger.New("test"), nil, nil, nil)
 }
 
 func TestReactionHelpersHandleDatabaseErrors(t *testing.T) {
@@ -334,7 +334,7 @@ func assertNoDMReaction(t *testing.T, h *Handler, messageID, userID string) {
 
 func TestToggleDMReactionPostCommitSummaryFailureReturnsCommittedAction(t *testing.T) {
 	base := newReactionHelperHandler(t)
-	h := NewHandler(base.db, logger.New("test"), websocket.NewHub(nil, nil), nil, nil, nil)
+	h := NewHandler(base.db, logger.New("test"), websocket.NewHub(nil, nil), nil, nil)
 	messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 
 	original := dmMessageReactionSummarySQL

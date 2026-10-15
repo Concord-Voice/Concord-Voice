@@ -20,7 +20,6 @@ export type Entitlement = EntitlementsChangedPayload;
  */
 export const FREE_ENTITLEMENT: Entitlement = {
   tier: 'free',
-  allowCustomScheme: false,
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
   minPtimeMs: 20,
   allowMusicMode: false,
@@ -43,8 +42,6 @@ export const FREE_ENTITLEMENT: Entitlement = {
   maxBannerBytes: 5242880,
   allowAnimatedProfile: false,
   usernameChangeIntervalMonths: 6,
-  maxServersCreated: 5,
-  messageHistorySearchDays: 90,
 };
 
 let hydrationGeneration = 0;

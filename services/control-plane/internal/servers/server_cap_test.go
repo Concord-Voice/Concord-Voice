@@ -1,89 +1,133 @@
 package servers_test
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// grantPremium inserts an active premium subscription and clears the cached tier
-// (login during CreateTestUser may have cached the then-free tier). Server
-// enforcement reads the subscriptions table via the entitlements cache (#1298).
-func grantPremium(t *testing.T, ts *testhelpers.TestServer, userID string) {
-	t.Helper()
-	_, err := ts.DB.Exec(
-		`INSERT INTO subscriptions (user_id, tier, status, source) VALUES ($1, 'premium', 'active', 'code')`,
-		userID,
-	)
-	require.NoError(t, err)
-	require.NoError(t, ts.Redis.Del(context.Background(), "ent:"+userID).Err())
-}
-
-func createServerViaAPI(ts *testhelpers.TestServer, accessToken, name string) *httptest.ResponseRecorder {
-	return ts.DoRequest("POST", "/api/v1/servers", map[string]interface{}{
-		"name": name,
-	}, testhelpers.AuthHeaders(accessToken))
-}
-
-// --- Server-creation cap (#1555 Gate 1) ---
-
-// A free ("Sonic") user may own at most 5 servers; the 6th create is rejected
-// with a typed, machine-readable 403.
-func TestCreateServerFreeUserCappedAtFive(t *testing.T) {
+// Server creation is uncapped for every account (founder un-gating 2026-10-15,
+// reversing the #1555 free cap of 5). A free user's 6th create — the one the
+// old cap rejected with server_cap_reached — must succeed.
+func TestCreateServerFreeUserUncapped(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "servercapfree")
 
-	for i := 1; i <= 5; i++ {
-		w := createServerViaAPI(ts, user.AccessToken, fmt.Sprintf("Cap Server %d", i))
-		require.Equalf(t, http.StatusCreated, w.Code, "create %d of 5 must succeed under the cap", i)
+	for i := 1; i <= 6; i++ {
+		w := ts.DoRequest("POST", "/api/v1/servers", map[string]interface{}{
+			"name": fmt.Sprintf("Uncapped Server %d", i),
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equalf(t, http.StatusCreated, w.Code, "free create %d must succeed (no cap)", i)
 	}
+}
 
-	w := createServerViaAPI(ts, user.AccessToken, "Cap Server 6")
-	require.Equal(t, http.StatusForbidden, w.Code)
+// Creation is uncapped in total, but bounded to 10 per account per rolling 24h
+// (Codex review of #3861: each create can store two inline images). The count
+// is of servers the account CREATED, read from the server_created audit row,
+// so an ownership transfer neither frees the creator's slot nor charges the
+// recipient, deleting a server frees its slot, and a create older than 24h
+// drops out. The first 10 are seeded in SQL: 11 HTTP creates would trip the
+// route's 10-per-minute limiter, whose 429 the quota's 429 cannot be told apart
+// from by status.
+func TestCreateServerDailyQuota(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "servercapquota")
+	recipient := ts.CreateTestUser(t, "servercaprecipient")
+	create := func(u testhelpers.TestUser, name string) *httptest.ResponseRecorder {
+		return ts.DoRequest("POST", "/api/v1/servers", map[string]interface{}{"name": name},
+			testhelpers.AuthHeaders(u.AccessToken))
+	}
+	exec := func(query string, args ...interface{}) {
+		_, err := ts.DB.Exec(query, args...)
+		require.NoError(t, err)
+	}
+	exec(`WITH s AS (
+			INSERT INTO servers (id, name, owner_id, created_at, updated_at)
+			SELECT gen_random_uuid(), 'Quota Server ' || g, $1, NOW(), NOW() FROM generate_series(1, 10) g
+			RETURNING id)
+		INSERT INTO audit_log (server_id, actor_id, action, target_type, target_id, metadata)
+		SELECT id, $1, 'server_created', 'server', id, '{}'::jsonb FROM s`, creator.ID)
 
+	w := create(creator, "Over Quota")
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, "server_cap_reached", body["code"])
-	assert.Equal(t, float64(5), body["limit"])
-	assert.NotEmpty(t, body["error"])
+	require.Equal(t, "server_create_quota", testhelpers.JSONField[string](t, body, "code"))
+	require.Equal(t, float64(10), testhelpers.JSONField[float64](t, body, "limit"))
+	retry, err := strconv.Atoi(w.Header().Get("Retry-After"))
+	require.NoError(t, err, "a quota refusal carries Retry-After")
+	require.True(t, retry > 0 && retry <= 86400, "Retry-After %d must fall inside the 24h window", retry)
+
+	exec(`UPDATE servers SET owner_id = $1 WHERE owner_id = $2`, recipient.ID, creator.ID)
+	require.Equal(t, http.StatusTooManyRequests, create(creator, "After Transfer").Code,
+		"transferring servers away must not free the creator's slots")
+	require.Equal(t, http.StatusCreated, create(recipient, "Recipient Server").Code,
+		"receiving servers must not charge the recipient's quota")
+
+	exec(`DELETE FROM servers WHERE name = 'Quota Server 1'`)
+	require.Equal(t, http.StatusCreated, create(creator, "After Delete").Code,
+		"deleting a server frees its slot")
+	require.Equal(t, http.StatusTooManyRequests, create(creator, "Back At Quota").Code,
+		"the create that just succeeded is counted")
+
+	exec(`UPDATE audit_log SET created_at = NOW() - INTERVAL '25 hours'
+		WHERE actor_id = $1 AND action = 'server_created'
+		  AND server_id = (SELECT id FROM servers WHERE name = 'Quota Server 2')`, creator.ID)
+	require.Equal(t, http.StatusCreated, create(creator, "After Aging").Code,
+		"a create older than 24h drops out of the count")
 }
 
-// A premium ("Supersonic") user has no cap on server creation — creating more
-// than the free limit succeeds.
-func TestCreateServerPremiumUserUnlimited(t *testing.T) {
+// An access token can outlive its account. The quota's users-row lock then
+// finds nothing, and CreateServer answers 401 instead of creating a server.
+func TestCreateServerDeletedAccountIsUnauthorized(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "servercapprem")
-	grantPremium(t, ts, user.ID)
+	user := ts.CreateTestUser(t, "servercapgone")
+	_, err := ts.DB.Exec(`DELETE FROM users WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
-	for i := 1; i <= 6; i++ {
-		w := createServerViaAPI(ts, user.AccessToken, fmt.Sprintf("Premium Server %d", i))
-		require.Equalf(t, http.StatusCreated, w.Code, "premium create %d must succeed (no cap)", i)
-	}
+	w := ts.DoRequest("POST", "/api/v1/servers", map[string]interface{}{"name": "Orphan Server"},
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	require.Equal(t, "Session no longer valid", testhelpers.JSONField[string](t, body, "error"),
+		"the 401 must come from the quota lock, not from the auth middleware")
+
+	var n int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM servers WHERE name = 'Orphan Server'`).Scan(&n))
+	require.Zero(t, n)
 }
 
-// The cap counts servers currently OWNED, not lifetime creations — deleting a
-// server frees a slot for a new create.
-func TestCreateServerDeleteFreesSlot(t *testing.T) {
+// The server_created audit row is what the quota counts, so a create whose
+// audit row cannot be written must not commit: an uncounted server would let
+// the account go past the quota.
+func TestCreateServerAuditFailureRollsBack(t *testing.T) {
 	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "servercapslot")
-
-	serverIDs := make([]string, 0, 5)
-	for i := 1; i <= 5; i++ {
-		serverIDs = append(serverIDs, ts.CreateTestServer(t, user.ID, fmt.Sprintf("Owned Server %d", i)))
+	user := ts.CreateTestUser(t, "servercapaudit")
+	exec := func(query string) {
+		_, err := ts.DB.Exec(query)
+		require.NoError(t, err)
 	}
+	exec(`CREATE OR REPLACE FUNCTION test_refuse_server_created() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused by test'; END $$`)
+	exec(`DROP TRIGGER IF EXISTS test_refuse_server_created ON audit_log`)
+	exec(`CREATE TRIGGER test_refuse_server_created BEFORE INSERT ON audit_log
+		FOR EACH ROW WHEN (NEW.action = 'server_created') EXECUTE FUNCTION test_refuse_server_created()`)
+	t.Cleanup(func() {
+		_, _ = ts.DB.Exec(`DROP TRIGGER IF EXISTS test_refuse_server_created ON audit_log`)
+		_, _ = ts.DB.Exec(`DROP FUNCTION IF EXISTS test_refuse_server_created()`)
+	})
 
-	w := createServerViaAPI(ts, user.AccessToken, "Over The Cap")
-	require.Equal(t, http.StatusForbidden, w.Code, "at cap, create must be rejected")
+	w := ts.DoRequest("POST", "/api/v1/servers", map[string]interface{}{"name": "Unaudited Server"},
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusInternalServerError, w.Code)
 
-	w = ts.DoRequest("DELETE", "/api/v1/servers/"+serverIDs[0], nil, testhelpers.AuthHeaders(user.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code)
-
-	w = createServerViaAPI(ts, user.AccessToken, "Fits After Delete")
-	assert.Equal(t, http.StatusCreated, w.Code, "deleting a server must free a cap slot")
+	var n int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM servers WHERE name = 'Unaudited Server'`).Scan(&n))
+	require.Zero(t, n, "the server row must roll back with its audit row")
 }

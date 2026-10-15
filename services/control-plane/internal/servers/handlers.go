@@ -43,6 +43,9 @@ const (
 	errMsgFailedUpdate          = "Failed to update server"
 	errMsgFailedDelete          = "Failed to delete server"
 	errMsgServerActivityChanged = "Server activity changed; retry deletion"
+
+	// serverCreateDailyQuota caps servers one account may create per rolling 24h.
+	serverCreateDailyQuota = 10
 )
 
 // Handler handles server-related requests
@@ -51,7 +54,6 @@ type Handler struct {
 	log         *logger.Logger
 	hub         *websocket.Hub
 	resolver    *rbac.Resolver
-	tiers       entitlements.TierResolver       // user-axis tier resolution (#1555 server-creation cap)
 	serverTiers entitlements.ServerTierResolver // server-axis tier resolution (#1521)
 	store       media.ObjectDeleter             // nil when object storage is not configured
 
@@ -76,13 +78,12 @@ type ActivePlanRail interface {
 }
 
 // NewHandler creates a new server handler
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, serverTiers entitlements.ServerTierResolver) *Handler {
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, serverTiers entitlements.ServerTierResolver) *Handler {
 	return &Handler{
 		db:             db,
 		log:            log,
 		hub:            hub,
 		resolver:       resolver,
-		tiers:          tiers,
 		serverTiers:    serverTiers,
 		securityEvents: securityevent.Discard,
 	}
@@ -344,6 +345,39 @@ func insertOwnerMembership(tx *sql.Tx, serverID, userID string) error {
 	return nil
 }
 
+// lockAndCountRecentCreates locks the caller's users row, then counts the
+// servers the account created in the last 24 hours. It also returns the
+// seconds until the oldest counted create leaves that window.
+//
+// Creation is free and unlimited in total (#3855), but each create can store
+// an inline icon and banner, so a per-account quota bounds storage. Same for
+// every tier. Creations are counted from the server_created audit row
+// CreateServer writes: its actor_id never changes, so an ownership transfer
+// neither frees the creator's slot nor charges the recipient. The row is
+// deleted with its server, so deleting a server frees its slot (and its
+// images). idx_audit_log_actor covers the count.
+//
+// The users row lock serializes one account's creates, so concurrent requests
+// cannot all read a count under the quota. The later FK checks take only KEY
+// SHARE on that row, so nothing is upgraded. sql.ErrNoRows means the account
+// no longer exists.
+func lockAndCountRecentCreates(ctx context.Context, tx *sql.Tx, userID string) (count, retryAfter int, err error) {
+	var one int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&one); err != nil {
+		return 0, 0, fmt.Errorf("lock user: %w", err)
+	}
+	var wait float64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(CEIL(EXTRACT(EPOCH FROM MIN(created_at) + INTERVAL '24 hours' - NOW())), 0)
+		FROM audit_log
+		WHERE actor_id = $1 AND action = 'server_created' AND created_at > NOW() - INTERVAL '24 hours'`,
+		userID).Scan(&count, &wait); err != nil {
+		return 0, 0, fmt.Errorf("count recent creates: %w", err)
+	}
+	return count, int(wait), nil
+}
+
 // CreateServer creates a new server
 func (h *Handler) CreateServer(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -364,12 +398,9 @@ func (h *Handler) CreateServer(c *gin.Context) {
 		return
 	}
 
-	// #1555 server-creation cap: resolve the user's tier before opening the
-	// transaction (the resolver may touch Redis/DB; keep the tx short).
-	// Fail-closed: unknown tier resolves to the free set (cap 5).
-	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
-
-	tx, err := h.db.Begin()
+	// READ COMMITTED is load-bearing: the quota count must see every create
+	// committed while this transaction waited on the users row lock.
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("Failed to start transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreate})
@@ -381,25 +412,24 @@ func (h *Handler) CreateServer(c *gin.Context) {
 		}
 	}()
 
-	// The cap counts servers currently OWNED (deleting one frees a slot);
-	// negative = unlimited (premium). Count + INSERT run in the same
-	// transaction; the residual concurrent-create race is accepted — the cap
-	// is a product boundary, not a security invariant (#1555 spec).
-	if ent.MaxServersCreated >= 0 {
-		var owned int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM servers WHERE owner_id = $1`, userID).Scan(&owned); err != nil {
-			h.log.Error("Failed to count owned servers", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreate})
-			return
-		}
-		if owned >= ent.MaxServersCreated {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Server limit reached",
-				"code":  "server_cap_reached",
-				"limit": ent.MaxServersCreated,
-			})
-			return
-		}
+	recent, retryAfter, err := lockAndCountRecentCreates(c.Request.Context(), tx, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Session no longer valid"})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check server create quota", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreate})
+		return
+	}
+	if recent >= serverCreateDailyQuota {
+		c.Header("Retry-After", strconv.Itoa(max(retryAfter, 1)))
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error": "You've created the maximum number of servers allowed in 24 hours. Try again later.",
+			"code":  "server_create_quota",
+			"limit": serverCreateDailyQuota,
+		})
+		return
 	}
 
 	serverID := uuid.New().String()
@@ -420,6 +450,14 @@ func (h *Handler) CreateServer(c *gin.Context) {
 
 	if err := insertOwnerMembership(tx, serverID, userID); err != nil {
 		h.log.Error("Failed to set up owner membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreate})
+		return
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO audit_log (server_id, actor_id, action, target_type, target_id, metadata, created_at)
+		VALUES ($1, $2, 'server_created', 'server', $1, '{}'::jsonb, NOW())`, serverID, userID); err != nil {
+		h.log.Error("Failed to record server creation", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreate})
 		return
 	}
