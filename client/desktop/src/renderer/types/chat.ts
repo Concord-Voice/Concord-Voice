@@ -83,7 +83,7 @@ export interface Message {
   call_event_payload?: CallEventPayload;
   /** Plaintext server-authored envelope for type === 'expiration_event' rows. Like
    *  call_event_payload it is never decrypted client-side — useMessageFetch skips the
-   *  E2EE pass for any non-'user' type. */
+   *  E2EE pass only for validated, empty-content call and expiration metadata. */
   expiration_event_payload?: ExpirationEventMessagePayload;
   created_at: string;
   updated_at: string;

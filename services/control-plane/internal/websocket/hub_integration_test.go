@@ -1190,6 +1190,8 @@ func TestHandleDMMessageMissingConversationID(t *testing.T) {
 
 func TestHandleDMMessageSystemType(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
+	recipient := registerUnsubscribedParticipant(setup)
+	setup.hub.dmSubscriptions[uuid.MustParse(setup.convID)][recipient.ID] = true
 
 	msg := IncomingMessage{
 		Type:     "dm_message",
@@ -1207,6 +1209,21 @@ func TestHandleDMMessageSystemType(t *testing.T) {
 
 	resp := readClientMsg(t, setup.client)
 	assert.Equal(t, "dm_message_ack", resp["type"])
+	var storedType string
+	require.NoError(t, setup.db.QueryRow(`SELECT type FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&storedType))
+	assert.Equal(t, "user", storedType, "client-controlled types must not mint metadata rows")
+	select {
+	case queued := <-setup.hub.dmBroadcast:
+		setup.hub.handleDMBroadcast(queued)
+	case <-time.After(time.Second):
+		t.Fatal("expected DM broadcast")
+	}
+	completePendingDMDeliveries(t, setup.hub)
+	broadcast := readClientMsg(t, recipient)
+	require.Equal(t, "dm_message", broadcast["type"])
+	data, ok := broadcast["data"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "user", data["type"])
 }
 
 func TestHandleDMMessageEncryptedLongerContentAllowed(t *testing.T) {

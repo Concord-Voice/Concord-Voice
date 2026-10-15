@@ -1,9 +1,11 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { z } from 'zod';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2ee/e2eeService';
 import { isPendingKeyError } from '../../services/e2ee/e2eeErrors';
 import type { MessageWithStatus } from '../../types/chat';
+import { DMExpirationEventSchema, ISOTimestamp, UUID } from '../../types/ws-events';
 import {
   indexMessages,
   subscribeSearchResultInvalidations,
@@ -12,6 +14,36 @@ import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
 
 const DEFAULT_LIMIT = 50;
 const MAX_PAGINATION_RECONCILIATION_ATTEMPTS = 2;
+
+const plaintextMetadataSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('call_event'),
+    content: z.literal(''),
+    call_event_payload: z.object({
+      ring_id: UUID.optional(),
+      caller_user_id: UUID.optional(),
+      participant_user_ids: z.array(UUID).nullish(),
+      started_at: ISOTimestamp,
+      ended_at: ISOTimestamp.optional(),
+      status: z.enum(['completed', 'missed', 'declined', 'canceled', 'failed']),
+      duration_seconds: z.number().int().nonnegative(),
+    }),
+  }),
+  z.object({
+    type: z.literal('expiration_event'),
+    content: z.literal(''),
+    expiration_event_payload: DMExpirationEventSchema.shape.data
+      .pick({
+        kind: true,
+        actor_user_id: true,
+        window_seconds: true,
+        previous_window_seconds: true,
+        include_pinned: true,
+        previous_include_pinned: true,
+      })
+      .extend({ changed_at: ISOTimestamp }),
+  }),
+]);
 
 /**
  * Purge generations, keyed by scope (channel id or DM conversation id).
@@ -164,16 +196,33 @@ async function decryptMessages(
   operationGuard: E2EEChannelOperationGuard
 ): Promise<MessageWithStatus[]> {
   operationGuard.assertCurrent();
+  // Only validated empty-content metadata may bypass message authentication.
+  const messages = rawMsgs.map((m) => {
+    if (!m.type || m.type === 'user') return m;
+    if (plaintextMetadataSchema.safeParse(m).success) {
+      if (m.type === 'call_event' && m.call_event_payload) {
+        return {
+          ...m,
+          call_event_payload: {
+            ...m.call_event_payload,
+            participant_user_ids: m.call_event_payload.participant_user_ids ?? undefined,
+          },
+        };
+      }
+      return m;
+    }
+    return {
+      ...m,
+      type: 'user',
+      call_event_payload: undefined,
+      expiration_event_payload: undefined,
+    };
+  });
   // Fail-closed: if E2EE isn't initialized, blank content rather than
   // leaking ciphertext. Mark as pendingKeys so the UI shows the correct placeholder.
   if (!e2eeService.isInitialized) {
-    return rawMsgs.map((m) => {
-      // Server-authored system rows have no ciphertext; never mark them pendingKeys
-      // (#1219). Tested on the DISCRIMINATOR, not on one literal: this guard read
-      // `=== 'call_event'` while four comments added alongside `expiration_event`
-      // promised any non-'user' type was skipped, so every fetched expiration row ran a
-      // doomed decrypt. A literal test silently excludes whatever type is added next.
-      if (m.type && m.type !== 'user') {
+    return messages.map((m) => {
+      if (m.type === 'call_event' || m.type === 'expiration_event') {
         return m;
       }
       const rt = m.replied_to;
@@ -197,7 +246,7 @@ async function decryptMessages(
   // getChannelKeyByVersion() calls. The current epoch is a cache hit there.
   const versionedKeys = new Map<number, CryptoKey>();
   const uniqueVersions = new Set<number>();
-  for (const m of rawMsgs) {
+  for (const m of messages) {
     if (m.key_version) {
       uniqueVersions.add(m.key_version);
     }
@@ -219,18 +268,8 @@ async function decryptMessages(
   operationGuard.assertCurrent();
 
   const decryptedMessages = await Promise.all(
-    rawMsgs.map(async (m) => {
-      // System rows carry plaintext server metadata in their own payload column and
-      // empty content; bypass the E2EE decrypt pass (#1219) — decryptContent on ''
-      // would set decryptFailed. Return the row untouched. This covers both the initial
-      // and pagination fetch sites, which both go through decryptMessages.
-      //
-      // The test is on the DISCRIMINATOR rather than a literal. It read
-      // `=== 'call_event'` when `expiration_event` landed, so those rows took the
-      // decrypt path and came back stamped decryptFailed; nothing showed it because
-      // MessageList dispatches on `type` before reading content, which put the
-      // correctness in the RENDERER instead of the read path.
-      if (m.type && m.type !== 'user') {
+    messages.map(async (m) => {
+      if (m.type === 'call_event' || m.type === 'expiration_event') {
         return m;
       }
 

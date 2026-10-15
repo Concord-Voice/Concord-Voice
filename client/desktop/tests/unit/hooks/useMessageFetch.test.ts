@@ -6,6 +6,12 @@ import type { MessageWithStatus } from '@/renderer/types/chat';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 import { removeMessage } from '@/renderer/services/messaging/searchService';
 
+const callEventPayload = {
+  status: 'completed' as const,
+  started_at: '2026-06-15T00:00:00Z',
+  duration_seconds: 42,
+};
+
 // Mock apiFetch and safeJson
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
@@ -247,6 +253,7 @@ describe('useMessageFetch', () => {
       id: 'pending-key-initial',
       content: '',
       type: 'call_event',
+      call_event_payload: callEventPayload,
     } as MessageWithStatus;
 
     mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 });
@@ -542,12 +549,14 @@ describe('useMessageFetch', () => {
       id: 'current-call-event',
       content: '',
       type: 'call_event',
+      call_event_payload: callEventPayload,
     } as MessageWithStatus;
     const olderCallEvent = {
       ...mockMessage,
       id: 'older-call-event',
       content: '',
       type: 'call_event',
+      call_event_payload: callEventPayload,
     } as MessageWithStatus;
     mockFetchResponse([currentCallEvent]);
 

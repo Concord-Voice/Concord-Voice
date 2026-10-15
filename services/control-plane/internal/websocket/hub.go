@@ -5270,7 +5270,7 @@ func (h *Hub) validateDMMessage(msg IncomingMessage) (*Client, uuid.UUID, *dmMes
 	return client, convUUID, input
 }
 
-// parseDMMessageFields extracts and validates content, type,
+// parseDMMessageFields extracts and validates content,
 // attachments, and mention metadata from a DM message payload.
 func (h *Hub) parseDMMessageFields(msg IncomingMessage) (*dmMessageInput, bool) {
 	content, ok := msg.Data[keyContent].(string)
@@ -5282,11 +5282,6 @@ func (h *Hub) parseDMMessageFields(msg IncomingMessage) (*dmMessageInput, bool) 
 	if err := validateEnvelope(&msg); err != nil {
 		h.rejectEnvelope(msg)
 		return nil, false
-	}
-
-	msgType := "user"
-	if t, ok := msg.Data["type"].(string); ok && t == "system" {
-		msgType = "system"
 	}
 
 	keyVersion, kvOK := extractKeyVersion(&msg)
@@ -5314,7 +5309,7 @@ func (h *Hub) parseDMMessageFields(msg IncomingMessage) (*dmMessageInput, bool) 
 	return &dmMessageInput{
 		content:         content,
 		keyVersion:      keyVersion,
-		msgType:         msgType,
+		msgType:         "user",
 		mentionAddendum: mentionAddendum,
 		attachmentIDs:   attachmentIDs,
 		gifSlug:         gifSlug,

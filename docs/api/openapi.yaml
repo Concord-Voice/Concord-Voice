@@ -20999,6 +20999,8 @@ components:
                   format: uuid
                 participant_user_ids:
                   type: array
+                  nullable: true
+                  description: Legacy null values represent an absent participant list; clients normalize them to absence.
                   items:
                     type: string
                     format: uuid
@@ -21080,6 +21082,11 @@ components:
           type: string
         type:
           type: string
+          description: >-
+            Client DM sends are stored as user messages regardless of a supplied type.
+            Only server-authored call_event and expiration_event rows with empty content
+            and valid payloads are plaintext metadata. All other history rows require
+            ordinary E2EE authentication; a non-user label alone never permits plaintext.
         key_version:
           type: integer
         edited_at:
@@ -21139,6 +21146,8 @@ components:
               format: uuid
             participant_user_ids:
               type: array
+              nullable: true
+              description: Legacy null values represent an absent participant list; clients normalize them to absence.
               items:
                 type: string
                 format: uuid
@@ -21153,6 +21162,32 @@ components:
               enum: [completed, missed, declined, canceled, failed]
             duration_seconds:
               type: integer
+        expiration_event_payload:
+          type: object
+          description: Server-authored metadata for an empty-content expiration_event row.
+          required: [kind, actor_user_id, window_seconds, changed_at]
+          properties:
+            kind:
+              type: string
+              enum: [set, changed, cleared]
+            actor_user_id:
+              type: string
+              format: uuid
+            window_seconds:
+              type: integer
+              nullable: true
+              enum: [3600, 86400, 604800, 2592000, null]
+            previous_window_seconds:
+              type: integer
+              nullable: true
+              enum: [3600, 86400, 604800, 2592000, null]
+            include_pinned:
+              type: boolean
+            previous_include_pinned:
+              type: boolean
+            changed_at:
+              type: string
+              format: date-time
     DMKey:
       type: object
       properties:

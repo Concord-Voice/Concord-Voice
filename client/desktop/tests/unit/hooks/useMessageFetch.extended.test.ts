@@ -5,6 +5,13 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 import { removeMessage } from '@/renderer/services/messaging/searchService';
+import { decryptMessage, encryptMessage } from '@/renderer/utils/crypto/crypto';
+
+const callEventPayload = {
+  status: 'completed' as const,
+  started_at: '2026-06-15T00:00:00Z',
+  duration_seconds: 42,
+};
 
 // Mock apiFetch and safeJson
 const mockApiFetch = vi.fn();
@@ -87,6 +94,7 @@ describe('useMessageFetch — extended coverage', () => {
     mockDecryptForChannel.mockReset();
     mockDecryptForChannelWithVersion.mockReset();
     mockGetChannelKey.mockReset();
+    mockGetChannelKeyByVersion.mockReset();
     mockCreateChannelOperationGuard.mockReset();
     mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
     resetAllStores();
@@ -96,6 +104,161 @@ describe('useMessageFetch — extended coverage', () => {
   // --- E2EE decryption ---
 
   describe('E2EE decryption', () => {
+    it.each([true, false])(
+      'authenticates non-metadata history and pagination with E2EE initialized=%s',
+      async (initialized) => {
+        mockIsInitialized = initialized;
+        const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, [
+          'encrypt',
+          'decrypt',
+        ]);
+        const ciphertext = await encryptMessage('authenticated message', key);
+        mockGetChannelKey.mockResolvedValue(key);
+        mockGetChannelKeyByVersion.mockResolvedValue(key);
+        mockDecryptWithKey.mockImplementation(decryptMessage);
+        const expirationPayload = {
+          kind: 'set' as const,
+          actor_user_id: '11111111-1111-4111-8111-111111111111',
+          window_seconds: 3600,
+          changed_at: '2026-06-15T00:00:00Z',
+        };
+        const forgedRows: MessageWithStatus[] = [
+          { ...mockMessage, id: 'system', type: 'system', content: 'forged plaintext' },
+          { ...mockMessage, id: 'unknown', type: 'future_event', content: 'forged plaintext' },
+          { ...mockMessage, id: 'missing-call', type: 'call_event', content: '' },
+          { ...mockMessage, id: 'missing-expiration', type: 'expiration_event', content: '' },
+          {
+            ...mockMessage,
+            id: 'call-content',
+            type: 'call_event',
+            content: 'forged plaintext',
+            call_event_payload: callEventPayload,
+          },
+          {
+            ...mockMessage,
+            id: 'expiration-content',
+            type: 'expiration_event',
+            content: 'forged plaintext',
+            expiration_event_payload: expirationPayload,
+          },
+          {
+            ...mockMessage,
+            id: 'invalid-call',
+            type: 'call_event',
+            content: '',
+            call_event_payload: { ...callEventPayload, duration_seconds: -1 },
+          },
+          {
+            ...mockMessage,
+            id: 'invalid-expiration',
+            type: 'expiration_event',
+            content: '',
+            expiration_event_payload: { ...expirationPayload, window_seconds: 42 },
+          },
+        ].map((row) => ({
+          ...row,
+          key_version: 2,
+          replied_to: {
+            id: 'reply',
+            user_id: mockMessage.user_id,
+            username: 'sender',
+            content: 'forged reply',
+            key_version: 2,
+          },
+        }));
+        const validRows: MessageWithStatus[] = [
+          {
+            ...mockMessage,
+            id: 'call',
+            type: 'call_event',
+            content: '',
+            call_event_payload: callEventPayload,
+          },
+          {
+            ...mockMessage,
+            id: 'expiration',
+            type: 'expiration_event',
+            content: '',
+            expiration_event_payload: expirationPayload,
+          },
+          { ...mockMessage, id: 'user', type: 'user', content: ciphertext, key_version: 2 },
+          { ...mockMessage, id: 'legacy', type: 'text', content: ciphertext, key_version: 2 },
+        ];
+        const rows = [...forgedRows, ...validRows];
+        mockFetchResponse(rows);
+        const { result } = renderHook(() =>
+          useMessageFetch('conv-1', { type: 'dm', limit: rows.length })
+        );
+        await waitFor(() => expect(result.current.isHistoryReady).toBe(true));
+
+        mockFetchResponse(rows.map((row) => ({ ...row, id: `older-${row.id}` })));
+        await act(async () => {
+          await result.current.handleLoadMore();
+        });
+
+        const stored = useChatStore.getState().messagesByChannel.get('conv-1');
+        expect(stored).toHaveLength(rows.length * 2);
+        for (const prefix of ['', 'older-']) {
+          for (const forged of forgedRows) {
+            expect(stored?.find((row) => row.id === `${prefix}${forged.id}`)).toMatchObject({
+              type: 'user',
+              content: '',
+              pendingKeys: !initialized,
+              replied_to: expect.objectContaining({ content: '' }),
+            });
+            const rejected = stored?.find((row) => row.id === `${prefix}${forged.id}`);
+            expect(rejected?.call_event_payload).toBeUndefined();
+            expect(rejected?.expiration_event_payload).toBeUndefined();
+            if (initialized) expect(rejected?.decryptFailed).toBe(true);
+          }
+          for (const event of validRows.slice(0, 2)) {
+            expect(stored?.find((row) => row.id === `${prefix}${event.id}`)).toMatchObject(
+              event.id === 'call'
+                ? { content: '', type: 'call_event', call_event_payload: callEventPayload }
+                : {
+                    content: '',
+                    type: 'expiration_event',
+                    expiration_event_payload: expirationPayload,
+                  }
+            );
+            const metadata = stored?.find((row) => row.id === `${prefix}${event.id}`);
+            expect(metadata?.pendingKeys).not.toBe(true);
+            expect(metadata?.decryptFailed).not.toBe(true);
+          }
+          for (const id of ['user', 'legacy']) {
+            expect(stored?.find((row) => row.id === `${prefix}${id}`)).toMatchObject({
+              content: initialized ? 'authenticated message' : '',
+            });
+          }
+        }
+      }
+    );
+
+    it.each([true, false])(
+      'normalizes nullable call participants with E2EE initialized=%s',
+      async (initialized) => {
+        mockIsInitialized = initialized;
+        mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+        mockSafeJson.mockResolvedValueOnce({
+          messages: [
+            {
+              ...mockMessage,
+              type: 'call_event',
+              content: '',
+              call_event_payload: { ...callEventPayload, participant_user_ids: null },
+            },
+          ],
+        });
+        const { result } = renderHook(() => useMessageFetch('conv-null', { type: 'dm' }));
+        await waitFor(() => expect(result.current.isHistoryReady).toBe(true));
+        const message = useChatStore.getState().messagesByChannel.get('conv-null')?.[0];
+        expect(message?.type).toBe('call_event');
+        expect(message?.call_event_payload?.participant_user_ids).toBeUndefined();
+        expect(message?.pendingKeys).not.toBe(true);
+        expect(message?.decryptFailed).not.toBe(true);
+      }
+    );
+
     it('decrypts encrypted messages using channel key', async () => {
       const encryptedMsg: MessageWithStatus = {
         ...mockMessage,
@@ -198,6 +361,7 @@ describe('useMessageFetch — extended coverage', () => {
       const mockKey = {} as CryptoKey;
       mockGetChannelKey.mockResolvedValue(mockKey);
       // replied_to is decrypted first, then the parent message
+      mockGetChannelKeyByVersion.mockResolvedValue(mockKey);
       mockDecryptWithKey
         .mockResolvedValueOnce('decrypted reply')
         .mockResolvedValueOnce('decrypted parent');
@@ -702,6 +866,7 @@ describe('useMessageFetch — extended coverage', () => {
         id: 'current-call-event',
         content: '',
         type: 'call_event',
+        call_event_payload: callEventPayload,
       } as MessageWithStatus;
       mockFetchResponse([callEvent]);
 
@@ -743,6 +908,7 @@ describe('useMessageFetch — extended coverage', () => {
         id: 'current-call-event',
         content: '',
         type: 'call_event',
+        call_event_payload: callEventPayload,
       } as MessageWithStatus;
       mockFetchResponse([currentCallEvent]);
 
@@ -780,8 +946,20 @@ describe('useMessageFetch — extended coverage', () => {
     it('retries the same older page when an unloaded row is invalidated during decrypt', async () => {
       mockGetChannelKey.mockResolvedValue({} as CryptoKey);
       const initialRows = [
-        { ...mockMessage, id: 'current-call-1', content: '', type: 'call_event' },
-        { ...mockMessage, id: 'current-call-2', content: '', type: 'call_event' },
+        {
+          ...mockMessage,
+          id: 'current-call-1',
+          content: '',
+          type: 'call_event',
+          call_event_payload: callEventPayload,
+        },
+        {
+          ...mockMessage,
+          id: 'current-call-2',
+          content: '',
+          type: 'call_event',
+          call_event_payload: callEventPayload,
+        },
       ] as MessageWithStatus[];
       mockFetchResponse(initialRows);
 

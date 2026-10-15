@@ -152,7 +152,7 @@ func TestOpsMessageCounterWebSocketValidationFailureIsNoOp(t *testing.T) {
 	require.Zero(t, counter.count(opsmetrics.MetricChannelMessagesTotal))
 }
 
-func TestOpsMessageCounterWebSocketDMExcludesSystemCallEventRows(t *testing.T) {
+func TestOpsMessageCounterWebSocketDMCountsClientSuppliedSystemType(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
 	counter := &opsCounterSpy{}
 	setup.hub.opsCounter = counter
@@ -171,7 +171,7 @@ func TestOpsMessageCounterWebSocketDMExcludesSystemCallEventRows(t *testing.T) {
 		})
 	}
 
-	require.Equal(t, 1, counter.count(opsmetrics.MetricDMMessagesTotal))
+	require.Equal(t, 2, counter.count(opsmetrics.MetricDMMessagesTotal))
 }
 
 func TestSetMentionChecker(t *testing.T) {
@@ -3860,24 +3860,28 @@ func TestParseDMMessageFieldsMissingContent(t *testing.T) {
 	assert.Nil(t, input)
 }
 
-func TestParseDMMessageFieldsSystemType(t *testing.T) {
-	hub := newMinimalHub()
-	clientID := uuid.New()
-	client := newTestClient(hub, uuid.New())
-	hub.clients[clientID] = client
+func TestParseDMMessageFieldsIgnoresClientType(t *testing.T) {
+	for _, messageType := range []interface{}{"user", "system", "call_event", "expiration_event", "future_event", nil, float64(1)} {
+		t.Run(fmt.Sprint(messageType), func(t *testing.T) {
+			hub := newMinimalHub()
+			clientID := uuid.New()
+			client := newTestClient(hub, uuid.New())
+			hub.clients[clientID] = client
 
-	msg := IncomingMessage{
-		ClientID: clientID,
-		Data: map[string]interface{}{
-			keyContent:    "system message",
-			keyKeyVersion: float64(1),
-			"type":        "system",
-		},
+			msg := IncomingMessage{
+				ClientID: clientID,
+				Data: map[string]interface{}{
+					keyContent:    "system message",
+					keyKeyVersion: float64(1),
+					"type":        messageType,
+				},
+			}
+			input, valid := hub.parseDMMessageFields(msg)
+			assert.True(t, valid)
+			require.NotNil(t, input)
+			assert.Equal(t, "user", input.msgType)
+		})
 	}
-	input, valid := hub.parseDMMessageFields(msg)
-	assert.True(t, valid)
-	require.NotNil(t, input)
-	assert.Equal(t, "system", input.msgType)
 }
 
 func TestParseDMMessageFieldsCustomKeyVersion(t *testing.T) {

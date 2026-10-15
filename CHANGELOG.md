@@ -69,6 +69,7 @@ expiration timer can now keep pinned messages, and says so.
 
 ### Fixed
 
+- **Direct messages authenticate unexpected message types** (internal development reference omitted) — participant messages are always stored as ordinary encrypted messages, and only validated call and expiration events can use the system-event history path.
 - **Session refresh security** (internal development reference omitted) — Session recovery after a refresh retry now verifies the device identifier recorded on either the old token or its live successor.
 - **Recovery codes cannot be reused by concurrent sign-in attempts** (internal development reference omitted) — the first successful attempt now consumes the code before another attempt can use it.
 
