@@ -1721,12 +1721,12 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 	// two-outcome form sent every benign SSO rotation race to the loud arm and
 	// emitted a SeverityHigh replay event for it.
 	//
-	// IP and user-agent are recorded evidence: stored absence is no signal, but
-	// a recorded value must match even when the request omits it. The >=1-known-
-	// signal rule keeps an all-absent SSO row from recovering on lineage alone.
+	// IP, user-agent and machine ID are recorded evidence: stored absence is no
+	// signal, but a recorded value must match even when the request omits it.
+	// At least one known signal keeps an all-absent SSO row from recovering on lineage alone.
 	ipKnown, ipOk := revokedIP != "", revokedIP == "" || revokedIP == requestIP
 	uaKnown, uaOk := revokedUA != "", revokedUA == "" || revokedUA == requestUA
-	midKnown, midOk := signalMatch(revokedMachineID, graceRequestMachineID)
+	midKnown, midOk := revokedMachineID != "", revokedMachineID == "" || revokedMachineID == graceRequestMachineID
 
 	withinWindow := time.Since(revokedAt) < 30*time.Second
 	anyKnown := ipKnown || uaKnown || midKnown
@@ -2262,6 +2262,13 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	if successorMachineID.Valid {
 		successor.MachineID = successorMachineID.String
 	}
+	// Rotation may have first recorded a machine binding on this successor.
+	graceMachineID := c.GetHeader(headerMachineID)
+	if successor.MachineID != "" && successor.MachineID != graceMachineID {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonRefreshReplay, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
+		return
+	}
 
 	// Revoke the successor (never delivered to the client) — checked, inside the tx.
 	var revokedSuccessorID string
@@ -2296,10 +2303,6 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 	newTokenHash := HashRefreshToken(newRefreshToken)
 	newTokenID := uuid.New().String()
-	graceMachineID := c.GetHeader(headerMachineID)
-	if graceMachineID == "" {
-		graceMachineID = successor.MachineID
-	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,

@@ -8,9 +8,8 @@ package auth
 // reader treats absence as NO SIGNAL — never as a value or mismatch.
 //
 // known is true only when BOTH sides carry a value; ok is true when the signal
-// is unknown OR the two sides agree. Grace recovery treats recorded IP and
-// user-agent evidence differently: stored absence is no signal, but a stored
-// value must match a presented value.
+// is unknown OR the two sides agree. Grace recovery instead requires a
+// presented match for every recorded signal, including machine_id.
 //
 // This is for optional symmetric comparisons. A DISPLAY reader must NOT use it
 // — it renders absent as "unknown" instead. Adding a nullable column? Pick one,
@@ -18,7 +17,7 @@ package auth
 //
 // Introduced by #3290. Coalescing nullable columns to "" must not turn absence
 // into a mismatch. This protects optional symmetric comparisons; grace recovery
-// separately treats stored IP and user-agent values as evidence to be refuted.
+// separately treats stored session metadata as evidence to be refuted.
 func signalMatch(stored, presented string) (known, ok bool) {
 	known = stored != "" && presented != ""
 	return known, !known || stored == presented
