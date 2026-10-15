@@ -130,8 +130,9 @@ if (fs.existsSync(NATIVE_ADDON)) {
   // Fail-loud, following the buildtag.json idiom above. Without this the
   // existsSync guard ALONE ships nothing, on every platform, with every leg
   // green — the packaging equivalent of a silent no-op, and precisely the defect
-  // #3194 exists to close. The build-desktop.yml step that produces this file is
-  // "Build the native addon (win32/darwin only)"; if we are here, it did not run.
+  // #3194 exists to close. The build-desktop.yml steps that produce this file are
+  // "Build the native addon (darwin)" and "Build the native addon (win32)"; if we are here,
+  // the one for this platform did not run.
   throw new Error(
     'forge.config.ts: concord_audiocap.node missing in CI packaging context. ' +
       'Run `npm run build:native` before electron-forge make/package — see the ' +
