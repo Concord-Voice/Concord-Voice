@@ -2997,6 +2997,27 @@ describe('RoomManager', () => {
       ).rejects.toThrow('Invalid media source for producer kind');
     });
 
+    it('rejects an audio producer carrying a non-audio codec (#3858)', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      const vp8Mic = {
+        ...createRtpParameters(),
+        codecs: [{ mimeType: 'video/VP8', payloadType: 96, clockRate: 90000 }],
+      };
+      await expect(
+        manager.produce('room-1', 'u-1', transport.id, 'audio', vp8Mic as any, 'mic')
+      ).rejects.toThrow('Invalid codec for producer kind');
+      expect(transport.produce).not.toHaveBeenCalled();
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_integrity',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'media_schema_rejected',
+        routeTemplate: 'socket.produce',
+      });
+    });
+
     it('rejects an unknown source string', async () => {
       await expect(
         manager.produce(
@@ -4472,11 +4493,65 @@ describe('RoomManager', () => {
     });
   });
 
-  describe('produce — per-user audio tier gating (#1300)', () => {
+  describe('produce — per-user audio tier gating (#1300, #3858)', () => {
     // u-1 (free floor: minPtime 20, standard opus ceiling 96 kbps) is joined by
     // the parent produce beforeEach. Add a premium peer with their own transport.
     let freeTransport: ReturnType<typeof createMockTransport>;
     let premiumTransport: ReturnType<typeof createMockTransport>;
+
+    type ProduceRtpParameters = Parameters<typeof manager.produce>[4];
+    const asRtp = (rtp: unknown): ProduceRtpParameters => rtp as ProduceRtpParameters;
+    type Who = 'free' | 'premium';
+    const actor = (who: Who) =>
+      who === 'free'
+        ? { userId: 'u-1', transport: freeTransport }
+        : { userId: 'u-prem', transport: premiumTransport };
+
+    const REFUSAL = 'Audio producer exceeds tier media limits';
+
+    /**
+     * Assert the gate refused a mic produce: the generic error, no producer ever
+     * created (the gate runs before the `await produce()`), one security deny, and
+     * a violation log carrying EXACTLY `{ userId, kind, source, reason }`.
+     */
+    async function expectRefused(rtp: unknown, reason: string, who: Who = 'free') {
+      const { userId, transport } = actor(who);
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      const warnSpy = vi.mocked(logger.warn);
+      warnSpy.mockClear();
+
+      await expect(
+        manager.produce('room-1', userId, transport.id, 'audio', asRtp(rtp), 'mic')
+      ).rejects.toThrow(REFUSAL);
+
+      expect(transport.produce).not.toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', userId)?.producers.size).toBe(0);
+      expectSecurityDeny(emit, 'structural_limit_exceeded');
+
+      const rejections = warnSpy.mock.calls.filter((c) => String(c[0]).includes('over-tier media'));
+      expect(rejections).toHaveLength(1);
+      const meta = rejections[0][1] as Record<string, unknown>;
+      expect(Object.keys(meta).sort()).toEqual(['kind', 'reason', 'source', 'userId']);
+      expect(meta).toEqual({ userId, kind: 'audio', source: 'mic', reason });
+    }
+
+    /** Assert the gate admitted a mic produce and the producer was created. */
+    async function expectAdmitted(rtp: unknown, who: Who = 'free') {
+      const { userId, transport } = actor(who);
+      const producer = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(producer);
+      const info = await manager.produce(
+        'room-1',
+        userId,
+        transport.id,
+        'audio',
+        asRtp(rtp),
+        'mic'
+      );
+      expect(info.producerId).toBe(producer.id);
+      expect(transport.produce).toHaveBeenCalledOnce();
+    }
 
     beforeEach(async () => {
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
@@ -4503,183 +4578,456 @@ describe('RoomManager', () => {
       await manager.createTransport('room-1', 'u-prem', 'send');
     });
 
-    it('REJECTS a free-tier mic producer with ptime below 20 ms (and never creates the producer)', async () => {
-      const emit = vi.fn();
-      manager.setSecurityEventEmitter(emit);
-      await expect(
-        manager.produce(
+    describe('ptime', () => {
+      it('REFUSES a free-tier mic whose ptime is below 20 ms (and never creates the producer)', async () => {
+        await expectRefused(createRtpParameters({ ptime: 10 }), 'ptime_below_tier_minimum');
+        await expectRefused(createRtpParameters({ ptime: 19 }), 'ptime_below_tier_minimum');
+      });
+
+      it('REFUSES a mic that declares no ptime anywhere (ptime_undeclared)', async () => {
+        // Bitrate is declared and within the ceiling, so ptime is the only gap.
+        await expectRefused(createRtpParameters({ useinbandfec: 1 }), 'ptime_undeclared');
+        await expectRefused(createRtpParameters(null), 'ptime_undeclared');
+      });
+
+      it('REFUSES a premium mic that declares no ptime too — absence is refused at every tier', async () => {
+        await expectRefused(createRtpParameters(null), 'ptime_undeclared', 'premium');
+      });
+
+      it('checks ptime before bitrate: a mic missing both is refused for its ptime', async () => {
+        // Each other refusal case carries one defect; these carry two, so reordering
+        // the bitrate checks ahead of the ptime checks changes the reason.
+        await expectRefused(createRtpParameters(null, []), 'ptime_undeclared');
+        await expectRefused(createRtpParameters({ ptime: 10 }, []), 'ptime_below_tier_minimum');
+      });
+
+      it('reads a numeric-string ptime as a number, like the bitrate sources', async () => {
+        await expectRefused(createRtpParameters({ ptime: '10' }), 'ptime_below_tier_minimum');
+        await expectAdmitted(createRtpParameters({ ptime: '20' }));
+      });
+
+      it('does NOT read minptime as the effective ptime: minptime alone is undeclared, not "below minimum"', async () => {
+        // Regression lock (Gitar review, #1300): Chromium/Electron emit `minptime=10`
+        // (or lower) by default while actually packetizing at 20 ms. minptime is the
+        // LOWER BOUND the encoder may drop to, not the real ptime. Read as ptime, a
+        // minptime of 5 would be refused as `ptime_below_tier_minimum`; the reason
+        // must instead be `ptime_undeclared`.
+        await expectRefused(createRtpParameters({ minptime: 5 }), 'ptime_undeclared');
+      });
+
+      it('ADMITS a stock free client that declares minptime AND an actual 20 ms ptime', async () => {
+        // The same minptime that must not stand in for ptime must not break a
+        // client that also declares the real one.
+        await expectAdmitted(createRtpParameters({ minptime: 5, ptime: 20 }));
+      });
+
+      it('ADMITS a free-tier mic whose ptime is exactly the 20 ms minimum', async () => {
+        await expectAdmitted(createRtpParameters({ ptime: 20 }));
+      });
+
+      it('ADMITS a premium mic at the 10 ms premium minimum, and refuses the same shape for free', async () => {
+        await expectRefused(createRtpParameters({ ptime: 10 }), 'ptime_below_tier_minimum');
+        await expectAdmitted(createRtpParameters({ ptime: 10 }), 'premium');
+      });
+
+      it('falls back to the transport-level rtpParameters ptime when the codec declares none', async () => {
+        const transportLevel = { ...createRtpParameters(null), ptime: 20 };
+        await expectAdmitted(transportLevel);
+      });
+
+      it('prefers the codec-level ptime over the transport-level one', async () => {
+        // Codec says 10 (below the free minimum); transport says 20. Codec wins.
+        const mixed = { ...createRtpParameters({ ptime: 10 }), ptime: 20 };
+        await expectRefused(mixed, 'ptime_below_tier_minimum');
+      });
+    });
+
+    describe('bitrate', () => {
+      it('REFUSES a mic that declares no bitrate at all (bitrate_undeclared)', async () => {
+        // No encodings, no maxaveragebitrate. ptime is valid, so bitrate is the gap.
+        await expectRefused(createRtpParameters({ ptime: 20 }, []), 'bitrate_undeclared');
+        // An encoding that carries an ssrc but no maxBitrate declares nothing.
+        await expectRefused(
+          createRtpParameters({ ptime: 20 }, [{ ssrc: 12345 }]),
+          'bitrate_undeclared'
+        );
+      });
+
+      it('REFUSES a mic whose rtpParameters carry no encodings array at all', async () => {
+        const noEncodings: Record<string, unknown> = { ...createRtpParameters({ ptime: 20 }, []) };
+        delete noEncodings.encodings;
+        await expectRefused(noEncodings, 'bitrate_undeclared');
+      });
+
+      it('REFUSES a premium mic that declares no bitrate too — absence is refused at every tier', async () => {
+        await expectRefused(createRtpParameters({ ptime: 10 }, []), 'bitrate_undeclared', 'premium');
+      });
+
+      it('ADMITS encodings maxBitrate exactly at the free ceiling and REFUSES one bps over', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20 }, [{ ssrc: 1, maxBitrate: 96_001 }]),
+          'opus_bitrate_above_tier_ceiling'
+        );
+        await expectAdmitted(createRtpParameters({ ptime: 20 }, [{ ssrc: 1, maxBitrate: 96_000 }]));
+      });
+
+      it('uses the fmtp maxaveragebitrate as a second source when no encoding declares one', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20, maxaveragebitrate: 96_001 }, []),
+          'opus_bitrate_above_tier_ceiling'
+        );
+        await expectAdmitted(createRtpParameters({ ptime: 20, maxaveragebitrate: 96_000 }, []));
+      });
+
+      it('REFUSES when encodings are within the ceiling but the fmtp is over', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20, maxaveragebitrate: 256_000 }, [
+            { ssrc: 1, maxBitrate: 64_000 },
+          ]),
+          'opus_bitrate_above_tier_ceiling'
+        );
+      });
+
+      it('REFUSES when the fmtp is within the ceiling but encodings are over', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20, maxaveragebitrate: 64_000 }, [
+            { ssrc: 1, maxBitrate: 256_000 },
+          ]),
+          'opus_bitrate_above_tier_ceiling'
+        );
+      });
+
+      it('ADMITS when both sources are declared and both are within the ceiling', async () => {
+        await expectAdmitted(
+          createRtpParameters({ ptime: 20, maxaveragebitrate: 64_000 }, [
+            { ssrc: 1, maxBitrate: 96_000 },
+          ])
+        );
+      });
+
+      it('takes the MAX across encodings: a low first entry cannot hide an over-ceiling later one', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20 }, [
+            { ssrc: 1, maxBitrate: 32_000 },
+            { ssrc: 2, maxBitrate: 256_000 },
+          ]),
+          'opus_bitrate_above_tier_ceiling'
+        );
+      });
+
+      it('takes the MAX across encodings: an over-ceiling first entry is not forgiven by a low later one', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20 }, [
+            { ssrc: 1, maxBitrate: 256_000 },
+            { ssrc: 2, maxBitrate: 32_000 },
+          ]),
+          'opus_bitrate_above_tier_ceiling'
+        );
+      });
+
+      it('ADMITS several encodings that are all within the ceiling', async () => {
+        await expectAdmitted(
+          createRtpParameters({ ptime: 20 }, [
+            { ssrc: 1, maxBitrate: 32_000 },
+            { ssrc: 2, maxBitrate: 96_000 },
+          ])
+        );
+      });
+
+      it.each([
+        ['NaN', Number.NaN],
+        ['Infinity', Number.POSITIVE_INFINITY],
+        ['-Infinity', Number.NEGATIVE_INFINITY],
+        ['a non-numeric string', 'lots'],
+        ['an empty string', ''],
+        ['null', null],
+        ['undefined', undefined],
+        ['an object', {}],
+        ['a boolean', true],
+      ])('treats a maxBitrate of %s as absent (bitrate_undeclared)', async (_label, garbage) => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20 }, [{ ssrc: 1, maxBitrate: garbage }]),
+          'bitrate_undeclared'
+        );
+      });
+
+      it('lets a valid fmtp carry the bitrate when the encoding maxBitrate is garbage', async () => {
+        await expectAdmitted(
+          createRtpParameters({ ptime: 20, maxaveragebitrate: 64_000 }, [
+            { ssrc: 1, maxBitrate: Number.NaN },
+          ])
+        );
+      });
+
+      it('does not let a garbage encoding mask a real over-ceiling one', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 20 }, [
+            { ssrc: 1, maxBitrate: Number.NaN },
+            { ssrc: 2, maxBitrate: 256_000 },
+          ]),
+          'opus_bitrate_above_tier_ceiling'
+        );
+      });
+
+      it('survives a malformed encodings value without throwing a non-gate error', async () => {
+        // Wire-derived: encodings may be any JSON. Everything non-array / non-object
+        // counts as undeclared, and the refusal is the gate's own.
+        const notAnArray = { ...createRtpParameters({ ptime: 20 }), encodings: 'x' };
+        await expectRefused(notAnArray, 'bitrate_undeclared');
+        const junkEntries = { ...createRtpParameters({ ptime: 20 }), encodings: [null, 7, 'x'] };
+        await expectRefused(junkEntries, 'bitrate_undeclared');
+      });
+
+      it('REFUSES a free mic at hifi bitrate (256 kbps) with the generic error and no producer', async () => {
+        // 256 kbps = the hifi tier, above the free 'standard' ceiling of 96 kbps.
+        await expectRefused(
+          createRtpParameters({ ptime: 20, maxaveragebitrate: 256_000 }),
+          'opus_bitrate_above_tier_ceiling'
+        );
+      });
+    });
+
+    describe('tiers and scope', () => {
+      it("a premium participant's higher ceiling admits what the free ceiling refuses", async () => {
+        const high = createRtpParameters({ ptime: 20 }, [{ ssrc: 1, maxBitrate: 192_000 }]);
+        await expectRefused(high, 'opus_bitrate_above_tier_ceiling', 'free');
+        await expectAdmitted(high, 'premium');
+      });
+
+      it('ADMITS a PREMIUM mic at studio bitrate (510 kbps) on both sources and 10 ms ptime', async () => {
+        await expectAdmitted(
+          createRtpParameters({ ptime: 10, maxaveragebitrate: 510_000 }, [
+            { ssrc: 1, maxBitrate: 510_000 },
+          ]),
+          'premium'
+        );
+      });
+
+      it('REFUSES a premium mic above even the studio ceiling', async () => {
+        await expectRefused(
+          createRtpParameters({ ptime: 10 }, [{ ssrc: 1, maxBitrate: 510_001 }]),
+          'opus_bitrate_above_tier_ceiling',
+          'premium'
+        );
+      });
+
+      it('returns early for a non-opus audio codec: nothing tier-gated is inspected', async () => {
+        const pcmu = {
+          ...createRtpParameters(null, []),
+          codecs: [{ mimeType: 'audio/PCMU', payloadType: 0, clockRate: 8000, channels: 1 }],
+        };
+        await expectAdmitted(pcmu);
+      });
+
+      it('does NOT gate a non-mic audio source (screen-audio is not tier-quality-gated)', async () => {
+        // Seed a screen producer (screen-audio requires one) ...
+        freeTransport.produce.mockResolvedValueOnce(
+          createMockProducer({ kind: 'video', id: 'scr' })
+        );
+        await manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'video',
+          asRtp(createRtpParameters()),
+          'screen'
+        );
+
+        // ... then a screen-audio stream that is over-tier AND undeclared still
+        // passes (it is NOT mic, so the audio-tier gate does not apply).
+        const screenAudio = createMockProducer({ kind: 'audio', id: 'scr-aud' });
+        freeTransport.produce.mockResolvedValueOnce(screenAudio);
+        const info = await manager.produce(
           'room-1',
           'u-1',
           freeTransport.id,
           'audio',
-          createRtpParameters({ ptime: 10 }) as any,
-          'mic'
-        )
-      ).rejects.toThrow('Audio producer exceeds tier media limits');
+          asRtp(
+            createRtpParameters({ ptime: 5, maxaveragebitrate: 510_000 }, [
+              { ssrc: 1, maxBitrate: 510_000 },
+            ])
+          ),
+          'screen-audio'
+        );
+        expect(info.source).toBe('screen-audio');
+      });
 
-      // The producer is rejected BEFORE the await — transport.produce never ran.
-      expect(freeTransport.produce).not.toHaveBeenCalled();
-      expect(manager.getParticipant('room-1', 'u-1')?.producers.size).toBe(0);
-      expectSecurityDeny(emit, 'structural_limit_exceeded');
-    });
-
-    it('REJECTS a free-tier mic producer whose opus bitrate exceeds the standard ceiling (96 kbps)', async () => {
-      await expect(
-        manager.produce(
+      it('does NOT gate screen-audio that declares nothing at all', async () => {
+        freeTransport.produce.mockResolvedValueOnce(
+          createMockProducer({ kind: 'video', id: 'scr' })
+        );
+        await manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'video',
+          asRtp(createRtpParameters()),
+          'screen'
+        );
+        freeTransport.produce.mockResolvedValueOnce(
+          createMockProducer({ kind: 'audio', id: 'scr-aud' })
+        );
+        const info = await manager.produce(
           'room-1',
           'u-1',
           freeTransport.id,
           'audio',
-          // 256 kbps = the hifi tier, above the free 'standard' ceiling of 96 kbps.
-          createRtpParameters({ maxaveragebitrate: 256_000 }) as any,
-          'mic'
-        )
-      ).rejects.toThrow('Audio producer exceeds tier media limits');
+          asRtp(createRtpParameters(null, [])),
+          'screen-audio'
+        );
+        expect(info.source).toBe('screen-audio');
+      });
 
-      expect(freeTransport.produce).not.toHaveBeenCalled();
-      expect(manager.getParticipant('room-1', 'u-1')?.producers.size).toBe(0);
+      it('the rejection violation log contains NO rtpParameters payload, codec params, or display fields', async () => {
+        const warnSpy = vi.mocked(logger.warn);
+        warnSpy.mockClear();
+
+        await expect(
+          manager.produce(
+            'room-1',
+            'u-1',
+            freeTransport.id,
+            'audio',
+            asRtp(
+              createRtpParameters({ ptime: 20, maxaveragebitrate: 256_000 }, [
+                { ssrc: 1, maxBitrate: 256_000 },
+              ])
+            ),
+            'mic'
+          )
+        ).rejects.toThrow(REFUSAL);
+
+        const rejectionCall = warnSpy.mock.calls.find((c) =>
+          String(c[0]).includes('over-tier media')
+        );
+        expect(rejectionCall).toBeDefined();
+        const meta = rejectionCall![1] as Record<string, unknown>;
+        expect(Object.keys(meta).sort()).toEqual(['kind', 'reason', 'source', 'userId']);
+        expect(meta.userId).toBe('u-1');
+        expect(meta.kind).toBe('audio');
+        expect(meta.source).toBe('mic');
+        // Nothing media-derived leaked.
+        const serialized = JSON.stringify(meta);
+        expect(serialized).not.toContain('256000');
+        expect(serialized).not.toContain('rtpParameters');
+        expect(serialized).not.toContain('maxaveragebitrate');
+        expect(serialized).not.toContain('maxBitrate');
+        expect(serialized).not.toContain('codecs');
+      });
     });
 
-    it('ADMITS a stock free client that declares only minptime (no actual ptime) — minptime is NOT the effective ptime', async () => {
-      // Regression lock (Gitar review, #1300): Chromium/Electron emit
-      // `minptime=10` (or lower) by default while actually packetizing at 20 ms.
-      // minptime is the LOWER BOUND the encoder may drop to, not the real ptime,
-      // so it must NOT trip the ptime gate — otherwise every stock free-tier mic
-      // is falsely rejected. An undeclared actual ptime admits (bitrate cap backstops).
-      const producer = createMockProducer({ kind: 'audio' });
-      freeTransport.produce.mockResolvedValueOnce(producer);
-      const info = await manager.produce(
-        'room-1',
-        'u-1',
-        freeTransport.id,
-        'audio',
-        createRtpParameters({ minptime: 5 }) as any, // only minptime, no ptime
-        'mic'
-      );
-      expect(info).toBeDefined();
-      expect(freeTransport.produce).toHaveBeenCalled();
-    });
+    describe('stock desktop client fixture', () => {
+      // Shape of the `rtpParameters` the Concord desktop mic produce hands the
+      // server, derived from mediasoup-client 3.24.4 (client/desktop/package.json
+      // `^3.24.4`). It was produced by driving that version's Chrome111 handler
+      // through `Transport.produce()` with the options `publishMicGraph` passes
+      // (voiceService.ts): `encodings: [{ maxBitrate, adaptivePtime, priority,
+      // networkPriority }]` and `codecOptions: { opusStereo, opusDtx, opusFec,
+      // opusNack: false, opusMaxAverageBitrate, opusMaxPlaybackRate, opusPtime }`,
+      // against a Chrome-shaped Opus offer, then capturing the object the
+      // `produce` event carries. What matters here, and what the fixture pins:
+      //   - `opusPtime` lands in `codecs[0].parameters.ptime`;
+      //   - `opusMaxAverageBitrate` / `opusMaxPlaybackRate` do NOT (they go only
+      //     into the SDP answer), so `maxaveragebitrate` is absent;
+      //   - `encodings[0].maxBitrate` is carried through, with the SSRC;
+      //   - `minptime=10` is the browser's own default fmtp, alongside the real ptime.
+      // Re-derive it when the mediasoup-client major/minor changes.
+      function stockDesktopMicRtpParameters(tier: {
+        ptime: number;
+        maxBitrate: number;
+        stereo: 0 | 1;
+        dtx: 0 | 1;
+      }) {
+        return {
+          mid: '0',
+          codecs: [
+            {
+              mimeType: 'audio/opus',
+              payloadType: 111,
+              clockRate: 48000,
+              channels: 2,
+              parameters: {
+                minptime: 10,
+                useinbandfec: 1,
+                'sprop-stereo': tier.stereo,
+                usedtx: tier.dtx,
+                ptime: tier.ptime,
+              },
+              rtcpFeedback: [{ type: 'transport-cc', parameter: '' }],
+            },
+          ],
+          headerExtensions: [
+            { uri: 'urn:ietf:params:rtp-hdrext:sdes:mid', id: 4, encrypt: false, parameters: {} },
+            {
+              uri: 'http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time',
+              id: 2,
+              encrypt: false,
+              parameters: {},
+            },
+            {
+              uri: 'http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01',
+              id: 3,
+              encrypt: false,
+              parameters: {},
+            },
+            {
+              uri: 'urn:ietf:params:rtp-hdrext:ssrc-audio-level',
+              id: 1,
+              encrypt: false,
+              parameters: {},
+            },
+          ],
+          encodings: [
+            {
+              ssrc: 3948193054,
+              active: true,
+              maxBitrate: tier.maxBitrate,
+              adaptivePtime: true,
+              priority: 'medium',
+              networkPriority: 'medium',
+              dtx: false,
+            },
+          ],
+          rtcp: { cname: 'k9Qz3mXr1WbT', reducedSize: true },
+          msid: 'strm1 trk1',
+        };
+      }
 
-    it('ADMITS a free-tier mic producer at exactly the standard ceiling and 20 ms ptime', async () => {
-      const producer = createMockProducer({ kind: 'audio' });
-      freeTransport.produce.mockResolvedValueOnce(producer);
+      // The desktop default tier is `standard` for every account (voiceStore
+      // `qualityTier ?? 'standard'`): 96 kbps, 20 ms, DTX on, mono.
+      const STANDARD = { ptime: 20, maxBitrate: 96_000, stereo: 0, dtx: 1 } as const;
+      // `studio`: 510 kbps, 10 ms, DTX off, stereo. Premium only.
+      const STUDIO = { ptime: 10, maxBitrate: 510_000, stereo: 1, dtx: 0 } as const;
 
-      const info = await manager.produce(
-        'room-1',
-        'u-1',
-        freeTransport.id,
-        'audio',
-        createRtpParameters({ ptime: 20, maxaveragebitrate: 96_000 }) as any,
-        'mic'
-      );
+      it('pins the premise: a stock mic carries ptime and encodings maxBitrate but no maxaveragebitrate', () => {
+        const rtp = stockDesktopMicRtpParameters(STANDARD);
+        expect(rtp.codecs[0].parameters.ptime).toBe(20);
+        expect(rtp.encodings[0].maxBitrate).toBe(96_000);
+        expect(rtp.codecs[0].parameters).not.toHaveProperty('maxaveragebitrate');
+      });
 
-      expect(info.producerId).toBe(producer.id);
-      expect(freeTransport.produce).toHaveBeenCalled();
-    });
+      it('ADMITS the stock desktop mic for a FREE participant at the default (standard) tier', async () => {
+        await expectAdmitted(stockDesktopMicRtpParameters(STANDARD), 'free');
+      });
 
-    it('ADMITS a producer with NO opus fmtp params — DOCUMENTED best-effort residual, NOT benign default', async () => {
-      // This is the explicit, accepted #1300 residual (spec §5): the audio gate
-      // inspects only client-DECLARED, OPTIONAL opus fmtp. A patched client
-      // EVADES the gate simply by omitting `maxaveragebitrate`/`ptime` — and we
-      // admit-on-absence BY DESIGN, because the stock client legitimately omits
-      // these, so we cannot fail-closed on a missing fmtp without rejecting
-      // legitimate free users. The advisory transport bitrate cap is the only
-      // remaining backstop here; hard enforcement against a non-cooperative
-      // client is future stats-monitoring work (#1542), not this gate. This
-      // test asserts the residual is REACHED on purpose, not that an over-tier
-      // stream is benign.
-      const producer = createMockProducer({ kind: 'audio' });
-      freeTransport.produce.mockResolvedValueOnce(producer);
+      it('ADMITS the stock desktop mic for a PREMIUM participant at the default (standard) tier', async () => {
+        await expectAdmitted(stockDesktopMicRtpParameters(STANDARD), 'premium');
+      });
 
-      const info = await manager.produce(
-        'room-1',
-        'u-1',
-        freeTransport.id,
-        'audio',
-        createRtpParameters() as any, // no parameters → gate admits (residual)
-        'mic'
-      );
+      it('ADMITS the stock desktop mic for a PREMIUM participant at the studio tier', async () => {
+        await expectAdmitted(stockDesktopMicRtpParameters(STUDIO), 'premium');
+      });
 
-      expect(info.producerId).toBe(producer.id);
-    });
-
-    it('ADMITS a PREMIUM mic producer at studio bitrate (510 kbps) and 10 ms ptime', async () => {
-      const producer = createMockProducer({ kind: 'audio' });
-      premiumTransport.produce.mockResolvedValueOnce(producer);
-
-      const info = await manager.produce(
-        'room-1',
-        'u-prem',
-        premiumTransport.id,
-        'audio',
-        createRtpParameters({ ptime: 10, maxaveragebitrate: 510_000 }) as any,
-        'mic'
-      );
-
-      expect(info.producerId).toBe(producer.id);
-      expect(premiumTransport.produce).toHaveBeenCalled();
-    });
-
-    it('does NOT gate a non-mic audio source (screen-audio is not tier-quality-gated)', async () => {
-      // Seed a screen producer (screen-audio requires one) ...
-      freeTransport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video', id: 'scr' }));
-      await manager.produce(
-        'room-1',
-        'u-1',
-        freeTransport.id,
-        'video',
-        createRtpParameters() as any,
-        'screen'
-      );
-
-      // ... then a screen-audio stream with an "over-tier" opus shape still passes
-      // (it is NOT mic, so the audio-tier gate does not apply).
-      const screenAudio = createMockProducer({ kind: 'audio', id: 'scr-aud' });
-      freeTransport.produce.mockResolvedValueOnce(screenAudio);
-      const info = await manager.produce(
-        'room-1',
-        'u-1',
-        freeTransport.id,
-        'audio',
-        createRtpParameters({ ptime: 5, maxaveragebitrate: 510_000 }) as any,
-        'screen-audio'
-      );
-
-      expect(info.source).toBe('screen-audio');
-    });
-
-    it('the rejection violation log contains NO rtpParameters payload, codec params, or display fields', async () => {
-      const { logger } = await import('../src/lib/logger.js');
-      const warnSpy = vi.mocked(logger.warn);
-      warnSpy.mockClear();
-
-      await expect(
-        manager.produce(
-          'room-1',
-          'u-1',
-          freeTransport.id,
-          'audio',
-          createRtpParameters({ ptime: 5, maxaveragebitrate: 256_000 }) as any,
-          'mic'
-        )
-      ).rejects.toThrow('Audio producer exceeds tier media limits');
-
-      // Exactly the PII-safe shape: { userId, kind, source, reason } — no more.
-      const rejectionCall = warnSpy.mock.calls.find((c) =>
-        String(c[0]).includes('over-tier media')
-      );
-      expect(rejectionCall).toBeDefined();
-      const meta = rejectionCall![1] as Record<string, unknown>;
-      expect(Object.keys(meta).sort()).toEqual(['kind', 'reason', 'source', 'userId']);
-      expect(meta.userId).toBe('u-1');
-      expect(meta.kind).toBe('audio');
-      expect(meta.source).toBe('mic');
-      // Nothing media-derived leaked.
-      const serialized = JSON.stringify(meta);
-      expect(serialized).not.toContain('256000');
-      expect(serialized).not.toContain('rtpParameters');
-      expect(serialized).not.toContain('maxaveragebitrate');
-      expect(serialized).not.toContain('codecs');
+      it('REFUSES the studio-tier stock mic for a FREE participant (over the ceiling and the ptime floor)', async () => {
+        // ptime 10 < 20 is checked first.
+        await expectRefused(stockDesktopMicRtpParameters(STUDIO), 'ptime_below_tier_minimum', 'free');
+        // At a free-legal ptime the bitrate alone still refuses it.
+        await expectRefused(
+          stockDesktopMicRtpParameters({ ...STUDIO, ptime: 20 }),
+          'opus_bitrate_above_tier_ceiling',
+          'free'
+        );
+      });
     });
   });
 

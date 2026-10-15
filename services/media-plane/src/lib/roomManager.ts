@@ -401,6 +401,17 @@ export const AUDIO_TIER_OPUS_BITRATE_CEILING_BPS: Readonly<Record<string, number
 };
 
 /**
+ * Why `enforceAudioTierGate` refused a mic producer (#1300, #3858). A closed set
+ * of fixed strings, so the log field stays countable (#1308): add a member only
+ * deliberately, and never build one from request data.
+ */
+type AudioTierRejectReason =
+  | 'ptime_undeclared'
+  | 'ptime_below_tier_minimum'
+  | 'bitrate_undeclared'
+  | 'opus_bitrate_above_tier_ceiling';
+
+/**
  * Fail-closed free-floor entitlement used as the `joinRoom` default when no
  * parsed entitlement is supplied (backward-compat callers / tests). Mirrors the
  * Go FREE floor — the same values `validateChannelAccess` falls back to via
@@ -3218,27 +3229,17 @@ export class RoomManager {
       );
     }
 
-    // Validate the client-declared source. It selects which per-room cap applies,
-    // so it is security-load-bearing (#1539): a video stream mislabeled as
-    // 'mic'/'screen-audio' would otherwise dodge the camera cap entirely. Every
-    // video producer must be a capped video source (camera/screen); every audio
-    // producer must be an audio source (mic/screen-audio). The legit client only
-    // ever emits these kind/source pairings (voiceService.ts). Static message —
-    // never interpolate the client-supplied source into the error/log (CWE-117).
-    const allowedSources: MediaSource[] =
-      kind === 'video' ? ['camera', 'screen'] : ['mic', 'screen-audio'];
-    if (!allowedSources.includes(source)) {
-      this.securityDeny('media_schema_rejected', 'socket.produce');
-      throw new Error('Invalid media source for producer kind');
-    }
+    this.assertProducerKindMatches(kind, source, rtpParameters);
 
     // Per-user audio-tier gating (#1300): for the joining user's OWN mic
     // producer, reject (BEFORE creating the producer) an over-tier opus stream.
     // Server-verifiable from rtpParameters at the produce boundary; the tier is
     // server-authoritative (participant entitlement parsed from the join-authorize
-    // response, never socket.handshake.auth). This fmtp tripwire inspects mic
-    // only; EVERY audio producer, screen-audio included, is also policed by
-    // its observed rate (#2153) whatever fmtp it declares or omits.
+    // response, never socket.handshake.auth). This tripwire reads what the
+    // client declares (ptime, encoding maxBitrate, fmtp) and refuses a mic that
+    // leaves them out (#3858); it inspects mic only. EVERY audio producer,
+    // screen-audio included, is also policed by its observed rate (#2153)
+    // whatever it declares or omits.
     // TOCTOU-safe: this is a pure synchronous check before the
     // `await produce()`, so a rejected stream never yields a (briefly-existing)
     // producer.
@@ -5332,41 +5333,50 @@ export class RoomManager {
   // ─── Private helpers ─────────────────────────────────────────────────
 
   /**
-   * Per-user audio-tier gate (#1300). REJECTS (throws — so the producer is never
-   * created) an over-tier mic opus stream for the participant's tier. Two
-   * server-verifiable checks against the inbound `rtpParameters`:
+   * Per-user audio-tier gate (#1300; fails closed on absence since #3858).
+   * REJECTS (throws — so the producer is never created) a mic opus stream that
+   * is over the participant's tier, or that does not declare what the gate needs
+   * in order to judge it. Server-verifiable checks against the inbound
+   * `rtpParameters`, in this order:
    *
-   *  1. **ptime guard** — the effective opus packet duration. Reject when the
-   *     declared ptime is below `participant.minPtimeMs` (free 20 ms; premium
-   *     10 ms). Lower ptime = more packets/sec = higher overhead, a premium
-   *     lever.
-   *  2. **audio-tier (bitrate) guard** — the opus `maxaveragebitrate` fmtp.
-   *     Reject when it exceeds the ceiling implied by the highest tier in
-   *     `participant.allowedAudioTiers` (free tops out at `standard` = 96 kbps).
+   *  1. **ptime guard** — the effective opus packet duration (see
+   *     `extractEffectivePtimeMs`). Reject `ptime_undeclared` when none is
+   *     declared, `ptime_below_tier_minimum` when it is below
+   *     `participant.minPtimeMs` (free 20 ms; premium 10 ms). Lower ptime = more
+   *     packets/sec = higher overhead, a premium lever.
+   *  2. **audio-tier (bitrate) guard** — two declared sources: the highest
+   *     `encodings[].maxBitrate` (primary: the stock client sets it on every
+   *     tier) and the opus `maxaveragebitrate` fmtp (second: mediasoup-client
+   *     writes it only into the SDP answer, so a stock client never sends it
+   *     here). Reject `bitrate_undeclared` when NEITHER is declared, and
+   *     `opus_bitrate_above_tier_ceiling` when EITHER is above the ceiling
+   *     implied by the highest tier in `participant.allowedAudioTiers` (free
+   *     tops out at `standard` = 96 kbps).
+   *
+   * The four `reason` strings are a closed, fixed set (so #1308 can count them): keep
+   * them short and stable, and never build one from request data.
    *
    * PII-safe: on reject we log ONLY `{ userId, kind, source, reason }` — never
    * the rtpParameters payload, codec parameters, or any media content
    * (observability.md core principle #4). The thrown error is generic.
    *
-   * Honest scope (BEST-EFFORT, NOT a hard guarantee). The values inspected are
-   * client-DECLARED, OPTIONAL opus `fmtp` parameters (`maxaveragebitrate`,
-   * `ptime`/`minptime`). They describe what the client SAYS it will send; they
-   * do not bind the local encoder. The gate therefore reliably rejects an
-   * HONEST/stock client that truthfully declares an over-tier opus, but a
-   * patched client evades it by simply OMITTING the fmtp (we admit-on-absence
-   * by design — the stock client legitimately omits these, so we cannot
-   * fail-closed on a missing fmtp without rejecting legitimate free users) or
-   * by mislabelling mic audio as `source: screen-audio` (only `mic` reaches
-   * here). This is a produce-time TRIPWIRE on declared intent, not a hard
-   * policer. The hard policer is #2153: it meters the ingress that actually
-   * arrives from EVERY audio producer, whatever `source` it declares and
-   * whatever fmtp it declares or omits, against limits derived from these same
-   * Participant caps. It bounds the sustained average RTP-layer (post-SRTP) rate, not a
-   * marginal overshoot, and it stops forwarding, not ingress. Mirrors the
-   * honest "NOT a pixel/fps limit" framing on createTransport — and like there,
-   * this gates AUDIO quality only, never video pixel/fps (client-enforced +
-   * bitrate-backstopped, see `[internal]rules/media-plane.md`). Only `mic`
-   * reaches here.
+   * Honest scope (a TRIPWIRE, NOT a hard guarantee). Every value inspected is a
+   * client DECLARATION. It says what the client claims it will send and does not
+   * bind its encoder, so a patched client that declares an in-tier value and
+   * sends more, or that mislabels mic audio as `source: screen-audio` (only
+   * `mic` reaches here), is not stopped by this gate. What the gate does stop is
+   * a client that simply leaves the declarations out: the old premise that a
+   * stock client legitimately omits them was wrong (the desktop client sends
+   * `ptime` and `encodings[].maxBitrate` on every tier), so absence is now
+   * refused rather than admitted. The enforcement is #2153: it meters the
+   * ingress that actually arrives from EVERY audio producer, whatever `source`
+   * it declares and whatever it declares or omits, against limits derived from
+   * these same Participant caps. It bounds the sustained average RTP-layer
+   * (post-SRTP) rate, not a marginal overshoot, and it stops forwarding, not
+   * ingress. Mirrors the honest "NOT a pixel/fps limit" framing on
+   * createTransport — and like there, this gates AUDIO quality only, never
+   * video pixel/fps (client-enforced + bitrate-backstopped, see
+   * `[internal]rules/media-plane.md`). Only `mic` reaches here.
    */
   private enforceAudioTierGate(
     participant: Participant,
@@ -5374,26 +5384,46 @@ export class RoomManager {
     source: MediaSource
   ): void {
     const opus = RoomManager.findOpusCodec(rtpParameters);
-    // No opus codec entry → nothing tier-gated to inspect (e.g. a non-opus
-    // audio codec); the bitrate transport cap remains the backstop.
+    // No opus codec entry → nothing to inspect. A non-opus mic cannot become a
+    // producer: produce() has already required every codec on an audio producer
+    // to be `audio/*`, opus is the router's only audio codec (`mediaCodecs` in
+    // config/index.ts), and mediasoup refuses an audio codec the router lacks.
     if (!opus) return;
 
     const ptime = RoomManager.extractEffectivePtimeMs(opus, rtpParameters);
-    if (ptime !== null && ptime < participant.minPtimeMs) {
+    if (ptime === null) {
+      this.rejectAudioTier(participant.userId, source, 'ptime_undeclared');
+    }
+    if (ptime < participant.minPtimeMs) {
       this.rejectAudioTier(participant.userId, source, 'ptime_below_tier_minimum');
     }
 
+    const encodingMaxBitrate = RoomManager.extractEncodingMaxBitrate(rtpParameters);
     const maxAvgBitrate = RoomManager.extractOpusMaxAverageBitrate(opus);
-    if (maxAvgBitrate !== null) {
-      const ceiling = RoomManager.resolveAllowedOpusBitrateCeiling(participant.allowedAudioTiers);
-      if (maxAvgBitrate > ceiling) {
-        this.rejectAudioTier(participant.userId, source, 'opus_bitrate_above_tier_ceiling');
-      }
+    if (encodingMaxBitrate === null && maxAvgBitrate === null) {
+      this.rejectAudioTier(participant.userId, source, 'bitrate_undeclared');
+    }
+
+    // Either declared value over the ceiling refuses: checking only the primary
+    // source would let a client park the over-tier figure in the other one.
+    const ceiling = RoomManager.resolveAllowedOpusBitrateCeiling(participant.allowedAudioTiers);
+    if (
+      (encodingMaxBitrate !== null && encodingMaxBitrate > ceiling) ||
+      (maxAvgBitrate !== null && maxAvgBitrate > ceiling)
+    ) {
+      this.rejectAudioTier(participant.userId, source, 'opus_bitrate_above_tier_ceiling');
     }
   }
 
-  /** Emit the PII-safe violation log and throw a generic produce error (#1300). */
-  private rejectAudioTier(userId: string, source: MediaSource, reason: string): never {
+  /**
+   * Emit the PII-safe violation log and throw a generic produce error (#1300).
+   * `reason` is one of the four fixed strings used by `enforceAudioTierGate`.
+   */
+  private rejectAudioTier(
+    userId: string,
+    source: MediaSource,
+    reason: AudioTierRejectReason
+  ): never {
     // PII-safe: userId (opaque id, no display fields), kind, source, reason ONLY.
     // NEVER the rtpParameters / codec params / media (observability.md #4).
     logger.warn('Audio producer rejected: over-tier media (#1300)', {
@@ -5405,6 +5435,51 @@ export class RoomManager {
     throw new Error('Audio producer exceeds tier media limits');
   }
 
+  /**
+   * Refuse a producer whose client-declared source or codecs do not match its
+   * kind. Both checks are security-load-bearing. The source selects which
+   * per-room cap applies (#1539): a video stream mislabeled as
+   * 'mic'/'screen-audio' would otherwise dodge the camera cap entirely, so every
+   * video producer must be camera/screen and every audio producer mic/screen-audio
+   * (the only pairings the legit client emits, voiceService.ts). Every codec on an
+   * audio producer must be `audio/*` (#3858): mediasoup matches each codec against
+   * every router codec, video included, so `kind: 'audio'` carrying `video/VP8`
+   * (alone, or ahead of an opus entry) was accepted, skipping the opus-only
+   * audio-tier gate and sending video down the mic path past the camera
+   * permission, cap and cooldown. Static messages: never interpolate client input
+   * into the error or log (CWE-117).
+   */
+  private assertProducerKindMatches(
+    kind: MediaKind,
+    source: MediaSource,
+    rtpParameters: RtpParameters
+  ): void {
+    const allowedSources: MediaSource[] =
+      kind === 'video' ? ['camera', 'screen'] : ['mic', 'screen-audio'];
+    if (!allowedSources.includes(source)) {
+      this.securityDeny('media_schema_rejected', 'socket.produce');
+      throw new Error('Invalid media source for producer kind');
+    }
+    if (kind === 'audio' && !RoomManager.codecsAreAudio(rtpParameters)) {
+      this.securityDeny('media_schema_rejected', 'socket.produce');
+      throw new Error('Invalid codec for producer kind');
+    }
+  }
+
+  /**
+   * True when `rtpParameters.codecs` is a non-empty array whose every entry has
+   * an `audio/…` mimeType (case-insensitive). The payload is wire-derived, so
+   * its shape is checked rather than trusted.
+   */
+  private static codecsAreAudio(rtpParameters: RtpParameters): boolean {
+    const codecs: unknown = (rtpParameters as { codecs?: unknown } | null | undefined)?.codecs;
+    if (!Array.isArray(codecs) || codecs.length === 0) return false;
+    return codecs.every((codec: unknown) => {
+      const mimeType = (codec as { mimeType?: unknown } | null)?.mimeType;
+      return typeof mimeType === 'string' && mimeType.toLowerCase().startsWith('audio/');
+    });
+  }
+
   /** Find the opus codec entry in rtpParameters (case-insensitive mimeType match). */
   private static findOpusCodec(
     rtpParameters: RtpParameters
@@ -5413,9 +5488,12 @@ export class RoomManager {
   }
 
   /**
-   * Effective opus ptime in ms. Precedence: the codec-level `ptime` fmtp, else
-   * the transport-level `rtpParameters` ptime (some clients put it there).
-   * Returns null when neither is present (admit-on-absence by design).
+   * Effective opus ptime in ms, as the client DECLARES it. Precedence: the
+   * codec-level `ptime` fmtp, else the transport-level `rtpParameters` ptime
+   * (some clients put it there). Returns null when neither is present, and the
+   * gate REFUSES a null (`ptime_undeclared`, #3858): the stock client always
+   * sends one (mediasoup-client writes `opusPtime` into the codec parameters it
+   * hands to the `produce` event), so absence is not a legitimate shape.
    *
    * We deliberately DO NOT fall back to `minptime`. That fmtp is only the LOWER
    * BOUND the encoder is permitted to drop to — NOT the actual packetization
@@ -5424,9 +5502,11 @@ export class RoomManager {
    * DEFAULT while actually packetizing at 20 ms. Treating `minptime` as the
    * effective ptime would make the gate read 10 ms for a normal free client and
    * falsely reject EVERY stock free-tier mic (10 < 20) — breaking the core
-   * feature for the very tier this gate only means to constrain. So an
-   * undeclared ptime is not enforced (the transport bitrate cap remains the
-   * backstop); only an explicit, actual `ptime` is checked. (Gitar review, #1300.)
+   * feature for the very tier this gate only means to constrain. So only an
+   * explicit, actual `ptime` counts as declared; a `minptime` alone is the same
+   * as no declaration and is refused. The value is still a client declaration:
+   * a client that lies about it is not stopped here (the #2153 observed-rate
+   * policer is what bounds what it really sends). (Gitar review, #1300.)
    */
   private static extractEffectivePtimeMs(
     opus: RtpParameters['codecs'][number],
@@ -5438,7 +5518,33 @@ export class RoomManager {
     return RoomManager.toFiniteNumber((rtpParameters as { ptime?: unknown }).ptime);
   }
 
-  /** Opus `maxaveragebitrate` fmtp (bps), or null when not declared. */
+  /**
+   * The highest `encodings[].maxBitrate` (bps) the client declares, or null when
+   * no encoding declares a finite number (#3858). Primary bitrate source: the
+   * desktop client sets it on every tier, and mediasoup-client passes it through
+   * to the `produce` event. The maximum is taken over every encoding that
+   * declares one, so a second encoding cannot hide an over-tier figure behind a
+   * low first entry. Anything that is not a finite number counts as absent.
+   * `encodings` is wire-derived, so its shape is checked rather than trusted.
+   */
+  private static extractEncodingMaxBitrate(rtpParameters: RtpParameters): number | null {
+    const encodings: unknown = rtpParameters.encodings;
+    if (!Array.isArray(encodings)) return null;
+    let highest: number | null = null;
+    for (const encoding of encodings as unknown[]) {
+      if (typeof encoding !== 'object' || encoding === null) continue;
+      const declared = RoomManager.toFiniteNumber((encoding as { maxBitrate?: unknown }).maxBitrate);
+      if (declared !== null && (highest === null || declared > highest)) highest = declared;
+    }
+    return highest;
+  }
+
+  /**
+   * Opus `maxaveragebitrate` fmtp (bps), or null when not declared. A second
+   * bitrate source only: mediasoup-client writes it into the SDP answer and
+   * never into the parameters sent to the server, so a stock client leaves it
+   * unset and `encodings[].maxBitrate` is what satisfies the gate.
+   */
   private static extractOpusMaxAverageBitrate(
     opus: RtpParameters['codecs'][number]
   ): number | null {

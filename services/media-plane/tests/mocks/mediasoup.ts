@@ -190,13 +190,30 @@ export function createRtpCapabilities(videoCodecs: string[] = ['video/VP8', 'vid
   };
 }
 
+/** What a stock free-tier client declares for its mic (desktop default `standard` tier). */
+export const STOCK_FREE_MIC_PTIME_MS = 20;
+export const STOCK_FREE_MIC_MAX_BITRATE_BPS = 96_000;
+
 /**
- * Build mock RtpParameters for an opus audio producer. By default it omits opus
- * fmtp parameters (the audio-tier gate is a no-op without them — mediasoup
- * defaults apply). Pass `opusParameters` to simulate a client-declared opus
- * ptime / maxaveragebitrate for the #1300 tier-gate tests.
+ * Build mock RtpParameters for an opus audio producer.
+ *
+ * The audio-tier gate refuses a mic producer that declares no ptime or no bitrate
+ * (#3858), so the defaults are what a stock free client declares: opus `ptime`
+ * 20 ms and one encoding with `maxBitrate` 96 kbps. That keeps every test that
+ * only needs a mic producer to EXIST admitted by the gate.
+ *
+ * - `opusParameters` undefined → `{ ptime: 20 }`; `null` → no opus parameters at
+ *   all; an object → exactly that object (no merge), so a gate test states every
+ *   field it depends on.
+ * - `encodings` undefined → `[{ ssrc, maxBitrate: 96_000 }]`; an array → exactly
+ *   that array (`[]` simulates a client that sends no encodings).
  */
-export function createRtpParameters(opusParameters?: Record<string, unknown>) {
+export function createRtpParameters(
+  opusParameters: Record<string, unknown> | null = { ptime: STOCK_FREE_MIC_PTIME_MS },
+  encodings: Array<Record<string, unknown>> = [
+    { ssrc: 12345, maxBitrate: STOCK_FREE_MIC_MAX_BITRATE_BPS },
+  ]
+) {
   return {
     codecs: [
       {
@@ -208,7 +225,7 @@ export function createRtpParameters(opusParameters?: Record<string, unknown>) {
       },
     ],
     headerExtensions: [],
-    encodings: [{ ssrc: 12345 }],
+    encodings,
     rtcp: { cname: 'test', reducedSize: true },
   };
 }

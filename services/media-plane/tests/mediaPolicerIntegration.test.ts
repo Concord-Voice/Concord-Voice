@@ -142,10 +142,20 @@ describe('media policer integration (#2153 real RoomManager + MediaPolicer + tic
       getStats: vi.fn(async () => [{ ssrc: 12_345, byteCount: 0, packetCount: 0 }]),
     });
     transport.produce.mockResolvedValueOnce(producer);
+    // A stock free mic declares its ptime and encoding maxBitrate; the audio tier
+    // gate refuses a mic that declares neither (#3858).
     const rtpParameters = {
-      codecs: [{ mimeType: 'audio/opus', payloadType: 111, clockRate: 48_000, channels: 2 }],
+      codecs: [
+        {
+          mimeType: 'audio/opus',
+          payloadType: 111,
+          clockRate: 48_000,
+          channels: 2,
+          parameters: { ptime: 20 },
+        },
+      ],
       headerExtensions: [],
-      encodings: [{ ssrc: 12_345 }],
+      encodings: [{ ssrc: 12_345, maxBitrate: 96_000 }],
       rtcp: { cname: 'test', reducedSize: true },
     };
     await manager.produce(
