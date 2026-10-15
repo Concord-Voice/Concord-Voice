@@ -96,6 +96,98 @@ func TestBitfieldWireForm_RequestDecode(t *testing.T) {
 	}
 }
 
+// TestBitfieldWireForm_LeadingPlusRefused pins the D2 "+64" refusal on every
+// request field that carries a bitfield. Go 1.27's encoding/json accepts a
+// leading '+', so the refusal lives in bitfield_wire.go, and ErrorIs pins that
+// branch rather than any error a decoder might also return: with the branch
+// deleted these rows fail on Go 1.26 (a different error) and on Go 1.27 (no
+// error). The escaped, case-variant and later-duplicate rows reach the field
+// without a literal '+' after the member's opening quote. The earlier-duplicate
+// rows prove every occurrence is checked, not only the last one the real decode
+// keeps: a later null leaves the signed value in place. Each refusal has an
+// accepted twin, so a decoder that refuses everything cannot pass.
+func TestBitfieldWireForm_LeadingPlusRefused(t *testing.T) {
+	override := func(members string) string {
+		return `{"target_type":"user","target_id":"` + bitfieldWireTestUUID + `",` + members + `}`
+	}
+	refused := []struct {
+		name string
+		body string
+		req  any
+	}{
+		{"create role permissions", `{"name":"r","permissions":"+8"}`, &CreateRoleRequest{}},
+		{"update role permissions", `{"permissions":"+8"}`, &UpdateRoleRequest{}},
+		{"override allow", override(`"allow":"+64","deny":"0"`), &UpsertOverrideRequest{}},
+		{"override deny", override(`"allow":"0","deny":"+8"`), &UpsertOverrideRequest{}},
+		{"plus zero", override(`"allow":"+0","deny":"0"`), &UpsertOverrideRequest{}},
+		{"escaped plus", override(`"allow":"\u002b64","deny":"0"`), &UpsertOverrideRequest{}},
+		{"case-variant key", override(`"ALLOW":"+64","deny":"0"`), &UpsertOverrideRequest{}},
+		{"signed later duplicate", override(`"allow":"1","allow":"+64","deny":"0"`), &UpsertOverrideRequest{}},
+		{"signed earlier duplicate, later null", override(`"allow":"+64","allow":null,"deny":"0"`), &UpsertOverrideRequest{}},
+		{"signed earlier duplicate, later null string", override(`"allow":"+64","allow":"null","deny":"0"`), &UpsertOverrideRequest{}},
+		{"signed earlier duplicate, later clean", override(`"allow":"+64","allow":"1","deny":"0"`), &UpsertOverrideRequest{}},
+		{"signed earlier duplicate, case-variant null", override(`"allow":"+64","ALLOW":null,"deny":"0"`), &UpsertOverrideRequest{}},
+		{"deny signed earlier duplicate", override(`"allow":"0","deny":"+8","deny":null`), &UpsertOverrideRequest{}},
+		{"create role signed earlier duplicate", `{"name":"r","permissions":"+8","permissions":null}`, &CreateRoleRequest{}},
+		{"update role signed earlier duplicate", `{"permissions":"+8","permissions":null}`, &UpdateRoleRequest{}},
+	}
+	for _, tc := range refused {
+		t.Run("refused/"+tc.name, func(t *testing.T) {
+			err := binding.JSON.BindBody([]byte(tc.body), tc.req)
+			assert.ErrorIs(t, err, errBitfieldSign, "%s must be refused for its leading '+'", tc.body)
+		})
+	}
+
+	t.Run("accepted/create role", func(t *testing.T) {
+		req := &CreateRoleRequest{}
+		require.NoError(t, binding.JSON.BindBody([]byte(`{"name":"r","permissions":"8","mfa_code":"123456"}`), req))
+		assert.Equal(t, int64(8), req.Permissions)
+		assert.Equal(t, "r", req.Name)
+		assert.Equal(t, "123456", req.MFACode)
+	})
+	t.Run("accepted/update role", func(t *testing.T) {
+		req := &UpdateRoleRequest{}
+		require.NoError(t, binding.JSON.BindBody([]byte(`{"permissions":"8"}`), req))
+		require.NotNil(t, req.Permissions)
+		assert.Equal(t, int64(8), *req.Permissions)
+	})
+	t.Run("accepted/update role without permissions", func(t *testing.T) {
+		req := &UpdateRoleRequest{}
+		require.NoError(t, binding.JSON.BindBody([]byte(`{"name":"r"}`), req))
+		assert.Nil(t, req.Permissions)
+	})
+	t.Run("accepted/clean duplicate keeps the last value", func(t *testing.T) {
+		req := &UpsertOverrideRequest{}
+		require.NoError(t, binding.JSON.BindBody([]byte(override(`"allow":"1","allow":"8","deny":"0"`)), req))
+		assert.Equal(t, int64(8), req.Allow)
+	})
+	// Go 1.27 clears a ",string" pointer only for the literal "null"; an escaped
+	// spelling of it left a present 0 that UpdateRole would write. Go 1.26 cleared
+	// both, and so must the wrapper. The literal row is the control.
+	for _, tc := range []struct{ name, body string }{
+		{"literal quoted null", `{"permissions":"null"}`},
+		{"escaped quoted null", `{"permissions":"nul\u006c"}`},
+		{"escaped quoted null after a value", `{"permissions":"8","permissions":"nul\u006c"}`},
+	} {
+		t.Run("accepted/update role "+tc.name+" leaves permissions absent", func(t *testing.T) {
+			req := &UpdateRoleRequest{}
+			require.NoError(t, binding.JSON.BindBody([]byte(tc.body), req))
+			assert.Nil(t, req.Permissions, "%s must leave permissions absent, as Go 1.26 did", tc.body)
+		})
+	}
+	t.Run("accepted/override deny", func(t *testing.T) {
+		req := &UpsertOverrideRequest{}
+		require.NoError(t, binding.JSON.BindBody([]byte(override(`"allow":"0","deny":"8"`)), req))
+		assert.Equal(t, int64(8), req.Deny)
+		assert.Equal(t, "user", req.TargetType)
+	})
+	t.Run("array body is refused by the shadow decode", func(t *testing.T) {
+		err := binding.JSON.BindBody([]byte(`[]`), &UpsertOverrideRequest{})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, errBitfieldSign)
+	})
+}
+
 // TestBitfieldWireForm_ChannelOverrideResponseEncode is half of W2.
 func TestBitfieldWireForm_ChannelOverrideResponseEncode(t *testing.T) {
 	co := ChannelOverride{Allow: 1<<62 | 1, Deny: 0}

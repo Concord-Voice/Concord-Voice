@@ -106,6 +106,7 @@ expiration timer can now keep pinned messages, and says so.
 - **Voice-call connection libraries updated** (internal development reference omitted) — mediasoup-client 3.24.1 and socket.io-client 4.8.4.
 - **HDR codec controls are separate** — Enable HDR allows supported HDR-capable codecs. Prioritize HDR Codecs prefers an HDR codec over hardware acceleration when both are available. If a codec check finishes after your camera or screen share starts, Concord Voice updates the active stream's codec choice. Neither setting guarantees HDR capture or display.
 - Voice, camera, and screen sends now use separate plan-based bitrate ceilings. The desktop lowers its send settings when a plan changes. When measured video use repeatedly exceeds an admitted limit, the server turns off video for a temporary cooldown while voice remains available. Closing a video stream during a server measurement does not erase its measured usage.
+- **Control plane built with Go 1.27.2** (internal development reference omitted) — moves the server to the newer Go release line, which keeps receiving security fixes after Go 1.26 support ends. It carries the same security fixes as Go 1.26.9. Permission values sent with a leading `+` are still refused.
 
 ### Security
 

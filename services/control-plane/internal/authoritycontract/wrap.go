@@ -144,6 +144,7 @@ func sealTo(h DeviceHead, recipient DeviceEntry, entry, pt []byte) (epk, nonce, 
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, nil, errSeal("nonce")
 	}
+	//nolint:gosec // G407 false positive: nonce is fresh crypto/rand output, read just above.
 	ct = g.Seal(nil, nonce, pt, wrapAAD(h.RealmID, h.AccountID, recipient.ID, entry, epk, nonce))
 	return epk, nonce, ct, nil
 }

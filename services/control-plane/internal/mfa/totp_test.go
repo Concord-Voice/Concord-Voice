@@ -222,7 +222,7 @@ func TestEncryptDecryptSecretRejectShortAESKeys(t *testing.T) {
 		if _, err := rand.Read(nonce); err != nil {
 			t.Fatalf("rand.Read: %v", err)
 		}
-		ct := gcm.Seal(nil, nonce, []byte("secret"), nil)
+		ct := gcm.Seal(nil, nonce, []byte("secret"), nil) //nolint:gosec // G407 false positive: crypto/rand.Read fills nonce above; gosec loses that fill inside this loop
 		if got, err := DecryptSecret(ct, nonce, key); err == nil {
 			t.Errorf("DecryptSecret opened a %d-byte-key ciphertext: %q", n, got)
 		}

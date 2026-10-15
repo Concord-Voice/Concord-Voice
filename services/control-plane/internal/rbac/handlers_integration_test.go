@@ -4494,6 +4494,54 @@ func TestOverrideUpsert_BitfieldWireForm(t *testing.T) {
 	}
 }
 
+// TestRoleWrite_LeadingPlusRefused carries I1's "+64" row to the role routes:
+// create and update must refuse "+8" with a 400 through the router and write
+// nothing. The unsigned "8" twin after each refusal proves the 400 is about the
+// sign, not the route or the body.
+func TestRoleWrite_LeadingPlusRefused(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+	auth := testhelpers.AuthHeaders(owner.AccessToken)
+
+	t.Run("create", func(t *testing.T) {
+		countRoles := func(t *testing.T, name string) int {
+			t.Helper()
+			var n int
+			require.NoError(t, ts.DB.QueryRow(
+				`SELECT COUNT(*) FROM roles WHERE server_id = $1 AND name = $2`, serverID, name,
+			).Scan(&n))
+			return n
+		}
+
+		refused := "PlusCreate" + uuid.New().String()[:6]
+		w := ts.DoRequest("POST", rolesPath(serverID), json.RawMessage(`{"name":"`+refused+`","permissions":"+8"}`), auth)
+		assert.Equal(t, http.StatusBadRequest, w.Code, "create-role must refuse a leading plus, got %d: %s", w.Code, w.Body.String())
+		assert.Zero(t, countRoles(t, refused), "a refused create must write no role")
+
+		accepted := "PlusTwin" + uuid.New().String()[:6]
+		w = ts.DoRequest("POST", rolesPath(serverID), json.RawMessage(`{"name":"`+accepted+`","permissions":"8"}`), auth)
+		assert.Equal(t, http.StatusCreated, w.Code, "create-role must accept the unsigned twin, got %d: %s", w.Code, w.Body.String())
+		assert.Equal(t, 1, countRoles(t, accepted), "the unsigned twin must write its role")
+	})
+
+	t.Run("update", func(t *testing.T) {
+		roleID := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "PlusUpdate"+uuid.New().String()[:6], 0)
+		storedPerms := func(t *testing.T) int64 {
+			t.Helper()
+			var perms int64
+			require.NoError(t, ts.DB.QueryRow(`SELECT permissions FROM roles WHERE id = $1`, roleID).Scan(&perms))
+			return perms
+		}
+
+		w := ts.DoRequest("PATCH", rolePath(serverID, roleID), json.RawMessage(`{"permissions":"+8"}`), auth)
+		assert.Equal(t, http.StatusBadRequest, w.Code, "update-role must refuse a leading plus, got %d: %s", w.Code, w.Body.String())
+		assert.Zero(t, storedPerms(t), "a refused update must leave the stored permissions unchanged")
+
+		w = ts.DoRequest("PATCH", rolePath(serverID, roleID), json.RawMessage(`{"permissions":"8"}`), auth)
+		assert.Equal(t, http.StatusOK, w.Code, "update-role must accept the unsigned twin, got %d: %s", w.Code, w.Body.String())
+		assert.Equal(t, int64(8), storedPerms(t), "the unsigned twin must store its permissions")
+	})
+}
+
 // TestGetMyPermissions_BitfieldWireForm is I2: both effective-permission
 // endpoints must return "permissions" as a JSON string, exact above 2^53.
 func TestGetMyPermissions_BitfieldWireForm(t *testing.T) {
