@@ -2730,61 +2730,55 @@ func validateRecoveryCodeFormat(raw string) (string, string) {
 	return code, ""
 }
 
-// fetchRecoveryRecord loads and validates the recovery record from Redis.
-// Returns the record on success. On failure it writes the HTTP response and returns nil.
-func (h *Handler) fetchRecoveryRecord(ctx context.Context, c *gin.Context, redisKey string) *recoveryRecord {
-	data, err := h.redis.Get(ctx, redisKey).Bytes()
-	if err == redis.Nil {
-		h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
-		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
-		middleware.MarkAuthFailureOutcome(c, outcome)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryCode, "attempts_remaining": 0})
-		return nil
+// consumeRecoveryCode commits redemption or a failed attempt only while the record is unchanged.
+func (h *Handler) consumeRecoveryCode(ctx context.Context, redisKey, code string) (*recoveryRecord, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("consume recovery code: %w", err)
+		}
+		var record recoveryRecord
+		matched := false
+		err := h.redis.Watch(ctx, func(tx *redis.Tx) error {
+			var err error
+			record, matched, err = commitRecoveryCodeAttempt(ctx, tx, redisKey, code)
+			return err
+		}, redisKey)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("consume recovery code: %w", err)
+		}
+		if !matched {
+			return nil, redis.Nil
+		}
+		return &record, nil
 	}
-	if err != nil {
-		h.log.Error("Failed to fetch recovery record from Redis", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
-		return nil
-	}
-
-	var record recoveryRecord
-	if err := json.Unmarshal(data, &record); err != nil {
-		h.log.Error("Failed to unmarshal recovery record", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
-		return nil
-	}
-
-	if record.Attempts >= recoveryMaxAttempts {
-		h.redis.Del(ctx, redisKey)
-		h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
-		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
-		middleware.MarkAuthFailureOutcome(c, outcome)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryCode, "attempts_remaining": 0})
-		return nil
-	}
-	return &record
 }
 
-// verifyRecoveryCode does a timing-safe comparison and handles wrong-code bookkeeping.
-// Returns true if the code matches. On mismatch it writes the HTTP response.
-func (h *Handler) verifyRecoveryCode(ctx context.Context, c *gin.Context, code string, record *recoveryRecord, redisKey string) bool {
-	if subtle.ConstantTimeCompare([]byte(hashRecoveryCode(code)), []byte(record.CodeHash)) == 1 {
-		return true
+func commitRecoveryCodeAttempt(ctx context.Context, tx *redis.Tx, redisKey, code string) (recoveryRecord, bool, error) {
+	var record recoveryRecord
+	data, err := tx.Get(ctx, redisKey).Bytes()
+	if err != nil {
+		return record, false, err
 	}
-	record.Attempts++
-	updated, _ := json.Marshal(record)
-	ttl := h.redis.TTL(ctx, redisKey).Val()
-	if ttl > 0 {
-		h.redis.Set(ctx, redisKey, updated, ttl)
+	if err := json.Unmarshal(data, &record); err != nil {
+		return record, false, err
 	}
-	h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
-	outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
-	middleware.MarkAuthFailureOutcome(c, outcome)
-	c.JSON(http.StatusUnauthorized, gin.H{
-		"error":              errInvalidExpiredRecoveryCode,
-		"attempts_remaining": 0,
+	matched := record.Attempts < recoveryMaxAttempts &&
+		subtle.ConstantTimeCompare([]byte(hashRecoveryCode(code)), []byte(record.CodeHash)) == 1
+	_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		if matched || record.Attempts >= recoveryMaxAttempts {
+			return pipe.Del(ctx, redisKey).Err()
+		}
+		record.Attempts++
+		updated, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return pipe.SetArgs(ctx, redisKey, updated, redis.SetArgs{KeepTTL: true}).Err()
 	})
-	return false
+	return record, matched, err
 }
 
 // buildVerifyCodeResponse constructs the response for a successful recovery code verification.
@@ -2853,18 +2847,19 @@ func (h *Handler) RecoveryVerifyCode(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	redisKey := recoveryRedisKey(email)
-	record := h.fetchRecoveryRecord(ctx, c, redisKey)
-	if record == nil {
+	record, err := h.consumeRecoveryCode(ctx, recoveryRedisKey(email), code)
+	if errors.Is(err, redis.Nil) {
+		h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
+		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		middleware.MarkAuthFailureOutcome(c, outcome)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryCode, "attempts_remaining": 0})
 		return
 	}
-
-	if !h.verifyRecoveryCode(ctx, c, code, record, redisKey) {
+	if err != nil {
+		h.log.Error("Failed to verify recovery code", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
 		return
 	}
-
-	// Code matches — delete Redis key (single use)
-	h.redis.Del(ctx, redisKey)
 
 	// Generate recovery JWT token
 	if h.mfaChecker == nil {
