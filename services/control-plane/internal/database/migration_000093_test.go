@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -310,9 +309,7 @@ func migration000093ReadFile(t *testing.T, filename string) string {
 
 func migration000093FilePath(t *testing.T, filename string) string {
 	t.Helper()
-	_, currentFile, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve migration test path")
 	return filepath.Join(
-		filepath.Dir(currentFile), "..", "..", "migrations", filename,
+		"..", "..", "migrations", filename,
 	)
 }

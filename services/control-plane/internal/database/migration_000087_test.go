@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -580,11 +579,9 @@ func migration000087RequireOrderedDown(t *testing.T, contents string) {
 func migration000087SQL(t *testing.T, direction string) string {
 	t.Helper()
 
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve migration test path")
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "migrations",
+	path := filepath.Join("..", "..", "migrations",
 		"000087_presence_history."+direction+".sql")
-	// #nosec G304 -- path is constructed from runtime.Caller and a fixed migration filename.
+	// #nosec G304 -- path is relative to the package directory and uses a fixed migration filename.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

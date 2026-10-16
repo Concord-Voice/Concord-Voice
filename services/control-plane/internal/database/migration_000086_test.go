@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -329,10 +328,8 @@ func migration000086SQL(t *testing.T, direction string) string {
 func migrationReadFile(t *testing.T, relativePath string) string {
 	t.Helper()
 
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve migration test path")
-	path := filepath.Join(filepath.Dir(filename), relativePath)
-	// #nosec G304 -- path is based on runtime.Caller and fixed test-owned filenames.
+	path := relativePath
+	// #nosec G304 -- path is relative to the package directory and uses fixed test-owned filenames.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

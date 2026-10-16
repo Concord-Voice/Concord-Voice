@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -273,9 +272,8 @@ func newPinAwareMigrationDB(t *testing.T) (*sql.DB, *migrate.Migrate) {
 	})
 	require.NoError(t, db.Ping())
 
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	migrationDir := filepath.Join(filepath.Dir(filename), "..", "..", "migrations")
+	migrationDir, err := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	require.NoError(t, err)
 	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	require.NoError(t, err)
 	m, err := migrate.NewWithDatabaseInstance("file://"+migrationDir, "postgres", driver)
@@ -296,9 +294,7 @@ func newPinAwareMigrationDB(t *testing.T) (*sql.DB, *migrate.Migrate) {
 // the migrations directory so no neighbour's number is hard-coded.
 func pinAwarePriorVersion(t *testing.T, v uint) uint {
 	t.Helper()
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	ups, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "migrations", "*.up.sql"))
+	ups, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.up.sql"))
 	require.NoError(t, err)
 	var prior uint
 	for _, path := range ups {

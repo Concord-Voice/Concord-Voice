@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -23,10 +22,8 @@ import (
 
 func openAPILines(t *testing.T) []string {
 	t.Helper()
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "..", "..", "docs", "api", "openapi.yaml")
-	contents, err := os.ReadFile(path) // #nosec G304 -- path is derived from this fixed test source file.
+	path := filepath.Join("..", "..", "..", "..", "docs", "api", "openapi.yaml")
+	contents, err := os.ReadFile(path) // #nosec G304 -- path is fixed relative to the package directory.
 	require.NoError(t, err)
 	return strings.Split(string(contents), "\n")
 }

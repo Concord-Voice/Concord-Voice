@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -637,10 +636,8 @@ func assertOpsMetricsReaderHasNoSessions(t *testing.T, adminDB *sql.DB, roleName
 func opsMetricsReaderMigrationSQL(t *testing.T, name string) string {
 	t.Helper()
 
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "migrations", name)
-	// #nosec G304 -- path is based on runtime.Caller and a fixed test-owned name.
+	path := filepath.Join("..", "..", "migrations", name)
+	// #nosec G304 -- path is relative to the package directory and uses a fixed test-owned name.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

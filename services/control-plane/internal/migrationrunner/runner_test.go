@@ -5,7 +5,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -19,12 +18,13 @@ import (
 )
 
 // controlPlaneMigrations returns the control plane's migrations directory as a
-// file:// URL, resolved from this file so the test needs no t.Chdir.
+// file:// URL, resolved from the package directory go test runs in, so the
+// test needs no t.Chdir.
 func controlPlaneMigrations(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	return "file://" + filepath.Join(filepath.Dir(file), "..", "..", "migrations")
+	dir, err := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	require.NoError(t, err)
+	return "file://" + dir
 }
 
 // freshSchemaDB returns a handle whose search_path is a throwaway schema, so the

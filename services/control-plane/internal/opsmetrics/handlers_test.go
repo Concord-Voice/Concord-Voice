@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -95,10 +94,8 @@ func TestAdminMetricsOpenAPISeriesBoundsMatchHandlers(t *testing.T) {
 
 func adminMetricsOpenAPI(t *testing.T) string {
 	t.Helper()
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "..", "..", "docs", "api", "admin-metrics.openapi.yaml")
-	contents, err := os.ReadFile(path) // #nosec G304 -- path is derived from this fixed test source file.
+	path := filepath.Join("..", "..", "..", "..", "docs", "api", "admin-metrics.openapi.yaml")
+	contents, err := os.ReadFile(path) // #nosec G304 -- path is fixed relative to the package directory.
 	require.NoError(t, err)
 	return string(contents)
 }

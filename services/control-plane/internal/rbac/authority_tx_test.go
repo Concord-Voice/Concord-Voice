@@ -7,8 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -86,9 +84,7 @@ func TestLockServerVisibilityCapture_InvalidInput_ErrorsBeforeAnyStatement(t *te
 }
 
 func TestWithAuthorityCapture_LocksUserForeignKeysBeforeServerParent(t *testing.T) {
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(file), "authority_tx.go"))
+	source, err := os.ReadFile("authority_tx.go")
 	require.NoError(t, err)
 	body := string(source)
 	start := strings.Index(body, "func (h *Handler) withAuthorityCapture(")

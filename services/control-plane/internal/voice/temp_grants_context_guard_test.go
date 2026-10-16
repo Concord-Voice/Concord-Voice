@@ -3,8 +3,6 @@ package voice
 import (
 	"context"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,9 +13,7 @@ import (
 // A confirmed database commit keeps best-effort delivery detached from request
 // cancellation without extending an existing whole-attempt deadline.
 func TestCompleteTemporaryGrantRevocationDetachesConfirmedPostCommitContext(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "temp_grants.go")) // #nosec G304 -- fixed sibling source
+	source, err := os.ReadFile("temp_grants.go") // #nosec G304 -- fixed sibling source
 	require.NoError(t, err)
 
 	start := strings.Index(string(source), "func (m *tempGrantManager) completeTemporaryGrantRevocation(")

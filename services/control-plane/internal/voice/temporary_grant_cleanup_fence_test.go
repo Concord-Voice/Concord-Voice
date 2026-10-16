@@ -7,8 +7,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -142,8 +140,6 @@ func TestCleanupWithoutTemporaryGrantSkipsAudienceFence(t *testing.T) {
 }
 
 func TestCleanupAudienceFenceClosesAfterCommitBeforeEffects(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
 	for _, tc := range []struct {
 		file, start, end string
 	}{
@@ -151,7 +147,7 @@ func TestCleanupAudienceFenceClosesAfterCommitBeforeEffects(t *testing.T) {
 		{"nats.go", "func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(", "func (s *NATSSubscriber) prepareStaleServerVoiceTerminalGrant("},
 	} {
 		t.Run(tc.file, func(t *testing.T) {
-			source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), tc.file)) // #nosec G304 -- fixed sibling source
+			source, err := os.ReadFile(tc.file) // #nosec G304 -- fixed sibling source
 			require.NoError(t, err)
 			start := strings.Index(string(source), tc.start)
 			require.GreaterOrEqual(t, start, 0)

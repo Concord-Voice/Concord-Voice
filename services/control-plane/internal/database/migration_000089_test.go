@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -424,10 +423,8 @@ func migration000089SQL(t *testing.T, direction string) string {
 	}[direction]
 	require.True(t, ok, "unexpected migration direction %q", direction)
 
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve migration test path")
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "migrations", migrationFile)
-	// #nosec G304 -- path is constructed from runtime.Caller and a fixed migration filename.
+	path := filepath.Join("..", "..", "migrations", migrationFile)
+	// #nosec G304 -- path is relative to the package directory and uses a fixed migration filename.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

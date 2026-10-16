@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 
@@ -46,9 +45,9 @@ const krTestPasswordHash = "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLC
 const krRotationFingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 func krMigrationsPath() string {
-	_, filename, _, _ := runtime.Caller(0)
-	// keyrotation/ is at internal/keyrotation/; migrations/ is at repo migrations/.
-	return filepath.Join(filepath.Dir(filename), "..", "..", "migrations")
+	// go test runs in internal/keyrotation/; migrations/ is at repo migrations/.
+	dir, _ := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	return dir
 }
 
 func krRunMigrations(db *sql.DB) error {

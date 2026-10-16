@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -342,11 +341,7 @@ func TestOpenAdminOpsMetricsReaderIntegration(t *testing.T) {
 
 func serverOpsMetricsMigration(t *testing.T, name string) string {
 	t.Helper()
-	_, filename, _, ok := goruntime.Caller(0)
-	if !ok {
-		t.Fatal("resolve server test path")
-	}
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "migrations", name)
+	path := filepath.Join("..", "..", "migrations", name)
 	contents, err := os.ReadFile(path) // #nosec G304 -- fixed test-owned migration name.
 	if err != nil {
 		t.Fatalf("read migration %s: %v", name, err)

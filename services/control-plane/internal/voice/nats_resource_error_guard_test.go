@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,14 +21,11 @@ import (
 )
 
 func TestServerVoiceParticipantLimitMatchesMediaAdmission(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	voiceDir := filepath.Dir(testFile)
-	controlPlaneSource, err := os.ReadFile(filepath.Join(voiceDir, "nats.go")) // #nosec G304 -- runtime.Caller plus fixed repository path
+	controlPlaneSource, err := os.ReadFile("nats.go") // #nosec G304 -- fixed path relative to the package directory
 	require.NoError(t, err)
 	mediaPlaneSource, err := os.ReadFile(filepath.Join(
-		voiceDir, "..", "..", "..", "media-plane", "src", "lib", "roomManager.ts",
-	)) // #nosec G304 -- runtime.Caller plus fixed repository path
+		"..", "..", "..", "media-plane", "src", "lib", "roomManager.ts",
+	)) // #nosec G304 -- fixed path relative to the package directory
 	require.NoError(t, err)
 
 	controlPlaneLimit := parseCrossPlaneParticipantLimit(
@@ -179,9 +175,7 @@ func TestServerHeartbeatBulkFanoutStopsWithHub(t *testing.T) {
 }
 
 func TestTerminalTempGrantCleanupStaysInTheCompositeTransaction(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "nats.go")) // #nosec G304 -- runtime.Caller plus fixed repository path
+	source, err := os.ReadFile("nats.go") // #nosec G304 -- fixed path relative to the package directory
 	require.NoError(t, err)
 	text := string(source)
 	require.Contains(t, text, "func (s *NATSSubscriber) withServerVoiceTerminalTransaction(")
@@ -242,9 +236,7 @@ func cleanupCall(expression ast.Expr) (string, bool) {
 }
 
 func TestNATSLifecycleDoesNotSuppressResourceCleanupErrors(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "nats.go"))
+	source, err := os.ReadFile("nats.go")
 	require.NoError(t, err)
 
 	ignoredCleanup, err := ignoredCleanupCalls("nats.go", source)
@@ -326,9 +318,7 @@ func f() {
 }
 
 func TestMissingChannelTerminalOutboxPublishesCountsBeforeCommit(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "nats.go")) // #nosec G304 -- runtime.Caller plus fixed repository path
+	source, err := os.ReadFile("nats.go") // #nosec G304 -- fixed path relative to the package directory
 	require.NoError(t, err)
 	files := token.NewFileSet()
 	parsed, err := parser.ParseFile(files, "nats.go", source, 0)
@@ -396,9 +386,7 @@ func TestMissingChannelTerminalOutboxPublishesCountsBeforeCommit(t *testing.T) {
 }
 
 func TestVoiceRoomResolutionUsesLifecycleContext(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "nats.go"))
+	source, err := os.ReadFile("nats.go")
 	require.NoError(t, err)
 	files := token.NewFileSet()
 	parsed, err := parser.ParseFile(files, "nats.go", source, 0)

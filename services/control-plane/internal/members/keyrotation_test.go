@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 
@@ -41,9 +40,9 @@ var (
 var krTestDBPassword = "concord_dev_password" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
 
 func krMigrationsPath() string {
-	_, filename, _, _ := runtime.Caller(0)
-	// members/ is at internal/members/keyrotation_test.go; migrations/ is at repo migrations/.
-	return filepath.Join(filepath.Dir(filename), "..", "..", "migrations")
+	// go test runs in internal/members/; migrations/ is at repo migrations/.
+	dir, _ := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	return dir
 }
 
 func krRunMigrations(db *sql.DB) error {

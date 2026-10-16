@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -107,9 +106,8 @@ func runIsolatedMigrationRoundTrip(t *testing.T) {
 	})
 	require.NoError(t, db.Ping())
 
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	migrationDir := filepath.Join(filepath.Dir(filename), "..", "..", "migrations")
+	migrationDir, err := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	require.NoError(t, err)
 	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	require.NoError(t, err)
 	m, err := migrate.NewWithDatabaseInstance("file://"+migrationDir, "postgres", driver)
@@ -189,7 +187,7 @@ func runIsolatedMigrationRoundTrip(t *testing.T) {
 		VALUES ('channel', $1, 'expiry')`, uuid.NewString())
 	assert.Error(t, err, "expiry reason must be rejected after downgrade")
 
-	t.Chdir(filepath.Join(filepath.Dir(filename), "..", ".."))
+	t.Chdir(filepath.Join("..", ".."))
 	for _, dirtyVersion := range []int64{128, 129} {
 		_, err = db.Exec(`UPDATE schema_migrations SET version = $1, dirty = TRUE`, dirtyVersion)
 		require.NoError(t, err)

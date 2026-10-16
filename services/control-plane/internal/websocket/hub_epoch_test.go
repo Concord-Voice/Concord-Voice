@@ -9,7 +9,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -43,13 +42,12 @@ const (
 // redistest owns Redis URL resolution now (#2680).
 var hubTestDBPassword = "concord_dev_password" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
 
-// hubTestMigrationsPath resolves the absolute path to the migrations directory
-// using runtime.Caller, matching the pattern in testhelpers/testdb.go.
+// hubTestMigrationsPath resolves the absolute path to the migrations directory.
+// go test runs in the package directory (internal/websocket/), so this holds
+// under -trimpath too.
 func hubTestMigrationsPath() string {
-	_, filename, _, _ := runtime.Caller(0)
-	// websocket/ is at internal/websocket/hub_epoch_test.go
-	// migrations/ is at migrations/
-	return filepath.Join(filepath.Dir(filename), "..", "..", "migrations")
+	dir, _ := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	return dir
 }
 
 // hubRunMigrations runs migrations once per package binary via sync.Once.

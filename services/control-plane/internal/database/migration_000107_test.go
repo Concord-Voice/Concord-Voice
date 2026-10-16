@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -65,10 +64,8 @@ func migration000107DownSQL(t *testing.T) string {
 
 func migration000107SQL(t *testing.T, name string) string {
 	t.Helper()
-	_, currentFile, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve migration test path")
-	path := filepath.Join(filepath.Dir(currentFile), "..", "..", "migrations", name)
-	// #nosec G304 -- path is fixed relative to this test-owned source file.
+	path := filepath.Join("..", "..", "migrations", name)
+	// #nosec G304 -- path is fixed relative to the package directory.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

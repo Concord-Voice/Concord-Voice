@@ -2,8 +2,6 @@ package channels
 
 import (
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -12,9 +10,7 @@ import (
 )
 
 func TestDeleteChannel_LocksBeforeAuthoritativeRereadAndDelete(t *testing.T) {
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(file), "handlers.go"))
+	source, err := os.ReadFile("handlers.go")
 	require.NoError(t, err)
 	body := string(source)
 	start := strings.Index(body, "func (h *Handler) deleteChannelTx(")
@@ -31,9 +27,7 @@ func TestDeleteChannel_LocksBeforeAuthoritativeRereadAndDelete(t *testing.T) {
 }
 
 func TestDeleteChannelGroup_LocksParentBeforeBoundedChildScan(t *testing.T) {
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(file), "groups.go"))
+	source, err := os.ReadFile("groups.go")
 	require.NoError(t, err)
 	body := string(source)
 	start := strings.Index(body, "func (h *Handler) lockAndAuthorizeChannelGroupDeleteTx(")
@@ -50,9 +44,7 @@ func TestDeleteChannelGroup_LocksParentBeforeBoundedChildScan(t *testing.T) {
 }
 
 func TestCreateChannel_RechecksGroupOwnershipInsideCreationTransaction(t *testing.T) {
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(file), "handlers.go"))
+	source, err := os.ReadFile("handlers.go")
 	require.NoError(t, err)
 	body := string(source)
 	start := strings.Index(body, "func (h *Handler) createChannelTx(")

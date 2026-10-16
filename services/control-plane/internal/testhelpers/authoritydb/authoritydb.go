@@ -14,13 +14,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/migrationrunner"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/lib/pq"
 )
 
@@ -172,13 +172,16 @@ func migrateOnceFor(dsn string) error {
 	return err
 }
 
+// storeMigrationsDir is resolved at package init, before any test can t.Chdir.
+var storeMigrationsDir, storeMigrationsDirErr = testdb.ModuleDir(filepath.Join("internal", "authority", "store", "migrations"))
+
 // MigrationsSourceURL is the file:// URL of the store's migrations directory.
 // The harness does not import package store, so store's own tests can import it.
 func MigrationsSourceURL() string {
-	_, file, _, _ := runtime.Caller(0)
-	dir := filepath.Join(filepath.Dir(file), "..", "..", "authority", "store", "migrations")
-	abs, _ := filepath.Abs(dir)
-	return "file://" + abs
+	if storeMigrationsDirErr != nil {
+		panic("authoritydb: " + storeMigrationsDirErr.Error())
+	}
+	return "file://" + storeMigrationsDir
 }
 
 // Fixture is one test's view of concord_authority_test, under three roles.

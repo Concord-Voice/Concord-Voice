@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -224,10 +223,8 @@ func migration000098SQL(t *testing.T, direction string) string {
 		"down": "000098_add_activity_settings_cleanup_marker.down.sql",
 	}[direction]
 	require.True(t, ok, "unexpected migration direction %q", direction)
-	_, currentFile, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	path := filepath.Join(filepath.Dir(currentFile), "..", "..", "migrations", filename)
-	// #nosec G304 -- fixed migration filename resolved from this test file.
+	path := filepath.Join("..", "..", "migrations", filename)
+	// #nosec G304 -- fixed migration filename relative to the package directory.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

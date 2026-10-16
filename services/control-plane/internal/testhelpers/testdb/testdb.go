@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -321,18 +320,39 @@ func truncateAllTablesOnce(db *sql.DB) error {
 	return err
 }
 
-// migrationsPath resolves the absolute path to the migrations directory.
-func migrationsPath() string {
-	_, filename, _, _ := runtime.Caller(0)
-	// testdb is at internal/testhelpers/testdb/testdb.go
-	// migrations is at migrations/
-	return filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations")
+// ModuleDir returns rel joined to the control-plane module root, found by
+// walking up from the working directory to go.mod. go test starts every test
+// binary in its package directory, so this holds under -trimpath, where
+// runtime.Caller returns module-relative import paths instead of file paths.
+func ModuleDir(rel string) (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve module root: %w", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return filepath.Join(dir, rel), nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", errors.New("resolve module root: no go.mod above the working directory")
+		}
+		dir = parent
+	}
 }
+
+// moduleMigrationsDir is resolved at package init, while the working directory
+// is still the test's package directory, so a later t.Chdir cannot move it.
+var moduleMigrationsDir, moduleMigrationsDirErr = ModuleDir("migrations")
 
 // ensureMigrations runs migrations exactly once per package binary via sync.Once.
 func ensureMigrations(db *sql.DB) error {
 	migrateOnce.Do(func() {
-		migrateErr = runMigrations(db, migrationsPath())
+		if moduleMigrationsDirErr != nil {
+			migrateErr = moduleMigrationsDirErr
+			return
+		}
+		migrateErr = runMigrations(db, moduleMigrationsDir)
 	})
 	return migrateErr
 }

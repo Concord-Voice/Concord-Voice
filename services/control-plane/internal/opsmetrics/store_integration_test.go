@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -271,10 +270,8 @@ func opsMetricsIntegrationRowCount(t *testing.T, db *sql.DB, query string) int {
 
 func readOpsMetricsIntegrationMigration(t *testing.T, direction string) string {
 	t.Helper()
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	path := filepath.Join(filepath.Dir(filename), "..", "..", "migrations", "000086_ops_metrics."+direction+".sql")
-	// #nosec G304 -- path is based on runtime.Caller and a fixed migration filename.
+	path := filepath.Join("..", "..", "migrations", "000086_ops_metrics."+direction+".sql")
+	// #nosec G304 -- path is relative to the package directory and uses a fixed migration filename.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(contents)

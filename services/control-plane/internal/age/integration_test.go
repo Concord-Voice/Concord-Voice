@@ -16,7 +16,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -47,8 +46,8 @@ var (
 )
 
 func ageMigrationsPath() string {
-	_, filename, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(filename), "..", "..", "migrations")
+	dir, _ := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	return dir
 }
 
 func ageRunMigrations(db *sql.DB) error {
