@@ -1032,7 +1032,11 @@ async function main() {
 
   // Wire up room events
   roomManager.onEvent((event) => {
-    logger.debug('Room event', { type: event.type, roomId: event.roomId });
+    // A tier-violation carries no room, by design (#1308).
+    logger.debug('Room event', {
+      type: event.type,
+      roomId: 'roomId' in event ? event.roomId : undefined,
+    });
   });
   roomManager.onEvent(natsService.createRoomEventHandler());
   roomManager.onEvent(redisService.createRoomEventHandler());

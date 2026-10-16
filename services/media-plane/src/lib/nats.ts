@@ -43,6 +43,7 @@ import { RequiredNatsSubscriptions } from './requiredNatsSubscriptions.js';
 //   voice.room_empty      — last user left, room destroyed
 //   voice.producer_added  — new producer (mic/camera/screen) started
 //   voice.producer_removed — producer stopped
+//   voice.tier_violation  — the audio tier gate refused a mic (#1308)
 // ---------------------------------------------------------------------------
 
 const jsonCodec = JSONCodec();
@@ -883,6 +884,18 @@ export class NatsService {
             producerId: event.producerId,
             kind: event.kind,
             source: event.source,
+            timestamp: new Date().toISOString(),
+          });
+          break;
+
+        case 'tier-violation':
+          // #1308 misbehaviour telemetry. The user id and the folded, closed
+          // reason ONLY -- never the room, the rtpParameters or any media
+          // detail. The control plane bounds this payload's length before it
+          // parses it, so nothing may be added here without raising that bound.
+          this.publish('voice.tier_violation', {
+            userId: event.userId,
+            reason: event.reason,
             timestamp: new Date().toISOString(),
           });
           break;

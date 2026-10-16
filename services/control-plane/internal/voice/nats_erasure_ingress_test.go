@@ -148,6 +148,10 @@ func TestNewNATSSubscriberWiresTheIngressGates(t *testing.T) {
 	require.NotNil(t, s.erasureBudget, "an unwired budget silently removes the cap")
 	require.NotNil(t, s.erasureSeen, "an unwired window silently removes dedup")
 	require.NotNil(t, s.voiceRoomBudget, "an unwired per-room budget removes G2")
+	require.NotNil(t, s.tierViolationUserBudget,
+		"an unwired per-user budget lets one user's reports flood the recorder (#1308)")
+	require.NotNil(t, s.tierViolationBudget,
+		"an unwired global budget lets distinct forged ids flood the recorder (#1308)")
 }
 
 // Regression lock on adversarial finding C6: an UNVERIFIED accept must not

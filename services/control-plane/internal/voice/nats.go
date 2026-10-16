@@ -19,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -130,6 +131,22 @@ type NATSSubscriber struct {
 	// storm cannot be mistaken for an admission-control shed (#3205). Its events
 	// were applied, not refused -- the two must stay distinguishable in a log.
 	voiceSkewShedState ingressShedState
+	// The voice.tier_violation door (#1308). It has its OWN subscription, in a
+	// queue group, and never reaches the lifecycle dispatcher. The voice.*
+	// wildcard also receives the subject on every replica; gateVoiceLifecycle
+	// drops that copy (ingress_gate.go), because counting it would count one
+	// report once per replica into the fleet-shared Redis window. Two budgets,
+	// per user and then global, plus its own shed state so its rejects are
+	// never mistaken for lifecycle sheds. Nil budgets ALLOW, like the three
+	// gates above; a nil sink records nothing.
+	tierViolationUserBudget *ingressbudget.KeyedBuckets
+	tierViolationBudget     *ingressbudget.Bucket
+	tierViolationShedState  ingressShedState
+	tierViolations          entitlements.Recorder
+	// tierViolationQueue overrides the queue group for a test that must not
+	// share one with every other control plane on a broker. Empty means
+	// natsQueueVoiceTierViolation, which is the only production value.
+	tierViolationQueue string
 	// erasureExistenceProbedHook counts existence queries, which is how the
 	// dedup-ahead-of-the-database ordering is asserted rather than assumed.
 	erasureExistenceProbedHook func()
@@ -3992,6 +4009,10 @@ func NewNATSSubscriber(
 		erasureBudget:   newErasureBudget(),
 		erasureSeen:     newErasureSeen(),
 		voiceRoomBudget: newVoiceRoomBudget(),
+		// #1308: the tier-violation door's two budgets, pinned by the same
+		// wiring test.
+		tierViolationUserBudget: newTierViolationUserBudget(),
+		tierViolationBudget:     newTierViolationBudget(),
 	}
 }
 
@@ -5192,11 +5213,25 @@ func (s *NATSSubscriber) Subscribe() error {
 	// not a voice event. The alternative -- giving the Hub its own NATS
 	// connection -- would add a transport to a component that deliberately has
 	// none.
-	if _, err := s.nats.Subscribe(
+	erasureSub, err := s.nats.Subscribe(
 		users.NATSSubjectPresenceErasureCleared, s.handlePresenceErasureCleared,
-	); err != nil {
+	)
+	if err != nil {
 		return errors.Join(
 			fmt.Errorf("subscribe presence erasure clear: %w", err),
+			s.unwindLifecycleSubscription(voiceSub, dispatcher),
+		)
+	}
+
+	// #1308: a queue group, so one replica counts each report and the shared
+	// Redis window sees it once. Registered last, so a failure here has only
+	// the two subscriptions above to unwind.
+	if _, err := s.nats.QueueSubscribe(
+		natsSubjectVoiceTierViolation, s.tierViolationQueueGroup(), s.admitTierViolation,
+	); err != nil {
+		return errors.Join(
+			fmt.Errorf("subscribe tier violation: %w", err),
+			erasureSub.Unsubscribe(),
 			s.unwindLifecycleSubscription(voiceSub, dispatcher),
 		)
 	}
@@ -8534,6 +8569,13 @@ const (
 	natsSubjectVoiceLeft      = "voice.left"
 	natsSubjectVoiceRoomEmpty = "voice.room_empty"
 	natsSubjectVoiceHeartbeat = "voice.heartbeat"
+	// Not a lifecycle event: the media plane's #3858 audio gate reports a
+	// refused mic here (#1308). Handled by admitTierViolation, never by
+	// handleVoiceLifecycleEvent.
+	natsSubjectVoiceTierViolation = "voice.tier_violation"
+	// natsQueueVoiceTierViolation is the queue group every control-plane
+	// replica joins for that subject.
+	natsQueueVoiceTierViolation = "control-plane.tier-violation"
 )
 
 // publishForceDisconnect publishes a voice.enforce.disconnect command so the

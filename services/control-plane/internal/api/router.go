@@ -1048,6 +1048,8 @@ func NewRouter(
 	requirePermissionInvalidatorWired(log, mfaHandler)
 	entCache := entitlements.NewCacheForInstance(redis, db, cfg.InstanceType)
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
+	// #1308: one recorder for every counted entitlement refusal.
+	violationRecorder := newViolationRecorder(redis, log, entCache, hub, securityEvents)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	sessionsHandler.SetSecurityEvents(securityEvents)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
@@ -1221,6 +1223,7 @@ func NewRouter(
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
 		wireMediaHandler(mediaHandler, redis, mfaHandler, cfg, log, opsCounters, dependencies)
+		mediaHandler.SetViolationRecorder(violationRecorder)
 		serversHandler.SetMediaStore(store)
 	}
 	requireDangerousActionGatesWired(log, channelsHandler, membersHandler, rbacHandler, mediaHandler)
@@ -1321,6 +1324,7 @@ func NewRouter(
 	// Start NATS voice event subscriber
 	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
 	voiceSub.SetOpsCounters(opsCounters)
+	voiceSub.SetTierViolationRecorder(violationRecorder)
 	activePlanReconciler.SetServerVoiceCleanup(voiceSub.ReconcileStaleServerVoiceParticipants)
 	// Temporary-SBAC revoke shares the one #2445 executor with the RBAC
 	// handler, so a presence-triggered revoke captures the same way an

@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"sync"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
 )
 
@@ -118,6 +120,36 @@ const (
 
 	// Sheds are reported on an interval, never per message. See ingressShedState.
 	ingressShedLogInterval = 30 * time.Second
+
+	// The voice.tier_violation door (#1308). Its honest payload is a fixed
+	// three-field document, {"userId":<36-char uuid>,"reason":<at most 23
+	// chars>,"timestamp":<RFC3339>}, about 120 bytes. 512 is ~4x that and is
+	// checked BEFORE any parse, for the reason G-1 below states.
+	tierViolationMaxPayloadBytes = 512
+
+	// Per user. An honest source is a modified or stale client retrying a
+	// refused mic, which the media plane's own produce limits hold to about
+	// two a second. The recorder escalates on its fifth count in a one-hour
+	// window and never again in that window, so admitting more than a burst
+	// past the threshold buys nothing but log lines and Redis INCRs. Refill
+	// keeps 120 per hour available, so a later window still reaches five.
+	tierViolationUserBudgetRefill   = 30 * time.Second
+	tierViolationUserBudgetBurst    = 8
+	tierViolationUserBudgetCapacity = 1024
+
+	// Global, applied AFTER the per-user budget so one noisy user cannot spend
+	// it. It exists because a per-user budget alone does not bound a flood of
+	// DISTINCT forged ids, each of which arrives with a full burst: unbounded,
+	// that is one WARN line and one hour-long Redis key per forged message.
+	// Honest volume is near zero -- only a misbehaving client produces one --
+	// so the erasure door's sizing (10/s, burst 32) is generous.
+	//
+	// ACCEPTED RESIDUAL: the bus is unauthenticated (#2857), so a forger who
+	// saturates this bucket sheds genuine tier-violation reports too. That
+	// suppresses a FLAG, never an enforcement: the media plane has already
+	// refused the producer before it publishes.
+	tierViolationBudgetRefill = time.Second / 10
+	tierViolationBudgetBurst  = 32
 )
 
 // A NEW-ROOM RATE GATE WAS DESIGNED AND THEN REMOVED. Do not reintroduce one
@@ -159,6 +191,15 @@ func newErasureBudget() *ingressbudget.Bucket {
 
 func newErasureSeen() *ingressbudget.Window {
 	return ingressbudget.NewWindow(erasureDedupCapacity, erasureDedupTTL)
+}
+
+func newTierViolationUserBudget() *ingressbudget.KeyedBuckets {
+	return ingressbudget.NewKeyedBuckets(
+		tierViolationUserBudgetRefill, tierViolationUserBudgetBurst, tierViolationUserBudgetCapacity)
+}
+
+func newTierViolationBudget() *ingressbudget.Bucket {
+	return ingressbudget.NewBucket(tierViolationBudgetRefill, tierViolationBudgetBurst)
 }
 
 func newVoiceRoomBudget() *ingressbudget.KeyedBuckets {
@@ -272,6 +313,15 @@ func (s *NATSSubscriber) erasureShed(class string) {
 // voiceShed records a shed on the voice-lifecycle door.
 func (s *NATSSubscriber) voiceShed(class string) {
 	s.reportShed(&s.voiceShedState, "Voice lifecycle event shed at the ingress gate", class)
+}
+
+const tierViolationShedMessage = "Voice tier violation report shed at the ingress gate"
+
+// tierViolationShed records a shed on the voice.tier_violation door. A dropped
+// report is a DROP and nothing more: the refusal it describes already
+// happened, and nothing here disconnects anyone.
+func (s *NATSSubscriber) tierViolationShed(class string) {
+	s.reportShed(&s.tierViolationShedState, tierViolationShedMessage, class)
 }
 
 const voiceSkewShedMessage = "Voice lifecycle stamp clamped at ingress"
@@ -510,6 +560,17 @@ func (s *NATSSubscriber) gateVoiceLifecycle(
 	next func(string, []byte),
 ) func(string, []byte) {
 	return func(subject string, data []byte) {
+		// G-T (#1308) -- voice.tier_violation is telemetry, not a lifecycle
+		// event, and this is not its door. The wildcard receives it on EVERY
+		// replica; admitTierViolation is reached through Subscribe's queue group,
+		// on one. Counting this copy would count one report once per replica
+		// into the fleet-shared window, so it is dropped on the SUBJECT alone,
+		// with no parse and no shed (it is not refused, only delivered twice).
+		// Every other subject continues below unchanged, so an unknown one still
+		// reaches unhandled_subject.
+		if subject == natsSubjectVoiceTierViolation {
+			return
+		}
 		// G-1 -- bound the bytes BEFORE any parse.
 		//
 		// json.Unmarshal runs on a raw NATS payload, and the transport's
@@ -551,4 +612,90 @@ func (s *NATSSubscriber) gateVoiceLifecycle(
 		}
 		next(subject, data)
 	}
+}
+
+// tierViolationQueueGroup is the queue group Subscribe joins for
+// voice.tier_violation: natsQueueVoiceTierViolation unless a test overrode it.
+func (s *NATSSubscriber) tierViolationQueueGroup() string {
+	if s.tierViolationQueue == "" {
+		return natsQueueVoiceTierViolation
+	}
+	return s.tierViolationQueue
+}
+
+// parseMediaPlaneViolationReason admits only the reasons the media plane
+// sends: its two audio gate reasons. attachment_over_tier is in the recorder's
+// closed set but is counted only by the authenticated upload handlers; taken
+// from this unauthenticated door it would let a forged report pass as upload
+// evidence against a chosen user.
+func parseMediaPlaneViolationReason(raw string) (entitlements.ViolationReason, bool) {
+	switch reason := entitlements.ViolationReason(raw); reason {
+	case entitlements.ViolationAudioPtimeBelowTier, entitlements.ViolationAudioBitrateOverTier:
+		return reason, true
+	default:
+		return "", false
+	}
+}
+
+// SetTierViolationRecorder wires the sink admitted voice.tier_violation reports
+// go to (#1308). Call before Subscribe. Optional: a nil sink records nothing.
+func (s *NATSSubscriber) SetTierViolationRecorder(sink entitlements.Recorder) {
+	s.tierViolations = sink
+}
+
+// tierViolationReport is the media plane's voice.tier_violation envelope. The
+// producer stamp (timestamp) is ignored: the recorder windows on Redis time.
+type tierViolationReport struct {
+	UserID string `json:"userId"`
+	Reason string `json:"reason"`
+}
+
+// admitTierViolation is the voice.tier_violation door: bound, parse, validate,
+// meter, record -- in that order, each refusal counted under a fixed class and
+// reported in aggregate, never per message and never with the payload.
+//
+// THE ORDER IS THE PROPERTY. The length bound runs before the parse for G-1's
+// reason (parser work on an unauthenticated door). The budgets run after
+// validation so a malformed or out-of-set message can never spend a genuine
+// user's tokens, and the per-user budget runs before the global one so a
+// single noisy user cannot spend everyone's.
+//
+// The nil uuid is refused with the rest: it is canonical, names no user, and
+// would otherwise mint a counter for one.
+//
+// The id must be CANONICAL, not merely parseable. The recorder keys on the
+// parsed value either way, so a non-canonical spelling could not alias into a
+// second window; refusing it keeps the per-user budget key and the Redis key
+// the same string and makes a producer that ever stops emitting canonical ids
+// visible as invalid_user instead of silently tolerated.
+func (s *NATSSubscriber) admitTierViolation(data []byte) {
+	if len(data) > tierViolationMaxPayloadBytes {
+		s.tierViolationShed("oversized_payload")
+		return
+	}
+	var report tierViolationReport
+	if json.Unmarshal(data, &report) != nil {
+		s.tierViolationShed("malformed_payload")
+		return
+	}
+	userID, err := uuid.Parse(report.UserID)
+	if err != nil || userID == uuid.Nil || userID.String() != report.UserID {
+		s.tierViolationShed("invalid_user")
+		return
+	}
+	reason, ok := parseMediaPlaneViolationReason(report.Reason)
+	if !ok {
+		s.tierViolationShed("invalid_reason")
+		return
+	}
+	if !s.tierViolationUserBudget.Allow(report.UserID) || !s.tierViolationBudget.Allow() {
+		s.tierViolationShed("ingress_budget")
+		return
+	}
+	if s.tierViolations == nil {
+		return
+	}
+	// Record never blocks on Redis, so this subscription's callback goroutine
+	// is never held by telemetry and a slow Redis cannot back up the queue.
+	s.tierViolations.Record(context.Background(), userID, reason)
 }

@@ -7,6 +7,7 @@ import {
   createMockWorker,
   createRtpCapabilities,
   createRtpParameters,
+  createVideoRtpParameters,
 } from './mocks/mediasoup.js';
 import './mocks/logger.js';
 
@@ -2817,7 +2818,7 @@ describe('RoomManager', () => {
         'u-1',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
 
@@ -2851,7 +2852,14 @@ describe('RoomManager', () => {
         await manager.createTransport('room-1', uid, 'send');
         const p = createMockProducer({ kind: 'video' });
         t.produce.mockResolvedValueOnce(p);
-        await manager.produce('room-1', uid, t.id, 'video', createRtpParameters() as any, 'camera');
+        await manager.produce(
+          'room-1',
+          uid,
+          t.id,
+          'video',
+          createVideoRtpParameters() as any,
+          'camera'
+        );
       }
 
       // 9th should fail
@@ -2863,7 +2871,7 @@ describe('RoomManager', () => {
           'u-1',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).rejects.toThrow('Video participant limit reached (max 8)');
@@ -2874,7 +2882,14 @@ describe('RoomManager', () => {
       const emit = vi.fn();
       manager.setSecurityEventEmitter(emit);
       await expect(
-        manager.produce('room-1', 'u-1', transport.id, 'video', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-1',
+          transport.id,
+          'video',
+          createVideoRtpParameters() as any,
+          'mic'
+        )
       ).rejects.toThrow('Invalid media source for producer kind');
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit).toHaveBeenCalledWith({
@@ -2906,7 +2921,14 @@ describe('RoomManager', () => {
         t.produce.mockResolvedValueOnce(
           createMockProducer({ kind: 'video', id: `${idPrefix}-${i}` })
         );
-        await manager.produce('room-1', uid, t.id, 'video', createRtpParameters() as any, 'camera');
+        await manager.produce(
+          'room-1',
+          uid,
+          t.id,
+          'video',
+          createVideoRtpParameters() as any,
+          'camera'
+        );
       }
     }
 
@@ -2919,7 +2941,7 @@ describe('RoomManager', () => {
           'u-1',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).rejects.toThrow('Video participant limit reached (max 8)');
@@ -2935,7 +2957,7 @@ describe('RoomManager', () => {
         'u-1',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
       expect(info.source).toBe('screen');
@@ -2968,7 +2990,7 @@ describe('RoomManager', () => {
       }
       const results = await Promise.allSettled(
         burst.map(({ uid, t }) =>
-          manager.produce('room-1', uid, t.id, 'video', createRtpParameters() as any, 'camera')
+          manager.produce('room-1', uid, t.id, 'video', createVideoRtpParameters() as any, 'camera')
         )
       );
       const fulfilled = results.filter((r) => r.status === 'fulfilled');
@@ -2981,7 +3003,14 @@ describe('RoomManager', () => {
 
     it('rejects a video producer with a non-video source (anti-mislabel, #1539)', async () => {
       await expect(
-        manager.produce('room-1', 'u-1', transport.id, 'video', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-1',
+          transport.id,
+          'video',
+          createVideoRtpParameters() as any,
+          'mic'
+        )
       ).rejects.toThrow('Invalid media source for producer kind');
     });
 
@@ -2996,6 +3025,87 @@ describe('RoomManager', () => {
           'camera'
         )
       ).rejects.toThrow('Invalid media source for producer kind');
+    });
+
+    it('rejects a video producer carrying a non-video codec (#1308)', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      const opusCamera = {
+        ...createVideoRtpParameters(),
+        codecs: [{ mimeType: 'audio/opus', payloadType: 111, clockRate: 48000, channels: 2 }],
+      };
+      await expect(
+        manager.produce('room-1', 'u-1', transport.id, 'video', opusCamera as any, 'camera')
+      ).rejects.toThrow('Invalid codec for producer kind');
+      const opusBehindVp8 = {
+        ...createVideoRtpParameters(),
+        codecs: [
+          { mimeType: 'video/VP8', payloadType: 96, clockRate: 90000 },
+          { mimeType: 'audio/opus', payloadType: 111, clockRate: 48000, channels: 2 },
+        ],
+      };
+      await expect(
+        manager.produce('room-1', 'u-1', transport.id, 'video', opusBehindVp8 as any, 'screen')
+      ).rejects.toThrow('Invalid codec for producer kind');
+      expect(transport.produce).not.toHaveBeenCalled();
+      expect(emit).toHaveBeenCalledTimes(2);
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_integrity',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'media_schema_rejected',
+        routeTemplate: 'socket.produce',
+      });
+    });
+
+    it('admits a video producer whose codecs are all video, RTX included (#1308)', async () => {
+      transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video' }));
+      const withRtx = {
+        ...createVideoRtpParameters(),
+        codecs: [
+          { mimeType: 'video/VP8', payloadType: 96, clockRate: 90000 },
+          { mimeType: 'video/rtx', payloadType: 97, clockRate: 90000, parameters: { apt: 96 } },
+        ],
+      };
+      await expect(
+        manager.produce('room-1', 'u-1', transport.id, 'video', withRtx as any, 'camera')
+      ).resolves.toBeDefined();
+    });
+
+    it.each([
+      ['an empty codecs array', 'refused', []],
+      ['no codecs property at all', 'refused', undefined],
+      ['a non-string mimeType', 'refused', [{ mimeType: 42, payloadType: 96, clockRate: 90000 }]],
+      [
+        'an upper-case VIDEO/VP8 mimeType (case-insensitive)',
+        'admitted',
+        [{ mimeType: 'VIDEO/VP8', payloadType: 96, clockRate: 90000 }],
+      ],
+    ])('video producer with %s is %s (#1308)', async (_label, outcome, codecs) => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      const rtp = { ...createVideoRtpParameters(), codecs };
+      if (outcome === 'refused') {
+        await expect(
+          manager.produce('room-1', 'u-1', transport.id, 'video', rtp as any, 'camera')
+        ).rejects.toThrow('Invalid codec for producer kind');
+        expect(transport.produce).not.toHaveBeenCalled();
+        expect(emit).toHaveBeenCalledTimes(1);
+        expect(emit).toHaveBeenCalledWith({
+          eventType: 'media_integrity',
+          outcome: 'denied',
+          severity: 'medium',
+          reasonCode: 'media_schema_rejected',
+          routeTemplate: 'socket.produce',
+        });
+      } else {
+        transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video' }));
+        await expect(
+          manager.produce('room-1', 'u-1', transport.id, 'video', rtp as any, 'camera')
+        ).resolves.toBeDefined();
+        expect(transport.produce).toHaveBeenCalledOnce();
+        expect(emit).not.toHaveBeenCalled();
+      }
     });
 
     it('rejects an audio producer carrying a non-audio codec (#3858)', async () => {
@@ -3026,7 +3136,7 @@ describe('RoomManager', () => {
           'u-1',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'bogus' as never
         )
       ).rejects.toThrow('Invalid media source for producer kind');
@@ -3043,7 +3153,14 @@ describe('RoomManager', () => {
       await manager.createTransport('room-1', uid, 'send');
       const p0 = createMockProducer({ kind: 'video' });
       t.produce.mockResolvedValueOnce(p0);
-      await manager.produce('room-1', uid, t.id, 'video', createRtpParameters() as any, 'screen');
+      await manager.produce(
+        'room-1',
+        uid,
+        t.id,
+        'video',
+        createVideoRtpParameters() as any,
+        'screen'
+      );
 
       const p = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(p);
@@ -3053,7 +3170,7 @@ describe('RoomManager', () => {
           'u-1',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'screen'
         )
       ).rejects.toThrow('Screen share limit reached (max 1)');
@@ -3095,7 +3212,7 @@ describe('RoomManager', () => {
             sender.userId,
             sender.transport.id,
             'video',
-            createRtpParameters() as any,
+            createVideoRtpParameters() as any,
             'screen'
           )
         )
@@ -3217,7 +3334,7 @@ describe('RoomManager', () => {
           'u-1',
           transport.id,
           kind,
-          createRtpParameters() as any,
+          (kind === 'video' ? createVideoRtpParameters() : createRtpParameters()) as any,
           source
         );
         await manager.supersedeOlderCameraProducers('room-1', 'u-1', info.producerId, info.source);
@@ -3319,7 +3436,7 @@ describe('RoomManager', () => {
           'u-scr-full',
           other.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'screen'
         );
 
@@ -3349,7 +3466,7 @@ describe('RoomManager', () => {
               'u-1',
               transport.id,
               'video',
-              createRtpParameters() as any,
+              createVideoRtpParameters() as any,
               'screen'
             )
           )
@@ -3451,7 +3568,7 @@ describe('RoomManager', () => {
             'u-1',
             transport.id,
             'video',
-            createRtpParameters() as any,
+            createVideoRtpParameters() as any,
             'camera'
           )
         ).rejects.toThrow('transport exploded');
@@ -3490,7 +3607,7 @@ describe('RoomManager', () => {
             'u-cam-peer',
             peer.id,
             'video',
-            createRtpParameters() as any,
+            createVideoRtpParameters() as any,
             'camera'
           )
         ).resolves.toBeDefined();
@@ -3511,7 +3628,7 @@ describe('RoomManager', () => {
               'u-1',
               transport.id,
               'video',
-              createRtpParameters() as any,
+              createVideoRtpParameters() as any,
               'camera'
             )
           )
@@ -3563,7 +3680,7 @@ describe('RoomManager', () => {
             'u-1',
             transport.id,
             'video',
-            createRtpParameters() as any,
+            createVideoRtpParameters() as any,
             'camera'
           );
           await manager.supersedeOlderCameraProducers(
@@ -3671,7 +3788,7 @@ describe('RoomManager', () => {
         'u-1',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
 
@@ -3681,7 +3798,7 @@ describe('RoomManager', () => {
           'u-1',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'screen-audio'
         )
       ).rejects.toThrow('screen-audio source must be audio kind');
@@ -3727,7 +3844,7 @@ describe('RoomManager', () => {
         'u-1',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
 
@@ -3833,7 +3950,7 @@ describe('RoomManager', () => {
           'u-novideo',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).rejects.toThrow('publish permission denied');
@@ -3848,7 +3965,7 @@ describe('RoomManager', () => {
           'u-noscreen',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'screen'
         )
       ).rejects.toThrow('publish permission denied');
@@ -3868,7 +3985,7 @@ describe('RoomManager', () => {
           'u-video-only',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).rejects.toThrow('publish permission denied');
@@ -3887,7 +4004,7 @@ describe('RoomManager', () => {
           'u-screen-only',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'screen'
         )
       ).rejects.toThrow('publish permission denied');
@@ -3908,7 +4025,7 @@ describe('RoomManager', () => {
           'u-both-cam',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).resolves.toBeDefined();
@@ -3929,7 +4046,7 @@ describe('RoomManager', () => {
           'u-both-scr',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'screen'
         )
       ).resolves.toBeDefined();
@@ -3954,7 +4071,7 @@ describe('RoomManager', () => {
         'u-nospeak-scr',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
       // The spoofable screen-audio publish must fail closed (no Speak).
@@ -3983,7 +4100,7 @@ describe('RoomManager', () => {
         'u-scr-audio',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
       transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'audio' }));
@@ -4049,7 +4166,7 @@ describe('RoomManager', () => {
           'u-noview',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).rejects.toThrow('publish permission denied');
@@ -4069,7 +4186,7 @@ describe('RoomManager', () => {
           'u-admin',
           transport.id,
           'video',
-          createRtpParameters() as any,
+          createVideoRtpParameters() as any,
           'camera'
         )
       ).resolves.toBeDefined();
@@ -4145,7 +4262,7 @@ describe('RoomManager', () => {
         userId,
         transport.id,
         kind,
-        createRtpParameters() as any,
+        (kind === 'video' ? createVideoRtpParameters() : createRtpParameters()) as any,
         source
       );
       return { producer, producerId: result.producerId };
@@ -4337,7 +4454,7 @@ describe('RoomManager', () => {
         'u-scrorph',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
 
@@ -4384,7 +4501,7 @@ describe('RoomManager', () => {
         'u-scrkeep',
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'screen'
       );
 
@@ -4510,15 +4627,29 @@ describe('RoomManager', () => {
 
     const REFUSAL = 'Audio producer exceeds tier media limits';
 
+    // #1308: the reason the control plane counts for each refusal.
+    const TIER_VIOLATION_FOR: Record<string, string> = {
+      ptime_undeclared: 'audio_ptime_below_tier',
+      ptime_below_tier_minimum: 'audio_ptime_below_tier',
+      bitrate_undeclared: 'audio_bitrate_over_tier',
+      opus_bitrate_above_tier_ceiling: 'audio_bitrate_over_tier',
+    };
+
+    // `onEvent` has no unsubscribe, so ONE capturing handler is registered per
+    // test (in beforeEach) and each helper call clears the shared array first.
+    let violations: RoomEvent[] = [];
+
     /**
      * Assert the gate refused a mic produce: the generic error, no producer ever
-     * created (the gate runs before the `await produce()`), one security deny, and
-     * a violation log carrying EXACTLY `{ userId, kind, source, reason }`.
+     * created (the gate runs before the `await produce()`), one security deny, a
+     * violation log carrying EXACTLY `{ userId, kind, source, reason }`, and
+     * exactly one folded tier-violation report.
      */
     async function expectRefused(rtp: unknown, reason: string, who: Who = 'free') {
       const { userId, transport } = actor(who);
       const emit = vi.fn();
       manager.setSecurityEventEmitter(emit);
+      violations.length = 0;
       const warnSpy = vi.mocked(logger.warn);
       warnSpy.mockClear();
 
@@ -4535,11 +4666,18 @@ describe('RoomManager', () => {
       const meta = rejections[0][1] as Record<string, unknown>;
       expect(Object.keys(meta).sort()).toEqual(['kind', 'reason', 'source', 'userId']);
       expect(meta).toEqual({ userId, kind: 'audio', source: 'mic', reason });
+
+      // Exactly one report, carrying the FOLDED reason (#1308).
+      expect(TIER_VIOLATION_FOR[reason]).toBeDefined();
+      expect(violations).toEqual([
+        { type: 'tier-violation', userId, reason: TIER_VIOLATION_FOR[reason] },
+      ]);
     }
 
     /** Assert the gate admitted a mic produce and the producer was created. */
     async function expectAdmitted(rtp: unknown, who: Who = 'free') {
       const { userId, transport } = actor(who);
+      violations.length = 0;
       const producer = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(producer);
       const info = await manager.produce(
@@ -4552,9 +4690,14 @@ describe('RoomManager', () => {
       );
       expect(info.producerId).toBe(producer.id);
       expect(transport.produce).toHaveBeenCalledOnce();
+      expect(violations).toEqual([]); // an admitted producer reports nothing (#1308)
     }
 
     beforeEach(async () => {
+      violations = [];
+      manager.onEvent((event) => {
+        if (event.type === 'tier-violation') violations.push(event);
+      });
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       freeTransport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(freeTransport);
@@ -4661,7 +4804,11 @@ describe('RoomManager', () => {
       });
 
       it('REFUSES a premium mic that declares no bitrate too — absence is refused at every tier', async () => {
-        await expectRefused(createRtpParameters({ ptime: 10 }, []), 'bitrate_undeclared', 'premium');
+        await expectRefused(
+          createRtpParameters({ ptime: 10 }, []),
+          'bitrate_undeclared',
+          'premium'
+        );
       });
 
       it('ADMITS encodings maxBitrate exactly at the free ceiling and REFUSES one bps over', async () => {
@@ -4788,6 +4935,120 @@ describe('RoomManager', () => {
       });
     });
 
+    describe('tier-violation report (#1308)', () => {
+      it('still refuses and still reports to later handlers when an earlier handler throws', async () => {
+        manager.onEvent(() => {
+          throw new Error('boom');
+        });
+        const later: RoomEvent[] = [];
+        manager.onEvent((event) => {
+          if (event.type === 'tier-violation') later.push(event);
+        });
+
+        await expect(
+          manager.produce(
+            'room-1',
+            'u-1',
+            freeTransport.id,
+            'audio',
+            asRtp(createRtpParameters({ ptime: 10 })),
+            'mic'
+          )
+        ).rejects.toThrow(REFUSAL);
+
+        expect(freeTransport.produce).not.toHaveBeenCalled();
+        expect(later).toEqual([
+          {
+            type: 'tier-violation',
+            userId: 'u-1',
+            reason: 'audio_ptime_below_tier',
+          },
+        ]);
+      });
+
+      it('reports nothing for a kind/codec mismatch refusal, even with over-tier opus', async () => {
+        const opusCamera = {
+          ...createRtpParameters({ ptime: 5, maxaveragebitrate: 510_000 }),
+        };
+        await expect(
+          manager.produce('room-1', 'u-1', freeTransport.id, 'video', asRtp(opusCamera), 'camera')
+        ).rejects.toThrow('Invalid codec for producer kind');
+        expect(freeTransport.produce).not.toHaveBeenCalled();
+        expect(violations).toEqual([]);
+      });
+
+      it('reports nothing for an over-tier screen-audio producer (the tier gate skips it)', async () => {
+        freeTransport.produce.mockResolvedValueOnce(
+          createMockProducer({ kind: 'video', id: 'scr' })
+        );
+        await manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'video',
+          asRtp(createVideoRtpParameters()),
+          'screen'
+        );
+        freeTransport.produce.mockResolvedValueOnce(
+          createMockProducer({ kind: 'audio', id: 'scr-aud' })
+        );
+        const info = await manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'audio',
+          asRtp(
+            createRtpParameters({ ptime: 5, maxaveragebitrate: 510_000 }, [
+              { ssrc: 1, maxBitrate: 510_000 },
+            ])
+          ),
+          'screen-audio'
+        );
+        expect(info.source).toBe('screen-audio');
+        expect(violations).toEqual([]);
+      });
+
+      it('reports nothing for a within-tier mic refused for lack of Speak permission', async () => {
+        await manager.joinRoom(
+          'room-perm',
+          'u-nospeak',
+          'sock-nospeak',
+          { username: 'ns' },
+          undefined,
+          {
+            credentialEpoch: '',
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            deferChannelPromotion: true,
+            roomContext: { roomKind: 'channel' },
+            permissions: 0n,
+          }
+        );
+        promoteChannelParticipant(manager, 'room-perm', 'u-nospeak', 'sock-nospeak', {
+          identity: { username: 'ns' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          permissions: 0n,
+          serverMuted: false,
+          serverDeafened: false,
+        });
+        const permTransport = createMockTransport();
+        mockRouter.createWebRtcTransport.mockResolvedValueOnce(permTransport);
+        await manager.createTransport('room-perm', 'u-nospeak', 'send');
+
+        await expect(
+          manager.produce(
+            'room-perm',
+            'u-nospeak',
+            permTransport.id,
+            'audio',
+            asRtp(createRtpParameters()),
+            'mic'
+          )
+        ).rejects.toThrow('publish permission denied');
+        expect(permTransport.produce).not.toHaveBeenCalled();
+        expect(violations).toEqual([]);
+      });
+    });
+
     describe('tiers and scope', () => {
       it("a premium participant's higher ceiling admits what the free ceiling refuses", async () => {
         const high = createRtpParameters({ ptime: 20 }, [{ ssrc: 1, maxBitrate: 192_000 }]);
@@ -4830,7 +5091,7 @@ describe('RoomManager', () => {
           'u-1',
           freeTransport.id,
           'video',
-          asRtp(createRtpParameters()),
+          asRtp(createVideoRtpParameters()),
           'screen'
         );
 
@@ -4862,7 +5123,7 @@ describe('RoomManager', () => {
           'u-1',
           freeTransport.id,
           'video',
-          asRtp(createRtpParameters()),
+          asRtp(createVideoRtpParameters()),
           'screen'
         );
         freeTransport.produce.mockResolvedValueOnce(
@@ -5021,7 +5282,11 @@ describe('RoomManager', () => {
 
       it('REFUSES the studio-tier stock mic for a FREE participant (over the ceiling and the ptime floor)', async () => {
         // ptime 10 < 20 is checked first.
-        await expectRefused(stockDesktopMicRtpParameters(STUDIO), 'ptime_below_tier_minimum', 'free');
+        await expectRefused(
+          stockDesktopMicRtpParameters(STUDIO),
+          'ptime_below_tier_minimum',
+          'free'
+        );
         // At a free-legal ptime the bitrate alone still refuses it.
         await expectRefused(
           stockDesktopMicRtpParameters({ ...STUDIO, ptime: 20 }),
@@ -6858,7 +7123,7 @@ describe('RoomManager', () => {
         'sender',
         sendTransport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'camera'
       );
 
@@ -7753,7 +8018,7 @@ describe('RoomManager', () => {
         userId,
         transport.id,
         kind,
-        createRtpParameters() as any,
+        (kind === 'video' ? createVideoRtpParameters() : createRtpParameters()) as any,
         source
       );
       return { transport, producer, info };
@@ -8239,11 +8504,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     return { rm, room, userId: 'u-2', consumer };
   }
 
-  function getConsumer(
-    room: Room,
-    userId: string,
-    consumerId: string
-  ) {
+  function getConsumer(room: Room, userId: string, consumerId: string) {
     return room.participants.get(userId)!.consumers.get(consumerId) as any;
   }
 
@@ -8841,7 +9102,14 @@ describe('tier-aware cap enforcement (#1542)', () => {
 
   async function produceScreen(roomId: string, userId: string, t: any, id: string) {
     t.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video', id }));
-    return manager.produce(roomId, userId, t.id, 'video', createRtpParameters() as any, 'screen');
+    return manager.produce(
+      roomId,
+      userId,
+      t.id,
+      'video',
+      createVideoRtpParameters() as any,
+      'screen'
+    );
   }
 
   it('premium-owner channel room allows up to 16 screenshares, rejects the 17th', async () => {
@@ -8885,7 +9153,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
       'u-free1',
       tFree1.id,
       'video',
-      createRtpParameters() as any,
+      createVideoRtpParameters() as any,
       'screen'
     );
     const p2 = createMockProducer({ kind: 'video', id: 'scr-2' });
@@ -8895,7 +9163,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
       'u-free2',
       tFree2.id,
       'video',
-      createRtpParameters() as any,
+      createVideoRtpParameters() as any,
       'screen'
     );
 
@@ -8947,7 +9215,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
         `u-${i}`,
         t.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         'camera'
       );
       expect(info.source).toBe('camera');
@@ -9207,7 +9475,7 @@ async function producePoliced(
     userId,
     transport.id,
     kind,
-    createRtpParameters() as any,
+    (kind === 'video' ? createVideoRtpParameters() : createRtpParameters()) as any,
     source
   );
   return producer;
@@ -9965,7 +10233,7 @@ describe('RoomManager #2153 — media-policy cooldown gate', () => {
         POLICER_USER,
         transport.id,
         'video',
-        createRtpParameters() as any,
+        createVideoRtpParameters() as any,
         source
       );
     await expect(produceVideo('camera')).rejects.toBeInstanceOf(VideoPolicyCooldownError);
@@ -9999,7 +10267,7 @@ describe('RoomManager #2153 — media-policy cooldown gate', () => {
       POLICER_USER,
       transport.id,
       'video',
-      createRtpParameters() as any,
+      createVideoRtpParameters() as any,
       'camera'
     );
 

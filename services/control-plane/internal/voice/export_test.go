@@ -466,3 +466,10 @@ func (s *NATSSubscriber) RenewObservedLeaseForFutureStampedRowsForTest(
 ) {
 	s.renewObservedLeaseForFutureStampedRows(ctx, channelID, participantIDs)
 }
+
+// UseTierViolationQueueForTest gives a subscriber its own queue group, so a
+// live-broker test is not sharing control-plane.tier-violation with every other
+// control plane a parallel test package starts on the same broker.
+func (s *NATSSubscriber) UseTierViolationQueueForTest(queue string) {
+	s.tierViolationQueue = queue
+}

@@ -279,6 +279,10 @@ type Handler struct {
 	// mfaVerifier confirms #3454's dangerous-action gates. Wired via
 	// SetMFAVerifier (mfa_wiring.go); nil fails every gate closed with a 500.
 	mfaVerifier stepup.MFATxCodeVerifier
+	// violations counts attachment tier-cap refusals for #1308's misbehaviour
+	// telemetry. Wired via SetViolationRecorder (violations.go); nil records
+	// nothing and changes no response.
+	violations entitlements.Recorder
 }
 
 // SetOpsCounter enables aggregate successful-upload counting.
@@ -412,6 +416,7 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 
 	file, header, err := parseAttachmentFile(c, ent.MaxAttachmentBytes)
 	if err != nil {
+		h.observeAttachmentRefusal(c, userID, err)
 		return // response already sent
 	}
 	defer func() { _ = file.Close() }()
@@ -1175,7 +1180,8 @@ func enforceTier1UploadLimit(c *gin.Context, h *Handler, purpose, serverID strin
 func parseMultipartFile(c *gin.Context, maxSize int64) (multipart.File, *multipart.FileHeader, error) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
-		if strings.Contains(err.Error(), "http: request body too large") {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 				"error":    fmt.Sprintf("File exceeds maximum size of %d bytes", maxSize),
 				"max_size": maxSize,
@@ -1725,14 +1731,19 @@ func updateDMIconURL(h *Handler, c *gin.Context, conversationID string) error {
 func parseAttachmentFile(c *gin.Context, maxSize int64) (multipart.File, *multipart.FileHeader, error) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
-		if strings.Contains(err.Error(), "http: request body too large") {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 				"error":    fmt.Sprintf("File exceeds maximum upload size of %d bytes", maxSize),
 				"max_size": maxSize,
 			})
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing file in request"})
+			// NOT counted (#1308): this limit is the tier allowance PLUS the
+			// multipart overhead allowance, so extra form fields or headers can
+			// trip it with a file inside the cap. Only the declared-size check
+			// below proves the FILE was over tier.
+			return nil, nil, err
 		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing file in request"})
 		return nil, nil, err
 	}
 	// header.Size is CIPHERTEXT; maxSize is the PLAINTEXT entitlement. Comparing
@@ -1751,7 +1762,7 @@ func parseAttachmentFile(c *gin.Context, maxSize int64) (multipart.File, *multip
 			"max_size": maxSize,
 		})
 		_ = file.Close()
-		return nil, nil, fmt.Errorf("file too large")
+		return nil, nil, errAttachmentOverTier
 	}
 	return file, header, nil
 }

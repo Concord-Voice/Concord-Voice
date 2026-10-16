@@ -40,6 +40,9 @@ import {
 } from '../src/lib/roomManager.js';
 
 const SPEAK_ONLY = (1n << 9n) | (1n << 16n) | (1n << 17n);
+// View + Join voice, Video and ScreenShare, and NOT Speak (#1308): the member
+// the symmetric video check exists for.
+const VIDEO_NO_SPEAK = (1n << 9n) | (1n << 16n) | (1n << 28n) | (1n << 21n);
 const VP8 = { mimeType: 'video/VP8', payloadType: 96, clockRate: 90000 };
 const OPUS_IN_TIER = {
   mimeType: 'audio/opus',
@@ -53,11 +56,11 @@ let worker: types.Worker;
 let router: types.Router;
 let manager: RoomManager;
 
-async function join(userId: string): Promise<string> {
+async function join(userId: string, permissions: bigint = SPEAK_ONLY): Promise<string> {
   await manager.joinRoom('room-fix', userId, `sock-${userId}`, { username: userId }, undefined, {
     entitlement: { ...FREE_MEDIA_ENTITLEMENT },
     mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-    permissions: SPEAK_ONLY,
+    permissions,
     credentialEpoch: '',
   });
   return (await manager.createTransport('room-fix', userId, 'send')).id;
@@ -156,5 +159,43 @@ describe('audio producer codec/kind check (#3858), real worker', () => {
         'mic'
       )
     ).rejects.toThrow('Audio producer exceeds tier media limits');
+  });
+});
+
+/**
+ * The symmetric video check (#1308), against the same real worker. mediasoup
+ * matches each codec against every router codec, so `kind: 'video'` carrying
+ * `audio/opus` would otherwise become a live producer: mic audio published by
+ * a member with Video but no Speak, past the Speak check and the audio gate.
+ * Removing `codecsAreVideo` turns the first case into an admitted producer.
+ */
+describe('video producer codec/kind check (#1308), real worker', () => {
+  it('refuses an opus-only camera from a member with Video but no Speak', async () => {
+    const t = await join('v-opus', VIDEO_NO_SPEAK);
+    await expect(
+      manager.produce(
+        'room-fix',
+        'v-opus',
+        t,
+        'video',
+        mic([OPUS_IN_TIER], [{ ssrc: 9, maxBitrate: 64_000 }]),
+        'camera'
+      )
+    ).rejects.toThrow('Invalid codec for producer kind');
+    expect(manager.getParticipant('room-fix', 'v-opus')?.producers.size).toBe(0);
+  });
+
+  it('admits a stock VP8 camera from the same member', async () => {
+    const t = await join('v-vp8', VIDEO_NO_SPEAK);
+    const info = await manager.produce(
+      'room-fix',
+      'v-vp8',
+      t,
+      'video',
+      mic([VP8], [{ ssrc: 10, maxBitrate: 500_000 }]),
+      'camera'
+    );
+    expect(info.producerId).toBeTruthy();
+    expect(manager.getParticipant('room-fix', 'v-vp8')?.producers.size).toBe(1);
   });
 });

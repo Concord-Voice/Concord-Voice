@@ -320,6 +320,25 @@ describe('NatsService', () => {
       expect(subject).toBe('voice.producer_removed');
     });
 
+    it('maps tier-violation to voice.tier_violation with only the user, reason and stamp (#1308)', () => {
+      const handler = service.createRoomEventHandler();
+
+      handler({
+        type: 'tier-violation',
+        userId: 'u-1',
+        reason: 'audio_bitrate_over_tier',
+      });
+
+      expect(mockNc.publish).toHaveBeenCalledTimes(1);
+      expect(mockNc.publish.mock.calls[0][0]).toBe('voice.tier_violation');
+      const payload = mockEncode.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      // The control plane bounds this payload before parsing it; the room id
+      // and every media detail stay on the media plane.
+      expect(Object.keys(payload).sort()).toEqual(['reason', 'timestamp', 'userId']);
+      expect(payload).toMatchObject({ userId: 'u-1', reason: 'audio_bitrate_over_tier' });
+      expect(payload.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    });
+
     it('does NOT publish active-speaker events to NATS', () => {
       const handler = service.createRoomEventHandler();
 

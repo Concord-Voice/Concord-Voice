@@ -48,7 +48,10 @@ func (c *Cache) IsSelfHosted() bool {
 
 // GetTier returns the user's tier, reading through to the subscriptions table on
 // a cache miss and populating the cache. On a Redis error (other than a miss) it
-// degrades to a direct DB resolve rather than failing open.
+// degrades to a direct DB resolve rather than failing open. A database failure
+// returns TierFree for THIS call and is never cached: a cached fallback would
+// hold a paying user to free for the TTL after the database recovers, and
+// GetTierChecked would read it back as an answer.
 func (c *Cache) GetTier(ctx context.Context, userID string) string {
 	if config.IsSelfHostedInstance(c.instanceType) {
 		return TierPremium
@@ -65,11 +68,45 @@ func (c *Cache) GetTier(ctx context.Context, userID string) string {
 		return ResolveTier(ctx, c.db, userID)
 	}
 
-	tier := ResolveTier(ctx, c.db, userID)
+	tier, resolveErr := resolveTierChecked(ctx, c.db, userID)
+	if resolveErr != nil {
+		log.Printf("entitlements: ResolveTier failed for user %q: %v", userID, resolveErr)
+		return TierFree
+	}
 	if setErr := c.SetTier(ctx, userID, tier); setErr != nil {
 		log.Printf("entitlements: cache SetTier failed for user %q: %v", userID, setErr)
 	}
 	return tier
+}
+
+// GetTierChecked is GetTier for a caller that PUSHES the tier rather than
+// enforcing with it (#1308's resync). It returns ("", err) when the tier could
+// not be read, where GetTier returns its fail-closed TierFree: least privilege
+// for one request, but a wrong set for a client to hold. A cached value and a
+// database answer, including "no live row" (TierFree), are both returned with
+// a nil error, and a database answer is cached as GetTier caches it. A failed
+// read is returned, not logged -- the caller owns that line; a failed cache
+// fill is logged as GetTier logs it, since the read itself succeeded.
+func (c *Cache) GetTierChecked(ctx context.Context, userID string) (string, error) {
+	if config.IsSelfHostedInstance(c.instanceType) {
+		return TierPremium, nil
+	}
+	val, err := c.redis.Get(ctx, c.key(userID)).Result()
+	if err == nil {
+		return val, nil
+	}
+	tier, dbErr := resolveTierChecked(ctx, c.db, userID)
+	if dbErr != nil {
+		return "", dbErr
+	}
+	if errors.Is(err, redis.Nil) {
+		// A miss is filled as GetTier fills it; after a Redis error the write
+		// would fail the same way, so it is not attempted.
+		if setErr := c.SetTier(ctx, userID, tier); setErr != nil {
+			log.Printf("entitlements: cache SetTier failed for user %q: %v", userID, setErr)
+		}
+	}
+	return tier, nil
 }
 
 // SetTier stores the tier string with the cache TTL.

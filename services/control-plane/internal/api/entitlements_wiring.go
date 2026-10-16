@@ -3,9 +3,11 @@ package api
 
 import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 // entitlementBroadcaster is the subset of *websocket.Hub the notifier needs.
@@ -20,6 +22,10 @@ type entitlementBroadcaster interface {
 }
 
 var _ entitlementBroadcaster = (*websocket.Hub)(nil)
+
+// The #1308 recorder takes the narrower EntitlementPusher, which has no
+// DisconnectUser: the same adapter, structurally unable to disconnect.
+var _ entitlements.EntitlementPusher = (*EntitlementNotifier)(nil)
 
 // Compile-time proof the adapter is a valid entitlements.SessionNotifier, i.e.
 // it can be injected into entitlements.OnTierChange by #1303/#1306.
@@ -54,4 +60,22 @@ func (n *EntitlementNotifier) BroadcastEntitlements(userID uuid.UUID, dto entitl
 		return
 	}
 	n.hub.BroadcastToUser(userID, websocket.OutgoingMessage{Type: "entitlements_changed", Data: data})
+}
+
+// newViolationRecorder builds #1308's misbehaviour recorder. Its threshold
+// resync rides the same entitlements_changed push as a tier change, through
+// this file's adapter, and reads the tier through the SAME cache the upload
+// handlers enforce with. For an upload refusal that is the set that refused;
+// for a media-plane report it is the current set, since the media plane
+// enforces the set it read at join.
+// One recorder serves both counted doors (the media upload handlers and the
+// voice.tier_violation NATS door), so both share one window per user.
+func newViolationRecorder(
+	rdb *redis.Client,
+	log *logger.Logger,
+	tiers entitlements.CheckedTierResolver,
+	hub entitlementBroadcaster,
+	events securityevent.Emitter,
+) *entitlements.ViolationRecorder {
+	return entitlements.NewViolationRecorder(rdb, log, tiers, NewEntitlementNotifier(hub, log), events)
 }

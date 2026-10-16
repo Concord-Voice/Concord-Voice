@@ -609,6 +609,10 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 			"error":    fmt.Sprintf("File exceeds maximum upload size of %d bytes", maxPlaintext),
 			"max_size": maxPlaintext,
 		})
+		// The tier-cap refusal, and the ONLY one on this path that #1308
+		// counts: the init body cap above and the chunk PUT's 413s measure
+		// transport shape, not entitlement.
+		h.recordAttachmentOverTier(c, userID)
 		return
 	}
 

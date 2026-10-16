@@ -21,7 +21,10 @@ function createEventEmitter() {
     }),
     once: vi.fn((event: string, handler: (...args: any[]) => void) => {
       const once = (...args: any[]) => {
-        events.set(event, (events.get(event) ?? []).filter((candidate) => candidate !== once));
+        events.set(
+          event,
+          (events.get(event) ?? []).filter((candidate) => candidate !== once)
+        );
         handler(...args);
       };
       if (!events.has(event)) events.set(event, []);
@@ -136,7 +139,8 @@ export function createMockRouter(overrides: Record<string, unknown> = {}) {
 export function createMockWorker(overrides: Record<string, unknown> = {}) {
   const emitter = createEventEmitter();
   const routers = new Map<string, ReturnType<typeof createMockRouter>>();
-  const pid = typeof overrides.pid === 'number' ? overrides.pid : Math.floor(Math.random() * 100000);
+  const pid =
+    typeof overrides.pid === 'number' ? overrides.pid : Math.floor(Math.random() * 100000);
   const worker = {
     pid,
     closed: false,
@@ -159,7 +163,9 @@ export function createMockWorker(overrides: Record<string, unknown> = {}) {
     dump: vi.fn(async () => ({
       pid,
       webRtcServerIds: [],
-      routerIds: [...routers.values()].filter((router) => !router.closed).map((router) => router.id),
+      routerIds: [...routers.values()]
+        .filter((router) => !router.closed)
+        .map((router) => router.id),
       channelMessageHandlers: { channelRequestHandlers: [], channelNotificationHandlers: [] },
     })),
     close: vi.fn((): void => {
@@ -224,6 +230,25 @@ export function createRtpParameters(
         ...(opusParameters ? { parameters: opusParameters } : {}),
       },
     ],
+    headerExtensions: [],
+    encodings,
+    rtcp: { cname: 'test', reducedSize: true },
+  };
+}
+
+/**
+ * A camera/screen producer's rtpParameters: every codec `video/*`, as
+ * `assertProducerKindMatches` requires of a video producer (#1308). Encodings
+ * default to the same single entry `createRtpParameters` uses, so swapping
+ * one helper for the other changes the codec and nothing else.
+ */
+export function createVideoRtpParameters(
+  encodings: Array<Record<string, unknown>> = [
+    { ssrc: 12345, maxBitrate: STOCK_FREE_MIC_MAX_BITRATE_BPS },
+  ]
+) {
+  return {
+    codecs: [{ mimeType: 'video/VP8', payloadType: 96, clockRate: 90000 }],
     headerExtensions: [],
     encodings,
     rtcp: { cname: 'test', reducedSize: true },

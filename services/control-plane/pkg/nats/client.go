@@ -84,6 +84,15 @@ func (c *Client) SubscribeWithSubject(subject string, handler func(subject strin
 	})
 }
 
+// QueueSubscribe registers a handler in a queue group: each message on subject
+// reaches ONE member of the group across every connection, where a plain
+// subscription delivers it to every subscriber.
+func (c *Client) QueueSubscribe(subject, queue string, handler func(data []byte)) (*nats.Subscription, error) {
+	return c.conn.QueueSubscribe(subject, queue, func(msg *nats.Msg) {
+		handler(msg.Data)
+	})
+}
+
 // Publish sends a JSON-encoded message to the given subject.
 func (c *Client) Publish(subject string, data interface{}) error {
 	payload, err := json.Marshal(data)

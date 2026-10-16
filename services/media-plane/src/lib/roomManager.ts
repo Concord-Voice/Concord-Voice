@@ -412,6 +412,26 @@ type AudioTierRejectReason =
   | 'opus_bitrate_above_tier_ceiling';
 
 /**
+ * The control plane's counted entitlement-violation reasons for an audio
+ * refusal (#1308), published on NATS `voice.tier_violation`. The control plane
+ * admits exactly this closed set (`entitlements.ParseViolationReason`).
+ */
+export type TierViolationReason = 'audio_ptime_below_tier' | 'audio_bitrate_over_tier';
+
+/**
+ * Fold each `enforceAudioTierGate` refusal onto its counted reason (#1308). An
+ * UNDECLARED ptime or bitrate counts under the matching reason: the stock
+ * client declares both on every tier (#3858), so absence is the same
+ * misbehaviour as an over-tier value.
+ */
+const AUDIO_TIER_VIOLATION_REASON: Readonly<Record<AudioTierRejectReason, TierViolationReason>> = {
+  ptime_undeclared: 'audio_ptime_below_tier',
+  ptime_below_tier_minimum: 'audio_ptime_below_tier',
+  bitrate_undeclared: 'audio_bitrate_over_tier',
+  opus_bitrate_above_tier_ceiling: 'audio_bitrate_over_tier',
+};
+
+/**
  * Fail-closed free-floor entitlement used as the `joinRoom` default when no
  * parsed entitlement is supplied (backward-compat callers / tests). Mirrors the
  * Go FREE floor — the same values `validateChannelAccess` falls back to via
@@ -1105,7 +1125,10 @@ export type RoomEvent =
     }
   | { type: 'camera-layering-gate'; roomId: string; enabled: boolean; targetSocketId?: string }
   | { type: 'screen-layering-gate'; roomId: string; targetSocketId: string; enabled: boolean }
-  | { type: 'active-speaker'; roomId: string; userId: string; volume: number };
+  | { type: 'active-speaker'; roomId: string; userId: string; volume: number }
+  // No roomId: telemetry never names the call, and the generic room-event debug
+  // log would otherwise pair a user with it (#1308).
+  | { type: 'tier-violation'; userId: string; reason: TierViolationReason };
 
 export type RoomEventHandler = (event: RoomEvent) => void;
 type CameraLayerSelection = { spatialLayer: 0 | 1 | 2; temporalLayer: 0 | 1 | 2 };
@@ -5440,14 +5463,26 @@ export class RoomManager {
   }
 
   /**
-   * Emit the PII-safe violation log and throw a generic produce error (#1300).
+   * Emit the PII-safe violation log, report the refusal for #1308's
+   * misbehaviour telemetry, and throw a generic produce error (#1300).
    * `reason` is one of the four fixed strings used by `enforceAudioTierGate`.
+   *
+   * The report is a `tier-violation` room event, which the NATS bridge
+   * publishes as `voice.tier_violation` carrying only the user id and the
+   * folded reason. It is emitted BEFORE the throw and cannot change it:
+   * `emitEvent` contains handler failures, so the refusal stands whatever the
+   * bridge does.
    */
   private rejectAudioTier(
     userId: string,
     source: MediaSource,
     reason: AudioTierRejectReason
   ): never {
+    this.emitEvent({
+      type: 'tier-violation',
+      userId,
+      reason: AUDIO_TIER_VIOLATION_REASON[reason],
+    });
     // PII-safe: userId (opaque id, no display fields), kind, source, reason ONLY.
     // NEVER the rtpParameters / codec params / media (observability.md #4).
     logger.warn('Audio producer rejected: over-tier media (#1300)', {
@@ -5470,8 +5505,12 @@ export class RoomManager {
    * every router codec, video included, so `kind: 'audio'` carrying `video/VP8`
    * (alone, or ahead of an opus entry) was accepted, skipping the opus-only
    * audio-tier gate and sending video down the mic path past the camera
-   * permission, cap and cooldown. Static messages: never interpolate client input
-   * into the error or log (CWE-117).
+   * permission, cap and cooldown. Symmetrically, every codec on a video producer
+   * must be `video/*` (#1308): otherwise a member with Video but no Speak
+   * permission could publish `kind: 'video'`, `source: 'camera'` carrying
+   * `audio/opus`, a mic stream that skips the Speak check and the audio-tier
+   * gate. Static messages: never interpolate client input into the error or log
+   * (CWE-117).
    */
   private assertProducerKindMatches(
     kind: MediaKind,
@@ -5484,7 +5523,11 @@ export class RoomManager {
       this.securityDeny('media_schema_rejected', 'socket.produce');
       throw new Error('Invalid media source for producer kind');
     }
-    if (kind === 'audio' && !RoomManager.codecsAreAudio(rtpParameters)) {
+    const codecsMatchKind =
+      kind === 'audio'
+        ? RoomManager.codecsAreAudio(rtpParameters)
+        : RoomManager.codecsAreVideo(rtpParameters);
+    if (!codecsMatchKind) {
       this.securityDeny('media_schema_rejected', 'socket.produce');
       throw new Error('Invalid codec for producer kind');
     }
@@ -5496,11 +5539,29 @@ export class RoomManager {
    * its shape is checked rather than trusted.
    */
   private static codecsAreAudio(rtpParameters: RtpParameters): boolean {
+    return RoomManager.everyCodecHasMimePrefix(rtpParameters, 'audio/');
+  }
+
+  /**
+   * True when `rtpParameters.codecs` is a non-empty array whose every entry has
+   * a `video/…` mimeType (case-insensitive). The mirror of `codecsAreAudio`
+   * (#1308); `video/rtx` is a `video/*` codec, so a stock RTX-bearing camera
+   * passes.
+   */
+  private static codecsAreVideo(rtpParameters: RtpParameters): boolean {
+    return RoomManager.everyCodecHasMimePrefix(rtpParameters, 'video/');
+  }
+
+  /** Shape-checked: the payload is wire-derived, so nothing about it is trusted. */
+  private static everyCodecHasMimePrefix(
+    rtpParameters: RtpParameters,
+    prefix: 'audio/' | 'video/'
+  ): boolean {
     const codecs: unknown = (rtpParameters as { codecs?: unknown } | null | undefined)?.codecs;
     if (!Array.isArray(codecs) || codecs.length === 0) return false;
     return codecs.every((codec: unknown) => {
       const mimeType = (codec as { mimeType?: unknown } | null)?.mimeType;
-      return typeof mimeType === 'string' && mimeType.toLowerCase().startsWith('audio/');
+      return typeof mimeType === 'string' && mimeType.toLowerCase().startsWith(prefix);
     });
   }
 

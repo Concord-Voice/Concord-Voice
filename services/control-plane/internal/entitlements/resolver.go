@@ -24,6 +24,21 @@ type TierResolver interface {
 // The partial unique index idx_subscriptions_user_active guarantees at most one
 // row matching the live-status set, so LIMIT 1 is exact, not arbitrary.
 func ResolveTier(ctx context.Context, db *sql.DB, userID string) string {
+	tier, err := resolveTierChecked(ctx, db, userID)
+	if err != nil {
+		// Degrade, don't fail open. %q quoting is injection-safe for the userID
+		// (observability.md: %q-escaped values need no further sanitization).
+		log.Printf("entitlements: ResolveTier failed for user %q: %v", userID, err)
+		return TierFree
+	}
+	return tier
+}
+
+// resolveTierChecked is ResolveTier's one query, with the error kept. No live
+// row is an ANSWER (TierFree, nil); a failed read is not ("", err). Callers
+// that hand the tier on rather than enforce with it -- GetTierChecked -- need
+// that difference, which ResolveTier's fail-closed free erases.
+func resolveTierChecked(ctx context.Context, db *sql.DB, userID string) (string, error) {
 	const q = `SELECT tier FROM subscriptions
 	           WHERE user_id = $1
 	             AND status IN ('active', 'trialing', 'past_due')
@@ -32,13 +47,10 @@ func ResolveTier(ctx context.Context, db *sql.DB, userID string) string {
 	var tier string
 	err := db.QueryRowContext(ctx, q, userID).Scan(&tier)
 	if errors.Is(err, sql.ErrNoRows) {
-		return TierFree
+		return TierFree, nil
 	}
 	if err != nil {
-		// Degrade, don't fail open. %q quoting is injection-safe for the userID
-		// (observability.md: %q-escaped values need no further sanitization).
-		log.Printf("entitlements: ResolveTier failed for user %q: %v", userID, err)
-		return TierFree
+		return "", err
 	}
-	return tier
+	return tier, nil
 }
