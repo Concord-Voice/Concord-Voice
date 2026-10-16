@@ -124,11 +124,12 @@ selfhost_storage_target_guard() {
 }
 
 # ── Self-host published-port posture (#3538) ─────────────────────────────────
-# Engine floor: before 28.0.0, hosts on the same L2 segment can reach ports
+# Engine floor: before 29.8.2, malicious registry DNS responses can disclose
+# registry credentials (CVE-2026-92543). Before 28.0.0, hosts on the same L2 segment can reach ports
 # published on 127.0.0.1; from 28.2.0 to 28.3.2 a firewalld reload drops the rule
 # that blocks them (CVE-2025-54388). Must equal MIN_ENGINE in install-selfhost.sh
 # (pinned by [internal]tests/test-selfhost-port-posture.sh).
-SELFHOST_MIN_ENGINE=28.3.3
+SELFHOST_MIN_ENGINE=29.8.2
 SELFHOST_DOCKER_DAEMON_JSON="${SELFHOST_DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}"
 
 # selfhost_posture_verdict MODE JSON -> 0 ok | 1 refused (prints violations).
@@ -167,16 +168,31 @@ selfhost_posture_verdict() {
 # Refuses, before any verb runs, an Engine older than SELFHOST_MIN_ENGINE and a
 # rendered model that publishes anything outside the self-host allowlist.
 selfhost_port_posture_gate() {
-  local engine rendered direct rc
+  local engine rendered direct rc engine_part
+  local -a engine_response=()
   command -v python3 >/dev/null 2>&1 \
     || { echo "selfhost-posture: python3 is required" >&2; return 1; }
-  engine="$(docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
-  if [[ -z "$engine" ]]; then
-    echo "selfhost-posture: cannot read the Docker Engine version (is the daemon running and accessible?) — refusing" >&2
+  # Retain every LF and the query status without command substitution. Extra
+  # NUL-delimited fields also refuse NUL bytes inside the server response.
+  while IFS= read -r -d '' engine_part; do
+    engine_response+=("$engine_part")
+  done < <(
+    query_status=0
+    docker version --format '{{.Server.Version}}' 2>/dev/null || query_status=$?
+    printf '\0%d\0' "$query_status"
+  )
+  if (( ${#engine_response[@]} != 2 )) || [[ ${engine_response[1]} != 0 ]]; then
+    echo "selfhost-posture: Docker Engine server version unavailable or invalid — refusing" >&2
     return 1
   fi
+  engine="${engine_response[0]%$'\n'}"
+  if [[ ! "$engine" =~ ^((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))(\+[A-Za-z0-9.+-]+)?$ ]]; then
+    echo "selfhost-posture: Docker Engine server version unavailable or invalid — refusing" >&2
+    return 1
+  fi
+  engine="${BASH_REMATCH[1]}"
   if [[ "$(printf '%s\n%s\n' "$SELFHOST_MIN_ENGINE" "$engine" | sort -V | head -1)" != "$SELFHOST_MIN_ENGINE" ]]; then
-    echo "selfhost-posture: Docker Engine $engine is older than $SELFHOST_MIN_ENGINE; older engines can let LAN neighbours reach ports published on 127.0.0.1 (CVE-2025-54388) — refusing" >&2
+    echo "selfhost-posture: Docker Engine $engine is older than $SELFHOST_MIN_ENGINE; require registry credential protection (CVE-2026-92543) and loopback-published port protection (CVE-2025-54388) — refusing" >&2
     return 1
   fi
   # Compose's error is NOT echoed: compose-go's dotenv errors can quote a whole .env

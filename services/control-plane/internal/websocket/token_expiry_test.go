@@ -204,10 +204,11 @@ func TestExpiredTokenUnregistersWhilePostRegistrationFenceStalls(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("post-registration credential check did not stall")
 	}
-	hub.mu.RLock()
-	registered := len(hub.clients)
-	hub.mu.RUnlock()
-	require.Equal(t, 1, registered)
+	require.Eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		return len(hub.clients) == 1
+	}, 2*time.Second, 10*time.Millisecond, "client must be registered before expiry assertion")
 	require.Eventually(t, func() bool {
 		hub.mu.RLock()
 		defer hub.mu.RUnlock()

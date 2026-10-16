@@ -2,7 +2,7 @@
 
 > **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover complete (2026-10-01)
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-10-01 (production now runs the published derivative; second dependency-only derivative and its not-affected record added)
+> **Last updated:** 2026-10-16 (publisher Engine prerequisite updated; historical release and cutover receipts retained)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
 
@@ -61,6 +61,62 @@ are in
 security review and recorded legal approval remain gates before publication
 dispatch. No application edits, authentication changes, or live cutover are
 authorized by the exception.
+
+A design exception, a not-affected record or generic automated-batch approval
+does not supply legal approval. Record the release-specific approval before any
+dispatch or visibility change that requires it.
+
+## Publisher Engine Prerequisite
+
+Registry operations require Docker **Server ≥29.8.2**, including manual runtime
+pulls in this runbook. CVE-2026-92543 lets an affected Engine classify a registry
+as insecure after a malicious mixed-address DNS response; digest pins do not
+remove that credential-disclosure path. The floor also retains earlier
+loopback/firewalld protection, including CVE-2025-54388. The self-host Compose
+v2 ≥2.24.5 requirement is unchanged.
+
+The `publish`, `smoke-arm64` and `finalize` jobs each run
+`scripts/ci/require-docker-engine.sh` after trusted recipe checkout and before
+registry login, Buildx setup or any other possible Engine pull. It checks the
+server in the same Docker identity/context used later. An old or unavailable
+daemon, failed query or invalid response stops the job before registry
+credentials are supplied. The exact-main admission remains required; a skipped
+branch dispatch does not validate the publisher.
+
+Hosted amd64 jobs only verify their preinstalled daemon. The ephemeral native
+arm64 job installs Docker CE from Docker's official signed Ubuntu apt repository,
+checks daemon startup, then runs the guard as root before root Docker login.
+That installation is confined to the runner; the existing 15-minute timeout is
+unchanged. Installation time and cost need a real run.
+
+Production/staging Docker server inventories, applicable Blacksmith local-Engine
+and remote-BuildKit inventories, and successful guarded publisher runs with
+sanitized amd64 and native arm64 server versions remain outstanding. A local
+Engine version does not certify a remote BuildKit service. Repository tests and
+the historical publication/cutover receipts below do not establish those facts
+or a deployed Engine upgrade. Affected managed hosts require separate
+operational authorization and post-upgrade evidence.
+
+Before a fresh MinIO publication, integrate this publisher prerequisite with the
+reviewed derivative recipe. Publication, legal approval, source-first promotion,
+consumer re-pin and live cutover retain their separate gates below. Published
+tags and digests remain immutable.
+
+For #3692's admission prerequisite, `REVIEW.md` permits publisher runtime
+validation after merge only with explicit security/deployment acceptance for the
+exact PR head and passing static, hermetic actual-step and required CI checks.
+Those fixtures do not exercise real native-arm64 installation or publisher
+network behavior. Exact-main admission remains enforced; a branch-skipped or
+old-main run does not validate the changed path.
+
+At the next separately authorized publication of the reviewed fresh derivative,
+retain the release-specific legal/access gates and record the run URL/source
+SHA, all three jobs' sanitized server versions and guard ordering, official CE
+startup/root admission, the unchanged 15-minute arm64 smoke outcome, native
+validation and paired source-first promotion digests. Retain failed/refused run
+evidence; safe refusal does not establish successful publication. No published
+tag may move to obtain a passing result. Fleet inventories/upgrades, consumer
+re-pin and live cutover remain separate evidence and approval obligations.
 
 ## Release Contract
 

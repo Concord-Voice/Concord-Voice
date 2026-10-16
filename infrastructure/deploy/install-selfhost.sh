@@ -182,20 +182,23 @@ preflight_os() {
   esac
 }
 
-# Version floors (#3538). Engine: before 28.0.0, LAN neighbours can reach ports
+# Version floors (#3538, #3692). Engine: before 29.8.2, malicious registry DNS
+# responses can disclose registry credentials (CVE-2026-92543). Before 28.0.0,
+# LAN neighbours can reach ports
 # published on 127.0.0.1, and from 28.2.0 to 28.3.2 a firewalld reload drops the
 # rule that blocks them (CVE-2025-54388). Compose: 2.24.5 is the oldest release
 # measured honouring `!override` in docker-compose.selfhost.yml (2.20 and 2.21
 # ignore it and merge the lists back to 0.0.0.0). MIN_ENGINE must equal
 # SELFHOST_MIN_ENGINE in concord-ctl.sh (pinned by test-selfhost-port-posture.sh).
-readonly MIN_ENGINE=28.3.3
+readonly MIN_ENGINE=29.8.2
 readonly MIN_COMPOSE=2.24.5
 
 # version_at_least HAVE NEED — dotted-version comparison via sort -V.
 version_at_least() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
 
 preflight_docker() {
-  local engine compose
+  local engine compose engine_part
+  local -a engine_response=()
   command -v docker >/dev/null 2>&1 || {
     echo -e "${RED}✗ Docker Engine not found${NC}" >&2
     return 2
@@ -204,9 +207,27 @@ preflight_docker() {
     echo -e "${RED}✗ Docker Compose v2 plugin not found${NC}" >&2
     return 2
   }
-  engine="$(docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
-  if [[ -z "$engine" ]] || ! version_at_least "$engine" "$MIN_ENGINE"; then
-    echo -e "${RED}✗ Docker Engine ${engine:-unknown (is the daemon running and accessible?)} — need >= $MIN_ENGINE (older engines can let LAN neighbours reach loopback-published ports, CVE-2025-54388). Install Docker CE from download.docker.com.${NC}" >&2
+  # NUL-delimited reads retain every terminal LF and the query status. Extra
+  # fields refuse a NUL inside Docker stdout instead of silently removing it.
+  while IFS= read -r -d '' engine_part; do
+    engine_response+=("$engine_part")
+  done < <(
+    query_status=0
+    docker version --format '{{.Server.Version}}' 2>/dev/null || query_status=$?
+    printf '\0%d\0' "$query_status"
+  )
+  if (( ${#engine_response[@]} != 2 )) || [[ ${engine_response[1]} != 0 ]]; then
+    echo -e "${RED}✗ Docker Engine server version unavailable or invalid — need a successful stable version query and >= $MIN_ENGINE. Install Docker CE from download.docker.com.${NC}" >&2
+    return 2
+  fi
+  engine="${engine_response[0]%$'\n'}"
+  if [[ ! "$engine" =~ ^((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))(\+[A-Za-z0-9.+-]+)?$ ]]; then
+    echo -e "${RED}✗ Docker Engine server version unavailable or invalid — need a successful stable version query and >= $MIN_ENGINE. Install Docker CE from download.docker.com.${NC}" >&2
+    return 2
+  fi
+  engine="${BASH_REMATCH[1]}"
+  if ! version_at_least "$engine" "$MIN_ENGINE"; then
+    echo -e "${RED}✗ Docker Engine $engine — need >= $MIN_ENGINE (registry credential protection, CVE-2026-92543; loopback-published port protection, CVE-2025-54388). Install Docker CE from download.docker.com.${NC}" >&2
     return 2
   fi
   compose="$(docker compose version --short 2>/dev/null | tr -d 'v' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
@@ -248,7 +269,7 @@ preflight_logrotate() {
 
 run_preflight() {
   echo -e "${BLUE}Running preflight (no files written yet)...${NC}"
-  if ! { preflight_os && preflight_docker && preflight_resources && preflight_logrotate && preflight_ports; }; then
+  if ! preflight_os || ! preflight_docker || ! preflight_resources || ! preflight_logrotate || ! preflight_ports; then
     echo -e "${RED}Preflight failed — aborting before any change.${NC}" >&2
     exit 2
   fi
@@ -370,7 +391,7 @@ validate_smtp_host() {
     printf '%s\n' 'installer: SMTP host is required' >&2
     return 1
   fi
-  if python3 - "$host" 2>/dev/null <<'PY'
+  if python3 - "$host" 2>/dev/null <<'PY'; then
 import ipaddress, re, sys
 host = sys.argv[1]
 try:
@@ -401,7 +422,6 @@ try:
 except ValueError:
     sys.exit(1)
 PY
-  then
     return 0
   fi
   printf '%s\n' 'installer: invalid SMTP host' >&2
@@ -412,7 +432,7 @@ PY
 validate_smtp_port() {
   local p="${1:-}"
   [[ -z "$p" ]] && return 0
-  { [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )); } || {
+  { [[ "$p" =~ ^[0-9]{1,5}$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; } || {
     printf '%s\n' 'installer: invalid SMTP port' >&2
     return 1
   }
@@ -436,7 +456,7 @@ validate_https_privacy_url() {
   if [[ "$authority" == *:* ]]; then
     port="${authority#*:}"
     [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
-    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
   fi
 }
 
@@ -489,7 +509,7 @@ warn_public_ip() {
 validate_public_ip() {
   local ip="${1:-}"
   if [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] &&
-    python3 - "$ip" 2>/dev/null <<'PY'
+    python3 - "$ip" 2>/dev/null <<'PY'; then
 import ipaddress, sys
 try:
     address = ipaddress.IPv4Address(sys.argv[1])
@@ -498,7 +518,6 @@ try:
 except ValueError:
     sys.exit(1)
 PY
-  then
     return 0
   fi
   echo -e "${RED}invalid public IP: expected an IPv4 address for basic self-host${NC}" >&2
@@ -708,7 +727,9 @@ collect_config() {
   CFG_PUBLIC_IP="$(ask 'Public IPv4 address (blank = auto-detect)' "$detected_ip")" || return $?
   while :; do
     CFG_STORAGE_MODE="$(ask 'Object storage (bundled / byo-s3)' bundled)" || return $?
-    case "$CFG_STORAGE_MODE" in bundled|byo-s3) break ;; esac
+    case "$CFG_STORAGE_MODE" in
+      bundled|byo-s3) break ;;
+    esac
     printf '%s\n' 'installer: select bundled or byo-s3' >&2
   done
   if [[ "$CFG_STORAGE_MODE" == byo-s3 ]]; then
@@ -887,7 +908,7 @@ print_storage_review() {
   printf 'Object storage mode: %s\n' "${CFG_STORAGE_MODE:-bundled}" || return 1
   if [[ "${CFG_STORAGE_MODE:-bundled}" == byo-s3 ]]; then
     printf 'Endpoint: %s\nBackend: %s\nRegion: %s\nBucket: %s\nTLS: %s\n' \
-      "$CFG_STORAGE_ENDPOINT" "$CFG_STORAGE_BACKEND" "${CFG_STORAGE_REGION:-(default / empty)}" \
+      "$CFG_STORAGE_ENDPOINT" "$CFG_STORAGE_BACKEND" "${CFG_STORAGE_REGION:-"(default / empty)"}" \
       "$CFG_STORAGE_BUCKET" "$CFG_STORAGE_USE_SSL" || return 1
     printf '%s\n' 'Access key: provided (hidden)' 'Secret key: provided (hidden)' || return 1
   fi
