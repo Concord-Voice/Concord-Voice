@@ -44,12 +44,15 @@ services:
     # redistest reads the real value via CONFIG GET (fallback 15), so it adapts to
     # whatever a server reports rather than depending on this line.
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set - copy .env.example to .env}
+    environment:
+      # Keep healthcheck authentication out of Docker exec arguments/events.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set - copy .env.example to .env}
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -373,6 +376,9 @@ services:
       # would silently do nothing. Enabling it REQUIRES publishing the RTC
       # range for TCP and allowing it on both firewall surfaces first.
       MEDIASOUP_ENABLE_TCP: "false"
+      # Shared listeners require the separate, explicitly validated lab overlay.
+      # An ambient shell/.env value must not migrate an ordinary deployment.
+      MEDIASOUP_SHARED_WEBRTC_SERVER: "false"
       # Peers whose X-Real-IP / X-Forwarded-For the #2032 admission gate trusts
       # (src/lib/admissionGate.ts). Matched by CIDR, not string equality — the
       # media-plane is reached through a docker bridge whose address is not a

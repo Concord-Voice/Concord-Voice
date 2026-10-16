@@ -5,11 +5,20 @@ import {
   RoomConsumerCountsUnavailableError,
   selectLeastLoadedWorkerIndex,
 } from './workerSelection.js';
-import type { Worker, Router, RouterRtpCodecCapability } from 'mediasoup/types';
+import type {
+  Worker,
+  Router,
+  RouterRtpCodecCapability,
+  WebRtcServer,
+  TransportListenInfo,
+} from 'mediasoup/types';
 import type { EmitSecurityEvent } from './securityEvent.js';
 
 /** Live consumer counts keyed by roomId, supplied by RoomManager (#3149). */
 export type RoomConsumerCountsProvider = () => ReadonlyMap<string, number>;
+
+/** Startup has no command owner yet; retain the existing native teardown bound. */
+const STARTUP_NATIVE_CLEANUP_TIMEOUT_MS = 35_000;
 
 /** A room's router plus the index of the worker hosting it. */
 type RouterAssignment = { router: Router; workerIndex: number };
@@ -54,6 +63,9 @@ export async function awaitNativeDeadline<T>(
 export class MediasoupService {
   private readonly routerWorkers = new WeakMap<Router, Worker>();
   private readonly nativeWorkers = new Map<Worker, NativeWorkerClosure>();
+  private readonly webRtcServers = new Map<Worker, WebRtcServer>();
+  private initialized = false;
+  private listenerFailed = false;
   private routerCreations = 0;
   private routerCreationVersion = 0;
   private closing = false;
@@ -173,11 +185,27 @@ export class MediasoupService {
 
   async close(deadlineMs: number): Promise<void> {
     this.closing = true;
+    this.initialized = false;
     const workers = [...this.workers];
     const closures = workers.map((worker) => this.trackNativeWorker(worker));
     logger.info('Closing mediasoup service');
     // Every subprocess listener is installed before the first close request.
-    for (const worker of workers) worker.close();
+    for (const server of this.webRtcServers.values()) {
+      try {
+        if (!server.closed) server.close();
+      } catch {
+        // Worker closure still has to run for every captured subprocess.
+        logger.error('Mediasoup shared listener close failed');
+      }
+    }
+    for (const worker of workers) {
+      try {
+        worker.close();
+      } catch {
+        // A thrown close request is not proof of native termination.
+        logger.error('Mediasoup worker close failed');
+      }
+    }
     await awaitNativeDeadline(
       () => Promise.all(closures.map((closure) => closure.closed)),
       deadlineMs
@@ -185,6 +213,7 @@ export class MediasoupService {
     if (closures.some((closure) => !closure.observed)) throw nativeTerminationUnavailable();
     this.workers = [];
     this.routers.clear();
+    this.webRtcServers.clear();
   }
 
   private workers: Worker[] = [];
@@ -199,47 +228,117 @@ export class MediasoupService {
   }
 
   async init() {
+    if (this.closing || this.initialized || this.workers.length !== 0) {
+      throw nativeTerminationUnavailable();
+    }
     logger.info('Initializing mediasoup workers', {
       numWorkers: config.mediasoup.numWorkers,
     });
 
-    for (let i = 0; i < config.mediasoup.numWorkers; i++) {
-      const logTags: mediasoup.types.WorkerLogTag[] = config.mediasoup.worker.logTags;
-      const worker = await mediasoup.createWorker({
-        logLevel: config.mediasoup.worker.logLevel,
-        logTags,
-        rtcMinPort: config.mediasoup.worker.rtcMinPort,
-        rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
-      });
+    try {
+      for (let i = 0; i < config.mediasoup.numWorkers; i++) {
+        const logTags: mediasoup.types.WorkerLogTag[] = config.mediasoup.worker.logTags;
+        const worker = await mediasoup.createWorker({
+          logLevel: config.mediasoup.worker.logLevel,
+          logTags,
+          rtcMinPort: config.mediasoup.worker.rtcMinPort,
+          rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
+        });
 
-      this.trackNativeWorker(worker);
-      worker.on('died', () => {
-        try {
-          this.emitSecurityEvent?.({
-            eventType: 'dependency',
-            outcome: 'failure',
-            severity: 'critical',
-            reasonCode: 'dependency_unavailable',
-          });
-        } catch {
-          // An observer must not change the mandatory worker-death exit path.
+        this.trackNativeWorker(worker);
+        // Retain this worker before listener creation can fail or yield.
+        this.workers.push(worker);
+        worker.on('died', () => {
+          this.listenerFailed = true;
+          try {
+            this.emitSecurityEvent?.({
+              eventType: 'dependency',
+              outcome: 'failure',
+              severity: 'critical',
+              reasonCode: 'dependency_unavailable',
+            });
+          } catch {
+            // An observer must not change the mandatory worker-death exit path.
+          }
+          try {
+            this.flushSecurityEvents?.();
+          } catch {
+            // Best effort: exit remains authoritative after a worker death.
+          }
+          logger.error('Mediasoup worker died');
+          process.exit(1);
+        });
+
+        if (this.closing) throw nativeTerminationUnavailable();
+        if (config.mediasoup.webRtcServer.enabled) {
+          await this.createWebRtcServer(worker, i);
         }
-        try {
-          this.flushSecurityEvents?.();
-        } catch {
-          // Best effort: exit remains authoritative after a worker death.
-        }
-        logger.error('Mediasoup worker died');
-        process.exit(1);
-      });
 
-      this.workers.push(worker);
-
-      logger.debug('Mediasoup worker created', {
-        pid: worker.pid,
-        index: i,
-      });
+        logger.debug('Mediasoup worker created', {
+          pid: worker.pid,
+          index: i,
+        });
+      }
+      this.initialized = true;
+      if (!this.isReady()) throw nativeTerminationUnavailable();
+    } catch (error) {
+      await this.close(performance.now() + STARTUP_NATIVE_CLEANUP_TIMEOUT_MS);
+      throw error;
     }
+  }
+
+  private async createWebRtcServer(worker: Worker, index: number): Promise<void> {
+    const shared = config.mediasoup.webRtcServer;
+    const listenInfos: TransportListenInfo[] = [
+      {
+        protocol: 'udp',
+        ip: shared.listenIp,
+        announcedAddress: shared.announcedAddress,
+        port: shared.ports[index],
+      },
+    ];
+    if (config.mediasoup.webRtcTransport.enableTcp) {
+      listenInfos.push({ ...listenInfos[0], protocol: 'tcp' });
+    }
+    const server = await worker.createWebRtcServer({ listenInfos });
+    this.webRtcServers.set(worker, server);
+    server.observer.once('close', () => {
+      if (this.closing) return;
+      this.listenerFailed = true;
+      logger.error('Mediasoup shared listener closed');
+    });
+    if (this.closing || this.listenerFailed || worker.closed || server.closed) {
+      throw nativeTerminationUnavailable();
+    }
+  }
+
+  isReady(): boolean {
+    if (
+      !this.initialized ||
+      this.closing ||
+      this.listenerFailed ||
+      this.workers.length !== config.mediasoup.numWorkers
+    ) {
+      return false;
+    }
+    return this.workers.every((worker) => {
+      if (worker.closed || this.workerStopped(worker)) return false;
+      return (
+        !config.mediasoup.webRtcServer.enabled ||
+        this.webRtcServers.get(worker)?.closed === false
+      );
+    });
+  }
+
+  /** Resolve by the captured router owner, independently of the room cache. */
+  getWebRtcServer(router: Router): WebRtcServer | undefined {
+    if (!config.mediasoup.webRtcServer.enabled) return undefined;
+    const worker = this.routerWorkers.get(router);
+    const server = worker && this.webRtcServers.get(worker);
+    if (!this.isReady() || router.closed || !server || server.closed) {
+      throw nativeTerminationUnavailable();
+    }
+    return server;
   }
 
   /**
@@ -290,6 +389,9 @@ export class MediasoupService {
   }
 
   async getOrCreateRouter(roomId: string): Promise<Router> {
+    if (config.mediasoup.webRtcServer.enabled && !this.isReady()) {
+      throw nativeTerminationUnavailable();
+    }
     const existing = this.routers.get(roomId);
 
     if (existing && !existing.router.closed) {
@@ -316,7 +418,7 @@ export class MediasoupService {
         mediaCodecs,
       });
       this.routerWorkers.set(router, worker);
-      if (this.closing) {
+      if (this.closing || (config.mediasoup.webRtcServer.enabled && !this.isReady())) {
         router.close();
         throw nativeTerminationUnavailable();
       }

@@ -94,6 +94,7 @@ import {
 function createMockMediasoupService(router = createMockRouter()) {
   const worker = createMockWorker();
   return {
+    getWebRtcServer: () => undefined,
     getOrCreateRouter: vi.fn().mockResolvedValue(router),
     removeRouter: vi.fn(),
     captureNativeTermination: vi.fn((targetRouter, transportIds?: readonly string[]) => ({

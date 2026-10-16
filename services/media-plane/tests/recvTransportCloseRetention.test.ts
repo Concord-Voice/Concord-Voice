@@ -69,6 +69,7 @@ async function admittedSession() {
     }
   });
   const adapter = {
+    getWebRtcServer: () => undefined,
     getOrCreateRouter: vi.fn().mockResolvedValue(router),
     removeRouter: vi.fn(),
     captureNativeTermination,

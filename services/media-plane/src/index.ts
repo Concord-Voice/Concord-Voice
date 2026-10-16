@@ -1063,6 +1063,7 @@ async function main() {
   app.get('/readyz', (_req, res) => {
     if (
       shuttingDown ||
+      !mediasoupService.isReady() ||
       voiceEnforcementReleaseQueue.saturated() ||
       !enforcementAvailable() ||
       !voiceEnforcementLease.valid() ||
@@ -1187,7 +1188,11 @@ async function main() {
     enforcementAvailability.setAvailable(ready);
   });
   function enforcementAvailable(): boolean {
-    return natsService.requiredSubscriptionsReady() && enforcementAvailability.isReady();
+    return (
+      mediasoupService.isReady() &&
+      natsService.requiredSubscriptionsReady() &&
+      enforcementAvailability.isReady()
+    );
   }
 
   const quarantineVoiceCommands = async (_reason: string): Promise<void> => {
@@ -2311,9 +2316,9 @@ async function main() {
     // invisible misconfiguration into a visible one and does nothing more.
     if (config.mediasoup.webRtcTransport.enableTcp) {
       logger.warn(
-        'MEDIASOUP_ENABLE_TCP is set — mediasoup will bind an ICE-TCP listener ' +
-          'per WebRTC transport and advertise a TCP candidate. This process ' +
-          'CANNOT verify that those ports are reachable. Publish the RTC range ' +
+        'MEDIASOUP_ENABLE_TCP is set — mediasoup will bind ICE-TCP listeners ' +
+          'and advertise TCP candidates. This process ' +
+          'CANNOT verify that those ports are reachable. Publish the matching media ports ' +
           'for TCP in compose AND allow it on both firewall surfaces (ufw and ' +
           'the DOCKER-USER chain), or every client will burn ICE connectivity ' +
           'checks on a black-holed candidate. See ADR-0040.',

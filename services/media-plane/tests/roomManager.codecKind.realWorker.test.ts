@@ -71,6 +71,7 @@ beforeAll(async () => {
   worker = await mediasoup.createWorker({ logLevel: 'error' });
   router = await worker.createRouter({ mediaCodecs: config.mediasoup.router.mediaCodecs });
   manager = new RoomManager({
+    getWebRtcServer: () => undefined,
     getOrCreateRouter: async () => router,
     removeRouter: () => undefined,
     captureNativeTermination: (r: types.Router, transportIds?: readonly string[]) => ({

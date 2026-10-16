@@ -44,6 +44,8 @@ describe('config', () => {
     delete process.env.RTC_MIN_PORT;
     delete process.env.RTC_MAX_PORT;
     delete process.env.MEDIASOUP_ENABLE_TCP;
+    delete process.env.MEDIASOUP_SHARED_WEBRTC_SERVER;
+    delete process.env.MEDIASOUP_WEBRTC_SERVER_PORTS;
     delete process.env.OPS_METRICS_ENABLED;
     delete process.env.OPS_METRICS_NODE_ID;
     delete process.env.OPS_METRICS_SHARED_SECRET;
@@ -436,6 +438,138 @@ describe('config', () => {
   });
 
   // ── Production Guard ────────────────────────────────────────────────
+
+  describe('shared WebRTC listener configuration', () => {
+    const sharedEnv = {
+      MEDIASOUP_SHARED_WEBRTC_SERVER: 'true',
+      NUM_WORKERS: '3',
+      ANNOUNCED_IP: 'media.example.test',
+    };
+
+    it('leaves legacy allocation unchanged and ignores an inactive shared range', async () => {
+      const { config } = await loadConfig({
+        MEDIASOUP_WEBRTC_SERVER_PORTS: 'invalid-inactive-range',
+        RTC_MIN_PORT: '45000',
+        RTC_MAX_PORT: '46000',
+      });
+      expect(config.mediasoup.webRtcServer).toEqual({
+        enabled: false,
+        ports: [],
+        listenIp: '0.0.0.0',
+        announcedAddress: '127.0.0.1',
+      });
+      expect(config.rtc).toEqual({ announcedIp: '127.0.0.1', minPort: 45000, maxPort: 46000 });
+      expect(config.mediasoup.worker).toEqual(expect.objectContaining({
+        rtcMinPort: 45000,
+        rtcMaxPort: 46000,
+      }));
+      expect(process.exit).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['true', true], [' TRUE ', true], ['false', false], [' False ', false],
+    ])('accepts explicit flag %j as %s', async (raw, enabled) => {
+      const { config } = await loadConfig({ ...sharedEnv, MEDIASOUP_SHARED_WEBRTC_SERVER: raw });
+      expect(config.mediasoup.webRtcServer.enabled).toBe(enabled);
+      expect(config.mediasoup.webRtcServer.ports).toEqual(enabled ? [40000, 40001, 40002] : []);
+      expect(process.exit).not.toHaveBeenCalled();
+    });
+
+    it.each(['', ' ', '1', 'yes', 'on', 'tru', 'false!'])(
+      'rejects an unknown shared-listener flag %j', async (raw) => {
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          await loadConfig({ ...sharedEnv, MEDIASOUP_SHARED_WEBRTC_SERVER: raw });
+          expect(process.exit).toHaveBeenCalledWith(1);
+          expect(error).toHaveBeenCalledWith(expect.stringContaining('MEDIASOUP_SHARED_WEBRTC_SERVER'));
+        } finally { error.mockRestore(); }
+      }
+    );
+
+    it.each([
+      { workers: '1', range: '1024-1024', ports: [1024] },
+      { workers: '3', range: '42000-42002', ports: [42000, 42001, 42002] },
+      { workers: '3', range: '65533-65535', ports: [65533, 65534, 65535] },
+      { workers: '32', range: '65504-65535', ports: Array.from({ length: 32 }, (_, i) => 65504 + i) },
+    ])('allocates exactly one unique listener per worker for $range', async ({ workers, range, ports }) => {
+      const { config } = await loadConfig({
+        ...sharedEnv,
+        NUM_WORKERS: workers,
+        MEDIASOUP_WEBRTC_SERVER_PORTS: range,
+        RTC_MIN_PORT: '47000',
+        RTC_MAX_PORT: '48000',
+      });
+      expect(config.mediasoup.webRtcServer).toEqual({
+        enabled: true,
+        ports,
+        listenIp: '0.0.0.0',
+        announcedAddress: 'media.example.test',
+      });
+      expect(config.rtc.minPort).toBe(47000);
+      expect(config.rtc.maxPort).toBe(48000);
+      expect(process.exit).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      '', '40000', '40000,40001,40002', '40000-40001', '40000-40003',
+      '40002-40000', '1023-1025', '65534-65536', '-1-1', '40000.0-40002',
+      '4e4-40002', '40000x-40002', '40000-40002junk', ' 40000-40002 ',
+      '40000 - 40002', '9007199254740993-9007199254740995',
+    ])('rejects invalid active port range %j', async (range) => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await loadConfig({ ...sharedEnv, MEDIASOUP_WEBRTC_SERVER_PORTS: range });
+        expect(process.exit).toHaveBeenCalledWith(1);
+        expect(error).toHaveBeenCalledWith(expect.stringContaining('MEDIASOUP_WEBRTC_SERVER_PORTS'));
+      } finally { error.mockRestore(); }
+    });
+
+    it.each(['127.0.0.1', '203.0.113.10', '2001:db8::10', 'media.example.test'])(
+      'accepts explicit reachable-address syntax %j', async (address) => {
+        const { config } = await loadConfig({ ...sharedEnv, ANNOUNCED_IP: address });
+        expect(config.mediasoup.webRtcServer.announcedAddress).toBe(address);
+        expect(process.exit).not.toHaveBeenCalled();
+      }
+    );
+
+    it('refuses shared mode without an explicit announced address', async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await loadConfig({ MEDIASOUP_SHARED_WEBRTC_SERVER: 'true', NUM_WORKERS: '3' });
+        expect(process.exit).toHaveBeenCalledWith(1);
+        expect(error).toHaveBeenCalledWith(expect.stringContaining('ANNOUNCED_IP'));
+      } finally { error.mockRestore(); }
+    });
+
+    it.each(['', ' ', '0.0.0.0', '::', '*', '*.example.test', 'https://media.example.test',
+      'media.example.test:40000', 'bad host', 'media.example.test\n', 'media\u0001host'])(
+      'refuses an invalid announced address %j', async (address) => {
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          await loadConfig({ ...sharedEnv, ANNOUNCED_IP: address });
+          expect(process.exit).toHaveBeenCalledWith(1);
+          expect(error).toHaveBeenCalledWith(expect.stringContaining('ANNOUNCED_IP'));
+        } finally { error.mockRestore(); }
+      }
+    );
+
+    it.each([false, true])('checks HTTP port collision only for enabled TCP=%s', async (tcp) => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await loadConfig({
+          ...sharedEnv,
+          PORT: '40001',
+          MEDIASOUP_ENABLE_TCP: String(tcp),
+        });
+        if (tcp) {
+          expect(process.exit).toHaveBeenCalledWith(1);
+          expect(error).toHaveBeenCalledWith(expect.stringContaining('PORT'));
+        } else {
+          expect(process.exit).not.toHaveBeenCalled();
+        }
+      } finally { error.mockRestore(); }
+    });
+  });
 
   describe('production guard', () => {
     it('calls process.exit(1) in production with default JWT secret', async () => {

@@ -38,6 +38,12 @@ you verify your email.
 
 ### Added
 
+- **Shared media listeners are available for isolated validation** — an optional
+  media-server mode gives each worker one shared UDP listener, with strict port
+  validation and readiness checks when a listener closes. Ordinary deployments
+  keep their existing port ranges. The candidate overlay is private and requires
+  further call, capacity and deployment validation before production activation.
+
 - **Purging messages now keeps pinned messages unless you choose to include them** (internal development reference omitted, internal development reference omitted) —
   every purge (channel, server, DM, group, and the purge a kick or ban can run) now has an "Include
   pinned messages" option, off by default. With it off, pinned messages are kept: your own are not deleted, and
@@ -137,6 +143,11 @@ you verify your email.
 
 - **Animated avatars, banners and server icons now follow the tier rules everywhere** (internal development reference omitted, internal development reference omitted) — two routes stored an image embedded in the request as-is, which let a free account set an animated image that the upload routes would have refused. Profile updates now refuse a new embedded avatar or banner on every plan and point to the upload route. Re-sending your current image still works. Creating or editing a server checks an embedded icon or banner for animation (animated GIF, APNG or animated WebP). An animated icon is refused for every server, and an animated banner is refused unless the server's boost level allows it. A file the server cannot read as a PNG, JPEG, GIF or WebP is refused. Static images, including the ones the desktop app sends when you create a server, are unaffected. Images already saved are not changed.
 - **Voice refuses a microphone stream that does not declare its packet time or bitrate** (internal development reference omitted, internal development reference omitted) — the server already refused a microphone stream that declared more than your plan allows, but a modified client could skip that check by declaring nothing. It also refuses a microphone stream that carries a video codec. The desktop app declares both values and sends only audio on every call, so normal calls are unaffected. A client that declares an allowed value and sends more is still limited by the server's rate policer.
+- **Redis health checks keep passwords out of Docker event commands** — the
+  health check authenticates through the environment instead of command-line
+  arguments. Existing deployments need the updated container configuration;
+  previously recorded credentials require separate access review and rotation.
+
 - **Group-DM icon requests require sign-in and current membership** (internal development reference omitted, internal development reference omitted) — People outside the conversation and former participants receive no icon. A read admitted before removal may finish afterward.
 - **Control plane built with Go 1.26.9 and `golang.org/x/net` 0.60.0** (internal development reference omitted) — closes the standard-library and HTTP/2 advisories published on 2026-10-08, including HTTP/2 server memory exhaustion from trailer headers, an HPACK encoder race that can crash the server, unbounded Range header parsing, and HTTP/1 connection desynchronization after a rejected CONNECT.
 - Disabled self-host feedback now refuses submissions before processing their contents or sending them to GitHub. The fresh installer rejects invalid feedback settings, SMTP host/sender inputs and proxy range combinations that trust every source before saving configuration, and refuses ambiguous retained data while preserving it for reviewed recovery. Self-host lifecycle commands use saved configuration rather than inherited shell overrides. Certificate import checks every required service name before installing the pair. Public self-host release publication requires nonempty cited proof files, reconstruction with current trusted tooling, and fresh asset bytes and attestations bound to the accepted release commit before promotion; it verifies the immutable result before reporting success.

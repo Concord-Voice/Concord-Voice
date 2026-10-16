@@ -2893,8 +2893,11 @@ export class RoomManager {
     try {
       let transport: WebRtcTransport;
       try {
+        const webRtcServer = this.mediasoup.getWebRtcServer(room.router);
         transport = await room.router.createWebRtcTransport({
-          listenIps: config.mediasoup.webRtcTransport.listenIps,
+          ...(webRtcServer
+            ? { webRtcServer }
+            : { listenIps: config.mediasoup.webRtcTransport.listenIps }),
           enableUdp: config.mediasoup.webRtcTransport.enableUdp,
           enableTcp: config.mediasoup.webRtcTransport.enableTcp,
           preferUdp: config.mediasoup.webRtcTransport.preferUdp,
@@ -2939,6 +2942,8 @@ export class RoomManager {
       // the transport to a detached object that nothing ever closes and that the
       // recv cap cannot see. Close the orphan and fail closed (#2032).
       this.assertTransportParticipantCurrent(room, participant, userId, transport, direction);
+
+      this.assertTransportReadyForCommit(room, participant, transport, direction);
 
       this.commitTransportToParticipant(room, participant, transport, direction);
 
@@ -2986,6 +2991,25 @@ export class RoomManager {
     if (!transport.closed) transport.close();
     if (direction === 'recv') this.releaseRecvTransportReservation(participant);
     throw new Error('Participant left during transport creation');
+  }
+
+  private assertTransportReadyForCommit(
+    room: Room,
+    participant: Participant,
+    transport: WebRtcTransport,
+    direction: 'send' | 'recv'
+  ): void {
+    try {
+      // Either native await can complete after the shared listener closes.
+      // Revalidate before the synchronous participant commit and reply.
+      this.mediasoup.getWebRtcServer(room.router);
+      if (transport.closed) throw new Error('Transport closed during creation');
+    } catch (error) {
+      this.retainNativeTermination(room, participant, [transport.id]);
+      if (!transport.closed) transport.close();
+      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+      throw error;
+    }
   }
 
   private attachTransportDiagnostics(

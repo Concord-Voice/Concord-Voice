@@ -14,6 +14,7 @@ vi.mock('mediasoup', () => ({
 vi.mock('@/config/index.js', () => ({
   config: {
     mediasoup: {
+      webRtcServer: { enabled: false, ports: [], listenIp: '0.0.0.0', announcedAddress: '127.0.0.1' },
       numWorkers: 3,
       worker: {
         logLevel: 'warn',

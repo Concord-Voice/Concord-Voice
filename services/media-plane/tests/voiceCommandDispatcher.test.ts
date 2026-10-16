@@ -851,6 +851,7 @@ describe('durable dispatcher with actual RoomManager admission state', () => {
   async function admittedFixture() {
     const router = createMockRouter();
     const manager = new RoomManager({
+      getWebRtcServer: () => undefined,
       getOrCreateRouter: async () => router,
       removeRouter: vi.fn(),
       captureNativeTermination: () => ({

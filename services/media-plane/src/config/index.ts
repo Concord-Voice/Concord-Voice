@@ -1,4 +1,5 @@
 import type { RouterRtpCodecCapability } from 'mediasoup/types';
+import { isIP } from 'node:net';
 
 // Node 24+ native .env loading, replacing the third-party `dotenv` package.
 // `process.loadEnvFile()` reads ./.env and THROWS when the file is absent,
@@ -343,13 +344,71 @@ function parseWorkerCountEnv(raw: string | undefined, fallback: number): number 
  * reading of garbage IS false, so unlike parseWorkerCountEnv there is no
  * fatal-exit branch here.
  *
- * Opening this gate binds a real TCP listener per live WebRTC transport
- * (mediasoup 3.28.0 worker/src/RTC/WebRtcTransport.cpp:157-193), so it must
- * not be opened unless the RTC port range is published in compose AND allowed
- * on both firewall surfaces. No deployed environment does that today.
+ * Opening this gate binds real TCP listeners: per live transport on the legacy
+ * path, or per worker in shared mode. It must not be opened unless the matching
+ * media ports are published in compose AND allowed on both firewall surfaces.
  */
 function parseTcpEnabledEnv(raw: string | undefined): boolean {
   return raw?.trim().toLowerCase() === 'true';
+}
+
+function parseSharedWebRtcServerEnabled(raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  const value = raw.trim().toLowerCase();
+  if (value !== 'true' && value !== 'false') {
+    console.error('FATAL: MEDIASOUP_SHARED_WEBRTC_SERVER must be true or false.');
+    process.exit(1);
+  }
+  return value === 'true';
+}
+
+/** One fixed socket per worker; the legacy RTC range retains its own meaning. */
+function parseWebRtcServerPorts(
+  raw: string | undefined,
+  workerCount: number,
+  enableTcp: boolean,
+  httpPort: number
+): readonly number[] {
+  const range = raw ?? `40000-${40000 + workerCount - 1}`;
+  const match = /^(\d+)-(\d+)$/.exec(range);
+  const start = Number(match?.[1]);
+  const end = Number(match?.[2]);
+  if (
+    !match ||
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 1024 ||
+    end > 65535 ||
+    end - start + 1 !== workerCount
+  ) {
+    console.error(
+      'FATAL: MEDIASOUP_WEBRTC_SERVER_PORTS must be a contiguous start-end range ' +
+        'within 1024-65535 containing exactly NUM_WORKERS ports.'
+    );
+    process.exit(1);
+    return [];
+  }
+  if (enableTcp && httpPort >= start && httpPort <= end) {
+    console.error(
+      'FATAL: MEDIASOUP_WEBRTC_SERVER_PORTS must not overlap the HTTP PORT with TCP enabled.'
+    );
+    process.exit(1);
+    return [];
+  }
+  return Object.freeze(Array.from({ length: workerCount }, (_, index) => start + index));
+}
+
+function validAnnouncedAddress(address: string | undefined): address is string {
+  if (!address || /\s/.test(address)) return false;
+  if (isIP(address)) {
+    return address !== '0.0.0.0' && !/^0*(?::0*)+$/.test(address);
+  }
+  // Bare DNS labels only: no URL, port, wildcard or malformed numeric address.
+  return (
+    address.length <= 253 &&
+    !/^[\d.]+$/.test(address) &&
+    address.split('.').every((label) => /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label))
+  );
 }
 
 function parseOpsMetricsIntervalMs(raw: string | undefined): number {
@@ -371,10 +430,22 @@ const opsMetricsIntervalMs = opsMetricsEnabled
 const opsMetricsRole = opsMetricsEnabled
   ? (process.env.OPS_METRICS_ROLE || 'local').trim().toLowerCase()
   : 'local';
+const numWorkers = parseWorkerCountEnv(process.env.NUM_WORKERS, 4);
+const httpPort = Number.parseInt(process.env.PORT || '3000', 10);
+const enableTcp = parseTcpEnabledEnv(process.env.MEDIASOUP_ENABLE_TCP);
+const sharedWebRtcServerEnabled = parseSharedWebRtcServerEnabled(
+  process.env.MEDIASOUP_SHARED_WEBRTC_SERVER
+);
+if (sharedWebRtcServerEnabled && !validAnnouncedAddress(process.env.ANNOUNCED_IP)) {
+  console.error(
+    'FATAL: ANNOUNCED_IP must explicitly name an IP address or bare hostname in shared mode.'
+  );
+  process.exit(1);
+}
 
 export const config = {
   environment: process.env.ENVIRONMENT || 'development',
-  port: Number.parseInt(process.env.PORT || '3000', 10),
+  port: httpPort,
 
   // Free-tier per-room concurrent camera-producer cap (#1539). P0 capacity
   // guardrail: bounds SFU egress fan-out so one free user can't saturate a box.
@@ -438,7 +509,22 @@ export const config = {
     // Worker count (#2178). Fail-closed at load — see parseWorkerCountEnv. The
     // default describes an unconstrained host; each compose file sets its own
     // value (base "4", production "3" = its cpus limit).
-    numWorkers: parseWorkerCountEnv(process.env.NUM_WORKERS, 4),
+    numWorkers,
+
+    // Explicit migration gate: existing deployments retain per-transport sockets.
+    webRtcServer: {
+      enabled: sharedWebRtcServerEnabled,
+      ports: sharedWebRtcServerEnabled
+        ? parseWebRtcServerPorts(
+            process.env.MEDIASOUP_WEBRTC_SERVER_PORTS,
+            numWorkers,
+            enableTcp,
+            httpPort
+          )
+        : [],
+      listenIp: '0.0.0.0',
+      announcedAddress: process.env.ANNOUNCED_IP || '127.0.0.1',
+    },
 
     worker: {
       logLevel: (process.env.MEDIASOUP_LOG_LEVEL || 'warn') as mediasoup.types.WorkerLogLevel,

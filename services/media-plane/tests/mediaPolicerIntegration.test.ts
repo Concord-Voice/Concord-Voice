@@ -82,6 +82,7 @@ describe('media policer integration (#2153 real RoomManager + MediaPolicer + tic
     const mockRouter = createMockRouter();
     const worker = createMockWorker();
     const mockMediasoup = {
+      getWebRtcServer: () => undefined,
       getOrCreateRouter: vi.fn().mockResolvedValue(mockRouter),
       removeRouter: vi.fn(),
       captureNativeTermination: vi.fn((router, transportIds?: readonly string[]) => ({

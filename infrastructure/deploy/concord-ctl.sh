@@ -752,14 +752,16 @@ activity_history_write_rollback_checkpoint() {
     return 1
   fi
   umask 077
-  if ! {
+  if {
        printf 'CONTROL_PLANE_IMAGE=%s\n' "$image"
        printf 'ACTIVITY_HISTORY_ROLLBACK_ADMIN_COMPLETE=true\n'
        printf 'ACTIVITY_HISTORY_ROLLBACK_DOWNGRADE_REQUESTED=%s\n' "$requested"
        printf 'ACTIVITY_HISTORY_ROLLBACK_DOWNGRADE_STATE=%s\n' "$state"
      } >"$temp" \
-     || ! chmod 600 "$temp" \
-     || ! mv "$temp" "$ACTIVITY_HISTORY_IMAGE_SELECTOR"; then
+     && chmod 600 "$temp" \
+     && mv "$temp" "$ACTIVITY_HISTORY_IMAGE_SELECTOR"; then
+    :
+  else
     rm -f "$temp"
     echo "activity-history: failed to persist rollback checkpoint state" >&2
     return 1
@@ -779,13 +781,15 @@ activity_history_write_rollback_checkpoint() {
 activity_history_write_activation_receipt() {
   local temp="${ACTIVITY_HISTORY_ACTIVATION_RECEIPT}.new.$$"
   umask 077
-  if ! {
+  if {
        printf 'ACTIVITY_HISTORY_ACTIVATION_STATE=activated\n'
        printf 'ACTIVITY_HISTORY_ACTIVATION_CONTRACT_MODE=%s\n' "$ACTIVITY_HISTORY_CONTRACT_MODE"
        printf 'ACTIVITY_HISTORY_ACTIVATION_INSTANCE_TYPE=%s\n' "$ACTIVITY_HISTORY_RENDERED_INSTANCE_TYPE"
      } >"$temp" \
-     || ! chmod 600 "$temp" \
-     || ! mv "$temp" "$ACTIVITY_HISTORY_ACTIVATION_RECEIPT"; then
+     && chmod 600 "$temp" \
+     && mv "$temp" "$ACTIVITY_HISTORY_ACTIVATION_RECEIPT"; then
+    :
+  else
     rm -f "$temp"
     echo "activity-history: control-plane is running and healthy, but the activation receipt could not be persisted; stop→up / down→up recovery will require re-activation" >&2
     return 1
@@ -1028,6 +1032,137 @@ activity_history_rollback() {
   activity_history_finish_rollback_start
 }
 
+# The R01 overlay is a lab candidate only. Consume a config-only render on
+# stdin, never an env file, and report no values from that secret-bearing JSON.
+media_shared_listeners_check_model() {
+  python3 -c '
+import json, re, sys
+
+def refuse():
+    print("media-shared-listeners: candidate render refused; require one published UDP listener per worker, loopback HTTP, TCP disabled and bridge networking", file=sys.stderr)
+    raise SystemExit(1)
+
+def ports(value):
+    value = str(value)
+    if not re.fullmatch(r"[1-9][0-9]{0,4}(?:-[1-9][0-9]{0,4})?", value):
+        refuse()
+    ends = [int(part) for part in value.split("-")]
+    lower, upper = ends[0], ends[-1]
+    if not 1 <= lower <= upper <= 65535:
+        refuse()
+    return list(range(lower, upper + 1))
+
+try:
+    model = json.load(sys.stdin)
+    media = model["services"]["media-plane"]
+    environment = media["environment"]
+    if not isinstance(environment, dict):
+        refuse()
+    if environment.get("MEDIASOUP_SHARED_WEBRTC_SERVER") != "true" or environment.get("MEDIASOUP_ENABLE_TCP") != "false" or environment.get("PORT") != "3000":
+        refuse()
+    workers = environment["NUM_WORKERS"]
+    if not isinstance(workers, str) or not re.fullmatch(r"[1-9][0-9]?", workers) or not 1 <= int(workers) <= 32:
+        refuse()
+    allocation = environment["MEDIASOUP_WEBRTC_SERVER_PORTS"]
+    if not isinstance(allocation, str) or not re.fullmatch(r"[1-9][0-9]{0,4}-[1-9][0-9]{0,4}", allocation):
+        refuse()
+    listeners = ports(allocation)
+    if listeners[0] < 1024 or len(listeners) != int(workers):
+        refuse()
+    if media.get("network_mode") or not isinstance(media.get("networks"), (dict, list)) or not media["networks"]:
+        refuse()
+    for name in media["networks"]:
+        network = model["networks"][name]
+        options = network.get("driver_opts") or dict()
+        if network.get("external") or network.get("name") == "host" or network.get("driver", "bridge") != "bridge":
+            refuse()
+        if "com.docker.network.bridge.trusted_host_interfaces" in options:
+            refuse()
+        for family in ("ipv4", "ipv6"):
+            if options.get("com.docker.network.bridge.gateway_mode_" + family, "nat") not in ("nat", "isolated"):
+                refuse()
+    actual = []
+    for binding in media["ports"]:
+        if not isinstance(binding, dict):
+            refuse()
+        targets, published = ports(binding["target"]), ports(binding["published"])
+        if targets != published:
+            refuse()
+        protocol, host = binding.get("protocol", "tcp"), binding.get("host_ip", "")
+        if protocol == "tcp" and targets == [3000] and host == "127.0.0.1":
+            actual.append(("http", 3000))
+        elif protocol == "udp" and host in ("", "0.0.0.0", "::"):
+            actual.extend(("udp", port) for port in targets)
+        else:
+            refuse()
+    if sorted(actual) != sorted([("http", 3000)] + [("udp", port) for port in listeners]):
+        refuse()
+except (KeyError, TypeError, ValueError, AttributeError, OverflowError, RecursionError):
+    refuse()
+print("media-shared-listeners: lab render matches the shared listener contract; deployment remains unadmitted")
+'
+}
+
+media_shared_listeners_routine_guard() {
+  local rendered ids id environment verdict
+  if ! rendered="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json 2>/dev/null)"; then
+    echo 'media-shared-listeners: unable to inspect desired media mode; refusing service mutation' >&2
+    return 1
+  fi
+  if ! verdict="$(python3 -c '
+import json, sys
+try:
+    environment = json.load(sys.stdin)["services"].get("media-plane", dict()).get("environment", dict())
+    value = environment.get("MEDIASOUP_SHARED_WEBRTC_SERVER", "false")
+    if value not in ("false", "true"):
+        raise ValueError()
+    print(value)
+except (KeyError, TypeError, ValueError, AttributeError, RecursionError):
+    raise SystemExit(1)
+' <<<"$rendered" 2>/dev/null)"; then
+    echo 'media-shared-listeners: desired media mode is ambiguous; refusing service mutation' >&2
+    return 1
+  fi
+  if [[ "$verdict" == true ]]; then
+    echo 'media-shared-listeners: shared deployment is not admitted; coordinated migration support is required' >&2
+    return 1
+  fi
+  # Include stopped containers and other projects: a routine deploy/rollback
+  # must not silently replace a shared generation after an operator stopped it.
+  if ! ids="$(docker ps --all --quiet --no-trunc --filter label=com.docker.compose.service=media-plane 2>/dev/null)"; then
+    echo 'media-shared-listeners: unable to discover existing media mode; refusing service mutation' >&2
+    return 1
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if [[ ! "$id" =~ ^[[:xdigit:]]{64}$ ]] \
+      || ! environment="$(docker inspect --format '{{json .Config.Env}}' "$id" 2>/dev/null)"; then
+      echo 'media-shared-listeners: unable to inspect existing media mode; refusing service mutation' >&2
+      return 1
+    fi
+    if ! verdict="$(python3 -c '
+import json, sys
+try:
+    environment = json.load(sys.stdin)
+    if not isinstance(environment, list) or any(not isinstance(item, str) for item in environment):
+        raise ValueError()
+    values = [item.split("=", 1)[1] for item in environment if item.startswith("MEDIASOUP_SHARED_WEBRTC_SERVER=")]
+    if len(values) > 1 or (values and values[0] not in ("false", "true")):
+        raise ValueError()
+    print(values[0] if values else "false")
+except (TypeError, ValueError, RecursionError):
+    raise SystemExit(1)
+' <<<"$environment" 2>/dev/null)"; then
+      echo 'media-shared-listeners: existing media mode is ambiguous; refusing service mutation' >&2
+      return 1
+    fi
+    if [[ "$verdict" == true ]]; then
+      echo 'media-shared-listeners: existing shared media requires coordinated rollback support; routine service mutation refused' >&2
+      return 1
+    fi
+  done <<<"$ids"
+}
+
 # Voice-enforcement rollout (#3140).  The control-plane owns the durable
 # activation bit; the deploy controller only invokes its CLI and verifies the
 # media-plane capability boundary.  Never replace either operation with shell
@@ -1137,7 +1272,7 @@ voice_enforcement_rollout_wait_media() {
     : >"$body"
     status="$(curl -sS --max-time 2 -o "$body" -w '%{http_code}' \
       http://127.0.0.1:3000/readyz 2>/dev/null || true)"
-    if [[ "$status" == 200 ]] && python3 - "$body" <<'PY'
+    if [[ "$status" == 200 ]] && python3 -c '
 import json
 import sys
 
@@ -1147,8 +1282,7 @@ try:
 except (OSError, ValueError):
     raise SystemExit(1)
 raise SystemExit(0 if value == {"ready": True, "voiceEnforcementProtocol": 3} else 1)
-PY
-    then
+' "$body"; then
       rm -f "$body"
       return 0
     fi
@@ -1399,12 +1533,22 @@ acquire_deploy_transaction_lock() {
     }
     /bin/chmod 0600 "$status_path"
     exec 8>"$status_path"
+    local -a lockf_child=("$0" "$LOCKF_REENTRY_MARKER" "$@")
+    if [[ "${ACTIVITY_HISTORY_CONTRACT_MODE:-managed}" == selfhost ]]; then
+      # The resolver scrubbed these exported controls after validating the
+      # wrapper attestation. Restore only that attestation for the fresh child;
+      # it repeats root/model admission and validates the lock parent itself.
+      lockf_child=(/usr/bin/env
+        "COMPOSE_OVERRIDE=$ACTIVITY_HISTORY_REQUESTED_COMPOSE_OVERRIDE"
+        "COMPOSE_PROFILES=$ACTIVITY_HISTORY_REQUESTED_COMPOSE_PROFILES"
+        "${lockf_child[@]}")
+    fi
     /usr/bin/lockf -s -k -t 0 "$lock_path" /bin/bash -c '
       "$@"
       child_rc=$?
       printf "%s\n" "$child_rc" >&8 || exit 125
       exit 0
-    ' _ "$0" "$LOCKF_REENTRY_MARKER" "$@" || lock_rc=$?
+    ' _ "${lockf_child[@]}" || lock_rc=$?
     exec 8>&-
 
     if [[ -s "$status_path" ]]; then
@@ -1480,6 +1624,12 @@ case "${1:-help}" in
     # flake. 90s comfortably exceeds the actor's worst-case hold.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
+    ;;
+esac
+
+case "${1:-help}" in
+  validate-config|rebuild|restart|freshstart|activity-history-activate|activity-history-rollback)
+    media_shared_listeners_routine_guard || exit 1
     ;;
 esac
 
@@ -1876,6 +2026,11 @@ else:
     case "${1:-}" in
       deploy)
         shift
+        if [[ $# -ne 0 ]]; then
+          echo 'Usage: concord-ctl.sh voice-enforcement-rollout deploy' >&2
+          exit 2
+        fi
+        media_shared_listeners_routine_guard || exit 1
         voice_enforcement_rollout_deploy "$@"
         selfhost_post_up_check || exit 1
         ;;
@@ -1893,6 +2048,11 @@ else:
     fi
     selfhost_live_port_check || exit 1
     echo "selfhost-posture: live port bindings match the self-host allowlist"
+    ;;
+
+  media-shared-listeners-check)
+    [[ $# -eq 1 ]] || { echo 'Usage: concord-ctl.sh media-shared-listeners-check < rendered-compose.json' >&2; exit 2; }
+    media_shared_listeners_check_model
     ;;
 
   validate-config)
@@ -2108,8 +2268,8 @@ else:
       remaining="$value"
       while :; do
         if [[ "$remaining" == *';'* ]]; then
-          directive="${remaining%%;*}"
-          remaining="${remaining#*;}"
+          directive="${remaining%%\;*}"
+          remaining="${remaining#*\;}"
         else
           directive="$remaining"
           last=true
@@ -2173,7 +2333,7 @@ else:
       encoded="$(encode_hsts_for_nginx "$policy")" || return 1
       mkdir -p "$NGINX_RENDER_DIR" || return 1
       tmp="$(mktemp "${NGINX_RENDER}.tmp.XXXXXX")" || return 1
-      if ! while IFS= read -r line || [[ -n "$line" ]]; do
+      if while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
           '# HTTPS — API + WebSocket Hub'*) in_api=1 ;;
           '# HTTPS — Media Plane'*) in_api=0 ;;
@@ -2190,6 +2350,8 @@ else:
           printf '%s\n' "$line"
         fi
       done < "$NGINX_SRC" > "$tmp"; then
+        :
+      else
         rm -f "$tmp"
         return 1
       fi
@@ -2847,6 +3009,7 @@ else:
     echo "  voice-enforcement-rollout deploy"
     echo "                 Build CP, drain/rebuild MP, verify protocol 3, activate"
     echo "  validate-config  §F: pre-rebuild guard via 'docker compose config --quiet'"
+    echo "  media-shared-listeners-check  validate a lab Compose JSON render on stdin; does not admit deployment"
     echo "  selfhost-port-check  Self-host only: refuse live port bindings outside the posture allowlist (#3538)"
     echo "  attachment-probe  Validate the armed attachment backend without pulling images"
     echo "  attachment-probe-cron-install  Idempotently install the nightly attachment probe"

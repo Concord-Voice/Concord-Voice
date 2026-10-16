@@ -15,6 +15,7 @@ vi.mock('@/config/index.js', () => ({
     audioLastNHoldMs: 2500,
     audioLevelObserver: { maxEntries: 1, threshold: -60, interval: 300 },
     mediasoup: {
+      webRtcServer: { enabled: false, ports: [], listenIp: '0.0.0.0', announcedAddress: '127.0.0.1' },
       numWorkers: 2,
       worker: { logLevel: 'error', logTags: [], rtcMinPort: 40000, rtcMaxPort: 49999 },
       router: {

@@ -45,6 +45,7 @@ describe('durable disconnect during channel promotion', () => {
     });
     const router = createMockRouter();
     const manager = new RoomManager({
+      getWebRtcServer: () => undefined,
       getOrCreateRouter: async () => router,
       removeRouter: vi.fn(),
       captureNativeTermination: (_router: unknown, transportIds: string[]) => ({

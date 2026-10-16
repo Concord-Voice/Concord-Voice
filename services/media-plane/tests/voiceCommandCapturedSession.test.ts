@@ -57,6 +57,7 @@ async function setup(
   const router = createMockRouter();
   const nativeTermination = vi.fn(options.nativeTermination ?? (async () => undefined));
   const manager = new RoomManager({
+    getWebRtcServer: () => undefined,
     getOrCreateRouter: async () => router,
     removeRouter: vi.fn(),
     captureNativeTermination: () => ({ worker: {}, router, routerId: router.id, transportIds: [] }),
