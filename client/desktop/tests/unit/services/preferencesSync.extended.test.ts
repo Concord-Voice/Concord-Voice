@@ -58,7 +58,7 @@ function initSyncServiceDeps() {
   });
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => {
   server.resetHandlers();

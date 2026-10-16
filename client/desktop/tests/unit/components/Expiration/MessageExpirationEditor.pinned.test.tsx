@@ -83,7 +83,7 @@ const statusRegion = () => document.querySelector('.message-expiration-status');
 const acknowledge = (user: ReturnType<typeof userEvent.setup>) =>
   user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 beforeEach(() => {
   resetAllStores();

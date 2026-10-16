@@ -26,7 +26,7 @@ import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 // to the purge route. It asserts on the requests the network layer saw, so it
 // names no client function that does not exist yet.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {

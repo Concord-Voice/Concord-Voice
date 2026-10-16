@@ -17,7 +17,7 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
 
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => {
   server.resetHandlers();

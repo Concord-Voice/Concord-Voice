@@ -7,7 +7,7 @@ import { mockServer, mockServer2 } from '../../../mocks/fixtures';
 import { server as mswServer } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';
 
-beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => mswServer.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => mswServer.close());
 afterEach(() => mswServer.resetHandlers());
 

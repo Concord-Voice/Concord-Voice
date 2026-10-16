@@ -162,7 +162,7 @@ function hold(c: FenceCase) {
 }
 
 describe('permission store continuations are fenced to the account that started them (#3406)', () => {
-  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
   afterAll(() => server.close());
   afterEach(() => server.resetHandlers());
 
@@ -244,7 +244,7 @@ describe('permission store continuations are fenced to the account that started 
 // write issues a further request. The reorder still reports ok, because its
 // write committed, but reconciled: false, because the view was not re-read.
 describe('writes that re-read are fenced to the account that started them (#3406)', () => {
-  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
   afterAll(() => server.close());
   afterEach(() => server.resetHandlers());
 

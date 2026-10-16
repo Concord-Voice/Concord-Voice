@@ -38,7 +38,7 @@ function initStubDeps(): void {
   });
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 
 describe('#1956: preferences sync 401 must not force logout', () => {

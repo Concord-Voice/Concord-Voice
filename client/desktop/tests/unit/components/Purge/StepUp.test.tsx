@@ -61,7 +61,7 @@ const SESSION_TEXT = 'Your session expired. Nothing was purged. Sign in again, t
 
 const noop = () => {};
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => {
   server.resetHandlers();
   vi.restoreAllMocks();

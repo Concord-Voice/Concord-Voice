@@ -1329,7 +1329,7 @@ describe('ConversationList', () => {
     let completedRequests: Request[];
     let releasePending: Array<() => void>;
 
-    beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+    beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
     afterAll(() => server.close());
 
     beforeEach(async () => {

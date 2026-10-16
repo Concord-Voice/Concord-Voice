@@ -23,7 +23,7 @@ const server = setupServer(
     }
   })
 );
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 
 // Mock crypto utilities
@@ -1204,7 +1204,10 @@ describe('AccountRecovery', () => {
         ok: true,
         json: async () => ({ status: 'pending', shares_received: 2 }),
       });
-      const poll = interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+      // findByText gates on the DOM; the poll is registered by a passive effect that can land later.
+      const pollHandler = () => interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+      await waitFor(() => expect(pollHandler()).toBeTypeOf('function'));
+      const poll = pollHandler();
       if (typeof poll !== 'function') throw new Error('Social recovery poll was not started');
       await act(async () => {
         await poll();
@@ -1278,7 +1281,10 @@ describe('AccountRecovery', () => {
       });
       fireEvent.click(screen.getByText('Recover via Recovery Circle'));
       await screen.findByText('Waiting for Recovery Circle approval');
-      const poll = interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+      // findByText gates on the DOM; the poll is registered by a passive effect that can land later.
+      const pollHandler = () => interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+      await waitFor(() => expect(pollHandler()).toBeTypeOf('function'));
+      const poll = pollHandler();
       if (typeof poll !== 'function') throw new Error('Social recovery poll was not started');
       let pollPromise: Promise<void> | undefined;
       await act(async () => {

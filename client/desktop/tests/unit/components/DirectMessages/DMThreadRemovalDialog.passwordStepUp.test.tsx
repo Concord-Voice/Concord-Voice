@@ -23,7 +23,7 @@ import DMThreadRemovalDialog from '@/renderer/components/DirectMessages/DMThread
 //
 // "Mutant:" comments name the production change each test exists to turn red.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

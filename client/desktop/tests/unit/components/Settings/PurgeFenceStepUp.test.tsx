@@ -124,6 +124,10 @@ function serveSection(fence: boolean, read: ReadScript): void {
     http.get(`${API_BASE}/api/v1/users/me/presence-settings`, () =>
       HttpResponse.json({ custom_text_tier: 0, custom_text: '', custom_text_emoji: '' })
     ),
+    http.get(`${API_BASE}/api/v1/friends`, () => HttpResponse.json({ friends: [] })),
+    http.post(`${API_BASE}/api/v1/klipy/customer-id`, () =>
+      HttpResponse.json({ customer_id: 'mock-klipy-customer-id' })
+    ),
     http.get(`${HISTORY_ENDPOINT}/settings`, () => new HttpResponse(null, { status: 404 })),
     http.get(HISTORY_ENDPOINT, () => new HttpResponse(null, { status: 404 })),
     http.get(PRIVACY_ENDPOINT, () =>
@@ -195,7 +199,7 @@ const CREDENTIAL = {
   },
 };
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 
 beforeEach(() => {

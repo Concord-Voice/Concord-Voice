@@ -62,7 +62,7 @@ const readHandlers = [
   http.get(`${API_BASE}/users/me/sso-identities`, () => HttpResponse.json({ identities: [] })),
 ];
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => {
   server.resetHandlers();
   server.close();

@@ -45,7 +45,7 @@ const onClose = vi.fn();
 const onResolved = vi.fn();
 const originalElectronBridge = globalThis.electron;
 beforeAll(async () => {
-  server.listen({ onUnhandledRequest: 'error' });
+  server.listen({ onUnhandledFrame: 'error' });
   const accountKeys = await generateKeyPair();
   originalPkcs8 = await crypto.subtle.exportKey('pkcs8', accountKeys.privateKey);
   wrappingKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, [

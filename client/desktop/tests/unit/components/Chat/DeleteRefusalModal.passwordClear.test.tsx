@@ -15,7 +15,7 @@ import type { DeleteRefusalView } from '@/renderer/services/messaging/deleteRefu
 // moment the attempt settles, and a view that hosts no credential unmounts the
 // stage that owned it.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

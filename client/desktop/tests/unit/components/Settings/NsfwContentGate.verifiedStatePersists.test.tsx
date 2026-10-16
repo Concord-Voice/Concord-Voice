@@ -22,7 +22,7 @@ import NsfwContentGate from '@/renderer/components/Settings/NsfwContentGate';
 
 const API_BASE = 'http://localhost:8080';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

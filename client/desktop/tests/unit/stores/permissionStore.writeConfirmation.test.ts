@@ -66,7 +66,7 @@ function confirmation(mfaCode: string | undefined): WriteConfirmation {
   return { mfaCode, context: captureApiRequestContext() };
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

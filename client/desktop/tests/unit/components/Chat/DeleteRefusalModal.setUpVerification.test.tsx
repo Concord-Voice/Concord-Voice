@@ -23,7 +23,7 @@ import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlaySto
 // retried) and opens App Settings at the MFA section with a "Back to chat"
 // return recorded.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

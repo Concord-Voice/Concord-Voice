@@ -22,7 +22,7 @@ const PATH = '/api/v1/mfa/email-sms/disable';
 const FIXTURE_PW = 'pw';
 const FIXTURE_OTP = '123456';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

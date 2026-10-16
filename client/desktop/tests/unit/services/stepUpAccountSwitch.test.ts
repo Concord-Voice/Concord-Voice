@@ -13,7 +13,7 @@ import { clearDMHistory } from '@/renderer/services/messaging/dmVisibilityApi';
 // account A would otherwise run as account B, whose permissions may widen it
 // to every author's messages.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => resetAllStores());

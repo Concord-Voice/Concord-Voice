@@ -57,7 +57,7 @@ const GENERIC_SEND_ERROR = "Couldn't send your email code. Check your connection
 const SENT = () =>
   HttpResponse.json({ message: 'Verification code sent to your email', expires_in: 600 });
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

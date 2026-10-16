@@ -8,7 +8,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 
 const API_BASE = 'http://localhost:8080/api/v1';
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 beforeEach(() => {

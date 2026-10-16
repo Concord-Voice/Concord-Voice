@@ -18,7 +18,7 @@ import {
 
 const PATH = '/api/v1/request-context-probe';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

@@ -31,7 +31,7 @@ vi.mock('@/renderer/components/Auth/StepUpCredentials', async (importOriginal) =
 const purgeSpy = vi.mocked(purgeMessages);
 const credentialsSpy = vi.mocked(StepUpCredentials);
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {

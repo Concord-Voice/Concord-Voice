@@ -32,7 +32,7 @@ function remotePreference(version: number, encryptedData = 'remote-ciphertext') 
   };
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 
 beforeEach(() => {

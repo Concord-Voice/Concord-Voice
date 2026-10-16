@@ -106,7 +106,7 @@ function serveSettings(body: unknown, status = 200, headers?: Record<string, str
   );
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 
 beforeEach(() => {
@@ -347,16 +347,20 @@ describe('Activity History settings schema', () => {
   });
 });
 
+// Checks each literal against the mutation type. Not `satisfies`: Semgrep's TypeScript grammar
+// cannot parse it, and the protected scan fails on any parse error.
+const asMutation = (mutation: PresenceHistorySettingsMutation) => mutation;
+
 describe('Activity History settings transport', () => {
   it.each([
     {
       name: 'enable',
-      mutation: {
+      mutation: asMutation({
         kind: 'enable',
         retentionDays: 30,
         consentVersion: 1,
         consentCopyHash: VALID_HASH,
-      } satisfies PresenceHistorySettingsMutation,
+      }),
       expected: {
         enabled: true,
         retention_days: 30,
@@ -367,15 +371,15 @@ describe('Activity History settings transport', () => {
     },
     {
       name: 'disable',
-      mutation: { kind: 'disable' } satisfies PresenceHistorySettingsMutation,
+      mutation: asMutation({ kind: 'disable' }),
       expected: { enabled: false },
     },
     {
       name: 'retention',
-      mutation: {
+      mutation: asMutation({
         kind: 'retention',
         retentionDays: 90,
-      } satisfies PresenceHistorySettingsMutation,
+      }),
       expected: { retention_days: 90 },
     },
   ])('sends the exact $name PATCH body', async ({ mutation, expected }) => {

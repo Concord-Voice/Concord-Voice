@@ -17,7 +17,7 @@ vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
 
 import AccountSection from '@/renderer/components/Settings/AccountSection';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

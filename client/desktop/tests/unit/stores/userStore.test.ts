@@ -80,7 +80,7 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import { mockUser } from '../../mocks/fixtures';
 import { server } from '../../mocks/server';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

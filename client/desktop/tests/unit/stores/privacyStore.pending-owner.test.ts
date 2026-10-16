@@ -25,7 +25,7 @@ let confirmed: Record<string, unknown>;
 let patchResponse: ((body: Record<string, unknown>) => Promise<Response> | Response) | null;
 const openResponses = new Set<(response: Response) => void>();
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 beforeEach(async () => {
   resetAllStores();

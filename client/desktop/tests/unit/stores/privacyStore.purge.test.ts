@@ -25,7 +25,7 @@ const legacyPrivacy = {
   share_personalization_with_gif_provider: true,
 };
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

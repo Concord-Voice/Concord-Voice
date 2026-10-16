@@ -20,7 +20,7 @@ const server = setupServer();
 let row: DeviceRecoveryRequest;
 let listStatus: number;
 const props = { activeMethods: ['totp'], onSetupTOTP: vi.fn(), onSetupWebAuthn: vi.fn() };
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 beforeEach(() => {
   resetAllStores();

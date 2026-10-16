@@ -13,7 +13,7 @@ import {
 // delete-rate soft-lock always carries the flag, and the DM/group routes carry
 // neither, so the flag and the route decide which reading a 403 gets.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {

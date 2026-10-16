@@ -19,7 +19,7 @@ const patches: Array<{ body: unknown; authorization: string | null }> = [];
 let confirmedPrivacy: Record<string, unknown>;
 let patchFailure: 'refused' | 'network' | null = null;
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 afterEach(() => {
   usePrivacyStore.getState().clearPrivacy();

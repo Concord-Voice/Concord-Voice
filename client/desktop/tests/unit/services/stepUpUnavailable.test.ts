@@ -11,7 +11,7 @@ import { clearDMHistory } from '@/renderer/services/messaging/dmVisibilityApi';
 // went wrong" instead. The flag, not the status, tells it apart from a
 // malformed-body 400.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => resetAllStores());

@@ -15,7 +15,7 @@ import {
 
 const SEND_PATH = '/api/v1/auth/mfa/email/send';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

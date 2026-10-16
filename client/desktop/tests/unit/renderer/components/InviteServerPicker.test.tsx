@@ -213,7 +213,7 @@ const SERVERS_WITH_INVITE = [
 ] as never;
 
 describe('InviteServerPicker — already-a-member greying', () => {
-  beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => mswServer.listen({ onUnhandledFrame: 'bypass' }));
   afterAll(() => mswServer.close());
   afterEach(() => mswServer.resetHandlers());
 

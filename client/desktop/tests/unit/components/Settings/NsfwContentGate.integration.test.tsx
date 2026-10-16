@@ -22,7 +22,7 @@ const FUTURE_COPY =
 
 // 'error' (stricter than 'bypass') fails the test on any request the handlers don't cover —
 // correct for this single-flow integration test (only GET public-key + PUT claim expected).
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

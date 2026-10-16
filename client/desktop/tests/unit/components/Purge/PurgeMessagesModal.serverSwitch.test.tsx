@@ -17,7 +17,7 @@ import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 // will receive. The dialog is freed, and nothing is reported, because a
 // challenge is answered before any batch.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

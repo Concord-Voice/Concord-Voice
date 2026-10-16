@@ -9,7 +9,7 @@ import { useAgeStatus } from '@/renderer/hooks/ui/useAgeStatus';
 const API_BASE = 'http://localhost:8080';
 const STATUS_PATH = `${API_BASE}/api/v1/age/status`;
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

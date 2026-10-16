@@ -30,7 +30,7 @@ const SENT = () =>
   HttpResponse.json({ message: 'Verification code sent to your email', expires_in: 600 });
 const tokenOf = (body: unknown) => (body as { mfa_challenge_token: string }).mfa_challenge_token;
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

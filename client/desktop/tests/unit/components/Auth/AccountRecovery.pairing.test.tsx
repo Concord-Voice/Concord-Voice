@@ -45,7 +45,7 @@ let token: string;
 let completionStatus = 200;
 const onComplete = vi.fn();
 beforeAll(async () => {
-  server.listen({ onUnhandledRequest: 'error' });
+  server.listen({ onUnhandledFrame: 'error' });
   accountKeys = await generateKeyPair();
   pkcs8 = await crypto.subtle.exportKey('pkcs8', accountKeys.privateKey);
 });

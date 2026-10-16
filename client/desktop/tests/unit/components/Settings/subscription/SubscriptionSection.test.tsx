@@ -10,7 +10,7 @@ import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 const API_BASE = 'http://localhost:8080/api/v1';
 const STATUS_PATH = `${API_BASE}/subscriptions/me`;
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

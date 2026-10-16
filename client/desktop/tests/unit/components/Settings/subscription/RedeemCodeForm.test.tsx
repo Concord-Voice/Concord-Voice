@@ -14,7 +14,7 @@ const ENTITLEMENTS_PATH = `${API_BASE}/api/v1/entitlements`;
 const BOARD = 'AVYJANBUCLDSHKQVBYJWWHYDTLF';
 const PICKUP = 'ZVUCDDSJCSFOAREL';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

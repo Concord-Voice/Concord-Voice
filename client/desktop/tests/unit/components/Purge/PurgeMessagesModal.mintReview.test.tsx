@@ -16,7 +16,7 @@ import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 // L4 — a mint and purge still in flight when the dialog closes and reopens
 //      must not write their outcome into the reopened dialog.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {

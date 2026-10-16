@@ -48,7 +48,7 @@ const privateCallScope = () => {
 
 const customStatusScope = () => screen.getByRole('group', { name: 'Custom status visibility' });
 
-beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => mswServer.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => mswServer.close());
 afterEach(() => mswServer.resetHandlers());
 

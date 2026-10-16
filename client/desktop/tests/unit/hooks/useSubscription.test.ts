@@ -19,7 +19,7 @@ import type { SubscriptionSource } from '@/renderer/hooks/ui/useSubscription';
 const API_BASE = 'http://localhost:8080';
 const STATUS_PATH = `${API_BASE}/api/v1/subscriptions/me`;
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

@@ -29,7 +29,7 @@ import { stubGatedWrite, writeCodes } from '../../../helpers/gatedWriteRoute';
 // `request.formData()` asserts on it, so the upload under test needs Node's native classes. Each is
 // restored in afterAll so no other suite in the worker sees them.
 beforeAll(async () => {
-  mswServer.listen({ onUnhandledRequest: 'bypass' });
+  mswServer.listen({ onUnhandledFrame: 'bypass' });
   const { Blob: NodeBlob, File: NodeFile } = await import('node:buffer');
   vi.stubGlobal('File', NodeFile);
   vi.stubGlobal('Blob', NodeBlob);

@@ -70,7 +70,7 @@ const mockPersonalConv: DMConversation = {
   createdAt: '2025-01-03T00:00:00Z',
 };
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 

@@ -9,7 +9,7 @@ import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 // purge request trips the delete-rate soft-lock; the modal then asks for the
 // factor the server named and re-sends the same purge with it.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {

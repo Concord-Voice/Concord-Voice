@@ -33,7 +33,7 @@ vi.mock('@/renderer/services/messaging/pinService', () => ({
   unpinMessage: vi.fn(),
 }));
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

@@ -13,7 +13,7 @@ import { captureAuthLifecycle } from '@/renderer/services/system/postLoginHydrat
 
 const API_BASE = 'http://localhost:8080';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => {
   vi.restoreAllMocks();

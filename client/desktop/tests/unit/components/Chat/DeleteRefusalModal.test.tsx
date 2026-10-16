@@ -1,6 +1,16 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type Mock,
+} from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { act, fireEvent, render, screen, userEvent, waitFor } from '../../../test-utils';
 import { server } from '../../../mocks/server';
@@ -26,7 +36,7 @@ import type { StepUpPurpose } from '@/renderer/components/Auth/stepUpPurpose';
 // input remount and the per-attempt copy now belong to the factor hook, and are
 // pinned here through the outcomes `onConfirm` resolves to.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
@@ -71,7 +81,7 @@ function readAnswers(methods: string[], backup = false) {
 const refusal = (r: Extract<StepUpSubmitOutcome, { kind: 'refusal' }>['refusal']) =>
   ({ kind: 'refusal', refusal: r }) as const;
 
-type Confirm = ReturnType<typeof vi.fn<DeleteRefusalModalProps['onConfirm']>>;
+type Confirm = Mock<DeleteRefusalModalProps['onConfirm']>;
 const okConfirm = (): Confirm =>
   vi.fn<DeleteRefusalModalProps['onConfirm']>(async () => ({ kind: 'success' }));
 

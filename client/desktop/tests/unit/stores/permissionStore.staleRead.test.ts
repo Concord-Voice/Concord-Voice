@@ -304,7 +304,7 @@ const cases: StaleReadCase[] = [
 ];
 
 describe('a read that started before a confirmed write cannot overwrite it (#3406)', () => {
-  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
   afterAll(() => server.close());
   afterEach(() => server.resetHandlers());
 
@@ -400,7 +400,7 @@ const serverError = () => new HttpResponse(null, { status: 500 });
 // Guards for the parts of the fix the cases above cannot reach. Each was
 // found as a surviving mutant of the fix (round 9).
 describe('stale permission reads: the paths behind the ordering (#3406)', () => {
-  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
   afterAll(() => server.close());
   afterEach(() => server.resetHandlers());
 

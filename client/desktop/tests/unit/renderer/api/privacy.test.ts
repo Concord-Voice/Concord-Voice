@@ -5,7 +5,7 @@ import { eraseAccount, PrivacyApiError } from '@/renderer/api/privacy';
 
 const API_BASE = 'http://localhost:8080';
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

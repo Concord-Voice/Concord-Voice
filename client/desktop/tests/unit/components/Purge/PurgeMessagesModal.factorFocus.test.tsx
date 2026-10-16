@@ -10,7 +10,7 @@ import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 // password field to a security key, the focused field unmounts. Focus must
 // stay inside the dialog rather than fall to the document body.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => resetAllStores());

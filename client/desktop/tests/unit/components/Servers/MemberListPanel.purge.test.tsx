@@ -43,7 +43,7 @@ const defaultProps = {
   ownerUserId: 'owner-1',
 };
 
-beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => mswServer.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => mswServer.close());
 afterEach(() => mswServer.resetHandlers());
 

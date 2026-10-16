@@ -11,7 +11,7 @@ import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 // stays open and the chosen range carries over to the new conversation.
 // Expected to FAIL against the current tree on the `onClose` assertion.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

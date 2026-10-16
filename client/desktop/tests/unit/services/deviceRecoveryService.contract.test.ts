@@ -213,7 +213,7 @@ const invalidations: Array<[string, (attempt: { dispose(): void }) => void]> = [
 ];
 
 beforeAll(async () => {
-  server.listen({ onUnhandledRequest: 'error' });
+  server.listen({ onUnhandledFrame: 'error' });
   const raw = new Uint8Array(base64ToArrayBuffer(vector.offer.responder_public_key));
   const url64 = (bytes: Uint8Array) =>
     arrayBufferToBase64(bytes.slice().buffer)

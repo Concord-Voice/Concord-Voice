@@ -16,7 +16,7 @@ import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlaySto
 // plain seam body, with no `delete_rate_limited`; the purge is sent again with
 // the code it asked for.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

@@ -14,7 +14,7 @@ import DMThreadRemovalDialog from '@/renderer/components/DirectMessages/DMThread
 // Plus the D2 pin: a refusal that names NO usable method is the
 // no-usable-method state, never a substituted code box.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

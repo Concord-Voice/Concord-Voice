@@ -19,7 +19,7 @@ beforeEach(() => {
 // #3458: "Include pinned messages". The option, its copy and the wire value
 // all derive from one PinMode, sampled from features.purgeKeepsPinned on open.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 beforeEach(() => {

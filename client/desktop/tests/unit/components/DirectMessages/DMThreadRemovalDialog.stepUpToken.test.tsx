@@ -17,7 +17,7 @@ import DMThreadRemovalDialog from '@/renderer/components/DirectMessages/DMThread
 // PR 2: the first Clear already carries the token, so a refused mint means NO
 // Clear request at all.
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterEach(() => {
   server.resetHandlers();
   resetRuntimeServerBase();

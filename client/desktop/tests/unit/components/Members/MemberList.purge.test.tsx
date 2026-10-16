@@ -37,7 +37,7 @@ vi.mock('@/renderer/components/Members/MemberContextMenu', async () => {
   return memberContextMenuDouble();
 });
 
-beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => mswServer.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => mswServer.close());
 afterEach(() => mswServer.resetHandlers());
 

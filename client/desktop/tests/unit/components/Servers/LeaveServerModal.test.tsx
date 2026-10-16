@@ -10,7 +10,7 @@ import LeaveServerModal from '@/renderer/components/Servers/LeaveServerModal';
 
 const API_BASE = 'http://localhost:8080';
 
-beforeAll(() => mswServer.listen({ onUnhandledRequest: 'bypass' }));
+beforeAll(() => mswServer.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => mswServer.close());
 afterEach(() => mswServer.resetHandlers());
 

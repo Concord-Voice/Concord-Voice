@@ -110,7 +110,7 @@ describe('moderateMember dispatch (#3552 review)', () => {
     return () => hits;
   };
 
-  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
   afterEach(() => {
     server.resetHandlers();
     vi.restoreAllMocks();

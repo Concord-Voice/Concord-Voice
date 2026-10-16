@@ -792,7 +792,7 @@ describe('ChannelSettingsModal', () => {
  */
 describe('ChannelSettingsModal — V6-V7 regression (#3406)', () => {
   const mockOnClose = vi.fn();
-  beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+  beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
   afterAll(() => server.close());
   afterEach(() => server.resetHandlers());
 
