@@ -129,14 +129,14 @@ func TestSendDMMessageAckIncludesExpiry(t *testing.T) {
 }
 
 func TestSendMessageAckAndDMBroadcastIncludeExactExpiry(t *testing.T) {
-	setup := setupEpochTest(t, false, false)
+	fixture := newDMVisibilityDeliveryFixture(t)
 	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
-	setup.hub.sendMessageAck(messageAck{
-		Client: setup.client, Nonce: "n", MessageID: mustUUID(t, setup.convID), ChannelUUID: mustUUID(t, setup.convID),
+	fixture.hub.sendMessageAck(messageAck{
+		Client: fixture.actorClient, Nonce: "n", MessageID: fixture.messageID, ChannelUUID: fixture.conversationID,
 		CreatedAt: expiresAt.Add(-time.Hour), UpdatedAt: expiresAt.Add(-time.Hour), ExpiresAt: &expiresAt,
 	})
 	select {
-	case data := <-setup.client.Send:
+	case data := <-fixture.actorClient.Send:
 		var msg map[string]any
 		require.NoError(t, json.Unmarshal(data, &msg))
 		payload, ok := msg["data"].(map[string]any)
@@ -146,20 +146,15 @@ func TestSendMessageAckAndDMBroadcastIncludeExactExpiry(t *testing.T) {
 		t.Fatal("timed out waiting for channel acknowledgement")
 	}
 
-	setup.hub.broadcastDMMessage(dmBroadcastCtx{
-		messageID: mustUUID(t, setup.convID), convUUID: mustUUID(t, setup.convID), senderUserID: setup.user1,
-		client: setup.client, input: &dmMessageInput{content: "ciphertext", keyVersion: 1, msgType: "user"},
+	fixture.hub.broadcastDMMessage(dmBroadcastCtx{
+		messageID: fixture.messageID, convUUID: fixture.conversationID, senderUserID: fixture.actorID,
+		client: fixture.actorClient, input: &dmMessageInput{content: "ciphertext", keyVersion: 1, msgType: "user"},
 		createdAt: expiresAt.Add(-time.Hour), updatedAt: expiresAt.Add(-time.Hour), expiresAt: &expiresAt,
 	})
-	select {
-	case broadcast := <-setup.hub.dmBroadcast:
-		payload := broadcast.Data.Data
-		got, ok := payload["expires_at"].(*time.Time)
-		require.True(t, ok)
-		assert.Equal(t, expiresAt, *got)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for DM broadcast")
-	}
+	completePendingDMDeliveries(t, fixture.hub)
+	broadcast := readClientMsg(t, fixture.peerClient)
+	assert.Equal(t, "dm_message", broadcast["type"])
+	assert.Equal(t, expiresAt.Format(time.RFC3339Nano), presenceFrameData(t, broadcast)["expires_at"])
 }
 
 func TestChannelBroadcastIncludesExactExpiry(t *testing.T) {

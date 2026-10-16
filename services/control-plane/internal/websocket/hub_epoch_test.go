@@ -313,19 +313,8 @@ func TestHandleDMMessageRemovedGroupParticipantCannotUseAdvertisedSuccessorEpoch
 	require.Equal(t, "error", response["type"])
 	assert.Contains(t, response["data"].(map[string]interface{})[keyMessage], "Not a participant")
 
-	// If a regression reaches fanout, apply it exactly as Run would so the
-	// authorized remaining participant exposes the unsafe delivery.
-	select {
-	case broadcast := <-setup.hub.dmBroadcast:
-		setup.hub.handleDMBroadcast(broadcast)
-		select {
-		case result := <-setup.hub.dmDeliveryResults:
-			setup.hub.handleDMMessageDeliveryResult(result)
-		case <-time.After(time.Second):
-			t.Fatal("DM delivery result did not complete")
-		}
-	default:
-	}
+	// Complete any queued work so a regression cannot hide an unsafe delivery.
+	completePendingDMDeliveries(t, setup.hub)
 	assert.Empty(t, recipient.Send, "the removed sender must not fan out a DM message")
 	assert.NotContains(t, setup.hub.dmSubscriptions[conversationID], setup.client.ID,
 		"definitive nonmembership must prune the stale sender subscription")

@@ -4209,13 +4209,13 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 		createdAt: createdAt, updatedAt: updatedAt, expiresAt: expiresAt,
 		replyToID: replyToID, gifSlug: input.gifSlug, attachments: attachmentSummaries,
 	})
-	h.broadcast <- BroadcastMessage{
+	h.handleBroadcast(BroadcastMessage{
 		ChannelID:      channelUUID,
 		ServerID:       chCtx.serverUUID,
 		ViewPermission: viewPerm,
 		ExcludeUser:    &msg.UserID,
 		Data:           OutgoingMessage{Type: "message", Data: broadcastData},
-	}
+	})
 
 	// Send lightweight unread_notify to server subscribers NOT subscribed to this channel.
 	h.sendUnreadNotify(chCtx.serverUUID, channelUUID, msg.UserID, viewPerm)
@@ -4399,7 +4399,11 @@ func (h *Hub) handleTyping(msg IncomingMessage) {
 		},
 	}
 
-	h.broadcast <- broadcastMsg
+	// Typing is transient; Run must never wait for a queue it drains itself.
+	select {
+	case h.broadcast <- broadcastMsg:
+	default:
+	}
 }
 
 // handleHeartbeat refreshes the Redis presence TTL for the user
@@ -5587,13 +5591,13 @@ func (h *Hub) broadcastDMMessage(ctx dmBroadcastCtx) {
 		excludeUser = &ctx.senderUserID
 	}
 	visibilitySource := NewDMMessageVisibilitySource(ctx.messageID)
-	h.dmBroadcast <- DMBroadcastMessage{
+	h.deliverDMMessageDerived(DMBroadcastMessage{
 		ConversationID:   ctx.convUUID,
 		VisibilitySource: &visibilitySource,
 		VisibilityMode:   dmVisibilityDeliverySubscribers,
 		ExcludeUser:      excludeUser,
 		Data:             OutgoingMessage{Type: "dm_message", Data: dmBroadcastData},
-	}
+	})
 }
 
 // handleDMMessage handles a DM chat message: validates, persists, then broadcasts.
@@ -5608,6 +5612,15 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 
 	convPersonal, ok := h.enforceDMEncryption(msg, convUUID, input.keyVersion)
 	if !ok {
+		return
+	}
+	// Hub.Run owns delivery admission, so no other job can take these slots before persistence returns.
+	deliveryJobs := 3 // Sender acknowledgement, subscribed recipients, and unread recipients.
+	if input.mentionAddendum != nil && !input.mentionAddendum.IsEmpty() {
+		deliveryJobs++
+	}
+	if h.dmDeliveryOutstanding > dmMessageDeliveryCapacity-deliveryJobs {
+		h.sendError(msg.ClientID, errMsgFailedSaveMessage)
 		return
 	}
 
@@ -6152,7 +6165,7 @@ func (h *Hub) handleDMTyping(msg IncomingMessage) {
 		return
 	}
 
-	h.dmBroadcast <- DMBroadcastMessage{
+	broadcastMsg := DMBroadcastMessage{
 		ConversationID: convUUID,
 		ExcludeUser:    &msg.UserID,
 		Data: OutgoingMessage{
@@ -6164,6 +6177,10 @@ func (h *Hub) handleDMTyping(msg IncomingMessage) {
 				keyIsTyping:       msg.Data[keyIsTyping],
 			},
 		},
+	}
+	select {
+	case h.dmBroadcast <- broadcastMsg:
+	default:
 	}
 }
 
@@ -6509,16 +6526,32 @@ func (h *Hub) handleServerUpdate(msg IncomingMessage) {
 	if err != nil {
 		return
 	}
+	client, ok := h.clients[msg.ClientID]
+	if !ok || client.UserID != msg.UserID {
+		return
+	}
+	subscribers, ok := h.serverSubscriptions[serverID]
+	if !ok || !subscribers[client.ID] {
+		return
+	}
 
 	// Re-query server info from DB
+	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
+	defer cancel()
 	var name string
 	var iconURL *string
 	var bannerURL *string
-	err = h.db.QueryRow(
-		"SELECT name, icon_url, banner_url FROM servers WHERE id = $1",
-		serverID,
+	err = h.db.QueryRowContext(ctx,
+		`SELECT s.name, s.icon_url, s.banner_url
+		 FROM servers s
+		 JOIN server_members sm ON sm.server_id = s.id AND sm.user_id = $2
+		 WHERE s.id = $1`,
+		serverID, client.UserID,
 	).Scan(&name, &iconURL, &bannerURL)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return
+		}
 		log.Printf("Failed to refresh server info for %s: %v", sanitizeLogValue(serverID.String()), err)
 		return
 	}
@@ -6538,10 +6571,6 @@ func (h *Hub) handleServerUpdate(msg IncomingMessage) {
 		return
 	}
 
-	subscribers, ok := h.serverSubscriptions[serverID]
-	if !ok {
-		return
-	}
 	for clientID := range subscribers {
 		if c, ok := h.clients[clientID]; ok {
 			c.enqueueOutbound(data)

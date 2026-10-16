@@ -31,6 +31,26 @@ Client -> WebSocket -> readPump() -> Hub.incoming -> Hub.handleIncoming() -> Rou
 Hub.broadcast -> handleBroadcast() -> writePump() -> WebSocket -> Clients
 ```
 
+Every application frame is paced before JSON decoding: each connection may burst
+10 frames, then send 20 frames per second. This includes unknown types, malformed
+JSON, and both text and binary data frames. Excess traffic waits in order, so
+subscription replay is not dropped and the existing chat quota remains separate.
+Very large replays can exceed the desktop's five-second readiness wait. Each
+received data frame refreshes the connection's read deadline while pacing may
+delay its next Pong; protocol ping/pong frames are handled by the socket reader.
+
+Typing indicators are dropped when their broadcast queue is full. Persisted channel
+messages dispatch directly from the hub loop. Inbound DM messages bypass the hub's
+`dmBroadcast` queue but enter the bounded derived-delivery queue; when it lacks
+room for the acknowledgement, recipient message, and unread notification (plus
+a mention notification when present), the message is rejected before persistence.
+Delivery workers may still fail under downstream overload. Client-triggered
+server metadata reads require a current subscription and membership and have a
+three-second deadline;
+database and presence handlers still execute serially on the hub loop.
+If a required connection or subscription acknowledgement cannot fit in a client's
+outbound queue, that connection is closed so its writer cannot block the hub.
+
 ## Connection
 
 ### Endpoint

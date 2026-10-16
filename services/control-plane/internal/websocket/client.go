@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -35,6 +36,10 @@ const (
 	rateLimitBurst    = 10 // max burst
 	rateLimitPerSec   = 5  // sustained rate (tokens per second)
 	rateLimitInterval = time.Second / time.Duration(rateLimitPerSec)
+
+	// Pace application frames separately so subscription replay keeps its order and chat quota.
+	applicationFrameBurst    = rateLimitBurst
+	applicationFrameInterval = 50 * time.Millisecond
 
 	// Reconnect replacement work is bounded independently of the socket queue.
 	// One slot is reserved for presence_snapshot; the rest cover Custom Status
@@ -438,8 +443,16 @@ func (c *Client) enqueueOutboundBlockingImmediate(data []byte) bool {
 	if c.sendClosed || c.Send == nil {
 		return false
 	}
-	c.Send <- data
-	return true
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		// A required acknowledgement cannot wait for a writer that also needs sendMu.
+		c.sendClosed = true
+		close(c.Send)
+		c.closeRevokedConnection()
+		return false
+	}
 }
 
 // enqueuePostBootstrap linearizes informational registration frames against
@@ -600,13 +613,14 @@ func (c *Client) rateLimitAllow() bool {
 // readPump pumps messages from the WebSocket connection to the hub
 func (c *Client) readPump() {
 	defer func() {
+		_ = c.Conn.Close()
 		select {
 		case c.Hub.unregister <- c:
 		case <-c.Hub.done:
 		}
-		_ = c.Conn.Close()
 		c.releaseConnection()
 	}()
+	budget := ingressbudget.NewBucket(applicationFrameInterval, applicationFrameBurst)
 
 	_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.Conn.SetReadLimit(maxMessageSize)
@@ -653,6 +667,19 @@ func (c *Client) readPump() {
 				log.Printf("WebSocket closed: %s", describeSocketFailure(err))
 			}
 			break
+		}
+		// A received data frame proves the peer is live even while pacing delays its next Pong.
+		if err := c.Conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+			return
+		}
+
+		// Meter even malformed and unknown frames before decoding or shared hub work.
+		for !budget.Allow() {
+			select {
+			case <-time.After(applicationFrameInterval):
+			case <-c.Hub.done:
+				return
+			}
 		}
 
 		// Parse incoming message

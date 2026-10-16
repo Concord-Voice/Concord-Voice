@@ -669,18 +669,11 @@ func TestHandleMessageBroadcastToOtherSubscribers(t *testing.T) {
 	channelUUID, _ := uuid.Parse(setup.convID)
 
 	// Add a second user/client subscribed to the same channel
-	otherUser := uuid.New()
-	otherClient := &Client{
-		ID:       uuid.New(),
-		UserID:   otherUser,
-		Username: "otheruser",
-		Send:     make(chan []byte, 10),
-		Hub:      setup.hub,
-		Channels: map[uuid.UUID]bool{channelUUID: true},
-	}
-	setup.hub.clients[otherClient.ID] = otherClient
-	setup.hub.userClients[otherUser] = map[uuid.UUID]bool{otherClient.ID: true}
+	otherClient := addHubMemberClient(t, setup, "otheruser")
+	otherClient.Channels[channelUUID] = true
 	setup.hub.channelSubscriptions[channelUUID][otherClient.ID] = true
+	setup.hub.broadcast = make(chan BroadcastMessage, 1)
+	setup.hub.broadcast <- BroadcastMessage{}
 
 	msg := IncomingMessage{
 		Type:     "message",
@@ -699,15 +692,14 @@ func TestHandleMessageBroadcastToOtherSubscribers(t *testing.T) {
 	resp := readClientMsg(t, setup.client)
 	assert.Equal(t, "message_ack", resp["type"])
 
-	// The broadcast message goes to the hub's broadcast channel
-	select {
-	case bMsg := <-setup.hub.broadcast:
-		assert.Equal(t, channelUUID, bMsg.ChannelID)
-		assert.Equal(t, "message", bMsg.Data.Type)
-		assert.Equal(t, &setup.user1, bMsg.ExcludeUser)
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected broadcast message")
-	}
+	applyAsyncChannelDelivery(t, setup.hub)
+	broadcast := readClientMsg(t, otherClient)
+	assert.Equal(t, "message", broadcast["type"])
+	data := presenceFrameData(t, broadcast)
+	assert.Equal(t, channelUUID.String(), data[keyChannelID])
+	assert.Equal(t, "broadcast test", data[keyContent])
+	assert.Empty(t, setup.client.Send, "sender must remain excluded from the broadcast")
+	assert.Len(t, setup.hub.broadcast, 1, "delivery must bypass the full hub queue")
 }
 
 // TestBroadcastToChannelAuthorized_FiltersStaleSubscriber covers CV-CAN-021..026:
@@ -1212,12 +1204,6 @@ func TestHandleDMMessageSystemType(t *testing.T) {
 	var storedType string
 	require.NoError(t, setup.db.QueryRow(`SELECT type FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&storedType))
 	assert.Equal(t, "user", storedType, "client-controlled types must not mint metadata rows")
-	select {
-	case queued := <-setup.hub.dmBroadcast:
-		setup.hub.handleDMBroadcast(queued)
-	case <-time.After(time.Second):
-		t.Fatal("expected DM broadcast")
-	}
 	completePendingDMDeliveries(t, setup.hub)
 	broadcast := readClientMsg(t, recipient)
 	require.Equal(t, "dm_message", broadcast["type"])
@@ -1268,6 +1254,8 @@ func TestHandleDMMessageBroadcastToSubscribers(t *testing.T) {
 	setup.hub.clients[client2ID] = client2
 	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
 	setup.hub.dmSubscriptions[convUUID][client2ID] = true
+	setup.hub.dmBroadcast = make(chan DMBroadcastMessage, 1)
+	setup.hub.dmBroadcast <- DMBroadcastMessage{}
 
 	msg := IncomingMessage{
 		Type:     "dm_message",
@@ -1286,14 +1274,68 @@ func TestHandleDMMessageBroadcastToSubscribers(t *testing.T) {
 	resp := readClientMsg(t, setup.client)
 	assert.Equal(t, "dm_message_ack", resp["type"])
 
-	// Broadcast goes to dmBroadcast channel
-	select {
-	case dmMsg := <-setup.hub.dmBroadcast:
-		assert.Equal(t, convUUID, dmMsg.ConversationID)
-		assert.Equal(t, "dm_message", dmMsg.Data.Type)
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected DM broadcast")
-	}
+	completePendingDMDeliveries(t, setup.hub)
+	broadcast := readClientMsg(t, client2)
+	assert.Equal(t, "dm_message", broadcast["type"])
+	data := presenceFrameData(t, broadcast)
+	assert.Equal(t, convUUID.String(), data[keyConversationID])
+	assert.Equal(t, "dm broadcast test", data[keyContent])
+	assert.Empty(t, setup.client.Send, "sender must remain excluded from the broadcast")
+	assert.Len(t, setup.hub.dmBroadcast, 1, "delivery must bypass the full hub queue")
+}
+
+func TestHandleDMMessageRejectsBeforePersistenceWhenDeliveryQueueNearFull(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	setup.hub.dmDeliveryOutstanding = dmMessageDeliveryCapacity - 1
+	setup.hub.handleDMMessage(IncomingMessage{
+		Type: "dm_message", UserID: setup.user1, ClientID: setup.client.ID,
+		Data: map[string]interface{}{
+			keyConversationID: setup.convID,
+			keyContent:        "must not be saved without live delivery capacity",
+			"key_version":     float64(1),
+		},
+	})
+	response := readClientMsg(t, setup.client)
+	require.Equal(t, "error", response["type"], "overload must reject the write before persistence")
+	var stored int
+	require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&stored))
+	require.Zero(t, stored, "a direct message must not be saved without room for its acknowledgement and recipient events")
+}
+
+func TestHandleDMMessageAdmitsAllDeliveryJobsAtCapacityBoundary(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	conversationID := uuid.MustParse(setup.convID)
+	activePeer := &Client{ID: uuid.New(), UserID: setup.user2, Send: make(chan []byte, 4)}
+	setup.hub.clients[activePeer.ID] = activePeer
+	setup.hub.dmSubscriptions[conversationID][activePeer.ID] = true
+
+	inactiveUser := uuid.New()
+	_, err := setup.db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		VALUES ($1, $2, 'inactivepeer', 'hash', TRUE, TRUE)`, inactiveUser, inactiveUser.String()+"@test.concord.chat")
+	require.NoError(t, err)
+	_, err = setup.db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, conversationID, inactiveUser)
+	require.NoError(t, err)
+	inactivePeer := &Client{ID: uuid.New(), UserID: inactiveUser, Send: make(chan []byte, 4)}
+	setup.hub.clients[inactivePeer.ID] = inactivePeer
+	setup.hub.userClients[inactiveUser] = map[uuid.UUID]bool{inactivePeer.ID: true}
+
+	setup.hub.dmDeliveryOutstanding = dmMessageDeliveryCapacity - 3
+	setup.hub.handleDMMessage(IncomingMessage{
+		Type: "dm_message", UserID: setup.user1, ClientID: setup.client.ID,
+		Data: map[string]interface{}{
+			keyConversationID: setup.convID,
+			keyContent:        "delivery capacity boundary",
+			"key_version":     float64(1),
+		},
+	})
+	require.Equal(t, dmMessageDeliveryCapacity, setup.hub.dmDeliveryOutstanding,
+		"acknowledgement, message, and unread notification must all enter the queue")
+	// The other capacity slots are simulated; drain only this message's three real jobs.
+	setup.hub.dmDeliveryOutstanding = 3
+	completePendingDMDeliveries(t, setup.hub)
+	require.Equal(t, "dm_message_ack", readClientMsg(t, setup.client)["type"])
+	require.Equal(t, "dm_message", readClientMsg(t, activePeer)["type"])
+	require.Equal(t, "dm_unread_notify", readClientMsg(t, inactivePeer)["type"])
 }
 
 // --- handleSetStatus with valid statuses (requires Redis) ---
@@ -2248,6 +2290,18 @@ func TestHandleServerUpdateSuccess(t *testing.T) {
 	data := presenceFrameData(t, resp)
 	assert.Equal(t, serverID.String(), data[keyServerID])
 	assert.Equal(t, "Test Server", data["name"])
+}
+
+func TestHandleServerUpdateRejectsRevokedMember(t *testing.T) {
+	setup := setupMessageTest(t)
+	_, err := setup.db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, setup.user2, setup.user1)
+	require.NoError(t, err)
+
+	setup.hub.handleServerUpdate(IncomingMessage{
+		UserID: setup.user1, ClientID: setup.client.ID,
+		Data: map[string]interface{}{keyServerID: setup.user2.String()},
+	})
+	require.Empty(t, setup.client.Send, "a stale subscription must not authorize server metadata fanout")
 }
 
 func TestHandleServerUpdateInvalidServerID(t *testing.T) {
