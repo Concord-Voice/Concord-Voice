@@ -79,6 +79,8 @@ you verify your email.
 
 ### Fixed
 
+- **Profile changes reach only connected people with a current relationship** (internal development reference omitted) — updates go to your own sessions, accepted friends, shared-server members and current DM participants. A blocked account receives no update even when another relationship exists. Existing profile fields and clears work as before.
+
 - **Account recovery now checks your reserved authenticator** (internal development reference omitted) — if you reserved an authenticator app or security key for recovery, proving access to your email alone no longer permits a reset or device or social recovery. Recovery asks for that factor before continuing. If you began recovery before this update, request a new email code and start again. A recovery policy that requires an unsupported verification method blocks recovery.
 
 - **Editing a message is held to the character limit** (internal development reference omitted, internal development reference omitted) — an edit could be saved longer than a new message is allowed to be. Over the limit, Save is disabled, Enter does nothing, and the box stays open with your text and says what the limit is. A counter appears as you near it.

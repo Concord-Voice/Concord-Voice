@@ -1124,20 +1124,20 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 
 	h.log.Info("Profile updated", "user_id", userID)
 
-	// Broadcast profile update to all connected clients in real time. A lone
+	// Notify the current profile audience in real time. A lone
 	// matching inline re-send changed nothing, so it has nothing to broadcast.
 	if h.hub != nil && changesProfile {
-		h.hub.BroadcastToAll(websocket.OutgoingMessage{
-			Type: "profile_updated",
-			Data: map[string]interface{}{
-				"user_id":          user.ID,
-				"username":         user.Username,
-				"display_name":     user.DisplayName,
-				"avatar_url":       user.AvatarURL,
-				"header_image_url": user.HeaderImageURL,
-				"color_scheme":     user.ColorScheme,
-			},
-		})
+		broadcastCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), time.Second)
+		defer cancel()
+		if err := h.broadcastProfileUpdate(broadcastCtx, user); err != nil {
+			failureClass := "database"
+			if errors.Is(err, context.DeadlineExceeded) {
+				failureClass = "timeout"
+			} else if errors.Is(err, errProfileBroadcastUnavailable) {
+				failureClass = "hub_unavailable"
+			}
+			h.log.Warn("Profile update broadcast suppressed", "failure_class", failureClass)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

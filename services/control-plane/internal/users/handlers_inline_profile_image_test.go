@@ -302,12 +302,13 @@ func TestUpdateMeMatchingResendDoesNotCarryAMismatchedField(t *testing.T) {
 }
 
 // A lone matching re-send changes nothing, so it must not broadcast
-// profile_updated (a legacy inline value can be megabytes, sent to every client).
+// profile_updated (a legacy inline value can be megabytes).
 // A real edit by the same user is the positive control: the observer does see it.
 func TestUpdateMeLoneMatchingResendDoesNotBroadcast(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "inlinequiet")
 	observer := ts.CreateTestUser(t, "inlinequietobs")
+	testhelpers.AddFriendship(t, ts.DB, uuid.MustParse(user.ID), uuid.MustParse(observer.ID))
 	stored := testhelpers.DataURL("image/png", testhelpers.StaticPNGBytes(t))
 	seedInlineProfileImage(t, ts, user.ID, "avatar_url", stored)
 	conn := dialProfileObserver(t, ts, observer.ID)
@@ -315,7 +316,7 @@ func TestUpdateMeLoneMatchingResendDoesNotBroadcast(t *testing.T) {
 	w := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{"avatar_url": stored},
 		testhelpers.AuthHeaders(user.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	ts.Hub.BroadcastToAll(concordws.OutgoingMessage{Type: "inline_quiet_sentinel", Data: map[string]interface{}{}})
+	ts.Hub.BroadcastToUser(uuid.MustParse(observer.ID), concordws.OutgoingMessage{Type: "inline_quiet_sentinel", Data: map[string]interface{}{}})
 	assert.NotContains(t, readProfileWireUntil(t, conn, "inline_quiet_sentinel"), "profile_updated",
 		"a lone matching re-send must not broadcast")
 

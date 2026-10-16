@@ -1128,8 +1128,9 @@ export const ServerVoiceCountsSchema = z.object({
 
 /**
  * `profile_updated` — user profile updated; server always emits user_id.
- * Server emitter: `services/control-plane/internal/users/handlers.go:613`
- * (broadcast-to-all via `BroadcastToAll(OutgoingMessage{Type: "profile_updated", ...})`).
+ * Server emitter: `services/control-plane/internal/users/profile_broadcast.go`.
+ * Delivered to self and accepted friends, shared-server peers and DM co-participants,
+ * unless either account blocked the other.
  */
 export const ProfileUpdatedSchema = z.object({
   type: z.literal('profile_updated'),

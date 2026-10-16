@@ -17880,7 +17880,7 @@ paths:
 
         | `unread_notify` | `channel_id`, `server_id` | Unread notification |
 
-        | `profile_updated` | `user_id`, `username`, `display_name`, `avatar_url` | Profile changed |
+        | `profile_updated` | `user_id`, `username`, `display_name`, `avatar_url`, `header_image_url`, `color_scheme` | Profile changed; delivered to the owner and accepted friends, shared-server peers and current DM co-participants unless either account blocked the other |
 
         | `preferences_updated` | `version` | Preferences sync trigger |
 
