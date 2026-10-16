@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -150,6 +151,9 @@ type Client struct {
 
 	// Buffered channel of outbound messages
 	Send chan []byte
+
+	releaseAdmission func()
+	admissionOwners  atomic.Int32
 	// activityRichPresenceCapable is declared explicitly on the authenticated
 	// WebSocket upgrade. Older desktop builds accept activity-category clear frames
 	// but misapply them to Custom Status, so live activity deltas remain disabled
@@ -596,8 +600,12 @@ func (c *Client) rateLimitAllow() bool {
 // readPump pumps messages from the WebSocket connection to the hub
 func (c *Client) readPump() {
 	defer func() {
-		c.Hub.unregister <- c
+		select {
+		case c.Hub.unregister <- c:
+		case <-c.Hub.done:
+		}
 		_ = c.Conn.Close()
+		c.releaseConnection()
 	}()
 
 	_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -660,7 +668,11 @@ func (c *Client) readPump() {
 		msg.CredEpoch = c.CredEpoch
 
 		// Route message to hub
-		c.Hub.incoming <- msg
+		select {
+		case c.Hub.incoming <- msg:
+		case <-c.Hub.done:
+			return
+		}
 	}
 }
 
@@ -679,6 +691,7 @@ func (c *Client) writePump() {
 	defer func() {
 		ticker.Stop()
 		_ = c.Conn.Close()
+		c.releaseConnection()
 	}()
 
 	for {

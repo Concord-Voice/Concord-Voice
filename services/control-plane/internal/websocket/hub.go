@@ -362,6 +362,11 @@ type Hub struct {
 
 	// Register requests from clients
 	register chan *Client
+	// Admission includes pending handshakes and closing clients. Keep its lock
+	// separate: registration can hold mu during a database lookup.
+	admissionMu               sync.Mutex
+	admittedConnections       int
+	admittedConnectionsByUser map[uuid.UUID]int
 
 	// Unregister requests from clients
 	unregister chan *Client
@@ -744,6 +749,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		serverSubscriptions:          make(map[uuid.UUID]map[uuid.UUID]bool),
 		dmSubscriptions:              make(map[uuid.UUID]map[uuid.UUID]bool),
 		register:                     make(chan *Client),
+		admittedConnectionsByUser:    make(map[uuid.UUID]int),
 		unregister:                   make(chan *Client),
 		incoming:                     make(chan IncomingMessage, 256),
 		broadcast:                    make(chan BroadcastMessage, 256),
@@ -1513,6 +1519,7 @@ func (h *Hub) shutdownClients() {
 		}
 		client.asyncWg.Wait()
 		client.closeOutbound()
+		client.releaseConnection()
 	}
 	// Hidden-sender suppressions are hub-scoped, not client-scoped (the offline
 	// edge fires during unregister, after asyncWg.Wait()), so they are joined
@@ -1835,6 +1842,7 @@ func (h *Hub) handleUnregister(client *Client) {
 	}
 	client.asyncWg.Wait()
 	client.closeOutbound()
+	defer client.releaseConnection()
 
 	if isLastConnection {
 		now := time.Now().Unix()

@@ -99,6 +99,16 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	if !middleware.EnforceClientVersion(c, h.minimumClientVersion, c.Query("client_version")) {
 		return
 	}
+	release, admitted := h.hub.reserveConnection(userID)
+	if !admitted {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "WebSocket connection limit reached"})
+		return
+	}
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	activityRichPresenceCapable := requestSupportsActivityRichPresence(c.Request)
 
 	// Look up username, display name, and avatar for this user
@@ -133,11 +143,34 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		Channels:                    make(map[uuid.UUID]bool),
 		activityRichPresenceCapable: activityRichPresenceCapable,
 		privacyClearThenCloseWake:   make(chan struct{}, 1),
+		releaseAdmission:            release,
+	}
+	client.admissionOwners.Store(2) // Handler and hub; pumps join before starting.
+	release = nil
+	defer client.releaseConnection()
+	closePending := func() {
+		if err := conn.Close(); err != nil && !alreadyDisconnected(err) {
+			log.Printf("Failed to close pending WebSocket: %s", describeSocketFailure(err))
+		}
+		client.releaseConnection() // No hub owns this client.
 	}
 
 	// Register client with hub. This channel is UNBUFFERED (hub.go:322) and that is
 	// load-bearing for the re-check below — do not add a buffer.
-	h.hub.register <- client
+	registrationTimer := time.NewTimer(pendingRegistrationTimeout)
+	defer registrationTimer.Stop()
+	select {
+	case h.hub.register <- client:
+	case <-h.hub.done:
+		closePending()
+		return
+	case <-c.Request.Context().Done():
+		closePending()
+		return
+	case <-registrationTimer.C:
+		closePending()
+		return
+	}
 
 	// #2414 §C: close the register-vs-disconnect-sweep ordering race. registerClient
 	// and the DisconnectUser handler are both serviced by the Hub's single Run
@@ -145,7 +178,8 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// is never swept, and survives until its access token expires (~15m).
 	//
 	// The unbuffered register channel above blocks until Run receives it, so by here
-	// registration has happened. That gives a total order in both directions:
+	// Run has accepted this client and will finish registration before another
+	// disconnect sweep. That gives a total order in both directions:
 	//   - the reset committed before this check  => we read the new epoch and close;
 	//   - the reset commits after this check     => its disconnectUser send follows our
 	//                                               already-consumed register, so the
@@ -158,13 +192,17 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	if h.fence != nil {
 		if err := h.fence.Check(c.Request.Context(), userID.String(), client.CredEpoch); err != nil {
 			log.Printf("Evicting WebSocket client for user %s: credential epoch superseded", sanitizeLogValue(userID.String()))
-			h.hub.unregister <- client
-			_ = conn.Close()
+			select {
+			case h.hub.unregister <- client:
+			case <-h.hub.done:
+			}
+			client.closeRevokedConnection()
 			return
 		}
 	}
 
 	// Start client's read and write pumps
+	client.admissionOwners.Add(2)
 	go client.writePump()
 	go client.readPump()
 }

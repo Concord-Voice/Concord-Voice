@@ -17820,6 +17820,13 @@ paths:
         Token bucket: 10 message burst, 5 messages/second sustained.
 
 
+        Connection admission: at most 8 connections per account and 10,000 per
+        control-plane process, shared by all authentication methods and source IPs.
+        Pending upgrades and closing clients count toward both limits. Excess
+        attempts receive HTTP 429 before the upgrade; existing sockets remain open.
+        A refused ticket has been consumed; obtain a fresh ticket before retrying.
+
+
         ## Client → Server Messages
 
 
@@ -17976,6 +17983,12 @@ paths:
           description: Switching Protocols (WebSocket upgrade)
         '403':
           $ref: '#/components/responses/ClientVersionTooOld'
+        '429':
+          description: Account or process WebSocket connection capacity reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 components:
   securitySchemes:
     BearerAuth:

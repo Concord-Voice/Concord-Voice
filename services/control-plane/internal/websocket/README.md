@@ -49,6 +49,20 @@ WebSocket connections use **ticket-based authentication**:
 
 > **Security note:** never pass a raw JWT token in the WebSocket URL. Tickets are single-use and expire in 30 seconds, which minimizes the window for interception.
 
+### Connection limits
+
+The control plane admits at most **8 connections per account** and **10,000 per
+process**. Both ticket authentication and the legacy JWT fallback share these
+limits, independent of source IP or session. Admission reserves both budgets
+atomically before the profile lookup, WebSocket upgrade, client allocation, or
+bootstrap work. Pending handshakes and closing clients count toward the limits.
+Excess attempts receive HTTP `429` without disconnecting existing clients.
+Failed upgrades release their reservation. An upgraded connection awaiting hub
+registration closes after 10 seconds if the hub does not accept it. Registered
+clients retain their reservation until hub cleanup and both message pumps finish.
+A consumed ticket cannot be
+reused after refusal; obtain a fresh ticket for a retry.
+
 ### Connection Lifecycle
 
 1. **Connect** - Client opens WebSocket with single-use ticket
