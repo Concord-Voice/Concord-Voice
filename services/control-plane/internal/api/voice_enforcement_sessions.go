@@ -21,6 +21,9 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/mediaproof"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -47,6 +50,7 @@ const (
 
 var voiceEnforcementCredentialEpochPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 var voiceEnforcementHealthNoncePattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var voiceEnforcementRBACLog = logger.New("production")
 
 type voiceEnforcementSessionHandler struct {
 	db               *sql.DB
@@ -314,19 +318,20 @@ func (h *voiceEnforcementSessionHandler) Register(c *gin.Context) {
 
 // guardVoiceEnforcementRegistration makes the registry row an extension of
 // A2, rather than an independently admitted capability. DM uses the complete
-// users -> participant-set advisory -> parent -> blocked-pair prefix so a
-// membership/block mutation cannot pass between this guard and the insert.
+// users -> participant-set advisory -> parent -> blocked-pair prefix; channel
+// uses the voice-join visibility, credential, membership, and RBAC fence.
 func guardVoiceEnforcementRegistration(ctx context.Context, tx *sql.Tx, request voiceEnforcementSessionRequest) (int, error) {
 	if request.RoomKind == "dm" {
 		return guardDMVoiceEnforcementRegistration(ctx, tx, request)
 	}
-	if err := credepoch.GuardTx(ctx, tx, request.UserID, request.CredentialEpoch); err != nil {
-		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, sql.ErrNoRows) {
+	var serverID string
+	if err := tx.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = $1`, request.RoomID).Scan(&serverID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return http.StatusForbidden, err
 		}
-		return http.StatusServiceUnavailable, fmt.Errorf("guard channel voice enforcement registration: %w", err)
+		return http.StatusServiceUnavailable, fmt.Errorf("preflight channel voice enforcement registration: %w", err)
 	}
-	return http.StatusNoContent, nil
+	return voice.CheckChannelVoiceAccessTx(ctx, tx, rbac.NewResolver(nil, nil, voiceEnforcementRBACLog), serverID, request.RoomID, request.UserID, request.CredentialEpoch)
 }
 
 func guardDMVoiceEnforcementRegistration(ctx context.Context, tx *sql.Tx, request voiceEnforcementSessionRequest) (int, error) {

@@ -7,6 +7,7 @@ package users_test
 // cleanup marker that made every later change fail the same way.
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -23,7 +24,7 @@ import (
 func dialPresenceObserver(t *testing.T, ts *testhelpers.TestServer, userID string) {
 	t.Helper()
 	ticket := "presence-idle-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":presence-idle", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:presence-idle::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	srv := httptest.NewServer(ts.Router)
 	t.Cleanup(srv.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+srv.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)

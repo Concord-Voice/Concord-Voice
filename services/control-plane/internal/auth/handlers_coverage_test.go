@@ -1939,11 +1939,11 @@ func TestWSTicketDoubleUse(t *testing.T) {
 	assert.NotEmpty(t, ticket)
 
 	// Validate once — should succeed
-	userID, _, _, err := auth.ValidateTicket(context.Background(), ts.Redis, ticket)
+	userID, _, _, _, err := auth.ValidateTicket(context.Background(), ts.Redis, ticket)
 	assert.NoError(t, err)
 	assert.NotEmpty(t, userID)
 
 	// Validate again — should fail (single-use)
-	_, _, _, err = auth.ValidateTicket(context.Background(), ts.Redis, ticket)
+	_, _, _, _, err = auth.ValidateTicket(context.Background(), ts.Redis, ticket)
 	assert.Error(t, err)
 }

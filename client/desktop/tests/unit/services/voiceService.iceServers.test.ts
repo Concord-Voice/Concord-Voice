@@ -76,7 +76,10 @@ const mockSocket = {
 };
 
 vi.mock('socket.io-client', () => ({
-  io: vi.fn().mockReturnValue(mockSocket),
+  io: vi.fn().mockImplementation((_url: string, options: { auth: (cb: () => void) => void }) => {
+    options.auth(() => {});
+    return mockSocket;
+  }),
 }));
 
 // --- apiClient ---
@@ -420,6 +423,14 @@ async function joinWith(iceServers: unknown) {
   await voiceService.joinChannel('channel-1', 'channel');
 }
 
+async function reconnectMockSocket() {
+  const { io } = await import('socket.io-client');
+  const options = vi.mocked(io).mock.calls.at(-1)?.[1] as { auth: (cb: () => void) => void };
+  options.auth(() => {});
+  mockSocket.connected = true;
+  socketListeners['connect']?.forEach((cb) => cb());
+}
+
 /** The private field is not directly reachable; the PiP accessor is its only reader. */
 const heldIceServers = () =>
   (
@@ -566,8 +577,7 @@ describe('VoiceService ICE-server threading (#3104)', () => {
     mockCreateRecvTransport.mockClear();
 
     socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
-    mockSocket.connected = true;
-    socketListeners['connect']?.forEach((cb) => cb());
+    await reconnectMockSocket();
 
     await vi.waitFor(() => {
       expect(mockCreateSendTransport).toHaveBeenCalled();
@@ -1121,8 +1131,7 @@ describe('NC-1: ICE credentials never reach console.* (#3104)', () => {
   it('emits no sentinel on the reconnect resume path', async () => {
     await joinWith(SENTINEL_ICE);
     socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
-    mockSocket.connected = true;
-    socketListeners['connect']?.forEach((cb) => cb());
+    await reconnectMockSocket();
     await vi.waitFor(() => {
       expect(mockCreateSendTransport.mock.calls.length).toBeGreaterThan(1);
     });

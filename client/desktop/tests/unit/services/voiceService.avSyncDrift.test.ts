@@ -48,7 +48,10 @@ const mockSocket = {
   io: { on: vi.fn() },
 };
 vi.mock('socket.io-client', () => ({
-  io: vi.fn().mockReturnValue(mockSocket),
+  io: vi.fn().mockImplementation((_url: string, options: { auth: (cb: () => void) => void }) => {
+    options.auth(() => {});
+    return mockSocket;
+  }),
 }));
 
 // --- apiClient ---
@@ -478,7 +481,7 @@ describe('A/V sync-drift sampler (#2941)', () => {
       }
     });
 
-    it.each([
+    const unusableReasons: AvSyncUnusableReason[] = [
       'first-sample',
       'kind-incomplete',
       'insufficient-samples',
@@ -489,7 +492,8 @@ describe('A/V sync-drift sampler (#2941)', () => {
       'out-of-order',
       'clock-regression',
       'sr-not-advanced',
-    ] satisfies AvSyncUnusableReason[])(
+    ];
+    it.each(unusableReasons)(
       'routine reason "%s" emits NOTHING -- not warn, not debug',
       (reason) => {
         const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);

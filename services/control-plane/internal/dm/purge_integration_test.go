@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -161,7 +162,7 @@ func purgeUnderTableLock(t *testing.T, ts *testhelpers.TestServer, lockQuery str
 func dialDMObserver(t *testing.T, ts *testhelpers.TestServer, userID, convID string) *gorillaWS.Conn {
 	t.Helper()
 	ticket := "dm-purge-observer-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":purge-observer", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:purge-observer::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)

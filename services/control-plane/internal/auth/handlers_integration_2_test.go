@@ -1455,12 +1455,12 @@ func TestWSTicketIssuedTicketUsableOnce(t *testing.T) {
 
 	// Validate ticket (first use)
 	ctx := context.Background()
-	userID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID)
 
 	// Second use should fail (single-use)
-	_, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
+	_, _, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
 	assert.Error(t, err)
 }
 
@@ -1468,7 +1468,7 @@ func TestWSTicketValidateEmptyTicket(t *testing.T) {
 	ts := setupTS(t)
 
 	ctx := context.Background()
-	_, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "")
+	_, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "")
 	assert.Error(t, err)
 }
 
@@ -1476,7 +1476,7 @@ func TestWSTicketValidateNonexistentTicket(t *testing.T) {
 	ts := setupTS(t)
 
 	ctx := context.Background()
-	_, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "nonexistent-ticket")
+	_, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "nonexistent-ticket")
 	assert.Error(t, err)
 }
 

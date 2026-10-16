@@ -148,7 +148,7 @@ func TestAuthenticateWS_TicketStaleEpochRejected(t *testing.T) {
 
 	ticket := "tickstale"
 	require.NoError(t, rc.Set(context.Background(),
-		wsTicketKeyPfx+ticket, userID.String()+":sess1:oldEpoch", 30*time.Second).Err())
+		wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "sess1", "oldEpoch"), 30*time.Second).Err())
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
 	_, _, err := h.authenticateWebSocket(newGinContext(r))
@@ -163,7 +163,7 @@ func TestAuthenticateWS_TicketDisabledUserRejected(t *testing.T) {
 
 	ticket := "tickdisabled"
 	require.NoError(t, rc.Set(context.Background(),
-		wsTicketKeyPfx+ticket, userID.String()+":sess1:someEpoch", 30*time.Second).Err())
+		wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "sess1", "someEpoch"), 30*time.Second).Err())
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
 	_, _, err := h.authenticateWebSocket(newGinContext(r))

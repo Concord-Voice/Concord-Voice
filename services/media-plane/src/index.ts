@@ -34,6 +34,7 @@ import {
 } from './lib/mediaPolicyWire.js';
 import {
   createAuthMiddleware,
+  createSocketTokenRenewal,
   parsePermissionBitfield,
   releaseDMVoiceAuthorization,
   validateChannelAccess,
@@ -59,6 +60,7 @@ import {
 } from './lib/forceDisconnect.js';
 import {
   registerVoiceEnforcementSession,
+  renewVoiceEnforcementSession,
   pollVoiceEnforcementHealth,
 } from './lib/voiceEnforcementSession.js';
 import type { VoiceEnforcementSession } from './lib/voiceEnforcementSession.js';
@@ -653,7 +655,8 @@ function registerJoinRoomHandler(
                   access.callId === authorizedAccess.callId)),
             // The lease fence is checked by runSocketBoundJoin before A1 and
             // again before promotion, so a late expiry cannot promote a row.
-            isConnected: () => socket.connected && !isShuttingDown(),
+            isConnected: () =>
+              socket.connected && Date.now() < data.tokenExpiresAt && !isShuttingDown(),
             join: async (access) => {
               logger.debug('Channel access validated', { roomId, userId: data.userId });
               // Prefer the server-authoritative identity returned by the
@@ -1586,6 +1589,31 @@ async function main() {
       event: RoomEventName,
       handler: H
     ): void => registerRateLimited(limitedSocket, event, handler, socketRateLimitDeps);
+    withRateLimit(
+      socket,
+      'refresh-auth',
+      createSocketTokenRenewal(socket, async (token) => {
+        const session = data.voiceEnforcementSession;
+        if (!session || !data.roomId) throw new Error('No admitted session');
+        // Registration is idempotent and reuses live bearer, epoch and DM gates.
+        const sessionIsCurrent = () => {
+          const participant = roomManager.getParticipant(session.roomId, session.userId);
+          return (
+            socket.connected &&
+            data.voiceEnforcementSession === session &&
+            data.roomId === session.roomId &&
+            participant?.socketId === socket.id &&
+            participant.voiceEnforcementSessionGeneration === session.sessionGeneration
+          );
+        };
+        await renewVoiceEnforcementSession(
+          token,
+          session,
+          sessionIsCurrent,
+          (staleSession) => voiceEnforcementReleaseQueue.releaseAfterTerminalClose(staleSession)
+        );
+      })
+    );
     logger.info('Client connected', {
       socketId: socket.id,
       userId: data.userId,

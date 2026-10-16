@@ -33,6 +33,7 @@ export type Clock = () => number;
 
 /** Every client-invokable room event. `disconnect` is a lifecycle event and is excluded. */
 export type RoomEventName =
+  | 'refresh-auth'
   | 'join-room'
   | 'update-rtp-capabilities'
   | 'create-transport'
@@ -61,6 +62,7 @@ export type RoomEventName =
  * union without a budget here is a compile error.
  */
 export const EVENT_BUDGETS: Record<RoomEventName, RateBudget> = {
+  'refresh-auth': { capacity: 5, refillPerSec: 0.1 },
   'join-room': { capacity: 5, refillPerSec: 0.5 },
   'update-rtp-capabilities': { capacity: 5, refillPerSec: 0.5 },
   // 12, not 8. A stock join spends 3; a picture-in-picture window adds a 4th

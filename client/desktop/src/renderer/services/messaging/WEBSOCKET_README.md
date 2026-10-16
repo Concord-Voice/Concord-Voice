@@ -15,7 +15,7 @@ This directory contains the complete WebSocket client implementation for Concord
 - Typing indicators
 - Presence updates
 - Auto-reconnection with exponential backoff
-- Ticket-based authentication (POST /auth/ws-ticket → single-use 30s ticket)
+- Ticket-based authentication (POST /auth/ws-ticket → single-use ticket valid for the shorter of 30 seconds or the issuing access token's remaining lifetime)
 
 ---
 
@@ -42,7 +42,7 @@ This directory contains the complete WebSocket client implementation for Concord
 └───────────────────────────────┬─────────────────────────────┘
                                  │
                         WebSocket Connection
-                        (ws://localhost:8080/api/v1/ws?ticket=<30s-single-use-ticket>)
+                        (ws://localhost:8080/api/v1/ws?ticket=<single-use-ticket>)
                                  │
 ┌───────────────────────────────┴─────────────────────────────┐
 │                     Backend (Go/gorilla/websocket)           │
@@ -94,7 +94,7 @@ Singleton service that manages the WebSocket connection lifecycle.
 
 **Features:**
 
-- Ticket-based authentication (POST /auth/ws-ticket → 30s single-use ticket)
+- Ticket-based authentication (POST /auth/ws-ticket → single-use ticket valid for the shorter of 30 seconds or the issuing access token's remaining lifetime)
 - Auto-reconnect with exponential backoff (1s → 2s → 4s → ... up to 30s)
 - Max 10 reconnection attempts
 - Connection state tracking: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `ERROR`
@@ -133,9 +133,9 @@ wsService.disconnect();
 **Connection Flow:**
 
 1. User logs in → JWT access token stored in `authStore`
-2. `useWebSocket` hook detects token → calls `POST /auth/ws-ticket` to get a 30-second single-use ticket
+2. `useWebSocket` hook detects token → calls `POST /auth/ws-ticket` to get a single-use ticket valid for the shorter of 30 seconds or the token's remaining lifetime
 3. WebSocket connects to `ws://localhost:8080/api/v1/ws?ticket=<ticket>`
-4. Backend validates ticket (single-use, expires in 30s) → sends `connected` message with `client_id` and `user_id`
+4. Backend validates ticket and retains the issuing access-token deadline → sends `connected` message with `client_id` and `user_id`
 5. Client stores connection info → notifies UI via `chatStore.setConnectionStatus(true, clientId)`
 6. Auto-resubscribes to all previously subscribed channels
 
@@ -454,9 +454,9 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 
 1. User logs in → JWT access token stored in `authStore`
 2. `App.tsx` renders `ProtectedRoute` → `useWebSocket()` hook activates
-3. Hook detects `accessToken` → calls `POST /auth/ws-ticket` to get a 30s single-use ticket
+3. Hook detects `accessToken` → calls `POST /auth/ws-ticket` to get a single-use ticket valid for the shorter of 30 seconds or the token's remaining lifetime
 4. WebSocket connects to `ws://localhost:8080/api/v1/ws?ticket=<ticket>`
-5. Backend validates ticket (single-use, 30s TTL) → sends `connected` message
+5. Backend validates ticket and retains the issuing access-token deadline → sends `connected` message
 6. Frontend stores `client_id` and `user_id` → updates `chatStore.isConnected = true`
 7. `ConnectionStatus` component shows "Connected" badge
 
@@ -478,7 +478,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 
 ### 4. Reconnection
 
-1. WebSocket connection lost (network issue, server restart, etc.)
+1. WebSocket connection closes (network issue, server restart, or the issuing access token expires; expiry uses close code 1008)
 2. `wsService` detects close event → schedules reconnect
 3. Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
 4. Attempts up to 10 times
@@ -633,9 +633,10 @@ console.log('Connected:', useChatStore.getState().isConnected);
 
 ### Ticket-Based Authentication
 
-- ✅ Client gets a 30-second single-use ticket via `POST /auth/ws-ticket`
+- ✅ Client gets a single-use ticket via `POST /auth/ws-ticket`, valid for the shorter of 30 seconds or the issuing access token's remaining lifetime
 - ✅ Ticket sent via query parameter (WebSocket upgrade handshake) — NOT the raw JWT
 - ✅ Ticket validated and consumed on backend before upgrade (single-use, prevents replay)
+- ✅ Connection closes with code 1008 when the issuing access token expires; reconnect obtains a fresh ticket
 - ✅ JWT blacklist check runs during ticket creation
 - ⚠️ Use HTTPS/WSS in production to protect ticket in transit
 

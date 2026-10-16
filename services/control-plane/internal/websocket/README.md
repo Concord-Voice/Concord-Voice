@@ -67,6 +67,14 @@ WebSocket connections use **ticket-based authentication**:
 2. Client connects to `wss://host/api/v1/ws?ticket=<ticket>`
 3. Server validates and consumes the ticket (single-use, prevents replay attacks)
 
+Tickets retain the issuing access token's absolute expiry. Their Redis TTL is
+the smaller of 30 seconds and the token's remaining lifetime. Both ticket and
+JWT admission require an expiry, and the connection closes with policy code
+1008 at that deadline; ping/pong traffic cannot extend it. Expired queued
+commands are discarded. The desktop reconnects with a fresh ticket without
+tearing down the separate media connection. Old ticket values without a
+deadline fail closed and require a fresh ticket during rollout.
+
 > **Security note:** never pass a raw JWT token in the WebSocket URL. Tickets are single-use and expire in 30 seconds, which minimizes the window for interception.
 
 ### Connection limits

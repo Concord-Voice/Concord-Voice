@@ -64,6 +64,7 @@ const mockSocket = {
   // false = server denial / attempts exhausted. waitForConnect keys on this (#2176).
   active: true,
   emit: vi.fn(),
+  timeout: vi.fn().mockImplementation(() => mockSocket),
   on: vi.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
     if (!socketListeners[event]) socketListeners[event] = [];
     socketListeners[event].push(cb);
@@ -92,7 +93,10 @@ const mockSocket = {
 };
 
 vi.mock('socket.io-client', () => ({
-  io: vi.fn().mockReturnValue(mockSocket),
+  io: vi.fn().mockImplementation((_url: string, options: { auth: (cb: () => void) => void }) => {
+    options.auth(() => {});
+    return mockSocket;
+  }),
 }));
 
 // --- apiClient ---
@@ -516,6 +520,14 @@ async function joinVoiceChannel(
   return { sendTransport, recvTransport, micProducer };
 }
 
+async function reconnectMockSocket() {
+  const { io } = await import('socket.io-client');
+  const options = vi.mocked(io).mock.calls.at(-1)?.[1] as { auth: (cb: () => void) => void };
+  options.auth(() => {});
+  mockSocket.connected = true;
+  socketListeners['connect']?.forEach((cb) => cb());
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -637,6 +649,170 @@ describe('VoiceService', () => {
   });
 
   // ===== Singleton =====
+
+  it('does not renew with the unchanged handshake token after room admission', async () => {
+    await joinVoiceChannel();
+    expect(mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth')).toEqual([]);
+  });
+
+  it('renews a live media socket when credentials rotate without replacing transports', async () => {
+    const { sendTransport, recvTransport, micProducer } = await joinVoiceChannel();
+    mockSocket.emit.mockClear();
+    useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+    expect(mockSocket.emit).toHaveBeenCalledWith(
+      'refresh-auth',
+      'refreshed-access-token',
+      expect.any(Function)
+    );
+    expect(sendTransport.close).not.toHaveBeenCalled();
+    expect(recvTransport.close).not.toHaveBeenCalled();
+    expect(micProducer.close).not.toHaveBeenCalled();
+    expect(mockSocket.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('does not buffer token renewal on a disconnected media socket', async () => {
+    await joinVoiceChannel();
+    mockSocket.emit.mockClear();
+    mockSocket.connected = false;
+    useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+    expect(mockSocket.emit).not.toHaveBeenCalled();
+  });
+
+  it('does not send a successor login token to the previous media session', async () => {
+    await joinVoiceChannel();
+    mockSocket.emit.mockClear();
+    useAuthStore.setState((state) => ({
+      accessToken: 'successor-login',
+      authGeneration: state.authGeneration + 1,
+    }));
+    expect(mockSocket.emit).not.toHaveBeenCalled();
+    expect(mockSocket.disconnect).toHaveBeenCalled();
+  });
+
+  it('sends a token rotated during room admission only after the room joins', async () => {
+    const joining = joinVoiceChannel();
+    const emit = mockSocket.emit.getMockImplementation();
+    const admitted = deferred<Record<string, unknown>>();
+    mockSocket.emit.mockImplementation(
+      (event: string, data: unknown, callback?: (response: unknown) => void) => {
+        if (event === 'join-room') {
+          void admitted.promise.then((response) => callback?.(response));
+          return;
+        }
+        emit?.(event, data, callback);
+      }
+    );
+    await vi.waitFor(() =>
+      expect(mockSocket.emit).toHaveBeenCalledWith(
+        'join-room',
+        expect.any(Object),
+        expect.any(Function)
+      )
+    );
+    useAuthStore.setState({ accessToken: 'refreshed-during-join' });
+    const beforeAdmission = mockSocket.emit.mock.calls.filter(
+      ([event]) => event === 'refresh-auth'
+    );
+    admitted.resolve(makeRoomJoined());
+    await joining;
+    expect(beforeAdmission).toEqual([]);
+    expect(mockSocket.emit).toHaveBeenCalledWith(
+      'refresh-auth',
+      'refreshed-during-join',
+      expect.any(Function)
+    );
+  });
+
+  it('does not send a successor login token after an old room admission', async () => {
+    const joining = joinVoiceChannel();
+    const emit = mockSocket.emit.getMockImplementation();
+    const admitted = deferred<Record<string, unknown>>();
+    mockSocket.emit.mockImplementation(
+      (event: string, data: unknown, callback?: (response: unknown) => void) => {
+        if (event === 'join-room') {
+          void admitted.promise.then((response) => callback?.(response));
+          return;
+        }
+        emit?.(event, data, callback);
+      }
+    );
+    await vi.waitFor(() =>
+      expect(mockSocket.emit).toHaveBeenCalledWith(
+        'join-room',
+        expect.any(Object),
+        expect.any(Function)
+      )
+    );
+    useAuthStore.setState((state) => ({
+      accessToken: 'successor-login',
+      authGeneration: state.authGeneration + 1,
+    }));
+    admitted.resolve(makeRoomJoined());
+    await expect(joining).rejects.toThrow('Voice authentication changed during room admission');
+    expect(mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth')).toEqual([]);
+  });
+
+  it('does not let an old room ack authorize renewal on a new socket handshake', async () => {
+    const joining = joinVoiceChannel();
+    const emit = mockSocket.emit.getMockImplementation();
+    const admitted = deferred<Record<string, unknown>>();
+    mockSocket.emit.mockImplementation(
+      (event: string, data: unknown, callback?: (response: unknown) => void) => {
+        if (event === 'join-room') {
+          void admitted.promise.then((response) => callback?.(response));
+          return;
+        }
+        emit?.(event, data, callback);
+      }
+    );
+    await vi.waitFor(() =>
+      expect(mockSocket.emit).toHaveBeenCalledWith(
+        'join-room',
+        expect.any(Object),
+        expect.any(Function)
+      )
+    );
+    mockSocket.connected = false;
+    socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+    const { io } = await import('socket.io-client');
+    const options = vi.mocked(io).mock.calls[0][1] as { auth: (cb: () => void) => void };
+    options.auth(() => {});
+    mockSocket.connected = true;
+    useAuthStore.setState({ accessToken: 'refreshed-after-reconnect' });
+    admitted.resolve(makeRoomJoined());
+    await expect(joining).rejects.toThrow('Voice authentication changed during room admission');
+    expect(mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth')).toEqual([]);
+  });
+
+  it('retries a failed renewal once without interrupting the live media session', async () => {
+    const { micProducer } = await joinVoiceChannel();
+    mockSocket.emit.mockClear();
+    useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+    const renewals = () => mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth');
+    expect(renewals()).toHaveLength(1);
+    expect(mockSocket.timeout).toHaveBeenCalledWith(5_000);
+    renewals()[0][2](null, { error: 'Authentication failed' });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(renewals()).toHaveLength(2);
+    renewals()[1][2](null, { success: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(renewals()).toHaveLength(2);
+    expect(micProducer.close).not.toHaveBeenCalled();
+  });
+
+  it('cancels a renewal retry when the auth generation changes', async () => {
+    await joinVoiceChannel();
+    mockSocket.emit.mockClear();
+    useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+    const renewals = () => mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth');
+    renewals()[0][2](new Error('timeout'));
+    useAuthStore.setState((state) => ({
+      accessToken: 'successor-login',
+      authGeneration: state.authGeneration + 1,
+    }));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(renewals()).toHaveLength(1);
+  });
 
   describe('singleton export', () => {
     it('exports a singleton with all public methods', () => {
@@ -1698,8 +1874,7 @@ describe('VoiceService', () => {
       expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
 
       // Socket.IO reconnects on the new network path.
-      mockSocket.connected = true;
-      socketListeners['connect']?.forEach((cb) => cb());
+      await reconnectMockSocket();
 
       // The media-plane tore down our participant the moment the socket
       // dropped (no server-side grace period), so a bare state flip back to
@@ -1733,8 +1908,7 @@ describe('VoiceService', () => {
       });
 
       socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
-      mockSocket.connected = true;
-      socketListeners['connect']?.forEach((cb) => cb());
+      await reconnectMockSocket();
 
       await vi.waitFor(() => {
         expect(useVoiceStore.getState().connectionState).toBe('connected');
@@ -1764,10 +1938,9 @@ describe('VoiceService', () => {
       });
 
       socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
-      mockSocket.connected = true;
+      await reconnectMockSocket();
       // Two connect events while the first resume is still in flight — the
       // second must be swallowed by the resumeInFlight single-flight guard.
-      socketListeners['connect']?.forEach((cb) => cb());
       socketListeners['connect']?.forEach((cb) => cb());
 
       await vi.waitFor(() => {
@@ -1805,8 +1978,7 @@ describe('VoiceService', () => {
       });
 
       socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
-      mockSocket.connected = true;
-      socketListeners['connect']?.forEach((cb) => cb());
+      await reconnectMockSocket();
 
       await vi.waitFor(() => {
         expect(mockApiFetch).toHaveBeenCalledWith(
@@ -1848,8 +2020,7 @@ describe('VoiceService', () => {
         status: 403,
         json: vi.fn().mockResolvedValue({}),
       });
-      mockSocket.connected = true;
-      socketListeners['connect']?.forEach((cb) => cb());
+      await reconnectMockSocket();
 
       await vi.waitFor(() => {
         expect(useVoiceStore.getState().connectionState).toBe('disconnected');
@@ -3182,7 +3353,6 @@ describe('VoiceService', () => {
 
     it('sets isSpeaking when audio exceeds threshold', async () => {
       await joinVoiceChannel();
-      setupAuth(); // ensure user is set for updateLocalSpeaking
 
       // Simulate high volume data from analyser
       mockAnalyser.getByteFrequencyData.mockImplementation((arr: Uint8Array) => {
@@ -3235,7 +3405,6 @@ describe('VoiceService', () => {
 
     it('debounces silence before clearing isSpeaking', async () => {
       await joinVoiceChannel();
-      setupAuth();
 
       // First: simulate speaking
       mockAnalyser.getByteFrequencyData.mockImplementation((arr: Uint8Array) => {

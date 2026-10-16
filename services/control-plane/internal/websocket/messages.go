@@ -21,7 +21,8 @@ type IncomingMessage struct {
 	// CredEpoch is the sender's credential-epoch claim captured at WS auth time
 	// (#2201). Server-set; used to fence ciphertext writes against a destructive
 	// reset that advanced the epoch after this socket connected.
-	CredEpoch string `json:"-"`
+	CredEpoch      string    `json:"-"`
+	TokenExpiresAt time.Time `json:"-"`
 }
 
 // OutgoingMessage represents a message sent to a client

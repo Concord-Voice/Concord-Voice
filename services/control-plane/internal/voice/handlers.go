@@ -299,64 +299,49 @@ type voiceJoinAuthorization struct {
 	avatarURL        sql.NullString
 }
 
+type voiceJoinAccessFailure struct {
+	status  int
+	message string
+	until   time.Time
+	cause   error
+}
+
+func (failure *voiceJoinAccessFailure) Error() string {
+	if failure.cause != nil {
+		return failure.cause.Error()
+	}
+	return failure.message
+}
+
+func (failure *voiceJoinAccessFailure) Unwrap() error { return failure.cause }
+
+// CheckChannelVoiceAccessTx reuses voice-join authority inside a caller-owned
+// registration transaction. A failed renewal cannot extend a revoked session.
+func CheckChannelVoiceAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, serverID, channelID, userID, epoch string) (int, error) {
+	_, failure := checkChannelVoiceAccessTx(ctx, tx, resolver, serverID, channelID, userID, epoch)
+	if failure == nil {
+		return http.StatusNoContent, nil
+	}
+	if failure.status >= http.StatusInternalServerError {
+		return http.StatusServiceUnavailable, failure
+	}
+	return http.StatusForbidden, failure
+}
+
 // recheckActivatedVoiceJoin repeats every authority read after the out-of-tx
 // PREPARE acknowledgement. A prepared candidate is not admitted until this
 // transaction commits with the exact reservation still intact.
 func (h *Handler) recheckActivatedVoiceJoin(c *gin.Context, tx *sql.Tx, preflightServerID, channelID, userID string) (voiceJoinAuthorization, bool) {
-	if err := rbac.LockServerVisibilityCapture(c.Request.Context(), tx, preflightServerID); err != nil {
-		h.log.Error("voice join: lock visibility", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return voiceJoinAuthorization{}, false
-	}
-	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
-		h.respondVoiceGuardTxError(c, err, errMsgFailedAuthorize)
-		return voiceJoinAuthorization{}, false
-	}
-	var lockedServerID string
-	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, preflightServerID).Scan(&lockedServerID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusForbidden, gin.H{"error": errMsgVoiceChannelAccessDenied})
-		} else {
-			h.log.Error("Failed to lock voice join server", "error", err)
+	result, failure := checkChannelVoiceAccessTx(c.Request.Context(), tx, h.resolver, preflightServerID, channelID, userID, middleware.TokenCredentialEpoch(c))
+	if failure != nil {
+		if failure.status >= http.StatusInternalServerError {
+			h.log.Error("voice join transaction authorization failed", "error", failure.cause)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		} else if !failure.until.IsZero() {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Member is timed out", "code": "member_timed_out", "timed_out_until": failure.until})
+		} else {
+			c.JSON(failure.status, gin.H{"error": failure.message})
 		}
-		return voiceJoinAuthorization{}, false
-	}
-	var result voiceJoinAuthorization
-	var channelType string
-	var timedOutUntil sql.NullTime
-	err := tx.QueryRowContext(c.Request.Context(), `
-		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
-		FROM channels c
-		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
-		WHERE c.id = $1 AND c.server_id = $3
-		FOR UPDATE OF c, sm
-	`, channelID, userID, lockedServerID).Scan(&result.channelID, &result.channelName, &channelType, &result.serverID, &result.audioQualityTier, &timedOutUntil)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgVoiceChannelAccessDenied})
-		return voiceJoinAuthorization{}, false
-	}
-	if err != nil {
-		h.log.Error("Failed to fetch channel for voice join", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return voiceJoinAuthorization{}, false
-	}
-	if channelType != "voice" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Not a voice channel"})
-		return voiceJoinAuthorization{}, false
-	}
-	result.permissions, err = h.resolver.ResolveChannelPermissionsTx(c.Request.Context(), tx, result.serverID, userID, result.channelID)
-	if err != nil {
-		h.log.Error("Failed to resolve effective voice permissions", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return voiceJoinAuthorization{}, false
-	}
-	if !result.permissions.Has(rbac.PermViewVoiceChannels) || !result.permissions.Has(rbac.PermJoinVoice) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return voiceJoinAuthorization{}, false
-	}
-	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Member is timed out", "code": "member_timed_out", "timed_out_until": timedOutUntil.Time})
 		return voiceJoinAuthorization{}, false
 	}
 	if err := tx.QueryRowContext(c.Request.Context(), `
@@ -369,6 +354,55 @@ func (h *Handler) recheckActivatedVoiceJoin(c *gin.Context, tx *sql.Tx, prefligh
 		return voiceJoinAuthorization{}, false
 	}
 	return result, true
+}
+
+func checkChannelVoiceAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, preflightServerID, channelID, userID, epoch string) (voiceJoinAuthorization, *voiceJoinAccessFailure) {
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, preflightServerID); err != nil {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("lock voice visibility: %w", err)}
+	}
+	if err := credepoch.GuardTx(ctx, tx, userID, epoch); err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusUnauthorized, message: "Authentication required", cause: err}
+		}
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("guard voice credential epoch: %w", err)}
+	}
+	var lockedServerID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, preflightServerID).Scan(&lockedServerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusForbidden, message: errMsgVoiceChannelAccessDenied}
+		}
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("lock voice server: %w", err)}
+	}
+	var result voiceJoinAuthorization
+	var channelType string
+	var timedOutUntil sql.NullTime
+	err := tx.QueryRowContext(ctx, `
+		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
+		FROM channels c
+		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
+		WHERE c.id = $1 AND c.server_id = $3
+		FOR UPDATE OF c, sm
+	`, channelID, userID, lockedServerID).Scan(&result.channelID, &result.channelName, &channelType, &result.serverID, &result.audioQualityTier, &timedOutUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusForbidden, message: errMsgVoiceChannelAccessDenied}
+	}
+	if err != nil {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("lock voice channel and membership: %w", err)}
+	}
+	if channelType != "voice" {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusBadRequest, message: "Not a voice channel"}
+	}
+	result.permissions, err = resolver.ResolveChannelPermissionsTx(ctx, tx, result.serverID, userID, result.channelID)
+	if err != nil {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("resolve voice permissions: %w", err)}
+	}
+	if !result.permissions.Has(rbac.PermViewVoiceChannels) || !result.permissions.Has(rbac.PermJoinVoice) {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusForbidden, message: errMsgInsufficientPerms}
+	}
+	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
+		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusForbidden, message: "Member is timed out", until: timedOutUntil.Time}
+	}
+	return result, nil
 }
 
 func (h *Handler) completeActivatedVoiceAdmission(

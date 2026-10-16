@@ -59,7 +59,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 #### Media Plane (Node.js + mediasoup, port 3000)
 
 - WebRTC SFU for voice and video (Opus codec, 7 quality tiers)
-- Socket.IO signaling for transport negotiation
+- Socket.IO signaling for transport negotiation and validated `refresh-auth` token renewal
 - `RoomManager` is authoritative for produce/consume/transport lifecycle
 - Frames are E2EE _above_ the SFU (see [Media E2EE](#media-e2ee-frame-encryption)). The SFU forwards opaque RTP
 - NATS integration for participant state events to control plane

@@ -29,6 +29,10 @@ const (
 	originFile = "file://"
 )
 
+func testTicketValue(userID, sessionID, epoch string) string {
+	return fmt.Sprintf("%s:%s:%s:%d", userID, sessionID, epoch, time.Now().Add(15*time.Minute).Unix())
+}
+
 // --- NewHandler tests ---
 
 func TestNewHandlerSetsFields(t *testing.T) {
@@ -517,7 +521,7 @@ func TestAuthenticateViaTicketValid(t *testing.T) {
 	userID := uuid.New()
 	ticket := "test-ticket-valid"
 	ctx := context.Background()
-	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, userID.String(), 30*time.Second).Err()
+	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
@@ -536,7 +540,7 @@ func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
 	userID := uuid.New()
 	ticket := "test-ticket-session"
 	ctx := context.Background()
-	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, userID.String()+":my-session-id", 30*time.Second).Err()
+	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "my-session-id", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
@@ -566,7 +570,7 @@ func TestAuthenticateViaTicketInvalidUserIDInTicket(t *testing.T) {
 
 	ticket := "test-ticket-bad-uuid"
 	ctx := context.Background()
-	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, notAValidUUID, 30*time.Second).Err()
+	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(notAValidUUID, "", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
@@ -639,7 +643,7 @@ func TestHandleWebSocketClientVersionFloorTicket(t *testing.T) {
 	testHandleWebSocketClientVersionFloor(t, "ticket", func(t *testing.T, redisClient *redis.Client, userID uuid.UUID) string {
 		t.Helper()
 		ticket := "client-version-ticket-" + uuid.NewString()
-		require.NoError(t, redisClient.Set(context.Background(), wsTicketKeyPfx+ticket, userID.String(), 30*time.Second).Err())
+		require.NoError(t, redisClient.Set(context.Background(), wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "", ""), 30*time.Second).Err())
 		return wsTicketPath + ticket
 	})
 }
@@ -855,7 +859,7 @@ func TestHandleWebSocketTicketAuth(t *testing.T) {
 
 	ticket := "integration-test-ticket"
 	ctx := context.Background()
-	err = redisClient.Set(ctx, wsTicketKeyPfx+ticket, userID.String()+":test-session", 30*time.Second).Err()
+	err = redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "test-session", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
 	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)

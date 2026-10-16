@@ -79,8 +79,8 @@ you verify your email.
 
 ### Fixed
 
+- **Real-time access expires with your sign-in** (internal development reference omitted) — control connections close when their access token expires. Active calls keep their media connection when the desktop renews a valid token; a renewed token must still belong to the same live session and retain access to the channel.
 - **Chat resists stalls under excessive connection traffic** (internal development reference omitted) — the server slows excess events from each connection while keeping them in order. If direct-message delivery is overloaded, a new message is rejected before it is saved so the sender can retry. A typing indicator may be skipped if its queue is full; a connection that cannot receive a required acknowledgement closes and can reconnect.
-
 - **Profile changes reach only connected people with a current relationship** (internal development reference omitted) — updates go to your own sessions, accepted friends, shared-server members and current DM participants. A blocked account receives no update even when another relationship exists. Existing profile fields and clears work as before.
 
 - **Account recovery now checks your reserved authenticator** (internal development reference omitted) — if you reserved an authenticator app or security key for recovery, proving access to your email alone no longer permits a reset or device or social recovery. Recovery asks for that factor before continuing. If you began recovery before this update, request a new email code and start again. A recovery policy that requires an unsupported verification method blocks recovery.

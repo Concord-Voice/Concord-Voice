@@ -329,7 +329,7 @@ func TestUpdateMeLoneMatchingResendDoesNotBroadcast(t *testing.T) {
 func dialProfileObserver(t *testing.T, ts *testhelpers.TestServer, userID string) *gorillaWS.Conn {
 	t.Helper()
 	ticket := "inline-quiet-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":inline-quiet", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:inline-quiet::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	srv := httptest.NewServer(ts.Router)
 	t.Cleanup(srv.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+srv.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)

@@ -94,7 +94,7 @@ func startEvictionTestSocket(t *testing.T, ticket string) (*Hub, *redis.Client, 
 	ctx := context.Background()
 	// Ticket value is "userID[:sessionID[:credEpoch]]" — pin the socket to E1.
 	require.NoError(t, rc.Set(ctx, wsTicketKeyPfx+ticket,
-		userID.String()+":test-session:E1", 30*time.Second).Err())
+		testTicketValue(userID.String(), "test-session", "E1"), 30*time.Second).Err())
 	require.NoError(t, rc.Set(ctx,
 		credepoch.Key(userID.String()), "active:E1", time.Minute).Err())
 

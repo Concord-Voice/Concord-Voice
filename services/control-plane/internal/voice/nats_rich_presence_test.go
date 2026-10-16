@@ -83,7 +83,8 @@ func connectVoiceWireClientAtURL(
 	t.Helper()
 	ticket := "voice-rich-presence-" + uuid.NewString()
 	require.NoError(t, redisClient.Set(
-		context.Background(), "ws_ticket:"+ticket, user.ID+":test-session", 30*time.Second,
+		context.Background(), "ws_ticket:"+ticket,
+		fmt.Sprintf("%s:test-session::%d", user.ID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second,
 	).Err())
 	conn, _, err := gorillaWS.DefaultDialer.Dial(
 		"ws"+strings.TrimPrefix(baseURL, "http")+

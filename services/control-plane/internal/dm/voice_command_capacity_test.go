@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -110,7 +111,7 @@ type dmVoiceCapacityEnvelope struct {
 func connectDMVoiceCapacityObserver(t *testing.T, ts *testhelpers.TestServer, userID, convID string) *gorillaWS.Conn {
 	t.Helper()
 	ticket := "dm-voice-capacity-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":capacity-test", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:capacity-test::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	server := httptest.NewServer(ts.Router)
 	t.Cleanup(server.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+server.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)

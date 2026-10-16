@@ -2404,7 +2404,7 @@ func TestDeleteMessage_RetirementFailureRollsBack(t *testing.T) {
 	fileID := insertDMMediaFile(t, ts, user1.ID, convID, "file", "application/octet-stream", 1)
 	insertDMMessageAttachment(t, ts, msgID, fileID, 0)
 	ticket := "dm-delete-broadcast-test-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, user2.ID+":delete-test", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:delete-test::%d", user2.ID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
@@ -3257,7 +3257,7 @@ func TestRemoveMemberAdminRemovesOther(t *testing.T) {
 
 	convID := createTestGroup(t, ts, admin, member, target)
 	ticket := "removed-member-notification"
-	require.NoError(t, ts.Redis.Set(context.Background(), "ws_ticket:"+ticket, target.ID+":test-session", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(context.Background(), "ws_ticket:"+ticket, fmt.Sprintf("%s:test-session::%d", target.ID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)

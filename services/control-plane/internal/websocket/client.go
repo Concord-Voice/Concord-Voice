@@ -146,7 +146,11 @@ type Client struct {
 	// CredEpoch is the credential-epoch claim captured at WS auth time (#2201).
 	// Every message frame from this socket carries it so a ciphertext write can
 	// be fenced against a destructive reset that advanced the epoch after connect.
-	CredEpoch string
+	CredEpoch            string
+	TokenExpiresAt       time.Time
+	tokenExpiryTimer     *time.Timer
+	tokenExpiryCloseOnce sync.Once
+	unregisterOnce       sync.Once
 
 	// The WebSocket connection
 	Conn *websocket.Conn
@@ -610,66 +614,74 @@ func (c *Client) rateLimitAllow() bool {
 	return false
 }
 
-// readPump pumps messages from the WebSocket connection to the hub
-func (c *Client) readPump() {
-	defer func() {
-		_ = c.Conn.Close()
+func (c *Client) tokenExpired() bool {
+	return !c.TokenExpiresAt.IsZero() && !time.Now().Before(c.TokenExpiresAt)
+}
+
+func (c *Client) closeExpiredToken() {
+	c.tokenExpiryCloseOnce.Do(func() {
+		if err := c.Conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Access token expired"), time.Now().Add(time.Second)); err != nil {
+			log.Printf("WebSocket expiry close frame failed: %s", describeSocketFailure(err))
+		}
+		if err := c.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("WebSocket expiry transport close failed: %s", describeSocketFailure(err))
+		}
+	})
+}
+
+func (c *Client) requestUnregister() {
+	c.unregisterOnce.Do(func() {
 		select {
 		case c.Hub.unregister <- c:
 		case <-c.Hub.done:
 		}
+	})
+}
+
+func (c *Client) connectionDeadline(wait time.Duration) time.Time {
+	deadline := time.Now().Add(wait)
+	if !c.TokenExpiresAt.IsZero() && c.TokenExpiresAt.Before(deadline) {
+		return c.TokenExpiresAt
+	}
+	return deadline
+}
+
+// readPump pumps messages from the WebSocket connection to the hub
+func (c *Client) readPump() {
+	defer func() {
+		if c.tokenExpiryTimer != nil {
+			c.tokenExpiryTimer.Stop()
+		}
+		if err := c.Conn.Close(); err != nil && !alreadyDisconnected(err) {
+			log.Printf("WebSocket read transport close failed: %s", describeSocketFailure(err))
+		}
+		c.requestUnregister()
 		c.releaseConnection()
 	}()
 	budget := ingressbudget.NewBucket(applicationFrameInterval, applicationFrameBurst)
 
-	_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	if err := c.Conn.SetReadDeadline(c.connectionDeadline(pongWait)); err != nil {
+		log.Printf("WebSocket read deadline failed: %s", describeSocketFailure(err))
+		return
+	}
 	c.Conn.SetReadLimit(maxMessageSize)
 	c.Conn.SetPongHandler(func(string) error {
-		return c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		return c.Conn.SetReadDeadline(c.connectionDeadline(pongWait))
 	})
 
 	for {
 		_, message, err := c.Conn.ReadMessage()
+		if c.tokenExpired() {
+			c.closeExpiredToken()
+			return
+		}
 		if err != nil {
-			// "Abnormal" is the complement of a completed close handshake, which is
-			// narrower than either log branch below: IsCloseError is false for 1006,
-			// for an explicit error code such as 1002 or 1008, AND for the errors
-			// that are not CloseErrors at all (TCP reset, EOF, read deadline).
-			//
-			// 1005 is excluded even though it names no clean exit of ours. Gorilla
-			// synthesizes it for a Close frame whose payload is under two bytes
-			// (conn.go advanceFrame), which RFC 6455 permits and which a browser
-			// produces from a bare `ws.close()` -- the peer completed the handshake
-			// and simply declined to state a reason. Our own renderer always passes
-			// 1000 explicitly, so this is not a path we generate, but an
-			// intermediary or a future client can. Counting it would report a
-			// graceful close as a dead socket, and this counter is deliberately
-			// dimension-free (a close CODE would partition users by why their
-			// connection died), so a miscount here can never be disambiguated
-			// afterwards -- the predicate is the only place the boundary exists.
-			if !websocket.IsCloseError(err,
-				websocket.CloseNormalClosure,
-				websocket.CloseGoingAway,
-				websocket.CloseNoStatusReceived,
-			) {
-				c.Hub.countWebSocketAbnormalClose()
-			}
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %s", describeSocketFailure(err))
-			} else {
-				// The branch above logs only codes OUTSIDE its expected list, and
-				// CloseAbnormalClosure (1006) is IN that list. A plain TCP reset,
-				// EOF or read-deadline is not a CloseError at all, so it misses
-				// those too. Between them that was every way a socket dies
-				// unexpectedly, and all of it was silent -- which is why a
-				// self-sustaining disconnect storm (#2444 follow-on) presented as
-				// client-side 1006s with no server-side trace whatsoever.
-				log.Printf("WebSocket closed: %s", describeSocketFailure(err))
-			}
+			c.recordReadFailure(err)
 			break
 		}
 		// A received data frame proves the peer is live even while pacing delays its next Pong.
-		if err := c.Conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		if err := c.Conn.SetReadDeadline(c.connectionDeadline(pongWait)); err != nil {
 			return
 		}
 
@@ -693,6 +705,7 @@ func (c *Client) readPump() {
 		msg.UserID = c.UserID
 		msg.ClientID = c.ID
 		msg.CredEpoch = c.CredEpoch
+		msg.TokenExpiresAt = c.TokenExpiresAt
 
 		// Route message to hub
 		select {
@@ -700,6 +713,25 @@ func (c *Client) readPump() {
 		case <-c.Hub.done:
 			return
 		}
+	}
+}
+
+func (c *Client) recordReadFailure(err error) {
+	// 1005 is a completed close without a reason; count only genuinely abnormal
+	// transport exits. The counter has no close-code dimension for privacy.
+	if !websocket.IsCloseError(err,
+		websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+		websocket.CloseNoStatusReceived,
+	) {
+		c.Hub.countWebSocketAbnormalClose()
+	}
+	// 1006 and transport errors need a trace even though IsUnexpectedCloseError
+	// considers 1006 expected or does not classify a non-CloseError.
+	if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+		log.Printf("WebSocket error: %s", describeSocketFailure(err))
+	} else {
+		log.Printf("WebSocket closed: %s", describeSocketFailure(err))
 	}
 }
 
@@ -717,7 +749,9 @@ func (c *Client) writePump() {
 	wroteSinceLastTick := false
 	defer func() {
 		ticker.Stop()
-		_ = c.Conn.Close()
+		if err := c.Conn.Close(); err != nil && !alreadyDisconnected(err) {
+			log.Printf("WebSocket write transport close failed: %s", describeSocketFailure(err))
+		}
 		c.releaseConnection()
 	}()
 
@@ -747,27 +781,43 @@ func (c *Client) writePump() {
 }
 
 func (c *Client) writePumpMessage(message []byte, ok bool) bool {
+	if c.tokenExpired() {
+		c.closeExpiredToken()
+		return true
+	}
 	if !c.claimOutboundWrite() {
 		return c.writePrivacyClearsThenClose()
 	}
 	defer c.releaseOutboundWrite()
-	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := c.Conn.SetWriteDeadline(c.connectionDeadline(writeWait)); err != nil {
+		log.Printf("WebSocket message write deadline failed: %s", describeSocketFailure(err))
+		return true
+	}
 	if !ok {
 		// Hub closed the channel. The empty close payload surfaces in browsers as
 		// 1006, so retain this fixed server-side diagnostic.
 		log.Print("WebSocket closed: hub closed the send channel")
-		_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+		if err := c.Conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
+			log.Printf("WebSocket hub close frame failed: %s", describeSocketFailure(err))
+		}
 		return true
 	}
 	return c.Conn.WriteMessage(websocket.TextMessage, message) != nil
 }
 
 func (c *Client) writePumpTick(wroteSinceLastTick bool) bool {
+	if c.tokenExpired() {
+		c.closeExpiredToken()
+		return true
+	}
 	if !c.claimOutboundWrite() {
 		return c.writePrivacyClearsThenClose()
 	}
 	defer c.releaseOutboundWrite()
-	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := c.Conn.SetWriteDeadline(c.connectionDeadline(writeWait)); err != nil {
+		log.Printf("WebSocket ping write deadline failed: %s", describeSocketFailure(err))
+		return true
+	}
 	if c.Conn.WriteMessage(websocket.PingMessage, nil) != nil {
 		return true
 	}
@@ -776,7 +826,10 @@ func (c *Client) writePumpTick(wroteSinceLastTick bool) bool {
 	}
 	// The application frame keeps Cloudflare's edge leg alive without treating
 	// an origin-to-client write as user presence.
-	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := c.Conn.SetWriteDeadline(c.connectionDeadline(writeWait)); err != nil {
+		log.Printf("WebSocket heartbeat write deadline failed: %s", describeSocketFailure(err))
+		return true
+	}
 	return c.Conn.WriteMessage(websocket.TextMessage, heartbeatAckFrame) != nil
 }
 
@@ -809,6 +862,10 @@ func (c *Client) privacyClearThenClosePending() bool {
 }
 
 func (c *Client) writePrivacyClearsThenClose() bool {
+	if c.tokenExpired() {
+		c.closeExpiredToken()
+		return true
+	}
 	c.privacyClearThenCloseMu.Lock()
 	if !c.privacyClearThenCloseScheduled {
 		c.privacyClearThenCloseMu.Unlock()
@@ -817,13 +874,21 @@ func (c *Client) writePrivacyClearsThenClose() bool {
 	frames := append([][]byte(nil), c.privacyClearThenClose...)
 	c.privacyClearThenCloseMu.Unlock()
 	for _, frame := range frames {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := c.Conn.SetWriteDeadline(c.connectionDeadline(writeWait)); err != nil {
+			log.Printf("WebSocket privacy-clear write deadline failed: %s", describeSocketFailure(err))
+			return true
+		}
 		if err := c.Conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 			return true
 		}
 	}
-	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-	_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+	if err := c.Conn.SetWriteDeadline(c.connectionDeadline(writeWait)); err != nil {
+		log.Printf("WebSocket privacy-close write deadline failed: %s", describeSocketFailure(err))
+		return true
+	}
+	if err := c.Conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
+		log.Printf("WebSocket privacy-close frame failed: %s", describeSocketFailure(err))
+	}
 	return true
 }
 

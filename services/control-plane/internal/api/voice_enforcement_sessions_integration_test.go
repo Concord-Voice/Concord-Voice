@@ -13,6 +13,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -44,6 +45,28 @@ func integrationVoiceSessionRequest(userID, conversation uuid.UUID) voiceEnforce
 		CredentialEpoch:   "",
 		SocketID:          "socket-" + uuid.NewString(),
 	}
+}
+
+func setupVoiceEnforcementChannel(t *testing.T, db *sql.DB, userID uuid.UUID) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	ownerID := dbtest.CreateUser(t, db)
+	serverID := uuid.New()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'voice enforcement', $2)`, serverID, ownerID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2)`, serverID, userID)
+	require.NoError(t, err)
+	roleID := uuid.New()
+	_, err = db.Exec(`
+		INSERT INTO roles (id, server_id, name, position, permissions, is_default, is_managed)
+		VALUES ($1, $2, '@all', 0, $3, true, true)`,
+		roleID, serverID, int64(rbac.BasePermissions))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`, serverID, userID, roleID)
+	require.NoError(t, err)
+	channelID := uuid.New()
+	_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, 'voice', 'voice')`, channelID, serverID)
+	require.NoError(t, err)
+	return serverID, channelID
 }
 
 func insertVoiceEnforcementSessionTx(ctx context.Context, tx *sql.Tx, request voiceEnforcementSessionRequest) error {
@@ -191,11 +214,13 @@ func TestVoiceEnforcementRegistrationRacesCredentialEpochRotation(t *testing.T) 
 	db, cleanup := dbtest.SetupTestDB(t)
 	t.Cleanup(cleanup)
 	userID := dbtest.CreateUser(t, db)
+	_, channelID := setupVoiceEnforcementChannel(t, db, userID)
 	conversation := uuid.New()
 	_, err := db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, voiceEnforcementIntegrationEpoch, userID)
 	require.NoError(t, err)
 	request := integrationVoiceSessionRequest(userID, conversation)
 	request.RoomKind = "channel"
+	request.RoomID = channelID.String()
 	request.CredentialEpoch = voiceEnforcementIntegrationEpoch
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -226,4 +251,86 @@ func TestVoiceEnforcementRegistrationRacesCredentialEpochRotation(t *testing.T) 
 	var sessions int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&sessions))
 	assert.Zero(t, sessions, "old-epoch registration must not leave a session row")
+}
+
+func TestVoiceEnforcementRegistrationRechecksChannelAuthority(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+
+	tests := []struct {
+		name   string
+		revoke func(t *testing.T, db *sql.DB, serverID, channelID, userID uuid.UUID)
+	}{
+		{
+			name: "server membership removed",
+			revoke: func(t *testing.T, db *sql.DB, serverID, _ uuid.UUID, userID uuid.UUID) {
+				t.Helper()
+				_, err := db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, userID)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "view voice permission removed",
+			revoke: func(t *testing.T, db *sql.DB, _ uuid.UUID, channelID, userID uuid.UUID) {
+				t.Helper()
+				_, err := db.Exec(`
+					INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+					VALUES ($1, $2, 'user', $3, 0, $4)`,
+					uuid.New(), channelID, userID, int64(rbac.PermViewVoiceChannels))
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "join voice permission removed",
+			revoke: func(t *testing.T, db *sql.DB, _ uuid.UUID, channelID, userID uuid.UUID) {
+				t.Helper()
+				_, err := db.Exec(`
+					INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+					VALUES ($1, $2, 'user', $3, 0, $4)`,
+					uuid.New(), channelID, userID, int64(rbac.PermJoinVoice))
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "voice timeout made active",
+			revoke: func(t *testing.T, db *sql.DB, serverID, _ uuid.UUID, userID uuid.UUID) {
+				t.Helper()
+				_, err := db.Exec(`UPDATE server_members SET timed_out_until = NOW() + INTERVAL '1 hour' WHERE server_id = $1 AND user_id = $2`, serverID, userID)
+				require.NoError(t, err)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			userID := dbtest.CreateUser(t, db)
+			serverID, channelID := setupVoiceEnforcementChannel(t, db, userID)
+			request := integrationVoiceSessionRequest(userID, channelID)
+			request.RoomKind = "channel"
+
+			registrationTx, err := db.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			require.NoError(t, insertVoiceEnforcementSessionTx(context.Background(), registrationTx, request))
+			require.NoError(t, registrationTx.Commit())
+
+			var recorded int
+			require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&recorded))
+			require.Equal(t, 1, recorded, "the authority change must follow a valid exact-session registration")
+
+			unchangedTx, err := db.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			status, err := guardVoiceEnforcementRegistration(context.Background(), unchangedTx, request)
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusNoContent, status, "unchanged exact-session re-registration remains admitted")
+			require.NoError(t, unchangedTx.Rollback())
+
+			tc.revoke(t, db, serverID, channelID, userID)
+
+			revokedTx, err := db.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			status, err = guardVoiceEnforcementRegistration(context.Background(), revokedTx, request)
+			assert.Equal(t, http.StatusForbidden, status, "the current channel authority must fence a previous exact session")
+			require.NoError(t, revokedTx.Rollback())
+		})
+	}
 }

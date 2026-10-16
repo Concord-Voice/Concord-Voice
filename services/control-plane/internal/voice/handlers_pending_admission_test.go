@@ -273,7 +273,7 @@ func TestAuthorizeJoinLockedServerLookupErrors(t *testing.T) {
 			router.ServeHTTP(response, request)
 			assert.Equal(t, test.wantStatus, response.Code)
 			if test.wantStatus == http.StatusInternalServerError {
-				assert.Contains(t, logBuffer.String(), "Failed to lock voice join server")
+				assert.Contains(t, logBuffer.String(), "lock voice server")
 			}
 		})
 	}

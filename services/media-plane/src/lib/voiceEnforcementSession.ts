@@ -100,6 +100,19 @@ export async function registerVoiceEnforcementSession(
   }
 }
 
+export async function renewVoiceEnforcementSession(
+  token: string,
+  session: VoiceEnforcementSession,
+  sessionIsCurrent: () => boolean,
+  releaseAfterTerminalClose: (session: VoiceEnforcementSession) => Promise<void>
+): Promise<void> {
+  if (!sessionIsCurrent()) throw new Error('Session changed during renewal');
+  await registerVoiceEnforcementSession(token, session);
+  if (sessionIsCurrent()) return;
+  await releaseAfterTerminalClose(session);
+  throw new Error('Session changed during renewal');
+}
+
 // The release proof is independent of a user JWT. A credential-epoch ejection
 // may invalidate that JWT before the target node can tear down the socket.
 export async function releaseVoiceEnforcementSession(

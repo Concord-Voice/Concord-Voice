@@ -36,7 +36,7 @@ func TestHandleWebSocketAdmissionPerUser(t *testing.T) {
 				path := wsTokenPath + generateTestJWT(t, identity, testJWTSecret)
 				if authPath == "ticket" {
 					ticket := fmt.Sprintf("admission-%d", attempt)
-					require.NoError(t, rc.Set(context.Background(), wsTicketKeyPfx+ticket, identity, 30*time.Second).Err())
+					require.NoError(t, rc.Set(context.Background(), wsTicketKeyPfx+ticket, testTicketValue(identity, "", ""), 30*time.Second).Err())
 					path = wsTicketPath + ticket
 				}
 				conn, response, err := gorillaWS.DefaultDialer.Dial("ws"+server.URL[4:]+path, nil)
@@ -338,7 +338,7 @@ func TestHandleWebSocketAdmissionDisconnectReleases(t *testing.T) {
 			userID := presenceTestUser(t, db)
 			const session = "admission-session"
 			ticket := "admission-disconnect"
-			require.NoError(t, rc.Set(context.Background(), wsTicketKeyPfx+ticket, userID.String()+":"+session, 30*time.Second).Err())
+			require.NoError(t, rc.Set(context.Background(), wsTicketKeyPfx+ticket, testTicketValue(userID.String(), session, ""), 30*time.Second).Err())
 			conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+server.URL[4:]+wsTicketPath+ticket, nil)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = conn.Close() })

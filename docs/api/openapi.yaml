@@ -2307,7 +2307,7 @@ paths:
       summary: Issue a WebSocket ticket
       description: 'Generate a short-lived, single-use ticket for WebSocket authentication.
 
-        The ticket is valid for 30 seconds and can only be used once.
+        The ticket is valid for the shorter of 30 seconds or the issuing access token''s remaining lifetime, and can only be used once.
 
         Rate limit: 10 requests per minute.
 
@@ -2326,7 +2326,7 @@ paths:
                 properties:
                   ticket:
                     type: string
-                    description: Single-use ticket (30s TTL)
+                    description: Single-use ticket (TTL is the shorter of 30 seconds or the issuing access token's remaining lifetime)
         '429':
           $ref: '#/components/responses/RateLimited'
         '403':
@@ -17812,6 +17812,8 @@ paths:
 
         - Ping/pong: 54s ping interval, 60s pong timeout
 
+        - The connection closes with code 1008 when the issuing access token expires
+
         - Max message size: 512KB
 
 
@@ -18000,7 +18002,7 @@ components:
       type: apiKey
       in: query
       name: ticket
-      description: Single-use 30-second WebSocket ticket from POST /auth/ws-ticket; preferred over JWT fallback.
+      description: Single-use WebSocket ticket from POST /auth/ws-ticket; its TTL is the shorter of 30 seconds or the issuing access token's remaining lifetime, and it is preferred over JWT fallback.
     WebSocketTokenAuth:
       type: apiKey
       in: query

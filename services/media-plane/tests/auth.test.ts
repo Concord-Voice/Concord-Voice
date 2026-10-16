@@ -60,6 +60,33 @@ function signToken(payload: Record<string, unknown>, options: jwt.SignOptions = 
 describe('createAuthMiddleware', () => {
   const middleware = createAuthMiddleware();
 
+  it('rejects a signed token with no expiration instead of granting an unbounded session', () => {
+    const token = jwt.sign({ user_id: TEST_USER_ID }, TEST_SIGNING_KEY, {
+      algorithm: 'HS256',
+      issuer: 'concordvoice-control-plane',
+    });
+    const socket = createMockSocket({ token, username: 'alice' });
+    const next = vi.fn();
+    middleware(socket as any, next);
+    expect(next).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Invalid token: missing expiration' })
+    );
+  });
+
+  it.each([
+    ['a string', 'websocket-ticket'],
+    ['an object', { audience: 'media' }],
+  ])('rejects a signed %s purpose token at socket admission', (_, purpose) => {
+    const token = signToken({ user_id: TEST_USER_ID, purpose });
+    const socket = createMockSocket({ token, username: 'alice' });
+    const next = vi.fn();
+
+    middleware(socket as any, next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'Authentication failed' }));
+    expect(socket.data.userId).toBeUndefined();
+  });
+
   it('emits a fixed denial event for rejected handshakes', () => {
     const emit = vi.fn();
     const rejectingMiddleware = createAuthMiddleware(emit);

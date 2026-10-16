@@ -255,6 +255,28 @@ MEDIASOUP_LOG_LEVEL=warn
 
 ### Client → Server
 
+**refresh-auth**
+
+```typescript
+socket.emit('refresh-auth', freshAccessToken, (result) => {
+  // { success: true } or { error: 'Authentication failed' }
+});
+```
+
+Access tokens must carry an expiry. The media socket closes at its verified
+deadline even when no signaling events arrive. Before that deadline, the
+desktop sends each proactively refreshed token through this rate-limited event.
+The server verifies the signature, issuer and expiry, requires the same user
+and credential epoch, and revalidates the admitted exact session through the
+control plane's idempotent registration before advancing the deadline. Revoked
+credentials, unavailable validation, or a session changed during validation
+cannot extend it. Room membership,
+enforcement generation, transports, camera and screen sharing remain intact.
+Old-token replay, invalid renewal and renewal after expiry cannot extend the
+session. Revocation still tears down the existing exact socket and media state.
+Deploy the desktop renewal support before enforcing expiry for long-running
+calls; older clients without renewal are disconnected when their token expires.
+
 **join-room**
 
 ```typescript

@@ -70,7 +70,7 @@ func TestAuthenticateViaTicket_DenylistIsSpellingInvariant(t *testing.T) {
 			// under test as the STORED value — the thing a pre-#3362 replica or a
 			// future mint path could legitimately have put there.
 			ticket := "canon-" + sp.name + "-" + uuid.NewString()
-			require.NoError(t, redisClient.Set(ctx, wsTicketKeyPfx+ticket, sp.stored, 30*time.Second).Err())
+			require.NoError(t, redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(sp.stored, "", ""), 30*time.Second).Err())
 
 			r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
 			c := newGinContext(r)

@@ -88,10 +88,11 @@ func serveVoiceEnforcementCoverageRequest(t *testing.T, handler gin.HandlerFunc,
 func TestVoiceEnforcementSessionHandlersPersistAndReleaseExactRows(t *testing.T) {
 	db := openVoiceEnforcementCoverageDB(t)
 	userID := testdb.CreateUser(t, db)
+	_, channelID := setupVoiceEnforcementChannel(t, db, userID)
 	request := voiceEnforcementSessionRequest{
 		SessionGeneration: uuid.NewString(),
 		NodeBootID:        uuid.NewString(),
-		RoomID:            uuid.NewString(),
+		RoomID:            channelID.String(),
 		RoomKind:          "channel",
 		UserID:            userID.String(),
 		SocketID:          "coverage-socket-1",

@@ -54,6 +54,8 @@ interface JwtClaims {
 // ---------------------------------------------------------------------------
 export interface AuthenticatedSocketData {
   userId: string;
+  /** Absolute deadline from the last verified access token, in milliseconds. */
+  tokenExpiresAt: number;
   /** Signed credential generation captured at socket upgrade. */
   credentialEpoch: string;
   username: string;
@@ -66,6 +68,82 @@ export interface AuthenticatedSocketData {
   rtpCapabilities?: unknown;
   /** Per-event rate-limit buckets (#2032). Freed with the socket. */
   rateBuckets?: Map<string, TokenBucket>;
+}
+
+function verifySocketToken(token: string): JwtClaims & { exp: number } {
+  const claims = jwt.verify(token, config.jwtSecret, {
+    algorithms: ['HS256'],
+    issuer: 'concordvoice-control-plane',
+  }) as JwtClaims;
+  if (Object.hasOwn(claims, 'purpose')) {
+    throw new Error('Invalid token: unexpected purpose');
+  }
+  if (typeof claims.exp !== 'number' || !Number.isSafeInteger(claims.exp * 1000)) {
+    throw new TypeError('Invalid token: missing expiration');
+  }
+  return claims as JwtClaims & { exp: number };
+}
+
+/** Bind the deadline and renewal to this socket; renewal never replaces room state. */
+export function createSocketTokenRenewal(
+  socket: Socket,
+  validateRenewal: (token: string) => Promise<void>
+) {
+  const data = socket.data as AuthenticatedSocketData;
+  let timer: ReturnType<typeof setTimeout>;
+  const scheduleExpiry = () => {
+    clearTimeout(timer);
+    const remaining = data.tokenExpiresAt - Date.now();
+    if (remaining <= 0) {
+      socket.disconnect(true);
+      return;
+    }
+    // Node truncates larger delays to 1 ms; recheck long-lived signed tokens.
+    timer = setTimeout(scheduleExpiry, Math.min(remaining, 2_147_483_647));
+    timer.unref();
+  };
+  socket.once('disconnect', () => clearTimeout(timer));
+  socket.use((_, next) => {
+    if (Date.now() >= data.tokenExpiresAt) {
+      socket.disconnect(true);
+      return;
+    }
+    next();
+  });
+  scheduleExpiry();
+
+  return async (token: unknown, callback?: unknown): Promise<void> => {
+    let result: { success: true } | { error: string };
+    try {
+      if (!socket.connected || Date.now() >= data.tokenExpiresAt || typeof token !== 'string') {
+        throw new Error('Invalid renewal');
+      }
+      const claims = verifySocketToken(token);
+      if (
+        claims.user_id !== data.userId ||
+        (typeof claims.cred_epoch === 'string' ? claims.cred_epoch : '') !== data.credentialEpoch ||
+        claims.exp * 1000 <= data.tokenExpiresAt
+      ) {
+        throw new Error('Invalid renewal');
+      }
+      await validateRenewal(token);
+      if (
+        !socket.connected ||
+        Date.now() >= data.tokenExpiresAt ||
+        Date.now() >= claims.exp * 1000 ||
+        claims.exp * 1000 <= data.tokenExpiresAt
+      ) {
+        throw new Error('Expired renewal');
+      }
+      data.tokenExpiresAt = claims.exp * 1000;
+      socket.handshake.auth.token = token;
+      scheduleExpiry();
+      result = { success: true };
+    } catch {
+      result = { error: 'Authentication failed' };
+    }
+    if (typeof callback === 'function') callback(result);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +173,25 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
       // Telemetry must never affect the authentication decision.
     }
   };
+  const rejectToken = (socket: Socket, next: (err?: ExtendedError) => void, err: unknown) => {
+    deny();
+    if (err instanceof Error && err.message === 'Invalid token: missing expiration') {
+      return next(err);
+    }
+    if (err instanceof jwt.TokenExpiredError) {
+      logger.warn('Socket connection rejected: token expired', { socketId: socket.id });
+      return next(new Error('Token expired'));
+    }
+    if (err instanceof jwt.JsonWebTokenError) {
+      logger.warn('Socket connection rejected: invalid token', {
+        socketId: socket.id,
+        error: err.message,
+      });
+      return next(new Error('Invalid token'));
+    }
+    logger.error('Socket auth unexpected error', { socketId: socket.id, error: err });
+    return next(new Error('Authentication failed'));
+  };
   return (socket: Socket, next: (err?: ExtendedError) => void) => {
     const { token, username, displayName, avatarUrl } = socket.handshake.auth;
 
@@ -103,7 +200,6 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
       deny();
       logger.warn('Socket connection rejected: missing token', {
         socketId: socket.id,
-        address: socket.handshake.address,
       });
       return next(new Error('Authentication required'));
     }
@@ -119,10 +215,7 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
 
     try {
       // Verify JWT signature and expiry
-      const decoded = jwt.verify(token, config.jwtSecret, {
-        algorithms: ['HS256'],
-        issuer: 'concordvoice-control-plane',
-      }) as JwtClaims;
+      const decoded = verifySocketToken(token);
 
       if (!decoded.user_id) {
         deny();
@@ -176,6 +269,7 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
       // Attach authenticated user data to socket
       const socketData = socket.data as AuthenticatedSocketData;
       socketData.userId = decoded.user_id;
+      socketData.tokenExpiresAt = decoded.exp * 1000;
       socketData.credentialEpoch = typeof decoded.cred_epoch === 'string' ? decoded.cred_epoch : '';
       // Entitlement tier rides the signed JWT claim (control-plane auth.Claims.Tier).
       // Absent or blank → 'free' (fail-closed). Consumption at the join/enforcement
@@ -188,34 +282,11 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
       logger.debug('Socket authenticated', {
         socketId: socket.id,
         userId: decoded.user_id,
-        username,
       });
 
       next();
     } catch (err) {
-      if (err instanceof jwt.TokenExpiredError) {
-        deny();
-        logger.warn('Socket connection rejected: token expired', {
-          socketId: socket.id,
-        });
-        return next(new Error('Token expired'));
-      }
-
-      if (err instanceof jwt.JsonWebTokenError) {
-        deny();
-        logger.warn('Socket connection rejected: invalid token', {
-          socketId: socket.id,
-          error: (err as Error).message,
-        });
-        return next(new Error('Invalid token'));
-      }
-
-      logger.error('Socket auth unexpected error', {
-        socketId: socket.id,
-        error: err,
-      });
-      deny();
-      return next(new Error('Authentication failed'));
+      return rejectToken(socket, next, err);
     }
   };
 }

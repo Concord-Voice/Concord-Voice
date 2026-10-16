@@ -421,7 +421,7 @@ func TestDMVisibility_EventsAreActorOnlyAndStatePreserved(t *testing.T) {
 	t.Cleanup(wsServer.Close)
 	connect := func(userID, suffix string) *gorillaWS.Conn {
 		ticket := "dm-visibility-" + suffix + "-" + uuid.NewString()
-		require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":"+suffix, time.Minute).Err())
+		require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:%s::%d", userID, suffix, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 		conn, _, dialErr := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 		require.NoError(t, dialErr)
 		t.Cleanup(func() { _ = conn.Close() })
@@ -691,7 +691,7 @@ func connectDMVisibilityWebSocket(t *testing.T, ts *testhelpers.TestServer, user
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	ticket := "dm-visibility-" + suffix + "-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":"+suffix, time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:%s::%d", userID, suffix, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })

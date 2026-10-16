@@ -110,6 +110,12 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		}
 	}()
 	activityRichPresenceCapable := requestSupportsActivityRichPresence(c.Request)
+	expiresAt, ok := c.Get(wsDeadlineContextKey)
+	deadline, valid := expiresAt.(time.Time)
+	if !ok || !valid || !time.Now().Before(deadline) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	// Look up username, display name, and avatar for this user
 	var username string
@@ -118,6 +124,10 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	if err := h.db.QueryRow("SELECT username, display_name, avatar_url FROM users WHERE id = $1", userID).Scan(&username, &displayName, &avatarURL); err != nil {
 		log.Printf("Failed to look up username for user %s: %v", sanitizeLogValue(userID.String()), err)
 		username = "Unknown"
+	}
+	if !time.Now().Before(deadline) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
 	}
 
 	// Upgrade HTTP connection to WebSocket
@@ -134,6 +144,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		UserID:                      userID,
 		SessionID:                   sessionID,
 		CredEpoch:                   c.GetString(wsCredEpochContextKey),
+		TokenExpiresAt:              deadline,
 		Username:                    username,
 		DisplayName:                 displayName,
 		AvatarURL:                   avatarURL,
@@ -149,11 +160,23 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	release = nil
 	defer client.releaseConnection()
 	closePending := func() {
+		if client.tokenExpiryTimer != nil {
+			client.tokenExpiryTimer.Stop()
+		}
 		if err := conn.Close(); err != nil && !alreadyDisconnected(err) {
 			log.Printf("Failed to close pending WebSocket: %s", describeSocketFailure(err))
 		}
 		client.releaseConnection() // No hub owns this client.
 	}
+	registered := make(chan struct{})
+	client.tokenExpiryTimer = time.AfterFunc(time.Until(deadline), func() {
+		client.closeExpiredToken()
+		select {
+		case <-registered:
+			client.requestUnregister()
+		default:
+		}
+	})
 
 	// Register client with hub. This channel is UNBUFFERED (hub.go:322) and that is
 	// load-bearing for the re-check below — do not add a buffer.
@@ -161,6 +184,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	defer registrationTimer.Stop()
 	select {
 	case h.hub.register <- client:
+		close(registered)
 	case <-h.hub.done:
 		closePending()
 		return
@@ -169,6 +193,11 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		return
 	case <-registrationTimer.C:
 		closePending()
+		return
+	}
+	if client.tokenExpired() {
+		client.closeExpiredToken()
+		client.requestUnregister()
 		return
 	}
 
@@ -191,14 +220,17 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// skip the check rather than dereference a nil fence.
 	if h.fence != nil {
 		if err := h.fence.Check(c.Request.Context(), userID.String(), client.CredEpoch); err != nil {
+			client.tokenExpiryTimer.Stop()
 			log.Printf("Evicting WebSocket client for user %s: credential epoch superseded", sanitizeLogValue(userID.String()))
-			select {
-			case h.hub.unregister <- client:
-			case <-h.hub.done:
-			}
+			client.requestUnregister()
 			client.closeRevokedConnection()
 			return
 		}
+	}
+	if client.tokenExpired() {
+		client.closeExpiredToken()
+		client.requestUnregister()
+		return
 	}
 
 	// Start client's read and write pumps
@@ -234,7 +266,7 @@ func (h *Handler) authenticateWebSocket(c *gin.Context) (uuid.UUID, string, erro
 func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUID, string, error) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
-	userIDStr, sessionID, ticketEpoch, err := auth.ValidateTicket(ctx, h.redis, ticket)
+	userIDStr, sessionID, ticketEpoch, expiresAt, err := auth.ValidateTicket(ctx, h.redis, ticket)
 	if err != nil {
 		return uuid.Nil, "", fmt.Errorf("invalid ticket: %w", err)
 	}
@@ -262,6 +294,7 @@ func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUI
 	// Retain the epoch for the socket so message-frame ciphertext writes can be
 	// fenced against a later reset (#2201, Codex #2397 review).
 	c.Set(wsCredEpochContextKey, ticketEpoch)
+	c.Set(wsDeadlineContextKey, expiresAt)
 	return userID, sessionID, nil
 }
 
@@ -272,6 +305,8 @@ func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUI
 //
 //nolint:gosec // G101: context-key name, not a credential
 const wsCredEpochContextKey = "ws_cred_epoch"
+
+const wsDeadlineContextKey = "ws_deadline"
 
 // checkUserDisabled mirrors the HTTP middleware's immediate-effect denylist
 // gate (#1623) for WS upgrades: a present user_disabled key OR a Redis error
@@ -319,6 +354,10 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 	if !ok || !token.Valid || !middleware.IsAccessToken(claims) {
 		return uuid.Nil, "", fmt.Errorf("invalid authentication")
 	}
+	expiresAt, err := claims.GetExpirationTime()
+	if err != nil || expiresAt == nil || !time.Now().Before(expiresAt.Time) {
+		return uuid.Nil, "", fmt.Errorf("invalid token deadline")
+	}
 
 	if err := h.checkTokenBlacklist(c, claims); err != nil {
 		return uuid.Nil, "", err
@@ -344,6 +383,7 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 		}
 	}
 	c.Set(wsCredEpochContextKey, tokenEpoch)
+	c.Set(wsDeadlineContextKey, expiresAt.Time)
 	return userID, sessionID, nil
 }
 

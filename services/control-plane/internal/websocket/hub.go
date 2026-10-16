@@ -1572,6 +1572,11 @@ func (h *Hub) Stopped() <-chan struct{} {
 
 // handleRegister registers a new client
 func (h *Hub) handleRegister(client *Client) {
+	if client.tokenExpired() {
+		client.closeExpiredToken()
+		client.releaseConnection()
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in client.asyncCancel, called by Run shutdown and handleUnregister
 	client.asyncCancel = cancel
 	// Start the replacement boundary before publishing the client in Hub maps so
@@ -2022,6 +2027,9 @@ func (h *Hub) removeFromSubscriptionMap(m map[uuid.UUID]map[uuid.UUID]bool, key,
 
 // handleIncoming processes incoming messages from clients
 func (h *Hub) handleIncoming(msg IncomingMessage) {
+	if !msg.TokenExpiresAt.IsZero() && !time.Now().Before(msg.TokenExpiresAt) {
+		return
+	}
 	// Recorded before the switch so it counts every application frame, not only a
 	// heartbeat -- a client actively chatting is self-evidently alive. msg.UserID
 	// is server-assigned in readPump from the authenticated connection, so a

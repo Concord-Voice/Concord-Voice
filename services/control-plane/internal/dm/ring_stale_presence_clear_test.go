@@ -7,6 +7,7 @@ package dm_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -61,7 +62,7 @@ func ringDM(t *testing.T, ts *testhelpers.TestServer, caller testhelpers.TestUse
 func dialRichPresenceViewer(t *testing.T, ts *testhelpers.TestServer, userID string) *gorillaWS.Conn {
 	t.Helper()
 	ticket := "dm-ring-clear-viewer-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":ring-viewer", time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:ring-viewer::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial(

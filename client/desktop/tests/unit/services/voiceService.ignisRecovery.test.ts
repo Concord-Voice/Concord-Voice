@@ -40,7 +40,10 @@ const mockSocket = {
 };
 
 vi.mock('socket.io-client', () => ({
-  io: vi.fn().mockReturnValue(mockSocket),
+  io: vi.fn().mockImplementation((_url: string, options: { auth: (cb: () => void) => void }) => {
+    options.auth(() => {});
+    return mockSocket;
+  }),
 }));
 
 // --- apiClient ---

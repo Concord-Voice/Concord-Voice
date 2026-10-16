@@ -781,6 +781,9 @@ const MIC_PROCESSING_STOPPED_ERROR =
 
 class VoiceService {
   private socket: Socket | null = null;
+  private mediaHandshake: { token: string | null; generation: number; admitted: boolean } | null =
+    null;
+  private authRenewalRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private device: Device | null = null;
   private sendTransport: mediasoupTypes.Transport | null = null;
   // Split recv transports for E2EE channels — avoids BUNDLE codec collision (#291).
@@ -3802,8 +3805,15 @@ class VoiceService {
         // refresh timer (#240) keeps the store token current mid-call.
         auth: (cb) => {
           const user = useUserStore.getState().user;
+          const auth = useAuthStore.getState();
+          this.clearAuthRenewalRetry();
+          this.mediaHandshake = {
+            token: auth.accessToken,
+            generation: auth.authGeneration,
+            admitted: false,
+          };
           cb({
-            token: useAuthStore.getState().accessToken,
+            token: auth.accessToken,
             username: user?.username || 'unknown',
             displayName: user?.display_name || undefined,
             avatarUrl: user?.avatar_url || undefined,
@@ -4050,6 +4060,8 @@ class VoiceService {
    * All operations are idempotent — safe to call multiple times.
    */
   emergencyCleanup(): void {
+    this.clearAuthRenewalRetry();
+    this.mediaHandshake = null;
     this.cleanupMediaAndTransports();
     this.cleanupTimersAndE2EE();
 
@@ -4137,6 +4149,7 @@ class VoiceService {
     // every console method is captured into the bug-report buffer (NC-1, #3104).
     console.debug('[ice] servers', describeIceServers(this.iceServers));
 
+    const admissionHandshake = this.mediaHandshake;
     const roomJoined = await this.emitAsync<RoomJoinedResponse>('join-room', {
       roomId: channelId,
       rtpCapabilities: undefined, // Will be set after device.load
@@ -4146,6 +4159,17 @@ class VoiceService {
     if (roomJoined.mediaFrameCryptoVersion !== MEDIA_E2EE_FRAME_CRYPTO_VERSION) {
       throw new Error('Media frame crypto version mismatch');
     }
+    if (
+      !admissionHandshake ||
+      this.mediaHandshake !== admissionHandshake ||
+      !this.socket?.connected ||
+      admissionHandshake.generation !== useAuthStore.getState().authGeneration
+    ) {
+      throw new Error('Voice authentication changed during room admission');
+    }
+    admissionHandshake.admitted = true;
+    const latestToken = useAuthStore.getState().accessToken;
+    if (latestToken) this.refreshAuthentication(latestToken);
 
     // Pin the camera cap for this session. Resolved once, here rather than beside
     // iceServers, because the most authoritative source is the SFU's own admitted
@@ -9074,6 +9098,43 @@ class VoiceService {
     });
   }
 
+  private clearAuthRenewalRetry(): void {
+    if (this.authRenewalRetryTimer) clearTimeout(this.authRenewalRetryTimer);
+    this.authRenewalRetryTimer = null;
+  }
+
+  refreshAuthentication(token: string, retry = false): void {
+    const socket = this.socket;
+    const handshake = this.mediaHandshake;
+    const canRenew = () =>
+      socket?.connected &&
+      this.socket === socket &&
+      this.mediaHandshake === handshake &&
+      handshake?.admitted &&
+      handshake.generation === useAuthStore.getState().authGeneration &&
+      useAuthStore.getState().accessToken === token &&
+      handshake.token !== token;
+    if (!socket || !canRenew()) return;
+    this.clearAuthRenewalRetry();
+    socket.timeout(5_000).emit('refresh-auth', token, (error: Error | null, response: unknown) => {
+      if (
+        retry ||
+        (!error &&
+          typeof response === 'object' &&
+          response !== null &&
+          'success' in response &&
+          response.success === true) ||
+        !canRenew()
+      ) {
+        return;
+      }
+      this.authRenewalRetryTimer = setTimeout(() => {
+        this.authRenewalRetryTimer = null;
+        if (canRenew()) this.refreshAuthentication(token, true);
+      }, 10_000);
+    });
+  }
+
   private setupSocketListeners(): void {
     if (!this.socket) return;
 
@@ -9306,6 +9367,8 @@ class VoiceService {
     });
 
     this.socket.on('disconnect', (reason) => {
+      this.clearAuthRenewalRetry();
+      this.mediaHandshake = null;
       // eslint-disable-next-line no-restricted-syntax -- reason is a string, not an Error; no err.cause propagation risk
       console.warn('Media plane disconnected:', reason);
       if (reason === 'io server disconnect') {
@@ -11311,6 +11374,8 @@ class VoiceService {
   }
 
   private async cleanup(): Promise<void> {
+    this.clearAuthRenewalRetry();
+    this.mediaHandshake = null;
     // Invalidate asynchronous crypto work and drop the live rotation listener
     // before closeProducer reaches the first await.
     this.invalidatePendingE2EEInit();
@@ -11466,12 +11531,20 @@ class VoiceService {
 // Export singleton
 export const voiceService = new VoiceService();
 
-// Auto-cleanup voice when auth tokens are cleared (logout, token revocation,
-// refresh failure). This fires BEFORE the React tree re-renders, ensuring
-// media stops immediately regardless of which code path called clearTokens().
+// Auto-cleanup voice when the auth session is replaced or cleared. This fires
+// before React re-renders, stopping media owned by the previous login.
 useAuthStore.subscribe((state, prevState) => {
-  if (prevState.accessToken && !state.accessToken) {
+  if (
+    prevState.accessToken &&
+    (!state.accessToken || state.authGeneration !== prevState.authGeneration)
+  ) {
     voiceService.emergencyCleanup();
+  } else if (
+    state.accessToken &&
+    state.accessToken !== prevState.accessToken &&
+    state.authGeneration === prevState.authGeneration
+  ) {
+    voiceService.refreshAuthentication(state.accessToken);
   }
 });
 

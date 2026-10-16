@@ -23,7 +23,7 @@ func connectVisibilityWS(t *testing.T, ts *testhelpers.TestServer, userID, convI
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	ticket := "dm-respawn-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":"+ticket, time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:%s::%d", userID, ticket, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
 	conn, _, dialErr := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 	require.NoError(t, dialErr)
 	t.Cleanup(func() { _ = conn.Close() })

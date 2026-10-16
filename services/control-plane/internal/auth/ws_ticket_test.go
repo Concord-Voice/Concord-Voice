@@ -15,6 +15,10 @@ import (
 
 const wsTicketKeyPrefix = "ws_ticket:"
 
+func testTicketValue(userID, sessionID, epoch string) string {
+	return fmt.Sprintf("%s:%s:%s:%d", userID, sessionID, epoch, time.Now().Add(15*time.Minute).Unix())
+}
+
 // --- ValidateTicket Unit Tests (no HTTP, direct Redis) ---
 
 func TestValidateTicketSuccess(t *testing.T) {
@@ -24,10 +28,10 @@ func TestValidateTicketSuccess(t *testing.T) {
 	// Seed a ticket directly in Redis
 	ticket := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 	key := wsTicketKeyPrefix + ticket
-	err := ts.Redis.Set(ctx, key, "user-123", 30*time.Second).Err()
+	err := ts.Redis.Set(ctx, key, testTicketValue("user-123", "", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
-	userID, sessionID, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, "user-123", userID)
 	assert.Empty(t, sessionID)
@@ -39,10 +43,10 @@ func TestValidateTicketWithSessionID(t *testing.T) {
 
 	ticket := "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
 	key := wsTicketKeyPrefix + ticket
-	err := ts.Redis.Set(ctx, key, "user-456:session-abc", 30*time.Second).Err()
+	err := ts.Redis.Set(ctx, key, testTicketValue("user-456", "session-abc", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
-	userID, sessionID, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, "user-456", userID)
 	assert.Equal(t, "session-abc", sessionID)
@@ -54,16 +58,16 @@ func TestValidateTicketSingleUse(t *testing.T) {
 
 	ticket := "singleuse1234567890singleuse1234567890singleuse1234567890singleu"
 	key := wsTicketKeyPrefix + ticket
-	err := ts.Redis.Set(ctx, key, "user-789", 30*time.Second).Err()
+	err := ts.Redis.Set(ctx, key, testTicketValue("user-789", "", ""), 30*time.Second).Err()
 	require.NoError(t, err)
 
 	// First use succeeds
-	userID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, "user-789", userID)
 
 	// Second use fails (ticket deleted)
-	_, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
+	_, _, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid or expired")
 }
@@ -72,7 +76,7 @@ func TestValidateTicketEmpty(t *testing.T) {
 	ts := setupTS(t)
 	ctx := context.Background()
 
-	_, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "")
+	_, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "empty ticket")
 }
@@ -81,7 +85,7 @@ func TestValidateTicketWhitespace(t *testing.T) {
 	ts := setupTS(t)
 	ctx := context.Background()
 
-	_, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "   ")
+	_, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "   ")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "empty ticket")
 }
@@ -91,7 +95,7 @@ func TestValidateTicketExpired(t *testing.T) {
 	ctx := context.Background()
 
 	// Nonexistent ticket (simulates expired)
-	_, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "nonexistent-ticket-value")
+	_, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, "nonexistent-ticket-value")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid or expired")
 }
@@ -113,7 +117,7 @@ func TestIssueTicketSuccess(t *testing.T) {
 
 	// Verify ticket is valid in Redis
 	ctx := context.Background()
-	userID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID)
 }
@@ -134,7 +138,7 @@ func TestIssueTicketWithSessionID(t *testing.T) {
 
 	// Validate and check session ID
 	ctx := context.Background()
-	userID, sessionID, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID)
 	assert.Equal(t, "test-session-123", sessionID)
@@ -167,11 +171,11 @@ func TestIssueTicketMultipleTickets(t *testing.T) {
 
 	// Both should be valid
 	ctx := context.Background()
-	userID1, _, _, err := auth.ValidateTicket(ctx, ts.Redis, body1["ticket"].(string))
+	userID1, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, body1["ticket"].(string))
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID1)
 
-	userID2, _, _, err := auth.ValidateTicket(ctx, ts.Redis, body2["ticket"].(string))
+	userID2, _, _, _, err := auth.ValidateTicket(ctx, ts.Redis, body2["ticket"].(string))
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID2)
 }
@@ -180,20 +184,14 @@ func TestValidateTicketSessionIDWithColons(t *testing.T) {
 	ts := setupTS(t)
 	ctx := context.Background()
 
-	// Post-#2201 the value is 3-segment (userID:sessionID:credEpoch), so a
-	// colon-bearing middle segment parses as sessionID + epoch tail. IssueTicket
-	// discards colon-bearing X-Session-ID values (session IDs are UUIDs), so
-	// this shape only documents the parser's defensive SplitN(3) behavior.
+	// Extra segments must not shift the authenticated epoch or deadline.
 	ticket := "colontest12345678901234567890123456789012345678901234567890abcde"
 	key := wsTicketKeyPrefix + ticket
 	err := ts.Redis.Set(ctx, key, "user-x:session:with:colons", 30*time.Second).Err()
 	require.NoError(t, err)
 
-	userID, sessionID, credEpoch, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
-	require.NoError(t, err)
-	assert.Equal(t, "user-x", userID)
-	assert.Equal(t, "session", sessionID)
-	assert.Equal(t, "with:colons", credEpoch)
+	_, _, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
+	require.Error(t, err)
 }
 
 func TestIssueTicketStoresWithTTL(t *testing.T) {
@@ -218,56 +216,55 @@ func TestIssueTicketStoresWithTTL(t *testing.T) {
 
 // --- #2201: credential epoch in the ticket value ---
 
-func TestValidateTicket_ThreeSegmentEpochValue(t *testing.T) {
+func TestValidateTicket_DeadlineAndEpochValue(t *testing.T) {
 	ts := setupTS(t)
 	ctx := context.Background()
 
 	ticket := "epoch3seg1234567890abcdef1234567890abcdef1234567890abcdef123456"
 	key := wsTicketKeyPrefix + ticket
-	require.NoError(t, ts.Redis.Set(ctx, key, "user-789:session-xyz:epochE9", 30*time.Second).Err())
+	require.NoError(t, ts.Redis.Set(ctx, key, testTicketValue("user-789", "session-xyz", "epochE9"), 30*time.Second).Err())
 
-	userID, sessionID, credEpoch, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, credEpoch, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, "user-789", userID)
 	assert.Equal(t, "session-xyz", sessionID)
 	assert.Equal(t, "epochE9", credEpoch)
 }
 
-func TestValidateTicket_ThreeSegmentEmptySession(t *testing.T) {
+func TestValidateTicket_DeadlineAndEmptySession(t *testing.T) {
 	ts := setupTS(t)
 	ctx := context.Background()
 
 	ticket := "epochnosess234567890abcdef1234567890abcdef1234567890abcdef123456"
 	key := wsTicketKeyPrefix + ticket
-	require.NoError(t, ts.Redis.Set(ctx, key, "user-790::epochE10", 30*time.Second).Err())
+	require.NoError(t, ts.Redis.Set(ctx, key, testTicketValue("user-790", "", "epochE10"), 30*time.Second).Err())
 
-	userID, sessionID, credEpoch, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, credEpoch, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, "user-790", userID)
 	assert.Empty(t, sessionID)
 	assert.Equal(t, "epochE10", credEpoch)
 }
 
-func TestValidateTicket_LegacyValuesParseEmptyEpoch(t *testing.T) {
+func TestValidateTicket_LegacyValuesWithoutDeadlineAreRejected(t *testing.T) {
 	ts := setupTS(t)
 	ctx := context.Background()
 
-	// Legacy one- and two-segment values (pre-#2201 instances inside the 30s
-	// deploy window) must parse with an empty epoch, not error.
+	// Old tickets cannot establish a signed deadline; a client must fetch a new one.
 	ticket := "legacyoneseg4567890abcdef1234567890abcdef1234567890abcdef1234567"
 	require.NoError(t, ts.Redis.Set(ctx, wsTicketKeyPrefix+ticket, "user-legacy", 30*time.Second).Err())
-	userID, sessionID, credEpoch, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
-	require.NoError(t, err)
-	assert.Equal(t, "user-legacy", userID)
+	userID, sessionID, credEpoch, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	require.Error(t, err)
+	assert.Empty(t, userID)
 	assert.Empty(t, sessionID)
 	assert.Empty(t, credEpoch)
 
 	ticket2 := "legacytwoseg4567890abcdef1234567890abcdef1234567890abcdef1234567"
 	require.NoError(t, ts.Redis.Set(ctx, wsTicketKeyPrefix+ticket2, "user-legacy2:sess-2", 30*time.Second).Err())
-	userID, sessionID, credEpoch, err = auth.ValidateTicket(ctx, ts.Redis, ticket2)
-	require.NoError(t, err)
-	assert.Equal(t, "user-legacy2", userID)
-	assert.Equal(t, "sess-2", sessionID)
+	userID, sessionID, credEpoch, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket2)
+	require.Error(t, err)
+	assert.Empty(t, userID)
+	assert.Empty(t, sessionID)
 	assert.Empty(t, credEpoch)
 }
 
@@ -297,7 +294,9 @@ func TestIssueTicket_StoresEpochFromRequestClaims(t *testing.T) {
 
 	stored, err := ts.Redis.Get(ctx, wsTicketKeyPrefix+ticket).Result()
 	require.NoError(t, err)
-	assert.Equal(t, fmt.Sprintf("%s::tickepoch1", user.ID), stored)
+	claims, err := auth.ValidateAccessToken(tok, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("%s::tickepoch1:%d", user.ID, claims.ExpiresAt.Unix()), stored)
 }
 
 // #2201 (Codex #2397 review): the ticket must bind to the authenticated `sid`
@@ -322,7 +321,7 @@ func TestIssueTicket_PrefersAuthenticatedSidOverSpoofedHeader(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	ticket := body["ticket"].(string)
 
-	userID, sessionID, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID)
 	assert.Equal(t, "authsid-9", sessionID,
