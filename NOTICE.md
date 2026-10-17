@@ -646,6 +646,7 @@ runs everything below and rewrites the four tables and the summary counts in one
 step. It is dry-run by default; `--apply` writes.
 
 ```bash
+(cd .github/tools/license-checker && npm ci --ignore-scripts --no-audit --no-fund) && \
 (cd client/desktop && npm ci) && (cd services/media-plane && npm ci) && \
 (cd client/admin && npm ci) && ./scripts/update-notice-md.py --apply
 ```
@@ -681,7 +682,7 @@ compensating control is manual and lives in `/weekly-deps` Phase 6.3 — diff th
 module cache's `LICENSE` across the two versions whenever a Go pin moves.
 
 The commands the script runs, for reference and for regenerating one family by
-hand:
+hand, from the repository root:
 
 `--excludePrivatePackages` is what drops the first-party rows: Concord Voice's
 own packages and the local `node-domexception` stub override (documented in
@@ -692,19 +693,22 @@ key, so a bare name never matches and the exclusion silently does nothing.
 `.github/workflows/license-check.yml` uses the same flag, so the two paths agree.
 
 ```bash
+(cd .github/tools/license-checker && npm ci --ignore-scripts --no-audit --no-fund)
+notice_checker="$PWD/.github/tools/license-checker/node_modules/.bin/license-checker"
+
 # Desktop client (npm)
-cd client/desktop && npx license-checker --production --csv --excludePrivatePackages > /tmp/desktop-licenses.csv
+(cd client/desktop && "$notice_checker" --production --csv --excludePrivatePackages > /tmp/desktop-licenses.csv)
 
 # Media-plane (npm)
-cd services/media-plane && npx license-checker --production --csv --excludePrivatePackages > /tmp/media-licenses.csv
+(cd services/media-plane && "$notice_checker" --production --csv --excludePrivatePackages > /tmp/media-licenses.csv)
 
 # Admin portal (npm) -- bundled into the control-plane runtime image at /admin-ui
-cd client/admin && npx license-checker --production --csv --excludePrivatePackages > /tmp/admin-licenses.csv
+(cd client/admin && "$notice_checker" --production --csv --excludePrivatePackages > /tmp/admin-licenses.csv)
 
 # Go control-plane (binary runtime modules). All THREE shipped binaries, not
 # just the server -- a module reachable from any of them is distributed. Lines
 # with an empty version are first-party module paths; drop them.
-cd services/control-plane && go list -deps -e -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/server ./cmd/migrate-media ./cmd/mfa-rekey | sort -u
+(cd services/control-plane && go list -deps -e -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/server ./cmd/migrate-media ./cmd/mfa-rekey | sort -u)
 ```
 
 Each table below is sorted the way `license-checker` sorts its CSV: by the full
