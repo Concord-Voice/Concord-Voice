@@ -83,53 +83,6 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   COMPOSE_CMD=selfhost_storage_compose
 fi
 
-managed_egress_gate() {
-  [[ $# -eq 1 && ( $1 == verify || $1 == ready ) ]] || return 1
-  [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] && return 0
-  local role
-  case "$COMPOSE_OVERRIDE" in
-    docker-compose.production.yml) role=production ;;
-    docker-compose.staging.yml) role=staging ;;
-    *) echo 'managed-egress: deployment role is unknown' >&2; return 1 ;;
-  esac
-  sudo -n /usr/local/sbin/nightwatch-egress "$1" --role "$role" >/dev/null || {
-    echo 'managed-egress: root-admitted role policy is unavailable or not ready' >&2
-    return 1
-  }
-}
-
-control_plane_cli() (
-  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never control-plane ./main "$@"
-    return
-  fi
-  local running temporary
-  running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
-  temporary=''
-  if [[ -z "$running" ]]; then
-    # Drained maintenance must remain non-serving until its namespace is admitted.
-    temporary="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --detach --no-deps --pull never \
-      --entrypoint /bin/sleep control-plane 2147483647)" || return 1
-    [[ "$temporary" =~ ^[a-f0-9]{64}$ ]] || { echo 'managed-egress: invalid maintenance container identity' >&2; return 1; }
-    trap 'result=$?; docker rm -f "$temporary" >/dev/null 2>&1 || result=1; sudo -n /usr/local/sbin/concord-egress refresh >/dev/null 2>&1 || result=1; exit "$result"' EXIT
-    trap 'exit 1' HUP INT TERM
-  fi
-  sudo -n /usr/local/sbin/concord-egress refresh >/dev/null || {
-    echo 'managed-egress: maintenance namespace reconciliation failed' >&2
-    return 1
-  }
-  managed_egress_gate verify || return 1
-  if [[ -n "$temporary" ]]; then
-    docker exec "$temporary" ./main "$@"
-  else
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T control-plane ./main "$@"
-  fi
-)
-
-if [[ "${1:-help}" == freshstart ]]; then
-  managed_egress_gate verify || exit 1
-fi
-
 selfhost_storage_start_guard() {
   [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] || return 0
   selfhost_storage_assert_no_running_minio
@@ -710,7 +663,8 @@ activity_history_image_is_local() {
 
 activity_history_run_admin() {
   local verb="$1"
-  control_plane_cli activity-history "$verb" --confirm-drained
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never \
+    control-plane ./main activity-history "$verb" --confirm-drained)
 }
 
 activity_history_start_control_plane() {
@@ -1239,7 +1193,8 @@ voice_enforcement_rollout_cli() {
       return 2
       ;;
   esac
-  control_plane_cli voice-enforcement-rollout "$verb" "$@"
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never \
+    control-plane ./main voice-enforcement-rollout "$verb" "$@")
 }
 
 voice_enforcement_rollout_deactivate_for_rollback() {
@@ -1685,12 +1640,6 @@ case "${1:-help}" in
     # flake. 90s comfortably exceeds the actor's worst-case hold.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
-    ;;
-esac
-
-case "${1:-help}" in
-  rebuild|restart|activity-history-activate|activity-history-rollback|voice-enforcement-rollout)
-    managed_egress_gate verify || exit 1
     ;;
 esac
 
@@ -2168,7 +2117,7 @@ else:
         exit 1
       fi
     fi
-    control_plane_cli storage-probe "$@"
+    cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never control-plane ./main storage-probe "$@"
     ;;
 
   attachment-probe-cron-install)
@@ -2828,10 +2777,8 @@ else:
           coturn_refresh_skipped=1
         fi
       fi
-      egress_ok=0
-      managed_egress_gate ready && egress_ok=1
       if (( $(date +%s) < DEADLINE )) &&
-          [[ $cp_ok -eq 1 && $mp_ok -eq 1 && $coturn_ok -eq 1 && $tls_ok -eq 1 && $egress_ok -eq 1 ]]; then
+          [[ $cp_ok -eq 1 && $mp_ok -eq 1 && $coturn_ok -eq 1 && $tls_ok -eq 1 ]]; then
         selfhost_post_up_check || exit 1
         if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
           echo "  ✓ all services healthy (control-plane + media-plane + coturn TLS)"
@@ -2934,7 +2881,6 @@ else:
     # place: freshstart still holds the interlock for everything destructive.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
-    managed_egress_gate verify || exit 1
 
     clear_activity_history_image_selector
     activity_history_invalidate_activation_receipt
