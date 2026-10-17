@@ -25,6 +25,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/roomplacement"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -42,6 +43,7 @@ type NATSSubscriber struct {
 	hub                 *websocket.Hub
 	nats                *natsclient.Client
 	redis               *redis.Client
+	roomPlacement       *roomplacement.Selector
 	tempGrant           *tempGrantManager
 	activity            *presence.ActivityService
 	opsCounters         *opsmetrics.Counters
@@ -238,6 +240,9 @@ func (s *NATSSubscriber) withServerVoiceTerminalTransaction(
 			return result, fmt.Errorf("lock server voice terminal lifecycle: %w", ctxErr)
 		}
 		return result, fmt.Errorf("lock server voice terminal lifecycle: %w", err)
+	}
+	if !s.lifecycleStillFull(ctx) {
+		return result, nil
 	}
 	qualified, err := requalify(ctx, tx)
 	if err != nil {
@@ -1275,6 +1280,9 @@ func (s *NATSSubscriber) withServerVoiceLifecycleClaim(
 	if err := lockVoiceParticipantUsersTx(ctx, tx, []uuid.UUID{request.senderID}, dmblock.LockShare); err != nil {
 		return false, voiceLifecycleRejected, err
 	}
+	if !s.lifecycleStillFull(ctx) {
+		return false, voiceLifecycleRejected, nil
+	}
 	qualified, err := s.serverVoiceLifecycleClaimQualified(ctx, tx, request)
 	if err != nil || !qualified {
 		return false, voiceLifecycleRejected, err
@@ -1614,6 +1622,9 @@ func (s *NATSSubscriber) withPrivateVoiceParticipantSetClaim(
 	if err != nil || rejected {
 		return false, voiceLifecycleRejected, err
 	}
+	if !s.lifecycleStillFull(ctx) {
+		return false, voiceLifecycleRejected, nil
+	}
 	state.mutationApplied, err = mutation(ctx, tx, voiceLifecycleFresh)
 	if err != nil {
 		return false, voiceLifecycleRejected, err
@@ -1920,6 +1931,9 @@ func (s *NATSSubscriber) withVoiceLifecycleLockInParticipantSet(
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
 		return false, fmt.Errorf("lock voice lifecycle mutation: %w", err)
 	}
+	if !s.lifecycleStillFull(ctx) {
+		return false, nil
+	}
 	applied, err = mutation(ctx, tx)
 	if err != nil {
 		return false, err
@@ -2004,6 +2018,12 @@ func (s *NATSSubscriber) withVoiceLifecycleClaimsOnce(
 		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback grouped voice lifecycle mutation")
 	}()
 	if err := s.lockGroupedPrivateVoiceScopes(ctx, tx, request, state); err != nil {
+		return nil, false, false, err
+	}
+	if !s.lifecycleStillFull(ctx) {
+		return nil, false, false, nil
+	}
+	if err := s.refreshGroupedPrivateVoiceLease(ctx, request, state.accepted); err != nil {
 		return nil, false, false, err
 	}
 	if err := s.prepareGroupedPrivateVoiceTarget(ctx, tx, request, state); err != nil {
@@ -2163,7 +2183,7 @@ func (s *NATSSubscriber) lockGroupedPrivateVoiceScopes(
 	state.scopeMemberships = memberships
 	state.preflightTarget = targetRecords
 	state.preflightOldScope = preflightOldScope
-	return s.refreshGroupedPrivateVoiceLease(ctx, request, state.accepted)
+	return nil
 }
 
 func groupedPrivateVoiceConversationIDs(
@@ -2903,6 +2923,9 @@ func (s *NATSSubscriber) upsertPrivateVoiceParticipantOnce(
 	rejected, err := s.lockPrivateVoiceParticipantUpsert(ctx, tx, state)
 	if err != nil || rejected {
 		return false, nil, err
+	}
+	if !s.lifecycleStillFull(ctx) {
+		return false, nil, nil
 	}
 	rejected, err = s.preparePrivateVoiceParticipantUpsertOldScopes(ctx, tx, state)
 	if err != nil || rejected {
@@ -3995,13 +4018,14 @@ func NewNATSSubscriber(
 	activity *presence.ActivityService,
 ) *NATSSubscriber {
 	return &NATSSubscriber{
-		db:        db,
-		log:       log,
-		hub:       hub,
-		nats:      nats,
-		redis:     redisClient,
-		tempGrant: newTempGrantManager(db, log, hub, resolver, nats),
-		activity:  activity,
+		db:            db,
+		log:           log,
+		hub:           hub,
+		nats:          nats,
+		redis:         redisClient,
+		roomPlacement: &roomplacement.Selector{Redis: redisClient},
+		tempGrant:     newTempGrantManager(db, log, hub, resolver, nats),
+		activity:      activity,
 		// #2854 B1. Wired here and only here; a nil gate is a silent no-op, so
 		// TestNewNATSSubscriberWiresTheIngressGates asserts all three are set.
 		// That test proves the gates EXIST. What proves the voice gate is
@@ -4249,13 +4273,9 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		}
 		return false, false, nil
 	}
-	if err := rbac.LockServerVisibilityCapture(ctx, tx, candidate.serverID.String()); err != nil {
-		return false, false, fmt.Errorf("lock stale server voice visibility: %w", err)
-	}
-
-	acquired, err := tryLockServerVoiceLifecycleTx(ctx, tx, candidate.userID)
+	acquired, err := lockStaleServerVoiceCleanupTx(ctx, tx, candidate)
 	if err != nil {
-		return false, false, fmt.Errorf("lock stale server voice participant cleanup: %w", err)
+		return false, false, err
 	}
 	if !acquired {
 		return false, false, nil
@@ -4303,27 +4323,22 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		}
 		return false, false, nil
 	}
+	live, err := s.roomPlacement.HasLiveRoom(ctx, candidate.channelID.String())
+	if err != nil {
+		return false, false, fmt.Errorf("check stale server voice room occupancy: %w", err)
+	}
+	if live {
+		return false, false, nil
+	}
 	if err := s.captureTerminalTemporaryGrant(
 		ctx, tx, temporary, preflightTemporary, temporaryGrantPlan,
 	); err != nil {
 		return false, false, err
 	}
 
-	result, err := tx.ExecContext(ctx, `
-		DELETE FROM voice_participants
-		WHERE channel_id = $1 AND user_id = $2
-		  AND lifecycle_observed_at <=
-		      clock_timestamp() - ($3::bigint * INTERVAL '1 second')
-	`, candidate.channelID, candidate.userID, leaseSeconds)
+	rowsAffected, err := deleteStaleServerVoiceParticipantTx(ctx, tx, candidate, leaseSeconds)
 	if err != nil {
-		return false, false, fmt.Errorf("delete stale server voice participant: %w", err)
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return false, false, fmt.Errorf("read stale server voice participant delete result: %w", err)
-	}
-	if rowsAffected != 0 && rowsAffected != 1 {
-		return false, false, fmt.Errorf("stale server voice participant delete affected %d rows", rowsAffected)
+		return false, false, err
 	}
 	var (
 		temporaryGrantRemoved  bool
@@ -4371,6 +4386,41 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 		operationID: operationID,
 	}, outcomes)
 	return true, admitted, returnErr
+}
+
+func deleteStaleServerVoiceParticipantTx(
+	ctx context.Context, tx *sql.Tx, candidate staleServerVoiceParticipant, leaseSeconds int64,
+) (int64, error) {
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM voice_participants
+		WHERE channel_id = $1 AND user_id = $2
+		  AND lifecycle_observed_at <=
+		      clock_timestamp() - ($3::bigint * INTERVAL '1 second')
+	`, candidate.channelID, candidate.userID, leaseSeconds)
+	if err != nil {
+		return 0, fmt.Errorf("delete stale server voice participant: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read stale server voice participant delete result: %w", err)
+	}
+	if rowsAffected != 0 && rowsAffected != 1 {
+		return 0, fmt.Errorf("stale server voice participant delete affected %d rows", rowsAffected)
+	}
+	return rowsAffected, nil
+}
+
+func lockStaleServerVoiceCleanupTx(
+	ctx context.Context, tx *sql.Tx, candidate staleServerVoiceParticipant,
+) (bool, error) {
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, candidate.serverID.String()); err != nil {
+		return false, fmt.Errorf("lock stale server voice visibility: %w", err)
+	}
+	acquired, err := tryLockServerVoiceLifecycleTx(ctx, tx, candidate.userID)
+	if err != nil {
+		return false, fmt.Errorf("lock stale server voice participant cleanup: %w", err)
+	}
+	return acquired, nil
 }
 
 func (s *NATSSubscriber) prepareStaleServerVoiceTerminalGrant(
@@ -4873,6 +4923,8 @@ func (s *NATSSubscriber) handleDMVoiceDependencyFailure(_ string, err error) {
 // voiceJoinedEvent matches the media plane's voice.joined NATS payload.
 type voiceJoinedEvent struct {
 	ChannelID   string `json:"channelId"`
+	Colour      string `json:"colour"`
+	InstanceID  string `json:"instance_id"`
 	CallID      string `json:"callId"`
 	UserID      string `json:"userId"`
 	Username    string `json:"username"`
@@ -4903,15 +4955,19 @@ func parseVoiceJoinedAdmission(event voiceJoinedEvent) (*voiceJoinedAdmission, e
 
 // voiceLeftEvent matches the media plane's voice.left NATS payload.
 type voiceLeftEvent struct {
-	ChannelID string `json:"channelId"`
-	CallID    string `json:"callId"`
-	UserID    string `json:"userId"`
-	Timestamp string `json:"timestamp"`
+	ChannelID  string `json:"channelId"`
+	Colour     string `json:"colour"`
+	InstanceID string `json:"instance_id"`
+	CallID     string `json:"callId"`
+	UserID     string `json:"userId"`
+	Timestamp  string `json:"timestamp"`
 }
 
 // voiceRoomEmptyEvent matches the media plane's voice.room_empty NATS payload.
 type voiceRoomEmptyEvent struct {
 	ChannelID          string   `json:"channelId"`
+	Colour             string   `json:"colour"`
+	InstanceID         string   `json:"instance_id"`
 	CallID             string   `json:"callId"`
 	RingID             string   `json:"ringId"`
 	CallerUserID       string   `json:"callerUserId"`
@@ -4922,12 +4978,15 @@ type voiceRoomEmptyEvent struct {
 
 // voiceHeartbeatEvent is the per-room heartbeat from the media plane.
 type voiceHeartbeatEvent struct {
-	ChannelID    string   `json:"channelId"`
-	CallID       string   `json:"callId"`
-	RingID       string   `json:"ringId"`
-	CallerUserID string   `json:"callerUserId"`
-	UserIDs      []string `json:"userIds"`
-	Timestamp    string   `json:"timestamp"`
+	ChannelID                 string   `json:"channelId"`
+	Colour                    string   `json:"colour"`
+	InstanceID                string   `json:"instance_id"`
+	ParticipantsAuthoritative bool     `json:"participants_authoritative"`
+	CallID                    string   `json:"callId"`
+	RingID                    string   `json:"ringId"`
+	CallerUserID              string   `json:"callerUserId"`
+	UserIDs                   []string `json:"userIds"`
+	Timestamp                 string   `json:"timestamp"`
 }
 
 // parseVoiceEventTime validates a producer stamp and bounds it above by the
@@ -5555,6 +5614,15 @@ func (s *NATSSubscriber) Close() {
 	}
 }
 
+// SetLifecyclePlacementEnabled is the explicit rollout gate for D8. Keep it
+// disabled until media publishes the required metadata and the cross-service
+// create guard, refresh-only admission, and deployment registration are verified.
+func (s *NATSSubscriber) SetLifecyclePlacementEnabled(enabled bool) {
+	if s != nil && s.roomPlacement != nil {
+		s.roomPlacement.Enabled = enabled
+	}
+}
+
 // handleVoiceLifecycleEvent fans one dispatched frame out to its handler.
 //
 // receivedAt is the dispatcher's NATS-receipt stamp (#3205) and is threaded
@@ -5564,6 +5632,16 @@ func (s *NATSSubscriber) Close() {
 func (s *NATSSubscriber) handleVoiceLifecycleEvent(
 	subject string, data []byte, receivedAt time.Time,
 ) {
+	if s.roomPlacement != nil && s.roomPlacement.Enabled {
+		authority := s.guardLifecycleEvent(subject, data)
+		if authority == roomplacement.LifecycleRefuse {
+			return
+		}
+		if authority == roomplacement.LifecycleRefreshOnly {
+			s.handleRefreshOnlyLifecycleEvent(subject, data, receivedAt)
+			return
+		}
+	}
 	switch subject {
 	case natsSubjectVoiceJoined:
 		s.handleJoined(data, receivedAt)
@@ -5574,6 +5652,327 @@ func (s *NATSSubscriber) handleVoiceLifecycleEvent(
 	case natsSubjectVoiceHeartbeat:
 		s.handleHeartbeat(data, receivedAt)
 	}
+}
+
+type lifecycleGenerationKey struct{}
+
+type lifecycleGeneration struct {
+	roomID     string
+	colour     string
+	instanceID string
+}
+
+func (s *NATSSubscriber) withLifecycleGeneration(
+	ctx context.Context, roomID, colour, instanceID string,
+) context.Context {
+	if s.roomPlacement == nil || !s.roomPlacement.Enabled {
+		return ctx
+	}
+	return context.WithValue(ctx, lifecycleGenerationKey{}, lifecycleGeneration{roomID, colour, instanceID})
+}
+
+func (s *NATSSubscriber) lifecycleStillFull(ctx context.Context) bool {
+	generation, ok := ctx.Value(lifecycleGenerationKey{}).(lifecycleGeneration)
+	if !ok {
+		return true
+	}
+	full, err := s.roomPlacement.LifecycleStillFull(
+		ctx, generation.roomID, generation.colour, generation.instanceID,
+	)
+	if err != nil {
+		s.log.Error(rejectedVoiceLifecycleEventLog, "failure_class", "placement_unavailable")
+		return false
+	}
+	return full
+}
+
+const rejectedVoiceLifecycleEventLog = "Rejected voice lifecycle event"
+
+func (s *NATSSubscriber) guardLifecycleEvent(subject string, data []byte) roomplacement.LifecycleAuthority {
+	const maxPlacementLifecycleFrameBytes = 64 * 1024
+	if len(data) == 0 || len(data) > maxPlacementLifecycleFrameBytes {
+		s.log.Error(rejectedVoiceLifecycleEventLog, "failure_class", "placement_metadata")
+		return roomplacement.LifecycleRefuse
+	}
+	var event struct {
+		ChannelID                 string `json:"channelId"`
+		UserID                    string `json:"userId"`
+		Colour                    string `json:"colour"`
+		InstanceID                string `json:"instance_id"`
+		ParticipantsAuthoritative *bool  `json:"participants_authoritative"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil || event.ChannelID == "" ||
+		event.Colour == "" || event.InstanceID == "" {
+		s.log.Error(rejectedVoiceLifecycleEventLog, "failure_class", "placement_metadata")
+		return roomplacement.LifecycleRefuse
+	}
+	roomID, err := uuid.Parse(event.ChannelID)
+	if err != nil || roomID == uuid.Nil {
+		s.log.Error(rejectedVoiceLifecycleEventLog, "failure_class", "placement_metadata")
+		return roomplacement.LifecycleRefuse
+	}
+	authority, err := s.roomPlacement.GuardLifecycle(
+		context.Background(), roomID.String(), event.Colour, event.InstanceID, subject,
+	)
+	if err != nil {
+		s.log.Error(rejectedVoiceLifecycleEventLog, "failure_class", "placement_unavailable")
+		return roomplacement.LifecycleRefuse
+	}
+	if authority == roomplacement.LifecycleRefuse {
+		s.log.Warn(rejectedVoiceLifecycleEventLog, "failure_class", "placement_fence")
+		return roomplacement.LifecycleRefuse
+	}
+	if subject == natsSubjectVoiceHeartbeat &&
+		(event.ParticipantsAuthoritative == nil || !*event.ParticipantsAuthoritative) {
+		// Ring-only rooms still renew their owner lease, but this heartbeat
+		// does not carry an authoritative participant snapshot.
+		return roomplacement.LifecycleRefuse
+	}
+	return authority
+}
+
+// Refresh-only authority can renew existing Server Voice rows, but cannot
+// enter the full handlers that remove peers, move users, or broadcast state.
+type refreshOnlyLifecycleFrame struct {
+	roomID    string
+	timestamp string
+	userIDs   []string
+	admission *voiceJoinedAdmission
+}
+
+func parseRefreshOnlyLifecycleFrame(subject string, data []byte) (refreshOnlyLifecycleFrame, bool) {
+	var frame refreshOnlyLifecycleFrame
+	switch subject {
+	case natsSubjectVoiceJoined:
+		var event voiceJoinedEvent
+		if json.Unmarshal(data, &event) != nil {
+			return frame, false
+		}
+		admission, err := parseVoiceJoinedAdmission(event)
+		if err != nil {
+			return frame, false
+		}
+		frame = refreshOnlyLifecycleFrame{event.ChannelID, event.Timestamp, []string{event.UserID}, admission}
+	case natsSubjectVoiceHeartbeat:
+		var event voiceHeartbeatEvent
+		if json.Unmarshal(data, &event) != nil || len(event.UserIDs) > maxServerVoiceParticipantIDs {
+			return frame, false
+		}
+		frame = refreshOnlyLifecycleFrame{event.ChannelID, event.Timestamp, event.UserIDs, nil}
+	default:
+		return frame, false
+	}
+	return frame, true
+}
+
+func (s *NATSSubscriber) handleRefreshOnlyLifecycleEvent(
+	subject string, data []byte, receivedAt time.Time,
+) {
+	frame, ok := parseRefreshOnlyLifecycleFrame(subject, data)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), richPresenceLifecycleTimeout)
+	defer cancel()
+	eventAt, err := s.clampVoiceEventTime(frame.timestamp, receivedAt)
+	if err != nil {
+		return
+	}
+	room, err := s.resolveRoom(ctx, frame.roomID)
+	if err != nil || room.isDM {
+		return
+	}
+	participantIDs, err := parseSortedVoiceParticipantIDs(frame.userIDs, maxServerVoiceParticipantIDs)
+	if err != nil {
+		return
+	}
+	channelID, err := uuid.Parse(frame.roomID)
+	if err != nil || channelID == uuid.Nil {
+		return
+	}
+	if subject == natsSubjectVoiceJoined {
+		if len(participantIDs) != 1 {
+			return
+		}
+		err = s.refreshOnlyJoined(ctx, channelID, participantIDs[0], eventAt, frame.admission)
+	} else {
+		err = s.refreshOnlyHeartbeat(ctx, channelID, participantIDs, eventAt)
+	}
+	if err != nil {
+		if frame.admission != nil {
+			s.publishForceDisconnect(channelID.String(), participantIDs[0].String(), frame.admission.socketID, frame.admission.admissionID.String())
+		}
+		if errors.Is(err, errVoicePendingAdmissionMismatch) && frame.admission != nil {
+			s.log.Warn(rejectedVoiceLifecycleEventLog, "failure_class", "admission")
+			return
+		}
+		s.log.Error(rejectedVoiceLifecycleEventLog, "failure_class", "state_write")
+	}
+}
+
+func (s *NATSSubscriber) refreshOnlyHeartbeat(
+	ctx context.Context, channelID uuid.UUID, participantIDs []uuid.UUID, eventAt time.Time,
+) (returnErr error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin refresh-only heartbeat: %w", err)
+	}
+	defer func() {
+		returnErr = joinRollbackErr(returnErr, tx.Rollback(), "rollback refresh-only heartbeat")
+	}()
+	ids := make([]string, 0, len(participantIDs))
+	for _, participantID := range participantIDs {
+		if err := LockServerVoiceLifecycleTx(ctx, tx, participantID); err != nil {
+			return err
+		}
+		ids = append(ids, participantID.String())
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE voice_participants
+		SET lifecycle_event_at = $3
+		WHERE channel_id = $1 AND user_id = ANY($2::uuid[])
+		  AND lifecycle_event_at <= $3
+	`, channelID, pq.Array(ids), eventAt); err != nil {
+		return fmt.Errorf("refresh-only voice heartbeat: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit refresh-only heartbeat: %w", err)
+	}
+	return nil
+}
+
+func (s *NATSSubscriber) refreshOnlyJoined(
+	ctx context.Context, channelID, senderID uuid.UUID, eventAt time.Time,
+	admission *voiceJoinedAdmission,
+) (returnErr error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin refresh-only join: %w", err)
+	}
+	defer func() {
+		returnErr = joinRollbackErr(returnErr, tx.Rollback(), "rollback refresh-only join")
+	}()
+	if err := LockServerVoiceLifecycleTx(ctx, tx, senderID); err != nil {
+		return err
+	}
+	if err := lockVoiceParticipantUsersTx(ctx, tx, []uuid.UUID{senderID}, dmblock.LockShare); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE voice_participants
+		SET lifecycle_event_at = $3
+		WHERE channel_id = $1 AND user_id = $2
+		  AND lifecycle_event_at <= $3
+	`, channelID, senderID, eventAt)
+	if err != nil {
+		return fmt.Errorf("refresh existing voice participant: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read refresh-only update result: %w", err)
+	}
+	applied := updated == 1
+	if updated == 0 {
+		applied, err = s.insertRefreshOnlyJoined(ctx, tx, channelID, senderID, eventAt, admission)
+		if err != nil {
+			return err
+		}
+		if !applied && admission == nil {
+			return nil
+		}
+	}
+	if applied && admission != nil {
+		removed, err := tx.ExecContext(ctx, `
+			DELETE FROM voice_pending_admissions
+			WHERE channel_id = $1 AND user_id = $2
+			  AND admission_id = $3 AND socket_id = $4
+			  AND expires_at > clock_timestamp()
+		`, channelID, senderID, admission.admissionID, admission.socketID)
+		if err != nil {
+			return fmt.Errorf("consume refresh-only pending admission: %w", err)
+		}
+		matched, err := removed.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read refresh-only pending admission result: %w", err)
+		}
+		if matched != 1 {
+			return fmt.Errorf("%w: refresh-only consume affected %d rows", errVoicePendingAdmissionMismatch, matched)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit refresh-only join: %w", err)
+	}
+	return nil
+}
+
+func (s *NATSSubscriber) insertRefreshOnlyJoined(
+	ctx context.Context, tx *sql.Tx, channelID, senderID uuid.UUID, eventAt time.Time,
+	admission *voiceJoinedAdmission,
+) (bool, error) {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM voice_participants
+		WHERE channel_id = $1 AND user_id = $2)
+	`, channelID, senderID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check refresh-only participant: %w", err)
+	}
+	if exists || admission == nil {
+		return false, nil
+	}
+	var lockedChannelID uuid.UUID
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM channels WHERE id = $1 FOR UPDATE`, channelID,
+	).Scan(&lockedChannelID); err != nil {
+		return false, fmt.Errorf("lock refresh-only voice channel: %w", err)
+	}
+	var reserved int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM voice_pending_admissions
+		WHERE channel_id = $1 AND user_id = $2
+		  AND admission_id = $3 AND socket_id = $4
+		  AND expires_at > clock_timestamp()
+		FOR UPDATE
+	`, channelID, senderID, admission.admissionID, admission.socketID).Scan(&reserved); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf("%w: refresh-only admission absent", errVoicePendingAdmissionMismatch)
+		}
+		return false, fmt.Errorf("check refresh-only pending admission: %w", err)
+	}
+	admitted, err := s.roomPlacement.ConsumeJoinIntent(ctx, channelID.String(), senderID.String())
+	if err != nil {
+		return false, fmt.Errorf("consume refresh-only join intent: %w", err)
+	}
+	if !admitted {
+		s.log.Warn(rejectedVoiceLifecycleEventLog, "failure_class", "placement_intent")
+		return false, errors.New("refresh-only join intent missing")
+	}
+	insert, err := tx.ExecContext(ctx, `
+		WITH target AS MATERIALIZED (
+			SELECT id, server_id FROM channels WHERE id = $1
+		)
+		INSERT INTO voice_participants
+			(channel_id, user_id, joined_at, lifecycle_event_at)
+		SELECT target.id, $2, $3, $3 FROM target
+		JOIN server_members AS member
+		  ON member.server_id = target.server_id AND member.user_id = $2
+		WHERE NOT EXISTS (
+			SELECT 1 FROM voice_participants
+			WHERE user_id = $2 AND channel_id <> $1
+		)
+		  AND (SELECT COUNT(*) FROM voice_participants WHERE channel_id = $1) < $4
+		ON CONFLICT (channel_id, user_id) DO NOTHING
+	`, channelID, senderID, eventAt, maxServerVoiceParticipantIDs)
+	if err != nil {
+		return false, fmt.Errorf("insert refresh-only voice participant: %w", err)
+	}
+	inserted, err := insert.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read refresh-only insert result: %w", err)
+	}
+	if inserted != 1 {
+		return false, errors.New("refresh-only join participant not inserted")
+	}
+	return true, nil
 }
 
 func parseDMVoiceCallLifecycleID(rawID, label string) (uuid.UUID, error) {
@@ -5684,6 +6083,7 @@ func (s *NATSSubscriber) handleJoined(data []byte, receivedAt time.Time) {
 		context.Background(), richPresenceLifecycleTimeout,
 	)
 	defer cancelActivity()
+	activityCtx = s.withLifecycleGeneration(activityCtx, event.ChannelID, event.Colour, event.InstanceID)
 	activityCtx = presence.WithActivityBuildCache(activityCtx)
 	ctx, err := s.resolveRoom(activityCtx, event.ChannelID)
 	if err != nil {
@@ -6049,6 +6449,7 @@ func (s *NATSSubscriber) handleLeft(data []byte, receivedAt time.Time) {
 		context.Background(), richPresenceLifecycleTimeout,
 	)
 	defer cancelActivity()
+	activityCtx = s.withLifecycleGeneration(activityCtx, event.ChannelID, event.Colour, event.InstanceID)
 	activityCtx = presence.WithActivityBuildCache(activityCtx)
 	ctx, err := s.resolveRoom(activityCtx, event.ChannelID)
 	if err != nil {
@@ -6502,6 +6903,7 @@ func (s *NATSSubscriber) handleDMRoomEmpty(
 		context.Background(), dmRoomEmptyCleanupTimeout,
 	)
 	defer cancelCleanup()
+	cleanupCtx = s.withLifecycleGeneration(cleanupCtx, event.ChannelID, event.Colour, event.InstanceID)
 	cleanupCtx = presence.WithActivityBuildCache(cleanupCtx)
 	if _, participantErr := s.collectVoiceParticipantRecords(
 		cleanupCtx, conversationID, true,
@@ -6943,6 +7345,7 @@ func (s *NATSSubscriber) handleEmptyDMHeartbeat(
 		context.Background(), dmRoomEmptyCleanupTimeout,
 	)
 	defer cancelCleanup()
+	cleanupCtx = s.withLifecycleGeneration(cleanupCtx, event.ChannelID, event.Colour, event.InstanceID)
 	cleanupCtx = presence.WithActivityBuildCache(cleanupCtx)
 	lease, hasLease, err := dm.LookupDMVoiceCallLease(
 		cleanupCtx, s.redis, conversationID,
@@ -7003,6 +7406,7 @@ func (s *NATSSubscriber) handleRoomEmpty(data []byte, receivedAt time.Time) {
 		context.Background(), richPresenceLifecycleTimeout,
 	)
 	defer cancelActivity()
+	activityCtx = s.withLifecycleGeneration(activityCtx, event.ChannelID, event.Colour, event.InstanceID)
 	activityCtx = presence.WithActivityBuildCache(activityCtx)
 	ctx, err := s.resolveRoom(activityCtx, event.ChannelID)
 	if err != nil {
@@ -7071,6 +7475,7 @@ func (s *NATSSubscriber) refreshDMHeartbeat(
 		context.Background(), richPresenceLifecycleTimeout,
 	)
 	defer cancelActivity()
+	activityCtx = s.withLifecycleGeneration(activityCtx, event.ChannelID, event.Colour, event.InstanceID)
 	activityCtx = presence.WithActivityBuildCache(activityCtx)
 	if s.activity == nil {
 		s.log.Error(logPrivateBridgeUnavailable)
@@ -7491,6 +7896,7 @@ func (s *NATSSubscriber) handleHeartbeat(data []byte, receivedAt time.Time) {
 		context.Background(), richPresenceLifecycleTimeout,
 	)
 	defer cancelActivity()
+	activityCtx = s.withLifecycleGeneration(activityCtx, event.ChannelID, event.Colour, event.InstanceID)
 	activityCtx = presence.WithActivityBuildCache(activityCtx)
 	ctx, err := s.resolveRoom(activityCtx, event.ChannelID)
 	if err != nil {
@@ -7831,7 +8237,7 @@ func (s *NATSSubscriber) renewObservedLeaseForFutureStampedRows(
 	channelID uuid.UUID,
 	participantIDs []uuid.UUID,
 ) {
-	if len(participantIDs) == 0 {
+	if len(participantIDs) == 0 || !s.lifecycleStillFull(ctx) {
 		return
 	}
 	ids := make([]string, 0, len(participantIDs))

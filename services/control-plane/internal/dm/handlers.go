@@ -24,6 +24,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/roomplacement"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voicecommand"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -118,16 +119,17 @@ type ActivePlanRail interface {
 
 // Handler handles DM-related requests.
 type Handler struct {
-	db          *sql.DB
-	log         *logger.Logger
-	hub         *websocket.Hub
-	cfg         *config.Config
-	nats        *natsclient.Client
-	redis       *redis.Client
-	entCache    *entitlements.Cache
-	purgeEngine *purge.Engine      // bulk message purge (#1352)
-	mfaVerifier stepup.MFAVerifier // step-up auth for DM/group purge and history clear
-	activePlans ActivePlanRail     // durable active-category reconciliation (#2448)
+	db            *sql.DB
+	log           *logger.Logger
+	hub           *websocket.Hub
+	cfg           *config.Config
+	nats          *natsclient.Client
+	redis         *redis.Client
+	roomPlacement *roomplacement.Selector
+	entCache      *entitlements.Cache
+	purgeEngine   *purge.Engine      // bulk message purge (#1352)
+	mfaVerifier   stepup.MFAVerifier // step-up auth for DM/group purge and history clear
+	activePlans   ActivePlanRail     // durable active-category reconciliation (#2448)
 	// pinnedExpirer deletes already-due pinned messages when a conversation's
 	// policy stops keeping pins (#3459 §8). Wired via SetPinnedExpirer.
 	pinnedExpirer *expiration.ContextExpirer
@@ -177,8 +179,9 @@ type HandlerDeps struct {
 	Hub *websocket.Hub
 	Cfg *config.Config
 	// NATS may be nil in tests.
-	NATS  *natsclient.Client
-	Redis *redis.Client
+	NATS                 *natsclient.Client
+	Redis                *redis.Client
+	RoomPlacementEnabled bool
 	// EntCache is the shared entitlement-tier cache (#1296) used to resolve the
 	// joining user's media entitlements for DM voice joins (#1300); production
 	// wiring passes the same instance the auth and voice handlers receive.
@@ -196,16 +199,17 @@ type HandlerDeps struct {
 // NewHandler creates a new DM handler from its dependency bundle.
 func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		db:          deps.DB,
-		log:         deps.Log,
-		hub:         deps.Hub,
-		cfg:         deps.Cfg,
-		nats:        deps.NATS,
-		redis:       deps.Redis,
-		entCache:    deps.EntCache,
-		purgeEngine: deps.PurgeEngine,
-		mfaVerifier: deps.MFAVerifier,
-		activePlans: deps.ActivePlans,
+		db:            deps.DB,
+		log:           deps.Log,
+		hub:           deps.Hub,
+		cfg:           deps.Cfg,
+		nats:          deps.NATS,
+		redis:         deps.Redis,
+		roomPlacement: &roomplacement.Selector{Redis: deps.Redis, Enabled: deps.RoomPlacementEnabled},
+		entCache:      deps.EntCache,
+		purgeEngine:   deps.PurgeEngine,
+		mfaVerifier:   deps.MFAVerifier,
+		activePlans:   deps.ActivePlans,
 	}
 }
 
@@ -3030,9 +3034,22 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 		"conversation_id", sanitizeLogValue(convID),
 		"media_tier", mediaEnt.Tier)
 
+	mediaURL, err := h.roomPlacement.Select(c.Request.Context(), convID, h.cfg.MediaPlaneURL)
+	if err != nil {
+		h.log.Error("Failed to claim DM voice room placement", "failure_class", "placement")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if h.roomPlacement.Enabled {
+		if err := h.roomPlacement.MintJoinIntent(c.Request.Context(), convID, userID); err != nil {
+			h.log.Error("Failed to mint DM voice join intent", "failure_class", "placement")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+			return
+		}
+	}
 	response := gin.H{
 		"allowed":            true,
-		"media_server_url":   h.cfg.MediaPlaneURL,
+		"media_server_url":   mediaURL,
 		"ice_servers":        h.cfg.ICEServers(userID),
 		"server_muted":       joinState.serverMuted,
 		"server_deafened":    joinState.serverDeafened,
@@ -3844,7 +3861,8 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
 		return
 	}
-	if _, err := uuid.Parse(targetID); err != nil {
+	target, err := uuid.Parse(targetID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
 		return
 	}
@@ -3854,11 +3872,6 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 	}
 
 	actor, err := uuid.Parse(actorID)
-	if err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
-		return
-	}
-	target, err := uuid.Parse(targetID)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
 		return
@@ -4020,34 +4033,7 @@ func (h *Handler) applyDMVoiceEnforcement(c *gin.Context, convID, targetID strin
 	if change.action == "unmute" && !h.guardDMVoiceUnmuteTx(c, tx, convID, targetID) {
 		return
 	}
-	result, err := tx.ExecContext(c.Request.Context(), change.updateSQL, convID, targetID)
-	if err != nil {
-		h.log.Error(change.failLog, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
-		return
-	}
-	ra, err := result.RowsAffected()
-	if err != nil {
-		h.log.Error(change.failLog, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
-		return
-	}
-	if ra == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
-		return
-	}
-	snapshot, err := dmVoiceEnforcementSnapshotTx(c.Request.Context(), tx, convID, targetID)
-	if err != nil {
-		h.log.Error(change.failLog, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
-		return
-	}
-	if err := enqueueDMVoiceSnapshotTx(c.Request.Context(), tx, convID, targetID, actor.String(), change.action, snapshot); err != nil {
-		if respondDMVoiceCommandQueueFull(c, err) {
-			return
-		}
-		h.log.Error(change.failLog, "failure_class", "voice_command_enqueue_failed")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+	if !h.updateDMVoiceEnforcementTx(c, tx, convID, targetID, actor.String(), change) {
 		return
 	}
 	if err := h.commitDMTopologyEffect(tx); err != nil {
@@ -4059,6 +4045,40 @@ func (h *Handler) applyDMVoiceEnforcement(c *gin.Context, convID, targetID strin
 	h.dmBroadcastVoiceState(convID, targetID, change.broadcastState)
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "DM voice moderation policy saved; enforcement queued", "enforcement_status": "queued"})
+}
+
+func (h *Handler) updateDMVoiceEnforcementTx(c *gin.Context, tx *sql.Tx, convID, targetID, actorID string, change dmVoiceEnforcementChange) bool {
+	result, err := tx.ExecContext(c.Request.Context(), change.updateSQL, convID, targetID)
+	if err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return false
+	}
+	ra, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return false
+	}
+	if ra == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
+		return false
+	}
+	snapshot, err := dmVoiceEnforcementSnapshotTx(c.Request.Context(), tx, convID, targetID)
+	if err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return false
+	}
+	if err := enqueueDMVoiceSnapshotTx(c.Request.Context(), tx, convID, targetID, actorID, change.action, snapshot); err != nil {
+		if respondDMVoiceCommandQueueFull(c, err) {
+			return false
+		}
+		h.log.Error(change.failLog, "failure_class", "voice_command_enqueue_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return false
+	}
+	return true
 }
 
 // DMHardMute server-mutes a participant in a group DM (admin only, user cannot undo).

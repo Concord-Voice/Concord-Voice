@@ -48,7 +48,7 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
     ACTIVITY_HISTORY_PRIVACY_POLICY_URL ATTACHMENT_WRITE_BACKEND CONTROL_PLANE_IMAGE \
     COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE
   COMPOSE_OVERRIDE=docker-compose.production.yml
-  COMPOSE_PROFILES=services
+  unset COMPOSE_PROFILES
 fi
 
 DEPLOY_REPO="${DEPLOY_REPO:-https://github.com/Concord-Voice/Concord-Voice.git}"
@@ -57,15 +57,36 @@ COMPOSE_ENV_FILE_ARG=""
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] \
   && COMPOSE_ENV_FILE_ARG="--env-file ${DEPLOY_DIR}/.env"
 # Self-host published-port posture (#3538). Reset AFTER deploy.env/deploy.env.local
-# are sourced, so neither can set or suppress it; empty in managed mode, which keeps
-# the managed COMPOSE_CMD byte-identical (no separating space before --profile).
+# are sourced, so neither can set or suppress it.
 COMPOSE_SELFHOST_ARG=""
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] \
   && COMPOSE_SELFHOST_ARG=" -f ${DEPLOY_DIR}/docker-compose.selfhost.yml"
-COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG} -f ${DEPLOY_DIR}/docker-compose.yml -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG} --profile ${COMPOSE_PROFILES:-services}"
+if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
+  MEDIA_DEPLOY_PROFILE=media-single
+elif [[ "$COMPOSE_OVERRIDE" == docker-compose.production.yml \
+     || "$COMPOSE_OVERRIDE" == docker-compose.staging.yml ]]; then
+  MEDIA_DEPLOY_PROFILE="${MEDIA_DEPLOY_PROFILE:-media-single}"
+  case "$MEDIA_DEPLOY_PROFILE" in
+    media-single|media-bluegreen) ;;
+    *) echo 'media-bluegreen: invalid media deployment profile' >&2; exit 2 ;;
+  esac
+else
+  MEDIA_DEPLOY_PROFILE=media-single
+fi
+if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
+  COMPOSE_PROFILE_ARGS="--profile media-bluegreen"
+  COMPOSE_PROFILES=media-bluegreen
+else
+  COMPOSE_PROFILE_ARGS="--profile services"
+  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
+    COMPOSE_PROFILES=services
+  fi
+fi
+[[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] || export COMPOSE_PROFILES
+COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG} -f ${DEPLOY_DIR}/docker-compose.yml -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG} ${COMPOSE_PROFILE_ARGS}"
 
-# Keep managed command construction unchanged. Self-host commands, including
-# internal renders and probes, dispatch through the same argv-based runner.
+# Self-host commands, including internal renders and probes, dispatch through
+# their existing argv-based runner.
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   if [[ "$ACTIVITY_HISTORY_REQUESTED_COMPOSE_OVERRIDE" != docker-compose.production.yml \
      || "$ACTIVITY_HISTORY_REQUESTED_COMPOSE_PROFILES" != services ]]; then
@@ -1297,7 +1318,8 @@ try:
         value = json.load(stream)
 except (OSError, ValueError):
     raise SystemExit(1)
-raise SystemExit(0 if value == {"ready": True, "voiceEnforcementProtocol": 3} else 1)
+raise SystemExit(0 if isinstance(value, dict) and value.get("ready") is True
+                 and value.get("voiceEnforcementProtocol") == 3 else 1)
 ' "$body"; then
       rm -f "$body"
       return 0
@@ -1379,6 +1401,773 @@ voice_enforcement_rollout_media_rebuild() {
     --wait-timeout 180 media-plane)
   voice_enforcement_rollout_wait_media
   voice_enforcement_rollout_activate
+}
+
+# The blue/green rail is enabled only when the rendered model contains both
+# closed color services with their expected loopback and RTC port assignments.
+# A partial overlay must never fall back to a service-less Compose invocation.
+media_bluegreen_render() {
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json 2>/dev/null)
+}
+
+media_bluegreen_model_present() {
+  local rendered
+  rendered="$(media_bluegreen_render)" || return 2
+  python3 -c '
+import json, sys
+try:
+    services = json.load(sys.stdin).get("services", {})
+    placement = services.get("control-plane", {}).get("environment", {}).get("ROOM_PLACEMENT_ENABLED")
+except (ValueError, TypeError, AttributeError):
+    raise SystemExit(2)
+raise SystemExit(0 if placement not in (None, "false") or any(n in services for n in ("media-plane-blue", "media-plane-green")) else 1)
+' <<<"$rendered"
+}
+
+media_bluegreen_validate_model() {
+  local rendered
+  rendered="$(media_bluegreen_render)" || {
+    echo 'media-bluegreen: cannot render the Compose model; refusing before mutation' >&2
+    return 1
+  }
+  python3 -c '
+import json, sys
+from urllib.parse import urlsplit
+try:
+    services = json.load(sys.stdin)["services"]
+    if "media-plane" in services:
+        raise ValueError("legacy media-plane is active alongside the color model")
+    if services["control-plane"].get("environment", {}).get("ROOM_PLACEMENT_ENABLED") != "true":
+        raise ValueError("control-plane room placement is not armed")
+    for colour, host_port, first_rtc in (("blue", "3000", "40000"), ("green", "3001", "42000")):
+        name = "media-plane-" + colour
+        service = services[name]
+        env = service.get("environment", {})
+        if (env.get("MEDIA_INSTANCE_COLOR") != colour or env.get("ROOM_PLACEMENT_ENABLED") != "true"
+                or env.get("INITIAL_NUM_WORKERS") != "1"
+                or env.get("NUM_WORKERS") != "3"):
+            raise ValueError(name + " has an invalid identity or initial worker count")
+        if "media-bluegreen" not in service.get("profiles", []) or "media-single" in service.get("profiles", []):
+            raise ValueError(name + " must be limited to the bluegreen profile")
+        if env.get("RTC_MIN_PORT") != first_rtc or env.get("RTC_MAX_PORT") != str(int(first_rtc) + 2):
+            raise ValueError(name + " has an invalid RTC window")
+        if service.get("network_mode"):
+            raise ValueError(name + " must use bridge networking")
+        ports = service.get("ports", [])
+        signal = [p for p in ports if p.get("target") == 3000 and p.get("protocol") == "tcp"]
+        rtc = [p for p in ports if p.get("protocol") == "udp" and int(p["target"]) >= int(first_rtc)]
+        if len(signal) != 1 or signal[0].get("host_ip") != "127.0.0.1" or signal[0].get("published") != host_port:
+            raise ValueError(name + " signaling must be published on its assigned loopback port")
+        expected = {str(p) for p in range(int(first_rtc), int(first_rtc) + 3)}
+        if {str(p["target"]) for p in rtc} != expected or {str(p["published"]) for p in rtc} != expected:
+            raise ValueError(name + " RTC publication does not match its three-port WebRtcServer window")
+        if not {"nats", "redis", "control-plane"}.issubset(service.get("depends_on", {})):
+            raise ValueError(name + " is missing a voice dependency gate")
+    if sys.argv[1] == "docker-compose.staging.yml":
+        proxy = services["staging-media-proxy"]
+        endpoint = urlsplit(services["control-plane"]["environment"]["MEDIA_PLANE_URL"])
+        published = [p for p in proxy.get("ports", []) if p.get("protocol") == "tcp"]
+        if (endpoint.scheme != "http" or len(published) != 1
+                or published[0].get("host_ip") != endpoint.hostname
+                or published[0].get("published") != str(endpoint.port)
+                or published[0].get("target") != 3000
+                or "media-bluegreen" not in proxy.get("profiles", [])
+                or "concordvoice-services" not in proxy.get("networks", {})):
+            raise ValueError("staging media ingress does not match the advertised URL")
+    print("bluegreen")
+except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    print("media-bluegreen: rendered model rejected: " + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+' "$COMPOSE_OVERRIDE" <<<"$rendered"
+}
+
+media_bluegreen_verify_standby_image() {
+  local colour="$1" container="$2" rendered project service expected actual config_output expected_config actual_config
+  [[ -n "$container" && "$container" != *$'\n'* ]] || {
+    echo 'media-bluegreen: running standby must resolve to exactly one container' >&2
+    return 1
+  }
+  service="media-plane-${colour}"
+  rendered="$(media_bluegreen_render)" || return 1
+  project="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$rendered")" || return 1
+  [[ -n "$project" && "$project" != *[[:space:]]* ]] || return 1
+  # Build the current source without replacing the running empty standby, then
+  # compare immutable image IDs before allowing an interrupted cutover to resume.
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build --quiet "$service") || {
+    echo "media-bluegreen: cannot build current ${service} image; refusing to reuse the running standby" >&2
+    return 1
+  }
+  expected="$(docker image inspect --format '{{.Id}}' "${project}-${service}")" || {
+    echo "media-bluegreen: cannot inspect the current ${service} image; refusing standby reuse" >&2
+    return 1
+  }
+  actual="$(docker inspect --format '{{.Image}}' "$container")" || {
+    echo "media-bluegreen: cannot inspect the running ${service}; refusing standby reuse" >&2
+    return 1
+  }
+  config_output="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --hash="$service")" || {
+    echo "media-bluegreen: cannot verify current ${service} configuration; refusing standby reuse" >&2
+    return 1
+  }
+  expected_config="$(awk -v service="$service" '$1 == service { print $2 }' <<<"$config_output")"
+  actual_config="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.config-hash" }}' "$container")" || {
+    echo "media-bluegreen: cannot inspect the running ${service} configuration; refusing standby reuse" >&2
+    return 1
+  }
+  [[ -n "$expected" && "$actual" == "$expected" && -n "$expected_config" \
+     && "$actual_config" == "$expected_config" ]] || {
+    echo "media-bluegreen: running ${service} image or configuration is stale; remove the empty standby under an approved operator procedure before retrying" >&2
+    return 1
+  }
+}
+
+media_bluegreen_redis() {
+  local password
+  password="$(activity_history_read_root_value REDIS_PASSWORD)" || {
+    echo 'media-bluegreen: canonical REDIS_PASSWORD is unavailable; refusing' >&2
+    return 1
+  }
+  if [[ -z "$password" || ! "$password" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    echo 'media-bluegreen: canonical REDIS_PASSWORD violates the URI-safe password contract; refusing' >&2
+    return 1
+  fi
+  local REDISCLI_AUTH="$password"
+  export REDISCLI_AUTH
+  # A Redis error reply must fail the command before a cutover arms the drain.
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T -e REDISCLI_AUTH redis redis-cli -e --raw "$@" 2>/dev/null)
+}
+
+media_bluegreen_port() {
+  case "$1" in
+    blue) printf '3000' ;;
+    green) printf '3001' ;;
+    *) return 1 ;;
+  esac
+}
+
+media_bluegreen_active_ready() {
+  local colour port
+  colour="$(media_bluegreen_redis GET media:active_colour)" || return 1
+  port="$(media_bluegreen_port "$colour")" || return 1
+  media_bluegreen_probe_ready "$colour" true "$port"
+}
+
+media_bluegreen_dependencies_ready() {
+  local service rows
+  for service in nats redis control-plane "$@"; do
+    rows="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --format json -- "$service")" || {
+      echo "media-bluegreen: cannot inspect ${service} dependency; refusing" >&2
+      return 1
+    }
+    if ! python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    rows = json.loads(raw) if raw.startswith("[") else [json.loads(line) for line in raw.splitlines() if line.strip()]
+    valid = bool(rows) and all(row.get("State") == "running" and row.get("Health") == "healthy" for row in rows)
+except (TypeError, ValueError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+' <<<"$rows"; then
+      echo "media-bluegreen: ${service} dependency is absent or unhealthy; refusing cutover" >&2
+      return 1
+    fi
+  done
+}
+
+media_bluegreen_probe_ready() {
+  local colour="$1" expected_accept="$2" port="$3" expected_workers="${4:-}" expected_empty="${5:-false}" status body
+  body="$(mktemp)" || return 1
+  status="$(curl -sS --max-time 3 -o "$body" -w '%{http_code}' \
+    "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)"
+  if ! python3 -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    count = value["rooms"]
+    creates = value["creates_in_flight"]
+    generation = value["generation"]
+    valid = (value["colour"] == sys.argv[2]
+             and value.get("ready") is (sys.argv[3] == "true")
+             and (sys.argv[3] == "false" or value.get("voiceEnforcementProtocol") == 3)
+             and value["accepting_new_rooms"] is (sys.argv[3] == "true")
+             and type(count) is int and count >= 0
+             and type(creates) is int and creates >= 0
+             and (sys.argv[5] != "true" or (count == 0 and creates == 0))
+             and (type(generation) is int or (isinstance(generation, str) and generation)))
+    if sys.argv[4] == "200":
+        valid = valid and sys.argv[3] == "true"
+    elif sys.argv[4] != "503" or sys.argv[3] != "false":
+        valid = False
+except (OSError, ValueError, KeyError, TypeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+' "$body" "$colour" "$expected_accept" "$status" "$expected_empty"; then
+    rm -f "$body"
+    return 1
+  fi
+  if [[ -n "$expected_workers" ]]; then
+    if [[ "$status" != 200 ]] || ! curl -sS --max-time 3 -o "$body" \
+      "http://127.0.0.1:${port}/health" 2>/dev/null \
+      || ! python3 -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    valid = value.get("colour") == sys.argv[2] and type(value.get("workers")) is int \
+        and value["workers"] == int(sys.argv[3])
+except (OSError, ValueError, TypeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+' "$body" "$colour" "$expected_workers"; then
+      rm -f "$body"
+      return 1
+    fi
+  fi
+  rm -f "$body"
+}
+
+media_bluegreen_preflight() {
+  local rendered active project legacy colour ids standby tombstone recover_control_plane="${1:-0}"
+  rendered="$(media_bluegreen_render)" || {
+    echo 'media-bluegreen: cannot render Compose; refusing before mutation' >&2
+    return 1
+  }
+  media_bluegreen_validate_model >/dev/null || return 1
+  active="$(media_bluegreen_redis GET media:active_colour)" || {
+    echo 'media-bluegreen: active colour cannot be read; refusing before mutation' >&2
+    return 1
+  }
+  project="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$rendered")" || return 1
+  [[ -n "$project" && "$project" != *[[:space:]]* ]] || return 1
+  legacy="$(docker ps --filter "label=com.docker.compose.project=${project}" \
+    --filter 'label=com.docker.compose.service=media-plane' --format '{{.ID}}')" || {
+    echo 'media-bluegreen: legacy container inspection failed; refusing' >&2
+    return 1
+  }
+  if [[ -n "$legacy" ]]; then
+    echo 'media-bluegreen: live legacy media-plane blocks first activation; an approved quiescent migration is required' >&2
+    return 1
+  fi
+  case "$active" in
+    '') standby=blue ;;
+    blue) standby=green ;;
+    green) standby=blue ;;
+    *) echo 'media-bluegreen: unknown active colour; refusing' >&2; return 1 ;;
+  esac
+  for colour in blue green; do
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${colour}")" || {
+      echo "media-bluegreen: cannot inspect ${colour} container; refusing" >&2
+      return 1
+    }
+    if [[ -z "$active" && -n "$ids" && "$colour" != "$standby" ]]; then
+      echo 'media-bluegreen: colour container exists without promotion; refusing' >&2
+      return 1
+    fi
+    if [[ "$colour" == "$standby" && -n "$ids" ]]; then
+      if ! media_bluegreen_probe_ready "$colour" true "$(media_bluegreen_port "$colour")" 1 true; then
+        echo "media-bluegreen: running standby ${colour} is not empty and ready for promotion" >&2
+        return 1
+      fi
+    fi
+  done
+  tombstone="$(media_bluegreen_redis EXISTS "media:colour_draining:${standby}")" || return 1
+  [[ "$tombstone" == 0 ]] || {
+    echo "media-bluegreen: standby ${standby} has a drain tombstone; reap before another cutover" >&2
+    return 1
+  }
+  if [[ -n "$active" ]]; then
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${active}")" || return 1
+    [[ -n "$ids" ]] || {
+      echo "media-bluegreen: active ${active} is not ready; refusing" >&2
+      return 1
+    }
+    if [[ "$recover_control_plane" != 1 ]]; then
+      media_bluegreen_probe_ready "$active" true "$(media_bluegreen_port "$active")" || {
+        echo "media-bluegreen: active ${active} is not ready; refusing" >&2
+        return 1
+      }
+      media_bluegreen_dependencies_ready || return 1
+    fi
+  fi
+  printf '%s:%s\n' "${active:-none}" "$standby"
+}
+
+media_bluegreen_cutover_locked() {
+  local active standby old_colour active_port standby_port tombstone old_generation status deadline running
+  media_bluegreen_preflight >/dev/null || return 1
+  if ! active="$(media_bluegreen_redis GET media:active_colour)"; then
+    echo 'media-bluegreen: Redis promotion read failed; refusing cutover' >&2
+    return 1
+  fi
+  if [[ -z "$active" ]]; then
+    active=''
+    standby=blue
+    # A bootstrap with an old single-plane container has no safe automatic
+    # color attribution; migration is an operator-controlled drain.
+    local project legacy
+    project="$(media_bluegreen_render | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')" || return 1
+    if ! legacy="$(docker ps --filter "label=com.docker.compose.project=${project}" \
+      --filter 'label=com.docker.compose.service=media-plane' --format '{{.ID}}')"; then
+      echo 'media-bluegreen: cannot inspect the legacy media service; refusing bootstrap' >&2
+      return 1
+    fi
+    if [[ -n "$legacy" ]]; then
+      echo 'media-bluegreen: legacy media-plane is still running; drain it before first color activation' >&2
+      return 1
+    fi
+  elif [[ "$active" == blue ]]; then
+    standby=green
+  elif [[ "$active" == green ]]; then
+    standby=blue
+  else
+    echo 'media-bluegreen: Redis names an unknown active color; refusing cutover' >&2
+    return 1
+  fi
+  old_colour="$active"
+  active_port=''
+  if [[ -n "$active" ]]; then
+    active_port="$(media_bluegreen_port "$active")" || return 1
+    if ! media_bluegreen_probe_ready "$active" true "$active_port"; then
+      echo "media-bluegreen: active ${active} does not satisfy the ready contract; refusing cutover" >&2
+      return 1
+    fi
+    old_generation="$(curl -sf --max-time 3 "http://127.0.0.1:${active_port}/readyz" \
+      | python3 -c 'import json,sys; v=json.load(sys.stdin); print(v["generation"])')" || {
+      echo 'media-bluegreen: cannot read active generation before cutover' >&2
+      return 1
+    }
+    [[ -n "$old_generation" && "$old_generation" != *[[:space:]]* ]] || {
+      echo 'media-bluegreen: active generation is malformed; refusing cutover' >&2
+      return 1
+    }
+  fi
+  if ! tombstone="$(media_bluegreen_redis EXISTS "media:colour_draining:${standby}")" \
+     || [[ "$tombstone" != 0 ]]; then
+    echo "media-bluegreen: standby ${standby} has a drain tombstone or Redis is unavailable; run media-reap first" >&2
+    return 1
+  fi
+  standby_port="$(media_bluegreen_port "$standby")" || return 1
+  if ! running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${standby}")"; then
+    echo "media-bluegreen: cannot inspect standby ${standby}; refusing cutover" >&2
+    return 1
+  fi
+  if [[ -n "$running" ]]; then
+    echo "media-bluegreen: verifying running empty standby ${standby} image provenance"
+    media_bluegreen_verify_standby_image "$standby" "$running" || return 1
+  else
+    echo "media-bluegreen: starting standby ${standby}"
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait \
+      --wait-timeout 180 "media-plane-${standby}") || return 1
+  fi
+  if ! media_bluegreen_probe_ready "$standby" true "$standby_port" 1 true; then
+    echo "media-bluegreen: standby ${standby} failed its identity, worker, or readiness gate" >&2
+    return 1
+  fi
+
+  if ! media_bluegreen_redis SADD media:colours:registered "$standby" >/dev/null; then
+    echo 'media-bluegreen: registry write failed before promotion; active color is unchanged' >&2
+    return 1
+  fi
+  if ! media_bluegreen_redis SET media:active_colour "$standby" >/dev/null; then
+    # An unacknowledged SET can have committed; resolve its outcome before any
+    # drain action, and refuse if Redis cannot prove the result.
+    active="$(media_bluegreen_redis GET media:active_colour)" || {
+      echo 'media-bluegreen: promotion outcome is unknown; refusing to arm a drain' >&2
+      return 1
+    }
+    [[ "$active" == "$standby" ]] || {
+      echo 'media-bluegreen: promotion was not confirmed; old color remains undrained' >&2
+      return 1
+    }
+  fi
+  # A successful SET reply confirms promotion. If its acknowledgement was
+  # lost, the branch above reads back and confirms the committed value.
+  if [[ -n "$active_port" ]]; then
+    if ! media_bluegreen_redis SET "media:colour_draining:${old_colour}" "$old_generation" >/dev/null; then
+      tombstone="$(media_bluegreen_redis GET "media:colour_draining:${old_colour}")" || return 1
+      [[ "$tombstone" == "$old_generation" ]] || {
+        echo 'media-bluegreen: drain tombstone was not confirmed; old color remains running' >&2
+        return 1
+      }
+    fi
+    deadline=$(( $(date +%s) + 90 ))
+    while :; do
+      status="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:${active_port}/readyz" 2>/dev/null || true)"
+      if media_bluegreen_probe_ready "$old_colour" false "$active_port"; then
+        break
+      fi
+      if (( $(date +%s) >= deadline )); then
+        echo "media-bluegreen: ${old_colour} did not acknowledge draining within 90 seconds; tombstone remains" >&2
+        return 1
+      fi
+      sleep 2
+    done
+  fi
+  echo "media-bluegreen: promoted ${standby}; prior color is serving existing rooms until reap"
+}
+
+media_bluegreen_sweep_markers() {
+  local colour="$1" active="$2" result owner_keys live_keys marker_keys marker_key channel_id channel_ids owner_key live_key
+  local -a scanned_channels=()
+  result="$(media_bluegreen_redis SISMEMBER media:colours:registered "$active")" || return 1
+  [[ "$result" == 1 ]] || {
+    echo "media-bluegreen: active color ${active} is absent from the registry; refusing reap" >&2
+    return 1
+  }
+  owner_keys="$(media_bluegreen_redis --scan --pattern 'voice:room_owner:*')" || return 1
+  live_keys="$(media_bluegreen_redis --scan --pattern 'voice:room_live:*')" || return 1
+  marker_keys="$(printf '%s\n%s' "$owner_keys" "$live_keys")"
+  while IFS= read -r marker_key; do
+    [[ -n "$marker_key" ]] || continue
+    if [[ ! "$marker_key" =~ ^voice:room_(owner|live):[0-9a-fA-F-]{36}$ ]]; then
+      echo 'media-bluegreen: marker-key scan returned an unexpected key; refusing before registry mutation' >&2
+      return 1
+    fi
+    channel_id="${marker_key#voice:room_owner:}"
+    channel_id="${channel_id#voice:room_live:}"
+    scanned_channels+=("$channel_id")
+  done <<<"$marker_keys"
+  channel_ids="$(printf '%s\n' "${scanned_channels[@]}" | LC_ALL=C sort -u)" || return 1
+  result="$(media_bluegreen_redis SREM media:colours:registered "$colour")" || return 1
+  [[ "$result" =~ ^[01]$ ]] || return 1
+  # Keep the target fenced after a partial sweep; the tombstone makes retry safe.
+  while IFS= read -r channel_id; do
+    [[ -n "$channel_id" ]] || continue
+    owner_key="voice:room_owner:${channel_id}"
+    live_key="voice:room_live:${channel_id}"
+    result="$(media_bluegreen_redis EVAL \
+      'local removed = 0; if redis.call("GET", KEYS[1]) == ARGV[1] then removed = removed + redis.call("DEL", KEYS[1]) end; local live = redis.call("GET", KEYS[2]); if live and string.sub(live, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. "-" then removed = removed + redis.call("DEL", KEYS[2]) end; return removed' \
+      2 "$owner_key" "$live_key" "$colour")" || return 1
+    [[ "$result" =~ ^[012]$ ]] || return 1
+  done <<<"$channel_ids"
+}
+
+media_bluegreen_reap_one() {
+  local colour="$1" force="${2:-0}" active port body status rooms creates owner_key channel_id live_key result generation
+  port="$(media_bluegreen_port "$colour")" || return 1
+  active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+  [[ -n "$active" && "$active" =~ ^(blue|green)$ ]] || {
+    echo 'media-bluegreen: active color is absent or invalid; refusing reap' >&2
+    return 1
+  }
+  [[ "$active" != "$colour" ]] || {
+    echo "media-bluegreen: refusing to reap active color ${colour}" >&2
+    return 1
+  }
+  result="$(media_bluegreen_redis SISMEMBER media:colours:registered "$colour")" || return 1
+  [[ "$result" =~ ^[01]$ ]] || return 1
+  if [[ "$result" == 0 ]]; then
+    result="$(media_bluegreen_redis EXISTS "media:colour_draining:${colour}")" || return 1
+    [[ "$result" == 1 ]] || {
+      echo "media-bluegreen: ${colour} is unregistered without a drain tombstone; refusing reap" >&2
+      return 1
+    }
+    result="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --all --format json -- "media-plane-${colour}")" || return 1
+    if python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    rows = json.loads(raw) if raw.startswith("[") else [json.loads(line) for line in raw.splitlines() if line.strip()]
+    stopped = isinstance(rows, list) and all(isinstance(row, dict)
+        and row.get("Service") == sys.argv[1] and row.get("State") in ("exited", "dead")
+        for row in rows)
+except (TypeError, ValueError):
+    stopped = False
+raise SystemExit(0 if stopped else 1)
+' "media-plane-${colour}" <<<"$result"; then
+      # R7 may have stopped/removed the container before losing its acknowledgement.
+      # Repeat the idempotent marker sweep before removing the tombstone.
+      media_bluegreen_sweep_markers "$colour" "$active" || return 1
+      (cd "$DEPLOY_DIR" && $COMPOSE_CMD rm -f "media-plane-${colour}") || return 1
+      result="$(media_bluegreen_redis DEL "media:colour_draining:${colour}")" || return 1
+      [[ "$result" =~ ^[01]$ ]] || return 1
+      echo "media-bluegreen: resumed reap of stopped color ${colour}"
+      return 0
+    fi
+  fi
+  body="$(mktemp)" || return 1
+  status=0
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T "media-plane-${colour}" \
+    wget -qO- http://127.0.0.1:3000/readyz >"$body" 2>/dev/null) || status=$?
+  # BusyBox wget returns 8 for the expected HTTP 503 drain response. Require
+  # that status as well as a matching body; a 200 liveness response is not R2.
+  if [[ "$status" -ne 8 ]] || ! python3 -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    generation = value.get("generation")
+    generation_ok = (type(generation) is int or
+                     (isinstance(generation, str) and generation and not any(c.isspace() for c in generation)))
+    valid = (value.get("colour") == sys.argv[2]
+             and generation_ok
+             and value.get("accepting_new_rooms") is False
+             and type(value.get("rooms")) is int and value["rooms"] >= 0
+             and type(value.get("creates_in_flight")) is int and value["creates_in_flight"] >= 0
+             and (type(value.get("generation")) is int or bool(value.get("generation"))))
+    if not valid:
+        raise SystemExit(1)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+' "$body" "$colour"; then
+    rm -f "$body"
+    echo "media-bluegreen: ${colour} readiness did not confirm a drained color" >&2
+    return 1
+  fi
+  read -r rooms creates generation < <(python3 -c '
+import json, sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+print(value["rooms"], value["creates_in_flight"], value["generation"])
+' "$body")
+  rm -f "$body"
+  echo "media-bluegreen: ${colour} reported generation ${generation} (diagnostic only; restart generations are not compared)"
+  if (( rooms != 0 || creates != 0 )); then
+    echo "media-bluegreen: ${colour} reports ${rooms} live rooms and ${creates} in-flight creates"
+    if (( creates != 0 )); then
+      echo 'media-bluegreen: in-flight creates must reach zero; --force cannot bypass this check' >&2
+      return 2
+    fi
+    if (( force != 1 )); then
+      echo 'media-bluegreen: live rooms remain; reap skipped (manual --force is available after the 2-hour drain window)' >&2
+      return 2
+    fi
+    echo 'media-bluegreen: verify from deployment/operations records that this color has drained for at least 2 hours.' >&2
+    local confirmation
+    if ! read -r -p "Type REAP ${colour} WITH ${rooms} LIVE ROOMS to continue: " confirmation; then
+      echo 'media-bluegreen: force confirmation was not received; color remains running' >&2
+      return 2
+    fi
+    [[ "$confirmation" == "REAP ${colour} WITH ${rooms} LIVE ROOMS" ]] || {
+      echo 'media-bluegreen: force confirmation did not match; color remains running' >&2
+      return 2
+    }
+  fi
+  # Validate the complete scan before the registry transition, then keep R4
+  # adjacent to the owner-matched R5 sweep so placement cannot race it.
+  media_bluegreen_sweep_markers "$colour" "$active" || return 1
+  # Re-read the own-namespace readiness immediately before the adjacent stop/rm.
+  body="$(mktemp)" || return 1
+  status=0
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T "media-plane-${colour}" \
+    wget -qO- http://127.0.0.1:3000/readyz >"$body" 2>/dev/null) || status=$?
+  if [[ "$status" -ne 8 ]] || ! python3 -c '
+import json, sys
+try:
+    value=json.load(open(sys.argv[1], encoding="utf-8"))
+    generation=value.get("generation")
+    generation_ok=(type(generation) is int or
+                   (isinstance(generation, str) and generation and not any(c.isspace() for c in generation)))
+    ok=(value.get("colour")==sys.argv[2] and value.get("accepting_new_rooms") is False
+        and generation_ok
+        and type(value.get("rooms")) is int and value["rooms"]>=0
+        and type(value.get("creates_in_flight")) is int and value["creates_in_flight"]>=0)
+except (OSError, ValueError, TypeError):
+    ok=False
+raise SystemExit(0 if ok else 1)
+' "$body" "$colour"; then
+    rm -f "$body"
+    echo "media-bluegreen: ${colour} changed after marker sweep; it remains running" >&2
+    return 1
+  fi
+  read -r rooms creates < <(python3 -c '
+import json, sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+print(value["rooms"], value["creates_in_flight"])
+' "$body")
+  if (( rooms != 0 || creates != 0 )); then
+    echo "media-bluegreen: ${colour} changed after marker sweep: ${rooms} live rooms, ${creates} in-flight creates" >&2
+    if (( creates != 0 || force != 1 )); then
+      rm -f "$body"
+      echo "media-bluegreen: ${colour} remains running" >&2
+      return 2
+    fi
+    echo 'media-bluegreen: re-confirm the 2-hour drain window from deployment/operations records.' >&2
+    local confirmation
+    if ! read -r -p "Type REAP ${colour} WITH ${rooms} LIVE ROOMS to continue: " confirmation; then
+      rm -f "$body"
+      echo "media-bluegreen: ${colour} remains running" >&2
+      return 2
+    fi
+    if [[ "$confirmation" != "REAP ${colour} WITH ${rooms} LIVE ROOMS" ]]; then
+      rm -f "$body"
+      echo "media-bluegreen: ${colour} remains running" >&2
+      return 2
+    fi
+  fi
+  rm -f "$body"
+  if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 "media-plane-${colour}"); then
+    echo "media-bluegreen: stop failed; ${colour} remains fenced; rerun media-reap to resume" >&2
+    return 1
+  fi
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD rm -f "media-plane-${colour}") || return 1
+  result="$(media_bluegreen_redis DEL "media:colour_draining:${colour}")" || return 1
+  [[ "$result" =~ ^[01]$ ]] || return 1
+  echo "media-bluegreen: reaped drained color ${colour}"
+}
+
+media_bluegreen_reap() {
+  local force="${1:-0}" keys key colour active rc=0 project colours
+  if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" != media-bluegreen ]]; then
+    project="$(media_bluegreen_render | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')" || return 1
+    colours="$(docker ps --filter "label=com.docker.compose.project=${project}" \
+      --filter 'label=com.docker.compose.service=media-plane-blue' --format '{{.ID}}')" || return 1
+    colours+="$(docker ps --filter "label=com.docker.compose.project=${project}" \
+      --filter 'label=com.docker.compose.service=media-plane-green' --format '{{.ID}}')" || return 1
+    [[ -z "$colours" ]] || {
+      echo 'media-bluegreen: colour container exists while legacy profile is selected; refusing reap' >&2
+      return 1
+    }
+    echo 'media-bluegreen: legacy profile selected; no colour to reap'
+    return 0
+  fi
+  media_bluegreen_validate_model || return 1
+  keys="$(media_bluegreen_redis --scan --pattern 'media:colour_draining:*')" || {
+    echo 'media-bluegreen: cannot enumerate drain tombstones' >&2
+    return 1
+  }
+  [[ -n "$keys" ]] || {
+    rm -f "${DEPLOY_DIR}/logs/media-reap-alert.flag" 2>/dev/null || true
+    echo 'media-bluegreen: no drained colors to reap'
+    return 0
+  }
+  active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+  [[ "$active" =~ ^(blue|green)$ ]] || {
+    echo 'media-bluegreen: active color is absent or invalid; refusing reap' >&2
+    return 1
+  }
+  # A corrupt later tombstone must not allow an earlier colour to be reaped.
+  while IFS= read -r key; do
+    [[ "$key" =~ ^media:colour_draining:(blue|green)$ ]] || {
+      echo 'media-bluegreen: unexpected drain tombstone key; refusing reap' >&2
+      return 1
+    }
+    colour="${BASH_REMATCH[1]}"
+    [[ "$colour" != "$active" ]] || {
+      echo "media-bluegreen: refusing to reap active color ${colour}" >&2
+      return 1
+    }
+  done <<<"$keys"
+  while IFS= read -r key; do
+    colour="${key#media:colour_draining:}"
+    media_bluegreen_reap_one "$colour" "$force" || {
+      _reap_rc=$?
+      if [[ $_reap_rc -eq 2 ]]; then
+        continue
+      fi
+      rc=1; break
+    }
+  done <<<"$keys"
+  if (( rc == 0 )); then
+    rm -f "${DEPLOY_DIR}/logs/media-reap-alert.flag" 2>/dev/null || true
+  else
+    mkdir -p "${DEPLOY_DIR}/logs" 2>/dev/null || true
+    printf 'media reaper failed at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      >"${DEPLOY_DIR}/logs/media-reap-alert.flag" 2>/dev/null || true
+    echo 'media-bluegreen: reap aborted; color remains running for operator inspection' >&2
+  fi
+  return "$rc"
+}
+
+# Build only explicit services. In particular, neither the active colour nor
+# the unselected legacy service may be pulled in by an implicit Compose up.
+media_bluegreen_rebuild_locked() {
+  local snapshot active standby rendered plan deps rest scope_token ingress_ids start_cp=0 start_media=0 full=0
+  local -a deps_arr=() rest_arr=()
+  if [[ $# -eq 0 ]]; then
+    start_cp=1
+  else
+    for scope_token in "$@"; do
+      [[ "$scope_token" == control-plane ]] && start_cp=1
+    done
+  fi
+  snapshot="$(media_bluegreen_preflight "$start_cp")" || return 1
+  active="${snapshot%%:*}"
+  standby="${snapshot#*:}"
+  rendered="$(media_bluegreen_render)" || return 1
+  if [[ $# -eq 0 ]]; then
+    full=1; start_cp=1; start_media=1
+  fi
+  for scope_token in "$@"; do
+    case "$scope_token" in
+      control-plane) start_cp=1 ;;
+      media-plane) start_media=1 ;;
+      media-plane-blue|media-plane-green)
+        if [[ "$scope_token" != "media-plane-${standby}" ]]; then
+          echo "media-bluegreen: ${scope_token} is not the resolved standby; refusing" >&2
+          return 1
+        fi
+        start_media=1 ;;
+      ops-agent|coturn|postgres|redis|nats|minio) ;;
+      *) echo "rebuild: invalid or unknown service '${scope_token}'" >&2; return 2 ;;
+    esac
+  done
+  # A direct non-voice scope still resolves and fences the active colour, but
+  # does not spuriously promote a new colour.
+  if (( full == 1 )); then
+    plan="$(python3 -c '
+import json, sys
+s = json.load(sys.stdin)["services"]
+standby = "media-plane-" + sys.argv[1]
+excluded = {"control-plane", "media-plane", standby, "media-plane-blue", "media-plane-green", "staging-media-proxy"}
+closure, todo = set(), ["control-plane", standby]
+while todo:
+    for dep in s[todo.pop()].get("depends_on") or {}:
+        if dep in s and dep not in excluded and dep not in closure:
+            closure.add(dep)
+            todo.append(dep)
+print(" ".join(sorted(closure)))
+print(" ".join(sorted(set(s) - closure - excluded)))
+' "$standby" <<<"$rendered")" || {
+      echo 'media-bluegreen: cannot resolve full service order; refusing' >&2
+      return 1
+    }
+    { IFS= read -r deps || true; IFS= read -r rest || true; } <<<"$plan"
+    read -r -a deps_arr <<<"$deps"
+    read -r -a rest_arr <<<"$rest"
+  fi
+  # Refusal above is before the Activity History guard: that guard can write a
+  # receipt, and a rejected cutover must leave the receipt and image pin intact.
+  activity_history_routine_guard || return 1
+  if (( full == 1 )) && [[ ${#deps_arr[@]} -gt 0 ]]; then
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${deps_arr[@]}") || return 1
+  fi
+  if (( start_cp == 1 )); then
+    clear_activity_history_image_selector || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane) || return 1
+    privacy_defaults_refuse_foreign_control_plane || return 1
+    activity_history_stop_control_plane || return 1
+    privacy_defaults_require_local_control_plane_drained || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 control-plane) || return 1
+    voice_enforcement_rollout_wait_control_plane || return 1
+  fi
+  if (( start_media == 1 )); then
+    if [[ "${COMPOSE_OVERRIDE:-}" == docker-compose.staging.yml ]]; then
+      ingress_ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q staging-media-proxy)" || return 1
+      if [[ -z "$ingress_ids" ]]; then
+        (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 staging-media-proxy) || return 1
+      fi
+      media_bluegreen_dependencies_ready staging-media-proxy || return 1
+    else
+      media_bluegreen_dependencies_ready || return 1
+    fi
+    media_bluegreen_cutover_locked || return 1
+    voice_enforcement_rollout_activate || return 1
+  fi
+  if (( full == 1 )) && [[ ${#rest_arr[@]} -gt 0 ]]; then
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps -- "${rest_arr[@]}") || return 1
+  elif (( full == 0 )); then
+    local -a extra=()
+    for scope_token in "$@"; do
+      case "$scope_token" in
+        control-plane|media-plane|media-plane-blue|media-plane-green) ;;
+        *) extra+=("$scope_token") ;;
+      esac
+    done
+    if [[ ${#extra[@]} -gt 0 ]]; then
+      (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${extra[@]}") || return 1
+    fi
+  fi
+  echo 'media-bluegreen: rebuild completed with active colour excluded'
 }
 
 # Unscoped rebuild (#3524). Every service, ordered so the paired voice handoff
@@ -1619,11 +2408,30 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   esac
 fi
 
+if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
+  case "${1:-help}" in
+    freshstart)
+      if [[ $# -ne 2 || "$2" != --allow-active-colour-recreate ]]; then
+        echo 'freshstart: bluegreen active colour requires --allow-active-colour-recreate' >&2
+        exit 2
+      fi
+      echo 'freshstart: bluegreen volume wipe requires an explicit single-colour bootstrap procedure; refusing service-less up' >&2
+      exit 1
+      ;;
+    restart)
+      if [[ $# -ne 2 || "$2" != --allow-active-colour-recreate ]]; then
+        echo 'restart: bluegreen active colour requires --allow-active-colour-recreate' >&2
+        exit 2
+      fi
+      ;;
+  esac
+fi
+
 case "${1:-help}" in
   nginx-reload|sudoers-sync)
     acquire_deploy_transaction_lock "$@"
     ;;
-  rebuild|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout)
+  rebuild|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -1667,13 +2475,30 @@ case "${1:-help}" in
     echo ""
     echo "=== Health Checks ==="
     VM_IP="${VM_IP:-localhost}"
-    for svc in "Control Plane:8080" "Media Plane:3000"; do
+    _media_status_rc=0
+    _media_status_port=3000
+    if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
+      if _active_colour="$(media_bluegreen_redis GET media:active_colour)"; then
+        _media_status_port="$(media_bluegreen_port "$_active_colour")" || _media_status_port=''
+      else
+        _media_status_port=''
+      fi
+    fi
+    for svc in "Control Plane:8080" "Media Plane:${_media_status_port}"; do
       name="${svc%%:*}"
       port="${svc##*:}"
-      if curl -sf "http://127.0.0.1:${port}/health" > /dev/null 2>&1; then
-        echo "  ✓ ${name} (http://${VM_IP}:${port})"
+      if [[ -z "$port" ]]; then
+        echo "  ✗ ${name} (active color unavailable)"
+        _media_status_rc=1
+      elif curl -sf "http://127.0.0.1:${port}/health" > /dev/null 2>&1; then
+        if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen && "$name" == 'Media Plane' ]]; then
+          echo "  ✓ ${name} (http://127.0.0.1:${port})"
+        else
+          echo "  ✓ ${name} (http://${VM_IP}:${port})"
+        fi
       else
         echo "  ✗ ${name} (port ${port})"
+        [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen && "$name" == 'Media Plane' ]] && _media_status_rc=1
       fi
     done
     # coturn check — verify STUN port is listening
@@ -1701,6 +2526,7 @@ case "${1:-help}" in
     fi
     [[ $_storage_status_rc -eq 0 ]] || exit 1
     [[ $_tls_status_rc -eq 0 ]] || exit 1
+    [[ $_media_status_rc -eq 0 ]] || exit 1
     ;;
 
   logs)
@@ -1708,11 +2534,26 @@ case "${1:-help}" in
     cd "$DEPLOY_DIR" && $COMPOSE_CMD logs -f --tail=100 "$@"
     ;;
 
+  media-bluegreen-preflight)
+    [[ $# -eq 1 ]] || { echo 'Usage: concord-ctl.sh media-bluegreen-preflight' >&2; exit 2; }
+    if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+      media_bluegreen_preflight >/dev/null
+      echo bluegreen
+    fi
+    ;;
+
   restart)
     # #1015: sync_releases no longer auto-called. The sync-releases.yml
     # workflow is the canonical writer for /opt/concord/releases/.
     # If you need to refresh release assets, trigger the workflow OR
     # invoke `concord-ctl.sh sync-releases` (manual recovery).
+    if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+      if [[ $# -ne 2 || "$2" != --allow-active-colour-recreate ]]; then
+        echo 'restart: bluegreen active colour requires --allow-active-colour-recreate' >&2
+        exit 2
+      fi
+      media_bluegreen_preflight >/dev/null || exit 1
+    fi
     echo "Restarting services..."
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed ]]; then
       echo "Note: release assets NOT refreshed automatically (#1015). Run 'concord-ctl.sh sync-releases' or trigger sync-releases.yml for a refresh."
@@ -1742,6 +2583,11 @@ case "${1:-help}" in
       fi
       case "$_svc" in
         control-plane|media-plane|ops-agent|coturn|postgres|redis|nats|minio) ;;
+        media-plane-blue|media-plane-green)
+          [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]] || {
+            echo "rebuild: unknown compose service '$_svc'" >&2
+            exit 2
+          } ;;
         *)
           echo "rebuild: unknown compose service '$_svc'" >&2
           exit 2
@@ -1749,6 +2595,21 @@ case "${1:-help}" in
       esac
       REBUILD_SCOPE+=("$_svc")
     done
+    if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+      media_bluegreen_rebuild_locked "${REBUILD_SCOPE[@]}"
+      exit $?
+    fi
+    # The ordinary production selector must never accidentally render colours.
+    _bluegreen_model_rc=0
+    media_bluegreen_model_present || _bluegreen_model_rc=$?
+    if [[ $_bluegreen_model_rc -eq 0 ]]; then
+      echo 'rebuild: room placement or blue/green services detected; refusing the legacy rebuild path before image-pin or container changes' >&2
+      exit 1
+    fi
+    if [[ $_bluegreen_model_rc -ne 1 ]]; then
+      echo 'rebuild: cannot determine whether the Compose model uses blue/green services; refusing before image-pin or container changes' >&2
+      exit 1
+    fi
 
     # The image-selector clear below IS scope-gated (#2178). It rm's the
     # control-plane rollback image pin and its own echo asserts "rebuilding the
@@ -2014,6 +2875,18 @@ else:
     selfhost_post_up_check || exit 1
     [[ $_rebuild_starts_coturn -eq 0 ]] || selfhost_tls_ready_gate || exit 1
     echo "Done."
+    ;;
+
+  media-reap)
+    shift
+    _media_reap_force=0
+    if [[ $# -eq 1 && "$1" == --force ]]; then
+      _media_reap_force=1
+    elif [[ $# -ne 0 ]]; then
+      echo 'Usage: concord-ctl.sh media-reap [--force]' >&2
+      exit 2
+    fi
+    media_bluegreen_reap "$_media_reap_force"
     ;;
 
   activity-history-routine-guard)
@@ -2744,7 +3617,11 @@ else:
       # that bit is #3107's restart predicate; see
       # [internal]tests/test-compose-health-contract.sh.
       curl -sf "${CP_PROBE_BASE}/readyz" >/dev/null 2>&1 && cp_ok=1
-      curl -sf "http://127.0.0.1:3000/health" >/dev/null 2>&1 && mp_ok=1
+      if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+        media_bluegreen_active_ready && mp_ok=1
+      else
+        curl -sf "http://127.0.0.1:3000/health" >/dev/null 2>&1 && mp_ok=1
+      fi
       nc -z -w2 localhost 3478 >/dev/null 2>&1 && coturn_ok=1
       if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
         tls_ok=1
@@ -2764,7 +3641,11 @@ else:
         fi
         _mp_remaining=$(( DEADLINE - $(date +%s) ))
         if (( _mp_remaining > 0 )); then
-          curl -sf --max-time "$_mp_remaining" "http://127.0.0.1:3000/health" >/dev/null 2>&1 && mp_ok=1
+          if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+            media_bluegreen_active_ready && mp_ok=1
+          else
+            curl -sf --max-time "$_mp_remaining" "http://127.0.0.1:3000/health" >/dev/null 2>&1 && mp_ok=1
+          fi
         else
           mp_refresh_skipped=1
         fi
@@ -2833,10 +3714,13 @@ else:
       fi
     fi
     if [[ $mp_ok -eq 0 ]]; then
+      _mp_probe_label='media-plane (:3000/health)'
+      [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]] \
+        && _mp_probe_label='active media colour (/readyz)'
       if [[ $mp_refresh_skipped -eq 1 ]]; then
-        echo "    media-plane (:3000/health) not rechecked (deadline)" >&2
+        echo "    ${_mp_probe_label} not rechecked (deadline)" >&2
       else
-        echo "    media-plane (:3000/health) failed" >&2
+        echo "    ${_mp_probe_label} failed" >&2
       fi
     fi
     if [[ $coturn_ok -eq 0 ]]; then
@@ -2858,6 +3742,8 @@ else:
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
       activity_history_routine_guard skip-receipt
     fi
+    # lockf re-enters under the lock after the parent confirmed and admitted TLS.
+    if (( ! CONCORD_CTL_LOCKF_REENTRY_INTERNAL )); then
     echo "=== Fresh Start: wiping all data and rebuilding ==="
     echo "This will DELETE all databases, caches, and user data."
     read -rp "Are you sure? (y/N) " confirm
@@ -2881,6 +3767,7 @@ else:
     # place: freshstart still holds the interlock for everything destructive.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
+    fi
 
     clear_activity_history_image_selector
     activity_history_invalidate_activation_receipt
@@ -2989,6 +3876,10 @@ else:
     ;;
 
   stop)
+    if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
+      echo 'stop: refusing to remove colour containers while bluegreen ownership is active' >&2
+      exit 1
+    fi
     echo "Stopping all services..."
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
       selfhost_storage_stop_stale_minio || exit 1
@@ -3024,6 +3915,8 @@ else:
     echo "                 Drain/disable, optionally downgrade, and start one pinned old CP image"
     echo "  voice-enforcement-rollout deploy"
     echo "                 Build CP, drain/rebuild MP, verify protocol 3, activate"
+    echo "  media-reap [--force]"
+    echo "                 Reap only a confirmed draining color; force requires operator confirmation"
     echo "  validate-config  §F: pre-rebuild guard via 'docker compose config --quiet'"
     echo "  media-shared-listeners-check  validate a lab Compose JSON render on stdin; does not admit deployment"
     echo "  selfhost-port-check  Self-host only: refuse live port bindings outside the posture allowlist (#3538)"

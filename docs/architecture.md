@@ -758,6 +758,14 @@ login-enabled role must revoke successfully, or startup fails closed.
 - server-mute and server-deafen enforcement
 - NATS event publishing
 
+The optional two-colour rail uses the control plane's `internal/roomplacement`
+package to claim room ownership in Redis. `ROOM_PLACEMENT_ENABLED` defaults to
+`false`; managed deployment keeps the `media-single` profile until the explicit
+blue/green gate is cleared. First East activation remains separately gated by
+the quiescent-bootstrap procedure, and West remains staging-only. These source
+defaults do not establish live host state; see [ADR-0042](adr/0042-blue-green-media-instances.md)
+and the [deploy runbook](runbooks/deploys.md).
+
 The SFU forwards opaque, E2EE-encrypted RTP frames (see [Media E2EE](#media-e2ee-frame-encryption)).
 
 **Component split (authoritative vs. infrastructure):**
@@ -1746,6 +1754,7 @@ Concord/
 │   └── src/constants/        # Typed constants + build-time generators
 ├── services/
 │   ├── control-plane/        # Go backend (generated internal-package count; migrations/)
+│   │   └── internal/roomplacement/ # Redis-backed, opt-in media room ownership
 │   └── media-plane/          # Node.js mediasoup WebRTC SFU (src/lib/ RoomManager, mediasoup)
 ├── infrastructure/
 │   ├── deploy/               # deploy-spa.sh, copy-certs.sh, provisioning

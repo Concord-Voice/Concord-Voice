@@ -71,6 +71,7 @@ async function admittedSession() {
   const adapter = {
     getWebRtcServer: () => undefined,
     getOrCreateRouter: vi.fn().mockResolvedValue(router),
+    getWebRtcServer: vi.fn().mockReturnValue({ closed: false }),
     removeRouter: vi.fn(),
     captureNativeTermination,
     confirmNativeTermination,
@@ -90,7 +91,9 @@ async function admittedSession() {
   const terminalProof = () =>
     manager.awaitNativeTermination(ROOM_ID, USER_ID, SOCKET_ID, SESSION_GENERATION);
   const queriedTransportIds = (since = 0) =>
-    confirmNativeTermination.mock.calls.slice(since).flatMap(([target]) => target.transportIds ?? []);
+    confirmNativeTermination.mock.calls
+      .slice(since)
+      .flatMap(([target]) => target.transportIds ?? []);
   return {
     manager,
     router,
@@ -164,7 +167,9 @@ describe('receive-close proof retirement (#2624)', () => {
     // The same retained obligation must succeed once native absence is authoritative.
     fixture.nativeTransportIds.delete(created.id);
     await expect(fixture.terminalProof()).resolves.toBeUndefined();
-    expect(fixture.queriedTransportIds().filter((id) => id === created.id).length).toBeGreaterThanOrEqual(3);
+    expect(
+      fixture.queriedTransportIds().filter((id) => id === created.id).length
+    ).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -172,7 +177,9 @@ type ReceiveCloseFixture = Awaited<ReturnType<typeof admittedSession>>;
 
 function delayedCompletion() {
   let complete = (): void => undefined;
-  const promise = new Promise<void>((resolve) => { complete = resolve; });
+  const promise = new Promise<void>((resolve) => {
+    complete = resolve;
+  });
   return { promise, complete: () => complete() };
 }
 
@@ -267,7 +274,9 @@ describe('receive capacity until authoritative close proof (#2624)', () => {
     for (const id of closedIds) fixture.nativeTransportIds.delete(id);
     await expect(fixture.terminalProof()).resolves.toBeUndefined();
     // Refusal must not discard any witness: the successful retry proves each exact closed ID.
-    expect(new Set(fixture.queriedTransportIds(beforeConfirmedAbsence))).toEqual(new Set(closedIds));
+    expect(new Set(fixture.queriedTransportIds(beforeConfirmedAbsence))).toEqual(
+      new Set(closedIds)
+    );
     const replacement = await fixture.manager.createTransport(ROOM_ID, USER_ID, 'recv');
     expect(fixture.nativeTransportIds.has(replacement.id)).toBe(true);
     expect(fixture.router.createWebRtcTransport).toHaveBeenCalledTimes(
@@ -306,11 +315,17 @@ describe('receive capacity until authoritative close proof (#2624)', () => {
       pendingCreate = fixture.manager.createTransport(ROOM_ID, USER_ID, 'recv');
       let pendingSettled = false;
       void pendingCreate.then(
-        () => { pendingSettled = true; },
-        () => { pendingSettled = true; }
+        () => {
+          pendingSettled = true;
+        },
+        () => {
+          pendingSettled = true;
+        }
       );
       await flushCloseContinuations();
-      expect(fixture.router.createWebRtcTransport).toHaveBeenCalledTimes(MAX_RECV_TRANSPORTS_PER_PARTICIPANT);
+      expect(fixture.router.createWebRtcTransport).toHaveBeenCalledTimes(
+        MAX_RECV_TRANSPORTS_PER_PARTICIPANT
+      );
       expect(pendingSettled).toBe(false);
       // Two live + one native create in flight + one unproven close consumes all four slots.
       await expectReceiveCapacityRefusal(fixture);
@@ -326,8 +341,10 @@ describe('receive capacity until authoritative close proof (#2624)', () => {
       const completedCreate = await pendingCreate;
       expect(fixture.nativeTransportIds.has(completedCreate.id)).toBe(true);
       expect(pendingSettled).toBe(true);
-      expect(new Set([...initiallyLive.slice(1).map(({ id }) => id), replacement.id, completedCreate.id]).size)
-        .toBe(MAX_RECV_TRANSPORTS_PER_PARTICIPANT);
+      expect(
+        new Set([...initiallyLive.slice(1).map(({ id }) => id), replacement.id, completedCreate.id])
+          .size
+      ).toBe(MAX_RECV_TRANSPORTS_PER_PARTICIPANT);
       await expectReceiveCapacityRefusal(fixture);
       const beforeTerminal = fixture.confirmNativeTermination.mock.calls.length;
       await fixture.terminalProof();

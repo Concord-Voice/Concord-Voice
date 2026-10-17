@@ -9,7 +9,64 @@ import {
   SocketRoomClaim,
   runSocketBoundJoin,
   withKeyedJoinFence,
+  roomCreationRefusalAck,
 } from '../src/lib/socketJoinLifecycle.js';
+import { RoomCreationRefusedError } from '../src/lib/roomManager.js';
+import { isCanonicalEnforcementUUID } from '../src/lib/enforcementCommand.js';
+
+describe('room creation refusal acknowledgement', () => {
+  it.each(['room_draining', 'room_owner_mismatch', 'room_owner_unavailable'] as const)(
+    'returns a typed ack for %s without requiring a socket close',
+    (code) => {
+      expect(roomCreationRefusalAck(new RoomCreationRefusedError(code))).toEqual({
+        error: code,
+        code,
+      });
+    }
+  );
+
+  it('does not reinterpret unrelated failures as placement refusals', () => {
+    expect(roomCreationRefusalAck(new Error('native failure'))).toBeUndefined();
+  });
+
+  it('does not log an expected placement refusal as an unexpected join error', () => {
+    const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+    const emitJoinError = source.slice(
+      source.indexOf('function emitJoinError('),
+      source.indexOf('function getKeyframeSenderUserId(')
+    );
+
+    expect(emitJoinError).toMatch(
+      /if \(\s*!\(error instanceof MediaPolicyCooldownError\) &&\s*!\(error instanceof RoomCreationRefusedError\)\s*\)/
+    );
+  });
+
+  it('preserves the DM authorization after a placement refusal (ADR-0042 V17)', () => {
+    const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+    const registration = source.slice(
+      source.indexOf('function registerJoinRoomHandler'),
+      source.indexOf('async function main')
+    );
+
+    expect(registration).toContain(
+      'if (error instanceof RoomCreationRefusedError) placementRefused = true;'
+    );
+    expect(registration).toContain('if (placementRefused) return;');
+    expect(registration).toContain('if (!placementRefused) {');
+    expect(registration).toContain(
+      "await cleanupDMJoinSafely('Failed to clean up an errored DM room join');"
+    );
+  });
+});
+
+describe('join-room placement identity', () => {
+  it('positive control: canonical UUID spelling is admitted by the existing validator', () => {
+    const canonical = '550e8400-e29b-41d4-a716-446655440010';
+
+    expect(isCanonicalEnforcementUUID(canonical)).toBe(true);
+    expect(isCanonicalEnforcementUUID(canonical.toUpperCase())).toBe(false);
+  });
+});
 
 describe('DMJoinCallIdTracker', () => {
   it('uses the requested call ID until authorization returns its canonical ID', () => {

@@ -112,6 +112,20 @@ export function createMockAudioLevelObserver(overrides: Record<string, unknown> 
   };
 }
 
+export function createMockWebRtcServer(overrides: Record<string, unknown> = {}) {
+  const observer = createEventEmitter();
+  return {
+    id: `webrtc-server-${Math.random().toString(36).slice(2, 8)}`,
+    closed: false,
+    observer,
+    close: vi.fn(function (this: { closed: boolean }) {
+      this.closed = true;
+      observer.emit('close');
+    }),
+    ...overrides,
+  };
+}
+
 export function createMockRouter(overrides: Record<string, unknown> = {}) {
   const emitter = createEventEmitter();
   const audioLevelObserver = createMockAudioLevelObserver();
@@ -160,6 +174,7 @@ export function createMockWorker(overrides: Record<string, unknown> = {}) {
       });
       return router;
     }),
+    createWebRtcServer: vi.fn(async () => createMockWebRtcServer()),
     dump: vi.fn(async () => ({
       pid,
       webRtcServerIds: [],
@@ -172,6 +187,7 @@ export function createMockWorker(overrides: Record<string, unknown> = {}) {
       worker.closed = true;
       worker.subprocessClosed = true;
       routers.clear();
+      emitter.emit('workerclose');
       emitter.emit('subprocessclose');
     }),
     on: emitter.on,

@@ -84,3 +84,13 @@ func TestMainDispatchesControlPlaneSubcommandsBeforeConfigLoad(t *testing.T) {
 		t.Fatal("main retains the retired admin-only dispatch branch")
 	}
 }
+
+func TestMainPassesRoomPlacementConfigToRouter(t *testing.T) {
+	source, err := os.ReadFile("main.go") // #nosec G304 -- fixed test-only source path
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	if !strings.Contains(string(source), "RoomPlacementEnabled: cfg.RoomPlacementEnabled") {
+		t.Fatal("server router dependencies must receive the explicit room placement config gate")
+	}
+}

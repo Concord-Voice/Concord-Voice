@@ -19,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/roomplacement"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -26,6 +27,7 @@ import (
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -465,6 +467,7 @@ type Handler struct {
 	audit                             *rbac.AuditWriter
 	entCache                          *entitlements.Cache
 	serverTiers                       entitlements.ServerTierResolver
+	roomPlacement                     *roomplacement.Selector
 	tempGrant                         *tempGrantManager
 	afterVoiceAdmissionPrepareForTest func()
 	commitVoiceEffectTxForTest        func(*sql.Tx) error
@@ -481,30 +484,33 @@ type Handler struct {
 // entitlements (#1300); production wiring passes the same instance the auth
 // handler receives.
 type HandlerDeps struct {
-	DB          *sql.DB
-	Log         *logger.Logger
-	Hub         *websocket.Hub
-	Cfg         *config.Config
-	Resolver    *rbac.Resolver
-	NATS        *natsclient.Client
-	Audit       *rbac.AuditWriter
-	EntCache    *entitlements.Cache
-	ServerTiers entitlements.ServerTierResolver
+	DB                   *sql.DB
+	Log                  *logger.Logger
+	Hub                  *websocket.Hub
+	Cfg                  *config.Config
+	Resolver             *rbac.Resolver
+	NATS                 *natsclient.Client
+	Audit                *rbac.AuditWriter
+	EntCache             *entitlements.Cache
+	ServerTiers          entitlements.ServerTierResolver
+	Redis                *redis.Client
+	RoomPlacementEnabled bool
 }
 
 // NewHandler creates a new voice handler.
 func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		db:          deps.DB,
-		log:         deps.Log,
-		hub:         deps.Hub,
-		cfg:         deps.Cfg,
-		resolver:    deps.Resolver,
-		nats:        deps.NATS,
-		audit:       deps.Audit,
-		entCache:    deps.EntCache,
-		serverTiers: deps.ServerTiers,
-		tempGrant:   newTempGrantManager(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS),
+		db:            deps.DB,
+		log:           deps.Log,
+		hub:           deps.Hub,
+		cfg:           deps.Cfg,
+		resolver:      deps.Resolver,
+		nats:          deps.NATS,
+		audit:         deps.Audit,
+		entCache:      deps.EntCache,
+		serverTiers:   deps.ServerTiers,
+		roomPlacement: &roomplacement.Selector{Redis: deps.Redis, Enabled: deps.RoomPlacementEnabled},
+		tempGrant:     newTempGrantManager(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS),
 	}
 }
 
@@ -723,9 +729,22 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 
 	h.log.Info("Voice join authorized", "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(authorization.serverID), "media_tier", mediaEnt.Tier)
 
+	mediaURL, err := h.roomPlacement.Select(c.Request.Context(), channelID, h.cfg.MediaPlaneURL)
+	if err != nil {
+		h.log.Error("Failed to claim voice room placement", "failure_class", "placement")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if h.roomPlacement.Enabled {
+		if err := h.roomPlacement.MintJoinIntent(c.Request.Context(), channelID, userID); err != nil {
+			h.log.Error("Failed to mint voice join intent", "failure_class", "placement")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+			return
+		}
+	}
 	response := gin.H{
 		"allowed":            true,
-		"media_server_url":   h.cfg.MediaPlaneURL,
+		"media_server_url":   mediaURL,
 		"ice_servers":        h.cfg.ICEServers(userID),
 		"permissions":        strconv.FormatInt(int64(authorization.permissions), 10),
 		"server_muted":       authorization.serverMuted,

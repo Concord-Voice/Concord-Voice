@@ -138,6 +138,7 @@ func TestLoad(t *testing.T) {
 		"ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS", "HSTS_HEADER_VALUE",
 		"CLIENT_MIN_VERSION",
 		"ACTIVITY_HISTORY_CLUSTER_ENABLED",
+		"ROOM_PLACEMENT_ENABLED",
 		"CONTROL_PLANE_REPLICA_COUNT", "ACTIVITY_HISTORY_OPERATOR_NAME",
 		"ACTIVITY_HISTORY_PRIVACY_POLICY_URL",
 	}
@@ -174,6 +175,7 @@ func TestLoad(t *testing.T) {
 		// Empty default: the STS policy default lives ONLY in
 		// middleware.DefaultHSTSHeaderValue (single source of truth).
 		assert.Equal(t, "", cfg.HSTSHeaderValue)
+		assert.False(t, cfg.RoomPlacementEnabled)
 
 		// Message-purge tunables (#1352) default to the lightweight compose values.
 		assert.Equal(t, 5000, cfg.PurgeMaxBatch)

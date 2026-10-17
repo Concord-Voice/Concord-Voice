@@ -2,6 +2,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { deferred } from '../../helpers/deferred';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
+import { notificationSoundService } from '@/renderer/services/system/notificationSoundService';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing voiceService
@@ -846,6 +847,224 @@ describe('VoiceService', () => {
   // ===== joinChannel =====
 
   describe('joinChannel', () => {
+    it.each(['room_owner_mismatch', 'room_draining'] as const)(
+      're-authorizes and re-dials once after %s without leaving connecting state',
+      async (code) => {
+        setupAuth();
+        mockSocket.connected = true;
+        const retryAuthorization = deferred<{
+          ok: true;
+          json: () => Promise<Record<string, unknown>>;
+        }>();
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: vi.fn().mockResolvedValue(makeJoinResponse()),
+          })
+          .mockReturnValueOnce(retryAuthorization.promise);
+        mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+        mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+        const sendTransport = makeSendTransport();
+        mockCreateSendTransport.mockReturnValue(sendTransport);
+        sendTransport.produce.mockResolvedValue(createMockProducer('prod-mic', 'mic'));
+        setupEmitResponses({
+          'join-room': makeRoomJoined(),
+          'create-transport': makeTransportOpts(),
+          produce: { id: 'prod-mic' },
+          'resume-consumer': undefined,
+          'close-producer': undefined,
+          'pause-producer': undefined,
+          'resume-producer': undefined,
+        });
+        let joinAttempts = 0;
+        const normalEmit = mockSocket.emit.getMockImplementation();
+        mockSocket.emit.mockImplementation((event, data, callback) => {
+          if (event === 'join-room') {
+            joinAttempts += 1;
+            callback?.(
+              joinAttempts === 1 ? { error: 'Placement changed', code } : makeRoomJoined()
+            );
+            return;
+          }
+          normalEmit?.(event, data, callback);
+        });
+        const play = vi.spyOn(notificationSoundService, 'play');
+
+        const joining = voiceService.joinChannel('channel-1');
+        await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+        expect(useVoiceStore.getState().connectionState).toBe('connecting');
+        expect(play).not.toHaveBeenCalled();
+        retryAuthorization.resolve({
+          ok: true,
+          json: async () => ({
+            ...makeJoinResponse(),
+            media_server_url: 'https://media-east.example.test',
+          }),
+        });
+        await joining;
+
+        const { io } = await import('socket.io-client');
+        expect(io).toHaveBeenCalledTimes(2);
+        expect(io).toHaveBeenNthCalledWith(
+          2,
+          'https://media-east.example.test',
+          expect.any(Object)
+        );
+        expect(joinAttempts).toBe(2);
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+        expect(play).toHaveBeenCalledOnce();
+        expect(play).toHaveBeenCalledWith('voice-join');
+        play.mockRestore();
+      }
+    );
+
+    it('does not re-dial after leave cancels the retry authorization', async () => {
+      setupAuth();
+      mockSocket.connected = true;
+      const retryAuthorization = deferred<{
+        ok: true;
+        json: () => Promise<Record<string, unknown>>;
+      }>();
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: vi.fn().mockResolvedValue(makeJoinResponse()),
+        })
+        .mockReturnValueOnce(retryAuthorization.promise);
+      setupEmitResponses({
+        'join-room': { error: 'Ownership changed', code: 'room_owner_mismatch' },
+      });
+
+      const joining = voiceService.joinChannel('channel-1');
+      await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+      await expect(voiceService.joinChannel('channel-2')).rejects.toThrow(
+        'Another voice call is already in progress'
+      );
+      await voiceService.leaveChannel();
+      retryAuthorization.resolve({
+        ok: true,
+        json: async () => makeJoinResponse(),
+      });
+      await expect(joining).rejects.toThrow('E2EE initialization superseded');
+
+      const { io } = await import('socket.io-client');
+      expect(io).toHaveBeenCalledOnce();
+      expect(useVoiceStore.getState().activeChannelId).toBeNull();
+      expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+    });
+
+    it('keeps the DM ring authorization on its one placement retry', async () => {
+      setupAuth();
+      mockSocket.connected = true;
+      useVoiceStore.getState().setCallState({
+        kind: 'outgoing-ringing',
+        conversationId: 'channel-1',
+        ringId: 'ring-1',
+        calleeUserIds: ['user-2'],
+        startedAt: Date.now(),
+        declinedUserIds: [],
+      });
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: vi.fn().mockResolvedValue({ ...makeJoinResponse(), call_id: 'call-1' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            ...makeJoinResponse(),
+            call_id: 'call-1',
+            media_server_url: 'https://media-east.example.test',
+          }),
+        });
+      const sendTransport = makeSendTransport();
+      mockCreateSendTransport.mockReturnValue(sendTransport);
+      mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+      sendTransport.produce.mockResolvedValue(createMockProducer('prod-mic', 'mic'));
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic' },
+        'resume-consumer': undefined,
+        'close-producer': undefined,
+        'pause-producer': undefined,
+        'resume-producer': undefined,
+      });
+      let joinAttempts = 0;
+      const normalEmit = mockSocket.emit.getMockImplementation();
+      mockSocket.emit.mockImplementation((event, data, callback) => {
+        if (event === 'join-room') {
+          joinAttempts += 1;
+          callback?.(
+            joinAttempts === 1
+              ? { error: 'Ownership changed', code: 'room_owner_mismatch' }
+              : makeRoomJoined()
+          );
+          return;
+        }
+        normalEmit?.(event, data, callback);
+      });
+
+      await voiceService.joinChannel('channel-1', 'dm');
+
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        2,
+        '/api/v1/dm/conversations/channel-1/voice/join',
+        expect.objectContaining({ body: JSON.stringify({ ring_id: 'ring-1' }) })
+      );
+      expect(useVoiceStore.getState().callState.kind).toBe('in-call');
+      expect(joinAttempts).toBe(2);
+    });
+
+    it('stops after the single ownership retry is refused again', async () => {
+      setupAuth();
+      mockSocket.connected = true;
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({ 'join-room': makeRoomJoined() });
+      let joinAttempts = 0;
+      mockSocket.emit.mockImplementation((event, _data, callback) => {
+        if (event !== 'join-room') return;
+        joinAttempts += 1;
+        const code = joinAttempts === 1 ? 'room_owner_mismatch' : 'room_draining';
+        callback?.({ error: `Refused ${joinAttempts}`, code });
+      });
+
+      await expect(voiceService.joinChannel('channel-1')).rejects.toThrow('Refused 2');
+
+      const { io } = await import('socket.io-client');
+      expect(io).toHaveBeenCalledTimes(2);
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(joinAttempts).toBe(2);
+      expect(useVoiceStore.getState().connectionState).toBe('error');
+    });
+
+    it('treats room_owner_unavailable as terminal without re-authorizing', async () => {
+      setupAuth();
+      mockSocket.connected = true;
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': {
+          error: 'Placement could not be checked',
+          code: 'room_owner_unavailable',
+        },
+      });
+
+      await expect(voiceService.joinChannel('channel-1')).rejects.toThrow(
+        'Placement could not be checked'
+      );
+
+      const { io } = await import('socket.io-client');
+      expect(io).toHaveBeenCalledOnce();
+      expect(mockApiFetch).toHaveBeenCalledOnce();
+      expect(useVoiceStore.getState().connectionState).toBe('error');
+    });
     describe('microphone capture join regressions', () => {
       beforeEach(() => {
         useVoiceStore.setState({ joinError: null } as Parameters<typeof useVoiceStore.setState>[0]);
@@ -1843,6 +2062,233 @@ describe('VoiceService', () => {
   });
 
   describe('network-change recovery (#1790)', () => {
+    it('does not rebuild over a same-channel successor socket after a delayed refusal', async () => {
+      await joinVoiceChannel();
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic' },
+        'resume-consumer': undefined,
+        'close-producer': undefined,
+        'pause-producer': undefined,
+        'resume-producer': undefined,
+        'leave-room': undefined,
+      });
+      const normalEmit = mockSocket.emit.getMockImplementation();
+      let resumeJoinAck: ((response: unknown) => void) | undefined;
+      mockSocket.emit.mockImplementation((event, data, callback) => {
+        if (event === 'join-room') {
+          resumeJoinAck = callback as (response: unknown) => void;
+          return;
+        }
+        normalEmit?.(event, data, callback);
+      });
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      await reconnectMockSocket();
+      await vi.waitFor(() => expect(resumeJoinAck).toEqual(expect.any(Function)));
+
+      await voiceService.leaveChannel();
+      const successorSocket = {
+        ...mockSocket,
+        connected: true,
+        active: true,
+        emit: vi.fn().mockImplementation(normalEmit),
+        on: vi.fn(),
+        off: vi.fn(),
+        once: vi.fn(),
+        disconnect: vi.fn(),
+        io: { on: vi.fn(), off: vi.fn() },
+      };
+      const { io } = await import('socket.io-client');
+      vi.mocked(io).mockImplementationOnce((_url, options) => {
+        (options as { auth: (cb: () => void) => void }).auth(() => {});
+        return successorSocket as unknown as ReturnType<typeof io>;
+      });
+      const sendTransport = makeSendTransport();
+      mockCreateSendTransport.mockReturnValue(sendTransport);
+      mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+      sendTransport.produce.mockResolvedValue(createMockProducer('prod-mic-successor', 'mic'));
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      await voiceService.joinChannel('channel-1');
+
+      resumeJoinAck({ error: 'Ownership changed', code: 'room_owner_mismatch' });
+      await vi.waitFor(() => expect((voiceService as any).resumeInFlight).toBe(false));
+
+      expect(useVoiceStore.getState().activeChannelId).toBe('channel-1');
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+      expect((voiceService as any).socket).toBe(successorSocket);
+      expect(io).toHaveBeenCalledTimes(2);
+    });
+    it('uses the one-shot internal rebuild after an ownership refusal on the stale socket', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.getState().setMuted(true);
+      useVoiceStore.getState().setDeafened(true);
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          ...makeJoinResponse(),
+          media_server_url: 'https://media-east.example.test',
+        }),
+      });
+      mockCreateSendTransport.mockReturnValue(makeSendTransport());
+      mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+      const sendTransport = makeSendTransport();
+      mockCreateSendTransport.mockReturnValue(sendTransport);
+      const rebuiltMic = createMockProducer('prod-mic-rebuilt', 'mic');
+      sendTransport.produce.mockResolvedValue(rebuiltMic);
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic-rebuilt' },
+        'resume-consumer': undefined,
+        'leave-room': undefined,
+      });
+      let joinAttempts = 0;
+      const normalEmit = mockSocket.emit.getMockImplementation();
+      mockSocket.emit.mockImplementation((event, data, callback) => {
+        if (event === 'join-room') {
+          joinAttempts += 1;
+          callback?.(
+            joinAttempts === 1
+              ? { error: 'Ownership changed', code: 'room_owner_mismatch' }
+              : makeRoomJoined()
+          );
+          return;
+        }
+        normalEmit?.(event, data, callback);
+      });
+      const emergencyCleanup = vi.spyOn(voiceService, 'emergencyCleanup');
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      await reconnectMockSocket();
+
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+      });
+
+      const { io } = await import('socket.io-client');
+      expect(io).toHaveBeenCalledTimes(2);
+      expect(io).toHaveBeenLastCalledWith('https://media-east.example.test', expect.any(Object));
+      expect(joinAttempts).toBe(2);
+      expect(mockApiFetch).toHaveBeenCalledTimes(3);
+      expect(useVoiceStore.getState().isMuted).toBe(true);
+      expect(useVoiceStore.getState().isDeafened).toBe(true);
+      expect(rebuiltMic.pause).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+        producerId: 'prod-mic-rebuilt',
+      });
+      expect(mockSocket.emit).toHaveBeenCalledWith('set-deafen', { isDeafened: true });
+      expect(emergencyCleanup).not.toHaveBeenCalled();
+      emergencyCleanup.mockRestore();
+    });
+
+    it('cleans up when an ownership-refusal rebuild fails after disconnecting', async () => {
+      await joinVoiceChannel();
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic-rebuilt' },
+        'resume-consumer': undefined,
+        'leave-room': undefined,
+      });
+      let joinAttempts = 0;
+      let internalRebuildAck: ((response: unknown) => void) | undefined;
+      const normalEmit = mockSocket.emit.getMockImplementation();
+      mockSocket.emit.mockImplementation((event, data, callback) => {
+        if (event === 'join-room') {
+          joinAttempts += 1;
+          if (joinAttempts === 1) {
+            callback?.({ error: 'Ownership changed', code: 'room_owner_mismatch' });
+          } else {
+            internalRebuildAck = callback as (response: unknown) => void;
+          }
+          return;
+        }
+        normalEmit?.(event, data, callback);
+      });
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      await reconnectMockSocket();
+      await vi.waitFor(() => expect(internalRebuildAck).toEqual(expect.any(Function)));
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
+      internalRebuildAck?.({ error: 'media join failed' });
+
+      await vi.waitFor(() => expect((voiceService as any).resumeInFlight).toBe(false));
+      expect(useVoiceStore.getState().connectionState).toBe('error');
+      expect(useVoiceStore.getState().activeChannelId).toBeNull();
+      expect((voiceService as any).socket).toBeNull();
+    });
+
+    it('does not rejoin after an explicit leave races the ownership-refusal cleanup', async () => {
+      await joinVoiceChannel();
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        'leave-room': undefined,
+      });
+      let joinAttempts = 0;
+      const normalEmit = mockSocket.emit.getMockImplementation();
+      mockSocket.emit.mockImplementation((event, data, callback) => {
+        if (event === 'join-room') {
+          joinAttempts += 1;
+          callback?.(
+            joinAttempts === 1
+              ? { error: 'Ownership changed', code: 'room_owner_mismatch' }
+              : makeRoomJoined()
+          );
+          return;
+        }
+        normalEmit?.(event, data, callback);
+      });
+
+      let finishInternalCleanup!: () => void;
+      const internalCleanup = new Promise<void>((resolve) => {
+        finishInternalCleanup = resolve;
+      });
+      const cleanup = (voiceService as any).cleanup.bind(voiceService);
+      const cleanupSpy = vi
+        .spyOn(voiceService as any, 'cleanup')
+        .mockImplementationOnce(() => internalCleanup)
+        .mockImplementation(cleanup);
+      const joinSpy = vi.spyOn(voiceService, 'joinChannel');
+      try {
+        socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+        await reconnectMockSocket();
+        await vi.waitFor(() => expect(joinAttempts).toBe(1));
+        await vi.waitFor(() => expect(cleanupSpy).toHaveBeenCalledTimes(1));
+
+        await voiceService.leaveChannel();
+        finishInternalCleanup();
+        await vi.waitFor(() => expect((voiceService as any).resumeInFlight).toBe(false));
+
+        expect(joinSpy).not.toHaveBeenCalled();
+        expect(useVoiceStore.getState().activeChannelId).toBeNull();
+        expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+      } finally {
+        cleanupSpy.mockRestore();
+        joinSpy.mockRestore();
+      }
+    });
     it('re-establishes the media session after a transient disconnect + socket reconnect', async () => {
       await joinVoiceChannel();
       expect(useVoiceStore.getState().connectionState).toBe('connected');

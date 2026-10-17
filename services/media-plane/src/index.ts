@@ -9,6 +9,7 @@ import { MediasoupService } from './lib/mediasoup.js';
 import {
   CryptoVersionMismatchError,
   MediaPolicyCooldownError,
+  RoomCreationRefusedError,
   VideoPolicyCooldownError,
   parseMediaFrameCryptoVersion,
   RoomManager,
@@ -72,7 +73,10 @@ import {
 } from './lib/voiceEnforcementShutdown.js';
 import { VoiceEnforcementExpiryFence, VoiceEnforcementLease } from './lib/voiceEnforcementLease.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
-import { handleNatsEnforcementCommand } from './lib/enforcementCommand.js';
+import {
+  handleNatsEnforcementCommand,
+  isCanonicalEnforcementUUID,
+} from './lib/enforcementCommand.js';
 import { getIdentityAuthorityReasonCode } from './lib/identityAuthority.js';
 import { enqueueServerEnforcement } from './lib/serverEnforcement.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
@@ -90,6 +94,7 @@ import {
   SocketRoomClaim,
   runSocketBoundJoin,
   withKeyedJoinFence,
+  roomCreationRefusalAck,
 } from './lib/socketJoinLifecycle.js';
 import { withRateLimit as registerRateLimited } from './lib/rateLimit.js';
 import type {
@@ -171,6 +176,8 @@ function logSocketHandlerFailure(event: RoomEventName, userId: string): void {
  * with its retry-after (#2153), or the generic failure.
  */
 function joinErrorAck(error: unknown): object {
+  const placementRefusal = roomCreationRefusalAck(error);
+  if (placementRefusal) return placementRefusal;
   if (error instanceof CryptoVersionMismatchError) {
     return {
       error: error.message,
@@ -196,7 +203,10 @@ function emitJoinError(
   // #2153: a cooldown refusal is an expected outcome, already logged (warn) where
   // RoomManager decided it. Logging it again here as an error with a stack would turn
   // every retry of a user in cooldown into a crash-shaped log line.
-  if (!(error instanceof MediaPolicyCooldownError)) {
+  if (
+    !(error instanceof MediaPolicyCooldownError) &&
+    !(error instanceof RoomCreationRefusedError)
+  ) {
     logger.error('Error joining room', {
       error: error instanceof Error ? error.message : error,
       stack: error instanceof Error ? error.stack : undefined,
@@ -497,6 +507,24 @@ async function rollbackRegisteredRoomJoin({
   });
 }
 
+function parseJoinMediaFrameCryptoVersion(
+  value: unknown,
+  observe: (event: Parameters<EmitSecurityEvent>[0]) => void
+): number {
+  try {
+    return parseMediaFrameCryptoVersion(value);
+  } catch (error) {
+    observe({
+      eventType: 'media_integrity',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'crypto_version_invalid',
+      routeTemplate: 'socket.join',
+    });
+    throw error;
+  }
+}
+
 function registerJoinRoomHandler(
   socket: Socket,
   data: AuthenticatedSocketData,
@@ -533,6 +561,11 @@ function registerJoinRoomHandler(
     }
   };
   const socketRoomClaim = new SocketRoomClaim();
+  const refuseJoin = (message: string, callback?: (payload: unknown) => void) => {
+    const error = { error: message };
+    if (callback) callback(error);
+    else socket.emit('error', error);
+  };
 
   // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion, callId? }
   // Server responds with: room-joined event containing router caps, existing producers, participants
@@ -541,9 +574,11 @@ function registerJoinRoomHandler(
     'join-room',
     async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion, callId }, callback?) => {
       if (isShuttingDown()) {
-        const error = { error: 'Voice service is shutting down' };
-        if (callback) callback(error);
-        else socket.emit('error', error);
+        refuseJoin('Voice service is shutting down', callback);
+        return;
+      }
+      if (!isCanonicalEnforcementUUID(roomId)) {
+        refuseJoin('Invalid room ID: canonical UUID required', callback);
         return;
       }
       // Claim before the first await: socket.data can name only one room, so a
@@ -557,9 +592,7 @@ function registerJoinRoomHandler(
           reasonCode: 'room_claim_conflict',
           routeTemplate: 'socket.join',
         });
-        const error = { error: 'Socket is already joining or joined to a voice room' };
-        if (callback) callback(error);
-        else socket.emit('error', error);
+        refuseJoin('Socket is already joining or joined to a voice room', callback);
         return;
       }
       const commitSocketMembership = () => {
@@ -581,6 +614,7 @@ function registerJoinRoomHandler(
         socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
       const token = socket.handshake.auth.token;
       let enforcementSession: VoiceEnforcementSession | undefined;
+      let placementRefused = false;
       const inputCallId = typeof callId === 'string' ? callId : undefined;
       const dmCallId = new DMJoinCallIdTracker(inputCallId);
       const cleanupDMJoin = async (authorizedCallId?: string) => {
@@ -623,36 +657,31 @@ function registerJoinRoomHandler(
         if (roomKind === 'dm') dmCallId.observe(access.callId);
         return access;
       };
+      const isAuthorizedAccess = (
+        access: Awaited<ReturnType<typeof authorizeRoom>>,
+        authorizedAccess?: Awaited<ReturnType<typeof authorizeRoom>>
+      ) =>
+        access.allowed &&
+        (roomKind === 'channel' ||
+          (typeof authorizedAccess?.callId === 'string' &&
+            authorizedAccess.callId !== '' &&
+            access.callId === authorizedAccess.callId));
       const executeJoin = async () => {
         try {
           if (!socket.connected) {
             await cleanupDMJoin(dmCallId.current());
             return;
           }
-          let parsedMediaFrameCryptoVersion: number;
-          try {
-            parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
-          } catch (error) {
-            observe({
-              eventType: 'media_integrity',
-              outcome: 'denied',
-              severity: 'medium',
-              reasonCode: 'crypto_version_invalid',
-              routeTemplate: 'socket.join',
-            });
-            throw error;
-          }
+          const parsedMediaFrameCryptoVersion = parseJoinMediaFrameCryptoVersion(
+            mediaFrameCryptoVersion,
+            observe
+          );
           // room_kind is only a routing hint: every endpoint independently
           // authorizes the JWT-derived user before any room mutation.
 
           const outcome = await runSocketBoundJoin({
             authorize: () => authorizeRoom(inputCallId, false),
-            isAllowed: (access, authorizedAccess) =>
-              access.allowed &&
-              (roomKind === 'channel' ||
-                (typeof authorizedAccess?.callId === 'string' &&
-                  authorizedAccess.callId !== '' &&
-                  access.callId === authorizedAccess.callId)),
+            isAllowed: isAuthorizedAccess,
             // The lease fence is checked by runSocketBoundJoin before A1 and
             // again before promotion, so a late expiry cannot promote a row.
             isConnected: () =>
@@ -679,40 +708,46 @@ function registerJoinRoomHandler(
               };
               // Thread the server-authoritative entitlement and permissions
               // into the participant; neither comes from the handshake.
-              const result = await roomManager.joinRoom(
-                roomId,
-                data.userId,
-                socket.id,
-                identity,
-                rtpCapabilities,
-                {
-                  voiceEnforcementSessionGeneration: enforcementSession.sessionGeneration,
-                  entitlement: {
-                    tier: access.userTier,
-                    allowedAudioTiers: access.allowedAudioTiers,
-                    minPtimeMs: access.minPtimeMs,
-                    maxManualBitrateBps: access.maxManualBitrateBps,
-                    cameraMaxBitrateBps: access.cameraMaxBitrateBps,
-                    screenMaxBitrateBps: access.screenMaxBitrateBps,
-                  },
-                  mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
-                  // Room kind selects the cap strategy; owner tier is absent for DMs.
-                  roomContext: {
-                    roomKind,
-                    ownerTier: access.roomOwnerTier,
-                    callId: access.callId,
-                    callRingId: access.callRingId,
-                    callCallerUserId: access.callCallerUserId,
-                  },
-                  // Effective publish permissions apply only to channel joins.
-                  // A missing channel field fails closed to an empty bitfield.
-                  permissions: roomKind === 'channel' ? (access.permissions ?? 0n) : undefined,
-                  admissionId,
-                  authorizationRevision: access.authorizationRevision,
-                  credentialEpoch: data.credentialEpoch,
-                  deferChannelPromotion: roomKind === 'channel',
-                }
-              );
+              let result: JoinRoomResult;
+              try {
+                result = await roomManager.joinRoom(
+                  roomId,
+                  data.userId,
+                  socket.id,
+                  identity,
+                  rtpCapabilities,
+                  {
+                    voiceEnforcementSessionGeneration: enforcementSession.sessionGeneration,
+                    entitlement: {
+                      tier: access.userTier,
+                      allowedAudioTiers: access.allowedAudioTiers,
+                      minPtimeMs: access.minPtimeMs,
+                      maxManualBitrateBps: access.maxManualBitrateBps,
+                      cameraMaxBitrateBps: access.cameraMaxBitrateBps,
+                      screenMaxBitrateBps: access.screenMaxBitrateBps,
+                    },
+                    mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
+                    // Room kind selects the cap strategy; owner tier is absent for DMs.
+                    roomContext: {
+                      roomKind,
+                      ownerTier: access.roomOwnerTier,
+                      callId: access.callId,
+                      callRingId: access.callRingId,
+                      callCallerUserId: access.callCallerUserId,
+                    },
+                    // Effective publish permissions apply only to channel joins.
+                    // A missing channel field fails closed to an empty bitfield.
+                    permissions: roomKind === 'channel' ? (access.permissions ?? 0n) : undefined,
+                    admissionId,
+                    authorizationRevision: access.authorizationRevision,
+                    credentialEpoch: data.credentialEpoch,
+                    deferChannelPromotion: roomKind === 'channel',
+                  }
+                );
+              } catch (error) {
+                if (error instanceof RoomCreationRefusedError) placementRefused = true;
+                throw error;
+              }
 
               // A2 must see an enforcement-addressable exact socket before it
               // can promote it. Failure is an admission failure: runSocketBoundJoin
@@ -797,6 +832,7 @@ function registerJoinRoomHandler(
               );
             },
             rollback: async (access) => {
+              if (placementRefused) return;
               await rollbackRegisteredRoomJoin({
                 roomManager,
                 cleanupDMJoin,
@@ -932,7 +968,9 @@ function registerJoinRoomHandler(
           }
           callback(response);
         } catch (error) {
-          await cleanupDMJoinSafely('Failed to clean up an errored DM room join');
+          if (!placementRefused) {
+            await cleanupDMJoinSafely('Failed to clean up an errored DM room join');
+          }
           emitJoinError(socket, roomId, data.userId, error, callback);
         }
       };
@@ -1005,6 +1043,10 @@ async function main() {
   } catch {
     logger.warn('Redis connection failed — running without persistent room state');
   }
+  const mediaInstanceIdentity = config.mediaInstanceColor
+    ? await redisService.initializeMediaInstance(config.mediaInstanceColor)
+    : undefined;
+  if (mediaInstanceIdentity) natsService.setMediaInstanceIdentity(mediaInstanceIdentity);
 
   // Initialize RoomManager
   // #1553 measurement counters — accumulated from heartbeat samples, surfaced on /health.
@@ -1017,6 +1059,9 @@ async function main() {
     onCameraPressureDemand: () => mediaMetrics.incrementCameraPressureDemand(),
   });
   roomManager.setSecurityEventEmitter((event) => securityEvents.emit(event));
+  if (config.roomPlacementEnabled) {
+    roomManager.setRoomCreationGuard((roomId) => redisService.guardRoomCreation(roomId));
+  }
 
   // Worker placement reads live consumer counts from RoomManager (#3149).
   // Installed here rather than injected: mediasoupService is constructed
@@ -1055,9 +1100,14 @@ async function main() {
   // exposure note.
   app.get('/health', (_req, res) => {
     const stats = roomManager.getStats();
+    const placement = redisService.healthState();
     res.json({
       status: 'healthy',
       service: 'media-plane',
+      colour: placement.color,
+      accepting_new_rooms: placement.acceptingNewRooms,
+      rooms: roomManager.getRoomIds().length,
+      owner_refusals_total: placement.ownerRefusalsTotal,
       workers: mediasoupService.getWorkerCount(),
       activeRooms: stats.activeRooms,
       totalParticipants: stats.totalParticipants,
@@ -1067,9 +1117,29 @@ async function main() {
       metrics: mediaMetrics.getSnapshot(),
     });
   });
-  app.get('/readyz', (_req, res) => {
+  app.get('/readyz', async (_req, res) => {
+    const acceptingNewRooms = await redisService.refreshAcceptingNewRooms();
+    const placement = redisService.healthState();
+    const rooms = roomManager.getRoomIds().length;
+    const createsInFlight = roomManager.getCreatesInFlightCount();
+    const placementBody = config.roomPlacementEnabled
+      ? {
+          colour: placement.color,
+          generation: placement.generation,
+          accepting_new_rooms: acceptingNewRooms,
+          rooms,
+          creates_in_flight: createsInFlight,
+        }
+      : {};
+    const placementReady =
+      !config.roomPlacementEnabled ||
+      (acceptingNewRooms &&
+        placement.generation !== null &&
+        mediasoupService.getWorkerCount() >= config.mediasoup.initialWorkers &&
+        !(rooms === 0 && !placement.redisReachable));
     if (
       shuttingDown ||
+      !placementReady ||
       !mediasoupService.isReady() ||
       voiceEnforcementReleaseQueue.saturated() ||
       !enforcementAvailable() ||
@@ -1078,10 +1148,17 @@ async function main() {
       !voiceEnforcementSubscriptionReady ||
       !natsService.isRequestSubscriptionHealthy(voiceEnforcementSubject)
     ) {
-      res.status(503).json({ ready: false });
+      res.status(503).json({
+        ready: false,
+        ...placementBody,
+      });
       return;
     }
-    res.json({ ready: true, voiceEnforcementProtocol: 3 });
+    res.json({
+      ready: true,
+      voiceEnforcementProtocol: 3,
+      ...placementBody,
+    });
   });
 
   // Express error handler — surface uncaught route errors via Winston with a
@@ -1606,11 +1683,8 @@ async function main() {
             participant.voiceEnforcementSessionGeneration === session.sessionGeneration
           );
         };
-        await renewVoiceEnforcementSession(
-          token,
-          session,
-          sessionIsCurrent,
-          (staleSession) => voiceEnforcementReleaseQueue.releaseAfterTerminalClose(staleSession)
+        await renewVoiceEnforcementSession(token, session, sessionIsCurrent, (staleSession) =>
+          voiceEnforcementReleaseQueue.releaseAfterTerminalClose(staleSession)
         );
       })
     );
@@ -2292,10 +2366,16 @@ async function main() {
   // allowing the control plane to delete stale voice_participants rows.
   let metricsSampling = false; // re-entrancy guard for the async metrics block below
   const roomHeartbeatInterval = setInterval(async () => {
-    for (const roomId of roomManager.getActiveRoomIds()) {
+    const roomIds = roomManager.getRoomIds();
+    const acceptingNewRooms = await redisService.refreshAcceptingNewRooms();
+    if (config.roomPlacementEnabled && !acceptingNewRooms) {
+      await mediasoupService.demoteIdleWorkersToInitial();
+    }
+    await redisService.heartbeatRoomOccupancy(roomIds);
+    for (const roomId of roomIds) {
       const room = roomManager.getRoom(roomId);
       if (!room) continue;
-      natsService.publish('voice.heartbeat', {
+      natsService.publishRoomHeartbeat({
         channelId: roomId,
         userIds: Array.from(room.participants.keys()),
         callId: room.callId,

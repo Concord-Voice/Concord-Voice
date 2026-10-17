@@ -363,6 +363,12 @@ func (s *NATSSubscriber) HandleLeftAt(data []byte, receivedAt time.Time) {
 	s.handleLeft(data, receivedAt)
 }
 
+// HandleVoiceLifecycleEventForTest exercises the same placement dispatcher
+// used for NATS lifecycle delivery.
+func (s *NATSSubscriber) HandleVoiceLifecycleEventForTest(subject string, data []byte, receivedAt time.Time) {
+	s.handleVoiceLifecycleEvent(subject, data, receivedAt)
+}
+
 // HandleRoomEmpty exposes handleRoomEmpty for testing.
 func (s *NATSSubscriber) HandleRoomEmpty(data []byte) { s.handleRoomEmpty(data, time.Now()) }
 

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createMockRouter, createMockTransport, createMockProducer, createMockWorker } from './mocks/mediasoup.js';
+import {
+  createMockRouter,
+  createMockTransport,
+  createMockProducer,
+  createMockWorker,
+} from './mocks/mediasoup.js';
 import './mocks/logger.js';
 
 // Mock mediasoup native module (same as roomManager.test.ts — prevents native
@@ -84,6 +89,7 @@ describe('media policer integration (#2153 real RoomManager + MediaPolicer + tic
     const mockMediasoup = {
       getWebRtcServer: () => undefined,
       getOrCreateRouter: vi.fn().mockResolvedValue(mockRouter),
+      getWebRtcServer: vi.fn().mockReturnValue({ closed: false }),
       removeRouter: vi.fn(),
       captureNativeTermination: vi.fn((router, transportIds?: readonly string[]) => ({
         worker,

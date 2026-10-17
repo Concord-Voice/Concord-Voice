@@ -17,17 +17,18 @@ vi.mock('@/config/index.js', () => ({
     mediasoup: {
       webRtcServer: { enabled: false, ports: [], listenIp: '0.0.0.0', announcedAddress: '127.0.0.1' },
       numWorkers: 2,
+      initialWorkers: 2,
       worker: { logLevel: 'error', logTags: [], rtcMinPort: 40000, rtcMaxPort: 49999 },
       router: {
         mediaCodecs: [{ kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 }],
       },
       webRtcTransport: {
-        listenIps: [{ ip: '127.0.0.1' }],
         enableUdp: true,
         enableTcp: false,
         maxIncomingBitrate: 50_000_000,
       },
     },
+    rtc: { minPort: 40000, maxPort: 49999, announcedIp: '127.0.0.1' },
   },
 }));
 
@@ -60,8 +61,12 @@ type ProofRoomManager = RoomManager & {
 function observe<T>(promise: Promise<T>) {
   const result = { status: 'pending' as 'pending' | 'fulfilled' | 'rejected', promise };
   void promise.then(
-    () => { result.status = 'fulfilled'; },
-    () => { result.status = 'rejected'; }
+    () => {
+      result.status = 'fulfilled';
+    },
+    () => {
+      result.status = 'rejected';
+    }
   );
   return result;
 }
@@ -131,7 +136,9 @@ function fakeRouter(id: string, nativeRouters: Map<string, unknown>) {
   router.createWebRtcTransport.mockImplementation(async () => {
     const transport = createMockTransport({ id: `${id}-transport-${nextTransport++}` });
     nativeTransportIds.add(transport.id);
-    transport.close.mockImplementation(() => { transport.closed = true; });
+    transport.close.mockImplementation(() => {
+      transport.closed = true;
+    });
     return transport;
   });
   return router;
@@ -157,7 +164,9 @@ describe('native terminalization with controlled completion', () => {
     mockCreateWorker.mockReset();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
   });
-  afterEach(() => { vi.useRealTimers(); });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('waits for subprocessclose after Worker.close only marks local closed', async () => {
     const { service, workers } = await fakeService();
@@ -201,20 +210,26 @@ describe('native terminalization with controlled completion', () => {
     expect((await workers[0].dump()).routerIds).toContain(router.id);
     expect((await router.dump()).transportIds).toContain(transport.id);
     workers[0].nativeRouters.delete(router.id);
-    await expect(service.confirmNativeTermination(target, performance.now() + 25)).resolves.toBeUndefined();
+    await expect(
+      service.confirmNativeTermination(target, performance.now() + 25)
+    ).resolves.toBeUndefined();
   });
 
-  it.each(['worker', 'router'] as const)('does not mistake a %s dump rejection for native absence', async (failedDump) => {
-    const { service, workers } = await fakeService();
-    const router = await service.getOrCreateRouter('room-dump-error');
-    const target = service.captureNativeTermination(router, ['old-transport']);
-    const nativeRouter = workers[0].nativeRouters.get(router.id)!;
-    nativeRouter.nativeTransportIds.add('old-transport');
-    if (failedDump === 'worker') workers[0].dump.mockRejectedValue(new Error('worker IPC failed'));
-    else nativeRouter.dump.mockRejectedValue(new Error('router IPC failed'));
-    await rejectsByDeadline(service.confirmNativeTermination(target, performance.now() + 25));
-    expect(workers[0].subprocessClosed).toBe(false);
-  });
+  it.each(['worker', 'router'] as const)(
+    'does not mistake a %s dump rejection for native absence',
+    async (failedDump) => {
+      const { service, workers } = await fakeService();
+      const router = await service.getOrCreateRouter('room-dump-error');
+      const target = service.captureNativeTermination(router, ['old-transport']);
+      const nativeRouter = workers[0].nativeRouters.get(router.id)!;
+      nativeRouter.nativeTransportIds.add('old-transport');
+      if (failedDump === 'worker')
+        workers[0].dump.mockRejectedValue(new Error('worker IPC failed'));
+      else nativeRouter.dump.mockRejectedValue(new Error('router IPC failed'));
+      await rejectsByDeadline(service.confirmNativeTermination(target, performance.now() + 25));
+      expect(workers[0].subprocessClosed).toBe(false);
+    }
+  );
 
   it('rechecks worker absence when router dump races native router removal', async () => {
     const { service, workers } = await fakeService();
@@ -225,7 +240,9 @@ describe('native terminalization with controlled completion', () => {
       workers[0].nativeRouters.delete(router.id);
       throw new Error('native router disappeared during dump');
     });
-    await expect(service.confirmNativeTermination(target, performance.now() + 25)).resolves.toBeUndefined();
+    await expect(
+      service.confirmNativeTermination(target, performance.now() + 25)
+    ).resolves.toBeUndefined();
     expect(workers[0].dump.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect((await workers[0].dump()).routerIds).not.toContain(router.id);
   });
@@ -233,7 +250,12 @@ describe('native terminalization with controlled completion', () => {
   it('accepts an empty transport target without closing its live router', async () => {
     const { service, workers } = await fakeService();
     const router = await service.getOrCreateRouter('room-no-media');
-    await expect(service.confirmNativeTermination(service.captureNativeTermination(router, []), performance.now() + 25)).resolves.toBeUndefined();
+    await expect(
+      service.confirmNativeTermination(
+        service.captureNativeTermination(router, []),
+        performance.now() + 25
+      )
+    ).resolves.toBeUndefined();
     expect(router.closed).toBe(false);
     expect(workers[0].closed).toBe(false);
   });
@@ -261,10 +283,12 @@ describe('native terminalization with controlled completion', () => {
   it('retains failed native proof after local deletion and leaves an exact successor untouched', async () => {
     const { service, workers } = await fakeService();
     const manager = new RoomManager(service) as ProofRoomManager;
-    const join = (userId: string, socketId: string, generation: string) => manager.joinRoom(
-      'room-exact', userId, socketId, { username: userId }, undefined,
-      { mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION, roomContext: { roomKind: 'channel' }, voiceEnforcementSessionGeneration: generation }
-    );
+    const join = (userId: string, socketId: string, generation: string) =>
+      manager.joinRoom('room-exact', userId, socketId, { username: userId }, undefined, {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        voiceEnforcementSessionGeneration: generation,
+      });
     await join('target', 'old-socket', 'old-generation');
     await join('survivor', 'survivor-socket', 'survivor-generation');
     const send = await manager.createTransport('room-exact', 'target', 'send');
@@ -272,18 +296,28 @@ describe('native terminalization with controlled completion', () => {
     const leave = observe(manager.leaveRoom('room-exact', 'target'));
     await flush();
     expect(manager.getParticipant('room-exact', 'target')).toBeUndefined();
-    const firstProof = manager.awaitNativeTermination('room-exact', 'target', 'old-socket', 'old-generation');
+    const firstProof = manager.awaitNativeTermination(
+      'room-exact',
+      'target',
+      'old-socket',
+      'old-generation'
+    );
     await rejectsByDeadline(firstProof, 40_000);
     await join('target', 'new-socket', 'new-generation');
     const successor = await manager.createTransport('room-exact', 'target', 'send');
-    await rejectsByDeadline(manager.awaitNativeTermination('room-exact', 'target', 'old-socket', 'old-generation'), 40_000);
+    await rejectsByDeadline(
+      manager.awaitNativeTermination('room-exact', 'target', 'old-socket', 'old-generation'),
+      40_000
+    );
     const nativeRouter = workers[0].nativeRouters.values().next().value!;
     expect(nativeRouter.nativeTransportIds).toContain(send.id);
     expect(nativeRouter.nativeTransportIds).toContain(recv.id);
     expect(nativeRouter.nativeTransportIds).toContain(successor.id);
     nativeRouter.nativeTransportIds.delete(send.id);
     nativeRouter.nativeTransportIds.delete(recv.id);
-    await expect(manager.awaitNativeTermination('room-exact', 'target', 'old-socket', 'old-generation')).resolves.toBeUndefined();
+    await expect(
+      manager.awaitNativeTermination('room-exact', 'target', 'old-socket', 'old-generation')
+    ).resolves.toBeUndefined();
     expect(manager.getParticipant('room-exact', 'target')?.socketId).toBe('new-socket');
     expect(manager.getParticipant('room-exact', 'survivor')?.socketId).toBe('survivor-socket');
     expect(nativeRouter.nativeTransportIds).toContain(successor.id);
@@ -299,9 +333,15 @@ function subprocessClosed(worker: Worker): Promise<void> {
 async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('owned native worker cleanup deadline')), timeoutMs);
-    })]);
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('owned native worker cleanup deadline')),
+          timeoutMs
+        );
+      }),
+    ]);
   } finally {
     clearTimeout(timer);
   }
@@ -309,13 +349,19 @@ async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 async function cleanupOwnedWorkers() {
   for (const worker of ownedWorkers.splice(0)) {
     if (worker.subprocessClosed) continue;
-    try { process.kill(worker.pid, 'SIGCONT'); } catch (error) {
+    try {
+      process.kill(worker.pid, 'SIGCONT');
+    } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
     }
     const closed = subprocessClosed(worker);
     worker.close();
-    try { await bounded(closed, 2000); } catch {
-      try { process.kill(worker.pid, 'SIGKILL'); } catch (error) {
+    try {
+      await bounded(closed, 2000);
+    } catch {
+      try {
+        process.kill(worker.pid, 'SIGKILL');
+      } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
       }
       await bounded(closed, 1000);
@@ -350,16 +396,24 @@ async function stopOwnedWorker(worker: Worker) {
 }
 
 describe('native terminalization with the pinned mediasoup worker', () => {
-  beforeEach(() => { mockCreateWorker.mockReset(); });
+  beforeEach(() => {
+    mockCreateWorker.mockReset();
+  });
   afterEach(cleanupOwnedWorkers);
 
   it('proves target transport absence while a shared-router survivor remains native', async () => {
     const { service, workers } = await nativeService();
     const router = await service.getOrCreateRouter('native-shared');
-    const targetTransport = await router.createWebRtcTransport({ listenInfos: [{ protocol: 'udp', ip: '127.0.0.1' }] });
-    const survivor = await router.createWebRtcTransport({ listenInfos: [{ protocol: 'udp', ip: '127.0.0.1' }] });
+    const targetTransport = await router.createWebRtcTransport({
+      listenInfos: [{ protocol: 'udp', ip: '127.0.0.1' }],
+    });
+    const survivor = await router.createWebRtcTransport({
+      listenInfos: [{ protocol: 'udp', ip: '127.0.0.1' }],
+    });
     const target = service.captureNativeTermination(router, [targetTransport.id]);
-    expect((await router.dump()).transportIds).toEqual(expect.arrayContaining([targetTransport.id, survivor.id]));
+    expect((await router.dump()).transportIds).toEqual(
+      expect.arrayContaining([targetTransport.id, survivor.id])
+    );
     targetTransport.close();
     await service.confirmNativeTermination(target, performance.now() + 2000);
     expect((await router.dump()).transportIds).not.toContain(targetTransport.id);
@@ -371,11 +425,18 @@ describe('native terminalization with the pinned mediasoup worker', () => {
   it('proves native router absence after the last participant leaves during a dump', async () => {
     const { service, workers } = await nativeService();
     const manager = new RoomManager(service) as ProofRoomManager;
-    await manager.joinRoom('native-last', 'last-user', 'last-socket', { username: 'last-user' }, undefined, {
-      mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-      roomContext: { roomKind: 'channel' },
-      voiceEnforcementSessionGeneration: 'last-generation',
-    });
+    await manager.joinRoom(
+      'native-last',
+      'last-user',
+      'last-socket',
+      { username: 'last-user' },
+      undefined,
+      {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        voiceEnforcementSessionGeneration: 'last-generation',
+      }
+    );
     const router = await service.getOrCreateRouter('native-last');
     const target = service.captureNativeTermination(router);
     const racingDump = router.dump();
@@ -384,7 +445,12 @@ describe('native terminalization with the pinned mediasoup worker', () => {
     await racingDump.catch(() => undefined);
     expect(manager.getParticipant('native-last', 'last-user')).toBeUndefined();
     expect(router.closed).toBe(true);
-    await manager.awaitNativeTermination('native-last', 'last-user', 'last-socket', 'last-generation');
+    await manager.awaitNativeTermination(
+      'native-last',
+      'last-user',
+      'last-socket',
+      'last-generation'
+    );
     await service.confirmNativeTermination(target, performance.now() + 2000);
     await leave.promise;
     expect((await workers[0].dump()).routerIds).not.toContain(router.id);

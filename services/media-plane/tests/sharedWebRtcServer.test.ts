@@ -261,7 +261,7 @@ describe('shared worker WebRTC listeners', () => {
     expect(createWorker).toHaveBeenCalledTimes(3);
   });
 
-  it('bounds failed-startup native cleanup at 35 seconds and retains unconfirmed workers', async () => {
+  it('bounds failed-startup native cleanup at 35 seconds without publishing an unbound worker', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     workers[0].createWebRtcServer.mockRejectedValueOnce(new Error('test listener bind failed'));
     workers[0].close.mockImplementation(() => { workers[0].closed = true; });
@@ -273,7 +273,8 @@ describe('shared worker WebRTC listeners', () => {
     await vi.advanceTimersByTimeAsync(1);
     await expect(initializing.promise).rejects.toThrow();
     expect(service.isReady()).toBe(false);
-    expect(service.getWorkerCount()).toBe(1);
+    expect(service.getWorkerCount()).toBe(0);
+    expect(service.getWorkers()).toEqual([]);
     workers[0].completeSubprocessClose();
     await expect(service.close(performance.now() + 1000)).resolves.toBeUndefined();
   });

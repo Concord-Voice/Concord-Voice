@@ -324,6 +324,10 @@ func normalizeSecurityEvents(events securityevent.Emitter) securityevent.Emitter
 
 // RouterDependencies groups runtime services that are injected into NewRouter.
 type RouterDependencies struct {
+	// RoomPlacementEnabled is an explicit rollout gate for ADR-0042 room
+	// placement. Keep false until media create fencing and deployment colour
+	// registration are validated together. Its zero value is safely disabled.
+	RoomPlacementEnabled bool
 	// Store is the process-wide legacy object store. Per-object and per-purpose
 	// routing below can override it where a storage registry is available.
 	Store            media.ObjectStore
@@ -860,6 +864,7 @@ func NewRouter(
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	securityEvents := normalizeSecurityEvents(dependencies.SecurityEvents)
+	roomPlacementEnabled := dependencies.RoomPlacementEnabled
 	router := gin.New()
 	configureTrustedProxies(router, cfg, log)
 
@@ -1099,15 +1104,17 @@ func NewRouter(
 	membersHandler.SetServerMessagePurger(messagesHandler, purgeRateLimit, purgeRateWindow)
 	invitesHandler := invites.NewHandler(db, log, hub, rbacResolver)
 	voiceHandler := voice.NewHandler(voice.HandlerDeps{
-		DB:          db,
-		Log:         log,
-		Hub:         hub,
-		Cfg:         cfg,
-		Resolver:    rbacResolver,
-		NATS:        natsClient,
-		Audit:       auditWriter,
-		EntCache:    entCache,
-		ServerTiers: serverEntCache,
+		DB:                   db,
+		Log:                  log,
+		Hub:                  hub,
+		Cfg:                  cfg,
+		Resolver:             rbacResolver,
+		NATS:                 natsClient,
+		Audit:                auditWriter,
+		EntCache:             entCache,
+		ServerTiers:          serverEntCache,
+		Redis:                redis,
+		RoomPlacementEnabled: roomPlacementEnabled,
 	})
 	// #2445: the REST RevokeTempAccess path owns its own tempGrantManager, so it
 	// needs the shared executor forwarded explicitly. revokeTemporaryChannelAccess
@@ -1127,16 +1134,17 @@ func NewRouter(
 
 	// mfaHandler implements mfa.Verifier — the DM purge step-up gate (#1352).
 	dmHandler := dm.NewHandler(dm.HandlerDeps{
-		DB:          db,
-		Log:         log,
-		Hub:         hub,
-		Cfg:         cfg,
-		NATS:        natsClient,
-		Redis:       redis,
-		EntCache:    entCache,
-		PurgeEngine: purgeEngine,
-		MFAVerifier: mfaHandler,
-		ActivePlans: activePlanRail,
+		DB:                   db,
+		Log:                  log,
+		Hub:                  hub,
+		Cfg:                  cfg,
+		NATS:                 natsClient,
+		Redis:                redis,
+		RoomPlacementEnabled: roomPlacementEnabled,
+		EntCache:             entCache,
+		PurgeEngine:          purgeEngine,
+		MFAVerifier:          mfaHandler,
+		ActivePlans:          activePlanRail,
 	})
 	requireMessageDeleteGuardWired(log, messagesHandler, dmHandler)
 	wirePinnedExpiry(lifecycleCtx, log, purgeEngine, hub, channelsHandler, dmHandler)
@@ -1323,6 +1331,7 @@ func NewRouter(
 
 	// Start NATS voice event subscriber
 	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
+	voiceSub.SetLifecyclePlacementEnabled(roomPlacementEnabled)
 	voiceSub.SetOpsCounters(opsCounters)
 	voiceSub.SetTierViolationRecorder(violationRecorder)
 	activePlanReconciler.SetServerVoiceCleanup(voiceSub.ReconcileStaleServerVoiceParticipants)

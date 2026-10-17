@@ -41,6 +41,9 @@ describe('config', () => {
     delete process.env.ANNOUNCED_IP;
     delete process.env.ALLOWED_ORIGINS;
     delete process.env.NUM_WORKERS;
+    delete process.env.INITIAL_NUM_WORKERS;
+    delete process.env.MEDIA_INSTANCE_COLOR;
+    delete process.env.ROOM_PLACEMENT_ENABLED;
     delete process.env.RTC_MIN_PORT;
     delete process.env.RTC_MAX_PORT;
     delete process.env.MEDIASOUP_ENABLE_TCP;
@@ -139,7 +142,9 @@ describe('config', () => {
 
     it('audio codec is opus at 48kHz stereo', async () => {
       const { config } = await loadConfig();
-      const audio = config.mediasoup.router.mediaCodecs.find((c: RouterRtpCodecCapability) => c.kind === 'audio');
+      const audio = config.mediasoup.router.mediaCodecs.find(
+        (c: RouterRtpCodecCapability) => c.kind === 'audio'
+      );
       expect(audio).toBeDefined();
       expect(audio.mimeType).toBe('audio/opus');
       expect(audio.clockRate).toBe(48000);
@@ -168,6 +173,7 @@ describe('config', () => {
       expect(config.rtc.minPort).toBe(40000);
       expect(config.rtc.maxPort).toBe(49999);
       expect(config.mediasoup.numWorkers).toBe(4);
+      expect(config.mediasoup.initialWorkers).toBe(4);
     });
 
     it('parses ALLOWED_ORIGINS as comma-separated list', async () => {
@@ -195,10 +201,12 @@ describe('config', () => {
       expect(config.port).toBe(5000);
     });
 
-    it('applies ANNOUNCED_IP override to rtc and transport listenIps', async () => {
+    it('applies ANNOUNCED_IP override to legacy and shared listener addresses', async () => {
       const { config } = await loadConfig({ ANNOUNCED_IP: '1.2.3.4' });
       expect(config.rtc.announcedIp).toBe('1.2.3.4');
-      expect(config.mediasoup.webRtcTransport.listenIps[0].announcedIp).toBe('1.2.3.4');
+      expect(config.mediasoup.webRtcTransport.listenIps).toEqual([
+        { ip: '0.0.0.0', announcedIp: '1.2.3.4' },
+      ]);
     });
 
     it('applies ALLOWED_ORIGINS override', async () => {
@@ -305,6 +313,81 @@ describe('config', () => {
       },
     ])('fails closed for $name', async ({ env }) => {
       await loadConfig(env);
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+  });
+
+  describe('initial mediasoup worker count', () => {
+    it('defaults to the maximum to preserve the single-colour startup count', async () => {
+      const { config } = await loadConfig({ NUM_WORKERS: '3' });
+      expect(config.mediasoup.initialWorkers).toBe(3);
+    });
+
+    it('allows a standby to start with one worker below the configured maximum', async () => {
+      const { config } = await loadConfig({ NUM_WORKERS: '3', INITIAL_NUM_WORKERS: '1' });
+      expect(config.mediasoup.initialWorkers).toBe(1);
+      expect(process.exit).not.toHaveBeenCalled();
+    });
+
+    it.each(['0', '-1', '4', '1.5', '1x'])(
+      'fails closed for INITIAL_NUM_WORKERS=%s',
+      async (raw) => {
+        const { config } = await loadConfig({ NUM_WORKERS: '3', INITIAL_NUM_WORKERS: raw });
+        expect(config.mediasoup.initialWorkers).toBe(3);
+        expect(process.exit).toHaveBeenCalledWith(1);
+      }
+    );
+
+    it('requires one published RTC port per maximum worker', async () => {
+      await loadConfig({ NUM_WORKERS: '3', RTC_MIN_PORT: '40000', RTC_MAX_PORT: '40001' });
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+  });
+
+  describe('blue-green media activation gate', () => {
+    it.each(['blue', 'green'] as const)(
+      'accepts the explicit %s instance colour',
+      async (color) => {
+        const { config } = await loadConfig({ MEDIA_INSTANCE_COLOR: color });
+        expect(config.mediaInstanceColor).toBe(color);
+        expect(process.exit).not.toHaveBeenCalled();
+      }
+    );
+
+    it('keeps the legacy deployment inactive when the colour is unset', async () => {
+      const { config } = await loadConfig();
+      expect(config.mediaInstanceColor).toBeUndefined();
+      expect(config.roomPlacementEnabled).toBe(false);
+    });
+
+    it('requires a colour before opening the room-placement enforcement gate', async () => {
+      await loadConfig({ ROOM_PLACEMENT_ENABLED: 'true' });
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it('keeps the create guard off for coloured standby processes until explicitly enabled', async () => {
+      const { config } = await loadConfig({ MEDIA_INSTANCE_COLOR: 'green' });
+      expect(config.roomPlacementEnabled).toBe(false);
+    });
+
+    it('opens room-placement enforcement only when explicitly enabled with a colour', async () => {
+      const { config } = await loadConfig({
+        MEDIA_INSTANCE_COLOR: 'blue',
+        ROOM_PLACEMENT_ENABLED: 'true',
+      });
+      expect(config.roomPlacementEnabled).toBe(true);
+    });
+
+    it.each(['TRUE', 'yes', '1', ' true '])(
+      'rejects a noncanonical placement boolean %j',
+      async (raw) => {
+        await loadConfig({ ROOM_PLACEMENT_ENABLED: raw });
+        expect(process.exit).toHaveBeenCalledWith(1);
+      }
+    );
+
+    it('fails closed for an unknown colour', async () => {
+      await loadConfig({ MEDIA_INSTANCE_COLOR: 'purple' });
       expect(process.exit).toHaveBeenCalledWith(1);
     });
   });
@@ -459,15 +542,20 @@ describe('config', () => {
         announcedAddress: '127.0.0.1',
       });
       expect(config.rtc).toEqual({ announcedIp: '127.0.0.1', minPort: 45000, maxPort: 46000 });
-      expect(config.mediasoup.worker).toEqual(expect.objectContaining({
-        rtcMinPort: 45000,
-        rtcMaxPort: 46000,
-      }));
+      expect(config.mediasoup.worker).toEqual(
+        expect.objectContaining({
+          rtcMinPort: 45000,
+          rtcMaxPort: 46000,
+        })
+      );
       expect(process.exit).not.toHaveBeenCalled();
     });
 
     it.each([
-      ['true', true], [' TRUE ', true], ['false', false], [' False ', false],
+      ['true', true],
+      [' TRUE ', true],
+      ['false', false],
+      [' False ', false],
     ])('accepts explicit flag %j as %s', async (raw, enabled) => {
       const { config } = await loadConfig({ ...sharedEnv, MEDIASOUP_SHARED_WEBRTC_SERVER: raw });
       expect(config.mediasoup.webRtcServer.enabled).toBe(enabled);
@@ -476,13 +564,18 @@ describe('config', () => {
     });
 
     it.each(['', ' ', '1', 'yes', 'on', 'tru', 'false!'])(
-      'rejects an unknown shared-listener flag %j', async (raw) => {
+      'rejects an unknown shared-listener flag %j',
+      async (raw) => {
         const error = vi.spyOn(console, 'error').mockImplementation(() => {});
         try {
           await loadConfig({ ...sharedEnv, MEDIASOUP_SHARED_WEBRTC_SERVER: raw });
           expect(process.exit).toHaveBeenCalledWith(1);
-          expect(error).toHaveBeenCalledWith(expect.stringContaining('MEDIASOUP_SHARED_WEBRTC_SERVER'));
-        } finally { error.mockRestore(); }
+          expect(error).toHaveBeenCalledWith(
+            expect.stringContaining('MEDIASOUP_SHARED_WEBRTC_SERVER')
+          );
+        } finally {
+          error.mockRestore();
+        }
       }
     );
 
@@ -490,42 +583,66 @@ describe('config', () => {
       { workers: '1', range: '1024-1024', ports: [1024] },
       { workers: '3', range: '42000-42002', ports: [42000, 42001, 42002] },
       { workers: '3', range: '65533-65535', ports: [65533, 65534, 65535] },
-      { workers: '32', range: '65504-65535', ports: Array.from({ length: 32 }, (_, i) => 65504 + i) },
-    ])('allocates exactly one unique listener per worker for $range', async ({ workers, range, ports }) => {
-      const { config } = await loadConfig({
-        ...sharedEnv,
-        NUM_WORKERS: workers,
-        MEDIASOUP_WEBRTC_SERVER_PORTS: range,
-        RTC_MIN_PORT: '47000',
-        RTC_MAX_PORT: '48000',
-      });
-      expect(config.mediasoup.webRtcServer).toEqual({
-        enabled: true,
-        ports,
-        listenIp: '0.0.0.0',
-        announcedAddress: 'media.example.test',
-      });
-      expect(config.rtc.minPort).toBe(47000);
-      expect(config.rtc.maxPort).toBe(48000);
-      expect(process.exit).not.toHaveBeenCalled();
-    });
+      {
+        workers: '32',
+        range: '65504-65535',
+        ports: Array.from({ length: 32 }, (_, i) => 65504 + i),
+      },
+    ])(
+      'allocates exactly one unique listener per worker for $range',
+      async ({ workers, range, ports }) => {
+        const { config } = await loadConfig({
+          ...sharedEnv,
+          NUM_WORKERS: workers,
+          MEDIASOUP_WEBRTC_SERVER_PORTS: range,
+          RTC_MIN_PORT: '47000',
+          RTC_MAX_PORT: '48000',
+        });
+        expect(config.mediasoup.webRtcServer).toEqual({
+          enabled: true,
+          ports,
+          listenIp: '0.0.0.0',
+          announcedAddress: 'media.example.test',
+        });
+        expect(config.rtc.minPort).toBe(47000);
+        expect(config.rtc.maxPort).toBe(48000);
+        expect(process.exit).not.toHaveBeenCalled();
+      }
+    );
 
     it.each([
-      '', '40000', '40000,40001,40002', '40000-40001', '40000-40003',
-      '40002-40000', '1023-1025', '65534-65536', '-1-1', '40000.0-40002',
-      '4e4-40002', '40000x-40002', '40000-40002junk', ' 40000-40002 ',
-      '40000 - 40002', '9007199254740993-9007199254740995',
+      '',
+      '40000',
+      '40000,40001,40002',
+      '40000-40001',
+      '40000-40003',
+      '40002-40000',
+      '1023-1025',
+      '65534-65536',
+      '-1-1',
+      '40000.0-40002',
+      '4e4-40002',
+      '40000x-40002',
+      '40000-40002junk',
+      ' 40000-40002 ',
+      '40000 - 40002',
+      '9007199254740993-9007199254740995',
     ])('rejects invalid active port range %j', async (range) => {
       const error = vi.spyOn(console, 'error').mockImplementation(() => {});
       try {
         await loadConfig({ ...sharedEnv, MEDIASOUP_WEBRTC_SERVER_PORTS: range });
         expect(process.exit).toHaveBeenCalledWith(1);
-        expect(error).toHaveBeenCalledWith(expect.stringContaining('MEDIASOUP_WEBRTC_SERVER_PORTS'));
-      } finally { error.mockRestore(); }
+        expect(error).toHaveBeenCalledWith(
+          expect.stringContaining('MEDIASOUP_WEBRTC_SERVER_PORTS')
+        );
+      } finally {
+        error.mockRestore();
+      }
     });
 
     it.each(['127.0.0.1', '203.0.113.10', '2001:db8::10', 'media.example.test'])(
-      'accepts explicit reachable-address syntax %j', async (address) => {
+      'accepts explicit reachable-address syntax %j',
+      async (address) => {
         const { config } = await loadConfig({ ...sharedEnv, ANNOUNCED_IP: address });
         expect(config.mediasoup.webRtcServer.announcedAddress).toBe(address);
         expect(process.exit).not.toHaveBeenCalled();
@@ -538,20 +655,33 @@ describe('config', () => {
         await loadConfig({ MEDIASOUP_SHARED_WEBRTC_SERVER: 'true', NUM_WORKERS: '3' });
         expect(process.exit).toHaveBeenCalledWith(1);
         expect(error).toHaveBeenCalledWith(expect.stringContaining('ANNOUNCED_IP'));
-      } finally { error.mockRestore(); }
+      } finally {
+        error.mockRestore();
+      }
     });
 
-    it.each(['', ' ', '0.0.0.0', '::', '*', '*.example.test', 'https://media.example.test',
-      'media.example.test:40000', 'bad host', 'media.example.test\n', 'media\u0001host'])(
-      'refuses an invalid announced address %j', async (address) => {
-        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-        try {
-          await loadConfig({ ...sharedEnv, ANNOUNCED_IP: address });
-          expect(process.exit).toHaveBeenCalledWith(1);
-          expect(error).toHaveBeenCalledWith(expect.stringContaining('ANNOUNCED_IP'));
-        } finally { error.mockRestore(); }
+    it.each([
+      '',
+      ' ',
+      '0.0.0.0',
+      '::',
+      '*',
+      '*.example.test',
+      'https://media.example.test',
+      'media.example.test:40000',
+      'bad host',
+      'media.example.test\n',
+      'media\u0001host',
+    ])('refuses an invalid announced address %j', async (address) => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await loadConfig({ ...sharedEnv, ANNOUNCED_IP: address });
+        expect(process.exit).toHaveBeenCalledWith(1);
+        expect(error).toHaveBeenCalledWith(expect.stringContaining('ANNOUNCED_IP'));
+      } finally {
+        error.mockRestore();
       }
-    );
+    });
 
     it.each([false, true])('checks HTTP port collision only for enabled TCP=%s', async (tcp) => {
       const error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -567,7 +697,9 @@ describe('config', () => {
         } else {
           expect(process.exit).not.toHaveBeenCalled();
         }
-      } finally { error.mockRestore(); }
+      } finally {
+        error.mockRestore();
+      }
     });
   });
 

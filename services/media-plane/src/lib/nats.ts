@@ -267,6 +267,8 @@ interface VoiceCommandRuntime {
 }
 
 export class NatsService {
+  private mediaInstanceIdentity:
+    { color: 'blue' | 'green'; generation: string; instanceId: string } | undefined;
   private voiceCommands: VoiceCommandRuntime | undefined;
 
   private async voiceCommandBinding(generation?: string): Promise<{
@@ -823,6 +825,34 @@ export class NatsService {
     }
   }
 
+  setMediaInstanceIdentity(identity: {
+    color: 'blue' | 'green';
+    generation: string;
+    instanceId: string;
+  }): void {
+    this.mediaInstanceIdentity = identity;
+  }
+
+  mediaLifecycleFields(): Record<string, string> {
+    const identity = this.mediaInstanceIdentity;
+    return identity ? { colour: identity.color, instance_id: identity.instanceId } : {};
+  }
+
+  publishRoomHeartbeat(payload: {
+    channelId: string;
+    userIds: string[];
+    callId?: string;
+    ringId?: string;
+    callerUserId?: string;
+    timestamp: string;
+  }): boolean {
+    return this.publish('voice.heartbeat', {
+      ...this.mediaLifecycleFields(),
+      ...payload,
+      participants_authoritative: payload.userIds.length > 0,
+    });
+  }
+
   /**
    * Returns a RoomEventHandler that publishes room events to NATS subjects.
    * Wire this into RoomManager.onEvent() to bridge media plane events to
@@ -831,8 +861,11 @@ export class NatsService {
   createRoomEventHandler(): RoomEventHandler {
     return (event: RoomEvent) => {
       switch (event.type) {
+        case 'room-created':
+          break;
         case 'user-joined':
           this.publish('voice.joined', {
+            ...this.mediaLifecycleFields(),
             channelId: event.roomId,
             userId: event.userId,
             username: event.username,
@@ -847,6 +880,7 @@ export class NatsService {
 
         case 'user-left':
           this.publish('voice.left', {
+            ...this.mediaLifecycleFields(),
             channelId: event.roomId,
             userId: event.userId,
             callId: event.callId,
@@ -856,6 +890,7 @@ export class NatsService {
 
         case 'room-empty':
           this.publish('voice.room_empty', {
+            ...this.mediaLifecycleFields(),
             channelId: event.roomId,
             callId: event.callId,
             ringId: event.ringId,

@@ -239,6 +239,8 @@ services:
       NATS_URL: nats://nats:4222
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - copy .env.example to .env}
       TURN_SERVER_HOST: ${TURN_SERVER_HOST:-localhost}
+      # Room placement stays disabled until the reviewed first-activation gate.
+      ROOM_PLACEMENT_ENABLED: "${ROOM_PLACEMENT_ENABLED:-false}"
       TURN_SECRET: ${TURN_SECRET:?}
       TURN_REALM: ${TURN_REALM:-concordvoice.chat}
       MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-}
@@ -376,6 +378,9 @@ services:
       # would silently do nothing. Enabling it REQUIRES publishing the RTC
       # range for TCP and allowing it on both firewall surfaces first.
       MEDIASOUP_ENABLE_TCP: "false"
+      # Must agree with the control-plane gate; keep room placement disabled
+      # unless both services are deliberately configured for activation.
+      ROOM_PLACEMENT_ENABLED: "${ROOM_PLACEMENT_ENABLED:-false}"
       # Shared listeners require the separate, explicitly validated lab overlay.
       # An ambient shell/.env value must not migrate an ordinary deployment.
       MEDIASOUP_SHARED_WEBRTC_SERVER: "false"
@@ -419,6 +424,7 @@ services:
       - concordvoice-data
     profiles:
       - services
+      - media-single
 
 volumes:
   postgres-data:

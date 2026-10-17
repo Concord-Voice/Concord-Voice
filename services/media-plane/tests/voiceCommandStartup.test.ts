@@ -28,7 +28,7 @@ const serviceRoot = fileURLToPath(new URL('..', import.meta.url));
 const codec = JSONCodec();
 const fixtureSigner = randomBytes(32).toString('hex');
 const generation = '11111111-1111-4111-8111-111111111111';
-const roomId = '22222222-2222-4222-8222-222222222222';
+const roomId = '2222222a-2222-4222-8222-222222222222';
 const userId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const bucket = 'VOICE_COMMAND_OWNER_V1';
 const backing = `KV_${bucket}`;
@@ -218,8 +218,9 @@ async function provision(connection: NatsConnection) {
 // The actual Redis client must finish its startup handshake. This bounded RESP
 // fixture implements only commands used by these tests; unknown commands fail.
 // No persistence behavior is claimed from this network double.
-async function redisFixture() {
+async function redisFixture(placement = false) {
   const sockets = new Set<NetworkSocket>();
+  const keys = new Map<string, string>();
   const server = tcpServer((socket) => {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
@@ -271,7 +272,35 @@ async function redisFixture() {
         else if (command === 'PING') socket.write('+PONG\r\n');
         else if (command === 'CLIENT' || command === 'QUIT') socket.write('+OK\r\n');
         else if (command === 'SMEMBERS') socket.write('*0\r\n');
-        else if (['SADD', 'SREM', 'EXPIRE', 'HSET', 'DEL'].includes(command ?? ''))
+        else if (placement && command === 'MGET') {
+          const values = arguments_.slice(1).map((key) => keys.get(key));
+          socket.write(
+            `*${values.length}\r\n${values.map((value) => (value === undefined ? '_\r\n' : `$${Buffer.byteLength(value)}\r\n${value}\r\n`)).join('')}`
+          );
+        } else if (placement && command === 'EVAL') {
+          const keyCount = Number(arguments_[2]);
+          const keysForScript = arguments_.slice(3, 3 + keyCount);
+          const scriptArgs = arguments_.slice(3 + keyCount);
+          if (keysForScript[1]?.startsWith('voice:room_live:') && scriptArgs[1]) {
+            keys.set(keysForScript[1], scriptArgs[1]);
+          }
+          socket.write(':1\r\n');
+        } else if (placement && command === 'SET') {
+          if (arguments_.includes('NX') && keys.has(arguments_[1])) socket.write('_\r\n');
+          else {
+            keys.set(arguments_[1], arguments_[2]);
+            socket.write('+OK\r\n');
+          }
+        } else if (placement && command === 'INCR') {
+          const value = Number(keys.get(arguments_[1]) ?? '0') + 1;
+          keys.set(arguments_[1], String(value));
+          socket.write(`:${value}\r\n`);
+        } else if (placement && command === 'GET') {
+          const value = keys.get(arguments_[1]);
+          socket.write(
+            value === undefined ? '_\r\n' : `$${Buffer.byteLength(value)}\r\n${value}\r\n`
+          );
+        } else if (['SADD', 'SREM', 'EXPIRE', 'HSET', 'DEL'].includes(command ?? ''))
           socket.write(':1\r\n');
         else socket.write('-ERR unsupported isolated fixture command\r\n');
       }
@@ -282,6 +311,12 @@ async function redisFixture() {
   if (!address || typeof address === 'string') throw new Error('Redis fixture port missing');
   return {
     url: `redis://127.0.0.1:${address.port}`,
+    seed(key: string, value: string) {
+      keys.set(key, value);
+    },
+    value(key: string) {
+      return keys.get(key);
+    },
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -377,7 +412,7 @@ async function controlPlane(connection: NatsConnection) {
         response.writeHead(204).end();
         return;
       }
-      if (path === `/api/v1/channels/${roomId}/voice/join`) {
+      if (path.toLowerCase() === `/api/v1/channels/${roomId}/voice/join`) {
         authorizations++;
         if (!authorizeEnabled) {
           response.writeHead(403).end('{"error":"fixture authorization denied"}');
@@ -514,7 +549,12 @@ async function processState(pid: number): Promise<string> {
   });
 }
 
-async function application(natsUrl: string, redisUrl: string, controlPlaneUrl: string) {
+async function application(
+  natsUrl: string,
+  redisUrl: string,
+  controlPlaneUrl: string,
+  placement = false
+) {
   const directory = await mkdtemp(join(tmpdir(), 'concord-startup-app-'));
   const port = await unusedPort();
   const loader = join(serviceRoot, 'node_modules/tsx/dist/loader.mjs');
@@ -540,6 +580,8 @@ async function application(natsUrl: string, redisUrl: string, controlPlaneUrl: s
         ANNOUNCED_IP: '127.0.0.1',
         OPS_METRICS_ENABLED: 'false',
         MEDIASOUP_ENABLE_TCP: 'false',
+        ROOM_PLACEMENT_ENABLED: placement ? 'true' : 'false',
+        MEDIA_INSTANCE_COLOR: placement ? 'blue' : '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     }
@@ -607,7 +649,7 @@ async function application(natsUrl: string, redisUrl: string, controlPlaneUrl: s
   };
 }
 
-async function pollingPeer(base: string) {
+async function pollingPeer(base: string, requestedRoomId = roomId) {
   const token = jwt.sign({ user_id: userId, cred_epoch: '' }, fixtureSigner, {
     issuer: 'concordvoice-control-plane',
     algorithm: 'HS256',
@@ -659,10 +701,10 @@ async function pollingPeer(base: string) {
     async transportStatus() {
       return (await fetch(endpoint, { signal: AbortSignal.timeout(2000) })).status;
     },
-    async join() {
+    async join(joinRoomId = requestedRoomId) {
       const ackId = id++;
       await post(
-        `42${ackId}${JSON.stringify(['join-room', { roomId, mediaFrameCryptoVersion: 5 }])}`
+        `42${ackId}${JSON.stringify(['join-room', { roomId: joinRoomId, mediaFrameCryptoVersion: 5 }])}`
       );
       let result: Record<string, unknown> | undefined;
       await vi.waitFor(
@@ -680,9 +722,9 @@ async function pollingPeer(base: string) {
   };
 }
 
-async function runtime(deniedSubject?: string) {
+async function runtime(deniedSubject?: string, placement = false) {
   const broker = await isolatedBroker(deniedSubject);
-  const redis = await redisFixture();
+  const redis = await redisFixture(placement);
   const cp = await controlPlane(broker.connection);
   const resources = await provision(broker.connection);
   let app: Awaited<ReturnType<typeof application>> | undefined;
@@ -692,7 +734,7 @@ async function runtime(deniedSubject?: string) {
     cp,
     resources,
     async start() {
-      app = await application(broker.url, redis.url, cp.url);
+      app = await application(broker.url, redis.url, cp.url, placement);
       return app;
     },
     async close() {
@@ -749,6 +791,43 @@ describe('actual index voice-command runtime boundaries', () => {
       });
     } finally {
       await failed.close();
+      await f.close();
+    }
+  }, 20_000);
+
+  it('reports instance readiness and refuses promotion after a colour drain', async () => {
+    const f = await runtime(undefined, true);
+    try {
+      const app = await f.start();
+      await app.listening();
+      const owner = await f.resources.owner();
+      await signedHealth(f.broker.connection, owner.nodeBootId);
+      expect(await app.ready()).toMatchObject({
+        status: 200,
+        body: {
+          ready: true,
+          voiceEnforcementProtocol: 3,
+          colour: 'blue',
+          generation: expect.stringMatching(
+            /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          ),
+          accepting_new_rooms: true,
+          rooms: 0,
+          creates_in_flight: 0,
+        },
+      });
+      f.redis.seed('media:colour_draining:blue', 'armed');
+      expect(await app.ready()).toMatchObject({
+        status: 503,
+        body: {
+          ready: false,
+          colour: 'blue',
+          accepting_new_rooms: false,
+          rooms: 0,
+          creates_in_flight: 0,
+        },
+      });
+    } finally {
       await f.close();
     }
   }, 20_000);
@@ -1023,6 +1102,51 @@ describe('actual index voice-command runtime boundaries', () => {
       });
       expect(await alive(workers[0])).toBe(false);
       await vi.waitFor(() => expect(app.result?.code).toBe(0), { timeout: 5000 });
+    } finally {
+      await f.close();
+    }
+  }, 20_000);
+
+  it('rejects an authorized uppercase channel UUID before alternate room or Redis ownership state', async () => {
+    const f = await runtime(undefined, true);
+    try {
+      f.cp.setAuthorize(true);
+      f.cp.setHealth(true);
+      const app = await f.start();
+      await app.listening();
+      const owner = await f.resources.owner();
+      await signedHealth(f.broker.connection, owner.nodeBootId);
+      const alternateRoomId = roomId.toUpperCase();
+      expect(
+        alternateRoomId,
+        'positive control: uppercase spelling must differ from the canonical room ID'
+      ).not.toBe(roomId);
+      const authorization = await fetch(
+        `${f.cp.url}/api/v1/channels/${alternateRoomId}/voice/join`,
+        {
+          method: 'POST',
+          body: '{}',
+        }
+      );
+      expect(
+        authorization.status,
+        'positive control: control plane accepts the uppercase UUID route'
+      ).toBe(200);
+      f.redis.seed(`voice:room_owner:${alternateRoomId}`, 'blue');
+      const peer = await pollingPeer(app.url, alternateRoomId);
+      const result = await peer.join();
+      expect(
+        f.redis.value(`voice:room_live:${alternateRoomId}`),
+        'alternate spelling must not create Redis room occupancy'
+      ).toBeUndefined();
+      expect(
+        result.error,
+        'authorized alternate UUID spelling must be rejected before room creation'
+      ).toMatch(/canonical|invalid room/i);
+      const health = (await (await fetch(`${app.url}/health`)).json()) as {
+        totalParticipants: number;
+      };
+      expect(health.totalParticipants).toBe(0);
     } finally {
       await f.close();
     }

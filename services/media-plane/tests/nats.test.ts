@@ -190,6 +190,61 @@ describe('NatsService', () => {
       expect(encodedData).toHaveProperty('timestamp');
     });
 
+    it('publishes the closed colour and opaque generation identity on lifecycle events', () => {
+      service.setMediaInstanceIdentity({
+        color: 'green',
+        generation: '42',
+        instanceId: 'green-42',
+      });
+      const handler = service.createRoomEventHandler();
+
+      handler({
+        type: 'user-left',
+        roomId: 'conv-1',
+        userId: 'u-1',
+        socketId: 'sock-1',
+        e2eeEpoch: 3,
+      });
+
+      expect(mockEncode.mock.calls.at(-1)?.[0]).toMatchObject({
+        colour: 'green',
+        instance_id: 'green-42',
+      });
+      expect(service.mediaLifecycleFields()).toEqual({
+        colour: 'green',
+        instance_id: 'green-42',
+      });
+    });
+
+    it('marks ring-only room heartbeats non-authoritative for participants', () => {
+      service.setMediaInstanceIdentity({ color: 'blue', generation: '77', instanceId: 'blue-77' });
+
+      service.publishRoomHeartbeat({
+        channelId: 'dm-ring',
+        userIds: [],
+        callId: 'call-1',
+        ringId: 'ring-1',
+        timestamp: '2026-10-15T12:00:00.000000Z',
+      });
+
+      expect(mockEncode.mock.calls.at(-1)?.[0]).toMatchObject({
+        colour: 'blue',
+        instance_id: 'blue-77',
+        participants_authoritative: false,
+        channelId: 'dm-ring',
+        userIds: [],
+      });
+
+      service.publishRoomHeartbeat({
+        channelId: 'channel-1',
+        userIds: ['user-1'],
+        timestamp: '2026-10-15T12:00:30.000000Z',
+      });
+      expect(mockEncode.mock.calls.at(-1)?.[0]).toMatchObject({
+        participants_authoritative: true,
+      });
+    });
+
     it('maps user-left to voice.left', () => {
       const handler = service.createRoomEventHandler();
 

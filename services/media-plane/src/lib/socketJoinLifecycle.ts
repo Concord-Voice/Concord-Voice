@@ -1,3 +1,5 @@
+import { RoomCreationRefusedError } from './roomManager.js';
+
 export type SocketBoundJoinOutcome<Access, Value> =
   | { access: Access; status: 'denied' }
   | { access: Access; status: 'revoked' }
@@ -36,6 +38,14 @@ interface RollbackSocketRoomJoinOptions {
 }
 
 export type EmptyDMJoinCleanupResult = 'active' | 'deferred' | 'noop' | 'released' | 'terminal';
+
+/** A placement refusal is an ack-only response; the socket remains usable. */
+export function roomCreationRefusalAck(
+  error: unknown
+): { error: string; code: string } | undefined {
+  if (!(error instanceof RoomCreationRefusedError)) return undefined;
+  return { error: error.code, code: error.code };
+}
 
 /** Keeps cleanup bound to the A1 call generation, even when A2 reports rotation. */
 export class DMJoinCallIdTracker {

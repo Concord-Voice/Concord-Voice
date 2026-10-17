@@ -12,8 +12,10 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import './mocks/logger.js';
 
+type ConfigModule = typeof import('../src/config/index.js');
+
 vi.mock('@/config/index.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/config/index.js')>();
+  const actual = await importOriginal<ConfigModule>();
   return {
     ...actual,
     config: {
@@ -54,6 +56,7 @@ const OPUS_IN_TIER = {
 
 let worker: types.Worker;
 let router: types.Router;
+let webRtcServer: types.WebRtcServer;
 let manager: RoomManager;
 
 async function join(userId: string, permissions: bigint = SPEAK_ONLY): Promise<string> {
@@ -73,9 +76,13 @@ function mic(codecs: unknown[], encodings: unknown[]) {
 beforeAll(async () => {
   worker = await mediasoup.createWorker({ logLevel: 'error' });
   router = await worker.createRouter({ mediaCodecs: config.mediasoup.router.mediaCodecs });
+  webRtcServer = await worker.createWebRtcServer({
+    listenInfos: [{ protocol: 'udp', ip: '127.0.0.1', port: 0 }],
+  });
   manager = new RoomManager({
     getWebRtcServer: () => undefined,
     getOrCreateRouter: async () => router,
+    getWebRtcServer: () => webRtcServer,
     removeRouter: () => undefined,
     captureNativeTermination: (r: types.Router, transportIds?: readonly string[]) => ({
       worker,
@@ -96,7 +103,14 @@ describe('audio producer codec/kind check (#3858), real worker', () => {
   it('refuses a VP8-only mic and creates no producer', async () => {
     const t = await join('f-vp8');
     await expect(
-      manager.produce('room-fix', 'f-vp8', t, 'audio', mic([VP8], [{ ssrc: 3, maxBitrate: 510_000 }]), 'mic')
+      manager.produce(
+        'room-fix',
+        'f-vp8',
+        t,
+        'audio',
+        mic([VP8], [{ ssrc: 3, maxBitrate: 510_000 }]),
+        'mic'
+      )
     ).rejects.toThrow('Invalid codec for producer kind');
     expect(manager.getParticipant('room-fix', 'f-vp8')?.producers.size).toBe(0);
   });
@@ -119,7 +133,14 @@ describe('audio producer codec/kind check (#3858), real worker', () => {
   it('refuses a mic with no codecs, and one whose mimeType is not a string', async () => {
     const t = await join('f-shape');
     await expect(
-      manager.produce('room-fix', 'f-shape', t, 'audio', mic([], [{ ssrc: 5, maxBitrate: 64_000 }]), 'mic')
+      manager.produce(
+        'room-fix',
+        'f-shape',
+        t,
+        'audio',
+        mic([], [{ ssrc: 5, maxBitrate: 64_000 }]),
+        'mic'
+      )
     ).rejects.toThrow('Invalid codec for producer kind');
     await expect(
       manager.produce(
@@ -140,7 +161,10 @@ describe('audio producer codec/kind check (#3858), real worker', () => {
       'f-stock',
       t,
       'audio',
-      mic([{ ...OPUS_IN_TIER, parameters: { ptime: 20, useinbandfec: 1, minptime: 10 } }], [{ ssrc: 7, maxBitrate: 64_000 }]),
+      mic(
+        [{ ...OPUS_IN_TIER, parameters: { ptime: 20, useinbandfec: 1, minptime: 10 } }],
+        [{ ssrc: 7, maxBitrate: 64_000 }]
+      ),
       'mic'
     );
     expect(info.producerId).toBeTruthy();

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createMockWorker } from './mocks/mediasoup.js';
+import { createMockWebRtcServer, createMockWorker } from './mocks/mediasoup.js';
 import './mocks/logger.js';
 
 // Mock mediasoup native module
@@ -13,9 +13,16 @@ vi.mock('mediasoup', () => ({
 // Mock config
 vi.mock('@/config/index.js', () => ({
   config: {
+    mediaInstanceColor: 'blue',
     mediasoup: {
-      webRtcServer: { enabled: false, ports: [], listenIp: '0.0.0.0', announcedAddress: '127.0.0.1' },
+      webRtcServer: {
+        enabled: false,
+        ports: [],
+        listenIp: '0.0.0.0',
+        announcedAddress: '127.0.0.1',
+      },
       numWorkers: 3,
+      initialWorkers: 3,
       worker: {
         logLevel: 'warn',
         logTags: ['info'],
@@ -25,11 +32,14 @@ vi.mock('@/config/index.js', () => ({
       router: {
         mediaCodecs: [{ kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 }],
       },
+      webRtcTransport: { enableUdp: true, enableTcp: false },
     },
+    rtc: { minPort: 40000, maxPort: 49999, announcedIp: '127.0.0.1' },
   },
 }));
 
 import { MediasoupService } from '../src/lib/mediasoup.js';
+import { config } from '@/config/index.js';
 import {
   NoWorkersAvailableError,
   RoomConsumerCountsUnavailableError,
@@ -61,7 +71,7 @@ describe('MediasoupService', () => {
       expect(service.getWorkerCount()).toBe(3);
     });
 
-    it('passes worker config to createWorker', async () => {
+    it('creates one WebRtcServer per worker on distinct configured ports', async () => {
       mockCreateWorker
         .mockResolvedValueOnce(createMockWorker())
         .mockResolvedValueOnce(createMockWorker());
@@ -74,6 +84,16 @@ describe('MediasoupService', () => {
         rtcMinPort: 40000,
         rtcMaxPort: 49999,
       });
+      const workers = await Promise.all(
+        mockCreateWorker.mock.results.map((result) => result.value)
+      );
+      expect(
+        workers.map((worker) => worker.createWebRtcServer.mock.calls[0][0].listenInfos)
+      ).toEqual(
+        [40000, 40001, 40002].map((port) => [
+          { protocol: 'udp', ip: '0.0.0.0', announcedAddress: '127.0.0.1', port },
+        ])
+      );
     });
 
     it('calls process.exit(1) when a worker dies', async () => {
@@ -278,10 +298,7 @@ describe('MediasoupService', () => {
       // Discriminating: the sequential sibling above spreads these across
       // three workers. Only the concurrency window co-locates them, so this
       // test fails if placement is ever serialized OR given a reservation.
-      await Promise.all([
-        service.getOrCreateRouter('room-a'),
-        service.getOrCreateRouter('room-b'),
-      ]);
+      await Promise.all([service.getOrCreateRouter('room-a'), service.getOrCreateRouter('room-b')]);
 
       expect(w[0].createRouter).toHaveBeenCalledTimes(2);
       expect(w[1].createRouter).not.toHaveBeenCalled();
@@ -387,6 +404,212 @@ describe('MediasoupService', () => {
       expect(worker1.close).toHaveBeenCalled();
       expect(worker2.close).toHaveBeenCalled();
       expect(service.getWorkerCount()).toBe(0);
+    });
+  });
+
+  describe('worker trade', () => {
+    it('keeps existing rooms ready while an optional worker binds its listener', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const first = createMockWorker();
+      const second = createMockWorker();
+      let finishBind!: (server: ReturnType<typeof createMockWebRtcServer>) => void;
+      second.createWebRtcServer.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishBind = resolve;
+        })
+      );
+      mockCreateWorker.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+      try {
+        await service.init();
+        const router = await service.getOrCreateRouter('room-a');
+        const promotion = service.addWorker();
+        await vi.waitFor(() => expect(second.createWebRtcServer).toHaveBeenCalledOnce());
+
+        expect(service.getWorkerCount()).toBe(1);
+        expect(service.isReady()).toBe(true);
+        expect(service.getWebRtcServer(router)).toBeDefined();
+
+        finishBind(createMockWebRtcServer());
+        await promotion;
+        expect(service.getWorkerCount()).toBe(2);
+        expect(service.isReady()).toBe(true);
+      } finally {
+        await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('retries a failed optional listener bind without poisoning the initial worker', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const first = createMockWorker();
+      const failed = createMockWorker();
+      failed.createWebRtcServer.mockRejectedValueOnce(new Error('listener bind failed'));
+      const replacement = createMockWorker();
+      mockCreateWorker
+        .mockResolvedValueOnce(first)
+        .mockResolvedValueOnce(failed)
+        .mockResolvedValueOnce(replacement);
+      try {
+        await service.init();
+        const router = await service.getOrCreateRouter('room-a');
+        await expect(service.addWorker()).rejects.toThrow('listener bind failed');
+
+        expect(failed.close).toHaveBeenCalledOnce();
+        expect(service.getWorkerCount()).toBe(1);
+        expect(service.isReady()).toBe(true);
+        expect(service.getWebRtcServer(router)).toBeDefined();
+
+        await service.addWorker();
+        expect(replacement.createWebRtcServer.mock.calls[0][0].listenInfos[0].port).toBe(40001);
+        expect(service.getWorkerCount()).toBe(2);
+      } finally {
+        await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('stays unready when failed promotion cannot prove native worker termination', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const failed = createMockWorker();
+      failed.createWebRtcServer.mockRejectedValueOnce(new Error('listener bind failed'));
+      failed.close.mockImplementation(() => {
+        failed.closed = true;
+      });
+      mockCreateWorker.mockResolvedValueOnce(createMockWorker()).mockResolvedValueOnce(failed);
+      try {
+        await service.init();
+        vi.useFakeTimers();
+        const refusal = expect(service.addWorker()).rejects.toThrow(
+          'Native media termination unavailable'
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await refusal;
+
+        expect(service.isReady()).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('starts at the configured initial count and promotes only when every worker owns a live router', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const promoted = new MediasoupService();
+      promoted.setRoomConsumerCounts(() => new Map());
+      try {
+        await promoted.init();
+        expect(promoted.getWorkerCount()).toBe(1);
+        await promoted.getOrCreateRouter('room-a');
+        await promoted.getOrCreateRouter('room-b');
+        expect(promoted.getWorkerCount()).toBe(2);
+        await promoted.getOrCreateRouter('room-c');
+        expect(promoted.getWorkerCount()).toBe(3);
+      } finally {
+        await promoted.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('refuses to demote live routers, preserves the initial floor, and reuses only released ports', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 2;
+      const workers = [createMockWorker(), createMockWorker(), createMockWorker()];
+      workers.forEach((worker) => mockCreateWorker.mockResolvedValueOnce(worker));
+      try {
+        await service.init();
+        await service.addWorker();
+        const router = await service.getOrCreateRouter('room-a');
+        await expect(service.removeWorker(workers[0])).rejects.toThrow(/live router/);
+        (router as any).closed = true;
+        await service.removeWorker(workers[0]);
+        expect(process.exit).not.toHaveBeenCalled();
+        await expect(service.removeWorker(workers[1])).rejects.toThrow(/initial count/);
+        await service.addWorker();
+        const replacement = await mockCreateWorker.mock.results.at(-1)?.value;
+        expect(replacement.createWebRtcServer.mock.calls[0][0].listenInfos[0].port).toBe(40000);
+      } finally {
+        if (service.getWorkerCount() > 0) await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('keeps live workers ready while an idle worker awaits native shutdown', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const active = createMockWorker();
+      const idle = createMockWorker();
+      idle.close.mockImplementation(() => {
+        idle.closed = true;
+      });
+      mockCreateWorker.mockResolvedValueOnce(active).mockResolvedValueOnce(idle);
+      try {
+        await service.init();
+        const router = await service.getOrCreateRouter('live-room');
+        await service.addWorker();
+        const demotion = service.removeWorker(idle);
+        await vi.waitFor(() => expect(idle.close).toHaveBeenCalledOnce());
+        expect(service.isReady()).toBe(true);
+        expect(service.getWebRtcServer(router)).toBeDefined();
+        idle.subprocessClosed = true;
+        idle._emit('subprocessclose');
+        await demotion;
+      } finally {
+        await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('fails closed if a demoted worker never confirms native shutdown', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const idle = createMockWorker();
+      idle.close.mockImplementation(() => {
+        idle.closed = true;
+      });
+      mockCreateWorker.mockResolvedValueOnce(createMockWorker()).mockResolvedValueOnce(idle);
+      try {
+        await service.init();
+        await service.addWorker();
+        vi.useFakeTimers();
+        const demotion = expect(service.removeWorker(idle)).rejects.toThrow(
+          'Native media termination unavailable'
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await demotion;
+        expect(service.isReady()).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
+    });
+
+    it('drains idle workers to the initial floor without removing active workers', async () => {
+      const initial = config.mediasoup.initialWorkers;
+      config.mediasoup.initialWorkers = 1;
+      const workers = [createMockWorker(), createMockWorker(), createMockWorker()];
+      workers.forEach((worker) => mockCreateWorker.mockResolvedValueOnce(worker));
+      try {
+        await service.init();
+        await service.addWorker();
+        await service.addWorker();
+        const removed = await service.demoteIdleWorkersToInitial();
+
+        expect(removed).toBe(2);
+        expect(service.getWorkerCount()).toBe(1);
+        expect(workers[1].close).toHaveBeenCalledOnce();
+        expect(workers[2].close).toHaveBeenCalledOnce();
+      } finally {
+        if (service.getWorkerCount() > 0) await service.close(performance.now() + 5_000);
+        config.mediasoup.initialWorkers = initial;
+      }
     });
   });
 });

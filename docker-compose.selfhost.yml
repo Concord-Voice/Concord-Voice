@@ -28,6 +28,9 @@ services:
     ports: !override
       - "127.0.0.1:8080:8080"
   media-plane:
+    # Self-host uses its existing services-only public overlay and does not
+    # opt into the managed blue/green rehearsal profile.
+    profiles: !override [services]
     # Match the supported two-CPU self-host floor; workers and quota move together.
     environment:
       NUM_WORKERS: "2"

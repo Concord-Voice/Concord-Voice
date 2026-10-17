@@ -28,7 +28,6 @@ vi.mock('@/config/index.js', () => ({
     audioLastNHoldMs: 2500,
     mediasoup: {
       webRtcTransport: {
-        listenIps: [{ ip: '0.0.0.0', announcedIp: '127.0.0.1' }],
         enableUdp: true,
         // #3105: matches production, where the gate defaults closed.
         enableTcp: false,
@@ -47,6 +46,7 @@ vi.mock('@/config/index.js', () => ({
 
 import {
   RoomManager,
+  RoomCreationRefusedError,
   VideoPolicyCooldownError,
   resolveVideoPublisherCap,
   ABSOLUTE_VIDEO_PUBLISHER_CEILING,
@@ -94,9 +94,11 @@ import {
 
 function createMockMediasoupService(router = createMockRouter()) {
   const worker = createMockWorker();
+  const webRtcServer = { closed: false };
   return {
     getWebRtcServer: () => undefined,
     getOrCreateRouter: vi.fn().mockResolvedValue(router),
+    getWebRtcServer: vi.fn().mockReturnValue(webRtcServer),
     removeRouter: vi.fn(),
     captureNativeTermination: vi.fn((targetRouter, transportIds?: readonly string[]) => ({
       worker,
@@ -422,7 +424,7 @@ describe('RoomManager', () => {
         username: 'bob',
       });
 
-      expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1));
       resolveRouter(mockRouter);
       await Promise.all([firstJoin, secondJoin]);
 
@@ -431,6 +433,122 @@ describe('RoomManager', () => {
         expect.arrayContaining(['u-1', 'u-2'])
       );
       expect(manager.getRoom('room-concurrent')?.participants.size).toBe(2);
+    });
+
+    it('counts a pending owner read and never leaves a gate after a refusal', async () => {
+      let releaseOwnerRead!: () => void;
+      const ownerRead = new Promise<void>((resolve) => {
+        releaseOwnerRead = resolve;
+      });
+      manager.setRoomCreationGuard(() => ownerRead);
+
+      const pending = joinRoomWithSupportedCrypto(manager, 'room-owner-read', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      expect(manager.getCreatesInFlightCount()).toBe(1);
+      releaseOwnerRead();
+      await pending;
+      expect(manager.getCreatesInFlightCount()).toBe(0);
+
+      manager.setRoomCreationGuard(async () => {
+        throw new Error('room_owner_unavailable');
+      });
+      await expect(
+        joinRoomWithSupportedCrypto(manager, 'room-refused', 'u-2', 'sock-2', {
+          username: 'bob',
+        })
+      ).rejects.toThrow('room_owner_unavailable');
+      expect(manager.getCreatesInFlightCount()).toBe(0);
+
+      manager.setRoomCreationGuard(undefined);
+      await joinRoomWithSupportedCrypto(manager, 'room-refused', 'u-3', 'sock-3', {
+        username: 'carol',
+      });
+      expect(manager.getRoom('room-refused')?.participants.has('u-3')).toBe(true);
+    });
+
+    it('skips the create guard for an existing room', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-existing', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      const guard = vi.fn(async () => {
+        throw new Error('must not guard existing room');
+      });
+      manager.setRoomCreationGuard(guard);
+
+      await joinRoomWithSupportedCrypto(manager, 'room-existing', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
+
+      expect(guard).not.toHaveBeenCalled();
+      expect(manager.getRoom('room-existing')?.participants.size).toBe(2);
+    });
+
+    it('emits room-created when a provisional ring-only DM creates its room', async () => {
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => {
+        events.push(event);
+      });
+
+      await manager.joinRoom('dm-ring-only', 'u-1', 'sock-1', { username: 'alice' }, undefined, {
+        credentialEpoch: 'credential-1',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm', callId: 'ring-call' },
+      });
+
+      expect(events[0]).toEqual({ type: 'room-created', roomId: 'dm-ring-only' });
+      expect(manager.getRoom('dm-ring-only')?.participants.size).toBe(0);
+    });
+
+    it('waits for room occupancy publication before exposing a newly created room', async () => {
+      (mockedConfig as { roomPlacementEnabled?: boolean }).roomPlacementEnabled = true;
+      let releaseOccupancy!: () => void;
+      const occupancyPublished = new Promise<void>((resolve) => {
+        releaseOccupancy = resolve;
+      });
+      manager.onEvent(async (event) => {
+        if (event.type === 'room-created') await occupancyPublished;
+      });
+
+      try {
+        const join = joinRoomWithSupportedCrypto(manager, 'room-occupancy-fence', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
+        await vi.waitFor(() => expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalled());
+        expect(manager.getRoom('room-occupancy-fence')).toBeUndefined();
+        expect(manager.getCreatesInFlightCount()).toBe(1);
+
+        releaseOccupancy();
+        await join;
+        expect(manager.getRoom('room-occupancy-fence')?.participants.has('u-1')).toBe(true);
+        expect(manager.getCreatesInFlightCount()).toBe(0);
+      } finally {
+        (mockedConfig as { roomPlacementEnabled?: boolean }).roomPlacementEnabled = false;
+      }
+    });
+
+    it('does not publish a room locally when its required create event fails', async () => {
+      (mockedConfig as { roomPlacementEnabled?: boolean }).roomPlacementEnabled = true;
+      manager.onEvent(async (event) => {
+        if (event.type === 'room-created') {
+          throw new RoomCreationRefusedError('room_owner_unavailable');
+        }
+      });
+
+      try {
+        await expect(
+          joinRoomWithSupportedCrypto(manager, 'room-occupancy-failed', 'u-1', 'sock-1', {
+            username: 'alice',
+          })
+        ).rejects.toThrow('room_owner_unavailable');
+
+        expect(manager.getRoom('room-occupancy-failed')).toBeUndefined();
+        expect(mockRouter.close).toHaveBeenCalled();
+        expect(mockMediasoup.removeRouter).toHaveBeenCalledWith('room-occupancy-failed');
+        expect(manager.getCreatesInFlightCount()).toBe(0);
+      } finally {
+        (mockedConfig as { roomPlacementEnabled?: boolean }).roomPlacementEnabled = false;
+      }
     });
 
     it('retries admission when the last leave closes the room during join', async () => {
@@ -2399,7 +2517,12 @@ describe('RoomManager', () => {
           await manager.createTransport('room-1', 'u-1', 'send');
 
           expect(mockRouter.createWebRtcTransport).toHaveBeenCalledWith(
-            expect.objectContaining({ enableTcp: gate, enableUdp: true, preferUdp: true })
+            expect.objectContaining({
+              webRtcServer: mockMediasoup.getWebRtcServer.mock.results[0]?.value,
+              enableTcp: gate,
+              enableUdp: true,
+              preferUdp: true,
+            })
           );
         } finally {
           wrt.enableTcp = original;

@@ -391,7 +391,7 @@ func TestActivePlanRailIsWiredAtItsConstructionSites(t *testing.T) {
 	// would not be a gate.
 	for _, wiring := range []string{
 		"activePlanRail, activePlanReconciler := buildActivePlanRail(",
-		"ActivePlans: activePlanRail,",
+		"ActivePlans:          activePlanRail,",
 		"accountService.SetActivePlanRail(activePlanRail)",
 		"serversHandler.SetActivePlanRail(activePlanRail)",
 	} {

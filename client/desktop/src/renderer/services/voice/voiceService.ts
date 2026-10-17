@@ -3732,12 +3732,16 @@ class VoiceService {
 
   private shouldRecoverInitialJoinFailure(
     shouldRecoverJoinFailure: boolean,
-    connectingStarted: boolean
+    connectingStarted: boolean,
+    internalRebuild: boolean
   ): boolean {
     if (!shouldRecoverJoinFailure) return false;
     if (!connectingStarted) return true;
     const state = useVoiceStore.getState().connectionState;
-    return state === 'connecting' || (state === 'reconnecting' && !this.resumeInFlight);
+    return (
+      state === 'connecting' ||
+      (state === 'reconnecting' && (!this.resumeInFlight || internalRebuild))
+    );
   }
 
   /** Authorize and join a voice channel */
@@ -3769,7 +3773,6 @@ class VoiceService {
       // Step 1: Authorize via control plane (uses apiFetch for automatic token refresh)
       const joinData = await this.authorizeVoiceJoin(channelId, joinType, ringId);
 
-      const { media_server_url } = joinData;
       // For DM voice joins the response omits `channel` and includes
       // `conversation` instead. Synthesize a channel-shaped object from
       // the conversation + dmStore peer/group-name lookup per spec §7.9
@@ -3790,70 +3793,14 @@ class VoiceService {
 
       this.resolveQualityTier(store, channel.audio_quality_tier ?? undefined);
 
-      // Step 2: Connect Socket.IO to media plane
-      // Fail fast when unauthenticated; the socket's auth callback below
-      // re-reads the store token on every connection attempt.
-      if (!useAuthStore.getState().accessToken) throw new Error('Not authenticated');
-
-      this.socket = io(media_server_url, {
-        // The auth CALLBACK form is evaluated on EVERY connection attempt
-        // (initial handshake + each automatic reconnection), so the
-        // handshake always presents the freshest store token — a static
-        // auth object would snapshot the call-start JWT, which is expired
-        // after the 15-min access-token TTL on long calls and would make
-        // every post-drop reconnect fail auth (#1790). The proactive
-        // refresh timer (#240) keeps the store token current mid-call.
-        auth: (cb) => {
-          const user = useUserStore.getState().user;
-          const auth = useAuthStore.getState();
-          this.clearAuthRenewalRetry();
-          this.mediaHandshake = {
-            token: auth.accessToken,
-            generation: auth.authGeneration,
-            admitted: false,
-          };
-          cb({
-            token: auth.accessToken,
-            username: user?.username || 'unknown',
-            displayName: user?.display_name || undefined,
-            avatarUrl: user?.avatar_url || undefined,
-            // room_kind routing hint per #1209 spec §6.5 / plan task C1.
-            // Tells the media-plane which control-plane endpoint to
-            // authoritatively validate against (server-channel join vs DM
-            // authorize). The user's identity for AUTHORIZATION is established
-            // by the JWT (token field above) — the room_kind hint just selects
-            // which validation endpoint runs. The username/displayName/
-            // avatarUrl fields here are client-supplied display data, NOT
-            // identity claims, and are documented as a known gap in
-            // [internal]rules/media-plane.md (server uses JWT-derived userId
-            // for participation enforcement).
-            room_kind: joinType === 'dm' ? 'dm' : 'channel',
-          });
-        },
-        // Websocket-first for latency, with HTTP long-polling as a fallback so a
-        // transient WS-transport blip degrades instead of hard-failing the join.
-        // tryAllTransports is REQUIRED: with 'websocket' listed first, engine.io does
-        // NOT auto-try the next transport on a failed WS *open* unless this is set
-        // (default false since socket.io-client 4.7.0). It is consulted ONLY when the
-        // initial WS transport fails, so the normal (~30ms) WS path is unchanged. Safe
-        // here because the media-plane is single-instance and its Socket.IO server
-        // advertises polling (handshake 200 + upgrades:['websocket']) — no sticky
-        // session requirement. #2176.
-        transports: ['websocket', 'polling'],
-        tryAllTransports: true,
-        reconnection: true,
-        reconnectionAttempts: 10,
-        reconnectionDelay: 1000,
-      });
-
-      await this.waitForConnect();
-      this.setupSocketListeners();
-      this.registerDocumentVisibilityListener();
-
-      // Steps 3–9: join room → load device → transports → E2EE →
-      // participants → mic producer → existing consumers. Shared with
-      // resumeAfterReconnect (#1790) via establishMediaSession.
-      await this.establishMediaSession(store, channel.id, joinData);
+      await this.connectAuthorizedJoinSession(
+        store,
+        channelId,
+        channel.id,
+        joinType,
+        ringId,
+        joinData
+      );
 
       store.setConnectionState('connected');
       notificationSoundService.stopAllLoops();
@@ -3870,13 +3817,120 @@ class VoiceService {
     } catch (err) {
       // A completed leave owns disconnected; a reconnecting initial join still
       // owns its failure until resumeAfterReconnect claims the rebuild.
-      if (this.shouldRecoverInitialJoinFailure(shouldRecoverJoinFailure, connectingStarted)) {
+      if (
+        this.shouldRecoverInitialJoinFailure(
+          shouldRecoverJoinFailure,
+          connectingStarted,
+          opts?.internalRebuild === true
+        )
+      ) {
         await this.handleJoinFailure(err);
       }
       throw err;
     } finally {
       this.joinInFlight = false;
     }
+  }
+
+  private async connectAuthorizedJoinSession(
+    store: ReturnType<typeof useVoiceStore.getState>,
+    authorizationId: string,
+    roomId: string,
+    joinType: 'channel' | 'dm',
+    ringId: string | undefined,
+    joinData: JoinResponse
+  ): Promise<void> {
+    try {
+      await this.dialAuthorizedMediaSession(store, roomId, joinType, joinData);
+    } catch (err) {
+      if (!this.isRoomOwnershipRefusal(err)) throw err;
+      const refusedSocket = this.socket;
+      if (!refusedSocket || !this.ownsInitialJoin(roomId, refusedSocket)) {
+        throw new E2EEInitializationSupersededError();
+      }
+
+      // joinInFlight prevents a successor join while cleanup awaits resource teardown.
+      await this.cleanup();
+      if (!this.joinInFlight || !this.ownsInitialJoin(roomId) || this.socket) {
+        throw new E2EEInitializationSupersededError();
+      }
+      const refreshedJoinData = await this.authorizeVoiceJoin(authorizationId, joinType, ringId);
+      if (!this.ownsInitialJoin(roomId) || this.socket) {
+        throw new E2EEInitializationSupersededError();
+      }
+      const channel = await this.resolveAuthorizedJoinChannel(
+        refreshedJoinData,
+        authorizationId,
+        joinType
+      );
+      if (!this.ownsInitialJoin(roomId) || this.socket) {
+        throw new E2EEInitializationSupersededError();
+      }
+      store.setActiveChannel(channel.id, channel.name, channel.server_id);
+      this.applyJoinMetadata(store, refreshedJoinData, joinType, authorizationId);
+      this.resolveQualityTier(store, channel.audio_quality_tier ?? undefined);
+      await this.dialAuthorizedMediaSession(store, channel.id, joinType, refreshedJoinData);
+      if (!this.ownsInitialJoin(channel.id) || !this.socket) {
+        throw new E2EEInitializationSupersededError();
+      }
+    }
+  }
+
+  private async dialAuthorizedMediaSession(
+    store: ReturnType<typeof useVoiceStore.getState>,
+    channelId: string,
+    joinType: 'channel' | 'dm',
+    joinData: JoinResponse
+  ): Promise<void> {
+    if (!useAuthStore.getState().accessToken) throw new Error('Not authenticated');
+
+    this.socket = io(joinData.media_server_url, {
+      // Read the current token for the initial handshake and each Socket.IO reconnect.
+      auth: (cb) => {
+        const user = useUserStore.getState().user;
+        const auth = useAuthStore.getState();
+        this.clearAuthRenewalRetry();
+        this.mediaHandshake = {
+          token: auth.accessToken,
+          generation: auth.authGeneration,
+          admitted: false,
+        };
+        // The JWT authorizes the participant; room_kind only selects the server validation path.
+        cb({
+          token: auth.accessToken,
+          username: user?.username || 'unknown',
+          displayName: user?.display_name || undefined,
+          avatarUrl: user?.avatar_url || undefined,
+          room_kind: joinType === 'dm' ? 'dm' : 'channel',
+        });
+      },
+      transports: ['websocket', 'polling'],
+      // Keep polling as fallback when the initial WebSocket transport cannot open.
+      tryAllTransports: true,
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+    });
+
+    await this.waitForConnect();
+    this.setupSocketListeners();
+    this.registerDocumentVisibilityListener();
+    await this.establishMediaSession(store, channelId, joinData);
+  }
+
+  private ownsInitialJoin(channelId: string, expectedSocket?: Socket): boolean {
+    return (
+      (!expectedSocket || this.socket === expectedSocket) &&
+      this.joinInFlight &&
+      useVoiceStore.getState().connectionState === 'connecting' &&
+      useVoiceStore.getState().activeChannelId === channelId
+    );
+  }
+
+  private isRoomOwnershipRefusal(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    const code = (err as Error & { code?: string }).code;
+    return code === 'room_owner_mismatch' || code === 'room_draining';
   }
 
   /**
@@ -4149,6 +4203,51 @@ class VoiceService {
     // every console method is captured into the bug-report buffer (NC-1, #3104).
     console.debug('[ice] servers', describeIceServers(this.iceServers));
 
+    const roomJoined = await this.joinMediaRoom(channelId, joinData);
+
+    // Load device with router capabilities
+    this.device = new Device();
+    this.routerRtpCapabilities = roomJoined.rtpCapabilities;
+    await this.device.load({ routerRtpCapabilities: roomJoined.rtpCapabilities });
+
+    // Send actual RTP capabilities to server (join-room sent undefined)
+    if (!this.socket) throw new Error('Socket disconnected before RTP capabilities update');
+    this.socket.emit('update-rtp-capabilities', {
+      rtpCapabilities: this.device.rtpCapabilities,
+    });
+
+    // Create transports in parallel (no dependency between send/recv)
+    await Promise.all([this.createSendTransport(), this.createRecvTransports()]);
+
+    // Initialize E2EE (all channels are always encrypted)
+    await this.setupE2EEForChannel(channelId, roomJoined);
+
+    // Set participants before consuming producers
+    store.setParticipants(this.buildParticipantList(roomJoined));
+
+    // Apply enforcement flags after participants are populated
+    this.applyEnforcementToParticipant(store, joinData);
+
+    // Produce audio unless the server denies Speak. A listen-only member (ViewVoiceChannels|JoinVoice
+    // without Speak, e.g. a listen-only role or channel override) is admitted by
+    // AuthorizeJoin, but the media-plane produce() gate would reject the mic
+    // publish and handleJoinFailure would tear the whole session down. Skip
+    // auto-produce and join with mic off so the stock client can listen.
+    if (this.joinPermitsSpeak(joinData)) {
+      await this.produceAudio();
+    } else {
+      store.setMuted(true);
+    }
+    this.setupLiveSubscriptions();
+
+    // Consume existing producers
+    await this.consumeExistingProducers(roomJoined.existingProducers);
+  }
+
+  private async joinMediaRoom(
+    channelId: string,
+    joinData: JoinResponse
+  ): Promise<RoomJoinedResponse> {
     const admissionHandshake = this.mediaHandshake;
     const roomJoined = await this.emitAsync<RoomJoinedResponse>('join-room', {
       roomId: channelId,
@@ -4190,43 +4289,7 @@ class VoiceService {
       joinData.channel?.audio_quality_tier
     );
 
-    // Load device with router capabilities
-    this.device = new Device();
-    this.routerRtpCapabilities = roomJoined.rtpCapabilities;
-    await this.device.load({ routerRtpCapabilities: roomJoined.rtpCapabilities });
-
-    // Send actual RTP capabilities to server (join-room sent undefined)
-    if (!this.socket) throw new Error('Socket disconnected before RTP capabilities update');
-    this.socket.emit('update-rtp-capabilities', {
-      rtpCapabilities: this.device.rtpCapabilities,
-    });
-
-    // Create transports in parallel (no dependency between send/recv)
-    await Promise.all([this.createSendTransport(), this.createRecvTransports()]);
-
-    // Initialize E2EE (all channels are always encrypted)
-    await this.setupE2EEForChannel(channelId, roomJoined);
-
-    // Set participants before consuming producers
-    store.setParticipants(this.buildParticipantList(roomJoined));
-
-    // Apply enforcement flags after participants are populated
-    this.applyEnforcementToParticipant(store, joinData);
-
-    // Produce audio unless the server denies Speak. A listen-only member (ViewVoiceChannels|JoinVoice
-    // without Speak, e.g. a listen-only role or channel override) is admitted by
-    // AuthorizeJoin, but the media-plane produce() gate would reject the mic
-    // publish and handleJoinFailure would tear the whole session down. Skip
-    // auto-produce and join with mic off so the stock client can listen.
-    if (this.joinPermitsSpeak(joinData)) {
-      await this.produceAudio();
-    } else {
-      store.setMuted(true);
-    }
-    this.setupLiveSubscriptions();
-
-    // Consume existing producers
-    await this.consumeExistingProducers(roomJoined.existingProducers);
+    return roomJoined;
   }
 
   /**
@@ -4253,6 +4316,7 @@ class VoiceService {
       return;
     }
     this.resumeInFlight = true;
+    const resumeSocket = this.socket;
     const joinType: 'channel' | 'dm' = store.isDMCall ? 'dm' : 'channel';
     try {
       // Step 1 (as in joinChannel): re-authorize via control plane so
@@ -4301,21 +4365,7 @@ class VoiceService {
       // the current pause policy before transmission, while resumed consumers
       // still need deafen restored here. Server-mute/deafen is separately
       // re-applied server-side at re-join.
-      const postResume = useVoiceStore.getState();
-      const mic = this.producers.get('mic');
-      if (postResume.isMuted && mic && !mic.paused) {
-        mic.pause();
-        this.socket.emit('pause-producer', { producerId: mic.id });
-        this.stopLocalVAD();
-      }
-      if (postResume.isDeafened) {
-        // Rebroadcast so the freshly-created server-side participant and
-        // peers' sidebars reflect the deafen state (#685 path).
-        this.socket.emit('set-deafen', { isDeafened: true });
-        for (const [, consumer] of this.consumers) {
-          if (consumer.kind === 'audio') consumer.pause();
-        }
-      }
+      this.restorePostResumeMuteState(this.socket);
 
       useVoiceStore.getState().setConnectionState('connected');
       this.startDecoderBudgetProfiling();
@@ -4324,6 +4374,13 @@ class VoiceService {
       // recovery from a fatal voice disconnect (issue acceptance criterion).
       console.warn('Voice media session resumed after network change');
     } catch (err) {
+      if (this.socket !== resumeSocket || useVoiceStore.getState().activeChannelId !== channelId) {
+        return;
+      }
+      if (this.isRoomOwnershipRefusal(err)) {
+        await this.retryResumeAfterOwnershipRefusal(channelId, joinType);
+        return;
+      }
       console.warn('Voice resume after network change failed:', errorMessage(err));
       // Stale-context guard (mirror of the success path): only tear down if
       // this resume still owns the call context. If a successor joinChannel
@@ -4336,6 +4393,49 @@ class VoiceService {
       }
     } finally {
       this.resumeInFlight = false;
+    }
+  }
+
+  private async retryResumeAfterOwnershipRefusal(
+    channelId: string,
+    joinType: 'channel' | 'dm'
+  ): Promise<void> {
+    const wasMuted = useVoiceStore.getState().isMuted;
+    const wasDeafened = useVoiceStore.getState().isDeafened;
+    const intent = Symbol('resume-rebuild');
+    this.legacyRebuildIntent = intent;
+    await this.leaveChannel({ internalRebuild: true });
+    if (this.legacyRebuildIntent !== intent || useVoiceStore.getState().activeChannelId !== null) {
+      return;
+    }
+    // leaveChannel resets the store; reapply privacy choices before the new
+    // join creates a mic producer, so an opted-out mic cannot briefly publish.
+    useVoiceStore.getState().setMuted(wasMuted);
+    useVoiceStore.getState().setDeafened(wasDeafened);
+    try {
+      await this.joinChannel(channelId, joinType, { internalRebuild: true });
+    } catch {
+      // joinChannel owns failure cleanup and the user-visible error state.
+      return;
+    }
+    if (this.socket) this.restorePostResumeMuteState(this.socket);
+  }
+
+  private restorePostResumeMuteState(socket: Socket): void {
+    const postResume = useVoiceStore.getState();
+    const mic = this.producers.get('mic');
+    if (postResume.isMuted && mic && !mic.paused) {
+      mic.pause();
+      socket.emit('pause-producer', { producerId: mic.id });
+      this.stopLocalVAD();
+    }
+    if (postResume.isDeafened) {
+      // Rebroadcast so the freshly-created server-side participant and
+      // peers' sidebars reflect the deafen state (#685 path).
+      socket.emit('set-deafen', { isDeafened: true });
+      for (const [, consumer] of this.consumers) {
+        if (consumer.kind === 'audio') consumer.pause();
+      }
     }
   }
 

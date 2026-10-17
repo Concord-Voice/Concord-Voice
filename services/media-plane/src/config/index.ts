@@ -336,6 +336,63 @@ function parseWorkerCountEnv(raw: string | undefined, fallback: number): number 
   return workers;
 }
 
+function parseInitialWorkerCountEnv(raw: string | undefined, maximum: number): number {
+  if (raw === undefined) return maximum;
+  const trimmed = raw.trim();
+  const workers = /^\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+  if (!Number.isSafeInteger(workers) || workers < 1 || workers > maximum) {
+    console.error(
+      `FATAL: INITIAL_NUM_WORKERS=${JSON.stringify(raw)} must be an integer between 1 and NUM_WORKERS (${maximum}).`
+    );
+    process.exit(1);
+    return maximum;
+  }
+  return workers;
+}
+
+const numWorkers = parseWorkerCountEnv(process.env.NUM_WORKERS, 4);
+const initialWorkers = parseInitialWorkerCountEnv(process.env.INITIAL_NUM_WORKERS, numWorkers);
+const mediaInstanceColorRaw = process.env.MEDIA_INSTANCE_COLOR?.trim().toLowerCase();
+if (
+  mediaInstanceColorRaw &&
+  mediaInstanceColorRaw !== 'blue' &&
+  mediaInstanceColorRaw !== 'green'
+) {
+  console.error('FATAL: MEDIA_INSTANCE_COLOR must be blue or green when set.');
+  process.exit(1);
+}
+const roomPlacementEnabledRaw = process.env.ROOM_PLACEMENT_ENABLED;
+if (
+  roomPlacementEnabledRaw !== undefined &&
+  roomPlacementEnabledRaw !== '' &&
+  roomPlacementEnabledRaw !== 'true' &&
+  roomPlacementEnabledRaw !== 'false'
+) {
+  console.error('FATAL: ROOM_PLACEMENT_ENABLED must be exactly true or false when set.');
+  process.exit(1);
+}
+const roomPlacementEnabled = roomPlacementEnabledRaw === 'true';
+if (roomPlacementEnabled && !mediaInstanceColorRaw) {
+  console.error('FATAL: ROOM_PLACEMENT_ENABLED requires MEDIA_INSTANCE_COLOR=blue or green.');
+  process.exit(1);
+}
+const rtcMinRaw = process.env.RTC_MIN_PORT || '40000';
+const rtcMaxRaw = process.env.RTC_MAX_PORT || '49999';
+const rtcMinPort = /^\d+$/.test(rtcMinRaw) ? Number(rtcMinRaw) : Number.NaN;
+const rtcMaxPort = /^\d+$/.test(rtcMaxRaw) ? Number(rtcMaxRaw) : Number.NaN;
+if (
+  !Number.isSafeInteger(rtcMinPort) ||
+  !Number.isSafeInteger(rtcMaxPort) ||
+  rtcMinPort < 1 ||
+  rtcMaxPort > 65_535 ||
+  rtcMaxPort - rtcMinPort + 1 < numWorkers
+) {
+  console.error(
+    `FATAL: RTC port range ${JSON.stringify(`${rtcMinPort}-${rtcMaxPort}`)} must contain at least NUM_WORKERS (${numWorkers}) ports.`
+  );
+  process.exit(1);
+}
+
 /**
  * Fail-closed gate for mediasoup ICE-TCP (#3105, ADR-0040).
  *
@@ -430,7 +487,6 @@ const opsMetricsIntervalMs = opsMetricsEnabled
 const opsMetricsRole = opsMetricsEnabled
   ? (process.env.OPS_METRICS_ROLE || 'local').trim().toLowerCase()
   : 'local';
-const numWorkers = parseWorkerCountEnv(process.env.NUM_WORKERS, 4);
 const httpPort = Number.parseInt(process.env.PORT || '3000', 10);
 const enableTcp = parseTcpEnabledEnv(process.env.MEDIASOUP_ENABLE_TCP);
 const sharedWebRtcServerEnabled = parseSharedWebRtcServerEnabled(
@@ -446,6 +502,12 @@ if (sharedWebRtcServerEnabled && !validAnnouncedAddress(process.env.ANNOUNCED_IP
 export const config = {
   environment: process.env.ENVIRONMENT || 'development',
   port: httpPort,
+  // Blue/green enforcement remains inactive for the legacy single-colour
+  // deployment until its compose and control-plane gates are enabled together.
+  mediaInstanceColor: mediaInstanceColorRaw as 'blue' | 'green' | undefined,
+  // Kept false until the control-plane selector, lifecycle guard and deploy
+  // registration are verified as one activation. The colour alone is inert.
+  roomPlacementEnabled,
 
   // Free-tier per-room concurrent camera-producer cap (#1539). P0 capacity
   // guardrail: bounds SFU egress fan-out so one free user can't saturate a box.
@@ -500,8 +562,8 @@ export const config = {
   // WebRTC settings
   rtc: {
     announcedIp: process.env.ANNOUNCED_IP || '127.0.0.1',
-    minPort: Number.parseInt(process.env.RTC_MIN_PORT || '40000', 10),
-    maxPort: Number.parseInt(process.env.RTC_MAX_PORT || '49999', 10),
+    minPort: rtcMinPort,
+    maxPort: rtcMaxPort,
   },
 
   // mediasoup settings
@@ -510,7 +572,7 @@ export const config = {
     // default describes an unconstrained host; each compose file sets its own
     // value (base "4", production "3" = its cpus limit).
     numWorkers,
-
+    initialWorkers,
     // Explicit migration gate: existing deployments retain per-transport sockets.
     webRtcServer: {
       enabled: sharedWebRtcServerEnabled,
@@ -529,8 +591,8 @@ export const config = {
     worker: {
       logLevel: (process.env.MEDIASOUP_LOG_LEVEL || 'warn') as mediasoup.types.WorkerLogLevel,
       logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'] as mediasoup.types.WorkerLogTag[],
-      rtcMinPort: Number.parseInt(process.env.RTC_MIN_PORT || '40000', 10),
-      rtcMaxPort: Number.parseInt(process.env.RTC_MAX_PORT || '49999', 10),
+      rtcMinPort,
+      rtcMaxPort,
     },
 
     // Header extensions are NOT declared here — mediasoup advertises its built-in

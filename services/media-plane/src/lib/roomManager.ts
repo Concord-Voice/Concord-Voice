@@ -1078,6 +1078,7 @@ type RoomContext = NonNullable<JoinRoomOptions['roomContext']>;
 // ---------------------------------------------------------------------------
 
 export type RoomEvent =
+  | { type: 'room-created'; roomId: string }
   | {
       type: 'user-joined';
       roomId: string;
@@ -1130,7 +1131,18 @@ export type RoomEvent =
   // log would otherwise pair a user with it (#1308).
   | { type: 'tier-violation'; userId: string; reason: TierViolationReason };
 
-export type RoomEventHandler = (event: RoomEvent) => void;
+export type RoomEventHandler = (event: RoomEvent) => void | Promise<void>;
+
+export type RoomCreationRefusalCode =
+  'room_draining' | 'room_owner_mismatch' | 'room_owner_unavailable';
+
+/** A typed, non-disconnecting refusal returned through the join-room ack. */
+export class RoomCreationRefusedError extends Error {
+  constructor(readonly code: RoomCreationRefusalCode) {
+    super(code);
+    this.name = 'RoomCreationRefusedError';
+  }
+}
 type CameraLayerSelection = { spatialLayer: 0 | 1 | 2; temporalLayer: 0 | 1 | 2 };
 
 export interface AggregateRoomCounts {
@@ -1743,6 +1755,8 @@ export class RoomManager {
 
   private readonly rooms: Map<string, Room> = new Map();
   private readonly roomCreationGates: Map<string, Promise<void>> = new Map();
+  private createsInFlight = 0;
+  private roomCreationGuard: ((roomId: string) => Promise<void>) | undefined;
   private readonly closedDMCallIds: Map<string, number> = new Map();
   private readonly mediasoup: MediasoupService;
   private readonly eventHandlers: RoomEventHandler[] = [];
@@ -1766,6 +1780,11 @@ export class RoomManager {
   /** Register an event handler for room events (used by NATS/Redis integration) */
   onEvent(handler: RoomEventHandler): void {
     this.eventHandlers.push(handler);
+  }
+
+  /** Install the owner fence used only when a new local room must be created. */
+  setRoomCreationGuard(guard: ((roomId: string) => Promise<void>) | undefined): void {
+    this.roomCreationGuard = guard;
   }
 
   /** Explicitly injected best-effort telemetry; never participates in media decisions. */
@@ -1892,13 +1911,34 @@ export class RoomManager {
   private emitEvent(event: RoomEvent): void {
     for (const handler of this.eventHandlers) {
       try {
-        handler(event);
+        void Promise.resolve(handler(event)).catch((err: unknown) => {
+          logger.error('Room event handler error', {
+            event: event.type,
+            error: err,
+          });
+        });
       } catch (err) {
         logger.error('Room event handler error', {
           event: event.type,
           error: err,
         });
       }
+    }
+  }
+
+  private async emitRoomCreatedAndWait(roomId: string): Promise<void> {
+    const results = await Promise.allSettled(
+      this.eventHandlers.map((handler) =>
+        Promise.resolve().then(() => handler({ type: 'room-created', roomId }))
+      )
+    );
+    for (const result of results) {
+      if (result.status !== 'rejected') continue;
+      logger.error('Room event handler error', {
+        event: 'room-created',
+        error: result.reason,
+      });
+      if (result.reason instanceof RoomCreationRefusedError) throw result.reason;
     }
   }
 
@@ -1929,6 +1969,147 @@ export class RoomManager {
 
   /** Get or create a room for the given channel ID */
   private async getOrCreateRoom(roomId: string, roomContext?: RoomContext): Promise<Room> {
+    const room = this.getExistingRoom(roomId, roomContext);
+    if (room) return room;
+
+    // Existing rooms remain joinable during Redis loss or a colour drain.
+    // For a new room, fence placement before consulting or mutating the gate:
+    // a refusal must never leave a promise that wedges subsequent joins.
+    this.createsInFlight += 1;
+    try {
+      await this.roomCreationGuard?.(roomId);
+
+      const creationInFlight = this.roomCreationGates.get(roomId);
+      if (creationInFlight) {
+        await creationInFlight;
+        return this.getOrCreateRoom(roomId, roomContext);
+      }
+
+      let releaseCreation!: () => void;
+      const creationGate = new Promise<void>((resolve) => {
+        releaseCreation = resolve;
+      });
+      this.roomCreationGates.set(roomId, creationGate);
+
+      try {
+        const router = await this.mediasoup.getOrCreateRouter(roomId);
+
+        // Audio last-N (#1544): resolve the forwarded-speaker cap (free 8 for Beta;
+        // tier deferred). The observer is sized to N so `volumes` surfaces the top-N.
+        const lastN = resolveAudioLastN();
+
+        // Create AudioLevelObserver for active speaker detection
+        let audioLevelObserver: AudioLevelObserver | null = null;
+        try {
+          audioLevelObserver = await router.createAudioLevelObserver({
+            maxEntries: lastN,
+            threshold: config.audioLevelObserver.threshold,
+            interval: config.audioLevelObserver.interval,
+          });
+        } catch (err) {
+          logger.warn('Failed to create AudioLevelObserver', {
+            roomId,
+            error: err,
+          });
+        }
+
+        const createdRoom: Room = {
+          id: roomId,
+          router,
+          audioLevelObserver,
+          participants: new Map(),
+          pendingDMParticipants: new Map(),
+          pendingChannelParticipants: new Map(),
+          createdAt: new Date(),
+          e2eeEpoch: 0,
+          mediaFrameCryptoVersion: null,
+          pendingProducerCounts: new Map(),
+          activeSpeakers: new ActiveSpeakerSet(lastN, config.audioLastNHoldMs),
+          lastNPausedConsumers: new Set(),
+          micProducerIds: new Set(),
+          roomKind: roomContext?.roomKind ?? 'channel',
+          callParticipantHistory: new Map(),
+          ownerTier: roomContext?.ownerTier,
+          cameraLayerDemands: new Map(),
+          cameraLayeringGateEnabled: false,
+          screenLayerDemands: new Map(),
+          screenLayeringGateBySharer: new Map(),
+          screenGateOffTimers: new Map(),
+        };
+
+        // Wire up active speaker events
+        if (audioLevelObserver) {
+          audioLevelObserver.on(
+            'volumes',
+            (volumes: Array<{ producer: Producer; volume: number }>) => {
+              // Preserve the single-speaker UI broadcast (loudest = volumes[0]).
+              if (volumes.length > 0) {
+                const { producer, volume } = volumes[0];
+                // Find the participant who owns this producer
+                for (const [, participant] of createdRoom.participants) {
+                  for (const [, entry] of participant.producers) {
+                    if (entry.producer.id === producer.id) {
+                      this.emitEvent({
+                        type: 'active-speaker',
+                        roomId,
+                        userId: participant.userId,
+                        volume,
+                      });
+                      break;
+                    }
+                  }
+                }
+              }
+              // Drive last-N from the full ranked top-N.
+              const ranked = volumes.map((v) => v.producer.id);
+              const delta = createdRoom.activeSpeakers.update(ranked, Date.now());
+              this.applyLastNDelta(createdRoom, delta);
+            }
+          );
+
+          // Clear active speaker when everyone stops talking
+          audioLevelObserver.on('silence', () => {
+            this.emitEvent({
+              type: 'active-speaker',
+              roomId,
+              userId: '',
+              volume: -Infinity,
+            });
+            const delta = createdRoom.activeSpeakers.update([], Date.now());
+            this.applyLastNDelta(createdRoom, delta);
+          });
+        }
+
+        if (config.roomPlacementEnabled) {
+          try {
+            // Publish occupancy before making the room visible to joins. A room
+            // created under placement must never be joinable without its live fence.
+            await this.emitRoomCreatedAndWait(roomId);
+          } catch (err) {
+            audioLevelObserver?.close();
+            if (!router.closed) router.close();
+            this.mediasoup.removeRouter(roomId);
+            throw err;
+          }
+        } else {
+          this.emitEvent({ type: 'room-created', roomId });
+        }
+        this.rooms.set(roomId, createdRoom);
+
+        logger.info('Room created', { roomId });
+        return createdRoom;
+      } finally {
+        if (this.roomCreationGates.get(roomId) === creationGate) {
+          this.roomCreationGates.delete(roomId);
+        }
+        releaseCreation();
+      }
+    } finally {
+      this.createsInFlight -= 1;
+    }
+  }
+
+  private getExistingRoom(roomId: string, roomContext?: RoomContext): Room | undefined {
     const room = this.rooms.get(roomId);
     if (room) {
       // Defensive: if the router was closed (e.g. race between leave and rejoin),
@@ -1962,118 +2143,7 @@ export class RoomManager {
         return room;
       }
     }
-
-    const creationInFlight = this.roomCreationGates.get(roomId);
-    if (creationInFlight) {
-      await creationInFlight;
-      return this.getOrCreateRoom(roomId, roomContext);
-    }
-
-    let releaseCreation!: () => void;
-    const creationGate = new Promise<void>((resolve) => {
-      releaseCreation = resolve;
-    });
-    this.roomCreationGates.set(roomId, creationGate);
-
-    try {
-      const router = await this.mediasoup.getOrCreateRouter(roomId);
-
-      // Audio last-N (#1544): resolve the forwarded-speaker cap (free 8 for Beta;
-      // tier deferred). The observer is sized to N so `volumes` surfaces the top-N.
-      const lastN = resolveAudioLastN();
-
-      // Create AudioLevelObserver for active speaker detection
-      let audioLevelObserver: AudioLevelObserver | null = null;
-      try {
-        audioLevelObserver = await router.createAudioLevelObserver({
-          maxEntries: lastN,
-          threshold: config.audioLevelObserver.threshold,
-          interval: config.audioLevelObserver.interval,
-        });
-      } catch (err) {
-        logger.warn('Failed to create AudioLevelObserver', {
-          roomId,
-          error: err,
-        });
-      }
-
-      const createdRoom: Room = {
-        id: roomId,
-        router,
-        audioLevelObserver,
-        participants: new Map(),
-        pendingDMParticipants: new Map(),
-        pendingChannelParticipants: new Map(),
-        createdAt: new Date(),
-        e2eeEpoch: 0,
-        mediaFrameCryptoVersion: null,
-        pendingProducerCounts: new Map(),
-        activeSpeakers: new ActiveSpeakerSet(lastN, config.audioLastNHoldMs),
-        lastNPausedConsumers: new Set(),
-        micProducerIds: new Set(),
-        roomKind: roomContext?.roomKind ?? 'channel',
-        callParticipantHistory: new Map(),
-        ownerTier: roomContext?.ownerTier,
-        cameraLayerDemands: new Map(),
-        cameraLayeringGateEnabled: false,
-        screenLayerDemands: new Map(),
-        screenLayeringGateBySharer: new Map(),
-        screenGateOffTimers: new Map(),
-      };
-
-      // Wire up active speaker events
-      if (audioLevelObserver) {
-        audioLevelObserver.on(
-          'volumes',
-          (volumes: Array<{ producer: Producer; volume: number }>) => {
-            // Preserve the single-speaker UI broadcast (loudest = volumes[0]).
-            if (volumes.length > 0) {
-              const { producer, volume } = volumes[0];
-              // Find the participant who owns this producer
-              for (const [, participant] of createdRoom.participants) {
-                for (const [, entry] of participant.producers) {
-                  if (entry.producer.id === producer.id) {
-                    this.emitEvent({
-                      type: 'active-speaker',
-                      roomId,
-                      userId: participant.userId,
-                      volume,
-                    });
-                    break;
-                  }
-                }
-              }
-            }
-            // Drive last-N from the full ranked top-N.
-            const ranked = volumes.map((v) => v.producer.id);
-            const delta = createdRoom.activeSpeakers.update(ranked, Date.now());
-            this.applyLastNDelta(createdRoom, delta);
-          }
-        );
-
-        // Clear active speaker when everyone stops talking
-        audioLevelObserver.on('silence', () => {
-          this.emitEvent({
-            type: 'active-speaker',
-            roomId,
-            userId: '',
-            volume: -Infinity,
-          });
-          const delta = createdRoom.activeSpeakers.update([], Date.now());
-          this.applyLastNDelta(createdRoom, delta);
-        });
-      }
-
-      this.rooms.set(roomId, createdRoom);
-
-      logger.info('Room created', { roomId });
-      return createdRoom;
-    } finally {
-      if (this.roomCreationGates.get(roomId) === creationGate) {
-        this.roomCreationGates.delete(roomId);
-      }
-      releaseCreation();
-    }
+    return undefined;
   }
 
   /** Close and remove a room (called when last participant leaves) */
@@ -4929,6 +4999,16 @@ export class RoomManager {
       .map(([roomId]) => roomId);
   }
 
+  /** All rooms, including provisional and ring-only DM rooms. */
+  getRoomIds(): string[] {
+    return Array.from(this.rooms.keys());
+  }
+
+  /** Number of room creations currently past the owner guard. */
+  getCreatesInFlightCount(): number {
+    return this.createsInFlight;
+  }
+
   /** Get a participant by userId in a specific room */
   /** Update a participant's RTP capabilities (after device.load on client) */
   updateRtpCapabilities(roomId: string, userId: string, rtpCapabilities: RtpCapabilities): void {
@@ -5618,7 +5698,9 @@ export class RoomManager {
     let highest: number | null = null;
     for (const encoding of encodings as unknown[]) {
       if (typeof encoding !== 'object' || encoding === null) continue;
-      const declared = RoomManager.toFiniteNumber((encoding as { maxBitrate?: unknown }).maxBitrate);
+      const declared = RoomManager.toFiniteNumber(
+        (encoding as { maxBitrate?: unknown }).maxBitrate
+      );
       if (declared !== null && (highest === null || declared > highest)) highest = declared;
     }
     return highest;

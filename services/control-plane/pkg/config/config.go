@@ -214,7 +214,8 @@ type Config struct {
 	AllowedOrigins []string
 
 	// Media plane
-	MediaPlaneURL string
+	MediaPlaneURL        string
+	RoomPlacementEnabled bool
 
 	// TURN/STUN (coturn)
 	TURNServerHost string // Hostname or IP of the TURN server (e.g. "turn.concordvoice.chat")
@@ -550,6 +551,9 @@ func Load() (*Config, error) {
 	if err := loadActivityHistoryConfig(cfg); err != nil {
 		return nil, err
 	}
+	if err := loadRoomPlacementConfig(cfg); err != nil {
+		return nil, err
+	}
 
 	cidrs, err := computeTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"), cfg.Environment)
 	if err != nil {
@@ -590,6 +594,24 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// loadRoomPlacementConfig accepts only the two explicit boolean spellings.
+// The unset value stays inert so deployment cannot activate placement by
+// inheriting an ambiguous or malformed environment value.
+func loadRoomPlacementConfig(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("room placement configuration unavailable")
+	}
+	switch raw, set := os.LookupEnv("ROOM_PLACEMENT_ENABLED"); {
+	case !set, raw == "false":
+		cfg.RoomPlacementEnabled = false
+	case raw == "true":
+		cfg.RoomPlacementEnabled = true
+	default:
+		return fmt.Errorf("ROOM_PLACEMENT_ENABLED must be exactly false or true")
+	}
+	return nil
 }
 
 func loadActivityHistoryConfig(cfg *Config) error {

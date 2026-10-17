@@ -38,12 +38,12 @@ you verify your email.
 
 ### Added
 
+- **New voice rooms can move to a second media instance while existing rooms drain** (internal development reference omitted) — when operators enable the new blue/green deployment mode, new rooms use the active instance while existing rooms remain on the draining instance. The mode is off by default and requires a separately verified first activation.
 - **Shared media listeners are available for isolated validation** — an optional
   media-server mode gives each worker one shared UDP listener, with strict port
   validation and readiness checks when a listener closes. Ordinary deployments
   keep their existing port ranges. The candidate overlay is private and requires
   further call, capacity and deployment validation before production activation.
-
 - **Purging messages now keeps pinned messages unless you choose to include them** (internal development reference omitted, internal development reference omitted) —
   every purge (channel, server, DM, group, and the purge a kick or ban can run) now has an "Include
   pinned messages" option, off by default. With it off, pinned messages are kept: your own are not deleted, and
