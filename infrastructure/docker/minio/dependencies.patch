@@ -1,5 +1,5 @@
 diff --git a/go.mod b/go.mod
-index a957085..434d7e5 100644
+index a957085..4d4b97d 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -1,8 +1,8 @@
@@ -110,7 +110,7 @@ index a957085..434d7e5 100644
  	github.com/VividCortex/ewma v1.2.0 // indirect
  	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 -	github.com/apache/thrift v0.21.0 // indirect
-+	github.com/apache/thrift v0.24.0 // indirect
++	github.com/apache/thrift v0.25.0 // indirect
  	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
  	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
  	github.com/beorn7/perks v1.0.1 // indirect
@@ -211,7 +211,7 @@ index a957085..434d7e5 100644
 +	google.golang.org/protobuf v1.36.11 // indirect
  )
 diff --git a/go.sum b/go.sum
-index 1ef381c..be1c30d 100644
+index 1ef381c..8efab99 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -5,30 +5,30 @@ aead.dev/minisign v0.3.0 h1:8Xafzy5PEVZqYDNP60yJHARlW1eOQtsKNp/Ph2c0vRA=
@@ -306,8 +306,8 @@ index 1ef381c..be1c30d 100644
  github.com/apache/thrift v0.16.0/go.mod h1:PHK3hniurgQaNMZYaCLEqXKsYK8upmhPbmdP2FXSqgU=
 -github.com/apache/thrift v0.21.0 h1:tdPmh/ptjE1IJnhbhrcl2++TauVjy242rkV/UzJChnE=
 -github.com/apache/thrift v0.21.0/go.mod h1:W1H8aR/QRtYNvrPeFXBtobyRkd0/YVhTc6i07XIAgDw=
-+github.com/apache/thrift v0.24.0 h1:zy31L1a49QTNB2bG1BBfMXol3yJrTH975G3pPubQVLQ=
-+github.com/apache/thrift v0.24.0/go.mod h1:zPt6WxgvTOM6hF92y8C+MkEM5LMxZuk4JcQOiU4Esvs=
++github.com/apache/thrift v0.25.0 h1:6LLlvoPjy8Cc/0b5TYRcTR3RZa2W0at3WQRcOkDwVGs=
++github.com/apache/thrift v0.25.0/go.mod h1:4lwyToijD9T70w7GlevFk7FnpY60Wv8I8krMkF6FkAo=
  github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de/go.mod h1:DCaWoUhZrYW9p1lxo/cm8EmUOOzAPSEZNGF2DK1dJgw=
  github.com/armon/consul-api v0.0.0-20180202201655-eb2c6b5be1b6/go.mod h1:grANhF5doyWs3UAsr3K4I6qtAmlQcZDesFNEHPZAzj8=
  github.com/armon/go-metrics v0.0.0-20190430140413-ec5e00d3c878/go.mod h1:3AMJUQhVx52RsWOnlkpikZr01T/yAVN2gn0861vByNg=

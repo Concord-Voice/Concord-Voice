@@ -59,8 +59,19 @@ platform image digests. The module and identity values for both
 are in
 [`SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md). Required
 security review and recorded legal approval remain gates before publication
-dispatch. No application edits, authentication changes, or live cutover are
-authorized by the exception.
+dispatch. The remaining #3527 recipe corrects Thrift to v0.25.0 while retaining
+the pinned Go 1.26.8 builder and the other twelve reviewed module versions. It
+is an unpublished intermediate; the separate #3716 compiler correction must
+produce the final reviewed recipe before the next publication is requested.
+The scoped #3527 proposal in `REVIEW.md` requires pre-merge source, binary,
+Parquet and contract evidence plus explicit exact-head security/deployment
+acceptance. If superseded unpublished, record that the intermediate publisher
+was not executed; the final publication validates only the final recipe. This
+publisher disposition does not silently defer scan or symbol evidence gaps.
+The `88c88a5bea7d` publication receipt remains historical evidence, and the
+shared Compose consumer still uses `823f9aa2bd62`. Neither receipt validates
+the new intermediate binaries or authorizes their publication. No application
+edits, authentication changes, or live cutover are authorized by the exception.
 
 A design exception, a not-affected record or generic automated-batch approval
 does not supply legal approval. Record the release-specific approval before any
