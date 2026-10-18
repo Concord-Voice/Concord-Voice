@@ -99,7 +99,6 @@ services:
         --realm=${TURN_REALM:-concordvoice.chat}
         --listening-ip=0.0.0.0
         --external-ip=${PUBLIC_IP:?PUBLIC_IP must be set to the host's public IP}
-        --relay-ip=${PUBLIC_IP}
         --cert=/etc/coturn/certs/cert.pem
         --pkey=/etc/coturn/certs/key.pem
     ports:
