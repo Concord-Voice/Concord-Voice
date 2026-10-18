@@ -79,6 +79,7 @@ you verify your email.
 
 ### Fixed
 
+- **TURN relay peer filtering** — correct an IPv6 loopback deny range that also matched IPv4 peers, causing authenticated relay setup to succeed while relayed traffic failed. Private and loopback peer restrictions remain in place.
 - **Real-time access expires with your sign-in** (internal development reference omitted) — control connections close when their access token expires. Active calls keep their media connection when the desktop renews a valid token; a renewed token must still belong to the same live session and retain access to the channel.
 - **Chat resists stalls under excessive connection traffic** (internal development reference omitted) — the server slows excess events from each connection while keeping them in order. If direct-message delivery is overloaded, a new message is rejected before it is saved so the sender can retry. A typing indicator may be skipped if its queue is full; a connection that cannot receive a required acknowledgement closes and can reconnect.
 - **Profile changes reach only connected people with a current relationship** (internal development reference omitted) — updates go to your own sessions, accepted friends, shared-server members and current DM participants. A blocked account receives no update even when another relationship exists. Existing profile fields and clears work as before.
