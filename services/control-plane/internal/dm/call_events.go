@@ -94,13 +94,13 @@ func (h *Handler) insertCallEvent(ctx context.Context, convID uuid.UUID, payload
 		if err != nil {
 			return err
 		}
-		// dm_messages.content is NOT NULL; call-event renderers use call_event_payload instead.
+		// Call-event metadata has no ciphertext epoch; 1 is only its schema placeholder.
 		var createdAt time.Time
 		if err := tx.QueryRowContext(ctx, `
 			WITH timestamps AS (SELECT clock_timestamp() AS created_at)
 			INSERT INTO dm_messages
-			  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
-			SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
+			  (id, conversation_id, user_id, content, type, key_version, call_event_payload, created_at, expires_at)
+			SELECT $1, $2, $3, '', $4, 1, $5, timestamps.created_at,
 			       CASE WHEN $6::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $6) END
 			FROM timestamps
 			RETURNING created_at
@@ -259,11 +259,12 @@ func insertCompletedCallEvent(
 		if err != nil {
 			return err
 		}
+		// Call-event metadata has no ciphertext epoch; 1 is only its schema placeholder.
 		query := `
 			WITH timestamps AS (SELECT $6::timestamptz AS created_at)
 			INSERT INTO dm_messages
-			  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
-			SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
+			  (id, conversation_id, user_id, content, type, key_version, call_event_payload, created_at, expires_at)
+			SELECT $1, $2, $3, '', $4, 1, $5, timestamps.created_at,
 			       CASE WHEN $7::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $7) END
 			FROM timestamps
 			ON CONFLICT (id) DO NOTHING
@@ -276,8 +277,8 @@ func insertCompletedCallEvent(
 			query = `
 				WITH timestamps AS (SELECT $6::timestamptz AS created_at)
 				INSERT INTO dm_messages
-				  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
-				SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
+				  (id, conversation_id, user_id, content, type, key_version, call_event_payload, created_at, expires_at)
+				SELECT $1, $2, $3, '', $4, 1, $5, timestamps.created_at,
 				       CASE WHEN $7::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $7) END
 				FROM timestamps
 				ON CONFLICT (id) DO UPDATE SET

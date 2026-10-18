@@ -4058,7 +4058,7 @@ func (h *Hub) fetchRepliedToSummary(replyToID string) map[string]interface{} {
 	var displayName *string
 	var keyVer int
 	err := h.db.QueryRow(`
-		SELECT m.id, m.user_id, u.username, u.display_name, m.content, COALESCE(m.key_version, 1)
+		SELECT m.id, m.user_id, u.username, u.display_name, m.content, m.key_version
 		FROM messages m INNER JOIN users u ON m.user_id = u.id WHERE m.id = $1
 	`, replyToID).Scan(&id, &userID, &username, &displayName, &content, &keyVer)
 	if err != nil {

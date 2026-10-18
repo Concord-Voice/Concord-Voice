@@ -21,7 +21,7 @@ func TestDMExpirationREST_RecoveryAfterBackfillFailure(t *testing.T) {
 	conversationID := ts.CreateDMConversation(t, alice.ID, bob.ID)
 	var messageID string
 	var createdAt time.Time
-	require.NoError(t, ts.DB.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, type) VALUES ($1, $2, 'ciphertext', 'user') RETURNING id, created_at`, conversationID, alice.ID).Scan(&messageID, &createdAt))
+	require.NoError(t, ts.DB.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version) VALUES ($1, $2, 'ciphertext', 'user', 1) RETURNING id, created_at`, conversationID, alice.ID).Scan(&messageID, &createdAt))
 	installDMExpirationFailure(t, ts.DB, conversationID)
 	auth := testhelpers.AuthHeaders(alice.AccessToken)
 

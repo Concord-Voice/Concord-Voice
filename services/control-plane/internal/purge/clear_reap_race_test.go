@@ -177,8 +177,8 @@ func TestRunClearReapBatchRaceSendAndClearDuringAHeldBatchSerialize(t *testing.T
 				checkedRollback(t, tx)
 				return
 			}
-			if err := tx.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, created_at)
-				VALUES ($1, $2, 'race-send', $3) RETURNING id`, f.conversationID, a, f.at(20)).Scan(&newMessageID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, created_at, key_version)
+				VALUES ($1, $2, 'race-send', $3, 1) RETURNING id`, f.conversationID, a, f.at(20)).Scan(&newMessageID); err != nil {
 				sendErr = err
 				checkedRollback(t, tx)
 				return

@@ -109,8 +109,8 @@ func TestSendDMMessageAckIncludesExpiry(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
 	var messageID uuid.UUID
 	require.NoError(t, setup.db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'persisted source', 'text') RETURNING id`, setup.convID, setup.user1).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'persisted source', 'text', 1) RETURNING id`, setup.convID, setup.user1).Scan(&messageID))
 	expiresAt := time.Now().UTC().Add(time.Hour)
 	setup.hub.sendDMMessageAck(dmMessageAckParams{
 		client: setup.client, nonce: "n", messageID: messageID, convUUID: mustUUID(t, setup.convID),

@@ -102,8 +102,8 @@ func TestPurgeChannel_EpochChangeAfterCommittedBatchRemainsPartialFailure(t *tes
 	serverID := ts.CreateTestServer(t, owner.ID, "purge epoch partial server")
 	channelID := ts.CreateTestChannel(t, serverID, "purge epoch partial channel")
 	_, err := ts.DB.Exec(`
-		INSERT INTO messages (id, channel_id, user_id, content, created_at)
-		SELECT gen_random_uuid(), $1, $2, 'purge-epoch-' || g, NOW()
+		INSERT INTO messages (id, channel_id, user_id, content, key_version, created_at)
+		SELECT gen_random_uuid(), $1, $2, 'purge-epoch-' || g, 1, NOW()
 		FROM generate_series(1, 5001) g`, channelID, owner.ID)
 	require.NoError(t, err)
 

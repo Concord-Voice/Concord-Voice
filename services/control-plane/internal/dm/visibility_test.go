@@ -87,7 +87,7 @@ func TestDMVisibility_ClearIsPrivateAndHidesOwnAndPeerHistory(t *testing.T) {
 	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
 	old := time.Now().UTC().Add(-time.Hour)
 	for _, message := range []struct{ user, body string }{{actor.ID, "actor-old"}, {peer.ID, "peer-old"}} {
-		_, err := ts.DB.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at) VALUES ($1, $2, $3, 'text', $4)`, convID, message.user, message.body, old)
+		_, err := ts.DB.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version) VALUES ($1, $2, $3, 'text', $4, 1)`, convID, message.user, message.body, old)
 		require.NoError(t, err)
 	}
 	_, err := ts.DB.Exec(`INSERT INTO privacy_settings (user_id, require_auth_before_purge) VALUES ($1, false) ON CONFLICT (user_id) DO UPDATE SET require_auth_before_purge = false`, actor.ID)

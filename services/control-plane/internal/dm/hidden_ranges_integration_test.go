@@ -60,8 +60,8 @@ func seedHiddenConv(t *testing.T, db *sql.DB) (convID, alice, bob string) {
 func seedHiddenMsg(t *testing.T, db *sql.DB, convID, userID string, agoSecs int) {
 	t.Helper()
 	_, err := db.Exec(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-		VALUES ($1, $2, 'msg', 'text', NOW() - make_interval(secs => $3))`, convID, userID, agoSecs)
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+		VALUES ($1, $2, 'msg', 'text', NOW() - make_interval(secs => $3), 1)`, convID, userID, agoSecs)
 	require.NoError(t, err)
 }
 
@@ -311,8 +311,8 @@ func TestHiddenRanges_FilterOwnAndPeerMessagesByProvenance(t *testing.T) {
 		{bob, now.Add(-time.Minute), "peer-new"},
 	} {
 		_, err := db.Exec(`
-			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-			VALUES ($1, $2, $3, 'text', $4)`, convID, message.user, message.body, message.at)
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+			VALUES ($1, $2, $3, 'text', $4, 1)`, convID, message.user, message.body, message.at)
 		require.NoError(t, err)
 	}
 	tx, err := db.BeginTx(context.Background(), nil)
@@ -346,8 +346,8 @@ func TestHiddenRanges_PinnedMessageIsNeverHidden(t *testing.T) {
 	for _, message := range []struct{ user, body string }{{alice, "own-pinned"}, {bob, "peer-pinned"}} {
 		var id string
 		require.NoError(t, db.QueryRow(`
-			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-			VALUES ($1, $2, $3, 'text', $4) RETURNING id`, convID, message.user, message.body, now.Add(-2*time.Hour)).Scan(&id))
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+			VALUES ($1, $2, $3, 'text', $4, 1) RETURNING id`, convID, message.user, message.body, now.Add(-2*time.Hour)).Scan(&id))
 		ids = append(ids, id)
 	}
 	tx, err := db.BeginTx(context.Background(), nil)

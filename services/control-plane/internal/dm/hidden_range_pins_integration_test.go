@@ -19,8 +19,8 @@ import (
 func seedDMAt(t *testing.T, db *sql.DB, convID, userID, content string, at time.Time, pinned bool) {
 	t.Helper()
 	_, err := db.Exec(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by)
-		VALUES ($1, $2, $3, 'text', $4, CASE WHEN $5 THEN NOW() END, CASE WHEN $5 THEN $2::uuid END)`,
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, key_version)
+		VALUES ($1, $2, $3, 'text', $4, CASE WHEN $5 THEN NOW() END, CASE WHEN $5 THEN $2::uuid END, 1)`,
 		convID, userID, content, at, pinned)
 	require.NoError(t, err)
 }

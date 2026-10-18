@@ -488,10 +488,15 @@ func TestBuildMessageBroadcastWithAttachments(t *testing.T) {
 }
 
 func TestBuildMessageBroadcastWithReply(t *testing.T) {
-	setup := setupEpochTest(t, false, false)
+	setup := setupMessageTest(t)
 	msgID := uuid.New()
-	chID := uuid.New()
+	chID := uuid.MustParse(setup.convID)
 	replyID := uuid.New().String()
+	_, err := setup.db.Exec(`
+		INSERT INTO messages (id, channel_id, user_id, content, key_version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 2, NOW(), NOW())
+	`, replyID, chID, setup.user1, "original")
+	require.NoError(t, err)
 
 	data := setup.hub.buildMessageBroadcast(messageBroadcastCtx{
 		messageID:   msgID,
@@ -505,6 +510,10 @@ func TestBuildMessageBroadcastWithReply(t *testing.T) {
 	})
 
 	assert.Equal(t, replyID, data["reply_to_id"])
+	summary, ok := data["replied_to"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, replyID, summary["id"])
+	assert.Equal(t, 2, summary["key_version"])
 }
 
 // --- sendMessageAck with attachments ---

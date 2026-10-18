@@ -361,8 +361,8 @@ func pinAwareMessage(t *testing.T, db *sql.DB, channelID, userID string, pinned 
 		now := time.Now().UTC()
 		pinnedAt = &now
 	}
-	_, err := db.Exec(`INSERT INTO messages (id, channel_id, user_id, content, created_at, pinned_at, expires_at)
-		VALUES ($1, $2, $3, 'ciphertext', now(), $4, $5)`, id, channelID, userID, pinnedAt, expires)
+	_, err := db.Exec(`INSERT INTO messages (id, channel_id, user_id, content, created_at, pinned_at, expires_at, key_version)
+		VALUES ($1, $2, $3, 'ciphertext', now(), $4, $5, 1)`, id, channelID, userID, pinnedAt, expires)
 	require.NoError(t, err)
 	return id
 }
@@ -375,8 +375,8 @@ func pinAwareDMMessage(t *testing.T, db *sql.DB, conversationID, userID string, 
 		now := time.Now().UTC()
 		pinnedAt = &now
 	}
-	_, err := db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at, pinned_at, expires_at)
-		VALUES ($1, $2, $3, 'ciphertext', 'user', now(), $4, $5)`, id, conversationID, userID, pinnedAt, expires)
+	_, err := db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at, pinned_at, expires_at, key_version)
+		VALUES ($1, $2, $3, 'ciphertext', 'user', now(), $4, $5, 1)`, id, conversationID, userID, pinnedAt, expires)
 	require.NoError(t, err)
 	return id
 }

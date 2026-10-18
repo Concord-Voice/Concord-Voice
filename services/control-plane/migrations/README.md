@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000170)
+## Existing Migrations (000001–000176)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -280,6 +280,40 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000168 | pin_aware_message_expiry | `channels.expiration_include_pinned` and `dm_conversations.expiration_include_pinned` (NOT NULL DEFAULT TRUE, so every existing timer keeps expiring pins), and nullable, unindexed `messages.held_expires_at` / `dm_messages.held_expires_at`: a pinned row in a context that keeps pins carries its would-be stamp there instead of in `expires_at`, so the sweeper never sees it. A permanently NOT VALID CHECK enforces the held shape on new writes; two evidence tables let a down then up restore keep-pins contexts and held stamps without relabelling a context whose policy moved (#3459) |
 | 000169 | add_voice_command_outbox | Typed immutable enforcement commands, transactional allocation/publication cursors and leased delivery receipts; down refuses commands or nonzero cursors |
 | 000170 | add_voice_command_capacity | Recorded consumer-acknowledged prefix retirement and bounded outstanding actor admission; backfills pending targets without dropping over-limit queues; down refuses retirement or admission evidence |
+| 000171 | guard_messages_key_version | Reject new NULL or nonpositive channel-message versions with a `NOT VALID` check (#2844) |
+| 000172 | validate_messages_key_version | Validate the channel-message version check in a separate migration transaction (#2844) |
+| 000173 | enforce_messages_key_version | Set channel-message `key_version` `NOT NULL` and drop its default while retaining the positive check (#2844) |
+| 000174 | guard_dm_messages_key_version | Reject new NULL or nonpositive DM-message versions with a `NOT VALID` check (#2844) |
+| 000175 | validate_dm_messages_key_version | Validate the DM-message version check in a separate migration transaction (#2844) |
+| 000176 | enforce_dm_messages_key_version | Set DM-message `key_version` `NOT NULL` and drop its default while retaining the positive check (#2844) |
+
+### Message key-version constraints (migrations 000171–000176, #2844)
+
+Both `messages.key_version` and `dm_messages.key_version` are required positive
+integers with no server default. Each table retains a permanent
+`CHECK (key_version IS NOT NULL AND key_version >= 1)` as well as native
+`NOT NULL`. The migration phases are deliberately separate: add the guard as
+`NOT VALID`, validate it in its own transaction, then enforce `NOT NULL` and
+drop the old default. The migration runner applies all pending files at control-
+plane startup; the files separate lock phases but are not operator pause points.
+
+User ciphertext writers persist the client-supplied epoch after server-side
+validation. Server-authored `call_event` and `expiration_event` metadata
+writers explicitly store version 1 only as a noncrypto placeholder for the
+uniform positive column. It does not claim that metadata content was encrypted
+at that epoch.
+Historical version-1 rows remain indistinguishable from rows that previously
+received the default; no backfill or provenance claim is made.
+
+Before deployment, run the counts-only preflight in
+[`[internal]deploys.md`](../../../[internal]deploys.md). Stop on any
+unexpected row type or malformed row, any nonpositive version, or any NULL
+ciphertext row. Drain and verify all old control-plane writers, including hosts
+outside the deploying Docker daemon, before the new binary starts migrations.
+The migration scan and lock duration must be rehearsed against a production-sized
+copy. A rollback to an older binary requires quiescing writes and applying all
+six down migrations in reverse order first; the downs restore nullable columns
+with `DEFAULT 1` but do not change stored values.
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use

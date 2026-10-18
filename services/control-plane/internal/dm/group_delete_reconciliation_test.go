@@ -551,8 +551,8 @@ func seedGroupAttachment(t *testing.T, db *sql.DB, convID, backend string) (stri
 	require.NoError(t, db.QueryRow(`SELECT created_by FROM dm_conversations WHERE id = $1`, convID).Scan(&userID))
 	var messageID, fileID, key string
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content)
-		VALUES ($1, $2, 'group attachment') RETURNING id`, convID, userID).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, key_version)
+		VALUES ($1, $2, 'group attachment', 1) RETURNING id`, convID, userID).Scan(&messageID))
 	require.NoError(t, db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version,
 		                         conversation_id, mime_type, file_size, storage_key, storage_backend)
@@ -639,8 +639,8 @@ func TestDeleteGroupDataFailsClosedOnCrossContextAttachmentBridge(t *testing.T) 
 				}
 			})
 			require.NoError(t, db.QueryRow(`
-				INSERT INTO dm_messages (conversation_id, user_id, content)
-				VALUES ($1, $2, 'cross context') RETURNING id`, otherConvID, userID).Scan(&otherMessageID))
+				INSERT INTO dm_messages (conversation_id, user_id, content, key_version)
+				VALUES ($1, $2, 'cross context', 1) RETURNING id`, otherConvID, userID).Scan(&otherMessageID))
 			_, err := db.Exec(`INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, 0)`, otherMessageID, fileID)
 			require.NoError(t, err)
 			if tc.softDeleted {
@@ -674,11 +674,11 @@ func TestDeleteGroupDataLocksMessagesInCreatedOrder(t *testing.T) {
 		firstUUID, secondUUID = secondUUID, firstUUID
 	}
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (id, conversation_id, user_id, content, created_at)
-		VALUES ($1, $2, $3, 'first', '2026-01-01T00:00:00Z') RETURNING id`, firstUUID, convID, userID).Scan(&firstID))
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, created_at, key_version)
+		VALUES ($1, $2, $3, 'first', '2026-01-01T00:00:00Z', 1) RETURNING id`, firstUUID, convID, userID).Scan(&firstID))
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (id, conversation_id, user_id, content, created_at)
-		VALUES ($1, $2, $3, 'second', '2026-01-02T00:00:00Z') RETURNING id`, secondUUID, convID, userID).Scan(&secondID))
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, created_at, key_version)
+		VALUES ($1, $2, $3, 'second', '2026-01-02T00:00:00Z', 1) RETURNING id`, secondUUID, convID, userID).Scan(&secondID))
 
 	barrier, err := db.BeginTx(context.Background(), nil)
 	require.NoError(t, err)

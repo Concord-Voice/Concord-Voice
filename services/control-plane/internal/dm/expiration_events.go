@@ -37,9 +37,10 @@ const wsDMExpirationEvent = "dm_expiration_event"
 // can never diverge — there is no separate commit for this row. Message
 // content is left empty, like a call_event row (insertCallEvent above):
 // the meaningful data lives entirely in expiration_event_payload, which the
-// client never decrypts (E2EE wraps dm_messages.content only). Returns the
-// generated row id so the caller can stamp it on the live broadcast for
-// scroll-anchoring.
+// client never decrypts (E2EE wraps dm_messages.content only). Version 1 is
+// only a schema placeholder for this metadata, not a ciphertext epoch.
+// Returns the generated row id so the caller can stamp it on the live
+// broadcast for scroll-anchoring.
 func insertDMExpirationEvent(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -54,8 +55,8 @@ func insertDMExpirationEvent(
 	}
 	var createdAt time.Time
 	if err := tx.QueryRowContext(ctx, `
-		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, expiration_event_payload, created_at, expires_at)
-		VALUES ($1, $2, $3, '', $4, $5, $6::timestamptz,
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version, expiration_event_payload, created_at, expires_at)
+		VALUES ($1, $2, $3, '', $4, 1, $5, $6::timestamptz,
 		        CASE WHEN $7::integer IS NULL THEN NULL ELSE $6::timestamptz + make_interval(secs => $7) END)
 		RETURNING created_at
 	`, messageID, conversationID, actorUserID, expirationEventDMMessagesType, payloadJSON, payload.ChangedAt, payload.WindowSeconds).Scan(&createdAt); err != nil {

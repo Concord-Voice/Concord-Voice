@@ -794,7 +794,7 @@ func TestSendDMMentionNotify_SendsToMentionedUsers(t *testing.T) {
 
 	mentionedUsers := map[uuid.UUID]bool{mentionedUserID: true}
 	messageID := uuid.New()
-	_, err = setup.db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type) VALUES ($1, $2, $3, 'mention source', 'user')`, messageID, convID, setup.user1)
+	_, err = setup.db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version) VALUES ($1, $2, $3, 'mention source', 'user', 1)`, messageID, convID, setup.user1)
 	require.NoError(t, err)
 
 	hub.sendDMMentionNotify(convID, NewDMMessageVisibilitySource(messageID), mentionedUsers, true)

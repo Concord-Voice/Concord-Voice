@@ -84,8 +84,8 @@ func channelExpiryAuditScope(t *testing.T) expiryAuditScope {
 			t.Helper()
 			var id string
 			require.NoError(t, f.db.QueryRow(`
-				INSERT INTO messages (channel_id, user_id, content, expires_at, pinned_at, pinned_by)
-				VALUES ($1, $2, $3, $4, CASE WHEN $5::boolean THEN NOW() END, CASE WHEN $5::boolean THEN $2::uuid END)
+				INSERT INTO messages (channel_id, user_id, content, expires_at, pinned_at, pinned_by, key_version)
+				VALUES ($1, $2, $3, $4, CASE WHEN $5::boolean THEN NOW() END, CASE WHEN $5::boolean THEN $2::uuid END, 1)
 				RETURNING id`,
 				f.channelID, f.authorID, uuid.NewString(), expiryAuditCutoff.Add(-time.Second), pinned).Scan(&id))
 			return id
@@ -120,8 +120,8 @@ func dmExpiryAuditScope(t *testing.T) expiryAuditScope {
 			t.Helper()
 			var id string
 			require.NoError(t, db.QueryRow(`
-				INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at, pinned_at, pinned_by)
-				VALUES ($1, $2, $3, 'text', $4, CASE WHEN $5::boolean THEN NOW() END, CASE WHEN $5::boolean THEN $2::uuid END)
+				INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at, pinned_at, pinned_by, key_version)
+				VALUES ($1, $2, $3, 'text', $4, CASE WHEN $5::boolean THEN NOW() END, CASE WHEN $5::boolean THEN $2::uuid END, 1)
 				RETURNING id`,
 				conversationID, author, uuid.NewString(), expiryAuditCutoff.Add(-time.Second), pinned).Scan(&id))
 			return id
@@ -259,8 +259,8 @@ func TestExpiryAudit_FailureBeforeCommitLeavesNoRowAndNoDeletion(t *testing.T) {
 	const marker = "expiry-audit-forced-failure"
 	var id string
 	require.NoError(t, s.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content, expires_at)
-		VALUES ($1, (SELECT owner_id FROM servers WHERE id = $4), $2, $3)
+		INSERT INTO messages (channel_id, user_id, content, expires_at, key_version)
+		VALUES ($1, (SELECT owner_id FROM servers WHERE id = $4), $2, $3, 1)
 		RETURNING id`,
 		s.contextID, marker, expiryAuditCutoff.Add(-time.Second), *s.serverID).Scan(&id))
 

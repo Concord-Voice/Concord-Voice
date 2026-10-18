@@ -57,8 +57,8 @@ func redteamSeedMessages(t *testing.T, db *sql.DB, conversationID string, n int,
 	ids := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		var id string
-		require.NoError(t, db.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, created_at)
-			VALUES ($1, $2, 'ciphertext', $3) RETURNING id`, conversationID, author, at.Add(time.Duration(i)*time.Millisecond)).Scan(&id))
+		require.NoError(t, db.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, created_at, key_version)
+			VALUES ($1, $2, 'ciphertext', $3, 1) RETURNING id`, conversationID, author, at.Add(time.Duration(i)*time.Millisecond)).Scan(&id))
 		ids = append(ids, id)
 	}
 	return ids

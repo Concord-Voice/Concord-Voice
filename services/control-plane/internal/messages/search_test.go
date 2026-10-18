@@ -85,8 +85,8 @@ func TestGetMessagesBulkDefaultLimit200(t *testing.T) {
 	// Seed 5 messages via SQL to avoid rate limit
 	for i := 0; i < 5; i++ {
 		_, err := ts.DB.Exec(
-			`INSERT INTO messages (id, channel_id, user_id, content, created_at, updated_at)
-			 VALUES (gen_random_uuid(), $1, $2, 'bulk msg', NOW(), NOW())`,
+			`INSERT INTO messages (id, channel_id, user_id, content, key_version, created_at, updated_at)
+			 VALUES (gen_random_uuid(), $1, $2, 'bulk msg', 1, NOW(), NOW())`,
 			channelID, user.ID,
 		)
 		require.NoError(t, err)
@@ -116,8 +116,8 @@ func TestGetMessagesUnboundedForFreeUser(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	_, err := ts.DB.Exec(
-		`INSERT INTO messages (id, channel_id, user_id, content, created_at, updated_at)
-		 VALUES (gen_random_uuid(), $1, $2, 'ancient-400d', NOW() - make_interval(days => 400), NOW())`,
+		`INSERT INTO messages (id, channel_id, user_id, content, key_version, created_at, updated_at)
+		 VALUES (gen_random_uuid(), $1, $2, 'ancient-400d', 1, NOW() - make_interval(days => 400), NOW())`,
 		channelID, user.ID,
 	)
 	require.NoError(t, err)

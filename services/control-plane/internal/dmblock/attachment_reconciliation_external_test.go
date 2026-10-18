@@ -101,7 +101,7 @@ func TestReconcileDue_RefusesCrossContextAttachmentBridge(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT created_by FROM dm_conversations WHERE id = $1`, conversation).Scan(&uploader))
 	require.NoError(t, db.QueryRow(`INSERT INTO servers (name, owner_id) VALUES ('dmblock bridge', $1) RETURNING id`, uploader).Scan(&serverID))
 	require.NoError(t, db.QueryRow(`INSERT INTO channels (server_id, name) VALUES ($1, 'bridge') RETURNING id`, serverID).Scan(&channelID))
-	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, 'cross-context bridge') RETURNING id`, channelID, uploader).Scan(&messageID))
+	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, key_version) VALUES ($1, $2, 'cross-context bridge', 1) RETURNING id`, channelID, uploader).Scan(&messageID))
 	_, err := db.Exec(`INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, 0)`, messageID, fileID)
 	require.NoError(t, err)
 
@@ -198,8 +198,8 @@ func seedEmptyConversationAttachmentFixture(t *testing.T, db *sql.DB) (conversat
 	require.NoError(t, err)
 	var messageID string
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content)
-		VALUES ($1, $2, 'empty-conversation attachment') RETURNING id`, conversation, a).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, key_version)
+		VALUES ($1, $2, 'empty-conversation attachment', 1) RETURNING id`, conversation, a).Scan(&messageID))
 	require.NoError(t, db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version,
 		                         conversation_id, mime_type, file_size, storage_key, storage_backend)

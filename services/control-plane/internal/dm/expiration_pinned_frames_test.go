@@ -148,8 +148,8 @@ func TestDMExpiration_PinnedToggleFramesCarryPinFields(t *testing.T) {
 
 	var duePin string
 	require.NoError(t, ts.DB.QueryRow(`
-INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at)
-VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour')
+INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at, key_version)
+VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour', 1)
 RETURNING id`, convID, alice.ID).Scan(&duePin))
 
 	w = ts.DoRequest(http.MethodPatch, path,

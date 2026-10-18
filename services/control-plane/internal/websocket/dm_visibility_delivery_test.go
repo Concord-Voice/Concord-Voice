@@ -49,7 +49,7 @@ func newDMVisibilityDeliveryFixture(t *testing.T) dmVisibilityDeliveryFixture {
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`, fixture.conversationID, fixture.actorID, fixture.peerID)
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at) VALUES ($1, $2, $3, 'old', 'user', $4)`, fixture.messageID, fixture.conversationID, fixture.peerID, fixture.createdAt)
+	_, err = db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version, created_at) VALUES ($1, $2, $3, 'old', 'user', 1, $4)`, fixture.messageID, fixture.conversationID, fixture.peerID, fixture.createdAt)
 	require.NoError(t, err)
 
 	fixture.hub = NewHub(db, nil)

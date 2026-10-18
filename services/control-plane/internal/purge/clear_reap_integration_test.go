@@ -78,8 +78,8 @@ func (f clearReapFixture) seedMessage(t *testing.T, author string, createdAt tim
 	t.Helper()
 	var id string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, created_at)
-		VALUES ($1, $2, 'clear-reap', $3) RETURNING id`, f.conversationID, author, createdAt).Scan(&id))
+		INSERT INTO dm_messages (conversation_id, user_id, content, created_at, key_version)
+		VALUES ($1, $2, 'clear-reap', $3, 1) RETURNING id`, f.conversationID, author, createdAt).Scan(&id))
 	return id
 }
 
@@ -87,8 +87,8 @@ func (f clearReapFixture) seedMessage(t *testing.T, author string, createdAt tim
 func (f clearReapFixture) seedAttachedMessage(t *testing.T, author string, createdAt time.Time, content string) (messageID, fileID, storageKey string) {
 	t.Helper()
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, created_at)
-		VALUES ($1, $2, $3, $4) RETURNING id`, f.conversationID, author, content, createdAt).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, created_at, key_version)
+		VALUES ($1, $2, $3, $4, 1) RETURNING id`, f.conversationID, author, content, createdAt).Scan(&messageID))
 	require.NoError(t, f.db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version,
 		                         conversation_id, mime_type, file_size, storage_key)

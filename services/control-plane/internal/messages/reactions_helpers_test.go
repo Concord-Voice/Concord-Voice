@@ -111,7 +111,7 @@ func TestToggleDMReactionRowRequiresCurrentParticipant(t *testing.T) {
 	)
 	require.NoError(t, err)
 	_, err = h.db.Exec(
-		`INSERT INTO dm_messages (id, conversation_id, user_id, content) VALUES ($1, $2, $3, 'hello')`,
+		`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version) VALUES ($1, $2, $3, 'hello', 1)`,
 		msgID, convID, otherUserID,
 	)
 	require.NoError(t, err)
@@ -313,7 +313,7 @@ func seedDMReactionForAggregateTest(t *testing.T, h *Handler) (messageID, actorI
 	)
 	require.NoError(t, err)
 	_, err = h.db.Exec(
-		`INSERT INTO dm_messages (id, conversation_id, user_id, content) VALUES ($1, $2, $3, 'reaction target')`,
+		`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version) VALUES ($1, $2, $3, 'reaction target', 1)`,
 		messageID, conversationID, peerID,
 	)
 	require.NoError(t, err)

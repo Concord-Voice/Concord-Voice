@@ -27,11 +27,11 @@ func TestPurgeConversationPostDeleteMembershipLossLeavesRecoveryAudit(t *testing
 	require.NoError(t, err)
 	var actorMessage, peerMessage string
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'actor-delete', 'text') RETURNING id`, convID, actorID).Scan(&actorMessage))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'actor-delete', 'text', 1) RETURNING id`, convID, actorID).Scan(&actorMessage))
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'peer-survives', 'text') RETURNING id`, convID, peer).Scan(&peerMessage))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'peer-survives', 'text', 1) RETURNING id`, convID, peer).Scan(&peerMessage))
 	_, err = db.Exec(`
 		INSERT INTO privacy_settings (user_id, require_auth_before_purge)
 		VALUES ($1, FALSE) ON CONFLICT (user_id) DO UPDATE SET require_auth_before_purge = FALSE`, actorID)

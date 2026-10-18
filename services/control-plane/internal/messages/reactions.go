@@ -739,7 +739,7 @@ func loadRepliedToForMessages(db *sql.DB, messages []models.MessageWithUser) (ma
 	}
 
 	rows, err := db.Query(`
-		SELECT m.id, m.user_id, u.username, u.display_name, m.content, COALESCE(m.key_version, 1)
+		SELECT m.id, m.user_id, u.username, u.display_name, m.content, m.key_version
 		FROM messages m
 		INNER JOIN users u ON m.user_id = u.id
 		WHERE m.id = ANY($1::uuid[])

@@ -38,8 +38,9 @@ const wsExpirationEvent = "expiration_event"
 // both atomically or neither. Message content is left empty, like a
 // call_event row — the meaningful data lives entirely in
 // expiration_event_payload, which the client never decrypts (E2EE wraps
-// messages.content only). Returns the generated row id so the caller can
-// stamp it on the live broadcast for scroll-anchoring (design spec §3.6).
+// messages.content only). Version 1 is only a schema placeholder for this
+// metadata, not a ciphertext epoch. Returns the generated row id so the caller
+// can stamp it on the live broadcast for scroll-anchoring (design spec §3.6).
 func insertChannelExpirationEvent(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -52,8 +53,8 @@ func insertChannelExpirationEvent(
 		return uuid.Nil, fmt.Errorf("marshal channel expiration event payload: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (id, channel_id, user_id, content, type, expiration_event_payload, created_at, expires_at)
-		VALUES ($1, $2, $3, '', $4, $5, $6::timestamptz,
+		INSERT INTO messages (id, channel_id, user_id, content, type, key_version, expiration_event_payload, created_at, expires_at)
+		VALUES ($1, $2, $3, '', $4, 1, $5, $6::timestamptz,
 		        CASE WHEN $7::integer IS NULL THEN NULL ELSE $6::timestamptz + make_interval(secs => $7) END)
 	`, messageID, channelID, actorUserID, expirationEventMessagesType, payloadJSON, payload.ChangedAt, payload.WindowSeconds); err != nil {
 		return uuid.Nil, fmt.Errorf("insert channel expiration_event row: %w", err)

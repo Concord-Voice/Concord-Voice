@@ -46,7 +46,7 @@ func TestSweeper_RunPass_UsesFixedCutoffAndBoundsContexts(t *testing.T) {
 		_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, $3, 'text')`, channel, server, "sweeper-channel-"+channel.String())
 		require.NoError(t, err)
 		var message string
-		require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'ciphertext', $3, $4) RETURNING id`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour)).Scan(&message))
+		require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'ciphertext', $3, $4, 1) RETURNING id`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour)).Scan(&message))
 		assert.NotEmpty(t, message)
 	}
 	var plans []purge.ExpiryPlan
@@ -80,11 +80,11 @@ func TestSweeper_RunPass_SelectsOnlyTheOldestFiveThousandCandidates(t *testing.T
 	_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, 'bounded candidates channel', 'text')`, channel, server)
 	require.NoError(t, err)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
-	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at)
-SELECT $1, $2, 'later expired', $3, $4 FROM generate_series(1, 5000)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
+	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version)
+SELECT $1, $2, 'later expired', $3, $4, 1 FROM generate_series(1, 5000)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
 	require.NoError(t, err)
 	var oldest string
-	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'oldest expired', $3, $4) RETURNING id`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-2*time.Hour)).Scan(&oldest))
+	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'oldest expired', $3, $4, 1) RETURNING id`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-2*time.Hour)).Scan(&oldest))
 
 	var plan purge.ExpiryPlan
 	s, err := NewSweeper(SweeperDeps{
@@ -113,7 +113,7 @@ func TestSweeper_RunPass_FlushesCommittedNotificationsBeforeError(t *testing.T) 
 		channel := uuid.New()
 		_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, $3, 'text')`, channel, server, channel.String())
 		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'ciphertext', $3, $4)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
+		_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'ciphertext', $3, $4, 1)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
 		require.NoError(t, err)
 	}
 	var notified []string
@@ -142,14 +142,14 @@ func TestSweeper_RunPreflight_RestoresUntilFreshGlobalCheck(t *testing.T) {
 	require.NoError(t, err)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 	var id string
-	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'ciphertext', $3, $4) RETURNING id`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour)).Scan(&id))
+	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'ciphertext', $3, $4, 1) RETURNING id`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour)).Scan(&id))
 	clockCalls, runs := 0, 0
 	var inserted string
 	s, err := NewSweeper(SweeperDeps{
 		DB: db, Clock: func(context.Context) (time.Time, error) {
 			clockCalls++
 			if clockCalls == 4 {
-				err := db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'eligible after empty discovery', $3, $4) RETURNING id`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute)).Scan(&inserted)
+				err := db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'eligible after empty discovery', $3, $4, 1) RETURNING id`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute)).Scan(&inserted)
 				require.NoError(t, err)
 			}
 			return cutoff, nil
@@ -183,7 +183,7 @@ func TestSweeper_RunPass_StaleZeroDoesNotNotify(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, 'stale channel', 'text')`, channel, server)
 	require.NoError(t, err)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
-	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'stale', $3, $4)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
+	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'stale', $3, $4, 1)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
 	require.NoError(t, err)
 	notifications := 0
 	s, err := NewSweeper(SweeperDeps{DB: db, Clock: func(context.Context) (time.Time, error) { return cutoff, nil }, RunExpiryBatch: func(context.Context, purge.ExpiryPlan) (purge.Result, error) { return purge.Result{}, nil }, EmitDMPurged: func(context.Context, string, time.Time) { notifications++ }, EmitServerPurged: func(context.Context, string, time.Time) { notifications++ }, Log: logger.New("test")})
@@ -205,7 +205,7 @@ func TestSweeper_RunPass_MapsDMAndGroupMetadata(t *testing.T) {
 	}
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 	for _, id := range []uuid.UUID{conversation, group} {
-		_, err := db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at) VALUES ($1, $2, 'ciphertext', 'user', $3, $4)`, id, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
+		_, err := db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at, key_version) VALUES ($1, $2, 'ciphertext', 'user', $3, $4, 1)`, id, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
 		require.NoError(t, err)
 	}
 	var got []purge.ContextType
@@ -243,7 +243,7 @@ func TestSweeper_RunPass_ReturnsCancellationAfterFinalNotification(t *testing.T)
 	_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, 'canceled notification channel', 'text')`, channel, server)
 	require.NoError(t, err)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
-	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'expired', $3, $4)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
+	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'expired', $3, $4, 1)`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute))
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -302,7 +302,7 @@ func TestSweeper_RunWorker_RunsScheduledPass(t *testing.T) {
 	require.NoError(t, err)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 	var messageID string
-	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES ($1, $2, 'scheduled', $3, $4) RETURNING id`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute)).Scan(&messageID))
+	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES ($1, $2, 'scheduled', $3, $4, 1) RETURNING id`, channel, owner, cutoff.Add(-time.Hour), cutoff.Add(-time.Minute)).Scan(&messageID))
 
 	plans := make(chan purge.ExpiryPlan, 1)
 	s, err := NewSweeper(SweeperDeps{

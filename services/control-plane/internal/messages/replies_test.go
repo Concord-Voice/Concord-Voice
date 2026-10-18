@@ -125,6 +125,8 @@ func TestGetMessagesWithReplies(t *testing.T) {
 	serverID := ts.CreateTestServer(t, user.ID, "GetReply Server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	originalID := ts.CreateTestMessage(t, channelID, user, "Original")
+	_, err := ts.DB.Exec(`UPDATE messages SET key_version = 2 WHERE id = $1`, originalID)
+	require.NoError(t, err)
 
 	// Send a reply
 	ts.DoRequest("POST", sendMessagePath, map[string]interface{}{
@@ -157,6 +159,7 @@ func TestGetMessagesWithReplies(t *testing.T) {
 	require.NotNil(t, replyMsg.RepliedTo)
 	assert.Equal(t, originalID, replyMsg.RepliedTo.ID)
 	assert.Equal(t, "Original", replyMsg.RepliedTo.Content)
+	assert.Equal(t, 2, replyMsg.RepliedTo.KeyVersion)
 }
 
 func TestGetMessagesReplyToDeleted(t *testing.T) {

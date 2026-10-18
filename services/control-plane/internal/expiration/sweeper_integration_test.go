@@ -28,17 +28,17 @@ func TestSweeper_RunPreflight_Restore25000(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`, conversation, owner, other)
 	require.NoError(t, err)
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
-	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at)
-SELECT $1, $2, 'expired', $3, $4 FROM generate_series(1, 12500)`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour))
+	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version)
+SELECT $1, $2, 'expired', $3, $4, 1 FROM generate_series(1, 12500)`, channel, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour))
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at)
-SELECT $1, $2, 'expired', 'user', $3, $4 FROM generate_series(1, 12500)`, conversation, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour))
+	_, err = db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at, key_version)
+SELECT $1, $2, 'expired', 'user', $3, $4, 1 FROM generate_series(1, 12500)`, conversation, owner, cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour))
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at) VALUES
-		($1, $2, 'exact cutoff', $3, $4), ($1, $2, 'future', $3, $5), ($1, $2, 'null', $3, NULL)`, channel, owner, cutoff.Add(-time.Hour), cutoff, cutoff.Add(time.Hour))
+	_, err = db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version) VALUES
+		($1, $2, 'exact cutoff', $3, $4, 1), ($1, $2, 'future', $3, $5, 1), ($1, $2, 'null', $3, NULL, 1)`, channel, owner, cutoff.Add(-time.Hour), cutoff, cutoff.Add(time.Hour))
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at) VALUES
-		($1, $2, 'exact cutoff', 'user', $3, $4), ($1, $2, 'future', 'user', $3, $5), ($1, $2, 'null', 'user', $3, NULL)`, conversation, owner, cutoff.Add(-time.Hour), cutoff, cutoff.Add(time.Hour))
+	_, err = db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at, key_version) VALUES
+		($1, $2, 'exact cutoff', 'user', $3, $4, 1), ($1, $2, 'future', 'user', $3, $5, 1), ($1, $2, 'null', 'user', $3, NULL, 1)`, conversation, owner, cutoff.Add(-time.Hour), cutoff, cutoff.Add(time.Hour))
 	require.NoError(t, err)
 	wrappedKey := "wrapped-key-survivor"
 	_, err = db.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key) VALUES ($1, $2, $3)`, channel, owner, wrappedKey)

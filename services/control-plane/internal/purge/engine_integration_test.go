@@ -60,8 +60,8 @@ func seedEngineFixture(t *testing.T) engineFixture {
 func (f engineFixture) seedMessages(t *testing.T, author string, n, agoSecs int) {
 	t.Helper()
 	_, err := f.db.Exec(`
-		INSERT INTO messages (channel_id, user_id, content, created_at)
-		SELECT $1, $2, 'msg-' || g, NOW() - make_interval(secs => $4)
+		INSERT INTO messages (channel_id, user_id, content, created_at, key_version)
+		SELECT $1, $2, 'msg-' || g, NOW() - make_interval(secs => $4), 1
 		FROM generate_series(1, $3) g`, f.channelID, author, n, agoSecs)
 	require.NoError(t, err)
 }
@@ -69,8 +69,8 @@ func (f engineFixture) seedMessages(t *testing.T, author string, n, agoSecs int)
 func (f engineFixture) seedAttachedMessage(t *testing.T, author string, backend *string) (messageID, fileID, storageKey string) {
 	t.Helper()
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content)
-		VALUES ($1, $2, 'attachment-message') RETURNING id`, f.channelID, author).Scan(&messageID))
+		INSERT INTO messages (channel_id, user_id, content, key_version)
+		VALUES ($1, $2, 'attachment-message', 1) RETURNING id`, f.channelID, author).Scan(&messageID))
 	require.NoError(t, f.db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version,
 		                         channel_id, mime_type, file_size, storage_key)
@@ -205,8 +205,8 @@ func TestEngineRun_AdmitCommitsWithTheAuditRow(t *testing.T) {
 func TestEngineRun_OnlyIDsLimitsEveryBatch(t *testing.T) {
 	f := seedEngineFixture(t)
 	rows, err := f.db.Query(`
-		INSERT INTO messages (channel_id, user_id, content)
-		SELECT $1, $2, 'fenced-' || g FROM generate_series(1, 8) g
+		INSERT INTO messages (channel_id, user_id, content, key_version)
+		SELECT $1, $2, 'fenced-' || g, 1 FROM generate_series(1, 8) g
 		RETURNING id`, f.channelID, f.authorID)
 	require.NoError(t, err)
 	var ids []string
@@ -245,8 +245,8 @@ func TestEngineRun_OnlyIDsLimitsEveryBatch(t *testing.T) {
 	})
 	for _, id := range []*string{&kept, &fenced} {
 		require.NoError(t, f.db.QueryRow(`
-			INSERT INTO dm_messages (conversation_id, user_id, content, type)
-			VALUES ($1, $2, 'fenced', 'text') RETURNING id`, conversationID, f.authorID).Scan(id))
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+			VALUES ($1, $2, 'fenced', 'text', 1) RETURNING id`, conversationID, f.authorID).Scan(id))
 	}
 	res, err = e.Run(context.Background(), Plan{
 		ContextType: ContextGroup, ContextID: conversationID, ActorID: f.authorID, Reason: "manual",
@@ -273,8 +273,8 @@ func TestEngineRunExpiryBatch_RechecksScopeAndCutoffAndAuditsExpiry(t *testing.T
 	insert := func(channelID string, expiresAt time.Time) string {
 		var id string
 		require.NoError(t, f.db.QueryRow(`
-			INSERT INTO messages (channel_id, user_id, content, expires_at)
-			VALUES ($1, $2, $3, $4) RETURNING id`, channelID, f.authorID, uuid.NewString(), expiresAt).Scan(&id))
+			INSERT INTO messages (channel_id, user_id, content, expires_at, key_version)
+			VALUES ($1, $2, $3, $4, 1) RETURNING id`, channelID, f.authorID, uuid.NewString(), expiresAt).Scan(&id))
 		return id
 	}
 	expiredID := insert(f.channelID, cutoff.Add(-time.Microsecond))
@@ -284,8 +284,8 @@ func TestEngineRunExpiryBatch_RechecksScopeAndCutoffAndAuditsExpiry(t *testing.T
 	futureSelectedID := insert(f.channelID, cutoff.Add(time.Microsecond))
 	var nullExpiryID string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content)
-		VALUES ($1, $2, 'no-expiry') RETURNING id`, f.channelID, f.authorID).Scan(&nullExpiryID))
+		INSERT INTO messages (channel_id, user_id, content, key_version)
+		VALUES ($1, $2, 'no-expiry', 1) RETURNING id`, f.channelID, f.authorID).Scan(&nullExpiryID))
 
 	res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{
 		ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID,
@@ -405,8 +405,8 @@ func TestEngineRunExpiryBatch_DMAndGroupScopes(t *testing.T) {
 		require.NoError(t, db.QueryRow(`
 			INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2) RETURNING conversation_id`, conversationID, uploader).Scan(new(string)))
 		require.NoError(t, db.QueryRow(`
-			INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at)
-			VALUES ($1, $2, 'expiry-message', 'text', $3) RETURNING id`, conversationID, uploader, cutoff.Add(-time.Microsecond)).Scan(&messageID))
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at, key_version)
+			VALUES ($1, $2, 'expiry-message', 'text', $3, 1) RETURNING id`, conversationID, uploader, cutoff.Add(-time.Microsecond)).Scan(&messageID))
 		return conversationID, messageID
 	}
 	dmID, dmMessageID := insertConversation(false)
@@ -436,8 +436,8 @@ func TestEngineRunExpiryBatch_CapsOnePassAndResumes(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		var id string
 		require.NoError(t, f.db.QueryRow(`
-			INSERT INTO messages (channel_id, user_id, content, expires_at)
-			VALUES ($1, $2, 'capped-expiry', $3) RETURNING id`, f.channelID, f.authorID, cutoff.Add(-time.Microsecond)).Scan(&id))
+			INSERT INTO messages (channel_id, user_id, content, expires_at, key_version)
+			VALUES ($1, $2, 'capped-expiry', $3, 1) RETURNING id`, f.channelID, f.authorID, cutoff.Add(-time.Microsecond)).Scan(&id))
 		ids = append(ids, id)
 	}
 	e := f.newEngine(2)
@@ -469,8 +469,8 @@ func TestEngineRunExpiryBatch_CancellationBeforeAuditLeavesNoEvidence(t *testing
 	f := seedEngineFixture(t)
 	var messageID string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content, expires_at)
-		VALUES ($1, $2, 'cancelled-expiry', NOW() - INTERVAL '1 minute') RETURNING id`, f.channelID, f.authorID).Scan(&messageID))
+		INSERT INTO messages (channel_id, user_id, content, expires_at, key_version)
+		VALUES ($1, $2, 'cancelled-expiry', NOW() - INTERVAL '1 minute', 1) RETURNING id`, f.channelID, f.authorID).Scan(&messageID))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := f.newEngine(5000).RunExpiryBatch(ctx, ExpiryPlan{
@@ -511,8 +511,8 @@ func TestEngineRunExpiryBatch_FinalizeErrorSalvagesAudit(t *testing.T) {
 	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 	var messageID string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content, expires_at)
-		VALUES ($1, $2, 'finalize-error', $3) RETURNING id`, f.channelID, f.authorID, cutoff.Add(-time.Microsecond)).Scan(&messageID))
+		INSERT INTO messages (channel_id, user_id, content, expires_at, key_version)
+		VALUES ($1, $2, 'finalize-error', $3, 1) RETURNING id`, f.channelID, f.authorID, cutoff.Add(-time.Microsecond)).Scan(&messageID))
 	_, err := f.db.Exec(`
 		CREATE FUNCTION test_reject_expiry_finalize() RETURNS trigger AS $$
 		BEGIN
@@ -626,8 +626,8 @@ func TestEngineDeleteOne_SerializesWithConcurrentAttachmentLink(t *testing.T) {
 	f := seedEngineFixture(t)
 	var messageID, fileID string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content)
-		VALUES ($1, $2, 'attachment-link-race') RETURNING id`, f.channelID, f.authorID).Scan(&messageID))
+		INSERT INTO messages (channel_id, user_id, content, key_version)
+		VALUES ($1, $2, 'attachment-link-race', 1) RETURNING id`, f.channelID, f.authorID).Scan(&messageID))
 	require.NoError(t, f.db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version,
 		                         channel_id, mime_type, file_size, storage_key)
@@ -828,7 +828,7 @@ func TestEngineRun_MultipleDeleteSpecs(t *testing.T) {
 		INSERT INTO channels (server_id, name) VALUES ($1, 'second') RETURNING id`,
 		f.serverID).Scan(&second))
 	_, err := f.db.Exec(`
-		INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, 'other-channel')`,
+		INSERT INTO messages (channel_id, user_id, content, key_version) VALUES ($1, $2, 'other-channel', 1)`,
 		second, f.authorID)
 	require.NoError(t, err)
 
@@ -860,8 +860,8 @@ func TestEngineRun_ServerPurgeGuardRunsForEveryBatchAndStopsStaleScope(t *testin
 		INSERT INTO channels (server_id, name) VALUES ($1, 'guarded-second') RETURNING id`,
 		f.serverID).Scan(&second))
 	_, err := f.db.Exec(`
-		INSERT INTO messages (channel_id, user_id, content)
-		VALUES ($1, $2, 'must-survive')`, second, f.authorID)
+		INSERT INTO messages (channel_id, user_id, content, key_version)
+		VALUES ($1, $2, 'must-survive', 1)`, second, f.authorID)
 	require.NoError(t, err)
 
 	var guarded []string
@@ -1032,8 +1032,8 @@ func TestEngineRun_DMMessagesSpec(t *testing.T) {
 		_, err := db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, u)
 		require.NoError(t, err)
 		_, err = db.Exec(`
-			INSERT INTO dm_messages (conversation_id, user_id, content, type)
-			VALUES ($1, $2, 'dm-msg', 'text')`, convID, u)
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+			VALUES ($1, $2, 'dm-msg', 'text', 1)`, convID, u)
 		require.NoError(t, err)
 	}
 
@@ -1151,8 +1151,8 @@ func TestEngineRun_PreservesSharedAttachmentUntilFinalReference(t *testing.T) {
 	_, fileID, key := f.seedAttachedMessage(t, f.authorID, nil)
 	var secondID string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content)
-		VALUES ($1, $2, 'shared-attachment-message') RETURNING id`, f.channelID, f.otherID).Scan(&secondID))
+		INSERT INTO messages (channel_id, user_id, content, key_version)
+		VALUES ($1, $2, 'shared-attachment-message', 1) RETURNING id`, f.channelID, f.otherID).Scan(&secondID))
 	_, err := f.db.Exec(`INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, 1)`, secondID, fileID)
 	require.NoError(t, err)
 
@@ -1225,8 +1225,8 @@ func TestDeleteOne_PreservesCrossBridgeReference(t *testing.T) {
 		}
 	})
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'cross-bridge-reference', 'text') RETURNING id`, conversationID, f.authorID).Scan(&dmMessageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'cross-bridge-reference', 'text', 1) RETURNING id`, conversationID, f.authorID).Scan(&dmMessageID))
 	_, err := f.db.Exec(`INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, 0)`, dmMessageID, fileID)
 	require.NoError(t, err)
 
@@ -1291,8 +1291,8 @@ func TestDeleteOne_QueuesExactBackendAfterCommit(t *testing.T) {
 	})
 	for _, messageID := range []*string{&legacyDMMessageID, &r2DMMessageID} {
 		require.NoError(t, f.db.QueryRow(`
-			INSERT INTO dm_messages (conversation_id, user_id, content)
-			VALUES ($1, $2, 'backend-delete-test') RETURNING id`, conversationID, f.authorID).Scan(messageID))
+			INSERT INTO dm_messages (conversation_id, user_id, content, key_version)
+			VALUES ($1, $2, 'backend-delete-test', 1) RETURNING id`, conversationID, f.authorID).Scan(messageID))
 	}
 	var legacyDMKey, r2DMKey string
 	var legacyDMFileID, r2DMFileID string

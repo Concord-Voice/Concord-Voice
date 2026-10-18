@@ -51,6 +51,9 @@ func TestDMExpirationAuthorizationAndPolicyMetadata(t *testing.T) {
 		require.NoError(t, ts.DB.QueryRow(`SELECT expiration_window_seconds, expiration_revision FROM dm_conversations WHERE id = $1`, convID).Scan(&window, &revision))
 		assert.Equal(t, 3600, window)
 		assert.Equal(t, 1, revision)
+		var version int
+		require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM dm_messages WHERE conversation_id = $1 AND type = 'expiration_event' ORDER BY created_at DESC LIMIT 1`, convID).Scan(&version))
+		assert.Equal(t, 1, version)
 	})
 
 	t.Run("outsider is not found and cannot mutate policy", func(t *testing.T) {
@@ -229,7 +232,7 @@ func TestDMHistoryRoundTripIncludesExpiry(t *testing.T) {
 	bob := ts.CreateTestUser(t, "exp_history_bob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
 	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
-	_, err := ts.DB.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at) VALUES ($1, $2, 'ciphertext', 'user', $3)`, convID, alice.ID, expiresAt)
+	_, err := ts.DB.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at, key_version) VALUES ($1, $2, 'ciphertext', 'user', $3, 1)`, convID, alice.ID, expiresAt)
 	require.NoError(t, err)
 
 	w := ts.DoRequest(http.MethodGet, dmExpirationPath+convID+"/messages", nil, testhelpers.AuthHeaders(alice.AccessToken))
@@ -272,6 +275,9 @@ func TestCompletedCallEventUsesEndedAtAndPreservesExpiryOnConflict(t *testing.T)
 			var created time.Time
 			var expires sql.NullTime
 			require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, summary.CallID).Scan(&created, &expires))
+			var version int
+			require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM dm_messages WHERE id = $1`, summary.CallID).Scan(&version))
+			assert.Equal(t, 1, version)
 			assert.WithinDuration(t, endedAt, created, time.Microsecond)
 			if tc.want {
 				require.True(t, expires.Valid)
@@ -300,6 +306,9 @@ func TestCompletedCallEventUsesEndedAtAndPreservesExpiryOnConflict(t *testing.T)
 	require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, conflictID).Scan(&created, &expires))
 	assert.Equal(t, firstCreated, created, "upsert preserves persisted message creation time")
 	assert.Equal(t, firstExpires, expires, "upsert preserves the original expiry window")
+	var version int
+	require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM dm_messages WHERE id = $1`, conflictID).Scan(&version))
+	assert.Equal(t, 1, version, "conflict update keeps the metadata key version")
 	var payloadJSON []byte
 	require.NoError(t, ts.DB.QueryRow(`SELECT call_event_payload FROM dm_messages WHERE id = $1`, conflictID).Scan(&payloadJSON))
 	var payload struct {

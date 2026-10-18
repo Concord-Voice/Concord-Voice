@@ -24,8 +24,8 @@ func TestGetMessagesCursorIgnoresForeignMessage(t *testing.T) {
 	seed := func(channelID, userID, age string) string {
 		var id string
 		require.NoError(t, ts.DB.QueryRow(
-			`INSERT INTO messages (id, channel_id, user_id, content, created_at, updated_at)
-			 VALUES (gen_random_uuid(), $1, $2, 'cursor msg', NOW() - $3::interval, NOW())
+			`INSERT INTO messages (id, channel_id, user_id, content, key_version, created_at, updated_at)
+			 VALUES (gen_random_uuid(), $1, $2, 'cursor msg', 1, NOW() - $3::interval, NOW())
 			 RETURNING id`,
 			channelID, userID, age,
 		).Scan(&id))

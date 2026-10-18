@@ -23,8 +23,8 @@ func insertDMMessageDirect(t *testing.T, ts *testhelpers.TestServer, convID, use
 	t.Helper()
 	msgID := uuid.New().String()
 	_, err := ts.DB.Exec(
-		`INSERT INTO dm_messages (id, conversation_id, user_id, content, type)
-		 VALUES ($1, $2, $3, $4, 'user')`,
+		`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version)
+		 VALUES ($1, $2, $3, $4, 'user', 1)`,
 		msgID, convID, userID, content,
 	)
 	require.NoError(t, err, "failed to insert DM message")
@@ -303,7 +303,7 @@ func TestGetChannelPins_DM_ReturnsPins(t *testing.T) {
 
 // A pinned DM row must carry its key epoch: after a group member leaves, the
 // current key is epoch 2 and a pre-leave pin opens only with the epoch-1 key
-// (#2822). A NULL legacy label reads as 1, matching the DM message fetch.
+// (#2822).
 func TestGetChannelPins_DM_CarriesKeyVersion(t *testing.T) {
 	ts := setupTS(t)
 	u1 := ts.CreateTestUser(t, "dmpinkv_a")
@@ -311,17 +311,20 @@ func TestGetChannelPins_DM_CarriesKeyVersion(t *testing.T) {
 	convID := ts.CreateDMConversation(t, u1.ID, u2.ID)
 
 	want := map[string]float64{}
-	for label, kv := range map[string]interface{}{"epoch two": 2, "epoch one": 1, "legacy": nil} {
-		id := insertDMMessageDirect(t, ts, convID, u1.ID, label)
+	for label, kv := range map[string]int{"epoch two": 2, "epoch one": 1} {
+		id := uuid.NewString()
 		_, err := ts.DB.Exec(
-			`UPDATE dm_messages SET key_version = $2, pinned_at = NOW(), pinned_by = $3 WHERE id = $1`,
-			id, kv, u1.ID,
+			`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version)
+			 VALUES ($1, $2, $3, $4, 'user', $5)`,
+			id, convID, u1.ID, label, kv,
 		)
 		require.NoError(t, err)
-		want[id] = 1
-		if kv == 2 {
-			want[id] = 2
-		}
+		_, err = ts.DB.Exec(
+			`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`,
+			id, u1.ID,
+		)
+		require.NoError(t, err)
+		want[id] = float64(kv)
 	}
 
 	w := ts.DoRequest("GET", pinAPICh+convID+pinsPath, nil,
@@ -448,8 +451,8 @@ func TestPinMessage_DM_LimitReached(t *testing.T) {
 	// Seed 50 already-pinned DM messages directly.
 	for i := 0; i < 50; i++ {
 		_, err := ts.DB.Exec(
-			`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, pinned_at, pinned_by)
-			 VALUES (gen_random_uuid(), $1, $2, 'seeded', 'user', NOW(), $2)`,
+			`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version, pinned_at, pinned_by)
+			 VALUES (gen_random_uuid(), $1, $2, 'seeded', 'user', 1, NOW(), $2)`,
 			convID, u1.ID,
 		)
 		require.NoError(t, err)

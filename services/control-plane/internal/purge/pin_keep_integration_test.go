@@ -22,8 +22,8 @@ func (f engineFixture) insertMessage(t *testing.T, agoSecs int) string {
 	t.Helper()
 	var id string
 	require.NoError(t, f.db.QueryRow(`
-		INSERT INTO messages (channel_id, user_id, content, created_at)
-		VALUES ($1, $2, 'pin-keep', NOW() - make_interval(secs => $3)) RETURNING id`,
+		INSERT INTO messages (channel_id, user_id, content, created_at, key_version)
+		VALUES ($1, $2, 'pin-keep', NOW() - make_interval(secs => $3), 1) RETURNING id`,
 		f.channelID, f.authorID, agoSecs).Scan(&id))
 	return id
 }
@@ -233,8 +233,8 @@ func TestPurge_SystemPathsStillDeletePins(t *testing.T) {
 		cutoff := time.Now().UTC().Truncate(time.Microsecond)
 		var id string
 		require.NoError(t, f.db.QueryRow(`
-			INSERT INTO messages (channel_id, user_id, content, expires_at, pinned_at, pinned_by)
-			VALUES ($1, $2, 'expired-pin', $3, NOW(), $2) RETURNING id`,
+			INSERT INTO messages (channel_id, user_id, content, expires_at, pinned_at, pinned_by, key_version)
+			VALUES ($1, $2, 'expired-pin', $3, NOW(), $2, 1) RETURNING id`,
 			f.channelID, f.authorID, cutoff.Add(-time.Second)).Scan(&id))
 
 		res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{
@@ -254,8 +254,8 @@ func TestPurge_SystemPathsStillDeletePins(t *testing.T) {
 		cutoff := time.Now().UTC().Truncate(time.Microsecond)
 		var id string
 		require.NoError(t, f.db.QueryRow(`
-			INSERT INTO messages (channel_id, user_id, content, held_expires_at, pinned_at, pinned_by)
-			VALUES ($1, $2, 'kept-pin', $3, NOW(), $2) RETURNING id`,
+			INSERT INTO messages (channel_id, user_id, content, held_expires_at, pinned_at, pinned_by, key_version)
+			VALUES ($1, $2, 'kept-pin', $3, NOW(), $2, 1) RETURNING id`,
 			f.channelID, f.authorID, cutoff.Add(-time.Second)).Scan(&id))
 
 		res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{

@@ -156,8 +156,8 @@ func runClearReapOracleState(t *testing.T, db *sql.DB, engine *purge.Engine, rng
 		}
 		var id string
 		require.NoError(t, db.QueryRow(`
-			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-			VALUES ($1, $2, 'oracle', $3, $4) RETURNING id`, conversationID, author, msgType, createdAt).Scan(&id))
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+			VALUES ($1, $2, 'oracle', $3, $4, 1) RETURNING id`, conversationID, author, msgType, createdAt).Scan(&id))
 		pinned := rng.Intn(5) == 0
 		if pinned {
 			_, err := db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, id, author)

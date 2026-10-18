@@ -41,6 +41,9 @@ func TestChannelExpirationREST_AuthorityAndValidation(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &policy)
 	assert.Equal(t, float64(window), testhelpers.JSONField[float64](t, policy, "window_seconds"))
 	assert.Equal(t, float64(1), testhelpers.JSONField[float64](t, policy, "revision"))
+	var version int
+	require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM messages WHERE channel_id = $1 AND type = 'expiration_event' ORDER BY created_at DESC LIMIT 1`, channelID).Scan(&version))
+	assert.Equal(t, 1, version)
 
 	// The policy is exposed consistently through channel GET and server list.
 	got := ts.DoRequest(http.MethodGet, channelExpirationPath+channelID, nil, testhelpers.AuthHeaders(owner.AccessToken))

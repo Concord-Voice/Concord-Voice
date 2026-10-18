@@ -31,8 +31,8 @@ func purgeConvPath(convID string) string {
 func insertDMMsg(t *testing.T, ts *testhelpers.TestServer, convID, userID, content string) {
 	t.Helper()
 	_, err := ts.DB.Exec(
-		`INSERT INTO dm_messages (id, conversation_id, user_id, content, type)
-		 VALUES (gen_random_uuid(), $1, $2, $3, 'text')`, convID, userID, content)
+		`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version)
+		 VALUES (gen_random_uuid(), $1, $2, $3, 'text', 1)`, convID, userID, content)
 	require.NoError(t, err)
 }
 

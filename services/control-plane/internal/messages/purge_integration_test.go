@@ -590,8 +590,8 @@ func TestPurgeChannel_LargeChannelBatched(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "big")
 
 	_, err := ts.DB.Exec(`
-		INSERT INTO messages (id, channel_id, user_id, content, created_at)
-		SELECT gen_random_uuid(), $1, $2, 'bulk-' || g, NOW() - (g || ' seconds')::interval
+		INSERT INTO messages (id, channel_id, user_id, content, key_version, created_at)
+		SELECT gen_random_uuid(), $1, $2, 'bulk-' || g, 1, NOW() - (g || ' seconds')::interval
 		FROM generate_series(1, 12000) g`, channelID, owner.ID)
 	require.NoError(t, err)
 	require.Equal(t, 12000, countChannelMessages(t, ts, channelID))

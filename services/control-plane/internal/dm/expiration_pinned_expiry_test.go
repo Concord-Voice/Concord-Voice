@@ -47,8 +47,8 @@ func TestDMExpiration_TogglingPinnedOnExpiresDuePinsUngated(t *testing.T) {
 		at time.Time
 	}{{&duePin, time.Now().Add(-time.Hour)}, {&futurePin, time.Now().Add(time.Hour)}} {
 		require.NoError(t, ts.DB.QueryRow(`
-INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at)
-VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, $3)
+INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at, key_version)
+VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, $3, 1)
 RETURNING id`, convID, alice.ID, held.at).Scan(held.id))
 	}
 
@@ -156,8 +156,8 @@ func TestDMExpiration_PinDeletionRunsInsideTheResponseBudget(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var duePin string
 	require.NoError(t, ts.DB.QueryRow(`
-INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at)
-VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour')
+INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at, key_version)
+VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour', 1)
 RETURNING id`, convID, alice.ID).Scan(&duePin))
 
 	sent := time.Now()
@@ -245,8 +245,8 @@ func TestDMExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld(t *testing
 	tap.reset()
 
 	_, err = ts.DB.Exec(`
-INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at)
-VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour')`,
+INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, held_expires_at, key_version)
+VALUES ($1, $2, 'ciphertext', 'user', NOW() - interval '25 hours', NOW() - interval '25 hours', $2, NOW() - interval '1 hour', 1)`,
 		convID, alice.ID)
 	require.NoError(t, err)
 

@@ -40,8 +40,8 @@ func pinScopes(f expirationFixture) []pinScope {
 				t.Helper()
 				var id string
 				require.NoError(t, f.db.QueryRow(`
-INSERT INTO messages (channel_id, user_id, content, created_at, pinned_at, pinned_by, expires_at, held_expires_at)
-VALUES ($1, $2, 'ciphertext', $3, CASE WHEN $4 THEN $3::timestamptz END, CASE WHEN $4 THEN $2::uuid END, $5, $6)
+INSERT INTO messages (channel_id, user_id, content, created_at, pinned_at, pinned_by, expires_at, held_expires_at, key_version)
+VALUES ($1, $2, 'ciphertext', $3, CASE WHEN $4 THEN $3::timestamptz END, CASE WHEN $4 THEN $2::uuid END, $5, $6, 1)
 RETURNING id`, f.channel, f.owner, created, pinned, expires, held).Scan(&id))
 				return id
 			},
@@ -81,8 +81,8 @@ WHERE id = $1 AND pinned_at IS NOT NULL`, messageID)
 				t.Helper()
 				var id string
 				require.NoError(t, f.db.QueryRow(`
-INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, expires_at, held_expires_at)
-VALUES ($1, $2, 'ciphertext', 'user', $3, CASE WHEN $4 THEN $3::timestamptz END, CASE WHEN $4 THEN $2::uuid END, $5, $6)
+INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, pinned_at, pinned_by, expires_at, held_expires_at, key_version)
+VALUES ($1, $2, 'ciphertext', 'user', $3, CASE WHEN $4 THEN $3::timestamptz END, CASE WHEN $4 THEN $2::uuid END, $5, $6, 1)
 RETURNING id`, f.conversation, f.owner, created, pinned, expires, held).Scan(&id))
 				return id
 			},
@@ -525,11 +525,11 @@ func TestPinAware_PreflightDeletesDuePinnedRowsBehindOlderCandidates(t *testing.
 	for _, ps := range pinScopes(f) {
 		ps.start(t, Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only", IncludePinned: ptr(false)})
 	}
-	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at)
-SELECT $1, $2, 'older', $3, $4 FROM generate_series(1, 5001)`, f.channel, f.owner, cutoff.Add(-3*time.Hour), cutoff.Add(-2*time.Hour))
+	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, expires_at, key_version)
+SELECT $1, $2, 'older', $3, $4, 1 FROM generate_series(1, 5001)`, f.channel, f.owner, cutoff.Add(-3*time.Hour), cutoff.Add(-2*time.Hour))
 	require.NoError(t, err)
-	_, err = f.db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at)
-SELECT $1, $2, 'older', 'user', $3, $4 FROM generate_series(1, 5001)`, f.conversation, f.owner, cutoff.Add(-3*time.Hour), cutoff.Add(-2*time.Hour))
+	_, err = f.db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, expires_at, key_version)
+SELECT $1, $2, 'older', 'user', $3, $4, 1 FROM generate_series(1, 5001)`, f.conversation, f.owner, cutoff.Add(-3*time.Hour), cutoff.Add(-2*time.Hour))
 	require.NoError(t, err)
 
 	duePinned := map[string]string{}
@@ -566,11 +566,11 @@ func TestPinAware_ApplyBackfillUnderKeepDrainsWithPinChurn(t *testing.T) {
 	window := 2592000
 	created := us(time.Now().Add(-48 * time.Hour))
 	target := created.Add(time.Duration(window) * time.Second)
-	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at)
-SELECT $1, $2, 'ciphertext', $3 FROM generate_series(1, 12001)`, f.channel, f.owner, created)
+	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, key_version)
+SELECT $1, $2, 'ciphertext', $3, 1 FROM generate_series(1, 12001)`, f.channel, f.owner, created)
 	require.NoError(t, err)
-	_, err = f.db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-SELECT $1, $2, 'ciphertext', 'user', $3 FROM generate_series(1, 12001)`, f.conversation, f.owner, created)
+	_, err = f.db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+SELECT $1, $2, 'ciphertext', 'user', $3, 1 FROM generate_series(1, 12001)`, f.conversation, f.owner, created)
 	require.NoError(t, err)
 
 	for _, ps := range pinScopes(f) {

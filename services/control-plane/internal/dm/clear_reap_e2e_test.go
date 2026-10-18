@@ -115,8 +115,8 @@ func TestClearReapE2EPastStampedCallEventIsRediscoveredAndReaped(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, afterFirstReap, conversationID, "an already-reaped conversation drops out of discovery")
 
-	_, err = db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-		SELECT id, created_by, 'call', 'call_event', $2 FROM dm_conversations WHERE id = $1`,
+	_, err = db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+		SELECT id, created_by, 'call', 'call_event', $2, 1 FROM dm_conversations WHERE id = $1`,
 		conversationID, time.Now().Add(-time.Minute))
 	require.NoError(t, err)
 

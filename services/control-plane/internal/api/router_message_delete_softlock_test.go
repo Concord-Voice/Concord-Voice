@@ -214,8 +214,8 @@ func (f *deleteRouterFixture) dmRoute(t *testing.T, n int) deleteRoute {
 	code := f.enrollTOTP(t, actor)
 
 	rows, err := f.db.Query(`
-		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at)
-		SELECT gen_random_uuid(), $1, $2, 'softlock-router', 'text', NOW() + g * INTERVAL '1 millisecond'
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version, created_at)
+		SELECT gen_random_uuid(), $1, $2, 'softlock-router', 'text', 1, NOW() + g * INTERVAL '1 millisecond'
 		FROM generate_series(1, $3) AS g
 		RETURNING id`, convID, actor.ID, n)
 	require.NoError(t, err)

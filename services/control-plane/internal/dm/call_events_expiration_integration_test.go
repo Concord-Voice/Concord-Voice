@@ -36,7 +36,9 @@ func TestInsertCallEvent_UsesDatabaseClockAndSharedExpiry(t *testing.T) {
 			require.NoError(t, err)
 			var created time.Time
 			var expires sql.NullTime
-			require.NoError(t, db.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`, convID).Scan(&created, &expires))
+			var version int
+			require.NoError(t, db.QueryRow(`SELECT created_at, expires_at, key_version FROM dm_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`, convID).Scan(&created, &expires, &version))
+			assert.Equal(t, 1, version)
 			assert.WithinDuration(t, time.Now().UTC(), created, 5*time.Second)
 			if tc.want {
 				require.NotNil(t, expires)
@@ -141,6 +143,9 @@ func TestCompletedCallEvent_NoOpDoesNotRespawn(t *testing.T) {
 	respawned, err := insertCompletedCallEvent(context.Background(), db, convUUID, callID, payload, false)
 	require.NoError(t, err)
 	assert.Len(t, respawned, 2, "the first insert reveals both hidden participants")
+	var version int
+	require.NoError(t, db.QueryRow(`SELECT key_version FROM dm_messages WHERE id = $1`, callID).Scan(&version))
+	assert.Equal(t, 1, version)
 	_, err = db.Exec(`UPDATE dm_participants SET hidden_at = $1 WHERE conversation_id = $2`, hiddenAt, convID)
 	require.NoError(t, err)
 	respawned, err = insertCompletedCallEvent(context.Background(), db, convUUID, callID, payload, false)

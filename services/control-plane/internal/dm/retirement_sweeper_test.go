@@ -630,8 +630,8 @@ func insertVisibleParticipant(t *testing.T, db *sql.DB, conversationID string) {
 
 func insertRetirementMessage(t *testing.T, db *sql.DB, conversationID string) {
 	t.Helper()
-	_, err := db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		SELECT id, created_by, 'ciphertext', 'user' FROM dm_conversations WHERE id = $1`, conversationID)
+	_, err := db.Exec(`INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		SELECT id, created_by, 'ciphertext', 'user', 1 FROM dm_conversations WHERE id = $1`, conversationID)
 	require.NoError(t, err)
 }
 

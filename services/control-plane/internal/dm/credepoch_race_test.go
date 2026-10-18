@@ -137,8 +137,8 @@ func TestCredEpochRace_DMMessageDeleteRejected(t *testing.T) {
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
 	var messageID string
 	require.NoError(t, ts.DB.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'must-remain', 'text') RETURNING id`, convID, alice.ID).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'must-remain', 'text', 1) RETURNING id`, convID, alice.ID).Scan(&messageID))
 
 	stale := ts.SimulateStaleEpochWindow(t, alice.ID)
 	w := ts.DoRequest(http.MethodDelete,
@@ -161,8 +161,8 @@ func TestDMMessageDeleteSerializesCurrentMembershipRemoval(t *testing.T) {
 	require.NoError(t, err)
 	var messageID string
 	require.NoError(t, ts.DB.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'membership-race-must-remain', 'text') RETURNING id`, convID, target.ID).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'membership-race-must-remain', 'text', 1) RETURNING id`, convID, target.ID).Scan(&messageID))
 
 	h := crossStoreVoiceHandler(ts)
 	fence, err := dm.BeginDMTopologyEffectForTest(context.Background(), h, convID, []uuid.UUID{uuid.MustParse(target.ID)})

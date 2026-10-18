@@ -279,6 +279,8 @@ func TestGetMessagesIncludesReactions(t *testing.T) {
 	serverID := ts.CreateTestServer(t, user.ID, "MsgReact Server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	msgID := ts.CreateTestMessage(t, channelID, user, "React to this!")
+	_, err := ts.DB.Exec(`UPDATE messages SET key_version = 2 WHERE id = $1`, msgID)
+	require.NoError(t, err)
 
 	ts.DoRequest("PUT", reactURL(msgID), emojiBody("🎉"),
 		testhelpers.AuthHeaders(user.AccessToken))
@@ -294,11 +296,13 @@ func TestGetMessagesIncludesReactions(t *testing.T) {
 	require.GreaterOrEqual(t, len(resp.Messages), 1)
 
 	var msg struct {
-		ID        string                   `json:"id"`
-		Reactions []models.ReactionSummary `json:"reactions"`
+		ID         string                   `json:"id"`
+		KeyVersion int                      `json:"key_version"`
+		Reactions  []models.ReactionSummary `json:"reactions"`
 	}
 	require.NoError(t, json.Unmarshal(resp.Messages[0], &msg))
 	assert.Equal(t, msgID, msg.ID)
+	assert.Equal(t, 2, msg.KeyVersion)
 	require.Len(t, msg.Reactions, 1)
 	assert.Equal(t, "🎉", msg.Reactions[0].Emoji)
 	assert.Equal(t, 1, msg.Reactions[0].Count)

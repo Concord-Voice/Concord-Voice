@@ -53,8 +53,8 @@ func insertPinnedChannelMessage(t *testing.T, ts *testhelpers.TestServer, channe
 	t.Helper()
 	var id string
 	require.NoError(t, ts.DB.QueryRow(`
-INSERT INTO messages (channel_id, user_id, content, created_at, pinned_at, pinned_by, expires_at, held_expires_at)
-VALUES ($1, $2, 'ciphertext', NOW() - interval '25 hours', CASE WHEN $5 THEN NOW() - interval '25 hours' END,
+INSERT INTO messages (channel_id, user_id, content, key_version, created_at, pinned_at, pinned_by, expires_at, held_expires_at)
+VALUES ($1, $2, 'ciphertext', 1, NOW() - interval '25 hours', CASE WHEN $5 THEN NOW() - interval '25 hours' END,
         CASE WHEN $5 THEN $2::uuid END, $3, $4)
 RETURNING id`, channelID, authorID, expires, held, held != nil || expires == nil).Scan(&id))
 	return id

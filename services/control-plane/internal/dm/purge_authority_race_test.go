@@ -25,8 +25,8 @@ func TestPurgeConversationRejectsParticipantRemovalAtGuard(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT created_by FROM dm_conversations WHERE id = $1`, convID).Scan(&actorID))
 	var messageID string
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type)
-		VALUES ($1, $2, 'must survive guard drift', 'text') RETURNING id`, convID, actorID).Scan(&messageID))
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, 'must survive guard drift', 'text', 1) RETURNING id`, convID, actorID).Scan(&messageID))
 
 	_, err := db.Exec(`
 		INSERT INTO privacy_settings (user_id, require_auth_before_purge)

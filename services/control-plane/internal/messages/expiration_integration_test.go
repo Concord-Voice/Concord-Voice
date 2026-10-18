@@ -65,8 +65,8 @@ func TestChannelMessageHistoryReturnsExpirationEventPayload(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	payload := `{"kind":"set","window_seconds":3600,"revision":1}`
 	_, err := ts.DB.Exec(`
-		INSERT INTO messages (id, channel_id, user_id, content, type, expiration_event_payload, created_at, updated_at)
-		VALUES (gen_random_uuid(), $1, $2, '', 'expiration_event', $3::jsonb, NOW(), NOW())`,
+		INSERT INTO messages (id, channel_id, user_id, content, type, expiration_event_payload, key_version, created_at, updated_at)
+		VALUES (gen_random_uuid(), $1, $2, '', 'expiration_event', $3::jsonb, 1, NOW(), NOW())`,
 		channelID, user.ID, payload)
 	require.NoError(t, err)
 

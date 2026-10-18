@@ -128,7 +128,7 @@ func insertDMMessage(t *testing.T, ts *testhelpers.TestServer, convID, userID, c
 	t.Helper()
 	msgID := uuid.New().String()
 	_, err := ts.DB.Exec(
-		`INSERT INTO dm_messages (id, conversation_id, user_id, content, type) VALUES ($1, $2, $3, $4, 'text')`,
+		`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version) VALUES ($1, $2, $3, $4, 'text', 1)`,
 		msgID, convID, userID, content,
 	)
 	require.NoError(t, err, "failed to insert DM message")
@@ -264,8 +264,8 @@ func TestListConversations_WithLastCallEvent(t *testing.T) {
 	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 
 	payload := `{"caller_user_id":"` + caller.ID + `","started_at":"2026-07-13T12:00:00Z","status":"missed","duration_seconds":0}`
-	_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, call_event_payload)
-		VALUES (gen_random_uuid(), $1, $2, '', 'call_event', $3)`, convID, caller.ID, payload)
+	_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, call_event_payload, key_version)
+		VALUES (gen_random_uuid(), $1, $2, '', 'call_event', $3, 1)`, convID, caller.ID, payload)
 	require.NoError(t, err)
 
 	w := ts.DoRequest("GET", pathDMConversations, nil, testhelpers.AuthHeaders(caller.AccessToken))
@@ -1416,8 +1416,8 @@ func TestGetMessages_ParticipantRemovedAfterPreCheckReadsNothing(t *testing.T) {
 			ids := make([]string, 0, 2)
 			for i := 0; i < 2; i++ {
 				id := uuid.New().String()
-				_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at)
-					VALUES ($1, $2, $3, 'ciphertext', 'text', $4)`, id, convID, user1.ID, base.Add(time.Duration(i)*time.Second))
+				_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at, key_version)
+					VALUES ($1, $2, $3, 'ciphertext', 'text', $4, 1)`, id, convID, user1.ID, base.Add(time.Duration(i)*time.Second))
 				require.NoError(t, err)
 				ids = append(ids, id)
 			}
@@ -1486,7 +1486,12 @@ func TestGetMessages_MessageFields(t *testing.T) {
 	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
 	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
 
-	insertDMMessage(t, ts, convID, user1.ID, "test content")
+	msgID := uuid.New().String()
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, $3, 'test content', 'text', 2)
+	`, msgID, convID, user1.ID)
+	require.NoError(t, err)
 
 	w := ts.DoRequest("GET", pathDMConversationsPrefix+convID+pathMessages, nil, testhelpers.AuthHeaders(user1.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -1501,6 +1506,7 @@ func TestGetMessages_MessageFields(t *testing.T) {
 	assert.Equal(t, convID, msg["conversation_id"])
 	assert.Equal(t, user1.ID, msg["user_id"])
 	assert.Equal(t, "test content", msg["content"])
+	assert.Equal(t, float64(2), msg["key_version"])
 	assert.Equal(t, "text", msg["type"])
 	assert.NotEmpty(t, msg["created_at"])
 	assert.NotEmpty(t, msg["username"])
@@ -1559,8 +1565,8 @@ func TestGetMessages_IncludesCallEventPayload(t *testing.T) {
 	convID := ts.CreateDMConversation(t, caller.ID, other.ID)
 
 	payload := `{"status":"completed","participant_user_ids":["` + caller.ID + `","` + other.ID + `"],"duration_seconds":42,"started_at":"2026-06-15T00:00:00Z"}`
-	_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, call_event_payload, created_at)
-		VALUES (gen_random_uuid(), $1, $2, '', 'call_event', $3, NOW())`, convID, caller.ID, payload)
+	_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, call_event_payload, created_at, key_version)
+		VALUES (gen_random_uuid(), $1, $2, '', 'call_event', $3, NOW(), 1)`, convID, caller.ID, payload)
 	require.NoError(t, err)
 
 	w := ts.DoRequest("GET", pathDMConversationsPrefix+convID+pathMessages, nil, testhelpers.AuthHeaders(caller.AccessToken))
@@ -2022,11 +2028,16 @@ func TestUpdateMessage_StoresKeyVersion(t *testing.T) {
 	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
 	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
 	originalCiphertext := testhelpers.ValidCiphertext()
-	msgID := insertDMMessage(t, ts, convID, user1.ID, originalCiphertext)
+	msgID := uuid.New().String()
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, $3, $4, 'text', 1)
+	`, msgID, convID, user1.ID, originalCiphertext)
+	require.NoError(t, err)
 	editedCiphertext := testhelpers.ValidCiphertext()
 	require.NotEqual(t, originalCiphertext, editedCiphertext)
 	// Epoch 2 must be issued before an edit may claim it.
-	_, err := ts.DB.Exec(`INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped-v2', 2)`, convID, user1.ID)
+	_, err = ts.DB.Exec(`INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped-v2', 2)`, convID, user1.ID)
 	require.NoError(t, err)
 
 	w := ts.DoRequest("PATCH", pathDMConversationsPrefix+convID+pathMsgSlash+msgID, map[string]interface{}{
@@ -6250,7 +6261,7 @@ func TestDMLastMessage_KeySetIsExactlySevenFields(t *testing.T) {
 			convID, token, userID := newDMConversation(t, ts)
 			msgID := uuid.New().String()
 			_, err := ts.DB.Exec(
-				`INSERT INTO dm_messages (id, conversation_id, user_id, content, type) VALUES ($1, $2, $3, $4, '')`,
+				`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version) VALUES ($1, $2, $3, $4, '', 1)`,
 				msgID, convID, userID, "ciphertext",
 			)
 			require.NoError(t, err)
@@ -6290,17 +6301,15 @@ func TestDMLastMessage_CarriesKeyVersion(t *testing.T) {
 	}
 }
 
-// An unlabelled legacy row previews as epoch 1, the label history and pins
-// give it. Previewed as 0 (dropped by omitempty), the sidebar tried only the
-// current key and failed a row the chat itself could open.
-func TestDMLastMessage_NullKeyVersionPreviewsAsEpochOne(t *testing.T) {
+// An explicitly stored epoch-1 row previews with the same label as history and pins.
+func TestDMLastMessage_ExplicitEpochOnePreviewsAsEpochOne(t *testing.T) {
 	for _, endpoint := range []string{"list", "single"} {
 		t.Run(endpoint, func(t *testing.T) {
 			ts := setupTS(t)
 			convID, token, userID := newDMConversation(t, ts)
 			_, err := ts.DB.Exec(
-				`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version) VALUES ($1, $2, $3, $4, NULL)`,
-				uuid.New().String(), convID, userID, "legacy ciphertext",
+				`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version) VALUES ($1, $2, $3, $4, 1)`,
+				uuid.New().String(), convID, userID, "epoch-1 ciphertext",
 			)
 			require.NoError(t, err)
 

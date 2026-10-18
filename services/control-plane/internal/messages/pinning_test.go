@@ -200,8 +200,8 @@ func TestPinMessageLimitReached(t *testing.T) {
 	// Seed 50 pinned messages directly via SQL to avoid rate limiting
 	for i := 0; i < 50; i++ {
 		_, err := ts.DB.Exec(
-			`INSERT INTO messages (id, channel_id, user_id, content, pinned_at, pinned_by, created_at, updated_at)
-			 VALUES (gen_random_uuid(), $1, $2, 'pinned msg', NOW(), $2, NOW(), NOW())`,
+			`INSERT INTO messages (id, channel_id, user_id, content, key_version, pinned_at, pinned_by, created_at, updated_at)
+			 VALUES (gen_random_uuid(), $1, $2, 'pinned msg', 1, NOW(), $2, NOW(), NOW())`,
 			channelID, user.ID,
 		)
 		require.NoError(t, err)
@@ -338,6 +338,8 @@ func TestGetChannelPinsSuccess(t *testing.T) {
 	// Create and pin 3 messages
 	for i := 0; i < 3; i++ {
 		msgID := ts.CreateTestMessage(t, channelID, user, "Pinned msg")
+		_, err := ts.DB.Exec(`UPDATE messages SET key_version = 2 WHERE id = $1`, msgID)
+		require.NoError(t, err)
 		ts.DoRequest("POST", pinAPIMsg+msgID+pinPath, nil,
 			testhelpers.AuthHeaders(user.AccessToken))
 	}
@@ -356,6 +358,7 @@ func TestGetChannelPinsSuccess(t *testing.T) {
 	// Verify ordered by pinned_at DESC (most recently pinned first)
 	for _, msg := range resp.PinnedMessages {
 		assert.NotNil(t, msg.PinnedAt)
+		assert.Equal(t, 2, msg.KeyVersion)
 	}
 }
 

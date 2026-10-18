@@ -379,7 +379,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 // optional cursor) — every value is parameterized (no interpolation).
 func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.MessageWithUser, error) {
 	query := `
-		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
+		SELECT m.id, m.channel_id, m.user_id, m.content, m.key_version,
 		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
 		       m.type, m.expiration_event_payload,
 		       u.username, u.display_name, u.avatar_url

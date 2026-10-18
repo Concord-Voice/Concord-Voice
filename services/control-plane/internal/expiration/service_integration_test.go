@@ -93,14 +93,14 @@ func startConversation(t *testing.T, f expirationFixture, request Request) Polic
 func insertChannelMessage(t *testing.T, f expirationFixture, created time.Time) string {
 	t.Helper()
 	var id string
-	require.NoError(t, f.db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at) VALUES ($1, $2, 'ciphertext', $3) RETURNING id`, f.channel, f.owner, created).Scan(&id))
+	require.NoError(t, f.db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, key_version) VALUES ($1, $2, 'ciphertext', $3, 1) RETURNING id`, f.channel, f.owner, created).Scan(&id))
 	return id
 }
 
 func insertDMMessage(t *testing.T, f expirationFixture, created time.Time) string {
 	t.Helper()
 	var id string
-	require.NoError(t, f.db.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at) VALUES ($1, $2, 'ciphertext', 'user', $3) RETURNING id`, f.conversation, f.owner, created).Scan(&id))
+	require.NoError(t, f.db.QueryRow(`INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version) VALUES ($1, $2, 'ciphertext', 'user', $3, 1) RETURNING id`, f.conversation, f.owner, created).Scan(&id))
 	return id
 }
 
@@ -213,7 +213,7 @@ func TestService_StartResumeChannel_UsesOriginalCreatedAtAndUTCConversion(t *tes
 	db := timezoneDB(t)
 	created := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 	var id string
-	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at) VALUES ($1, $2, 'ciphertext', $3) RETURNING id`, f.channel, f.owner, created).Scan(&id))
+	require.NoError(t, db.QueryRow(`INSERT INTO messages (channel_id, user_id, content, created_at, key_version) VALUES ($1, $2, 'ciphertext', $3, 1) RETURNING id`, f.channel, f.owner, created).Scan(&id))
 	window := 3600
 	policy := startChannelDB(t, db, f.channel.String(), Request{Mode: "set", WindowSeconds: &window, Retroactive: "apply"})
 	assert.True(t, policy.BackfillPending)
@@ -250,7 +250,7 @@ func TestService_ApplyBackfillBatchesAt5000Rows(t *testing.T) {
 	f := newExpirationFixture(t)
 	installBatchFailureAudit(t, f)
 	created := time.Now().UTC().Add(-48 * time.Hour)
-	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at) SELECT $1, $2, 'ciphertext', $3 FROM generate_series(1, 5001)`, f.channel, f.owner, created)
+	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, key_version) SELECT $1, $2, 'ciphertext', $3, 1 FROM generate_series(1, 5001)`, f.channel, f.owner, created)
 	require.NoError(t, err)
 	window := 3600
 	policy := startChannel(t, f, Request{Mode: "set", WindowSeconds: &window, Retroactive: "apply"})
@@ -337,7 +337,7 @@ WHERE conversation_id = $1 AND expires_at > $2 AND false`
 func TestService_ResumeCapsFiveBatchesAndRetainsPendingMarker(t *testing.T) {
 	f := newExpirationFixture(t)
 	created := time.Now().UTC().Truncate(time.Microsecond).Add(-48 * time.Hour)
-	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at) SELECT $1, $2, 'ciphertext', $3 FROM generate_series(1, 25001)`, f.channel, f.owner, created)
+	_, err := f.db.Exec(`INSERT INTO messages (channel_id, user_id, content, created_at, key_version) SELECT $1, $2, 'ciphertext', $3, 1 FROM generate_series(1, 25001)`, f.channel, f.owner, created)
 	require.NoError(t, err)
 	dueID := insertChannelMessage(t, f, created)
 	dueAt := created.Add(-time.Hour)

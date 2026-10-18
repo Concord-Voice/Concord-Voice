@@ -451,6 +451,7 @@ erDiagram
         UUID channel_id FK
         UUID user_id FK
         TEXT content "ciphertext"
+        INTEGER key_version "required; >=1; no default"
         UUID reply_to_id FK
         UUID pinned_by FK
         TIMESTAMPTZ edited_at
@@ -479,6 +480,7 @@ erDiagram
         UUID conversation_id FK
         UUID user_id FK
         TEXT content "ciphertext"
+        INTEGER key_version "required; >=1; no default"
         VARCHAR type "incl. call_event"
         UUID pinned_by FK
         JSONB call_event_payload
@@ -617,6 +619,14 @@ erDiagram
         INTEGER successor_epoch
     }
 ```
+
+`messages.key_version` and `dm_messages.key_version` are required positive
+integers with no server default (migrations 000171–000176). Ciphertext writers
+persist the client-supplied epoch after server-side validation. Server-authored
+`call_event` and `expiration_event` rows explicitly store 1 solely as a
+noncrypto metadata placeholder; it is not a ciphertext epoch claim. Existing
+version-1 rows retain their stored value, and their historical provenance is
+ambiguous.
 
 **Supporting tables**, covered for completeness. Most carry a simple `user_id → users` FK:
 

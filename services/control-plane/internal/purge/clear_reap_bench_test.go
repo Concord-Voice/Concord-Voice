@@ -23,8 +23,8 @@ func TestMeasureClearReapBatchWallTime(t *testing.T) {
 	author := f.members[0]
 
 	_, err := f.db.Exec(`
-		INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at)
-		SELECT $1, $2, 'bench', 'user', $3::timestamptz + g * interval '1 millisecond'
+		INSERT INTO dm_messages (conversation_id, user_id, content, type, created_at, key_version)
+		SELECT $1, $2, 'bench', 'user', $3::timestamptz + g * interval '1 millisecond', 1
 		  FROM generate_series(1, 10000) g`, f.conversationID, author, f.base)
 	require.NoError(t, err)
 	// Every fifth message carries its own tier-2 attachment (20%).

@@ -1238,7 +1238,7 @@ func TestHandleDMMessageEncryptedLongerContentAllowed(t *testing.T) {
 }
 
 func TestHandleDMMessageBroadcastToSubscribers(t *testing.T) {
-	setup := setupEpochTest(t, false, false)
+	setup := setupEpochTest(t, true, true)
 	convUUID, _ := uuid.Parse(setup.convID)
 
 	// Add user2 as a subscriber
@@ -1264,7 +1264,7 @@ func TestHandleDMMessageBroadcastToSubscribers(t *testing.T) {
 		Data: map[string]interface{}{
 			keyConversationID: setup.convID,
 			keyContent:        "dm broadcast test",
-			"key_version":     float64(1),
+			"key_version":     float64(2),
 		},
 	}
 
@@ -1280,6 +1280,7 @@ func TestHandleDMMessageBroadcastToSubscribers(t *testing.T) {
 	data := presenceFrameData(t, broadcast)
 	assert.Equal(t, convUUID.String(), data[keyConversationID])
 	assert.Equal(t, "dm broadcast test", data[keyContent])
+	assert.Equal(t, float64(2), data[keyKeyVersion])
 	assert.Empty(t, setup.client.Send, "sender must remain excluded from the broadcast")
 	assert.Len(t, setup.hub.dmBroadcast, 1, "delivery must bypass the full hub queue")
 }
@@ -3006,8 +3007,8 @@ func testLastMessage(t *testing.T, setup *hubTestSetup) dmUnreadLastMessage {
 	t.Helper()
 	messageID := uuid.New()
 	_, err := setup.db.Exec(`
-		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at)
-		VALUES ($1, $2, $3, 'hello from test', 'user', $4)`,
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version, created_at)
+		VALUES ($1, $2, $3, 'hello from test', 'user', 1, $4)`,
 		messageID, setup.convID, setup.user1, testLastMessageTime)
 	require.NoError(t, err)
 	return dmUnreadLastMessage{
@@ -3197,8 +3198,8 @@ func TestSendDMMentionNotify_CarriesNoLastMessage(t *testing.T) {
 
 	messageID := uuid.New()
 	_, err := setup.db.Exec(`
-		INSERT INTO dm_messages (id, conversation_id, user_id, content, type)
-		VALUES ($1, $2, $3, 'mention source', 'user')`, messageID, convUUID, setup.user1)
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, key_version)
+		VALUES ($1, $2, $3, 'mention source', 'user', 1)`, messageID, convUUID, setup.user1)
 	require.NoError(t, err)
 	setup.hub.sendDMMentionNotify(convUUID, NewDMMessageVisibilitySource(messageID), map[uuid.UUID]bool{setup.user2: true}, false)
 

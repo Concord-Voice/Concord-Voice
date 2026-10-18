@@ -397,7 +397,7 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $1 AND dp.hidden_at IS NULL
 		LEFT JOIN dm_read_states drs ON drs.conversation_id = dc.id AND drs.user_id = $1
 		LEFT JOIN LATERAL (
-		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload, COALESCE(m.key_version, 1) AS key_version FROM dm_messages m
+		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload, m.key_version FROM dm_messages m
 		    WHERE m.conversation_id = dc.id ` + hiddenRangeFilter(1) + `
 		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
@@ -2367,7 +2367,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
-			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, m.expiration_event_payload, COALESCE(m.key_version, 1),
+			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, m.expiration_event_payload, m.key_version,
 			       m.edited_at, m.expires_at, m.created_at,
 			       u.username, u.display_name, u.avatar_url
 			FROM dm_messages m
@@ -2384,7 +2384,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
-			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, m.expiration_event_payload, COALESCE(m.key_version, 1),
+			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, m.expiration_event_payload, m.key_version,
 			       m.edited_at, m.expires_at, m.created_at,
 			       u.username, u.display_name, u.avatar_url
 			FROM dm_messages m
@@ -3224,7 +3224,7 @@ func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversati
 		       att.file_type, att.mime_type
 		FROM dm_conversations dc
 		LEFT JOIN LATERAL (
-		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload, COALESCE(m.key_version, 1) AS key_version FROM dm_messages m
+		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload, m.key_version FROM dm_messages m
 		    WHERE m.conversation_id = dc.id `+hiddenRangeFilter(2)+`
 		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
@@ -3445,7 +3445,7 @@ func (h *Handler) writeDMMessageCiphertext(c *gin.Context, tx *sql.Tx, convID, m
 		      SELECT 1 FROM dm_key_revocations
 		      WHERE conversation_id = $4 AND revoked_epoch = $2
 		  )`+hiddenRangeFilter(5)+`
-		RETURNING COALESCE(key_version, 1), edited_at, expires_at, created_at
+		RETURNING key_version, edited_at, expires_at, created_at
 	`, req.Content, req.KeyVersion, messageID, convID, userID).Scan(&result.KeyVersion, &result.EditedAt, &result.ExpiresAt, &result.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {

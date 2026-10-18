@@ -207,6 +207,16 @@ func TestSendMessageE2EEWithKeyVersion(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	msg := body["message"].(map[string]interface{})
 	assert.Equal(t, float64(2), msg["key_version"])
+
+	history := ts.DoRequest("GET", pathChannels+channelID+"/messages", nil,
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, history.Code, history.Body.String())
+	var historyBody map[string]interface{}
+	testhelpers.ParseJSON(t, history, &historyBody)
+	historyMessages := testhelpers.JSONField[[]interface{}](t, historyBody, "messages")
+	require.Len(t, historyMessages, 1)
+	historyMessage := testhelpers.JSONElem[map[string]interface{}](t, historyMessages, 0)
+	assert.Equal(t, float64(2), historyMessage["key_version"])
 }
 
 // #2832: this test previously asserted the opposite — that omitting key_version

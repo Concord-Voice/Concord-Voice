@@ -613,7 +613,7 @@ func (h *Handler) GetChannelPins(c *gin.Context) {
 	}
 
 	rows, err := h.db.Query(`
-		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
+		SELECT m.id, m.channel_id, m.user_id, m.content, m.key_version,
 		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
 		       u.username, u.display_name, u.avatar_url
 		FROM messages m
@@ -703,7 +703,7 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 	//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	rows, err := h.db.Query(`
-		SELECT dm.id, dm.conversation_id, dm.user_id, dm.content, dm.type, COALESCE(dm.key_version, 1),
+		SELECT dm.id, dm.conversation_id, dm.user_id, dm.content, dm.type, dm.key_version,
 		       dm.pinned_at, dm.pinned_by, dm.edited_at, dm.expires_at, dm.created_at, dm.updated_at,
 		       u.username, u.display_name, u.avatar_url
 		FROM dm_messages dm
