@@ -85,7 +85,7 @@ fi
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] || export COMPOSE_PROFILES
 
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
-  # Managed callers and root admission must address the same local daemon.
+  # Managed filesystem and daemon operations must address the same host.
   unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   export DOCKER_HOST=unix:///var/run/docker.sock
 fi
@@ -108,85 +108,6 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   # either; the captured attestation above remains the contract authority.
   selfhost_storage_scrub_environment || exit 1
   COMPOSE_CMD=selfhost_storage_compose
-fi
-
-managed_egress_gate() {
-  [[ $# -eq 1 && ( $1 == verify || $1 == ready ) ]] || return 1
-  [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] && return 0
-  local role
-  case "$COMPOSE_OVERRIDE" in
-    docker-compose.production.yml) role=production ;;
-    docker-compose.staging.yml) role=staging ;;
-    *) echo 'managed-egress: deployment role is unknown' >&2; return 1 ;;
-  esac
-  sudo -n /usr/local/sbin/nightwatch-egress "$1" --role "$role" >/dev/null || {
-    echo 'managed-egress: root-admitted role policy is unavailable or not ready' >&2
-    return 1
-  }
-}
-
-
-managed_compose_build() (
-  cd "$DEPLOY_DIR" || return
-  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
-    $COMPOSE_CMD "$@"
-    return
-  fi
-  managed_egress_gate verify || return
-  local image
-  image="$($COMPOSE_CMD config --images egress-build)" || return
-  # Check the root contract before creating a bridge that it does not own.
-  if ! sudo -n /usr/local/sbin/concord-egress refresh | python3 -c '
-import json, sys
-value = json.load(sys.stdin)
-sys.exit(0 if value.get("status") == "enforced" and value.get("build_admitted") is True and value.get("build_image") == sys.argv[1] else 1)
-' "$image"; then
-    echo 'managed-egress: root-admitted build purpose is unavailable' >&2
-    return 1
-  fi
-  $COMPOSE_CMD up -d --no-deps --no-build --pull never --wait --wait-timeout 90 egress-build >&2 || return
-  sudo -n /usr/local/sbin/concord-egress refresh >/dev/null || return
-  managed_egress_gate verify || return
-  local metadata
-  metadata="$(mktemp -d)" || return
-  trap 'rm -rf -- "$metadata"' EXIT
-  export BUILDX_CONFIG="$metadata" BUILDX_BUILDER=concord-egress
-  unset BUILDKIT_HOST
-  docker buildx create --name concord-egress --driver remote --driver-opt default-load=true \
-    docker-container://concord-egress-build >/dev/null || return
-  $COMPOSE_CMD "$@"
-)
-
-control_plane_cli() (
-  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never control-plane ./main "$@"
-    return
-  fi
-  local running temporary
-  running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
-  temporary=''
-  if [[ -z "$running" ]]; then
-    # Drained maintenance must remain non-serving until its namespace is admitted.
-    temporary="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --detach --no-deps --pull never \
-      --entrypoint /bin/sleep control-plane 2147483647)" || return 1
-    [[ "$temporary" =~ ^[a-f0-9]{64}$ ]] || { echo 'managed-egress: invalid maintenance container identity' >&2; return 1; }
-    trap 'result=$?; docker rm -f "$temporary" >/dev/null 2>&1 || result=1; sudo -n /usr/local/sbin/concord-egress refresh >/dev/null 2>&1 || result=1; exit "$result"' EXIT
-    trap 'exit 1' HUP INT TERM
-  fi
-  sudo -n /usr/local/sbin/concord-egress refresh >/dev/null || {
-    echo 'managed-egress: maintenance namespace reconciliation failed' >&2
-    return 1
-  }
-  managed_egress_gate verify || return 1
-  if [[ -n "$temporary" ]]; then
-    docker exec "$temporary" ./main "$@"
-  else
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T control-plane ./main "$@"
-  fi
-)
-
-if [[ "${1:-help}" == freshstart ]]; then
-  managed_egress_gate verify || exit 1
 fi
 
 selfhost_storage_start_guard() {
@@ -769,7 +690,8 @@ activity_history_image_is_local() {
 
 activity_history_run_admin() {
   local verb="$1"
-  control_plane_cli activity-history "$verb" --confirm-drained
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never \
+    control-plane ./main activity-history "$verb" --confirm-drained)
 }
 
 activity_history_start_control_plane() {
@@ -1298,7 +1220,8 @@ voice_enforcement_rollout_cli() {
       return 2
       ;;
   esac
-  control_plane_cli voice-enforcement-rollout "$verb" "$@"
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never \
+    control-plane ./main voice-enforcement-rollout "$verb" "$@")
 }
 
 voice_enforcement_rollout_deactivate_for_rollback() {
@@ -1443,7 +1366,7 @@ voice_enforcement_rollout_deploy() {
   # default before any media handoff.  The explicit deactivation follows CP
   # readiness because the rollout singleton is created by CP startup migration.
   echo "voice-enforcement-rollout: building the new control-plane image"
-  (cd "$DEPLOY_DIR" && managed_compose_build build control-plane)
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane)
   # Migrations 000165–000166 change privacy and presence defaults. Stop and
   # drain the previous local binary before startup can apply them; older
   # writers must not run beside the new policy. Multi-host deployments must
@@ -1463,7 +1386,7 @@ voice_enforcement_rollout_deploy() {
   # and can leave old sockets unregistered during the handoff.
   voice_enforcement_rollout_stop_media
   echo "voice-enforcement-rollout: building the new media-plane image"
-  (cd "$DEPLOY_DIR" && managed_compose_build build media-plane)
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
   echo "voice-enforcement-rollout: starting the new media-plane"
   echo "voice-enforcement-rollout: waiting for media-plane liveness"
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
@@ -1479,7 +1402,7 @@ voice_enforcement_rollout_deploy() {
 voice_enforcement_rollout_media_rebuild() {
   voice_enforcement_rollout_cli deactivate
   voice_enforcement_rollout_stop_media
-  (cd "$DEPLOY_DIR" && managed_compose_build build media-plane)
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
     --wait-timeout 180 media-plane)
   voice_enforcement_rollout_wait_media
@@ -1576,7 +1499,7 @@ media_bluegreen_verify_standby_image() {
   [[ -n "$project" && "$project" != *[[:space:]]* ]] || return 1
   # Build the current source without replacing the running empty standby, then
   # compare immutable image IDs before allowing an interrupted cutover to resume.
-  (cd "$DEPLOY_DIR" && managed_compose_build build --quiet "$service") || {
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build --quiet "$service") || {
     echo "media-bluegreen: cannot build current ${service} image; refusing to reuse the running standby" >&2
     return 1
   }
@@ -1839,7 +1762,7 @@ media_bluegreen_cutover_locked() {
     media_bluegreen_verify_standby_image "$standby" "$running" || return 1
   else
     echo "media-bluegreen: starting standby ${standby}"
-    (cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps --wait \
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait \
       --wait-timeout 180 "media-plane-${standby}") || return 1
   fi
   if ! media_bluegreen_probe_ready "$standby" true "$standby_port" 1 true; then
@@ -2151,6 +2074,41 @@ media_bluegreen_reap() {
   return "$rc"
 }
 
+# Reconcile before managed image builds for every override except canonical
+# staging; an equivalent production path must not skip the closure gate.
+managed_production_nats_reconcile() {
+  [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
+     && "$COMPOSE_OVERRIDE" != docker-compose.staging.yml ]] || return 0
+  local container host_config
+  if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json 2>/dev/null) \
+      | python3 -c 'import json, sys; sys.exit(bool(json.load(sys.stdin)["services"]["nats"].get("ports")))' 2>/dev/null; then
+    echo 'rebuild: cannot prove production NATS has no published ports; refusing' >&2
+    return 1
+  fi
+  # freshstart checks the model before wiping, then starts fresh NATS afterward.
+  [[ "${1:-}" != model-only ]] || return 0
+  if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --pull missing --wait --wait-timeout 180 nats) >/dev/null 2>&1; then
+    echo 'rebuild: cannot reconcile production NATS; refusing' >&2
+    return 1
+  fi
+  container="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -q nats 2>/dev/null)" || {
+    echo 'rebuild: cannot select production NATS container; refusing' >&2
+    return 1
+  }
+  if [[ ! "$container" =~ ^[[:xdigit:]]{12,64}$ ]]; then
+    echo 'rebuild: production NATS container is missing or ambiguous; refusing' >&2
+    return 1
+  fi
+  host_config="$(docker inspect --format '{{json .HostConfig.PortBindings}}|{{.HostConfig.PublishAllPorts}}' "$container" 2>/dev/null)" || {
+    echo 'rebuild: cannot inspect production NATS port bindings; refusing' >&2
+    return 1
+  }
+  if ! python3 -c 'import json, sys; ports, publish = sys.argv[1].rsplit("|", 1); sys.exit(publish != "false" or json.loads(ports) not in ({}, None))' "$host_config" 2>/dev/null; then
+    echo 'rebuild: production NATS still publishes host ports; refusing' >&2
+    return 1
+  fi
+}
+
 # Build only explicit services. In particular, neither the active colour nor
 # the unselected legacy service may be pulled in by an implicit Compose up.
 media_bluegreen_rebuild_locked() {
@@ -2211,12 +2169,13 @@ print(" ".join(sorted(set(s) - closure - excluded)))
   # Refusal above is before the Activity History guard: that guard can write a
   # receipt, and a rejected cutover must leave the receipt and image pin intact.
   activity_history_routine_guard || return 1
+  managed_production_nats_reconcile || return 1
   if (( full == 1 )) && [[ ${#deps_arr[@]} -gt 0 ]]; then
-    (cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 -- "${deps_arr[@]}") || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${deps_arr[@]}") || return 1
   fi
   if (( start_cp == 1 )); then
     clear_activity_history_image_selector || return 1
-    (cd "$DEPLOY_DIR" && managed_compose_build build control-plane) || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane) || return 1
     privacy_defaults_refuse_foreign_control_plane || return 1
     activity_history_stop_control_plane || return 1
     privacy_defaults_require_local_control_plane_drained || return 1
@@ -2237,7 +2196,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
     voice_enforcement_rollout_activate || return 1
   fi
   if (( full == 1 )) && [[ ${#rest_arr[@]} -gt 0 ]]; then
-    (cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps -- "${rest_arr[@]}") || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps -- "${rest_arr[@]}") || return 1
   elif (( full == 0 )); then
     local -a extra=()
     for scope_token in "$@"; do
@@ -2247,7 +2206,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
       esac
     done
     if [[ ${#extra[@]} -gt 0 ]]; then
-      (cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 -- "${extra[@]}") || return 1
+      (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${extra[@]}") || return 1
     fi
   fi
   echo 'media-bluegreen: rebuild completed with active colour excluded'
@@ -2301,7 +2260,7 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
   # service name may start with `-`, and Compose would read it as a flag.
   if [[ ${#closure_arr[@]} -gt 0 ]]; then
     echo "rebuild: starting the voice services' dependencies: ${closure_arr[*]}"
-    (cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 -- \
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- \
       "${closure_arr[@]}")
   fi
   voice_enforcement_rollout_deploy
@@ -2309,7 +2268,7 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
     # No --wait: coturn's STUN probe flaking would abort a deploy that
     # otherwise succeeded, and post-rsync's wait-healthy follows anyway.
     echo "rebuild: starting the remaining services: ${rest_arr[*]}"
-    (cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps -- "${rest_arr[@]}")
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps -- "${rest_arr[@]}")
   fi
 }
 
@@ -2531,12 +2490,6 @@ case "${1:-help}" in
     # flake. 90s comfortably exceeds the actor's worst-case hold.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
-    ;;
-esac
-
-case "${1:-help}" in
-  rebuild|restart|activity-history-activate|activity-history-rollback|voice-enforcement-rollout)
-    managed_egress_gate verify || exit 1
     ;;
 esac
 
@@ -2907,6 +2860,7 @@ else:
     # would be a first-activation bypass. It takes an optional receipt_mode
     # argument, so the scope list must never reach it.
     activity_history_routine_guard
+    managed_production_nats_reconcile || exit 1
 
     # Unscoped — or escalated from a scoped call whose peers were not up — runs
     # every service in order (#3524). The image-selector clear happens inside
@@ -2952,14 +2906,14 @@ else:
     if [[ $_has_control_plane -eq 1 ]]; then
       # Build while the previous control-plane is still serving. A slow or
       # failed image build must not extend the migration drain or leave it down.
-      (cd "$DEPLOY_DIR" && managed_compose_build build "${REBUILD_SCOPE[@]}") || exit 1
+      (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "${REBUILD_SCOPE[@]}") || exit 1
       echo "rebuild: draining the previous control-plane before its startup migrations"
       privacy_defaults_refuse_foreign_control_plane || exit 1
       activity_history_stop_control_plane || exit 1
       privacy_defaults_require_local_control_plane_drained || exit 1
       cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
     else
-      cd "$DEPLOY_DIR" && managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
+      cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
     fi
     selfhost_post_up_check || exit 1
     [[ $_rebuild_starts_coturn -eq 0 ]] || selfhost_tls_ready_gate || exit 1
@@ -3009,6 +2963,7 @@ else:
           exit 2
         fi
         media_shared_listeners_routine_guard || exit 1
+        managed_production_nats_reconcile || exit 1
         voice_enforcement_rollout_deploy "$@"
         selfhost_post_up_check || exit 1
         ;;
@@ -3079,7 +3034,7 @@ else:
         exit 1
       fi
     fi
-    control_plane_cli storage-probe "$@"
+    cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never control-plane ./main storage-probe "$@"
     ;;
 
   attachment-probe-cron-install)
@@ -3747,10 +3702,8 @@ else:
           coturn_refresh_skipped=1
         fi
       fi
-      egress_ok=0
-      managed_egress_gate ready && egress_ok=1
       if (( $(date +%s) < DEADLINE )) &&
-          [[ $cp_ok -eq 1 && $mp_ok -eq 1 && $coturn_ok -eq 1 && $tls_ok -eq 1 && $egress_ok -eq 1 ]]; then
+          [[ $cp_ok -eq 1 && $mp_ok -eq 1 && $coturn_ok -eq 1 && $tls_ok -eq 1 ]]; then
         selfhost_post_up_check || exit 1
         if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
           echo "  ✓ all services healthy (control-plane + media-plane + coturn TLS)"
@@ -3859,20 +3812,21 @@ else:
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
     fi
-    managed_egress_gate verify || exit 1
 
+    managed_production_nats_reconcile model-only || exit 1
     clear_activity_history_image_selector
     activity_history_invalidate_activation_receipt
     echo ""
     echo "Stopping all services and removing volumes..."
     cd "$DEPLOY_DIR" && $COMPOSE_CMD down -v
+    managed_production_nats_reconcile || exit 1
     echo ""
     # #1015: sync_releases no longer auto-called. If the server's
     # /opt/concord/releases/ is empty or stale, trigger sync-releases.yml
     # OR run `concord-ctl.sh sync-releases` before invoking freshstart.
     echo "Rebuilding and starting fresh..."
     echo "Note: release assets NOT refreshed automatically (#1015). Run 'concord-ctl.sh sync-releases' or trigger sync-releases.yml AFTER freshstart completes to populate /opt/concord/releases/."
-    cd "$DEPLOY_DIR" && managed_compose_build up -d --build
+    cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build
     if ! voice_enforcement_rollout_wait_control_plane \
       || ! voice_enforcement_rollout_wait_media \
       || ! voice_enforcement_rollout_activate; then
