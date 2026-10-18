@@ -1978,6 +1978,8 @@ export class RoomManager {
     this.createsInFlight += 1;
     try {
       await this.roomCreationGuard?.(roomId);
+      const currentRoom = this.getExistingRoom(roomId, roomContext);
+      if (currentRoom) return currentRoom;
 
       const creationInFlight = this.roomCreationGates.get(roomId);
       if (creationInFlight) {

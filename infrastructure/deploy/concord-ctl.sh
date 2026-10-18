@@ -1895,9 +1895,8 @@ raise SystemExit(0 if stopped else 1)
   body="$(mktemp)" || return 1
   status=0
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T "media-plane-${colour}" \
-    wget -qO- http://127.0.0.1:3000/readyz >"$body" 2>/dev/null) || status=$?
-  # BusyBox wget returns 8 for the expected HTTP 503 drain response. Require
-  # that status as well as a matching body; a 200 liveness response is not R2.
+    node -e 'fetch("http://127.0.0.1:3000/readyz", {signal: AbortSignal.timeout(3000)}).then(async response => { process.stdout.write(await response.text()); process.exitCode = response.status === 503 ? 8 : 1; }).catch(() => { process.exitCode = 1; });' >"$body" 2>/dev/null) || status=$?
+  # Require HTTP 503 as well as the matching drain body; a 200 liveness response is not R2.
   if [[ "$status" -ne 8 ]] || ! python3 -c '
 import json, sys
 try:
@@ -1955,7 +1954,7 @@ print(value["rooms"], value["creates_in_flight"], value["generation"])
   body="$(mktemp)" || return 1
   status=0
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T "media-plane-${colour}" \
-    wget -qO- http://127.0.0.1:3000/readyz >"$body" 2>/dev/null) || status=$?
+    node -e 'fetch("http://127.0.0.1:3000/readyz", {signal: AbortSignal.timeout(3000)}).then(async response => { process.stdout.write(await response.text()); process.exitCode = response.status === 503 ? 8 : 1; }).catch(() => { process.exitCode = 1; });' >"$body" 2>/dev/null) || status=$?
   if [[ "$status" -ne 8 ]] || ! python3 -c '
 import json, sys
 try:

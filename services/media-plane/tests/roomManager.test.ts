@@ -435,6 +435,49 @@ describe('RoomManager', () => {
       expect(manager.getRoom('room-concurrent')?.participants.size).toBe(2);
     });
 
+    it('preserves the first room when another create guard finishes after admission', async () => {
+      (mockedConfig as { roomPlacementEnabled?: boolean }).roomPlacementEnabled = true;
+      let releaseFirst!: () => void;
+      let releaseSecond!: () => void;
+      const guard = vi
+        .fn()
+        .mockReturnValueOnce(
+          new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+          })
+        )
+        .mockReturnValueOnce(
+          new Promise<void>((resolve) => {
+            releaseSecond = resolve;
+          })
+        );
+      manager.setRoomCreationGuard(guard);
+      try {
+        const first = joinRoomWithSupportedCrypto(manager, 'room-delayed-guard', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
+        const second = joinRoomWithSupportedCrypto(manager, 'room-delayed-guard', 'u-2', 'sock-2', {
+          username: 'bob',
+        });
+        expect(guard).toHaveBeenCalledTimes(2);
+        releaseFirst();
+        await first;
+        const originalRoom = manager.getRoom('room-delayed-guard');
+        expect(manager.getParticipant('room-delayed-guard', 'u-1')?.socketId).toBe('sock-1');
+
+        releaseSecond();
+        await second;
+        expect(manager.getRoom('room-delayed-guard')).toBe(originalRoom);
+        expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
+        expect([...manager.getRoom('room-delayed-guard')!.participants.keys()]).toEqual([
+          'u-1',
+          'u-2',
+        ]);
+      } finally {
+        (mockedConfig as { roomPlacementEnabled?: boolean }).roomPlacementEnabled = false;
+      }
+    });
+
     it('counts a pending owner read and never leaves a gate after a refusal', async () => {
       let releaseOwnerRead!: () => void;
       const ownerRead = new Promise<void>((resolve) => {

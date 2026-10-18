@@ -3850,7 +3850,7 @@ class VoiceService {
       }
 
       // joinInFlight prevents a successor join while cleanup awaits resource teardown.
-      await this.cleanup();
+      await this.cleanup(true);
       if (!this.joinInFlight || !this.ownsInitialJoin(roomId) || this.socket) {
         throw new E2EEInitializationSupersededError();
       }
@@ -4090,7 +4090,7 @@ class VoiceService {
     if (this.socket?.connected) {
       this.socket.emit('leave-room');
     }
-    await this.cleanup();
+    await this.cleanup(opts?.internalRebuild === true);
 
     notificationSoundService.stopAllLoops();
     // Silent during the legacy-fallback rebuild — the user is not leaving.
@@ -11473,7 +11473,7 @@ class VoiceService {
     });
   }
 
-  private async cleanup(): Promise<void> {
+  private async cleanup(preserveTestSuspension = false): Promise<void> {
     this.clearAuthRenewalRetry();
     this.mediaHandshake = null;
     // Invalidate asynchronous crypto work and drop the live rotation listener
@@ -11514,7 +11514,7 @@ class VoiceService {
     this.consumers.clear();
     this.decoderBudgetSampler.clear();
     this.consumerMeta.clear();
-    this.testSuspensionDepth = 0;
+    if (!preserveTestSuspension) this.testSuspensionDepth = 0;
     this.testSuspendedProducerIds.clear();
     this.testSuspendedConsumerIds.clear();
     this.testRestoreEligibleProducerIds.clear();

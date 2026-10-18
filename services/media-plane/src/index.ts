@@ -2366,11 +2366,11 @@ async function main() {
   // allowing the control plane to delete stale voice_participants rows.
   let metricsSampling = false; // re-entrancy guard for the async metrics block below
   const roomHeartbeatInterval = setInterval(async () => {
-    const roomIds = roomManager.getRoomIds();
     const acceptingNewRooms = await redisService.refreshAcceptingNewRooms();
     if (config.roomPlacementEnabled && !acceptingNewRooms) {
       await mediasoupService.demoteIdleWorkersToInitial();
     }
+    const roomIds = roomManager.getRoomIds();
     await redisService.heartbeatRoomOccupancy(roomIds);
     for (const roomId of roomIds) {
       const room = roomManager.getRoom(roomId);

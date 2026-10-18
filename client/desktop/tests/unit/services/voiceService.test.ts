@@ -2062,6 +2062,171 @@ describe('VoiceService', () => {
   });
 
   describe('network-change recovery (#1790)', () => {
+    it('keeps the call microphone paused until an output test releases it during ownership rebuild', async () => {
+      const { renderHook, act } = await import('@testing-library/react');
+      const { useOutputTest } = await import('@/renderer/hooks/device/useOutputTest');
+      await joinVoiceChannel();
+      useVoiceStore.setState({ audioOutputDeviceId: 'speaker-1' });
+      const pendingSink = deferred<void>();
+      const savedAudio = globalThis.Audio;
+      const oscillator = {
+        frequency: { value: 0 },
+        connect: vi.fn(),
+        start: vi.fn(),
+        stop: vi.fn(),
+      };
+      Object.assign(MockAudioContext.prototype, { createOscillator: () => oscillator });
+      Object.assign(mockGainNode.gain, {
+        setValueAtTime: vi.fn(),
+        linearRampToValueAtTime: vi.fn(),
+      });
+      globalThis.Audio = class {
+        srcObject = null;
+        setSinkId = vi.fn(() => pendingSink.promise);
+        play = vi.fn().mockResolvedValue(undefined);
+        pause = vi.fn();
+      } as unknown as typeof Audio;
+      const { result, unmount } = renderHook(() => useOutputTest());
+      let starting!: Promise<void>;
+      try {
+        act(() => {
+          starting = result.current.playTestTone();
+        });
+        expect((voiceService as any).testSuspensionDepth).toBe(1);
+        mockApiFetch.mockResolvedValue({ ok: true, json: async () => makeJoinResponse() });
+        const sendTransport = makeSendTransport();
+        mockCreateSendTransport.mockReturnValue(sendTransport);
+        mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+        mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+        const rebuiltMic = createMockProducer('prod-mic-output-test', 'mic');
+        rebuiltMic.pause.mockImplementation(() => {
+          rebuiltMic.paused = true;
+        });
+        rebuiltMic.resume.mockImplementation(() => {
+          rebuiltMic.paused = false;
+        });
+        sendTransport.produce.mockResolvedValue(rebuiltMic);
+        setupEmitResponses({
+          'join-room': makeRoomJoined(),
+          'create-transport': makeTransportOpts(),
+          produce: { id: rebuiltMic.id },
+          'resume-consumer': undefined,
+          'leave-room': undefined,
+        });
+        let joinAttempts = 0;
+        const normalEmit = mockSocket.emit.getMockImplementation();
+        mockSocket.emit.mockImplementation((event, data, callback) => {
+          if (event === 'join-room') {
+            callback?.(
+              ++joinAttempts === 1
+                ? { error: 'Ownership changed', code: 'room_owner_mismatch' }
+                : makeRoomJoined()
+            );
+            return;
+          }
+          normalEmit?.(event, data, callback);
+        });
+        socketListeners.disconnect?.forEach((cb) => cb('transport close'));
+        await reconnectMockSocket();
+        await vi.waitFor(() => expect(useVoiceStore.getState().connectionState).toBe('connected'));
+        expect(
+          rebuiltMic.resume,
+          'replacement microphone resumed during the output test'
+        ).not.toHaveBeenCalled();
+        expect((voiceService as any).testSuspensionDepth).toBe(1);
+
+        act(() => result.current.stopTest());
+        expect((voiceService as any).testSuspensionDepth).toBe(0);
+        expect(rebuiltMic.resume).toHaveBeenCalledTimes(1);
+        pendingSink.resolve();
+        await starting;
+      } finally {
+        unmount();
+        pendingSink.resolve();
+        await starting;
+        globalThis.Audio = savedAudio;
+        delete (MockAudioContext.prototype as any).createOscillator;
+        delete (mockGainNode.gain as any).setValueAtTime;
+        delete (mockGainNode.gain as any).linearRampToValueAtTime;
+      }
+    });
+
+    it('keeps the call microphone paused until a microphone test releases it during an initial ownership retry', async () => {
+      const { renderHook, act } = await import('@testing-library/react');
+      const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
+      setupAuth();
+      mockSocket.connected = true;
+      useVoiceStore.setState({ audioOutputDeviceId: 'speaker-1' });
+      mockApiFetch.mockResolvedValue({ ok: true, json: async () => makeJoinResponse() });
+      const sendTransport = makeSendTransport();
+      mockCreateSendTransport.mockReturnValue(sendTransport);
+      mockCreateRecvTransport.mockReturnValue(makeRecvTransport());
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
+      const rebuiltMic = createMockProducer('prod-mic-initial-test', 'mic');
+      rebuiltMic.pause.mockImplementation(() => {
+        rebuiltMic.paused = true;
+      });
+      rebuiltMic.resume.mockImplementation(() => {
+        rebuiltMic.paused = false;
+      });
+      sendTransport.produce.mockResolvedValue(rebuiltMic);
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: rebuiltMic.id },
+        'resume-consumer': undefined,
+      });
+      let initialAck: ((response: unknown) => void) | undefined;
+      let joinAttempts = 0;
+      const normalEmit = mockSocket.emit.getMockImplementation();
+      mockSocket.emit.mockImplementation((event, data, callback) => {
+        if (event === 'join-room' && ++joinAttempts === 1) {
+          initialAck = callback;
+          return;
+        }
+        normalEmit?.(event, data, callback);
+      });
+      const joining = voiceService.joinChannel('channel-1');
+      await vi.waitFor(() => expect(initialAck).toEqual(expect.any(Function)));
+      const pendingSink = deferred<void>();
+      const setSinkId = vi.fn(() => pendingSink.promise);
+      const savedAudio = globalThis.Audio;
+      globalThis.Audio = class {
+        srcObject = null;
+        setSinkId = setSinkId;
+        play = vi.fn().mockResolvedValue(undefined);
+        pause = vi.fn();
+      } as unknown as typeof Audio;
+      const { result, unmount } = renderHook(() => useMicTest());
+      let starting!: Promise<void>;
+      try {
+        act(() => {
+          starting = result.current.startTest();
+        });
+        await vi.waitFor(() => expect(setSinkId).toHaveBeenCalled());
+        expect((voiceService as any).testSuspensionDepth).toBe(1);
+        initialAck?.({ error: 'Ownership changed', code: 'room_owner_mismatch' });
+        await joining;
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+        expect(
+          rebuiltMic.resume,
+          'replacement microphone resumed during the microphone test'
+        ).not.toHaveBeenCalled();
+        expect((voiceService as any).testSuspensionDepth).toBe(1);
+
+        act(() => result.current.stopTest());
+        expect((voiceService as any).testSuspensionDepth).toBe(0);
+        expect(rebuiltMic.resume).toHaveBeenCalledTimes(1);
+        pendingSink.resolve();
+        await starting;
+      } finally {
+        unmount();
+        pendingSink.resolve();
+        await starting;
+        globalThis.Audio = savedAudio;
+      }
+    });
+
     it('does not rebuild over a same-channel successor socket after a delayed refusal', async () => {
       await joinVoiceChannel();
       mockApiFetch.mockResolvedValue({

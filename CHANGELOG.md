@@ -14,6 +14,7 @@ adjustment when automatic gain is off. Calls and Microphone Test share
 microphone processing, with a sample-peak ceiling while automatic gain is on.
 The noise gate can now adapt during a call or Microphone Test, or use a fixed
 threshold you set yourself.
+Call recovery keeps the call microphone paused until a microphone or output test ends.
 The desktop also includes a patched
 source-map-js dependency. Local camera previews stay
 visible during producer swaps, and a remote tile returns when its replacement
@@ -79,6 +80,7 @@ you verify your email.
 
 ### Fixed
 
+- **Blue/green retries preserve call and room ownership** (internal development reference omitted) — the call microphone stays paused during microphone and output tests through an initial ownership retry or internal reconnect. Concurrent room placement waits recheck for a room created by the first caller, so they cannot replace its participants. Heartbeats take their room snapshot after drain and demotion checks, so a room closed during those waits is not advertised again. Both drained-readiness probes use Node's bounded fetch, preserving the response body for the expected 503 and refusing other statuses or network failures. Blue/green remains off by default and first activation still requires separate verification.
 - **TURN relay peer filtering** — correct an IPv6 loopback deny range that also matched IPv4 peers, causing authenticated relay setup to succeed while relayed traffic failed. Private and loopback peer restrictions remain in place.
 - **Real-time access expires with your sign-in** (internal development reference omitted) — control connections close when their access token expires. Active calls keep their media connection when the desktop renews a valid token; a renewed token must still belong to the same live session and retain access to the channel.
 - **Chat resists stalls under excessive connection traffic** (internal development reference omitted) — the server slows excess events from each connection while keeping them in order. If direct-message delivery is overloaded, a new message is rejected before it is saved so the sender can retry. A typing indicator may be skipped if its queue is full; a connection that cannot receive a required acknowledgement closes and can reconnect.
