@@ -233,6 +233,8 @@ services:
       # stack that forgets it meets the production guards. The production,
       # staging and ZAP overlays name it; a dev run exports ENVIRONMENT=development.
       ENVIRONMENT: ${ENVIRONMENT:-production}
+      INSTANCE_TYPE: ${INSTANCE_TYPE:-saas}
+      SITE_ID: ${SITE_ID:-}
       DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:?}@postgres:5432/concord?sslmode=disable
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
       NATS_URL: nats://nats:4222
@@ -346,6 +348,9 @@ services:
     # Keep Docker's SIGKILL deadline after both windows.
     stop_grace_period: 45s
     environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      INSTANCE_TYPE: ${INSTANCE_TYPE:-saas}
+      SITE_ID: ${SITE_ID:-}
       CONTROL_PLANE_URL: http://control-plane:8080
       NATS_URL: nats://nats:4222
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379

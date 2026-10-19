@@ -5,6 +5,34 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="${SCRIPT_DIR}/../.."
+CONFIG_ROOT="${DEPLOY_DIR}"
+CONFIG_DEPLOY_DIR="${SCRIPT_DIR}"
+STAGE_RELEASE_MODE=0
+
+# The staged app helper invokes only a verified, immutable source snapshot.
+# Recognize that one closed path shape here; never accept a caller-supplied
+# source/config root. A malformed path in the reserved release namespace must
+# fail closed instead of falling through to the ordinary managed deployment.
+if [[ "$SCRIPT_DIR" == /opt/concord-west-stage/releases/*/infrastructure/deploy ]]; then
+  if [[ ! "$SCRIPT_DIR" =~ ^/opt/concord-west-stage/releases/[0-9a-f]{40}/infrastructure/deploy$ \
+     || -L "${BASH_SOURCE[0]}" || ! -f "${BASH_SOURCE[0]}" ]]; then
+    echo 'west-stage: malformed immutable release controller path; refusing deployment' >&2
+    exit 1
+  fi
+  STAGE_RELEASE_MODE=1
+  CONFIG_ROOT=/opt/concord
+  CONFIG_DEPLOY_DIR=/opt/concord/infrastructure/deploy
+elif [[ "$SCRIPT_DIR" == /opt/concord-west-stage/releases/* ]]; then
+  echo 'west-stage: controller is outside the admitted immutable release layout; refusing deployment' >&2
+  exit 1
+fi
+if (( STAGE_RELEASE_MODE )) && [[ "${1:-help}" == freshstart ]]; then
+  echo 'west-stage: freshstart is not admitted for an immutable stage release' >&2
+  exit 1
+fi
+
+# The snapshot contains immutable source/build inputs; runtime config and state
+# stay in the canonical managed deployment. Preserve ordinary managed path bytes.
 
 # Capture the caller-requested contract before sourcing any host file. A
 # managed deploy.env.local must never be able to switch the controller into the
@@ -14,8 +42,21 @@ ACTIVITY_HISTORY_REQUESTED_CONTRACT_MODE="${ACTIVITY_HISTORY_CONTRACT_MODE-}"
 ACTIVITY_HISTORY_REQUESTED_COMPOSE_OVERRIDE="${COMPOSE_OVERRIDE-}"
 ACTIVITY_HISTORY_REQUESTED_COMPOSE_PROFILES="${COMPOSE_PROFILES-}"
 
+if (( STAGE_RELEASE_MODE )); then
+  if [[ -n "$ACTIVITY_HISTORY_REQUESTED_CONTRACT_MODE" \
+     && "$ACTIVITY_HISTORY_REQUESTED_CONTRACT_MODE" != managed ]]; then
+    echo 'west-stage: immutable stage release refuses caller contract-mode overrides' >&2
+    exit 1
+  fi
+  if [[ -n "$ACTIVITY_HISTORY_REQUESTED_COMPOSE_OVERRIDE" \
+     && "$ACTIVITY_HISTORY_REQUESTED_COMPOSE_OVERRIDE" != docker-compose.west-staging.yml ]]; then
+    echo 'west-stage: immutable stage release refuses caller Compose overrides' >&2
+    exit 1
+  fi
+fi
+
 if [[ "$ACTIVITY_HISTORY_REQUESTED_CONTRACT_MODE" == selfhost \
-   && -e "${SCRIPT_DIR}/deploy.env.local" ]]; then
+   && -e "${CONFIG_DEPLOY_DIR}/deploy.env.local" ]]; then
   echo "activity-history: self-host contract refuses deploy.env.local" >&2
   exit 1
 fi
@@ -26,8 +67,8 @@ fi
 if [[ -f "${SCRIPT_DIR}/deploy.env" ]]; then
   source "${SCRIPT_DIR}/deploy.env"
 fi
-if [[ -f "${SCRIPT_DIR}/deploy.env.local" ]]; then
-  source "${SCRIPT_DIR}/deploy.env.local"
+if [[ -f "${CONFIG_DEPLOY_DIR}/deploy.env.local" ]]; then
+  source "${CONFIG_DEPLOY_DIR}/deploy.env.local"
 fi
 
 # Keep the values sourced from the canonical application-env writer separate
@@ -37,6 +78,31 @@ ACTIVITY_HISTORY_DEPLOY_WRITER_GATE="${ACTIVITY_HISTORY_CLUSTER_ENABLED-}"
 ACTIVITY_HISTORY_DEPLOY_WRITER_REPLICAS="${CONTROL_PLANE_REPLICA_COUNT-}"
 ACTIVITY_HISTORY_DEPLOY_WRITER_OPERATOR_NAME="${ACTIVITY_HISTORY_OPERATOR_NAME-}"
 ACTIVITY_HISTORY_DEPLOY_WRITER_PRIVACY_POLICY_URL="${ACTIVITY_HISTORY_PRIVACY_POLICY_URL-}"
+
+# Read one simple inventory identity from either canonical writer file without
+# sourcing or decoding shell/Compose expressions. Writers may wrap these
+# restricted tokens in @Q single quotes (deploy.env.local) or Compose double
+# quotes (.env); no escapes or interpolation are admitted for identity fields.
+canonical_identity_value() {
+  local file="$1" key="$2" line count=0 value=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "${key}"=*) count=$((count + 1)); value="${line#*=}" ;;
+    esac
+  done < "$file"
+  [[ "$count" == 1 && -n "$value" ]] || return 1
+  if [[ "$value" =~ ^\'([A-Za-z0-9._-]+)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  elif [[ "$value" =~ ^\"([A-Za-z0-9._-]+)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  elif [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    :
+  else
+    return 1
+  fi
+  printf '%s' "$value"
+}
 
 ACTIVITY_HISTORY_CONTRACT_MODE="${ACTIVITY_HISTORY_REQUESTED_CONTRACT_MODE:-managed}"
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
@@ -54,8 +120,13 @@ fi
 DEPLOY_REPO="${DEPLOY_REPO:-https://github.com/Concord-Voice/Concord-Voice.git}"
 COMPOSE_OVERRIDE="${COMPOSE_OVERRIDE:-docker-compose.staging.yml}"
 COMPOSE_ENV_FILE_ARG=""
+COMPOSE_PRODUCTION_ARG=""
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] \
-  && COMPOSE_ENV_FILE_ARG="--env-file ${DEPLOY_DIR}/.env"
+  && COMPOSE_ENV_FILE_ARG="--env-file ${CONFIG_ROOT}/.env"
+if (( STAGE_RELEASE_MODE )); then
+  COMPOSE_OVERRIDE=docker-compose.west-staging.yml
+  COMPOSE_ENV_FILE_ARG="--env-file /opt/concord/.env"
+fi
 # Self-host published-port posture (#3538). Reset AFTER deploy.env/deploy.env.local
 # are sourced, so neither can set or suppress it.
 COMPOSE_SELFHOST_ARG=""
@@ -63,15 +134,58 @@ COMPOSE_SELFHOST_ARG=""
   && COMPOSE_SELFHOST_ARG=" -f ${DEPLOY_DIR}/docker-compose.selfhost.yml"
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   MEDIA_DEPLOY_PROFILE=media-single
+  COMPOSE_PROJECT_ARG=""
+elif [[ "$COMPOSE_OVERRIDE" == docker-compose.west-staging.yml ]]; then
+  # A third Compose layer is privileged West-only state. Bind it to both
+  # canonical writer files before any controller command can use it.
+  stage_identity_value() {
+    canonical_identity_value "$1" "$2"
+  }
+  stage_env_file="${CONFIG_ROOT}/.env"
+  stage_deploy_file="${CONFIG_DEPLOY_DIR}/deploy.env.local"
+  stage_identity_keys=(DEPLOY_TARGET_ID DEPLOY_ROLE SITE_ID DEPLOY_CANONICAL_HOST PUBLIC_IP ENVIRONMENT DOMAIN STAGE_PRIVATE_ADDRESS)
+  stage_values=()
+  for stage_key in "${stage_identity_keys[@]}"; do
+    if ! stage_value="$(stage_identity_value "$stage_env_file" "$stage_key")" \
+       || ! deploy_value="$(stage_identity_value "$stage_deploy_file" "$stage_key")"; then
+      echo 'west-stage: canonical deployment identity is missing or ambiguous; refusing Compose selection' >&2
+      exit 1
+    fi
+    [[ "$stage_value" == "$deploy_value" ]] \
+      || { echo "west-stage: $stage_key differs between canonical writer files; refusing Compose selection" >&2; exit 1; }
+    stage_values+=("$stage_value")
+  done
+  stage_target=${stage_values[0]}
+  stage_role=${stage_values[1]}
+  stage_site=${stage_values[2]}
+  stage_host=${stage_values[3]}
+  stage_public_ip=${stage_values[4]}
+  stage_environment=${stage_values[5]}
+  stage_domain=${stage_values[6]}
+  stage_private_address=${stage_values[7]}
+  [[ "$(stage_identity_value "$stage_deploy_file" COMPOSE_OVERRIDE)" == docker-compose.west-staging.yml ]] \
+    || { echo 'west-stage: deploy.env.local does not select the West staging overlay; refusing Compose selection' >&2; exit 1; }
+  if [[ "$stage_target" != west-stage-1 || "$stage_role" != stage \
+     || "$stage_site" != us-west || "$stage_host" != 15.204.77.113 \
+     || "$stage_public_ip" != 15.204.77.113 || "$stage_environment" != production \
+     || "$stage_domain" != staging.concordvoice.chat || "$stage_private_address" != 10.246.6.1 ]]; then
+    echo 'west-stage: canonical target, role, site, host, domain, alias or runtime mode does not match; refusing Compose selection' >&2
+    exit 1
+  fi
+  MEDIA_DEPLOY_PROFILE=media-single
+  COMPOSE_PROJECT_ARG=" -p concord-west-stage"
+  COMPOSE_PRODUCTION_ARG=" -f ${DEPLOY_DIR}/docker-compose.production.yml"
 elif [[ "$COMPOSE_OVERRIDE" == docker-compose.production.yml \
      || "$COMPOSE_OVERRIDE" == docker-compose.staging.yml ]]; then
   MEDIA_DEPLOY_PROFILE="${MEDIA_DEPLOY_PROFILE:-media-single}"
+  COMPOSE_PROJECT_ARG=""
   case "$MEDIA_DEPLOY_PROFILE" in
     media-single|media-bluegreen) ;;
     *) echo 'media-bluegreen: invalid media deployment profile' >&2; exit 2 ;;
   esac
 else
   MEDIA_DEPLOY_PROFILE=media-single
+  COMPOSE_PROJECT_ARG=""
 fi
 if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
   COMPOSE_PROFILE_ARGS="--profile media-bluegreen"
@@ -83,14 +197,46 @@ else
   fi
 fi
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] || export COMPOSE_PROFILES
-
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
   # Managed filesystem and daemon operations must address the same host.
   unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   export DOCKER_HOST=unix:///var/run/docker.sock
 fi
-COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG} -f ${DEPLOY_DIR}/docker-compose.yml -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG} ${COMPOSE_PROFILE_ARGS}"
+COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG}${COMPOSE_PROJECT_ARG} -f ${DEPLOY_DIR}/docker-compose.yml${COMPOSE_PRODUCTION_ARG} -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG} ${COMPOSE_PROFILE_ARGS}"
 
+# Read managed fleet identity as inert data. These values are intentionally
+# simple inventory tokens; do not source either canonical writer file here.
+managed_identity_value() {
+  canonical_identity_value "$1" "$2"
+}
+
+managed_core_identity_admit() {
+  local key root_value deploy_value expected
+  [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
+     && "$COMPOSE_OVERRIDE" == docker-compose.production.yml ]] || {
+    echo 'managed-core: production nginx requires the managed production Compose selection' >&2
+    return 1
+  }
+  for key in DEPLOY_TARGET_ID DEPLOY_ROLE SITE_ID DEPLOY_CANONICAL_HOST PUBLIC_IP ENVIRONMENT DOMAIN; do
+    case "$key" in
+      DEPLOY_TARGET_ID) expected=east-core-1 ;;
+      DEPLOY_ROLE) expected=core ;;
+      SITE_ID) expected=us-east ;;
+      DEPLOY_CANONICAL_HOST|PUBLIC_IP) expected=15.204.207.82 ;;
+      ENVIRONMENT) expected=production ;;
+      DOMAIN) expected=concordvoice.chat ;;
+    esac
+    if ! root_value="$(managed_identity_value "${CONFIG_ROOT}/.env" "$key")" \
+       || ! deploy_value="$(managed_identity_value "${CONFIG_DEPLOY_DIR}/deploy.env.local" "$key")"; then
+      echo 'managed-core: canonical deployment identity is missing or ambiguous; refusing nginx activation' >&2
+      return 1
+    fi
+    [[ "$root_value" == "$expected" && "$deploy_value" == "$expected" ]] || {
+      echo "managed-core: $key does not match the admitted East core identity in both canonical writer files; refusing nginx activation" >&2
+      return 1
+    }
+  done
+}
 # Self-host commands, including internal renders and probes, dispatch through
 # their existing argv-based runner.
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
@@ -312,8 +458,8 @@ selfhost_post_up_check() {
 if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   selfhost_port_posture_gate || exit 1
 fi
-ACTIVITY_HISTORY_IMAGE_SELECTOR="${SCRIPT_DIR}/.env.activity-history-image.local"
-ACTIVITY_HISTORY_ACTIVATION_RECEIPT="${SCRIPT_DIR}/.env.activity-history-receipt.local"
+ACTIVITY_HISTORY_IMAGE_SELECTOR="${CONFIG_DEPLOY_DIR}/.env.activity-history-image.local"
+ACTIVITY_HISTORY_ACTIVATION_RECEIPT="${CONFIG_DEPLOY_DIR}/.env.activity-history-receipt.local"
 ACTIVITY_HISTORY_IMAGE_SELECTOR_LOADED=0
 ACTIVITY_HISTORY_IMAGE_SELECTOR_SELECTED=0
 ACTIVITY_HISTORY_ROLLBACK_CHECKPOINT_IMAGE=""
@@ -436,7 +582,7 @@ dump_health_diagnostics() {
 }
 
 activity_history_read_root_value() {
-  local key="$1" file="${DEPLOY_DIR}/.env" count value
+  local key="$1" file="${CONFIG_ROOT}/.env" count value
   [[ -f "$file" ]] || return 1
   count="$(grep -cE "^${key}=" "$file" 2>/dev/null || true)"
   [[ "$count" == 1 ]] || return 1
@@ -450,7 +596,7 @@ activity_history_read_root_value() {
 install_attachment_probe_cron() {
   local marker='concord-ctl.sh attachment-probe'
   local current
-  local line="30 2 * * * ${DEPLOY_DIR}/[internal]concord-ctl.sh attachment-probe --backend r2-useast >> ${DEPLOY_DIR}/logs/attachment-probe.log 2>&1 && rm -f ${DEPLOY_DIR}/logs/attachment-probe-alert.flag || echo \"attachment-probe failed at \$(date -Is)\" > ${DEPLOY_DIR}/logs/attachment-probe-alert.flag"
+  local line="30 2 * * * ${DEPLOY_DIR}/[internal]concord-ctl.sh attachment-probe --backend r2-useast >> ${CONFIG_ROOT}/logs/attachment-probe.log 2>&1 && rm -f ${CONFIG_ROOT}/logs/attachment-probe-alert.flag || echo \"attachment-probe failed at \$(date -Is)\" > ${CONFIG_ROOT}/logs/attachment-probe-alert.flag"
   if ! current="$(LC_ALL=C crontab -l 2>&1)"; then
     if [[ "$current" != *"no crontab for"* ]]; then
       echo "attachment-probe-cron-install: could not read the existing crontab: $current" >&2
@@ -526,11 +672,11 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
 activity_history_load_contract() {
   local root_gate root_replicas instance_type
   local mode="${ACTIVITY_HISTORY_CONTRACT_MODE:-managed}"
-  local deploy_file="${SCRIPT_DIR}/deploy.env.local"
+  local deploy_file="${CONFIG_DEPLOY_DIR}/deploy.env.local"
   if ! root_gate="$(activity_history_read_root_value ACTIVITY_HISTORY_CLUSTER_ENABLED)" \
      || ! root_replicas="$(activity_history_read_root_value CONTROL_PLANE_REPLICA_COUNT)" \
-     || [[ "$(grep -cE '^ACTIVITY_HISTORY_OPERATOR_NAME=' "${DEPLOY_DIR}/.env" 2>/dev/null || true)" != 1 ]] \
-     || [[ "$(grep -cE '^ACTIVITY_HISTORY_PRIVACY_POLICY_URL=' "${DEPLOY_DIR}/.env" 2>/dev/null || true)" != 1 ]]; then
+     || [[ "$(grep -cE '^ACTIVITY_HISTORY_OPERATOR_NAME=' "${CONFIG_ROOT}/.env" 2>/dev/null || true)" != 1 ]] \
+     || [[ "$(grep -cE '^ACTIVITY_HISTORY_PRIVACY_POLICY_URL=' "${CONFIG_ROOT}/.env" 2>/dev/null || true)" != 1 ]]; then
     echo "activity-history: canonical root .env contract is missing or duplicated" >&2
     return 1
   fi
@@ -1357,6 +1503,8 @@ voice_enforcement_rollout_deploy() {
     echo "Usage: concord-ctl.sh voice-enforcement-rollout deploy" >&2
     return 2
   }
+  local -a restore_pull=()
+  [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]] || restore_pull=(--pull never)
 
   # The paired rollout always replaces the control-plane image.  Do not let a
   # stale Activity History rollback pin silently select an old digest here.
@@ -1365,8 +1513,10 @@ voice_enforcement_rollout_deploy() {
   # Build first so the new image owns the migration and the compatibility
   # default before any media handoff.  The explicit deactivation follows CP
   # readiness because the rollout singleton is created by CP startup migration.
-  echo "voice-enforcement-rollout: building the new control-plane image"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane)
+  if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
+    echo "voice-enforcement-rollout: building the new control-plane image"
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane)
+  fi
   # Migrations 000165–000166 change privacy and presence defaults. Stop and
   # drain the previous local binary before startup can apply them; older
   # writers must not run beside the new policy. Multi-host deployments must
@@ -1376,7 +1526,7 @@ voice_enforcement_rollout_deploy() {
   activity_history_stop_control_plane || return 1
   privacy_defaults_require_local_control_plane_drained || return 1
   echo "voice-enforcement-rollout: starting the control-plane in compatibility mode"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build "${restore_pull[@]}" --wait \
     --wait-timeout 180 control-plane)
   voice_enforcement_rollout_wait_control_plane
   voice_enforcement_rollout_cli deactivate
@@ -1385,11 +1535,13 @@ voice_enforcement_rollout_deploy() {
   # created or started.  A single compose up for CP+MP has ambiguous ordering
   # and can leave old sockets unregistered during the handoff.
   voice_enforcement_rollout_stop_media
-  echo "voice-enforcement-rollout: building the new media-plane image"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
+  if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
+    echo "voice-enforcement-rollout: building the new media-plane image"
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
+  fi
   echo "voice-enforcement-rollout: starting the new media-plane"
   echo "voice-enforcement-rollout: waiting for media-plane liveness"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build "${restore_pull[@]}" --wait \
     --wait-timeout 180 media-plane)
   echo "voice-enforcement-rollout: waiting for media-plane protocol 3 readiness"
   voice_enforcement_rollout_wait_media
@@ -2031,7 +2183,7 @@ media_bluegreen_reap() {
     return 1
   }
   [[ -n "$keys" ]] || {
-    rm -f "${DEPLOY_DIR}/logs/media-reap-alert.flag" 2>/dev/null || true
+    rm -f "${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
     echo 'media-bluegreen: no drained colors to reap'
     return 0
   }
@@ -2063,20 +2215,21 @@ media_bluegreen_reap() {
     }
   done <<<"$keys"
   if (( rc == 0 )); then
-    rm -f "${DEPLOY_DIR}/logs/media-reap-alert.flag" 2>/dev/null || true
+    rm -f "${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
   else
-    mkdir -p "${DEPLOY_DIR}/logs" 2>/dev/null || true
+    mkdir -p "${CONFIG_ROOT}/logs" 2>/dev/null || true
     printf 'media reaper failed at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-      >"${DEPLOY_DIR}/logs/media-reap-alert.flag" 2>/dev/null || true
+      >"${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
     echo 'media-bluegreen: reap aborted; color remains running for operator inspection' >&2
   fi
   return "$rc"
 }
 
-# Reconcile before managed image builds for every override except canonical
-# staging; an equivalent production path must not skip the closure gate.
+# Reconcile before managed production image builds; immutable West staging and
+# canonical staging must not pull or start production NATS.
 managed_production_nats_reconcile() {
   [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
+     && $STAGE_RELEASE_MODE -eq 0 \
      && "$COMPOSE_OVERRIDE" != docker-compose.staging.yml ]] || return 0
   local container host_config
   if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json 2>/dev/null) \
@@ -2219,9 +2372,143 @@ print(" ".join(sorted(set(s) - closure - excluded)))
 # the handoff #3140 exists to prevent; and `--no-deps` is safe in stage 1
 # because the list is transitively complete, so Compose cannot pull
 # control-plane in early.
+west_stage_volume_owned() {
+  local name=$1 inspected
+  inspected="$(docker volume inspect --format '{{json .}}' "$name" 2>/dev/null)" || return 1
+  printf '%s' "$inspected" | python3 -c '
+import json, sys
+try:
+    volume = json.load(sys.stdin)
+    name = sys.argv[1]
+    labels = volume.get("Labels") or {}
+    if volume.get("Name") != name or volume.get("Driver") != "local":
+        raise ValueError("volume identity")
+    if labels.get("com.docker.compose.project") != "concord-west-stage" \
+            or labels.get("com.docker.compose.volume") != name.removeprefix("concord-west-stage_") \
+            or labels.get("com.concordvoice.environment") != "west-stage":
+        raise ValueError("volume ownership")
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+' "$name"
+}
+
+west_stage_prepare_owned_stack() {
+  (( STAGE_RELEASE_MODE )) || return 0
+
+  local network_name='concord-west-stage_concordvoice-services'
+  local network_json inspected service container volume known_volumes
+  local -a services=(postgres redis nats minio coturn control-plane media-plane)
+  local -a volumes=(postgres-data redis-data nats-data minio-data)
+
+  known_volumes="$(docker volume ls --format '{{.Name}}')" || return 1
+  for volume in "${volumes[@]}"; do
+    if grep -Fxq "concord-west-stage_$volume" <<<"$known_volumes" \
+       && ! west_stage_volume_owned "concord-west-stage_$volume"; then
+      echo "west-stage: foreign stage volume exists; refusing Compose create" >&2
+      return 1
+    fi
+  done
+
+  # Create only stopped containers after the lifecycle/admission gates and
+  # image build. This materializes Compose's actual network and container
+  # configuration without starting, replacing, or removing running resources.
+  if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-build --no-recreate); then
+    echo 'west-stage: could not create the stopped stage resource set; refusing to start services' >&2
+    return 1
+  fi
+
+  for volume in "${volumes[@]}"; do
+    if ! west_stage_volume_owned "concord-west-stage_$volume"; then
+      echo "west-stage: stage volume ownership is invalid; refusing to start services" >&2
+      return 1
+    fi
+  done
+
+  if ! network_json="$(docker network inspect --format '{{json .}}' "$network_name" 2>/dev/null)"; then
+    echo 'west-stage: cannot inspect the stage bridge network; refusing to start services' >&2
+    return 1
+  fi
+  if ! printf '%s' "$network_json" | python3 -c '
+import ipaddress, json, sys
+try:
+    network = json.load(sys.stdin)
+    labels = network.get("Labels") or {}
+    options = network.get("Options") or {}
+    containers = network.get("Containers") or {}
+    expected = {
+        "Name": "concord-west-stage_concordvoice-services",
+        "Driver": "bridge",
+    }
+    if any(network.get(key) != value for key, value in expected.items()):
+        raise ValueError("network identity")
+    if labels.get("com.docker.compose.project") != "concord-west-stage":
+        raise ValueError("project label")
+    if labels.get("com.docker.compose.network") != "concordvoice-services":
+        raise ValueError("network label")
+    if options.get("com.docker.network.bridge.name") != "cvstage0":
+        raise ValueError("bridge option")
+    alias = ipaddress.ip_address("10.246.6.1")
+    subnets = (network.get("IPAM") or {}).get("Config") or []
+    if not subnets or any(alias in ipaddress.ip_network(item["Subnet"], strict=False)
+                          for item in subnets):
+        raise ValueError("stage alias overlaps bridge subnet")
+    allowed = {"concordvoice-" + name for name in (
+        "postgres", "redis", "nats", "minio", "coturn", "control-plane", "media-plane"
+    )}
+    if not isinstance(containers, dict):
+        raise ValueError("network membership")
+    for member in containers.values():
+        name = str(member.get("Name", "")).lstrip("/")
+        if name not in allowed:
+            raise ValueError("foreign network member")
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+'; then
+    echo 'west-stage: stage bridge identity or membership is not exclusively owned; refusing to start services' >&2
+    return 1
+  fi
+
+  if ! ip link show cvstage0 >/dev/null 2>&1; then
+    echo 'west-stage: expected cvstage0 Linux bridge is absent; refusing to start services' >&2
+    return 1
+  fi
+
+  for service in "${services[@]}"; do
+    container="concordvoice-${service}"
+    if ! inspected="$(docker inspect --format '{{json .}}' "$container" 2>/dev/null)"; then
+      echo "west-stage: cannot inspect the admitted ${service} container; refusing to start services" >&2
+      return 1
+    fi
+    if ! printf '%s' "$inspected" | python3 -c '
+import json, sys
+try:
+    container = json.load(sys.stdin)
+    name = str(container.get("Name", "")).lstrip("/")
+    service = sys.argv[1]
+    labels = (container.get("Config") or {}).get("Labels") or {}
+    networks = ((container.get("NetworkSettings") or {}).get("Networks") or {})
+    if name != "concordvoice-" + service:
+        raise ValueError("container name")
+    if labels.get("com.docker.compose.project") != "concord-west-stage":
+        raise ValueError("project label")
+    if labels.get("com.docker.compose.service") != service:
+        raise ValueError("service label")
+    if set(networks) != {"concord-west-stage_concordvoice-services"}:
+        raise ValueError("network membership")
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+' "$service"; then
+      echo "west-stage: ${service} container ownership or network membership is invalid; refusing to start services" >&2
+      return 1
+    fi
+  done
+}
+
 rebuild_unscoped() {
   local rendered plan closure rest
   local -a closure_arr=() rest_arr=()
+  local -a build_flags=(--build)
+  [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]] || build_flags=(--no-build --pull never)
   # stderr is NOT merged: Compose warns on stderr while exiting 0, and a merged
   # warning would corrupt the JSON (same rule as the scoped dependency probe).
   if ! rendered="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json)"; then
@@ -2259,7 +2546,7 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
   # service name may start with `-`, and Compose would read it as a flag.
   if [[ ${#closure_arr[@]} -gt 0 ]]; then
     echo "rebuild: starting the voice services' dependencies: ${closure_arr[*]}"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- \
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d "${build_flags[@]}" --no-deps --wait --wait-timeout 180 -- \
       "${closure_arr[@]}")
   fi
   voice_enforcement_rollout_deploy
@@ -2267,7 +2554,7 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
     # No --wait: coturn's STUN probe flaking would abort a deploy that
     # otherwise succeeded, and post-rsync's wait-healthy follows anyway.
     echo "rebuild: starting the remaining services: ${rest_arr[*]}"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps -- "${rest_arr[@]}")
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d "${build_flags[@]}" --no-deps -- "${rest_arr[@]}")
   fi
 }
 
@@ -2472,7 +2759,7 @@ case "${1:-help}" in
   nginx-reload|sudoers-sync)
     acquire_deploy_transaction_lock "$@"
     ;;
-  rebuild|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap)
+  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -2493,7 +2780,7 @@ case "${1:-help}" in
 esac
 
 case "${1:-help}" in
-  validate-config|rebuild|restart|freshstart|activity-history-activate|activity-history-rollback)
+  validate-config|rebuild|stage-restore|restart|freshstart|activity-history-activate|activity-history-rollback)
     media_shared_listeners_routine_guard || exit 1
     ;;
 esac
@@ -2505,9 +2792,9 @@ case "${1:-help}" in
     echo "=== Concord Service Status ==="
     # NOTE: Branch + commit info no longer surfaced — server has no .git/ post-#848.
     # See `gh api repos/Concord-Voice/Concord-Voice-Alpha/deployments` for deploy history.
-    if [[ -f "${DEPLOY_DIR}/.deploy-meta" ]]; then
+    if [[ -f "${CONFIG_ROOT}/.deploy-meta" ]]; then
       echo "Last deploy:"
-      cat "${DEPLOY_DIR}/.deploy-meta" | sed 's/^/  /'
+      cat "${CONFIG_ROOT}/.deploy-meta" | sed 's/^/  /'
     else
       echo "Last deploy: (no metadata file — first deploy not yet completed)"
     fi
@@ -2560,8 +2847,8 @@ case "${1:-help}" in
     # Release sync status
     echo ""
     echo "=== Release Sync ==="
-    if [[ -f "${DEPLOY_DIR}/releases/.tag" ]]; then
-      echo "  Cached: $(cat "${DEPLOY_DIR}/releases/.tag") ($(ls "${DEPLOY_DIR}/releases/" 2>/dev/null | wc -l) files)"
+    if [[ -f "${CONFIG_ROOT}/releases/.tag" ]]; then
+      echo "  Cached: $(cat "${CONFIG_ROOT}/releases/.tag") ($(ls "${CONFIG_ROOT}/releases/" 2>/dev/null | wc -l) files)"
     else
       echo "  No releases synced"
     fi
@@ -2606,8 +2893,16 @@ case "${1:-help}" in
     echo "Done."
     ;;
 
-  rebuild)
-    shift  # consume "rebuild"
+  rebuild|stage-restore)
+    STAGE_RESTORE_MODE=0
+    if [[ $1 == stage-restore ]]; then
+      [[ $EUID -eq 0 && $STAGE_RELEASE_MODE -eq 1 && $# -eq 1 ]] || {
+        echo 'stage-restore: root and the admitted West stage release are required' >&2
+        exit 2
+      }
+      STAGE_RESTORE_MODE=1
+    fi
+    shift
     # Optional service scope (#2178). `rebuild` with NO arguments rebuilds every
     # service (#3524): the voice services' dependencies, then the paired voice
     # handoff, then the rest. Every out-of-band caller (operator SSH,
@@ -2861,6 +3156,18 @@ else:
     activity_history_routine_guard
     managed_production_nats_reconcile || exit 1
 
+    if (( STAGE_RELEASE_MODE )); then
+      # Build every active stage image before creating the stopped resource
+      # set. The ownership check then observes Compose's actual configuration
+      # before any service can start; all ordinary managed/self-host paths keep
+      # their established build ordering below.
+      if [[ $STAGE_RESTORE_MODE -eq 0 ]] && ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD build); then
+        echo 'west-stage: stage image build failed; refusing to start services' >&2
+        exit 1
+      fi
+      west_stage_prepare_owned_stack || exit 1
+    fi
+
     # Unscoped — or escalated from a scoped call whose peers were not up — runs
     # every service in order (#3524). The image-selector clear happens inside
     # the paired handoff, immediately before the control-plane build.
@@ -3007,18 +3314,18 @@ else:
   attachment-probe)
     shift
     attachment_write_backend=legacy
-    if [[ -f "${DEPLOY_DIR}/.env" ]]; then
-      attachment_write_backend_count="$(grep -cE '^ATTACHMENT_WRITE_BACKEND=' "${DEPLOY_DIR}/.env" 2>/dev/null || true)"
+    if [[ -f "${CONFIG_ROOT}/.env" ]]; then
+      attachment_write_backend_count="$(grep -cE '^ATTACHMENT_WRITE_BACKEND=' "${CONFIG_ROOT}/.env" 2>/dev/null || true)"
       if [[ "$attachment_write_backend_count" == 1 ]]; then
         if ! attachment_write_backend="$(activity_history_read_root_value ATTACHMENT_WRITE_BACKEND)"; then
-          echo "attachment-probe: could not read ATTACHMENT_WRITE_BACKEND from ${DEPLOY_DIR}/.env" >&2
+          echo "attachment-probe: could not read ATTACHMENT_WRITE_BACKEND from ${CONFIG_ROOT}/.env" >&2
           exit 1
         fi
         attachment_write_backend="${attachment_write_backend#"${attachment_write_backend%%[![:space:]]*}"}"
         attachment_write_backend="${attachment_write_backend%"${attachment_write_backend##*[![:space:]]}"}"
         attachment_write_backend="${attachment_write_backend:-legacy}"
       elif [[ "$attachment_write_backend_count" != 0 ]]; then
-        echo "attachment-probe: ATTACHMENT_WRITE_BACKEND is duplicated in ${DEPLOY_DIR}/.env" >&2
+        echo "attachment-probe: ATTACHMENT_WRITE_BACKEND is duplicated in ${CONFIG_ROOT}/.env" >&2
         exit 1
       fi
     fi
@@ -3062,9 +3369,34 @@ else:
     # the service level (systemctl reload SIGHUPs nginx workers).
     #
     # Spec ref: 2026-05-09-919-spa-deploy-trust-chain-design.md §5.9
-    NGINX_SRC="${DEPLOY_DIR}/[internal]nginx/concordvoice.conf"
-    NGINX_RENDER_DIR="${DEPLOY_DIR}/[internal]nginx/.rendered"
-    NGINX_RENDER="${NGINX_RENDER_DIR}/concordvoice.conf"
+    NGINX_STAGE=0
+    NGINX_STAGE_BOOTSTRAP=0
+    if [[ "$COMPOSE_OVERRIDE" == docker-compose.west-staging.yml ]]; then
+      NGINX_STAGE=1
+      if [[ $# -eq 2 && "$2" == --stage-bootstrap ]]; then
+        NGINX_STAGE_BOOTSTRAP=1
+      elif [[ $# -ne 1 ]]; then
+        echo 'Usage: concord-ctl.sh nginx-reload [--stage-bootstrap]' >&2
+        exit 2
+      fi
+    elif [[ $# -ne 1 ]]; then
+      echo 'Usage: concord-ctl.sh nginx-reload' >&2
+      exit 2
+    fi
+    if (( !NGINX_STAGE )) && [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
+      managed_core_identity_admit || exit 1
+    fi
+    if (( NGINX_STAGE )); then
+      NGINX_SRC="${DEPLOY_DIR}/[internal]nginx/west-staging.conf.template"
+    else
+      NGINX_SRC="${DEPLOY_DIR}/[internal]nginx/concordvoice.conf"
+    fi
+    NGINX_RENDER_DIR="${CONFIG_DEPLOY_DIR}/nginx/.rendered"
+    if (( NGINX_STAGE )); then
+      NGINX_RENDER="${NGINX_RENDER_DIR}/west-staging.conf"
+    else
+      NGINX_RENDER="${NGINX_RENDER_DIR}/concordvoice.conf"
+    fi
     NGINX_DST="/etc/nginx/sites-available/concordvoice"
     NGINX_CANDIDATE="/etc/nginx/sites-available/.concordvoice.candidate"
     NGINX_BACKUP="/etc/nginx/sites-available/.concordvoice.backup"
@@ -3080,9 +3412,81 @@ else:
     if [[ ! -f "$NGINX_SRC" ]]; then
       echo "" >&2
       echo "  ✗ nginx-reload: source-of-truth config not found at $NGINX_SRC" >&2
-      echo "    Did the rsync of [internal]nginx/ complete? Check deploy.sh logs." >&2
+      echo "    Did the immutable release copy of [internal]nginx/ complete?" >&2
       exit 1
     fi
+
+    render_west_stage_config() {
+      local tmp cert_dir archive_dir cert key mode san actual expected public_key cert_key cert_path_prefix cert_path_suffix cert_link key_link cert_generation
+      cert_dir=/etc/letsencrypt/live/staging.concordvoice.chat
+      archive_dir=/etc/letsencrypt/archive/staging.concordvoice.chat
+      cert_path_prefix=/etc/letsencrypt/live
+      cert_path_suffix=/staging.concordvoice.chat
+      cert="$cert_dir/fullchain.pem"
+      key="$cert_dir/privkey.pem"
+      if (( NGINX_STAGE_BOOTSTRAP )); then
+        :
+      else
+        cert_link="$(readlink -- "$cert" 2>/dev/null)" || return 1
+        key_link="$(readlink -- "$key" 2>/dev/null)" || return 1
+        [[ -L "$cert" && -L "$key" \
+           && "$cert_link" =~ ^\.\./\.\./archive/staging\.concordvoice\.chat/fullchain([1-9][0-9]*)\.pem$ ]] || {
+          echo '  ✗ nginx-reload: stage certificate or key is missing/unsafe; refusing TLS render' >&2
+          return 1
+        }
+        cert_generation="${BASH_REMATCH[1]}"
+        [[ "$key_link" == "../../archive/staging.concordvoice.chat/privkey${cert_generation}.pem" \
+           && -d "$cert_dir" && ! -L "$cert_dir" && -d "$archive_dir" && ! -L "$archive_dir" \
+           && -f "$archive_dir/fullchain${cert_generation}.pem" \
+           && ! -L "$archive_dir/fullchain${cert_generation}.pem" \
+           && -f "$archive_dir/privkey${cert_generation}.pem" \
+           && ! -L "$archive_dir/privkey${cert_generation}.pem" ]] || {
+          echo '  ✗ nginx-reload: stage certificate lineage is inconsistent' >&2
+          return 1
+        }
+        mode="$(stat -Lc %a -- "$key" 2>/dev/null || stat -L -f %Lp -- "$key" 2>/dev/null)" || return 1
+        [[ "$mode" == 600 ]] || {
+          echo '  ✗ nginx-reload: stage private key must have mode 0600' >&2
+          return 1
+        }
+        openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || {
+          echo '  ✗ nginx-reload: stage certificate is expired or unreadable' >&2
+          return 1
+        }
+        for cert_name in staging.concordvoice.chat api.staging.concordvoice.chat media.staging.concordvoice.chat turn.staging.concordvoice.chat; do
+          openssl x509 -in "$cert" -noout -checkhost "$cert_name" >/dev/null 2>&1 || {
+            echo '  ✗ nginx-reload: stage certificate SAN set is incomplete' >&2
+            return 1
+          }
+        done
+        san="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null)" || return 1
+        actual="$(printf '%s\n' "$san" | grep -oE 'DNS:[A-Za-z0-9.-]+' | LC_ALL=C sort -u)" || true
+        expected=$'DNS:api.staging.concordvoice.chat\nDNS:media.staging.concordvoice.chat\nDNS:staging.concordvoice.chat\nDNS:turn.staging.concordvoice.chat'
+        [[ "$actual" == "$expected" ]] || {
+          echo '  ✗ nginx-reload: stage certificate must contain exactly the four admitted DNS names' >&2
+          return 1
+        }
+        public_key="$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')" || return 1
+        cert_key="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')" || return 1
+        [[ -n "$public_key" && "$public_key" == "$cert_key" ]] || {
+          echo '  ✗ nginx-reload: stage private key does not match the certificate' >&2
+          return 1
+        }
+      fi
+      mkdir -p "$NGINX_RENDER_DIR" || return 1
+      tmp="$(mktemp "${NGINX_RENDER}.tmp.XXXXXX")" || return 1
+      if (( NGINX_STAGE_BOOTSTRAP )); then
+        awk '/^# WEST_STAGE_HTTPS_BEGIN$/ { exit } { print }' "$NGINX_SRC" >"$tmp" || { rm -f "$tmp"; return 1; }
+      else
+        awk '!/^# WEST_STAGE_HTTPS_(BEGIN|END)$/' "$NGINX_SRC" \
+          | sed "s|${cert_path_prefix}${cert_path_suffix}|$cert_dir|g" >"$tmp" \
+          || { rm -f "$tmp"; return 1; }
+      fi
+      if ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$NGINX_RENDER"; then
+        rm -f "$tmp"
+        return 1
+      fi
+    }
 
     # Decode only canonical writer data forms; never source the runtime env
     # file. Supports plain data, Bash @Q single/ANSI-C quoting, and Compose's
@@ -3297,29 +3701,38 @@ else:
       fi
     }
 
-    if ! hsts_header_value="$(read_concord_env_value HSTS_HEADER_VALUE)"; then
+    if (( NGINX_STAGE )); then
+      if ! render_west_stage_config; then
+        echo '  ✗ nginx-reload: stage vhost render/certificate validation failed — refusing to stage nginx' >&2
+        exit 1
+      fi
+    elif ! hsts_header_value="$(read_concord_env_value HSTS_HEADER_VALUE)"; then
       echo "  ✗ nginx-reload: could not safely read HSTS_HEADER_VALUE — REFUSING to stage nginx" >&2
       exit 1
-    fi
-    hsts_header_value="${hsts_header_value:-$HSTS_DEFAULT}"
-    if ! validate_hsts_header_value "$hsts_header_value"; then
-      echo "  ✗ nginx-reload: HSTS_HEADER_VALUE is malformed — REFUSING to stage nginx" >&2
-      exit 1
-    fi
-    if ! render_nginx_config "$hsts_header_value"; then
-      echo "  ✗ nginx-reload: failed to atomically render the nginx HSTS policy — REFUSING to stage nginx" >&2
-      exit 1
+    else
+      hsts_header_value="${hsts_header_value:-$HSTS_DEFAULT}"
+      if ! validate_hsts_header_value "$hsts_header_value"; then
+        echo "  ✗ nginx-reload: HSTS_HEADER_VALUE is malformed — REFUSING to stage nginx" >&2
+        exit 1
+      fi
+      if ! render_nginx_config "$hsts_header_value"; then
+        echo "  ✗ nginx-reload: failed to atomically render the nginx HSTS policy — REFUSING to stage nginx" >&2
+        exit 1
+      fi
     fi
 
     # #1692: render/remove the admin-console vhost from runtime env. The
     # codename host stays out of git; ADMIN_WEBAUTHN_RP_ID in /opt/concord/.env
     # is the deploy-time source, and only ${ADMIN_DOMAIN} is envsubst-expanded.
-    if ! admin_enabled="$(read_concord_env_value ADMIN_CONSOLE_ENABLED)" \
+    if (( NGINX_STAGE )); then
+      admin_desired=absent
+    elif ! admin_enabled="$(read_concord_env_value ADMIN_CONSOLE_ENABLED)" \
        || ! admin_domain="$(read_concord_env_value ADMIN_WEBAUTHN_RP_ID)"; then
       echo "  ✗ nginx-reload: could not safely read admin-console settings — REFUSING to stage nginx" >&2
       exit 1
     fi
 
+    if (( ! NGINX_STAGE )); then
     admin_enabled="${admin_enabled:-false}"
     if [[ ! "$admin_enabled" =~ ^(true|false)$ ]]; then
       echo "  ✗ nginx-reload: ADMIN_CONSOLE_ENABLED must be true or false — REFUSING to stage nginx" >&2
@@ -3355,11 +3768,13 @@ else:
         admin_desired=present
       fi
     fi
+    fi
 
     # Root-owned candidates and hard-link backups live beside their targets.
     # The candidates are inactive until mv(1) atomically replaces each fixed
     # live pathname; hard links preserve the exact previous inode for rollback.
     main_swapped=0
+    main_was_present=0
     admin_mutated=0
     admin_was_present=0
     activation_attempted=0
@@ -3368,14 +3783,18 @@ else:
     cleanup_nginx_candidates() {
       local cleanup_failed=0
       sudo /bin/rm -f -- "$NGINX_CANDIDATE" || cleanup_failed=1
-      sudo /bin/rm -f -- "$ADMIN_CANDIDATE" || cleanup_failed=1
+      if (( ! NGINX_STAGE )); then
+        sudo /bin/rm -f -- "$ADMIN_CANDIDATE" || cleanup_failed=1
+      fi
       return "$cleanup_failed"
     }
 
     cleanup_nginx_backups() {
       local cleanup_failed=0
       sudo /bin/rm -f -- "$NGINX_BACKUP" || cleanup_failed=1
-      sudo /bin/rm -f -- "$ADMIN_BACKUP" || cleanup_failed=1
+      if (( ! NGINX_STAGE )); then
+        sudo /bin/rm -f -- "$ADMIN_BACKUP" || cleanup_failed=1
+      fi
       return "$cleanup_failed"
     }
 
@@ -3397,7 +3816,11 @@ else:
       local restore_failed=0
       echo "  Restoring the previous nginx configuration" >&2
       if (( main_swapped )); then
-        sudo /usr/bin/mv -fT -- "$NGINX_BACKUP" "$NGINX_DST" || restore_failed=1
+        if (( main_was_present )); then
+          sudo /usr/bin/mv -fT -- "$NGINX_BACKUP" "$NGINX_DST" || restore_failed=1
+        else
+          sudo /bin/rm -f -- "$NGINX_DST" || restore_failed=1
+        fi
       fi
       if (( admin_mutated )); then
         if (( admin_was_present )); then
@@ -3410,7 +3833,9 @@ else:
       # A successful reload/start can make the rejected transaction active.
       # After restoring the files, load the old configuration back into nginx.
       if (( activation_attempted )) && (( restore_failed == 0 )); then
-        if ! sudo /usr/sbin/nginx -t; then
+        if (( NGINX_STAGE_BOOTSTRAP && !main_was_present )); then
+          sudo /bin/systemctl stop nginx || restore_failed=1
+        elif ! sudo /usr/sbin/nginx -t; then
           restore_failed=1
         elif systemctl is-active --quiet nginx; then
           sudo /bin/systemctl reload nginx || restore_failed=1
@@ -3445,7 +3870,7 @@ else:
     }
 
     verify_active_hsts() {
-      local expected="$1" headers line value
+      local expected="$1" probe_host=${2:-api.concordvoice.chat} probe_ip=${3:-127.0.0.1} headers line value
       local count=0
       # HTTP field values use optional whitespace at their boundaries. curl (or
       # nginx) may normalize that OWS, so compare the semantic value rather
@@ -3454,8 +3879,8 @@ else:
       expected="${expected%"${expected##*[![:blank:]]}"}"
       if ! headers="$(curl --noproxy '*' --silent --show-error --insecure \
           --head --http1.1 --max-time 10 \
-          --resolve api.concordvoice.chat:443:127.0.0.1 \
-          https://api.concordvoice.chat/nginx-health)"; then
+          --resolve "$probe_host:443:$probe_ip" \
+          "https://$probe_host/nginx-health")"; then
         return 1
       fi
       while IFS= read -r line || [[ -n "$line" ]]; do
@@ -3471,10 +3896,20 @@ else:
       (( count == 1 ))
     }
 
+    verify_stage_active() {
+      if (( NGINX_STAGE_BOOTSTRAP )); then
+        curl --noproxy '*' --silent --show-error --output /dev/null --max-time 10 \
+          --resolve staging.concordvoice.chat:80:127.0.0.1 \
+          http://staging.concordvoice.chat/.well-known/acme-challenge/concord-stage-probe
+      else
+        verify_active_hsts "$HSTS_DEFAULT" api.staging.concordvoice.chat 10.246.6.1
+      fi
+    }
+
     # A backup can be the only remaining copy after an interrupted rollback.
     # Never classify it as debris: fail closed before any privileged mutation.
     if ! require_nginx_backup_absent "$NGINX_BACKUP" \
-       || ! require_nginx_backup_absent "$ADMIN_BACKUP"; then
+       || { (( ! NGINX_STAGE )) && ! require_nginx_backup_absent "$ADMIN_BACKUP"; }; then
       exit 1
     fi
 
@@ -3498,13 +3933,24 @@ else:
         exit 1
       fi
     fi
-    if ! sudo /usr/bin/ln -fT -- "$NGINX_DST" "$NGINX_BACKUP"; then
+    if sudo /usr/bin/test -e "$NGINX_DST"; then
+      main_was_present=1
+      if ! sudo /usr/bin/ln -fT -- "$NGINX_DST" "$NGINX_BACKUP"; then
+        echo "  ✗ nginx-reload: could not preserve the current main config" >&2
+        cleanup_nginx_candidates || true
+        cleanup_nginx_backups || true
+        exit 1
+      fi
+    elif (( !NGINX_STAGE_BOOTSTRAP )) || ! sudo /usr/bin/test ! -e "$NGINX_DST" \
+         || [[ -L "$NGINX_DST" ]]; then
       echo "  ✗ nginx-reload: could not preserve the current main config" >&2
       cleanup_nginx_candidates || true
       cleanup_nginx_backups || true
       exit 1
     fi
-    if sudo /usr/bin/test -e "$ADMIN_DST"; then
+    if (( NGINX_STAGE )); then
+      :
+    elif sudo /usr/bin/test -e "$ADMIN_DST"; then
       admin_was_present=1
       if ! sudo /usr/bin/ln -fT -- "$ADMIN_DST" "$ADMIN_BACKUP"; then
         echo "  ✗ nginx-reload: could not preserve the current admin config" >&2
@@ -3535,17 +3981,19 @@ else:
       echo "  ✗ nginx-reload: could not atomically activate the main candidate" >&2
       exit 1
     fi
-    admin_mutated=1
-    if [[ "$admin_desired" == present ]]; then
-      if ! sudo /usr/bin/mv -fT -- "$ADMIN_CANDIDATE" "$ADMIN_DST"; then
-        echo "  ✗ nginx-reload: could not atomically activate the admin candidate" >&2
-        exit 1
-      fi
-    else
-      echo "  Removing disabled admin vhost $ADMIN_DST"
-      if ! sudo /bin/rm -f -- "$ADMIN_DST"; then
-        echo "  ✗ nginx-reload: admin vhost removal failed" >&2
-        exit 1
+    if (( ! NGINX_STAGE )); then
+      admin_mutated=1
+      if [[ "$admin_desired" == present ]]; then
+        if ! sudo /usr/bin/mv -fT -- "$ADMIN_CANDIDATE" "$ADMIN_DST"; then
+          echo "  ✗ nginx-reload: could not atomically activate the admin candidate" >&2
+          exit 1
+        fi
+      else
+        echo "  Removing disabled admin vhost $ADMIN_DST"
+        if ! sudo /bin/rm -f -- "$ADMIN_DST"; then
+          echo "  ✗ nginx-reload: admin vhost removal failed" >&2
+          exit 1
+        fi
       fi
     fi
 
@@ -3571,10 +4019,18 @@ else:
       activation_verb=started
     fi
 
-    echo "  Probing active HSTS ownership"
-    if ! verify_active_hsts "$hsts_header_value"; then
-      echo "  ✗ nginx-reload: active /nginx-health did not return exactly one expected HSTS field; rolling back" >&2
-      exit 1
+    if (( NGINX_STAGE )); then
+      echo "  Probing active West stage vhost"
+      if ! verify_stage_active; then
+        echo "  ✗ nginx-reload: active West stage probe failed; rolling back" >&2
+        exit 1
+      fi
+    else
+      echo "  Probing active HSTS ownership"
+      if ! verify_active_hsts "$hsts_header_value"; then
+        echo "  ✗ nginx-reload: active /nginx-health did not return exactly one expected HSTS field; rolling back" >&2
+        exit 1
+      fi
     fi
 
     transaction_pending=0
@@ -3587,7 +4043,11 @@ else:
       echo "    Active configuration was not rolled back; resolve the stale artifact before retrying." >&2
       exit 1
     fi
-    echo "  ✓ nginx config staged + validated + $activation_verb + probed"
+    if (( NGINX_STAGE )); then
+      echo "  ✓ West staging vhost staged + validated + $activation_verb + probed"
+    else
+      echo "  ✓ nginx config staged + validated + $activation_verb + probed"
+    fi
     ;;
 
   sudoers-sync)
@@ -3647,6 +4107,7 @@ else:
     # and 3000 to 127.0.0.1 only, so [::1] is free for any local user to answer a
     # `localhost` probe (curl tries it first) and fake readiness (#3538).
     CP_PROBE_BASE="http://127.0.0.1:8080"
+    COTURN_PROBE_HOST="${stage_private_address:-127.0.0.1}"
     cp_ok=0; mp_ok=0; coturn_ok=0; tls_ok=0
     cp_refresh_skipped=0; mp_refresh_skipped=0; coturn_refresh_skipped=0
     while [[ $(date +%s) -lt $DEADLINE ]]; do
@@ -3665,7 +4126,7 @@ else:
       else
         curl -sf "http://127.0.0.1:3000/health" >/dev/null 2>&1 && mp_ok=1
       fi
-      nc -z -w2 localhost 3478 >/dev/null 2>&1 && coturn_ok=1
+      nc -z -w2 "$COTURN_PROBE_HOST" 3478 >/dev/null 2>&1 && coturn_ok=1
       if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
         tls_ok=1
       else
@@ -3696,7 +4157,7 @@ else:
         if (( _coturn_remaining > 0 )); then
           _coturn_probe_limit=2
           (( _coturn_remaining < _coturn_probe_limit )) && _coturn_probe_limit="$_coturn_remaining"
-          nc -z -w "$_coturn_probe_limit" localhost 3478 >/dev/null 2>&1 && coturn_ok=1
+          nc -z -w "$_coturn_probe_limit" "$COTURN_PROBE_HOST" 3478 >/dev/null 2>&1 && coturn_ok=1
         else
           coturn_refresh_skipped=1
         fi

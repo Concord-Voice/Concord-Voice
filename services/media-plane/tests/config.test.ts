@@ -36,6 +36,8 @@ describe('config', () => {
   beforeEach(() => {
     // Ensure we're in dev mode by default
     delete process.env.ENVIRONMENT;
+    delete process.env.INSTANCE_TYPE;
+    delete process.env.SITE_ID;
     delete process.env.PORT;
     delete process.env['JWT_' + 'SECRET'];
     delete process.env.ANNOUNCED_IP;
@@ -705,18 +707,120 @@ describe('config', () => {
 
   describe('production guard', () => {
     it('calls process.exit(1) in production with default JWT secret', async () => {
-      await loadConfig({ ENVIRONMENT: 'production' });
+      await loadConfig({ ENVIRONMENT: 'production', SITE_ID: 'us-west' });
       expect(process.exit).toHaveBeenCalledWith(1);
     });
 
     it('does NOT call process.exit with custom JWT secret in production', async () => {
-      await loadConfig({ ENVIRONMENT: 'production', ['JWT_' + 'SECRET']: 'my-secure-value' });
+      await loadConfig({
+        ENVIRONMENT: 'production',
+        SITE_ID: 'us-west',
+        ['JWT_' + 'SECRET']: 'my-secure-value',
+      });
       expect(process.exit).not.toHaveBeenCalled();
     });
 
     it('does NOT call process.exit in development with default secret', async () => {
       await loadConfig({ ENVIRONMENT: 'development' });
       expect(process.exit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('SITE_ID runtime identity guard', () => {
+    const valid63 = `a${'x'.repeat(62)}`;
+    const invalid64 = `a${'x'.repeat(63)}`;
+    const managedProduction = {
+      ENVIRONMENT: 'production',
+      INSTANCE_TYPE: 'saas',
+      JWT_SECRET: 'secure-test-jwt', // pragma: allowlist secret -- synthetic test value
+    };
+    const cases = [
+      {
+        name: 'managed production accepts a valid site',
+        env: { ...managedProduction, SITE_ID: 'us-west' },
+        allowed: true,
+        siteId: 'us-west',
+      },
+      { name: 'managed production requires a site', env: managedProduction, allowed: false },
+      {
+        name: 'normalized self-hosted production allows a missing site',
+        env: {
+          ENVIRONMENT: 'production',
+          INSTANCE_TYPE: ' Self-Hosted ',
+          JWT_SECRET: 'secure-test-jwt', // pragma: allowlist secret -- same synthetic test value
+        },
+        allowed: true,
+      },
+      {
+        name: 'normalized self-hosted still rejects an invalid supplied site',
+        env: {
+          ENVIRONMENT: 'production',
+          INSTANCE_TYPE: ' Self-Hosted ',
+          SITE_ID: 'US-WEST',
+          JWT_SECRET: 'secure-test-jwt', // pragma: allowlist secret -- same synthetic test value
+        },
+        allowed: false,
+      },
+      {
+        name: 'unknown instance marker fails safe as managed',
+        env: {
+          ENVIRONMENT: 'production',
+          INSTANCE_TYPE: 'enterprise',
+          JWT_SECRET: 'secure-test-jwt', // pragma: allowlist secret -- same synthetic test value
+        },
+        allowed: false,
+      },
+      {
+        name: '63 character boundary is valid',
+        env: { ...managedProduction, SITE_ID: valid63 },
+        allowed: true,
+        siteId: valid63,
+      },
+      {
+        name: '64 character boundary is invalid',
+        env: { ...managedProduction, SITE_ID: invalid64 },
+        allowed: false,
+      },
+      {
+        name: 'leading hyphen is invalid',
+        env: { ...managedProduction, SITE_ID: '-us-west' },
+        allowed: false,
+      },
+      {
+        name: 'uppercase is invalid',
+        env: { ...managedProduction, SITE_ID: 'US-west' },
+        allowed: false,
+      },
+      {
+        name: 'newline is invalid',
+        env: { ...managedProduction, SITE_ID: 'us-west\n' },
+        allowed: false,
+      },
+      {
+        name: 'whitespace is invalid',
+        env: { ...managedProduction, SITE_ID: 'us-west ' },
+        allowed: false,
+      },
+      {
+        name: 'invalid supplied site is rejected outside production',
+        env: { ENVIRONMENT: 'development', SITE_ID: 'US-west' },
+        allowed: false,
+      },
+      {
+        name: 'development may omit site identity',
+        env: { ENVIRONMENT: 'development' },
+        allowed: true,
+      },
+    ];
+
+    it.each(cases)('$name', async ({ env, allowed, siteId }) => {
+      const { config } = await loadConfig(env);
+      if (allowed) {
+        expect(process.exit).not.toHaveBeenCalled();
+        if (siteId !== undefined) expect(Reflect.get(config, 'siteId')).toBe(siteId);
+      } else {
+        expect(process.exit).toHaveBeenCalledWith(1);
+      }
     });
   });
 });

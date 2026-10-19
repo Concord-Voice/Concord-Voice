@@ -501,6 +501,8 @@ if (sharedWebRtcServerEnabled && !validAnnouncedAddress(process.env.ANNOUNCED_IP
 
 export const config = {
   environment: process.env.ENVIRONMENT || 'development',
+  // Regional identity for the planned P6 director/registry consumer.
+  siteId: process.env.SITE_ID || '',
   port: httpPort,
   // Blue/green enforcement remains inactive for the legacy single-colour
   // deployment until its compose and control-plane gates are enabled together.
@@ -661,6 +663,18 @@ export const config = {
 };
 
 // Production safety guard — mirrors control-plane's config.validate()
+if (config.siteId && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(config.siteId)) {
+  console.error('FATAL: SITE_ID must match the regional identity grammar.');
+  process.exit(1);
+}
+if (
+  config.environment === 'production' &&
+  !config.siteId &&
+  process.env.INSTANCE_TYPE?.trim().toLowerCase() !== 'self-hosted'
+) {
+  console.error('FATAL: SITE_ID is required for managed production.');
+  process.exit(1);
+}
 if (config.environment === 'production' && config.jwtSecret === DEV_JWT_SECRET) {
   console.error(
     'FATAL: JWT_SECRET must be set to a secure value in production. ' +

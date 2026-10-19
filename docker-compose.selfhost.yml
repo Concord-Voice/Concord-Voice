@@ -25,6 +25,9 @@ services:
   redis-commander:
     ports: !reset []
   control-plane:
+    environment:
+      INSTANCE_TYPE: self-hosted
+      SITE_ID: ${SITE_ID:-}
     ports: !override
       - "127.0.0.1:8080:8080"
   media-plane:
@@ -33,6 +36,8 @@ services:
     profiles: !override [services]
     # Match the supported two-CPU self-host floor; workers and quota move together.
     environment:
+      INSTANCE_TYPE: self-hosted
+      SITE_ID: ${SITE_ID:-}
       NUM_WORKERS: "2"
     deploy:
       resources:

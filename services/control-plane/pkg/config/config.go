@@ -29,6 +29,8 @@ const (
 	InstanceTypeSelfHosted = "self-hosted"
 )
 
+var siteIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
 // NormalizeInstanceType returns the only two supported deployment instance
 // types, tolerating casing/whitespace for operator-authored env vars.
 func NormalizeInstanceType(raw string) string {
@@ -198,6 +200,8 @@ func (c CloudflareR2Config) String() string {
 // Config holds all configuration for the application
 type Config struct {
 	Environment string
+	// SiteID is the regional identity consumed by the planned P6 director/registry.
+	SiteID string
 	// HSTSHeaderValue is the Strict-Transport-Security policy the security
 	// middleware emits in production. Optional; empty falls back to the
 	// middleware default. Managed nginx validates the same grammar/default and
@@ -435,6 +439,7 @@ func Load() (*Config, error) {
 		// enrolment, SMTP dev mode). Local development sets it explicitly
 		// (.env.example, concord-dev.sh).
 		Environment:              getEnv("ENVIRONMENT", "production"),
+		SiteID:                   getEnv("SITE_ID", ""),
 		HSTSHeaderValue:          getEnv("HSTS_HEADER_VALUE", ""),
 		Port:                     getEnv("PORT", "8080"),
 		DatabaseURL:              getEnv("DATABASE_URL", defaultDevDatabaseURL()),
@@ -813,6 +818,9 @@ func (c *Config) validate() error {
 	if err := c.validateAttachmentWriteBackend(); err != nil {
 		return err
 	}
+	if err := c.validateSiteID(); err != nil {
+		return err
+	}
 	// #1283 env-integrity invariant. CONCORD_ENV=test enables two test-only
 	// backdoors: auth.isTestEnv() writes the plaintext `test_only:`
 	// verification code, and isE2ETestEnv() (#1277) relaxes the per-IP auth
@@ -828,6 +836,19 @@ func (c *Config) validate() error {
 		return fmt.Errorf("CONCORD_ENV=test is forbidden unless ENVIRONMENT is development or test (got %q); it would relax auth rate limits and leak verification codes", c.Environment)
 	}
 	return c.validateProduction()
+}
+
+func (c *Config) validateSiteID() error {
+	if c.SiteID == "" {
+		if c.Environment == "production" && !IsSelfHostedInstance(c.InstanceType) {
+			return fmt.Errorf("SITE_ID is required for managed services in production")
+		}
+		return nil
+	}
+	if !siteIDPattern.MatchString(c.SiteID) {
+		return fmt.Errorf("SITE_ID must match the regional identity grammar")
+	}
+	return nil
 }
 
 func normalizeAttachmentWriteBackend(raw string) string {

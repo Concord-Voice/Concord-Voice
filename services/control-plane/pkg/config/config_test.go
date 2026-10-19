@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -331,6 +332,7 @@ func validProductionConfig() *Config { // #nosec G101 -- test fixture with fake 
 	redisURL := "redis://:" + testVal + "@redis:6379"                             //nolint:gosec // test fixture
 	return &Config{                                                               //nolint:gosec // G101: test fixture with fake values, not real credentials
 		Environment:      "production",
+		SiteID:           "us-east",
 		JWTSecret:        "real-production-jwt-secret", //nolint:gosec // G101 false positive: test fixture, not a real secret
 		DatabaseURL:      dbURL,
 		RedisURL:         redisURL,
@@ -373,6 +375,59 @@ func TestValidateDevelopmentSkipsAllChecks(t *testing.T) {
 func TestValidateProductionPassesWithValidConfig(t *testing.T) {
 	cfg := validProductionConfig()
 	assert.NoError(t, cfg.validate())
+}
+
+func TestValidateSiteID(t *testing.T) {
+	valid63 := "a" + strings.Repeat("x", 62)
+	invalid64 := "a" + strings.Repeat("x", 63)
+	selfHosted := NormalizeInstanceType(" Self-Hosted ")
+	unknownInstance := NormalizeInstanceType("enterprise")
+	tests := []struct {
+		name        string
+		environment string
+		instance    string
+		value       string
+		wantErr     bool
+	}{
+		{"managed production accepts a valid site", "production", InstanceTypeSaaS, "us-west", false},
+		{"managed production requires a site", "production", InstanceTypeSaaS, "", true},
+		{"explicit normalized self-hosted allows a missing site", "production", selfHosted, "", false},
+		{"explicit normalized self-hosted still rejects an invalid supplied site", "production", selfHosted, "US-WEST", true},
+		{"unknown instance marker fails safe as managed", "production", unknownInstance, "", true},
+		{"63 character boundary is valid", "production", InstanceTypeSaaS, valid63, false},
+		{"64 character boundary is invalid", "production", InstanceTypeSaaS, invalid64, true},
+		{"leading hyphen is invalid", "production", InstanceTypeSaaS, "-us-west", true},
+		{"uppercase is invalid", "production", InstanceTypeSaaS, "US-west", true},
+		{"newline is invalid", "production", InstanceTypeSaaS, "us-west\n", true},
+		{"whitespace is invalid", "production", InstanceTypeSaaS, "us-west ", true},
+		{"invalid supplied site is rejected outside production", "development", InstanceTypeSaaS, "US-west", true},
+		{"development may omit site identity", "development", InstanceTypeSaaS, "", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CONCORD_ENV", "")
+			cfg := validProductionConfig()
+			cfg.Environment = tc.environment
+			cfg.InstanceType = tc.instance
+			field := reflect.ValueOf(cfg).Elem().FieldByName("SiteID")
+			require.True(t, field.IsValid(), "Config must expose the runtime SITE_ID field")
+			require.True(t, field.CanSet(), "Config.SITE_ID must be settable by Load")
+			field.SetString(tc.value)
+
+			err := cfg.validate()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "SITE_ID")
+				if tc.value != "" {
+					assert.NotContains(t, err.Error(), tc.value,
+						"identity diagnostics must not repeat the raw supplied value")
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestValidateProductionRequiresCloudflareR2CredentialsWhileSelectorIsLegacy(t *testing.T) {
