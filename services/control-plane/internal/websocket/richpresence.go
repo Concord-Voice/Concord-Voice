@@ -70,6 +70,9 @@ func (h *Hub) DeliverRichPresence(ctx context.Context, plan presence.DeliveryPla
 
 	disconnected := make(map[*Client]bool)
 	if len(clearData) > 0 {
+		if err := h.disconnectLegacyRichPresenceClients(ctx, plan.ClearRecipients); err != nil {
+			return err
+		}
 		if err := h.deliverPrivacyCriticalToUsersWhere(
 			ctx,
 			plan.ClearRecipients,
@@ -92,6 +95,26 @@ func (h *Hub) DeliverRichPresence(ctx context.Context, plan presence.DeliveryPla
 		}
 	}
 	return nil
+}
+
+// Legacy clients can hold activity from bootstrap, but cannot consume its live
+// clear. Reconnect only those devices in the revoked audience for a fresh snapshot.
+func (h *Hub) disconnectLegacyRichPresenceClients(ctx context.Context, recipients map[uuid.UUID]bool) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var disconnectErr error
+	for userID, included := range recipients {
+		if !included {
+			continue
+		}
+		for clientID := range h.userClients[userID] {
+			client := h.clients[clientID]
+			if client != nil && !activityRichPresenceClient(client) {
+				disconnectErr = errors.Join(disconnectErr, h.disconnectPrivacyCriticalClient(client))
+			}
+		}
+	}
+	return errors.Join(disconnectErr, ctx.Err())
 }
 
 // DeliverRichPresenceClearsThenDisconnect sends committed revocation clears
@@ -170,6 +193,26 @@ func (h *Hub) deliverClearsThenDisconnectUser(
 
 func activityRichPresenceClient(client *Client) bool {
 	return client != nil && client.activityRichPresenceCapable
+}
+
+// RichPresenceClientUserIDs snapshots every local user: even clients without
+// live activity capability can hold a bootstrap projection and need a fresh
+// snapshot after revocation. Cleanup intersects this set with fresh authorization
+// in bounded batches, so offline members cannot exhaust its cap.
+func (h *Hub) RichPresenceClientUserIDs() []uuid.UUID {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	users := make(map[uuid.UUID]bool)
+	for _, client := range h.clients {
+		if client != nil {
+			users[client.UserID] = true
+		}
+	}
+	userIDs := make([]uuid.UUID, 0, len(users))
+	for userID := range users {
+		userIDs = append(userIDs, userID)
+	}
+	return userIDs
 }
 
 // DisconnectRichPresenceClients closes every local device for the included

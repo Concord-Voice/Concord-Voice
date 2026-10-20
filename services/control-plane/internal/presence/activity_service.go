@@ -132,8 +132,8 @@ func NewActivityService(
 		userID uuid.UUID,
 		before, after ActivityPolicySettings,
 	) (activitySettingsRecipients, error) {
-		return computeActivitySettingsRecipients(
-			ctx, dependencies, userID, before, after, false,
+		return computeConnectedActivitySettingsRecipients(
+			ctx, dependencies, delivery, userID, before, after, false,
 		)
 	}
 	// Hidden-sender cleanup can encounter an absent sibling category while the
@@ -144,8 +144,8 @@ func NewActivityService(
 		userID uuid.UUID,
 		before, after ActivityPolicySettings,
 	) (activitySettingsRecipients, error) {
-		return computeActivitySettingsRecipients(
-			ctx, dependencies, userID, before, after, true,
+		return computeConnectedActivitySettingsRecipients(
+			ctx, dependencies, delivery, userID, before, after, true,
 		)
 	}
 	return service

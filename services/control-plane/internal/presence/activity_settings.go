@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 const activitySettingsSuppressionMinimumBudget = 2 * activityCleanupTimeout
@@ -259,6 +260,64 @@ type activitySettingsRecipientDependencies struct {
 	visibility ChannelVisibilityResolver
 	builder    activityBuilder
 	store      *ActivityStore
+	connected  []uuid.UUID
+}
+
+// connectedActivityClientProvider bounds cleanup to clients that can hold a projection.
+// A later registration publishes a freshly authorized snapshot under the sender
+// gate; an already registered bootstrap receives the normal buffered clear.
+type connectedActivityClientProvider interface {
+	RichPresenceClientUserIDs() []uuid.UUID
+}
+
+func computeConnectedActivitySettingsRecipients(
+	ctx context.Context,
+	dependencies activitySettingsRecipientDependencies,
+	delivery Delivery,
+	userID uuid.UUID,
+	before, after ActivityPolicySettings,
+	allowAbsentCategory bool,
+) (activitySettingsRecipients, error) {
+	clients, supported := delivery.(connectedActivityClientProvider)
+	if !supported {
+		return computeActivitySettingsRecipients(ctx, dependencies, userID, before, after, allowAbsentCategory)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dependencies.connected = clients.RichPresenceClientUserIDs()
+	if dependencies.connected == nil {
+		// A supported empty snapshot selects nobody, but still validates the
+		// stored scope and generation before cleanup may delete its evidence.
+		dependencies.connected = []uuid.UUID{}
+	}
+	return computeActivitySettingsRecipients(ctx, dependencies, userID, before, after, allowAbsentCategory)
+}
+
+// resolveConnectedSettingsAudience batches only audience queries/authorization.
+// Scope loading and generation fences surround the whole resolution once.
+// nil retains the legacy bounded audience; an explicit empty slice selects none.
+func resolveConnectedSettingsAudience(
+	ctx context.Context,
+	connected []uuid.UUID,
+	resolve func([]uuid.UUID) (map[uuid.UUID]bool, error),
+) (map[uuid.UUID]bool, error) {
+	if len(connected) == 0 {
+		return resolve(connected)
+	}
+	recipients := make(map[uuid.UUID]bool)
+	for start := 0; start < len(connected); start += activitySettingsRecipientLimit {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := min(start+activitySettingsRecipientLimit, len(connected))
+		batch, err := resolve(connected[start:end])
+		if err != nil {
+			return nil, err
+		}
+		mergeAudience(recipients, batch)
+	}
+	return recipients, nil
 }
 
 func computeActivitySettingsRecipients(
@@ -279,8 +338,8 @@ func computeActivitySettingsRecipients(
 	if err != nil {
 		return nil, err
 	}
-	if err := mergeActiveSettingsRecipients(recipients, CategoryServerVoice, serverRecipients, serverActive); err != nil {
-		return nil, err
+	if serverActive {
+		recipients[CategoryServerVoice] = serverRecipients
 	}
 	privateRecipients, privateActive, err := changedPrivateSettingsRecipients(
 		ctx, dependencies, userID, before, after, allowAbsentCategory,
@@ -288,8 +347,11 @@ func computeActivitySettingsRecipients(
 	if err != nil {
 		return nil, err
 	}
-	if err := mergeActiveSettingsRecipients(recipients, CategoryPrivateCall, privateRecipients, privateActive); err != nil {
-		return nil, err
+	if privateActive {
+		recipients[CategoryPrivateCall] = privateRecipients
+	}
+	if dependencies.connected == nil && len(recipients.union()) > activitySettingsRecipientLimit {
+		return nil, errors.New("rich-presence settings recipient union limit exceeded")
 	}
 	return recipients, nil
 }
@@ -334,22 +396,6 @@ func changedPrivateSettingsRecipients(
 		before.MasterEnabled,
 		allowAbsentCategory,
 	)
-}
-
-func mergeActiveSettingsRecipients(
-	into activitySettingsRecipients,
-	category Category,
-	recipients map[uuid.UUID]bool,
-	active bool,
-) error {
-	if !active {
-		return nil
-	}
-	into[category] = recipients
-	if len(into.union()) > activitySettingsRecipientLimit {
-		return errors.New("rich-presence settings recipient union limit exceeded")
-	}
-	return nil
 }
 
 func serverActivityPolicyChanged(before, after ActivityPolicySettings) bool {
@@ -424,7 +470,7 @@ func currentServerSettingsRecipients(
 		return map[uuid.UUID]bool{}, true, nil
 	}
 	out, err := visibleServerSettingsRecipients(
-		ctx, dependencies.db, dependencies.visibility, userID, serverID, channelID, tier,
+		ctx, dependencies, userID, serverID, channelID, tier,
 	)
 	if err != nil {
 		return nil, false, err
@@ -467,32 +513,33 @@ func loadCurrentServerSettingsActivity(
 
 func visibleServerSettingsRecipients(
 	ctx context.Context,
-	db DBTX,
-	visibility ChannelVisibilityResolver,
+	dependencies activitySettingsRecipientDependencies,
 	userID, serverID, channelID uuid.UUID,
 	tier Tier,
 ) (map[uuid.UUID]bool, error) {
-	candidates, err := serverSettingsCandidates(ctx, db, userID, serverID, tier)
-	if err != nil {
-		return nil, err
-	}
-	if visibility == nil {
-		return nil, errors.New("rich-presence settings channel authorization unavailable")
-	}
-	byText, texts := textIndexedSettingsCandidates(candidates)
-	visible, err := visibility.FilterVisibleUserIDsForChannelFresh(
-		ctx, serverID.String(), channelID.String(), texts,
-	)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[uuid.UUID]bool, len(visible))
-	for _, visibleID := range visible {
-		if candidateID, ok := byText[visibleID]; ok {
-			out[candidateID] = true
+	return resolveConnectedSettingsAudience(ctx, dependencies.connected, func(connected []uuid.UUID) (map[uuid.UUID]bool, error) {
+		candidates, err := serverSettingsCandidates(ctx, dependencies.db, userID, serverID, tier, connected)
+		if err != nil {
+			return nil, err
 		}
-	}
-	return out, nil
+		if dependencies.visibility == nil {
+			return nil, errors.New("rich-presence settings channel authorization unavailable")
+		}
+		byText, texts := textIndexedSettingsCandidates(candidates)
+		visible, err := dependencies.visibility.FilterVisibleUserIDsForChannelFresh(
+			ctx, serverID.String(), channelID.String(), texts,
+		)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[uuid.UUID]bool, len(visible))
+		for _, visibleID := range visible {
+			if candidateID, ok := byText[visibleID]; ok {
+				out[candidateID] = true
+			}
+		}
+		return out, nil
+	})
 }
 
 func textIndexedSettingsCandidates(
@@ -533,12 +580,14 @@ func serverSettingsCandidates(
 	db DBTX,
 	userID, serverID uuid.UUID,
 	tier Tier,
+	connected []uuid.UUID,
 ) (map[uuid.UUID]bool, error) {
 	return queryBoundedSettingsRecipients(ctx, db, `
 		SELECT member.user_id
 		FROM server_members member
 		WHERE member.server_id = $2
 		  AND member.user_id <> $1
+		  AND ($5::uuid[] IS NULL OR member.user_id = ANY($5::uuid[]))
 		  AND ($3 = 2 OR EXISTS (
 			SELECT 1 FROM friendships direct
 			WHERE direct.status = 'accepted'
@@ -577,7 +626,7 @@ func serverSettingsCandidates(
 		  ))
 		ORDER BY member.user_id
 		LIMIT $4
-	`, userID, serverID, tier, activitySettingsRecipientLimit+1)
+	`, userID, serverID, tier, activitySettingsRecipientLimit+1, settingsConnectedCandidateArray(connected))
 }
 
 func currentPrivateSettingsRecipients(
@@ -596,7 +645,7 @@ func currentPrivateSettingsRecipients(
 		return settingsRecipientsWithoutState(
 			ctx, dependencies.db, userID, CategoryPrivateCall, priorEligible, allowAbsentCategory,
 			func() (map[uuid.UUID]bool, error) {
-				return privateSettingsRecipientsFromRow(ctx, dependencies.db, userID, tier)
+				return privateSettingsRecipientsFromRow(ctx, dependencies.db, userID, tier, dependencies.connected)
 			},
 		)
 	}
@@ -627,7 +676,7 @@ func currentPrivateSettingsRecipients(
 		built.Input.PrivateCall.Context.ConversationID != conversationID {
 		return nil, false, errors.New("rich-presence private settings generation changed")
 	}
-	recipients, err := privateSettingsRecipients(ctx, dependencies.db, userID, conversationID, tier)
+	recipients, err := privateSettingsRecipients(ctx, dependencies.db, userID, conversationID, tier, dependencies.connected)
 	if err != nil {
 		return nil, false, err
 	}
@@ -651,6 +700,19 @@ func privateSettingsRecipients(
 	db DBTX,
 	userID, conversationID uuid.UUID,
 	tier Tier,
+	connected []uuid.UUID,
+) (map[uuid.UUID]bool, error) {
+	return resolveConnectedSettingsAudience(ctx, connected, func(batch []uuid.UUID) (map[uuid.UUID]bool, error) {
+		return privateSettingsCandidates(ctx, db, userID, conversationID, tier, batch)
+	})
+}
+
+func privateSettingsCandidates(
+	ctx context.Context,
+	db DBTX,
+	userID, conversationID uuid.UUID,
+	tier Tier,
+	connected []uuid.UUID,
 ) (map[uuid.UUID]bool, error) {
 	return queryBoundedSettingsRecipients(ctx, db, `
 		WITH candidates AS (
@@ -704,9 +766,10 @@ func privateSettingsRecipients(
 		)
 		SELECT user_id FROM candidates
 		WHERE user_id <> $1
+		  AND ($5::uuid[] IS NULL OR user_id = ANY($5::uuid[]))
 		ORDER BY user_id
 		LIMIT $4
-	`, userID, conversationID, tier, activitySettingsRecipientLimit+1)
+	`, userID, conversationID, tier, activitySettingsRecipientLimit+1, settingsConnectedCandidateArray(connected))
 }
 
 // settingsRecipientsWithoutState answers a category with no stored generation.
@@ -823,7 +886,7 @@ func serverSettingsRecipientsFromRow(
 	}
 	voice := built.Input.ServerVoice.Context
 	return visibleServerSettingsRecipients(
-		ctx, dependencies.db, dependencies.visibility, userID, voice.ServerID, voice.ChannelID, tier,
+		ctx, dependencies, userID, voice.ServerID, voice.ChannelID, tier,
 	)
 }
 
@@ -834,6 +897,7 @@ func privateSettingsRecipientsFromRow(
 	db DBTX,
 	userID uuid.UUID,
 	tier Tier,
+	connected []uuid.UUID,
 ) (map[uuid.UUID]bool, error) {
 	var conversationID uuid.UUID
 	var calls int
@@ -847,7 +911,19 @@ func privateSettingsRecipientsFromRow(
 	if calls != 1 {
 		return nil, errors.New("rich-presence private settings scope is not unique")
 	}
-	return privateSettingsRecipients(ctx, db, userID, conversationID, tier)
+	return privateSettingsRecipients(ctx, db, userID, conversationID, tier, connected)
+}
+
+// nil preserves the legacy resolver; a present empty batch selects nobody.
+func settingsConnectedCandidateArray(connected []uuid.UUID) any {
+	if connected == nil {
+		return nil
+	}
+	texts := make([]string, len(connected))
+	for i, userID := range connected {
+		texts[i] = userID.String()
+	}
+	return pq.Array(texts)
 }
 
 func exactCurrentPrivateCallScope(
@@ -961,13 +1037,13 @@ var hiddenSenderWidestPriorSettings = ActivityPolicySettings{
 // this mirrors SuppressAllActivityAlreadyGated, whose caller holds the gate for
 // its own transaction.
 //
-// It delivers clears rather than disconnecting, which is a DELIBERATE divergence
+// Capable clients receive clears; legacy bootstrap holders reconnect because
+// they cannot consume live activity frames. Clear delivery is a deliberate divergence
 // from the #2408 settings-suppression precedent above (spec 3.2.1): total
 // suppression is fully expressible as a clear frame, and disconnecting the
 // sender's audience emits a correlated timing signal on precisely the action the
 // user took in order not to be observed. Disconnect is retained only for the
-// fail-closed paths, where the audience cannot be resolved and a clear therefore
-// cannot be aimed.
+// fail-closed paths and legacy clients that require a replacement snapshot.
 func (s *ActivityService) SuppressHiddenSenderActivityAlreadyGated(
 	ctx context.Context,
 	userID uuid.UUID,

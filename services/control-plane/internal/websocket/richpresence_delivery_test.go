@@ -18,6 +18,74 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRichPresenceClientUserIDs_EmptyHub(t *testing.T) {
+	hub := NewHub(nil, nil)
+	snapshotter, supported := any(hub).(interface {
+		RichPresenceClientUserIDs() []uuid.UUID
+	})
+	require.True(t, supported, "the delivery hub must expose its local Rich Presence clients")
+	assert.Empty(t, snapshotter.RichPresenceClientUserIDs())
+}
+
+func TestRichPresenceClientUserIDs_UniqueConnectedUsersAndDetachedSnapshot(t *testing.T) {
+	hub := NewHub(nil, nil)
+	firstUserID, secondUserID, incapableUserID := uuid.New(), uuid.New(), uuid.New()
+	addClient := func(userID uuid.UUID, capable bool) uuid.UUID {
+		clientID := uuid.New()
+		hub.clients[clientID] = &Client{
+			ID: clientID, UserID: userID, activityRichPresenceCapable: capable,
+		}
+		if hub.userClients[userID] == nil {
+			hub.userClients[userID] = make(map[uuid.UUID]bool)
+		}
+		hub.userClients[userID][clientID] = true
+		return clientID
+	}
+	firstDeviceID := addClient(firstUserID, true)
+	secondDeviceID := addClient(firstUserID, true)
+	legacyDeviceID := addClient(firstUserID, false)
+	addClient(secondUserID, true)
+	addClient(incapableUserID, false)
+	hub.clients[uuid.New()] = nil
+
+	snapshotter, supported := any(hub).(interface {
+		RichPresenceClientUserIDs() []uuid.UUID
+	})
+	require.True(t, supported, "the delivery hub must expose its local Rich Presence clients")
+	snapshot := snapshotter.RichPresenceClientUserIDs()
+	// Bootstrap snapshots include Rich Presence regardless of live-frame
+	// capability. Cleanup must reconnect legacy devices holding that snapshot.
+	assert.ElementsMatch(t, []uuid.UUID{firstUserID, secondUserID, incapableUserID}, snapshot,
+		"every connected snapshot holder contributes one user, including incapable-only clients")
+
+	hub.mu.Lock()
+	delete(hub.clients, firstDeviceID)
+	delete(hub.userClients[firstUserID], firstDeviceID)
+	hub.mu.Unlock()
+	assert.ElementsMatch(t, []uuid.UUID{firstUserID, secondUserID, incapableUserID}, snapshotter.RichPresenceClientUserIDs(),
+		"remaining connected devices keep their user in the snapshot")
+
+	hub.mu.Lock()
+	delete(hub.clients, secondDeviceID)
+	delete(hub.userClients[firstUserID], secondDeviceID)
+	hub.mu.Unlock()
+	assert.ElementsMatch(t, []uuid.UUID{firstUserID, secondUserID, incapableUserID}, snapshotter.RichPresenceClientUserIDs(),
+		"the remaining legacy device can still hold its bootstrap projection")
+
+	hub.mu.Lock()
+	delete(hub.clients, legacyDeviceID)
+	delete(hub.userClients[firstUserID], legacyDeviceID)
+	hub.mu.Unlock()
+	assert.ElementsMatch(t, []uuid.UUID{secondUserID, incapableUserID}, snapshotter.RichPresenceClientUserIDs(),
+		"a user leaves the snapshot only after its last device is removed")
+	assert.ElementsMatch(t, []uuid.UUID{firstUserID, secondUserID, incapableUserID}, snapshot,
+		"later registry changes cannot alter the previously returned snapshot")
+	require.Len(t, snapshot, 3)
+	snapshot[0] = uuid.Nil
+	assert.ElementsMatch(t, []uuid.UUID{secondUserID, incapableUserID}, snapshotter.RichPresenceClientUserIDs(),
+		"a caller can mutate its detached slice without changing the registry")
+}
+
 type gatedWriteConn struct {
 	net.Conn
 	writeStarted chan struct{}
@@ -478,6 +546,11 @@ func TestDeliverRichPresence_RequiresUpgradeActivityCapabilityForLiveFrames(t *t
 	legacy := customTextDeliveryClient(hub, recipientID, 2)
 	capable := customTextDeliveryClient(hub, recipientID, 2)
 	capable.activityRichPresenceCapable = true
+	disconnected := make(map[uuid.UUID]int)
+	hub.customTextClientDisconnect = func(client *Client) error {
+		disconnected[client.ID]++
+		return nil
+	}
 
 	err := hub.DeliverRichPresence(context.Background(), presence.DeliveryPlan{
 		SenderID:         senderID,
@@ -490,9 +563,80 @@ func TestDeliverRichPresence_RequiresUpgradeActivityCapabilityForLiveFrames(t *t
 	})
 
 	require.NoError(t, err)
-	assertNoMessage(t, legacy)
+	assert.Empty(t, legacy.Send, "legacy devices must not receive unsupported live frames")
+	assert.Equal(t, map[uuid.UUID]int{legacy.ID: 1}, disconnected,
+		"revocation reconnects legacy bootstrap snapshot holders before live updates")
 	assertRichPresenceClear(t, readClientMsg(t, capable), senderID, presence.CategoryServerVoice)
 	assertServerVoiceUpdate(t, readClientMsg(t, capable), senderID)
+}
+
+func TestDeliverRichPresence_LegacySnapshotHolderReconnectsOnlyForClear(t *testing.T) {
+	for _, clear := range []bool{true, false} {
+		name := "update keeps legacy devices connected"
+		if clear {
+			name = "clear reconnects only targeted legacy devices"
+		}
+		t.Run(name, func(t *testing.T) {
+			hub := newCustomTextDeliveryHub()
+			senderID, recipientID, legacyOnlyID := uuid.New(), uuid.New(), uuid.New()
+			capable := activityRichPresenceDeliveryClient(hub, recipientID, 2)
+			legacy := customTextDeliveryClient(hub, recipientID, 2)
+			secondLegacy := customTextDeliveryClient(hub, recipientID, 2)
+			legacyOnly := customTextDeliveryClient(hub, legacyOnlyID, 2)
+			unrelatedLegacy := customTextDeliveryClient(hub, uuid.New(), 2)
+			unrelatedCapable := activityRichPresenceDeliveryClient(hub, uuid.New(), 2)
+			disconnected := make(map[uuid.UUID]int)
+			hub.customTextClientDisconnect = func(client *Client) error {
+				disconnected[client.ID]++
+				return nil
+			}
+			plan := presence.DeliveryPlan{SenderID: senderID, Category: presence.CategoryServerVoice}
+			if clear {
+				plan.ClearRecipients = map[uuid.UUID]bool{recipientID: true, legacyOnlyID: true}
+			} else {
+				plan.UpdateRecipients = map[uuid.UUID]bool{recipientID: true, legacyOnlyID: true}
+				plan.Minimized = true
+				plan.Payload = json.RawMessage(`{"channel_id":"11111111-1111-1111-1111-111111111111","server_id":"22222222-2222-2222-2222-222222222222"}`)
+				plan.UpdatedAt = 1784088000
+			}
+
+			require.NoError(t, hub.DeliverRichPresence(context.Background(), plan))
+
+			if clear {
+				assert.Equal(t, map[uuid.UUID]int{legacy.ID: 1, secondLegacy.ID: 1, legacyOnly.ID: 1}, disconnected,
+					"every targeted legacy device must refresh its bootstrap snapshot")
+				assertRichPresenceClear(t, readClientMsg(t, capable), senderID, presence.CategoryServerVoice)
+			} else {
+				assert.Empty(t, disconnected, "an update does not revoke a legacy bootstrap projection")
+				assertServerVoiceUpdate(t, readClientMsg(t, capable), senderID)
+			}
+			for _, client := range []*Client{legacy, secondLegacy, legacyOnly, unrelatedLegacy, unrelatedCapable} {
+				assert.Empty(t, client.Send, "only targeted capable devices accept live activity frames")
+			}
+		})
+	}
+}
+
+func TestDeliverRichPresence_LegacyClearDisconnectFailurePropagates(t *testing.T) {
+	hub := newCustomTextDeliveryHub()
+	recipientID := uuid.New()
+	legacy := customTextDeliveryClient(hub, recipientID, 1)
+	disconnectErr := errors.New("legacy snapshot holder transport close failed")
+	disconnectCalls := 0
+	hub.customTextClientDisconnect = func(client *Client) error {
+		assert.Same(t, legacy, client)
+		disconnectCalls++
+		return disconnectErr
+	}
+
+	err := hub.DeliverRichPresence(context.Background(), presence.DeliveryPlan{
+		SenderID: uuid.New(), Category: presence.CategoryPrivateCall,
+		ClearRecipients: map[uuid.UUID]bool{recipientID: true},
+	})
+
+	assert.ErrorIs(t, err, disconnectErr)
+	assert.Equal(t, 1, disconnectCalls)
+	assert.Empty(t, legacy.Send, "an unsupported clear cannot replace the failed reconnect")
 }
 
 func TestDeliverRichPresence_CapableBootstrapOrdersSnapshotBeforeLiveClear(t *testing.T) {

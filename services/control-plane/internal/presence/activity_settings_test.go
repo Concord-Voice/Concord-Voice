@@ -21,6 +21,65 @@ type settingsClearThenDisconnectStub struct {
 	clearThenDisconnectErr error
 }
 
+type settingsConnectedDeliveryStub struct {
+	activityServiceDeliveryStub
+	connected []uuid.UUID
+}
+
+func (d *settingsConnectedDeliveryStub) RichPresenceClientUserIDs() []uuid.UUID {
+	return d.connected
+}
+
+func TestComputeConnectedActivitySettingsRecipients_CanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	delivery := &settingsConnectedDeliveryStub{connected: []uuid.UUID{uuid.New()}}
+	recipients, err := computeConnectedActivitySettingsRecipients(
+		ctx, activitySettingsRecipientDependencies{}, delivery, uuid.New(),
+		ActivityPolicySettings{}, ActivityPolicySettings{}, false,
+	)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, recipients)
+}
+
+func TestActivitySettingsCandidates_AbsentAndEmptyConnectedFilters(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	senderID := testdb.CreateUser(t, db)
+	viewerID := testdb.CreateUser(t, db)
+	unrelatedID := testdb.CreateUser(t, db)
+	serverID := uuid.New()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'connected-filter', $2)`, serverID, senderID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2), ($1, $3)`,
+		serverID, senderID, viewerID)
+	require.NoError(t, err)
+	for _, test := range []struct {
+		name       string
+		connected  []uuid.UUID
+		wantViewer bool
+	}{
+		{name: "nil filter preserves legacy audience", wantViewer: true},
+		{name: "explicit empty filter selects nobody", connected: []uuid.UUID{}},
+		{name: "connected viewer remains eligible", connected: []uuid.UUID{viewerID}, wantViewer: true},
+		{name: "connected unrelated user is not an audience", connected: []uuid.UUID{unrelatedID}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			want := make(map[uuid.UUID]bool)
+			if test.wantViewer {
+				want[viewerID] = true
+			}
+			serverRecipients, err := serverSettingsCandidates(ctx, db, senderID, serverID, TierServers, test.connected)
+			require.NoError(t, err)
+			assert.Equal(t, want, serverRecipients)
+			privateRecipients, err := privateSettingsRecipients(ctx, db, senderID, uuid.New(), TierServers, test.connected)
+			require.NoError(t, err)
+			assert.Equal(t, want, privateRecipients)
+		})
+	}
+}
+
 func (d *settingsClearThenDisconnectStub) DeliverRichPresenceClearsThenDisconnect(
 	_ context.Context,
 	plans []DeliveryPlan,
@@ -167,10 +226,10 @@ func TestActivitySettingsRecipients_BlockVetoesDefaultFoF(t *testing.T) {
 	`, serverID, sender, viewer)
 	require.NoError(t, err)
 
-	serverRecipients, err := serverSettingsCandidates(ctx, db, sender, serverID, TierFriends)
+	serverRecipients, err := serverSettingsCandidates(ctx, db, sender, serverID, TierFriends, nil)
 	require.NoError(t, err)
 	require.Contains(t, serverRecipients, viewer, "no privacy row enables unblocked FoF")
-	privateRecipients, err := privateSettingsRecipients(ctx, db, sender, uuid.New(), TierFriends)
+	privateRecipients, err := privateSettingsRecipients(ctx, db, sender, uuid.New(), TierFriends, nil)
 	require.NoError(t, err)
 	require.Contains(t, privateRecipients, viewer)
 
@@ -191,10 +250,10 @@ func TestActivitySettingsRecipients_BlockVetoesDefaultFoF(t *testing.T) {
 	`, viewer, sender, uuid.New())
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	serverRecipients, err = serverSettingsCandidates(ctx, db, sender, serverID, TierFriends)
+	serverRecipients, err = serverSettingsCandidates(ctx, db, sender, serverID, TierFriends, nil)
 	require.NoError(t, err)
 	require.NotContains(t, serverRecipients, viewer)
-	privateRecipients, err = privateSettingsRecipients(ctx, db, sender, uuid.New(), TierFriends)
+	privateRecipients, err = privateSettingsRecipients(ctx, db, sender, uuid.New(), TierFriends, nil)
 	require.NoError(t, err)
 	require.NotContains(t, privateRecipients, viewer)
 	require.Contains(t, privateRecipients, mutual, "the unblocked direct friend remains eligible")

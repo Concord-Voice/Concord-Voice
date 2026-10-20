@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Changing activity sharing settings in large servers no longer disconnects
+unrelated users.
+
 Trusted-device recovery asks you to compare a fingerprint on both devices
 before transferring your account key. Voice joins capture the selected
 microphone once and explain how to recover if capture fails. Audio and video

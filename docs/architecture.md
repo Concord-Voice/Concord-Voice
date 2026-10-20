@@ -1144,6 +1144,21 @@ selection is pure and settings-independent. Issue #2234 owns confirmed settings
 and Issue #2235 owns presentation; issue #2233 introduces no outbound renderer
 command, Rich Presence service, or API.
 
+Activity settings and hidden-sender cleanup snapshot all users currently
+connected to the local hub, then intersect their IDs with the prior
+policy audience in batches of at most 512. SQL applies the connected-candidate
+restriction before its row limit, and Server Voice retains fresh channel
+visibility checks. The full local audience may span multiple batches; offline
+server membership does not consume the cleanup bound or trigger global socket
+teardown. Scope loading and generation validation run once around the audience
+batches, including when the connected snapshot is empty. Category-specific clears
+and targeted reconnects retain their existing delivery and cleanup-receipt
+semantics. Clients registering after capture receive
+a freshly authorized snapshot under the existing sender publication gate.
+Legacy devices are included because their reconnect snapshot can contain activity
+even when live activity frames are disabled. A live clear reconnects only the
+targeted legacy devices; capable devices consume the clear normally.
+
 Migration 000098 adds `activity_settings_pending_cleanups`, one durable marker
 per user containing the exact versioned before/after policy bracket committed
 with a real activity-policy change. After successful suppression concludes its

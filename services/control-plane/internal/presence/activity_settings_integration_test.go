@@ -2,7 +2,9 @@ package presence_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +46,420 @@ func (d *settingsActivityDelivery) DisconnectRichPresenceClients(
 func (d *settingsActivityDelivery) DisconnectAllRichPresenceClients(context.Context) error {
 	d.all++
 	return nil
+}
+
+// Existing delivery fixtures deliberately exercise the fallback without a local
+// client snapshot. This fixture exposes the hub's optional snapshot of every
+// connected user, including legacy clients holding bootstrap projections.
+type connectedSettingsActivityDelivery struct {
+	settingsActivityDelivery
+	connectedUserIDs []uuid.UUID
+}
+
+func (d *connectedSettingsActivityDelivery) RichPresenceClientUserIDs() []uuid.UUID {
+	if d.connectedUserIDs == nil {
+		return nil
+	}
+	return append([]uuid.UUID{}, d.connectedUserIDs...)
+}
+
+type connectedSettingsVisibility struct {
+	deniedID   uuid.UUID
+	batchSizes []int
+	failOnCall int
+	err        error
+}
+
+func (v *connectedSettingsVisibility) FilterVisibleUserIDsForChannelFresh(
+	_ context.Context,
+	_, _ string,
+	candidateUserIDs []string,
+) ([]string, error) {
+	v.batchSizes = append(v.batchSizes, len(candidateUserIDs))
+	if len(v.batchSizes) == v.failOnCall {
+		return nil, v.err
+	}
+	visible := make([]string, 0, len(candidateUserIDs))
+	for _, candidateID := range candidateUserIDs {
+		if candidateID != v.deniedID.String() {
+			visible = append(visible, candidateID)
+		}
+	}
+	return visible, nil
+}
+
+func createSettingsServerMembers(t *testing.T, db *sql.DB, serverID uuid.UUID, count int) []uuid.UUID {
+	t.Helper()
+	userIDs := make([]uuid.UUID, count)
+	texts := make([]string, count)
+	for index := range userIDs {
+		userIDs[index] = uuid.New()
+		texts[index] = userIDs[index].String()
+	}
+	if count == 0 {
+		return userIDs
+	}
+	// Audience tests never authenticate these users. Match CreateUser's inert
+	// password placeholder, and insert large fixtures in two database round trips.
+	_, err := db.Exec(`
+		INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		SELECT user_id, user_id::text || '@test.local', 'u_' || user_id::text, 'x', TRUE, TRUE
+		FROM unnest($1::uuid[]) AS fixture(user_id)
+	`, pq.Array(texts))
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO server_members (server_id, user_id)
+		SELECT $1, user_id FROM unnest($2::uuid[]) AS fixture(user_id)
+	`, serverID, pq.Array(texts))
+	require.NoError(t, err)
+	return userIDs
+}
+
+func TestActivitySettingsResolver_PrivateCallFiltersConnectedServerPeersBeforeLimit(t *testing.T) {
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(dbCleanup)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	senderID := testhelpers.CreateUser(t, db)
+	_, serverID, _ := createServerVoiceBuilderFixtureForUser(t, db, senderID, "Private peers", "Voice")
+	offlineIDs := createSettingsServerMembers(t, db, serverID, 513)
+	viewerID := createSettingsServerMembers(t, db, serverID, 1)[0]
+	unrelatedID := testhelpers.CreateUser(t, db)
+	participantID := testhelpers.CreateUser(t, db)
+	lifecycleAt := time.Date(2026, 10, 20, 11, 0, 0, 0, time.UTC)
+	createPrivateCallBuilderFixture(t, db, uuid.New(), false, map[uuid.UUID]time.Time{
+		senderID: lifecycleAt, participantID: lifecycleAt,
+	})
+	store := presence.NewActivityStore(redisClient)
+	state := presence.ActivityState{
+		SourceToken: uuid.New(), SourceVersion: lifecycleAt.UnixMicro(),
+		Payload: json.RawMessage(`{"call_type":"dm"}`), UpdatedAt: lifecycleAt.Unix(),
+	}
+	stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryPrivateCall, state)
+	require.NoError(t, err)
+	require.True(t, stored)
+	seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryPrivateCall, state)
+	seedActivitySnapshotLifecycle(t, redisClient, participantID, presence.CategoryPrivateCall, state)
+	delivery := &connectedSettingsActivityDelivery{
+		connectedUserIDs: []uuid.UUID{senderID, unrelatedID, viewerID},
+	}
+	service := presence.NewActivityService(
+		presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+		presence.NewActivityBuilder(db, &activityLeaseVerifier{match: true}, store), store, db,
+		activitySnapshotVisibility{allow: true}, delivery, permitAllPresence{},
+	)
+	before := presence.ActivityPolicySettings{
+		MasterEnabled: true, ServerVoiceTier: presence.TierOff,
+		PrivateCallTier: presence.TierServers, PrivateCallShowDetails: true,
+	}
+	after := before
+	after.PrivateCallShowDetails = false
+
+	err = service.ApplySettingsSuppressionAlreadyGated(ctx, senderID, before, after)
+
+	require.NoError(t, err, "offline server peers must not exhaust Private Call recipients")
+	assert.Zero(t, delivery.all)
+	require.Len(t, delivery.plans, 1)
+	assert.Equal(t, presence.CategoryPrivateCall, delivery.plans[0].Category)
+	assert.Equal(t, map[uuid.UUID]bool{viewerID: true}, delivery.plans[0].ClearRecipients)
+	assert.Equal(t, []map[uuid.UUID]bool{{viewerID: true}}, delivery.targeted)
+	for _, excludedID := range append([]uuid.UUID{senderID, unrelatedID, participantID}, offlineIDs...) {
+		assert.NotContains(t, delivery.plans[0].ClearRecipients, excludedID)
+	}
+	_, found, err := store.Get(ctx, senderID, presence.CategoryPrivateCall)
+	require.NoError(t, err)
+	assert.True(t, found, "a details change retains the active Private Call generation")
+}
+
+func TestActivitySettingsResolver_NoConnectedClientsSuppressesWithoutDelivery(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		connected []uuid.UUID
+	}{
+		{name: "nil snapshot"},
+		{name: "empty snapshot", connected: []uuid.UUID{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, dbCleanup := testhelpers.SetupTestDB(t)
+			redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+			t.Cleanup(dbCleanup)
+			t.Cleanup(redisCleanup)
+			ctx := context.Background()
+			senderID := testhelpers.CreateUser(t, db)
+			_, serverID, channelID := createServerVoiceBuilderFixtureForUser(t, db, senderID, "Offline peers", "Voice")
+			createSettingsServerMembers(t, db, serverID, 513)
+			store := presence.NewActivityStore(redisClient)
+			lifecycleAt := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+			_, err := db.Exec(`
+				INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+				VALUES ($1, $2, $3, $3)
+			`, channelID, senderID, lifecycleAt)
+			require.NoError(t, err)
+			state := presence.ActivityState{
+				SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+				Payload: json.RawMessage(`{}`), UpdatedAt: lifecycleAt.Unix(),
+			}
+			stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryServerVoice, state)
+			require.NoError(t, err)
+			require.True(t, stored)
+			seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, state)
+			delivery := &connectedSettingsActivityDelivery{connectedUserIDs: test.connected}
+			service := presence.NewActivityService(
+				presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+				presence.NewActivityBuilder(db, nil, store), store, db,
+				activitySnapshotVisibility{allow: true}, delivery, permitAllPresence{},
+			)
+			before := presence.ActivityPolicySettings{
+				MasterEnabled: true, ServerVoiceTier: presence.TierServers, PrivateCallTier: presence.TierServers,
+			}
+			after := before
+			after.MasterEnabled = false
+
+			err = service.ApplySettingsSuppressionAlreadyGated(ctx, senderID, before, after)
+
+			require.NoError(t, err)
+			assert.Zero(t, delivery.all)
+			assert.Empty(t, delivery.plans)
+			assert.Empty(t, delivery.targeted)
+			for _, category := range []presence.Category{presence.CategoryServerVoice, presence.CategoryPrivateCall} {
+				_, found, err := store.Get(ctx, senderID, category)
+				require.NoError(t, err)
+				assert.False(t, found, "master suppression removes stored %s even without connected viewers", category)
+			}
+		})
+	}
+}
+
+func TestHiddenSenderSuppression_NoConnectedClientsStillValidatesStoredGeneration(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		connected []uuid.UUID
+		stale     bool
+	}{
+		{name: "nil clients with valid generation"},
+		{name: "empty clients with valid generation", connected: []uuid.UUID{}},
+		{name: "nil clients with expired lifecycle", stale: true},
+		{name: "empty clients with expired lifecycle", connected: []uuid.UUID{}, stale: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, dbCleanup := testhelpers.SetupTestDB(t)
+			redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+			t.Cleanup(dbCleanup)
+			t.Cleanup(redisCleanup)
+			ctx := context.Background()
+			senderID := testhelpers.CreateUser(t, db)
+			_, _, channelID := createServerVoiceBuilderFixtureForUser(t, db, senderID, "No clients", "Hidden")
+			lifecycleAt := time.Date(2026, 10, 20, 13, 0, 0, 0, time.UTC)
+			_, err := db.Exec(`
+				INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+				VALUES ($1, $2, $3, $3)
+			`, channelID, senderID, lifecycleAt)
+			require.NoError(t, err)
+			store := presence.NewActivityStore(redisClient)
+			state := presence.ActivityState{
+				SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+				Payload: json.RawMessage(`{"server_id":"hidden-evidence"}`), UpdatedAt: lifecycleAt.Unix(),
+			}
+			stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryServerVoice, state)
+			require.NoError(t, err)
+			require.True(t, stored)
+			if !test.stale {
+				seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, state)
+			}
+			delivery := &connectedSettingsActivityDelivery{connectedUserIDs: test.connected}
+			service := presence.NewActivityService(
+				presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+				presence.NewActivityBuilder(db, nil, store), store, db,
+				activitySnapshotVisibility{allow: true}, delivery, permitAllPresence{},
+			)
+
+			err = service.ForceSuppressHiddenSenderActivityAlreadyGated(ctx, senderID)
+
+			if test.stale {
+				assert.Error(t, err, "an empty client snapshot cannot validate stale published evidence")
+				assert.Equal(t, 1, delivery.all, "unknown published evidence keeps the existing fail-closed fallback")
+			} else {
+				assert.NoError(t, err)
+				assert.Zero(t, delivery.all)
+			}
+			assert.Empty(t, delivery.plans)
+			assert.Empty(t, delivery.targeted)
+			retained, found, getErr := store.Get(ctx, senderID, presence.CategoryServerVoice)
+			require.NoError(t, getErr)
+			assert.Equal(t, test.stale, found, "only validated hidden generations may be deleted")
+			if test.stale {
+				assert.Equal(t, state, retained, "failed resolution must preserve exact stored evidence")
+			}
+		})
+	}
+}
+
+func TestActivitySettingsResolver_SecondConnectedBatchFailureDeliversNothing(t *testing.T) {
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(dbCleanup)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	senderID := testhelpers.CreateUser(t, db)
+	_, serverID, channelID := createServerVoiceBuilderFixtureForUser(t, db, senderID, "Batch failure", "Voice")
+	viewers := createSettingsServerMembers(t, db, serverID, 513)
+	lifecycleAt := time.Date(2026, 10, 20, 14, 0, 0, 0, time.UTC)
+	_, err := db.Exec(`
+		INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, channelID, senderID, lifecycleAt)
+	require.NoError(t, err)
+	store := presence.NewActivityStore(redisClient)
+	state := presence.ActivityState{
+		SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+		Payload: json.RawMessage(`{}`), UpdatedAt: lifecycleAt.Unix(),
+	}
+	stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryServerVoice, state)
+	require.NoError(t, err)
+	require.True(t, stored)
+	seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, state)
+	visibilityErr := errors.New("second connected audience authorization failed")
+	visibility := &connectedSettingsVisibility{failOnCall: 2, err: visibilityErr}
+	delivery := &connectedSettingsActivityDelivery{connectedUserIDs: viewers}
+	service := presence.NewActivityService(
+		presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+		presence.NewActivityBuilder(db, nil, store), store, db,
+		visibility, delivery, permitAllPresence{},
+	)
+	before := presence.ActivityPolicySettings{
+		MasterEnabled: true, ServerVoiceTier: presence.TierServers, ServerVoiceShowDetails: true,
+	}
+	after := before
+	after.ServerVoiceShowDetails = false
+
+	err = service.ApplySettingsSuppressionAlreadyGated(ctx, senderID, before, after)
+
+	assert.ErrorIs(t, err, visibilityErr)
+	assert.Equal(t, []int{512, 1}, visibility.batchSizes, "the failure must occur after a successful first batch")
+	assert.Equal(t, 1, delivery.all)
+	assert.Empty(t, delivery.plans, "no partial clear may escape before all authorization batches succeed")
+	assert.Empty(t, delivery.targeted)
+}
+
+func TestActivitySettingsResolver_ConnectedAudienceIsIndependentOfServerSize(t *testing.T) {
+	tests := []struct {
+		name             string
+		offlineMembers   int
+		connectedViewers int
+		hidden           bool
+	}{
+		{name: "below limit control", connectedViewers: 1},
+		{name: "offline server members do not exhaust the recipient limit", offlineMembers: 513, connectedViewers: 1},
+		{name: "every connected viewer across multiple batches is refreshed", offlineMembers: 1, connectedViewers: 513},
+		{name: "hidden sender uses the same bounded connected audience", offlineMembers: 513, connectedViewers: 1, hidden: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, dbCleanup := testhelpers.SetupTestDB(t)
+			redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+			t.Cleanup(dbCleanup)
+			t.Cleanup(redisCleanup)
+			ctx := context.Background()
+			senderID := testhelpers.CreateUser(t, db)
+			_, serverID, channelID := createServerVoiceBuilderFixtureForUser(
+				t, db, senderID, "Connected audience", "Settings",
+			)
+			viewers := createSettingsServerMembers(t, db, serverID, test.connectedViewers)
+			offlineIDs := createSettingsServerMembers(t, db, serverID, test.offlineMembers)
+			deniedID := createSettingsServerMembers(t, db, serverID, 1)[0]
+			unrelatedID := testhelpers.CreateUser(t, db)
+			lifecycleAt := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
+			_, err := db.Exec(`
+				INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+				VALUES ($1, $2, $3, $3)
+			`, channelID, senderID, lifecycleAt)
+			require.NoError(t, err)
+			_, err = db.Exec(`
+				INSERT INTO user_presence_settings (user_id, server_voice_tier, server_voice_show_details)
+				VALUES ($1, 2, TRUE)
+				ON CONFLICT (user_id) DO UPDATE
+				SET server_voice_tier = EXCLUDED.server_voice_tier,
+				    server_voice_show_details = EXCLUDED.server_voice_show_details
+			`, senderID)
+			require.NoError(t, err)
+			store := presence.NewActivityStore(redisClient)
+			state := presence.ActivityState{
+				SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+				Payload: json.RawMessage(`{"server_id":"connected-audience"}`), UpdatedAt: lifecycleAt.Unix(),
+			}
+			stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryServerVoice, state)
+			require.NoError(t, err)
+			require.True(t, stored)
+			seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, state)
+			delivery := &connectedSettingsActivityDelivery{
+				connectedUserIDs: append([]uuid.UUID{senderID, unrelatedID, deniedID}, viewers...),
+			}
+			visibility := &connectedSettingsVisibility{deniedID: deniedID}
+			service := presence.NewActivityService(
+				presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+				presence.NewActivityBuilder(db, nil, store), store, db,
+				visibility, delivery, permitAllPresence{},
+			)
+
+			if test.hidden {
+				err = service.ForceSuppressHiddenSenderActivityAlreadyGated(ctx, senderID)
+			} else {
+				before := presence.ActivityPolicySettings{
+					MasterEnabled: true, ServerVoiceTier: presence.TierServers,
+					ServerVoiceShowDetails: true, PrivateCallTier: presence.TierOff,
+				}
+				after := before
+				after.ServerVoiceShowDetails = false
+				err = service.ApplySettingsSuppressionAlreadyGated(ctx, senderID, before, after)
+			}
+
+			assert.NoError(t, err, "server population must not trigger a recipient-limit error")
+			assert.Zero(t, delivery.all, "a known connected audience must not disconnect the whole replica")
+			want := make(map[uuid.UUID]int, len(viewers))
+			for _, viewerID := range viewers {
+				want[viewerID] = 1
+			}
+			cleared := make(map[uuid.UUID]int)
+			for _, plan := range delivery.plans {
+				assert.Equal(t, senderID, plan.SenderID)
+				assert.Equal(t, presence.CategoryServerVoice, plan.Category)
+				for recipientID, included := range plan.ClearRecipients {
+					if included {
+						cleared[recipientID]++
+					}
+				}
+			}
+			assert.Equal(t, want, cleared, "every authorized connected viewer receives exactly one clear")
+			reconnected := make(map[uuid.UUID]int)
+			for _, recipients := range delivery.targeted {
+				for recipientID, included := range recipients {
+					if included {
+						reconnected[recipientID]++
+					}
+				}
+			}
+			if test.hidden {
+				assert.Empty(t, reconnected, "a successful terminal clear needs no reconnect")
+			} else {
+				assert.Equal(t, want, reconnected, "every authorized connected viewer refreshes its projection")
+			}
+			for _, excludedID := range append([]uuid.UUID{senderID, unrelatedID, deniedID}, offlineIDs...) {
+				assert.NotContains(t, cleared, excludedID)
+				assert.NotContains(t, reconnected, excludedID)
+			}
+			require.NotEmpty(t, visibility.batchSizes, "the server audience must pass fresh channel authorization")
+			for _, size := range visibility.batchSizes {
+				assert.LessOrEqual(t, size, 512, "fresh authorization must retain its bounded input")
+			}
+			if test.connectedViewers > 512 {
+				assert.GreaterOrEqual(t, len(visibility.batchSizes), 2, "authorization must cover later batches")
+			}
+			_, found, getErr := store.Get(ctx, senderID, presence.CategoryServerVoice)
+			require.NoError(t, getErr)
+			assert.Equal(t, !test.hidden, found, "detail changes preserve the active generation; hidden suppression removes it")
+		})
+	}
 }
 
 // A sender can be present in Server Voice with no Private Call activity when it
