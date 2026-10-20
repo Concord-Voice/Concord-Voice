@@ -14,6 +14,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os"
 	"strings"
 	"sync"
@@ -2620,6 +2621,184 @@ func TestUploadAvatarAnimatedGIF_FreeRejectedWithUpsellCode(t *testing.T) {
 	resp := parseBody(t, w)
 	assert.Equal(t, "animated_profile_premium", resp["code"], "typed upsell code (#1522 pattern)")
 	assert.False(t, ts.store.hasObject("avatars/"+userID), "nothing stored on reject")
+}
+
+// Aardvark regression: animation entitlement is determined from the container
+// structure before full GIF decoding. This starts with a valid static GIF and
+// appends a second, structurally complete image descriptor whose empty image
+// data makes gif.DecodeAll fail. The structure classifier can still prove the
+// upload is animated without materializing either frame.
+func TestUploadAvatarAnimatedGIF_FreeRejectedBeforeFullDecode(t *testing.T) {
+	raw := makeStaticGIFUpload(t)
+	require.Equal(t, gifTrailer, raw[len(raw)-1], "static fixture ends at the GIF trailer")
+	raw = append(raw[:len(raw)-1],
+		gifImageDescriptor,
+		0, 0, // left
+		0, 0, // top
+		1, 0, // width
+		1, 0, // height
+		0, // packed: no local color table
+		8, // LZW minimum code size
+		0, // empty image-data sub-block chain
+		gifTrailer,
+	)
+	animated, err := isAnimatedGIFStructure(raw)
+	require.NoError(t, err)
+	require.True(t, animated, "fixture must be structurally identifiable as animated before decode")
+	_, err = gif.DecodeAll(bytes.NewReader(raw))
+	require.Error(t, err, "fixture must fail if the handler performs a full decode before entitlement")
+
+	body, ct := multipartBody(t, "file", "avatar.gif", raw, nil)
+	req := httptest.NewRequest(http.MethodPost, pathUploadAvatar, body)
+	req.Header.Set(hdrContentType, ct)
+	require.NoError(t, req.ParseMultipartForm(1<<20))
+	file, _, err := req.FormFile("file")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+	h := NewHandler(nil, nil, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+	processed, ok := h.processGIFTier1Image(c, file, tier1ImageJob{
+		userID:  "test-free-user",
+		purpose: purposeAvatar,
+		maxW:    AvatarMaxDim,
+		maxH:    AvatarMaxDim,
+	})
+
+	require.False(t, ok)
+	require.Nil(t, processed)
+	require.Equal(t, http.StatusForbidden, w.Code,
+		"free-user animation entitlement must be rejected before full GIF decoding; body: %s", w.Body.String())
+	resp := parseBody(t, w)
+	assert.Equal(t, "animated_profile_premium", resp["code"], "pre-decode rejection keeps the typed upsell code")
+}
+
+func TestProcessGIFTier1Image_ReturnsBusyWhenProcessingSlotIsOccupied(t *testing.T) {
+	raw := makeStaticGIFUpload(t)
+	body, ct := multipartBody(t, "file", "avatar.gif", raw, nil)
+	req := httptest.NewRequest(http.MethodPost, pathUploadAvatar, body)
+	req.Header.Set(hdrContentType, ct)
+	require.NoError(t, req.ParseMultipartForm(1<<20))
+	file, _, err := req.FormFile("file")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+	h := NewHandler(nil, nil, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+
+	gifProcessingSlots <- struct{}{}
+	t.Cleanup(func() { <-gifProcessingSlots })
+	processed, ok := h.processGIFTier1Image(c, file, tier1ImageJob{
+		userID:  "test-free-user",
+		purpose: purposeAvatar,
+		maxW:    AvatarMaxDim,
+		maxH:    AvatarMaxDim,
+	})
+	require.False(t, ok)
+	require.Nil(t, processed)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+func TestUploadAvatarGIFDeclaredPNG_SerializesAndFlattens(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "mislabeledgif")
+	raw := makeAnimatedGIFUpload(t)
+	makeBody := func() (*bytes.Buffer, string) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", `form-data; name="file"; filename="avatar.png"`)
+		header.Set("Content-Type", mimePNG)
+		part, err := writer.CreatePart(header)
+		require.NoError(t, err)
+		_, err = part.Write(raw)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		return &body, writer.FormDataContentType()
+	}
+
+	gifProcessingSlots <- struct{}{}
+	slotHeld := true
+	t.Cleanup(func() {
+		if slotHeld {
+			<-gifProcessingSlots
+		}
+	})
+	body, ct := makeBody()
+	busy := ts.doMultipart(ts.handler.UploadAvatar, http.MethodPost, pathUploadAvatar, userID, body, ct)
+	require.Equal(t, http.StatusServiceUnavailable, busy.Code, "body: %s", busy.Body.String())
+	require.Equal(t, "1", busy.Header().Get("Retry-After"))
+	<-gifProcessingSlots
+	slotHeld = false
+
+	body, ct = makeBody()
+	success := ts.doMultipart(ts.handler.UploadAvatar, http.MethodPost, pathUploadAvatar, userID, body, ct)
+	require.Equal(t, http.StatusCreated, success.Code, "body: %s", success.Body.String())
+	data, contentType := ts.storedObject(t, ts.liveProfileStorageKey(t, userID, "avatar"))
+	require.Equal(t, mimePNG, contentType, "mislabeled animation remains flattened")
+	_, err := png.Decode(bytes.NewReader(data))
+	require.NoError(t, err)
+}
+
+type gifProbeFaultFile struct {
+	*bytes.Reader
+	readErr error
+	seekErr error
+}
+
+func (f *gifProbeFaultFile) Read(p []byte) (int, error) {
+	if f.readErr != nil {
+		return 0, f.readErr
+	}
+	return f.Reader.Read(p)
+}
+
+func (f *gifProbeFaultFile) Seek(offset int64, whence int) (int64, error) {
+	if f.seekErr != nil {
+		return 0, f.seekErr
+	}
+	return f.Reader.Seek(offset, whence)
+}
+
+func (f *gifProbeFaultFile) Close() error { return nil }
+
+func TestProcessTier1Image_GIFProbeFailureRejectsUpload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		seekErr error
+	}{
+		{name: "read failure", readErr: io.ErrClosedPipe},
+		{name: "rewind failure", seekErr: io.ErrClosedPipe},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			h := NewHandler(nil, nil, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+			file := &gifProbeFaultFile{Reader: bytes.NewReader(makeStaticGIFUpload(t)), readErr: tc.readErr, seekErr: tc.seekErr}
+			processed, ok := h.processTier1Image(c, file, tier1ImageJob{
+				userID: "test-user", purpose: purposeAvatar, contentType: mimePNG,
+				maxW: AvatarMaxDim, maxH: AvatarMaxDim,
+			})
+			require.False(t, ok)
+			require.Nil(t, processed)
+			require.Equal(t, http.StatusBadRequest, w.Code)
+		})
+	}
+}
+
+func TestHasGIFSignature_ShortFileRewindsWithoutClassifyingGIF(t *testing.T) {
+	file := &gifProbeFaultFile{Reader: bytes.NewReader([]byte("GIF"))}
+	isGIF, err := hasGIFSignature(file)
+	require.NoError(t, err)
+	require.False(t, isGIF)
+	pos, err := file.Seek(0, io.SeekCurrent)
+	require.NoError(t, err)
+	require.Zero(t, pos)
 }
 
 // Behavior lock: a STATIC (single-frame) GIF keeps today's flatten path for

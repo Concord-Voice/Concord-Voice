@@ -355,16 +355,16 @@ func TestSafeDecodeGIF_RejectsFrameCountOverBudget(t *testing.T) {
 }
 
 func TestSafeDecodeGIF_RejectsTotalPixelBudget(t *testing.T) {
-	// 9 frames × 5000×5000 logical screen = 225,000,000 px > maxGifTotalPixels
-	// (200,000,000). Each FRAME descriptor is 1×1, so the pre-decode scan (which
+	// 3 frames × 5000×5000 logical screen = 75,000,000 px > maxGifTotalPixels
+	// (50,000,000). Each FRAME descriptor is 1×1, so the pre-decode scan (which
 	// sums frame-descriptor areas) passes and the POST-decode guard — which keys
 	// on frames × screen — is the rejecting layer here. The dedicated pre-scan
 	// coverage (frame-descriptor pixel bomb) is a separate test; this exercises
 	// the frames×screen defense-in-depth arm. Fixture stays tiny (1×1 frames).
 	pal := gifTestPalette()
-	frames := make([]*image.Paletted, 9)
-	delays := make([]int, 9)
-	disposal := make([]byte, 9)
+	frames := make([]*image.Paletted, 3)
+	delays := make([]int, 3)
+	disposal := make([]byte, 3)
 	for i := range frames {
 		frames[i] = solidPalettedFrame(t, image.Rect(0, 0, 1, 1), gifColRed, pal)
 		disposal[i] = gif.DisposalNone
@@ -396,14 +396,27 @@ func TestSafeDecodeGIF_RejectsOversizedScreenDimension(t *testing.T) {
 // rejects on the summed descriptor area, never touching the (empty) pixel data.
 func TestScanGIFFrameBudget_RejectsFrameDescriptorPixelBombWithoutDecode(t *testing.T) {
 	const dim = 5000
-	// 9 × 5000×5000 = 225,000,000 px > maxGifTotalPixels (200,000,000), under the
+	// 3 × 5000×5000 = 75,000,000 px > maxGifTotalPixels (50,000,000), under the
 	// frame-count cap so the pixel arm fires.
-	raw := gifWithFakeFrameDescriptors(dim, dim, 9)
+	raw := gifWithFakeFrameDescriptors(dim, dim, 3)
 	require.Less(t, len(raw), 1000, "fixture is tiny; the bomb is in declared descriptor dims, not bytes")
 
 	err := scanGIFFrameBudget(raw)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pixel")
+}
+
+// Aardvark regression: the pre-decode guard must bound aggregate animated-GIF
+// work to the static decoder's 50,000,000-pixel memory budget. The fake stream
+// stays tiny while its two full-screen descriptors declare 50,010,000 pixels,
+// so the scanner can reject it before gif.DecodeAll allocates either frame.
+func TestScanGIFFrameBudget_RejectsUnsafeAnimatedLiveMemoryBudgetBeforeDecode(t *testing.T) {
+	raw := gifWithFakeFrameDescriptors(5000, 5001, 2)
+	require.Less(t, len(raw), 100, "fixture stays compressed; only declared pixel work is large")
+
+	err := scanGIFFrameBudget(raw)
+	require.Error(t, err, "pre-decode guard must reject GIFs exceeding the safe animated GIF live-memory budget")
+	assert.Contains(t, err.Error(), "pixel", "rejection must come from the aggregate pixel budget")
 }
 
 // scanGIFFrameBudget rejects a frame-count-over-limit animation before decode.
@@ -450,6 +463,67 @@ func TestScanGIFFrameBudget_AcceptsValidAnimation(t *testing.T) {
 	raw := encodeTestGIF(t, frames, []int{5, 5}, []byte{gif.DisposalNone, gif.DisposalNone}, 0, 16, 16)
 
 	require.NoError(t, scanGIFFrameBudget(raw))
+}
+
+// A noncanonical Plain Text Extension can make the byte scanner skip image
+// descriptors that image/gif decodes. Reject this form before DecodeAll so its
+// frames cannot escape the pre-decode pixel budget.
+func TestSafeDecodeGIF_RejectsPlainTextExtensionThatHidesFramesFromScanner(t *testing.T) {
+	pal := gifTestPalette()
+	frames := []*image.Paletted{
+		solidPalettedFrame(t, image.Rect(0, 0, 1, 1), gifColRed, pal),
+		solidPalettedFrame(t, image.Rect(0, 0, 1, 1), gifColBlue, pal),
+	}
+	raw := encodeTestGIF(t, frames, []int{5, 5}, nil, -1, 1, 1)
+	start, err := skipGIFHeaderAndGCT(raw)
+	require.NoError(t, err)
+	require.Equal(t, gifTrailer, raw[len(raw)-1])
+	imageBlocks := raw[start : len(raw)-1]
+	require.Less(t, len(imageBlocks)+12, 256)
+
+	// Go consumes the size byte plus 12 header bytes, then treats the next zero
+	// as the extension terminator. The scanner follows the declared size and
+	// instead skips both image descriptors as extension payload.
+	crafted := append([]byte{}, raw[:start]...)
+	crafted = append(crafted, gifExtension, gifPlainTextLabel, byte(len(imageBlocks)+12)) // #nosec G115 -- checked above to fit one byte
+	crafted = append(crafted, make([]byte, 13)...)
+	crafted = append(crafted, imageBlocks...)
+	crafted = append(crafted, gifTrailer)
+	decoded, err := gif.DecodeAll(bytes.NewReader(crafted))
+	require.NoError(t, err)
+	require.Len(t, decoded.Image, 2, "fixture must reach Go's pixel decoder")
+
+	require.ErrorContains(t, scanGIFFrameBudget(crafted), "plain text")
+	_, err = safeDecodeGIF(bytes.NewReader(crafted))
+	require.ErrorContains(t, err, "plain text")
+}
+
+func TestSafeDecodeGIF_AcceptsCanonicalPlainTextExtension(t *testing.T) {
+	pal := gifTestPalette()
+	frame := solidPalettedFrame(t, image.Rect(0, 0, 1, 1), gifColRed, pal)
+	raw := encodeTestGIF(t, []*image.Paletted{frame}, []int{5}, nil, -1, 1, 1)
+	start, err := skipGIFHeaderAndGCT(raw)
+	require.NoError(t, err)
+	withText := append([]byte{}, raw[:start]...)
+	withText = append(withText, gifExtension, gifPlainTextLabel, 12)
+	withText = append(withText, make([]byte, 12)...)
+	withText = append(withText, 0)
+	withText = append(withText, raw[start:]...)
+
+	decoded, err := safeDecodeGIF(bytes.NewReader(withText))
+	require.NoError(t, err)
+	require.Len(t, decoded.Image, 1)
+}
+
+func TestProcessImageGIF_RejectsWhenAnotherGIFIsProcessing(t *testing.T) {
+	pal := gifTestPalette()
+	frame := solidPalettedFrame(t, image.Rect(0, 0, 1, 1), gifColRed, pal)
+	raw := encodeTestGIF(t, []*image.Paletted{frame}, []int{5}, nil, -1, 1, 1)
+
+	gifProcessingSlots <- struct{}{}
+	t.Cleanup(func() { <-gifProcessingSlots })
+	_, err := ProcessImageGIF(bytes.NewReader(raw), 1, 1)
+	require.ErrorContains(t, err, "processing busy")
 }
 
 func TestSafeDecodeGIF_RejectsTruncatedData(t *testing.T) {

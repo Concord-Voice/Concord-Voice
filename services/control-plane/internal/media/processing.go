@@ -41,12 +41,29 @@ const (
 const (
 	maxGifFrames = 120 // hard frame-count ceiling for the animated pipeline
 
-	// maxGifTotalPixels bounds frames × logical-screen pixels — the total pixel
-	// throughput the coalesce/resize loop will touch. 4 × maxDecodePixels
-	// (4 × 50,000,000 = 200,000,000 px) keeps worst-case work within a small
-	// constant multiple of the static pipeline's ceiling.
-	maxGifTotalPixels int64 = 4 * maxDecodePixels
+	// maxGifTotalPixels bounds the aggregate decoded paletted frame storage and
+	// the frames × logical-screen work performed by the coalescing loop. Keep
+	// animation within the static decoder's pixel ceiling rather than multiplying
+	// that ceiling by the frame count: coalescing also needs RGBA canvases and may
+	// clone one for DisposalPrevious.
+	maxGifTotalPixels int64 = maxDecodePixels
 )
+
+// A single near-budget GIF can hold hundreds of MiB across decoded frames,
+// coalescing canvases, and output buffers. Bound the whole decode/process
+// pipeline across avatar and banner routes, not just gif.DecodeAll.
+var gifProcessingSlots = make(chan struct{}, 1)
+
+func tryAcquireGIFProcessing() bool {
+	select {
+	case gifProcessingSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseGIFProcessing() { <-gifProcessingSlots }
 
 // Canonical Tier 1 image MIME types, defined once so the allowlists and the
 // image-type error bodies reference named constants rather than repeating the
@@ -240,14 +257,6 @@ func safeDecodeGIF(r io.Reader) (*gif.GIF, error) {
 	return g, nil
 }
 
-// isAnimatedGIF is the upload path's definition of "animated" for a decoded
-// GIF: more than one frame. gif.DecodeAll yields one frame per image
-// descriptor, so isAnimatedGIFStructure (the inline check) counts the same thing
-// without decoding.
-func isAnimatedGIF(g *gif.GIF) bool {
-	return len(g.Image) > 1
-}
-
 // IsAnimatedImage reports whether raw is an image a browser would animate in an
 // <img> element: a multi-frame GIF, an APNG (a PNG with an acTL chunk ahead of
 // its first IDAT), or an animated WebP (a VP8X animation flag, or an ANIM/ANMF
@@ -413,6 +422,7 @@ const (
 	gifTrailer         byte = 0x3B
 
 	gifGraphicControlLabel byte = 0xF9
+	gifPlainTextLabel      byte = 0x01
 )
 
 // scanGIFFrameBudget walks the GIF byte structure and enforces the frame-count
@@ -489,6 +499,12 @@ func skipGIFHeaderAndGCT(raw []byte) (int, error) {
 func scanGIFBlock(raw []byte, pos int, block byte, budget *gifFrameBudget) (int, error) {
 	switch block {
 	case gifExtension:
+		// image/gif consumes a Plain Text Extension's size byte and 12
+		// header bytes regardless of the declared size. A different size
+		// lets this block walker skip image descriptors the decoder will see.
+		if pos+1 < len(raw) && raw[pos] == gifPlainTextLabel && raw[pos+1] != 12 {
+			return 0, fmt.Errorf("media: malformed gif: plain text extension block is not 12 bytes")
+		}
 		return scanGIFExtension(raw, pos)
 	case gifImageDescriptor:
 		return scanGIFImageFrame(raw, pos, budget)
@@ -588,6 +604,11 @@ func skipGIFSubBlocks(raw []byte, pos int) (int, error) {
 // (optimized GIFs ship partial frames; naive per-frame resize glitches), then
 // re-palettized. Output frames are full logical frames with disposal "none".
 func ProcessImageGIF(r io.Reader, maxWidth, maxHeight int) (*ProcessedImage, error) {
+	if !tryAcquireGIFProcessing() {
+		return nil, fmt.Errorf("media: gif processing busy")
+	}
+	defer releaseGIFProcessing()
+
 	g, err := safeDecodeGIF(r)
 	if err != nil {
 		return nil, err

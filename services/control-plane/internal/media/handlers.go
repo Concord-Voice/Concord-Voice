@@ -1292,9 +1292,48 @@ type tier1ImageJob struct {
 // writes the HTTP error response itself and returns ok=false.
 func (h *Handler) processTier1Image(c *gin.Context, file multipart.File, job tier1ImageJob) (*ProcessedImage, bool) {
 	if job.contentType != mimeGIF {
+		// A declared allowed type is not necessarily the file's real type.
+		// image.Decode recognizes GIF bytes even when they are declared PNG or
+		// JPEG, so those flattened uploads need the same memory slot.
+		isGIF, err := hasGIFSignature(file)
+		if err != nil {
+			h.log.Error("Failed to inspect image upload", "error", err, "user_id", job.userID, "purpose", job.purpose)
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
+			return nil, false
+		}
+		if isGIF {
+			if !tryAcquireGIFProcessing() {
+				writeGIFProcessingBusy(c)
+				return nil, false
+			}
+			defer releaseGIFProcessing()
+		}
 		return h.processStaticTier1Image(c, file, job)
 	}
 	return h.processGIFTier1Image(c, file, job)
+}
+
+// hasGIFSignature peeks at the file without changing the static decoder's
+// starting position. It is only used to select the processing slot; declared
+// non-GIF uploads still take the existing static flatten path.
+func hasGIFSignature(file multipart.File) (bool, error) {
+	var signature [6]byte
+	_, readErr := io.ReadFull(file, signature[:])
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return false, nil
+	}
+	if readErr != nil {
+		return false, readErr
+	}
+	return bytes.Equal(signature[:], []byte("GIF87a")) || bytes.Equal(signature[:], []byte("GIF89a")), nil
+}
+
+func writeGIFProcessingBusy(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Image processing is busy; please retry"})
 }
 
 func (h *Handler) processStaticTier1Image(c *gin.Context, file io.Reader, job tier1ImageJob) (*ProcessedImage, bool) {
@@ -1307,10 +1346,11 @@ func (h *Handler) processStaticTier1Image(c *gin.Context, file io.Reader, job ti
 	return processed, true
 }
 
-// processGIFTier1Image is the #1302 animated-aware branch. The GIF is decoded
-// ONCE through safeDecodeGIF — the decompression-bomb guards run during
-// animation detection, before any entitlement gate — and the frame count
-// selects the path:
+// processGIFTier1Image is the #1302 animated-aware branch. The GIF container is
+// classified without decoding pixels so unauthorized animations are rejected
+// before gif.DecodeAll can allocate their frames. Authorized uploads then pass
+// through safeDecodeGIF once, and the structural classification selects the
+// path:
 //
 //   - single frame → today's static flatten path, every tier (decision 5);
 //   - multi frame  → entitlement gate per purpose, then animation-preserving
@@ -1326,6 +1366,21 @@ func (h *Handler) processGIFTier1Image(c *gin.Context, file multipart.File, job 
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read file"})
 		return nil, false
 	}
+	animated, err := isAnimatedGIFStructure(raw)
+	if err != nil {
+		h.log.Error("Failed to inspect gif upload", "error", err, "user_id", job.userID, "purpose", job.purpose)
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
+		return nil, false
+	}
+	if animated && !h.authorizeAnimatedUpload(c, job.userID, job.purpose, job.serverID) {
+		return nil, false
+	}
+	if !tryAcquireGIFProcessing() {
+		writeGIFProcessingBusy(c)
+		return nil, false
+	}
+	defer releaseGIFProcessing()
+
 	g, err := safeDecodeGIF(bytes.NewReader(raw))
 	if err != nil {
 		// Includes the bomb-guard rejections (frame count / total pixels /
@@ -1334,12 +1389,9 @@ func (h *Handler) processGIFTier1Image(c *gin.Context, file multipart.File, job 
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
 		return nil, false
 	}
-	if !isAnimatedGIF(g) {
+	if !animated {
 		// Static GIF keeps the flatten path for every tier (#1302 decision 5).
 		return h.processStaticTier1Image(c, bytes.NewReader(raw), job)
-	}
-	if !h.authorizeAnimatedUpload(c, job.userID, job.purpose, job.serverID) {
-		return nil, false
 	}
 	processed, err := processDecodedGIF(g, job.maxW, job.maxH)
 	if err != nil {
