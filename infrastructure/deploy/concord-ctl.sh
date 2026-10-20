@@ -3933,16 +3933,19 @@ else:
         exit 1
       fi
     fi
-    if sudo /usr/bin/test -e "$NGINX_DST"; then
-      main_was_present=1
-      if ! sudo /usr/bin/ln -fT -- "$NGINX_DST" "$NGINX_BACKUP"; then
+    if (( NGINX_STAGE_BOOTSTRAP )); then
+      if sudo /usr/bin/test -e "$NGINX_DST"; then
+        main_was_present=1
+      elif ! sudo /usr/bin/test ! -e "$NGINX_DST" || [[ -L "$NGINX_DST" ]]; then
         echo "  ✗ nginx-reload: could not preserve the current main config" >&2
         cleanup_nginx_candidates || true
         cleanup_nginx_backups || true
         exit 1
       fi
-    elif (( !NGINX_STAGE_BOOTSTRAP )) || ! sudo /usr/bin/test ! -e "$NGINX_DST" \
-         || [[ -L "$NGINX_DST" ]]; then
+    else
+      main_was_present=1
+    fi
+    if (( main_was_present )) && ! sudo /usr/bin/ln -fT -- "$NGINX_DST" "$NGINX_BACKUP"; then
       echo "  ✗ nginx-reload: could not preserve the current main config" >&2
       cleanup_nginx_candidates || true
       cleanup_nginx_backups || true
