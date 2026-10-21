@@ -3,6 +3,9 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The legacy object-storage destination guards (ADR-0038 follow-up).
@@ -265,5 +268,35 @@ func TestStorageHostname_IPv4MappedIsJudgedByTheWrappedAddress(t *testing.T) {
 		if !ok || !privateNetworkStorageHost(host) {
 			t.Errorf("%q refused, but it is genuinely in-cluster", endpoint)
 		}
+	}
+}
+
+// TestValidateProduction_SelfHostedSpellingsGetTheSelfHostedStorageRule: the
+// storage-host rule reads INSTANCE_TYPE through the same normalisation as the
+// rest of Config, so every spelling NormalizeInstanceType accepts is exempt
+// from SaaS placement. The SaaS spelling is the control: the same endpoint is
+// refused there, so the exemption cannot pass by accident.
+func TestValidateProduction_SelfHostedSpellingsGetTheSelfHostedStorageRule(t *testing.T) {
+	const external = "s3.operator.example:9000"
+	for _, spelling := range []string{"self-hosted", "Self-Hosted", "SELF-HOSTED", " self-hosted ", "\tSelf-Hosted\n"} {
+		t.Run("spelling "+spelling, func(t *testing.T) {
+			require.Equal(t, InstanceTypeSelfHosted, NormalizeInstanceType(spelling), "the spelling is one NormalizeInstanceType accepts")
+			cfg := validProductionConfig()
+			cfg.InstanceType = spelling
+			cfg.StorageEndpoint = external
+			cfg.StorageUseSSL = true
+			assert.False(t, cfg.storageDestinationEscapesTheCluster())
+			assert.NoError(t, cfg.validateProduction())
+		})
+	}
+	for _, spelling := range []string{"saas", "", "enterprise"} {
+		t.Run("control "+spelling, func(t *testing.T) {
+			cfg := validProductionConfig()
+			cfg.InstanceType = spelling
+			cfg.StorageEndpoint = external
+			cfg.StorageUseSSL = true
+			assert.True(t, cfg.storageDestinationEscapesTheCluster())
+			assert.Error(t, cfg.validateProduction())
+		})
 	}
 }

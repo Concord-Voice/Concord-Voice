@@ -213,6 +213,9 @@ type Config struct {
 	JWTSecret       string // #nosec G117 -- False positive: config field name, actual secret loaded from env
 	NATSUrl         string
 	OpsMetrics      OpsMetricsConfig
+	// Billing is the Stripe billing configuration (#2033), validated by
+	// LoadBillingConfig and logged at boot by BillingConfig.LogBoot.
+	Billing BillingConfig
 
 	// CORS settings
 	AllowedOrigins []string
@@ -559,6 +562,12 @@ func Load() (*Config, error) {
 	if err := loadRoomPlacementConfig(cfg); err != nil {
 		return nil, err
 	}
+
+	billing, err := LoadBillingConfig(cfg.Environment, cfg.InstanceType)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Billing = billing
 
 	cidrs, err := computeTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"), cfg.Environment)
 	if err != nil {
@@ -1123,7 +1132,7 @@ func (c *Config) managedR2CredentialMissing(value string) bool {
 }
 
 func (c *Config) storageDestinationEscapesTheCluster() bool {
-	if c.InstanceType == InstanceTypeSelfHosted {
+	if IsSelfHostedInstance(c.InstanceType) {
 		return false
 	}
 	host, ok := storageHostname(c.StorageEndpoint)

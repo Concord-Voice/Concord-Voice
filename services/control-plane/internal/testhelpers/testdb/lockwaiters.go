@@ -99,6 +99,32 @@ func WaitForAdvisoryLockWaiter(t *testing.T, probe *sql.DB, key int64) {
 		advisoryWaiterQuery, classID, objID)
 }
 
+// relationLockWaiterQuery matches a backend parked on a relation-level lock in
+// a given mode. $1 resolves through the probe's search_path.
+const relationLockWaiterQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM pg_locks
+		WHERE locktype = 'relation'
+		  AND NOT granted
+		  AND relation = to_regclass($1::text)
+		  AND mode = $2::text
+	)`
+
+// WaitForRelationLockWaiter blocks until at least one backend is waiting to
+// take mode (a pg_locks mode name such as "AccessExclusiveLock") on relation,
+// then returns.
+//
+// It is the barrier for guarded down migrations (#2033): a test holds a row
+// write on the table in an open transaction, starts the down, waits here for
+// the down's LOCK TABLE to park, then commits the row.
+//
+// probe MUST be a pool distinct from the one running the waiting statement.
+func WaitForRelationLockWaiter(t *testing.T, probe *sql.DB, relation, mode string) {
+	t.Helper()
+	waitForLockPredicate(t, probe, "a backend waiting for "+mode+" on "+relation,
+		relationLockWaiterQuery, relation, mode)
+}
+
 // waitForLockPredicate polls query until it reports true. It is the single
 // implementation behind every waiter helper in this package, so no test ever
 // inlines a pg_locks poll of its own.

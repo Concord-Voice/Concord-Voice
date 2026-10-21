@@ -68,7 +68,7 @@ func (c *Cache) GetTier(ctx context.Context, userID string) string {
 		return ResolveTier(ctx, c.db, userID)
 	}
 
-	tier, resolveErr := resolveTierChecked(ctx, c.db, userID)
+	tier, resolveErr := ResolveTierChecked(ctx, c.db, userID)
 	if resolveErr != nil {
 		log.Printf("entitlements: ResolveTier failed for user %q: %v", userID, resolveErr)
 		return TierFree
@@ -95,7 +95,7 @@ func (c *Cache) GetTierChecked(ctx context.Context, userID string) (string, erro
 	if err == nil {
 		return val, nil
 	}
-	tier, dbErr := resolveTierChecked(ctx, c.db, userID)
+	tier, dbErr := ResolveTierChecked(ctx, c.db, userID)
 	if dbErr != nil {
 		return "", dbErr
 	}

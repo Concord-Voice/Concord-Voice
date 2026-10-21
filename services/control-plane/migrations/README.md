@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000177)
+## Existing Migrations (000001–000182)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -287,6 +287,11 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000175 | validate_dm_messages_key_version | Validate the DM-message version check in a separate migration transaction (#2844) |
 | 000176 | enforce_dm_messages_key_version | Set DM-message `key_version` `NOT NULL` and drop its default while retaining the positive check (#2844) |
 | 000177 | feedback_screenshot_lifecycle | PostgreSQL screenshot byte staging and quota ledger, receipt-backed submission and unresolved-pin retention, transactional abandoned-upload expiry and retained-image offload tracking with a durable three-attempt application PUT cap; preserves existing images and guards rollback while lifecycle evidence exists |
+| 000178 | subscriptions_stripe_billing | `subscriptions.status` admits every Stripe status (live set unchanged); adds `plan`, `billing_interval`, `founders_rate`, `cancel_at`; CHECKs make a `stripe` row carry both Stripe ids and a period end (#2033); down refuses Stripe rows and new statuses |
+| 000179 | subscriptions_per_source_live_indexes | Replaces the one-live-row-per-user index with a unique live-code index, a unique `stripe_subscription_id` index and live-Stripe indexes on `user_id` and `current_period_end`; down refuses while a user holds two live rows |
+| 000180 | stripe_customers | One Stripe Customer per user and one user per Customer, cascading with the user; down refuses any mapping |
+| 000181 | stripe_webhook_events | Webhook dedupe by `evt_` id, no payload, `processed_at` index for 30-day retention; plain down |
+| 000182 | billing_erasure_outbox | Pending Stripe Customer erasures with no user id or FK; down refuses any pending obligation |
 
 ### Message key-version constraints (migrations 000171–000176, #2844)
 
@@ -452,6 +457,19 @@ and uses a compatible image that embeds migration 000169. Do not erase commands,
 reset cursors or force an older schema version to bypass that refusal. See the
 [voice command transport runbook](../../../[internal]voice-command-transport.md)
 for delivery diagnostics and preservation of continuity evidence.
+
+Migrations 000178–000182 are the Stripe billing foundation (epic #2033). 000178
+widens `subscriptions.status` to every Stripe status without changing the live
+set, adds the plan, interval, founders-rate and `cancel_at` columns, and adds
+CHECKs that make a `stripe` row carry both Stripe ids and a period end. 000179
+makes the live-row indexes per source, so a user can hold a live code grant and
+a live Stripe subscription at once. 000180–000182 add `stripe_customers`,
+`stripe_webhook_events` and `billing_erasure_outbox`. Every down except 000181's
+refuses while billing data exists. A refused down leaves golang-migrate
+recording **N-1** as dirty while the schema is still at N: confirm the schema,
+then force **N**, never N-1 (table in `[internal]rules/migrations.md` § "Stripe
+billing"). The rollback floor is PR-1: an image built before 000178 fails the
+version-existence check and cannot boot against it.
 
 ## Troubleshooting
 

@@ -56,37 +56,41 @@ func NewHandler(db *sql.DB, log *logger.Logger) *Handler {
 	return &Handler{db: db, log: log}
 }
 
+// getMeQuery reads the row whose values fill the legacy top-level status
+// fields. Liveness is entitlements.LiveRowPredicate, the per-source rule tier
+// enforcement uses. Since migration 000179 a user can hold one live code row
+// and live Stripe rows at once, so the order is explicit: a Stripe row before a
+// code row (#2033 spec §5; PR-5 puts the seat between them), then the latest
+// period end (a NULL end, which never lapses, sorts first), then id so the pick
+// is deterministic. Both operands of the concatenation are constants.
+const getMeQuery = `SELECT tier, status, source, current_period_end
+	  FROM subscriptions
+	 WHERE user_id = $1 AND ` + entitlements.LiveRowPredicate + `
+	 ORDER BY CASE WHEN source = 'stripe' THEN 0 ELSE 1 END,
+	          current_period_end DESC NULLS FIRST,
+	          id
+	 LIMIT 1`
+
 // GetMe handles GET /api/v1/subscriptions/me. It returns the acting user's live
-// subscription status (tier/status/source/expiry) or the free-default shape when
-// no live row exists. Query or scan errors return 503 without confirming a tier.
-//
-// The query mirrors entitlements.ResolveTier's live-row predicate exactly, so
-// successful status reads use the same live-row criteria as tier enforcement.
-// The partial unique index idx_subscriptions_user_active guarantees at most one
-// matching row, so LIMIT 1 is exact.
+// subscription status (tier/status/source/expiry) from the highest-precedence
+// live row (see getMeQuery), or the free-default shape when no live row exists.
+// Query or scan errors return 503 without confirming a tier.
 func (h *Handler) GetMe(c *gin.Context) {
 	userID := c.GetString("user_id")
-
-	const q = `SELECT tier, status, source, current_period_end FROM subscriptions
-	           WHERE user_id = $1
-	             AND status IN ('active', 'trialing', 'past_due')
-	             AND (current_period_end IS NULL OR current_period_end > NOW())
-	           LIMIT 1`
 
 	var (
 		tier, status, source string
 		periodEnd            sql.NullTime
 	)
-	err := h.db.QueryRowContext(c.Request.Context(), q, userID).
+	err := h.db.QueryRowContext(c.Request.Context(), getMeQuery, userID).
 		Scan(&tier, &status, &source, &periodEnd)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusOK, freeDefault())
 		return
 	}
 	if err != nil {
-		// Report unavailability without confirming a tier. %q is safe for userID
-		// (observability.md: %q-escaped values need no further sanitization). No
-		// row values are logged — PII-safe.
+		// Report unavailability without confirming a tier. The user id passes
+		// through sanitizeID (CWE-117) and no row values are logged (PII-safe).
 		h.log.Error("subscriptions: status read failed", "user_id", sanitizeID(userID), "error", err.Error())
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "subscription status unavailable"})
 		return

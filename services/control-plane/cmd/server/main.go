@@ -128,6 +128,9 @@ func runControlPlane() (runErr error) {
 	// the escaping pkg/logger handler covers slog.Default(), the package-level slog
 	// functions, and stdlib log output, which SetDefault routes through the same handler.
 	slog.SetDefault(log.Logger)
+	// Spec §14 boot line: purchase mode, key-mode class, founders cutoff and
+	// self-host state. The key is never logged.
+	cfg.Billing.LogBoot(log.Logger)
 	securityEvents := securityevent.Discard
 	if cfg.Environment == "production" {
 		writer, openErr := securityevent.Open(securityevent.ControlPlanePath, securityevent.ServiceControlPlane, log)

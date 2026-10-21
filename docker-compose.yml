@@ -270,6 +270,16 @@ services:
       PURGE_RATE_WINDOW_SEC: ${PURGE_RATE_WINDOW_SEC:-3600}
       KLIPY_API_KEY: ${KLIPY_API_KEY:-}
       KLIPY_CUSTOMER_ID_KEY: ${KLIPY_CUSTOMER_ID_KEY:-}
+      # Stripe billing (#2033): dormant unless configured, so soft :- defaults
+      # and never :?. The public self-host overlay merges into this map, so a
+      # self-hosted control plane can receive these too; it ignores the keys
+      # with a warning and refuses any purchase mode but off.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      BILLING_PURCHASE_MODE: ${BILLING_PURCHASE_MODE:-}
+      BILLING_PURCHASE_ALLOWLIST: ${BILLING_PURCHASE_ALLOWLIST:-}
+      FOUNDERS_PRICING_ENDS_AT: ${FOUNDERS_PRICING_ENDS_AT:-}
+      STRIPE_AUTOMATIC_TAX: ${STRIPE_AUTOMATIC_TAX:-}
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.19.0.0/16}
       # Activity History is deployed dormant. First activation is performed only
       # through the drained concord-ctl preflight; ordinary Compose starts must

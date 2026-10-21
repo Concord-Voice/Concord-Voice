@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,29 +22,32 @@ func TestMigration000070_Subscriptions(t *testing.T) {
 		require.True(t, exists, "subscriptions should exist after migrations apply")
 	})
 
-	t.Run("partial unique index forbids two active subscriptions per user", func(t *testing.T) {
+	t.Run("partial unique index forbids two live code subscriptions per user", func(t *testing.T) {
 		u := ts.CreateTestUser(t, "sub_active_unique")
 		_, err := ts.DB.ExecContext(ctx,
 			`INSERT INTO subscriptions (user_id, tier, status, source)
 			 VALUES ($1, 'premium', 'active', 'code')`, u.ID)
 		require.NoError(t, err)
 
+		// 000179 replaced 000070's one-live-row-per-user index with per-source
+		// indexes: a second live CODE row is still refused, while a live Stripe
+		// row beside it is legal (TestMigration000179_LiveRowIndexes).
 		_, err = ts.DB.ExecContext(ctx,
 			`INSERT INTO subscriptions (user_id, tier, status, source)
-			 VALUES ($1, 'premium', 'trialing', 'stripe')`, u.ID)
-		require.Error(t, err, "second active/trialing subscription for same user must fail")
+			 VALUES ($1, 'premium', 'trialing', 'code')`, u.ID)
+		migrationRequirePQError(t, err, "23505", "idx_subscriptions_user_live_code")
 	})
 
 	t.Run("canceled subscriptions are exempt from the partial unique index", func(t *testing.T) {
 		u := ts.CreateTestUser(t, "sub_canceled_exempt")
-		_, err := ts.DB.ExecContext(ctx,
-			`INSERT INTO subscriptions (user_id, tier, status, source)
-			 VALUES ($1, 'premium', 'canceled', 'stripe')`, u.ID)
-		require.NoError(t, err)
-		_, err = ts.DB.ExecContext(ctx,
-			`INSERT INTO subscriptions (user_id, tier, status, source)
-			 VALUES ($1, 'premium', 'canceled', 'stripe')`, u.ID)
-		require.NoError(t, err, "two canceled subscriptions for same user are allowed")
+		for range 2 {
+			_, err := ts.DB.ExecContext(ctx,
+				`INSERT INTO subscriptions
+				     (user_id, tier, status, source, stripe_customer_id, stripe_subscription_id, current_period_end)
+				 VALUES ($1, 'premium', 'canceled', 'stripe', $2, $3, NOW() - INTERVAL '1 day')`,
+				u.ID, "cus_test_"+uuid.NewString(), "sub_test_"+uuid.NewString())
+			require.NoError(t, err, "two canceled subscriptions for same user are allowed")
+		}
 	})
 
 	t.Run("ON DELETE CASCADE removes subscriptions with the user", func(t *testing.T) {
@@ -63,7 +67,7 @@ func TestMigration000070_Subscriptions(t *testing.T) {
 	t.Run("CHECK constraints reject out-of-enum status and source; tier stays extensible", func(t *testing.T) {
 		u := ts.CreateTestUser(t, "sub_check_enum")
 		// Out-of-enum (typo'd) status must be rejected — this CHECK is what stops a
-		// typo'd status from dodging the partial unique "one active subscription" index.
+		// typo'd status from dodging the live-set partial unique indexes (000179).
 		_, err := ts.DB.ExecContext(ctx,
 			`INSERT INTO subscriptions (user_id, tier, status, source)
 			 VALUES ($1, 'premium', 'aktiv', 'code')`, u.ID)

@@ -83,7 +83,9 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 	// Migrate once per package binary; cleanup truncation between tests ensures isolation.
 	if err := ensureMigrations(db); err != nil {
 		releaseLock()
-		_ = db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("testhelpers: failed to close database: %v", closeErr)
+		}
 		t.Fatalf("testhelpers: migration failed: %v", err)
 	}
 
@@ -94,7 +96,9 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 				t.Errorf("testhelpers: failed to truncate tables: %v", err)
 			}
 			releaseLock()
-			_ = db.Close()
+			if err := db.Close(); err != nil {
+				t.Errorf("testhelpers: failed to close database: %v", err)
+			}
 		})
 	}
 	t.Cleanup(cleanup)
@@ -143,14 +147,16 @@ func openTestDatabaseLockConn(t *testing.T, dbURL string) (*sql.DB, *sql.Conn) {
 
 	conn, err := db.Conn(context.Background())
 	if err != nil {
-		_ = db.Close()
+		closeTestDatabaseLockDB(t, db)
 		t.Fatalf("testhelpers: failed to reserve database lock connection: %v", err)
 	}
 	lockCtx, cancel := context.WithTimeout(context.Background(), testDBLockTimeout)
 	defer cancel()
 	if _, err := conn.ExecContext(lockCtx, `SELECT pg_advisory_lock($1)`, testDBAdvisoryLockID); err != nil {
-		_ = conn.Close()
-		_ = db.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("testhelpers: failed to close database lock connection: %v", closeErr)
+		}
+		closeTestDatabaseLockDB(t, db)
 		if errors.Is(lockCtx.Err(), context.DeadlineExceeded) {
 			// Never interpolate dbURL here — it carries the password (observability.md #1).
 			t.Fatalf("testhelpers: timed out after %s waiting for the shared test-database "+
@@ -218,7 +224,6 @@ func closeTestDatabaseLockDB(t *testing.T, db *sql.DB) {
 	}
 }
 
-// TruncateAllTables removes all data from application tables.
 // TruncateAllTables resets the shared test database between tests. The single
 // multi-table TRUNCATE takes ACCESS EXCLUSIVE locks progressively, so it can
 // lose a lock-order deadlock (SQLSTATE 40P01) against a lingering background
@@ -300,6 +305,8 @@ func truncateAllTablesOnce(db *sql.DB) error {
 		subscriptions,
 		redemption_codes,
 		code_redemptions,
+		stripe_webhook_events,
+		billing_erasure_outbox,
 		user_presence_settings
 	CASCADE`)
 	if err != nil {

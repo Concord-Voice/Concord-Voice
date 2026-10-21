@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
@@ -29,9 +30,22 @@ func migration000110OriginalSourceCheck(t *testing.T, sql string) string {
 func migration000110InsertSource(t *testing.T, db *sql.DB, source string) error {
 	t.Helper()
 	userID := testhelpers.CreateUser(t, db)
+	// Since 000178 a Stripe row must carry both Stripe ids and a period end
+	// (subscriptions_stripe_identity_check, subscriptions_stripe_period_check),
+	// and no other row may carry both ids, so the source CHECK stays the only
+	// constraint each call exercises.
+	var customerID, subscriptionID sql.NullString
+	var periodEnd sql.NullTime
+	if source == "stripe" {
+		customerID = sql.NullString{String: "cus_test_" + userID.String(), Valid: true}
+		subscriptionID = sql.NullString{String: "sub_test_" + userID.String(), Valid: true}
+		periodEnd = sql.NullTime{Time: time.Now().Add(30 * 24 * time.Hour), Valid: true}
+	}
 	_, err := db.Exec(
-		"INSERT INTO subscriptions (user_id, tier, status, source) VALUES ($1, 'premium', 'active', $2)",
-		userID, source)
+		`INSERT INTO subscriptions
+		     (user_id, tier, status, source, stripe_customer_id, stripe_subscription_id, current_period_end)
+		 VALUES ($1, 'premium', 'active', $2, $3, $4, $5)`,
+		userID, source, customerID, subscriptionID, periodEnd)
 	return err
 }
 
@@ -68,14 +82,20 @@ func TestMigration000110_TightensSubscriptionSource(t *testing.T) {
 	// the up migration's fail-closed pre-flight guard — which is otherwise
 	// unreachable, because SetupTestDB only ever migrates an empty database.
 	t.Run("down widens, and up refuses to re-apply while a legacy row survives", func(t *testing.T) {
-		db, cleanup := testhelpers.SetupTestDB(t)
-		defer cleanup()
+		// No defer: SetupTestDB registers its own t.Cleanup (truncate, then
+		// close db). The restore below is registered later, so it runs first,
+		// while db is still open.
+		db, _ := testhelpers.SetupTestDB(t)
 
 		// Always leave the shared test database on the narrowed constraint, even if
 		// an assertion below fails partway through.
 		t.Cleanup(func() {
-			_, _ = db.Exec("DELETE FROM subscriptions WHERE source = 'kickstarter'")
-			_, _ = db.Exec(up)
+			if _, err := db.Exec("DELETE FROM subscriptions WHERE source = 'kickstarter'"); err != nil {
+				t.Errorf("cleanup: could not remove kickstarter rows: %v", err)
+			}
+			if _, err := db.Exec(up); err != nil {
+				t.Errorf("cleanup: could not re-apply 000110: %v", err)
+			}
 		})
 
 		_, err := db.Exec(down)

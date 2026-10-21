@@ -111,9 +111,11 @@ func TestSweep_LeavesStripeSourced(t *testing.T) {
 	user := testhelpers.CreateUser(t, db)
 	var subID uuid.UUID
 	require.NoError(t, db.QueryRow(`
-		INSERT INTO subscriptions (user_id, tier, status, source, current_period_end)
-		VALUES ($1, 'premium', 'active', 'stripe', $2)
-		RETURNING id`, user, time.Now().Add(-time.Hour)).Scan(&subID))
+		INSERT INTO subscriptions
+		    (user_id, tier, status, source, stripe_customer_id, stripe_subscription_id, current_period_end)
+		VALUES ($1, 'premium', 'active', 'stripe', $2, $3, $4)
+		RETURNING id`,
+		user, "cus_test_"+uuid.NewString(), "sub_test_"+uuid.NewString(), time.Now().Add(-time.Hour)).Scan(&subID))
 
 	rec := &recordingTierChange{}
 	n, err := newTestSweeper(db, rec).SweepExpired(ctx)
@@ -121,6 +123,41 @@ func TestSweep_LeavesStripeSourced(t *testing.T) {
 	assert.Equal(t, 0, n, "a stripe-sourced row is owned by the Stripe webhook path, not the sweep")
 	assert.Equal(t, "active", statusOf(t, db, subID), "stripe row must stay live")
 	assert.Empty(t, rec.calls, "no downgrade may be fired for a stripe-sourced row")
+}
+
+// TestSweep_CodeExpiryBesideLiveStripeRowIsNotADowngrade: since migration
+// 000179 a user can hold a lapsed code row beside a live Stripe row. The sweep
+// still expires the code row, but the post-expiry tier resolves through the
+// live Stripe row, so the change it reports is premium->premium: not a
+// downgrade, so no forced disconnect.
+func TestSweep_CodeExpiryBesideLiveStripeRowIsNotADowngrade(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	user := testhelpers.CreateUser(t, db)
+	codeID := insertSub(t, db, user, "active", time.Now().Add(-time.Hour))
+	var stripeID uuid.UUID
+	require.NoError(t, db.QueryRow(`
+		INSERT INTO subscriptions
+		    (user_id, tier, status, source, stripe_customer_id, stripe_subscription_id, current_period_end)
+		VALUES ($1, 'premium', 'active', 'stripe', $2, $3, $4)
+		RETURNING id`,
+		user, "cus_test_"+uuid.NewString(), "sub_test_"+uuid.NewString(), time.Now().Add(30*24*time.Hour)).Scan(&stripeID))
+
+	rec := &recordingTierChange{}
+	n, err := newTestSweeper(db, rec).SweepExpired(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "only the lapsed code row is swept")
+
+	assert.Equal(t, "expired", statusOf(t, db, codeID), "the lapsed code row is still expired")
+	assert.Equal(t, "active", statusOf(t, db, stripeID), "the Stripe row is untouched")
+	assert.Equal(t, entitlements.TierPremium, entitlements.ResolveTier(ctx, db, user.String()),
+		"the live Stripe row keeps the user premium")
+	require.Len(t, rec.calls, 1)
+	assert.Equal(t, [3]string{user.String(), "premium", "premium"}, rec.calls[0],
+		"the expiry reports premium->premium, not a downgrade")
+	assert.False(t, entitlements.IsDowngrade(rec.calls[0][1], rec.calls[0][2]))
 }
 
 // TestSweep_IdempotentAcrossRuns: re-running the sweep (e.g. after a restart)

@@ -43,13 +43,22 @@ func doGet(r *gin.Engine, path string) *httptest.ResponseRecorder {
 	return w
 }
 
-// insertSubscription writes a subscriptions row directly for fixture setup.
+// insertSubscription writes a subscriptions row directly for fixture setup. A
+// stripe row also gets the unique Stripe id pair that 000178's
+// subscriptions_stripe_identity_check requires; its caller must pass a non-nil
+// periodEnd (subscriptions_stripe_period_check).
 func insertSubscription(t *testing.T, db *sql.DB, userID uuid.UUID, tier, status, source string, periodEnd *time.Time) {
 	t.Helper()
+	var customerID, subscriptionID sql.NullString
+	if source == "stripe" {
+		customerID = sql.NullString{String: "cus_test_" + uuid.NewString(), Valid: true}
+		subscriptionID = sql.NullString{String: "sub_test_" + uuid.NewString(), Valid: true}
+	}
 	_, err := db.Exec(
-		`INSERT INTO subscriptions (user_id, tier, status, source, current_period_end)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		userID, tier, status, source, periodEnd,
+		`INSERT INTO subscriptions
+		     (user_id, tier, status, source, current_period_end, stripe_customer_id, stripe_subscription_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		userID, tier, status, source, periodEnd, customerID, subscriptionID,
 	)
 	require.NoError(t, err)
 }
@@ -112,11 +121,13 @@ func TestGetMe_ExpiredRowFreeDefault(t *testing.T) {
 }
 
 // TestGetMe_CanceledRowFreeDefault: a canceled status is not in the live set →
-// free default (the status predicate excludes it).
+// free default (the status predicate excludes it, even while the period end is
+// still in the future).
 func TestGetMe_CanceledRowFreeDefault(t *testing.T) {
 	h, r, db := newTestHandler(t)
 	user := testhelpers.CreateUser(t, db)
-	insertSubscription(t, db, user, "premium", "canceled", "stripe", nil)
+	periodEnd := time.Now().UTC().Add(30 * 24 * time.Hour)
+	insertSubscription(t, db, user, "premium", "canceled", "stripe", &periodEnd)
 
 	r.GET("/subscriptions/me", authAs(user), h.GetMe)
 	w := doGet(r, "/subscriptions/me")

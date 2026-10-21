@@ -66,6 +66,9 @@ type ExpirySweeper struct {
 	// a DB resolve would read TierFree and fire a bogus premium->free downgrade
 	// (forced disconnect) for a user who is still premium (#2158 self-hosted).
 	selfHosted bool
+	// resolveTier reads the post-flip tier with its error kept. It is
+	// entitlements.ResolveTierChecked; tests replace it to fail the read.
+	resolveTier func(ctx context.Context, q entitlements.Querier, userID string) (string, error)
 }
 
 // NewExpirySweeper binds the sweeper to the shared entitlement Cache (for
@@ -83,7 +86,7 @@ func NewExpirySweeper(db *sql.DB, log *logger.Logger, cache *entitlements.Cache,
 // mode. The dependency-injection seam used by tests (a recorder) and by any
 // future caller that already holds a convergence-point adapter.
 func NewExpirySweeperWith(db *sql.DB, log *logger.Logger, changer TierChanger) *ExpirySweeper {
-	return &ExpirySweeper{db: db, log: log, changer: changer}
+	return &ExpirySweeper{db: db, log: log, changer: changer, resolveTier: entitlements.ResolveTierChecked}
 }
 
 // expiredSubscription is one subscription row that has passed its period end but
@@ -115,20 +118,21 @@ func (s *ExpirySweeper) SweepExpired(ctx context.Context) (int, error) {
 	return swept, nil
 }
 
-// selectExpiredSubscriptions returns live subscriptions whose period has ended.
-// The status predicate matches the live set (identical to ResolveTier and the
-// grant UPSERT) so an already-'expired'/'canceled' row is never re-selected —
-// this is what makes the sweep idempotent across restarts.
+// selectExpiredSubscriptions returns live code-sourced subscriptions whose
+// period has ended. The status predicate matches the live set (the status half
+// of entitlements.LiveRowPredicate) so an already-'expired'/'canceled' row is
+// never re-selected — this is what makes the sweep idempotent across restarts.
 //
 // The source predicate scopes the sweep to code-owned grants ('code') and
 // deliberately excludes 'stripe'. A Stripe subscription's lifecycle (renewal,
-// past_due grace, terminal cancel) is owned by the Stripe
-// webhook path (#1306); its local current_period_end can lag a delayed renewal
-// webhook, so expiring a stripe row here would fire a premium->free
-// downgrade/disconnect before Stripe has declared the subscription terminal.
-// This mirrors the redemption grant path (redemption/grants.go), which likewise
-// refuses to rewrite a 'stripe' source. Today every live row is source='code'
-// (no Stripe integration yet), so the predicate is a forward-safe no-op.
+// past_due grace, terminal cancel) is owned by the Stripe webhook path and
+// Reconcile (#2033). Its local current_period_end can lag a delayed renewal
+// webhook, which is why entitlements.LiveRowPredicate gives a Stripe row a
+// 6-hour buffer past its period end; expiring a stripe row here would fire a
+// premium->free downgrade/disconnect before Stripe has declared the
+// subscription terminal. The redemption grant path (redemption/grants.go)
+// likewise reads and writes only source='code' rows, so neither path ever
+// writes a Stripe row.
 func (s *ExpirySweeper) selectExpiredSubscriptions(ctx context.Context) ([]expiredSubscription, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, user_id, tier
@@ -217,7 +221,10 @@ func (s *ExpirySweeper) expireOne(ctx context.Context, e expiredSubscription) er
 	// an in-memory hub push + a Redis Unlink (fast), so the lock is held only
 	// briefly. A re-run after a post-notify crash re-notifies — OnTierChange is
 	// idempotent, so at-least-once (never at-most-once) is the intended trade.
-	newTier := s.resolveNewTier(ctx, e.userID)
+	newTier, err := s.resolveNewTier(ctx, tx, e.userID)
+	if err != nil {
+		return fmt.Errorf("resolve tier after expiry: %w", err)
+	}
 	if err := s.changer.OnTierChange(ctx, e.userID, e.oldTier, newTier); err != nil {
 		return fmt.Errorf("notify tier change after expiry: %w", err)
 	}
@@ -232,12 +239,16 @@ func (s *ExpirySweeper) expireOne(ctx context.Context, e expiredSubscription) er
 // self-hosted instance every user is premium regardless of subscription rows, so
 // short-circuit to TierPremium (an expired row there yields premium->premium, a
 // no-op notification rather than a spurious downgrade/disconnect). On SaaS,
-// DB-resolve the remaining live entitlement (normally none → free).
-func (s *ExpirySweeper) resolveNewTier(ctx context.Context, userID uuid.UUID) string {
+// DB-resolve the remaining live entitlement (normally none → free) inside the
+// expiry transaction. A failed read is an error, not free: since migration
+// 000179 a user can hold a live Stripe row beside the expiring code row, and a
+// fail-closed free here would push free entitlements to, and disconnect, a
+// paying user. The error rolls the flip back for the next sweep to retry.
+func (s *ExpirySweeper) resolveNewTier(ctx context.Context, tx *sql.Tx, userID uuid.UUID) (string, error) {
 	if s.selfHosted {
-		return entitlements.TierPremium
+		return entitlements.TierPremium, nil
 	}
-	return entitlements.ResolveTier(ctx, s.db, userID.String())
+	return s.resolveTier(ctx, tx, userID.String())
 }
 
 // StartExpirySweepWorker launches a goroutine that runs the expiry sweep once at

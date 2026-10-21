@@ -115,12 +115,15 @@ func (c *Catalog) Supports(grantKind string) bool {
 
 const defaultPremiumMonths = 1
 
-// grantPremiumSubscription creates or extends the user's active subscription
-// row to premium, source='code'. grant_params {"months": N} extends
-// current_period_end by N months (default 1). It UPSERTs against the partial
-// unique index idx_subscriptions_user_active (one active sub per user): if an
-// active row exists it extends from the greater of NOW() and the existing
-// period end (so stacking codes accumulate); otherwise it inserts a fresh row.
+// grantPremiumSubscription creates or extends the user's code-sourced
+// subscription row to premium. grant_params {"months": N} extends
+// current_period_end by N months (default 1). It reads and writes only the
+// user's source='code' row, of which the partial unique index
+// idx_subscriptions_user_live_code allows at most one in a live status: if that
+// row exists it extends from the greater of NOW() and the existing period end
+// (so stacking codes accumulate); otherwise it inserts a fresh code row. A
+// Stripe row is never read or written here, so a redemption cannot move a
+// Stripe billing period (#2033 spec §5 regression lock).
 //
 // All SQL is parameterized. The tier move (free→premium, or premium→premium
 // extension) is reported via GrantResult so the engine fires OnTierChange after
@@ -129,11 +132,11 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 	months := monthsFromParams(params)
 
 	// Serialize same-user premium grants on the USER row. Two premium codes
-	// redeemed by the same user concurrently with NO prior subscription would
+	// redeemed by the same user concurrently with NO prior code row would
 	// otherwise BOTH see "no existing sub" (a FOR UPDATE on the subscriptions
 	// SELECT locks nothing when zero rows match) and BOTH attempt an INSERT,
-	// racing the partial unique index idx_subscriptions_user_active. Locking the
-	// always-present users row first gives a real lock target, so the second
+	// racing the partial unique index idx_subscriptions_user_live_code. Locking
+	// the always-present users row first gives a real lock target, so the second
 	// transaction blocks until the first commits and then observes the inserted
 	// subscription via the extend path. The lock order is consistent
 	// (users row → subscriptions row), so it cannot deadlock with the engine's
@@ -142,7 +145,13 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 		return GrantResult{}, fmt.Errorf("redemption: lock user for premium grant: %w", err)
 	}
 
-	// Read the user's current active subscription (if any).
+	// Read the user's code row in a live status, if any. This select has NO
+	// time predicate and so deliberately does not use
+	// entitlements.LiveRowPredicate: it mirrors idx_subscriptions_user_live_code
+	// (source='code' AND a live status), so a code row whose period has ended
+	// but which the expiry sweep has not flipped yet is found and extended.
+	// Filtering that row out by period would make the INSERT below collide with
+	// the index (23505).
 	var (
 		existingID  uuid.UUID
 		periodEnd   sql.NullTime
@@ -152,6 +161,7 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 		SELECT id, current_period_end
 		  FROM subscriptions
 		 WHERE user_id = $1
+		   AND source = 'code'
 		   AND status IN ('active', 'trialing', 'past_due')`, userID).Scan(&existingID, &periodEnd)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -173,18 +183,9 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 	var subID uuid.UUID
 	if hasExisting {
 		subID = existingID
-		// Preserve an externally-managed source (e.g. 'stripe') — redeeming a
-		// code must never silently rewrite the billing source of record. Today
-		// every active sub is source='code' (no Stripe integration yet) so the
-		// CASE is a no-op; it is forward-safe for when Stripe (C1/C2, #1305/#1306)
-		// lands. Full reconciliation for a paying Stripe subscriber redeeming a
-		// code (period stacking vs. the Stripe billing period) is defined by
-		// #1305/#1306 and lands with them; until then we extend the period and
-		// keep the source, which is correct for every subscription that exists.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
 			   SET tier = $1, status = 'active',
-			       source = CASE WHEN source = 'stripe' THEN source ELSE 'code' END,
 			       current_period_end = $2, updated_at = NOW()
 			 WHERE id = $3`,
 			entitlements.TierPremium, newEnd, subID); err != nil {
@@ -200,10 +201,14 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 		}
 	}
 
-	// oldTier: premium if the user already had an active sub, else free. The
-	// engine uses this to decide whether OnTierChange is a no-op (both premium)
-	// or a real upgrade (free→premium). Either way OnTierChange invalidates the
-	// cache and pushes the live update.
+	// oldTier: premium if the user held a code row in a live status, else free.
+	// That row may have lapsed without the expiry sweep flipping it yet, so this
+	// can over-report premium for a grant that has already ended. Stripe rows
+	// are not consulted, so a Stripe payer reads as free here; PR-2's D1 refuses
+	// that redemption (409 already_covered). The engine uses this to decide
+	// whether OnTierChange is a no-op (both premium) or a real upgrade
+	// (free→premium). Either way OnTierChange invalidates the cache and pushes
+	// the live update.
 	oldTier := entitlements.TierFree
 	if hasExisting {
 		oldTier = entitlements.TierPremium

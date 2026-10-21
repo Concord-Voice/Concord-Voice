@@ -471,7 +471,7 @@ func TestViolationRecorderDoesNotPushADegradedTierResolve(t *testing.T) {
 
 // The real failure path, end to end: the production Cache over a database
 // handle whose every query fails, with an empty cache. The error comes out of
-// resolveTierChecked itself, so this is the test that notices the resolver
+// ResolveTierChecked itself, so this is the test that notices the resolver
 // swallowing a DB error into TierFree -- a stub that returns an error proves
 // only that the recorder handles one.
 func TestViolationRecorderDoesNotPushWhenTheRealTierReadFails(t *testing.T) {

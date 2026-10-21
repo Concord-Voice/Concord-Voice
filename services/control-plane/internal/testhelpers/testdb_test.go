@@ -45,7 +45,13 @@ func TestTruncateAllTablesClearsData(t *testing.T) {
 	db, cleanup := SetupTestDB(t)
 	defer cleanup()
 
-	// Insert a row.
+	// Insert one row per table. tier1_erasure_delete_obligations,
+	// stripe_webhook_events and billing_erasure_outbox have no foreign key, so
+	// only their explicit entries in truncateAllTablesOnce clear them;
+	// stripe_customers is not listed and is cleared through CASCADE from users.
+	// The FK-less billing rows use unique keys and an at-least-one count: a red
+	// run from before a table was listed leaves its row behind in the scratch
+	// database, and the next reset must clear that row too.
 	_, err := db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
 		VALUES (gen_random_uuid(), 'trunctest@test.concord.chat', 'trunctest',
 		'$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY',
@@ -54,12 +60,27 @@ func TestTruncateAllTablesClearsData(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key)
 		VALUES ('avatars/trunctest')`)
 	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO stripe_customers (user_id, stripe_customer_id)
+		SELECT id, 'cus_test_trunctest' FROM users WHERE username = 'trunctest'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO stripe_webhook_events (event_id, event_type)
+		VALUES ('evt_trunctest_' || gen_random_uuid(), 'invoice.paid')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO billing_erasure_outbox (stripe_customer_id)
+		VALUES ('cus_test_trunctest_' || gen_random_uuid())`)
+	require.NoError(t, err)
 
 	var before int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&before))
 	assert.Equal(t, 1, before)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations`).Scan(&before))
 	assert.Equal(t, 1, before)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM stripe_customers`).Scan(&before))
+	assert.Equal(t, 1, before)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM stripe_webhook_events`).Scan(&before))
+	assert.GreaterOrEqual(t, before, 1)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&before))
+	assert.GreaterOrEqual(t, before, 1)
 
 	// Truncate and verify.
 	require.NoError(t, TruncateAllTables(db))
@@ -69,11 +90,16 @@ func TestTruncateAllTablesClearsData(t *testing.T) {
 	assert.Equal(t, 0, after)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations`).Scan(&after))
 	assert.Equal(t, 0, after)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM stripe_customers`).Scan(&after))
+	assert.Equal(t, 0, after)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM stripe_webhook_events`).Scan(&after))
+	assert.Equal(t, 0, after)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&after))
+	assert.Equal(t, 0, after)
 }
 
 func TestSetupTestDBCleanupTruncates(t *testing.T) {
 	db, cleanup := SetupTestDB(t)
-	t.Cleanup(func() { _ = db.Close() }) // safety net if test exits early
 
 	// Insert a row, then run the cleanup.
 	_, err := db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)

@@ -1,0 +1,100 @@
+# Shared billing configuration cases (#2033, spec section 11, R9).
+# TestBillingEnvCases (pkg/config/billing_test.go) runs every row through
+# config.LoadBillingConfig; [internal]tests/test-billing-env.sh runs
+# every row through [internal]check-billing-env.sh. Both must give
+# each row the same outcome.
+#
+# Columns are separated by one TAB: name, outcome, expect, then zero or more
+# NAME=value assignments. Unlisted variables are unset. NAME= sets an empty
+# value, which both readers treat as unset.
+#   outcome ok: accepted. expect is a substring of the success summary
+#     (Go: BillingConfig.Summary(); shell: the "check-billing-env: ok" line),
+#     or "-" for no summary check.
+#   outcome fatal: refused. expect is a substring of the Go error and of the
+#     shell's stderr.
+#   values: \r, \n and \t stand for CR, LF and TAB. No other backslash may
+#     appear. Literal spaces are kept; never end a line with one.
+# No field may be empty: the shell reader collapses adjacent TABs.
+unset_everything_is_dormant	ok	mode=off key_mode=none key_restricted=false allowlist_entries=0 founders_pricing_ends_at=unset automatic_tax=false self_hosted=false self_host_keys_ignored=false
+explicit_off	ok	mode=off	BILLING_PURCHASE_MODE=off
+empty_values_are_unset	ok	mode=off key_mode=none	BILLING_PURCHASE_MODE=	STRIPE_SECRET_KEY=	STRIPE_WEBHOOK_SECRET=	STRIPE_AUTOMATIC_TAX=
+dev_restricted_test_key	ok	key_mode=test key_restricted=true	ENVIRONMENT=development	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+dev_secret_test_key	ok	key_mode=test key_restricted=false	ENVIRONMENT=development	STRIPE_SECRET_KEY=sk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+production_restricted_live_key	ok	key_mode=live key_restricted=true	ENVIRONMENT=production	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+unset_environment_is_production	ok	key_mode=live key_restricted=false	STRIPE_SECRET_KEY=sk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+dev_allowlist_soak	ok	mode=allowlist key_mode=test key_restricted=true allowlist_entries=1 founders_pricing_ends_at=2027-05-01T00:00:00Z	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+production_allowlist_live	ok	mode=allowlist key_mode=live key_restricted=true allowlist_entries=2	ENVIRONMENT=production	BILLING_PURCHASE_MODE=allowlist	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607,0a1b2c3d-4e5f-4061-8273-94a5b6c7d8e9	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+production_on_live	ok	mode=on key_mode=live	ENVIRONMENT=production	BILLING_PURCHASE_MODE=on	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+automatic_tax_true	ok	automatic_tax=true	STRIPE_AUTOMATIC_TAX=true
+automatic_tax_false	ok	automatic_tax=false	STRIPE_AUTOMATIC_TAX=false
+live_key_in_development_fatal	fatal	a live STRIPE_SECRET_KEY requires ENVIRONMENT=production	ENVIRONMENT=development	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+live_key_in_staging_fatal	fatal	a live STRIPE_SECRET_KEY requires ENVIRONMENT=production	ENVIRONMENT=staging	STRIPE_SECRET_KEY=sk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+environment_is_case_sensitive_fatal	fatal	a live STRIPE_SECRET_KEY requires ENVIRONMENT=production	ENVIRONMENT=Production	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+test_key_in_production_fatal	fatal	a test STRIPE_SECRET_KEY is not allowed with ENVIRONMENT=production	ENVIRONMENT=production	STRIPE_SECRET_KEY=sk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+test_key_with_unset_environment_fatal	fatal	a test STRIPE_SECRET_KEY is not allowed with ENVIRONMENT=production	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+publishable_test_key_fatal	fatal	STRIPE_SECRET_KEY must start with rk_test_, rk_live_, sk_test_ or sk_live_	ENVIRONMENT=development	STRIPE_SECRET_KEY=pk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+publishable_live_key_fatal	fatal	STRIPE_SECRET_KEY must start with rk_test_, rk_live_, sk_test_ or sk_live_	ENVIRONMENT=production	STRIPE_SECRET_KEY=pk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+upper_case_key_prefix_fatal	fatal	STRIPE_SECRET_KEY must start with rk_test_, rk_live_, sk_test_ or sk_live_	ENVIRONMENT=development	STRIPE_SECRET_KEY=SK_TEST_FAKE	STRIPE_WEBHOOK_SECRET=whsec_fake
+unknown_key_mode_fatal	fatal	STRIPE_SECRET_KEY must start with rk_test_, rk_live_, sk_test_ or sk_live_	ENVIRONMENT=development	STRIPE_SECRET_KEY=sk_prod_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+webhook_secret_bad_prefix_fatal	fatal	STRIPE_WEBHOOK_SECRET must start with whsec_	ENVIRONMENT=development	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=wh_fake
+key_without_webhook_secret_fatal	fatal	STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET must both be set or both be empty	ENVIRONMENT=development	STRIPE_SECRET_KEY=rk_test_fake
+webhook_secret_without_key_fatal	fatal	STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET must both be set or both be empty	ENVIRONMENT=development	STRIPE_WEBHOOK_SECRET=whsec_fake
+unknown_mode_fatal	fatal	BILLING_PURCHASE_MODE must be exactly off, allowlist or on	BILLING_PURCHASE_MODE=enabled
+allowlist_without_keys_fatal	fatal	BILLING_PURCHASE_MODE=allowlist requires STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z
+on_without_keys_fatal	fatal	BILLING_PURCHASE_MODE=on requires STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET	ENVIRONMENT=production	BILLING_PURCHASE_MODE=on	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z
+on_with_test_key_fatal	fatal	BILLING_PURCHASE_MODE=on requires a live STRIPE_SECRET_KEY	ENVIRONMENT=development	BILLING_PURCHASE_MODE=on	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+allowlist_with_empty_allowlist_fatal	fatal	BILLING_PURCHASE_MODE=allowlist requires a non-empty BILLING_PURCHASE_ALLOWLIST	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+allowlist_without_founders_fatal	fatal	BILLING_PURCHASE_MODE=allowlist requires FOUNDERS_PRICING_ENDS_AT	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+on_without_founders_fatal	fatal	BILLING_PURCHASE_MODE=on requires FOUNDERS_PRICING_ENDS_AT	ENVIRONMENT=production	BILLING_PURCHASE_MODE=on	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+on_with_invalid_founders_fatal	fatal	BILLING_PURCHASE_MODE=on requires FOUNDERS_PRICING_ENDS_AT	ENVIRONMENT=production	BILLING_PURCHASE_MODE=on	FOUNDERS_PRICING_ENDS_AT=2027-05-01	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_mode_surrounding_spaces_accepted	ok	mode=allowlist	BILLING_PURCHASE_MODE= allowlist 	ENVIRONMENT=development	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_mode_tab_and_cr_accepted	ok	mode=off	BILLING_PURCHASE_MODE=\toff\r
+rf3_mode_upper_case_fatal	fatal	BILLING_PURCHASE_MODE must be exactly off, allowlist or on	BILLING_PURCHASE_MODE=OFF
+rf3_mode_title_case_never_opens_purchase	fatal	BILLING_PURCHASE_MODE must be exactly off, allowlist or on	ENVIRONMENT=production	BILLING_PURCHASE_MODE=On	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_key_trailing_cr_accepted	ok	key_mode=test key_restricted=true	ENVIRONMENT=development	STRIPE_SECRET_KEY=rk_test_fake\r	STRIPE_WEBHOOK_SECRET=whsec_fake\r\n
+rf3_key_trailing_newline_accepted	ok	key_mode=live key_restricted=false	ENVIRONMENT=production	STRIPE_SECRET_KEY=sk_live_fake\n	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_key_leading_space_accepted	ok	key_mode=test	STRIPE_SECRET_KEY= rk_test_fake	ENVIRONMENT=development	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_whitespace_only_key_is_unset	ok	key_mode=none	ENVIRONMENT=development	STRIPE_SECRET_KEY=\t\r\n
+rf3_allowlist_spaces_around_entries_accepted	ok	allowlist_entries=2	BILLING_PURCHASE_ALLOWLIST= 3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607 , 0a1b2c3d-4e5f-4061-8273-94a5b6c7d8e9 	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_allowlist_whitespace_only_is_empty_fatal	fatal	BILLING_PURCHASE_MODE=allowlist requires a non-empty BILLING_PURCHASE_ALLOWLIST	BILLING_PURCHASE_ALLOWLIST=\t\t	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_allowlist_empty_middle_entry_fatal	fatal	BILLING_PURCHASE_ALLOWLIST has an empty entry	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607,,0a1b2c3d-4e5f-4061-8273-94a5b6c7d8e9
+rf3_allowlist_trailing_comma_fatal	fatal	BILLING_PURCHASE_ALLOWLIST has an empty entry	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607,
+rf3_allowlist_blank_entry_fatal	fatal	BILLING_PURCHASE_ALLOWLIST has an empty entry	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607, ,0a1b2c3d-4e5f-4061-8273-94a5b6c7d8e9
+rf3_allowlist_non_uuid_fatal	fatal	BILLING_PURCHASE_ALLOWLIST entry 2 is not a UUID	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607,not-a-uuid
+# pragma: allowlist nextline secret
+rf3_allowlist_uuid_without_hyphens_fatal	fatal	BILLING_PURCHASE_ALLOWLIST entry 1 is not a UUID	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a5d6e4f708a91b2c3d4e5f607
+rf3_allowlist_braced_uuid_fatal	fatal	BILLING_PURCHASE_ALLOWLIST entry 1 is not a UUID	BILLING_PURCHASE_ALLOWLIST={3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607}
+rf3_allowlist_upper_case_uuid_accepted	ok	allowlist_entries=1	ENVIRONMENT=development	BILLING_PURCHASE_MODE=allowlist	BILLING_PURCHASE_ALLOWLIST=3F1C2B4A-5D6E-4F70-8A91-B2C3D4E5F607	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_allowlist_checked_even_when_off_fatal	fatal	BILLING_PURCHASE_ALLOWLIST entry 1 is not a UUID	BILLING_PURCHASE_ALLOWLIST=everyone
+rf3_founders_without_offset_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00
+rf3_founders_date_only_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01
+rf3_founders_space_separator_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01 00:00:00Z
+rf3_founders_lower_case_z_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00z
+rf3_founders_fractional_seconds_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00.5Z
+rf3_founders_impossible_date_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-02-30T00:00:00Z
+rf3_founders_non_leap_day_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-02-29T00:00:00Z
+rf3_founders_leap_day_accepted	ok	founders_pricing_ends_at=2028-02-29T12:00:00Z	FOUNDERS_PRICING_ENDS_AT=2028-02-29T12:00:00Z
+rf3_founders_hour_24_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01T24:00:00Z
+rf3_founders_leap_second_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-06-30T23:59:60Z
+rf3_founders_offset_hour_24_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00+24:00
+rf3_founders_offset_minute_60_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00+05:60
+rf3_founders_last_century_fatal	fatal	FOUNDERS_PRICING_ENDS_AT must be an RFC3339 timestamp with a zone offset	FOUNDERS_PRICING_ENDS_AT=1999-12-31T23:59:59Z
+rf3_founders_offset_accepted	ok	founders_pricing_ends_at=2027-05-01T02:00:00+02:00	FOUNDERS_PRICING_ENDS_AT=2027-05-01T02:00:00+02:00
+rf3_founders_zero_offset_renders_z	ok	founders_pricing_ends_at=2027-05-01T00:00:00Z	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00+00:00
+rf3_founders_negative_zero_offset_renders_z	ok	founders_pricing_ends_at=2027-05-01T00:00:00Z	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00-00:00
+rf3_founders_surrounding_whitespace_accepted	ok	founders_pricing_ends_at=2027-05-01T00:00:00Z	FOUNDERS_PRICING_ENDS_AT=\t2027-05-01T00:00:00Z\r\n
+rf3_tax_upper_case_fatal	fatal	STRIPE_AUTOMATIC_TAX must be exactly empty, false or true	STRIPE_AUTOMATIC_TAX=TRUE
+rf3_tax_numeric_fatal	fatal	STRIPE_AUTOMATIC_TAX must be exactly empty, false or true	STRIPE_AUTOMATIC_TAX=1
+rf3_tax_trailing_tab_accepted	ok	automatic_tax=true	STRIPE_AUTOMATIC_TAX=true\t
+rf3_environment_trailing_cr_is_not_production_fatal	fatal	a live STRIPE_SECRET_KEY requires ENVIRONMENT=production	ENVIRONMENT=production\r	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf3_environment_leading_space_is_not_production_fatal	fatal	a live STRIPE_SECRET_KEY requires ENVIRONMENT=production	ENVIRONMENT= production	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf4_selfhost_live_keys_ignored	ok	mode=off key_mode=none key_restricted=false allowlist_entries=0 founders_pricing_ends_at=unset automatic_tax=false self_hosted=true self_host_keys_ignored=true	ENVIRONMENT=production	INSTANCE_TYPE=self-hosted	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf4_selfhost_title_case_instance_type	ok	self_hosted=true self_host_keys_ignored=true	ENVIRONMENT=production	INSTANCE_TYPE=Self-Hosted	STRIPE_SECRET_KEY=sk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf4_selfhost_padded_upper_case_instance_type	ok	self_hosted=true self_host_keys_ignored=true	INSTANCE_TYPE= SELF-HOSTED 	ENVIRONMENT=production	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf4_selfhost_publishable_key_ignored	ok	self_hosted=true self_host_keys_ignored=true	INSTANCE_TYPE=self-hosted	STRIPE_SECRET_KEY=pk_live_fake
+rf4_selfhost_webhook_secret_alone_ignored	ok	self_hosted=true self_host_keys_ignored=true	INSTANCE_TYPE=self-hosted	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf4_selfhost_without_keys_no_warning	ok	mode=off key_mode=none key_restricted=false allowlist_entries=0 founders_pricing_ends_at=unset automatic_tax=false self_hosted=true self_host_keys_ignored=false	ENVIRONMENT=production	INSTANCE_TYPE=self-hosted
+rf4_selfhost_whitespace_keys_no_warning	ok	self_hosted=true self_host_keys_ignored=false	INSTANCE_TYPE=self-hosted	STRIPE_SECRET_KEY=\r\n	STRIPE_WEBHOOK_SECRET=\t
+rf4_selfhost_allowlist_mode_fatal	fatal	BILLING_PURCHASE_MODE must be off on self-hosted instances	ENVIRONMENT=production	INSTANCE_TYPE=Self-Hosted	BILLING_PURCHASE_MODE=allowlist	BILLING_PURCHASE_ALLOWLIST=3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z	STRIPE_SECRET_KEY=rk_live_fake	STRIPE_WEBHOOK_SECRET=whsec_fake
+rf4_selfhost_on_mode_fatal	fatal	BILLING_PURCHASE_MODE must be off on self-hosted instances	INSTANCE_TYPE=self-hosted	BILLING_PURCHASE_MODE=on	FOUNDERS_PRICING_ENDS_AT=2027-05-01T00:00:00Z
+rf4_misspelt_instance_type_is_saas	fatal	a test STRIPE_SECRET_KEY is not allowed with ENVIRONMENT=production	ENVIRONMENT=production	INSTANCE_TYPE=selfhosted	STRIPE_SECRET_KEY=sk_test_fake	STRIPE_WEBHOOK_SECRET=whsec_fake

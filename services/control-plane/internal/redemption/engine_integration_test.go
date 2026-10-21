@@ -107,40 +107,6 @@ func TestRedeem_PremiumHappyPath(t *testing.T) {
 	assert.Equal(t, [3]string{user.String(), "free", "premium"}, notifier.calls[0])
 }
 
-func TestRedeem_PremiumPreservesStripeSource(t *testing.T) {
-	db, cleanup := testhelpers.SetupTestDB(t)
-	defer cleanup()
-	ctx := context.Background()
-	user := insertUser(t, db)
-	originalEnd := time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second)
-	_, err := db.Exec(
-		`INSERT INTO subscriptions (user_id, tier, status, source, current_period_end)
-		 VALUES ($1, 'premium', 'active', 'stripe', $2)`,
-		user, originalEnd,
-	)
-	require.NoError(t, err)
-
-	code := issueOne(t, db, redemption.IssueSpec{
-		GrantKind:   redemption.GrantPremiumSubscription,
-		GrantParams: map[string]any{"months": 1},
-		Count:       1,
-		SingleUse:   true,
-		MaxRedeems:  intPtr(1),
-		BatchID:     "stripe-preservation",
-	})
-	_, err = newEngine(db, &recordingNotifier{}).Redeem(ctx, user, code)
-	require.NoError(t, err)
-
-	var source string
-	var extendedEnd time.Time
-	require.NoError(t, db.QueryRow(
-		`SELECT source, current_period_end FROM subscriptions WHERE user_id=$1`, user,
-	).Scan(&source, &extendedEnd))
-	assert.Equal(t, "stripe", source)
-	assert.Greater(t, extendedEnd.Unix(), originalEnd.Unix())
-	assert.WithinDuration(t, originalEnd.AddDate(0, 1, 0), extendedEnd, time.Second)
-}
-
 // TestRedeem_FeatureAndCosmetic: non-premium kinds redeem (ledger-of-record),
 // no subscription, no tier change.
 func TestRedeem_FeatureAndCosmetic(t *testing.T) {
@@ -421,3 +387,169 @@ func TestRedeem_ConcurrentSameUserPremiumNoPriorSub(t *testing.T) {
 
 func intPtr(i int) *int              { return &i }
 func timePtr(t time.Time) *time.Time { return &t }
+
+// insertStripeRow inserts a live Stripe-sourced premium row carrying the unique
+// ids subscriptions_stripe_identity_check requires, and returns its id.
+func insertStripeRow(t *testing.T, db *sql.DB, user uuid.UUID, periodEnd time.Time) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	require.NoError(t, db.QueryRow(
+		`INSERT INTO subscriptions
+		     (user_id, tier, status, source, current_period_end, stripe_subscription_id, stripe_customer_id)
+		 VALUES ($1, 'premium', 'active', 'stripe', $2, $3, $4)
+		 RETURNING id`,
+		user, periodEnd, "sub_test_"+uuid.NewString(), "cus_test_"+uuid.NewString(),
+	).Scan(&id))
+	return id
+}
+
+// insertCodeRow inserts a code-sourced premium row in the live status 'active'
+// with the given period end, which may already be past, and returns its id.
+func insertCodeRow(t *testing.T, db *sql.DB, user uuid.UUID, periodEnd time.Time) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	require.NoError(t, db.QueryRow(
+		`INSERT INTO subscriptions (user_id, tier, status, source, current_period_end)
+		 VALUES ($1, 'premium', 'active', 'code', $2)
+		 RETURNING id`,
+		user, periodEnd,
+	).Scan(&id))
+	return id
+}
+
+// subscriptionRowText renders one subscriptions row, every column including
+// updated_at, as JSON text, so a test can assert the row is byte-identical.
+func subscriptionRowText(t *testing.T, db *sql.DB, id uuid.UUID) string {
+	t.Helper()
+	var row string
+	require.NoError(t, db.QueryRow(
+		`SELECT row_to_json(s)::text FROM subscriptions s WHERE s.id = $1`, id,
+	).Scan(&row))
+	return row
+}
+
+// codeRowCount counts the user's code-sourced rows in any status.
+func codeRowCount(t *testing.T, db *sql.DB, user uuid.UUID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND source = 'code'`, user,
+	).Scan(&n))
+	return n
+}
+
+// ledgerSubscription returns the subscription the user's one redemption
+// ledger row links.
+func ledgerSubscription(t *testing.T, db *sql.DB, user uuid.UUID) uuid.NullUUID {
+	t.Helper()
+	var linked uuid.NullUUID
+	require.NoError(t, db.QueryRow(
+		`SELECT resulting_subscription_id FROM code_redemptions WHERE user_id = $1`, user,
+	).Scan(&linked))
+	return linked
+}
+
+// redeemPremiumMonth issues one single-use, one-month premium:subscription
+// code and redeems it as user.
+func redeemPremiumMonth(t *testing.T, db *sql.DB, user uuid.UUID, batchID string, n redemption.Notifier) {
+	t.Helper()
+	code := issueOne(t, db, redemption.IssueSpec{
+		GrantKind:   redemption.GrantPremiumSubscription,
+		GrantParams: map[string]any{"months": 1},
+		Count:       1,
+		SingleUse:   true,
+		MaxRedeems:  intPtr(1),
+		BatchID:     batchID,
+	})
+	_, err := newEngine(db, n).Redeem(context.Background(), user, code)
+	require.NoError(t, err)
+}
+
+// TestRedeem_PremiumNeverWritesStripeRow is the #2033 regression lock (spec
+// §5): a Stripe payer's redemption leaves the Stripe row byte-identical (same
+// current_period_end, same updated_at, every column) and grants the month on a
+// separate code row, which the ledger links.
+func TestRedeem_PremiumNeverWritesStripeRow(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	user := insertUser(t, db)
+	stripeID := insertStripeRow(t, db, user, time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second))
+	before := subscriptionRowText(t, db, stripeID)
+
+	notifier := &recordingNotifier{}
+	redeemPremiumMonth(t, db, user, "stripe-regression-lock", notifier)
+
+	assert.Equal(t, before, subscriptionRowText(t, db, stripeID), "a redemption must never write a Stripe row")
+	require.Equal(t, 1, codeRowCount(t, db, user), "the month lands on a new code row")
+	var codeID uuid.UUID
+	var codeEnd time.Time
+	require.NoError(t, db.QueryRow(
+		`SELECT id, current_period_end FROM subscriptions WHERE user_id = $1 AND source = 'code'`, user,
+	).Scan(&codeID, &codeEnd))
+	assert.WithinDuration(t, time.Now().AddDate(0, 1, 0), codeEnd, time.Minute)
+	assert.Equal(t, uuid.NullUUID{UUID: codeID, Valid: true}, ledgerSubscription(t, db, user),
+		"the ledger links the code row, not the Stripe row")
+
+	// OldTier is "free" here although the payer is premium: the grant only
+	// sees code rows. PR-2's D1 refuses this redemption (409 already_covered),
+	// so only NewTier is pinned.
+	require.Len(t, notifier.calls, 1)
+	assert.Equal(t, "premium", notifier.calls[0][2])
+}
+
+// TestRedeem_PremiumExtendsCodeRowBesideStripeRow (Review Focus RF1): a user
+// with a live code row AND a live Stripe row redeems; only the code row is
+// extended and the Stripe row is untouched. The Stripe row is inserted first,
+// so a select that ignored source would find it first.
+func TestRedeem_PremiumExtendsCodeRowBesideStripeRow(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	user := insertUser(t, db)
+	stripeID := insertStripeRow(t, db, user, time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second))
+	codeEnd := time.Now().UTC().AddDate(0, 0, 10).Truncate(time.Second)
+	codeID := insertCodeRow(t, db, user, codeEnd)
+	stripeBefore := subscriptionRowText(t, db, stripeID)
+
+	notifier := &recordingNotifier{}
+	redeemPremiumMonth(t, db, user, "rf1-code-beside-stripe", notifier)
+
+	assert.Equal(t, stripeBefore, subscriptionRowText(t, db, stripeID), "the Stripe row must be untouched")
+	var extended time.Time
+	require.NoError(t, db.QueryRow(
+		`SELECT current_period_end FROM subscriptions WHERE id = $1`, codeID,
+	).Scan(&extended))
+	assert.WithinDuration(t, codeEnd.AddDate(0, 1, 0), extended, time.Second, "the code row stacks a month on its own end")
+	assert.Equal(t, 1, codeRowCount(t, db, user), "the code row is extended, not duplicated")
+	assert.Equal(t, uuid.NullUUID{UUID: codeID, Valid: true}, ledgerSubscription(t, db, user))
+
+	require.Len(t, notifier.calls, 1)
+	assert.Equal(t, [3]string{user.String(), "premium", "premium"}, notifier.calls[0])
+}
+
+// TestRedeem_PremiumExtendsLapsedUnsweptCodeRow (Review Focus RF2): a code row
+// whose period has ended but which the expiry sweep has not flipped yet is
+// still in the live status set, so idx_subscriptions_user_live_code covers it.
+// The grant must find and extend that row: inserting a second code row would
+// fail with 23505. This pins the select's deliberate lack of a time predicate.
+func TestRedeem_PremiumExtendsLapsedUnsweptCodeRow(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	user := insertUser(t, db)
+	codeID := insertCodeRow(t, db, user, time.Now().UTC().Add(-time.Hour).Truncate(time.Second))
+
+	notifier := &recordingNotifier{}
+	redeemPremiumMonth(t, db, user, "rf2-lapsed-unswept", notifier)
+
+	assert.Equal(t, 1, codeRowCount(t, db, user), "the lapsed row is extended, not duplicated")
+	var status string
+	var extended time.Time
+	require.NoError(t, db.QueryRow(
+		`SELECT status, current_period_end FROM subscriptions WHERE id = $1`, codeID,
+	).Scan(&status, &extended))
+	assert.Equal(t, "active", status)
+	assert.WithinDuration(t, time.Now().AddDate(0, 1, 0), extended, time.Minute, "a lapsed period restarts from now")
+	assert.Equal(t, uuid.NullUUID{UUID: codeID, Valid: true}, ledgerSubscription(t, db, user))
+
+	require.Len(t, notifier.calls, 1)
+	assert.Equal(t, "premium", notifier.calls[0][2])
+}

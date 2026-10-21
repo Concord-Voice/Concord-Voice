@@ -600,6 +600,26 @@ func (s *AccountService) deleteAccountTx(
 			fmt.Errorf("delete account: drain DM block reconciliation: %w", err)
 	}
 
+	// #2033 spec §10 step 1: record the Stripe Customer's erasure obligation
+	// before the users delete cascades its stripe_customers mapping away. The
+	// outbox has no user_id and no FK, so the obligation outlives the user,
+	// and the billing worker (PR-2) deletes the Customer, which cancels its
+	// subscriptions. It ships in PR-1 so a rollback to this image still
+	// records it. Erasure makes no Stripe call and is never blocked by billing
+	// (spec C11); a user with no mapping inserts nothing. FOR UPDATE locks the
+	// mapping row the cascade deletes anyway: a Checkout self-heal that
+	// rewrites stripe_customer_id runs no FK check, so the users lock does not
+	// order it, and without the row lock this read could enqueue the old
+	// Customer while the cascade removes the new one (spec R31).
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO billing_erasure_outbox (stripe_customer_id)
+		SELECT stripe_customer_id FROM stripe_customers WHERE user_id = $1
+		FOR UPDATE
+		ON CONFLICT (stripe_customer_id) DO NOTHING`, lockedUserID); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{},
+			fmt.Errorf("delete account: enqueue billing erasure: %w", err)
+	}
+
 	result, err := tx.ExecContext(ctx,
 		`DELETE FROM users WHERE id = $1`,
 		lockedUserID,
