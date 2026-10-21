@@ -10,7 +10,11 @@ FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2ee
 
 WORKDIR /src
 COPY --from=admin_ui package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+# Cache mounts (here and in the Go stage) persist on the builder between builds
+# and never enter a layer. A fresh builder starts them empty, so the cache-cold
+# CI job (ADR-0006/0016) still downloads and compiles everything.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --ignore-scripts
 COPY --from=admin_ui . .
 RUN npm run build && test -f dist/index.html
 
@@ -29,15 +33,21 @@ RUN apk add --no-cache git
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+# Dockerfile.ops-agent mounts the same two cache targets, so builds of either
+# image on one builder share compiled packages.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 # Copy source code
 COPY . .
 
-# Build the application and tools
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o migrate-media ./cmd/migrate-media
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mfa-rekey ./cmd/mfa-rekey
+# Build the application and tools in one invocation so shared packages compile
+# once. No -a: Go's build cache keys on CGO_ENABLED, so forcing a full rebuild
+# buys nothing. -trimpath and -s -w match Dockerfile.ops-agent.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ \
+      ./cmd/server ./cmd/migrate-media ./cmd/mfa-rekey
 
 # Final stage. Tracks the supported Alpine line -- 3.21 reaches EOL 2026-11-01.
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
@@ -53,9 +63,8 @@ RUN apk --no-cache add ca-certificates \
 WORKDIR /home/appuser
 
 # Copy binaries from builder
-COPY --from=builder /app/main .
-COPY --from=builder /app/migrate-media .
-COPY --from=builder /app/mfa-rekey .
+COPY --from=builder /out/server ./main
+COPY --from=builder /out/migrate-media /out/mfa-rekey ./
 
 # Copy migrations
 COPY --from=builder /app/migrations ./migrations

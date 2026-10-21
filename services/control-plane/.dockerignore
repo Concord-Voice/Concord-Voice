@@ -5,7 +5,10 @@
 .env.*
 *.md
 docs/
-tests/benchmarks/
+# go build never reads tests. Excluding them halves this context and keeps a
+# test-only edit from invalidating the builder's `COPY . .` layer.
+tests/
+**/*_test.go
 tmp/
 *.test
 coverage.out

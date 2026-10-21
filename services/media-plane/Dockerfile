@@ -41,6 +41,12 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/stubs ./stubs
 COPY --from=builder /app/package*.json ./
 
+# The runtime only runs `node dist/index.js`. Drop the base image's bundled
+# npm/npx/corepack: unused here, and their vendored deps carry fixable HIGH
+# CVEs that container-image-scan.yml fails on.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+
 # Run as non-root user
 RUN addgroup -S appuser && adduser -S appuser -G appuser
 RUN chown -R appuser:appuser /app

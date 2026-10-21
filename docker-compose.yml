@@ -32,7 +32,10 @@ services:
 
   # Redis Cache
   redis:
-    image: redis:7-alpine
+    # Exact version plus digest, refreshed by Dependabot's docker-compose block.
+    # A floating tag never updates on a long-lived host: Compose pulls only a
+    # missing image. Same for nats below.
+    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     container_name: concordvoice-redis
     # Deliberately NOT raising `--databases` (#2680 review). Widening the pool was
     # proposed as test headroom, but it buys nothing measurable — collision needs
@@ -61,7 +64,7 @@ services:
 
   # NATS Message Broker (for inter-service messaging)
   nats:
-    image: nats:2-alpine
+    image: nats:2.15.1-alpine@sha256:2ae57dfba3063d5e25fecb75256118c0882a1a2d2cf7d0fba17a7c701df956f6
     container_name: concordvoice-nats
     # -js enables JetStream; -c points at our config which pins store_dir to
     # /data/jetstream with a 5G max_file cap. The nats-data named volume below
@@ -359,7 +362,8 @@ services:
       # Constrain RTC port range to match the Docker port mapping below.
       # mediasoup does NOT bound a bind to the published window (#3105), so a
       # wider range here binds ports Docker never published. Staging carries
-      # the identical constraint (docker-compose.staging.yml:49-52).
+      # the identical constraint (docker-compose.staging.yml, media-plane
+      # RTC_MIN_PORT/RTC_MAX_PORT).
       RTC_MAX_PORT: 40099
       ANNOUNCED_IP: 127.0.0.1
       OPS_METRICS_ENABLED: ${OPS_METRICS_ENABLED:-false}

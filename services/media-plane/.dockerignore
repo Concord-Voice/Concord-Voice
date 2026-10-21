@@ -19,6 +19,9 @@ coverage
 .env.*
 *.md
 docs/
+# tsconfig compiles only src/, so tests never reach the image; excluding them
+# keeps a test-only edit from invalidating the builder's `COPY . .` layer.
+tests/
 *.test
 *.log
 .DS_Store

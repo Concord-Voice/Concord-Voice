@@ -1,4 +1,7 @@
-FROM postgres:16-alpine
+# Exact version plus digest. A floating tag here is frozen at whatever the host
+# first pulled, because a deploy rebuild reuses the cached base. Dependabot
+# refreshes this line; its ignore rule holds the major at 16 (dependabot.yml).
+FROM postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
 
 RUN mkdir -p /etc/postgresql \
     && chown postgres:postgres /etc/postgresql \
