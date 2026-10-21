@@ -85,6 +85,7 @@ import { clearFriendEligibilityCache } from '@/renderer/services/system/friendEl
 import { stopProactiveRefresh } from '@/renderer/services/system/apiClient';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/messaging/searchService';
+import { bulkRequestPacer } from '@/renderer/services/messaging/searchChunk';
 import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
@@ -409,6 +410,15 @@ describe('resetService', () => {
       expect(isIndexed('prior-account-message')).toBe(false);
     });
 
+    it("lifts the prior account's search 429 block (the server limit is per user)", () => {
+      bulkRequestPacer.block(Date.now() + 120_000);
+
+      gracefulReset();
+
+      expect(bulkRequestPacer.blockedUntil).toBe(0);
+      expect(bulkRequestPacer.delayMs()).toBe(0);
+    });
+
     it('clears E2EE keys before clearing content or indexed plaintext', () => {
       // gracefulReset clears renderer key custody (clearKeys fences internally),
       // and must do so BEFORE wiping content stores / the plaintext search index.
@@ -631,6 +641,16 @@ describe('resetService', () => {
       recoveryReset();
 
       expect(e2eeService.fencePendingOperations).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the search pacer's 429 block: the account did not change", () => {
+      const until = Date.now() + 120_000;
+      bulkRequestPacer.block(until);
+
+      recoveryReset();
+
+      expect(bulkRequestPacer.blockedUntil).toBe(until);
+      bulkRequestPacer.reset();
     });
 
     it('never clears E2EE key material — handleReconnected gates on isInitialized', () => {

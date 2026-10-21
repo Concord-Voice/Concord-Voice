@@ -3139,7 +3139,7 @@ paths:
           default: 50
       - name: before
         in: query
-        description: Message UUID for cursor pagination (get messages before this ID)
+        description: 'Message UUID for cursor pagination. Messages are ordered newest first by created_at, then by id, and a page holds the messages that follow this one in that order, so a message sharing its created_at is not skipped.'
         schema:
           type: string
           format: uuid
@@ -3162,9 +3162,14 @@ paths:
       tags:
       - Messages
       summary: Bulk message fetch
-      description: 'Message history with a larger page size (up to 200) for client search backfill.
+      description: 'Message history with a larger page size (up to 200) for client search.
 
-        Cursor pagination, newest-first. Requires Read Message History.
+        Cursor pagination, newest-first, optionally bounded below by `since`.
+        The response carries no reaction, reply or attachment enrichment:
+        search reads only id, author, time and ciphertext, so `reactions`,
+        `replied_to` and `attachments` are omitted. Use `GET
+        /channels/{id}/messages` when the enrichment is needed. Requires Read
+        Message History.
 
         Rate limit: 20 requests per minute.
 
@@ -3183,10 +3188,16 @@ paths:
           default: 200
       - name: before
         in: query
-        description: Message UUID for cursor pagination (get messages before this ID)
+        description: 'Message UUID for cursor pagination. Messages are ordered newest first by created_at, then by id, and a page holds the messages that follow this one in that order, so a message sharing its created_at is not skipped.'
         schema:
           type: string
           format: uuid
+      - name: since
+        in: query
+        description: 'RFC 3339 timestamp. Only messages created at or after it are returned. Search sends the start of its 90-day chunk here. A value that is not RFC 3339, including an empty `since=`, is rejected with 400 `Invalid ''since'' parameter`.'
+        schema:
+          type: string
+          format: date-time
       responses:
         '200':
           description: Messages

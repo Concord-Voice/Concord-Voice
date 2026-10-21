@@ -212,6 +212,7 @@ const ChatView: React.FC = () => {
   // Pinned messages panel state — ChatView-specific UI (count badge + panel)
   const [showPinnedPanel, setShowPinnedPanel] = useState(false);
   const [showSearchPanel, setShowSearchPanel] = useState(false);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
   const [pinnedCount, setPinnedCount] = useState(0);
   const [pinRefreshKey, setPinRefreshKey] = useState(0);
   const pinGenerationRef = useRef(0);
@@ -222,9 +223,15 @@ const ChatView: React.FC = () => {
     };
   }, [activeChannelId]);
 
-  // Toggle search panel via keyboard shortcut (#176)
+  // Toggle search panel via keyboard shortcut (#176). Closing it from inside unmounts the focused
+  // control, so focus moves to the Search button first rather than falling to <body>.
   useEffect(() => {
-    const handler = () => setShowSearchPanel((prev) => !prev);
+    const handler = () => {
+      if (document.activeElement?.closest('.search-panel-backdrop')) {
+        searchButtonRef.current?.focus();
+      }
+      setShowSearchPanel((prev) => !prev);
+    };
     globalThis.addEventListener('concord:toggle-search', handler);
     return () => globalThis.removeEventListener('concord:toggle-search', handler);
   }, []);
@@ -324,6 +331,7 @@ const ChatView: React.FC = () => {
             </button>
           )}
           <button
+            ref={searchButtonRef}
             className="chat-header-search-button"
             onClick={() => setShowSearchPanel(!showSearchPanel)}
             aria-label="Search messages"
@@ -440,6 +448,7 @@ const ChatView: React.FC = () => {
         isOpen={showSearchPanel}
         onClose={() => setShowSearchPanel(false)}
         onScrollToMessage={handleScrollToMessage}
+        returnFocusRef={searchButtonRef}
         accessibleChannelIds={channels
           .filter((c) => c.server_id === activeChannel?.server_id)
           .map((c) => c.id)}

@@ -807,6 +807,70 @@ describe('ChatView', () => {
     expect(searchBtn).toHaveAttribute('aria-expanded', 'true');
   });
 
+  it('returns focus to the Search messages button when the shortcut closes the panel from inside it', async () => {
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    act(() => {
+      globalThis.dispatchEvent(new Event('concord:toggle-search'));
+    });
+    const input = screen.getByPlaceholderText('Search messages...');
+    await waitFor(() => expect(input).toHaveFocus());
+
+    act(() => {
+      globalThis.dispatchEvent(new Event('concord:toggle-search'));
+    });
+
+    expect(screen.queryByPlaceholderText('Search messages...')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Search messages' })).toHaveFocus();
+  });
+
+  it('leaves focus where it is when the shortcut closes the panel from outside it', async () => {
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    act(() => {
+      globalThis.dispatchEvent(new Event('concord:toggle-search'));
+    });
+    await waitFor(() => expect(screen.getByPlaceholderText('Search messages...')).toHaveFocus());
+    const outside = document.createElement('button');
+    document.body.append(outside);
+    act(() => outside.focus());
+
+    act(() => {
+      globalThis.dispatchEvent(new Event('concord:toggle-search'));
+    });
+
+    expect(screen.queryByPlaceholderText('Search messages...')).not.toBeInTheDocument();
+    expect(outside).toHaveFocus();
+    outside.remove();
+  });
+
+  // At the CALLER: the panel can return focus only to a control its owner hands it.
+  it.each([
+    ['Escape', async (user: ReturnType<typeof userEvent.setup>) => user.keyboard('{Escape}')],
+    [
+      'the Close button',
+      async (user: ReturnType<typeof userEvent.setup>) =>
+        user.click(screen.getByRole('button', { name: 'Close' })),
+    ],
+  ])(
+    'returns focus to the Search messages button when %s closes the search panel',
+    async (_, close) => {
+      useChannelStore.setState({ activeChannelId: 'channel-1' });
+      const user = userEvent.setup();
+      render(<ChatView />);
+
+      const searchBtn = screen.getByRole('button', { name: 'Search messages' });
+      await user.click(searchBtn);
+      await waitFor(() => expect(screen.getByPlaceholderText('Search messages...')).toHaveFocus());
+
+      await close(user);
+
+      expect(screen.queryByPlaceholderText('Search messages...')).not.toBeInTheDocument();
+      expect(searchBtn).toHaveAttribute('aria-expanded', 'false');
+      expect(searchBtn).toHaveFocus();
+    }
+  );
+
   // #3459 at the CALLER: the clause helper and the panel note are each unit-tested, but only the
   // owner can fail to hand them the policy. Both cells vary the one input (includePinned) through
   // the real hook, store and list-row parser.

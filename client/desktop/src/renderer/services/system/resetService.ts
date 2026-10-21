@@ -59,6 +59,7 @@ import { useSavedGifsStore } from '../../stores/chat/savedGifsStore';
 import { useNotificationPrefsStore } from '../../stores/ui/notificationPrefsStore';
 import { resetPostLoginHydrationLifecycle } from './postLoginHydrationLifecycle';
 import { clearIndex } from '../messaging/searchService';
+import { bulkRequestPacer } from '../messaging/searchChunk';
 import { e2eeService } from '../e2ee/e2eeService';
 
 /**
@@ -157,6 +158,9 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // Search indexes decrypted message content outside the chat stores. Purge it
   // explicitly so no plaintext survives an account lifecycle transition.
   clearIndex();
+  // The search pacer is module-wide and the server's bulk limit is per user: a
+  // 429 block earned by this account must not pause the next one's search.
+  bulkRequestPacer.reset();
   // Clear rich-presence (custom-text) cache — other users' statuses + self —
   // so signing into a different account never surfaces the prior user's
   // statuses (#1233/Gitar; risk: privacy cross-account leak).

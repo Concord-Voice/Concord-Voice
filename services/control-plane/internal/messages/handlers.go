@@ -253,7 +253,26 @@ func parseBulkPagination(c *gin.Context) (limit int, before string, ok bool) {
 	return limit, before, true
 }
 
-// GetMessagesBulk returns message history with a larger page size (200) for search backfill.
+// parseBulkSince reads the optional `since` lower bound (RFC 3339) a search
+// chunk sends (#3875). A zero time means no bound. Only an absent parameter is
+// unbounded: `?since=` sent empty is a value, and it is refused like any other
+// that does not parse.
+func parseBulkSince(c *gin.Context) (time.Time, bool) {
+	raw, ok := c.GetQuery("since")
+	if !ok {
+		return time.Time{}, true
+	}
+	since, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'since' parameter"})
+		return time.Time{}, false
+	}
+	return since, true
+}
+
+// GetMessagesBulk returns message history with a larger page size (200) for
+// search. Search reads only id, author, time and ciphertext, so the bulk page
+// skips the reaction, reply and attachment enrichment GetMessages runs (#3875).
 func (h *Handler) GetMessagesBulk(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
@@ -267,14 +286,17 @@ func (h *Handler) GetMessagesBulk(c *gin.Context) {
 		return
 	}
 
-	messages, err := h.queryMessages(channelID, before, limit)
+	since, ok := parseBulkSince(c)
+	if !ok {
+		return
+	}
+
+	messages, err := h.queryMessages(channelID, before, since, limit)
 	if err != nil {
 		h.log.Error("Failed to query messages (bulk)", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMessages})
 		return
 	}
-
-	h.enrichMessages(messages, userID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"messages": messages,
@@ -359,7 +381,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		return
 	}
 
-	messages, err := h.queryMessages(channelID, before, limit)
+	messages, err := h.queryMessages(channelID, before, time.Time{}, limit)
 	if err != nil {
 		h.log.Error("Failed to query messages", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMessages})
@@ -374,10 +396,23 @@ func (h *Handler) GetMessages(c *gin.Context) {
 	})
 }
 
-// queryMessages fetches messages for a channel with optional cursor-based
-// pagination. Placeholders are fixed literals ($1 channel, $2 limit, $3 the
-// optional cursor) — every value is parameterized (no interpolation).
-func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.MessageWithUser, error) {
+// queryMessages fetches messages for a channel, newest first, with optional
+// cursor-based pagination and an optional lower time bound. Placeholders are
+// fixed literals ($1 channel, $2 limit, then the optional cursor and the
+// optional since bound in that order) — every value is parameterized (no
+// interpolation). A zero since means no bound; the bound is inclusive.
+//
+// Both the order and the cursor are the pair (created_at, id), descending. id is
+// the tie-breaker for messages that share a created_at (a bulk import, or two
+// sends in the same microsecond): a strict `created_at < cursor` would skip every
+// tied row for good, and ordering by created_at alone would let LIMIT cut a run
+// of tied rows differently from one request to the next. The cursor is a row
+// comparison against the cursor message's own (created_at, id), so a page ends
+// and the next one resumes at exactly the same row. PostgreSQL derives a
+// `created_at <=` bound from the leading column of that comparison, so the
+// (channel_id, created_at) index range scan is kept without repeating the bound
+// by hand.
+func (h *Handler) queryMessages(channelID, before string, since time.Time, limit int) ([]models.MessageWithUser, error) {
 	query := `
 		SELECT m.id, m.channel_id, m.user_id, m.content, m.key_version,
 		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
@@ -390,13 +425,26 @@ func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.M
 
 	if before != "" {
 		// Scoped to $1 so a cursor naming another channel's message reads as
-		// unknown rather than leaking its existence and timestamp.
+		// unknown rather than leaking its existence and timestamp: an unknown
+		// cursor yields a NULL row, the comparison is NULL, and the page is empty.
 		query += `
-		  AND m.created_at < (SELECT created_at FROM messages WHERE id = $3 AND channel_id = $1)`
+		  AND (m.created_at, m.id) < (SELECT c.created_at, c.id FROM messages c WHERE c.id = $3 AND c.channel_id = $1)`
 		args = append(args, before)
 	}
+	if !since.IsZero() {
+		// Fixed literals keep every value a parameter and keep the
+		// (channel_id, created_at) index range scan.
+		if before != "" {
+			query += `
+		  AND m.created_at >= $4`
+		} else {
+			query += `
+		  AND m.created_at >= $3`
+		}
+		args = append(args, since)
+	}
 	query += `
-		ORDER BY m.created_at DESC
+		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT $2`
 
 	rows, err := h.db.Query(query, args...)

@@ -41,7 +41,9 @@ you used most recently. Server owners can require MFA for dangerous actions
 from Server Settings, and members who need it are told how to set it up. A message
 expiration timer can now keep pinned messages, and says so. Every account can create
 any number of servers, search as far back as a subscriber can, and use full theme
-colour customization.
+colour customization. Message search now looks back 90 days at a time and
+loads older results as you scroll, and it tells you when it is paused or
+stopped instead of reporting no results.
 Account recovery now asks for an authenticator you reserved for recovery after
 you verify your email.
 
@@ -143,9 +145,11 @@ you verify your email.
 - **Audio menus now show one Default option** (internal development reference omitted) — it follows your operating system's default device, while named microphones and speakers remain selectable.
 - **Camera replacements and call cleanup preserve the right video** (internal development reference omitted) — local previews survive swaps, and remote video turns on only after its replacement consumer attaches. A remote tile can briefly disappear if its old producer closes first; room-level debounce keeps that gap from disabling layered camera publishing. Queued camera loads are canceled when their producer closes or their owner leaves before the stream attaches. Late media from an earlier voice session is closed before it can attach after a rejoin.
 - **Settings sections start collapsed and stay the way you leave them** (internal development reference omitted, internal development reference omitted) — every section in Settings now opens collapsed, including the six that used to open expanded. A section you expand stays expanded while you use Settings and for 30 minutes after you leave, so you can go test something and come straight back to the section you were working in. After that window, or an interface reload, sections start collapsed again. Expand all, the sidebar links and the update indicator remember what they open the same way.
+- **Scrolling back through a channel no longer skips messages that share a timestamp** (internal development reference omitted): history pages now break ties by message ID, so two messages saved in the same instant both load, and message search reads both.
 
 ### Changed
 
+- **Message search loads older results as you need them** (internal development reference omitted): a search first looks back 90 days or 600 messages, whichever comes first, and fetches more only when you scroll toward the end of the results or choose "Search older messages". Searches stay below the server's request limit, say when they are paused or stopped, and a second search in the same channel reuses what the first one already decrypted while the search panel stays open.
 - **Unlimited servers, message search and theme colours for everyone** (internal development reference omitted) — the free plan no longer limits how many servers you can create, message search reaches as far back for free accounts as for subscribers, and full theme colour customization is free for every account. To prevent abuse, one account can create up to 10 servers in any 24 hours.
 - **Settings has clearer homes for account, privacy, and security controls** (internal development reference omitted) — Account shows a compact Subscription summary, optional benefits, and code redemption. Security contains password, verification, SSO, and sessions; Privacy keeps audience, content, and activity-history choices. About & Updates includes System Permissions, formatted legal documents with familiar names, and KLIPY attribution plus its privacy policy. Subsections appear beneath their parent in navigation. Open and closed sections, including nested details, are remembered while you use Settings and for 30 minutes after you leave; after that window or an interface reload they start collapsed again, and a deliberate subsection link opens its destination.
 - **New-account privacy defaults** — Friend requests start at Mutual Servers, Server Voice details start off, Private Call presence starts at Friends, and notifications show the sender without message text. Existing saved choices remain unchanged.
