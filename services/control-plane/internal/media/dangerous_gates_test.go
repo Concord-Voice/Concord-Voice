@@ -965,39 +965,3 @@ func TestServerImageGate_GraceCoversTheNextUploadInTheSameSession(t *testing.T) 
 	assert.Equal(t, imgMFARequired, classifyImgGate(t, banner, f.serverID,
 		env.upload(t, banner, session(), f.serverID, ""), "another session"))
 }
-
-// A feedback screenshot's key is fresh for every upload (#1747), so a failed
-// record leaves an object nothing points at, and the compensating delete must
-// still run. This is the other side of C4: only a FIXED key keeps its object.
-// Kills: routing the unique-key purposes through the fixed-key path (the
-// #3454 x #1747 merge sent screenshots to the DM-icon path and answered 500),
-// or dropping the DeleteObject from storeUniqueKeyTier1Image.
-func TestFeedbackScreenshotInsertFailureDeletesTheObject(t *testing.T) {
-	env := setupImgGateEnv(t)
-	ts := env.ts
-	user := ts.CreateTestUser(t, "fbs"+strings.ReplaceAll(uuid.NewString(), "-", "")[:10])
-	_, err := ts.DB.Exec(`CREATE OR REPLACE FUNCTION imggate_fail_insert() RETURNS trigger
-		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'imggate: forced failure'; END $$`)
-	require.NoError(t, err)
-	_, err = ts.DB.Exec(`CREATE TRIGGER imggate_fail_insert BEFORE INSERT ON media_files
-		FOR EACH ROW WHEN (NEW.storage_key LIKE 'feedback-screenshots/%') EXECUTE FUNCTION imggate_fail_insert()`)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, _ = ts.DB.Exec(`DROP TRIGGER IF EXISTS imggate_fail_insert ON media_files`)
-		_, _ = ts.DB.Exec(`DROP FUNCTION IF EXISTS imggate_fail_insert()`)
-	})
-
-	body, contentType := imgMultipart(t, nil, imgPNG(t))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/media/upload/feedback-screenshot", body)
-	req.Header = testhelpers.AuthHeaders(user.AccessToken)
-	req.Header.Set("Content-Type", contentType)
-	w := httptest.NewRecorder()
-	ts.Router.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
-	assert.JSONEq(t, imgRecordFailBody, w.Body.String())
-	deleted := env.store.deletes()
-	require.Len(t, deleted, 1, "the orphaned unique-key object is deleted")
-	assert.True(t, strings.HasPrefix(deleted[0], "feedback-screenshots/"), deleted[0])
-	assert.False(t, env.store.has(deleted[0]), "nothing is left at the deleted key")
-}

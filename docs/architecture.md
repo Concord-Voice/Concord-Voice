@@ -529,7 +529,49 @@ through this same path, which is what makes the feature's "removes embedded
 camera metadata such as GPS location" claim true rather than aspirational.
 They live under the `feedback-screenshots/` object-key namespace and are
 served publicly by unguessable UUID (`/api/v1/media/feedback-screenshots/<uuid>`)
-with no DB admission check — the UUID itself is the access control.
+without authentication so the report image proxy can fetch them. A screenshot
+lifecycle ledger admits staged pending or pinned images. Pending uploads
+expire after 72 hours; submission validates ownership and pins images before
+calling the issue provider. Historical images are preserved because their
+submission evidence is unavailable.
+
+`internal/feedbackscreenshots` stages processed image bytes, lifecycle state and
+media metadata in one PostgreSQL transaction. Pending allowance is 8 images/40 MiB
+per account; total retained allowance is 128 images/128 MiB per account and
+10,000 images/10 GiB globally. Pending usage includes provisional pins that are
+neither published nor permanently retained; pinning cannot free pending capacity.
+Staged logical image bytes have an additional
+512 MiB global cap, including pinned images awaiting offload; this is not a limit
+on PostgreSQL physical storage or WAL. Pinned images remain charged.
+
+A minute worker expires pending bytes and metadata transactionally after 72 hours,
+or after account erasure. Confirmed published, pinned images and permanently
+retained images are offloaded to their immutable legacy-store object keys, with
+a disk-watermark check immediately before each PUT. Blocked, failed or uncertain
+offloads keep the PostgreSQL bytes readable and charged for retry. Offload batches
+contain at most five images. A durable counter allows at most three application
+PUT attempts per image; exhaustion stops automated PUT and requires operator
+reconciliation while staged bytes remain readable and charged. SDK retries can
+create additional physical writes or versions. An hourly aggregate warning counts
+capped images needing operator reconciliation; alert routing is planned. The
+proxy reads staged bytes until offload is
+confirmed, and all screenshot streams use `Cache-Control: no-store`. Unresolved
+publication pins become permanently retained at a separate `retained_at` deadline,
+72 hours from the first unresolved pending-to-pinned transition. Later pins do
+not extend it. This makes images eligible for offload without recording
+publication success.
+Definitive rejection before permanent retention releases only that submission's
+pin and restores pending state when no other attempt protects the image, clearing
+`retained_at` so a later independent pin starts a new retention window. Pending
+`expires_at` stays fixed at staging plus 72 hours; a late rejection can therefore
+make the image immediately eligible for cleanup.
+The development stub leaves uploads pending.
+Pin returns an internal durable UUID receipt stored in ledger `pin_tokens`.
+Confirmation and rejection settle that receipt's submission independently of the
+nullable owner, so account deletion cannot strand an in-flight publication outcome.
+Initial pinning still validates ownership. The ledger survives account deletion;
+submitted images remain retained.
+Screenshot upload admission also applies the legacy-store SaaS disk watermark.
 
 Removal is therefore a **side effect of processing**, not a dedicated step.
 `processing_metadata_test.go` pins it as an invariant — including the

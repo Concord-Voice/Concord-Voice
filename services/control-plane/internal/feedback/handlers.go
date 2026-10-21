@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -31,7 +32,7 @@ const (
 	// maxBodyBytes is a hard cap on the assembled GitHub issue body.
 	// Stays comfortably under GitHub's 65,536-char limit to leave room
 	// for unexpected expansion (markdown rendering, escape sequences).
-	// `buildIssue` truncates the logs tail when this cap would be
+	// `buildIssue` truncates the body tail when this cap would be
 	// exceeded — never silently submits an oversize body that GitHub
 	// would reject with 422.
 	maxBodyBytes = 60_000
@@ -116,6 +117,13 @@ type GitHubIssueCreator interface {
 	CreateIssue(ctx context.Context, req IssueRequest) (*IssueResponse, error)
 }
 
+// ScreenshotPinner durably preserves submitted screenshots owned by userID.
+type ScreenshotPinner interface {
+	Pin(context.Context, string, []string) (string, error)
+	ConfirmPublished(context.Context, string, []string) error
+	ReleaseRejected(context.Context, string, []string) error
+}
+
 // Handler owns the POST /api/v1/feedback endpoint.
 //
 // Explicitly disabled self-host feedback refuses before reading report bodies.
@@ -125,9 +133,10 @@ type GitHubIssueCreator interface {
 type Handler struct {
 	disabled bool
 
-	log     *logger.Logger
-	github  GitHubIssueCreator
-	corrKey []byte // HKDF-derived correlation key (see buildFeedbackHandler)
+	log              *logger.Logger
+	github           GitHubIssueCreator
+	screenshotPinner ScreenshotPinner
+	corrKey          []byte // HKDF-derived correlation key (see buildFeedbackHandler)
 	// mediaBaseURL is the absolute public origin (config.PublicMediaBaseURL) used
 	// to author camo-fetchable screenshot URLs in filed issues (#1747). Empty =
 	// attachment embeds are skipped.
@@ -141,6 +150,12 @@ type Handler struct {
 // embedded screenshot URLs (empty disables attachment embeds).
 func NewHandler(log *logger.Logger, github GitHubIssueCreator, corrKey []byte, mediaBaseURL string) *Handler {
 	return &Handler{log: log, github: github, corrKey: corrKey, mediaBaseURL: mediaBaseURL}
+}
+
+// SetScreenshotPinner installs the lifecycle service used to pin screenshots
+// before a report containing them can be published.
+func (h *Handler) SetScreenshotPinner(pinner ScreenshotPinner) {
+	h.screenshotPinner = pinner
 }
 
 // NewDisabledHandler builds the explicitly disabled self-host feedback handler.
@@ -201,34 +216,15 @@ func (h *Handler) Submit(c *gin.Context) {
 		return
 	}
 
-	// Defense-in-depth PII re-sanitization. The threat model is a
-	// compromised client that bypasses the renderer-side scrub at
-	// services/system/logBufferService.ts — the server is the LAST line before
-	// content reaches a public-ish GitHub issue, so every free-text
-	// string the client sends gets scrubbed here, not just Logs.
-	// (Gitar / @security-reviewer finding, PR #1547.)
-	req.Title = Sanitize(req.Title)
-	req.Description = Sanitize(req.Description)
-	req.Category = Sanitize(req.Category)
-	if req.Diagnostics != nil {
-		req.Diagnostics.AppVersion = Sanitize(req.Diagnostics.AppVersion)
-		req.Diagnostics.Platform = Sanitize(req.Diagnostics.Platform)
-		req.Diagnostics.MachineIDPrefix = Sanitize(req.Diagnostics.MachineIDPrefix)
-		req.Diagnostics.ConnectionPhase = Sanitize(req.Diagnostics.ConnectionPhase)
-		if req.Diagnostics.GPU != nil {
-			req.Diagnostics.GPU.Vendor = Sanitize(req.Diagnostics.GPU.Vendor)
-			req.Diagnostics.GPU.Renderer = Sanitize(req.Diagnostics.GPU.Renderer)
-		}
-		req.Diagnostics.Logs = Sanitize(req.Diagnostics.Logs)
-	}
+	sanitizeRequest(&req)
 
 	// De-identify the reporter: the (public-ish) issue body carries a
 	// non-reversible HMAC correlation token, never the raw internal UUID.
 	// The token is stable across a user's reports so triage can dedup.
 	reporterToken := DeriveCorrelationToken(h.corrKey, userID)
-	title, body, labels := buildIssue(&req, reporterToken, h.mediaBaseURL)
-
-	// Dev stub: log the body and return success without calling GitHub.
+	title, body, labels, embeddedPaths := buildIssue(&req, reporterToken, h.mediaBaseURL)
+	// The development stub creates no issue that could reference a screenshot.
+	// Leave uploads pending so their ordinary 72-hour expiry releases storage.
 	if h.github == nil {
 		h.log.Info("feedback.submit (dev stub — no GitHub call)",
 			"type", req.Type,
@@ -240,24 +236,112 @@ func (h *Handler) Submit(c *gin.Context) {
 		c.JSON(http.StatusOK, submitResponse{Dev: true})
 		return
 	}
-
-	// Production path: post to GitHub. 12s budget (room under the client's
-	// http.Client 15s above and the typical client UI timeout).
+	// Pinning and publication share one budget so a successful GitHub call can
+	// still be acknowledged before the server's 15-second write deadline.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
 	defer cancel()
+	// Only screenshots that will be embedded need preservation. Validate owner,
+	// existence and expiry through the lifecycle service before the issue can
+	// leave this process. Pins intentionally survive an ambiguous GitHub result.
+	pinReceipt, pinnedPaths, err := h.pinEmbeddedScreenshots(ctx, c.Request.Context(), userID, embeddedPaths)
+	if err != nil {
+		if errors.Is(err, feedbackscreenshots.ErrInvalid) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid screenshot attachments"})
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "screenshot storage unavailable"})
+		return
+	}
 
+	// Production path: post to GitHub within the remaining request budget.
 	issue, err := h.github.CreateIssue(ctx, IssueRequest{
 		Title:  title,
 		Body:   body,
 		Labels: labels,
 	})
 	if err != nil {
+		if isDefinitiveIssueRejection(err) {
+			h.recordScreenshotPublication(c.Request.Context(), pinReceipt, pinnedPaths, false)
+		}
 		h.log.Warn("feedback.submit: GitHub create failed", "error", err.Error(), "user_id", userID)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "feedback submission failed; please try again later"})
 		return
 	}
 
+	h.recordScreenshotPublication(ctx, pinReceipt, pinnedPaths, true)
 	c.JSON(http.StatusOK, submitResponse{IssueURL: issue.HTMLURL, Dev: false})
+}
+
+func (h *Handler) pinEmbeddedScreenshots(ctx, requestCtx context.Context, userID string, paths []string) (string, []string, error) {
+	if len(paths) == 0 {
+		return "", nil, nil
+	}
+	if h.screenshotPinner == nil {
+		return "", nil, errors.New("screenshot storage unavailable")
+	}
+	receipt, err := h.screenshotPinner.Pin(ctx, userID, paths)
+	if err != nil {
+		if receipt != "" {
+			h.releaseAmbiguousPin(requestCtx, receipt, paths)
+		}
+		return "", nil, err
+	}
+	return receipt, paths, nil
+}
+
+// Sanitize every free-text field server-side before it reaches a public issue.
+// The renderer scrub is not a trust boundary (Gitar finding, PR #1547).
+func sanitizeRequest(req *submitRequest) {
+	req.Title = Sanitize(req.Title)
+	req.Description = Sanitize(req.Description)
+	req.Category = Sanitize(req.Category)
+	if req.Diagnostics == nil {
+		return
+	}
+	req.Diagnostics.AppVersion = Sanitize(req.Diagnostics.AppVersion)
+	req.Diagnostics.Platform = Sanitize(req.Diagnostics.Platform)
+	req.Diagnostics.MachineIDPrefix = Sanitize(req.Diagnostics.MachineIDPrefix)
+	req.Diagnostics.ConnectionPhase = Sanitize(req.Diagnostics.ConnectionPhase)
+	if req.Diagnostics.GPU != nil {
+		req.Diagnostics.GPU.Vendor = Sanitize(req.Diagnostics.GPU.Vendor)
+		req.Diagnostics.GPU.Renderer = Sanitize(req.Diagnostics.GPU.Renderer)
+	}
+	req.Diagnostics.Logs = Sanitize(req.Diagnostics.Logs)
+}
+
+// A provider outcome must settle its pin even if the client disconnected or
+// the shared publication deadline elapsed just after the provider responded.
+func (h *Handler) recordScreenshotPublication(requestCtx context.Context, receipt string, paths []string, published bool) {
+	if len(paths) == 0 {
+		return
+	}
+	timeout := 5 * time.Second
+	if published {
+		// Pinning and the provider share 12 seconds under a 15-second server
+		// write deadline; leave room to return the successful response.
+		timeout = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), timeout)
+	defer cancel()
+	var err error
+	if published {
+		err = h.screenshotPinner.ConfirmPublished(ctx, receipt, paths)
+	} else {
+		err = h.screenshotPinner.ReleaseRejected(ctx, receipt, paths)
+	}
+	if err != nil {
+		h.log.Error("feedback screenshot publication outcome could not be recorded", "error", err, "published", published)
+	}
+}
+
+// If COMMIT's acknowledgement was lost, rejection by receipt succeeds only
+// when PostgreSQL actually kept the pin. A missing pin means it rolled back.
+func (h *Handler) releaseAmbiguousPin(requestCtx context.Context, receipt string, paths []string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), 5*time.Second)
+	defer cancel()
+	if err := h.screenshotPinner.ReleaseRejected(ctx, receipt, paths); err != nil && !errors.Is(err, feedbackscreenshots.ErrInvalid) {
+		h.log.Error("ambiguous feedback screenshot pin could not be released", "error", err)
+	}
 }
 
 // validate runs cheap structural checks on the parsed request. Heavier
@@ -491,19 +575,23 @@ func inlineCode(s string) string {
 // titles — so it keeps neutralizeAutolinks, which still defuses the `#123`
 // issue-ref and `@name` autolinks that DO fire in titles.
 //
-// If the assembled body would exceed `maxBodyBytes`, truncateBody does a
-// rune-boundary-aware head-keep (header + the start of the Description block),
-// dropping the remainder. The truncation is marked inline so triagers know it
-// happened.
-func buildIssue(req *submitRequest, reporterToken, mediaBaseURL string) (title, body string, labels []string) {
+// Screenshots precede unbounded diagnostics metadata so truncation cannot
+// silently drop their section. The returned paths include only complete image
+// embeds retained in the final body.
+func buildIssue(req *submitRequest, reporterToken, mediaBaseURL string) (title, body string, labels, embeddedPaths []string) {
 	var b strings.Builder
+	var screenshotEnds []int
 
 	switch req.Type {
 	case reportTypeBug:
 		title = "[Bug Report] " + neutralizeAutolinks(req.Title)
 		labels = []string{"type: bug"}
 		fmt.Fprintf(&b, "**Reported by:** report `%s`\n", reporterToken)
+		if mediaBaseURL != "" && len(req.Attachments) > 0 {
+			screenshotEnds = writeAttachments(&b, req.Attachments, mediaBaseURL)
+		}
 		if req.Diagnostics != nil {
+			b.WriteString("\n## Client details\n\n")
 			fmt.Fprintf(&b, "**App Version:** %s\n", inlineCode(req.Diagnostics.AppVersion))
 			fmt.Fprintf(&b, "**Platform:** %s\n", inlineCode(req.Diagnostics.Platform))
 		}
@@ -511,9 +599,6 @@ func buildIssue(req *submitRequest, reporterToken, mediaBaseURL string) (title, 
 		fencedBlock(&b, req.Description)
 		if req.Diagnostics != nil {
 			writeDiagnostics(&b, req.Diagnostics)
-		}
-		if mediaBaseURL != "" && len(req.Attachments) > 0 {
-			writeAttachments(&b, req.Attachments, mediaBaseURL)
 		}
 
 	case reportTypeFeature:
@@ -528,10 +613,17 @@ func buildIssue(req *submitRequest, reporterToken, mediaBaseURL string) (title, 
 	}
 
 	body = b.String()
+	retainedBytes := len(body)
 	if len(body) > maxBodyBytes {
 		body = truncateBody(body)
+		retainedBytes = len(body) - len(truncatedBodyMarker)
 	}
-	return title, body, labels
+	for i, end := range screenshotEnds {
+		if end <= retainedBytes {
+			embeddedPaths = append(embeddedPaths, req.Attachments[i].URL)
+		}
+	}
+	return title, body, labels, embeddedPaths
 }
 
 // writeAttachments appends server-authored markdown image embeds for bug-report
@@ -540,17 +632,20 @@ func buildIssue(req *submitRequest, reporterToken, mediaBaseURL string) (title, 
 // isValidScreenshotPath to be exactly /api/v1/media/feedback-screenshots/<uuid>.
 // No user-controlled text reaches the markdown link, so the body's
 // injection-inert posture (fencedBlock/inlineCode for all user free-text) holds.
-func writeAttachments(b *strings.Builder, attachments []attachmentRef, mediaBaseURL string) {
+func writeAttachments(b *strings.Builder, attachments []attachmentRef, mediaBaseURL string) []int {
 	b.WriteString("\n## Screenshots\n\n")
+	ends := make([]int, 0, len(attachments))
 	for i, att := range attachments {
 		fmt.Fprintf(b, "![screenshot-%d](%s%s)\n", i+1, mediaBaseURL, att.URL)
+		ends = append(ends, b.Len()-1) // the closing ')' makes the embed complete
 	}
+	return ends
 }
 
 // truncateBody applies a blunt HEAD-keep truncation when the assembled body
 // would exceed GitHub's issue-body cap: it keeps the first maxBodyBytes-N
-// bytes (the header + the start of whatever section follows — Description and,
-// for bug reports, the Diagnostics/Logs that trail it) and appends a marker
+// bytes (the header, complete screenshot embeds that fit, and the start of
+// later Description/Diagnostics content) and appends a marker
 // noting that the body was truncated. Returns a body of at most maxBodyBytes
 // bytes. This is a head-keep, NOT a within-logs tail-keep — the whole tail
 // (including the closing log fence) is simply dropped.
@@ -564,12 +659,13 @@ func writeAttachments(b *strings.Builder, attachments []attachmentRef, mediaBase
 // multi-byte rune at the cut (e.g. the 3-byte ZWSP that neutralizeAutolinks
 // inserts, or any non-ASCII user input) is never split into an invalid byte
 // sequence that GitHub would render as U+FFFD. (#158 review, PR #1547 — Fix 8.)
+const truncatedBodyMarker = "\n\n_... (body truncated to fit GitHub issue-body limit) ..._\n"
+
 func truncateBody(body string) string {
-	const marker = "\n\n_... (body truncated to fit GitHub issue-body limit) ..._\n"
 	if len(body) <= maxBodyBytes {
 		return body
 	}
-	keep := maxBodyBytes - len(marker)
+	keep := maxBodyBytes - len(truncatedBodyMarker)
 	if keep < 0 {
 		keep = 0
 	}
@@ -578,7 +674,7 @@ func truncateBody(body string) string {
 	for keep > 0 && !utf8.RuneStart(body[keep]) {
 		keep--
 	}
-	return body[:keep] + marker
+	return body[:keep] + truncatedBodyMarker
 }
 
 // writeDiagnostics emits the optional "Diagnostics" section in the bug-report

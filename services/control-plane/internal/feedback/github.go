@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,25 @@ type IssueRequest struct {
 type IssueResponse struct {
 	Number  int    `json:"number"`
 	HTMLURL string `json:"html_url"`
+}
+
+// issueAPIStatusError is a received provider response. Selected 4xx statuses
+// prove that this issue creation was rejected, unlike a transport timeout.
+type issueAPIStatusError struct {
+	status int
+	body   string
+}
+
+func (e *issueAPIStatusError) Error() string {
+	return fmt.Sprintf("github: API status %d: %s", e.status, e.body)
+}
+
+func isDefinitiveIssueRejection(err error) bool {
+	var status *issueAPIStatusError
+	return errors.As(err, &status) &&
+		(status.status == http.StatusBadRequest || status.status == http.StatusUnauthorized ||
+			status.status == http.StatusForbidden || status.status == http.StatusNotFound ||
+			status.status == http.StatusUnprocessableEntity || status.status == http.StatusTooManyRequests)
 }
 
 // Client is a minimal GitHub issues API client scoped to a single repo. The
@@ -95,7 +115,7 @@ func (c *Client) CreateIssue(ctx context.Context, req IssueRequest) (*IssueRespo
 		// surface this to the end-user (handlers.go returns a generic 502);
 		// it is logged for the operator.
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		return nil, fmt.Errorf("github: API status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, &issueAPIStatusError{status: resp.StatusCode, body: string(bodyBytes)}
 	}
 
 	var issue IssueResponse

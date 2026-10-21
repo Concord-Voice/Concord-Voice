@@ -74,6 +74,7 @@ func TestCreateIssue_Non2xxReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "github: API status 422")
 	assert.Contains(t, err.Error(), "Validation Failed")
+	assert.True(t, isDefinitiveIssueRejection(err), "a received 422 proves this issue was rejected")
 }
 
 // TestCreateIssue_TransportError covers the "GitHub unreachable" case via
@@ -86,6 +87,13 @@ func TestCreateIssue_TransportError(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "github: transport:"),
 		"expected transport-error wrapping, got: %v", err)
+	assert.False(t, isDefinitiveIssueRejection(err), "transport errors cannot prove whether an issue was filed")
+}
+
+func TestIssueRejectionClassifierKeepsAmbiguousResponsesPinned(t *testing.T) {
+	for _, code := range []int{http.StatusRequestTimeout, http.StatusConflict, http.StatusInternalServerError, http.StatusBadGateway} {
+		assert.False(t, isDefinitiveIssueRejection(&issueAPIStatusError{status: code}), "status %d is not proof of rejection", code)
+	}
 }
 
 // TestCreateIssue_LabelsOmittedWhenEmpty ensures the omitempty on Labels works —

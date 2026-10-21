@@ -3,6 +3,7 @@ package media
 import (
 	"bytes"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -33,6 +34,113 @@ func TestSetDiskWatermark(t *testing.T) {
 // real filesystem is touched.
 func refusingWatermark(selfHosted bool) *DiskWatermark {
 	return newDiskWatermark("/", selfHosted, fixedDiskStatFS(100, 0), logger.NewWithWriter(&bytes.Buffer{}))
+}
+
+// TestUploadFeedbackScreenshot_DiskWatermarkGate proves that feedback
+// screenshots obey the SaaS shared-disk refusal and remain writable for
+// self-hosted deployments, below-threshold occupancy, and an unset watermark.
+// Each case checks the externally visible object and media_files effects, so
+// the refusal cannot pass merely because the response status happens to match.
+func TestUploadFeedbackScreenshot_DiskWatermarkGate(t *testing.T) {
+	tests := []struct {
+		name       string
+		watermark  *DiskWatermark
+		wantStatus int
+	}{
+		{
+			name:       "SaaS refuses at capacity",
+			watermark:  refusingWatermark(false),
+			wantStatus: http.StatusInsufficientStorage,
+		},
+		{
+			name:       "SaaS refuses at 75 percent boundary",
+			watermark:  newDiskWatermark("/", false, fixedDiskStatFS(100, 25), logger.NewWithWriter(&bytes.Buffer{})),
+			wantStatus: http.StatusInsufficientStorage,
+		},
+		{
+			name:       "SaaS refuses at 80 percent",
+			watermark:  newDiskWatermark("/", false, fixedDiskStatFS(100, 20), logger.NewWithWriter(&bytes.Buffer{})),
+			wantStatus: http.StatusInsufficientStorage,
+		},
+		{
+			name:       "self-hosted allows at capacity",
+			watermark:  refusingWatermark(true),
+			wantStatus: http.StatusCreated,
+		},
+		{
+			name:       "SaaS allows below refusal threshold",
+			watermark:  newDiskWatermark("/", false, fixedDiskStatFS(100, 26), logger.NewWithWriter(&bytes.Buffer{})),
+			wantStatus: http.StatusCreated,
+		},
+		{
+			name:       "unset watermark allows upload",
+			wantStatus: http.StatusCreated,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			if tt.watermark != nil {
+				ts.handler.SetDiskWatermark(tt.watermark)
+			}
+			userID := ts.createTestUser(t, "screenshot_watermark")
+			body, ct := multipartBody(t, "file", "screenshot.png", makePNG(t, 200, 200), nil)
+
+			w := ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+
+			require.Equal(t, tt.wantStatus, w.Code, "body: %s", w.Body.String())
+			var metadataCount int
+			require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id = $1 AND storage_key LIKE 'feedback-screenshots/%' AND deleted_at IS NULL`, userID).Scan(&metadataCount))
+			if tt.wantStatus == http.StatusInsufficientStorage {
+				resp := parseBody(t, w)
+				assert.Equal(t, errMsgAttachmentStorageAtCapacity, resp["error"])
+				assert.Empty(t, ts.store.objects, "a refused screenshot must never reach the object store")
+				assert.Zero(t, metadataCount, "a refused screenshot must not create media metadata")
+				return
+			}
+
+			resp := parseBody(t, w)
+			url, ok := resp["url"].(string)
+			require.True(t, ok, "successful screenshot response URL must be a string, got %#v", resp["url"])
+			storageKey, ok := resp["storage_key"].(string)
+			require.True(t, ok, "successful screenshot response storage_key must be a string, got %#v", resp["storage_key"])
+			assert.Equal(t, "/api/v1/media/"+storageKey, url)
+			assert.True(t, strings.HasPrefix(storageKey, "feedback-screenshots/"), "unexpected storage key %q", storageKey)
+			assert.Zero(t, ts.store.objectCount(), "pending screenshots must remain in PostgreSQL until publication")
+			assert.Equal(t, 1, metadataCount, "successful screenshot must create one live media row")
+			var storedKey string
+			require.NoError(t, ts.db.QueryRow(`SELECT storage_key FROM media_files WHERE uploader_id = $1 AND storage_key LIKE 'feedback-screenshots/%' AND deleted_at IS NULL`, userID).Scan(&storedKey))
+			assert.Equal(t, storageKey, storedKey, "metadata must point at the uploaded object")
+			var state string
+			var staged []byte
+			require.NoError(t, ts.db.QueryRow(`SELECT state,staged_data FROM feedback_screenshot_uploads WHERE object_key=$1`, strings.TrimPrefix(storageKey, "feedback-screenshots/")).Scan(&state, &staged))
+			assert.Equal(t, "pending", state)
+			assert.NotEmpty(t, staged, "accepted screenshot bytes must be durably staged")
+		})
+	}
+}
+
+func TestUploadAvatar_DiskWatermarkDoesNotBlockOtherTier1Media(t *testing.T) {
+	ts := setupMediaTest(t)
+	ts.handler.SetDiskWatermark(refusingWatermark(false))
+	userID := ts.createTestUser(t, "avatar_watermark_control")
+	body, ct := multipartBody(t, "file", fileAvatarPng, makePNG(t, 100, 100), nil)
+
+	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+
+	require.Equal(t, http.StatusCreated, w.Code, "the feedback screenshot gate must not block avatar uploads; body: %s", w.Body.String())
+	assert.Equal(t, 1, ts.store.objectCount())
+	resp := parseBody(t, w)
+	storageKey, ok := resp["storage_key"].(string)
+	require.True(t, ok, "successful avatar response storage_key must be a string, got %#v", resp["storage_key"])
+	assert.True(t, ts.store.hasObject(storageKey), "successful avatar object must exist at the returned key")
+	var metadataCount int
+	var storedKey string
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_key FROM media_files WHERE uploader_id = $1 AND profile_slot = 'avatar' AND deleted_at IS NULL`, userID).Scan(&storedKey))
+	assert.Equal(t, storageKey, storedKey, "avatar metadata must point at the uploaded object")
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id = $1 AND profile_slot = 'avatar' AND deleted_at IS NULL`, userID).Scan(&metadataCount))
+	assert.Equal(t, 1, metadataCount, "successful avatar upload must create one live media row")
 }
 
 // =====================================================================

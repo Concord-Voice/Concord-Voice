@@ -20,6 +20,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedback"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
@@ -334,7 +335,10 @@ type RouterDependencies struct {
 	OpsMetricsReader opsmetrics.Reader
 	PresenceHistory  *presencehistory.Service
 	SecurityEvents   securityevent.Emitter
-	Tier1ErasureWake func()
+	// MediaDiskWatermark permits a deterministic filesystem reading in router
+	// integration tests. Production leaves it nil and constructs the real gate.
+	MediaDiskWatermark *media.DiskWatermark
+	Tier1ErasureWake   func()
 	// PurgeEngine is the process-owned purge terminal. When omitted, NewRouter
 	// retains embedders' construction behavior but does not start reaper loops.
 	PurgeEngine *purge.Engine
@@ -751,7 +755,10 @@ func wireMediaHandler(
 	// selfHosted comes from the existing InstanceType seam rather than a
 	// new flag: self-hosted/dev/air-gapped deployments only ever warn,
 	// they never refuse (MinIO is their sole, permanent backend).
-	watermark := media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log)
+	watermark := dependencies.MediaDiskWatermark
+	if watermark == nil {
+		watermark = media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log)
+	}
 	watermark.SetSecurityEvents(dependencies.SecurityEvents)
 	handler.SetDiskWatermark(watermark)
 	// Per-object backend resolution for the attachment download path
@@ -1210,6 +1217,7 @@ func NewRouter(
 	}
 
 	feedbackHandler := buildFeedbackHandler(cfg, log)
+	feedbackHandler.SetScreenshotPinner(feedbackscreenshots.New(db))
 	notificationsHandler := notifications.NewHandler(db, log)
 	ownershipHandler := ownership.NewHandler(ownership.HandlerDeps{
 		DB:          db,

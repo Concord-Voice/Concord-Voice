@@ -6856,7 +6856,24 @@ paths:
                     `POST /media/upload/feedback-screenshot`. The server bounds the
                     count (max 4), rejects any other URL shape, and re-authors each
                     into a server-controlled absolute image embed in the filed issue
-                    — the only trusted link in the body. Rejected (400) for `type: feature`.'
+                    — the only trusted link in the body. Embedded screenshots must be owned
+                    and staged or already retained; pending screenshots must be unexpired.
+                    They are pinned before issue publication. Provisional pins remain
+                    charged to pending allowance until publication or permanent retention.
+                    Publication outcomes remain recordable after account deletion.
+                    Confirmed published images
+                    remain retained. Unresolved publication pins become permanently retained
+                    and eligible for offload at a separate retained_at deadline, 72 hours
+                    from the first unresolved pending-to-pinned transition, without
+                    claiming publication success. Later pins do not extend this deadline.
+                    Before permanent retention, a definitive
+                    provider rejection releases only that submission''s pin and restores
+                    pending state when no other attempt protects the image, clearing
+                    retained_at so a later independent pin starts a new retention window. Original pending
+                    expiry remains 72 hours after staging, so a late rejection can make an
+                    image immediately eligible for cleanup. The development
+                    stub leaves screenshots pending for normal expiry.
+                    Rejected (400) for `type: feature` or invalid screenshot ownership/lifecycle.'
                   maxItems: 4
                   items:
                     type: object
@@ -6887,8 +6904,7 @@ paths:
                     description: True when a development configuration logged the
                       issue body instead of filing it (repository or FEEDBACK_PAT unset).
         '400':
-          description: Invalid request body (missing required field, oversize, or
-            unknown type)
+          description: Invalid request body or screenshot attachment (including ownership, expiry, and upload state)
         '401':
           description: Missing or invalid Bearer token
         '413':
@@ -6898,7 +6914,7 @@ paths:
         '502':
           description: GitHub API call failed (only on the non-dev path)
         '503':
-          description: Feedback is disabled for this self-hosted instance
+          description: Feedback is disabled or screenshot lifecycle storage is unavailable
           content:
             application/json:
               schema:
@@ -6910,6 +6926,7 @@ paths:
                     type: string
                     enum:
                     - feedback_disabled
+                    - screenshot storage unavailable
   /redeem:
     post:
       tags:
@@ -8731,6 +8748,12 @@ paths:
 
         Registered without auth so GitHub''s camo image proxy can fetch a screenshot embedded in a filed feedback issue.
 
+        Pending images are read from PostgreSQL. Abandoned uploads expire after
+        72 hours and return 404; pending images also become unavailable after
+        account erasure. Submitted screenshots are retained, and remain readable
+        from PostgreSQL until object-store offload is confirmed. Historical remote
+        images remain readable. Screenshot streams use Cache-Control: no-store.
+
         Explicitly disabled feedback returns 503 feedback_disabled with Cache-Control: no-store before storage access.
 
         Rate limit: 120 requests per minute (IP-based).
@@ -8747,10 +8770,10 @@ paths:
         description: Per-upload screenshot UUID
       responses:
         '200':
-          description: Screenshot image stream (content type from storage)
+          description: Screenshot image stream from staged bytes or confirmed remote storage
           headers:
             Cache-Control:
-              description: public, max-age=3600, must-revalidate
+              description: no-store
               schema:
                 type: string
           content:
@@ -8774,8 +8797,9 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           description: >-
-            Feedback is disabled (feedback_disabled) or media storage is not configured.
-            Disabled feedback refuses before accessing storage.
+            Feedback is disabled (feedback_disabled), media storage is not configured,
+            or screenshot lifecycle storage is unavailable. Disabled feedback refuses
+            before accessing storage.
           headers:
             Cache-Control:
               description: no-store when feedback is disabled
@@ -9472,6 +9496,35 @@ paths:
         Returns an unguessable public media path (`/api/v1/media/feedback-screenshots/<uuid>`) the client passes
         to POST /feedback as attachments[].url.
 
+        On SaaS, a configured shared-disk watermark refuses uploads at 75% occupancy
+        before staging the image (HTTP 507). The worker checks it again immediately
+        before offloading a confirmed published or permanently retained image to
+        its immutable object key.
+
+        Uploads atomically stage processed image bytes, lifecycle state and media
+        metadata in PostgreSQL. Each account may hold 8 pending screenshots
+        (40 MiB), including provisional pinned images that are neither published
+        nor permanently retained, and 128 total retained screenshots (128 MiB).
+        Pinning an unresolved report does not free pending allowance. The shared screenshot
+        allowance is 10000 objects and 10 GiB. All staged logical image bytes share
+        an additional 512 MiB cap, including retained images awaiting offload.
+        Allowance exhaustion returns 429. Abandoned uploads expire transactionally
+        after 72 hours. Confirmed published, pinned images and permanently retained
+        images are eligible for offload. Unresolved publication pins become
+        permanently retained at a separate deadline 72 hours from the first
+        unresolved pending-to-pinned transition; later pins do not extend it.
+        Permanent retention does not record publication success or extend the
+        original pending expiry of 72 hours after staging.
+        Final definitive rejection clears that deadline when the image returns to
+        pending, so a later independent pin starts a new retention window.
+        Blocked, failed or uncertain offloads preserve staged
+        bytes and quotas. Automated offload stops after three durable
+        application-level PUT attempts per image; the image remains readable and
+        charged in PostgreSQL pending operator reconciliation. The storage SDK
+        may retry internally, so this is not a physical object-version limit.
+        Submitted screenshots remain available and count toward retained storage
+        after offload. The returned public URL remains the same throughout.
+
         Explicitly disabled feedback returns 503 feedback_disabled with Cache-Control: no-store before reading the upload body or processing images.
 
         Rate limit: 12 requests per minute.
@@ -9494,7 +9547,7 @@ paths:
                   description: Image file (PNG, JPEG, or WebP)
       responses:
         '201':
-          description: Image processed and stored
+          description: Image processed and staged with media metadata in PostgreSQL
           content:
             application/json:
               schema:
@@ -9512,16 +9565,51 @@ paths:
               schema:
                 $ref: '#/components/schemas/MediaFileTooLargeError'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          description: >-
+            The request rate limit or screenshot storage allowance is exhausted.
+            Rate-limit responses include Retry-After. Pending allowance can recover
+            when abandoned screenshots expire after 72 hours; staged-byte allowance
+            can also recover after confirmed offload. Retained published images
+            continue to count toward retained object and byte allowances.
+          headers:
+            Retry-After:
+              description: Seconds until the route rate-limit window resets, when rate-limited
+              schema:
+                type: integer
+            X-RateLimit-Limit:
+              description: Maximum requests in the route rate-limit window, when rate-limited
+              schema:
+                type: integer
+            X-RateLimit-Remaining:
+              description: Requests remaining in the route rate-limit window, when rate-limited
+              schema:
+                type: integer
+            X-RateLimit-Reset:
+              description: Unix timestamp when the route rate-limit window resets, when rate-limited
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/RateLimitError'
+                - $ref: '#/components/schemas/FeedbackScreenshotQuotaError'
         '503':
           description: >-
-            Feedback is disabled (feedback_disabled) or media storage is not configured.
+            Feedback is disabled (feedback_disabled), media storage is not configured,
+            or screenshot lifecycle storage is unavailable.
             Disabled feedback refuses before reading the upload body or writing media.
           headers:
             Cache-Control:
               description: no-store when feedback is disabled
               schema:
                 type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '507':
+          description: Shared local media storage is at capacity (SaaS disk watermark)
           content:
             application/json:
               schema:
@@ -19739,6 +19827,15 @@ components:
       required:
       - error
       - message
+    FeedbackScreenshotQuotaError:
+      type: object
+      properties:
+        error:
+          type: string
+          enum:
+          - Screenshot storage allowance exceeded
+      required:
+      - error
     SuccessMessage:
       type: object
       properties:

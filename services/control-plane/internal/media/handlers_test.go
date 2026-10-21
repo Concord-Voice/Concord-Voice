@@ -3197,6 +3197,7 @@ func TestProxyFeedbackScreenshotServesByKeyWithNoAuthCheck(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
+	assert.Equal(t, cacheControlNoStore, w.Header().Get(headerCacheControl))
 }
 
 func TestProxyFeedbackScreenshotInvalidID(t *testing.T) {

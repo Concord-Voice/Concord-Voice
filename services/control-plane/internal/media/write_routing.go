@@ -149,6 +149,16 @@ func (h *Handler) requireAttachmentWriteStore(c *gin.Context) (ObjectStore, stri
 	return store, backendID, true
 }
 
+// checkFeedbackScreenshotDiskWatermark gates the accumulating screenshot purpose
+// without changing profile/entity image policy. Screenshots always use legacy
+// storage, even when new attachments are routed to a vendor backend.
+func (h *Handler) checkFeedbackScreenshotDiskWatermark(c *gin.Context, purpose string) bool {
+	if purpose != purposeFeedbackScreenshot {
+		return true
+	}
+	return h.checkAttachmentDiskWatermark(c, "")
+}
+
 // checkAttachmentDiskWatermark applies the shared-disk occupancy gate, but ONLY
 // to a write that lands on the legacy backend.
 //

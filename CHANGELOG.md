@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Bug-report screenshots now have storage allowances and expire after 72 hours if
+the report is abandoned. Screenshots remain available when report delivery is
+uncertain or storage transfers need to retry. Shared-disk capacity guards apply
+to transfers and uploads.
+
 Changing activity sharing settings in large servers no longer disconnects
 unrelated users.
 

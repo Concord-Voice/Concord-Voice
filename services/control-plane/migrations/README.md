@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000176)
+## Existing Migrations (000001–000177)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -286,6 +286,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000174 | guard_dm_messages_key_version | Reject new NULL or nonpositive DM-message versions with a `NOT VALID` check (#2844) |
 | 000175 | validate_dm_messages_key_version | Validate the DM-message version check in a separate migration transaction (#2844) |
 | 000176 | enforce_dm_messages_key_version | Set DM-message `key_version` `NOT NULL` and drop its default while retaining the positive check (#2844) |
+| 000177 | feedback_screenshot_lifecycle | PostgreSQL screenshot byte staging and quota ledger, receipt-backed submission and unresolved-pin retention, transactional abandoned-upload expiry and retained-image offload tracking with a durable three-attempt application PUT cap; preserves existing images and guards rollback while lifecycle evidence exists |
 
 ### Message key-version constraints (migrations 000171–000176, #2844)
 

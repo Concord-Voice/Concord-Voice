@@ -32,6 +32,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
@@ -355,6 +356,7 @@ func (r *feedbackScreenshotRows) Next(dest []driver.Value) error {
 
 type feedbackScreenshotRouterFixture struct {
 	router  http.Handler
+	db      *sql.DB
 	rdb     *redis.Client
 	store   *feedbackScreenshotStore
 	dbState *feedbackScreenshotDB
@@ -362,14 +364,30 @@ type feedbackScreenshotRouterFixture struct {
 }
 
 func newFeedbackScreenshotRouterFixture(t *testing.T, instance, repo string) *feedbackScreenshotRouterFixture {
+	return newFeedbackScreenshotRouterFixtureWithMediaOrigin(t, instance, repo, "")
+}
+
+func newFeedbackScreenshotRouterFixtureWithMediaOrigin(t *testing.T, instance, repo, publicMediaBaseURL string) *feedbackScreenshotRouterFixture {
+	return newFeedbackScreenshotRouterFixtureWithGitHubToken(t, instance, repo, publicMediaBaseURL, "")
+}
+
+func newFeedbackScreenshotRouterFixtureWithGitHubToken(t *testing.T, instance, repo, publicMediaBaseURL, githubToken string) *feedbackScreenshotRouterFixture {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	mr := miniredis.RunT(t) // Private keyspace and frozen limiter clock; no shared Redis flush.
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { require.NoError(t, rdb.Close()) })
 	state := &feedbackScreenshotDB{}
-	db := sql.OpenDB(feedbackScreenshotConnector{state: state})
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	var db *sql.DB
+	if config.IsSelfHostedInstance(instance) && strings.EqualFold(strings.TrimSpace(repo), "selfhost/disabled") {
+		db = sql.OpenDB(feedbackScreenshotConnector{state: state})
+		t.Cleanup(func() { require.NoError(t, db.Close()) })
+	} else {
+		db, _ = testdb.SetupTestDB(t)
+		_, err := db.Exec(`INSERT INTO users (id,email,username,password_hash,age_verified,email_verified)
+			VALUES ($1,'screenshot-router@test.local','screenshot_router','test-only-hash',TRUE,TRUE)`, feedbackScreenshotUserID)
+		require.NoError(t, err)
+	}
 	store := &feedbackScreenshotStore{objects: map[string][]byte{feedbackScreenshotObjectKey: []byte("owned-previous-screenshot")}}
 	cfg := &config.Config{
 		Environment: "test", InstanceType: instance,
@@ -378,12 +396,17 @@ func newFeedbackScreenshotRouterFixture(t *testing.T, instance, repo string) *fe
 		AllowedOrigins:   []string{"*"},
 		MFAEncryptionKey: strings.Repeat("0", 64), MFAEncryptionKeyVersion: 1,
 		WebAuthnRPID: "localhost", WebAuthnRPOrigins: []string{"http://localhost:3001"},
-		GitHubFeedback: config.GitHubFeedbackConfig{Repo: repo},
+		PublicMediaBaseURL: publicMediaBaseURL,
+		GitHubFeedback:     config.GitHubFeedbackConfig{Repo: repo, Token: githubToken},
 	}
 	router, hub, natsClient, opsRuntime, enforcer, _, closePresence, _, _, _, err := NewRouter(
 		t.Context(), db, rdb, cfg, nil, logger.NewWithWriter(io.Discard),
-		RouterDependencies{Store: store, PresenceHistory: presencehistory.NewService(db,
-			presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: instance}), true)},
+		RouterDependencies{Store: store,
+			// The test host may be above SaaS's 75% disk threshold. Keep
+			// router behavior deterministic while real gate coverage lives in media.
+			MediaDiskWatermark: media.NewDiskWatermark(true, logger.NewWithWriter(io.Discard)),
+			PresenceHistory: presencehistory.NewService(db,
+				presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: instance}), true)},
 	)
 	require.NoError(t, err)
 	require.NotNil(t, natsClient, "the router's erasure publisher boot guard requires a handle")
@@ -404,7 +427,46 @@ func newFeedbackScreenshotRouterFixture(t *testing.T, instance, repo string) *fe
 		require.NoError(t, opsRuntime.Stop(context.Background()))
 	})
 	require.NoError(t, rdb.Set(t.Context(), credepoch.Key(feedbackScreenshotUserID), "none", time.Minute).Err())
-	return &feedbackScreenshotRouterFixture{router: router, rdb: rdb, store: store, dbState: state, secret: cfg.JWTSecret}
+	return &feedbackScreenshotRouterFixture{router: router, db: db, rdb: rdb, store: store, dbState: state, secret: cfg.JWTSecret}
+}
+
+func TestNewRouter_FeedbackSubmissionPinsUploadedScreenshot(t *testing.T) {
+	transport := &feedbackBoundaryTransport{}
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+	f := newFeedbackScreenshotRouterFixtureWithGitHubToken(t, "saas", "owned/feedback", "https://media.example.test", "test-only-feedback-token") //nolint:gosec // Fixture token; transport never leaves this process.
+	imagePayload, imageContentType := feedbackScreenshotMultipart(t)
+	uploadResponse, body := f.request(http.MethodPost, feedbackScreenshotUploadPath, imagePayload, imageContentType, f.token(t, true))
+	require.Equal(t, http.StatusCreated, uploadResponse.Code, uploadResponse.Body.String())
+	assert.Positive(t, body.reads, "verified caller's screenshot must pass through the real upload handler")
+	var upload struct {
+		URL string `json:"url"`
+	}
+	require.NoError(t, json.Unmarshal(uploadResponse.Body.Bytes(), &upload))
+	require.True(t, strings.HasPrefix(upload.URL, "/api/v1/media/feedback-screenshots/"), upload.URL)
+	id := strings.TrimPrefix(upload.URL, "/api/v1/media/feedback-screenshots/")
+
+	submitPayload, err := json.Marshal(map[string]any{
+		"type":        "bug",
+		"title":       "router screenshot lifecycle",
+		"description": "submitted through the real router",
+		"attachments": []map[string]string{{"url": upload.URL}},
+	})
+	require.NoError(t, err)
+	submitResponse, submitBody := f.request(http.MethodPost, "/api/v1/feedback", string(submitPayload), "application/json", f.token(t, true))
+	require.Equal(t, http.StatusOK, submitResponse.Code, submitResponse.Body.String())
+	assert.Positive(t, submitBody.reads)
+	assert.JSONEq(t, `{"issueUrl":"https://example.invalid/owned-feedback/7","dev":false}`, submitResponse.Body.String())
+	require.Len(t, transport.requests, 1, "the configured GitHub client must use the in-memory transport")
+
+	var state string
+	var owner string
+	var published bool
+	require.NoError(t, f.db.QueryRow(`SELECT state,user_id::text,published FROM feedback_screenshot_uploads WHERE object_key=$1`, id).Scan(&state, &owner, &published))
+	assert.Equal(t, "pinned", state, "submission must durably pin the uploaded screenshot before returning success")
+	assert.Equal(t, feedbackScreenshotUserID, owner)
+	assert.True(t, published, "a successful submission must finalize retention")
 }
 
 func (f *feedbackScreenshotRouterFixture) token(t *testing.T, verified bool) string {
@@ -490,20 +552,26 @@ func TestNewRouter_FeedbackScreenshotModeControls(t *testing.T) {
 			require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
 			assert.Positive(t, body.reads, "the same real handler must consume enabled multipart uploads")
 			puts, _, deletes := f.store.counts()
-			assert.Equal(t, 1, puts)
+			assert.Zero(t, puts, "pending screenshots stay in PostgreSQL")
 			assert.Zero(t, deletes)
-			assert.EqualValues(t, 1, f.dbState.inserts.Load(), "genuine media handler must persist metadata")
+			var mediaCount int
+			require.NoError(t, f.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id=$1 AND storage_key LIKE 'feedback-screenshots/%'`, feedbackScreenshotUserID).Scan(&mediaCount))
+			assert.Equal(t, 1, mediaCount, "genuine media handler must persist metadata")
 			var uploaded struct {
 				StorageKey string `json:"storage_key"`
+				URL        string `json:"url"`
 			}
 			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &uploaded))
 			assert.True(t, strings.HasPrefix(uploaded.StorageKey, "feedback-screenshots/"))
-			f.store.mu.Lock()
-			stored := append([]byte(nil), f.store.objects[uploaded.StorageKey]...)
-			f.store.mu.Unlock()
+			var stored []byte
+			require.NoError(t, f.db.QueryRow(`SELECT staged_data FROM feedback_screenshot_uploads WHERE object_key=$1`, strings.TrimPrefix(uploaded.StorageKey, "feedback-screenshots/")).Scan(&stored))
 			_, format, err := image.Decode(bytes.NewReader(stored))
-			require.NoError(t, err, "assert against the bytes actually sent to storage")
+			require.NoError(t, err, "assert against the processed bytes staged in PostgreSQL")
 			assert.Equal(t, "jpeg", format)
+			stagedProxy, _ := f.request(http.MethodGet, uploaded.URL, "", "", "")
+			require.Equal(t, http.StatusOK, stagedProxy.Code)
+			assert.Equal(t, stored, stagedProxy.Body.Bytes())
+			assert.Equal(t, "no-store", stagedProxy.Header().Get("Cache-Control"))
 			proxy, _ := f.request(http.MethodGet, feedbackScreenshotPublicPath, "", "", "")
 			require.Equal(t, http.StatusOK, proxy.Code)
 			assert.Equal(t, "owned-previous-screenshot", proxy.Body.String())

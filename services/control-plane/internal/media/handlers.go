@@ -30,6 +30,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	invitecodes "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -255,7 +256,7 @@ type Handler struct {
 	// Injected via SetSessionRedis rather than NewHandler so the constructor
 	// signature stays put; every session route answers 503 when it is nil.
 	sessionRedis *redis.Client
-	// diskWatermark gates NEW attachment writes on shared-disk occupancy
+	// diskWatermark gates NEW attachment and feedback-screenshot writes on shared-disk occupancy
 	// (#2759 unit A1). Injected via SetDiskWatermark for the same reason as
 	// sessionRedis; a nil value allows every write (Check is nil-safe), which
 	// matches the other optional dependencies on this struct.
@@ -290,7 +291,7 @@ func (h *Handler) SetOpsCounter(counter interface{ Increment(opsmetrics.MetricKe
 	h.opsCounter = counter
 }
 
-// SetDiskWatermark wires the shared-disk occupancy gate for attachment
+// SetDiskWatermark wires the shared-disk occupancy gate for attachment and screenshot
 // writes (#2759 unit A1). Mirrors SetOpsCounter/SetSessionRedis: an optional
 // dependency the handler works without (Check on a nil *DiskWatermark always
 // allows the write).
@@ -390,6 +391,7 @@ func (h *Handler) UploadDMIcon(c *gin.Context) {
 // returned `url` is a public, unguessable proxy path that the feedback handler
 // re-authors into a server-controlled absolute URL when building the GitHub
 // issue (see internal/feedback/handlers.go) — the client never controls the host.
+// Screenshot writes also obey the shared-disk watermark before persistence.
 // POST /api/v1/media/upload/feedback-screenshot
 func (h *Handler) UploadFeedbackScreenshot(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -925,9 +927,10 @@ func (h *Handler) ProxyDMIcon(c *gin.Context) {
 // PUBLIC: the unguessable UUID is the only identifier. Registered without auth so
 // GitHub's image proxy (camo) can fetch a screenshot embedded in a filed issue
 // without an Authorization header. Do NOT add JWT/membership assumptions here — see
-// router.go for the registration. Like a DM icon, proxyTier1Media streams it by
-// object-store key without a media_files admission check, so the object outlives an
-// uploader's account-erasure cascade until it is reaped (tracked: #3153). (#1747)
+// router.go for the registration. Pending images are read from PostgreSQL;
+// published images move to the object store after a confirmed PUT. Submitted
+// images are retained; abandoned uploads expire after 72 hours. Historical screenshots with
+// no lifecycle evidence remain readable because their report references are unknown.
 func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 	id := c.Param("id")
 	// Require the CANONICAL lowercase 36-char UUID form, not merely something
@@ -942,7 +945,25 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 		return
 	}
 
-	h.proxyTier1Media(c, fmt.Sprintf("feedback-screenshots/%s", id), true)
+	storageKey := fmt.Sprintf("feedback-screenshots/%s", id)
+	data, contentType, remote, allowed, err := feedbackscreenshots.New(h.db).Read(c.Request.Context(), storageKey)
+	if err != nil {
+		h.log.Error("Failed to check screenshot lifecycle", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		return
+	}
+	if !allowed {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+		return
+	}
+	// Pinning may later be reversed after a definitive publication rejection.
+	// No-store prevents an earlier public cache from retaining that image.
+	if !remote {
+		c.Header(headerCacheControl, cacheControlNoStore)
+		c.Data(http.StatusOK, contentType, data)
+		return
+	}
+	h.proxyTier1MediaWithCache(c, storageKey, cacheControlNoStore)
 }
 
 // DeleteMedia soft-deletes a media file and removes it from object storage.
@@ -1055,6 +1076,9 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 	if !ok {
 		return
 	}
+	if !h.checkFeedbackScreenshotDiskWatermark(c, purpose) {
+		return
+	}
 
 	var fileID string
 	if purpose == purposeAvatar || purpose == purposeBanner {
@@ -1080,30 +1104,23 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		h.storeDMIcon(c, store, userID, conversationID, header.Size, processed)
 		return
 	}
-	h.storeUniqueKeyTier1Image(c, store, userID, purpose, tier1StorageKey(purpose, userID, serverID, conversationID), header.Size, processed)
+	h.storeUniqueKeyTier1Image(c, userID, purpose, tier1StorageKey(purpose, userID, serverID, conversationID), header.Size, processed)
 }
 
-// storeUniqueKeyTier1Image stores a Tier-1 image whose key is fresh for every
-// upload (a feedback screenshot, #1747), records it and answers. Unlike the
-// fixed-key purposes above, a failed record leaves an object nothing points
-// at, so it is deleted: #3454 C4's "never delete after a failed record" holds
-// only because a fixed key's write has already replaced the live image.
-func (h *Handler) storeUniqueKeyTier1Image(c *gin.Context, store ObjectStore, userID, purpose, storageKey string, originalSize int64, processed *ProcessedImage) {
-	reader := bytes.NewReader(processed.Data)
-	if err := store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
-		h.log.Error("Failed to store processed image", "error", err, "user_id", userID, "purpose", purpose)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+// storeUniqueKeyTier1Image stages pending screenshots and their metadata in
+// one PostgreSQL transaction. Only positively published images are offloaded.
+func (h *Handler) storeUniqueKeyTier1Image(c *gin.Context, userID, purpose, storageKey string, originalSize int64, processed *ProcessedImage) {
+	screenshots := feedbackscreenshots.New(h.db)
+	fileID, err := screenshots.Stage(c.Request.Context(), userID, storageKey, processed.Data, processed.ContentType)
+	if err != nil {
+		if errors.Is(err, feedbackscreenshots.ErrQuota) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Screenshot storage allowance exceeded"})
+			return
+		}
+		h.log.Error("Failed to stage screenshot", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
 		return
 	}
-
-	fileID, err := insertTier1Record(c.Request.Context(), h, c, userID, storageKey, processed)
-	if err != nil {
-		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
-			h.log.Error("Failed to delete orphaned media object", "error", delErr, "storage_key", storageKey)
-		}
-		return // response already sent
-	}
-
 	h.respondTier1Upload(c, purpose, userID, storageKey, fileID, originalSize, processed)
 }
 
@@ -1976,6 +1993,14 @@ func createAttachmentRecord(h *Handler, c *gin.Context, p attachmentParams) erro
 // (Cloudflare / shared caches OK) — only safe for routes registered without
 // auth middleware.
 func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
+	cachePolicy := cacheControlPrivate
+	if public {
+		cachePolicy = cacheControlPublic
+	}
+	h.proxyTier1MediaWithCache(c, key, cachePolicy)
+}
+
+func (h *Handler) proxyTier1MediaWithCache(c *gin.Context, key, cachePolicy string) {
 	profileMedia := isProfileTier1StorageKey(key)
 	if profileMedia {
 		admitted, err := h.profileTier1MediaAdmitted(c.Request.Context(), key)
@@ -2008,10 +2033,8 @@ func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 	// public server/DM assets retain their shared-cache policy.
 	if profileMedia {
 		c.Header(headerCacheControl, cacheControlNoStore)
-	} else if public {
-		c.Header(headerCacheControl, cacheControlPublic)
 	} else {
-		c.Header(headerCacheControl, cacheControlPrivate)
+		c.Header(headerCacheControl, cachePolicy)
 	}
 	c.Header(headerContentType, contentType)
 	c.Status(http.StatusOK)

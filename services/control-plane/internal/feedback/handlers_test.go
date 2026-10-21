@@ -4,18 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -25,9 +28,17 @@ type fakeGitHub struct {
 	calls       []IssueRequest
 	returnIssue *IssueResponse
 	returnErr   error
+	onCreate    func()
+	onCreateCtx func(context.Context)
 }
 
-func (f *fakeGitHub) CreateIssue(_ context.Context, req IssueRequest) (*IssueResponse, error) {
+func (f *fakeGitHub) CreateIssue(ctx context.Context, req IssueRequest) (*IssueResponse, error) {
+	if f.onCreate != nil {
+		f.onCreate()
+	}
+	if f.onCreateCtx != nil {
+		f.onCreateCtx(ctx)
+	}
 	f.calls = append(f.calls, req)
 	if f.returnErr != nil {
 		return nil, f.returnErr
@@ -36,6 +47,64 @@ func (f *fakeGitHub) CreateIssue(_ context.Context, req IssueRequest) (*IssueRes
 		return f.returnIssue, nil
 	}
 	return &IssueResponse{Number: 1, HTMLURL: "https://github.com/test/repo/issues/1"}, nil
+}
+
+type fakeScreenshotPinner struct {
+	userID           string
+	paths            []string
+	err              error
+	calls            int
+	confirmCalls     int
+	releaseCalls     int
+	onPin            func()
+	onPinCtx         func(context.Context)
+	receipt          string
+	confirmedReceipt string
+	releasedReceipt  string
+	confirmedPaths   []string
+	releasedPaths    []string
+	onConfirmCtx     func(context.Context)
+	onReleaseCtx     func(context.Context)
+	releaseErr       error
+}
+
+func (f *fakeScreenshotPinner) Pin(ctx context.Context, userID string, paths []string) (string, error) {
+	f.calls++
+	f.userID = userID
+	f.paths = append([]string(nil), paths...)
+	if f.onPin != nil {
+		f.onPin()
+	}
+	if f.onPinCtx != nil {
+		f.onPinCtx(ctx)
+	}
+	if f.err != nil {
+		return f.receipt, f.err
+	}
+	if f.receipt == "" {
+		return "test-pin-receipt", nil
+	}
+	return f.receipt, nil
+}
+
+func (f *fakeScreenshotPinner) ConfirmPublished(ctx context.Context, receipt string, paths []string) error {
+	f.confirmCalls++
+	f.confirmedReceipt = receipt
+	f.confirmedPaths = append([]string(nil), paths...)
+	if f.onConfirmCtx != nil {
+		f.onConfirmCtx(ctx)
+	}
+	return nil
+}
+
+func (f *fakeScreenshotPinner) ReleaseRejected(ctx context.Context, receipt string, paths []string) error {
+	f.releaseCalls++
+	f.releasedReceipt = receipt
+	f.releasedPaths = append([]string(nil), paths...)
+	if f.onReleaseCtx != nil {
+		f.onReleaseCtx(ctx)
+	}
+	return f.releaseErr
 }
 
 // newTestEngine wires the handler into a Gin engine with the auth
@@ -74,7 +143,9 @@ var testCorrKey = []byte("test-corr-key-0000000000000000000") // pragma: allowli
 const testMediaBaseURL = "https://media.test"
 
 func newTestHandler(github GitHubIssueCreator) *Handler {
-	return NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	h := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	h.SetScreenshotPinner(&fakeScreenshotPinner{})
+	return h
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────
@@ -284,6 +355,259 @@ func TestSubmit_GitHubErrorReturns502(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, w.Code)
 }
 
+func TestSubmit_AttachmentsRequirePinningBeforeIssueCreation(t *testing.T) {
+	github := &fakeGitHub{}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+	})
+
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code,
+		"a screenshot-bearing issue must not be published unless its attachment was pinned")
+	assert.Empty(t, github.calls, "GitHub must not receive an issue with an unpinned screenshot")
+}
+
+func TestSubmit_PinsAttachmentsBeforeIssueCreation(t *testing.T) {
+	var events []string
+	github := &fakeGitHub{onCreate: func() { events = append(events, "issue") }}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{receipt: "published-report-receipt", onPin: func() { events = append(events, "pin") }}
+	handler.SetScreenshotPinner(pinner)
+	path := feedbackScreenshotPathPrefix + testAttachmentUUID
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshots.",
+		"attachments": []map[string]string{{"url": path}, {"url": feedbackScreenshotPathPrefix + "550e8400-e29b-41d4-a716-446655440001"}},
+	})
+
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, "user-1", pinner.userID)
+	assert.Equal(t, []string{path, feedbackScreenshotPathPrefix + "550e8400-e29b-41d4-a716-446655440001"}, pinner.paths)
+	assert.Equal(t, []string{"pin", "issue"}, events)
+	assert.Equal(t, 1, pinner.confirmCalls)
+	assert.Equal(t, "published-report-receipt", pinner.confirmedReceipt, "publication must settle the exact pin attempt, not the uploader identity")
+	assert.Equal(t, pinner.paths, pinner.confirmedPaths)
+	assert.Zero(t, pinner.releaseCalls)
+}
+
+func TestSubmit_SuccessSettlesReceiptAfterClientDisconnect(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	github := &fakeGitHub{onCreate: cancel}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{
+		receipt: "published-after-disconnect",
+		onConfirmCtx: func(ctx context.Context) {
+			require.NoError(t, ctx.Err(), "publication confirmation must survive client cancellation")
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok)
+			require.WithinDuration(t, time.Now().Add(2*time.Second), deadline, time.Second)
+		},
+	}
+	handler.SetScreenshotPinner(pinner)
+	path := feedbackScreenshotPathPrefix + testAttachmentUUID
+	body, err := json.Marshal(map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": path}},
+	})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/feedback", bytes.NewReader(body)).WithContext(requestCtx)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	newTestEngine(t, handler, "user-1").ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code)
+	require.ErrorIs(t, requestCtx.Err(), context.Canceled)
+	require.Equal(t, 1, pinner.confirmCalls)
+	require.Equal(t, "published-after-disconnect", pinner.confirmedReceipt)
+	require.Equal(t, []string{path}, pinner.confirmedPaths)
+}
+
+func TestSubmit_AmbiguousPinCommitReleasesReceiptWithoutPublishing(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	github := &fakeGitHub{}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{
+		receipt: "ambiguous-commit-receipt",
+		err:     errors.New("commit acknowledgement lost"),
+		onPin:   cancel,
+		onReleaseCtx: func(ctx context.Context) {
+			require.NoError(t, ctx.Err(), "ambiguous commit cleanup must survive client cancellation")
+		},
+	}
+	handler.SetScreenshotPinner(pinner)
+	path := feedbackScreenshotPathPrefix + testAttachmentUUID
+	body, err := json.Marshal(map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": path}},
+	})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/feedback", bytes.NewReader(body)).WithContext(requestCtx)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	newTestEngine(t, handler, "user-1").ServeHTTP(response, request)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.Empty(t, github.calls)
+	require.Equal(t, 1, pinner.releaseCalls)
+	require.Equal(t, "ambiguous-commit-receipt", pinner.releasedReceipt)
+	require.Equal(t, []string{path}, pinner.releasedPaths)
+}
+
+func TestSubmit_DefinitiveGitHubRejectionReleasesPin(t *testing.T) {
+	github := &fakeGitHub{returnErr: &issueAPIStatusError{status: http.StatusUnprocessableEntity}}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{receipt: "rejected-report-receipt"}
+	handler.SetScreenshotPinner(pinner)
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+	})
+	require.Equal(t, http.StatusBadGateway, response.Code)
+	require.Equal(t, 1, pinner.calls)
+	require.Equal(t, 1, pinner.releaseCalls)
+	require.Equal(t, "rejected-report-receipt", pinner.releasedReceipt, "rejection must release only the attempt returned by Pin")
+	require.Equal(t, pinner.paths, pinner.releasedPaths)
+	require.Zero(t, pinner.confirmCalls)
+}
+
+func TestSubmit_DefinitiveRejectionSettlesReceiptAfterClientDisconnect(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	github := &fakeGitHub{
+		returnErr: &issueAPIStatusError{status: http.StatusUnprocessableEntity},
+		onCreate:  cancel,
+	}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{
+		receipt: "disconnected-report-receipt",
+		onReleaseCtx: func(ctx context.Context) {
+			require.NoError(t, ctx.Err(), "the rejected attempt must settle despite client cancellation")
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok, "detached rejection settlement must remain bounded")
+			require.WithinDuration(t, time.Now().Add(5*time.Second), deadline, time.Second)
+		},
+	}
+	handler.SetScreenshotPinner(pinner)
+	path := feedbackScreenshotPathPrefix + testAttachmentUUID
+	body, err := json.Marshal(map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": path}},
+	})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/feedback", bytes.NewReader(body)).WithContext(requestCtx)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	newTestEngine(t, handler, "user-1").ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusBadGateway, response.Code)
+	require.ErrorIs(t, requestCtx.Err(), context.Canceled)
+	require.Equal(t, 1, pinner.releaseCalls)
+	require.Equal(t, "disconnected-report-receipt", pinner.releasedReceipt)
+	require.Equal(t, []string{path}, pinner.releasedPaths)
+	require.Zero(t, pinner.confirmCalls)
+}
+
+func TestSubmit_DevStubLeavesScreenshotPending(t *testing.T) {
+	handler := NewHandler(logger.New("test"), nil, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{}
+	handler.SetScreenshotPinner(pinner)
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+	})
+	require.Equal(t, http.StatusOK, response.Code)
+	require.JSONEq(t, `{"dev":true}`, response.Body.String())
+	require.Zero(t, pinner.calls, "no external issue exists to justify retaining this image")
+	require.Zero(t, pinner.confirmCalls)
+}
+
+func TestSubmit_PinAndIssueShareResponseDeadline(t *testing.T) {
+	var pinDeadline, issueDeadline time.Time
+	github := &fakeGitHub{onCreateCtx: func(ctx context.Context) {
+		issueDeadline, _ = ctx.Deadline()
+	}}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	handler.SetScreenshotPinner(&fakeScreenshotPinner{onPinCtx: func(ctx context.Context) {
+		pinDeadline, _ = ctx.Deadline()
+	}})
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+	})
+	require.Equal(t, http.StatusOK, response.Code)
+	require.False(t, pinDeadline.IsZero())
+	require.Equal(t, pinDeadline, issueDeadline, "pinning must not grant GitHub a fresh deadline")
+}
+
+func TestSubmit_PinErrorsFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pinErr     error
+		wantStatus int
+		wantError  string
+	}{
+		{name: "invalid ownership or lifecycle state", pinErr: feedbackscreenshots.ErrInvalid, wantStatus: http.StatusBadRequest, wantError: "invalid screenshot attachments"},
+		{name: "storage failure", pinErr: errors.New("database details must stay private"), wantStatus: http.StatusServiceUnavailable, wantError: "screenshot storage unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			github := &fakeGitHub{}
+			handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+			handler.SetScreenshotPinner(&fakeScreenshotPinner{err: tc.pinErr})
+			response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+				"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+				"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+			})
+
+			assert.Equal(t, tc.wantStatus, response.Code)
+			assert.Contains(t, response.Body.String(), tc.wantError)
+			assert.NotContains(t, response.Body.String(), "database details")
+			assert.Empty(t, github.calls, "pin errors must prevent issue creation")
+		})
+	}
+}
+
+func TestSubmit_GitHubErrorKeepsScreenshotPinned(t *testing.T) {
+	var events []string
+	github := &fakeGitHub{returnErr: assertGitHubError("timeout"), onCreate: func() { events = append(events, "issue") }}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{onPin: func() { events = append(events, "pin") }}
+	handler.SetScreenshotPinner(pinner)
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Screenshot report", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+	})
+
+	assert.Equal(t, http.StatusBadGateway, response.Code)
+	assert.Equal(t, []string{"pin", "issue"}, events, "the handler has no unpin operation after an ambiguous GitHub error")
+	assert.Equal(t, 1, pinner.calls, "the screenshot remains pinned after GitHub returns an ambiguous error")
+	assert.Zero(t, pinner.releaseCalls)
+}
+
+func TestSubmit_ScreenshotPinSkippedWhenNoEmbedWillBeCreated(t *testing.T) {
+	t.Run("no attachments", func(t *testing.T) {
+		pinner := &fakeScreenshotPinner{}
+		handler := NewHandler(logger.New("test"), &fakeGitHub{}, testCorrKey, testMediaBaseURL)
+		handler.SetScreenshotPinner(pinner)
+		response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+			"type": "bug", "title": "Report", "description": "No screenshot.",
+		})
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.Zero(t, pinner.calls)
+	})
+
+	t.Run("empty media origin", func(t *testing.T) {
+		pinner := &fakeScreenshotPinner{}
+		handler := NewHandler(logger.New("test"), &fakeGitHub{}, testCorrKey, "")
+		handler.SetScreenshotPinner(pinner)
+		response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+			"type": "bug", "title": "Report", "description": "Screenshot embeds are disabled.",
+			"attachments": []map[string]string{{"url": feedbackScreenshotPathPrefix + testAttachmentUUID}},
+		})
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.Zero(t, pinner.calls)
+	})
+}
+
 // ─── PR #1547 review fixes ────────────────────────────────────────────────
 
 // Category is bounded — Gitar / @security-reviewer finding on the
@@ -487,6 +811,28 @@ func TestSubmit_AssembledBodyStaysUnderGitHubLimit(t *testing.T) {
 	assert.LessOrEqual(t, len(gh.calls[0].Body), maxBodyBytes,
 		"assembled body %d bytes exceeds maxBodyBytes %d — would be rejected by GitHub",
 		len(gh.calls[0].Body), maxBodyBytes)
+}
+
+func TestSubmit_OverflowingDiagnosticsKeepPinnedScreenshotsInFinalIssue(t *testing.T) {
+	github := &fakeGitHub{}
+	handler := NewHandler(logger.New("test"), github, testCorrKey, testMediaBaseURL)
+	pinner := &fakeScreenshotPinner{}
+	handler.SetScreenshotPinner(pinner)
+	path := feedbackScreenshotPathPrefix + testAttachmentUUID
+	response := doPost(t, newTestEngine(t, handler, "user-1"), map[string]interface{}{
+		"type": "bug", "title": "Oversized metadata", "description": "Report with screenshot.",
+		"attachments": []map[string]string{{"url": path}},
+		"diagnostics": map[string]interface{}{
+			"gpu": map[string]string{"vendor": strings.Repeat("v ", maxBodyBytes/2), "renderer": "test"},
+		},
+	})
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Len(t, github.calls, 1)
+	require.LessOrEqual(t, len(github.calls[0].Body), maxBodyBytes)
+	require.Contains(t, github.calls[0].Body, "![screenshot-1]("+testMediaBaseURL+path+")")
+	require.Contains(t, github.calls[0].Body, truncatedBodyMarker)
+	require.Equal(t, []string{path}, pinner.paths)
+	require.Equal(t, []string{path}, pinner.confirmedPaths)
 }
 
 // ─── Public-repo injection hardening (PR #1547 Fixes 2/4/5) ───────────────
@@ -745,7 +1091,7 @@ func TestBuildIssue_NoRawUserID(t *testing.T) {
 	const uid = "550e8400-e29b-41d4-a716-446655440000"
 	token := DeriveCorrelationToken([]byte("s"), uid)
 
-	_, body, _ := buildIssue(req, token, testMediaBaseURL)
+	_, body, _, _ := buildIssue(req, token, testMediaBaseURL)
 
 	assert.NotContains(t, body, uid, "raw UUID must never appear in the issue body")
 	assert.Contains(t, body, "**Reported by:** report `"+token+"`")
@@ -837,20 +1183,22 @@ func TestBuildIssue_Screenshots(t *testing.T) {
 	}
 
 	t.Run("bug report with attachments and a configured mediaBaseURL embeds screenshots", func(t *testing.T) {
-		_, body, _ := buildIssue(bugReqWithAttachments, "report-token", "https://media.test")
+		_, body, _, paths := buildIssue(bugReqWithAttachments, "report-token", "https://media.test")
 
 		assert.Contains(t, body, "## Screenshots")
 		assert.Contains(t, body, "![screenshot-1](https://media.test"+feedbackScreenshotPathPrefix+id1+")")
 		assert.Contains(t, body, "![screenshot-2](https://media.test"+feedbackScreenshotPathPrefix+id2+")")
+		assert.Equal(t, []string{feedbackScreenshotPathPrefix + id1, feedbackScreenshotPathPrefix + id2}, paths)
 		// The description free text is still present alongside the screenshots.
 		assert.Contains(t, body, "Steps to reproduce")
 	})
 
 	t.Run("empty mediaBaseURL skips the screenshots section entirely", func(t *testing.T) {
-		_, body, _ := buildIssue(bugReqWithAttachments, "report-token", "")
+		_, body, _, paths := buildIssue(bugReqWithAttachments, "report-token", "")
 
 		assert.NotContains(t, body, "## Screenshots")
 		assert.NotContains(t, body, "![screenshot")
+		assert.Empty(t, paths)
 	})
 
 	t.Run("feature requests never emit a screenshots section, even with attachments set", func(t *testing.T) {
@@ -860,9 +1208,19 @@ func TestBuildIssue_Screenshots(t *testing.T) {
 			Description: "Would help.",
 			Attachments: []attachmentRef{ref(feedbackScreenshotPathPrefix + id1)},
 		}
-		_, body, _ := buildIssue(featureReq, "report-token", "https://media.test")
+		_, body, _, paths := buildIssue(featureReq, "report-token", "https://media.test")
 
 		assert.NotContains(t, body, "## Screenshots")
+		assert.Empty(t, paths)
+	})
+
+	t.Run("truncation returns only complete screenshot embeds", func(t *testing.T) {
+		longOrigin := strings.Repeat("o", maxBodyBytes/2)
+		_, body, _, paths := buildIssue(bugReqWithAttachments, "report-token", longOrigin)
+		require.Len(t, body, maxBodyBytes)
+		require.Equal(t, []string{feedbackScreenshotPathPrefix + id1}, paths)
+		require.Contains(t, body, "![screenshot-1]("+longOrigin+feedbackScreenshotPathPrefix+id1+")")
+		require.NotContains(t, body, "![screenshot-2]("+longOrigin+feedbackScreenshotPathPrefix+id2+")")
 	})
 }
 
@@ -885,6 +1243,7 @@ func TestSubmit_PublicSelfhostScreenshotOrigin(t *testing.T) {
 		t.Run(cell.name, func(t *testing.T) {
 			github := &fakeGitHub{}
 			handler := NewHandler(logger.New("test"), github, testCorrKey, cell.origin)
+			handler.SetScreenshotPinner(&fakeScreenshotPinner{})
 			response := doPost(t, newTestEngine(t, handler, "owned-screenshot-reporter"), map[string]interface{}{
 				"type": "bug", "title": "Screenshot report", "description": "Screenshot should reach the issue.",
 				"attachments": []map[string]string{{"url": screenshotPath}},

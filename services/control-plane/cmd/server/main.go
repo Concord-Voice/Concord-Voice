@@ -25,6 +25,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -333,10 +334,12 @@ func runControlPlane() (runErr error) {
 	var expirationWorkers sync.WaitGroup
 	waitActivityHistoryWorkers := runtime.waitWorkers
 	waitTier1ErasureReclaimer := func() {}
+	waitFeedbackScreenshots := func() {}
 	waitBackgroundWorkers := func() {
 		expirationWorkers.Wait()
 		waitActivityHistoryWorkers()
 		waitTier1ErasureReclaimer()
+		waitFeedbackScreenshots()
 		waitVoiceCommandOutbox()
 		waitVoiceCommandTransport()
 		if voicePermissionEnforcer != nil {
@@ -413,6 +416,12 @@ func runControlPlane() (runErr error) {
 	// quietly rather than logged as a fault.
 	media.StartSessionSweepWorkers(cleanupCtx, storageRegistry, log, media.DefaultSessionSweepInterval)
 	waitTier1ErasureReclaimer = tier1ErasureReclaimer.Start(cleanupCtx)
+	// The worker checks the same shared-disk watermark immediately before its
+	// post-publication object PUT. Pending uploads have already been staged in
+	// PostgreSQL and can be expired without contacting object storage.
+	screenshotWatermark := media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log)
+	screenshotWatermark.SetSecurityEvents(securityEvents)
+	waitFeedbackScreenshots = feedbackscreenshots.New(db).Start(cleanupCtx, mediaStore, screenshotWatermark, log)
 
 	// Tier-2 orphan reclamation (#2759 follow-on). A SIBLING of the sweeper
 	// above, not a duplicate: that one aborts INCOMPLETE multipart uploads,
