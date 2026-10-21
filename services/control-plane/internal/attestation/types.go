@@ -106,7 +106,7 @@ type VerifyResponse struct {
 }
 
 // PublishSPAPayload is the body of POST /api/v1/internal/attestation/publish/spa.
-// Published by main-cd.yml on every main-push (no code signing happens there,
+// Published by main-cd.yml on every nightly deploy (no code signing happens there,
 // so cert_hash is structurally absent from this axis).
 type PublishSPAPayload struct {
 	SpaVersion string `json:"spa_version" binding:"required"`

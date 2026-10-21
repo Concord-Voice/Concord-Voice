@@ -108,7 +108,7 @@ func (h *Handler) runOIDCVerify(
 //
 // Body: {spa_version, html_hash}
 //
-// Published by main-cd.yml on every main-push (no signing → no cert_hash on
+// Published by main-cd.yml on every nightly deploy (no signing → no cert_hash on
 // this axis). W1 (#677 reconciliation): the OIDC verifier rejects tokens that
 // were not minted by main-cd.yml, so a token issued for build-desktop.yml
 // cannot publish to this endpoint.
