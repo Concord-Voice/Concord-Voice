@@ -73,9 +73,10 @@ COPY --from=builder /app/migrations ./migrations
 # remain confined to admin-ui-builder and are absent from this Alpine stage.
 COPY --chown=appuser:appuser --from=admin-ui-builder /src/dist ./admin-ui
 
-# GID 10001 is reserved for the host security-event bind mounts. Keep any
-# image-local inode from inheriting that runtime supplementary identity.
-RUN matches="$(find / -xdev -group 10001 -print -quit)" && test -z "$matches"
+# GID 10001 is reserved for the host security-event bind mounts, and GID 10002
+# for host secret files under /opt/concord/etc (apple_signin.p8). Keep any
+# image-local inode from inheriting either runtime supplementary identity.
+RUN matches="$(find / -xdev \( -group 10001 -o -group 10002 \) -print -quit)" && test -z "$matches"
 
 USER appuser
 
