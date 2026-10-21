@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, act } from '../../../test-utils';
+import { render, screen, act, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
@@ -8,7 +8,7 @@ import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { mockUser, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
-import { vi } from 'vitest';
+import { vi, afterEach } from 'vitest';
 
 // ── Hooks mocks ──────────────────────────────────────────────────────────────
 vi.mock('@/renderer/hooks/messaging/useChannelSubscription', () => ({
@@ -703,5 +703,150 @@ describe('VoiceTextChat — Up Arrow edits the last own message (#1959)', () => 
     act(() => (capturedMessageInputProps.onEditLastMessage as () => void)());
 
     expect(useChatStore.getState().editingMessage).toBeNull();
+  });
+});
+
+// ── Jump routing (#3894) ─────────────────────────────────────────────────────
+
+describe('VoiceTextChat — jump routing (#3894)', () => {
+  afterEach(async () => {
+    // `vi.fn(impl)` survives a reset, so this restores the file's default fetch result.
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    (useMessageFetch as ReturnType<typeof vi.fn>).mockReset();
+  });
+
+  const MISSING_COPY = "Couldn't reach that message. It may have been deleted or expired.";
+  const FAILED_COPY =
+    "Couldn't reach that message. Loading older messages failed. Try again in a moment.";
+
+  /** Mounts the panel over a mocked fetch hook and hands the owner's ref a fake list handle. */
+  async function mountJumpSurface(hook: {
+    messages: unknown[];
+    error: string | null;
+    loadUntil: ReturnType<typeof vi.fn>;
+  }) {
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    (useMessageFetch as ReturnType<typeof vi.fn>).mockReturnValue({
+      messages: hook.messages,
+      isLoading: false,
+      hasMore: true,
+      error: hook.error,
+      handleLoadMore: vi.fn(),
+      loadUntil: hook.loadUntil,
+      isHistoryReady: true,
+    });
+    useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
+    useChannelStore.setState({ channels: [linkedTextChannel] });
+    render(<VoiceTextChat />);
+    const state = { mounted: false };
+    const handle = {
+      scrollToMessage: vi.fn((_id: string) => state.mounted),
+      scrollToBottomIfNear: vi.fn(),
+    };
+    const ref = capturedMessageListProps.ref as { current: unknown } | undefined;
+    expect(ref).toBeDefined();
+    if (ref) ref.current = handle;
+    return { state, handle };
+  }
+
+  const clickQuote = () =>
+    act(() => {
+      (capturedMessageListProps.onScrollToMessage as (id: string) => void)('quoted-1');
+    });
+
+  // kills: JumpNotice not given the hook notice
+  it('G7 a jump that cannot find the row says why in the notice under the list', async () => {
+    const loadUntil = vi.fn(async () => ({ status: 'exhausted' as const, requests: 1 }));
+    await mountJumpSurface({ messages: [], error: null, loadUntil });
+
+    clickQuote();
+
+    await waitFor(() => expect(loadUntil).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(document.querySelector('.jump-notice')).toHaveTextContent(MISSING_COPY)
+    );
+  });
+
+  // kills: initial-history-error gate ignores the loaded list
+  it('G8 an error beside loaded messages does not block a jump', async () => {
+    const loadUntil = vi.fn();
+    const { state, handle } = await mountJumpSurface({
+      messages: [mockMessage],
+      error: 'Failed to load more messages',
+      loadUntil,
+    });
+    loadUntil.mockImplementation(async () => {
+      state.mounted = true;
+      return { status: 'found' as const, requests: 1 };
+    });
+
+    clickQuote();
+
+    await waitFor(() =>
+      expect(loadUntil).toHaveBeenCalledWith('quoted-1', 10, expect.any(AbortSignal))
+    );
+    await waitFor(() => expect(handle.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+    expect(document.querySelector('.jump-notice')).toBeEmptyDOMElement();
+  });
+
+  // kills: initial-history-error gate ignores the empty list
+  it('G8 an error with no messages ends the jump failed without paging', async () => {
+    const loadUntil = vi.fn(async () => ({ status: 'found' as const, requests: 1 }));
+    await mountJumpSurface({
+      messages: [],
+      error: 'Failed to load messages',
+      loadUntil,
+    });
+
+    clickQuote();
+
+    await waitFor(() =>
+      expect(document.querySelector('.jump-notice')).toHaveTextContent(FAILED_COPY)
+    );
+    expect(loadUntil).not.toHaveBeenCalled();
+  });
+
+  // kills: handler not passed to the list
+  it('G4 a reply-quote click reaches the list handle, then the fetch hook pages for the row', async () => {
+    const loadUntil = vi.fn(async () => ({ status: 'found' as const, requests: 1 }));
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    (useMessageFetch as ReturnType<typeof vi.fn>).mockReturnValue({
+      messages: [],
+      isLoading: false,
+      hasMore: true,
+      error: null,
+      handleLoadMore: vi.fn(),
+      loadUntil,
+      isHistoryReady: true,
+    });
+    useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
+    useChannelStore.setState({ channels: [linkedTextChannel] });
+    render(<VoiceTextChat />);
+    // The list is mocked and holds no handle of its own: hand the owner's ref ours.
+    const state = { mounted: false };
+    const handle = {
+      scrollToMessage: vi.fn((_id: string) => state.mounted),
+      scrollToBottomIfNear: vi.fn(),
+    };
+    const ref = capturedMessageListProps.ref as { current: unknown } | undefined;
+    expect(ref).toBeDefined();
+    if (ref) ref.current = handle;
+    expect(typeof capturedMessageListProps.onScrollToMessage).toBe('function');
+    loadUntil.mockImplementation(async () => {
+      state.mounted = true;
+      return { status: 'found' as const, requests: 1 };
+    });
+
+    act(() => {
+      (capturedMessageListProps.onScrollToMessage as (id: string) => void)('quoted-1');
+    });
+
+    // Reached: the list handle was asked about the quoted row and it was not mounted.
+    await waitFor(() => expect(handle.scrollToMessage).toHaveBeenCalledWith('quoted-1'));
+    expect(handle.scrollToMessage.mock.results[0]?.value).toBe(false);
+    // Obeyed: the hook then paged through the fetch hook and the row was reached.
+    await waitFor(() => expect(handle.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+    expect(loadUntil).toHaveBeenCalledWith('quoted-1', 10, expect.any(AbortSignal));
+    expect(document.querySelector('.jump-notice')).toBeEmptyDOMElement();
   });
 });

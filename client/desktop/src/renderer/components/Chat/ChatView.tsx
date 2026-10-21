@@ -5,6 +5,7 @@ import { expirationClause, expirationControlLabel } from './MessageExpirationInd
 import { useHoverIntent } from '../../hooks/ui/useHoverIntent';
 import MessageInput from './MessageInput';
 import TypingIndicator from './TypingIndicator';
+import JumpNotice from './JumpNotice';
 import PinnedMessagesPanel from './PinnedMessagesPanel';
 import SearchPanel from './SearchPanel';
 import { pinMessage, unpinMessage, getChannelPins } from '../../services/messaging/pinService';
@@ -14,6 +15,8 @@ import { useAuthStore } from '../../stores/auth/authStore';
 import { useChannelSubscription } from '../../hooks/messaging/useChannelSubscription';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
+import { isJumpFailure, useJumpToMessage } from '../../hooks/messaging/useJumpToMessage';
+import { focusComposerIfLost } from './chatSurface';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useReadMarker } from '../../hooks/messaging/useReadMarker';
 import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
@@ -54,12 +57,10 @@ const ChatView: React.FC = () => {
   useChannelSubscription(activeChannelId);
 
   // Shared fetch/decrypt/paginate logic
-  const { messages, isLoading, hasMore, error, handleLoadMore, isHistoryReady } = useMessageFetch(
-    activeChannelId,
-    {
+  const { messages, isLoading, hasMore, error, handleLoadMore, loadUntil, isHistoryReady } =
+    useMessageFetch(activeChannelId, {
       type: 'channel',
-    }
-  );
+    });
 
   // Active channel info
   const activeChannel = channels.find((c) => c.id === activeChannelId);
@@ -182,9 +183,41 @@ const ChatView: React.FC = () => {
   // Scroll handling
   const messageListRef = useRef<MessageListHandle>(null);
 
-  const handleScrollToMessage = useCallback((messageId: string) => {
-    messageListRef.current?.scrollToMessage(messageId);
-  }, []);
+  // A jump may land in another channel of this server (a search result); anything
+  // outside the loaded list, in another server, or a voice channel is refused.
+  const switchChannel = useCallback(
+    (targetId: string) => {
+      const target = channels.find((c) => c.id === targetId);
+      if (!target || target.server_id !== activeChannel?.server_id || target.type === 'voice') {
+        return false;
+      }
+      useChannelStore.getState().setActiveChannel(targetId);
+      return true;
+    },
+    [channels, activeChannel?.server_id]
+  );
+  const { jump, notice } = useJumpToMessage({
+    channelId: activeChannelId,
+    isHistoryReady,
+    hasInitialHistoryError: error !== null && messages.length === 0,
+    loadUntil,
+    listRef: messageListRef,
+    switchChannel,
+  });
+  const handleScrollToMessage = useCallback(
+    (messageId: string) => {
+      if (!activeChannelId) return;
+      void jump(activeChannelId, messageId).then((outcome) => {
+        if (isJumpFailure(outcome)) focusComposerIfLost(surfaceId);
+      });
+    },
+    [activeChannelId, jump, surfaceId]
+  );
+  const handleSearchJump = useCallback(
+    (channelId: string, messageId: string, signal?: AbortSignal) =>
+      jump(channelId, messageId, { signal, inline: true }),
+    [jump]
+  );
 
   // Auto-scroll to bottom when the reply bar appears
   useEffect(() => {
@@ -416,6 +449,8 @@ const ChatView: React.FC = () => {
         />
       </div>
 
+      <JumpNotice text={notice} />
+
       <TypingIndicator channelId={activeChannelId} />
 
       <div className="chat-input">
@@ -447,7 +482,8 @@ const ChatView: React.FC = () => {
         channelId={activeChannelId}
         isOpen={showSearchPanel}
         onClose={() => setShowSearchPanel(false)}
-        onScrollToMessage={handleScrollToMessage}
+        onJump={handleSearchJump}
+        surfaceId={surfaceId}
         returnFocusRef={searchButtonRef}
         accessibleChannelIds={channels
           .filter((c) => c.server_id === activeChannel?.server_id)

@@ -228,3 +228,18 @@
   outline: 2px solid var(--state-focused);
   outline-offset: 2px;
 }
+
+/* Busy: the label already says so. Nothing dims it, since opacity would take the
+   text below the contrast floor, and the button stays focusable. */
+.search-result-jump[aria-disabled='true'] {
+  cursor: progress;
+}
+
+/* Sits on the card's own surface, so it declares no background of its own. */
+.search-result-jump-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  overflow-wrap: break-word;
+}

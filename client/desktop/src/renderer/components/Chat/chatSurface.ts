@@ -51,3 +51,10 @@ export function findSurfaceMessageRow(surfaceId: string, messageId: string): HTM
 export function focusSurfaceComposer(surfaceId: string): void {
   findSurfaceComposer(surfaceId)?.focus();
 }
+
+/** A Jump that closes its own panel (pinned messages) leaves focus on `<body>` when the jump then
+ *  fails. Gives it to the surface's composer, unless the user has already moved it elsewhere. */
+export function focusComposerIfLost(surfaceId: string): void {
+  const active = document.activeElement;
+  if (!active || active === document.body) focusSurfaceComposer(surfaceId);
+}

@@ -1,13 +1,15 @@
 import { act, fireEvent, render, screen } from '../../../test-utils';
-import MessageList from '@/renderer/components/Chat/MessageList';
+import MessageList, { type MessageListHandle } from '@/renderer/components/Chat/MessageList';
 import { mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 import { useChannelScrollStore } from '@/renderer/stores/chat/channelScrollStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { beforeEach, vi } from 'vitest';
-import { StrictMode } from 'react';
+import { StrictMode, createRef } from 'react';
 import { render as bareRender } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { readCss, ruleBody } from '../../../helpers/cssRules';
 
 // Mock the Message component to simplify testing
 vi.mock('@/renderer/components/Chat/Message', () => ({
@@ -1250,6 +1252,253 @@ describe('MessageList', () => {
       unmount();
       expect(useChannelScrollStore.getState().anchors).toEqual({
         ignored: { messageId: 'msg-3', offset: 0 },
+      });
+    });
+
+    // ---- scrollToMessage (#3894): the boolean, the cancelled restore, the cue ----
+
+    describe('scrollToMessage (#3894)', () => {
+      let scrollIntoView: ReturnType<typeof vi.fn>;
+      let originalScrollIntoView: PropertyDescriptor | undefined;
+
+      beforeEach(() => {
+        // jsdom has no scrollIntoView and never moves scrollTop for it, so the spy is the seam.
+        originalScrollIntoView = Object.getOwnPropertyDescriptor(
+          Element.prototype,
+          'scrollIntoView'
+        );
+        scrollIntoView = vi.fn();
+        Object.defineProperty(Element.prototype, 'scrollIntoView', {
+          configurable: true,
+          writable: true,
+          value: scrollIntoView,
+        });
+      });
+      afterEach(() => {
+        if (originalScrollIntoView) {
+          Object.defineProperty(Element.prototype, 'scrollIntoView', originalScrollIntoView);
+        } else {
+          Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+        }
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+      });
+
+      const rowOf = (id: string) =>
+        getList().querySelector<HTMLElement>(`[data-message-id="${id}"]`);
+      /** A saved anchor for msg-3 whose page is not loaded yet; msg-3 arrives with a later page. */
+      const withoutAnchorRow = rows.filter((message) => message.id !== 'msg-3');
+      const mountWithPendingAnchor = () => {
+        useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+        const handle = createRef<MessageListHandle>();
+        const view = render(
+          <MessageList
+            ref={handle}
+            messages={withoutAnchorRow}
+            currentUserId="user-1"
+            persistenceKey="k"
+            hasMore
+          />
+        );
+        // The pending anchor is real and the list parked at the provisional latest position.
+        expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+          messageId: 'msg-3',
+          offset: 30,
+        });
+        expect(getList().scrollTop).toBe(900);
+        const revealAnchorPage = () =>
+          act(() => {
+            view.rerender(
+              <MessageList
+                ref={handle}
+                messages={rows}
+                currentUserId="user-1"
+                persistenceKey="k"
+                hasMore
+              />
+            );
+          });
+        return { handle, revealAnchorPage };
+      };
+      const jumpTo = (handle: React.RefObject<MessageListHandle | null>, id: string) => {
+        let result: boolean | undefined;
+        act(() => {
+          result = handle.current?.scrollToMessage(id);
+        });
+        return result;
+      };
+
+      // control
+      it('E1 returns false for an unmounted id and true for a mounted one', () => {
+        const handle = createRef<MessageListHandle>();
+        render(<MessageList ref={handle} messages={rows} currentUserId="user-1" />);
+        const target = rowOf('msg-3');
+        expect(target).not.toBeNull();
+        expect(rowOf('not-loaded')).toBeNull();
+
+        expect(jumpTo(handle, 'not-loaded')).toBe(false);
+        expect(scrollIntoView).not.toHaveBeenCalled();
+        expect(document.querySelector('.message-highlight')).toBeNull();
+
+        expect(jumpTo(handle, 'msg-3')).toBe(true);
+        expect(scrollIntoView).toHaveBeenCalledTimes(1);
+        expect(scrollIntoView.mock.contexts[0]).toBe(target);
+        expect(target).toHaveClass('message-highlight');
+      });
+
+      // kills: cancelPendingRestore removed from scrollToMessage
+      it('E2 a jump cancels the pending anchor, so the page that reveals it does not snap the list back', () => {
+        const { handle, revealAnchorPage } = mountWithPendingAnchor();
+
+        expect(jumpTo(handle, 'msg-8')).toBe(true);
+        expect(useChannelScrollStore.getState().getAnchor('k')).toBeUndefined();
+        expect(rowOf('msg-8')).toHaveClass('message-highlight');
+
+        revealAnchorPage();
+        expect(rowOf('msg-3'), 'the paged-in anchor row is now mounted').not.toBeNull();
+        // The restore would have set scrollTop to 330 (see 'keeps a missing saved anchor pending').
+        expect(getList().scrollTop).toBe(900);
+        expect(rowOf('msg-8')).toHaveClass('message-highlight');
+      });
+
+      // kills: highlight timeout shortened
+      it('E7 the highlight stays for the whole 2 s after a jump, then clears', () => {
+        vi.useFakeTimers();
+        try {
+          const handle = createRef<MessageListHandle>();
+          render(<MessageList ref={handle} messages={rows} currentUserId="user-1" />);
+
+          expect(jumpTo(handle, 'msg-3')).toBe(true);
+          expect(rowOf('msg-3')).toHaveClass('message-highlight');
+          act(() => {
+            vi.advanceTimersByTime(1999);
+          });
+          expect(rowOf('msg-3')).toHaveClass('message-highlight');
+          act(() => {
+            vi.advanceTimersByTime(1);
+          });
+          expect(rowOf('msg-3')).not.toHaveClass('message-highlight');
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // kills: isNearBottomRef = false removed from scrollToMessage
+      it('E3 a jump away from the latest row stops following, so a resize does not re-pin and no unseen arrival is marked seen', () => {
+        const hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+        const ro = mockResizeObserver();
+        try {
+          const handle = createRef<MessageListHandle>();
+          const onLatestSeen = vi.fn();
+          const onLatestLeft = vi.fn();
+          const props = { currentUserId: 'user-1', onLatestSeen, onLatestLeft };
+          const arrival = { ...mockMessage2, id: 'msg-arrived' };
+          const { rerender } = render(<MessageList ref={handle} messages={rows} {...props} />);
+          // An arrival while the window is unfocused: shown, pinned, but not seen.
+          rerender(<MessageList ref={handle} messages={[...rows, arrival]} {...props} />);
+          const list = getList();
+          expect(list.scrollTop).toBe(1100);
+          expect(onLatestSeen).not.toHaveBeenCalled();
+
+          // Control: while following, growth re-pins to the bottom.
+          layout.rowHeight = 110;
+          ro.fire();
+          expect(list.scrollTop).toBe(1210);
+
+          expect(onLatestLeft).not.toHaveBeenCalled();
+          expect(jumpTo(handle, 'msg-1')).toBe(true);
+          expect(onLatestLeft).toHaveBeenCalledTimes(1);
+          // scrollIntoView is smooth in a browser: the observer fires before any scroll event.
+          layout.rowHeight = 120;
+          ro.fire();
+          expect(list.scrollTop, 'a followed list would have been re-pinned to 1320').toBe(1210);
+
+          hasFocus.mockReturnValue(true);
+          act(() => {
+            window.dispatchEvent(new Event('focus'));
+          });
+          expect(onLatestSeen).not.toHaveBeenCalled();
+        } finally {
+          ro.restore();
+        }
+      });
+
+      // kills: constant 'smooth'
+      it('E4 scrolls with behavior auto under Reduce Animations or the OS preference, smooth otherwise', () => {
+        const handle = createRef<MessageListHandle>();
+        render(<MessageList ref={handle} messages={rows} currentUserId="user-1" />);
+        const osReduces = (reduces: boolean) =>
+          vi.stubGlobal(
+            'matchMedia',
+            vi.fn((query: string) => ({
+              matches: reduces && query === '(prefers-reduced-motion: reduce)',
+            }))
+          );
+        const behaviorOfNextJump = () => {
+          scrollIntoView.mockClear();
+          expect(jumpTo(handle, 'msg-2')).toBe(true);
+          expect(scrollIntoView).toHaveBeenCalledTimes(1);
+          return scrollIntoView.mock.calls[0][0];
+        };
+
+        // Reduce Animations alone.
+        useSettingsStore.setState((s) => ({
+          appearance: { ...s.appearance, reduceAnimations: true },
+        }));
+        osReduces(false);
+        expect(behaviorOfNextJump()).toEqual({ behavior: 'auto', block: 'center' });
+
+        // The OS preference alone.
+        useSettingsStore.setState((s) => ({
+          appearance: { ...s.appearance, reduceAnimations: false },
+        }));
+        osReduces(true);
+        expect(behaviorOfNextJump()).toEqual({ behavior: 'auto', block: 'center' });
+
+        // Neither: the smooth default (control for the two cells above).
+        osReduces(false);
+        expect(behaviorOfNextJump()).toEqual({ behavior: 'smooth', block: 'center' });
+      });
+
+      // kills: cancel moved after the lookup
+      it('E5 a failed jump (unknown id) still clears the pending anchor', () => {
+        const { handle, revealAnchorPage } = mountWithPendingAnchor();
+
+        expect(jumpTo(handle, 'not-loaded')).toBe(false);
+        expect(scrollIntoView).not.toHaveBeenCalled();
+        expect(useChannelScrollStore.getState().getAnchor('k')).toBeUndefined();
+
+        revealAnchorPage();
+        expect(rowOf('msg-3'), 'the paged-in anchor row is now mounted').not.toBeNull();
+        // A failed jump does not move or stop following, so the page stays at the latest
+        // row (1000). A surviving anchor would have restored the list to 330 instead.
+        expect(getList().scrollTop).toBe(1000);
+      });
+
+      // kills: focus call removed
+      it('E6a the landed row takes focus without scrolling', () => {
+        const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+        const handle = createRef<MessageListHandle>();
+        render(<MessageList ref={handle} messages={rows} currentUserId="user-1" />);
+        const target = rowOf('msg-4');
+        expect(target).not.toBeNull();
+        expect(target).not.toHaveFocus();
+
+        expect(jumpTo(handle, 'msg-4')).toBe(true);
+        expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+        expect(focus.mock.contexts).toContain(target);
+        expect(target).toHaveFocus();
+      });
+
+      // kills: cue removed
+      it('E6b the highlight rule carries a static inset bar in --text-primary', () => {
+        const css = readCss('src/renderer/components/Chat/MessageList.css');
+        const body = ruleBody(css, '.message-highlight');
+        expect(body, 'the .message-highlight rule exists').not.toBeNull();
+        const shadow = /box-shadow:\s*([^;]+);/.exec(body ?? '')?.[1];
+        expect(shadow, 'the rule declares a box-shadow').toBeDefined();
+        expect(shadow).toMatch(/^inset\b/);
+        expect(shadow).toContain('var(--text-primary)');
       });
     });
   });

@@ -185,10 +185,10 @@
 }
 
 .scroll-to-bottom svg {
-  animation: bounce 1s infinite;
+  animation: scroll-to-bottom-nudge 1s infinite;
 }
 
-@keyframes bounce {
+@keyframes scroll-to-bottom-nudge {
   0%,
   100% {
     transform: translateY(0);
@@ -202,6 +202,10 @@
 .message-highlight {
   animation: reply-highlight 2s ease-out;
   border-radius: 4px;
+  /* The tint fades and is colour only, and Reduce Animations zeroes the animation
+     so those users never see it. The bar is static for the same 2s the class stays
+     on, so the landed row is marked without motion or colour perception. */
+  box-shadow: inset 3px 0 0 var(--text-primary);
 }
 
 @keyframes reply-highlight {

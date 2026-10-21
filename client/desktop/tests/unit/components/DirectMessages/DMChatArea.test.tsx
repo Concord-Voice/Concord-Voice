@@ -102,6 +102,8 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
         data-encrypted={props.isChannelEncrypted}
       >
         <span>{`Messages are Encrypted End-to-End${props.expirationClause ?? ''}`}</span>
+        {/* The real composer always renders this; a Jump that closes its panel hands focus to it. */}
+        <textarea className="message-input-textarea" aria-label="Message composer" />
         <button data-testid="trigger-send" onClick={() => props.onSendMessage?.('Hello world')}>
           Send
         </button>
@@ -2253,5 +2255,211 @@ describe('DMChatArea — Up Arrow edits the last own message (#1959)', () => {
     act(() => (capturedMIProps.onEditLastMessage as () => void)());
 
     expect(useChatStore.getState().editingMessage).toBeNull();
+  });
+});
+
+// ── Jump routing (#3894) ──────────────────────────────────────────────────────
+
+describe('DMChatArea — jump routing (#3894)', () => {
+  /** 50 rows, newest first as the DM route sends them, so the oldest id is row-49. */
+  const initialRows = Array.from({ length: 50 }, (_, i) => ({
+    id: `row-${i}`,
+    channel_id: 'conv-1',
+    user_id: 'user-2',
+    content: 'x',
+    username: 'alice',
+    display_name: 'Alice',
+    created_at: new Date(Date.UTC(2025, 0, 1, 12, 0, 0) - i * 60_000).toISOString(),
+    updated_at: '2025-01-01T12:00:00Z',
+  }));
+  const target = { ...initialRows[0], id: 'jump-target' };
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockGetPins.mockReset();
+    mockGetPins.mockResolvedValue([]);
+    capturedMLProps = {};
+    useUserStore.setState({ user: mockUser });
+    useDMStore.setState({ conversations: [makeConversation()], clearUnread: vi.fn() });
+  });
+
+  /** A full first page, then the jump page; the fake list mounts the target once it is asked for. */
+  function installHistory(jumpPage: unknown[] = [target]) {
+    const pageUrls: string[] = [];
+    const fakeList = {
+      mounted: false,
+      scrollToMessage: vi.fn((_id: string) => fakeList.mounted),
+      scrollToBottomIfNear: vi.fn(),
+    };
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/dm/conversations/conv-1/messages')) {
+        if (url.includes('before=')) {
+          pageUrls.push(url);
+          fakeList.mounted = jumpPage.length > 0;
+          return { ok: true, json: async () => ({ messages: jumpPage }) } as Response;
+        }
+        return { ok: true, json: async () => ({ messages: initialRows }) } as Response;
+      }
+      return { ok: true, json: async () => ({ messages: [] }) } as Response;
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    return { pageUrls, fakeList };
+  }
+
+  async function settleInitialHistory(fakeList: object) {
+    await waitFor(() => {
+      expect(capturedMLProps).toHaveProperty('isHistoryReady', true);
+      expect((capturedMLProps.messages as unknown[]).length).toBe(50);
+    });
+    // The list is mocked and holds no handle of its own: hand the owner's ref ours.
+    const ref = capturedMLProps.ref as { current: unknown } | undefined;
+    expect(ref).toBeDefined();
+    if (ref) ref.current = fakeList;
+  }
+
+  // kills: old handler kept
+  it('G3 a reply-quote click goes through the hook: the list is asked, then older history is paged', async () => {
+    const { pageUrls, fakeList } = installHistory();
+    await settleInitialHistory(fakeList);
+
+    act(() => {
+      (capturedMLProps.onScrollToMessage as (id: string) => void)('jump-target');
+    });
+
+    await waitFor(() => expect(fakeList.scrollToMessage).toHaveBeenCalledWith('jump-target'));
+    expect(fakeList.scrollToMessage.mock.results[0]?.value).toBe(false);
+    // A DM route ignores `limit`, so the jump asks for the 50 the route sends.
+    await waitFor(() => expect(pageUrls).toHaveLength(1));
+    expect(pageUrls[0]).toContain('before=row-49');
+    expect(pageUrls[0]).toContain('limit=50');
+    await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+    expect(document.querySelector('.jump-notice')).toBeEmptyDOMElement();
+  });
+
+  // kills: old handler kept
+  it('G3 a pinned-message Jump click takes the same route', async () => {
+    mockGetPins.mockResolvedValue([{ ...target }]);
+    const { pageUrls, fakeList } = installHistory();
+    await settleInitialHistory(fakeList);
+
+    fireEvent.click(screen.getByLabelText('Pinned messages'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Jump' }));
+
+    await waitFor(() => expect(fakeList.scrollToMessage).toHaveBeenCalledWith('jump-target'));
+    await waitFor(() => expect(pageUrls).toHaveLength(1));
+    expect(pageUrls[0]).toContain('before=row-49');
+    await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+    expect(document.querySelector('.jump-notice')).toBeEmptyDOMElement();
+  });
+
+  const MISSING_COPY = "Couldn't reach that message. It may have been deleted or expired.";
+  const FAILED_COPY =
+    "Couldn't reach that message. Loading older messages failed. Try again in a moment.";
+
+  // kills: JumpNotice not given the hook notice
+  it('G6 a jump that cannot find the row says why in the notice under the list', async () => {
+    const { pageUrls, fakeList } = installHistory([]);
+    await settleInitialHistory(fakeList);
+
+    act(() => {
+      (capturedMLProps.onScrollToMessage as (id: string) => void)('gone');
+    });
+
+    await waitFor(() => expect(pageUrls).toHaveLength(1));
+    await waitFor(() =>
+      expect(document.querySelector('.jump-notice')).toHaveTextContent(MISSING_COPY)
+    );
+  });
+
+  // kills: focusComposerIfLost not called after a failed jump; isJumpFailure gate dropped
+  it('G9 a pinned-message Jump that cannot find its row hands focus to the composer', async () => {
+    mockGetPins.mockResolvedValue([{ ...target }]);
+    const { pageUrls, fakeList } = installHistory([]);
+    await settleInitialHistory(fakeList);
+    fireEvent.click(screen.getByLabelText('Pinned messages'));
+    const jump = await screen.findByRole('button', { name: 'Jump' });
+    // The click closes the panel and its button goes with it, so nothing holds focus.
+    expect(screen.getByLabelText('Message composer')).not.toHaveFocus();
+
+    fireEvent.click(jump);
+
+    await waitFor(() => expect(pageUrls).toHaveLength(1));
+    await waitFor(() =>
+      expect(document.querySelector('.jump-notice')).toHaveTextContent(MISSING_COPY)
+    );
+    await waitFor(() => expect(screen.getByLabelText('Message composer')).toHaveFocus());
+  });
+
+  // control; kills: the composer takes focus on every outcome
+  it('G9 a pinned-message Jump that reaches its row leaves the composer alone', async () => {
+    mockGetPins.mockResolvedValue([{ ...target }]);
+    const { pageUrls, fakeList } = installHistory();
+    await settleInitialHistory(fakeList);
+    fireEvent.click(screen.getByLabelText('Pinned messages'));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Jump' }));
+
+    await waitFor(() => expect(pageUrls).toHaveLength(1));
+    await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+    await act(async () => {});
+    expect(screen.getByLabelText('Message composer')).not.toHaveFocus();
+    expect(document.querySelector('.jump-notice')).toBeEmptyDOMElement();
+  });
+
+  // kills: initial-history-error gate ignores the loaded list
+  it('G8 an error beside loaded messages does not block a jump', async () => {
+    const { pageUrls, fakeList } = installHistory();
+    await settleInitialHistory(fakeList);
+    const base = mockApiFetch.getMockImplementation();
+    if (!base) throw new Error('installHistory set no fetch');
+    let refused = 0;
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (refused === 0 && String(input).includes('before=')) {
+        refused += 1;
+        throw new Error('network down');
+      }
+      return base(input, init);
+    });
+    // A failed older-page load sets `error` while all 50 rows stay loaded.
+    await act(async () => {
+      await (capturedMLProps.onLoadMore as () => Promise<void>)();
+    });
+    expect(refused).toBe(1);
+    expect(pageUrls).toHaveLength(0);
+
+    act(() => {
+      (capturedMLProps.onScrollToMessage as (id: string) => void)('jump-target');
+    });
+
+    await waitFor(() => expect(pageUrls).toHaveLength(1));
+    await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+    expect(document.querySelector('.jump-notice')).toBeEmptyDOMElement();
+  });
+
+  // kills: initial-history-error gate ignores the empty list
+  it('G8 an error with no messages ends the jump failed without paging', async () => {
+    const urls: string[] = [];
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      throw new Error('network down');
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(capturedMLProps).toHaveProperty('isHistoryReady', true));
+    expect(capturedMLProps.messages as unknown[]).toHaveLength(0);
+    const fakeList = { scrollToMessage: vi.fn(() => false), scrollToBottomIfNear: vi.fn() };
+    const ref = capturedMLProps.ref as { current: unknown } | undefined;
+    expect(ref).toBeDefined();
+    if (ref) ref.current = fakeList;
+
+    act(() => {
+      (capturedMLProps.onScrollToMessage as (id: string) => void)('gone');
+    });
+
+    await waitFor(() =>
+      expect(document.querySelector('.jump-notice')).toHaveTextContent(FAILED_COPY)
+    );
+    expect(urls.filter((u) => u.includes('before='))).toHaveLength(0);
   });
 });

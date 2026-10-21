@@ -11,9 +11,46 @@ import {
   subscribeSearchResultInvalidations,
 } from '../../services/messaging/searchService';
 import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
+import { isAbortError } from '../../services/system/requestContext';
 
 const DEFAULT_LIMIT = 50;
 const MAX_PAGINATION_RECONCILIATION_ATTEMPTS = 2;
+/** A channel jump page: the list route's cap (`messages/handlers.go:223`). */
+const JUMP_PAGE_LIMIT = 100;
+
+/**
+ * How `loadUntil` ended (#3894). `found`: the row is in the store.
+ * `exhausted`: history ended without it. `too-far`: the request budget is
+ * spent. `interrupted`: a history refetch or a moved head dropped the page;
+ * run again once history is ready. `failed`: refused, rate-limited, purged,
+ * a network error, or a channel whose own fetch never answered (whether older
+ * history exists is unknown). `cancelled`: the channel or the account changed,
+ * or the hook's owner went away.
+ */
+export type LoadUntilStatus =
+  'found' | 'exhausted' | 'too-far' | 'interrupted' | 'failed' | 'cancelled';
+
+/** `requests` counts HTTP attempts, including reconcile retries and joined pages. */
+export interface LoadUntilResult {
+  status: LoadUntilStatus;
+  requests: number;
+}
+
+interface PageOptions {
+  /** Scroll pages report through `error`; jump pages never do. */
+  reportError: boolean;
+  pageLimit: number;
+  maxAttempts: number;
+}
+
+interface PageResult {
+  status: 'done' | 'interrupted' | 'failed' | 'cancelled';
+  requests: number;
+}
 
 const plaintextMetadataSchema = z.discriminatedUnion('type', [
   z.object({
@@ -66,6 +103,65 @@ function currentPurgeGeneration(scopeId: string): number {
 
 function recordScopePurge(scopeId: string): void {
   purgeGenerationByScope.set(scopeId, currentPurgeGeneration(scopeId) + 1);
+}
+
+/**
+ * Live history fetches (initial and refetch), counted per channel across EVERY hook
+ * instance (#3894).
+ *
+ * A page publishes only while none runs for its channel. The refetch replaces that
+ * channel's rows, and a page published inside its window is read by it as an arrival
+ * and appended after the newest page, out of order and with the cursor unmoved. The
+ * count cannot live in the hook: the main chat and the voice panel for a voice
+ * channel's linked text chat each run the hook for one channel over one set of rows,
+ * so one instance's page has to be fenced by the other's fetch. A fetch for a channel
+ * the chat has left is keyed by that channel and gates nothing in the new one.
+ */
+const liveHistoryFetches = new Map<string, number>();
+const historyIdleWaiters = new Set<{ channelId: string; wake: () => void }>();
+
+function historyFetchesFor(key: string | null): number {
+  return key ? (liveHistoryFetches.get(key) ?? 0) : 0;
+}
+
+function historyFetchBegan(key: string): void {
+  liveHistoryFetches.set(key, historyFetchesFor(key) + 1);
+}
+
+function historyFetchEnded(key: string): void {
+  const left = historyFetchesFor(key) - 1;
+  if (left > 0) {
+    liveHistoryFetches.set(key, left);
+    return;
+  }
+  liveHistoryFetches.delete(key);
+  // Each wake() deletes its own entry, which a Set iterator allows; nothing it does adds one.
+  for (const waiter of historyIdleWaiters) if (waiter.channelId === key) waiter.wake();
+}
+
+/**
+ * Resolves once no history fetch is live for `key` (at once when none is), or when
+ * `signal` aborts. A refetch that superseded the one that just ended may already have
+ * begun by the time this wakes, so it looks again rather than trusting the wake. The
+ * signal matters because the fetch it waits on may belong to another instance: its
+ * owner leaving must not keep this jump waiting on a request that is not its own.
+ */
+async function historyIdle(key: string | null, signal?: AbortSignal): Promise<void> {
+  if (!key) return;
+  while (historyFetchesFor(key) > 0 && !signal?.aborted) {
+    await new Promise<void>((resolve) => {
+      const waiter: { channelId: string; wake: () => void } = {
+        channelId: key,
+        wake: () => {
+          historyIdleWaiters.delete(waiter);
+          signal?.removeEventListener('abort', waiter.wake);
+          resolve();
+        },
+      };
+      historyIdleWaiters.add(waiter);
+      signal?.addEventListener('abort', waiter.wake, { once: true });
+    });
+  }
 }
 
 /** Index decrypted messages for search (passive, skips failed/pending). */
@@ -370,7 +466,9 @@ async function loadOlderMessagesAttempt({
   limit,
   before,
   attempt,
+  maxAttempts,
   isCurrent,
+  historyFetchInFlight,
   prependMessages,
   setHasMore,
 }: {
@@ -379,10 +477,12 @@ async function loadOlderMessagesAttempt({
   limit: number;
   before: string;
   attempt: number;
+  maxAttempts: number;
   isCurrent: () => boolean;
+  historyFetchInFlight: () => boolean;
   prependMessages: (channelId: string, messages: MessageWithStatus[]) => void;
   setHasMore: (hasMore: boolean) => void;
-}): Promise<'retry' | 'done'> {
+}): Promise<'retry' | 'done' | 'stale'> {
   const attemptMessages = useChatStore.getState().messagesByChannel.get(channelId) || [];
   const idsAtRequestStart = new Set(attemptMessages.map((message) => message.id));
   const invalidatedDuringRequest = new Set<string>();
@@ -394,16 +494,20 @@ async function loadOlderMessagesAttempt({
   try {
     const res = await apiFetch(buildEndpoint(type, channelId, limit, before));
 
-    // Channel changed while request was in flight — discard results.
-    if (!isCurrent()) return 'done';
+    // Channel, account or purge generation changed while the request was in
+    // flight — discard results.
+    if (!isCurrent()) return 'stale';
 
     const rawMsgs = await readMessagePage(res, channelId, 'Failed to load more messages');
     const msgs = await decryptMessages(channelId, rawMsgs, operationGuard);
     operationGuard.assertCurrent();
 
-    if (!isCurrent()) return 'done';
+    if (!isCurrent()) return 'stale';
 
     const currentMessages = useChatStore.getState().messagesByChannel.get(channelId) || [];
+    // P7: publish only onto the head this page was asked for, and never while a history refetch runs.
+    // No await may sit between this check and `prependMessages` below.
+    if (currentMessages[0]?.id !== before || historyFetchInFlight()) return 'stale';
     const reconciled = reconcileFetchedMessages(
       msgs,
       currentMessages,
@@ -411,7 +515,7 @@ async function loadOlderMessagesAttempt({
       invalidatedDuringRequest
     );
     if (reconciled.needsAuthoritativeRefetch) {
-      if (attempt + 1 < MAX_PAGINATION_RECONCILIATION_ATTEMPTS) return 'retry';
+      if (attempt + 1 < maxAttempts) return 'retry';
       // Keep the cursor retryable if this page changed twice in a row.
       setHasMore(true);
       return 'done';
@@ -429,11 +533,59 @@ async function loadOlderMessagesAttempt({
 }
 
 /**
+ * Why a page that returned `stale` published nothing (#3894): the user left
+ * or the account changed (`cancelled`), a purge landed (`failed`; the refetch
+ * the purge queued is the truth), or the head moved or a history refetch ran
+ * (`interrupted`: run again from the new head once history is ready).
+ */
+function stalePageStatus(sameChannelAndAuth: boolean, purged: boolean): PageResult['status'] {
+  if (!sameChannelAndAuth) return 'cancelled';
+  if (purged) return 'failed';
+  return 'interrupted';
+}
+
+/**
+ * The status of a page whose attempt threw. A scroll page (`reportError`)
+ * keeps its handling: a pending key refetches, anything else sets `error`.
+ * A jump page never sets `error`, because it feeds the owner's history banner.
+ */
+function thrownPageStatus(
+  err: unknown,
+  page: {
+    sameChannelAndAuth: boolean;
+    purged: boolean;
+    reportError: boolean;
+    retry: () => void;
+    setError: (error: string) => void;
+  }
+): PageResult['status'] {
+  if (!page.sameChannelAndAuth || isAbortError(err)) return 'cancelled';
+  if (page.reportError) {
+    const retried = handleFetchError(
+      err,
+      'Failed to load more messages',
+      page.retry,
+      page.setError
+    );
+    return retried ? 'interrupted' : 'failed';
+  }
+  if (page.purged) return 'failed';
+  if (isPendingKeyError(err)) {
+    // Rotation: refetch from a fresh first page; the jump resumes in budget.
+    page.retry();
+    return 'interrupted';
+  }
+  return 'failed';
+}
+
+/**
  * Loads, decrypts, reconciles, and paginates messages for a channel.
  *
  * @param channelId - The channel to load, or `null` when no channel is active.
  * @param options - Message type, page size, and optional completion callback.
- * @returns The channel messages, loading and pagination state, error state, and older-message loader.
+ * @returns The channel messages, loading and pagination state, error state, the
+ *   older-message loader, and `loadUntil`, which pages older history until a
+ *   message is in the store.
  */
 export function useMessageFetch(channelId: string | null, options: UseMessageFetchOptions) {
   const { type, limit = DEFAULT_LIMIT, onFetchComplete } = options;
@@ -446,7 +598,26 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
   const prependMessages = useChatStore((s) => s.prependMessages);
 
   const [isLoading, setIsLoading] = useState(false);
-  const [hasMore, setHasMore] = useState(false);
+  // Whether older history remains, per channel. A flag written for the channel the
+  // chat left says nothing about the one it entered, so a channel whose own fetch
+  // never answered has no entry and is read as unknown, never as "history ends".
+  const [hasMoreByChannel, setHasMoreByChannel] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map()
+  );
+  // Mirrors the map for callbacks that must not close over a render (#3894).
+  const hasMoreRef = useRef(new Map<string, boolean>());
+  const updateHasMore = useCallback((key: string, value: boolean) => {
+    if (hasMoreRef.current.get(key) === value) return;
+    hasMoreRef.current.set(key, value);
+    setHasMoreByChannel(new Map(hasMoreRef.current));
+  }, []);
+  const hasMore = channelId ? (hasMoreByChannel.get(channelId) ?? false) : false;
+  // The older page running now, so a second caller joins it (single flight).
+  const inFlightPageRef = useRef<{
+    channelId: string | null;
+    visit: number;
+    promise: Promise<PageResult>;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [historySettledForChannelId, setHistorySettledForChannelId] = useState<string | null>(null);
   const [fetchTrigger, setFetchTrigger] = useState(0);
@@ -464,6 +635,17 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
   // when the channel has changed and skip stale state updates.
   const channelIdRef = useRef(channelId);
   channelIdRef.current = channelId;
+  // A visit token, bumped on every channel change. Comparing `channelIdRef` passes again once the
+  // chat has gone X -> Y -> X, so a page asked for before the round trip would publish rows that
+  // were deleted meanwhile: the purge lane that clears a scope bumps only the hook mounted on
+  // it, and a deletion made while away sends no event at all. The token never repeats.
+  const visitRef = useRef({ channelId, visit: 0 });
+  if (visitRef.current.channelId !== channelId) {
+    visitRef.current = { channelId, visit: visitRef.current.visit + 1 };
+  }
+  // This instance's own live history fetches. `isLoading` is per instance while the history
+  // fence is per channel, so only a fetch this instance runs may hold its `isLoading` up.
+  const ownLiveFetchesRef = useRef(0);
   useEffect(() => {
     // React StrictMode replays effect setup/cleanup; restore the live value on
     // each setup so its first cleanup cannot permanently null this guard.
@@ -552,6 +734,18 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     if (!channelId) return;
 
     let aborted = false;
+    // This fetch's place in the per-channel count, given back exactly once: by the
+    // cleanup that abandons it or by its own end, whichever comes first. An
+    // abandoned request may stay on the wire for a long time, but every path
+    // below checks `aborted` before publishing, so it can publish nothing and
+    // must not hold up paging for the replacement that did.
+    let counted = false;
+    const retire = () => {
+      if (!counted) return;
+      counted = false;
+      ownLiveFetchesRef.current -= 1;
+      historyFetchEnded(channelId);
+    };
 
     const fetchMessages = async () => {
       let retrying = false;
@@ -568,6 +762,9 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         invalidatedDuringRequest.add(messageId);
       });
 
+      counted = true;
+      ownLiveFetchesRef.current += 1;
+      historyFetchBegan(channelId);
       try {
         const operationGuard = e2eeService.createChannelOperationGuard(channelId);
         const res = await apiFetch(buildEndpoint(type, channelId, limit));
@@ -602,7 +799,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         unsubscribeInvalidations();
         indexDecryptedMessages(channelId, merged);
         setMessages(channelId, merged);
-        setHasMore(rawMsgs.length === limit);
+        updateHasMore(channelId, rawMsgs.length === limit);
         onFetchCompleteRef.current?.();
         if (reconciled.needsAuthoritativeRefetch) {
           // An edit/delete for an unloaded row can only tombstone this stale
@@ -619,6 +816,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
           retrying = handleFetchError(err, 'Failed to load messages', retryFetch, setError);
         }
       } finally {
+        retire();
         unsubscribeInvalidations();
         if (!aborted) {
           setIsLoading(false);
@@ -631,53 +829,171 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
 
     return () => {
       aborted = true;
+      retire();
     };
-  }, [channelId, setMessages, fetchTrigger, retryFetch, type, limit]);
+  }, [channelId, setMessages, fetchTrigger, retryFetch, type, limit, updateHasMore]);
 
-  // Load older messages (pagination)
-  const handleLoadMore = useCallback(async () => {
-    if (!channelId || isLoading || !hasMore) return;
-
-    const requestChannelId = channelId;
-    const channelMessages = useChatStore.getState().messagesByChannel.get(requestChannelId);
-    if (!channelMessages || channelMessages.length === 0) return;
-
-    setError(null);
-    const oldestMessage = channelMessages[0];
-    const purgeGenerationAtRequestStart = currentPurgeGeneration(requestChannelId);
-
-    setIsLoading(true);
-    try {
-      for (let attempt = 0; attempt < MAX_PAGINATION_RECONCILIATION_ATTEMPTS; attempt += 1) {
-        const outcome = await loadOlderMessagesAttempt({
-          type,
-          channelId: requestChannelId,
-          limit,
-          before: oldestMessage.id,
-          attempt,
-          // A page in flight when a purge lands carries deleted plaintext, so
-          // the purge generation fences pagination exactly as it fences the
-          // initial fetch above.
-          isCurrent: () =>
-            channelIdRef.current === requestChannelId &&
-            currentPurgeGeneration(requestChannelId) === purgeGenerationAtRequestStart,
-          prependMessages,
-          setHasMore,
-        });
-        if (outcome === 'done') return;
+  // One older page (#3894). Scrolling and `loadUntil` both come through here,
+  // so both get the channel, account, purge and publication fences. Never
+  // rejects.
+  const runOlderPage = useCallback(
+    async (channelKey: string | null, opts: PageOptions): Promise<PageResult> => {
+      // A history fetch is replacing this channel's rows; a page now would be dropped.
+      if (historyFetchesFor(channelKey) > 0) return { status: 'interrupted', requests: 0 };
+      if (!channelKey) return { status: 'done', requests: 0 };
+      const head = useChatStore.getState().messagesByChannel.get(channelKey)?.[0];
+      if (hasMoreRef.current.get(channelKey) !== true || !head) {
+        return { status: 'done', requests: 0 };
       }
-    } catch (err) {
-      if (channelIdRef.current === requestChannelId) {
+      const before = head.id; // re-derived per page: never reuse a cursor across pages
+      // A page in flight when a purge lands carries deleted plaintext, so the
+      // purge generation fences pagination exactly as it fences the initial
+      // fetch above. The auth snapshot keeps account A's page out of account B.
+      const purgeGeneration = currentPurgeGeneration(channelKey);
+      const lifecycle = captureAuthLifecycle();
+      const visit = visitRef.current.visit;
+      const sameVisit = () =>
+        channelIdRef.current === channelKey && visitRef.current.visit === visit;
+      const sameChannelAndAuth = () => sameVisit() && isSameAuthLifecycle(lifecycle);
+      const purged = () => currentPurgeGeneration(channelKey) !== purgeGeneration;
+      if (opts.reportError) setError(null);
+      setIsLoading(true);
+      let requests = 0;
+      try {
+        for (let attempt = 0; attempt < opts.maxAttempts; attempt += 1) {
+          requests += 1;
+          const outcome = await loadOlderMessagesAttempt({
+            type,
+            channelId: channelKey,
+            limit: opts.pageLimit,
+            before,
+            attempt,
+            maxAttempts: opts.maxAttempts,
+            isCurrent: () => sameChannelAndAuth() && !purged(),
+            historyFetchInFlight: () => historyFetchesFor(channelKey) > 0,
+            prependMessages,
+            setHasMore: (value) => updateHasMore(channelKey, value),
+          });
+          if (outcome === 'retry') continue;
+          if (outcome === 'done') return { status: 'done', requests };
+          return { status: stalePageStatus(sameChannelAndAuth(), purged()), requests };
+        }
+        return { status: 'done', requests };
+      } catch (err) {
         // Reconcile from a fresh initial snapshot after rotation. Retrying
         // the same `before` cursor could be stale after live edits/deletes.
-        handleFetchError(err, 'Failed to load more messages', retryFetch, setError);
+        const status = thrownPageStatus(err, {
+          sameChannelAndAuth: sameChannelAndAuth(),
+          purged: purged(),
+          reportError: opts.reportError,
+          retry: retryFetch,
+          setError,
+        });
+        return { status, requests };
+      } finally {
+        // The initial fetch shares `isLoading`: a page ending mid-refetch must leave it for the refetch to clear.
+        // Only this instance's own refetch counts: another instance's fetch on the same channel
+        // never clears this flag, so it must not hold it up.
+        if (sameVisit() && ownLiveFetchesRef.current === 0) {
+          setIsLoading(false);
+        }
       }
-    } finally {
-      if (channelIdRef.current === requestChannelId) {
-        setIsLoading(false);
+    },
+    [type, prependMessages, retryFetch, updateHasMore]
+  );
+
+  // Single flight: a page already running for this channel is joined, so the
+  // list's own load triggers and a jump merge instead of racing one cursor.
+  const loadOlderPage = useCallback(
+    (opts: PageOptions): Promise<PageResult> => {
+      const channelKey = channelIdRef.current;
+      const visit = visitRef.current.visit;
+      const running = inFlightPageRef.current;
+      // A page asked for on an earlier visit to this channel will be dropped; never join it.
+      if (running && running.channelId === channelKey && running.visit === visit) {
+        return running.promise;
       }
-    }
-  }, [channelId, isLoading, hasMore, prependMessages, retryFetch, type, limit]);
+      const entry = { channelId: channelKey, visit, promise: runOlderPage(channelKey, opts) };
+      inFlightPageRef.current = entry;
+      const release = () => {
+        if (inFlightPageRef.current === entry) inFlightPageRef.current = null;
+      };
+      void entry.promise.then(release, release);
+      return entry.promise;
+    },
+    [runOlderPage]
+  );
+
+  // A DM asks for its route's fixed 50 so `hasMore` compares with what was asked.
+  const jumpPageLimit = type === 'channel' ? JUMP_PAGE_LIMIT : limit;
+
+  /**
+   * Pages older history until `messageId` is in the store, spending at most
+   * `maxRequests` HTTP attempts it starts (a joined page counts in full). The
+   * cursor, channel and account are re-read every turn. Returns at once on
+   * `interrupted`; the caller runs it again once history is ready. `signal`
+   * ends it as `cancelled` before its next page, so a replaced or abandoned
+   * jump stops spending the list route's budget; a page already running is
+   * shared with the list and finishes.
+   */
+  const loadUntil = useCallback(
+    async (
+      messageId: string,
+      maxRequests: number,
+      signal?: AbortSignal
+    ): Promise<LoadUntilResult> => {
+      const channelKey = channelIdRef.current;
+      const visit = visitRef.current.visit;
+      const lifecycle = captureAuthLifecycle();
+      const holds = () =>
+        (useChatStore.getState().messagesByChannel.get(channelKey ?? '') ?? []).some(
+          (m) => m.id === messageId
+        );
+      let requests = 0;
+      for (;;) {
+        // Wait out a history fetch running for this channel, in this instance or in
+        // another over the same rows; resolves at once when none does, and when
+        // `signal` aborts. One that was abandoned (StrictMode's first, a superseded
+        // refetch) no longer counts, however long its request stays out.
+        await historyIdle(channelKey, signal);
+        if (
+          signal?.aborted ||
+          !channelKey ||
+          channelIdRef.current !== channelKey ||
+          visitRef.current.visit !== visit ||
+          !isSameAuthLifecycle(lifecycle)
+        ) {
+          return { status: 'cancelled', requests };
+        }
+        if (holds()) return { status: 'found', requests };
+        const hasOlder = hasMoreRef.current.get(channelKey);
+        // No entry: this channel's own fetch never answered, so whether older history
+        // exists is unknown. That is a failed load, not a verdict that the message is gone.
+        if (hasOlder === undefined) return { status: 'failed', requests };
+        if (!hasOlder) return { status: 'exhausted', requests };
+        if (requests >= maxRequests) return { status: 'too-far', requests };
+        const page = await loadOlderPage({
+          reportError: false,
+          pageLimit: jumpPageLimit,
+          maxAttempts: Math.min(MAX_PAGINATION_RECONCILIATION_ATTEMPTS, maxRequests - requests),
+        });
+        requests += page.requests;
+        if (page.status !== 'done') return { status: page.status, requests };
+        if (page.requests === 0) return { status: 'exhausted', requests }; // nothing to page from
+      }
+    },
+    [loadOlderPage, jumpPageLimit]
+  );
+
+  // Load older messages (pagination). Unchanged for the list: errors still
+  // reach `error`, and a pending key still refetches.
+  const handleLoadMore = useCallback(async () => {
+    await loadOlderPage({
+      reportError: true,
+      pageLimit: limit,
+      maxAttempts: MAX_PAGINATION_RECONCILIATION_ATTEMPTS,
+    });
+  }, [loadOlderPage, limit]);
 
   return {
     messages,
@@ -685,6 +1001,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     hasMore,
     error,
     handleLoadMore,
+    loadUntil,
     isHistoryReady: historySettledForChannelId === channelId,
   };
 }

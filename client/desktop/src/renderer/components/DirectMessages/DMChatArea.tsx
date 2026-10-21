@@ -5,12 +5,15 @@ import DMPinnedMessagesPanel from './DMPinnedMessagesPanel';
 import { getPins } from '../../services/messaging/pinService';
 import MessageInput from '../Chat/MessageInput';
 import TypingIndicator from '../Chat/TypingIndicator';
+import JumpNotice from '../Chat/JumpNotice';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useDMSubscription } from '../../hooks/messaging/useDMSubscription';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
+import { isJumpFailure, useJumpToMessage } from '../../hooks/messaging/useJumpToMessage';
+import { focusComposerIfLost } from '../Chat/chatSurface';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useReadMarker } from '../../hooks/messaging/useReadMarker';
 import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
@@ -118,10 +121,6 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: closes pinned panel when switching threads; not a render loop
     setShowPinnedPanel(false);
   }, [selectedThreadId]);
-
-  const handleScrollToMessage = useCallback((messageId: string) => {
-    messageListRef.current?.scrollToMessage(messageId);
-  }, []);
 
   const conversations = useDMStore((s) => s.conversations);
   const clearUnread = useDMStore((s) => s.clearUnread);
@@ -315,14 +314,30 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
   }, [selectedThreadId, clearUnread]);
 
   // Shared fetch/decrypt/paginate logic
-  const { messages, isLoading, hasMore, error, handleLoadMore, isHistoryReady } = useMessageFetch(
-    selectedThreadId,
-    { type: 'dm', onFetchComplete: handleFetchComplete }
-  );
+  const { messages, isLoading, hasMore, error, handleLoadMore, loadUntil, isHistoryReady } =
+    useMessageFetch(selectedThreadId, { type: 'dm', onFetchComplete: handleFetchComplete });
   // #1959: this panel's id ties its rows, its composer and the delete-refusal flow together,
   // so focus and an open edit never cross into another panel showing messages.
   const surfaceId = useId();
   const editLastMessage = useEditLastMessage(messages, currentUserId, surfaceId);
+  // Pins and reply quotes jump through the same hook as a channel; a DM has no
+  // other conversation to cross into, so it passes no `switchChannel`.
+  const { jump, notice } = useJumpToMessage({
+    channelId: selectedThreadId,
+    isHistoryReady,
+    hasInitialHistoryError: error !== null && messages.length === 0,
+    loadUntil,
+    listRef: messageListRef,
+  });
+  const handleScrollToMessage = useCallback(
+    (messageId: string) => {
+      if (!selectedThreadId) return;
+      void jump(selectedThreadId, messageId).then((outcome) => {
+        if (isJumpFailure(outcome)) focusComposerIfLost(surfaceId);
+      });
+    },
+    [selectedThreadId, jump, surfaceId]
+  );
 
   // Advance the read marker while the thread stays open (#2006), so a message
   // read as it arrives doesn't come back as unread after a refresh —
@@ -562,6 +577,8 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
             hasInitialHistoryError={error !== null}
           />
         </div>
+
+        <JumpNotice text={notice} />
 
         <TypingIndicator channelId={selectedThreadId} />
 

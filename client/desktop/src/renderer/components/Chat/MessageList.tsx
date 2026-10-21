@@ -15,6 +15,7 @@ import type { ExpirationWindowSeconds } from '../../services/messaging/expiratio
 import { useChannelScrollStore, type ScrollAnchor } from '../../stores/chat/channelScrollStore';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
 import './MessageList.css';
 
 export interface MessageListProps {
@@ -71,7 +72,10 @@ export interface MessageListProps {
 }
 
 export interface MessageListHandle {
-  scrollToMessage: (messageId: string) => void;
+  /** Brings a mounted row into view, focuses and highlights it; false when the
+   *  list does not hold that row. Either way a not-yet-restored saved anchor is
+   *  abandoned, as Return to Latest does. */
+  scrollToMessage: (messageId: string) => boolean;
   scrollToBottomIfNear: () => void;
 }
 
@@ -417,6 +421,22 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       unseenAtBottomRef.current = 0;
       onLatestLeftRef.current?.();
     }, []);
+    // An explicit move (Return to Latest, a jump to a message) abandons a saved
+    // anchor that has not been restored yet; left pending, the restore would wait
+    // on history, then snap the list off wherever the user was taken.
+    const cancelPendingRestore = useCallback(() => {
+      if (!persistenceKey) return;
+      const pending = pendingAnchorRef.current;
+      if (pending?.key === persistenceKey) {
+        dismissedPendingAnchorRef.current = {
+          key: persistenceKey,
+          messageId: pending.anchor.messageId,
+        };
+        landedKeyRef.current = persistenceKey;
+      }
+      pendingAnchorRef.current = null;
+      useChannelScrollStore.getState().clearAnchor(persistenceKey);
+    }, [persistenceKey]);
     // The badge while not following: unread rows still below the viewport.
     const refreshBadge = useCallback(
       (list: HTMLElement) => {
@@ -476,13 +496,27 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
 
     useImperativeHandle(ref, () => ({
       scrollToMessage: (messageId: string) => {
+        // First, even for a row that is not here: a failed jump still consumes a
+        // not-yet-restored anchor, or the restore would snap the list back later.
+        cancelPendingRestore();
         const el = listRef.current ? findRow(listRef.current, messageId) : null;
-        if (el) {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          setHighlightedMessageId(messageId);
-          if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-          highlightTimerRef.current = setTimeout(() => setHighlightedMessageId(null), 2000);
+        if (!el) return false;
+        landingScrollTopRef.current = null;
+        // Stop following before moving, or the ResizeObserver re-pins the bottom.
+        if (isNearBottomRef.current) {
+          isNearBottomRef.current = false;
+          leaveLatest();
         }
+        const reduceMotion =
+          useSettingsStore.getState().appearance.reduceAnimations ||
+          globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+        el.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
+        // Rows are tabIndex={-1}: a screen reader reads the message it landed on.
+        el.focus({ preventScroll: true });
+        setHighlightedMessageId(messageId);
+        if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = setTimeout(() => setHighlightedMessageId(null), 2000);
+        return true;
       },
       scrollToBottomIfNear: () => {
         if (isNearBottomRef.current) {
@@ -627,7 +661,6 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         // replay, and applyLanding pinned the list rather than leaving it to
         // the messages effect, whose deps do not change on a key change.
         isNearBottomRef.current = following;
-        // eslint-disable-next-line @eslint-react/set-state-in-effect -- Landing intentionally derives the initial button state from scroll geometry.
         setShowScrollButton(!following && !isNearBottom(list));
         // For both rules the badge shows how many unread rows are still
         // below the viewport, re-counted on every scroll: the open-time read
@@ -949,18 +982,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
 
     const scrollToBottom = useCallback(
       (smooth = true, cancelPending = false) => {
-        if (cancelPending && persistenceKey) {
-          const pending = pendingAnchorRef.current;
-          if (pending?.key === persistenceKey) {
-            dismissedPendingAnchorRef.current = {
-              key: persistenceKey,
-              messageId: pending.anchor.messageId,
-            };
-            landedKeyRef.current = persistenceKey;
-          }
-          pendingAnchorRef.current = null;
-          useChannelScrollStore.getState().clearAnchor(persistenceKey);
-        }
+        if (cancelPending) cancelPendingRestore();
         // Reaching the bottom with unseen messages pending counts as reading
         // them, whoever they're from — the count only ever holds others' messages.
         if (newMessageCountRef.current > 0) {
@@ -978,7 +1000,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
           });
         }
       },
-      [persistenceKey]
+      [cancelPendingRestore]
     );
 
     const handleScroll = useCallback(() => {

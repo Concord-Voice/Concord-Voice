@@ -13,6 +13,7 @@ import type {
   SearchStatus,
   UseChannelSearchResult,
 } from '@/renderer/hooks/messaging/useChannelSearch';
+import type { JumpOutcome } from '@/renderer/hooks/messaging/useJumpToMessage';
 
 // The hook has its own suites; here it is a mutable return value the panel renders.
 let hookState: UseChannelSearchResult;
@@ -80,7 +81,8 @@ function PanelWithOpener() {
         channelId={CHANNEL}
         isOpen={open}
         onClose={() => setOpen(false)}
-        onScrollToMessage={() => undefined}
+        onJump={async (): Promise<JumpOutcome> => 'reached'}
+        surfaceId="s1"
         returnFocusRef={openerRef}
       />
     </>
@@ -88,17 +90,51 @@ function PanelWithOpener() {
 }
 
 describe('SearchPanel', () => {
-  const defaultProps = {
+  const defaultProps: SearchPanelProps = {
     channelId: CHANNEL,
     isOpen: true,
     onClose: vi.fn(),
-    onScrollToMessage: vi.fn(),
+    onJump: vi.fn(async (): Promise<JumpOutcome> => 'reached'),
+    surfaceId: 's1',
   };
 
+  // The panel sits in its owner's chat surface, beside the composer a crossing jump hands focus to.
+  // Every render and rerender goes through here so the tree keeps one shape.
+  function panel(props: Partial<SearchPanelProps> = {}) {
+    return (
+      <div data-chat-surface="s1">
+        <textarea className="message-input-textarea" aria-label="Message composer" />
+        <SearchPanel {...defaultProps} {...props} />
+      </div>
+    );
+  }
+
   function renderPanel(query = '', props: Partial<SearchPanelProps> = {}) {
-    const utils = render(<SearchPanel {...defaultProps} {...props} />);
+    const utils = render(panel(props));
     if (query) typeQuery(query);
     return utils;
+  }
+
+  /** An `onJump` that settles when the test says so, with the outcome it settles to. */
+  function pendingJump() {
+    let resolve!: (outcome: JumpOutcome) => void;
+    const promise = new Promise<JumpOutcome>((r) => {
+      resolve = r;
+    });
+    const onJump = vi.fn<SearchPanelProps['onJump']>(() => promise);
+    let settled = false;
+    void promise.then(() => {
+      settled = true;
+    });
+    return {
+      onJump,
+      isSettled: () => settled,
+      settle: (outcome: JumpOutcome) =>
+        act(async () => {
+          resolve(outcome);
+          await promise;
+        }),
+    };
   }
 
   function typeQuery(value: string) {
@@ -160,7 +196,7 @@ describe('SearchPanel', () => {
     it('clears the query when the channel changes, leaving the session to the hook', () => {
       const { rerender } = renderPanel('hello');
       expect(screen.getByPlaceholderText('Search messages...')).toHaveValue('hello');
-      rerender(<SearchPanel {...defaultProps} channelId="channel-2" />);
+      rerender(panel({ channelId: 'channel-2' }));
       expect(screen.getByPlaceholderText('Search messages...')).toHaveValue('');
       expect(hookState.cancel).not.toHaveBeenCalled();
     });
@@ -188,39 +224,286 @@ describe('SearchPanel', () => {
     });
   });
 
+  // Every card jumps (#3894): a loaded row is scrolled to, an unloaded one is paged for. The
+  // panel hands the owner the hit's own channel and message id and renders the outcome.
   describe('Jump', () => {
-    it('shows only for a message loaded in this channel', () => {
+    const TOO_FAR =
+      "Couldn't reach that message. It's too far back to load. Scroll up in the chat, then try again.";
+    const MISSING = "Couldn't reach that message. It may have been deleted or expired.";
+    const FAILED =
+      "Couldn't reach that message. Loading older messages failed. Try again in a moment.";
+
+    function jumpIn(author: string): HTMLElement {
+      const card = screen.getByText(author).closest('.search-result-card') as HTMLElement;
+      return within(card).getByRole('button', { name: /^Jump/ });
+    }
+
+    // jsdom has no scrollIntoView; a failed jump scrolls its line into view, so every case needs one.
+    const scrollIntoView = vi.fn();
+    beforeEach(() => {
+      scrollIntoView.mockReset();
+      Object.defineProperty(Element.prototype, 'scrollIntoView', {
+        configurable: true,
+        writable: true,
+        value: scrollIntoView,
+      });
+    });
+    afterEach(() => {
+      Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+    });
+
+    // kills: canJump restored
+    it('F1 a loaded and an unloaded hit both render a Jump button', () => {
       loadRows(CHANNEL, ['loaded']);
-      mockHook({ status: { kind: 'finished' }, results: [item('loaded'), item('elsewhere')] });
+      mockHook({
+        status: { kind: 'finished' },
+        results: [
+          item('loaded'),
+          item('unloaded'),
+          item('elsewhere', { channelId: 'other-channel' }),
+        ],
+      });
       renderPanel('hello');
-      const jumps = screen.getAllByRole('button', { name: 'Jump' });
-      expect(jumps).toHaveLength(1);
-      const card = jumps[0].closest('.search-result-card') as HTMLElement;
-      expect(within(card).getByText('Author loaded')).toBeInTheDocument();
+      // The cards rendered, so the absence of a gate is what the buttons below show.
+      expect(document.querySelectorAll('.search-result-card')).toHaveLength(3);
+      expect(screen.getAllByRole('button', { name: 'Jump' })).toHaveLength(3);
+      for (const author of ['Author loaded', 'Author unloaded', 'Author elsewhere']) {
+        expect(jumpIn(author)).toHaveTextContent('Jump');
+      }
     });
 
-    it('is withheld for a message that is only loaded in another channel', () => {
-      loadRows('other-channel', ['elsewhere']);
-      mockHook({ results: [item('elsewhere', { channelId: 'other-channel' })] });
-      renderPanel('hello');
-      expect(screen.queryByRole('button', { name: 'Jump' })).not.toBeInTheDocument();
+    // kills: native disabled; busy guard removed
+    it('F2 busy: Jumping…, aria-disabled, a second click does not call onJump, focus stays on the button', async () => {
+      const { onJump, settle } = pendingJump();
+      mockHook({ results: [item('a')] });
+      renderPanel('hello', { onJump });
+      const user = userEvent.setup();
+      const button = screen.getByRole('button', { name: 'Jump' });
+
+      await user.click(button);
+
+      expect(onJump).toHaveBeenCalledTimes(1);
+      const busy = screen.getByRole('button', { name: 'Jumping…' });
+      expect(busy).toBe(button);
+      expect(busy).toHaveAttribute('aria-disabled', 'true');
+      expect(busy).not.toHaveAttribute('disabled');
+      expect(busy).toHaveFocus();
+
+      await user.click(busy);
+
+      expect(onJump).toHaveBeenCalledTimes(1);
+      expect(busy).toHaveFocus();
+      await settle('cancelled');
     });
 
-    it('appears once the message loads into the channel', () => {
-      mockHook({ results: [item('late')] });
-      renderPanel('hello');
-      expect(screen.queryByRole('button', { name: 'Jump' })).not.toBeInTheDocument();
-      act(() => loadRows(CHANNEL, ['late']));
-      expect(screen.getByRole('button', { name: 'Jump' })).toBeInTheDocument();
-    });
+    // kills: wrong copy; second live region
+    it.each([
+      { outcome: 'too-far', copy: TOO_FAR },
+      { outcome: 'missing', copy: MISSING },
+      { outcome: 'failed', copy: FAILED },
+    ] as const)(
+      'F3 $outcome renders its exact sentence in an alert the button points at, with one status region',
+      async ({ outcome, copy }) => {
+        const { onJump, settle } = pendingJump();
+        mockHook({ results: [item('a')] });
+        renderPanel('hello', { onJump });
+        fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
 
-    it('scrolls to the message and closes the panel', () => {
-      loadRows(CHANNEL, ['msg-1']);
-      mockHook({ results: [item('msg-1')] });
-      renderPanel('hello');
+        await settle(outcome);
+
+        const alert = await screen.findByRole('alert');
+        expect(alert.tagName).toBe('P');
+        expect(alert.textContent).toBe(copy);
+        expect(alert.id).not.toBe('');
+        const button = screen.getByRole('button', { name: 'Jump' });
+        expect(button).toHaveAttribute('aria-describedby', alert.id);
+        expect(button).not.toHaveAttribute('aria-disabled');
+        expect(screen.getAllByRole('status')).toHaveLength(1);
+      }
+    );
+
+    // kills: failure line not scrolled into view; scrolled for a jump that did not fail
+    it('F3b a failed jump scrolls its own line into view, and a reached one scrolls nothing', async () => {
+      const failing = pendingJump();
+      mockHook({ results: [item('a')] });
+      const { unmount } = renderPanel('hello', { onJump: failing.onJump });
       fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
-      expect(defaultProps.onScrollToMessage).toHaveBeenCalledWith('msg-1');
-      expect(defaultProps.onClose).toHaveBeenCalled();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      await failing.settle('missing');
+
+      const alert = await screen.findByRole('alert');
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+      expect(scrollIntoView.mock.contexts[0]).toBe(alert);
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+      unmount();
+
+      scrollIntoView.mockClear();
+      const reaching = pendingJump();
+      renderPanel('hello', { onJump: reaching.onJump, onClose: vi.fn() });
+      fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+      await reaching.settle('reached');
+
+      expect(reaching.isSettled()).toBe(true);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+    });
+
+    // control
+    it('F4 reached closes the panel and clears the busy state', async () => {
+      const { onJump, settle } = pendingJump();
+      const onClose = vi.fn();
+      mockHook({ results: [item('a')] });
+      renderPanel('hello', { onJump, onClose });
+      fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+      expect(screen.getByRole('button', { name: 'Jumping…' })).toBeInTheDocument();
+      expect(onClose).not.toHaveBeenCalled();
+
+      await settle('reached');
+
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', { name: 'Jump' })).not.toHaveAttribute('aria-disabled');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    // control
+    it('F4 cancelled clears the busy state and shows no line', async () => {
+      const { onJump, settle } = pendingJump();
+      const onClose = vi.fn();
+      mockHook({ results: [item('a')] });
+      renderPanel('hello', { onJump, onClose });
+      fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+      expect(screen.getByRole('button', { name: 'Jumping…' })).toBeInTheDocument();
+
+      await settle('cancelled');
+
+      expect(screen.getByRole('button', { name: 'Jump' })).not.toHaveAttribute('aria-disabled');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(onClose).not.toHaveBeenCalled();
+    });
+
+    // kills: signal passed to a crossing jump
+    it("F5 a crossing hit: onJump gets that hit's channel and no signal, onClose ran before it resolved, the composer has focus", async () => {
+      const { onJump, settle, isSettled } = pendingJump();
+      const onClose = vi.fn();
+      mockHook({ results: [item('there', { channelId: 'channel-2' }), item('here')] });
+      renderPanel('hello', { onJump, onClose });
+      const composer = screen.getByRole('textbox', { name: 'Message composer' });
+      expect(composer).not.toHaveFocus();
+
+      fireEvent.click(jumpIn('Author there'));
+
+      expect(onJump).toHaveBeenCalledTimes(1);
+      expect(onJump.mock.calls[0][0]).toBe('channel-2');
+      expect(onJump.mock.calls[0][1]).toBe('there');
+      expect(onJump.mock.calls[0][2]).toBeUndefined();
+      // The order: close and focus came first, while the jump was still pending.
+      expect(isSettled()).toBe(false);
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(composer).toHaveFocus();
+
+      await settle('reached');
+
+      // A crossing jump is not tied to the panel: its outcome closes nothing a second time.
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    // kills: abort effect removed
+    it('F6 a query change aborts the in-flight jump, and a later failure shows nothing', async () => {
+      const { onJump, settle } = pendingJump();
+      mockHook({ results: [item('a')] });
+      renderPanel('hello', { onJump });
+      fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+      expect(screen.getByRole('button', { name: 'Jumping…' })).toBeInTheDocument();
+      const signal = onJump.mock.calls[0][2];
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(signal?.aborted).toBe(false);
+
+      typeQuery('hello there');
+
+      expect(signal?.aborted).toBe(true);
+      expect(screen.getByRole('button', { name: 'Jump' })).not.toHaveAttribute('aria-disabled');
+
+      await settle('failed');
+
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Jump' })).not.toHaveAttribute('aria-describedby');
+    });
+
+    // kills: abort effect removed; close not part of the reset condition
+    it('F6b closing the panel aborts the in-flight jump, and reopening it shows a fresh card', async () => {
+      const { onJump, settle } = pendingJump();
+      mockHook({ results: [item('a')] });
+      const { rerender } = renderPanel('hello', { onJump });
+      fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+      expect(screen.getByRole('button', { name: 'Jumping…' })).toBeInTheDocument();
+      const signal = onJump.mock.calls[0][2];
+      expect(signal?.aborted).toBe(false);
+
+      rerender(panel({ onJump, isOpen: false }));
+
+      expect(signal?.aborted).toBe(true);
+
+      rerender(panel({ onJump, isOpen: true }));
+      await settle('failed');
+
+      // The jump settled after the panel closed: nothing was left to report it to.
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Jump' })).not.toHaveAttribute('aria-disabled');
+    });
+
+    // kills: abort effect removed; results-leave not part of the reset condition
+    it('F6c results that no longer hold the card abort its in-flight jump', async () => {
+      const { onJump, settle } = pendingJump();
+      mockHook({ results: [item('a'), item('b')] });
+      const { rerender } = renderPanel('hello', { onJump });
+      fireEvent.click(jumpIn('Author a'));
+      const signal = onJump.mock.calls[0][2];
+      expect(signal?.aborted).toBe(false);
+
+      mockHook({ results: [item('b')] });
+      rerender(panel({ onJump }));
+
+      expect(signal?.aborted).toBe(true);
+      expect(screen.queryByText('Author a')).not.toBeInTheDocument();
+
+      await settle('failed');
+
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(jumpIn('Author b')).not.toHaveAttribute('aria-disabled');
+    });
+
+    // kills: previous jump not aborted
+    it("F7 a second card's jump aborts the first and only the second is busy", async () => {
+      const settlers: Array<(outcome: JumpOutcome) => void> = [];
+      const onJump = vi.fn<SearchPanelProps['onJump']>(
+        () =>
+          new Promise<JumpOutcome>((resolve) => {
+            settlers.push(resolve);
+          })
+      );
+      mockHook({ results: [item('a'), item('b')] });
+      renderPanel('hello', { onJump });
+
+      fireEvent.click(jumpIn('Author a'));
+      const first = onJump.mock.calls[0][2];
+      expect(first?.aborted).toBe(false);
+      fireEvent.click(jumpIn('Author b'));
+
+      expect(onJump).toHaveBeenCalledTimes(2);
+      const second = onJump.mock.calls[1][2];
+      expect(first?.aborted).toBe(true);
+      expect(second?.aborted).toBe(false);
+      expect(jumpIn('Author b')).toHaveTextContent('Jumping…');
+      expect(jumpIn('Author a')).toHaveTextContent('Jump');
+
+      // The first jump settles late. Its failure is for a jump nobody waits on any more.
+      await act(async () => {
+        settlers[0]('failed');
+      });
+
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(jumpIn('Author b')).toHaveTextContent('Jumping…');
     });
   });
 
@@ -451,7 +734,7 @@ describe('SearchPanel', () => {
             await user.keyboard('{Enter}');
           }
           expect(loadMore).toHaveBeenCalledTimes(1);
-          rerender(<SearchPanel {...defaultProps} />);
+          rerender(panel());
           expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
           expect(document.activeElement).not.toBe(document.body);
           await waitFor(() => expect(statusLine()).toHaveFocus());
@@ -543,9 +826,9 @@ describe('SearchPanel', () => {
     it('the panel being closed from outside ends the session and clears the query', () => {
       const { rerender } = renderPanel('hello');
       expect(hookState.endSession).not.toHaveBeenCalled();
-      rerender(<SearchPanel {...defaultProps} isOpen={false} />);
+      rerender(panel({ isOpen: false }));
       expect(hookState.endSession).toHaveBeenCalledTimes(1);
-      rerender(<SearchPanel {...defaultProps} isOpen={true} />);
+      rerender(panel({ isOpen: true }));
       expect(screen.getByPlaceholderText('Search messages...')).toHaveValue('');
     });
 
@@ -626,7 +909,7 @@ describe('SearchPanel', () => {
       const live = screen.getByRole('status');
       expect(live).toBeEmptyDOMElement();
       mockHook({ status: { kind: 'running', reachedAt: null } });
-      rerender(<SearchPanel {...defaultProps} />);
+      rerender(panel());
       expect(screen.getByRole('status')).toBe(live);
       expect(live).toHaveTextContent('Searching older messages');
     });
@@ -637,34 +920,9 @@ describe('SearchPanel', () => {
       const live = screen.getByRole('status');
       expect(live).toHaveTextContent('Searching older messages');
       mockHook({ status: { kind: 'more', reachedAt: REACHED }, results: [item('a')] });
-      rerender(<SearchPanel {...defaultProps} />);
+      rerender(panel());
       expect(screen.getByRole('status')).toBe(live);
       expect(live).toHaveTextContent(SEARCHED_BACK);
-    });
-  });
-
-  describe('message list subscription', () => {
-    // hookCalls gets one entry per render of the panel, which makes a re-render observable.
-    it('re-renders an open panel when a message loads into its channel', () => {
-      renderPanel();
-      const rendered = hookCalls.length;
-      act(() => loadRows(CHANNEL, ['late']));
-      expect(hookCalls.length).toBeGreaterThan(rendered);
-    });
-
-    it('does not re-render a closed panel when a message loads into its channel', () => {
-      renderPanel('', { isOpen: false });
-      const rendered = hookCalls.length;
-      act(() => loadRows(CHANNEL, ['late']));
-      expect(hookCalls.length).toBe(rendered);
-    });
-
-    it('offers Jump for a row that loaded while the panel was closed', () => {
-      mockHook({ results: [item('late')] });
-      const { rerender } = renderPanel('', { isOpen: false });
-      act(() => loadRows(CHANNEL, ['late']));
-      rerender(<SearchPanel {...defaultProps} isOpen={true} />);
-      expect(screen.getByRole('button', { name: 'Jump' })).toBeInTheDocument();
     });
   });
 
@@ -761,12 +1019,15 @@ describe('SearchPanel', () => {
       expect(screen.getByRole('button', { name: 'Open search' })).toHaveFocus();
     });
 
-    it('leaves focus alone when Jump closes the panel, for the scroll to place', () => {
-      loadRows(CHANNEL, ['msg-1']);
+    // The panel closes when the jump reaches its row, a promise later; the scroll has already placed
+    // focus by then, so the opener must not take it back.
+    it('leaves focus alone when Jump closes the panel, for the scroll to place', async () => {
       mockHook({ results: [item('msg-1')] });
       render(<PanelWithOpener />);
       fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
-      expect(screen.queryByPlaceholderText('Search messages...')).not.toBeInTheDocument();
+      await waitFor(() =>
+        expect(screen.queryByPlaceholderText('Search messages...')).not.toBeInTheDocument()
+      );
       expect(screen.getByRole('button', { name: 'Open search' })).not.toHaveFocus();
     });
 

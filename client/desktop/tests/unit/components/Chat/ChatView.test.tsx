@@ -63,6 +63,24 @@ vi.mock('@/renderer/components/Chat/MessageList', () => ({
   },
 }));
 
+// Record the props the owner hands the panel (the right surface id and jump handler, #3894) and
+// render the REAL panel under them: the focus-return tests below press its Escape and Close.
+let capturedSearchPanelProps: {
+  surfaceId?: string;
+  onJump?: (channelId: string, messageId: string, signal?: AbortSignal) => Promise<string>;
+} = {};
+vi.mock('@/renderer/components/Chat/SearchPanel', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/components/Chat/SearchPanel')>();
+  const RealSearchPanel = actual.default;
+  return {
+    ...actual,
+    default: (props: React.ComponentProps<typeof RealSearchPanel>) => {
+      capturedSearchPanelProps = props;
+      return <RealSearchPanel {...props} />;
+    },
+  };
+});
+
 // Capture MessageInput props so a test can invoke the callbacks the composer owner passes in
 // (the real composer is mocked, so ArrowUp cannot be pressed on a textarea here).
 let capturedMessageInputProps: { onEditLastMessage?: () => void } = {};
@@ -161,6 +179,7 @@ describe('ChatView', () => {
     mockUnpinMessage.mockReset();
     capturedMessageListProps = {};
     capturedMessageInputProps = {};
+    capturedSearchPanelProps = {};
     useUserStore.setState({ user: mockUser });
     useChannelStore.setState({ channels: [mockChannel], activeChannelId: null });
     useServerStore.setState({ activeServerId: 'server-1' });
@@ -768,6 +787,250 @@ describe('ChatView', () => {
 
     const onScrollToMessage = capturedMessageListProps.onScrollToMessage as (id: string) => void;
     expect(typeof onScrollToMessage).toBe('function');
+  });
+
+  // ── Jump routing (#3894) ──
+
+  describe('jump routing (#3894)', () => {
+    const MISSING_COPY = "Couldn't reach that message. It may have been deleted or expired.";
+    const FAILED_COPY =
+      "Couldn't reach that message. Loading older messages failed. Try again in a moment.";
+
+    /** 50 rows, newest first as the server sends them, so the oldest id is row-49. */
+    const initialRows = Array.from({ length: 50 }, (_, i) => ({
+      ...mockMessage,
+      id: `row-${i}`,
+      created_at: new Date(Date.UTC(2025, 0, 1, 12, 0, 0) - i * 60_000).toISOString(),
+    }));
+
+    /**
+     * A full first page (so more history exists) and a one-row jump page. The fake list handle
+     * reports the target as mounted only after the jump page has been requested.
+     */
+    function installHistory(jumpPageRows: unknown[]) {
+      const pageUrls: string[] = [];
+      const fakeList = {
+        mounted: false,
+        scrollToMessage: vi.fn((_id: string) => fakeList.mounted),
+        scrollToBottomIfNear: vi.fn(),
+      };
+      mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/channels/channel-1/messages')) {
+          if (url.includes('before=')) {
+            pageUrls.push(url);
+            fakeList.mounted = true;
+            return { ok: true, json: async () => ({ messages: jumpPageRows }) } as Response;
+          }
+          return { ok: true, json: async () => ({ messages: initialRows }) } as Response;
+        }
+        return { ok: true, json: async () => ({ messages: [] }) } as Response;
+      });
+      useChannelStore.setState({ activeChannelId: 'channel-1' });
+      render(<ChatView />);
+      return { pageUrls, fakeList };
+    }
+
+    async function settleInitialHistory(fakeList: { scrollToMessage: unknown }) {
+      await waitFor(() => {
+        expect(capturedMessageListProps).toHaveProperty('isHistoryReady', true);
+        expect((capturedMessageListProps.messages as unknown[]).length).toBe(50);
+      });
+      // The list is mocked and holds no handle of its own: hand the owner's ref ours.
+      const ref = capturedMessageListProps.ref as { current: unknown } | undefined;
+      expect(ref).toBeDefined();
+      if (ref) ref.current = fakeList;
+    }
+
+    function jumpNotice() {
+      const notice = document.querySelector('.jump-notice');
+      expect(notice).toBeInTheDocument();
+      return notice as HTMLElement;
+    }
+
+    // kills: handler not routed through the hook
+    it('G1 a reply-quote click asks the list handle, then pages older history through loadUntil', async () => {
+      const { pageUrls, fakeList } = installHistory([{ ...mockMessage, id: 'jump-target' }]);
+      await settleInitialHistory(fakeList);
+
+      act(() => {
+        (capturedMessageListProps.onScrollToMessage as (id: string) => void)('jump-target');
+      });
+
+      // Reached: the list handle was asked, and it said the row is not mounted yet.
+      await waitFor(() => expect(fakeList.scrollToMessage).toHaveBeenCalledWith('jump-target'));
+      expect(fakeList.scrollToMessage.mock.results[0]?.value).toBe(false);
+      // Obeyed: loadUntil went out for the older page, from the oldest loaded row, 100 deep.
+      await waitFor(() => expect(pageUrls).toHaveLength(1));
+      expect(pageUrls[0]).toContain('before=row-49');
+      expect(pageUrls[0]).toContain('limit=100');
+      // The jump then finds the row mounted and ends without a notice.
+      await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+      expect(jumpNotice()).toBeEmptyDOMElement();
+    });
+
+    // kills: handler not routed through the hook
+    it('G1 a pinned-message Jump click takes the same route', async () => {
+      mockGetChannelPins.mockResolvedValue([{ ...mockMessage, id: 'jump-target' }]);
+      const { pageUrls, fakeList } = installHistory([{ ...mockMessage, id: 'jump-target' }]);
+      await settleInitialHistory(fakeList);
+      const user = userEvent.setup();
+
+      await user.click(screen.getByRole('button', { name: 'Pinned messages' }));
+      await user.click(await screen.findByRole('button', { name: 'Jump' }));
+
+      await waitFor(() => expect(fakeList.scrollToMessage).toHaveBeenCalledWith('jump-target'));
+      await waitFor(() => expect(pageUrls).toHaveLength(1));
+      expect(pageUrls[0]).toContain('before=row-49');
+      await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+      expect(jumpNotice()).toBeEmptyDOMElement();
+    });
+
+    // kills: JumpNotice not rendered by the owner
+    it('G1 a jump that cannot finish says why in the notice under the list', async () => {
+      const { pageUrls, fakeList } = installHistory([]);
+      await settleInitialHistory(fakeList);
+
+      act(() => {
+        (capturedMessageListProps.onScrollToMessage as (id: string) => void)('gone');
+      });
+
+      await waitFor(() => expect(pageUrls).toHaveLength(1));
+      await waitFor(() => expect(jumpNotice()).toHaveTextContent(MISSING_COPY));
+    });
+
+    // kills: search jump not marked inline
+    it('G5 a same-channel search jump that fails returns the failure and leaves the line to the search card', async () => {
+      const { pageUrls, fakeList } = installHistory([]);
+      await settleInitialHistory(fakeList);
+      let outcome: string | undefined;
+
+      // The jump settles through effects, which React flushes only when an act scope returns, so
+      // awaiting it inside an async act deadlocks: start it synchronously and poll for the outcome.
+      act(() => {
+        void capturedSearchPanelProps
+          .onJump?.('channel-1', 'gone', new AbortController().signal)
+          ?.then((o) => {
+            outcome = o;
+          });
+      });
+
+      await waitFor(() => expect(outcome).toBe('missing'));
+      // Positive control: the jump paged and failed, so a notice was possible.
+      expect(pageUrls).toHaveLength(1);
+      expect(jumpNotice()).toBeEmptyDOMElement();
+    });
+
+    // kills: initial-history-error gate ignores the loaded list
+    it('G8 an error beside loaded messages does not block a jump', async () => {
+      const { pageUrls, fakeList } = installHistory([{ ...mockMessage, id: 'jump-target' }]);
+      await settleInitialHistory(fakeList);
+      const base = mockApiFetch.getMockImplementation();
+      if (!base) throw new Error('installHistory set no fetch');
+      let refused = 0;
+      mockApiFetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (refused === 0 && String(input).includes('before=')) {
+          refused += 1;
+          throw new Error('network down');
+        }
+        return base(input, init);
+      });
+      // A failed older-page load sets `error` while all 50 rows stay loaded.
+      await act(async () => {
+        await (capturedMessageListProps.onLoadMore as () => Promise<void>)();
+      });
+      expect(refused).toBe(1);
+      expect(pageUrls).toHaveLength(0);
+
+      act(() => {
+        (capturedMessageListProps.onScrollToMessage as (id: string) => void)('jump-target');
+      });
+
+      await waitFor(() => expect(pageUrls).toHaveLength(1));
+      await waitFor(() => expect(fakeList.scrollToMessage.mock.results.at(-1)?.value).toBe(true));
+      expect(jumpNotice()).toBeEmptyDOMElement();
+    });
+
+    // kills: initial-history-error gate ignores the empty list
+    it('G8 an error with no messages ends the jump failed without paging', async () => {
+      const urls: string[] = [];
+      mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+        urls.push(String(input));
+        throw new Error('network down');
+      });
+      useChannelStore.setState({ activeChannelId: 'channel-1' });
+      render(<ChatView />);
+      await waitFor(() => expect(capturedMessageListProps).toHaveProperty('isHistoryReady', true));
+      expect(capturedMessageListProps.messages as unknown[]).toHaveLength(0);
+      const fakeList = { scrollToMessage: vi.fn(() => false), scrollToBottomIfNear: vi.fn() };
+      const ref = capturedMessageListProps.ref as { current: unknown } | undefined;
+      expect(ref).toBeDefined();
+      if (ref) ref.current = fakeList;
+
+      act(() => {
+        (capturedMessageListProps.onScrollToMessage as (id: string) => void)('gone');
+      });
+
+      await waitFor(() => expect(jumpNotice()).toHaveTextContent(FAILED_COPY));
+      expect(urls.filter((u) => u.includes('before='))).toHaveLength(0);
+    });
+
+    describe('G2 the search panel and switchChannel', () => {
+      const voice = { ...mockChannel, id: 'voice-1', name: 'lounge', type: 'voice' as const };
+      const bulletin = {
+        ...mockChannel,
+        id: 'bulletin-1',
+        name: 'news',
+        type: 'bulletin' as const,
+      };
+      const elsewhere = { ...mockChannel, id: 'other-1', name: 'away', server_id: 'server-2' };
+
+      beforeEach(() => {
+        useChannelStore.setState({
+          channels: [mockChannel, voice, bulletin, elsewhere],
+          activeChannelId: 'channel-1',
+        });
+      });
+
+      // kills: surface id or onJump not passed to the panel
+      it('G2 hands the panel this surface id and a jump handler', () => {
+        render(<ChatView />);
+
+        expect(typeof capturedSearchPanelProps.onJump).toBe('function');
+        expect(capturedSearchPanelProps.surfaceId).toBeTruthy();
+        const root = document.querySelector('[data-chat-surface]');
+        expect(root).toHaveAttribute('data-chat-surface', capturedSearchPanelProps.surfaceId);
+      });
+
+      // kills: type check inverted
+      it('G2 accepts a bulletin channel of the active server', async () => {
+        render(<ChatView />);
+        expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
+
+        await act(async () => {
+          void capturedSearchPanelProps.onJump?.('bulletin-1', 'm1');
+        });
+
+        expect(useChannelStore.getState().activeChannelId).toBe('bulletin-1');
+      });
+
+      // kills: type check inverted
+      it.each([
+        ['a voice channel', 'voice-1'],
+        ["another server's channel", 'other-1'],
+        ['a channel that is not loaded', 'nowhere'],
+      ])('G2 refuses %s: missing, and the chat stays put', async (_name, targetId) => {
+        render(<ChatView />);
+        let outcome: string | undefined;
+
+        await act(async () => {
+          outcome = await capturedSearchPanelProps.onJump?.(targetId, 'm1');
+        });
+
+        expect(outcome).toBe('missing');
+        expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
+      });
+    });
   });
 
   it('handlePinToggle logs redacted error when pinMessage rejects', async () => {

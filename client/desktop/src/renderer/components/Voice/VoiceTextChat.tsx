@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { MessageSquare, Volume2, PanelBottom, PanelRight } from 'lucide-react';
-import MessageList from '../Chat/MessageList';
+import MessageList, { type MessageListHandle } from '../Chat/MessageList';
 import MessageInput from '../Chat/MessageInput';
+import JumpNotice from '../Chat/JumpNotice';
 import DeleteRefusalModal from '../Chat/DeleteRefusalModal';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useUserStore } from '../../stores/auth/userStore';
@@ -9,6 +10,7 @@ import { useDMStore } from '../../stores/chat/dmStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useTTSSettingsStore } from '../../stores/audio/ttsSettingsStore';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
+import { useJumpToMessage } from '../../hooks/messaging/useJumpToMessage';
 import { useReadMarker } from '../../hooks/messaging/useReadMarker';
 import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
 import { apiFetch } from '../../services/system/apiClient';
@@ -107,19 +109,33 @@ const VoiceTextChat: React.FC = () => {
       });
   }, [isDMCall, targetId, readPath]);
 
-  const { messages, isLoading, hasMore, error, handleLoadMore, isHistoryReady } = useMessageFetch(
-    targetId,
-    {
+  const { messages, isLoading, hasMore, error, handleLoadMore, loadUntil, isHistoryReady } =
+    useMessageFetch(targetId, {
       type: fetchType,
       onFetchComplete: handleFetchComplete,
-    }
-  );
+    });
 
   const currentUserId = user?.id || '';
   // #1959: this panel's id ties its rows, its composer and the delete-refusal flow together,
   // so focus and an open edit never cross into another panel showing messages.
   const surfaceId = useId();
   const editLastMessage = useEditLastMessage(messages, currentUserId, surfaceId);
+  // A reply quote jumps through the same hook as the main chat; this panel shows
+  // one conversation, so it passes no `switchChannel`.
+  const messageListRef = useRef<MessageListHandle>(null);
+  const { jump, notice } = useJumpToMessage({
+    channelId: targetId,
+    isHistoryReady,
+    hasInitialHistoryError: error !== null && messages.length === 0,
+    loadUntil,
+    listRef: messageListRef,
+  });
+  const handleScrollToMessage = useCallback(
+    (messageId: string) => {
+      if (targetId) void jump(targetId, messageId);
+    },
+    [targetId, jump]
+  );
 
   // Advance the read marker while the panel is open (#3289): a message read
   // as it arrives here. Same shape as ChatView and DMChatArea: debounced,
@@ -191,6 +207,7 @@ const VoiceTextChat: React.FC = () => {
       <div className="voice-text-chat__messages">
         <MessageList
           surfaceId={surfaceId}
+          ref={messageListRef}
           key={targetId}
           messages={messages}
           currentUserId={currentUserId}
@@ -205,12 +222,15 @@ const VoiceTextChat: React.FC = () => {
           onEditMessage={editMessage}
           onDeleteMessage={deleteMessage}
           onReply={handleReply}
+          onScrollToMessage={handleScrollToMessage}
           onPinToggle={handlePinToggle}
           canPin={canPin}
           onLatestSeen={handleLatestSeen}
           onLatestLeft={flushSeen}
         />
       </div>
+
+      <JumpNotice text={notice} />
 
       {isSpeaking && (
         <div className="voice-text-chat__tts-indicator">

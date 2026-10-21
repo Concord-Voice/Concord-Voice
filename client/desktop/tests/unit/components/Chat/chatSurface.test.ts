@@ -1,6 +1,7 @@
 import {
   findSurfaceComposer,
   findSurfaceMessageRow,
+  focusComposerIfLost,
   focusSurfaceComposer,
 } from '@/renderer/components/Chat/chatSurface';
 
@@ -236,6 +237,45 @@ describe('chatSurface DOM helpers', () => {
       focusSurfaceComposer('outer');
 
       expect(document.activeElement).toBe(outerComposer);
+    });
+  });
+
+  describe('focusComposerIfLost', () => {
+    it('gives the composer focus when it sits on <body>', () => {
+      const a = makeSurface('surface-a');
+      const composer = makeComposer();
+      a.appendChild(composer);
+      // Positive gate: nothing has focus, which is where a closed panel's button leaves it.
+      expect(document.activeElement).toBe(document.body);
+
+      focusComposerIfLost('surface-a');
+
+      expect(document.activeElement).toBe(composer);
+    });
+
+    it('leaves focus where the user already moved it', () => {
+      const a = makeSurface('surface-a');
+      const composer = makeComposer();
+      a.appendChild(composer);
+      const elsewhere = document.createElement('button');
+      document.body.appendChild(elsewhere);
+      elsewhere.focus();
+      expect(document.activeElement).toBe(elsewhere);
+
+      focusComposerIfLost('surface-a');
+
+      expect(document.activeElement).toBe(elsewhere);
+    });
+
+    it('does nothing for a surface with no composer, never landing on another surface', () => {
+      const withComposer = makeSurface('has-composer');
+      makeSurface('no-composer');
+      withComposer.appendChild(makeComposer());
+      expect(document.activeElement).toBe(document.body);
+
+      expect(() => focusComposerIfLost('no-composer')).not.toThrow();
+
+      expect(document.activeElement).toBe(document.body);
     });
   });
 });

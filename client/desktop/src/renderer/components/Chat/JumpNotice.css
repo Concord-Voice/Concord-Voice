@@ -1,0 +1,22 @@
+/* ─── Jump Notice ───────────────────────────────────────────────────────── */
+
+/* One rule carries the foreground and its background together. */
+.jump-notice {
+  display: block;
+  flex-shrink: 0;
+  padding: calc(6px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  overflow-wrap: break-word;
+}
+
+/* Collapsed, never display: none. That would drop the live region from the
+   accessibility tree, and the first message would not be announced. */
+.jump-notice:empty {
+  height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+}

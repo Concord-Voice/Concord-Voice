@@ -1,19 +1,27 @@
-import React, { useState, useCallback, useRef, useEffect, useMemo, useId } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useId } from 'react';
 import { X, Search } from 'lucide-react';
 import {
   useChannelSearch,
   type SearchResultItem,
   type SearchStatus,
 } from '../../hooks/messaging/useChannelSearch';
+import {
+  JUMP_FAILURE_COPY,
+  type JumpFailure,
+  type JumpOutcome,
+} from '../../hooks/messaging/useJumpToMessage';
 import { ACTIVE_SEARCH_PROFILE } from '../../services/messaging/searchProfile';
-import { useChatStore } from '../../stores/chat/chatStore';
+import { focusSurfaceComposer } from './chatSurface';
 import './SearchPanel.css';
 
 export interface SearchPanelProps {
   channelId: string;
   isOpen: boolean;
   onClose: () => void;
-  onScrollToMessage: (messageId: string) => void;
+  /** Jumps to a message, switching channel first when it lives in another one (#3894). */
+  onJump: (channelId: string, messageId: string, signal?: AbortSignal) => Promise<JumpOutcome>;
+  /** The owner's chat surface, so a jump that leaves this channel can focus that surface's composer. */
+  surfaceId: string;
   /** Channel IDs for server-wide search (only in server context, not DMs) */
   accessibleChannelIds?: string[];
   /** Whether to show server-wide toggle (false for DMs) */
@@ -24,6 +32,10 @@ export interface SearchPanelProps {
    */
   returnFocusRef?: React.RefObject<HTMLElement | null>;
 }
+
+/** What the one card whose Jump was pressed shows. */
+type CardJump =
+  { id: string; phase: 'busy' } | { id: string; phase: 'failed'; outcome: JumpFailure };
 
 function truncateContent(content: string, maxLength = 120): string {
   const codePoints = Array.from(content);
@@ -135,7 +147,8 @@ const SearchPanel: React.FC<SearchPanelProps> = ({
   channelId,
   isOpen,
   onClose,
-  onScrollToMessage,
+  onJump,
+  surfaceId,
   accessibleChannelIds,
   showServerWideToggle = false,
   returnFocusRef,
@@ -143,21 +156,29 @@ const SearchPanel: React.FC<SearchPanelProps> = ({
   const headingId = useId();
   const [query, setQuery] = useState('');
   const [serverWide, setServerWide] = useState(false);
+  const [cardJump, setCardJump] = useState<CardJump | null>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const statusLineRef = useRef<HTMLDivElement>(null);
+  const jumpAbortRef = useRef<AbortController | null>(null);
 
   const scopes = serverWide && accessibleChannelIds ? accessibleChannelIds : undefined;
   const { results, status, search, loadMore, cancel, endSession } = useChannelSearch(channelId, {
     scopes,
   });
 
-  // Jump needs a row the message list holds; it cannot scroll to one it has not loaded. A closed
-  // panel subscribes to nothing, so a busy channel does not re-render it on every message.
-  const channelRows = useChatStore((s) =>
-    isOpen ? s.messagesByChannel.get(channelId) : undefined
-  );
-  const jumpable = useMemo(() => new Set((channelRows ?? []).map((m) => m.id)), [channelRows]);
+  // A card's jump state ends with the card: closing the panel, or results that no
+  // longer include it. Dropped during render, like the hook's channel notice, so no
+  // effect sets state and a card that comes back later does not show a stale line.
+  if (cardJump !== null && (!isOpen || !results.some((r) => r.id === cardJump.id))) {
+    setCardJump(null);
+  }
+
+  // Nothing is left to report to once the state is gone. A jump that ended some
+  // other way is already settled, so aborting it again changes nothing.
+  useEffect(() => {
+    if (cardJump === null) jumpAbortRef.current?.abort();
+  }, [cardJump]);
 
   // Scroll-driven, never visibility-driven: a short list cannot start a chain of chunks.
   const handleResultsScroll = useCallback(
@@ -181,6 +202,7 @@ const SearchPanel: React.FC<SearchPanelProps> = ({
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const newQuery = e.target.value;
       setQuery(newQuery);
+      setCardJump(null);
       if (newQuery.trim()) {
         search(newQuery);
       } else {
@@ -191,11 +213,33 @@ const SearchPanel: React.FC<SearchPanelProps> = ({
   );
 
   const handleJump = useCallback(
-    (messageId: string) => {
-      onScrollToMessage(messageId);
-      onClose();
+    (result: SearchResultItem) => {
+      if (cardJump?.phase === 'busy' && cardJump.id === result.id) return;
+      jumpAbortRef.current?.abort();
+      const crossing = result.channelId !== channelId;
+      const controller = new AbortController();
+      jumpAbortRef.current = controller;
+      setCardJump({ id: result.id, phase: 'busy' });
+      const outcome = onJump(result.channelId, result.id, crossing ? undefined : controller.signal);
+      if (crossing) {
+        // The switch ends this search session, so the jump is not tied to the panel and
+        // is not aborted when it closes. Focus moves now so it is never on <body>.
+        onClose();
+        focusSurfaceComposer(surfaceId);
+      }
+      void outcome.then((o) => {
+        if (crossing || controller.signal.aborted) return;
+        if (o === 'reached') {
+          onClose();
+          setCardJump(null);
+        } else if (o === 'cancelled') {
+          setCardJump(null);
+        } else {
+          setCardJump({ id: result.id, phase: 'failed', outcome: o });
+        }
+      });
     },
-    [onScrollToMessage, onClose]
+    [cardJump, channelId, onJump, onClose, surfaceId]
   );
 
   // The panel closes itself here (Close, the backdrop, Escape). Its focused control unmounts with
@@ -302,7 +346,7 @@ const SearchPanel: React.FC<SearchPanelProps> = ({
             <SearchResultCard
               key={result.id}
               result={result}
-              canJump={jumpable.has(result.id)}
+              jump={cardJump?.id === result.id ? cardJump : undefined}
               onJump={handleJump}
             />
           ))}
@@ -326,13 +370,21 @@ const SearchPanel: React.FC<SearchPanelProps> = ({
 
 function SearchResultCard({
   result,
-  canJump,
+  jump,
   onJump,
 }: Readonly<{
   result: SearchResultItem;
-  canJump: boolean;
-  onJump: (id: string) => void;
+  jump: CardJump | undefined;
+  onJump: (result: SearchResultItem) => void;
 }>) {
+  const errorId = useId();
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const busy = jump?.phase === 'busy';
+  const failure = jump?.phase === 'failed' ? jump.outcome : null;
+  // A card scrolled partly out of the results list would hide the line that says why Jump failed.
+  useEffect(() => {
+    if (failure) errorRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [failure]);
   return (
     <div className="search-result-card">
       <div className="search-result-meta">
@@ -342,10 +394,20 @@ function SearchResultCard({
         </span>
       </div>
       <div className="search-result-content">{truncateContent(result.content)}</div>
-      {canJump && (
-        <button className="search-result-jump" onClick={() => onJump(result.id)}>
-          Jump
-        </button>
+      {/* aria-disabled, never disabled: a natively disabled button drops focus to <body>. */}
+      <button
+        type="button"
+        className="search-result-jump"
+        aria-disabled={busy ? 'true' : undefined}
+        aria-describedby={failure ? errorId : undefined}
+        onClick={() => onJump(result)}
+      >
+        {busy ? 'Jumping…' : 'Jump'}
+      </button>
+      {failure && (
+        <p id={errorId} ref={errorRef} role="alert" className="search-result-jump-error">
+          {JUMP_FAILURE_COPY[failure]}
+        </p>
       )}
     </div>
   );
