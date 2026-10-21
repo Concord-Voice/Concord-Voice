@@ -2610,16 +2610,16 @@ acquire_deploy_transaction_lock() {
   # actor, which means no contender -- the interlock is protecting against
   # something that cannot exist on that host.
   #
-  # Scoped to the WAITING callers on purpose. nginx-reload and sudoers-sync are
-  # managed-only paths that legitimately require the lock, and their strict
-  # behaviour is untouched: they pass no wait, so they never take this branch.
+  # nginx-reload and sudoers-sync are managed-only paths that require the lock,
+  # even though they now wait for a contending healthwatch cycle.
   # The skip is ANNOUNCED, never silent. A deploy that quietly runs without the
   # interlock it was told it has is the worse failure of the two: it looks
   # identical to one that took the lock. Self-hosted hosts are single-operator
   # and have no healthwatch actor today, so the exposure is nil -- but that is a
   # property of TODAY'S self-host topology, not a guarantee, and the notice is
   # what makes it re-checkable when that changes.
-  if (( ${DEPLOY_LOCK_WAIT_SECS:-0} > 0 )) \
+  if [[ "$operation" != nginx-reload && "$operation" != sudoers-sync ]] \
+     && (( ${DEPLOY_LOCK_WAIT_SECS:-0} > 0 )) \
      && [[ ! -d "$(dirname "$DEPLOY_TRANSACTION_LOCK_PATH")" ]]; then
     echo "  ℹ ${operation}: no $(dirname "$DEPLOY_TRANSACTION_LOCK_PATH") — running WITHOUT the deploy transaction lock." >&2
     echo "    Expected on a self-hosted host: that directory and the #3107 healthwatch actor are both" >&2
@@ -2756,10 +2756,7 @@ if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
 fi
 
 case "${1:-help}" in
-  nginx-reload|sudoers-sync)
-    acquire_deploy_transaction_lock "$@"
-    ;;
-  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap)
+  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|nginx-reload|sudoers-sync)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -2774,6 +2771,8 @@ case "${1:-help}" in
     # carrying a 45s stop_grace_period. Failing the deploy there would surface as
     # an unexplained "lock is busy" on a few percent of deploys and read as CI
     # flake. 90s comfortably exceeds the actor's worst-case hold.
+    # The early post-rsync sudoers and nginx transactions need the same wait:
+    # a healthy actor cycle must not fail Main CD before the rebuild begins.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
     ;;

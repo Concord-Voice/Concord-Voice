@@ -153,6 +153,61 @@ func TestRunVoiceCommandOwnerRecoveryRefusesMissingProofBeforeConfiguration(t *t
 	assert.Equal(t, 64, code, "stop proof validation must precede serving configuration and broker access")
 }
 
+func TestRunVoiceCommandOwnerInspectRejectsArgumentsBeforeConfiguration(t *testing.T) {
+	t.Setenv("DATABASE_URL", "://invalid")
+	t.Setenv("NATS_URL", "://invalid")
+	assert.Equal(t, 64, runVoiceCommandOwner([]string{"inspect", "--unexpected"}))
+}
+
+func TestRunVoiceCommandOwnerInspectRefusesUnavailableDatabase(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("DATABASE_URL", "://invalid")
+	db, _, err := openVoiceCommandOwnerStore(context.Background())
+	require.Nil(t, db)
+	require.EqualError(t, err, "voice-command-owner: database unavailable")
+	assert.Equal(t, 1, runVoiceCommandOwner([]string{"inspect"}))
+}
+
+func TestInspectVoiceCommandOwnerRealServices(t *testing.T) {
+	db, _ := mainVoiceReceiptDatabase(t)
+	url, js, ctx := mainVoiceCommandBroker(t)
+	options, _ := provisionMainHeldOwner(ctx, t, db, url, js)
+	before, revision := readMainCommandOwner(t, js)
+
+	status, err := inspectVoiceCommandOwner(ctx, db, url)
+	require.NoError(t, err)
+	assert.Equal(t, "held", status.Phase)
+	assert.Equal(t, revision, status.Revision)
+	assert.Equal(t, options.ExpectedBootID.String(), status.NodeBootID)
+	t.Chdir(t.TempDir())
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("DATABASE_URL", testdb.DatabaseURL())
+	t.Setenv("NATS_URL", url)
+	assert.Zero(t, runVoiceCommandOwner([]string{"inspect"}), "operator command must use the verified read-only path")
+	t.Setenv("NATS_URL", "://invalid")
+	assert.Equal(t, 1, runVoiceCommandOwner([]string{"inspect"}), "inspection must refuse an unavailable broker")
+	t.Setenv("NATS_URL", url)
+	after, afterRevision := readMainCommandOwner(t, js)
+	assert.Equal(t, before, after)
+	assert.Equal(t, revision, afterRevision, "inspection must not change ownership")
+
+	require.NoError(t, recoverVoiceCommandOwner(ctx, db, url, options))
+	status, err = inspectVoiceCommandOwner(ctx, db, url)
+	require.NoError(t, err)
+	assert.Equal(t, "released", status.Phase)
+	assert.Greater(t, status.Revision, revision)
+	assert.Equal(t, options.ExpectedBootID.String(), status.NodeBootID)
+
+	require.NoError(t, js.DeleteStream("VOICE_COMMANDS_V1"))
+	_, err = inspectVoiceCommandOwner(ctx, db, url)
+	require.Error(t, err, "inspection must refuse a missing receipt-bound stream")
+	_, err = db.Exec(`DELETE FROM voice_command_transport`)
+	require.NoError(t, err)
+	_, err = inspectVoiceCommandOwner(ctx, db, url)
+	require.Error(t, err, "inspection must refuse a missing committed receipt")
+}
+
 func TestRecoverVoiceCommandOwnerExactHeldRealServices(t *testing.T) {
 	db, _ := mainVoiceReceiptDatabase(t)
 	url, js, ctx := mainVoiceCommandBroker(t)

@@ -290,6 +290,32 @@ func (c *Client) Verify(ctx context.Context, receipt voicecommand.TransportRecei
 	return err
 }
 
+// VoiceCommandOwnerStatus is a verified, read-only snapshot for local operators.
+type VoiceCommandOwnerStatus struct {
+	Phase      string
+	Revision   uint64
+	NodeBootID string
+}
+
+// InspectVoiceCommandOwner verifies the resource receipt before reading the owner.
+func (c *Client) InspectVoiceCommandOwner(ctx context.Context, receipt voicecommand.TransportReceipt) (VoiceCommandOwnerStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, voiceCommandAPIBudget)
+	defer cancel()
+	js, kvManager, err := c.voiceCommandJetStream(ctx)
+	if err != nil {
+		return VoiceCommandOwnerStatus{}, err
+	}
+	_, entry, owner, err := verifiedVoiceCommandOwner(ctx, js, kvManager, receipt)
+	if err != nil {
+		return VoiceCommandOwnerStatus{}, err
+	}
+	status := VoiceCommandOwnerStatus{Phase: owner.Phase, Revision: entry.Revision()}
+	if owner.NodeBootID != nil {
+		status.NodeBootID = *owner.NodeBootID
+	}
+	return status, nil
+}
+
 func verifiedVoiceCommandOwner(ctx context.Context, js natssdk.JetStreamContext, kvManager jetstream.JetStream, receipt voicecommand.TransportReceipt) (jetstream.KeyValue, jetstream.KeyValueEntry, voiceCommandOwnerRecord, error) {
 	var owner voiceCommandOwnerRecord
 	if !receipt.Identity.Valid() || !canonicalVoiceCommandUUID.MatchString(receipt.Generation.String()) {

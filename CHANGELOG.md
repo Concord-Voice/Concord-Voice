@@ -89,6 +89,8 @@ you verify your email.
 
 ### Fixed
 
+- **Go certificate validation updated** — control-plane and operations-agent builds use Go 1.27.3, which includes the `crypto/x509` fix for [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809).
+
 - **Attachments in call text chat** (internal development reference omitted) — encrypted attachments can now upload and send in the
   active call's DM conversation or a server call's linked text channel. Cancelling an upload
   or closing its composer stops legacy uploads too, and late responses cannot send a message

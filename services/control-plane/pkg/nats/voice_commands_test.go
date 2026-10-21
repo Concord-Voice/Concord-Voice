@@ -690,6 +690,35 @@ func TestVoiceCommandReleaseInitialOwnerRealJetStream(t *testing.T) {
 	})
 }
 
+func TestInspectVoiceCommandOwnerRealJetStream(t *testing.T) {
+	client, js, ctx := voiceCommandBroker(t)
+	generation := uuid.New()
+	identity, err := client.Initialize(ctx, generation)
+	require.NoError(t, err)
+	receipt := voicecommand.TransportReceipt{Generation: generation, Identity: identity}
+
+	status, err := client.InspectVoiceCommandOwner(ctx, receipt)
+	require.NoError(t, err)
+	assert.Equal(t, VoiceCommandOwnerStatus{Phase: "initializing", Revision: identity.InitializingRevision}, status)
+
+	require.NoError(t, client.ReleaseInitialOwner(ctx, receipt))
+	boot := uuid.New().String()
+	_, revision := holdCommandOwner(t, js, boot)
+	status, err = client.InspectVoiceCommandOwner(ctx, receipt)
+	require.NoError(t, err)
+	assert.Equal(t, VoiceCommandOwnerStatus{Phase: "held", Revision: revision, NodeBootID: boot}, status)
+
+	invalid := receipt
+	invalid.Identity.InitializingRevision++
+	_, err = client.InspectVoiceCommandOwner(ctx, invalid)
+	require.ErrorIs(t, err, ErrVoiceCommandContinuity)
+	_, err = (&Client{}).InspectVoiceCommandOwner(ctx, receipt)
+	require.Error(t, err)
+	retained, retainedRevision := readCommandOwner(t, js)
+	assert.Equal(t, "held", retained.Phase)
+	assert.Equal(t, revision, retainedRevision, "read-only inspection and refusals cannot change ownership")
+}
+
 func TestVoiceCommandReceiptRejectsRecreatedResourcesRealJetStream(t *testing.T) {
 	for _, resource := range []string{"stream", "bucket"} {
 		t.Run("same configuration and generation cannot mask recreated "+resource, func(t *testing.T) {

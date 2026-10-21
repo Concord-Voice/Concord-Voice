@@ -21,6 +21,53 @@ import (
 
 const voiceCommandOwnerRecoveryBudget = 10 * time.Second
 const voiceCommandOwnerRecoveryUsage = "usage: control-plane voice-command-owner recover --expected-revision N --expected-boot-id UUID --confirm-predecessor-stopped"
+const voiceCommandOwnerInspectUsage = "usage: control-plane voice-command-owner inspect"
+
+func runVoiceCommandOwner(args []string) int {
+	if len(args) > 0 && args[0] == "inspect" {
+		return runVoiceCommandOwnerInspect(args)
+	}
+	return runVoiceCommandOwnerRecovery(args)
+}
+
+func runVoiceCommandOwnerInspect(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, voiceCommandOwnerInspectUsage)
+		return 64
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), voiceCommandOwnerRecoveryBudget)
+	defer cancel()
+	db, natsURL, err := openVoiceCommandOwnerStore(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeVoiceCommandOwnerStore(db)
+	status, err := inspectVoiceCommandOwner(ctx, db, natsURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "voice-command-owner: inspection refused; verify transport continuity")
+		return 1
+	}
+	fmt.Printf("phase=%s revision=%d node_boot_id=%s receipt=verified\n", status.Phase, status.Revision, status.NodeBootID)
+	return 0
+}
+
+func inspectVoiceCommandOwner(ctx context.Context, db *sql.DB, url string) (status natsclient.VoiceCommandOwnerStatus, returnErr error) {
+	receipt, err := voicecommand.LoadReceipt(ctx, db)
+	if err != nil {
+		return status, err
+	}
+	client, err := natsclient.NewVoiceCommandClient(ctx, url)
+	if err != nil {
+		return status, err
+	}
+	defer func() {
+		if err := client.Close(); err != nil && !errors.Is(err, natsclient.ErrDrainNothingToDo) {
+			returnErr = errors.Join(returnErr, errors.New("close voice command inspection broker failed"))
+		}
+	}()
+	return client.InspectVoiceCommandOwner(ctx, receipt)
+}
 
 type voiceCommandOwnerRecoveryOptions struct {
 	ExpectedRevision          uint64
@@ -67,22 +114,13 @@ func runVoiceCommandOwnerRecovery(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), voiceCommandOwnerRecoveryBudget)
 	defer cancel()
-	cfg, err := config.Load()
+	db, natsURL, err := openVoiceCommandOwnerStore(ctx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "voice-command-owner: configuration unavailable")
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	db, err := openVoiceCommandRecoveryDB(ctx, cfg.DatabaseURL)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "voice-command-owner: database unavailable")
-		return 1
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			fmt.Fprintln(os.Stderr, "voice-command-owner: database close failed")
-		}
-	}()
-	if err := recoverVoiceCommandOwner(ctx, db, cfg.NATSUrl, options); err != nil {
+	defer closeVoiceCommandOwnerStore(db)
+	if err := recoverVoiceCommandOwner(ctx, db, natsURL, options); err != nil {
 		// Connection/configuration errors can contain URL credentials. The
 		// command emits a fixed refusal rather than writing that error to stderr.
 		fmt.Fprintln(os.Stderr, "voice-command-owner: recovery refused; verify transport continuity and exact stopped predecessor")
@@ -90,6 +128,24 @@ func runVoiceCommandOwnerRecovery(args []string) int {
 	}
 	fmt.Println("voice-command-owner: ownership released")
 	return 0
+}
+
+func openVoiceCommandOwnerStore(ctx context.Context) (*sql.DB, string, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, "", errors.New("voice-command-owner: configuration unavailable")
+	}
+	db, err := openVoiceCommandRecoveryDB(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, "", errors.New("voice-command-owner: database unavailable")
+	}
+	return db, cfg.NATSUrl, nil
+}
+
+func closeVoiceCommandOwnerStore(db *sql.DB) {
+	if err := db.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "voice-command-owner: database close failed")
+	}
 }
 
 func openVoiceCommandRecoveryDB(ctx context.Context, databaseURL string) (*sql.DB, error) {

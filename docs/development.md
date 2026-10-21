@@ -21,8 +21,8 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
   `client/admin` need **Node.js >= 24.15.0**, and `services/media-plane` needs
   **>= 24.11.0**. Node 26 is included. Each workspace's `package.json` `engines`
   field is authoritative. Go-only work does not require Node.js
-- **Go** 1.27.2 (the supported toolchain, recorded in `services/control-plane/go.mod`)
-  Select this exact release with `GOTOOLCHAIN=go1.27.2` if a newer Go is installed;
+- **Go** 1.27.3 (the supported toolchain, recorded in `services/control-plane/go.mod`)
+  Select this exact release with `GOTOOLCHAIN=go1.27.3` if a newer Go is installed;
   CI and both Docker builders use the same version. pre-commit builds the
   golangci-lint hook with your system Go, so a system Go older than 1.27 makes that
   hook fail; upgrade Go, then run `pre-commit clean` so the hook rebuilds

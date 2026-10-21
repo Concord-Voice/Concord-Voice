@@ -70,7 +70,7 @@ func dispatchControlPlaneSubcommand(args []string) (int, bool) {
 		activityHistory:         presencehistory.RunAdminCtl,
 		storageProbe:            probe.Run,
 		voiceEnforcementRollout: runVoiceEnforcementRollout,
-		voiceCommandOwner:       runVoiceCommandOwnerRecovery,
+		voiceCommandOwner:       runVoiceCommandOwner,
 	})
 }
 

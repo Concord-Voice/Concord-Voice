@@ -20,7 +20,7 @@ RUN npm run build && test -f dist/index.html
 # the shipped stdlib directly, without a GOTOOLCHAIN build-time download.
 # The `go` directive separately controls the module's compatibility defaults.
 # scripts/check-go-toolchain.py enforces alignment with Dockerfile.ops-agent.
-FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS builder
+FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
 
 WORKDIR /app
 
