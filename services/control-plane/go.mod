@@ -3,7 +3,7 @@ module github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane
 go 1.27.2
 
 require (
-	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/fxamacker/cbor/v2 v2.9.6
 	github.com/gin-gonic/gin v1.12.0
