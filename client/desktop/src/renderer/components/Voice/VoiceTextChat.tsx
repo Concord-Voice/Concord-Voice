@@ -14,6 +14,7 @@ import { useEditLastMessage } from '../../hooks/messaging/useEditLastMessage';
 import { apiFetch } from '../../services/system/apiClient';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useVoiceTextChatTarget } from '../../hooks/voice/useVoiceTextChatTarget';
+import type { AttachmentSummary } from '../../types/chat';
 import './VoiceTextChat.css';
 
 const VoiceTextChat: React.FC = () => {
@@ -147,7 +148,7 @@ const VoiceTextChat: React.FC = () => {
     mentionMeta?: string,
     replyToId?: string,
     attachmentIds?: string[],
-    attachments?: import('../../types/chat').AttachmentSummary[]
+    attachments?: AttachmentSummary[]
   ) => {
     if (!targetId) return;
     sendMessage(content, { mentionMeta, replyToId, attachmentIds, attachments });
@@ -230,6 +231,8 @@ const VoiceTextChat: React.FC = () => {
           <MessageInput
             onSendMessage={handleSendMessage}
             onTyping={sendTyping}
+            channelId={isDMCall ? undefined : targetId}
+            conversationId={isDMCall ? targetId : undefined}
             channelName={targetName}
             disabled={!currentUserId}
             placeholder={`Message ${targetName} text chat...`}

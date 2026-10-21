@@ -117,6 +117,11 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
       kind: 'simulcast',
       encodings: (() => {
         const ladder = simulcastLadderBitrates(input.maxBitrate);
+        // mediasoup defaults omitted simulcast modes to L1T3 on EVERY encoding.
+        // Hardware H264 encoders can reject temporal layering after negotiation,
+        // leaving the remote feed black when a gate change enables simulcast.
+        // Pin all H264 rungs to L1T1; one omitted rung would restore L1T3 for all.
+        const temporalMode = mime === 'video/h264' ? { scalabilityMode: 'L1T1' } : {};
         // `priority` / `networkPriority` are PER-SENDER in libwebrtc, not per-encoding, so
         // they ride encoding[0] alone. `UnimplementedRtpParameterHasValue` rejects a
         // non-default value on any encoding after index 0, and BOTH publish paths run that
@@ -128,9 +133,9 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
         // libwebrtc defaults, so every other setting throws -- and the app default is
         // 'medium'. Do NOT "restore symmetry" by spreading `base` again.
         return [
-          { ...base, rid: 'q', scaleResolutionDownBy: 4, maxBitrate: ladder.q },
-          { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: ladder.h },
-          { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: ladder.f },
+          { ...base, ...temporalMode, rid: 'q', scaleResolutionDownBy: 4, maxBitrate: ladder.q },
+          { ...temporalMode, rid: 'h', scaleResolutionDownBy: 2, maxBitrate: ladder.h },
+          { ...temporalMode, rid: 'f', scaleResolutionDownBy: 1, maxBitrate: ladder.f },
         ];
       })(),
     };

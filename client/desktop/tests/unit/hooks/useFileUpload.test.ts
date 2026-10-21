@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { deferred } from '../../helpers/deferred';
+import { resetAllStores } from '../../helpers/store-helpers';
 import { renderHook, act } from '@testing-library/react';
 import {
   useFileUpload,
@@ -1411,6 +1413,7 @@ describe("useFileUpload — A10'-a: no whole-file buffering on the chunked path"
 
 describe('useFileUpload — cancel, stall, and unmount', () => {
   beforeEach(() => {
+    resetAllStores();
     // RTL auto-unmounts each prior hook at cleanup, and every one of those that
     // left a session open fires the abandon DELETE. Without this the counts
     // below measure the whole describe block, not the test.
@@ -1456,6 +1459,47 @@ describe('useFileUpload — cancel, stall, and unmount', () => {
       signal: () => seenSignal,
     };
   }
+
+  it.each(['cancel', 'unmount'] as const)(
+    'discards an already completed upload when %s wins before its continuation',
+    async (action) => {
+      const flight = deferred<{ file_id: string }>();
+      const started = deferred();
+      mockUploadAttachmentChunked.mockImplementationOnce(() => {
+        started.resolve();
+        return flight.promise;
+      });
+      const { result, unmount } = renderHook(() => useFileUpload());
+      await act(async () => {
+        await result.current.addFiles([createMockFile('hello.txt', 5)]);
+      });
+      let done!: ReturnType<typeof result.current.uploadAll>;
+      await act(async () => {
+        done = result.current.uploadAll('channel-1');
+        await started.promise;
+      });
+      await act(async () => {
+        // Model a response already resolved when cleanup/cancel runs. Aborting
+        // transport alone cannot withdraw this successful promise result.
+        flight.resolve({ file_id: 'late-file' });
+        if (action === 'cancel') result.current.cancelUpload(result.current.files[0].uploadId);
+        else unmount();
+        expect(await done).toEqual({ ids: [], summaries: [], cancelled: true });
+      });
+      if (action === 'cancel') {
+        expect(result.current.files[0].status).toBe('cancelled');
+        // A subsequent send with the cancelled card still present is also a
+        // deliberate stop, even though this time no request starts.
+        await act(async () => {
+          expect(await result.current.uploadAll('channel-1')).toEqual({
+            ids: [],
+            summaries: [],
+            cancelled: true,
+          });
+        });
+      }
+    }
+  );
 
   it('a cancelled upload is CANCELLED, not an error', async () => {
     // A user who pressed stop has not hit a failure. Reporting one as `error`

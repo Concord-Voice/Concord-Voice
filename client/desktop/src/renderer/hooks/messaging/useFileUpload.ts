@@ -68,7 +68,9 @@ export interface FileUploadState {
   height?: number;
 }
 
-interface UploadResult {
+export interface UploadResult {
+  /** The send attempt was deliberately stopped; this is not an upload failure. */
+  cancelled?: boolean;
   ids: string[];
   summaries: AttachmentSummary[];
 }
@@ -274,6 +276,7 @@ interface UploadContext {
    *  session no client-side path can ever abandon. This is what stops the
    *  loop, and it is the wiring the old dead abortRef never had. */
   stopped: { current: boolean };
+  cancelled: boolean;
   limit: AttachmentLimit;
 }
 
@@ -400,6 +403,9 @@ async function uploadOnePending(
         )
       );
     });
+    // A response may have resolved just before cancel/unmount ran. Do not
+    // accept its id after the owning operation has stopped.
+    if (controller.signal.aborted || ctx.stopped.current) throw new UploadAbortedError();
     setFiles((prev) =>
       prev.map((f) =>
         f.uploadId === uploadId
@@ -419,6 +425,7 @@ async function uploadOnePending(
     // A cancel is not a failure. Reporting one as `error` would put a red row
     // and a retry affordance in front of a user who just asked it to stop.
     const cancelled = controller.signal.aborted || err instanceof UploadAbortedError;
+    if (cancelled) ctx.cancelled = true;
     const errorMsg = err instanceof Error ? err.message : 'Upload failed';
     const terminal = cancelled
       ? { status: 'cancelled' as const, stalled: false, error: undefined }
@@ -531,6 +538,7 @@ function isDoneWithId(f: FileUploadState): f is FileUploadState & { id: string }
 function collectDoneFiles(files: FileUploadState[]): UploadResult {
   const done = files.filter(isDoneWithId);
   return {
+    ...(files.some((f) => f.status === 'cancelled') ? { cancelled: true } : {}),
     ids: done.map((f) => f.id),
     summaries: done.map((f) => buildSummary(f.id, f)),
   };
@@ -607,6 +615,7 @@ async function uploadSingleFile(
   const response = await apiFetch('/api/v1/media/upload/attachment', {
     method: 'POST',
     body: formData,
+    signal,
   });
   if (!response.ok) {
     const errBody = await response.text();
@@ -920,6 +929,7 @@ export function useFileUpload() {
           fileAborts: fileAbortsRef.current,
           liveSessions: liveSessionsRef.current,
           stopped: stoppedRef,
+          cancelled: files.some((f) => f.status === 'cancelled'),
           limit: limitRef.current,
         };
         const pending = await uploadPendingFiles(files, setFiles, ctx);
@@ -933,6 +943,7 @@ export function useFileUpload() {
             : { ids: [], summaries: [] };
 
         return {
+          ...(ctx.cancelled ? { cancelled: true } : {}),
           ids: [...pending.ids, ...extra.ids],
           summaries: [...pending.summaries, ...extra.summaries],
         };

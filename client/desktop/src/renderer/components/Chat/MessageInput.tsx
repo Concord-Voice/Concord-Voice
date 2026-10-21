@@ -21,7 +21,11 @@ import {
   type ParsedMention,
 } from '../../utils/messaging/mentions';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
-import { useFileUpload, type AttachmentRejection } from '../../hooks/messaging/useFileUpload';
+import {
+  useFileUpload,
+  type AttachmentRejection,
+  type UploadResult,
+} from '../../hooks/messaging/useFileUpload';
 import { useDraftMessage } from '../../hooks/messaging/useDraftMessage';
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useMessageCharLimit } from '../../hooks/messaging/useMessageCharLimit';
@@ -84,14 +88,14 @@ async function tryUploadAttachments(
     channelId: string,
     conversationId?: string,
     additionalFiles?: File[]
-  ) => Promise<{ ids: string[]; summaries: AttachmentSummary[] }>,
+  ) => Promise<UploadResult>,
   channelId: string,
   conversationId: string | undefined,
   overflowFiles: File[],
   expectedAttachmentCount: number,
   setUploadError: (msg: string | null) => void,
   setUploadStatus: (msg: string | null) => void
-): Promise<{ ids: string[]; summaries: AttachmentSummary[] } | null> {
+): Promise<UploadResult | null> {
   setUploadError(null);
   setUploadStatus(null);
   try {
@@ -100,6 +104,7 @@ async function tryUploadAttachments(
       conversationId,
       overflowFiles.length > 0 ? overflowFiles : undefined
     );
+    if (result.cancelled) return null;
     if (result.ids.length < expectedAttachmentCount) {
       setUploadError('Failed to upload all attachments');
       return null;
@@ -268,6 +273,14 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const isSendingRef = useRef(false);
+  const sendGenerationRef = useRef(0);
+  useEffect(
+    () => () => {
+      // Invalidate awaiting sends, including across StrictMode effect replay.
+      sendGenerationRef.current += 1;
+    },
+    []
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     files: uploadFiles,
@@ -695,11 +708,33 @@ const MessageInput: React.FC<MessageInputProps> = ({
     }
   };
 
+  const resetAfterSend = (isOverflow: boolean) => {
+    if (isOverflow) {
+      setUploadStatus('Long message sent as a .md attachment.');
+    } else {
+      setUploadError(null);
+    }
+
+    setContent('');
+    clearDraftNow();
+    setShowMentions(false);
+    selectedMentionsRef.current = [];
+    clearFiles();
+    setRejections([]);
+    setAcceptedCount(0);
+    setSelectionCount(0);
+    onCancelReply?.();
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
+  };
+
   const handleSend = async () => {
     // Guard against concurrent invocations (e.g., double-tap Enter before
     // isUploading becomes true on the next render cycle).
     if (isSendingRef.current) return;
     isSendingRef.current = true;
+    const sendGeneration = sendGenerationRef.current;
 
     try {
       const trimmedContent = content.trim();
@@ -746,29 +781,13 @@ const MessageInput: React.FC<MessageInputProps> = ({
         }
       }
 
+      if (sendGeneration !== sendGenerationRef.current) return;
       const sendContent = finalContent || (attachmentIds ? ' ' : '');
       if (!sendContent) return;
 
       onSendMessage(sendContent, mentionMeta, replyingTo?.id, attachmentIds, attachmentSummaries);
 
-      if (isOverflow) {
-        setUploadStatus('Long message sent as a .md attachment.');
-      } else {
-        setUploadError(null);
-      }
-
-      setContent('');
-      clearDraftNow();
-      setShowMentions(false);
-      selectedMentionsRef.current = [];
-      clearFiles();
-      setRejections([]);
-      setAcceptedCount(0);
-      setSelectionCount(0);
-      onCancelReply?.();
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
+      resetAfterSend(isOverflow);
     } finally {
       isSendingRef.current = false;
     }

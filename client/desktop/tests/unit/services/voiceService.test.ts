@@ -5121,6 +5121,47 @@ describe('VoiceService', () => {
   // ===== Codec Selection =====
 
   describe('codec selection', () => {
+    it.each(['camera', 'screen'] as const)(
+      'publishes H264 with one temporal layer per rung after the %s gate turns on',
+      async (source) => {
+        useVideoSettingsStore.setState({
+          preferredVideoCodec: 'video/H264',
+          hardwareAcceleration: false,
+          supportSimulcast: true,
+        });
+        const { sendTransport } = await joinVoiceChannel();
+        const stream = createMockMediaStream([{ kind: 'video', id: 'layer-gate-track' }]);
+        if (source === 'camera') {
+          mockGetUserMedia.mockResolvedValue(stream);
+          await voiceService.toggleVideo();
+        } else {
+          mockGetDisplayMedia.mockResolvedValue(stream);
+          await voiceService.produceScreen();
+        }
+        sendTransport.produce.mockClear();
+
+        const handler = socketListeners[`${source}-layering-gate`]?.[0];
+        expect(handler).toBeDefined();
+        handler?.({ enabled: true });
+
+        await vi.waitFor(() => {
+          expect(sendTransport.produce).toHaveBeenCalledWith(
+            expect.objectContaining({
+              codec: expect.objectContaining({ mimeType: 'video/H264' }),
+              stopTracks: false,
+              encodings: [
+                expect.objectContaining({ scalabilityMode: 'L1T1' }),
+                expect.objectContaining({ scalabilityMode: 'L1T1' }),
+                expect.objectContaining({ scalabilityMode: 'L1T1' }),
+              ],
+            })
+          );
+        });
+        const state = useVoiceStore.getState();
+        expect(source === 'camera' ? state.isVideoOn : state.isScreenSharing).toBe(true);
+      }
+    );
+
     it('pickCameraCodec returns VP8 as last resort', async () => {
       await joinVoiceChannel();
       // Access private method via any cast

@@ -7,6 +7,7 @@ import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { deferred } from '../../../helpers/deferred';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 const mockSidebarProfiles = vi.hoisted(() => ({
@@ -607,6 +608,38 @@ describe('MessageInput', () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
     const sendButton = screen.getByLabelText('Send message');
     expect(sendButton).toBeDisabled();
+  });
+
+  it('does not send a late successful upload after unmount', async () => {
+    uploadMockOverrides.hasFiles = true;
+    const upload = deferred<{ ids: string[]; summaries: [] }>();
+    mockUploadAll.mockReturnValueOnce(upload.promise);
+    const view = render(<MessageInput onSendMessage={onSendMessage} channelId="channel-1" />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'with files' } });
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', code: 'Enter' });
+    expect(mockUploadAll).toHaveBeenCalled();
+    view.unmount();
+    await act(async () => {
+      upload.resolve({ ids: ['late-file'], summaries: [] });
+      await upload.promise;
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('preserves the draft without an error when attachment upload is cancelled', async () => {
+    uploadMockOverrides.hasFiles = true;
+    uploadMockOverrides.files = [{ file: { name: 'hello.txt' }, status: 'cancelled' }];
+    mockUploadAll.mockResolvedValueOnce({ ids: [], summaries: [], cancelled: true });
+    render(<MessageInput onSendMessage={onSendMessage} channelId="channel-1" />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'keep this draft' } });
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', code: 'Enter' });
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect(mockClearFiles).not.toHaveBeenCalled();
+    expect(screen.getByRole('textbox')).toHaveValue('keep this draft');
+    expect(screen.queryByText('Failed to upload all attachments')).not.toBeInTheDocument();
+    expect(screen.queryByText('Failed to upload attachments')).not.toBeInTheDocument();
   });
 
   it('calls uploadAll and onSendMessage when sending with files', async () => {

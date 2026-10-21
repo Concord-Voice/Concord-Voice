@@ -38,6 +38,27 @@ describe('resolveCameraScalabilityMode', () => {
 });
 
 describe('buildCameraEncodingPlan', () => {
+  it.each(['video/H264', 'video/h264'])(
+    'explicitly limits every %s simulcast encoding to one temporal layer',
+    (mimeType) => {
+      const plan = buildCameraEncodingPlan({
+        codec: codec(mimeType),
+        maxBitrate: 2_500_000,
+        scalabilityMode: 'L3T3',
+        priority,
+        eligibility: ALL_ELIGIBLE,
+      });
+      // mediasoup defaults OMITTED simulcast modes to L1T3 before addTransceiver.
+      // All rungs must opt out: its handler takes the highest temporal count.
+      expect(plan.encodings).toHaveLength(3);
+      expect(plan.encodings.map((encoding) => encoding.scalabilityMode)).toEqual([
+        'L1T1',
+        'L1T1',
+        'L1T1',
+      ]);
+    }
+  );
+
   it('uses one SVC encoding for AV1', () => {
     const plan = buildCameraEncodingPlan({
       codec: codec('video/AV1'),
@@ -82,9 +103,15 @@ describe('buildCameraEncodingPlan', () => {
     // rejects those per-sender fields on any encoding after index 0. See the `per-sender RTP
     // encoding parameters (libwebrtc contract)` suite below, which owns that rule.
     expect(plan.encodings).toEqual([
-      { rid: 'q', scaleResolutionDownBy: 4, maxBitrate: 176_056, ...priority },
-      { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 563_380 },
-      { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 1_760_564 },
+      {
+        rid: 'q',
+        scaleResolutionDownBy: 4,
+        maxBitrate: 176_056,
+        scalabilityMode: 'L1T1',
+        ...priority,
+      },
+      { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 563_380, scalabilityMode: 'L1T1' },
+      { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 1_760_564, scalabilityMode: 'L1T1' },
     ]);
     expect(plan.encodings.reduce((sum, encoding) => sum + (encoding.maxBitrate ?? 0), 0)).toBe(
       2_500_000

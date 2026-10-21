@@ -89,6 +89,13 @@ you verify your email.
 
 ### Fixed
 
+- **Attachments in call text chat** (internal development reference omitted) — encrypted attachments can now upload and send in the
+  active call's DM conversation or a server call's linked text channel. Cancelling an upload
+  or closing its composer stops legacy uploads too, and late responses cannot send a message
+  after the composer closes. Deliberate cancellation keeps the draft without an upload-failure alert.
+- **H.264 video after another camera turns on** (internal development reference omitted) — layered camera and screen publishing now
+  explicitly uses one temporal layer per H.264 stream, avoiding an unsupported encoder mode
+  that can leave a remote video tile black.
 - **Animated image uploads use less server memory** (internal development reference omitted) — the server checks whether an animated GIF is allowed before decoding its frames, rejects animations that exceed the new processing limit, and limits concurrent GIF processing. If processing is busy, an upload can be retried. Static GIFs and allowed smaller animations continue to upload.
 - **Blue/green retries preserve call and room ownership** (internal development reference omitted) — the call microphone stays paused during microphone and output tests through an initial ownership retry or internal reconnect. Concurrent room placement waits recheck for a room created by the first caller, so they cannot replace its participants. Heartbeats take their room snapshot after drain and demotion checks, so a room closed during those waits is not advertised again. Both drained-readiness probes use Node's bounded fetch, preserving the response body for the expected 503 and refusing other statuses or network failures. Blue/green remains off by default and first activation still requires separate verification.
 - **TURN relay peer filtering** — correct an IPv6 loopback deny range that also matched IPv4 peers, causing authenticated relay setup to succeed while relayed traffic failed. Private and loopback peer restrictions remain in place.
