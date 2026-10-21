@@ -2374,10 +2374,10 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			INNER JOIN users u ON u.id = m.user_id
 			WHERE m.conversation_id = $1
 			  AND EXISTS (SELECT 1 FROM dm_participants dp WHERE dp.conversation_id = m.conversation_id AND dp.user_id = $4)
-			  AND m.created_at < (SELECT cursor_m.created_at FROM dm_messages cursor_m WHERE cursor_m.id = $2 AND cursor_m.conversation_id = $1
+			  AND (m.created_at, m.id) < (SELECT cursor_m.created_at, cursor_m.id FROM dm_messages cursor_m WHERE cursor_m.id = $2 AND cursor_m.conversation_id = $1
 			  `+purge.HiddenRangeFilter("cursor_m", 4)+`)
 			`+hiddenRangeFilter(4)+`
-			ORDER BY m.created_at DESC
+			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $3
 		`, convID, cursor, limit, userID)
 	} else {
@@ -2392,7 +2392,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			WHERE m.conversation_id = $1
 			  AND EXISTS (SELECT 1 FROM dm_participants dp WHERE dp.conversation_id = m.conversation_id AND dp.user_id = $3)
 			`+hiddenRangeFilter(3)+`
-			ORDER BY m.created_at DESC
+			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $2
 		`, convID, limit, userID)
 	}
