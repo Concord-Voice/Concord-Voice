@@ -3915,6 +3915,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Voice admission dependency unavailable (including a missing or invalid managed TURN key); retry later
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /channels/{id}/voice/participants:
     get:
       tags:
@@ -5920,6 +5926,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '409':
           description: Supplied ring is stale, or another call/cleanup owns the conversation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Voice admission dependency unavailable (including a missing or invalid managed TURN key); retry later
           content:
             application/json:
               schema:

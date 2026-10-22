@@ -24,6 +24,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -144,6 +145,7 @@ func newDMHandlerWithRail(t *testing.T, db *sql.DB, convID string) (*Handler, *r
 	handler := NewHandler(HandlerDeps{
 		DB:          db,
 		Log:         log,
+		Cfg:         &config.Config{},
 		PurgeEngine: purge.NewEngine(db, log, purge.NewReaper(db, log, nil), 5000),
 		ActivePlans: rail,
 	})

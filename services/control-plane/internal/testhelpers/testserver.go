@@ -72,6 +72,7 @@ func (s *SyncBuffer) Reset() {
 // TestServer wraps a fully-wired Gin router with a real DB and Redis for integration testing.
 type TestServer struct {
 	Router                   *gin.Engine
+	Config                   *config.Config
 	Hub                      *websocket.Hub
 	DB                       *sql.DB
 	Redis                    *redis.Client
@@ -183,6 +184,7 @@ func SetupTestServerWithRouterDB(t *testing.T, routerDB *sql.DB) *TestServer {
 
 	return &TestServer{
 		Router:                   router,
+		Config:                   cfg,
 		Hub:                      hub,
 		DB:                       db,
 		Redis:                    redisClient,

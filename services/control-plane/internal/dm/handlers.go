@@ -3017,6 +3017,12 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	if !authorized {
 		return
 	}
+	iceServers, err := h.cfg.ICEServersChecked(userID)
+	if err != nil {
+		h.log.Error("DM voice join TURN key unavailable", "failure_class", "turn_runtime")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
 	// Resolve the joining user's media entitlements server-side from the
 	// AUTHENTICATED user_id (never a client value). Per-user enforcement is
 	// room-kind-independent, so DM voice joins carry the same media_entitlements
@@ -3061,7 +3067,7 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	response := gin.H{
 		"allowed":            true,
 		"media_server_url":   mediaURL,
-		"ice_servers":        h.cfg.ICEServers(userID),
+		"ice_servers":        iceServers,
 		"server_muted":       joinState.serverMuted,
 		"server_deafened":    joinState.serverDeafened,
 		"media_entitlements": mediaEnt,

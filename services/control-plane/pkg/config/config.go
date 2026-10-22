@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -237,6 +238,7 @@ type Config struct {
 	// TURN/STUN (coturn)
 	TURNServerHost string // Hostname or IP of the TURN server (e.g. "turn.concordvoice.chat")
 	TURNSecret     string // Shared secret for HMAC ephemeral credentials
+	TURNSecretFile string // Managed runtime key snapshot; mutually exclusive with TURNSecret
 	TURNRealm      string // TURN realm (e.g. "concordvoice.chat")
 
 	// Client config (#155 Tier 2 + Tier 3)
@@ -482,6 +484,7 @@ func Load() (*Config, error) {
 		MediaPlaneURL:             getEnv("MEDIA_PLANE_URL", "http://localhost:3000"),
 		TURNServerHost:            getEnv("TURN_SERVER_HOST", ""),
 		TURNSecret:                getEnv("TURN_SECRET", ""),
+		TURNSecretFile:            getEnv("TURN_SECRET_FILE", ""),
 		TURNRealm:                 getEnv("TURN_REALM", "localhost"),
 		AllowedOrigins:            parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
 		ClientMinVersion:          strings.TrimSpace(getEnv("CLIENT_MIN_VERSION", "")),
@@ -847,6 +850,14 @@ func loadCloudflareKVBridgeConfig(cfg *Config) error {
 // validate checks for dangerous configuration in production environments.
 // Returns an error if required secrets are missing or still set to dev defaults.
 func (c *Config) validate() error {
+	if c.TURNSecretFile != "" {
+		if !filepath.IsAbs(c.TURNSecretFile) || c.TURNSecret != "" {
+			return fmt.Errorf("TURN_SECRET_FILE must be absolute and cannot be combined with TURN_SECRET")
+		}
+		if strings.TrimSpace(c.TURNServerHost) == "" {
+			return fmt.Errorf("TURN_SECRET_FILE requires TURN_SERVER_HOST")
+		}
+	}
 	if c.RedisCredentialMode != "" && c.RedisCredentialMode != "legacy" && c.RedisCredentialMode != "managed" {
 		return fmt.Errorf("REDIS_CREDENTIAL_MODE must be legacy or managed")
 	}

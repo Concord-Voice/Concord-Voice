@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1828,6 +1829,20 @@ func TestAuthorizeVoiceJoin_Success(t *testing.T) {
 
 	conv := testhelpers.JSONField[map[string]interface{}](t, body, "conversation")
 	assert.Equal(t, convID, conv["id"])
+}
+
+func TestAuthorizeVoiceJoin_MissingManagedTURNKeyRefusesAdmission(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmturnmiss1")
+	user2 := ts.CreateTestUser(t, "dmturnmiss2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	ts.Config.TURNServerHost = "turn.fixture.invalid"
+	ts.Config.TURNSecretFile = filepath.Join(t.TempDir(), "missing-active-key")
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceJoin, nil, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.NotContains(t, w.Body.String(), "ice_servers")
 }
 
 func TestAuthorizeVoiceJoin_EncryptedConversation(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -271,6 +272,30 @@ func TestAuthorizeJoin(t *testing.T) {
 		assert.Equal(t, "", body["display_name"])
 		assert.Equal(t, "", body["avatar_url"])
 	})
+}
+
+func TestAuthorizeJoin_MissingManagedTURNKeyRefusesAdmission(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "turnmissowner")
+	member := ts.CreateTestUser(t, "turnmissmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Missing TURN Key")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-turn-missing")
+	ts.Config.TURNServerHost = "turn.fixture.invalid"
+	ts.Config.TURNSecretFile = filepath.Join(t.TempDir(), "missing-active-key")
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.NotContains(t, w.Body.String(), "ice_servers")
+	var pending int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM voice_pending_admissions WHERE channel_id=$1 AND user_id=$2`, channelID, member.ID).Scan(&pending))
+	assert.Zero(t, pending)
+
+	// A key outage must not reveal the channel to a non-member: 403, like a
+	// nonexistent channel, rather than the member's 503.
+	outsider := ts.CreateTestUser(t, "turnmissoutsider")
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(outsider.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 func TestAuthorizeJoinTimedOutMemberForbidden(t *testing.T) {

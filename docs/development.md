@@ -523,6 +523,7 @@ opt-in unavailable. It does not prevent existing history reads or deletion.
 |----------|---------|-------------|
 | `TURN_EXTERNAL_IP` | (auto-detect) | Public IP for TURN relay |
 | `TURN_SECRET` | (generated) | Shared HMAC secret for ephemeral credentials |
+| `TURN_SECRET_FILE` | (unset) | Absolute path to the managed active-key file (dormant, #3931). Mutually exclusive with `TURN_SECRET` and requires `TURN_SERVER_HOST`; a missing or invalid file makes voice joins return 503. See the [deploy runbook](runbooks/deploys.md#turn-relay-allocation-proof) |
 | `TURN_PORT` | `3478` | STUN/TURN listening port (UDP+TCP) |
 | `TURN_TLS_PORT` | `5349` | STUN/TURN TLS listening port |
 | `TURN_MIN_PORT` | `49152` | Min TURN relay port |

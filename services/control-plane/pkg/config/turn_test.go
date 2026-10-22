@@ -4,6 +4,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha1" // #nosec G505 -- SHA1 required by TURN RFC; mirroring the implementation
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,73 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestICEServersCheckedManagedFileUsesCurrentKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active-turn-key")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 32)), 0o600))
+	cfg := &Config{TURNServerHost: turnHost, TURNSecretFile: path}
+
+	first, err := cfg.ICEServersChecked(turnUser1)
+	require.NoError(t, err)
+	require.Len(t, first, 4)
+	mac := hmac.New(sha1.New, []byte(strings.Repeat("a", 32)))
+	_, err = mac.Write([]byte(first[1].Username))
+	require.NoError(t, err)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(mac.Sum(nil)), first[1].Credential)
+
+	replacement := filepath.Join(filepath.Dir(path), "replacement")
+	require.NoError(t, os.WriteFile(replacement, []byte(strings.Repeat("b", 32)), 0o600))
+	require.NoError(t, os.Rename(replacement, path))
+	second, err := cfg.ICEServersChecked(turnUser1)
+	require.NoError(t, err)
+	mac = hmac.New(sha1.New, []byte(strings.Repeat("b", 32)))
+	_, err = mac.Write([]byte(second[1].Username))
+	require.NoError(t, err)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(mac.Sum(nil)), second[1].Credential)
+	assert.NotEqual(t, first[1].Credential, second[1].Credential)
+}
+
+func TestICEServersCheckedManagedFileFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active-turn-key")
+	cfg := &Config{TURNServerHost: turnHost, TURNSecretFile: path}
+	_, err := cfg.ICEServersChecked(turnUser1)
+	require.Error(t, err, "missing managed key must not become STUN-only")
+
+	for _, tc := range []struct {
+		name string
+		data string
+		mode os.FileMode
+	}{
+		{"empty", "", 0o600},
+		{"short", "short", 0o600},
+		{"newline", strings.Repeat("a", 32) + "\n", 0o600},
+		{"world-readable", strings.Repeat("a", 32), 0o644},
+		{"group-writable", strings.Repeat("a", 32), 0o660},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(path, []byte(tc.data), 0o600))
+			require.NoError(t, os.Chmod(path, tc.mode))
+			servers, err := cfg.ICEServersChecked(turnUser1)
+			require.Error(t, err)
+			assert.Empty(t, servers)
+		})
+	}
+	cfg.TURNSecret = strings.Repeat("l", 32)
+	require.NoError(t, os.Chmod(path, 0o600))
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 32)), 0o600))
+	_, err = cfg.ICEServersChecked(turnUser1)
+	require.Error(t, err, "conflicting legacy key must not be used")
+}
+
+func TestManagedTURNConfigurationRejectsRelativeOrDualSource(t *testing.T) {
+	cfg := &Config{Environment: "test", TURNSecretFile: "relative/key"}
+	require.ErrorContains(t, cfg.validate(), "TURN_SECRET_FILE must be absolute")
+	cfg.TURNSecretFile = filepath.Join(t.TempDir(), "active-key")
+	cfg.TURNSecret = strings.Repeat("l", 32)
+	require.ErrorContains(t, cfg.validate(), "cannot be combined")
+	cfg.TURNSecret = ""
+	require.ErrorContains(t, cfg.validate(), "requires TURN_SERVER_HOST")
+}
 
 const (
 	turnHost   = "turn.concordvoice.chat"

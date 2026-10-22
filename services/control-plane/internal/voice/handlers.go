@@ -706,6 +706,15 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 	channelID = authorization.channelID
+	// Read the managed key only after the authoritative membership and
+	// permission check, so a key outage cannot tell a non-member that a channel
+	// exists (503 vs 403), and still before any admission side effect.
+	iceServers, err := h.cfg.ICEServersChecked(userID)
+	if err != nil {
+		h.log.Error("Voice join TURN key unavailable", "failure_class", "turn_runtime")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
 
 	// Resolve the server's Mach tier once and reuse it for both the media
 	// entitlement and the room-cap tier below: same serverID and request
@@ -763,7 +772,7 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	response := gin.H{
 		"allowed":            true,
 		"media_server_url":   mediaURL,
-		"ice_servers":        h.cfg.ICEServers(userID),
+		"ice_servers":        iceServers,
 		"permissions":        strconv.FormatInt(int64(authorization.permissions), 10),
 		"server_muted":       authorization.serverMuted,
 		"server_deafened":    authorization.serverDeafened,

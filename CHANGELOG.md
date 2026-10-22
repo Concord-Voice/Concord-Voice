@@ -57,6 +57,7 @@ you verify your email.
 
 - **Managed Redis credential rotation groundwork** (internal development reference omitted) — a default-off runtime path prepares scoped service identities and rotates their credentials. Activation still requires separate host checks and deployment approval.
 - **A separate West staging deployment path is available to operators** (internal development reference omitted) — it remains off until its own secrets, private access and live checks are complete. West is not a production site.
+- **TURN credential rotation groundwork** (internal development reference omitted) — a dormant server path can issue short-lived credentials; host wiring and live-call proof remain required before activation.
 - **New voice rooms can move to a second media instance while existing rooms drain** (internal development reference omitted) — when operators enable the new blue/green deployment mode, new rooms use the active instance while existing rooms remain on the draining instance. The mode is off by default and requires a separately verified first activation.
 - **Shared media listeners are available for isolated validation** — an optional
   media-server mode gives each worker one shared UDP listener, with strict port
