@@ -283,3 +283,7 @@ graphify-out/*
 # beside whichever package it scanned, not only at the repo root.
 **/.impeccable/hook.cache.json
 **/.impeccable/config.local.json
+
+# Tri-Harness Concord Bridge worktrees and audit traces
+.worktrees/
+.agent-bus/

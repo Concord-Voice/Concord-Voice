@@ -25,6 +25,7 @@ This policy defines the approved MCP server allowlist, the vetting process for a
 | Context7 | Upstash | Approved | Read-only library/framework documentation from Context7 database | Yes -- context7.com API | API key (optional, for rate limits) | Low | Read-only documentation lookups. No code or project data sent. Open source, MIT. Repo: [upstash/context7](https://github.com/upstash/context7). |
 | Playwright | Microsoft | Approved | Local browser automation via accessibility trees; filesystem restricted to workspace root by default | Configurable -- can reach any URL the browser navigates to | None | Medium | Used for local testing only. Open source, Apache-2.0. DNS rebinding vulnerability (pre-v0.0.40) patched; ensure version >= 0.0.40. Supports origin allow/blocklists. Repo: [microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp). |
 | GitHub | Model Context Protocol | Approved | Repos, issues, PRs, code search, workflows, file contents | Yes -- api.github.com | GitHub Personal Access Token (PAT) | High | Broad repo access. Use fine-grained PATs with minimum scope (repo read, issues, PRs). Classic PATs auto-hide unauthorized tools. Open source, MIT. Package: `@modelcontextprotocol/server-github`. Repo: [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers). Approved 2026-04-04. |
+| concord-bridge | Concord Voice (in-repo) | Approved (dev tooling) | Repo files in per-task git worktrees under `.worktrees/`; writes an audit ledger to `.agent-bus/audit/` | Indirect -- the server makes no network calls; the headless Claude, Codex and Antigravity workers it spawns use their own CLIs' network access | None for the server. Workers run on the developer's existing local CLI sign-ins | High | Local source `dev-tooling/concord-bridge`; runs the built `dev-tooling/concord-bridge/dist/index.js` (gitignored; build with `npm --prefix dev-tooling/concord-bridge run build`). **Approving one `bridge_dispatch_task` call launches a headless agent** that runs without further per-tool prompts from this host. See §3. |
 | ~~PostgreSQL MCP~~ | — | **Removed** | — | — | — | — | Removed from inventory 2026-05-02 (#778, late-cycle scope addition). Was unused in practice — never loaded successfully in any verification matrix run, and `psql` CLI covers the dev-DB introspection use case. Re-vet via §4 if a future need arises. |
 | Stripe | Stripe, Inc. | Approved | Customers, products, payments, invoices, subscriptions | Yes -- api.stripe.com | Stripe API key (secret or restricted) | High | Financial and payment data. **Use restricted API keys (rk_*) with minimum permissions only.** Must never use production keys — test mode only. Open source, MIT. Repo: [stripe/agent-toolkit](https://github.com/stripe/agent-toolkit). Approved 2026-04-04. |
 | ~~Terraform MCP~~ | — | **Removed** | — | — | — | — | Removed from inventory 2026-07-11 after Terraform and HCP Terraform were retired. The repository has no active Terraform manifests or HCP-backed deployment workflow. Re-vet via §4 if an infrastructure-as-code need returns. |
@@ -50,6 +51,7 @@ These files use only vetted server implementations from §2. Do not substitute a
 | Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use fine-grained PAT with minimum scope (note: in `.mcp.json` this env var is read from `${ADMIN_PAT}` in the shell/launchd env — set `ADMIN_PAT`, not `GITHUB_PERSONAL_ACCESS_TOKEN`, via `export` for CLI or `launchctl setenv ADMIN_PAT ...` for App) |
 | Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
+| concord-bridge | Local source `dev-tooling/concord-bridge` (`node dev-tooling/concord-bridge/dist/index.js`) | in-repo (1.0.0) | None |
 
 **SonarQube is intentionally absent from this table.** It is registered at *user* scope
 (`~/.claude.json`) by `sonar integrate claude --global`, which runs the same SonarSource
@@ -72,6 +74,7 @@ not also live in `.mcp.json`:
 | Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use a fine-grained PAT with minimum scope |
 | Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
+| concord-bridge | Local source `dev-tooling/concord-bridge` (`node dev-tooling/concord-bridge/dist/index.js`) | in-repo (1.0.0) | None |
 
 **SonarQube is absent here too, and not by choice.** `scripts/sync-codex-tooling.py`
 enforces MCP-*name* parity between `.codex/config.toml` and `.mcp.json` (it compares
@@ -80,6 +83,22 @@ SonarQube from `.mcp.json` therefore requires dropping it here in the same commi
 the `check-codex-mirrors` pre-commit hook fails. Restore the capability at user scope
 with `sonar integrate codex --global`, which uses the same Keychain credential as the
 Claude Code path.
+
+### concord-bridge: what one approval grants
+
+concord-bridge is not a data source; it is a dispatcher. It spawns headless Claude, Codex or
+Antigravity workers, each in its own git worktree under `.worktrees/`, and records every
+dispatch in `.agent-bus/audit/`. The server holds no credentials: each worker runs on the
+developer's existing local CLI sign-in for that harness.
+
+- **One approval launches an agent.** Approving a single `bridge_dispatch_task` call starts a
+  headless worker that reads and writes inside its worktree and runs its own tools without
+  further prompts from the approving host. Review the role, harness and prompt before you
+  approve, the way you would review a command before running it.
+- **`@red-team-critical` needs a human yes outside RC-1 to RC-3.** When none of the automatic
+  triggers RC-1 to RC-3 applies, the bridge asks the human through MCP elicitation (the RC-4
+  override). Text in the prompt cannot satisfy it. If the client cannot elicit, the dispatch
+  fails closed. See [`docs/agent-catalog.md`](../agent-catalog.md#red-team-critical-activation-rc-1-to-rc-4).
 
 ### Why separate configs?
 
