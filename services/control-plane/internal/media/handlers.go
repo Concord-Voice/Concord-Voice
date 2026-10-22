@@ -47,6 +47,7 @@ const (
 	errMsgFailedVerifyAccess        = "Failed to verify access"
 	errMsgFailedVerifyPerms         = "Failed to verify permissions"
 	errMsgFailedStoreImage          = "Failed to store image"
+	errMsgNotGroupDMParticipant     = "Not a group DM participant"
 	errMsgUserNotFound              = "User not found"
 	errMsgFailedRecordMediaMetadata = "Failed to record media metadata"
 	errMsgNotFound                  = "Not found"
@@ -1133,19 +1134,82 @@ func (h *Handler) storeUniqueKeyTier1Image(c *gin.Context, userID, purpose, stor
 // dm_conversations.icon_url pointing at nothing (#3454 C4). A failed record
 // leaves the new image in place, which the next upload overwrites.
 func (h *Handler) storeDMIcon(c *gin.Context, store ObjectStore, userID, conversationID string, originalSize int64, processed *ProcessedImage) {
+	ctx, cancelWrite := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancelWrite()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error("Failed to start group icon upload", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back group icon upload", "error", rollbackErr)
+		}
+	}()
+
+	var uploader int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR SHARE`, userID).Scan(&uploader)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotGroupDMParticipant})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to lock group icon uploader", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
+		return
+	}
+
+	// Match group-role writers' conversation-before-participant lock order.
+	var group int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM dm_conversations WHERE id = $1 AND is_group = TRUE FOR NO KEY UPDATE`, conversationID).Scan(&group)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotGroupDMParticipant})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to lock group for icon upload", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
+		return
+	}
+	var role string
+	err = tx.QueryRowContext(ctx, `SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID).Scan(&role)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotGroupDMParticipant})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to lock group icon admin", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
+		return
+	}
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only group admins can upload icons"})
+		return
+	}
+
 	storageKey := tier1StorageKey(purposeDMIcon, userID, "", conversationID)
 	reader := bytes.NewReader(processed.Data)
-	if err := store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
+	putCtx, cancel := context.WithTimeout(ctx, fixedKeyImagePutTimeout)
+	defer cancel()
+	if err := store.PutObject(putCtx, storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
 		h.log.Error("Failed to store processed image", "error", err, "user_id", userID, "purpose", purposeDMIcon)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
 		return
 	}
 
-	fileID, err := insertTier1Record(c.Request.Context(), h, c, userID, storageKey, processed)
+	fileID, err := insertTier1Row(ctx, tx, userID, storageKey, processed)
 	if err != nil {
-		return // response already sent
+		h.log.Error(errMsgFailedRecordMediaMetadata, "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRecordMediaMetadata})
+		return
 	}
-	if err := updateDMIconURL(h, c, conversationID); err != nil {
+	if err := updateDMIconURL(h, c, tx, conversationID); err != nil {
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit group icon upload", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
 		return
 	}
 
@@ -1770,21 +1834,9 @@ func insertTier1Row(ctx context.Context, q RowQuerier, userID, storageKey string
 	return fileID, nil
 }
 
-// insertTier1Record is insertTier1Row on the pool, answering a failure with
-// the 500 itself.
-func insertTier1Record(ctx context.Context, h *Handler, c *gin.Context, userID, storageKey string, processed *ProcessedImage) (string, error) {
-	fileID, err := insertTier1Row(ctx, h.db, userID, storageKey, processed)
-	if err != nil {
-		h.log.Error(errMsgFailedRecordMediaMetadata, "error", err, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRecordMediaMetadata})
-		return "", err
-	}
-	return fileID, nil
-}
-
-func updateDMIconURL(h *Handler, c *gin.Context, conversationID string) error {
+func updateDMIconURL(h *Handler, c *gin.Context, tx *sql.Tx, conversationID string) error {
 	proxyURL := fmt.Sprintf("/api/v1/media/dm-icons/%s", conversationID)
-	if _, dbErr := h.db.Exec(
+	if _, dbErr := tx.ExecContext(c.Request.Context(),
 		`UPDATE dm_conversations SET icon_url = $1, updated_at = NOW() WHERE id = $2`,
 		proxyURL, conversationID,
 	); dbErr != nil {
@@ -2321,7 +2373,7 @@ func (h *Handler) userIsDMAdmin(c *gin.Context, userID, conversationID string) b
 	).Scan(&role)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Not a group DM participant"})
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotGroupDMParticipant})
 		} else {
 			h.log.Error("Failed to check DM admin", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})

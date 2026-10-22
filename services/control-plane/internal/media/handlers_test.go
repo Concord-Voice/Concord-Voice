@@ -2321,6 +2321,309 @@ func TestUploadDMIconNotParticipant(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
+func TestUploadDMIconRejectsRevokedAdminBeforeObjectWrite(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmiconrevokedadmin")
+	member := ts.createTestUser(t, "dmiconrevokedmember")
+	convID := ts.createTestGroupDM(t, admin, member)
+	body, ct := multipartBody(t, "file", fileIconPng, makePNG(t, 100, 100), map[string]string{
+		keyConversationID: convID,
+	})
+
+	revocation, err := ts.db.Begin()
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := revocation.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("roll back icon revocation: %v", rollbackErr)
+		}
+	}()
+	_, err = revocation.Exec(`UPDATE dm_participants SET role = 'member' WHERE conversation_id = $1 AND user_id = $2`, convID, admin)
+	require.NoError(t, err)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- ts.doMultipart(ts.handler.UploadDMIcon, http.MethodPost, pathUploadDMIcon, admin, body, ct)
+	}()
+	waiting := false
+	var early *httptest.ResponseRecorder
+waitForLock:
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		select {
+		case early = <-done:
+			break waitForLock
+		default:
+		}
+		require.NoError(t, ts.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FROM dm_participants%' AND query LIKE '%FOR SHARE%')`).Scan(&waiting))
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	objectWrittenBeforeRevocation := ts.store.objectCount() != 0
+	require.NoError(t, revocation.Commit())
+	if early != nil {
+		t.Fatalf("icon upload completed before role revocation committed: HTTP %d, object written: %t", early.Code, objectWrittenBeforeRevocation)
+	}
+	require.True(t, waiting, "icon upload should wait for the admin row lock")
+	select {
+	case w := <-done:
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("icon upload did not finish after role revocation")
+	}
+	assert.False(t, objectWrittenBeforeRevocation)
+	assert.Zero(t, ts.store.objectCount())
+}
+
+func TestUploadDMIconWaitsForUploaderErasureBeforeObjectWrite(t *testing.T) {
+	ts := setupMediaTest(t)
+	creator := ts.createTestUser(t, "dmiconerasurecreator")
+	uploader := ts.createTestUser(t, "dmiconerasureadmin")
+	convID := ts.createTestGroupDM(t, creator, uploader)
+	_, err := ts.db.Exec(`UPDATE dm_participants SET role = 'admin' WHERE conversation_id = $1 AND user_id = $2`, convID, uploader)
+	require.NoError(t, err)
+	body, ct := multipartBody(t, "file", fileIconPng, makePNG(t, 100, 100), map[string]string{keyConversationID: convID})
+	probe, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, probe.Close()) })
+
+	locked := make(chan int64, 1)
+	release := make(chan struct{})
+	erasureDone := make(chan error, 1)
+	go func() { erasureDone <- eraseUserForTier1Race(ts.db, uploader, locked, release) }()
+	txID := <-locked
+	uploadDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		uploadDone <- ts.doMultipart(ts.handler.UploadDMIcon, http.MethodPost, pathUploadDMIcon, uploader, body, ct)
+	}()
+
+	waiting := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline) && !waiting; {
+		waiting = rowLockWaiterExists(t, probe, txID)
+		time.Sleep(10 * time.Millisecond)
+	}
+	objectsBeforeErasure := ts.store.objectCount()
+	close(release)
+	select {
+	case err := <-erasureDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("account erasure did not finish")
+	}
+	select {
+	case w := <-uploadDone:
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("icon upload did not finish after erasure")
+	}
+	assert.True(t, waiting, "icon upload should wait for the uploader's user lock")
+	assert.Zero(t, objectsBeforeErasure, "icon object must not be written before erasure commits")
+	assert.Zero(t, ts.store.objectCount())
+}
+
+type blockingDMIconStore struct {
+	*mockStore
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingDMIconStore) PutObject(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
+	close(s.entered)
+	<-s.release
+	return s.mockStore.PutObject(ctx, key, reader, size, contentType)
+}
+
+func TestUploadDMIconHoldsAdminRoleUntilObjectWrite(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmiconlockadmin")
+	member := ts.createTestUser(t, "dmiconlockmember")
+	convID := ts.createTestGroupDM(t, admin, member)
+	body, ct := multipartBody(t, "file", fileIconPng, makePNG(t, 100, 100), map[string]string{
+		keyConversationID: convID,
+	})
+	store := &blockingDMIconStore{mockStore: ts.store, entered: make(chan struct{}), release: make(chan struct{})}
+	ts.handler.store = store
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- ts.doMultipart(ts.handler.UploadDMIcon, http.MethodPost, pathUploadDMIcon, admin, body, ct)
+	}()
+	select {
+	case <-store.entered:
+	case <-time.After(5 * time.Second):
+		close(store.release)
+		t.Fatal("icon upload did not reach object storage")
+	}
+
+	demotionDone := make(chan error, 1)
+	go func() {
+		_, err := ts.db.Exec(`UPDATE dm_participants SET role = 'member' WHERE conversation_id = $1 AND user_id = $2`, convID, admin)
+		demotionDone <- err
+	}()
+	waiting := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		require.NoError(t, ts.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%UPDATE dm_participants SET role%')`).Scan(&waiting))
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Zero(t, ts.store.objectCount(), "the fixed key should not be overwritten before PutObject resumes")
+	close(store.release)
+	require.True(t, waiting, "role demotion should wait until the authorized object write commits")
+	select {
+	case w := <-done:
+		assert.Equal(t, http.StatusCreated, w.Code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("icon upload did not finish")
+	}
+	select {
+	case err := <-demotionDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("role demotion did not finish")
+	}
+	assert.Equal(t, 1, ts.store.objectCount())
+}
+
+func callStoreDMIcon(t *testing.T, ts *testSetup, userID, conversationID string) *httptest.ResponseRecorder {
+	t.Helper()
+	data := makePNG(t, 100, 100)
+	processed := &ProcessedImage{Data: data, ContentType: mimePNG, Width: 100, Height: 100}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, pathUploadDMIcon, nil)
+	ts.handler.storeDMIcon(c, ts.handler.store, userID, conversationID, int64(len(data)), processed)
+	return w
+}
+
+func TestStoreDMIconDeniedAfterGroupOrParticipantRemoval(t *testing.T) {
+	for _, removeGroup := range []bool{true, false} {
+		name := "participant"
+		if removeGroup {
+			name = "group"
+		}
+		t.Run(name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			admin := ts.createTestUser(t, "dmiconremovedadmin")
+			peer := ts.createTestUser(t, "dmiconremovedpeer")
+			convID := ts.createTestGroupDM(t, admin, peer)
+			var err error
+			if removeGroup {
+				_, err = ts.db.Exec(`DELETE FROM dm_conversations WHERE id = $1`, convID)
+			} else {
+				_, err = ts.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, admin)
+			}
+			require.NoError(t, err)
+
+			w := callStoreDMIcon(t, ts, admin, convID)
+			assert.Equal(t, http.StatusForbidden, w.Code)
+			assert.Zero(t, ts.store.objectCount())
+		})
+	}
+}
+
+func TestStoreDMIconDatabaseUnavailableDoesNotWrite(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmicondbunavailable")
+	peer := ts.createTestUser(t, "dmicondbunavailablepeer")
+	convID := ts.createTestGroupDM(t, admin, peer)
+	closedDB, err := sql.Open("postgres", "")
+	require.NoError(t, err)
+	require.NoError(t, closedDB.Close())
+	ts.handler.db = closedDB
+
+	w := callStoreDMIcon(t, ts, admin, convID)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Zero(t, ts.store.objectCount())
+}
+
+func TestStoreDMIconObjectWriteFailureLeavesNoMetadata(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmiconputfailure")
+	peer := ts.createTestUser(t, "dmiconputfailurepeer")
+	convID := ts.createTestGroupDM(t, admin, peer)
+	ts.store.putErr = errors.New("synthetic icon write failure")
+
+	w := callStoreDMIcon(t, ts, admin, convID)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Zero(t, ts.store.objectCount())
+	var count int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE storage_key = $1`, fmt.Sprintf(fmtDMIconsKey, convID)).Scan(&count))
+	assert.Zero(t, count)
+}
+
+func TestStoreDMIconURLUpdateFailureRollsBackMetadata(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmiconurlfailure")
+	peer := ts.createTestUser(t, "dmiconurlfailurepeer")
+	convID := ts.createTestGroupDM(t, admin, peer)
+	_, err := ts.db.Exec(`CREATE FUNCTION reject_dm_icon_url_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic icon URL refusal'; END $$`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, dropTriggerErr := ts.db.Exec(`DROP TRIGGER IF EXISTS reject_dm_icon_url_test ON dm_conversations`)
+		assert.NoError(t, dropTriggerErr)
+		_, dropFunctionErr := ts.db.Exec(`DROP FUNCTION IF EXISTS reject_dm_icon_url_test()`)
+		assert.NoError(t, dropFunctionErr)
+	})
+	_, err = ts.db.Exec(`CREATE TRIGGER reject_dm_icon_url_test BEFORE UPDATE OF icon_url ON dm_conversations FOR EACH ROW EXECUTE FUNCTION reject_dm_icon_url_test()`)
+	require.NoError(t, err)
+
+	w := callStoreDMIcon(t, ts, admin, convID)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.True(t, ts.store.hasObject(fmt.Sprintf(fmtDMIconsKey, convID)), "a failed record must not delete the fixed-key icon")
+	var count int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE storage_key = $1`, fmt.Sprintf(fmtDMIconsKey, convID)).Scan(&count))
+	assert.Zero(t, count)
+}
+
+func TestStoreDMIconMetadataInsertFailureKeepsFixedKeyObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmiconinsertfailure")
+	peer := ts.createTestUser(t, "dmiconinsertfailurepeer")
+	convID := ts.createTestGroupDM(t, admin, peer)
+	_, err := ts.db.Exec(`CREATE FUNCTION reject_dm_icon_insert_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic icon insert refusal'; END $$`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, dropTriggerErr := ts.db.Exec(`DROP TRIGGER IF EXISTS reject_dm_icon_insert_test ON media_files`)
+		assert.NoError(t, dropTriggerErr)
+		_, dropFunctionErr := ts.db.Exec(`DROP FUNCTION IF EXISTS reject_dm_icon_insert_test()`)
+		assert.NoError(t, dropFunctionErr)
+	})
+	_, err = ts.db.Exec(`CREATE TRIGGER reject_dm_icon_insert_test BEFORE INSERT ON media_files FOR EACH ROW EXECUTE FUNCTION reject_dm_icon_insert_test()`)
+	require.NoError(t, err)
+
+	w := callStoreDMIcon(t, ts, admin, convID)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.True(t, ts.store.hasObject(fmt.Sprintf(fmtDMIconsKey, convID)))
+	var count int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE storage_key = $1`, fmt.Sprintf(fmtDMIconsKey, convID)).Scan(&count))
+	assert.Zero(t, count)
+}
+
+func TestStoreDMIconCommitFailureKeepsFixedKeyObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "dmiconcommitfailure")
+	peer := ts.createTestUser(t, "dmiconcommitfailurepeer")
+	convID := ts.createTestGroupDM(t, admin, peer)
+	_, err := ts.db.Exec(`CREATE FUNCTION reject_dm_icon_commit_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic icon commit refusal'; END $$`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, dropTriggerErr := ts.db.Exec(`DROP TRIGGER IF EXISTS reject_dm_icon_commit_test ON media_files`)
+		assert.NoError(t, dropTriggerErr)
+		_, dropFunctionErr := ts.db.Exec(`DROP FUNCTION IF EXISTS reject_dm_icon_commit_test()`)
+		assert.NoError(t, dropFunctionErr)
+	})
+	_, err = ts.db.Exec(`CREATE CONSTRAINT TRIGGER reject_dm_icon_commit_test AFTER INSERT ON media_files DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_dm_icon_commit_test()`)
+	require.NoError(t, err)
+
+	w := callStoreDMIcon(t, ts, admin, convID)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.True(t, ts.store.hasObject(fmt.Sprintf(fmtDMIconsKey, convID)), "a failed commit must not delete the fixed-key icon")
+	var count int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE storage_key = $1`, fmt.Sprintf(fmtDMIconsKey, convID)).Scan(&count))
+	assert.Zero(t, count)
+}
+
 func TestUploadDMIconMissingConversationID(t *testing.T) {
 	ts := setupMediaTest(t)
 	admin := ts.createTestUser(t, "dmiconnoid")

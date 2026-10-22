@@ -32,9 +32,8 @@ import (
 //
 // Media never writes the servers row, so the gate takes it FOR SHARE.
 
-// serverImagePutTimeout bounds the PutObject made while the gate's locks are
-// held (I-BOUND).
-const serverImagePutTimeout = 5 * time.Second
+// fixedKeyImagePutTimeout bounds PutObject while image authority locks are held.
+const fixedKeyImagePutTimeout = 5 * time.Second
 
 // errMsgInsufficientPermissions is the uploads' generic ManageServer 403, unchanged.
 const errMsgInsufficientPermissions = "Insufficient permissions"
@@ -191,7 +190,7 @@ func (h *Handler) admitAndStoreServerImage(
 	}
 
 	storageKey := tier1StorageKey(up.purpose, up.userID, up.serverID, "")
-	putCtx, cancel := context.WithTimeout(ctx, serverImagePutTimeout)
+	putCtx, cancel := context.WithTimeout(ctx, fixedKeyImagePutTimeout)
 	defer cancel()
 	if err := up.store.PutObject(putCtx, storageKey, bytes.NewReader(up.processed.Data), int64(len(up.processed.Data)), up.processed.ContentType); err != nil {
 		return "", outcome, fmt.Errorf("%w: %w", errServerImageStore, err)
