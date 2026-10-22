@@ -206,13 +206,22 @@ type Config struct {
 	// middleware emits in production. Optional; empty falls back to the
 	// middleware default. Managed nginx validates the same grammar/default and
 	// replaces this upstream field at the public edge.
-	HSTSHeaderValue string
-	Port            string
-	DatabaseURL     string
-	RedisURL        string
-	JWTSecret       string // #nosec G117 -- False positive: config field name, actual secret loaded from env
-	NATSUrl         string
-	OpsMetrics      OpsMetricsConfig
+	HSTSHeaderValue           string
+	Port                      string
+	DatabaseURL               string
+	RedisURL                  string
+	RedisCredentialMode       string
+	RedisEndpoint             string
+	RedisTLS                  bool
+	RedisTLSCAFile            string
+	RedisInfisicalURL         string
+	RedisInfisicalProjectID   string
+	RedisInfisicalEnvironment string
+	RedisInfisicalPath        string
+	RedisInfisicalClientID    string
+	JWTSecret                 string // #nosec G117 -- False positive: config field name, actual secret loaded from env
+	NATSUrl                   string
+	OpsMetrics                OpsMetricsConfig
 	// Billing is the Stripe billing configuration (#2033), validated by
 	// LoadBillingConfig and logged at boot by BillingConfig.LogBoot.
 	Billing BillingConfig
@@ -422,6 +431,10 @@ type Config struct {
 func Load() (*Config, error) {
 	// Load .env file if it exists (development)
 	_ = godotenv.Load()
+	redisTLS := getEnv("REDIS_TLS", "false")
+	if redisTLS != "true" && redisTLS != "false" {
+		return nil, fmt.Errorf("REDIS_TLS must be true or false")
+	}
 	mfaEncryptionKeyVersion := 1
 	if raw, explicit := os.LookupEnv("MFA_ENCRYPTION_KEY_VERSION"); explicit {
 		parsed, err := strconv.Atoi(raw)
@@ -441,38 +454,47 @@ func Load() (*Config, error) {
 		// running with development behaviour (codes logged or returned, SMS
 		// enrolment, SMTP dev mode). Local development sets it explicitly
 		// (.env.example, concord-dev.sh).
-		Environment:              getEnv("ENVIRONMENT", "production"),
-		SiteID:                   getEnv("SITE_ID", ""),
-		HSTSHeaderValue:          getEnv("HSTS_HEADER_VALUE", ""),
-		Port:                     getEnv("PORT", "8080"),
-		DatabaseURL:              getEnv("DATABASE_URL", defaultDevDatabaseURL()),
-		RedisURL:                 getEnv("REDIS_URL", defaultDevRedisURL()),
-		JWTSecret:                getEnv("JWT_SECRET", devJWTSecret),
-		NATSUrl:                  getEnv("NATS_URL", "nats://localhost:4222"),
-		OpsMetrics:               opsMetrics,
-		MediaPlaneURL:            getEnv("MEDIA_PLANE_URL", "http://localhost:3000"),
-		TURNServerHost:           getEnv("TURN_SERVER_HOST", ""),
-		TURNSecret:               getEnv("TURN_SECRET", ""),
-		TURNRealm:                getEnv("TURN_REALM", "localhost"),
-		AllowedOrigins:           parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
-		ClientMinVersion:         strings.TrimSpace(getEnv("CLIENT_MIN_VERSION", "")),
-		SpaURL:                   getEnv("SPA_URL", ""),
-		SpaIpcContract:           getEnvInt("SPA_IPC_CONTRACT", 0),
-		SpaConfigFile:            getEnv("SPA_CONFIG_FILE", ""),
-		PublicMediaBaseURL:       strings.TrimRight(getEnv("PUBLIC_MEDIA_BASE_URL", ""), "/"),
-		InstanceType:             getEnv("INSTANCE_TYPE", "saas"),
-		ServerVersion:            getEnv("SERVER_VERSION", "dev"),
-		ReleasesDir:              getEnv("RELEASES_DIR", ""),
-		SMTPHost:                 getEnv("SMTP_HOST", ""),
-		SMTPPort:                 getEnvInt("SMTP_PORT", 587),
-		SMTPUsername:             getEnv("SMTP_USERNAME", ""),
-		SMTPPassword:             getEnv("SMTP_PASSWORD", ""), // #nosec G101 -- env var name, not a secret
-		SMTPFrom:                 getEnv("SMTP_FROM", "Concord Voice <noreply@example.com>"),
-		MFAEncryptionKey:         getEnv("MFA_ENCRYPTION_KEY", devMFAEncKey),
-		MFAEncryptionKeyVersion:  mfaEncryptionKeyVersion,
-		MFAEncryptionKeysRetired: getEnv("MFA_ENCRYPTION_KEYS_RETIRED", ""),
-		WebAuthnRPID:             getEnv("WEBAUTHN_RP_ID", "localhost"),
-		WebAuthnRPOrigins:        parseOrigins(getEnv("WEBAUTHN_RP_ORIGINS", "http://localhost:3001")),
+		Environment:               getEnv("ENVIRONMENT", "production"),
+		SiteID:                    getEnv("SITE_ID", ""),
+		HSTSHeaderValue:           getEnv("HSTS_HEADER_VALUE", ""),
+		Port:                      getEnv("PORT", "8080"),
+		DatabaseURL:               getEnv("DATABASE_URL", defaultDevDatabaseURL()),
+		RedisURL:                  getEnv("REDIS_URL", defaultDevRedisURL()),
+		RedisCredentialMode:       getEnv("REDIS_CREDENTIAL_MODE", "legacy"),
+		RedisEndpoint:             getEnv("REDIS_ENDPOINT", ""),
+		RedisTLS:                  redisTLS == "true",
+		RedisTLSCAFile:            getEnv("REDIS_TLS_CA_FILE", ""),
+		RedisInfisicalURL:         getEnv("REDIS_INFISICAL_URL", "https://app.infisical.com"),
+		RedisInfisicalProjectID:   getEnv("REDIS_INFISICAL_PROJECT_ID", ""),
+		RedisInfisicalEnvironment: getEnv("REDIS_INFISICAL_ENVIRONMENT", ""),
+		RedisInfisicalPath:        getEnv("REDIS_INFISICAL_PATH", ""),
+		RedisInfisicalClientID:    getEnv("REDIS_INFISICAL_CLIENT_ID", ""),
+		JWTSecret:                 getEnv("JWT_SECRET", devJWTSecret),
+		NATSUrl:                   getEnv("NATS_URL", "nats://localhost:4222"),
+		OpsMetrics:                opsMetrics,
+		MediaPlaneURL:             getEnv("MEDIA_PLANE_URL", "http://localhost:3000"),
+		TURNServerHost:            getEnv("TURN_SERVER_HOST", ""),
+		TURNSecret:                getEnv("TURN_SECRET", ""),
+		TURNRealm:                 getEnv("TURN_REALM", "localhost"),
+		AllowedOrigins:            parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
+		ClientMinVersion:          strings.TrimSpace(getEnv("CLIENT_MIN_VERSION", "")),
+		SpaURL:                    getEnv("SPA_URL", ""),
+		SpaIpcContract:            getEnvInt("SPA_IPC_CONTRACT", 0),
+		SpaConfigFile:             getEnv("SPA_CONFIG_FILE", ""),
+		PublicMediaBaseURL:        strings.TrimRight(getEnv("PUBLIC_MEDIA_BASE_URL", ""), "/"),
+		InstanceType:              getEnv("INSTANCE_TYPE", "saas"),
+		ServerVersion:             getEnv("SERVER_VERSION", "dev"),
+		ReleasesDir:               getEnv("RELEASES_DIR", ""),
+		SMTPHost:                  getEnv("SMTP_HOST", ""),
+		SMTPPort:                  getEnvInt("SMTP_PORT", 587),
+		SMTPUsername:              getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:              getEnv("SMTP_PASSWORD", ""), // #nosec G101 -- env var name, not a secret
+		SMTPFrom:                  getEnv("SMTP_FROM", "Concord Voice <noreply@example.com>"),
+		MFAEncryptionKey:          getEnv("MFA_ENCRYPTION_KEY", devMFAEncKey),
+		MFAEncryptionKeyVersion:   mfaEncryptionKeyVersion,
+		MFAEncryptionKeysRetired:  getEnv("MFA_ENCRYPTION_KEYS_RETIRED", ""),
+		WebAuthnRPID:              getEnv("WEBAUTHN_RP_ID", "localhost"),
+		WebAuthnRPOrigins:         parseOrigins(getEnv("WEBAUTHN_RP_ORIGINS", "http://localhost:3001")),
 		// Admin console (#1688) — dormant by default; the dev RP defaults point at
 		// https-localhost (the console requires Secure for the __Host- session
 		// cookie); the allowed-AAGUIDs default is empty (operator opts in to the gate).
@@ -810,6 +832,14 @@ func loadCloudflareKVBridgeConfig(cfg *Config) error {
 // validate checks for dangerous configuration in production environments.
 // Returns an error if required secrets are missing or still set to dev defaults.
 func (c *Config) validate() error {
+	if c.RedisCredentialMode != "" && c.RedisCredentialMode != "legacy" && c.RedisCredentialMode != "managed" {
+		return fmt.Errorf("REDIS_CREDENTIAL_MODE must be legacy or managed")
+	}
+	if c.RedisCredentialMode == "managed" {
+		if err := c.validateManagedRedis(); err != nil {
+			return err
+		}
+	}
 	if c.ClientMinVersion != "" {
 		if _, err := clientversion.Parse(c.ClientMinVersion); err != nil {
 			return fmt.Errorf("CLIENT_MIN_VERSION must be a stable X.Y.Z version: %w", err)
@@ -845,6 +875,25 @@ func (c *Config) validate() error {
 		return fmt.Errorf("CONCORD_ENV=test is forbidden unless ENVIRONMENT is development or test (got %q); it would relax auth rate limits and leak verification codes", c.Environment)
 	}
 	return c.validateProduction()
+}
+
+func (c *Config) validateManagedRedis() error {
+	host, port, err := net.SplitHostPort(c.RedisEndpoint)
+	if err != nil || host == "" || port == "" || strings.ContainsAny(c.RedisEndpoint, "/@") {
+		return fmt.Errorf("REDIS_ENDPOINT must be a bare host:port")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("REDIS_ENDPOINT port is invalid")
+	}
+	if value, set := os.LookupEnv("REDIS_URL"); set && value != "" {
+		return fmt.Errorf("REDIS_URL must be empty in managed mode")
+	}
+	if c.RedisInfisicalProjectID == "" || c.RedisInfisicalEnvironment == "" ||
+		c.RedisInfisicalPath == "" || c.RedisInfisicalClientID == "" {
+		return fmt.Errorf("managed Redis provider selectors are required")
+	}
+	return nil
 }
 
 func (c *Config) validateSiteID() error {
@@ -1164,7 +1213,7 @@ func (c *Config) validateProduction() error {
 			"JWT_SECRET must be set to a secure value in production. The default dev secret is not allowed."},
 		{c.DatabaseURL == defaultDevDatabaseURL(),
 			"DATABASE_URL must be set to a secure value in production. The default dev connection string is not allowed."},
-		{c.RedisURL == defaultDevRedisURL(),
+		{c.RedisCredentialMode != "managed" && c.RedisURL == defaultDevRedisURL(),
 			"REDIS_URL must be set to a secure value in production. The default dev connection string is not allowed."},
 		{c.MFAEncryptionKey == devMFAEncKey,
 			"MFA_ENCRYPTION_KEY must be set to a secure value in production. The default dev key is not allowed. Generate with: openssl rand -hex 32"},

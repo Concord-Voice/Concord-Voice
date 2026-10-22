@@ -478,7 +478,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 
 ### 4. Reconnection
 
-1. WebSocket connection closes (network issue, server restart, or the issuing access token expires; expiry uses close code 1008)
+1. WebSocket connection closes (network issue, server restart, or the socket's authority deadline passes; expiry uses close code 1008). The deadline starts at the issuing access token's expiry. On each token rotation `useWebSocket` calls `wsService.renewToken`, which sends `{"type":"auth_renew","data":{"token":...}}` over the open socket, and an `auth_renew_result` with `ok: true` means the server moved the deadline to the new token's expiry, so the socket stays up. `renewToken` sends only while CONNECTED, only for a token that differs from the socket's, and only when `authGeneration` still matches the socket's. It waits 5 s for the ack, retries once after 11 s, then gives up silently and this reconnect path takes over at the old deadline
 2. `wsService` detects close event → schedules reconnect
 3. Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
 4. Attempts up to 10 times
@@ -636,7 +636,8 @@ console.log('Connected:', useChatStore.getState().isConnected);
 - ✅ Client gets a single-use ticket via `POST /auth/ws-ticket`, valid for the shorter of 30 seconds or the issuing access token's remaining lifetime
 - ✅ Ticket sent via query parameter (WebSocket upgrade handshake) — NOT the raw JWT
 - ✅ Ticket validated and consumed on backend before upgrade (single-use, prevents replay)
-- ✅ Connection closes with code 1008 when the issuing access token expires; reconnect obtains a fresh ticket
+- ✅ Connection closes with code 1008 at its authority deadline; reconnect obtains a fresh ticket
+- ✅ In-band renewal (`auth_renew`) can only move that deadline later, to the expiry of a rotated token that passes the handshake's checks for the same user, credential epoch and refresh lineage. The token is sent only inside the open WSS session and is never logged
 - ✅ JWT blacklist check runs during ticket creation
 - ⚠️ Use HTTPS/WSS in production to protect ticket in transit
 

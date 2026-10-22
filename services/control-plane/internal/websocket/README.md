@@ -71,9 +71,29 @@ Tickets retain the issuing access token's absolute expiry. Their Redis TTL is
 the smaller of 30 seconds and the token's remaining lifetime. Both ticket and
 JWT admission require an expiry, and the connection closes with policy code
 1008 at that deadline; ping/pong traffic cannot extend it. Expired queued
-commands are discarded. The desktop reconnects with a fresh ticket without
-tearing down the separate media connection. Old ticket values without a
-deadline fail closed and require a fresh ticket during rollout.
+commands are discarded. Old ticket values without a deadline fail closed and
+require a fresh ticket during rollout.
+
+#### In-band token renewal
+
+An open socket can move its deadline without reconnecting. The client sends
+`{"type":"auth_renew","data":{"token":"<access JWT>"}}` after each token
+rotation and the server answers `{"type":"auth_renew_result","data":{"ok":true}}`
+or `{"ok":false}`, with no reason. `readPump` handles the frame after the
+ingress budget and never forwards it to the hub (`token_renewal.go`). The token
+must pass `validateAccessToken`, the same gate as the JWT handshake, and must
+carry the socket's user and credential epoch. Its sid must equal the socket's
+or be the socket's direct successor (`refresh_tokens.predecessor_id`, unrevoked).
+Its `exp` must be later than the current deadline, and that deadline must not
+have passed. Attempts are throttled to one per socket per 10 seconds and each
+renewal, including both waits on `Hub.Run`, is bounded by a 3-second context.
+Session ids are compared in canonical form. On a rotated sid, `Hub.Run` rebinds
+the client to the new sid first; on every accepted token `readPump` then
+re-checks the sid's revocation, closing the socket if it is revoked or the check
+fails. The deadline moves only after that check passes. Any refusal keeps the old deadline, logs only a
+fixed reason class (never the token), and the socket closes at that deadline.
+The desktop then reconnects with a fresh ticket without tearing down the
+separate media connection.
 
 > **Security note:** never pass a raw JWT token in the WebSocket URL. Tickets are single-use and expire in 30 seconds, which minimizes the window for interception.
 

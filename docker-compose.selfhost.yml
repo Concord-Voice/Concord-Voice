@@ -18,6 +18,8 @@ services:
     ports: !reset []
   redis:
     ports: !reset []
+    environment:
+      REDIS_CREDENTIAL_MODE: legacy
   nats:
     ports: !reset []
   pgadmin:
@@ -26,6 +28,7 @@ services:
     ports: !reset []
   control-plane:
     environment:
+      REDIS_CREDENTIAL_MODE: legacy
       INSTANCE_TYPE: self-hosted
       SITE_ID: ${SITE_ID:-}
     ports: !override
@@ -36,6 +39,7 @@ services:
     profiles: !override [services]
     # Match the supported two-CPU self-host floor; workers and quota move together.
     environment:
+      REDIS_CREDENTIAL_MODE: legacy
       INSTANCE_TYPE: self-hosted
       SITE_ID: ${SITE_ID:-}
       NUM_WORKERS: "2"

@@ -34,6 +34,7 @@ const mockWsService = {
   connect: vi.fn(),
   disconnect: vi.fn(),
   updateToken: vi.fn(),
+  renewToken: vi.fn(),
   resetReconnectState: vi.fn(),
   on: vi.fn((type: string, handler: HandlerFn) => {
     registeredHandlers.set(type, handler);
@@ -329,6 +330,7 @@ describe('useWebSocket — extended', () => {
       rerender();
 
       expect(mockWsService.updateToken).toHaveBeenCalledWith('token-2');
+      expect(mockWsService.renewToken).toHaveBeenCalledWith('token-2');
       expect(mockWsService.connect).not.toHaveBeenCalled();
       expect(mockWsService.disconnect).not.toHaveBeenCalled();
     });

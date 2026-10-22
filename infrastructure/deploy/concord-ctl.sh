@@ -119,6 +119,86 @@ fi
 
 DEPLOY_REPO="${DEPLOY_REPO:-https://github.com/Concord-Voice/Concord-Voice.git}"
 COMPOSE_OVERRIDE="${COMPOSE_OVERRIDE:-docker-compose.staging.yml}"
+REDIS_CREDENTIAL_MODE="${REDIS_CREDENTIAL_MODE:-legacy}"
+redis_managed_writer_consistency_guard() {
+  local root_file="${CONFIG_ROOT}/.env" deploy_file="${CONFIG_DEPLOY_DIR}/deploy.env.local"
+  local key line root_value deploy_value root_count deploy_count
+  local keys=(REDIS_CREDENTIAL_MODE)
+  [[ -f "$root_file" && ! -L "$root_file" && -f "$deploy_file" && ! -L "$deploy_file" ]] || {
+    echo 'redis-managed: canonical writer pair is missing; refusing before Compose' >&2
+    return 1
+  }
+  if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
+    keys+=(REDIS_ENDPOINT REDIS_TLS REDIS_TLS_CA_FILE REDIS_INFISICAL_URL
+      REDIS_SERVER_PROJECT_ID REDIS_SERVER_ENVIRONMENT REDIS_SERVER_PATH REDIS_SERVER_CLIENT_ID
+      REDIS_CONTROL_PLANE_PROJECT_ID REDIS_CONTROL_PLANE_ENVIRONMENT REDIS_CONTROL_PLANE_PATH REDIS_CONTROL_PLANE_CLIENT_ID
+      REDIS_MEDIA_PLANE_PROJECT_ID REDIS_MEDIA_PLANE_ENVIRONMENT REDIS_MEDIA_PLANE_PATH REDIS_MEDIA_PLANE_CLIENT_ID
+      REDIS_CONTROL_UID REDIS_MEDIA_UID REDIS_ACL_UID REDIS_ACL_GID)
+  fi
+  for key in "${keys[@]}"; do
+    root_count=0 deploy_count=0 root_value="" deploy_value=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "${key}="* ]]; then
+        root_count=$((root_count + 1))
+        root_value="${line#*=}"
+      fi
+    done < "$root_file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "${key}="* ]]; then
+        deploy_count=$((deploy_count + 1))
+        deploy_value="${line#*=}"
+      fi
+    done < "$deploy_file"
+    if [[ "$key" == REDIS_CREDENTIAL_MODE && "$REDIS_CREDENTIAL_MODE" == legacy \
+       && "$root_count" == 0 && "$deploy_count" == 0 ]]; then
+      return 0 # Existing legacy hosts may predate the mode selector in both writers.
+    fi
+    # The canonical writer emits raw Compose values and Bash's @Q form respectively.
+    if [[ "$root_count" != 1 || "$deploy_count" != 1 || "$root_value" != "${!key:-}" || "$deploy_value" != "${!key@Q}" ]]; then
+      echo "redis-managed: canonical writers disagree on ${key}; refusing before Compose" >&2
+      return 1
+    fi
+  done
+}
+case "$REDIS_CREDENTIAL_MODE" in
+  legacy) COMPOSE_REDIS_MANAGED_ARG="" ;;
+  managed)
+    if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
+      echo 'redis-managed: managed Redis credentials are unavailable to self-host installs' >&2
+      exit 2
+    fi
+    for _redis_selector in REDIS_ENDPOINT REDIS_TLS REDIS_INFISICAL_URL \
+      REDIS_SERVER_PROJECT_ID REDIS_SERVER_ENVIRONMENT REDIS_SERVER_PATH REDIS_SERVER_CLIENT_ID \
+      REDIS_CONTROL_PLANE_PROJECT_ID REDIS_CONTROL_PLANE_ENVIRONMENT REDIS_CONTROL_PLANE_PATH REDIS_CONTROL_PLANE_CLIENT_ID \
+      REDIS_MEDIA_PLANE_PROJECT_ID REDIS_MEDIA_PLANE_ENVIRONMENT REDIS_MEDIA_PLANE_PATH REDIS_MEDIA_PLANE_CLIENT_ID \
+      REDIS_CONTROL_UID REDIS_MEDIA_UID REDIS_ACL_UID REDIS_ACL_GID; do
+      if [[ -z "${!_redis_selector:-}" ]]; then
+        echo "redis-managed: required selector ${_redis_selector} is missing; refusing before Compose mutation" >&2
+        exit 1
+      fi
+    done
+    [[ "$REDIS_TLS" == true || "$REDIS_TLS" == false ]] || {
+      echo 'redis-managed: REDIS_TLS must be true or false' >&2; exit 1;
+    }
+    [[ "$REDIS_ENDPOINT" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || {
+      echo 'redis-managed: REDIS_ENDPOINT must be a bare host:port' >&2; exit 1;
+    }
+    [[ "$REDIS_INFISICAL_URL" == https://* && "$REDIS_INFISICAL_URL" != *'@'* ]] || {
+      echo 'redis-managed: REDIS_INFISICAL_URL must be HTTPS without userinfo' >&2; exit 1;
+    }
+    for _redis_uid in REDIS_CONTROL_UID REDIS_MEDIA_UID REDIS_ACL_UID REDIS_ACL_GID; do
+      [[ "${!_redis_uid}" =~ ^[0-9]+$ ]] || {
+        echo "redis-managed: ${_redis_uid} must come from selected-image inspection" >&2; exit 1;
+      }
+      if [[ "$_redis_uid" != REDIS_ACL_UID ]] &&
+          ! python3 -c 'import sys; n = int(sys.argv[1]); sys.exit(n < 1 or n > 65535)' "${!_redis_uid}" 2>/dev/null; then
+        echo "redis-managed: ${_redis_uid} must be in 1..65535" >&2; exit 1
+      fi
+    done
+    COMPOSE_REDIS_MANAGED_ARG=" -f ${DEPLOY_DIR}/docker-compose.redis-managed.yml"
+    ;;
+  *) echo 'redis-managed: REDIS_CREDENTIAL_MODE must be legacy or managed' >&2; exit 2 ;;
+esac
 COMPOSE_ENV_FILE_ARG=""
 COMPOSE_PRODUCTION_ARG=""
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] \
@@ -202,7 +282,7 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
   unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   export DOCKER_HOST=unix:///var/run/docker.sock
 fi
-COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG}${COMPOSE_PROJECT_ARG} -f ${DEPLOY_DIR}/docker-compose.yml${COMPOSE_PRODUCTION_ARG} -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG} ${COMPOSE_PROFILE_ARGS}"
+COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG}${COMPOSE_PROJECT_ARG} -f ${DEPLOY_DIR}/docker-compose.yml${COMPOSE_PRODUCTION_ARG} -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG}${COMPOSE_REDIS_MANAGED_ARG} ${COMPOSE_PROFILE_ARGS}"
 
 # Read managed fleet identity as inert data. These values are intentionally
 # simple inventory tokens; do not source either canonical writer file here.
@@ -259,6 +339,184 @@ fi
 selfhost_storage_start_guard() {
   [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] || return 0
   selfhost_storage_assert_no_running_minio
+}
+
+redis_managed_controller_host_identity() {
+  local user_by_name user_by_id enumerated_user group_by_name group_by_id enumerated_group name password_field uid gid gecos home shell group_name group_gid members lock_status
+  user_by_name="$(getent passwd redis-auth-controller 2>/dev/null)" || {
+    echo 'redis-managed: dedicated locked host controller account is unavailable' >&2; return 1;
+  }
+  user_by_id="$(getent passwd 10004 2>/dev/null)" || {
+    echo 'redis-managed: controller host UID lookup failed' >&2; return 1;
+  }
+  group_by_name="$(getent group redis-auth-controller 2>/dev/null)" || {
+    echo 'redis-managed: dedicated host controller group is unavailable' >&2; return 1;
+  }
+  group_by_id="$(getent group 10004 2>/dev/null)" || {
+    echo 'redis-managed: controller host GID lookup failed' >&2; return 1;
+  }
+  enumerated_user="$(getent passwd 2>/dev/null | awk -F: '$3 == "10004" { print }')" || {
+    echo 'redis-managed: cannot enumerate host UID reservations' >&2; return 1;
+  }
+  enumerated_group="$(getent group 2>/dev/null | awk -F: '$3 == "10004" { print }')" || {
+    echo 'redis-managed: cannot enumerate host GID reservations' >&2; return 1;
+  }
+  IFS=: read -r name password_field uid gid gecos home shell <<<"$user_by_name"
+  IFS=: read -r group_name password_field group_gid members <<<"$group_by_name"
+  [[ "$user_by_name" == "$user_by_id" && "$user_by_name" == "$enumerated_user" && \
+     "$group_by_name" == "$group_by_id" && "$group_by_name" == "$enumerated_group" && \
+     "$name" == redis-auth-controller && "$uid" == 10004 && "$gid" == 10004 && \
+     "$group_name" == redis-auth-controller && "$group_gid" == 10004 && -z "$members" && \
+     ( "$shell" == /usr/sbin/nologin || "$shell" == /sbin/nologin ) ]] || {
+    echo 'redis-managed: host controller UID/GID must be reserved to its private non-login account' >&2; return 1;
+  }
+  lock_status="$(LC_ALL=C passwd -S redis-auth-controller 2>/dev/null)" || {
+    echo 'redis-managed: cannot verify host controller password lock' >&2; return 1;
+  }
+  [[ "$lock_status" =~ ^redis-auth-controller[[:space:]]+(L|LK)[[:space:]] ]] || {
+    echo 'redis-managed: host controller password is not locked' >&2; return 1;
+  }
+}
+
+redis_managed_host_preflight() {
+  [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || return 0
+  redis_managed_controller_host_identity || return 1
+  redis_managed_marker_preflight "${REDIS_MANAGED_MARKER_MODE:-required}" || return 1
+  if [[ "${REDIS_MANAGED_INITIAL_PREFLIGHT:-0}" == 1 ]]; then
+    redis_managed_host_preflight_initial
+    return $?
+  fi
+  command -v findmnt >/dev/null 2>&1 || {
+    echo 'redis-managed: findmnt is required to prove the ACL bind is on host RAM' >&2
+    return 1
+  }
+  local auth_dir=/run/concord/redis-auth fstype role uid gid slot_gid
+  fstype="$(findmnt -n -T "$auth_dir" -o FSTYPE 2>/dev/null || true)"
+  [[ "$fstype" == tmpfs ]] || {
+    echo 'redis-managed: /run/concord/redis-auth is not on tmpfs; refusing disk fallback' >&2
+    return 1
+  }
+  [[ ! -L "$auth_dir" && "$(stat -c '%u:%g:%a' "$auth_dir" 2>/dev/null || true)" == '10004:0:2710' && \
+     ! -L "$auth_dir/state" && "$(stat -c '%u:%a' "$auth_dir/state" 2>/dev/null || true)" == '10004:700' ]] || {
+    echo 'redis-managed: controller RAM directories are not owned by the dedicated account' >&2; return 1;
+  }
+  for required in "$auth_dir/acl/users.acl" "$auth_dir/acks/control-plane" "$auth_dir/acks/media-plane" \
+    "$auth_dir/acks/media-plane-blue" "$auth_dir/acks/media-plane-green" \
+    /run/concord/redis-identities/controller/redis-infisical-client-secret \
+    /run/concord/redis-identities/control-plane/redis-infisical-client-secret \
+    /run/concord/redis-identities/media-plane/redis-infisical-client-secret; do
+    [[ -e "$required" ]] || {
+      echo "redis-managed: required preflight path is absent: $required" >&2
+      return 1
+    }
+  done
+  [[ -d "$auth_dir/acl" && -f "$auth_dir/acl/users.acl" ]] || {
+    echo 'redis-managed: ACL directory and ACL file must exist' >&2
+    return 1
+  }
+  [[ "$(stat -c '%u:%a' "$auth_dir/acks" 2>/dev/null || true)" == '10004:700' && ! -L "$auth_dir/acks" ]] || {
+    echo 'redis-managed: ACK slot parent is not controller-private' >&2
+    return 1
+  }
+  local slot
+  for slot in control-plane media-plane media-plane-blue media-plane-green; do
+    slot_gid="$(redis_managed_app_gid "$slot")" || return 1
+    [[ "$slot_gid" =~ ^[1-9][0-9]*$ && "$slot_gid" != 10004 ]] || {
+      echo 'redis-managed: inspected app GID is unsafe for an ACK slot' >&2; return 1;
+    }
+    [[ -d "$auth_dir/acks/$slot" && ! -L "$auth_dir/acks/$slot" && \
+       "$(stat -c '%u:%g:%a' "$auth_dir/acks/$slot" 2>/dev/null || true)" == "10004:${slot_gid}:2710" ]] || {
+      echo 'redis-managed: ACK slot ownership or isolation is invalid' >&2
+      return 1
+    }
+  done
+  for role in controller control-plane media-plane; do
+    local identity_dir="/run/concord/redis-identities/${role}"
+    local identity_file="${identity_dir}/redis-infisical-client-secret"
+    [[ "$(findmnt -n -T "$identity_dir" -o FSTYPE 2>/dev/null || true)" == tmpfs ]] || {
+      echo "redis-managed: ${role} identity directory is not on host RAM" >&2
+      return 1
+    }
+    [[ ! -L "$identity_dir" && ! -L "$identity_file" ]] || {
+      echo "redis-managed: ${role} identity path must not be a symlink" >&2
+      return 1
+    }
+    uid=10004
+    case "$role" in
+      control-plane) uid="$REDIS_CONTROL_UID" ;;
+      media-plane) uid="$REDIS_MEDIA_UID" ;;
+    esac
+    [[ "$(stat -c '%u:%a' "$identity_dir" 2>/dev/null)" == "${uid}:500" && \
+       "$(stat -c '%u:%a' "$identity_file" 2>/dev/null)" == "${uid}:400" ]] || {
+      echo "redis-managed: ${role} identity ownership/mode must match inspected UID and private read-only modes" >&2
+      return 1
+    }
+  done
+  [[ ! -L "$auth_dir/acl" && ! -L "$auth_dir/acl/users.acl" ]] || {
+    echo 'redis-managed: ACL bind source must not be a symlink' >&2
+    return 1
+  }
+  [[ "$(stat -c '%u:%g:%a' "$auth_dir/acl" 2>/dev/null || true)" == "10004:${REDIS_ACL_GID}:2710" ]] || {
+    echo 'redis-managed: ACL directory must be controller-owned, Redis-group traversable, and private' >&2
+    return 1
+  }
+  gid="$(stat -c '%u:%g:%a' "$auth_dir/acl/users.acl" 2>/dev/null || true)"
+  [[ "$gid" == "10004:${REDIS_ACL_GID}:440" ]] || {
+    echo 'redis-managed: ACL ownership/mode must match controller UID and inspected Redis GID' >&2
+    return 1
+  }
+}
+
+redis_managed_marker_preflight() {
+  local mode="${1:-required}" dir=/var/lib/concord/redis-auth marker=/var/lib/concord/redis-auth/activated
+  redis_managed_controller_host_identity || return 1
+  [[ ! -L /var/lib/concord && ! -L "$dir" ]] || {
+    echo 'redis-managed: persistent marker path is a symlink' >&2; return 1;
+  }
+  if [[ "$mode" == first || "$mode" == lost ]]; then
+    [[ ! -e "$dir" || "$(stat -c '%u:%a' "$dir" 2>/dev/null || true)" == '10004:700' ]] || {
+      echo 'redis-managed: legacy root-owned marker requires a separately reviewed migration' >&2; return 1;
+    }
+    install -d -o 10004 -g 10004 -m 0700 "$dir" || return 1
+  fi
+  [[ -d "$dir" && "$(stat -c '%u:%a' "$dir" 2>/dev/null || true)" == '10004:700' ]] || {
+    echo 'redis-managed: persistent marker parent is not controller-private' >&2; return 1;
+  }
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    [[ "$mode" == first || "$mode" == lost ]] || {
+      echo 'redis-managed: activated-host marker is missing; refusing ordinary startup' >&2; return 1;
+    }
+    return 0
+  fi
+  if [[ "$mode" == first ]]; then
+    [[ ! -L "$marker" && -f "$marker" && "$(stat -c '%u:%a' "$marker" 2>/dev/null || true)" == '10004:600' ]] \
+      && cmp -s "$marker" <(printf 'concord-managed-redis-initializing-v1\n') || {
+        echo 'redis-managed: first activation marker is not an interrupted initialization' >&2; return 1;
+      }
+    return 0
+  fi
+  [[ ! -L "$marker" && -f "$marker" && \
+     "$(stat -c '%u:%a:%s' "$marker" 2>/dev/null || true)" == '10004:600:25' && \
+     "$(cat "$marker" 2>/dev/null || true)" == concord-managed-redis-v1 ]] || {
+    echo 'redis-managed: activated-host marker is invalid or already present' >&2; return 1;
+  }
+}
+
+redis_managed_app_gid() {
+  local service="$1" model image image_id
+  if [[ "$service" == media-plane* ]]; then
+    if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+      service=media-plane-blue
+    else
+      service=media-plane
+    fi
+  fi
+  model="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile services config --format json)" || return 1
+  image="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["services"][sys.argv[1]].get("image", ""))' "$service" <<<"$model")" || return 1
+  [[ -n "$image" ]] || return 1
+  image_id="$(docker image inspect --format '{{.Id}}' "$image")" || return 1
+  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --cpus 0.1 --memory 64m --entrypoint id "$image_id" -g appuser
 }
 
 # Load the TLS caller API only on verbs that need it. Help, stop/down, logs,
@@ -460,6 +718,7 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
 fi
 ACTIVITY_HISTORY_IMAGE_SELECTOR="${CONFIG_DEPLOY_DIR}/.env.activity-history-image.local"
 ACTIVITY_HISTORY_ACTIVATION_RECEIPT="${CONFIG_DEPLOY_DIR}/.env.activity-history-receipt.local"
+REDIS_MANAGED_REBUILD_MARKER="${CONFIG_DEPLOY_DIR}/.redis-managed-rebuild.local"
 ACTIVITY_HISTORY_IMAGE_SELECTOR_LOADED=0
 ACTIVITY_HISTORY_IMAGE_SELECTOR_SELECTED=0
 ACTIVITY_HISTORY_ROLLBACK_CHECKPOINT_IMAGE=""
@@ -1680,6 +1939,28 @@ media_bluegreen_verify_standby_image() {
 }
 
 media_bluegreen_redis() {
+  if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
+    local request response
+    request="$(python3 -c 'import json,sys; print(json.dumps({"operation":"redis","args":sys.argv[1:]}, separators=(",",":")))' "$@")" || return 1
+    response="$(printf '%s\n' "$request" | (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T --user 0 redis-auth-controller redis-auth-controller request))" || {
+      echo 'media-bluegreen: managed Redis operator request failed; refusing state mutation' >&2
+      return 1
+    }
+    python3 -c '
+import json, sys
+try:
+    raw = sys.stdin.read()
+    if len(raw) > 65536:
+        raise ValueError("response too large")
+    value = json.loads(raw)
+    if not isinstance(value, dict) or set(value) != {"output"} or not isinstance(value["output"], str):
+        raise ValueError("invalid response")
+    sys.stdout.write(value["output"])
+except (ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit("media-bluegreen: invalid managed Redis response; refusing")
+' <<<"$response"
+    return $?
+  fi
   local password
   password="$(activity_history_read_root_value REDIS_PASSWORD)" || {
     echo 'media-bluegreen: canonical REDIS_PASSWORD is unavailable; refusing' >&2
@@ -2457,6 +2738,995 @@ media_bluegreen_reap() {
   return "$rc"
 }
 
+redis_managed_control_request() {
+  local request="$1"
+  printf '%s\n' "$request" | (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T --user 0 redis-auth-controller redis-auth-controller request)
+}
+
+redis_managed_bind_stopped_instance() {
+  local slot="$1" id="$2" inspected hostname status previous replaced request response
+  [[ "$slot" == control-plane || "$slot" == media-plane || "$slot" == media-plane-blue || "$slot" == media-plane-green ]] || return 1
+  [[ "$id" =~ ^[a-f0-9]{64}$ ]] || {
+    echo 'redis-managed: exactly one full container ID is required per ACK slot' >&2; return 1;
+  }
+  inspected="$(docker inspect --type container --format '{"Id":{{json .Id}},"State":{"Running":{{json .State.Running}}},"Config":{"Hostname":{{json .Config.Hostname}},"User":{{json .Config.User}},"Labels":{"com.docker.compose.service":{{json (index .Config.Labels "com.docker.compose.service")}}}},"Mounts":{{json .Mounts}}}' "$id")" || return 1
+  hostname="$(python3 -c '
+import json,re,sys
+try:
+    c=json.load(sys.stdin); slot=sys.argv[1]; cid=sys.argv[2]
+    if c["Id"]!=cid or c["State"]["Running"] or c["Config"]["Labels"].get("com.docker.compose.service")!=slot:
+        raise ValueError()
+    if c["Config"]["User"]!="appuser": raise ValueError()
+    host=c["Config"]["Hostname"]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}",host): raise ValueError()
+    mounts=c["Mounts"]
+    ack=[m for m in mounts if m.get("Destination")=="/run/redis-auth"]
+    if len(ack)!=1 or ack[0].get("Source")!="/run/concord/redis-auth/acks/"+slot or ack[0].get("RW") is not False:
+        raise ValueError()
+    identity=[m for m in mounts if m.get("Destination")=="/run/secrets"]
+    role="control-plane" if slot=="control-plane" else "media-plane"
+    if len(identity)!=1 or identity[0].get("Source")!="/run/concord/redis-identities/"+role or identity[0].get("RW") is not False:
+        raise ValueError()
+    if any(m.get("Source","").startswith("/run/concord/redis-auth") and m is not ack[0] for m in mounts):
+        raise ValueError()
+    print(host)
+except (KeyError,TypeError,ValueError,json.JSONDecodeError):
+    raise SystemExit("redis-managed: inspected container is not isolated in its ACK slot")
+' "$slot" "$id" <<<"$inspected")" || return 1
+  status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+  previous="$(python3 -c '
+import json,re,sys
+s=json.load(sys.stdin); b=s.get("bindings",{}).get(sys.argv[1])
+if b is None: print(""); raise SystemExit(0)
+cid=b.get("containerId")
+if not isinstance(cid,str) or not re.fullmatch(r"[a-f0-9]{64}",cid): raise SystemExit(1)
+print(cid)
+' "$slot" <<<"$status")" || return 1
+  if [[ -n "$previous" && "$previous" != "$id" ]]; then
+    if docker inspect --type container "$previous" >/dev/null 2>&1; then
+      echo 'redis-managed: prior slot container still exists; refusing rebind' >&2
+      return 1
+    fi
+  fi
+  replaced="$previous"
+  [[ "$previous" == "$id" ]] && replaced=''
+  request="$(python3 -c 'import json,sys; print(json.dumps({"operation":"bind","slot":sys.argv[1],"containerId":sys.argv[2],"instanceId":sys.argv[3],"replacedContainerId":sys.argv[4]},separators=(",",":")))' "$slot" "$id" "$hostname" "$replaced")" || return 1
+  response="$(redis_managed_control_request "$request")" || return 1
+  python3 -c 'import json,sys; s=json.load(sys.stdin); b=s.get("bindings",{}).get(sys.argv[1]); raise SystemExit(0 if b=={"containerId":sys.argv[2],"instanceId":sys.argv[3]} else 1)' "$slot" "$id" "$hostname" <<<"$response" || return 1
+  printf '%s\n' "$hostname"
+}
+
+redis_managed_replace_ready() {
+  local slot="$1" status previous request
+  status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+  previous="$(python3 -c '
+import json,re,sys
+b=json.load(sys.stdin).get("bindings",{}).get(sys.argv[1])
+if b is None: print(""); raise SystemExit(0)
+cid=b.get("containerId")
+if not isinstance(cid,str) or not re.fullmatch(r"[a-f0-9]{64}",cid): raise SystemExit(1)
+print(cid)
+' "$slot" <<<"$status")" || return 1
+  [[ -n "$previous" ]] || return 0
+  request="$(python3 -c 'import json,sys; print(json.dumps({"operation":"replace-ready","slot":sys.argv[1],"containerId":sys.argv[2]},separators=(",",":")))' "$slot" "$previous")" || return 1
+  redis_managed_control_request "$request" >/dev/null || {
+    echo 'redis-managed: prior ACK slot has not acknowledged; refusing container replacement' >&2
+    return 1
+  }
+}
+
+redis_managed_require_registered_state() {
+  local status="${1:-}"
+  if [[ -z "$status" ]]; then
+    status="$(redis_managed_control_request '{"operation":"status"}')" || {
+      echo 'redis-managed: controller status unavailable; refusing before app creation or traffic drain' >&2
+      return 1
+    }
+  fi
+  python3 -c '
+import json, re, sys
+try:
+    valid_host = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+    status = json.load(sys.stdin)
+    if set(status) != {"state", "rotationId", "targets", "instances", "bindings"} or not isinstance(status["rotationId"], str) or not status["rotationId"]:
+        raise ValueError()
+    targets = status["targets"]
+    if not isinstance(targets, dict) or set(targets) != {"control-plane", "media-plane"}:
+        raise ValueError()
+    if any(type(value) is not int or value < 1 for value in targets.values()):
+        raise ValueError()
+    instances = status["instances"]
+    if not isinstance(instances, dict) or set(instances) != {"control-plane", "media-plane"}:
+        raise ValueError()
+    for hosts in instances.values():
+        if not isinstance(hosts, list) or not hosts or len(hosts) > 64 or len(set(hosts)) != len(hosts):
+            raise ValueError()
+        if any(not isinstance(host, str) or not valid_host.fullmatch(host) for host in hosts):
+            raise ValueError()
+except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+    raise SystemExit("redis-managed: controller has no known registered instance set; operator-reviewed registration is required before app creation or traffic drain")
+' <<<"$status"
+}
+
+redis_managed_require_candidate_state() {
+  python3 -c '
+import json, re, sys
+host = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+try:
+    s=json.load(sys.stdin)
+    common={"state","rotationId","targets","bindings"}
+    if s.get("state") not in ("finalized","prepared","promoted") or not isinstance(s.get("rotationId"),str) or not s["rotationId"]:
+        raise ValueError()
+    if set(s.get("targets",{}))!={"control-plane","media-plane"} or any(type(v) is not int or v<1 for v in s["targets"].values()): raise ValueError()
+    if not isinstance(s.get("bindings"),dict): raise ValueError()
+    if set(s)==common|{"instances"}:
+        instances=s["instances"]
+        if set(instances)!={"control-plane","media-plane"}: raise ValueError()
+        for hosts in instances.values():
+            if not isinstance(hosts,list) or not hosts or len(hosts)>64 or len(set(hosts))!=len(hosts) or any(not isinstance(h,str) or not host.fullmatch(h) for h in hosts): raise ValueError()
+    elif set(s)==common|{"priorRotationId","priorExpected","priorAckProofs"}:
+        if not isinstance(s["priorRotationId"],str) or not s["priorRotationId"] or s["priorRotationId"]==s["rotationId"]: raise ValueError()
+        previous=s["priorExpected"]
+        if not isinstance(previous,dict) or set(previous)!={"control-plane","media-plane"}: raise ValueError()
+        for hosts in previous.values():
+            if not isinstance(hosts,list) or len(hosts)>64 or len(set(hosts))!=len(hosts) or any(not isinstance(h,str) or not host.fullmatch(h) for h in hosts): raise ValueError()
+        proofs=s["priorAckProofs"]
+        if not isinstance(proofs,list) or len(proofs)>128: raise ValueError()
+        seen_proofs=set()
+        seen_containers=set()
+        for p in proofs:
+            if not isinstance(p,dict) or set(p)!={"service","instanceId","slot","containerId"} or not isinstance(p["instanceId"],str) or not host.fullmatch(p["instanceId"]) or not isinstance(p["containerId"],str) or not re.fullmatch(r"[a-f0-9]{64}",p["containerId"]): raise ValueError()
+            if p["service"] == "control-plane":
+                if p["slot"] != "control-plane" or p["instanceId"] not in previous["control-plane"]: raise ValueError()
+            elif p["service"] == "media-plane":
+                if p["slot"] not in ("media-plane","media-plane-blue","media-plane-green") or p["instanceId"] not in previous["media-plane"]: raise ValueError()
+            else: raise ValueError()
+            # The controller derives this proof from the accepted ACK and its
+            # journaled historical binding. The current slot may already have
+            # been rebound to the N+1 candidate by the time status is reread.
+            proof_key=(p["service"],p["instanceId"])
+            if proof_key in seen_proofs or p["containerId"] in seen_containers: raise ValueError()
+            seen_proofs.add(proof_key)
+            seen_containers.add(p["containerId"])
+    else: raise ValueError()
+except (ValueError,TypeError,KeyError,json.JSONDecodeError):
+    raise SystemExit("redis-managed: controller has no valid candidate registration state")
+' <<<"$1"
+}
+
+redis_managed_assert_compatible_image() {
+  local container="$1" role="$2" image modes
+  image="$(docker inspect --format '{{.Image}}' "$container")" || return 1
+  modes="$(docker image inspect --format '{{ index .Config.Labels "org.concord.redis-credential-modes" }}' "$image" 2>/dev/null || true)"
+  [[ "$modes" == legacy,managed ]] || {
+    echo "redis-managed: ${role} image lacks managed credential-mode rollback support; refusing before drain" >&2
+    return 1
+  }
+}
+
+redis_managed_prepare_registered_apps() {
+  local standby="$1" active="$2" full="$3" start_cp="$4" status service ids hostname cp_running=0
+  local candidate_service="media-plane-${standby}" active_service=""
+  local -a cp_hosts=() media_hosts=() prior_cp_hosts=() prior_media_hosts=() prior_cp_containers=() prior_media_containers=() start_services=()
+
+  [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || return 0
+  [[ "$active" == none ]] || active_service="media-plane-${active}"
+
+  # Recheck immediately before inspecting or creating application containers.
+  status="$(redis_managed_control_request '{"operation":"status"}')" || {
+    echo 'redis-managed: controller status unavailable; refusing before app creation or traffic drain' >&2
+    return 1
+  }
+  redis_managed_require_candidate_state "$status" || return 1
+
+  ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
+  if [[ -n "$ids" ]]; then
+    [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || { echo 'redis-managed: unsupported control-plane ACK slot scale' >&2; return 1; }
+    cp_running=1
+    if [[ "$full" == 1 || "$start_cp" == 1 ]]; then
+      echo 'redis-managed: control-plane image replacement cannot proceed without a registered candidate; refusing before drain' >&2
+      return 1
+    fi
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      hostname="$(docker inspect --format '{{.Config.Hostname}}' "$id")" || return 1
+      [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] || return 1
+      redis_managed_assert_compatible_image "$id" control-plane || return 1
+      cp_hosts+=("$hostname")
+      prior_cp_hosts+=("$hostname")
+      prior_cp_containers+=("$id")
+    done <<<"$ids"
+  else
+    service=control-plane
+    redis_managed_replace_ready "$service" || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "$service") || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$service") || return 1
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
+    [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || return 1
+    hostname="$(redis_managed_bind_stopped_instance "$service" "$ids")" || return 1
+    redis_managed_assert_compatible_image "$ids" control-plane || return 1
+    [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] || return 1
+    cp_hosts+=("$hostname")
+  fi
+
+  if [[ -n "$active_service" ]]; then
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "$active_service")" || return 1
+    [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || {
+      echo 'redis-managed: active media instance is absent; refusing expected-set registration' >&2
+      return 1
+    }
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      hostname="$(docker inspect --format '{{.Config.Hostname}}' "$id")" || return 1
+      [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] || return 1
+      redis_managed_assert_compatible_image "$id" active-media || return 1
+      media_hosts+=("$hostname")
+      prior_media_hosts+=("$hostname")
+      prior_media_containers+=("$id")
+    done <<<"$ids"
+  fi
+
+  ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "$candidate_service")" || return 1
+  [[ -z "$ids" ]] || {
+    echo 'redis-managed: standby media instance is already running before expected-set registration' >&2
+    return 1
+  }
+  redis_managed_replace_ready "$candidate_service" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "$candidate_service") || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$candidate_service") || return 1
+  ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$candidate_service")" || return 1
+  [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || return 1
+  hostname="$(redis_managed_bind_stopped_instance "$candidate_service" "$ids")" || return 1
+  redis_managed_assert_compatible_image "$ids" candidate-media || return 1
+  [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] || return 1
+  media_hosts+=("$hostname")
+  start_services+=("$candidate_service")
+
+  # Container creation can span an activation rotation, which replaces the
+  # expected-instance set. Register against the current controller generation.
+  status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+  redis_managed_require_candidate_state "$status" || return 1
+
+  local registration
+  registration="$(python3 -c '
+import json, re, sys
+try:
+    valid_host = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+    status = json.loads(sys.argv[1])
+    common = {"state", "rotationId", "targets", "bindings"}
+    if set(status) not in (common | {"instances"}, common | {"priorRotationId", "priorExpected", "priorAckProofs"}) or not isinstance(status["rotationId"], str) or not status["rotationId"]:
+        raise ValueError()
+    targets = status["targets"]
+    if not isinstance(targets, dict) or set(targets) != {"control-plane", "media-plane"}:
+        raise ValueError()
+    if any(type(value) is not int or value < 1 for value in targets.values()):
+        raise ValueError()
+    proofs_to_check = []
+    if "instances" in status:
+        previous = status["instances"]
+        if not isinstance(previous, dict) or set(previous) != {"control-plane", "media-plane"}:
+            raise ValueError()
+        old_cp, old_media = previous["control-plane"], previous["media-plane"]
+        if not isinstance(old_cp, list) or not isinstance(old_media, list):
+            raise ValueError()
+        if any(not isinstance(host, str) or not valid_host.fullmatch(host) for host in old_cp + old_media):
+            raise ValueError()
+        if len(old_cp) > 64 or len(old_media) > 64 or len(set(old_cp)) != len(old_cp) or len(set(old_media)) != len(old_media):
+            raise ValueError()
+    else:
+        if not isinstance(status["priorRotationId"], str) or not status["priorRotationId"] or status["priorRotationId"] == status["rotationId"]:
+            raise ValueError()
+        previous = status["priorExpected"]
+        if not isinstance(previous, dict) or set(previous) != {"control-plane", "media-plane"}:
+            raise ValueError()
+        old_cp, old_media = previous["control-plane"], previous["media-plane"]
+        if any(not isinstance(hosts, list) or len(hosts) > 64 or len(set(hosts)) != len(hosts) or any(not isinstance(host, str) or not valid_host.fullmatch(host) for host in hosts) for hosts in (old_cp, old_media)):
+            raise ValueError()
+        active_cp, active_media = set(sys.argv[4].splitlines()), set(sys.argv[5].splitlines())
+        active_cp_ids, active_media_ids = set(sys.argv[6].splitlines()), set(sys.argv[7].splitlines())
+        proofs = status["priorAckProofs"]
+        if not isinstance(proofs, list) or len(proofs) > 128:
+            raise ValueError()
+        by_host = {}
+        for proof in proofs:
+            if not isinstance(proof, dict) or set(proof) != {"service", "instanceId", "slot", "containerId"}:
+                raise ValueError()
+            service, host, slot, cid = (proof[k] for k in ("service", "instanceId", "slot", "containerId"))
+            if not isinstance(host, str) or not valid_host.fullmatch(host) or not isinstance(cid, str) or not re.fullmatch(r"[a-f0-9]{64}", cid):
+                raise ValueError()
+            if service == "control-plane":
+                if slot != "control-plane" or host not in old_cp: raise ValueError()
+            elif service == "media-plane":
+                if slot not in ("media-plane", "media-plane-blue", "media-plane-green") or host not in old_media: raise ValueError()
+            else: raise ValueError()
+            if host in by_host: raise ValueError()
+            by_host[host] = cid
+        for host in old_cp:
+            if host not in active_cp and host not in by_host: raise ValueError()
+            if host in by_host and (host not in active_cp or by_host[host] not in active_cp_ids):
+                proofs_to_check.append(by_host[host])
+        for host in old_media:
+            if host not in active_media and host not in by_host: raise ValueError()
+            if host in by_host and (host not in active_media or by_host[host] not in active_media_ids):
+                proofs_to_check.append(by_host[host])
+        bindings=status["bindings"]
+        for host, cid in zip(sys.argv[4].splitlines(), sys.argv[6].splitlines()):
+            if host not in old_cp or bindings.get("control-plane") != {"containerId":cid,"instanceId":host}: raise ValueError()
+        media_slot=sys.argv[8]
+        for host, cid in zip(sys.argv[5].splitlines(), sys.argv[7].splitlines()):
+            if host not in old_media or bindings.get(media_slot) != {"containerId":cid,"instanceId":host}: raise ValueError()
+    cp = sys.argv[2].splitlines()
+    media = sys.argv[3].splitlines()
+    if not cp or not media or any(not valid_host.fullmatch(host) for host in cp + media):
+        raise ValueError()
+    if "instances" in status:
+        expected_cp, expected_media = old_cp + cp, old_media + media
+    else:
+        expected_cp, expected_media = cp, media
+    request = {"operation":"register", "rotationId":status["rotationId"],
+      "instances":{"control-plane":sorted(set(expected_cp)), "media-plane":sorted(set(expected_media))}, "targets":targets}
+    if any(len(request["instances"][service]) > 64 for service in request["instances"]):
+        raise ValueError()
+    print(json.dumps({"request": request, "priorProofContainers": sorted(set(proofs_to_check))}, separators=(",",":")))
+except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+    raise SystemExit("redis-managed: controller policy or inspected instance set is invalid")
+ ' "$status" "$(printf '%s\n' "${cp_hosts[@]}")" "$(printf '%s\n' "${media_hosts[@]}")" "$(printf '%s\n' "${prior_cp_hosts[@]}")" "$(printf '%s\n' "${prior_media_hosts[@]}")" "$(printf '%s\n' "${prior_cp_containers[@]}")" "$(printf '%s\n' "${prior_media_containers[@]}")" "$active_service")" || return 1
+  local proof_ids proof_id proof_state proof_matches
+  proof_ids="$(python3 -c 'import json,sys; print("\n".join(json.loads(sys.stdin.read())["priorProofContainers"]))' <<<"$registration")" || return 1
+  while IFS= read -r proof_id; do
+    [[ -n "$proof_id" ]] || continue
+    proof_matches="$(docker ps -a --no-trunc -q --filter "id=$proof_id")" || return 1
+    if [[ -n "$proof_matches" ]]; then
+      [[ "$proof_matches" == "$proof_id" ]] || { echo 'redis-managed: prior ACK container lookup was ambiguous' >&2; return 1; }
+      proof_state="$(docker inspect --format '{{.State.Running}}' "$proof_id")" || return 1
+      [[ "$proof_state" == false ]] || { echo 'redis-managed: prior ACK instance is not active or stopped; refusing candidate registration' >&2; return 1; }
+    fi
+  done <<<"$proof_ids"
+  registration="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["request"],separators=(",",":")))' <<<"$registration")" || return 1
+  local registered
+  registered="$(redis_managed_control_request "$registration")" || {
+    echo 'redis-managed: controller rejected expected-instance registration; apps remain stopped' >&2
+    return 1
+  }
+  python3 -c 'import json,sys; v=json.load(sys.stdin); raise SystemExit(0 if isinstance(v,dict) and v.get("state") in ("prepared","promoted") else 1)' <<<"$registered" || {
+    echo 'redis-managed: controller did not confirm expected-instance registration' >&2
+    return 1
+  }
+
+  if [[ "$cp_running" == 0 ]]; then
+    start_services+=(control-plane)
+  fi
+  if [[ ${#start_services[@]} -gt 0 ]]; then
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 -- "${start_services[@]}") || return 1
+  fi
+
+  local deadline=$((SECONDS + 90)) current
+  while (( SECONDS < deadline )); do
+    current="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+    if python3 -c 'import json,sys; v=json.load(sys.stdin); raise SystemExit(0 if v.get("state") in ("promoted","finalized") else 1)' <<<"$current"; then
+      return 0
+    fi
+    sleep 3
+  done
+  echo 'redis-managed: expected instances did not prove the target generation; traffic remains unchanged' >&2
+  return 1
+}
+
+redis_managed_policy_preflight() {
+  [[ "$REDIS_CREDENTIAL_MODE" == managed && "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed ]] || {
+    echo 'redis-managed: prepare/rebuild require an explicitly selected managed deployment' >&2
+    return 1
+  }
+  redis_managed_controller_host_identity || return 1
+  redis_managed_marker_preflight "${REDIS_MANAGED_MARKER_MODE:-required}" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD config --quiet) || {
+    echo 'redis-managed: selected Compose model is invalid; refusing maintenance' >&2
+    return 1
+  }
+  redis_managed_validate_mount_model || return 1
+  managed_production_nats_reconcile || return 1
+  redis_managed_image_preflight
+}
+
+redis_managed_validate_transport() {
+  local interpolation_env
+  interpolation_env="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --environment)" || {
+    echo 'redis-managed: cannot inspect Compose interpolation inputs; refusing maintenance' >&2
+    return 1
+  }
+  python3 -c '
+import sys
+values = {key: value for line in sys.stdin for key, sep, value in [line.rstrip("\n").partition("=")] if sep}
+if values.get("REDIS_ENDPOINT", "redis:6379") != "redis:6379" or values.get("REDIS_TLS", "false") != "false" or values.get("REDIS_TLS_CA_FILE", "") != "":
+    raise SystemExit("redis-managed: only in-stack Redis without TLS or a custom CA is supported; refusing before Compose mutation")
+' <<<"$interpolation_env" || return 1
+}
+
+redis_managed_validate_mount_model() {
+  redis_managed_validate_transport || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile services --profile media-bluegreen --env-file /dev/null config --no-interpolate --no-env-resolution --format json) | python3 -c '
+import json,sys
+try:
+    services=json.load(sys.stdin)["services"]
+    app_slots={"control-plane","media-plane","media-plane-blue","media-plane-green"}
+    def overlaps(source, protected):
+        return isinstance(source,str) and source.startswith("/") and (source==protected or source.startswith(protected+"/") or protected.startswith(source.rstrip("/")+"/"))
+    marker=[m for m in services["redis-auth-controller"]["volumes"] if m.get("target")=="/var/lib/concord/redis-auth"]
+    if len(marker)!=1 or marker[0].get("source")!="/var/lib/concord/redis-auth" or marker[0].get("read_only") or marker[0].get("type")!="bind" or marker[0].get("bind",{}).get("create_host_path") is not False:
+        raise ValueError()
+    for name, spec in services.items():
+        if name!="redis-auth-controller" and any(overlaps(m.get("source"),"/var/lib/concord/redis-auth") for m in spec.get("volumes",[])):
+            raise ValueError()
+        if name not in app_slots and set(spec.get("depends_on",{})) & app_slots:
+            raise ValueError()
+    for slot in app_slots:
+        mounts=services[slot]["volumes"]
+        ack=[m for m in mounts if m.get("target")=="/run/redis-auth"]
+        if len(ack)!=1 or ack[0].get("source")!="/run/concord/redis-auth/acks/"+slot or not ack[0].get("read_only"):
+            raise ValueError()
+        identity=[m for m in mounts if m.get("target")=="/run/secrets"]
+        role="control-plane" if slot=="control-plane" else "media-plane"
+        if len(identity)!=1 or identity[0].get("source")!="/run/concord/redis-identities/"+role or not identity[0].get("read_only"):
+            raise ValueError()
+        if any(overlaps(m.get("source"),"/run/concord/redis-auth") and m is not ack[0] for m in mounts):
+            raise ValueError()
+        if any(overlaps(m.get("source"),"/run/concord/redis-identities") and m is not identity[0] for m in mounts):
+            raise ValueError()
+        if any(overlaps(m.get("source"),"/var/lib/concord/redis-auth") for m in mounts):
+            raise ValueError()
+except (KeyError,TypeError,ValueError,json.JSONDecodeError):
+    raise SystemExit("redis-managed: ACK slot Compose mounts are not isolated")
+' || return 1
+}
+
+redis_managed_image_preflight() {
+  local model service image image_id account actual_uid actual_gid
+  local -a image_services=(control-plane redis-auth-controller)
+  if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+    image_services+=(media-plane-blue media-plane-green)
+  else
+    image_services+=(media-plane)
+  fi
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile services build "${image_services[@]}") || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD pull redis) || return 1
+  model="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile services config --format json)" || return 1
+  image_services+=(redis)
+  for service in "${image_services[@]}"; do
+    image="$(python3 -c 'import json,sys; s=json.load(sys.stdin)["services"][sys.argv[1]]; print(s.get("image", ""))' "$service" <<<"$model")" || return 1
+    [[ -n "$image" ]] || { echo "redis-managed: selected ${service} image is unavailable in Compose model" >&2; return 1; }
+    image_id="$(docker image inspect --format '{{.Id}}' "$image")" || {
+      echo "redis-managed: selected ${service} image is unavailable locally after build/pull" >&2; return 1;
+    }
+    case "$service" in
+      control-plane|media-plane|media-plane-blue|media-plane-green) account=appuser ;;
+      redis) account=redis ;;
+      redis-auth-controller) account=redis-auth-controller ;;
+    esac
+    actual_uid="$(docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --cpus 0.1 --memory 64m --entrypoint id \
+      "$image_id" -u "$account" 2>/dev/null)" || {
+      echo "redis-managed: cannot resolve selected ${service} image UID" >&2; return 1;
+    }
+    actual_gid="$(docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --cpus 0.1 --memory 64m --entrypoint id \
+      "$image_id" -g "$account" 2>/dev/null)" || {
+      echo "redis-managed: cannot resolve selected ${service} image GID" >&2; return 1;
+    }
+    [[ "$actual_uid" =~ ^(0|[1-9][0-9]*)$ && "$actual_gid" =~ ^(0|[1-9][0-9]*)$ ]] || {
+      echo "redis-managed: selected ${service} image returned nonnumeric UID/GID" >&2; return 1;
+    }
+    case "$service" in
+      control-plane)
+        [[ "$actual_uid" == "$REDIS_CONTROL_UID" ]] || { echo 'redis-managed: control-plane UID selector differs from inspected image' >&2; return 1; }
+        [[ "$actual_gid" != 0 ]] || { echo 'redis-managed: control-plane GID must not be root' >&2; return 1; }
+        REDIS_CONTROL_GID="$actual_gid" ;;
+      media-plane|media-plane-blue|media-plane-green)
+        [[ "$actual_uid" == "$REDIS_MEDIA_UID" && "$actual_gid" != 0 && ( -z "${REDIS_MEDIA_GID:-}" || "$actual_gid" == "$REDIS_MEDIA_GID" ) ]] || {
+          echo "redis-managed: ${service} UID/GID differs from inspected media image" >&2; return 1;
+        }
+        REDIS_MEDIA_GID="$actual_gid" ;;
+      redis) [[ "$actual_uid" == "$REDIS_ACL_UID" && "$actual_gid" == "$REDIS_ACL_GID" ]] || { echo 'redis-managed: Redis ACL UID/GID selectors differ from inspected image' >&2; return 1; } ;;
+      redis-auth-controller) [[ "$actual_uid" == 10004 && "$actual_gid" == 10004 ]] || { echo 'redis-managed: controller image must use the dedicated UID/GID' >&2; return 1; } ;;
+    esac
+    if [[ "$service" != redis-auth-controller && ( "$actual_uid" == 10004 || "$actual_gid" == 10004 ) ]]; then
+      echo "redis-managed: ${service} account collides with the controller identity" >&2; return 1;
+    fi
+  done
+}
+
+redis_managed_prepare_ram_state() {
+  local root=/run/concord/redis-auth
+  redis_managed_controller_host_identity || return 1
+  if [[ "${REDIS_MANAGED_RECOVER:-0}" != 1 && ( -e "$root/state/rotation.json" || -e "$root/acl/users.acl" ) ]] \
+    && { [[ "${REDIS_MANAGED_RECOVER:-0}" != 3 ]] || ! cmp -s /var/lib/concord/redis-auth/activated <(printf 'concord-managed-redis-initializing-v1\n'); }; then
+    echo 'redis-managed: existing journal or ACL requires redis-managed-rebuild or explicit --recover' >&2
+    return 1
+  fi
+  if [[ "${REDIS_MANAGED_RECOVER:-0}" == 1 && -e "$root/acl/users.acl" && ! -e "$root/state/rotation.json" ]]; then
+    echo 'redis-managed: ACL exists without a journal; refusing to invent revoked-user history' >&2
+    return 1
+  fi
+  [[ ( ! -e "$root" && ! -L "$root" ) || ( ! -L "$root" && "$(stat -c '%u:%g:%a' "$root" 2>/dev/null || true)" == '10004:0:2710' ) ]] || {
+    echo 'redis-managed: legacy root-owned RAM state requires a separately reviewed migration' >&2; return 1;
+  }
+  [[ "${REDIS_CONTROL_GID:-}" =~ ^[1-9][0-9]*$ && "${REDIS_MEDIA_GID:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+  local path expected slot slot_gid
+  for path in "$root/state" "$root/acks" "$root/acl" \
+    "$root/acks/control-plane" "$root/acks/media-plane" "$root/acks/media-plane-blue" "$root/acks/media-plane-green"; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    case "$path" in
+      "$root/state"|"$root/acks") expected='10004:10004:700' ;;
+      "$root/acl") expected="10004:${REDIS_ACL_GID}:2710" ;;
+      "$root/acks/control-plane") expected="10004:${REDIS_CONTROL_GID}:2710" ;;
+      *) expected="10004:${REDIS_MEDIA_GID}:2710" ;;
+    esac
+    [[ -d "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' "$path" 2>/dev/null || true)" == "$expected" ]] || {
+      echo 'redis-managed: existing RAM state needs a separately reviewed ownership migration' >&2; return 1;
+    }
+  done
+  install -d -o 10004 -g 0 -m 2710 "$root" || return 1
+  install -d -o 10004 -g 10004 -m 0700 "$root/state" "$root/acks" \
+    || return 1
+  install -d -o 10004 -g "$REDIS_ACL_GID" -m 2710 "$root/acl" \
+    || return 1
+  for slot in control-plane media-plane media-plane-blue media-plane-green; do
+    slot_gid="$REDIS_MEDIA_GID"
+    [[ "$slot" == control-plane ]] && slot_gid="$REDIS_CONTROL_GID"
+    install -d -o 10004 -g "$slot_gid" -m 2710 "$root/acks/$slot" || return 1
+  done
+}
+
+redis_managed_prepare_controller() {
+  local recover="${1:-0}" proof="${2:-}"
+  local -a args=(run --rm --no-deps redis-auth-controller prepare)
+  [[ "$recover" == 3 ]] && args+=(--first-activation)
+  [[ "$recover" == 1 ]] && args+=(--recover)
+  if [[ "$recover" == 2 ]]; then
+    args=(run -T --rm --no-deps redis-auth-controller prepare --recover-lost-state)
+    redis_managed_read_lost_state_proof "$proof" | (cd "$DEPLOY_DIR" && $COMPOSE_CMD "${args[@]}")
+    return $?
+  fi
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD "${args[@]}")
+}
+
+redis_managed_read_lost_state_proof() {
+  python3 -c '
+import os, stat, sys
+path = sys.argv[1]
+if not path.startswith("/"):
+    raise SystemExit("redis-managed: lost-state proof must have an absolute path")
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+except OSError:
+    raise SystemExit("redis-managed: lost-state proof is unavailable or is a symlink")
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600 or not 0 < info.st_size <= 16384:
+        raise SystemExit("redis-managed: lost-state proof requires a root-owned 0600 regular file of at most 16 KiB")
+    data = os.read(fd, 16385)
+    if len(data) != info.st_size:
+        raise SystemExit("redis-managed: lost-state proof changed during read")
+    sys.stdout.buffer.write(data)
+finally:
+    os.close(fd)
+' "$1"
+}
+
+redis_managed_stopped_apps() {
+  local service ids
+  for service in control-plane media-plane media-plane-blue media-plane-green; do
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "$service" 2>/dev/null)" || return 1
+    [[ -z "$ids" ]] || {
+      echo "redis-managed: ${service} is still running; refusing the next maintenance step" >&2
+      return 1
+    }
+  done
+}
+
+redis_managed_select_media_service() {
+  local mode="${1:-}" active response
+  if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-single ]]; then
+    echo media-plane
+    return 0
+  fi
+  response="$(redis_managed_control_request '{"operation":"redis","args":["GET","media:active_colour"]}')" || {
+    echo 'redis-managed: cannot read the active media colour; refusing service selection' >&2
+    return 1
+  }
+  active="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("output", ""))' <<<"$response")" || return 1
+  [[ -n "$active" || "$mode" != initial ]] || active=blue
+  [[ "$active" == blue || "$active" == green ]] || {
+    echo 'redis-managed: active media colour is missing or invalid; operator selection is required' >&2
+    return 1
+  }
+  echo "media-plane-${active}"
+}
+
+redis_managed_wait_apps() {
+  local media_service="${1:-media-plane}" mode="${2:-}" deadline=$((SECONDS + 180)) status media_port=3000 active confirmed
+  while (( SECONDS < deadline )); do
+    status="$(redis_managed_control_request '{"operation":"status"}')" || { sleep 3; continue; }
+    if python3 -c 'import json,sys; s=json.load(sys.stdin); raise SystemExit(0 if s.get("state")=="finalized" else 1)' <<<"$status"; then
+      local cp media
+      cp="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
+      media="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "$media_service")" || return 1
+      [[ -n "$cp" && -n "$media" ]] || { sleep 3; continue; }
+      curl -fsS --max-time 3 http://127.0.0.1:8080/readyz >/dev/null || { sleep 3; continue; }
+      if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
+        active="$(media_bluegreen_redis GET media:active_colour)" || { sleep 3; continue; }
+        if [[ -z "$active" ]]; then
+          [[ "$mode" == initial && "$media_service" == media-plane-blue ]] || {
+            echo 'redis-managed: missing active colour for a noninitial media selection' >&2; return 1;
+          }
+          media_bluegreen_probe_ready blue true 3000 || { sleep 3; continue; }
+          media_bluegreen_redis SADD media:colours:registered blue >/dev/null || return 1
+          if ! media_bluegreen_redis SET media:active_colour blue >/dev/null; then
+            confirmed="$(media_bluegreen_redis GET media:active_colour)" || return 1
+            [[ "$confirmed" == blue ]] || {
+              echo 'redis-managed: initial active colour write was not confirmed' >&2; return 1;
+            }
+          fi
+          active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+          [[ "$active" == blue ]] || {
+            echo 'redis-managed: initial active colour readback disagrees with selected media' >&2; return 1;
+          }
+        fi
+        [[ "$media_service" == "media-plane-${active}" ]] || {
+          echo 'redis-managed: active colour changed during startup; refusing success' >&2; return 1;
+        }
+        media_port="$(media_bluegreen_port "$active")" || return 1
+        media_bluegreen_probe_ready "$active" true "$media_port" || { sleep 3; continue; }
+      else
+        curl -fsS --max-time 3 "http://127.0.0.1:${media_port}/readyz" >/dev/null || { sleep 3; continue; }
+      fi
+      redis_managed_control_request '{"operation":"redis","args":["GET","media:active_colour"]}' >/dev/null || { sleep 3; continue; }
+      return 0
+    fi
+    sleep 3
+  done
+  echo 'redis-managed: expected Redis acknowledgments and app health did not complete; services remain for operator recovery' >&2
+  return 1
+}
+
+redis_managed_register_stopped_apps() {
+  local media_service="${1:-media-plane}" status service ids hostname registration response
+  local -a cp_hosts=() media_hosts=()
+  status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+  for service in control-plane "$media_service"; do
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
+    [[ -n "$ids" ]] || { echo "redis-managed: no stopped ${service} container was created" >&2; return 1; }
+    [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || { echo 'redis-managed: unsupported ACK slot scale' >&2; return 1; }
+    hostname="$(redis_managed_bind_stopped_instance "$service" "$ids")" || return 1
+    redis_managed_assert_compatible_image "$ids" "$service" || return 1
+    if [[ "$service" == control-plane ]]; then cp_hosts+=("$hostname"); else media_hosts+=("$hostname"); fi
+  done
+  registration="$(python3 -c '
+import json, re, sys
+s=json.loads(sys.argv[1]); valid=re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+if s.get("state") not in ("finalized", "prepared", "promoted") or not s.get("rotationId"): raise SystemExit(1)
+targets=s.get("targets",{}); old=s.get("instances",{})
+cp=sys.argv[2].splitlines(); media=sys.argv[3].splitlines()
+if set(targets)!={"control-plane","media-plane"} or any(type(v) is not int or v < 1 for v in targets.values()): raise SystemExit(1)
+if not cp or not media or any(not valid.fullmatch(h) for h in cp+media): raise SystemExit(1)
+if old and set(old)!={"control-plane","media-plane"}: raise SystemExit(1)
+instances={k:sorted(set(old.get(k,[])+v)) for k,v in (("control-plane",cp),("media-plane",media))}
+print(json.dumps({"operation":"register","rotationId":s["rotationId"],"instances":instances,"targets":targets},separators=(",",":")))
+' "$status" "$(printf '%s\n' "${cp_hosts[@]}")" "$(printf '%s\n' "${media_hosts[@]}")")" || return 1
+  response="$(redis_managed_control_request "$registration")" || return 1
+  python3 -c 'import json,sys; v=json.load(sys.stdin); raise SystemExit(0 if v.get("state") in ("prepared","promoted","finalized") else 1)' <<<"$response"
+}
+
+redis_managed_prepare_locked() {
+  local recover=0 proof='' media_service mode=initial redis_running controller_running status cp_id media_id
+  [[ "${1:-}" == --first-activation && $# -eq 1 ]] && recover=3
+  [[ "${1:-}" == --recover ]] && recover=1
+  if [[ "${1:-}" == --recover-lost-state && $# -eq 2 ]]; then
+    recover=2
+    proof="$2"
+  fi
+  [[ ( $# -eq 1 && ( "$recover" == 1 || "$recover" == 3 ) ) || ( $# -eq 2 && "$recover" == 2 ) ]] || {
+    echo 'Usage: concord-ctl.sh redis-managed-prepare --first-activation | --recover | --recover-lost-state <proof.json>' >&2; return 2;
+  }
+  REDIS_MANAGED_RECOVER="$recover"
+  REDIS_MANAGED_MARKER_MODE=required
+  [[ "$recover" == 3 ]] && REDIS_MANAGED_MARKER_MODE=first
+  [[ "$recover" == 2 ]] && REDIS_MANAGED_MARKER_MODE=lost
+  if [[ "$recover" == 2 ]]; then
+    [[ ! -e /run/concord/redis-auth/state/rotation.json && ! -L /run/concord/redis-auth/state/rotation.json && \
+       ! -e /run/concord/redis-auth/acl/users.acl && ! -L /run/concord/redis-auth/acl/users.acl ]] || {
+      echo 'redis-managed: lost-state recovery requires both RAM files absent; refusing to discard known state' >&2; return 1;
+    }
+    redis_managed_read_lost_state_proof "$proof" >/dev/null || return 1
+  fi
+  redis_managed_policy_preflight || return 1
+  REDIS_MANAGED_INITIAL_PREFLIGHT=1
+  redis_managed_host_preflight || return 1
+  if [[ "$recover" == 1 ]]; then
+    [[ -f /run/concord/redis-auth/state/rotation.json && ! -L /run/concord/redis-auth/state/rotation.json ]] || {
+      echo 'redis-managed: recovery requires an intact journal; refusing to infer history' >&2; return 1;
+    }
+  elif [[ -e /run/concord/redis-auth/state/rotation.json || -e /run/concord/redis-auth/acl/users.acl ]] \
+    && { [[ "$recover" != 3 ]] || ! cmp -s /var/lib/concord/redis-auth/activated <(printf 'concord-managed-redis-initializing-v1\n'); }; then
+    echo 'redis-managed: state already exists; use redis-managed-rebuild or --recover' >&2; return 1
+  fi
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop control-plane) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop media-plane media-plane-blue media-plane-green) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop redis) || return 1
+  redis_managed_stopped_apps || return 1
+  controller_running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q redis-auth-controller)" || return 1
+  [[ -z "$controller_running" ]] || {
+    echo 'redis-managed: controller is still running; refusing concurrent journal recovery' >&2; return 1;
+  }
+  redis_running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q redis)" || return 1
+  [[ -z "$redis_running" ]] || {
+    echo 'redis-managed: Redis is still running; refusing ACL preparation' >&2; return 1;
+  }
+  redis_managed_prepare_ram_state || return 1
+  redis_managed_prepare_controller "$recover" "$proof" || return 1
+  REDIS_MANAGED_MARKER_MODE=required
+  redis_managed_marker_preflight required || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait redis) || return 1
+  [[ "$recover" == 1 ]] && mode=recover
+  media_service="$(redis_managed_select_media_service "$mode")" || return 1
+  if [[ "$recover" == 1 ]]; then
+    status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+    cp_id="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q control-plane)" || return 1
+    media_id="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$media_service")" || return 1
+    if python3 -c '
+import json,re,sys
+try:
+    bindings=json.load(sys.stdin)["bindings"]
+    pairs=(("control-plane",sys.argv[2]),(sys.argv[1],sys.argv[3]))
+    valid=all(re.fullmatch(r"[a-f0-9]{64}", cid) and bindings.get(slot,{}).get("containerId")==cid for slot,cid in pairs)
+except (KeyError,TypeError,ValueError,json.JSONDecodeError):
+    valid=False
+raise SystemExit(0 if valid and sys.argv[2]!=sys.argv[3] else 1)
+' "$media_service" "$cp_id" "$media_id" <<<"$status"; then
+      redis_managed_resume_stopped_rebuild restart
+      return $?
+    fi
+  fi
+  for service in control-plane "$media_service"; do
+    redis_managed_replace_ready "$service" || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$service") || return 1
+  done
+  redis_managed_register_stopped_apps "$media_service" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
+  redis_managed_wait_apps "$media_service" "$mode"
+}
+
+redis_managed_host_preflight_initial() {
+  [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || return 1
+  command -v findmnt >/dev/null 2>&1 || { echo 'redis-managed: findmnt is required' >&2; return 1; }
+  [[ "$(findmnt -n -T /run/concord -o FSTYPE 2>/dev/null || true)" == tmpfs ]] || {
+    echo 'redis-managed: /run/concord must be on host RAM; refusing disk fallback' >&2; return 1;
+  }
+  for role in controller control-plane media-plane; do
+    local path="/run/concord/redis-identities/${role}"
+    local expected_uid=10004
+    [[ "$role" == control-plane ]] && expected_uid="$REDIS_CONTROL_UID"
+    [[ "$role" == media-plane ]] && expected_uid="$REDIS_MEDIA_UID"
+    [[ -d "$path" && ! -L "$path" && -f "$path/redis-infisical-client-secret" && ! -L "$path/redis-infisical-client-secret" ]] || {
+      echo "redis-managed: ${role} provider identity is unavailable" >&2; return 1;
+    }
+    [[ "$(findmnt -n -T "$path" -o FSTYPE 2>/dev/null || true)" == tmpfs ]] || {
+      echo "redis-managed: ${role} provider identity is not on host RAM" >&2; return 1;
+    }
+    [[ "$(stat -c '%u:%a' "$path" 2>/dev/null || true)" == "${expected_uid}:500" && \
+       "$(stat -c '%u:%a' "$path/redis-infisical-client-secret" 2>/dev/null || true)" == "${expected_uid}:400" ]] || {
+      echo "redis-managed: ${role} provider identity ownership/mode is invalid" >&2; return 1;
+    }
+  done
+  [[ "$REDIS_ACL_GID" != 10001 ]] || { echo 'redis-managed: ACL GID collides with reserved host group 10001' >&2; return 1; }
+}
+
+# shortcut: a crash after successful health can leave this marker, add verified-complete retry if recurring.
+redis_managed_rebuild_marker() {
+  python3 - "$REDIS_MANAGED_REBUILD_MARKER" "$@" <<'PY'
+import json, os, re, stat, sys, tempfile
+
+path, action, raw_status, media_service, cp_id, media_id = sys.argv[1:]
+try:
+    status = json.loads(raw_status)
+    bindings = status["bindings"]
+    if not isinstance(status["rotationId"], str) or not status["rotationId"] or media_service not in ("media-plane", "media-plane-blue", "media-plane-green"):
+        raise ValueError()
+    if any(not re.fullmatch(r"[a-f0-9]{64}", cid) for cid in (cp_id, media_id)) or cp_id == media_id:
+        raise ValueError()
+    if bindings["control-plane"]["containerId"] != cp_id or bindings[media_service]["containerId"] != media_id:
+        raise ValueError()
+    if action == "begin":
+        if status["state"] != "finalized" or os.path.lexists(path):
+            raise ValueError()
+        marker = {"rotationId": status["rotationId"], "mediaService": media_service,
+                  "containers": {"control-plane": cp_id, "media-plane": media_id}}
+        fd, temp = tempfile.mkstemp(prefix=".redis-managed-rebuild.", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(marker, output, separators=(",", ":"))
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.link(temp, path)
+            os.unlink(temp)
+            temp = None
+            directory = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temp is not None:
+                os.unlink(temp)
+    elif action == "verify":
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                raise ValueError()
+            marker = json.load(source)
+        if set(marker) != {"rotationId", "mediaService", "containers"} or marker["rotationId"] != status["rotationId"] or marker["mediaService"] != media_service:
+            raise ValueError()
+        old = marker["containers"]
+        if set(old) != {"control-plane", "media-plane"} or any(not isinstance(cid, str) or not re.fullmatch(r"[a-f0-9]{64}", cid) for cid in old.values()):
+            raise ValueError()
+        if not {cp_id, media_id}.isdisjoint(old.values()):
+            raise ValueError()
+    else:
+        raise ValueError()
+except (OSError, ValueError, KeyError, TypeError):
+    raise SystemExit("redis-managed: rebuild marker is missing, invalid, or does not prove both replacements")
+PY
+}
+
+redis_managed_rebuild_locked() {
+  local status service media_service cp_id='' media_id=''
+  if [[ $# -eq 1 && "$1" == --resume ]]; then
+    redis_managed_resume_stopped_rebuild rebuild
+    return $?
+  fi
+  [[ $# -eq 0 ]] || { echo 'Usage: concord-ctl.sh redis-managed-rebuild [--resume]' >&2; return 2; }
+  [[ ! -e "$REDIS_MANAGED_REBUILD_MARKER" && ! -L "$REDIS_MANAGED_REBUILD_MARKER" ]] || {
+    echo 'redis-managed: interrupted rebuild marker exists; use redis-managed-rebuild --resume or operator-reviewed recovery' >&2; return 1;
+  }
+  redis_managed_policy_preflight || return 1
+  redis_managed_host_preflight || return 1
+  status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+  python3 -c 'import json,sys; s=json.load(sys.stdin); t=s.get("targets",{}); raise SystemExit(0 if s.get("state")=="finalized" and set(t)=={"control-plane","media-plane"} and all(type(v) is int and v > 0 for v in t.values()) else 1)' <<<"$status" || {
+    echo 'redis-managed: rebuild requires finalized single-generation state; use operator-reviewed recovery' >&2; return 1;
+  }
+  redis_managed_require_registered_state "$status" || return 1
+  media_service="$(redis_managed_select_media_service rebuild)" || return 1
+  for service in control-plane "$media_service"; do
+    local ids
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "$service")" || return 1
+    [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || { echo "redis-managed: expected one running ${service} before rebuild" >&2; return 1; }
+    redis_managed_assert_compatible_image "$ids" "$service" || return 1
+    if [[ "$service" == control-plane ]]; then cp_id="$ids"; else media_id="$ids"; fi
+  done
+  redis_managed_status_acks_preflight "$status" || return 1
+  local initial_status="$status"
+  redis_managed_assert_same_rotation "$initial_status" || return 1
+  redis_managed_rebuild_marker begin "$status" "$media_service" "$cp_id" "$media_id" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop control-plane) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop media-plane media-plane-blue media-plane-green) || return 1
+  redis_managed_stopped_apps || return 1
+  redis_managed_assert_same_rotation "$initial_status" || return 1
+  local cp_running
+  cp_running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
+  [[ -z "$cp_running" ]] || { echo 'redis-managed: zero-control-plane migration gate failed' >&2; return 1; }
+  for service in control-plane "$media_service"; do
+    redis_managed_replace_ready "$service" || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "$service") || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$service") || return 1
+  done
+  redis_managed_assert_same_rotation "$initial_status" || return 1
+  redis_managed_register_stopped_apps "$media_service" || return 1
+  redis_managed_assert_same_rotation "$initial_status" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
+  redis_managed_assert_same_rotation "$initial_status" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
+  redis_managed_wait_apps "$media_service" || return 1
+  rm -- "$REDIS_MANAGED_REBUILD_MARKER"
+}
+
+redis_managed_resume_stopped_rebuild() {
+  local mode="${1:-restart}" status media_service service ids bound hostname cp_id='' media_id=''
+  redis_managed_marker_preflight required || return 1
+  redis_managed_host_preflight || return 1
+  redis_managed_validate_mount_model || return 1
+  redis_managed_stopped_apps || return 1
+  status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+  python3 -c 'import json,sys; s=json.load(sys.stdin); t=s.get("targets",{}); raise SystemExit(0 if s.get("state") in ("finalized","prepared","promoted") and s.get("rotationId") and set(t)=={"control-plane","media-plane"} and all(type(v) is int and v>0 for v in t.values()) else 1)' <<<"$status" || return 1
+  media_service="$(redis_managed_select_media_service rebuild)" || return 1
+  for service in control-plane "$media_service"; do
+    ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
+    [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || { echo 'redis-managed: resume requires exactly one stopped container per slot' >&2; return 1; }
+    bound="$(python3 -c 'import json,sys; s=json.load(sys.stdin); b=s.get("bindings",{}).get(sys.argv[1],{}); print(b.get("containerId",""))' "$service" <<<"$status")" || return 1
+    [[ "$ids" == "$bound" ]] || { echo 'redis-managed: resume container differs from durable ACK binding' >&2; return 1; }
+    redis_managed_assert_compatible_image "$ids" "$service" || return 1
+    if [[ "$service" == control-plane ]]; then cp_id="$ids"; else media_id="$ids"; fi
+  done
+  if [[ "$mode" == rebuild ]]; then
+    redis_managed_rebuild_marker verify "$status" "$media_service" "$cp_id" "$media_id" || return 1
+  fi
+  for service in control-plane "$media_service"; do
+    if [[ "$service" == control-plane ]]; then ids="$cp_id"; else ids="$media_id"; fi
+    hostname="$(redis_managed_bind_stopped_instance "$service" "$ids")" || return 1
+    [[ -n "$hostname" ]] || return 1
+  done
+  redis_managed_assert_same_rotation "$status" || return 1
+  redis_managed_register_stopped_apps "$media_service" || return 1
+  redis_managed_assert_same_rotation "$status" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 control-plane) || return 1
+  redis_managed_assert_same_rotation "$status" || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 "$media_service") || return 1
+  redis_managed_wait_apps "$media_service" || return 1
+  [[ "$mode" != rebuild ]] || rm -- "$REDIS_MANAGED_REBUILD_MARKER"
+}
+
+redis_managed_restart_bound_stack() {
+  local services service ids cp_running media_running status
+  local -a supporting=()
+  [[ ! -e "$REDIS_MANAGED_REBUILD_MARKER" && ! -L "$REDIS_MANAGED_REBUILD_MARKER" ]] || {
+    echo 'redis-managed: interrupted rebuild requires redis-managed-rebuild --resume; refusing restart' >&2; return 1;
+  }
+  redis_managed_host_preflight || return 1
+  redis_managed_validate_mount_model || return 1
+  services="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --services)" || return 1
+  while IFS= read -r service; do
+    case "$service" in
+      control-plane|media-plane|media-plane-blue|media-plane-green|redis-auth-controller|redis) ;;
+      postgres|minio|nats|coturn|ops-agent|pgadmin|redis-commander)
+        ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
+        [[ -z "$ids" ]] || supporting+=("$service")
+        ;;
+      *) echo 'redis-managed: unsupported service in stopped stack; refusing restart' >&2; return 1 ;;
+    esac
+  done <<<"$services"
+  [[ ${#supporting[@]} -gt 0 ]] || return 1
+  cp_running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
+  media_running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q media-plane)" || return 1
+  if [[ -n "$cp_running" || -n "$media_running" ]]; then
+    [[ -n "$cp_running" && -n "$media_running" ]] || {
+      echo 'redis-managed: partial app outage requires operator-reviewed recovery' >&2; return 1;
+    }
+    status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
+    redis_managed_require_registered_state "$status" || return 1
+    redis_managed_status_acks_preflight "$status" || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop) || return 1
+  fi
+  redis_managed_stopped_apps || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 redis) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 "${supporting[@]}") || return 1
+  redis_managed_resume_stopped_rebuild
+}
+
+redis_managed_status_acks_preflight() {
+  local status="$1"
+  # The status endpoint intentionally exposes no ACK detail; require the
+  # controller's finalized state and a live Redis probe before any outage.
+  python3 -c 'import json,sys; s=json.loads(sys.argv[1]); raise SystemExit(0 if s.get("state")=="finalized" and set(s.get("instances",{}))=={"control-plane","media-plane"} else 1)' "$status" || return 1
+  redis_managed_control_request '{"operation":"redis","args":["GET","media:active_colour"]}' >/dev/null
+}
+
+redis_managed_assert_same_rotation() {
+  local before="$1" after
+  after="$(redis_managed_control_request '{"operation":"status"}')" || {
+    echo 'redis-managed: controller state unavailable at maintenance boundary; apps remain stopped' >&2
+    return 1
+  }
+  python3 -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); raise SystemExit(0 if a.get("rotationId")==b.get("rotationId") and a.get("targets")==b.get("targets") else 1)' "$before" "$after" || {
+    echo 'redis-managed: policy rotation changed during outage; use operator-reviewed redis-managed-prepare --recover' >&2
+    return 1
+  }
+}
+
 # Reconcile before managed production image builds; immutable West staging and
 # canonical staging must not pull or start production NATS.
 managed_production_nats_reconcile() {
@@ -2496,7 +3766,7 @@ managed_production_nats_reconcile() {
 # Build only explicit services. In particular, neither the active colour nor
 # the unselected legacy service may be pulled in by an implicit Compose up.
 media_bluegreen_rebuild_locked() {
-  local snapshot active standby rendered plan deps rest scope_token ingress_ids start_cp=0 start_media=0 full=0
+  local snapshot active standby rendered plan deps rest scope_token ingress_ids start_cp=0 start_media=0 full=0 managed_apps_prepared=0
   local -a deps_arr=() rest_arr=()
   if [[ $# -eq 0 ]]; then
     start_cp=1
@@ -2526,6 +3796,16 @@ media_bluegreen_rebuild_locked() {
       *) echo "rebuild: invalid or unknown service '${scope_token}'" >&2; return 2 ;;
     esac
   done
+  if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
+    if (( start_cp == 1 )); then
+      echo 'redis-managed: ordinary control-plane rebuild requires redis-managed-rebuild for the explicit full outage' >&2
+      return 1
+    fi
+    if (( $# != 1 || start_media != 1 )); then
+      echo 'redis-managed: ordinary blue/green rebuild supports one media-colour scope only' >&2
+      return 1
+    fi
+  fi
   # A direct non-voice scope still resolves and fences the active colour, but
   # does not spuriously promote a new colour.
   if (( full == 1 )); then
@@ -2552,12 +3832,29 @@ print(" ".join(sorted(set(s) - closure - excluded)))
   fi
   # Refusal above is before the Activity History guard: that guard can write a
   # receipt, and a rejected cutover must leave the receipt and image pin intact.
+  if [[ "$REDIS_CREDENTIAL_MODE" == managed ]] && (( start_media == 1 || start_cp == 1 )); then
+    redis_managed_require_registered_state || return 1
+  fi
   activity_history_routine_guard || return 1
   managed_production_nats_reconcile || return 1
   if (( full == 1 )) && [[ ${#deps_arr[@]} -gt 0 ]]; then
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${deps_arr[@]}") || return 1
   fi
+  if [[ "$REDIS_CREDENTIAL_MODE" == managed && "$start_media" == 1 ]]; then
+    if (( start_cp == 1 )); then
+      clear_activity_history_image_selector || return 1
+      privacy_defaults_refuse_foreign_control_plane || return 1
+    fi
+    redis_managed_prepare_registered_apps "$standby" "${active:-none}" "$full" "$start_cp" || return 1
+    managed_apps_prepared=1
+  elif [[ "$REDIS_CREDENTIAL_MODE" == managed && "$start_cp" == 1 ]]; then
+    echo 'redis-managed: control-plane-only replacement requires a registered candidate; refusing before drain' >&2
+    return 1
+  fi
   if (( start_cp == 1 )); then
+    if [[ "$managed_apps_prepared" == 1 ]]; then
+      : # cold prepare already created, registered, started, and proved this instance
+    else
     clear_activity_history_image_selector || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane) || return 1
     privacy_defaults_refuse_foreign_control_plane || return 1
@@ -2565,6 +3862,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
     privacy_defaults_require_local_control_plane_drained || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 control-plane) || return 1
     voice_enforcement_rollout_wait_control_plane || return 1
+    fi
   fi
   if (( start_media == 1 )); then
     if [[ "${COMPOSE_OVERRIDE:-}" == docker-compose.staging.yml ]]; then
@@ -2988,7 +4286,12 @@ if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
 fi
 
 case "${1:-help}" in
-  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|nginx-reload|sudoers-sync)
+  nginx-reload|sudoers-sync)
+    # These early post-rsync transactions wait for an in-progress actor cycle.
+    DEPLOY_LOCK_WAIT_SECS=90
+    acquire_deploy_transaction_lock "$@"
+    ;;
+  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|redis-managed-prepare|redis-managed-rebuild)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -3003,10 +4306,12 @@ case "${1:-help}" in
     # carrying a 45s stop_grace_period. Failing the deploy there would surface as
     # an unexplained "lock is busy" on a few percent of deploys and read as CI
     # flake. 90s comfortably exceeds the actor's worst-case hold.
-    # The early post-rsync sudoers and nginx transactions need the same wait:
-    # a healthy actor cycle must not fail Main CD before the rebuild begins.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
+    if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
+       && "$COMPOSE_OVERRIDE" == docker-compose.production.yml ]]; then
+      redis_managed_writer_consistency_guard || exit 1
+    fi
     ;;
 esac
 
@@ -3102,6 +4407,7 @@ case "${1:-help}" in
     ;;
 
   restart)
+    redis_managed_host_preflight || exit 1
     # #1015: sync_releases no longer auto-called. The sync-releases.yml
     # workflow is the canonical writer for /opt/concord/releases/.
     # If you need to refresh release assets, trigger the workflow OR
@@ -3118,10 +4424,27 @@ case "${1:-help}" in
       echo "Note: release assets NOT refreshed automatically (#1015). Run 'concord-ctl.sh sync-releases' or trigger sync-releases.yml for a refresh."
     fi
     selfhost_tls_admit_gate || exit 1
+    if [[ "$REDIS_CREDENTIAL_MODE" == managed && "$MEDIA_DEPLOY_PROFILE" == media-single ]]; then
+      redis_managed_restart_bound_stack || exit 1
+      selfhost_post_up_check || exit 1
+      selfhost_tls_ready_gate || exit 1
+      echo "Done."
+      exit 0
+    fi
     cd "$DEPLOY_DIR" && $COMPOSE_CMD restart
     selfhost_post_up_check || exit 1
     selfhost_tls_ready_gate || exit 1
     echo "Done."
+    ;;
+
+  redis-managed-prepare)
+    [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || { echo 'redis-managed-prepare requires REDIS_CREDENTIAL_MODE=managed' >&2; exit 2; }
+    redis_managed_prepare_locked "${@:2}" || exit $?
+    ;;
+
+  redis-managed-rebuild)
+    [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || { echo 'redis-managed-rebuild requires REDIS_CREDENTIAL_MODE=managed' >&2; exit 2; }
+    redis_managed_rebuild_locked "${@:2}" || exit $?
     ;;
 
   rebuild|stage-restore)
@@ -3134,6 +4457,7 @@ case "${1:-help}" in
       STAGE_RESTORE_MODE=1
     fi
     shift
+    redis_managed_host_preflight || exit 1
     # Optional service scope (#2178). `rebuild` with NO arguments rebuilds every
     # service (#3524): the voice services' dependencies, then the paired voice
     # handoff, then the rest. Every out-of-band caller (operator SSH,
@@ -3165,6 +4489,10 @@ case "${1:-help}" in
     if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
       media_bluegreen_rebuild_locked "${REBUILD_SCOPE[@]}"
       exit $?
+    fi
+    if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
+      echo 'redis-managed: ordinary rebuild is refused; use redis-managed-rebuild for the explicit full outage' >&2
+      exit 1
     fi
     # The ordinary production selector must never accidentally render colours.
     _bluegreen_model_rc=0
@@ -4493,6 +5821,10 @@ else:
     ;;
 
   freshstart)
+    if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
+      echo 'redis-managed: freshstart bypasses the reviewed Redis identity recovery path; refusing volume wipe' >&2
+      exit 1
+    fi
     # skip-receipt: the receipt never authorizes freshstart's volume wipe — a
     # gate-true freshstart still requires live one-container proof (#2326).
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
@@ -4523,6 +5855,10 @@ else:
     # place: freshstart still holds the interlock for everything destructive.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
+    if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
+       && "$COMPOSE_OVERRIDE" == docker-compose.production.yml ]]; then
+      redis_managed_writer_consistency_guard || exit 1
+    fi
     fi
 
     managed_production_nats_reconcile model-only || exit 1
@@ -4642,7 +5978,11 @@ else:
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
       selfhost_storage_stop_stale_minio || exit 1
     fi
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD down
+    if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
+      cd "$DEPLOY_DIR" && $COMPOSE_CMD stop
+    else
+      cd "$DEPLOY_DIR" && $COMPOSE_CMD down
+    fi
     echo "Done."
     ;;
 
@@ -4652,6 +5992,9 @@ else:
     echo "Usage: $0 <command>"
     echo ""
     echo "Commands:"
+    echo "  redis-managed-prepare --first-activation | --recover | --recover-lost-state <proof.json>"
+    echo "                 Explicit stopped activation or reviewed recovery"
+    echo "  redis-managed-rebuild [--resume]   Planned full app outage or resume bound stopped containers"
     echo "  status         Show running containers, health checks, last deploy metadata"
     echo "  logs           Tail service logs (pass service name to filter, e.g. 'logs control-plane')"
     echo "  restart        Restart all services (no auto-sync since #1015)"

@@ -101,6 +101,7 @@ function createRedisService() {
       if (id.endsWith('/logger.js'))
         return { logger: { info() {}, warn() {}, error() {}, debug() {} } };
       if (id.endsWith('/roomManager.js')) return { RoomCreationRefusedError };
+      if (id.endsWith('/managedRedis.js')) return {};
       return require(id);
     },
     module,

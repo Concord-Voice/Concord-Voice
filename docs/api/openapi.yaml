@@ -18059,7 +18059,10 @@ paths:
 
         - Ping/pong: 54s ping interval, 60s pong timeout
 
-        - The connection closes with code 1008 when the issuing access token expires
+        - The connection closes with code 1008 at its authority deadline, which starts at the
+        issuing access token''s expiry. An `auth_renew` frame carrying a rotated access token moves
+        the deadline later when the token passes the handshake''s checks for the same user,
+        credential epoch and refresh session lineage. A refused renewal keeps the old deadline.
 
         - Max message size: 512KB
 
@@ -18100,6 +18103,9 @@ paths:
 
         | `set_status` | `status` (online/dnd/invisible) | Set user status |
 
+        | `auth_renew` | `token` | Renew the open socket''s authority deadline with a rotated access
+        token. Throttled to one attempt per socket per 10 seconds. Answered with `auth_renew_result`. |
+
 
         ## Server → Client Messages
 
@@ -18109,6 +18115,9 @@ paths:
         |------|--------|-------------|
 
         | `connected` | `client_id`, `user_id` | Connection established |
+
+        | `auth_renew_result` | `ok` (boolean) | Answer to `auth_renew`. `true` means the deadline moved to
+        the new token''s expiry. `false` carries no reason by design. |
 
         | `presence_snapshot` | `users[]` | Permitted base-presence users plus freshly authorized
         activity-only users (which remain status `offline`). Each entry has `user_id`, `status`, and optional

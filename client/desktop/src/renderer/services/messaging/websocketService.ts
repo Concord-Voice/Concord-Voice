@@ -175,6 +175,26 @@ export class WebSocketService {
   private onlineFallbackTimer: NodeJS.Timeout | null = null;
   private readonly ONLINE_FALLBACK_MS = 15_000;
 
+  // In-band token renewal. The server closes a socket at the exp of the token
+  // that opened it; renewal sends each rotated token over the open socket so
+  // the deadline moves instead. socketToken/socketGeneration describe the
+  // token and auth generation the current socket was opened with.
+  private socketToken: string | null = null;
+  private socketGeneration: number | null = null;
+  private renewal: {
+    token: string;
+    ws: WebSocket;
+    attempt: number;
+    // True only between sending a frame and its ack or ack timeout. An ack
+    // outside that window (a late one, during the retry wait) is ignored.
+    awaitingAck: boolean;
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null = null;
+  private readonly RENEW_ACK_TIMEOUT_MS = 5_000;
+  // Longer than the server's 10 s per-socket renewal throttle, so the retry
+  // is not refused by it.
+  private readonly RENEW_RETRY_DELAY_MS = 11_000;
+
   // Message handlers
   private readonly messageHandlers = new Map<string, Set<MessageHandler>>();
   private readonly connectionHandlers = new Set<ConnectionHandler>();
@@ -228,6 +248,7 @@ export class WebSocketService {
     this.clearReconnectTimer();
     this.clearPingInterval();
     this.clearOnlineRetry();
+    this.cancelRenewal();
     this.reconnectAttempts = 0;
 
     // Reject any in-flight whenConnectionReady() waiters with a clear reason.
@@ -290,6 +311,90 @@ export class WebSocketService {
    */
   updateToken(token: string): void {
     this.token = token;
+  }
+
+  /**
+   * Carry a rotated access token over the open socket so the server extends
+   * the socket's authority deadline instead of closing it at the old token's
+   * exp. Best effort: on a refusal or a missing ack it retries once, then
+   * leaves the old deadline in force and the ordinary reconnect takes over.
+   * A token from another auth generation (logout, account switch) is never
+   * sent over this socket.
+   */
+  renewToken(token: string): void {
+    if (this.state !== ConnectionState.CONNECTED || !this.ws) return;
+    if (token === this.socketToken || this.renewal?.token === token) return;
+    if (useAuthStore.getState().authGeneration !== this.socketGeneration) return;
+    this.cancelRenewal();
+    this.renewal = { token, ws: this.ws, attempt: 0, awaitingAck: false, timer: null };
+    this.sendRenewal();
+  }
+
+  private renewalIsCurrent(): boolean {
+    const r = this.renewal;
+    return (
+      r !== null &&
+      r.ws === this.ws &&
+      this.state === ConnectionState.CONNECTED &&
+      useAuthStore.getState().authGeneration === this.socketGeneration
+    );
+  }
+
+  private sendRenewal(): void {
+    const r = this.renewal;
+    if (!r || !this.renewalIsCurrent() || r.ws.readyState !== WebSocket.OPEN) {
+      this.cancelRenewal();
+      return;
+    }
+    r.attempt += 1;
+    try {
+      r.ws.send(JSON.stringify({ type: 'auth_renew', data: { token: r.token } }));
+    } catch {
+      // The token is never logged. A failed send is a failed attempt.
+      this.renewalFailed();
+      return;
+    }
+    r.awaitingAck = true;
+    r.timer = setTimeout(() => this.renewalFailed(), this.RENEW_ACK_TIMEOUT_MS);
+  }
+
+  private renewalFailed(): void {
+    const r = this.renewal;
+    if (!r) return;
+    r.awaitingAck = false;
+    if (r.timer) clearTimeout(r.timer);
+    r.timer = null;
+    if (r.attempt >= 2 || !this.renewalIsCurrent()) {
+      this.renewal = null;
+      return;
+    }
+    r.timer = setTimeout(() => {
+      if (this.renewal === r) {
+        r.timer = null;
+        this.sendRenewal();
+      }
+    }, this.RENEW_RETRY_DELAY_MS);
+  }
+
+  private handleRenewalResult(ok: boolean): void {
+    const r = this.renewal;
+    // A result with no attempt waiting for it (a late ack after a timeout)
+    // changes nothing.
+    if (!r || !r.awaitingAck || r.ws !== this.ws) return;
+    r.awaitingAck = false;
+    if (r.timer) clearTimeout(r.timer);
+    r.timer = null;
+    if (ok) {
+      this.socketToken = r.token;
+      this.renewal = null;
+    } else {
+      this.renewalFailed();
+    }
+  }
+
+  private cancelRenewal(): void {
+    if (this.renewal?.timer) clearTimeout(this.renewal.timer);
+    this.renewal = null;
   }
 
   /**
@@ -770,6 +875,9 @@ export class WebSocketService {
       return;
     }
 
+    // The token this socket's ticket is fetched with; renewal compares
+    // against it. Read before the await, as acquireTicket does.
+    const ticketToken = this.token;
     try {
       const ticket = await this.acquireTicket(wsBaseUrl, signal);
 
@@ -799,6 +907,8 @@ export class WebSocketService {
       if (!attemptIsCurrent()) return;
 
       this.ws = new WebSocket(finalUrl.href);
+      this.socketToken = ticketToken;
+      this.socketGeneration = authGeneration;
 
       this.ws.onopen = this.handleOpen.bind(this);
       this.ws.onmessage = this.handleMessage.bind(this);
@@ -902,6 +1012,13 @@ export class WebSocketService {
 
         // Now that handshake is complete, mark as connected
         this.setState(ConnectionState.CONNECTED);
+        // A rotation that landed while the ticket was in flight reached
+        // updateToken before the socket was CONNECTED; renew it now.
+        if (this.token && this.token !== this.socketToken) this.renewToken(this.token);
+        break;
+
+      case 'auth_renew_result':
+        this.handleRenewalResult(message.data.ok);
         break;
 
       case 'error':
@@ -960,6 +1077,7 @@ export class WebSocketService {
     console.debug(`[WebSocket] closed (code: ${event.code}, reason: ${event.reason || 'none'})`);
 
     this.clearPingInterval();
+    this.cancelRenewal();
     this.ws = null;
 
     // If a connection-ready wait was in flight, reject it so waiters see the failure

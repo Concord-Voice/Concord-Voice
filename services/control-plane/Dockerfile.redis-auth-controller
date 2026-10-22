@@ -1,0 +1,21 @@
+FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+# Fail the build if a future digest update changes the reviewed release line.
+RUN GOTOOLCHAIN=local go version | grep -q '^go version go1\.27\.3 ' \
+    && grep -Eq '^3\.24\.' /etc/alpine-release \
+    && go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/redis-auth-controller ./cmd/redis-auth-controller
+
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+RUN grep -Eq '^3\.24\.' /etc/alpine-release \
+    && apk --no-cache add ca-certificates \
+    && addgroup -S -g 10004 redis-auth-controller \
+    && adduser -S -D -H -u 10004 -G redis-auth-controller redis-auth-controller \
+    && printf '%s\n' '{"operation":"status"}' > /etc/redis-auth-controller-health.json
+COPY --from=builder /out/redis-auth-controller /usr/local/bin/redis-auth-controller
+USER 10004:10004
+ENTRYPOINT ["redis-auth-controller"]
+CMD ["serve"]

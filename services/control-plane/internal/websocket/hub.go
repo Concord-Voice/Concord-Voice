@@ -413,6 +413,11 @@ type Hub struct {
 	// Force-disconnect a specific session (targeted single-session revocation)
 	disconnectSession chan string
 
+	// rebindSession moves a client to its successor refresh session after an
+	// in-band token renewal (token_renewal.go). SessionID is read unlocked by
+	// handleDisconnectSession on Run, so only Run writes it.
+	rebindSession chan sessionRebind
+
 	// Signal to recompute and broadcast server voice counts
 	voiceCountSignal chan struct{}
 
@@ -764,6 +769,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		dmDeliveryActive:             make(map[uuid.UUID]bool),
 		disconnectUser:               make(chan uuid.UUID, 16),
 		disconnectSession:            make(chan string, 16),
+		rebindSession:                make(chan sessionRebind),
 		voiceCountSignal:             make(chan struct{}, 1),
 		revalidateChannel:            make(chan channelRevalidation, 256),
 		revalidateServer:             make(chan uuid.UUID, 16),
@@ -1436,6 +1442,10 @@ func (h *Hub) Run() {
 
 		case sessionID := <-h.disconnectSession:
 			h.handleDisconnectSession(sessionID)
+
+		case rebind := <-h.rebindSession:
+			rebind.client.SessionID = rebind.sessionID
+			close(rebind.done)
 
 		case <-onlineCountC:
 			h.flushOnlineCounts()

@@ -97,6 +97,8 @@ import {
   // Permission refresh (#3456) (2)
   ServerPermissionsChangedSchema,
   PermissionsChangedSchema,
+  // Control-socket token renewal (1)
+  AuthRenewResultSchema,
   // Union + scrubber
   WebSocketEventSchema,
   EntitlementsChangedSchema,
@@ -2506,10 +2508,10 @@ describe('Server role events (#2359)', () => {
     }
   });
 
-  it('WebSocketEventSchema has exactly 82 members', () => {
+  it('WebSocketEventSchema has exactly 83 members', () => {
     // Pins the count quoted in [internal]rules/frontend.md and in the ws-events.ts
     // header, so a future addition cannot silently drift the docs.
-    expect(WebSocketEventSchema.options).toHaveLength(82);
+    expect(WebSocketEventSchema.options).toHaveLength(83);
   });
 });
 
@@ -2591,6 +2593,63 @@ describe('Permission refresh events (#3456)', () => {
     if (asUser.success) expect(asUser.data.data).toEqual({});
     expect(
       WebSocketEventSchema.safeParse({ type: 'server_permissions_changed', data: {} }).success
+    ).toBe(false);
+  });
+});
+
+describe('Control-socket token renewal ack (auth_renew_result)', () => {
+  // The exact frames the control plane writes: authRenewAcceptedFrame and
+  // authRenewRejectedFrame in services/control-plane/internal/websocket/
+  // token_renewal.go. Parsing the same literals keeps the two sides in step.
+  const ACCEPTED_FRAME = '{"type":"auth_renew_result","data":{"ok":true}}';
+  const REJECTED_FRAME = '{"type":"auth_renew_result","data":{"ok":false}}';
+
+  // Kills: AuthRenewResultSchema removed or its literal retyped.
+  it('AuthRenewResultSchema accepts ok:true and ok:false', () => {
+    for (const [frame, ok] of [
+      [ACCEPTED_FRAME, true],
+      [REJECTED_FRAME, false],
+    ] as const) {
+      const result = AuthRenewResultSchema.safeParse(JSON.parse(frame));
+      expect(result.success, frame).toBe(true);
+      if (result.success) expect(result.data.data.ok).toBe(ok);
+    }
+  });
+
+  // Kills: ok made optional, or the data envelope made optional/nullable.
+  it('AuthRenewResultSchema rejects a missing ok, a null data and a missing data envelope', () => {
+    expect(AuthRenewResultSchema.safeParse({ type: 'auth_renew_result', data: {} }).success).toBe(
+      false
+    );
+    expect(AuthRenewResultSchema.safeParse({ type: 'auth_renew_result', data: null }).success).toBe(
+      false
+    );
+    expect(AuthRenewResultSchema.safeParse({ type: 'auth_renew_result' }).success).toBe(false);
+  });
+
+  // Kills: ok loosened from z.boolean() to a coercing or wider type.
+  it('AuthRenewResultSchema rejects a non-boolean ok', () => {
+    for (const ok of ['true', 1, 0, null, {}]) {
+      expect(
+        AuthRenewResultSchema.safeParse({ type: 'auth_renew_result', data: { ok } }).success,
+        `ok=${JSON.stringify(ok)}`
+      ).toBe(false);
+    }
+  });
+
+  // Kills: the schema left out of WebSocketEventSchema (every ack would then
+  // count as a wire violation and never reach the renewal handler).
+  it('WebSocketEventSchema routes both frames to auth_renew_result', () => {
+    for (const frame of [ACCEPTED_FRAME, REJECTED_FRAME]) {
+      const result = WebSocketEventSchema.safeParse(JSON.parse(frame));
+      expect(result.success, frame).toBe(true);
+      if (result.success) expect(result.data.type).toBe('auth_renew_result');
+    }
+  });
+
+  it('WebSocketEventSchema rejects an auth_renew_result envelope with a non-boolean ok', () => {
+    expect(
+      WebSocketEventSchema.safeParse({ type: 'auth_renew_result', data: { ok: 'yes' } }).success
     ).toBe(false);
   });
 });

@@ -83,6 +83,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 
 - **Database:** PostgreSQL 16 (schema under `services/control-plane/migrations/`)
 - **Cache:** Redis 8 for sessions, presence, RBAC cache, rate limiting (both planes connect to the same server)
+- **Managed Redis credentials (source prepared, default off):** a dedicated controller writes the Redis ACL while each service reads its own scoped runtime credential and acknowledges rotation. Production activation remains gated by [ADR-0048](adr/0048-managed-redis-runtime-credentials.md) and the [runbook](runbooks/managed-redis-runtime.md).
 - **Messaging:** NATS 2.x for inter-service events
 - **CI/CD:** GitHub Actions → SonarQube Quality Gate (≥ 80% coverage)
 - **Security:** pre-commit hooks, SAST (Semgrep), secret detection (gitleaks, TruffleHog)
@@ -276,6 +277,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 | `friends`         | Friend requests, acceptance/decline, blocking, friend codes                                                                                                                           |
 | `invites`         | Server invite code generation, listing, revoking, joining, preview                                                                                                                    |
 | `klipy`           | KLIPY GIF API + media proxy with SSRF egress guard                                                                                                                                    |
+| `managedredis`    | Managed Redis ACL policy, credential lifecycle, rotation journal, and controller state                                                                                                  |
 | `media`           | Object-store handler: avatar, banner, server-icon, attachment up/download. Tier-1 uploads are decoded and re-encoded, which strips EXIF/XMP/IPTC (#2469)                              |
 | `members`         | Server membership: add, update role, remove, ban/unban (optional purge-on-ban/kick of the removed user's messages, #1353)                                                             |
 | `messages`        | Channel + DM message CRUD, reactions, pins, embed suppression                                                                                                                         |

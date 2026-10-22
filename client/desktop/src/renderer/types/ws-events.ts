@@ -12,8 +12,9 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 82 schemas total: 79 subscriber events (handled via wsService.on) + 3
- * envelope-only events (connected, connection_ready, heartbeat_ack) consumed
+ * 83 schemas total: 79 subscriber events (handled via wsService.on) + 4
+ * envelope-only events (connected, connection_ready, heartbeat_ack,
+ * auth_renew_result) consumed
  * internally by wsService.handleMessage — all must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts
  * (heartbeat_ack has no consumer at all; it is in the union so the dispatch
@@ -1720,6 +1721,20 @@ export const HeartbeatAckSchema = z.object({
   data: z.object({}),
 });
 
+/**
+ * `auth_renew_result` — ENVELOPE-ONLY answer to the client's `auth_renew`
+ * frame, which carries a rotated access token over the open socket so the
+ * server can move the socket's authority deadline instead of closing it at
+ * the old token's exp. `ok` is the whole answer: the server sends no reason on
+ * purpose. Consumed by wsService.handleMessage (renewal ack). Server emitter:
+ * `authRenewAcceptedFrame` / `authRenewRejectedFrame` in
+ * `services/control-plane/internal/websocket/token_renewal.go` — keep in sync.
+ */
+export const AuthRenewResultSchema = z.object({
+  type: z.literal('auth_renew_result'),
+  data: z.object({ ok: z.boolean() }),
+});
+
 // ──────────── Message purge (#1352) — 3 events ───────────────────────────
 
 /**
@@ -1808,7 +1823,7 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (82 schemas: 79 subscriber + 3 envelope)
+// 4. The discriminated union (83 schemas: 79 subscriber + 4 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 /** Message-expiration policy change (#1351).
@@ -2006,18 +2021,19 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   DmPurgedSchema,
   ServerPurgedSchema,
 
-  // System + envelope (6: 3 subscriber + 3 envelope-only)
+  // System + envelope (7: 3 subscriber + 4 envelope-only)
   SubscribedSchema,
   ErrorSchema,
   SessionRevokedSchema,
   ConnectedSchema,
   ConnectionReadySchema,
   HeartbeatAckSchema,
+  AuthRenewResultSchema,
 ]);
-// TOTAL: 82 schemas (79 subscriber + 3 envelope-only;
+// TOTAL: 83 schemas (79 subscriber + 4 envelope-only;
 // +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive;
 // +6 server-role events #2359; +server_permissions_changed/permissions_changed
-// #3456).
+// #3456; +auth_renew_result control-socket token renewal).
 // The count is asserted in tests/unit/types/ws-events.test.ts so an addition
 // cannot silently drift the number quoted in [internal]rules/frontend.md.
 
@@ -2151,6 +2167,7 @@ export type SessionRevokedPayload = z.infer<typeof SessionRevokedSchema>['data']
 export type ConnectedPayload = z.infer<typeof ConnectedSchema>['data'];
 export type ConnectionReadyPayload = z.infer<typeof ConnectionReadySchema>['data'];
 export type HeartbeatAckPayload = z.infer<typeof HeartbeatAckSchema>['data'];
+export type AuthRenewResultPayload = z.infer<typeof AuthRenewResultSchema>['data'];
 
 // ════════════════════════════════════════════════════════════════════════
 // 6. PII-safe issue scrubber

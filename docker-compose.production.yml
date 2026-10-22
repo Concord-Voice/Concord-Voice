@@ -51,6 +51,8 @@ services:
     <<: *hardening
     read_only: true
     tmpfs: [/tmp:size=32M]
+    environment:
+      REDIS_CREDENTIAL_MODE: legacy
     cap_add: [SETGID, SETUID, DAC_OVERRIDE]
     deploy:
       resources:
@@ -164,6 +166,15 @@ services:
       SERVER_VERSION: "${SERVER_VERSION:-dev}"
       CLIENT_MIN_VERSION: "${CLIENT_MIN_VERSION:-}"
       DATABASE_URL: "postgres://concord:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/concord?sslmode=disable"
+      REDIS_CREDENTIAL_MODE: legacy
+      REDIS_ENDPOINT: ${REDIS_ENDPOINT:-redis:6379}
+      REDIS_TLS: ${REDIS_TLS:-false}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_INFISICAL_URL: ${REDIS_INFISICAL_URL:-https://app.infisical.com}
+      REDIS_INFISICAL_PROJECT_ID: ${REDIS_CONTROL_PLANE_PROJECT_ID:-}
+      REDIS_INFISICAL_ENVIRONMENT: ${REDIS_CONTROL_PLANE_ENVIRONMENT:-}
+      REDIS_INFISICAL_PATH: ${REDIS_CONTROL_PLANE_PATH:-}
+      REDIS_INFISICAL_CLIENT_ID: ${REDIS_CONTROL_PLANE_CLIENT_ID:-}
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379"
       MEDIA_PLANE_URL: "https://media.${DOMAIN:?DOMAIN must be set}"
       TURN_SERVER_HOST: "${TURN_SERVER_HOST:-turn.${DOMAIN:?DOMAIN must be set}}"
@@ -217,6 +228,16 @@ services:
         max-file: "5"
     environment:
       ENVIRONMENT: production
+      REDIS_CREDENTIAL_MODE: legacy
+      REDIS_ENDPOINT: ${REDIS_ENDPOINT:-redis:6379}
+      REDIS_TLS: ${REDIS_TLS:-false}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_INFISICAL_URL: ${REDIS_INFISICAL_URL:-https://app.infisical.com}
+      REDIS_INFISICAL_PROJECT_ID: ${REDIS_MEDIA_PLANE_PROJECT_ID:-}
+      REDIS_INFISICAL_ENVIRONMENT: ${REDIS_MEDIA_PLANE_ENVIRONMENT:-}
+      REDIS_INFISICAL_PATH: ${REDIS_MEDIA_PLANE_PATH:-}
+      REDIS_INFISICAL_CLIENT_ID: ${REDIS_MEDIA_PLANE_CLIENT_ID:-}
+      REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379"
       ANNOUNCED_IP: "${PUBLIC_IP:?PUBLIC_IP must be set}"
       ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,spa-cache://concord,https://spa.${DOMAIN}"
       RTC_MIN_PORT: "40000"

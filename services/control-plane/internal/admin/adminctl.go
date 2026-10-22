@@ -17,9 +17,11 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/redis/go-redis/v9"
 )
 
 // verbResetEnrollment is the break-glass recovery subcommand name (extracted to
@@ -77,7 +79,24 @@ func RunAdminCtl(args []string) int {
 	}
 	defer func() { _ = db.Close() }()
 
-	rdb, err := database.NewRedisClient(cfg.RedisURL)
+	var rdb *redis.Client
+	if cfg.RedisCredentialMode == "managed" {
+		tlsConfig, tlsErr := database.ManagedRedisTLSConfig(cfg.RedisEndpoint, cfg.RedisTLS, cfg.RedisTLSCAFile)
+		if tlsErr != nil {
+			outf(os.Stderr, "admin: managed redis TLS invalid\n")
+			return 1
+		}
+		reader, readerErr := managedredis.NewInfisicalReader(cfg.RedisInfisicalURL, cfg.RedisInfisicalClientID, managedredis.ClientSecretFile, nil)
+		if readerErr != nil {
+			outf(os.Stderr, "admin: managed redis provider invalid\n")
+			return 1
+		}
+		scope := managedredis.SecretScope{Project: cfg.RedisInfisicalProjectID, Environment: cfg.RedisInfisicalEnvironment,
+			Path: cfg.RedisInfisicalPath, Name: "REDIS_CONTROL_PLANE_CREDENTIAL"}
+		rdb, _, err = database.OpenManagedRedis(cfg.RedisEndpoint, tlsConfig, reader, scope)
+	} else {
+		rdb, err = database.NewRedisClient(cfg.RedisURL)
+	}
 	if err != nil {
 		outf(os.Stderr, "admin: open redis: %v\n", err)
 		return 1

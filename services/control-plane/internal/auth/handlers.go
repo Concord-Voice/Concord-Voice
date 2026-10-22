@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
@@ -23,10 +24,12 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/devicerecovery"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
@@ -159,6 +162,7 @@ func SetRefreshCookie(c *gin.Context, value string, maxAge int) {
 type Handler struct {
 	db                        *sql.DB
 	redis                     *redis.Client
+	recoveryWatchClient       func(context.Context) (*redis.Client, error)
 	log                       *logger.Logger
 	jwtSecret                 string
 	instanceType              string
@@ -173,6 +177,19 @@ type Handler struct {
 	keyBroadcaster            keyrotation.Broadcaster
 	initialDistributorChecker keyrotation.InitialDistributorChecker
 	securityEvents            securityevent.Emitter
+}
+
+// SetManagedRedisRecovery gives WATCH a fresh, non-streaming authenticated
+// client per attempt; go-redis's pinned streaming sticky transaction path panics.
+// Call once during router setup, before requests start.
+func (h *Handler) SetManagedRedisRecovery(runtime *managedredis.Runtime, endpoint string, tlsConfig *tls.Config) {
+	h.recoveryWatchClient = func(ctx context.Context) (*redis.Client, error) {
+		snapshot, err := runtime.Snapshot(runtime.Now())
+		if err != nil {
+			return nil, fmt.Errorf("managed Redis recovery credential unavailable")
+		}
+		return database.NewRecoveryWatchClient(ctx, endpoint, tlsConfig, snapshot, runtime)
+	}
 }
 
 // SetSecurityEvents injects bounded Nightwatch telemetry without widening this
@@ -2748,13 +2765,7 @@ func (h *Handler) consumeRecoveryCode(ctx context.Context, redisKey, code string
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("consume recovery code: %w", err)
 		}
-		var record recoveryRecord
-		matched := false
-		err := h.redis.Watch(ctx, func(tx *redis.Tx) error {
-			var err error
-			record, matched, err = commitRecoveryCodeAttempt(ctx, tx, redisKey, code)
-			return err
-		}, redisKey)
+		record, matched, err := h.watchRecoveryCodeAttempt(ctx, redisKey, code)
 		if errors.Is(err, redis.TxFailedErr) {
 			continue
 		}
@@ -2766,6 +2777,30 @@ func (h *Handler) consumeRecoveryCode(ctx context.Context, redisKey, code string
 		}
 		return &record, nil
 	}
+}
+
+func (h *Handler) watchRecoveryCodeAttempt(ctx context.Context, redisKey, code string) (recoveryRecord, bool, error) {
+	watchClient := h.redis
+	if h.recoveryWatchClient != nil {
+		var err error
+		watchClient, err = h.recoveryWatchClient(ctx)
+		if err != nil {
+			return recoveryRecord{}, false, err
+		}
+	}
+	var record recoveryRecord
+	matched := false
+	err := watchClient.Watch(ctx, func(tx *redis.Tx) error {
+		var err error
+		record, matched, err = commitRecoveryCodeAttempt(ctx, tx, redisKey, code)
+		return err
+	}, redisKey)
+	if h.recoveryWatchClient != nil {
+		if watchClient.Close() != nil {
+			h.log.Warn("Recovery Redis attempt client cleanup failed")
+		}
+	}
+	return record, matched, err
 }
 
 func commitRecoveryCodeAttempt(ctx context.Context, tx *redis.Tx, redisKey, code string) (recoveryRecord, bool, error) {
@@ -2844,19 +2879,8 @@ func (h *Handler) addVerifyCodeHints(resp gin.H, userID string) {
 
 // RecoveryVerifyCode validates the recovery code and returns a recovery token plus recovery key data.
 func (h *Handler) RecoveryVerifyCode(c *gin.Context) {
-	var req struct {
-		Email string `json:"email" binding:"required"`
-		Code  string `json:"code" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Email and code are required"})
-		return
-	}
-
-	email := strings.ToLower(strings.TrimSpace(req.Email))
-	code, errMsg := validateRecoveryCodeFormat(req.Code)
-	if errMsg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+	email, code, ok := parseRecoveryVerifyCodeRequest(c)
+	if !ok {
 		return
 	}
 
@@ -2877,22 +2901,45 @@ func (h *Handler) RecoveryVerifyCode(c *gin.Context) {
 		return
 	}
 
+	if h.recoveryPolicyAllowsEmailCompletion(ctx, c, record.UserID) {
+		h.CompleteRecovery(c, record.UserID, "email")
+	}
+}
+
+func (h *Handler) recoveryPolicyAllowsEmailCompletion(ctx context.Context, c *gin.Context, userID string) bool {
 	if h.mfaChecker == nil {
 		h.log.Error("MFA checker not configured for recovery token generation")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errRecoveryVerificationFailed})
-		return
+		return false
 	}
-	methods, err := h.mfaChecker.GetRecoveryMethods(ctx, record.UserID)
+	methods, err := h.mfaChecker.GetRecoveryMethods(ctx, userID)
 	if err != nil {
 		h.log.Error("Failed to read recovery policy", "error_class", "recovery_policy")
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errRecoveryVerificationFailed})
-		return
+		return false
 	}
 	if len(methods) > 0 {
-		h.issueRecoveryChallenge(ctx, c, record.UserID, methods)
-		return
+		h.issueRecoveryChallenge(ctx, c, userID, methods)
+		return false
 	}
-	h.CompleteRecovery(c, record.UserID, "email")
+	return true
+}
+
+func parseRecoveryVerifyCodeRequest(c *gin.Context) (string, string, bool) {
+	var req struct {
+		Email string `json:"email" binding:"required"`
+		Code  string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email and code are required"})
+		return "", "", false
+	}
+	code, errMsg := validateRecoveryCodeFormat(req.Code)
+	if errMsg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		return "", "", false
+	}
+	return strings.ToLower(strings.TrimSpace(req.Email)), code, true
 }
 
 // CompleteRecovery is called only after the recovery policy's required proofs.

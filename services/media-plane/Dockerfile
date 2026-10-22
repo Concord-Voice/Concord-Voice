@@ -33,6 +33,7 @@ FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2ee
 LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice"
 LABEL org.opencontainers.image.description="Concord Voice media-plane (mediasoup SFU)"
 LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
+LABEL org.concord.redis-credential-modes="legacy,managed"
 
 WORKDIR /app
 

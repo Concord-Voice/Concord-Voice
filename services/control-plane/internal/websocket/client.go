@@ -146,11 +146,24 @@ type Client struct {
 	// CredEpoch is the credential-epoch claim captured at WS auth time (#2201).
 	// Every message frame from this socket carries it so a ciphertext write can
 	// be fenced against a destructive reset that advanced the epoch after connect.
-	CredEpoch            string
+	CredEpoch string
+	// TokenExpiresAt is the socket's authority deadline: the exp of the access
+	// token that authenticated it, moved later only by a validated in-band
+	// renewal (token_renewal.go). Guarded by deadlineMu once the pumps run; read
+	// it through tokenDeadline.
 	TokenExpiresAt       time.Time
+	deadlineMu           sync.Mutex
+	tokenExpiryStopped   bool // guarded by deadlineMu
 	tokenExpiryTimer     *time.Timer
 	tokenExpiryCloseOnce sync.Once
 	unregisterOnce       sync.Once
+
+	// renewAuthority validates in-band token renewals; nil disables them.
+	renewAuthority tokenRenewalAuthority
+	// lastRenewalAttempt and lastThrottleLog are read and written only on the
+	// read goroutine.
+	lastRenewalAttempt time.Time
+	lastThrottleLog    time.Time
 
 	// The WebSocket connection
 	Conn *websocket.Conn
@@ -615,7 +628,8 @@ func (c *Client) rateLimitAllow() bool {
 }
 
 func (c *Client) tokenExpired() bool {
-	return !c.TokenExpiresAt.IsZero() && !time.Now().Before(c.TokenExpiresAt)
+	deadline := c.tokenDeadline()
+	return !deadline.IsZero() && !time.Now().Before(deadline)
 }
 
 func (c *Client) closeExpiredToken() {
@@ -641,8 +655,8 @@ func (c *Client) requestUnregister() {
 
 func (c *Client) connectionDeadline(wait time.Duration) time.Time {
 	deadline := time.Now().Add(wait)
-	if !c.TokenExpiresAt.IsZero() && c.TokenExpiresAt.Before(deadline) {
-		return c.TokenExpiresAt
+	if tokenDeadline := c.tokenDeadline(); !tokenDeadline.IsZero() && tokenDeadline.Before(deadline) {
+		return tokenDeadline
 	}
 	return deadline
 }
@@ -650,9 +664,7 @@ func (c *Client) connectionDeadline(wait time.Duration) time.Time {
 // readPump pumps messages from the WebSocket connection to the hub
 func (c *Client) readPump() {
 	defer func() {
-		if c.tokenExpiryTimer != nil {
-			c.tokenExpiryTimer.Stop()
-		}
+		c.stopTokenExpiry()
 		if err := c.Conn.Close(); err != nil && !alreadyDisconnected(err) {
 			log.Printf("WebSocket read transport close failed: %s", describeSocketFailure(err))
 		}
@@ -700,12 +712,18 @@ func (c *Client) readPump() {
 			log.Printf("Invalid message format: %v", err)
 			continue
 		}
+		// Renewal never reaches the hub: it does Redis/DB work, which the Run
+		// goroutine must not, and its frame carries a credential.
+		if msg.Type == authRenewMessageType {
+			c.handleTokenRenewal(msg)
+			continue
+		}
 
 		// Set sender info
 		msg.UserID = c.UserID
 		msg.ClientID = c.ID
 		msg.CredEpoch = c.CredEpoch
-		msg.TokenExpiresAt = c.TokenExpiresAt
+		msg.TokenExpiresAt = c.tokenDeadline()
 
 		// Route message to hub
 		select {

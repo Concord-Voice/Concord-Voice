@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+The desktop's chat connection no longer drops and reconnects every 14 minutes
+while you're signed in.
+
 When voice is briefly paused for server maintenance, joining a call now says
 so and suggests trying again in a few minutes, instead of a generic error.
 
@@ -52,6 +55,7 @@ you verify your email.
 
 ### Added
 
+- **Managed Redis credential rotation groundwork** (internal development reference omitted) — a default-off runtime path prepares scoped service identities and rotates their credentials. Activation still requires separate host checks and deployment approval.
 - **A separate West staging deployment path is available to operators** (internal development reference omitted) — it remains off until its own secrets, private access and live checks are complete. West is not a production site.
 - **New voice rooms can move to a second media instance while existing rooms drain** (internal development reference omitted) — when operators enable the new blue/green deployment mode, new rooms use the active instance while existing rooms remain on the draining instance. The mode is off by default and requires a separately verified first activation.
 - **Shared media listeners are available for isolated validation** — an optional

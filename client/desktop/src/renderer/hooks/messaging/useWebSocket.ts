@@ -418,9 +418,11 @@ export function useWebSocket() {
       wsService.resetReconnectState();
       wsService.connect(accessToken);
     } else {
-      // CONNECTED: keep the open socket and refresh the stored token so any
-      // future reconnect uses it.
+      // CONNECTED: keep the open socket, refresh the stored token so any
+      // future reconnect uses it, and carry it over the socket so the server
+      // extends the socket's deadline instead of closing it at the old exp.
       wsService.updateToken(accessToken);
+      wsService.renewToken(accessToken);
     }
   }, [accessToken, clientVersionBlocked, wsService]);
 

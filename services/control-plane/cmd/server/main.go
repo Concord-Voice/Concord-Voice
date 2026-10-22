@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -172,11 +174,22 @@ func runControlPlane() (runErr error) {
 	}
 
 	// Initialize Redis
-	redisClient, err := database.NewRedisClient(cfg.RedisURL)
+	var redisClient *redis.Client
+	var redisRuntime *managedredis.Runtime
+	var redisTLSConfig *tls.Config
+	var stopRedisPoll func()
+	if cfg.RedisCredentialMode == "managed" {
+		redisClient, redisRuntime, redisTLSConfig, stopRedisPoll, err = initializeManagedRedis(cfg)
+	} else {
+		redisClient, err = database.NewRedisClient(cfg.RedisURL)
+	}
 	if err != nil {
 		return fmt.Errorf("connect to Redis: %w", err)
 	}
 	defer closeRedisClient(redisClient, log)
+	if stopRedisPoll != nil {
+		defer stopRedisPoll()
+	}
 
 	// Repopulate the user-disabled denylist from the DB source of truth (#1623):
 	// closes the window after a Redis flush where the immediate-effect mid-session
@@ -297,6 +310,8 @@ func runControlPlane() (runErr error) {
 					MediaStoreResolver:   media.NewRegistryStoreResolver(storageRegistry),
 					MediaWriteRouter:     media.NewRegistryWriteRouter(storageRegistry),
 					Readiness:            readiness,
+					RedisRuntime:         redisRuntime,
+					RedisTLSConfig:       redisTLSConfig,
 				},
 			)
 			if routerErr != nil {

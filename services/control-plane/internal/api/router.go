@@ -3,6 +3,7 @@ package api // revive:disable-line:var-naming
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/joinpause"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/members"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
@@ -326,6 +328,8 @@ func normalizeSecurityEvents(events securityevent.Emitter) securityevent.Emitter
 
 // RouterDependencies groups runtime services that are injected into NewRouter.
 type RouterDependencies struct {
+	RedisRuntime   *managedredis.Runtime
+	RedisTLSConfig *tls.Config
 	// RoomPlacementEnabled is an explicit rollout gate for ADR-0042 room
 	// placement. Keep false until media create fencing and deployment colour
 	// registration are validated together. Its zero value is safely disabled.
@@ -868,6 +872,17 @@ func connectNATS(cfg *config.Config, log *logger.Logger) *natsclient.Client {
 	return nc
 }
 
+func configureManagedRedisRecovery(authHandler *auth.Handler, cfg *config.Config, dependencies RouterDependencies) error {
+	if cfg.RedisCredentialMode != "managed" {
+		return nil
+	}
+	if dependencies.RedisRuntime == nil {
+		return fmt.Errorf("managed Redis runtime unavailable")
+	}
+	authHandler.SetManagedRedisRecovery(dependencies.RedisRuntime, cfg.RedisEndpoint, dependencies.RedisTLSConfig)
+	return nil
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	lifecycleCtx context.Context,
@@ -1054,6 +1069,9 @@ func NewRouter(
 
 	// Initialize handlers
 	authHandler := auth.NewHandlerForInstance(db, redis, log, cfg.JWTSecret, hub, cfg.InstanceType)
+	if err := configureManagedRedisRecovery(authHandler, cfg, dependencies); err != nil {
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
+	}
 	authHandler.SetSecurityEvents(securityEvents)
 	authHandler.SetPresenceHistory(presenceHistoryService)
 	authHandler.SetEmailService(emailSvc)

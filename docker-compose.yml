@@ -46,16 +46,19 @@ services:
     # the now-out-of-range SELECT, recoverable only by discarding the volume.
     # redistest reads the real value via CONFIG GET (fallback 15), so it adapts to
     # whatever a server reports rather than depending on this line.
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set - copy .env.example to .env}
+    entrypoint: ["/bin/sh", "/usr/local/bin/redis-entrypoint.sh"]
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
     environment:
+      REDIS_CREDENTIAL_MODE: ${REDIS_CREDENTIAL_MODE:-legacy}
       # Keep healthcheck authentication out of Docker exec arguments/events.
-      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set - copy .env.example to .env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-}
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
+      - ./infrastructure/docker/redis/redis-entrypoint.sh:/usr/local/bin/redis-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "if [ \"$$REDIS_CREDENTIAL_MODE\" = managed ]; then redis-cli ping 2>&1 | grep -q NOAUTH; else redis-cli ping; fi"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -170,7 +173,7 @@ services:
     image: rediscommander/redis-commander:latest
     container_name: concordvoice-redis-commander
     environment:
-      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:?}
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:-}
     ports:
       - "8081:8081"
     depends_on:
@@ -239,7 +242,16 @@ services:
       INSTANCE_TYPE: ${INSTANCE_TYPE:-saas}
       SITE_ID: ${SITE_ID:-}
       DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:?}@postgres:5432/concord?sslmode=disable
-      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      REDIS_CREDENTIAL_MODE: ${REDIS_CREDENTIAL_MODE:-legacy}
+      REDIS_ENDPOINT: ${REDIS_ENDPOINT:-redis:6379}
+      REDIS_TLS: ${REDIS_TLS:-false}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_INFISICAL_URL: ${REDIS_INFISICAL_URL:-https://app.infisical.com}
+      REDIS_INFISICAL_PROJECT_ID: ${REDIS_CONTROL_PLANE_PROJECT_ID:-}
+      REDIS_INFISICAL_ENVIRONMENT: ${REDIS_CONTROL_PLANE_ENVIRONMENT:-}
+      REDIS_INFISICAL_PATH: ${REDIS_CONTROL_PLANE_PATH:-}
+      REDIS_INFISICAL_CLIENT_ID: ${REDIS_CONTROL_PLANE_CLIENT_ID:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       NATS_URL: nats://nats:4222
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - copy .env.example to .env}
       TURN_SERVER_HOST: ${TURN_SERVER_HOST:-localhost}
@@ -366,7 +378,16 @@ services:
       SITE_ID: ${SITE_ID:-}
       CONTROL_PLANE_URL: http://control-plane:8080
       NATS_URL: nats://nats:4222
-      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      REDIS_CREDENTIAL_MODE: ${REDIS_CREDENTIAL_MODE:-legacy}
+      REDIS_ENDPOINT: ${REDIS_ENDPOINT:-redis:6379}
+      REDIS_TLS: ${REDIS_TLS:-false}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_INFISICAL_URL: ${REDIS_INFISICAL_URL:-https://app.infisical.com}
+      REDIS_INFISICAL_PROJECT_ID: ${REDIS_MEDIA_PLANE_PROJECT_ID:-}
+      REDIS_INFISICAL_ENVIRONMENT: ${REDIS_MEDIA_PLANE_ENVIRONMENT:-}
+      REDIS_INFISICAL_PATH: ${REDIS_MEDIA_PLANE_PATH:-}
+      REDIS_INFISICAL_CLIENT_ID: ${REDIS_MEDIA_PLANE_CLIENT_ID:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       JWT_SECRET: ${JWT_SECRET:?}
       RTC_MIN_PORT: 40000
       # Constrain RTC port range to match the Docker port mapping below.

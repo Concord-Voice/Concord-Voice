@@ -537,6 +537,23 @@ export const config = {
   // Redis — room state, cross-instance coordination
   // Default includes dev password to match docker-compose and control plane defaults
   redisUrl: process.env.REDIS_URL || 'redis://:concord_dev_redis@localhost:6379',
+  redisCredentialMode: (() => {
+    const mode = process.env.REDIS_CREDENTIAL_MODE || 'legacy';
+    if (mode !== 'legacy' && mode !== 'managed') throw new Error('invalid_redis_credential_mode');
+    return mode;
+  })(),
+  redisEndpoint: process.env.REDIS_ENDPOINT || '',
+  redisTls: (() => {
+    const value = process.env.REDIS_TLS || 'false';
+    if (value !== 'true' && value !== 'false') throw new Error('invalid_redis_tls_setting');
+    return value === 'true';
+  })(),
+  redisTlsCaFile: process.env.REDIS_TLS_CA_FILE || '',
+  redisInfisicalUrl: process.env.REDIS_INFISICAL_URL || 'https://app.infisical.com',
+  redisInfisicalProjectId: process.env.REDIS_INFISICAL_PROJECT_ID || '',
+  redisInfisicalEnvironment: process.env.REDIS_INFISICAL_ENVIRONMENT || '',
+  redisInfisicalPath: process.env.REDIS_INFISICAL_PATH || '',
+  redisInfisicalClientId: process.env.REDIS_INFISICAL_CLIENT_ID || '',
 
   // NATS — inter-service messaging (control plane ↔ media plane)
   natsUrl: process.env.NATS_URL || 'nats://localhost:4222',

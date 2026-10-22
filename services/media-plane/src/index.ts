@@ -1041,6 +1041,9 @@ async function main() {
   try {
     await redisService.connect();
   } catch {
+    if (config.redisCredentialMode === 'managed') {
+      throw new Error('managed_redis_cold_start_failed');
+    }
     logger.warn('Redis connection failed — running without persistent room state');
   }
   const mediaInstanceIdentity = config.mediaInstanceColor
@@ -1140,8 +1143,10 @@ async function main() {
         placement.generation !== null &&
         mediasoupService.getWorkerCount() >= config.mediasoup.initialWorkers &&
         !(rooms === 0 && !placement.redisReachable));
+    const managedRedisReady = config.redisCredentialMode !== 'managed' || placement.redisReachable;
     if (
       shuttingDown ||
+      !managedRedisReady ||
       !placementReady ||
       !mediasoupService.isReady() ||
       voiceEnforcementReleaseQueue.saturated() ||

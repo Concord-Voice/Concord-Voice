@@ -55,6 +55,7 @@ FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cab
 LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice"
 LABEL org.opencontainers.image.description="Concord Voice control-plane service"
 LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
+LABEL org.concord.redis-credential-modes="legacy,managed"
 
 RUN apk --no-cache add ca-certificates \
     && addgroup -S appuser && adduser -S appuser -G appuser

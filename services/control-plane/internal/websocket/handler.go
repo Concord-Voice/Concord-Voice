@@ -160,23 +160,19 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	release = nil
 	defer client.releaseConnection()
 	closePending := func() {
-		if client.tokenExpiryTimer != nil {
-			client.tokenExpiryTimer.Stop()
-		}
+		client.stopTokenExpiry()
 		if err := conn.Close(); err != nil && !alreadyDisconnected(err) {
 			log.Printf("Failed to close pending WebSocket: %s", describeSocketFailure(err))
 		}
 		client.releaseConnection() // No hub owns this client.
 	}
 	registered := make(chan struct{})
+	client.renewAuthority = h
+	client.deadlineMu.Lock()
 	client.tokenExpiryTimer = time.AfterFunc(time.Until(deadline), func() {
-		client.closeExpiredToken()
-		select {
-		case <-registered:
-			client.requestUnregister()
-		default:
-		}
+		client.onTokenExpiryTimer(registered)
 	})
+	client.deadlineMu.Unlock()
 
 	// Register client with hub. This channel is UNBUFFERED (hub.go:322) and that is
 	// load-bearing for the re-check below — do not add a buffer.
@@ -220,7 +216,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// skip the check rather than dereference a nil fence.
 	if h.fence != nil {
 		if err := h.fence.Check(c.Request.Context(), userID.String(), client.CredEpoch); err != nil {
-			client.tokenExpiryTimer.Stop()
+			client.stopTokenExpiry()
 			log.Printf("Evicting WebSocket client for user %s: credential epoch superseded", sanitizeLogValue(userID.String()))
 			client.requestUnregister()
 			client.closeRevokedConnection()
@@ -335,6 +331,27 @@ func extractBearerToken(c *gin.Context) string {
 }
 
 func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.UUID, string, error) {
+	verified, err := h.validateAccessToken(c.Request.Context(), tokenString)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	c.Set(wsCredEpochContextKey, verified.CredEpoch)
+	c.Set(wsDeadlineContextKey, verified.ExpiresAt)
+	return verified.UserID, verified.SessionID, nil
+}
+
+// accessTokenAuth is what a fully validated access token proves about its bearer.
+type accessTokenAuth struct {
+	UserID    uuid.UUID
+	SessionID string
+	CredEpoch string
+	ExpiresAt time.Time
+}
+
+// validateAccessToken is the single access-token gate shared by the JWT handshake
+// fallback and in-band control-socket renewal, so the two cannot drift. It holds
+// no gin state: renewal runs on a socket's read goroutine, not inside a request.
+func (h *Handler) validateAccessToken(ctx context.Context, tokenString string) (accessTokenAuth, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, jwt.ErrSignatureInvalid
@@ -342,7 +359,7 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 		return []byte(h.jwtSecret), nil
 	})
 	if err != nil {
-		return uuid.Nil, "", err
+		return accessTokenAuth{}, err
 	}
 
 	// IsAccessToken rejects an MFA-challenge or account-recovery JWT presented here.
@@ -352,47 +369,45 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 	// omits the claim and emailVerifiedFromClaims defaults an absent claim to true.
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid || !middleware.IsAccessToken(claims) {
-		return uuid.Nil, "", fmt.Errorf("invalid authentication")
+		return accessTokenAuth{}, fmt.Errorf("invalid authentication")
 	}
 	expiresAt, err := claims.GetExpirationTime()
 	if err != nil || expiresAt == nil || !time.Now().Before(expiresAt.Time) {
-		return uuid.Nil, "", fmt.Errorf("invalid token deadline")
+		return accessTokenAuth{}, fmt.Errorf("invalid token deadline")
 	}
 
-	if err := h.checkTokenBlacklist(c, claims); err != nil {
-		return uuid.Nil, "", err
+	if err := h.checkTokenBlacklist(ctx, claims); err != nil {
+		return accessTokenAuth{}, err
 	}
 
 	userID, sessionID, err := parseUserIDFromClaims(claims)
 	if err != nil {
-		return uuid.Nil, "", err
+		return accessTokenAuth{}, err
 	}
 	// Share HTTP bearer auth's live disabled/email state while retaining the
 	// WebSocket policy that an explicitly unverified token is rejected here.
-	emailVerified, err := middleware.VerifyLiveTokenState(c.Request.Context(), h.redis, userID.String(), claims)
+	emailVerified, err := middleware.VerifyLiveTokenState(ctx, h.redis, userID.String(), claims)
 	if err != nil {
-		return uuid.Nil, "", err
+		return accessTokenAuth{}, err
 	}
 	if !emailVerified {
-		return uuid.Nil, "", fmt.Errorf("email verification required")
+		return accessTokenAuth{}, fmt.Errorf("email verification required")
 	}
 	tokenEpoch, _ := claims["cred_epoch"].(string)
 	if h.fence != nil {
-		if ferr := h.fence.Check(c.Request.Context(), userID.String(), tokenEpoch); ferr != nil {
-			return uuid.Nil, "", fmt.Errorf("credential epoch check failed: %w", ferr)
+		if ferr := h.fence.Check(ctx, userID.String(), tokenEpoch); ferr != nil {
+			return accessTokenAuth{}, fmt.Errorf("credential epoch check failed: %w", ferr)
 		}
 	}
-	c.Set(wsCredEpochContextKey, tokenEpoch)
-	c.Set(wsDeadlineContextKey, expiresAt.Time)
-	return userID, sessionID, nil
+	return accessTokenAuth{UserID: userID, SessionID: sessionID, CredEpoch: tokenEpoch, ExpiresAt: expiresAt.Time}, nil
 }
 
-func (h *Handler) checkTokenBlacklist(c *gin.Context, claims jwt.MapClaims) error {
+func (h *Handler) checkTokenBlacklist(ctx context.Context, claims jwt.MapClaims) error {
 	jti, ok := claims["jti"].(string)
 	if !ok || jti == "" {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	exists, err := h.redis.Exists(ctx, fmt.Sprintf("blacklist:%s", jti)).Result()
 	if err != nil {
