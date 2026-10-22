@@ -609,7 +609,7 @@ Full self-hosting guide with single-command setup coming soon.
 - 8 GB RAM
 - 100 GB SSD
 - PostgreSQL 16
-- Redis 7
+- Redis 8
 - Reverse proxy with TLS (nginx, Caddy)
 
 **For voice (Media Plane):**

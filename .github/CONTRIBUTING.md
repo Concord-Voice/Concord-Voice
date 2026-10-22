@@ -42,7 +42,7 @@ See [GETTING_STARTED.md](../docs/GETTING_STARTED.md) for detailed setup instruct
 - pre-commit (`pip install pre-commit` or `brew install pre-commit`)
 - Docker Desktop
 - PostgreSQL 16
-- Redis 7
+- Redis 8
 
 ### Quick Start
 

@@ -82,7 +82,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 ### Infrastructure
 
 - **Database:** PostgreSQL 16 (schema under `services/control-plane/migrations/`)
-- **Cache:** Redis 7 for sessions, presence, RBAC cache, rate limiting (both planes connect to the same server)
+- **Cache:** Redis 8 for sessions, presence, RBAC cache, rate limiting (both planes connect to the same server)
 - **Messaging:** NATS 2.x for inter-service events
 - **CI/CD:** GitHub Actions → SonarQube Quality Gate (≥ 80% coverage)
 - **Security:** pre-commit hooks, SAST (Semgrep), secret detection (gitleaks, TruffleHog)
@@ -115,7 +115,7 @@ flowchart TB
 
     subgraph Infrastructure
         PG[("PostgreSQL 16<br/>55 tables")]
-        RD[("Redis 7<br/>sessions / presence / RBAC")]
+        RD[("Redis 8<br/>sessions / presence / RBAC")]
         NATS["NATS 2.x<br/>inter-service events"]
         OBJ[("MinIO / S3<br/>avatars, attachments")]
         TURN["coturn<br/>STUN / TURN (TLS)"]
@@ -255,7 +255,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 
 **Port**: 8080 · Source: `services/control-plane/`
 
-**Tech Stack:** Go (toolchain in `services/control-plane/go.mod`), Gin web framework, PostgreSQL 16, Redis 7, `gorilla/websocket`. `NewRouter` in `internal/api/router.go` assembles the router.
+**Tech Stack:** Go (toolchain in `services/control-plane/go.mod`), Gin web framework, PostgreSQL 16, Redis 8, `gorilla/websocket`. `NewRouter` in `internal/api/router.go` assembles the router.
 
 **Account-root authority** (`cmd/account-authority`, `internal/authority/*`, #3587): a separate binary on its own database, not part of the control plane's process. Its design is tracked under epic #2553, and the binary is not deployed until #3593.
 
@@ -801,7 +801,7 @@ login-enabled role must revoke successfully, or startup fails closed.
 
 **Port**: 3000 · **RTC ports**: 40000–40099/UDP (dev), 40000–41999/UDP (production) — UDP by default; ICE-TCP requires `MEDIASOUP_ENABLE_TCP=true` plus matching TCP ingress ([ADR-0040](adr/0040-ice-tcp-ingress-posture.md)) · Source: `services/media-plane/`
 
-**Tech Stack:** Node.js 26, mediasoup 3.28.0, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
+**Tech Stack:** Node.js 26, mediasoup 3.28.0, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 8 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
 
 **Responsibilities:**
 
@@ -1640,7 +1640,7 @@ Desktop client
                                                      ├── control-plane :8080
                                                      ├── media-plane   :3000 (WebRTC UDP direct)
                                                      ├── PostgreSQL 16
-                                                     ├── Redis 7
+                                                     ├── Redis 8
                                                      ├── NATS 2.x
                                                      ├── MinIO (object storage)
                                                      ├── ops-agent (aggregate host/container metrics)
@@ -1840,7 +1840,7 @@ Concord/
 | Control plane  | Go + Gin (toolchain in `services/control-plane/go.mod`)               | Fast, concurrent, single-binary deploy                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Media plane    | Node.js 26 + mediasoup 3.22                                           | Mature, widely-used WebRTC SFU                                                                                                                                                                                                                                                                                                                                                                                                                |
 | Database       | PostgreSQL 16                                                         | Relational + JSONB, mature, declarative partitioning available                                                                                                                                                                                                                                                                                                                                                                                |
-| Cache          | Redis 7 (server, node-redis 6.x client)                               | Sessions, presence, RBAC cache, rate limiting, voice room state                                                                                                                                                                                                                                                                                                                                                                               |
+| Cache          | Redis 8 (server, node-redis 6.x client)                               | Sessions, presence, RBAC cache, rate limiting, voice room state                                                                                                                                                                                                                                                                                                                                                                               |
 | Messaging      | NATS 2.x                                                              | Lightweight inter-service voice events                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Object storage | MinIO / S3                                                            | Avatars, banners, attachments (tiered: server-readable vs E2EE; image metadata stripped on both tiers — see Image metadata handling). Backend selected per-process by `STORAGE_BACKEND` (`minio` default) — [ADR-0024](adr/0024-object-storage-minio-s3-seam.md). MinIO's role as the SaaS attachment default is planned to narrow — see Planned / Not Yet Implemented and [ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md). |
 | SPA serving    | Cloudflare Pages                                                      | Atomic deploys, decoupled from the control plane (ADR-0015)                                                                                                                                                                                                                                                                                                                                                                                   |
