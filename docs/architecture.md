@@ -533,11 +533,21 @@ through this same path, which is what makes the feature's "removes embedded
 camera metadata such as GPS location" claim true rather than aspirational.
 They live under the `feedback-screenshots/` object-key namespace and are
 served publicly by unguessable UUID (`/api/v1/media/feedback-screenshots/<uuid>`)
-without authentication so the report image proxy can fetch them. A screenshot
+through a control-plane proxy. The proxy requires a live Tier-1 `media_files`
+row and reads the object from that row's `storage_backend`; missing rows or
+backends never fall back to another bucket. New screenshot writes can be moved
+to a dedicated private R2 bucket with `FEEDBACK_SCREENSHOT_WRITE_BACKEND`,
+while legacy rows remain readable from MinIO. New uploads keep their selected
+backend in both the media row and lifecycle ledger until deferred offload.
+These screenshots are plaintext. Their media URLs are public bearer capabilities
+immediately after upload, even if no issue is submitted, so users must review
+them before uploading. Successful proxy responses use `no-store`;
+external issue image caches may retain copies after account erasure. The proxy
+does not require authentication so the report image proxy can fetch them. A screenshot
 lifecycle ledger admits staged pending or pinned images. Pending uploads
 expire after 72 hours; submission validates ownership and pins images before
-calling the issue provider. Historical images are preserved because their
-submission evidence is unavailable.
+calling the issue provider. Historical images with metadata are preserved
+because their submission evidence is unavailable.
 
 `internal/feedbackscreenshots` stages processed image bytes, lifecycle state and
 media metadata in one PostgreSQL transaction. Pending allowance is 8 images/40 MiB
@@ -548,10 +558,16 @@ Staged logical image bytes have an additional
 512 MiB global cap, including pinned images awaiting offload; this is not a limit
 on PostgreSQL physical storage or WAL. Pinned images remain charged.
 
-A minute worker expires pending bytes and metadata transactionally after 72 hours,
-or after account erasure. Confirmed published, pinned images and permanently
-retained images are offloaded to their immutable legacy-store object keys, with
-a disk-watermark check immediately before each PUT. Blocked, failed or uncertain
+A minute worker expires abandoned pending bytes and metadata transactionally after 72 hours.
+Account erasure clears staged screenshot bytes and tombstones their lifecycle rows
+in the erasure transaction. Confirmed published, pinned images and permanently
+retained images are offloaded to their immutable keys in the backend selected
+at upload. The shared-disk watermark is checked before legacy-store PUTs.
+Offload holds the owner, ledger and media rows through the object write so erasure can
+reclaim a completed placement or prevent a later write. Already offloaded
+objects use the best-effort deletion queue and daily orphan sweep; a dropped
+queue item can leave private bytes beyond 24 hours after erasure.
+Blocked, failed or uncertain
 offloads keep the PostgreSQL bytes readable and charged for retry. Offload batches
 contain at most five images. A durable counter allows at most three application
 PUT attempts per image; exhaustion stops automated PUT and requires operator
@@ -571,11 +587,11 @@ pin and restores pending state when no other attempt protects the image, clearin
 make the image immediately eligible for cleanup.
 The development stub leaves uploads pending.
 Pin returns an internal durable UUID receipt stored in ledger `pin_tokens`.
-Confirmation and rejection settle that receipt's submission independently of the
-nullable owner, so account deletion cannot strand an in-flight publication outcome.
-Initial pinning still validates ownership. The ledger survives account deletion;
-submitted images remain retained.
-Screenshot upload admission also applies the legacy-store SaaS disk watermark.
+Initial pinning validates ownership. A direct user-row deletion can null the owner
+without clearing the receipt, but full account erasure tombstones the ledger and
+clears its receipts and staged bytes. A later publication outcome cannot settle
+that receipt; erasure takes precedence, and the public proxy requires a live media
+row. Screenshot upload admission also applies the shared PostgreSQL disk watermark.
 
 Removal is therefore a **side effect of processing**, not a dedicated step.
 `processing_metadata_test.go` pins it as an invariant — including the

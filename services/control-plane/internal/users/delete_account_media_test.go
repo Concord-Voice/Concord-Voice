@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
@@ -218,6 +219,51 @@ func TestDeleteAccountCaptureCarriesBackend(t *testing.T) {
 	require.Len(t, rec.tier2, 1)
 	require.NotNil(t, rec.tier2[0].Backend, "a row naming a backend must not capture as NULL")
 	assert.Equal(t, "r2", *rec.tier2[0].Backend)
+}
+
+func TestDeleteAccountCapturesFeedbackScreenshotForErasure(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "erasefeedback")
+	key := "feedback-screenshots/" + user.ID
+	_, err := ts.DB.Exec(`INSERT INTO media_files
+		(uploader_id, file_type, media_tier, mime_type, file_size, storage_key, storage_backend)
+		VALUES ($1, 'photo', 1, 'image/jpeg', 10, $2, 'r2-feedback-useast')`, user.ID, key)
+	require.NoError(t, err)
+	rec := &recordingReclaimer{}
+	svc := users.NewAccountService(ts.DB, logger.New("test"))
+	svc.SetErasedMediaReclaimer(rec.reclaim)
+	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.Len(t, rec.tier2, 1)
+	assert.Equal(t, key, rec.tier2[0].Key)
+	require.NotNil(t, rec.tier2[0].Backend)
+	assert.Equal(t, "r2-feedback-useast", *rec.tier2[0].Backend)
+}
+
+func TestDeleteAccountClearsPublishedScreenshotBeforeOffload(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "erasestagedfeedback")
+	key := "feedback-screenshots/" + user.ID
+	path := "/api/v1/media/" + key
+	shots := feedbackscreenshots.New(ts.DB)
+	_, err := shots.Stage(context.Background(), user.ID, key, []byte("staged plaintext"), "image/png", "r2-feedback-useast")
+	require.NoError(t, err)
+	receipt, err := shots.Pin(context.Background(), user.ID, []string{path})
+	require.NoError(t, err)
+	require.NoError(t, shots.ConfirmPublished(context.Background(), receipt, []string{path}))
+
+	rec := &recordingReclaimer{}
+	svc := users.NewAccountService(ts.DB, logger.New("test"))
+	svc.SetErasedMediaReclaimer(rec.reclaim)
+	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	var state, backend string
+	var staged []byte
+	require.NoError(t, ts.DB.QueryRow(`SELECT state,storage_backend,staged_data FROM feedback_screenshot_uploads
+		WHERE object_key=$1`, user.ID).Scan(&state, &backend, &staged))
+	assert.Equal(t, "deleted", state)
+	assert.Equal(t, "r2-feedback-useast", backend, "keep placement for any uncertain prior PUT")
+	assert.Nil(t, staged, "erasure must clear staged plaintext in its transaction")
+	require.Len(t, rec.tier2, 1)
+	assert.Equal(t, key, rec.tier2[0].Key)
 }
 
 // TestDeleteAccountWithoutReclaimerStillErases pins the deliberate degrade: an

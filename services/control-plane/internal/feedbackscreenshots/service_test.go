@@ -29,9 +29,13 @@ func publicPathForTest(id string) string { return publicPrefix + id }
 
 func stageForTest(t *testing.T, svc *Service, userID, id string, data []byte) string {
 	t.Helper()
-	fileID, err := svc.Stage(context.Background(), userID, storageKeyForTest(id), data, "image/png")
+	fileID, err := svc.Stage(context.Background(), userID, storageKeyForTest(id), data, "image/png", "")
 	require.NoError(t, err)
 	return fileID
+}
+
+func resolveFakePutter(putter *fakePutter) ResolvePutter {
+	return func(*string) (ObjectPutter, error) { return putter, nil }
 }
 
 func pinForTest(t *testing.T, svc *Service, userID string, paths []string) string {
@@ -76,7 +80,7 @@ func TestStageValidatesIdentitySizeAndType(t *testing.T) {
 		{uuid.NewString(), "image/gif", []byte("image")},
 		{uuid.NewString(), "image/jpeg", nil},
 	} {
-		_, err := svc.Stage(context.Background(), userID, storageKeyForTest(tc.id), tc.data, tc.mime)
+		_, err := svc.Stage(context.Background(), userID, storageKeyForTest(tc.id), tc.data, tc.mime, "")
 		require.ErrorIs(t, err, ErrInvalid)
 	}
 	_, _, _, allowed, err := svc.Read(context.Background(), "feedback-screenshots/not-a-uuid")
@@ -98,7 +102,7 @@ func TestStageMetadataFailureRollsBackBytesAndQuota(t *testing.T) {
 		_, _ = db.Exec(`DROP TRIGGER IF EXISTS reject_feedback_screenshot_metadata_insert ON media_files`)
 		_, _ = db.Exec(`DROP FUNCTION IF EXISTS reject_feedback_screenshot_metadata_insert()`)
 	})
-	_, err = svc.Stage(context.Background(), userID, storageKeyForTest(id), []byte("image"), "image/png")
+	_, err = svc.Stage(context.Background(), userID, storageKeyForTest(id), []byte("image"), "image/png", "")
 	require.Error(t, err)
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM feedback_screenshot_uploads WHERE object_key=$1`, id).Scan(&count))
@@ -121,7 +125,7 @@ func TestConcurrentStageCallsSerializePendingQuota(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := svc.Stage(ctx, userID, storageKeyForTest(uuid.NewString()), []byte("image"), "image/png")
+			_, err := svc.Stage(ctx, userID, storageKeyForTest(uuid.NewString()), []byte("image"), "image/png", "")
 			results <- result{err: err}
 		}()
 	}
@@ -151,10 +155,10 @@ func TestPendingByteQuotaCapsAtFortyMiB(t *testing.T) {
 	svc := New(db)
 	data := make([]byte, int(maxPendingSize/4))
 	for i := 0; i < 4; i++ {
-		_, err := svc.Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), data, "image/png")
+		_, err := svc.Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), data, "image/png", "")
 		require.NoError(t, err)
 	}
-	_, err := svc.Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("x"), "image/png")
+	_, err := svc.Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("x"), "image/png", "")
 	require.ErrorIs(t, err, ErrQuota, "a fifth image exceeds the 40 MiB pending byte allowance")
 }
 
@@ -164,7 +168,7 @@ func TestPerUserByteQuotaIncludesPublishedScreenshots(t *testing.T) {
 		(object_key,user_id,size_bytes,state,put_completed,published,expires_at)
 		VALUES ($1,$2,$3,'pinned',TRUE,TRUE,NOW())`, uuid.NewString(), userID, maxUserSize)
 	require.NoError(t, err)
-	_, err = New(db).Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("x"), "image/png")
+	_, err = New(db).Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("x"), "image/png", "")
 	require.ErrorIs(t, err, ErrQuota)
 }
 
@@ -175,7 +179,7 @@ func TestGlobalByteQuotaIncludesOtherOwnersPublishedScreenshots(t *testing.T) {
 		(object_key,user_id,size_bytes,state,put_completed,published,expires_at)
 		VALUES ($1,$2,$3,'pinned',TRUE,TRUE,NOW())`, uuid.NewString(), otherUserID, maxGlobalSize)
 	require.NoError(t, err)
-	_, err = New(db).Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("x"), "image/png")
+	_, err = New(db).Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("x"), "image/png", "")
 	require.ErrorIs(t, err, ErrQuota)
 }
 
@@ -220,7 +224,7 @@ func TestProvisionalPinsContinueCountingAgainstPendingQuota(t *testing.T) {
 		stageForTest(t, svc, userID, id, []byte("image"))
 		pinForTest(t, svc, userID, []string{publicPathForTest(id)})
 	}
-	_, err := svc.Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("ninth"), "image/png")
+	_, err := svc.Stage(context.Background(), userID, storageKeyForTest(uuid.NewString()), []byte("ninth"), "image/png", "")
 	require.ErrorIs(t, err, ErrQuota, "provisionally pinned uploads still consume the pending allowance")
 }
 
@@ -493,7 +497,7 @@ func TestOffloadRequiresConfirmedPublicationAndUsesStagedBytes(t *testing.T) {
 	stageForTest(t, svc, userID, id, data)
 	putter := &fakePutter{}
 	checker := &allowChecker{}
-	count, err := svc.Offload(ctx, putter, checker)
+	count, err := svc.Offload(ctx, resolveFakePutter(putter), checker)
 	require.NoError(t, err)
 	require.Zero(t, count)
 	require.Empty(t, putter.keys)
@@ -501,7 +505,7 @@ func TestOffloadRequiresConfirmedPublicationAndUsesStagedBytes(t *testing.T) {
 	path := publicPathForTest(id)
 	receipt := pinForTest(t, svc, userID, []string{path})
 	require.NoError(t, svc.ConfirmPublished(ctx, receipt, []string{path}))
-	count, err = svc.Offload(ctx, putter, checker)
+	count, err = svc.Offload(ctx, resolveFakePutter(putter), checker)
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 	require.Equal(t, []string{storageKeyForTest(id)}, putter.keys)
@@ -512,6 +516,261 @@ func TestOffloadRequiresConfirmedPublicationAndUsesStagedBytes(t *testing.T) {
 	require.True(t, allowed)
 	require.True(t, remote)
 	require.Nil(t, got)
+}
+
+func TestOffloadUsesStagedVendorBackendWithoutLegacyDiskGate(t *testing.T) {
+	db, userID := setup(t)
+	svc := New(db)
+	id := uuid.NewString()
+	key := storageKeyForTest(id)
+	_, err := svc.Stage(context.Background(), userID, key, []byte("vendor image"), "image/png", "r2-feedback-useast")
+	require.NoError(t, err)
+	var ledgerBackend, mediaBackend string
+	require.NoError(t, db.QueryRow(`SELECT storage_backend FROM feedback_screenshot_uploads WHERE object_key=$1`, id).Scan(&ledgerBackend))
+	require.NoError(t, db.QueryRow(`SELECT storage_backend FROM media_files WHERE storage_key=$1`, key).Scan(&mediaBackend))
+	require.Equal(t, "r2-feedback-useast", ledgerBackend)
+	require.Equal(t, ledgerBackend, mediaBackend)
+	path := publicPathForTest(id)
+	receipt := pinForTest(t, svc, userID, []string{path})
+	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
+	vendor := &fakePutter{}
+	checker := &allowChecker{err: errors.New("legacy disk full")}
+	resolve := func(backend *string) (ObjectPutter, error) {
+		require.NotNil(t, backend)
+		require.Equal(t, "r2-feedback-useast", *backend)
+		return vendor, nil
+	}
+	count, err := svc.Offload(context.Background(), resolve, checker)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	require.Zero(t, checker.calls, "R2 offload must not be blocked by MinIO disk usage")
+	require.Equal(t, []string{key}, vendor.keys)
+}
+
+func TestOffloadSkipsScreenshotAfterOwnerDeletion(t *testing.T) {
+	db, userID := setup(t)
+	svc := New(db)
+	id := uuid.NewString()
+	stageForTest(t, svc, userID, id, []byte("erased image"))
+	path := publicPathForTest(id)
+	receipt := pinForTest(t, svc, userID, []string{path})
+	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
+	_, err := db.Exec(`UPDATE feedback_screenshot_uploads SET retained=TRUE WHERE object_key=$1`, id)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM users WHERE id=$1`, userID)
+	require.NoError(t, err)
+	putter := &fakePutter{}
+	count, err := svc.Offload(context.Background(), resolveFakePutter(putter), &allowChecker{})
+	require.NoError(t, err)
+	require.Zero(t, count)
+	require.Empty(t, putter.keys, "an erased owner cannot cause a later object PUT")
+	count, err = svc.Sweep(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "ownerless pinned bytes must be reclaimed")
+	var state string
+	var staged []byte
+	var published, retained bool
+	var pinAttempts int
+	require.NoError(t, db.QueryRow(`SELECT state,staged_data,published,retained,pin_attempts
+		FROM feedback_screenshot_uploads WHERE object_key=$1`, id).
+		Scan(&state, &staged, &published, &retained, &pinAttempts))
+	require.Equal(t, "deleted", state)
+	require.Nil(t, staged)
+	require.False(t, published)
+	require.False(t, retained)
+	require.Zero(t, pinAttempts)
+}
+
+func TestOffloadHoldsOwnerLockThroughObjectWrite(t *testing.T) {
+	db, userID := setup(t)
+	svc := New(db)
+	id := uuid.NewString()
+	stageForTest(t, svc, userID, id, []byte("publish before erasure"))
+	path := publicPathForTest(id)
+	receipt := pinForTest(t, svc, userID, []string{path})
+	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	putter := &fakePutter{onPut: func() { close(entered); <-release }}
+	type outcome struct {
+		count int
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		count, err := svc.Offload(context.Background(), resolveFakePutter(putter), &allowChecker{})
+		done <- outcome{count, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("offload never entered the object writer")
+	}
+	var lockedID string
+	err := db.QueryRow(`SELECT id FROM users WHERE id=$1 FOR UPDATE NOWAIT`, userID).Scan(&lockedID)
+	require.ErrorContains(t, err, "could not obtain lock", "account erasure must wait until object placement is confirmed")
+	close(release)
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Equal(t, 1, result.count)
+	case <-time.After(5 * time.Second):
+		t.Fatal("offload did not finish after releasing the object writer")
+	}
+}
+
+func TestOffloadKeepsOwnerLockAfterSlowAcquisitionDuringPut(t *testing.T) {
+	db, userID := setup(t)
+	svc := New(db)
+	id := uuid.NewString()
+	stageForTest(t, svc, userID, id, []byte("publish before erasure"))
+	path := publicPathForTest(id)
+	receipt := pinForTest(t, svc, userID, []string{path})
+	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
+
+	blocker, err := db.Begin()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = blocker.Rollback() })
+	var lockedID string
+	require.NoError(t, blocker.QueryRow(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&lockedID))
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	putter := &fakePutter{onPut: func() { close(entered); <-release }}
+	type outcome struct {
+		count int
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		count, err := svc.Offload(context.Background(), resolveFakePutter(putter), &allowChecker{})
+		done <- outcome{count, err}
+	}()
+	require.Eventually(t, func() bool {
+		var attempts int
+		return db.QueryRow(`SELECT put_attempts FROM feedback_screenshot_uploads WHERE object_key=$1`, id).
+			Scan(&attempts) == nil && attempts == 1
+	}, 5*time.Second, 20*time.Millisecond)
+	time.Sleep(putTimeout + time.Second)
+	require.NoError(t, blocker.Commit())
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("offload did not reach object writer after the owner lock was released")
+	}
+	time.Sleep(putTimeout + time.Second)
+	err = db.QueryRow(`SELECT id FROM users WHERE id=$1 FOR UPDATE NOWAIT`, userID).Scan(&lockedID)
+	require.ErrorContains(t, err, "could not obtain lock", "the transaction must outlive the active PUT")
+	close(release)
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Equal(t, 1, result.count)
+	case <-time.After(5 * time.Second):
+		t.Fatal("offload did not confirm after the object writer returned")
+	}
+}
+
+func TestOffloadRefundsUnusedChargeAfterAccountErasure(t *testing.T) {
+	db, userID := setup(t)
+	svc := New(db)
+	id := uuid.NewString()
+	_, err := svc.Stage(context.Background(), userID, storageKeyForTest(id), []byte("image"), "image/png", "r2-feedback-useast")
+	require.NoError(t, err)
+	path := publicPathForTest(id)
+	receipt := pinForTest(t, svc, userID, []string{path})
+	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
+
+	blocker, err := db.Begin()
+	require.NoError(t, err)
+	var lockedID string
+	require.NoError(t, blocker.QueryRow(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&lockedID))
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		_ = blocker.Rollback()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("offload did not stop after cancellation")
+		}
+	})
+	putter := &fakePutter{}
+	type outcome struct {
+		count int
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		defer close(finished)
+		count, err := svc.Offload(ctx, resolveFakePutter(putter), &allowChecker{})
+		done <- outcome{count, err}
+	}()
+	require.Eventually(t, func() bool {
+		var attempts int
+		return db.QueryRow(`SELECT put_attempts FROM feedback_screenshot_uploads WHERE object_key=$1`, id).
+			Scan(&attempts) == nil && attempts == 1
+	}, 5*time.Second, 20*time.Millisecond)
+	_, err = blocker.Exec(`DELETE FROM users WHERE id=$1`, userID)
+	require.NoError(t, err)
+	require.NoError(t, blocker.Commit())
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Zero(t, result.count)
+	case <-time.After(5 * time.Second):
+		t.Fatal("offload did not finish after account erasure")
+	}
+	require.Empty(t, putter.keys)
+	_, err = db.Exec(`UPDATE feedback_screenshot_uploads SET retry_at=NOW()-INTERVAL '1 second' WHERE object_key=$1`, id)
+	require.NoError(t, err)
+	count, err := svc.Sweep(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	var state string
+	var attempts int
+	var completed bool
+	require.NoError(t, db.QueryRow(`SELECT state,put_attempts,put_completed FROM feedback_screenshot_uploads WHERE object_key=$1`, id).
+		Scan(&state, &attempts, &completed))
+	require.Equal(t, "deleted", state)
+	require.Zero(t, attempts, "a PUT that never began cannot block vendor-backend rollback")
+	require.False(t, completed)
+}
+
+func TestUnavailableStagedBackendKeepsBytesWithoutChargingPut(t *testing.T) {
+	db, userID := setup(t)
+	svc := New(db)
+	id := uuid.NewString()
+	key := storageKeyForTest(id)
+	data := []byte("retry after backend returns")
+	_, err := svc.Stage(context.Background(), userID, key, data, "image/png", "r2-feedback-useast")
+	require.NoError(t, err)
+	path := publicPathForTest(id)
+	receipt := pinForTest(t, svc, userID, []string{path})
+	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
+	count, err := svc.Offload(context.Background(), func(*string) (ObjectPutter, error) {
+		return nil, errors.New("backend unavailable")
+	}, &allowChecker{})
+	require.Error(t, err)
+	require.Zero(t, count)
+	var staged []byte
+	var attempts int
+	require.NoError(t, db.QueryRow(`SELECT staged_data,put_attempts FROM feedback_screenshot_uploads WHERE object_key=$1`, id).Scan(&staged, &attempts))
+	require.Equal(t, data, staged)
+	require.Zero(t, attempts)
 }
 
 func TestOffloadFailureKeepsStagedBytesForRetry(t *testing.T) {
@@ -525,7 +784,7 @@ func TestOffloadFailureKeepsStagedBytesForRetry(t *testing.T) {
 	receipt := pinForTest(t, svc, userID, []string{path})
 	require.NoError(t, svc.ConfirmPublished(ctx, receipt, []string{path}))
 	putter := &fakePutter{err: errors.New("object store unavailable")}
-	count, err := svc.Offload(ctx, putter, &allowChecker{})
+	count, err := svc.Offload(ctx, resolveFakePutter(putter), &allowChecker{})
 	require.Error(t, err)
 	require.Zero(t, count)
 	got, _, remote, allowed, err := svc.Read(ctx, storageKeyForTest(id))
@@ -536,7 +795,7 @@ func TestOffloadFailureKeepsStagedBytesForRetry(t *testing.T) {
 	_, err = db.Exec(`UPDATE feedback_screenshot_uploads SET retry_at=NOW()-INTERVAL '1 second' WHERE object_key=$1`, id)
 	require.NoError(t, err)
 	putter.err = nil
-	count, err = svc.Offload(ctx, putter, &allowChecker{})
+	count, err = svc.Offload(ctx, resolveFakePutter(putter), &allowChecker{})
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 }
@@ -566,7 +825,7 @@ func TestOffloadConfirmationFailureKeepsSourceBytesAndAttemptCharge(t *testing.T
 		_, _ = db.Exec(`DROP FUNCTION IF EXISTS reject_feedback_screenshot_offload_confirmation()`)
 	})
 	putter := &fakePutter{}
-	count, err := svc.Offload(context.Background(), putter, &allowChecker{})
+	count, err := svc.Offload(context.Background(), resolveFakePutter(putter), &allowChecker{})
 	require.ErrorContains(t, err, "confirm screenshot offload")
 	require.Zero(t, count)
 	require.Equal(t, data, putter.data[storageKeyForTest(id)])
@@ -582,7 +841,7 @@ func TestOffloadConfirmationFailureKeepsSourceBytesAndAttemptCharge(t *testing.T
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE feedback_screenshot_uploads SET retry_at=NOW()-INTERVAL '1 second' WHERE object_key=$1`, id)
 	require.NoError(t, err)
-	count, err = svc.Offload(context.Background(), putter, &allowChecker{})
+	count, err = svc.Offload(context.Background(), resolveFakePutter(putter), &allowChecker{})
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT staged_data,put_attempts,put_completed FROM feedback_screenshot_uploads WHERE object_key=$1`, id).
@@ -604,7 +863,7 @@ func TestOffloadConfirmsRemoteSuccessAfterWorkerCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	putter := &fakePutter{onPut: cancel}
-	count, err := svc.Offload(ctx, putter, &allowChecker{})
+	count, err := svc.Offload(ctx, resolveFakePutter(putter), &allowChecker{})
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
@@ -642,7 +901,7 @@ func TestOffloadNeverWritesObjectWithoutDurableAttemptCharge(t *testing.T) {
 		_, _ = db.Exec(`DROP FUNCTION IF EXISTS reject_feedback_screenshot_attempt_charge()`)
 	})
 	putter := &fakePutter{}
-	count, err := svc.Offload(context.Background(), putter, &allowChecker{})
+	count, err := svc.Offload(context.Background(), resolveFakePutter(putter), &allowChecker{})
 	require.ErrorContains(t, err, "charge screenshot offload attempt")
 	require.Zero(t, count)
 	require.Empty(t, putter.keys, "no object version is created before the attempt is charged")
@@ -666,7 +925,7 @@ func TestOffloadHonorsDiskGateAndCapsObjectStoreAttempts(t *testing.T) {
 	require.NoError(t, svc.ConfirmPublished(ctx, receipt, []string{path}))
 	putter := &fakePutter{}
 	checker := &allowChecker{err: errors.New("disk watermark refused")}
-	count, err := svc.Offload(ctx, putter, checker)
+	count, err := svc.Offload(ctx, resolveFakePutter(putter), checker)
 	require.Error(t, err)
 	require.Zero(t, count)
 	require.Empty(t, putter.keys, "the disk check must run before any object-store write")
@@ -678,14 +937,14 @@ func TestOffloadHonorsDiskGateAndCapsObjectStoreAttempts(t *testing.T) {
 		require.NoError(t, err)
 		putter.err = errors.New("object store uncertain failure")
 		checker.err = nil
-		count, err = svc.Offload(ctx, putter, checker)
+		count, err = svc.Offload(ctx, resolveFakePutter(putter), checker)
 		require.Error(t, err)
 		require.Zero(t, count)
 	}
 	_, err = db.Exec(`UPDATE feedback_screenshot_uploads SET retry_at=NOW()-INTERVAL '1 second' WHERE object_key=$1`, id)
 	require.NoError(t, err)
 	putCount := len(putter.keys)
-	count, err = svc.Offload(ctx, putter, checker)
+	count, err = svc.Offload(ctx, resolveFakePutter(putter), checker)
 	require.NoError(t, err)
 	require.Zero(t, count)
 	require.Len(t, putter.keys, putCount, "no fourth remote attempt may be made after the durable cap")
@@ -705,7 +964,7 @@ func TestExpiredUnresolvedPinBecomesRetainedAndOffloadEligible(t *testing.T) {
 	_, err := db.Exec(`UPDATE feedback_screenshot_uploads SET retained_at=NOW()-INTERVAL '1 second' WHERE object_key=$1`, id)
 	require.NoError(t, err)
 	putter := &fakePutter{}
-	count, err := svc.Offload(ctx, putter, &allowChecker{})
+	count, err := svc.Offload(ctx, resolveFakePutter(putter), &allowChecker{})
 	require.NoError(t, err)
 	require.Equal(t, 1, count, "the expiry transition makes unresolved evidence permanent and offloadable")
 	var published, retained bool
@@ -738,7 +997,7 @@ func TestWorkerReclaimsExpiredUploadAndOffloadsPublishedImageAtStartup(t *testin
 	var logs bytes.Buffer
 	putter := &fakePutter{}
 	ctx, cancel := context.WithCancel(context.Background())
-	wait := svc.Start(ctx, putter, &allowChecker{}, logger.NewWithWriter(&logs))
+	wait := svc.Start(ctx, resolveFakePutter(putter), &allowChecker{}, logger.NewWithWriter(&logs))
 	t.Cleanup(func() { cancel(); wait() })
 	require.Eventually(t, func() bool {
 		var expiredState string
@@ -766,7 +1025,7 @@ func TestWorkerLogsOffloadFailureAndKeepsPublishedBytes(t *testing.T) {
 	receipt := pinForTest(t, svc, userID, []string{path})
 	require.NoError(t, svc.ConfirmPublished(context.Background(), receipt, []string{path}))
 	var logs bytes.Buffer
-	svc.runPass(context.Background(), &fakePutter{err: errors.New("object store unavailable")}, &allowChecker{}, logger.NewWithWriter(&logs))
+	svc.runPass(context.Background(), resolveFakePutter(&fakePutter{err: errors.New("object store unavailable")}), &allowChecker{}, logger.NewWithWriter(&logs))
 	require.Contains(t, logs.String(), "feedback screenshot offload failed")
 	got, _, remote, allowed, err := svc.Read(context.Background(), storageKeyForTest(id))
 	require.NoError(t, err)

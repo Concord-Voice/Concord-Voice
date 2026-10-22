@@ -195,7 +195,7 @@ func (h *Handler) admitAndStoreServerImage(
 	if err := up.store.PutObject(putCtx, storageKey, bytes.NewReader(up.processed.Data), int64(len(up.processed.Data)), up.processed.ContentType); err != nil {
 		return "", outcome, fmt.Errorf("%w: %w", errServerImageStore, err)
 	}
-	fileID, err := insertTier1Row(ctx, tx, up.userID, storageKey, up.processed)
+	fileID, err := insertTier1Row(ctx, tx, up.userID, storageKey, "", up.processed)
 	if err != nil {
 		return "", outcome, fmt.Errorf("record server image: %w", err)
 	}

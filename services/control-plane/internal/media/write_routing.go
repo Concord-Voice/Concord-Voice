@@ -20,16 +20,17 @@ import (
 // go", keyed on the CALLER'S PURPOSE, because there is no row yet to read a
 // column from.
 //
-// Tier 1 (media_tier = 1: avatars/, banners/, server-icons/, server-banners/,
+// Fixed-key Tier 1 (avatars/, banners/, server-icons/, server-banners/,
 // dm-icons/) is a STATIC rule: ADR-0038 keeps every one of those objects on
-// the legacy backend unconditionally and forever, so ResolveTier1WriteStore
+// the legacy backend, so ResolveTier1WriteStore
 // takes no parameter and consults nothing but the legacy identifier -- there
 // is no "current write default" question for it to ask, and no per-object
 // resolver could express that it must never be asked one. Tier 2
-// (attachments/) is the only caller of ResolveAttachmentWriteStore, which is
+// (attachments/) calls ResolveAttachmentWriteStore, which is
 // free to move where NEW objects land (via
 // storage.Registry.AttachmentWriteBackendID) without a single tier-1 call
-// site changing.
+// site changing. Unique-key feedback screenshots have their own selector and
+// private bucket; the fixed-key Tier 1 rule does not apply to them.
 //
 // THE FLIP IS NOT THIS UNIT'S JOB. ResolveAttachmentWriteStore resolves to
 // the legacy backend today, because AttachmentWriteBackendID does -- see that
@@ -59,6 +60,7 @@ type WriteRouter interface {
 	// the legacy backend -- leave the column NULL (migration 000114's
 	// permanent spelling), never write the literal "legacy".
 	ResolveAttachmentWriteStore() (store ObjectStore, backendID string, err error)
+	ResolveFeedbackScreenshotWriteStore() (store ObjectStore, backendID string, err error)
 }
 
 // registryWriteRouter adapts the boot-time *storage.Registry to WriteRouter.
@@ -93,6 +95,21 @@ func (r registryWriteRouter) ResolveAttachmentWriteStore() (ObjectStore, string,
 	}
 	if client == nil {
 		return nil, "", fmt.Errorf("media: attachment write backend %q resolved to no client", string(id))
+	}
+	if id == storage.LegacyBackendID {
+		return client, "", nil
+	}
+	return client, string(id), nil
+}
+
+func (r registryWriteRouter) ResolveFeedbackScreenshotWriteStore() (ObjectStore, string, error) {
+	id := r.registry.FeedbackScreenshotWriteBackendID()
+	client, err := r.registry.Resolve(id)
+	if err != nil {
+		return nil, "", err
+	}
+	if client == nil {
+		return nil, "", fmt.Errorf("media: feedback screenshot write backend %q resolved to no client", string(id))
 	}
 	if id == storage.LegacyBackendID {
 		return client, "", nil
@@ -149,9 +166,30 @@ func (h *Handler) requireAttachmentWriteStore(c *gin.Context) (ObjectStore, stri
 	return store, backendID, true
 }
 
-// checkFeedbackScreenshotDiskWatermark gates the accumulating screenshot purpose
-// without changing profile/entity image policy. Screenshots always use legacy
-// storage, even when new attachments are routed to a vendor backend.
+func (h *Handler) requireFeedbackScreenshotWriteStore(c *gin.Context) (ObjectStore, string, bool) {
+	if h.writeRouter == nil {
+		store, ok := h.requireObjectStore(c)
+		return store, "", ok
+	}
+	store, backendID, err := h.writeRouter.ResolveFeedbackScreenshotWriteStore()
+	if err != nil {
+		h.log.Error("Could not resolve the feedback screenshot write backend", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		return nil, "", false
+	}
+	return store, backendID, true
+}
+
+func (h *Handler) requireTier1UploadStore(c *gin.Context, purpose string) (ObjectStore, string, bool) {
+	if purpose == purposeFeedbackScreenshot {
+		return h.requireFeedbackScreenshotWriteStore(c)
+	}
+	store, ok := h.requireTier1WriteStore(c)
+	return store, "", ok
+}
+
+// checkFeedbackScreenshotDiskWatermark gates staged PostgreSQL screenshot
+// bytes on the shared disk, regardless of their eventual object backend.
 func (h *Handler) checkFeedbackScreenshotDiskWatermark(c *gin.Context, purpose string) bool {
 	if purpose != purposeFeedbackScreenshot {
 		return true

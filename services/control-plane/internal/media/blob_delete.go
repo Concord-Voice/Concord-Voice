@@ -24,8 +24,7 @@ import (
 // the retry signal that would have caught it has been destroyed. Message
 // purges (000090) run through that rail.
 //
-// ACCOUNT DELETION (000059) NOW REACHES THIS RAIL, but only for tier 2, and the
-// asymmetry is the thing to understand before editing either half.
+// ACCOUNT DELETION (000059) reaches this rail for per-upload unique keys.
 //
 // The problem it closes: `media_files.uploader_id` is `REFERENCES users(id) ON
 // DELETE CASCADE` (migration 000042), so `DELETE FROM users` HARD-deletes every
@@ -39,19 +38,17 @@ import (
 //
 //   - users.deleteAccountTx captures the blob refs under the user-row lock
 //     BEFORE the cascade, and users.reclaimErasedMedia discharges them after the
-//     commit. TIER 2 arrives here, through EnqueueBlobDeletes, whose
-//     per-upload-unique-key contract `attachments/<fileID>` satisfies. TIER 1
-//     does NOT and must not: its keys are deterministic per subject, exactly
-//     what that contract refuses, so it goes to the durable Tier-1 erasure
-//     obligation worker instead — and only for the two keys whose SUBJECT is
+//     commit. Tier-2 attachments and Tier-1 feedback screenshots arrive here
+//     through EnqueueBlobDeletes; both use unique keys. Fixed-key Tier-1
+//     assets go to the durable Tier-1 erasure obligation worker instead —
+//     and only for the two keys whose SUBJECT is
 //     the erased user (see ErasableTier1Keys; `server-icons/` and `dm-icons/`
 //     belong to subjects that outlive their uploader).
 //   - media.OrphanReaper recovers the history the capture cannot reach — every
 //     object stranded by an erasure that already happened, plus the
-//     soft-deleted-but-unreaped rows the same cascade destroys. It is TIER 2
-//     ONLY, and permanently so: proxyTier1Media serves profile media by key
-//     without reading media_files at all, so a row-less tier-1 object is not
-//     evidence of an orphan.
+//     soft-deleted-but-unreaped rows the same cascade destroys. It lists only
+//     attachment and feedback screenshot prefixes; fixed-key Tier-1 objects
+//     cannot be swept because their references can outlive an uploader row.
 //
 // WHAT REMAINS OPEN, stated rather than implied away: tier-1 profile media
 // stranded by an erasure that predates this change. It is PLAINTEXT (the server

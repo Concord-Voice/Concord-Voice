@@ -49,6 +49,10 @@ const LegacyAttachmentBackendID = "legacy"
 // but fails closed forever. A bare "r2" would have needed exactly that rename.
 const AttachmentBackendR2USEast = "r2-useast"
 
+// FeedbackScreenshotBackendR2USEast is a distinct, private R2 bucket for
+// plaintext issue screenshots. Persisted media_files values must stay stable.
+const FeedbackScreenshotBackendR2USEast = "r2-feedback-useast"
+
 // ObjectBackend is one non-legacy object-storage destination plus the
 // credential that reaches it.
 //
@@ -132,6 +136,28 @@ func (c *Config) AttachmentBackends() []ObjectBackend {
 		live = append(live, backend)
 	}
 	return live
+}
+
+// FeedbackScreenshotBackends registers only the dedicated screenshot credential.
+// Missing credentials leave the backend unavailable; they never route a write
+// or read into the attachment bucket or MinIO by accident.
+func (c *Config) FeedbackScreenshotBackends() []ObjectBackend {
+	if c == nil {
+		return nil
+	}
+	backend := ObjectBackend{
+		ID:                 FeedbackScreenshotBackendR2USEast,
+		Endpoint:           c.FeedbackScreenshotR2.Endpoint,
+		ExpectedHostSuffix: ".r2.cloudflarestorage.com",
+		Region:             c.FeedbackScreenshotR2.Region,
+		Bucket:             c.FeedbackScreenshotR2.Bucket,
+		AccessKeyID:        c.FeedbackScreenshotR2.AccessKeyID,
+		SecretAccessKey:    c.FeedbackScreenshotR2.SecretAccessKey,
+	}
+	if backend.AccessKeyID == "" || backend.SecretAccessKey == "" {
+		return nil
+	}
+	return []ObjectBackend{backend}
 }
 
 // attachmentBackendCandidates is the UNFILTERED declaration table -- every

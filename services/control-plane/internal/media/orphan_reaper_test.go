@@ -3,6 +3,7 @@ package media_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,13 +22,13 @@ import (
 // what was deleted -- a reaper that lists the whole bucket and filters
 // afterwards would pass a delete-only assertion.
 type fakeOrphanStore struct {
-	mu         sync.Mutex
-	objects    []storage.StoredObject
-	listPrefix string
-	listCutoff time.Time
-	listErr    error
-	deleteErr  error
-	deleted    []string
+	mu           sync.Mutex
+	objects      []storage.StoredObject
+	listPrefixes []string
+	listCutoff   time.Time
+	listErr      error
+	deleteErr    error
+	deleted      []string
 }
 
 func (f *fakeOrphanStore) ListObjects(
@@ -35,12 +36,18 @@ func (f *fakeOrphanStore) ListObjects(
 ) ([]storage.StoredObject, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.listPrefix = prefix
+	f.listPrefixes = append(f.listPrefixes, prefix)
 	f.listCutoff = olderThan
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	return f.objects, nil
+	var listed []storage.StoredObject
+	for _, obj := range f.objects {
+		if strings.HasPrefix(obj.Key, prefix) {
+			listed = append(listed, obj)
+		}
+	}
+	return listed, nil
 }
 
 func (f *fakeOrphanStore) DeleteObject(_ context.Context, key string) error {
@@ -116,6 +123,24 @@ func TestOrphanSweepReapsUnclaimedOnly(t *testing.T) {
 		"an object a media_files row claims must never be deleted")
 }
 
+func TestOrphanSweepReapsOnlyRowlessScreenshotsOnTheirBackend(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "orphanfeedback")
+	const backend = "r2-feedback-useast"
+	claimed := "feedback-screenshots/" + user.ID
+	orphan := "feedback-screenshots/00000000-0000-4000-8000-000000000001"
+	_, err := ts.DB.Exec(`INSERT INTO media_files
+		(uploader_id, file_type, media_tier, mime_type, file_size, storage_key, storage_backend)
+		VALUES ($1, 'photo', 1, 'image/jpeg', 10, $2, $3)`, user.ID, claimed, backend)
+	require.NoError(t, err)
+	store := &fakeOrphanStore{objects: objectsFor(claimed, orphan, "server-icons/00000000-0000-4000-8000-000000000002")}
+	reaper := media.NewOrphanReaper(ts.DB, store, backend, logger.New("test"))
+	res, err := reaper.SweepOrphans(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Listed)
+	assert.Equal(t, []string{orphan}, store.deleted)
+}
+
 // TestOrphanSweepSparesSoftDeletedRows pins the deliberate absence of a
 // `deleted_at` predicate in claimedKeysQuery. A soft-deleted row still CLAIMS
 // its object -- the straggler sweep owns it -- and two reclaimers racing the
@@ -172,10 +197,8 @@ func TestOrphanSweepIsPairKeyed(t *testing.T) {
 	assert.Empty(t, store2.deleted)
 }
 
-// TestOrphanSweepScopeIsTier2Only is the guard against the widening that would
-// blank live server icons. The reaper must ask the store only for the
-// attachments prefix, and must ignore a tier-1 key even if one is handed back.
-func TestOrphanSweepScopeIsTier2Only(t *testing.T) {
+// TestOrphanSweepScopePreservesFixedKeyAssets guards against blanking live icons.
+func TestOrphanSweepScopePreservesFixedKeyAssets(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	user := ts.CreateTestUser(t, "orphanreap4")
 
@@ -190,7 +213,7 @@ func TestOrphanSweepScopeIsTier2Only(t *testing.T) {
 	res, err := reaper.SweepOrphans(context.Background())
 	require.NoError(t, err)
 
-	assert.Equal(t, "attachments/", store.listPrefix,
+	assert.Equal(t, []string{"attachments/", "feedback-screenshots/"}, store.listPrefixes,
 		"the listing itself must be scoped; filtering afterwards is not the same guarantee")
 	assert.Equal(t, 0, res.Listed)
 	assert.Empty(t, store.deleted, "tier-1 profile media is never an orphan-reaper candidate")

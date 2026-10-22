@@ -74,7 +74,8 @@ type Registry struct {
 	entries map[BackendID]backendEntry
 	// attachmentWrite is the selector captured at boot. It intentionally has no
 	// fallback: an armed but unusable backend must fail the new write closed.
-	attachmentWrite BackendID
+	attachmentWrite         BackendID
+	feedbackScreenshotWrite BackendID
 	// order preserves registration order (legacy first, then every non-legacy
 	// backend that actually got an entry) -- see BackendIDs. A plain map
 	// iteration would work for Resolve/ResolveRow, which only ever look up one
@@ -110,8 +111,9 @@ type backendEntry struct {
 // (while the write default still points at MinIO) holds no objects at all.
 func NewRegistry(cfg *config.Config, legacy *Client, log *logger.Logger) *Registry {
 	registry := &Registry{
-		entries:         make(map[BackendID]backendEntry, 2),
-		attachmentWrite: LegacyBackendID,
+		entries:                 make(map[BackendID]backendEntry, 2),
+		attachmentWrite:         LegacyBackendID,
+		feedbackScreenshotWrite: LegacyBackendID,
 	}
 
 	if legacy != nil {
@@ -134,13 +136,25 @@ func NewRegistry(cfg *config.Config, legacy *Client, log *logger.Logger) *Regist
 	if registry.attachmentWrite == "" {
 		registry.attachmentWrite = LegacyBackendID
 	}
+	registry.feedbackScreenshotWrite = BackendID(cfg.FeedbackScreenshotWriteBackend)
+	if registry.feedbackScreenshotWrite == "" {
+		registry.feedbackScreenshotWrite = LegacyBackendID
+	}
 	for _, backend := range cfg.AttachmentBackends() {
+		registry.register(backend, log)
+	}
+	for _, backend := range cfg.FeedbackScreenshotBackends() {
 		registry.register(backend, log)
 	}
 	if _, err := registry.Resolve(registry.attachmentWrite); err != nil {
 		log.Error("ATTACHMENT WRITE BACKEND UNUSABLE", "backend", string(registry.attachmentWrite), "error", err)
 	} else {
 		log.Info("Attachment write default", "backend", string(registry.attachmentWrite))
+	}
+	if _, err := registry.Resolve(registry.feedbackScreenshotWrite); err != nil {
+		log.Error("FEEDBACK SCREENSHOT WRITE BACKEND UNUSABLE", "backend", string(registry.feedbackScreenshotWrite), "error", err)
+	} else {
+		log.Info("Feedback screenshot write default", "backend", string(registry.feedbackScreenshotWrite))
 	}
 	return registry
 }
@@ -265,6 +279,15 @@ func (r *Registry) AttachmentWriteBackendID() BackendID {
 		return LegacyBackendID
 	}
 	return r.attachmentWrite
+}
+
+// FeedbackScreenshotWriteBackendID selects NEW feedback screenshot writes.
+// Existing rows always resolve their own recorded backend.
+func (r *Registry) FeedbackScreenshotWriteBackendID() BackendID {
+	if r == nil || r.feedbackScreenshotWrite == "" {
+		return LegacyBackendID
+	}
+	return r.feedbackScreenshotWrite
 }
 
 // newVendorClient builds a client for a non-legacy backend.

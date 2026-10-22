@@ -106,6 +106,8 @@ func TestRun_CommandOutcomes(t *testing.T) {
 	t.Setenv("CLOUDFLARE_KV_BRIDGE_ENABLED", "false")
 	t.Setenv("CLOUDFLARE_R2_USEAST_ID", "")
 	t.Setenv("CLOUDFLARE_R2_USEAST_ID_KEY", "")
+	t.Setenv("CLOUDFLARE_R2_FEEDBACK_ID", "")
+	t.Setenv("CLOUDFLARE_R2_FEEDBACK_ID_KEY", "")
 
 	t.Run("invalid arguments", func(t *testing.T) {
 		stdout, stderr, code := captureRunOutput(t, []string{"--backend", "unknown"})
@@ -147,6 +149,13 @@ func TestRun_CommandOutcomes(t *testing.T) {
 		assert.Equal(t, 1, code)
 		assert.Empty(t, stderr)
 		assertJSONResult(t, stdout, "r2-useast", "failed", "unknown storage backend")
+	})
+
+	t.Run("explicit unregistered screenshot R2 fails closed", func(t *testing.T) {
+		stdout, stderr, code := captureRunOutput(t, []string{"--backend", "r2-feedback-useast", "--json"})
+		assert.Equal(t, 1, code)
+		assert.Empty(t, stderr)
+		assertJSONResult(t, stdout, "r2-feedback-useast", "failed", "unknown storage backend")
 	})
 
 	t.Run("explicit unregistered R2 reports text failure", func(t *testing.T) {
@@ -409,6 +418,7 @@ func TestParseArgs_BackendExplicitness(t *testing.T) {
 		{name: "omitted backend", args: nil, wantBackend: ""},
 		{name: "explicit legacy", args: []string{"--backend", string(storage.LegacyBackendID)}, wantBackend: string(storage.LegacyBackendID), wantExplicit: true},
 		{name: "explicit r2", args: []string{"--backend=r2-useast"}, wantBackend: "r2-useast", wantExplicit: true},
+		{name: "explicit screenshot r2", args: []string{"--backend=r2-feedback-useast"}, wantBackend: "r2-feedback-useast", wantExplicit: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseArgs(tc.args)

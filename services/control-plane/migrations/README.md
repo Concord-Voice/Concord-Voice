@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000183)
+## Existing Migrations (000001–000184)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -293,6 +293,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000181 | stripe_webhook_events | Webhook dedupe by `evt_` id, no payload, `processed_at` index for 30-day retention; plain down |
 | 000182 | billing_erasure_outbox | Pending Stripe Customer erasures with no user id or FK; down refuses any pending obligation |
 | 000183 | billing_ops_metrics | Admit the `billing_erasure_outbox_pending` gauge and `billing_drift_corrections_total` counter to the closed operations metric catalog (#2033) |
+| 000184 | feedback_screenshot_backend | Stores the selected backend in the screenshot lifecycle ledger for deferred offload; rollback refuses while live or potentially written vendor placements exist |
 
 ### Message key-version constraints (migrations 000171–000176, #2844)
 

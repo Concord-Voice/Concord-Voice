@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -20,6 +21,7 @@ import (
 const devJWTSecret = "dev_jwt_secret_change_in_production"                              // #nosec G101 -- Not a real secret, just the default placeholder
 const devMFAEncKey = "0000000000000000000000000000000000000000000000000000000000000000" // #nosec G101 -- 32-byte zero key, dev only
 const devMinIOSecretKey = "concord_dev_minio"                                           // #nosec G101 -- dev default, guarded by validate()
+const httpsPrefix = "https://"
 
 // Instance type values advertised by GET /server/capabilities and consumed by
 // entitlement resolution. Unknown values normalize to SaaS so misconfiguration
@@ -144,17 +146,16 @@ func (c CloudflareKVBridgeConfig) String() string {
 		c.AccountID, c.NamespaceID, len(c.APIToken))
 }
 
-// CloudflareR2Config holds the Cloudflare R2 credentials and destination for
-// the ATTACHMENT object-storage bucket (ADR-0038 — the SaaS write-default
-// migration off single-drive MinIO; tracked on a separate branch from this
-// change). Endpoint/Region/Bucket are non-secret destination LITERALS pinned
+// CloudflareR2Config holds one Cloudflare R2 bucket's credentials and destination.
+// The attachment instance follows ADR-0038; the feedback screenshot instance
+// uses a separate bucket and credential. Endpoint/Region/Bucket are non-secret destination LITERALS pinned
 // in docker-compose.production.yml — never sourced from an operator-writable
 // env var here, for the same reason backup-offsite.sh pins its own R2
 // account/bucket in reviewed source rather than reading them from
 // /opt/concord/.env: a concord-writable destination is a redirection channel
 // for a compromised host.
 //
-// AccessKeyID/SecretAccessKey are the ATTACHMENT-bucket credential
+// The attachment instance's AccessKeyID/SecretAccessKey are the ATTACHMENT-bucket credential
 // (CLOUDFLARE_R2_USEAST_ID / CLOUDFLARE_R2_USEAST_ID_KEY, Infisical
 // prod:/runtime, rotated on a 6-month cadence — Object Read+Write,
 // bucket-scoped). They are DISTINCT from the break-glass backup credential
@@ -337,6 +338,12 @@ type Config struct {
 	// AttachmentWriteBackend is the registry backend id for new v3 attachment
 	// writes. Empty configuration normalizes to the permanent legacy selector.
 	AttachmentWriteBackend string
+	// FeedbackScreenshotR2 is a separate private bucket and credential for
+	// public issue screenshot proxies. Legacy rows still resolve to MinIO.
+	FeedbackScreenshotR2 CloudflareR2Config
+	// FeedbackScreenshotWriteBackend selects the destination for new screenshots.
+	// Legacy remains the default until the dedicated bucket cutover.
+	FeedbackScreenshotWriteBackend string
 
 	// Message-purge engine (#1352). Lightweight compose-only tunables — NOT in
 	// validate()/provision-secrets.yml (won't fatal-exit, won't trip Class-1 drift).
@@ -536,11 +543,19 @@ func Load() (*Config, error) {
 			SecretAccessKey: getEnv("CLOUDFLARE_R2_USEAST_ID_KEY", ""), // #nosec G101 -- env var name, not a secret
 		},
 		AttachmentWriteBackend: normalizeAttachmentWriteBackend(getEnv("ATTACHMENT_WRITE_BACKEND", "")),
-		PurgeMaxBatch:          getEnvInt("PURGE_MAX_BATCH", 5000),
-		PurgeRateLimit:         getEnvInt("PURGE_RATE_LIMIT", 5),
-		PurgeRateWindowSec:     getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
-		KlipyAPIKey:            getEnv("KLIPY_API_KEY", ""),
-		KlipyCustomerIDKey:     getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
+		FeedbackScreenshotR2: CloudflareR2Config{
+			Endpoint:        getEnv("CLOUDFLARE_R2_FEEDBACK_ENDPOINT", ""),
+			Region:          getEnv("CLOUDFLARE_R2_FEEDBACK_REGION", "auto"),
+			Bucket:          getEnv("CLOUDFLARE_R2_FEEDBACK_BUCKET", ""),
+			AccessKeyID:     getEnv("CLOUDFLARE_R2_FEEDBACK_ID", ""),
+			SecretAccessKey: getEnv("CLOUDFLARE_R2_FEEDBACK_ID_KEY", ""), // #nosec G101 -- env var name, not a secret
+		},
+		FeedbackScreenshotWriteBackend: normalizeAttachmentWriteBackend(getEnv("FEEDBACK_SCREENSHOT_WRITE_BACKEND", "")),
+		PurgeMaxBatch:                  getEnvInt("PURGE_MAX_BATCH", 5000),
+		PurgeRateLimit:                 getEnvInt("PURGE_RATE_LIMIT", 5),
+		PurgeRateWindowSec:             getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
+		KlipyAPIKey:                    getEnv("KLIPY_API_KEY", ""),
+		KlipyCustomerIDKey:             getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
 		GitHubFeedback: GitHubFeedbackConfig{
 			// TrimSpace both fields: a trailing newline on the PAT (the common
 			// copy-paste / secret-store artifact) corrupts the
@@ -857,6 +872,9 @@ func (c *Config) validate() error {
 	if err := c.validateAttachmentWriteBackend(); err != nil {
 		return err
 	}
+	if err := c.validateFeedbackScreenshotWriteBackend(); err != nil {
+		return err
+	}
 	if err := c.validateSiteID(); err != nil {
 		return err
 	}
@@ -945,6 +963,35 @@ func (c *Config) validateAttachmentWriteBackend() error {
 	}
 	if selected != LegacyAttachmentBackendID && IsSelfHostedInstance(c.InstanceType) {
 		return fmt.Errorf("ATTACHMENT_WRITE_BACKEND must be %q for self-hosted deployments", LegacyAttachmentBackendID)
+	}
+	return nil
+}
+
+func (c *Config) validateFeedbackScreenshotWriteBackend() error {
+	selected := normalizeAttachmentWriteBackend(c.FeedbackScreenshotWriteBackend)
+	if selected != LegacyAttachmentBackendID && selected != FeedbackScreenshotBackendR2USEast {
+		return fmt.Errorf("FEEDBACK_SCREENSHOT_WRITE_BACKEND must be %q or %q", LegacyAttachmentBackendID, FeedbackScreenshotBackendR2USEast)
+	}
+	if selected != LegacyAttachmentBackendID && IsSelfHostedInstance(c.InstanceType) {
+		return fmt.Errorf("FEEDBACK_SCREENSHOT_WRITE_BACKEND must be %q for self-hosted deployments", LegacyAttachmentBackendID)
+	}
+	r2 := c.FeedbackScreenshotR2
+	if (r2.AccessKeyID == "") != (r2.SecretAccessKey == "") {
+		return errors.New("CLOUDFLARE_R2_FEEDBACK_ID and CLOUDFLARE_R2_FEEDBACK_ID_KEY must be set together")
+	}
+	registered := r2.AccessKeyID != "" && r2.SecretAccessKey != ""
+	if selected != LegacyAttachmentBackendID {
+		if !registered || r2.Bucket == "" || !strings.HasPrefix(r2.Endpoint, httpsPrefix) {
+			return errors.New("FEEDBACK_SCREENSHOT_WRITE_BACKEND requires a complete private HTTPS screenshot R2 backend")
+		}
+	}
+	if registered {
+		if r2.Bucket == c.CloudflareR2.Bucket {
+			return errors.New("FEEDBACK_SCREENSHOT_WRITE_BACKEND requires a bucket separate from attachments")
+		}
+		if r2.AccessKeyID == c.CloudflareR2.AccessKeyID {
+			return errors.New("FEEDBACK_SCREENSHOT_WRITE_BACKEND requires a credential separate from attachments")
+		}
 	}
 	return nil
 }
@@ -1161,6 +1208,17 @@ func privateNetworkStorageHost(host string) bool {
 	return ip.IsLoopback() || ip.IsPrivate()
 }
 
+// vendorEndpointIsPlaintext reports a CONFIGURED vendor endpoint that is not
+// https://. Empty is not an error -- the backend is dormant by default, so a
+// deployment that never sets it is the normal case, not a misconfiguration.
+func (c *Config) vendorEndpointIsPlaintext() bool {
+	return c.CloudflareR2.Endpoint != "" && !strings.HasPrefix(c.CloudflareR2.Endpoint, httpsPrefix)
+}
+
+func (c *Config) managedR2CredentialMissing(value string) bool {
+	return !IsSelfHostedInstance(c.InstanceType) && strings.TrimSpace(value) == ""
+}
+
 // storageDestinationEscapesTheCluster reports a SaaS deployment whose legacy
 // object-storage endpoint points somewhere the container network cannot reach.
 //
@@ -1169,17 +1227,6 @@ func privateNetworkStorageHost(host string) bool {
 // defaults INSTANCE_TYPE to "saas", so empty means SaaS everywhere it can
 // occur -- but an == comparison would let a Config that never went through
 // Load() skip the check, which is the wrong direction for a guard.
-// vendorEndpointIsPlaintext reports a CONFIGURED vendor endpoint that is not
-// https://. Empty is not an error -- the backend is dormant by default, so a
-// deployment that never sets it is the normal case, not a misconfiguration.
-func (c *Config) vendorEndpointIsPlaintext() bool {
-	return c.CloudflareR2.Endpoint != "" && !strings.HasPrefix(c.CloudflareR2.Endpoint, "https://")
-}
-
-func (c *Config) managedR2CredentialMissing(value string) bool {
-	return !IsSelfHostedInstance(c.InstanceType) && strings.TrimSpace(value) == ""
-}
-
 func (c *Config) storageDestinationEscapesTheCluster() bool {
 	if IsSelfHostedInstance(c.InstanceType) {
 		return false
@@ -1330,7 +1377,7 @@ func (c *Config) validateProduction() error {
 			"ADMIN_WEBAUTHN_ALLOWED_AAGUIDS must list at least one authenticator AAGUID in production when ADMIN_CONSOLE_ENABLED=true. checkAAGUID is fail-closed — an empty list rejects every enrollment, bricking the console. Configure the approved YubiKey AAGUIDs (coordinate with #558)."},
 		{c.AdminConsoleEnabled && c.CFAccessAUD == "",
 			"CF_ACCESS_AUD must be set when ADMIN_CONSOLE_ENABLED=true — it is the Cloudflare Access audience tag the origin verifies; an empty AUD would accept any Access token (CWE-287)."},
-		{c.AdminConsoleEnabled && !strings.HasPrefix(c.CFAccessTeamDomain, "https://"),
+		{c.AdminConsoleEnabled && !strings.HasPrefix(c.CFAccessTeamDomain, httpsPrefix),
 			"CF_ACCESS_TEAM_DOMAIN must be the https Cloudflare Access team domain (JWKS + issuer source) when ADMIN_CONSOLE_ENABLED=true."},
 		// #1303 — redemption admin token. An UNSET token is allowed in
 		// production (it simply disables the HTTP code-generation endpoint;

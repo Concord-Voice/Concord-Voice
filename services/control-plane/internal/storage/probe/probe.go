@@ -1,4 +1,4 @@
-// Package probe runs a bounded read/write check against one attachment store.
+// Package probe runs a bounded read/write check against one object store.
 package probe
 
 import (
@@ -42,7 +42,7 @@ type probeOptions struct {
 	json            bool
 }
 
-// Run executes the attachment storage probe. It returns 64 for invalid CLI
+// Run executes the object storage probe. It returns 64 for invalid CLI
 // arguments, 1 for configuration, resolution, or storage failures, and 0 on
 // success or an intentionally skipped legacy default.
 func Run(args []string) int {
@@ -113,7 +113,7 @@ func writeSkipped() {
 func parseArgs(args []string) (probeOptions, error) {
 	fs := flag.NewFlagSet("storage-probe", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	backend := fs.String("backend", "", "attachment backend (legacy or r2-useast)")
+	backend := fs.String("backend", "", "object backend (legacy, r2-useast, or r2-feedback-useast)")
 	jsonOutput := fs.Bool("json", false, "write machine-readable output")
 	if err := fs.Parse(args); err != nil {
 		return probeOptions{}, err
@@ -121,7 +121,10 @@ func parseArgs(args []string) (probeOptions, error) {
 	if fs.NArg() != 0 {
 		return probeOptions{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	if *backend != "" && *backend != string(storage.LegacyBackendID) && *backend != config.AttachmentBackendR2USEast {
+	if *backend != "" &&
+		*backend != string(storage.LegacyBackendID) &&
+		*backend != config.AttachmentBackendR2USEast &&
+		*backend != config.FeedbackScreenshotBackendR2USEast {
 		return probeOptions{}, fmt.Errorf("unknown backend %q", *backend)
 	}
 	backendExplicit := false

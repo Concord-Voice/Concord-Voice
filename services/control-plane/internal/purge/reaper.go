@@ -79,8 +79,8 @@ func NewReaper(db *sql.DB, log *logger.Logger, backends media.DeleterResolver) *
 // the worker to guess at placement, and the wrong guess is not a failed delete but
 // a SUCCESSFUL one against the wrong bucket (see reapBlob).
 //
-// CONTRACT: callers may only enqueue refs that are unique per upload (today:
-// `attachments/<fileID>` from the engine's reap CTE). The worker deletes the object
+// CONTRACT: callers may only enqueue refs that are unique per upload
+// (`attachments/<fileID>` or `feedback-screenshots/<uuid>`). The worker deletes the object
 // unconditionally, WITHOUT the live-key guard reapSweptBlob applies — enqueueing a
 // DETERMINISTIC tier-1 key (`avatars/<userID>`, media.tier1StorageKey) would delete
 // an object a live row may still point at. Route any such key through the sweep.

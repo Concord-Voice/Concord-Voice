@@ -930,11 +930,11 @@ func (h *Handler) ProxyDMIcon(c *gin.Context) {
 // PUBLIC: the unguessable UUID is the only identifier. Registered without auth so
 // GitHub's image proxy (camo) can fetch a screenshot embedded in a filed issue
 // without an Authorization header. Do NOT add JWT/membership assumptions here — see
-// router.go for the registration. Pending images are read from PostgreSQL;
-// published images move to the object store after a confirmed PUT. Submitted
-// images are retained; abandoned uploads expire after 72 hours. Historical screenshots with
-// no lifecycle evidence remain readable because their report references are unknown.
+// router.go for the registration. A live media row admits staged bytes or
+// selects the remote backend after offload. Erasure or an unavailable backend
+// must not expose bytes. Abandoned pending uploads expire after 72 hours.
 func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
+	c.Header(headerCacheControl, cacheControlNoStore)
 	id := c.Param("id")
 	// Require the CANONICAL lowercase 36-char UUID form, not merely something
 	// uuid.Parse accepts — it also parses `{braces}`, `urn:uuid:...`, 32-hex,
@@ -949,6 +949,19 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 	}
 
 	storageKey := fmt.Sprintf("feedback-screenshots/%s", id)
+	var backend sql.NullString
+	err = h.db.QueryRowContext(c.Request.Context(), `SELECT storage_backend FROM media_files
+		WHERE storage_key=$1 AND media_tier=1 AND mime_type IN ('image/jpeg','image/png')
+		  AND deleted_at IS NULL`, storageKey).Scan(&backend)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+		} else {
+			h.log.Error("Failed to resolve feedback screenshot metadata", "error", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		}
+		return
+	}
 	data, contentType, remote, allowed, err := feedbackscreenshots.New(h.db).Read(c.Request.Context(), storageKey)
 	if err != nil {
 		h.log.Error("Failed to check screenshot lifecycle", "error", err)
@@ -959,14 +972,38 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
 		return
 	}
-	// Pinning may later be reversed after a definitive publication rejection.
-	// No-store prevents an earlier public cache from retaining that image.
 	if !remote {
-		c.Header(headerCacheControl, cacheControlNoStore)
 		c.Data(http.StatusOK, contentType, data)
 		return
 	}
-	h.proxyTier1MediaWithCache(c, storageKey, cacheControlNoStore)
+	var backendID *string
+	if backend.Valid {
+		backendID = &backend.String
+	}
+	store, ok := h.requireObjectStoreForRow(c, backendID)
+	if !ok {
+		return
+	}
+	obj, contentType, err := store.GetObject(c.Request.Context(), storageKey)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+		} else {
+			h.log.Error("Failed to fetch feedback screenshot")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		}
+		return
+	}
+	defer func() {
+		if err := obj.Close(); err != nil {
+			h.log.Warn("Failed to close feedback screenshot stream")
+		}
+	}()
+	c.Header(headerContentType, contentType)
+	c.Status(http.StatusOK)
+	if _, err := io.Copy(c.Writer, obj); err != nil {
+		h.log.Warn("Failed to stream feedback screenshot")
+	}
 }
 
 // DeleteMedia soft-deletes a media file and removes it from object storage.
@@ -1164,7 +1201,7 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		return // response already sent
 	}
 
-	store, ok := h.requireTier1WriteStore(c)
+	store, backendID, ok := h.requireTier1UploadStore(c, purpose)
 	if !ok {
 		return
 	}
@@ -1196,14 +1233,14 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		h.storeDMIcon(c, store, userID, conversationID, header.Size, processed)
 		return
 	}
-	h.storeUniqueKeyTier1Image(c, userID, purpose, tier1StorageKey(purpose, userID, serverID, conversationID), header.Size, processed)
+	h.storeUniqueKeyTier1Image(c, userID, purpose, tier1StorageKey(purpose, userID, serverID, conversationID), backendID, header.Size, processed)
 }
 
 // storeUniqueKeyTier1Image stages pending screenshots and their metadata in
 // one PostgreSQL transaction. Only positively published images are offloaded.
-func (h *Handler) storeUniqueKeyTier1Image(c *gin.Context, userID, purpose, storageKey string, originalSize int64, processed *ProcessedImage) {
+func (h *Handler) storeUniqueKeyTier1Image(c *gin.Context, userID, purpose, storageKey, backendID string, originalSize int64, processed *ProcessedImage) {
 	screenshots := feedbackscreenshots.New(h.db)
-	fileID, err := screenshots.Stage(c.Request.Context(), userID, storageKey, processed.Data, processed.ContentType)
+	fileID, err := screenshots.Stage(c.Request.Context(), userID, storageKey, processed.Data, processed.ContentType, backendID)
 	if err != nil {
 		if errors.Is(err, feedbackscreenshots.ErrQuota) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Screenshot storage allowance exceeded"})
@@ -1289,7 +1326,7 @@ func (h *Handler) storeDMIcon(c *gin.Context, store ObjectStore, userID, convers
 		return
 	}
 
-	fileID, err := insertTier1Row(ctx, tx, userID, storageKey, processed)
+	fileID, err := insertTier1Row(ctx, tx, userID, storageKey, "", processed)
 	if err != nil {
 		h.log.Error(errMsgFailedRecordMediaMetadata, "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRecordMediaMetadata})
@@ -1906,20 +1943,20 @@ func (h *Handler) insertProfileTier1Record(ctx context.Context, c *gin.Context, 
 // insertTier1RecordQuery upserts the media_files row for a tier-1 key. The
 // ON CONFLICT rebinds a re-upload of a fixed key to its latest uploader.
 const insertTier1RecordQuery = `
-	INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, created_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+	INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, storage_backend, created_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NOW())
 	ON CONFLICT (storage_key) WHERE deleted_at IS NULL
-	DO UPDATE SET uploader_id = EXCLUDED.uploader_id, file_size = EXCLUDED.file_size, mime_type = EXCLUDED.mime_type, updated_at = NOW()
+	DO UPDATE SET uploader_id = EXCLUDED.uploader_id, file_size = EXCLUDED.file_size, mime_type = EXCLUDED.mime_type, storage_backend = EXCLUDED.storage_backend, updated_at = NOW()
 	RETURNING id
 `
 
 // insertTier1Row upserts the media_files row for storageKey on q (the pool, or
 // a transaction) and returns its id. It writes no response and no log: its
 // callers answer the failure in their own terms.
-func insertTier1Row(ctx context.Context, q RowQuerier, userID, storageKey string, processed *ProcessedImage) (string, error) {
+func insertTier1Row(ctx context.Context, q RowQuerier, userID, storageKey, backendID string, processed *ProcessedImage) (string, error) {
 	fileID := uuid.New().String()
 	if err := q.QueryRowContext(ctx, insertTier1RecordQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
-		processed.ContentType, len(processed.Data), storageKey).Scan(&fileID); err != nil {
+		processed.ContentType, len(processed.Data), storageKey, backendID).Scan(&fileID); err != nil {
 		return "", err
 	}
 	return fileID, nil

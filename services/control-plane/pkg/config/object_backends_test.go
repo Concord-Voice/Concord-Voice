@@ -53,6 +53,21 @@ func TestAttachmentBackends_CredentialGate(t *testing.T) {
 	}
 }
 
+func TestFeedbackScreenshotBackendsStaySeparate(t *testing.T) {
+	cfg := &Config{
+		CloudflareR2:         CloudflareR2Config{Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "attachments", AccessKeyID: "attachment-id", SecretAccessKey: "attachment-key"},
+		FeedbackScreenshotR2: CloudflareR2Config{Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "feedback", AccessKeyID: "feedback-id", SecretAccessKey: "feedback-key"},
+	}
+	require.Len(t, cfg.AttachmentBackends(), 1)
+	require.Len(t, cfg.FeedbackScreenshotBackends(), 1)
+	assert.Equal(t, AttachmentBackendR2USEast, cfg.AttachmentBackends()[0].ID)
+	assert.Equal(t, FeedbackScreenshotBackendR2USEast, cfg.FeedbackScreenshotBackends()[0].ID)
+	assert.NotEqual(t, cfg.AttachmentBackends()[0].Bucket, cfg.FeedbackScreenshotBackends()[0].Bucket)
+	cfg.FeedbackScreenshotR2.SecretAccessKey = ""
+	assert.Empty(t, cfg.FeedbackScreenshotBackends())
+	assert.Len(t, cfg.AttachmentBackends(), 1)
+}
+
 // TestAttachmentBackends_NilConfig — the registry calls this on a possibly-nil
 // Config, so a nil receiver must yield no backends rather than panic at boot.
 func TestAttachmentBackends_NilConfig(t *testing.T) {

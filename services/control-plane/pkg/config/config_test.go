@@ -132,6 +132,55 @@ func TestAttachmentWriteBackendSelector(t *testing.T) {
 	}
 }
 
+func TestFeedbackScreenshotWriteBackendSelector(t *testing.T) {
+	const selected = FeedbackScreenshotBackendR2USEast
+	base := CloudflareR2Config{
+		Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "feedback",
+		AccessKeyID: "test-id", SecretAccessKey: "test-key",
+	}
+	for _, tc := range []struct {
+		name, selector, instance string
+		r2                       CloudflareR2Config
+		wantErr                  bool
+	}{
+		{"default", "", InstanceTypeSaaS, CloudflareR2Config{}, false},
+		{"armed", selected, InstanceTypeSaaS, base, false},
+		{"missing credentials", selected, InstanceTypeSaaS, CloudflareR2Config{Endpoint: base.Endpoint, Bucket: base.Bucket}, true},
+		{"non-TLS endpoint", selected, InstanceTypeSaaS, CloudflareR2Config{Endpoint: "http://account.r2.cloudflarestorage.com", Bucket: base.Bucket, AccessKeyID: base.AccessKeyID, SecretAccessKey: base.SecretAccessKey}, true},
+		{"self-hosted", selected, InstanceTypeSelfHosted, base, true},
+		{"attachment backend refused", AttachmentBackendR2USEast, InstanceTypeSaaS, base, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{FeedbackScreenshotWriteBackend: tc.selector, FeedbackScreenshotR2: tc.r2, InstanceType: tc.instance}
+			err := cfg.validateFeedbackScreenshotWriteBackend()
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+	cfg := &Config{FeedbackScreenshotWriteBackend: selected, FeedbackScreenshotR2: base, CloudflareR2: CloudflareR2Config{Bucket: base.Bucket}, InstanceType: InstanceTypeSaaS}
+	require.ErrorContains(t, cfg.validateFeedbackScreenshotWriteBackend(), "separate from attachments")
+	cfg.CloudflareR2 = CloudflareR2Config{Bucket: "attachments", AccessKeyID: base.AccessKeyID, SecretAccessKey: base.SecretAccessKey}
+	require.ErrorContains(t, cfg.validateFeedbackScreenshotWriteBackend(), "credential separate from attachments")
+	cfg.CloudflareR2.AccessKeyID = "attachment-id"
+	require.NoError(t, cfg.validateFeedbackScreenshotWriteBackend())
+	cfg.FeedbackScreenshotWriteBackend = LegacyAttachmentBackendID
+	cfg.CloudflareR2.Bucket = base.Bucket
+	require.ErrorContains(t, cfg.validateFeedbackScreenshotWriteBackend(), "bucket separate from attachments")
+	cfg.CloudflareR2.Bucket = "attachments"
+	cfg.CloudflareR2.AccessKeyID = base.AccessKeyID
+	require.ErrorContains(t, cfg.validateFeedbackScreenshotWriteBackend(), "credential separate from attachments")
+	cfg.CloudflareR2.AccessKeyID = "attachment-id"
+	require.NoError(t, cfg.validateFeedbackScreenshotWriteBackend())
+	cfg.FeedbackScreenshotR2.AccessKeyID = ""
+	require.ErrorContains(t, cfg.validateFeedbackScreenshotWriteBackend(), "must be set together")
+	cfg.FeedbackScreenshotR2.AccessKeyID = base.AccessKeyID
+	cfg.FeedbackScreenshotR2.SecretAccessKey = ""
+	require.ErrorContains(t, cfg.validateFeedbackScreenshotWriteBackend(), "must be set together")
+}
+
 func TestLoad(t *testing.T) {
 	// Save and unset all env vars to test defaults
 	envVars := []string{

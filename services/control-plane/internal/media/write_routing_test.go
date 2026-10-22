@@ -30,11 +30,14 @@ import (
 // the only way to tell "tier-1 is pinned to legacy" apart from "tier-1 happens
 // to agree with the write default", the state the real registry is in today.
 type stubWriteRouter struct {
-	tier1      ObjectStore
-	tier1Err   error
-	attachment ObjectStore
-	backendID  string
-	attachErr  error
+	tier1         ObjectStore
+	tier1Err      error
+	attachment    ObjectStore
+	backendID     string
+	attachErr     error
+	screenshot    ObjectStore
+	screenshotID  string
+	screenshotErr error
 }
 
 func (s stubWriteRouter) ResolveTier1WriteStore() (ObjectStore, error) {
@@ -49,6 +52,13 @@ func (s stubWriteRouter) ResolveAttachmentWriteStore() (ObjectStore, string, err
 		return nil, "", s.attachErr
 	}
 	return s.attachment, s.backendID, nil
+}
+
+func (s stubWriteRouter) ResolveFeedbackScreenshotWriteStore() (ObjectStore, string, error) {
+	if s.screenshotErr != nil {
+		return nil, "", s.screenshotErr
+	}
+	return s.screenshot, s.screenshotID, nil
 }
 
 func writeRoutingContext() (*gin.Context, *httptest.ResponseRecorder) {
@@ -301,6 +311,21 @@ func TestRegistryWriteRouter_LegacyAttachmentWriteYieldsEmptyIdentifier(t *testi
 	assert.Empty(t, backendID,
 		"the legacy write default must persist as NULL, never the string \"legacy\"")
 	assert.NotEqual(t, string(storage.LegacyBackendID), backendID)
+}
+
+func TestRegistryWriteRouter_FeedbackScreenshotDefaultsLegacyAndFailsClosedWhenArmed(t *testing.T) {
+	legacy := &storage.Client{}
+	defaultRouter := NewRegistryWriteRouter(storage.NewRegistry(nil, legacy, logger.NewWithWriter(discardWriter{})))
+	got, backendID, err := defaultRouter.ResolveFeedbackScreenshotWriteStore()
+	require.NoError(t, err)
+	assert.Same(t, legacy, got)
+	assert.Empty(t, backendID)
+
+	armed := storage.NewRegistry(&config.Config{FeedbackScreenshotWriteBackend: config.FeedbackScreenshotBackendR2USEast}, legacy, logger.NewWithWriter(discardWriter{}))
+	got, backendID, err = NewRegistryWriteRouter(armed).ResolveFeedbackScreenshotWriteStore()
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Empty(t, backendID)
 }
 
 // TestRegistryWriteRouter_UnconfiguredLegacyFailsClosed — with no legacy client

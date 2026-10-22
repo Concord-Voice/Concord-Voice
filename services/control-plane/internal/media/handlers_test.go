@@ -30,6 +30,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	invitecodes "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -3913,22 +3914,131 @@ func TestUploadFeedbackScreenshotRejectsGIF(t *testing.T) {
 	assert.NotContains(t, resp["allowed_types"], mimeGIF)
 }
 
-func TestProxyFeedbackScreenshotServesByKeyWithNoAuthCheck(t *testing.T) {
+func TestProxyFeedbackScreenshotRequiresLiveRow(t *testing.T) {
 	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "screenshotreader")
 	id := uuid.New().String()
 	key := fmt.Sprintf("feedback-screenshots/%s", id)
-	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
+	jpeg, err := processImage(bytes.NewReader(makePNG(t, 64, 64)), purposeFeedbackScreenshot, FeedbackScreenshotMaxDim, FeedbackScreenshotMaxDim)
+	require.NoError(t, err)
+	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(jpeg.Data), int64(len(jpeg.Data)), mimeImageJPEG))
 
-	// Public route registered with no auth middleware (router.go) — invoke
-	// without setting user_id in the gin context, and with no media_files row
-	// backing the object, to lock in that ProxyFeedbackScreenshot performs
-	// neither an auth check nor a DB admission check; it streams straight from
-	// the object store by key, like a DM icon or server icon.
-	w := ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", feedbackScreenshotsPathPrefix+id, gin.Params{{Key: "id", Value: id}})
+	proxy := func() *httptest.ResponseRecorder {
+		return ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", feedbackScreenshotsPathPrefix+id, gin.Params{{Key: "id", Value: id}})
+	}
+	assert.Equal(t, http.StatusNotFound, proxy().Code, "a rowless object must not be public")
+	assert.Zero(t, ts.store.GetObjectCalls())
+	_, err = ts.db.Exec(`INSERT INTO media_files
+		(uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
+		VALUES ($1, 'photo', 1, $2, 100, $3)`, userID, mimeImageJPEG, key)
+	require.NoError(t, err)
+	w := proxy()
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
+	assert.Equal(t, mimeImageJPEG, w.Header().Get(hdrContentType))
 	assert.Equal(t, cacheControlNoStore, w.Header().Get(headerCacheControl))
+	_, err = ts.db.Exec(`DELETE FROM media_files WHERE storage_key = $1`, key)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, proxy().Code)
+	assert.Equal(t, 1, ts.store.GetObjectCalls(), "erasure must block before object storage")
+}
+
+func TestProxyFeedbackScreenshotMissingObjectAndBackendFailure(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "screenshotfault")
+	id := uuid.New().String()
+	key := "feedback-screenshots/" + id
+	_, err := ts.db.Exec(`INSERT INTO media_files
+		(uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
+		VALUES ($1, 'photo', 1, $2, 100, $3)`, userID, mimeImageJPEG, key)
+	require.NoError(t, err)
+
+	proxy := func() *httptest.ResponseRecorder {
+		return ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", feedbackScreenshotsPathPrefix+id, gin.Params{{Key: "id", Value: id}})
+	}
+	missing := proxy()
+	assert.Equal(t, http.StatusNotFound, missing.Code)
+	assert.Equal(t, cacheControlNoStore, missing.Header().Get(headerCacheControl))
+
+	ts.store.getErr = errors.New("backend unavailable")
+	unavailable := proxy()
+	assert.Equal(t, http.StatusServiceUnavailable, unavailable.Code)
+	assert.Contains(t, unavailable.Body.String(), errMsgStorageUnavailable)
+	assert.Equal(t, cacheControlNoStore, unavailable.Header().Get(headerCacheControl))
+}
+
+func TestUploadFeedbackScreenshotRefusesUnavailableWriteBackend(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "screenshotwritefault")
+	ts.handler.SetWriteRouter(stubWriteRouter{screenshotErr: errors.New("R2 unavailable")})
+	body, ct := multipartBody(t, "file", "screenshot.png", makePNG(t, 32, 32), nil)
+	w := ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Empty(t, ts.store.objects, "an unavailable R2 backend must not fall back to MinIO")
+	vendor := newMockStore()
+	vendor.putErr = errors.New("R2 write unavailable")
+	ts.handler.SetWriteRouter(stubWriteRouter{screenshot: vendor, screenshotID: "r2-feedback-useast"})
+	body, ct = multipartBody(t, "file", "screenshot.png", makePNG(t, 32, 32), nil)
+	w = ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+	require.Equal(t, http.StatusCreated, w.Code)
+	url, ok := parseBody(t, w)["url"].(string)
+	require.True(t, ok)
+	lifecycle := feedbackscreenshots.New(ts.db)
+	receipt, err := lifecycle.Pin(context.Background(), userID, []string{url})
+	require.NoError(t, err)
+	require.NoError(t, lifecycle.ConfirmPublished(context.Background(), receipt, []string{url}))
+	_, err = lifecycle.Offload(context.Background(), func(*string) (feedbackscreenshots.ObjectPutter, error) {
+		return vendor, nil
+	}, allowScreenshotOffload{})
+	require.Error(t, err)
+	assert.Empty(t, vendor.objects)
+	assert.Empty(t, ts.store.objects, "a failed R2 offload must not fall back to MinIO")
+	var rows int
+	require.NoError(t, ts.db.QueryRow(`SELECT count(*) FROM media_files WHERE uploader_id = $1`, userID).Scan(&rows))
+	assert.Equal(t, 1, rows, "staged bytes remain available for a later retry")
+}
+
+func TestFeedbackScreenshotUploadRecordsSeparateBackendAndFailsClosedWithoutReader(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "screenshotr2")
+	vendor := newMockStore()
+	ts.handler.SetWriteRouter(stubWriteRouter{tier1: ts.store, screenshot: vendor, screenshotID: "r2-feedback-useast"})
+	body, ct := multipartBody(t, "file", "screenshot.png", makePNG(t, 32, 32), nil)
+	w := ts.doMultipart(ts.handler.UploadFeedbackScreenshot, "POST", pathUploadFeedbackScreenshot, userID, body, ct)
+	require.Equal(t, http.StatusCreated, w.Code)
+	url, ok := parseBody(t, w)["url"].(string)
+	require.True(t, ok)
+	id := strings.TrimPrefix(url, feedbackScreenshotsPathPrefix)
+	key := "feedback-screenshots/" + id
+	var backend string
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_backend FROM media_files WHERE storage_key = $1`, key).Scan(&backend))
+	assert.Equal(t, "r2-feedback-useast", backend)
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_backend FROM feedback_screenshot_uploads WHERE object_key = $1`, id).Scan(&backend))
+	assert.Equal(t, "r2-feedback-useast", backend, "deferred writes keep the upload's selected backend")
+	assert.Empty(t, ts.store.objects)
+	assert.Empty(t, vendor.objects, "pending screenshots remain staged in PostgreSQL")
+	proxy := func() *httptest.ResponseRecorder {
+		return ts.doNoAuth(ts.handler.ProxyFeedbackScreenshot, "GET", url, gin.Params{{Key: "id", Value: id}})
+	}
+	assert.Equal(t, http.StatusOK, proxy().Code, "staged bytes are readable before offload")
+	lifecycle := feedbackscreenshots.New(ts.db)
+	receipt, err := lifecycle.Pin(context.Background(), userID, []string{url})
+	require.NoError(t, err)
+	require.NoError(t, lifecycle.ConfirmPublished(context.Background(), receipt, []string{url}))
+	_, err = lifecycle.Offload(context.Background(), func(selected *string) (feedbackscreenshots.ObjectPutter, error) {
+		require.NotNil(t, selected)
+		assert.Equal(t, "r2-feedback-useast", *selected)
+		return vendor, nil
+	}, allowScreenshotOffload{})
+	require.NoError(t, err)
+	assert.Empty(t, ts.store.objects, "offload must not write to MinIO")
+	assert.NotEmpty(t, vendor.objects)
+	unavailable := proxy()
+	assert.Equal(t, http.StatusServiceUnavailable, unavailable.Code, "an unwired backend must not fall back to MinIO")
+	assert.Equal(t, cacheControlNoStore, unavailable.Header().Get(headerCacheControl))
+	ts.handler.SetStoreResolver(stubDeleteStoreResolver{store: vendor})
+	assert.Equal(t, http.StatusOK, proxy().Code)
 }
 
 func TestProxyFeedbackScreenshotInvalidID(t *testing.T) {

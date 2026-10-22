@@ -47,7 +47,10 @@ type ObjectPutter interface {
 	PutObject(context.Context, string, io.Reader, int64, string) error
 }
 
-// DiskChecker applies the shared-disk watermark immediately before offload.
+// ResolvePutter selects the backend recorded when the screenshot was staged.
+type ResolvePutter func(backend *string) (ObjectPutter, error)
+
+// DiskChecker applies the shared-disk watermark before legacy-store offload.
 type DiskChecker interface{ Check() error }
 
 // Service owns screenshot lifecycle records and quota enforcement.
@@ -90,7 +93,7 @@ func stageIdentity(userID, key, contentType string, data []byte) (uuid.UUID, uui
 
 // Stage atomically charges quota, stores pending bytes and creates Tier 1 metadata.
 // No object-store write starts before a report is positively published.
-func (s *Service) Stage(ctx context.Context, userID, key string, data []byte, contentType string) (fileID string, retErr error) {
+func (s *Service) Stage(ctx context.Context, userID, key string, data []byte, contentType, backendID string) (fileID string, retErr error) {
 	uid, objectID, err := stageIdentity(userID, key, contentType, data)
 	size := int64(len(data))
 	if err != nil {
@@ -130,15 +133,15 @@ func (s *Service) Stage(ctx context.Context, userID, key string, data []byte, co
 		return "", ErrQuota
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO feedback_screenshot_uploads
-        (object_key,user_id,size_bytes,state,put_completed,staged_data,content_type,expires_at)
-        VALUES ($1,$2,$3,'pending',FALSE,$4,$5,NOW()+$6::interval)`,
-		objectID, uid, size, data, contentType, reservationTTL.String())
+        (object_key,user_id,size_bytes,state,put_completed,staged_data,content_type,expires_at,storage_backend)
+        VALUES ($1,$2,$3,'pending',FALSE,$4,$5,NOW()+$6::interval,NULLIF($7,''))`,
+		objectID, uid, size, data, contentType, reservationTTL.String(), backendID)
 	if err != nil {
 		return "", fmt.Errorf("insert staged screenshot: %w", err)
 	}
 	err = tx.QueryRowContext(ctx, `INSERT INTO media_files
-        (uploader_id,file_type,media_tier,mime_type,file_size,storage_key)
-        VALUES ($1,'photo',1,$2,$3,$4) RETURNING id::text`, uid, contentType, size, key).Scan(&fileID)
+        (uploader_id,file_type,media_tier,mime_type,file_size,storage_key,storage_backend)
+        VALUES ($1,'photo',1,$2,$3,$4,NULLIF($5,'')) RETURNING id::text`, uid, contentType, size, key, backendID).Scan(&fileID)
 	if err != nil {
 		return "", fmt.Errorf("insert screenshot metadata: %w", err)
 	}
@@ -324,7 +327,7 @@ func finishOnePin(ctx context.Context, tx *sql.Tx, token, id uuid.UUID, publishe
 }
 
 // Read returns staged bytes for pending or not-yet-offloaded pinned images.
-// Historical rowless images and positively offloaded images use object storage.
+// The caller must admit a live media row before serving a remote image.
 func (s *Service) Read(ctx context.Context, key string) (data []byte, contentType string, remote, allowed bool, err error) {
 	id, err := parseStorageKey(key)
 	if err != nil {
@@ -368,7 +371,8 @@ func (s *Service) Sweep(ctx context.Context) (deletedCount int, retErr error) {
 	defer rollbackScreenshotTx(tx, "screenshot sweep claim", &retErr)
 	rows, err := tx.QueryContext(ctx, `WITH expired AS (
         SELECT object_key FROM feedback_screenshot_uploads
-        WHERE state='pending' AND (expires_at<=NOW() OR user_id IS NULL)
+        WHERE ((state='pending' AND (expires_at<=NOW() OR user_id IS NULL))
+            OR (state='pinned' AND user_id IS NULL))
           AND (retry_at IS NULL OR retry_at<=NOW())
         ORDER BY expires_at,object_key FOR UPDATE SKIP LOCKED LIMIT $1
     ) UPDATE feedback_screenshot_uploads fs
@@ -404,18 +408,21 @@ func (s *Service) reclaimOne(ctx context.Context, id uuid.UUID) (retErr error) {
 	defer tx.Rollback() //nolint:errcheck // The next defer reports rollback errors.
 	defer rollbackScreenshotTx(tx, "expired screenshot cleanup", &retErr)
 	var state string
-	if err = tx.QueryRowContext(ctx, `SELECT state FROM feedback_screenshot_uploads WHERE object_key=$1 FOR UPDATE`, id).Scan(&state); err != nil {
+	var owner sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT state,user_id FROM feedback_screenshot_uploads WHERE object_key=$1 FOR UPDATE`, id).Scan(&state, &owner); err != nil {
 		return fmt.Errorf("lock expired screenshot cleanup: %w", err)
 	}
-	if state != "pending" {
+	if state != "pending" && (state != "pinned" || owner.Valid) {
 		return ErrInvalid
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM media_files WHERE storage_key=$1 AND media_tier=1`, storageKey(id)); err != nil {
 		return fmt.Errorf("delete expired screenshot metadata: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE feedback_screenshot_uploads
-        SET state='deleted',user_id=NULL,staged_data=NULL,content_type=NULL,retry_at=NULL,updated_at=NOW()
-		WHERE object_key=$1 AND state='pending'`, id)
+        SET state='deleted',user_id=NULL,staged_data=NULL,content_type=NULL,
+            published=FALSE,retained=FALSE,pin_attempts=0,pin_tokens='{}',
+            retained_at=NULL,retry_at=NULL,updated_at=NOW()
+		WHERE object_key=$1 AND (state='pending' OR (state='pinned' AND user_id IS NULL))`, id)
 	if err != nil {
 		return fmt.Errorf("reclaim expired screenshot bytes: %w", err)
 	}
@@ -438,8 +445,8 @@ func (s *Service) reclaimOne(ctx context.Context, id uuid.UUID) (retErr error) {
 // A failed or uncertain PUT leaves the PostgreSQL bytes readable and charged;
 // attempts are durably capped because versioned stores can retain overwritten
 // objects even when each retry uses identical bytes and an immutable key.
-func (s *Service) Offload(ctx context.Context, putter ObjectPutter, checker DiskChecker) (completed int, retErr error) {
-	if putter == nil || checker == nil {
+func (s *Service) Offload(ctx context.Context, resolve ResolvePutter, checker DiskChecker) (completed int, retErr error) {
+	if resolve == nil || checker == nil {
 		return 0, ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -459,6 +466,7 @@ func (s *Service) Offload(ctx context.Context, putter ObjectPutter, checker Disk
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT object_key FROM feedback_screenshot_uploads
 		WHERE state='pinned' AND (published OR retained) AND staged_data IS NOT NULL
+		  AND user_id IS NOT NULL
 		  AND put_attempts<$2 AND (retry_at IS NULL OR retry_at<=NOW())
 		ORDER BY retry_at NULLS FIRST,object_key FOR UPDATE SKIP LOCKED LIMIT $1`, maxOffloadBatch, maxPutAttempts)
 	if err != nil {
@@ -479,54 +487,135 @@ func (s *Service) Offload(ctx context.Context, putter ObjectPutter, checker Disk
 	}
 	var failures []error
 	for _, id := range ids {
-		var data []byte
-		var mime string
-		if err = s.db.QueryRowContext(ctx, `SELECT staged_data,content_type FROM feedback_screenshot_uploads
-			WHERE object_key=$1 AND state='pinned' AND (published OR retained) AND staged_data IS NOT NULL`, id).Scan(&data, &mime); err != nil {
-			failures = append(failures, fmt.Errorf("load staged screenshot: %w", err))
-			continue
+		written, offloadErr := s.offloadOne(ctx, id, resolve, checker)
+		if offloadErr != nil {
+			failures = append(failures, offloadErr)
+		} else if written {
+			completed++
 		}
-		if err = checker.Check(); err != nil {
-			failures = append(failures, fmt.Errorf("check screenshot offload disk: %w", err))
-			continue
-		}
-		claim, claimErr := s.db.ExecContext(ctx, `UPDATE feedback_screenshot_uploads
-			SET put_attempts=put_attempts+1,updated_at=NOW()
-			WHERE object_key=$1 AND state='pinned' AND (published OR retained)
-			  AND staged_data IS NOT NULL AND put_attempts<$2`, id, maxPutAttempts)
-		if claimErr != nil {
-			failures = append(failures, fmt.Errorf("charge screenshot offload attempt: %w", claimErr))
-			continue
-		}
-		n, affectErr := claim.RowsAffected()
-		if affectErr != nil || n != 1 {
-			failures = append(failures, fmt.Errorf("charge screenshot offload affected %d rows: %w", n, affectErr))
-			continue
-		}
-		putCtx, cancel := context.WithTimeout(ctx, putTimeout)
-		putErr := putter.PutObject(putCtx, storageKey(id), bytes.NewReader(data), int64(len(data)), mime)
-		cancel()
-		if putErr != nil {
-			failures = append(failures, fmt.Errorf("offload screenshot: %w", putErr))
-			continue
-		}
-		confirmCtx, confirmCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		result, updateErr := s.db.ExecContext(confirmCtx, `UPDATE feedback_screenshot_uploads
-            SET put_completed=TRUE,staged_data=NULL,content_type=NULL,retry_at=NULL,updated_at=NOW()
-			WHERE object_key=$1 AND state='pinned' AND (published OR retained) AND staged_data IS NOT NULL`, id)
-		confirmCancel()
-		if updateErr != nil {
-			failures = append(failures, fmt.Errorf("confirm screenshot offload: %w", updateErr))
-			continue
-		}
-		n, affectErr = result.RowsAffected()
-		if affectErr != nil || n != 1 {
-			failures = append(failures, fmt.Errorf("confirm screenshot offload affected %d rows: %w", n, affectErr))
-			continue
-		}
-		completed++
 	}
 	return completed, errors.Join(failures...)
+}
+
+func (s *Service) offloadOne(ctx context.Context, id uuid.UUID, resolve ResolvePutter, checker DiskChecker) (bool, error) {
+	var data []byte
+	var mime string
+	var backend sql.NullString
+	var owner sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT staged_data,content_type,storage_backend,user_id FROM feedback_screenshot_uploads
+		WHERE object_key=$1 AND state='pinned' AND (published OR retained) AND staged_data IS NOT NULL`, id).Scan(&data, &mime, &backend, &owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load staged screenshot: %w", err)
+	}
+	if !owner.Valid {
+		return false, nil
+	}
+	var backendID *string
+	if backend.Valid {
+		backendID = &backend.String
+	}
+	putter, resolveErr := resolve(backendID)
+	if resolveErr != nil || putter == nil {
+		return false, fmt.Errorf("resolve screenshot offload backend: %w", errors.Join(resolveErr, ErrInvalid))
+	}
+	if backendID == nil {
+		if err = checker.Check(); err != nil {
+			return false, fmt.Errorf("check screenshot offload disk: %w", err)
+		}
+	}
+	var chargedAttempts int
+	claimErr := s.db.QueryRowContext(ctx, `UPDATE feedback_screenshot_uploads
+		SET put_attempts=put_attempts+1,updated_at=NOW()
+		WHERE object_key=$1 AND state='pinned' AND (published OR retained)
+		  AND staged_data IS NOT NULL AND put_attempts<$2
+		RETURNING put_attempts`, id, maxPutAttempts).Scan(&chargedAttempts)
+	if claimErr != nil {
+		return false, fmt.Errorf("charge screenshot offload attempt: %w", claimErr)
+	}
+	written, attempted, putErr := s.putWhileOwned(ctx, id, owner.String, data, mime, putter)
+	if attempted {
+		return written, putErr
+	}
+	// No object write occurred. Undo only this durable charge, even if erasure
+	// has since tombstoned the ledger row.
+	refundCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	refund, refundErr := s.db.ExecContext(refundCtx, `UPDATE feedback_screenshot_uploads
+		SET put_attempts=put_attempts-1,updated_at=NOW()
+		WHERE object_key=$1 AND put_attempts=$2 AND NOT put_completed`, id, chargedAttempts)
+	if refundErr != nil {
+		return false, errors.Join(putErr, fmt.Errorf("refund unused screenshot offload attempt: %w", refundErr))
+	}
+	n, refundErr := refund.RowsAffected()
+	if refundErr != nil || n != 1 {
+		return false, errors.Join(putErr, fmt.Errorf("refund unused screenshot offload affected %d rows: %w", n, refundErr))
+	}
+	return false, putErr
+}
+
+// Keep the owner, ledger and media rows locked through the remote write. Erasure takes
+// the owner lock first, so it either captures this object or prevents the PUT.
+func (s *Service) putWhileOwned(ctx context.Context, id uuid.UUID, owner string, data []byte, mime string, putter ObjectPutter) (written bool, attempted bool, retErr error) {
+	if err := ctx.Err(); err != nil {
+		return false, false, err
+	}
+	confirmCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	// A transaction deadline must not release the owner lock during a slow PUT.
+	limit := time.AfterFunc(putTimeout+5*time.Second, cancel)
+	defer limit.Stop()
+	tx, err := s.db.BeginTx(confirmCtx, nil)
+	if err != nil {
+		return false, false, fmt.Errorf("begin screenshot offload confirmation: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // The next defer reports rollback errors.
+	defer rollbackScreenshotTx(tx, "screenshot offload confirmation", &retErr)
+	var liveID string
+	if err := tx.QueryRowContext(confirmCtx, `SELECT id FROM users WHERE id=$1 FOR SHARE`, owner).Scan(&liveID); errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	} else if err != nil {
+		return false, false, fmt.Errorf("lock screenshot owner: %w", err)
+	}
+	if err := tx.QueryRowContext(confirmCtx, `SELECT object_key FROM feedback_screenshot_uploads
+		WHERE object_key=$1 AND user_id=$2 AND state='pinned' AND (published OR retained)
+		  AND staged_data IS NOT NULL FOR UPDATE`, id, owner).Scan(&liveID); errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	} else if err != nil {
+		return false, false, fmt.Errorf("lock staged screenshot: %w", err)
+	}
+	if err := tx.QueryRowContext(confirmCtx, `SELECT id FROM media_files
+		WHERE storage_key=$1 AND uploader_id=$2 AND media_tier=1 AND deleted_at IS NULL FOR SHARE`, storageKey(id), owner).Scan(&liveID); errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	} else if err != nil {
+		return false, false, fmt.Errorf("lock screenshot metadata: %w", err)
+	}
+	if !limit.Stop() {
+		return false, false, fmt.Errorf("lock screenshot offload: %w", context.DeadlineExceeded)
+	}
+	putCtx, putCancel := context.WithTimeout(ctx, putTimeout)
+	putErr := putter.PutObject(putCtx, storageKey(id), bytes.NewReader(data), int64(len(data)), mime)
+	putCancel()
+	if putErr != nil {
+		return false, true, fmt.Errorf("offload screenshot: %w", putErr)
+	}
+	limit.Reset(putTimeout + 5*time.Second)
+	result, err := tx.ExecContext(confirmCtx, `UPDATE feedback_screenshot_uploads
+		SET put_completed=TRUE,staged_data=NULL,content_type=NULL,retry_at=NULL,updated_at=NOW()
+		WHERE object_key=$1 AND user_id=$2 AND state='pinned' AND (published OR retained) AND staged_data IS NOT NULL`, id, owner)
+	if err != nil {
+		return false, true, fmt.Errorf("confirm screenshot offload: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return false, true, fmt.Errorf("confirm screenshot offload affected %d rows: %w", n, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, true, fmt.Errorf("commit screenshot offload confirmation: %w", err)
+	}
+	return true, true, nil
 }
 
 func readScreenshotIDs(rows *sql.Rows, capacity int, label string) (ids []uuid.UUID, retErr error) {
@@ -570,7 +659,7 @@ func storageKey(id uuid.UUID) string { return storagePrefix + id.String() }
 
 // Start reclaims abandoned bytes and offloads permanent images at startup and
 // each minute. The caller cancels ctx and waits with the returned function.
-func (s *Service) Start(ctx context.Context, putter ObjectPutter, checker DiskChecker, log *logger.Logger) func() {
+func (s *Service) Start(ctx context.Context, resolve ResolvePutter, checker DiskChecker, log *logger.Logger) func() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -578,7 +667,7 @@ func (s *Service) Start(ctx context.Context, putter ObjectPutter, checker DiskCh
 		defer ticker.Stop()
 		var lastCappedReport time.Time
 		for {
-			s.runPass(ctx, putter, checker, log)
+			s.runPass(ctx, resolve, checker, log)
 			if log != nil && time.Since(lastCappedReport) >= time.Hour && ctx.Err() == nil {
 				lastCappedReport = time.Now()
 				s.reportCappedOffloads(ctx, log)
@@ -593,14 +682,14 @@ func (s *Service) Start(ctx context.Context, putter ObjectPutter, checker DiskCh
 	return func() { <-done }
 }
 
-func (s *Service) runPass(ctx context.Context, putter ObjectPutter, checker DiskChecker, log *logger.Logger) {
+func (s *Service) runPass(ctx context.Context, resolve ResolvePutter, checker DiskChecker, log *logger.Logger) {
 	passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	count, sweepErr := s.Sweep(passCtx)
 	offloaded := 0
 	var offloadErr error
-	if putter != nil && checker != nil && passCtx.Err() == nil {
-		offloaded, offloadErr = s.Offload(passCtx, putter, checker)
+	if resolve != nil && checker != nil && passCtx.Err() == nil {
+		offloaded, offloadErr = s.Offload(passCtx, resolve, checker)
 	}
 	if sweepErr != nil && ctx.Err() == nil && log != nil {
 		log.Error("feedback screenshot cleanup failed", "operation", "feedback_screenshot_cleanup", "error", sweepErr)

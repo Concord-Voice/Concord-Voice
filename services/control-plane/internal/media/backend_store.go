@@ -17,13 +17,9 @@ import (
 // write-default flip the two stop being the same thing for attachments/ while
 // staying the same thing forever for profile media.
 //
-// SCOPE: the tier-2 attachment download only. The tier-1 proxies
-// (proxyTier1Media, proxyInviteIcon, proxyFriendCodeAvatarObject) derive their
-// key deterministically from the subject and read no media_files row, and
-// ADR-0038 keeps ALL profile media on MinIO unconditionally and forever — so
-// they correctly keep using the process-wide store, and giving them a resolver
-// would imply a placement decision that does not exist for them. Write and
-// delete paths are out of scope here (units B2/B3).
+// Attachment downloads and feedback screenshot proxy reads use this resolver.
+// Fixed-key Tier-1 proxies (profile, server and DM icons) remain on MinIO and
+// derive their keys without a per-object placement decision.
 
 // StoreResolver resolves a media_files.storage_backend column value to the
 // object store that actually holds that row's object.

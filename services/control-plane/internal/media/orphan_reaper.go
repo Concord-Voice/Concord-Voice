@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/lib/pq"
@@ -12,46 +13,13 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
-// Tier-2 orphan reclamation: objects the bucket holds that no media_files row
-// claims (#2759 follow-on).
-//
-// WHY THIS IS SCOPED TO TIER 2 AND MUST STAY THAT WAY. The premise of a
-// bucket-listing reaper is "an object with no row is unreferenced". For tier-2
-// attachments that premise is TRUE: keys are `attachments/<fileID>` minted from
-// a fresh uuid per upload, media_files is the only thing that ever names one,
-// and the delivery path reaches them only through a row.
-//
-// For TIER 1 it is FALSE, and catastrophically so. Handler.proxyTier1Media
-// serves `avatars/`, `banners/`, `server-icons/`, `server-banners/` and
-// `dm-icons/` by calling GetObject on the key DIRECTLY -- it never reads
-// media_files at all. The authoritative references are servers.icon_url,
-// dm_conversations.icon_url and users.avatar_url, which are plain URL strings
-// this table knows nothing about. A row-less tier-1 object is therefore the
-// NORMAL state of every server icon whose uploader has since deleted their
-// account (media_files.uploader_id is ON DELETE CASCADE, and
-// insertTier1Record's ON CONFLICT ... DO UPDATE rebinds the row to whoever last
-// changed the icon -- a moderator, not necessarily the owner). Widening this
-// reaper's prefix to tier-1 would blank live server and group-DM icons across
-// the estate, and every one of those deletes would return SUCCESS.
-//
-// isRecognizedAttachmentKey is the scope. It is applied twice -- once as the
-// listing prefix, once per object -- and an earlier revision claimed the second
-// application guards against a prefix rename WIDENING the scope. That was
-// wrong, and provably so: attachmentKeyPrefix is always a member of
-// recognizedAttachmentKeyPrefixes, so every key the listing admits necessarily
-// passes the predicate. The per-object check cannot narrow what the listing
-// already selected; it is defence against a future listing that is widened, not
-// against the predicate.
-//
-// The REAL #1608 hazard runs the other way and is not closed here. When
-// attachmentKeyPrefix repoints to a new prefix, this reaper lists only the new
-// one and every old-prefix orphan silently leaves coverage -- Listed simply
-// drops. The session sweeper is immune because ListIncompleteUploads passes ""
-// and enumerates the whole bucket, which is why the predicate genuinely IS the
-// scope there and only a partial scope here. Closing it means listing once per
-// entry in recognizedAttachmentKeyPrefixes; tracked rather than done, because
-// no rename has happened yet and the unconditional sweep log below makes the
-// drop visible when one does.
+// Orphan reclamation is restricted to per-upload UUID keys whose public/read
+// path requires a live media_files row: attachments and feedback screenshots.
+// Fixed-key avatars, banners and icons may outlive their uploader's row while
+// remaining referenced by another user or server; sweeping them would erase
+// live assets. A 24-hour age floor protects the PutObject-before-row window.
+// The attachment listing currently covers only the active attachment prefix;
+// a future prefix rename also needs its older prefixes listed (#1608).
 
 const (
 	// DefaultOrphanSweepInterval is the cadence for the orphan sweep. Daily,
@@ -111,7 +79,7 @@ const claimedKeysQuery = `SELECT storage_key FROM media_files
 	         WHERE storage_key = ANY($1::text[])
 	           AND storage_backend IS NOT DISTINCT FROM $2::text`
 
-// OrphanReaper deletes tier-2 attachment objects that no media_files row claims.
+// OrphanReaper deletes unique-key objects that no media_files row claims.
 //
 // IT RECOVERS RESIDUE THE ROW-DRIVEN RAILS CANNOT SEE, which is the only reason
 // it exists. Every other reclamation path in this codebase starts from a row:
@@ -151,27 +119,16 @@ type OrphanSweepResult struct {
 	Failed   int
 }
 
-// SweepOrphans deletes every unclaimed tier-2 attachment object older than the
+// SweepOrphans deletes every unclaimed unique-key object older than the
 // minimum age, and reports what it attempted.
 //
 // One failed delete never stops the sweep -- the next key is unrelated to it --
 // but a batch in which EVERY delete failed is not a successful sweep and says so.
 func (r *OrphanReaper) SweepOrphans(ctx context.Context) (OrphanSweepResult, error) {
 	var res OrphanSweepResult
-	objects, err := r.store.ListObjects(ctx, attachmentKeyPrefix, time.Now().Add(-r.minAge))
+	candidates, err := r.listCandidates(ctx)
 	if err != nil {
 		return res, err
-	}
-
-	candidates := make([]string, 0, len(objects))
-	for _, obj := range objects {
-		// Applied again despite the listing prefix: see the file header. The
-		// predicate is the historical union of attachment prefixes, so this is
-		// what stops a future prefix rename from widening the scope silently.
-		if !isRecognizedAttachmentKey(obj.Key) {
-			continue
-		}
-		candidates = append(candidates, obj.Key)
 	}
 	res.Listed = len(candidates)
 
@@ -228,6 +185,24 @@ func (r *OrphanReaper) SweepOrphans(ctx context.Context) (OrphanSweepResult, err
 			"every orphan delete failed (%d attempted); object-store reclaim is not working", res.Failed)
 	}
 	return res, nil
+}
+
+func (r *OrphanReaper) listCandidates(ctx context.Context) ([]string, error) {
+	var candidates []string
+	cutoff := time.Now().Add(-r.minAge)
+	for _, prefix := range []string{attachmentKeyPrefix, "feedback-screenshots/"} {
+		objects, err := r.store.ListObjects(ctx, prefix, cutoff)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range objects {
+			if !isRecognizedAttachmentKey(obj.Key) && !strings.HasPrefix(obj.Key, "feedback-screenshots/") {
+				continue
+			}
+			candidates = append(candidates, obj.Key)
+		}
+	}
+	return candidates, nil
 }
 
 // claimedKeys returns the subset of keys that some media_files row claims on

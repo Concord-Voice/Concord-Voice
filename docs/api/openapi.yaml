@@ -8759,11 +8759,13 @@ paths:
 
         Registered without auth so GitHub''s camo image proxy can fetch a screenshot embedded in a filed feedback issue.
 
+        A live media_files row is required; missing or erased rows return 404.
         Pending images are read from PostgreSQL. Abandoned uploads expire after
-        72 hours and return 404; pending images also become unavailable after
-        account erasure. Submitted screenshots are retained, and remain readable
-        from PostgreSQL until object-store offload is confirmed. Historical remote
-        images remain readable. Screenshot streams use Cache-Control: no-store.
+        72 hours. Published or retained images remain readable from PostgreSQL
+        until offload is confirmed. Remote reads use the row''s storage_backend,
+        which selects the private bucket; unavailable backends return 503.
+        Responses use Cache-Control: no-store, though external issue image caches
+        may retain copies.
 
         Explicitly disabled feedback returns 503 feedback_disabled with Cache-Control: no-store before storage access.
 
@@ -8787,8 +8789,14 @@ paths:
               description: no-store
               schema:
                 type: string
+                enum:
+                - no-store
           content:
-            image/*:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
               schema:
                 type: string
                 format: binary
@@ -8809,13 +8817,15 @@ paths:
         '503':
           description: >-
             Feedback is disabled (feedback_disabled), media storage is not configured,
-            or screenshot lifecycle storage is unavailable. Disabled feedback refuses
-            before accessing storage.
+            the recorded backend is unavailable, or screenshot lifecycle storage
+            cannot be read. Disabled feedback refuses before accessing storage.
           headers:
             Cache-Control:
-              description: no-store when feedback is disabled
+              description: no-store
               schema:
                 type: string
+                enum:
+                - no-store
           content:
             application/json:
               schema:
@@ -9504,13 +9514,14 @@ paths:
       description: 'Tier 1 authenticated upload for in-app bug-report screenshots (#1747).
 
         Image is resized to fit 2560x2560 and re-encoded (stripping EXIF/GPS metadata); max raw upload 5 MiB.
-        Returns an unguessable public media path (`/api/v1/media/feedback-screenshots/<uuid>`) the client passes
-        to POST /feedback as attachments[].url.
+        It is plaintext. The returned unguessable media path (`/api/v1/media/feedback-screenshots/<uuid>`)
+        is public immediately after upload, including before issue submission. Anyone with that media URL can
+        fetch the image; the client passes it to POST /feedback as attachments[].url for public issue embeds.
 
         On SaaS, a configured shared-disk watermark refuses uploads at 75% occupancy
-        before staging the image (HTTP 507). The worker checks it again immediately
-        before offloading a confirmed published or permanently retained image to
-        its immutable object key.
+        before staging the image (HTTP 507). The worker checks it again before
+        offloading to the legacy store. Deferred offload uses the backend selected
+        at upload, including the dedicated R2 bucket when configured.
 
         Uploads atomically stage processed image bytes, lifecycle state and media
         metadata in PostgreSQL. Each account may hold 8 pending screenshots
@@ -9608,7 +9619,9 @@ paths:
         '503':
           description: >-
             Feedback is disabled (feedback_disabled), media storage is not configured,
-            or screenshot lifecycle storage is unavailable.
+            the selected storage backend cannot be resolved, or screenshot lifecycle
+            storage is unavailable. An outage of a configured backend is discovered
+            during deferred offload; a staged upload can return 201 first.
             Disabled feedback refuses before reading the upload body or writing media.
           headers:
             Cache-Control:

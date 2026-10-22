@@ -434,12 +434,21 @@ func runControlPlane() (runErr error) {
 	// quietly rather than logged as a fault.
 	media.StartSessionSweepWorkers(cleanupCtx, storageRegistry, log, media.DefaultSessionSweepInterval)
 	waitTier1ErasureReclaimer = tier1ErasureReclaimer.Start(cleanupCtx)
-	// The worker checks the same shared-disk watermark immediately before its
-	// post-publication object PUT. Pending uploads have already been staged in
-	// PostgreSQL and can be expired without contacting object storage.
+	// The worker checks the shared-disk watermark before legacy-store PUTs.
+	// Pending uploads are staged in PostgreSQL and can expire without object I/O.
 	screenshotWatermark := media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log)
 	screenshotWatermark.SetSecurityEvents(securityEvents)
-	waitFeedbackScreenshots = feedbackscreenshots.New(db).Start(cleanupCtx, mediaStore, screenshotWatermark, log)
+	resolveScreenshotStore := func(backend *string) (feedbackscreenshots.ObjectPutter, error) {
+		store, err := storageRegistry.ResolveRow(backend)
+		if err != nil {
+			return nil, err
+		}
+		if store == nil {
+			return nil, fmt.Errorf("feedback screenshot backend resolved to no client")
+		}
+		return store, nil
+	}
+	waitFeedbackScreenshots = feedbackscreenshots.New(db).Start(cleanupCtx, resolveScreenshotStore, screenshotWatermark, log)
 
 	// Tier-2 orphan reclamation (#2759 follow-on). A SIBLING of the sweeper
 	// above, not a duplicate: that one aborts INCOMPLETE multipart uploads,

@@ -742,8 +742,14 @@ func (b *retirementLogBuffer) String() string {
 	return b.Buffer.String()
 }
 
-func (s *retirementOrphanStore) ListObjects(context.Context, string, time.Time) ([]storage.StoredObject, error) {
-	return s.objects, nil
+func (s *retirementOrphanStore) ListObjects(_ context.Context, prefix string, _ time.Time) ([]storage.StoredObject, error) {
+	var listed []storage.StoredObject
+	for _, object := range s.objects {
+		if strings.HasPrefix(object.Key, prefix) {
+			listed = append(listed, object)
+		}
+	}
+	return listed, nil
 }
 
 func (s *retirementOrphanStore) DeleteObject(_ context.Context, key string) error {

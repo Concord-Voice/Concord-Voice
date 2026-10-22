@@ -318,8 +318,9 @@ type feedbackScreenshotConnector struct{ state *feedbackScreenshotDB }
 type feedbackScreenshotDriver struct{}
 type feedbackScreenshotConn struct{ state *feedbackScreenshotDB }
 type feedbackScreenshotRows struct {
-	value driver.Value
-	done  bool
+	column string
+	value  driver.Value
+	done   bool
 }
 
 func (c feedbackScreenshotConnector) Connect(context.Context) (driver.Conn, error) {
@@ -337,14 +338,18 @@ func (c *feedbackScreenshotConn) ExecContext(context.Context, string, []driver.N
 	return nil, errors.New("unexpected persistence write")
 }
 func (c *feedbackScreenshotConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if strings.HasPrefix(strings.TrimSpace(query), "INSERT INTO media_files") && len(args) == 7 {
+	query = strings.TrimSpace(query)
+	if strings.HasPrefix(query, "INSERT INTO media_files") && len(args) == 8 {
 		c.state.inserts.Add(1)
-		return &feedbackScreenshotRows{value: args[0].Value}, nil
+		return &feedbackScreenshotRows{column: "id", value: args[0].Value}, nil
+	}
+	if strings.HasPrefix(query, "SELECT storage_backend FROM media_files") && len(args) == 1 && args[0].Value == feedbackScreenshotObjectKey {
+		return &feedbackScreenshotRows{column: "storage_backend"}, nil
 	}
 	return nil, errors.New("query outside screenshot metadata boundary")
 }
-func (*feedbackScreenshotRows) Columns() []string { return []string{"id"} }
-func (*feedbackScreenshotRows) Close() error      { return nil }
+func (r *feedbackScreenshotRows) Columns() []string { return []string{r.column} }
+func (*feedbackScreenshotRows) Close() error        { return nil }
 func (r *feedbackScreenshotRows) Next(dest []driver.Value) error {
 	if r.done {
 		return io.EOF
@@ -386,6 +391,10 @@ func newFeedbackScreenshotRouterFixtureWithGitHubToken(t *testing.T, instance, r
 		db, _ = testdb.SetupTestDB(t)
 		_, err := db.Exec(`INSERT INTO users (id,email,username,password_hash,age_verified,email_verified)
 			VALUES ($1,'screenshot-router@test.local','screenshot_router','test-only-hash',TRUE,TRUE)`, feedbackScreenshotUserID)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO media_files
+			(uploader_id,file_type,media_tier,mime_type,file_size,storage_key)
+			VALUES ($1,'photo',1,'image/jpeg',25,$2)`, feedbackScreenshotUserID, feedbackScreenshotObjectKey)
 		require.NoError(t, err)
 	}
 	store := &feedbackScreenshotStore{objects: map[string][]byte{feedbackScreenshotObjectKey: []byte("owned-previous-screenshot")}}
@@ -555,7 +564,7 @@ func TestNewRouter_FeedbackScreenshotModeControls(t *testing.T) {
 			assert.Zero(t, puts, "pending screenshots stay in PostgreSQL")
 			assert.Zero(t, deletes)
 			var mediaCount int
-			require.NoError(t, f.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id=$1 AND storage_key LIKE 'feedback-screenshots/%'`, feedbackScreenshotUserID).Scan(&mediaCount))
+			require.NoError(t, f.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id=$1 AND storage_key LIKE 'feedback-screenshots/%' AND storage_key<>$2`, feedbackScreenshotUserID, feedbackScreenshotObjectKey).Scan(&mediaCount))
 			assert.Equal(t, 1, mediaCount, "genuine media handler must persist metadata")
 			var uploaded struct {
 				StorageKey string `json:"storage_key"`

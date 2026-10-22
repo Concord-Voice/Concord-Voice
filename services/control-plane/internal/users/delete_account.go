@@ -51,13 +51,11 @@ type AccountDeleter interface {
 // erasure removes an incomplete channel.
 type ChannelDeletedBroadcaster func(serverID, channelID string)
 
-// ErasedMediaReclaimer wakes durable Tier-1 retry processing and hands captured
-// Tier-2 refs to the purge rail after an erasure commits. Production passes no
-// Tier-1 refs through this callback.
+// ErasedMediaReclaimer hands captured unique-key refs to the purge rail after
+// an erasure commits. Production passes no fixed-key Tier-1 refs here.
 type ErasedMediaReclaimer func(ctx context.Context, tier1, tier2 []media.BlobRef)
 
-// erasedMedia is the tier-2 object-storage half of one erasure, captured under
-// the user-row lock BEFORE `DELETE FROM users` fires.
+// erasedMedia holds unique-key refs captured before `DELETE FROM users`.
 type erasedMedia struct {
 	tier1 []media.BlobRef
 	tier2 []media.BlobRef
@@ -68,17 +66,13 @@ type erasedMedia struct {
 // not that the budget was tight.
 const erasedMediaReclaimTimeout = 30 * time.Second
 
-// erasedMediaQuery captures the live Tier-2 objects an erasure strands. It
-// rides idx_media_files_uploader (partial on exactly that
-// predicate) instead of sequentially scanning media_files under the erasure's
-// user-row lock, and the rows it skips are genuinely covered: a soft-deleted
-// attachment row is either already reaped or is a straggler-sweep candidate,
-// and once the cascade destroys it the orphan reaper (media.OrphanReaper)
-// reclaims the object from the bucket. Two mechanisms, one deliberate handoff.
+// erasedMediaQuery captures live unique-key attachments and feedback screenshots
+// before the user cascade drops their rows. Soft-deleted or historically
+// stranded objects are recovered by the backend-pair-keyed orphan reaper.
 const erasedMediaQuery = `SELECT storage_key, storage_backend
 	         FROM media_files
 	         WHERE uploader_id = $1
-	           AND media_tier = 2
+	           AND (media_tier = 2 OR (media_tier = 1 AND storage_key LIKE 'feedback-screenshots/%'))
 	           AND deleted_at IS NULL`
 
 const insertTier1ErasureObligationsQuery = `INSERT INTO tier1_erasure_delete_obligations (storage_key)
@@ -449,8 +443,8 @@ func (s *AccountService) reclaimErasedMedia(
 ) {
 	if s.reclaimMedia == nil {
 		if s.log != nil {
-			s.log.Error("delete account: no media reclaimer is wired; Tier-2 objects are not queued",
-				"tier2_objects", len(stranded.tier2))
+			s.log.Error("delete account: no media reclaimer is wired; unique-key objects are not queued",
+				"objects", len(stranded.tier2))
 		}
 		return
 	}
@@ -587,6 +581,16 @@ func (s *AccountService) deleteAccountTx(
 	if mediaErr != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{},
 			fmt.Errorf("delete account: capture media: %w", mediaErr)
+	}
+	// Clear staged plaintext before the user's FK is nulled; a later worker
+	// must not offload bytes after account erasure.
+	if _, err := tx.ExecContext(ctx, `UPDATE feedback_screenshot_uploads
+		SET state='deleted',user_id=NULL,staged_data=NULL,content_type=NULL,
+			published=FALSE,retained=FALSE,pin_attempts=0,pin_tokens='{}',
+			retained_at=NULL,retry_at=NULL,updated_at=NOW()
+		WHERE user_id=$1`, lockedUserID); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{},
+			fmt.Errorf("delete account: clear staged screenshots: %w", err)
 	}
 
 	channelIDs, serverIDs, err := deleteIncompleteChannelsTx(ctx, tx, lockedUserID)
@@ -771,8 +775,7 @@ func (s *AccountService) captureErasurePrivateCallPlans(
 	return nil
 }
 
-// captureErasedMedia reads the objects this erasure is about to strand, split
-// by tier. See erasedMediaQuery for what the narrowing admits and why.
+// captureErasedMedia reads the unique-key objects this erasure would strand.
 func (s *AccountService) captureErasedMedia(
 	ctx context.Context,
 	tx *sql.Tx,
