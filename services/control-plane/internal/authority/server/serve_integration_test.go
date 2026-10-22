@@ -684,6 +684,15 @@ func TestHandshakeRefusalsThroughServe(t *testing.T) {
 			want[c.code] = w
 		}
 	}
+	// The client reads the last case's alert before the server's
+	// HandshakeContext returns, and a stop that cancels in that gap makes
+	// crypto/tls report context.Canceled, which the listener does not count.
+	// One served round trip lets that handshake return first.
+	// ponytail: a barrier by latency, not a hook; a listener-side
+	// "refusal settled" signal if this ever flakes again.
+	if !reaches(s.r.addr, s.clientConfig(t, pinned)) {
+		t.Fatal("the pinned client was not served after the refusal cases")
+	}
 	if err := s.r.stop(t); err != nil {
 		t.Fatal(err)
 	}
