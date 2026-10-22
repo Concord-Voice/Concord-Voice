@@ -18,12 +18,3 @@
 # cannot express is "only these ids", so a NEW advisory against the same dev
 # package version is muted here too until effectiveUntil; the npm-audit gate,
 # which matches by id, still fails on a new HIGH/CRITICAL one.
-
-[[PackageOverrides]]
-name = "extract-zip"
-version = "2.0.1"
-ecosystem = "npm"
-group = "dev"
-vulnerability.ignore = true
-effectiveUntil = 2026-11-13
-reason = "GHSA-jmr9-qjv8-65gv and GHSA-7pqw-9j4j-h8q3 (symlink traversal / write): no fixed extract-zip. Dev-only and never loaded since Forge 8 (PR #3794): installed only via @reforged/maker-appimage 5.3.1 -> maker-base 7.11.2 -> shared-types 7.11.2 -> @electron/packager 18.4.4. Retire when maker-appimage >= 6.0.0 lands. Accepted in #2734."
