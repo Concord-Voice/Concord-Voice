@@ -84,7 +84,7 @@ func TestAccountActivityCatalogIsFixed(t *testing.T) {
 		opsmetrics.MetricMediaUploadsTotal:           opsmetrics.KindCounter,
 	}
 
-	require.Equal(t, 72, opsmetrics.CatalogSize())
+	require.Equal(t, 74, opsmetrics.CatalogSize())
 	for key, kind := range expected {
 		definition, ok := opsmetrics.Definition(key)
 		require.True(t, ok, "missing metric %q", key)
@@ -98,6 +98,34 @@ func TestAccountActivityCatalogIsFixed(t *testing.T) {
 		}
 		require.Zero(t, definition.Min)
 		require.Positive(t, definition.Max)
+	}
+}
+
+// #2033 PR-2 (spec section 14, refinement R-c): two billing metrics, both
+// control-source counts. The gauge reports erasure obligations OLDER than 24 hours,
+// so any non-zero value is the alert; the counter counts drift corrections.
+func TestBillingMetricsAreCatalogued(t *testing.T) {
+	for _, tc := range []struct {
+		key    opsmetrics.MetricKey
+		name   string
+		kind   opsmetrics.Kind
+		rollup opsmetrics.RollupMode
+	}{
+		{opsmetrics.MetricBillingErasureOutboxPending, "billing_erasure_outbox_pending", opsmetrics.KindGauge, opsmetrics.RollupAverage},
+		{opsmetrics.MetricBillingDriftCorrectionsTotal, "billing_drift_corrections_total", opsmetrics.KindCounter, opsmetrics.RollupLast},
+	} {
+		require.Equal(t, opsmetrics.MetricKey(tc.name), tc.key)
+		definition, ok := opsmetrics.Definition(tc.key)
+		require.True(t, ok, "missing metric %q", tc.name)
+		require.Equal(t, opsmetrics.SourceControl, definition.Source)
+		require.Equal(t, opsmetrics.Unit("count"), definition.Unit)
+		require.Equal(t, tc.kind, definition.Kind)
+		require.Equal(t, tc.rollup, definition.Rollup)
+		require.Zero(t, definition.Min)
+		require.Positive(t, definition.Max)
+		require.NoError(t, opsmetrics.ValidateSample(opsmetrics.Sample{Key: tc.key, Value: 3, Source: opsmetrics.SourceControl}))
+		require.Error(t, opsmetrics.ValidateSample(opsmetrics.Sample{Key: tc.key, Value: -1, Source: opsmetrics.SourceControl}))
+		require.Error(t, opsmetrics.ValidateSample(opsmetrics.Sample{Key: tc.key, Value: 3, Source: opsmetrics.SourceMedia}))
 	}
 }
 

@@ -25,7 +25,7 @@ import (
 // the `require.Len` below is the backstop that turns that miss into a failure
 // instead of a false green.
 var migration000136MetricLiteral = regexp.MustCompile(
-	`'(?:host|service|http|websocket|channel|dm|ops|media|registered|pending|users|active|presence|server)_[a-z0-9_]+'`)
+	`'(?:host|service|http|websocket|channel|dm|ops|media|registered|pending|users|active|presence|server|billing)_[a-z0-9_]+'`)
 
 // The two keys this migration admits. #3328 separated two failure modes that had
 // been riding one client timer; these make the separation countable rather than

@@ -217,7 +217,8 @@ func isAccountProviderMetric(key MetricKey) bool {
 		MetricActiveUsers24H,
 		MetricActiveUsers7D,
 		MetricActiveUsers15D,
-		MetricActiveUsers30D:
+		MetricActiveUsers30D,
+		MetricBillingErasureOutboxPending:
 		return true
 	default:
 		return false

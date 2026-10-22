@@ -1107,6 +1107,9 @@ async function main() {
       colour: placement.color,
       accepting_new_rooms: placement.acceptingNewRooms,
       rooms: roomManager.getRoomIds().length,
+      // Reported on every profile: the legacy-conversion actuator needs it
+      // where /readyz omits the placement body.
+      creates_in_flight: roomManager.getCreatesInFlightCount(),
       owner_refusals_total: placement.ownerRefusalsTotal,
       workers: mediasoupService.getWorkerCount(),
       activeRooms: stats.activeRooms,

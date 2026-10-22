@@ -146,3 +146,72 @@ func TestDeleteAccountBillingErasure_EnqueueFaultFailsErasureAndKeepsTheUser(t *
 	assert.Equal(t, 1, mappingRows(t, db, customerID), "the mapping survives the rollback")
 	assert.Zero(t, outboxRows(t, db, customerID))
 }
+
+// seedStripeSubscription inserts a source='stripe' row for userID on customerID
+// and returns the customer id.
+func seedStripeSubscription(t *testing.T, db *sql.DB, userID uuid.UUID, customerID string) string {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO subscriptions
+		(user_id, tier, status, source, stripe_customer_id, stripe_subscription_id, current_period_end, plan, billing_interval)
+		VALUES ($1, 'premium', 'active', 'stripe', $2, $3, NOW() + INTERVAL '30 days', 'wing', 'month')`,
+		userID, customerID, "sub_test_"+uuid.NewString())
+	require.NoError(t, err)
+	return customerID
+}
+
+// B3: Reconcile can write a user's Stripe row on a Customer the mapping does
+// not name. Erasure queues every such Customer too, each exactly once, and
+// never another user's.
+func TestDeleteAccountBillingErasure_EnqueuesSubscriptionCustomers(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	erased := testdb.CreateUser(t, db)
+	bystander := testdb.CreateUser(t, db)
+	mapped := mapStripeCustomer(t, db, erased)
+	seedStripeSubscription(t, db, erased, mapped) // on the mapped Customer: queued once, not twice
+	unmapped := seedStripeSubscription(t, db, erased, "cus_test_"+uuid.NewString())
+	seedStripeSubscription(t, db, erased, unmapped) // two rows, one Customer
+	bystanderCustomer := seedStripeSubscription(t, db, bystander, "cus_test_"+uuid.NewString())
+	_, err := db.Exec(`INSERT INTO subscriptions (user_id, tier, status, source) VALUES ($1, 'premium', 'active', 'code')`, erased)
+	require.NoError(t, err, "a code row carries no Customer and adds nothing")
+	var before int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&before))
+
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+
+	assert.Equal(t, 1, outboxRows(t, db, mapped), "the mapped Customer is queued once")
+	assert.Equal(t, 1, outboxRows(t, db, unmapped), "the unmapped Customer holding the user's Stripe rows is queued once")
+	assert.Zero(t, outboxRows(t, db, bystanderCustomer), "another user's Customer is not queued")
+	var after int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&after))
+	assert.Equal(t, before+2, after, "exactly the two Customers are queued")
+}
+
+func TestDeleteAccountBillingErasure_UnmappedUserWithStripeRowsIsQueued(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	erased := testdb.CreateUser(t, db)
+	customer := seedStripeSubscription(t, db, erased, "cus_test_"+uuid.NewString())
+
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+
+	assert.Zero(t, countUsers(t, db, erased))
+	assert.Equal(t, 1, outboxRows(t, db, customer), "a Customer known only from a subscription row is queued")
+}
+
+func TestDeleteAccountBillingErasure_SubscriptionEnqueueFaultFailsErasure(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	erased := testdb.CreateUser(t, db)
+	customer := seedStripeSubscription(t, db, erased, "cus_test_"+uuid.NewString())
+
+	hook, wrapped := stmthook.Open(t)
+	hook.Arm([]string{"SELECT DISTINCT stripe_customer_id FROM subscriptions"}, nil, stmthook.ErrInjected)
+
+	err := NewAccountService(wrapped, logger.New("test")).DeleteAccount(context.Background(), erased.String())
+
+	require.ErrorIs(t, err, stmthook.ErrInjected)
+	assert.Contains(t, err.Error(), "enqueue billing erasure of subscription customers")
+	assert.Equal(t, 1, countUsers(t, db, erased), "a failed enqueue rolls the whole erasure back")
+	assert.Zero(t, outboxRows(t, db, customer))
+}

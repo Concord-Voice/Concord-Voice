@@ -131,19 +131,14 @@ const defaultPremiumMonths = 1
 func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID, _ string, params map[string]any) (GrantResult, error) {
 	months := monthsFromParams(params)
 
-	// Serialize same-user premium grants on the USER row. Two premium codes
-	// redeemed by the same user concurrently with NO prior code row would
-	// otherwise BOTH see "no existing sub" (a FOR UPDATE on the subscriptions
-	// SELECT locks nothing when zero rows match) and BOTH attempt an INSERT,
-	// racing the partial unique index idx_subscriptions_user_live_code. Locking
-	// the always-present users row first gives a real lock target, so the second
-	// transaction blocks until the first commits and then observes the inserted
-	// subscription via the extend path. The lock order is consistent
-	// (users row → subscriptions row), so it cannot deadlock with the engine's
-	// redemption_codes-row claim (a disjoint table touched earlier).
-	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID); err != nil {
-		return GrantResult{}, fmt.Errorf("redemption: lock user for premium grant: %w", err)
-	}
+	// The engine already holds the users row FOR UPDATE for this transaction
+	// (lockUser, taken before the code claim and the ledger insert). That lock
+	// is what serializes same-user premium grants: with NO prior code row, the
+	// SELECT below locks nothing, so without it two concurrent redemptions would
+	// both see "no existing sub" and race the partial unique index
+	// idx_subscriptions_user_live_code. It must be taken up front rather than
+	// here: by this point the ledger INSERT has taken FOR KEY SHARE on the same
+	// row, and upgrading it deadlocks against a second transaction doing the same.
 
 	// Read the user's code row in a live status, if any. This select has NO
 	// time predicate and so deliberately does not use

@@ -658,7 +658,7 @@ describe("ServicesWorkspace", () => {
 });
 
 describe("CountersWorkspace", () => {
-  it("renders all 31 homes in four groups and labels twenty-one monotonic values", () => {
+  it("renders all 33 homes in four groups and labels twenty-two monotonic values", () => {
     const { container } = render(
       <CountersWorkspace
         counters={resource(fullCounters())}
@@ -670,7 +670,7 @@ describe("CountersWorkspace", () => {
 
     expect(
       container.querySelectorAll("[data-primary-home='counters']"),
-    ).toHaveLength(31);
+    ).toHaveLength(33);
     for (const group of [
       "Control plane",
       "Media activity",
@@ -679,7 +679,7 @@ describe("CountersWorkspace", () => {
     ]) {
       expect(screen.getByRole("heading", { name: group })).toBeVisible();
     }
-    expect(screen.getAllByText("Process lifetime")).toHaveLength(21);
+    expect(screen.getAllByText("Process lifetime")).toHaveLength(22);
     for (const key of [
       "server_voice_terminal_outbox_captured_total",
       "server_voice_terminal_outbox_delivered_total",
@@ -726,7 +726,7 @@ describe("CountersWorkspace", () => {
     expect(screen.getByText(new RegExp(copy, "i"))).toBeVisible();
   });
 
-  it("renders a valid empty sample as 31 fixed metric homes", () => {
+  it("renders a valid empty sample as 33 fixed metric homes", () => {
     const { container } = render(
       <CountersWorkspace
         counters={resource({ node_id: NODE_ID, counters: [] })}
@@ -738,7 +738,7 @@ describe("CountersWorkspace", () => {
 
     expect(
       container.querySelectorAll("[data-primary-home='counters']"),
-    ).toHaveLength(31);
+    ).toHaveLength(33);
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
   });
 });
@@ -757,7 +757,7 @@ describe("TimeSeriesWorkspace", () => {
       />,
     );
 
-    expect(screen.getAllByRole("option")).toHaveLength(72);
+    expect(screen.getAllByRole("option")).toHaveLength(74);
     for (const preset of [
       "Host pressure",
       "HTTP traffic",
@@ -888,7 +888,7 @@ describe("ChangesWorkspace", () => {
 });
 
 describe("primary workspace map", () => {
-  it("keeps the approved 4/28/31/9 split totaling 72 keys", () => {
+  it("keeps the approved 4/28/33/9 split totaling 74 keys", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
     expect([
@@ -896,8 +896,8 @@ describe("primary workspace map", () => {
       ...PRIMARY_METRIC_MAP.mediaActivity,
       ...PRIMARY_METRIC_MAP.mediaEgress,
       ...PRIMARY_METRIC_MAP.participantHours,
-    ]).toHaveLength(31);
+    ]).toHaveLength(33);
     expect(PRIMARY_METRIC_MAP.usersActivity).toHaveLength(9);
-    expect(METRIC_KEYS).toHaveLength(72);
+    expect(METRIC_KEYS).toHaveLength(74);
   });
 });

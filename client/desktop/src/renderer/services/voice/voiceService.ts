@@ -778,6 +778,10 @@ const MIC_PROCESSING_FAILED_ERROR =
   'Microphone processing failed. Retry your microphone or rejoin the call.';
 const MIC_PROCESSING_STOPPED_ERROR =
   'Microphone processing stopped. Retry your microphone or rejoin the call.';
+// Control-plane refusal while a media conversion pauses new voice joins.
+const VOICE_JOINS_PAUSED_CODE = 'voice_joins_paused';
+const VOICE_JOINS_PAUSED_ERROR =
+  'Voice is briefly paused for maintenance. Try again in a few minutes.';
 
 class VoiceService {
   private socket: Socket | null = null;
@@ -4069,6 +4073,9 @@ class VoiceService {
     store.setConnectionState('error');
     const microphoneGuidance = this.microphoneJoinGuidance(err);
     if (microphoneGuidance) store.setJoinError(microphoneGuidance);
+    if ((err as { code?: unknown } | null)?.code === VOICE_JOINS_PAUSED_CODE) {
+      store.setJoinError(VOICE_JOINS_PAUSED_ERROR);
+    }
     // #2153 §1d: a join refused during a policer cooldown opens the app-level dialog.
     // Set AFTER reset() — reset preserves the field, but ordering it last means the
     // interrupt does not depend on that preservation to survive this path.
@@ -4159,7 +4166,13 @@ class VoiceService {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `Voice join failed: ${res.status}`);
+      const error: Error & { code?: string } = new Error(
+        err.error || `Voice join failed: ${res.status}`
+      );
+      // Only the maintenance pause is surfaced by code; other refusals keep
+      // their existing generic handling.
+      if (err.code === VOICE_JOINS_PAUSED_CODE) error.code = VOICE_JOINS_PAUSED_CODE;
+      throw error;
     }
 
     const joinData: JoinResponse = await res.json();

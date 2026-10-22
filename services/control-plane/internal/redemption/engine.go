@@ -61,7 +61,8 @@ type RedeemOutcome struct {
 //
 // Security-critical sequence (spec §4), entirely within ONE transaction:
 //  1. Checksum pre-filter (NormalizeAndValidate) — reject typos/probes pre-DB.
-//  2. SHA-256 → atomic conditional UPDATE … RETURNING. The WHERE clause is the
+//  2. Lock the redeeming user's row FOR UPDATE (lockUser), then SHA-256 →
+//     atomic conditional UPDATE … RETURNING. The WHERE clause is the
 //     concurrency guard: redemption_count is incremented ONLY if the row is
 //     live (not revoked/expired/not-yet-valid) AND under max_redemptions, in a
 //     single statement. No check-then-update across a round-trip — N concurrent
@@ -88,7 +89,10 @@ func (e *Engine) Redeem(ctx context.Context, userID uuid.UUID, rawInput string) 
 	// Rollback is a no-op after a successful Commit; safe to always defer.
 	defer func() { _ = tx.Rollback() }()
 
-	// ── Step 2: atomic claim ────────────────────────────────────────────
+	// ── Step 2: lock the user, then atomic claim ────────────────────────
+	if err := lockUser(ctx, tx, userID); err != nil {
+		return RedeemOutcome{}, err
+	}
 	claim, err := e.claimCode(ctx, tx, codeHash)
 	if err != nil {
 		return RedeemOutcome{}, err
@@ -120,6 +124,26 @@ func (e *Engine) Redeem(ctx context.Context, userID uuid.UUID, rawInput string) 
 		return RedeemOutcome{}, fmt.Errorf("redemption: commit: %w", err)
 	}
 	return e.notifyAfterCommit(ctx, userID, result)
+}
+
+// lockUser takes the redeeming user's row FOR UPDATE, first in the transaction.
+//
+// Lock order: users → redemption_codes → code_redemptions → subscriptions. Users
+// comes first because every other writer of the entitlement rows (Reconcile,
+// account erasure, the expiry sweep) also takes the users row before anything
+// else, and because it must precede the ledger INSERT: that INSERT's foreign key
+// to users takes FOR KEY SHARE on the row, and a later FOR UPDATE would have to
+// UPGRADE it. Two same-user redemptions would each hold key-share and each wait
+// for the other to release it (SQLSTATE 40P01). Taking FOR UPDATE up front makes
+// the second transaction block here instead, holding nothing, and it also gives
+// the premium grant its same-user serialization point (no prior subscription
+// row exists to lock). A missing user locks zero rows; the ledger INSERT's FK
+// then rejects the redemption as before.
+func lockUser(ctx context.Context, tx *sql.Tx, userID uuid.UUID) error {
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID); err != nil {
+		return fmt.Errorf("redemption: lock user: %w", err)
+	}
+	return nil
 }
 
 // claimResult is the row returned by the atomic conditional UPDATE.

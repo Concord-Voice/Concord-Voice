@@ -36,7 +36,7 @@ func TestGetMe_DBErrorReturnsUnavailable(t *testing.T) {
 // Return a malformed period-end value at the SQL driver boundary so the real
 // database/sql Scan fails after reading a row. No network or fixture DB is needed.
 func TestGetMe_ScanFailureReturnsUnavailable(t *testing.T) {
-	db := sql.OpenDB(statusConnector{values: []driver.Value{"premium", "active", "code", "invalid-time"}})
+	db := sql.OpenDB(statusConnector{values: []driver.Value{"premium", "active", "code", "invalid-time", nil, nil, false, false, nil}})
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })
 
 	w := statusResponse(db)
@@ -54,13 +54,13 @@ func TestGetMe_NoRowsRemainsFree(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, map[string]any{"tier": "free", "status": "none"}, resp)
+	assert.Equal(t, map[string]any{"tier": "free", "status": "none", "billing": "available"}, resp)
 }
 
 func statusResponse(db *sql.DB) *httptest.ResponseRecorder {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := subscriptions.NewHandler(db, logger.New("test"))
+	h := subscriptions.NewHandler(db, logger.New("test"), subscriptions.BillingAvailable)
 	r.GET("/subscriptions/me", func(c *gin.Context) {
 		c.Set("user_id", "11111111-1111-4111-8111-111111111111")
 		h.GetMe(c)
@@ -99,7 +99,10 @@ func (c statusConn) QueryContext(context.Context, string, []driver.NamedValue) (
 type statusRows struct{ values []driver.Value }
 
 func (statusRows) Columns() []string {
-	return []string{"tier", "status", "source", "current_period_end"}
+	return []string{
+		"tier", "status", "source", "current_period_end",
+		"plan", "billing_interval", "founders_rate", "cancel_at_period_end", "cancel_at",
+	}
 }
 func (statusRows) Close() error { return nil }
 func (r *statusRows) Next(dest []driver.Value) error {

@@ -1787,6 +1787,33 @@ describe('VoiceService', () => {
       expect(mockApiFetch).toHaveBeenCalledTimes(1);
     });
 
+    it('explains a maintenance pause and keeps other refusals generic', async () => {
+      setupAuth();
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({
+          error: 'Voice is paused for maintenance',
+          code: 'voice_joins_paused',
+        }),
+      });
+      await expect(voiceService.joinChannel('ch')).rejects.toThrow(
+        'Voice is paused for maintenance'
+      );
+      expect(useVoiceStore.getState().joinError).toBe(
+        'Voice is briefly paused for maintenance. Try again in a few minutes.'
+      );
+
+      useVoiceStore.getState().setJoinError(null);
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({ error: 'Service unavailable', code: 'other_code' }),
+      });
+      await expect(voiceService.joinChannel('ch')).rejects.toThrow('Service unavailable');
+      expect(useVoiceStore.getState().joinError).toBeNull();
+    });
+
     it('handles json parse failure on error response', async () => {
       setupAuth();
       mockApiFetch.mockResolvedValueOnce({

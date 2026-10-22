@@ -127,31 +127,32 @@ func TestGetMe_LatestStripePeriodEndFirst(t *testing.T) {
 	}
 }
 
-// TestGetMe_FreeStripeRowShownWhileEnforcementStaysPremium pins the spec
-// section 5 edge (design spec line 190): Reconcile writes tier='free' on a live
-// Stripe row when it cannot map the subscription (an unknown concord_plan, an
-// item count other than 1, a quantity other than 1). Beside a live premium code
-// row, GetMe shows that free Stripe row (the Stripe-first order keeps the
-// charged subscription and its manage link visible) while
-// entitlements.ResolveTierQ, which takes the maximum rank over live rows,
-// enforces premium. A change that made GetMe skip the free row, or made the
-// resolver prefer Stripe, breaks one half of this test.
-func TestGetMe_FreeStripeRowShownWhileEnforcementStaysPremium(t *testing.T) {
+// TestGetMe_TopLevelFollowsEnforcedTier pins decision P2-A. Reconcile writes
+// tier='free' on a live Stripe row when it cannot map the subscription (an
+// unknown concord_plan, an item count other than 1, a quantity other than 1).
+// Beside a live premium code row, the legacy top-level fields follow the tier
+// that is enforced (premium first, then Stripe before code), so they describe
+// the code row, while stripe still shows the malformed Stripe row (plan null)
+// and code is present. entitlements.ResolveTierQ agrees with the top level.
+func TestGetMe_TopLevelFollowsEnforcedTier(t *testing.T) {
 	h, _, db := newTestHandler(t)
 	user := testhelpers.CreateUser(t, db)
 	insertPrecedenceRow(t, db, user, "code", "")
-	_, err := db.Exec(
-		`INSERT INTO subscriptions
-		     (user_id, tier, status, source, current_period_end, stripe_subscription_id, stripe_customer_id)
-		 VALUES ($1, 'free', 'active', 'stripe', NOW() + INTERVAL '30 days', $2, $3)`,
-		user, "sub_test_"+uuid.NewString(), "cus_test_"+uuid.NewString())
-	require.NoError(t, err)
+	insertStripeRow(t, db, user, stripeRowSpec{
+		tier: "free", periodEnd: time.Now().UTC().Add(30 * 24 * time.Hour).Truncate(time.Second),
+	})
 
 	resp := getMeFor(t, h, user)
-	assert.Equal(t, "free", resp.Tier, "GetMe describes the live Stripe row, even when it is free")
-	assert.Equal(t, "stripe", resp.Source)
+	assert.Equal(t, "premium", resp.Tier, "the top level follows the enforced tier, not the free Stripe row")
+	assert.Equal(t, "code", resp.Source)
 	assert.Equal(t, "active", resp.Status)
 
+	require.NotNil(t, resp.Stripe, "/me.stripe still shows the Stripe row")
+	assert.Equal(t, "active", resp.Stripe.Status)
+	assert.Nil(t, resp.Stripe.Plan, "a malformed row has no plan")
+	assert.Nil(t, resp.Stripe.Interval, "a malformed row has no interval")
+	require.NotNil(t, resp.Code)
+
 	assert.Equal(t, entitlements.TierPremium, entitlements.ResolveTierQ(t.Context(), db, user.String()),
-		"enforcement takes the maximum rank over live rows: the premium code row still counts")
+		"enforcement takes the maximum rank over live rows")
 }

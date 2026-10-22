@@ -113,7 +113,8 @@ func TestNewRouterWiresDMBlockCleanupWithoutNATS(t *testing.T) {
 	require.Less(t, purge, cleanup, "attachment retirement must be wired before block cleanup can run")
 	require.Less(t, notifier, cleanup, "DM topology notifications must be wired before block cleanup can run")
 	require.Less(t, reconcilerWiring, natsBranch, "SQL-only block cleanup must be wired before the NATS-dependent branch")
-	require.Contains(t, source, "if !dmBlockCleanupWired(activePlanReconciler) {")
+	require.Contains(t, newRouterSource, "requireActivePlanCleanupsWired(log, activePlanReconciler)")
+	require.Contains(t, source, "if !dmBlockCleanupWired(reconciler) {")
 }
 
 func TestNewRouterWiresDMBlockVoiceEjectionRequestReply(t *testing.T) {

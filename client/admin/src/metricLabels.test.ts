@@ -60,6 +60,22 @@ describe("metricLabels", () => {
     }
   });
 
+  // #2033 PR-2: the billing erasure gauge and the drift-correction counter.
+  // The operator surface reads the chart wording (neither is reworded), so one
+  // assertion per key covers both surfaces.
+  it("carries the two billing keys with their approved wording", () => {
+    const erasure = "billing_erasure_outbox_pending" as MetricKey;
+    const drift = "billing_drift_corrections_total" as MetricKey;
+    expect(everyKey).toContain(erasure);
+    expect(everyKey).toContain(drift);
+    expect(METRIC_LABELS[erasure]).toBe("Billing erasures overdue (24 h+)");
+    expect(METRIC_LABELS[drift]).toBe("Billing drift corrections");
+    expect(OPERATOR_METRIC_LABELS[erasure]).toBe(METRIC_LABELS[erasure]);
+    expect(OPERATOR_METRIC_LABELS[drift]).toBe(METRIC_LABELS[drift]);
+    expect(metricLabel(erasure)).toBe("Billing erasures overdue (24 h+)");
+    expect(metricLabel(drift)).toBe("Billing drift corrections");
+  });
+
   it("reads the reworded operator labels for non-service keys", () => {
     expect(metricLabel("host_load_1m")).toBe("One-minute load");
     expect(metricLabel("presence_ttl_lapsed_total")).toBe(

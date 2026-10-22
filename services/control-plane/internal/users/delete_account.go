@@ -619,6 +619,21 @@ func (s *AccountService) deleteAccountTx(
 		return nil, nil, plan, drainedObligation{}, erasedMedia{},
 			fmt.Errorf("delete account: enqueue billing erasure: %w", err)
 	}
+	// The mapping is not the only record of a Customer: Reconcile can write a
+	// user's Stripe row for a subscription on a Customer the mapping does not
+	// name (the "already mapped to a different customer" path). Each such
+	// Customer is queued as well, before the cascade deletes the rows. The
+	// mapped Customer is already queued, so ON CONFLICT skips it here. A row
+	// can also sit on a Customer another user is mapped to; the billing worker
+	// skips any Customer still mapped when it runs, so that one is not deleted.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO billing_erasure_outbox (stripe_customer_id)
+		SELECT DISTINCT stripe_customer_id FROM subscriptions
+		WHERE user_id = $1 AND source = 'stripe' AND stripe_customer_id IS NOT NULL
+		ON CONFLICT (stripe_customer_id) DO NOTHING`, lockedUserID); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{},
+			fmt.Errorf("delete account: enqueue billing erasure of subscription customers: %w", err)
+	}
 
 	result, err := tx.ExecContext(ctx,
 		`DELETE FROM users WHERE id = $1`,

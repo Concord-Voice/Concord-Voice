@@ -1,10 +1,13 @@
 // Package billing holds Concord's Stripe integration (epic #2033).
 //
-// PR-1 ships only the catalog side: the identifiers that Stripe objects and
-// later billing code key on, a client constructor, and Bootstrap, which the
-// operator tool cmd/stripe-bootstrap runs. Nothing in the control-plane
-// server imports this package yet, so it ships dormant. Design:
-// [internal]specs/2026-10-15-2033-stripe-billing-design.md §6.
+// It began as the catalog side only (PR-1): the identifiers that Stripe
+// objects and later billing code key on, a client constructor, and Bootstrap,
+// which the operator tool cmd/stripe-bootstrap runs. It now also holds the
+// Service, the subscription classifier and, as this PR lands them, Reconcile,
+// the webhook, the Portal session and the background workers. All of it stays
+// dormant until Stripe keys are configured: with no keys the control plane
+// registers no billing route and starts no billing worker. Design:
+// [internal]specs/2026-10-15-2033-stripe-billing-design.md §6, §7.
 package billing
 
 // Catalog identifiers. They are constants, not config (spec §11): the same
@@ -34,3 +37,8 @@ const (
 	LookupKeyWingMonthly       = "wing_monthly"
 	LookupKeyWingYearly        = "wing_yearly"
 )
+
+// ReturnURLPortal is where Stripe sends a customer leaving the Customer Portal.
+// Like the Checkout return URLs it is a constant, never a request value, so a
+// client cannot steer the redirect (spec §11).
+const ReturnURLPortal = "https://concordvoice.com/billing/return?result=portal"

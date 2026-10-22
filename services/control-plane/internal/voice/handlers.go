@@ -17,6 +17,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/joinpause"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/roomplacement"
@@ -88,6 +89,21 @@ func verifyVoiceAdmissionActivationResponse(
 		}
 	}
 	return voiceAdmissionActivationRejected
+}
+
+// parseUnpausedVoiceJoinAdmission is parseVoiceJoinAdmission plus the
+// conversion join pause. A2 activation completes an admission A1 already
+// passed, so a pause that lands between the two must not strand the
+// registered half.
+func (h *Handler) parseUnpausedVoiceJoinAdmission(c *gin.Context, channelID, userID string, isMediaHop bool) (voiceJoinAdmission, bool) {
+	admission, ok := parseVoiceJoinAdmission(c, channelID)
+	if !ok {
+		return admission, false
+	}
+	if isMediaHop && admission.Activate {
+		return admission, true
+	}
+	return admission, !joinpause.Refuse(c, h.redis, h.log, userID)
 }
 
 func parseVoiceJoinAdmission(c *gin.Context, channelID string) (voiceJoinAdmission, bool) {
@@ -468,6 +484,7 @@ type Handler struct {
 	entCache                          *entitlements.Cache
 	serverTiers                       entitlements.ServerTierResolver
 	roomPlacement                     *roomplacement.Selector
+	redis                             *redis.Client
 	tempGrant                         *tempGrantManager
 	afterVoiceAdmissionPrepareForTest func()
 	commitVoiceEffectTxForTest        func(*sql.Tx) error
@@ -510,6 +527,7 @@ func NewHandler(deps HandlerDeps) *Handler {
 		entCache:      deps.EntCache,
 		serverTiers:   deps.ServerTiers,
 		roomPlacement: &roomplacement.Selector{Redis: deps.Redis, Enabled: deps.RoomPlacementEnabled},
+		redis:         deps.Redis,
 		tempGrant:     newTempGrantManager(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS),
 	}
 }
@@ -649,7 +667,7 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
 	isMediaHop := middleware.IsMediaPlaneServiceHop(c)
-	admission, ok := parseVoiceJoinAdmission(c, channelID)
+	admission, ok := h.parseUnpausedVoiceJoinAdmission(c, channelID, userID, isMediaHop)
 	if !ok {
 		return
 	}

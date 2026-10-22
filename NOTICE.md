@@ -13,10 +13,10 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 398 third-party software components across its four
+Concord Voice distributes 400 third-party software components across its four
 CVSL application artifact families:
 
-- **59** Go modules linked into the control-plane runtime binaries. The image
+- **61** Go modules linked into the control-plane runtime binaries. The image
   ships **three** Go binaries — `main` (`./cmd/server`), `migrate-media` and
   `mfa-rekey` (`services/control-plane/Dockerfile:39-41,57-59`) — and the table
   is the union of what all three link. The image also carries the admin portal
@@ -37,20 +37,20 @@ Application-dependency license distribution:
 
 | License family | Share | Compatible with CVSL 1.0 + AGPL-3.0 |
 |---|---|---|
-| MIT | 82.7% (329) | ✓ |
-| ISC | 6.3% (25) | ✓ |
-| Apache-2.0 | 4.3% (17) | ✓ |
+| MIT | 82.8% (331) | ✓ |
+| ISC | 6.2% (25) | ✓ |
+| Apache-2.0 | 4.2% (17) | ✓ |
 | BSD-3-Clause | 3.8% (15) | ✓ |
-| BSD-2-Clause | 1.3% (5) | ✓ |
-| BlueOak-1.0.0 | 1.3% (5) | ✓ |
-| Python-2.0 | 0.3% (1) | ✓ |
-| Unlicense | 0.3% (1) | ✓ |
+| BSD-2-Clause | 1.2% (5) | ✓ |
+| BlueOak-1.0.0 | 1.2% (5) | ✓ |
+| Python-2.0 | 0.2% (1) | ✓ |
+| Unlicense | 0.2% (1) | ✓ |
 | MPL-2.0 (build-time only) | not in the count above | ✓ |
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | not in the count above | ✓ (attribution required) |
 
-Shares are exact counts over the 398 components tabulated below, not estimates.
+Shares are exact counts over the 400 components tabulated below, not estimates.
 The final two rows cover build-time and build-data dependencies, which are not
-part of that 398 and therefore carry no share of it; see
+part of that 400 and therefore carry no share of it; see
 [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 for their treatment.
 
@@ -58,7 +58,7 @@ No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the four
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 398-component count.
+recorded separately below; it is not part of the 400-component count.
 
 ## License Texts
 
@@ -198,6 +198,8 @@ current tree rather than a guarantee.
 | github.com/quic-go/quic-go | v0.64.1 | MIT |
 | github.com/redis/go-redis/v9 | v9.23.0 | BSD-2-Clause |
 | github.com/rs/xid | v1.6.0 | MIT |
+| github.com/shopspring/decimal | v1.4.0 | MIT |
+| github.com/stripe/stripe-go/v87 | v87.0.0 | MIT |
 | github.com/tinylib/msgp | v1.6.5 | MIT |
 | github.com/ugorji/go/codec | v1.3.2 | MIT |
 | github.com/vmihailenco/msgpack/v5 | v5.4.1 | BSD-2-Clause |

@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000182)
+## Existing Migrations (000001–000183)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -292,6 +292,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000180 | stripe_customers | One Stripe Customer per user and one user per Customer, cascading with the user; down refuses any mapping |
 | 000181 | stripe_webhook_events | Webhook dedupe by `evt_` id, no payload, `processed_at` index for 30-day retention; plain down |
 | 000182 | billing_erasure_outbox | Pending Stripe Customer erasures with no user id or FK; down refuses any pending obligation |
+| 000183 | billing_ops_metrics | Admit the `billing_erasure_outbox_pending` gauge and `billing_drift_corrections_total` counter to the closed operations metric catalog (#2033) |
 
 ### Message key-version constraints (migrations 000171–000176, #2844)
 
@@ -469,7 +470,17 @@ refuses while billing data exists. A refused down leaves golang-migrate
 recording **N-1** as dirty while the schema is still at N: confirm the schema,
 then force **N**, never N-1 (table in `[internal]rules/migrations.md` § "Stripe
 billing"). The rollback floor is PR-1: an image built before 000178 fails the
-version-existence check and cannot boot against it.
+version-existence check and cannot boot against it. A PR-1 image fails the same
+check once 000183 is recorded, so a rollback from PR-2 to PR-1 runs the 000183
+down first (`down 1`, back to 182; it never refuses).
+
+Migration 000183 admits the two billing operations metrics
+(`billing_erasure_outbox_pending`, `billing_drift_corrections_total`) to the
+closed `ops_metric_*` CHECKs, widening the 72-key 000142 catalog to 74. Apply it
+before deploying code that emits either key. Its down migration follows the 000142
+protocol: under an `ACCESS EXCLUSIVE` lock on both metric tables it deletes only the
+two retired series, then restores the exact 000142 catalog. Unlike the 000178–000182
+downs it does not refuse, because the rows are telemetry rather than an obligation.
 
 ## Troubleshooting
 

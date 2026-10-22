@@ -19,6 +19,7 @@ const (
 	resourceMissingBody = `{"error":{"type":"invalid_request_error","code":"resource_missing","message":"No such object"}}`
 	serverErrorBody     = `{"error":{"type":"api_error","message":"Something went wrong on Stripe's end."}}`
 	permissionErrorBody = `{"error":{"type":"invalid_request_error","message":"The provided key does not have the required permissions for this endpoint."}}`
+	invalidRequestBody  = `{"error":{"type":"invalid_request_error","message":"This Checkout Session is not open and cannot be expired."}}`
 	lookupKeyTakenBody  = `{"error":{"type":"invalid_request_error","message":"A price with this lookup_key already exists. Set transfer_lookup_key to true to move it."}}`
 )
 
@@ -32,9 +33,17 @@ type fakeStripe struct {
 	prices   []*fakePrice
 	coupons  map[string]*fakeCoupon
 	portals  []*fakePortal
-	requests []fakeRequest
-	seq      map[string]int
-	failures map[string]fakeFailure // keyed by "METHOD /path"
+	// Runtime resources (PR-2): what the webhook, Reconcile, the outbox and
+	// the Portal endpoint read and write.
+	subscriptions []*fakeSubscription
+	customers     map[string]bool // customer ids that exist
+	// deletedCustomers are ids this account once held and deleted: Stripe
+	// still retrieves them, as {"deleted": true}.
+	deletedCustomers map[string]bool
+	sessions         []*fakeSession
+	requests         []fakeRequest
+	seq              map[string]int
+	failures         map[string]fakeFailure // keyed by "METHOD /path"
 	// replayed names create routes that answer as Stripe does when it replays
 	// an Idempotency-Key whose object was since deleted: a "created" object
 	// that nothing stores, so a later retrieve finds no such object.
@@ -103,6 +112,70 @@ type fakePortal struct {
 	Metadata  map[string]string `json:"metadata"`
 }
 
+// fakeSubscription is the wire shape of a Stripe Subscription as the runtime
+// code reads it: items carry an expanded price, customer is always an id, and
+// discounts are ids unless the request expands them (see retrieveSubscription).
+type fakeSubscription struct {
+	ID                string            `json:"id"`
+	Object            string            `json:"object"`
+	Status            string            `json:"status"`
+	Customer          string            `json:"customer"`
+	CancelAt          int64             `json:"cancel_at"`
+	CancelAtPeriodEnd bool              `json:"cancel_at_period_end"`
+	Metadata          map[string]string `json:"metadata"`
+	Items             fakeSubItems      `json:"items"`
+	Discounts         []any             `json:"discounts"`
+	couponIDs         []string          // test-side source of Discounts
+}
+
+type fakeSubItems struct {
+	Object string        `json:"object"`
+	Data   []fakeSubItem `json:"data"`
+}
+
+type fakeSubItem struct {
+	ID               string     `json:"id"`
+	Object           string     `json:"object"`
+	CurrentPeriodEnd int64      `json:"current_period_end"`
+	Quantity         int64      `json:"quantity"`
+	Price            *fakePrice `json:"price"`
+}
+
+type fakeDiscount struct {
+	ID     string             `json:"id"`
+	Object string             `json:"object"`
+	Source fakeDiscountSource `json:"source"`
+}
+
+type fakeDiscountSource struct {
+	Type   string     `json:"type"`
+	Coupon fakeCoupon `json:"coupon"`
+}
+
+type fakeSession struct {
+	ID       string `json:"id"`
+	Object   string `json:"object"`
+	Customer string `json:"customer"`
+	Status   string `json:"status"`
+	URL      string `json:"url"`
+}
+
+type fakePortalSession struct {
+	ID            string         `json:"id"`
+	Object        string         `json:"object"`
+	Configuration string         `json:"configuration"`
+	Customer      string         `json:"customer"`
+	ReturnURL     string         `json:"return_url"`
+	URL           string         `json:"url"`
+	Flow          map[string]any `json:"flow,omitempty"`
+}
+
+type fakeDeleted struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Deleted bool   `json:"deleted"`
+}
+
 type fakeList struct {
 	Object  string `json:"object"`
 	URL     string `json:"url"`
@@ -123,14 +196,17 @@ type seededCatalog struct {
 func newFakeStripe(t *testing.T) *fakeStripe {
 	t.Helper()
 	return &fakeStripe{
-		t:        t,
-		products: []*fakeProduct{},
-		prices:   []*fakePrice{},
-		coupons:  map[string]*fakeCoupon{},
-		portals:  []*fakePortal{},
-		seq:      map[string]int{},
-		failures: map[string]fakeFailure{},
-		replayed: map[string]bool{},
+		t:         t,
+		products:  []*fakeProduct{},
+		prices:    []*fakePrice{},
+		coupons:   map[string]*fakeCoupon{},
+		portals:   []*fakePortal{},
+		customers: map[string]bool{},
+		seq:       map[string]int{},
+		failures:  map[string]fakeFailure{},
+		replayed:  map[string]bool{},
+
+		deletedCustomers: map[string]bool{},
 	}
 }
 
@@ -169,6 +245,13 @@ func (f *fakeStripe) handler() http.Handler {
 	mux.HandleFunc("GET /v1/billing_portal/configurations", f.listPortals)
 	mux.HandleFunc("POST /v1/billing_portal/configurations", f.createPortal)
 	mux.HandleFunc("POST /v1/billing_portal/configurations/{id}", f.updatePortal)
+	mux.HandleFunc("GET /v1/subscriptions/{id}", f.retrieveSubscription)
+	mux.HandleFunc("GET /v1/subscriptions", f.listSubscriptions)
+	mux.HandleFunc("DELETE /v1/customers/{id}", f.deleteCustomer)
+	mux.HandleFunc("GET /v1/customers/{id}", f.retrieveCustomer)
+	mux.HandleFunc("GET /v1/checkout/sessions", f.listSessions)
+	mux.HandleFunc("POST /v1/checkout/sessions/{id}/expire", f.expireSession)
+	mux.HandleFunc("POST /v1/billing_portal/sessions", f.createPortalSession)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -256,6 +339,77 @@ func (f *fakeStripe) seedPortal(id string, metadata map[string]string) *fakePort
 	pc := &fakePortal{ID: id, Object: "billing_portal.configuration", Active: true, Metadata: metadata}
 	f.portals = append(f.portals, pc)
 	return pc
+}
+
+// seedCustomer registers a customer id so DELETE /v1/customers/{id} finds it.
+func (f *fakeStripe) seedCustomer(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.customers[id] = true
+}
+
+// seedSubscription stores an active, quantity-1 subscription whose single item
+// carries a price with concord_plan=plan and the given interval and period end
+// (unix seconds). The returned pointer is the stored object: a test mutates it
+// before the code under test runs (Status, Quantity, CancelAt, Items, Metadata).
+// coupons are the coupon ids applied as discounts.
+func (f *fakeStripe) seedSubscription(id, customerID, plan, interval string, periodEnd int64, coupons ...string) *fakeSubscription {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	price := &fakePrice{
+		ID: f.nextID("price"), Object: "price", Active: true, Currency: "usd",
+		Metadata:  map[string]string{PlanMetadataKey: plan},
+		Recurring: fakeRecurring{Interval: interval, IntervalCount: 1, UsageType: "licensed"},
+		Type:      "recurring", UnitAmount: 899,
+	}
+	sub := &fakeSubscription{
+		ID: id, Object: "subscription", Status: "active", Customer: customerID,
+		Metadata: map[string]string{},
+		Items: fakeSubItems{Object: "list", Data: []fakeSubItem{{
+			ID: f.nextID("si"), Object: "subscription_item", CurrentPeriodEnd: periodEnd, Quantity: 1, Price: price,
+		}}},
+		couponIDs: coupons,
+	}
+	f.subscriptions = append(f.subscriptions, sub)
+	f.customers[customerID] = true
+	return sub
+}
+
+// seedSession stores a Checkout Session for customerID in the given status.
+func (f *fakeStripe) seedSession(id, customerID, status string) *fakeSession {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cs := &fakeSession{ID: id, Object: "checkout.session", Customer: customerID, Status: status, URL: "https://checkout.stripe.test/c/" + id}
+	f.sessions = append(f.sessions, cs)
+	return cs
+}
+
+// seedDeletedCustomer records a customer this account held and deleted, so a
+// delete answers resource_missing and a retrieve answers deleted: true.
+func (f *fakeStripe) seedDeletedCustomer(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.customers, id)
+	f.deletedCustomers[id] = true
+}
+
+// customerExists reports whether the fake still holds the customer.
+func (f *fakeStripe) customerExists(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.customers[id]
+}
+
+// sessionStatus returns the stored status of a Checkout Session, or "" if absent.
+func (f *fakeStripe) sessionStatus(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, cs := range f.sessions {
+		if cs.ID == id {
+			return cs.Status
+		}
+	}
+	return ""
 }
 
 // seedCatalog provisions the complete, valid catalog with fixed IDs.
@@ -413,6 +567,129 @@ func (f *fakeStripe) updatePortal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+// retrieveSubscription mirrors Stripe: customer is an id (the code under test
+// must never expand it), items.data[].price is a full object, and discounts are
+// bare ids unless the request carries expand[]=discounts.
+func (f *fakeStripe) retrieveSubscription(w http.ResponseWriter, r *http.Request) {
+	for _, sub := range f.subscriptions {
+		if sub.ID == r.PathValue("id") {
+			f.writeJSON(w, f.renderSubscription(sub, requestsExpand(r.Form, "discounts")))
+			return
+		}
+	}
+	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+func (f *fakeStripe) renderSubscription(sub *fakeSubscription, expandDiscounts bool) fakeSubscription {
+	shown := *sub
+	shown.Discounts = make([]any, 0, len(sub.couponIDs))
+	for i, couponID := range sub.couponIDs {
+		id := fmt.Sprintf("di_%s_%d", sub.ID, i)
+		if !expandDiscounts {
+			shown.Discounts = append(shown.Discounts, id)
+			continue
+		}
+		shown.Discounts = append(shown.Discounts, fakeDiscount{
+			ID: id, Object: "discount",
+			Source: fakeDiscountSource{Type: "coupon", Coupon: fakeCoupon{ID: couponID, Object: "coupon", Valid: true}},
+		})
+	}
+	return shown
+}
+
+// listSubscriptions filters by customer. Like Stripe it omits canceled
+// subscriptions unless status=all (or status=canceled) is asked for.
+func (f *fakeStripe) listSubscriptions(w http.ResponseWriter, r *http.Request) {
+	customer := r.Form.Get("customer")
+	status := r.Form.Get("status")
+	out := make([]fakeSubscription, 0, len(f.subscriptions))
+	for _, sub := range f.subscriptions {
+		if customer != "" && sub.Customer != customer {
+			continue
+		}
+		if status == "" && sub.Status == "canceled" {
+			continue
+		}
+		if status != "" && status != "all" && sub.Status != status {
+			continue
+		}
+		out = append(out, f.renderSubscription(sub, requestsExpand(r.Form, "data.discounts")))
+	}
+	f.writeJSON(w, fakeList{Object: "list", URL: r.URL.Path, Data: out})
+}
+
+// deleteCustomer removes a seeded customer; a second delete is resource_missing.
+func (f *fakeStripe) deleteCustomer(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !f.customers[id] {
+		f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+		return
+	}
+	delete(f.customers, id)
+	f.deletedCustomers[id] = true
+	f.writeJSON(w, fakeDeleted{ID: id, Object: "customer", Deleted: true})
+}
+
+// retrieveCustomer mirrors Stripe: a live customer is returned without a
+// deleted field, a deleted one as {"deleted": true}, and an id this account
+// never held (or one of another account) is resource_missing.
+func (f *fakeStripe) retrieveCustomer(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	switch {
+	case f.customers[id]:
+		f.writeJSON(w, map[string]any{"id": id, "object": "customer"})
+	case f.deletedCustomers[id]:
+		f.writeJSON(w, fakeDeleted{ID: id, Object: "customer", Deleted: true})
+	default:
+		f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+	}
+}
+
+func (f *fakeStripe) listSessions(w http.ResponseWriter, r *http.Request) {
+	customer, status := r.Form.Get("customer"), r.Form.Get("status")
+	out := make([]*fakeSession, 0, len(f.sessions))
+	for _, cs := range f.sessions {
+		if (customer == "" || cs.Customer == customer) && (status == "" || cs.Status == status) {
+			out = append(out, cs)
+		}
+	}
+	f.writeJSON(w, fakeList{Object: "list", URL: r.URL.Path, Data: out})
+}
+
+// expireSession expires an open session. Stripe refuses a session that is no
+// longer open (for example one the customer completed first) with
+// invalid_request_error and no code, which the erasure outbox must tolerate.
+func (f *fakeStripe) expireSession(w http.ResponseWriter, r *http.Request) {
+	for _, cs := range f.sessions {
+		if cs.ID != r.PathValue("id") {
+			continue
+		}
+		if cs.Status != "open" {
+			f.writeRaw(w, http.StatusBadRequest, invalidRequestBody)
+			return
+		}
+		cs.Status = "expired"
+		f.writeJSON(w, cs)
+		return
+	}
+	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+// createPortalSession echoes the configuration, customer, return_url and
+// flow_data[type] it was given, so a test asserts what the endpoint sent.
+func (f *fakeStripe) createPortalSession(w http.ResponseWriter, r *http.Request) {
+	ps := &fakePortalSession{
+		ID: f.nextID("bps"), Object: "billing_portal.session",
+		Configuration: r.PostForm.Get("configuration"), Customer: r.PostForm.Get("customer"),
+		ReturnURL: r.PostForm.Get("return_url"),
+	}
+	ps.URL = "https://billing.stripe.test/p/session/" + ps.ID
+	if flowType := r.PostForm.Get("flow_data[type]"); flowType != "" {
+		ps.Flow = map[string]any{"type": flowType}
+	}
+	f.writeJSON(w, ps)
 }
 
 func (f *fakeStripe) writeJSON(w http.ResponseWriter, v any) {

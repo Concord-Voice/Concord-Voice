@@ -789,6 +789,9 @@ describe('actual index voice-command runtime boundaries', () => {
         status: 200,
         body: { ready: true, voiceEnforcementProtocol: 3 },
       });
+      // Legacy (placement off) still reports both conversion-gate counts.
+      const health = await fetch(`${restarted.url}/health`).then((res) => res.json());
+      expect(health).toMatchObject({ rooms: 0, creates_in_flight: 0 });
     } finally {
       await failed.close();
       await f.close();

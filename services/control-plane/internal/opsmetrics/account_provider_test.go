@@ -17,6 +17,12 @@ type fakeAccountRepository struct {
 	activeErr     error
 	qualification error
 	recorded      []ActivityQualification
+	// overdue and overdueErr back BillingErasureOverdue (#2033 PR-2): the count of
+	// billing_erasure_outbox rows older than 24 hours, read independently of the
+	// other counts so one failing query omits only its own sample.
+	overdue    int64
+	overdueErr error
+	overdueAt  []time.Time
 }
 
 func (repository *fakeAccountRepository) CurrentCounts(context.Context, time.Time) (accountCurrentCounts, error) {
@@ -25,6 +31,11 @@ func (repository *fakeAccountRepository) CurrentCounts(context.Context, time.Tim
 
 func (repository *fakeAccountRepository) ActiveCounts(context.Context, time.Time) (accountActiveCounts, error) {
 	return repository.active, repository.activeErr
+}
+
+func (repository *fakeAccountRepository) BillingErasureOverdue(_ context.Context, at time.Time) (int64, error) {
+	repository.overdueAt = append(repository.overdueAt, at)
+	return repository.overdue, repository.overdueErr
 }
 
 func (repository *fakeAccountRepository) RecordQualifications(_ context.Context, qualifications []ActivityQualification) error {
@@ -36,6 +47,7 @@ func TestAccountProviderReturnsOnlyFixedAggregateMetrics(t *testing.T) {
 	repository := &fakeAccountRepository{
 		current: accountCurrentCounts{registered: 120, pending: 4, activeSessions: 33},
 		active:  accountActiveCounts{hours24: 18, days7: 70, days15: 91, days30: 108},
+		overdue: 4,
 	}
 	provider := newAccountProvider(repository, nil)
 	at := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
@@ -50,7 +62,9 @@ func TestAccountProviderReturnsOnlyFixedAggregateMetrics(t *testing.T) {
 		MetricActiveUsers7D:               70,
 		MetricActiveUsers15D:              91,
 		MetricActiveUsers30D:              108,
+		MetricBillingErasureOutboxPending: 4,
 	}, metrics)
+	require.Equal(t, []time.Time{at}, repository.overdueAt, "the overdue count is evaluated at the collection instant")
 	for key := range metrics {
 		definition, ok := Definition(key)
 		require.True(t, ok)
@@ -153,6 +167,42 @@ func TestAccountProviderDegradesQueriesIndependently(t *testing.T) {
 		require.ErrorIs(t, err, activeErr)
 		require.Equal(t, float64(6), metrics[MetricRegisteredUsersCurrent])
 		require.NotContains(t, metrics, MetricActiveUsers24H)
+	})
+}
+
+func TestAccountProviderBillingErasureOverdueDegradesIndependently(t *testing.T) {
+	overdueErr := errors.New("billing outbox count failed")
+	at := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("only the billing gauge is omitted", func(t *testing.T) {
+		repository := &fakeAccountRepository{
+			current:    accountCurrentCounts{registered: 6, pending: 1, activeSessions: 2},
+			active:     accountActiveCounts{hours24: 2, days7: 3, days15: 4, days30: 5},
+			overdueErr: overdueErr,
+		}
+		metrics, err := newAccountProvider(repository, nil).AccountMetrics(context.Background(), at)
+		require.ErrorIs(t, err, overdueErr)
+		require.NotContains(t, metrics, MetricBillingErasureOutboxPending)
+		require.Equal(t, float64(6), metrics[MetricRegisteredUsersCurrent])
+		require.Equal(t, float64(2), metrics[MetricActiveUsers24H])
+	})
+
+	t.Run("a failing account count does not hide the billing gauge", func(t *testing.T) {
+		repository := &fakeAccountRepository{
+			currentErr: errors.New("current counts failed"),
+			activeErr:  errors.New("active counts failed"),
+			overdue:    7,
+		}
+		metrics, err := newAccountProvider(repository, nil).AccountMetrics(context.Background(), at)
+		require.Error(t, err)
+		require.Equal(t, float64(7), metrics[MetricBillingErasureOutboxPending])
+	})
+
+	t.Run("zero overdue is reported as zero, not omitted", func(t *testing.T) {
+		metrics, err := newAccountProvider(&fakeAccountRepository{}, nil).AccountMetrics(context.Background(), at)
+		require.NoError(t, err)
+		require.Contains(t, metrics, MetricBillingErasureOutboxPending)
+		require.Zero(t, metrics[MetricBillingErasureOutboxPending])
 	})
 }
 

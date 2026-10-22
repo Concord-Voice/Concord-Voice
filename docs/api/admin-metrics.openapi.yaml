@@ -358,6 +358,8 @@ components:
         - server_voice_terminal_outbox_channel_suppressed_total
         - server_voice_terminal_outbox_lock_retained_total
         - server_voice_terminal_outbox_queue_rescheduled_total
+        - billing_erasure_outbox_pending
+        - billing_drift_corrections_total
     CounterMetricKey:
       type: string
       enum:
@@ -383,6 +385,7 @@ components:
         - server_voice_terminal_outbox_channel_suppressed_total
         - server_voice_terminal_outbox_lock_retained_total
         - server_voice_terminal_outbox_queue_rescheduled_total
+        - billing_drift_corrections_total
     MetricSource:
       type: string
       enum:
@@ -499,7 +502,7 @@ components:
           # MUST equal the number of MetricKey enum entries: /metrics/current can
           # emit one point per catalog key, so a bound below the enum size rejects
           # a valid response. Pinned by TestOpenAPIMetricBoundsMatchTheEnums.
-          maxItems: 72
+          maxItems: 74
           items:
             $ref: '#/components/schemas/AdminMetricPoint'
     AdminCounterPoint:
@@ -544,7 +547,7 @@ components:
           # can emit one point per counter key, so a bound below the enum size rejects
           # a valid response. Same invariant as AdminCurrentResponse.metrics above,
           # which carried this note while this one did not.
-          maxItems: 22
+          maxItems: 23
           items:
             $ref: '#/components/schemas/AdminCounterPoint'
     AdminSeriesMetric:

@@ -28,7 +28,7 @@ describe("metric catalog", () => {
   it("assigns every fixed metric key to one primary home", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
-    expect(PRIMARY_METRIC_MAP.control).toHaveLength(16);
+    expect(PRIMARY_METRIC_MAP.control).toHaveLength(18);
     expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(9);
     expect(PRIMARY_METRIC_MAP.mediaEgress).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.participantHours).toHaveLength(3);
@@ -37,9 +37,9 @@ describe("metric catalog", () => {
     );
 
     const assigned = Object.values(PRIMARY_METRIC_MAP).flat();
-    expect(assigned).toHaveLength(72);
+    expect(assigned).toHaveLength(74);
     expect(new Set(assigned)).toEqual(new Set(METRIC_KEYS));
-    expect(COUNTER_METRIC_KEYS).toHaveLength(22);
+    expect(COUNTER_METRIC_KEYS).toHaveLength(23);
 
     for (const key of [
       "server_voice_terminal_outbox_captured_total",
@@ -52,6 +52,16 @@ describe("metric catalog", () => {
       expect(PRIMARY_METRIC_MAP.control).toContain(key);
       expect(COUNTER_METRIC_KEYS).toContain(key);
     }
+
+    // #2033 PR-2: a control-source gauge and a control-source counter.
+    expect(PRIMARY_METRIC_MAP.control).toContain(
+      "billing_erasure_outbox_pending",
+    );
+    expect(PRIMARY_METRIC_MAP.control).toContain(
+      "billing_drift_corrections_total",
+    );
+    expect(COUNTER_METRIC_KEYS).toContain("billing_drift_corrections_total");
+    expect(COUNTER_METRIC_KEYS).not.toContain("billing_erasure_outbox_pending");
   });
 });
 

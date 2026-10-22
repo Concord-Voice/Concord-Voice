@@ -2178,6 +2178,216 @@ print(value["rooms"], value["creates_in_flight"])
   echo "media-bluegreen: reaped drained color ${colour}"
 }
 
+# ── First legacy-to-colour conversion (#2466) ──────────────────────────────
+# The control plane refuses new voice admissions while this key exists; it
+# never writes it. Value: `<t0>:<deadline>[:<test-user-uuid>]`.
+readonly MEDIA_LEGACY_PAUSE_KEY='media:legacy_join_pause'
+readonly MEDIA_LEGACY_CUTOFF_SECS=7200
+
+media_legacy_staging() {
+  [[ "$COMPOSE_OVERRIDE" == docker-compose.staging.yml \
+     || "$COMPOSE_OVERRIDE" == docker-compose.west-staging.yml ]]
+}
+
+# Production's window is fixed. Staging may shorten it to rehearse the cutoff.
+media_legacy_window_valid() {
+  local window="$1"
+  (( window == MEDIA_LEGACY_CUTOFF_SECS )) && return 0
+  media_legacy_staging && (( window >= 60 && window < MEDIA_LEGACY_CUTOFF_SECS ))
+}
+
+# Prints "<t0> <deadline>" for a well-formed pause value.
+media_legacy_parse_pause() {
+  [[ "$1" =~ ^([0-9]{1,12}):([0-9]{1,12})(:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$ ]] \
+    || return 1
+  local t0="${BASH_REMATCH[1]}" deadline="${BASH_REMATCH[2]}"
+  media_legacy_window_valid "$(( deadline - t0 ))" || return 1
+  echo "$t0 $deadline"
+}
+
+# running | exited | absent; anything else fails.
+media_legacy_state() {
+  local rows
+  rows="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --all --format json -- media-plane)" || return 1
+  python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    rows = json.loads(raw) if raw.startswith("[") else [json.loads(line) for line in raw.splitlines() if line.strip()]
+except ValueError:
+    raise SystemExit(1)
+if not rows:
+    print("absent")
+elif len(rows) == 1 and isinstance(rows[0], dict) and rows[0].get("Service") == "media-plane" \
+        and rows[0].get("State") in ("running", "exited"):
+    print(rows[0]["State"])
+else:
+    raise SystemExit(1)
+' <<<"$rows"
+}
+
+# Prints "<rooms> <creates>" from legacy /health; any doubt is a failure.
+media_legacy_counts() {
+  local body
+  body="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T media-plane \
+    node -e 'fetch("http://127.0.0.1:3000/health", {signal: AbortSignal.timeout(3000)}).then(async response => { process.stdout.write(await response.text()); process.exitCode = response.ok ? 0 : 1; }).catch(() => { process.exitCode = 1; });' 2>/dev/null)" \
+    || return 1
+  python3 -c '
+import json, sys
+try:
+    value = json.loads(sys.argv[1])
+    rooms, creates = value["rooms"], value["creates_in_flight"]
+    if type(rooms) is not int or type(creates) is not int or rooms < 0 or creates < 0:
+        raise ValueError
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+print(rooms, creates)
+' "$body"
+}
+
+# The every-minute actuator. Stops legacy at zero rooms and zero creates, or at
+# the deadline whatever the counts; never enables a colour or lifts the pause.
+media_legacy_actuate() {
+  local value window t0 deadline state now first second rooms creates reason
+  value="$(media_bluegreen_redis GET "$MEDIA_LEGACY_PAUSE_KEY")" || return 1
+  if [[ -z "$value" ]]; then
+    echo 'media-bluegreen: legacy profile selected; no colour to reap'
+    return 0
+  fi
+  window="$(media_legacy_parse_pause "$value")" || {
+    echo 'media-legacy: join pause value is malformed; refusing to act' >&2
+    return 1
+  }
+  read -r t0 deadline <<<"$window"
+  state="$(media_legacy_state)" || {
+    echo 'media-legacy: cannot read the legacy container state' >&2
+    return 1
+  }
+  case "$state" in
+    exited)
+      echo 'media-legacy: legacy stopped; awaiting colour activation'
+      return 0 ;;
+    running) ;;
+    *)
+      echo "media-legacy: legacy container is ${state}; refusing to act" >&2
+      return 1 ;;
+  esac
+  now="$(date +%s)"
+  first="$(media_legacy_counts)" || first=''
+  second=''
+  if [[ "$first" == '0 0' ]]; then
+    # A create landing between two field reads must not look empty.
+    sleep 2
+    second="$(media_legacy_counts)" || second=''
+  fi
+  if [[ "$first" == '0 0' && "$second" == '0 0' ]]; then
+    reason=empty
+  elif (( now >= deadline )); then
+    reason=deadline
+  elif [[ -z "$first" ]]; then
+    echo "media-legacy: counts unknown, $(( deadline - now ))s to cutoff" >&2
+    return 1
+  else
+    read -r rooms creates <<<"${second:-$first}"
+    echo "media-legacy: rooms=${rooms} creates_in_flight=${creates} remaining=$(( deadline - now ))s"
+    return 0
+  fi
+  read -r rooms creates <<<"${second:-${first:-unknown unknown}}"
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop media-plane) || {
+    echo 'media-legacy: legacy stop failed; retrying next run' >&2
+    return 1
+  }
+  echo "media-legacy: stopped legacy reason=${reason} rooms=${rooms} creates_in_flight=${creates} t0=${t0} at=${now}"
+  mkdir -p "${CONFIG_ROOT}/logs" 2>/dev/null || true
+  printf 'legacy media stopped (%s) at %s; activate the colour\n' "$reason" "$now" \
+    >"${CONFIG_ROOT}/logs/media-legacy-stopped-alert.flag" 2>/dev/null || true
+}
+
+# Arms the pause, then proves the control plane sees it before the clock counts.
+media_legacy_pause() {
+  local allow_user="${1:-}" value current now window body result
+  [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]] || {
+    echo 'media-legacy: the join pause applies only to a managed host' >&2
+    return 1
+  }
+  # The test-user exception is added after the colour profile is enabled.
+  if [[ -n "$allow_user" ]]; then
+    current="$(media_bluegreen_redis GET "$MEDIA_LEGACY_PAUSE_KEY")" || return 1
+    media_legacy_parse_pause "$current" >/dev/null || {
+      echo 'media-legacy: no valid pause to add a test user to' >&2
+      return 1
+    }
+    # T0 and the deadline are kept byte for byte; only the exception changes.
+    value="$(cut -d: -f1-2 <<<"$current"):${allow_user}"
+    media_legacy_parse_pause "$value" >/dev/null || {
+      echo 'media-legacy: test user must be a lowercase UUID' >&2
+      return 1
+    }
+    result="$(media_bluegreen_redis SET "$MEDIA_LEGACY_PAUSE_KEY" "$value" XX)" || return 1
+    [[ "$result" == OK ]] || return 1
+    echo "media-legacy: test user ${allow_user} may join; deadline unchanged"
+    return 0
+  fi
+  [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" != media-bluegreen ]] || {
+    echo 'media-legacy: a new join pause applies only to a legacy host' >&2
+    return 1
+  }
+  window="${MEDIA_LEGACY_CUTOFF_SECONDS:-$MEDIA_LEGACY_CUTOFF_SECS}"
+  [[ "$window" =~ ^[0-9]{1,5}$ ]] && media_legacy_window_valid "$window" || {
+    echo "media-legacy: cutoff window ${window}s is not allowed here" >&2
+    return 1
+  }
+  now="$(date +%s)"
+  value="${now}:$(( now + window ))"
+  result="$(media_bluegreen_redis SET "$MEDIA_LEGACY_PAUSE_KEY" "$value" NX)" || return 1
+  [[ "$result" == OK ]] || {
+    echo 'media-legacy: a join pause already exists; refusing to restart its clock' >&2
+    return 1
+  }
+  body="$(mktemp)" || return 1
+  for _ in $(seq 1 30); do
+    if curl -sS --max-time 2 -o "$body" http://127.0.0.1:8080/voice-join-pause 2>/dev/null \
+      && python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["voice_join_pause"]
+raise SystemExit(0 if value["active"] is True and value["deadline"] == int(sys.argv[2]) else 1)
+' "$body" "$(( now + window ))" 2>/dev/null; then
+      rm -f "$body"
+      echo "media-legacy: joins paused T0=$(date -u -d "@${now}" '+%Y-%m-%dT%H:%M:%SZ') cutoff=$(date -u -d "@$(( now + window ))" '+%Y-%m-%dT%H:%M:%SZ')"
+      return 0
+    fi
+    sleep 2
+  done
+  rm -f "$body"
+  media_legacy_resume_value "$value" >/dev/null || true
+  echo 'media-legacy: control plane did not confirm the pause; removed it' >&2
+  return 1
+}
+
+# Compare-and-delete: only the value this run read is removed.
+media_legacy_resume_value() {
+  local result
+  result="$(media_bluegreen_redis EVAL \
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return -1" \
+    1 "$MEDIA_LEGACY_PAUSE_KEY" "$1")" || return 1
+  [[ "$result" == 1 ]]
+}
+
+media_legacy_resume() {
+  local value
+  value="$(media_bluegreen_redis GET "$MEDIA_LEGACY_PAUSE_KEY")" || return 1
+  if [[ -z "$value" ]]; then
+    echo 'media-legacy: no join pause to lift'
+    return 0
+  fi
+  media_legacy_resume_value "$value" || {
+    echo 'media-legacy: pause changed while lifting it; nothing removed' >&2
+    return 1
+  }
+  rm -f "${CONFIG_ROOT}/logs/media-legacy-stopped-alert.flag" 2>/dev/null || true
+  echo 'media-legacy: voice joins resumed'
+}
+
 media_bluegreen_reap() {
   local keys key colour active rc=0 project colours
   if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" != media-bluegreen ]]; then
@@ -2190,8 +2400,14 @@ media_bluegreen_reap() {
       echo 'media-bluegreen: colour container exists while legacy profile is selected; refusing reap' >&2
       return 1
     }
-    echo 'media-bluegreen: legacy profile selected; no colour to reap'
-    return 0
+    if media_legacy_actuate; then
+      rm -f "${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
+      return 0
+    fi
+    mkdir -p "${CONFIG_ROOT}/logs" 2>/dev/null || true
+    printf 'media reaper failed at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      >"${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
+    return 1
   fi
   media_bluegreen_validate_model || return 1
   keys="$(media_bluegreen_redis --scan --pattern 'media:colour_draining:*')" || {
@@ -2772,7 +2988,7 @@ if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
 fi
 
 case "${1:-help}" in
-  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|nginx-reload|sudoers-sync)
+  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|nginx-reload|sudoers-sync)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -3248,6 +3464,27 @@ else:
       exit 2
     fi
     media_bluegreen_reap
+    ;;
+
+  media-legacy-pause)
+    shift
+    if [[ $# -eq 2 && "$1" == --allow-user ]]; then
+      media_legacy_pause "$2" || exit 1
+    elif [[ $# -eq 0 ]]; then
+      media_legacy_pause || exit 1
+    else
+      echo 'Usage: concord-ctl.sh media-legacy-pause [--allow-user <uuid>]' >&2
+      exit 2
+    fi
+    ;;
+
+  media-legacy-resume)
+    shift
+    if [[ $# -ne 0 ]]; then
+      echo 'Usage: concord-ctl.sh media-legacy-resume' >&2
+      exit 2
+    fi
+    media_legacy_resume || exit 1
     ;;
 
   activity-history-routine-guard)
@@ -4437,7 +4674,12 @@ else:
     echo "  voice-enforcement-rollout deploy"
     echo "                 Build CP, drain/rebuild MP, verify protocol 3, activate"
     echo "  media-reap"
-    echo "                 Reap a draining color when empty or at its automatic 2-hour cutoff"
+    echo "                 Reap a draining color when empty or at its automatic 2-hour cutoff;"
+    echo "                 on a paused legacy host, stop legacy when empty or at the cutoff"
+    echo "  media-legacy-pause [--allow-user <uuid>]"
+    echo "                 Pause new voice joins on legacy media and start the 2-hour clock"
+    echo "  media-legacy-resume"
+    echo "                 Lift the legacy join pause (abort, or after the colour is proved)"
     echo "  validate-config  §F: pre-rebuild guard via 'docker compose config --quiet'"
     echo "  media-shared-listeners-check  validate a lab Compose JSON render on stdin; does not admit deployment"
     echo "  selfhost-port-check  Self-host only: refuse live port bindings outside the posture allowlist (#3538)"

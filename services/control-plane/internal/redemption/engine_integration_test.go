@@ -13,7 +13,6 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/redemption"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -383,6 +382,53 @@ func TestRedeem_ConcurrentSameUserPremiumNoPriorSub(t *testing.T) {
 	var periodEnd time.Time
 	require.NoError(t, db.QueryRow(`SELECT current_period_end FROM subscriptions WHERE user_id=$1`, user).Scan(&periodEnd))
 	assert.WithinDuration(t, time.Now().AddDate(0, 2, 0), periodEnd, 36*time.Hour, "two 1-month codes stack to ~2 months even under concurrency")
+}
+
+// TestRedeem_ConcurrentSameUserPremiumCodesNoDeadlock is the regression lock for
+// #1306: one user redeeming two premium codes at once used to abort one of them
+// with SQLSTATE 40P01. The ledger INSERT's foreign key takes FOR KEY SHARE on the
+// users row; the premium grant then asked for FOR UPDATE on the same row, so two
+// transactions each held key-share and each waited for the other to release it.
+// Oracle: across many rounds, both redeems succeed (codes are distinct and
+// single-use, so there is nothing else for either to fail on); a 40P01 abort
+// fails that assertion and names itself in the error.
+func TestRedeem_ConcurrentSameUserPremiumCodesNoDeadlock(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	eng := newEngine(db, &recordingNotifier{})
+
+	const rounds = 20
+	for round := 0; round < rounds; round++ {
+		user := insertUser(t, db)
+		codes := [2]string{}
+		for i := range codes {
+			codes[i] = issueOne(t, db, redemption.IssueSpec{
+				GrantKind: redemption.GrantPremiumSubscription, GrantParams: map[string]any{"months": 1},
+				Count: 1, SingleUse: true, MaxRedeems: intPtr(1), BatchID: fmt.Sprintf("dl-%d-%d", round, i),
+			})
+		}
+
+		var (
+			wg    sync.WaitGroup
+			errs  [2]error
+			start = make(chan struct{})
+		)
+		for i := range codes {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, errs[i] = eng.Redeem(context.Background(), user, codes[i])
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		for i, err := range errs {
+			assert.NoErrorf(t, err, "round %d: redeem %d of two concurrent same-user premium codes must succeed "+
+				"(a 40P01 here is the ledger FK key-share, then users FOR UPDATE upgrade)", round, i)
+		}
+	}
 }
 
 func intPtr(i int) *int              { return &i }

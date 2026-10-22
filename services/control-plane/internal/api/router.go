@@ -25,6 +25,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/joinpause"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/members"
@@ -578,6 +579,17 @@ func requireServerVoiceCleanupWired(log *logger.Logger, reconciler *activepresen
 	}
 }
 
+// requireActivePlanCleanupsWired fails startup when the reconciler is missing
+// its voice pending-admission or DM block cleanup.
+func requireActivePlanCleanupsWired(log *logger.Logger, reconciler *activepresence.Reconciler) {
+	if !voicePendingAdmissionCleanupWired(reconciler) {
+		log.Fatal("voice pending admission cleanup is not wired")
+	}
+	if !dmBlockCleanupWired(reconciler) {
+		log.Fatal("DM block reconciliation is not wired")
+	}
+}
+
 // buildActivePlanRail constructs the #2448 rail and hands back both halves: the
 // rail its three consumers hold, and the reconciler cmd/server drives from the
 // Activity History startup pass and its ticker.
@@ -890,6 +902,10 @@ func NewRouter(
 	// scope (healthHandler below) so router_test.go can call it directly.
 	router.GET("/health", healthHandler)
 	router.HEAD("/health", healthHandler)
+	// Loopback-only: production nginx proxies only /api/ and /health, and the
+	// catch-all configs (West staging, failover) deny this path, so only
+	// concord-ctl.sh's legacy-conversion pause proof reaches it on 127.0.0.1:8080.
+	router.GET("/voice-join-pause", joinpause.Handler(redis))
 
 	// Initialize WebSocket hub
 	hub := newHubWithSecurityEvents(db, redis, opsCounters, securityEvents)
@@ -1313,7 +1329,7 @@ func NewRouter(
 	// entitlement set: exposes the live subscription's status/source/expiry that
 	// the Settings subscription page renders. An absent live row returns the free
 	// default; query or scan errors return 503 without confirming a tier.
-	subscriptionsHandler := subscriptions.NewHandler(db, log)
+	subscriptionsHandler := subscriptions.NewHandler(db, log, billingState(cfg))
 
 	// Redemption engine + issuer (#1303). The first LIVE caller of the
 	// entitlements.OnTierChange convergence point: a premium code grant
@@ -1323,6 +1339,13 @@ func NewRouter(
 	// disables it (503).
 	redemptionEntNotifier := NewEntitlementNotifier(hub, log)
 	redemptionHandler := buildRedemptionHandler(db, entCache, redemptionEntNotifier, cfg, log)
+
+	// Stripe billing (#2033 PR-2): nil unless keys are configured and the
+	// instance is not self-hosted, so production without keys registers no
+	// billing route and runs no billing worker. The workers live as long as
+	// the router's lifecycle context.
+	billingSvc := wireBilling(lifecycleCtx, cfg, db, entCache, redemptionEntNotifier, opsCounters, log)
+	startBillingWorkers(lifecycleCtx, billingSvc)
 
 	// DM-block convergence is pure SQL and must run on every Block-serving
 	// replica, including self-hosted deployments without NATS.
@@ -1361,12 +1384,7 @@ func NewRouter(
 		}
 	}
 	requireServerVoiceCleanupWired(log, activePlanReconciler)
-	if !voicePendingAdmissionCleanupWired(activePlanReconciler) {
-		log.Fatal("voice pending admission cleanup is not wired")
-	}
-	if !dmBlockCleanupWired(activePlanReconciler) {
-		log.Fatal("DM block reconciliation is not wired")
-	}
+	requireActivePlanCleanupsWired(log, activePlanReconciler)
 	// API v1 routes
 	noStore := func(c *gin.Context) {
 		c.Header(headerCacheControl, "no-store")
@@ -1374,6 +1392,14 @@ func NewRouter(
 	}
 	v1 := router.Group("/api/v1")
 	{
+		// Stripe webhook: unauthenticated by design; the Stripe-Signature HMAC
+		// over the raw body is the only authentication. Stripe sends no Origin
+		// and no X-Machine-Id/X-Device-Name, so CORS and ValidateCustomHeaders
+		// pass it through. No app-level limiter: nginx limit_req zone=api applies.
+		if billingSvc != nil {
+			v1.POST("/billing/stripe/webhook", billingSvc.Webhook)
+		}
+
 		// Auth routes with rate limiting + IP-based auth failure ban check
 		authRoutes := v1.Group("/auth")
 		authRoutes.Use(middleware.AuthBanCheck(redis))
@@ -1750,6 +1776,14 @@ func NewRouter(
 				middleware.RateLimitByUser(redis, 60, 1*time.Minute),
 				voiceEnforcementSessionHandler.Register,
 			)
+			// Stripe Customer Portal session (#2033): verified email, not gated by
+			// purchase mode, so an existing subscriber can always manage billing.
+			if billingSvc != nil {
+				protected.POST("/billing/portal-session",
+					middleware.RateLimitByUser(redis, 10, 10*time.Minute),
+					billingSvc.PortalSession,
+				)
+			}
 			// WebSocket ticket (short-lived, single-use)
 			protected.POST("/auth/ws-ticket",
 				middleware.RateLimitByUser(redis, 10, 1*time.Minute),

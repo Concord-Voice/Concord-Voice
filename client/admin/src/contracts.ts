@@ -65,6 +65,8 @@ const CONTROL_METRIC_KEYS = [
   "server_voice_terminal_outbox_channel_suppressed_total",
   "server_voice_terminal_outbox_lock_retained_total",
   "server_voice_terminal_outbox_queue_rescheduled_total",
+  "billing_erasure_outbox_pending",
+  "billing_drift_corrections_total",
 ] as const;
 
 export const ACCOUNT_ACTIVITY_METRIC_KEYS = [
@@ -146,13 +148,17 @@ export const COUNTER_METRIC_KEYS = [
   "server_voice_terminal_outbox_channel_suppressed_total",
   "server_voice_terminal_outbox_lock_retained_total",
   "server_voice_terminal_outbox_queue_rescheduled_total",
+  "billing_drift_corrections_total",
   "media_egress_cumulative_bytes",
   "media_participant_hours_audio",
   "media_participant_hours_webcam",
   "media_participant_hours_screenshare",
   "media_camera_layering_gate_flips_total",
   "media_camera_pressure_demands_total",
-] as const satisfies readonly MetricKey[];
+] as const;
+// Compile-time check that every counter key is a MetricKey. Not `as const
+// satisfies`: the pinned CI Semgrep parser rejects `satisfies` and fails the scan.
+const _counterKeysAreMetricKeys: readonly MetricKey[] = COUNTER_METRIC_KEYS;
 
 export type CounterMetricKey = (typeof COUNTER_METRIC_KEYS)[number];
 export type MetricSource = "host" | "control" | "media";

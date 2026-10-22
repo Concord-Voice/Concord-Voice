@@ -285,11 +285,6 @@ func findPortalConfiguration(ctx context.Context, c *stripe.Client) (*stripe.Bil
 	return found, nil
 }
 
-func isResourceMissing(err error) bool {
-	var se *stripe.Error
-	return errors.As(err, &se) && se.Code == stripe.ErrorCodeResourceMissing
-}
-
 // validate checks every existing catalog object before any write.
 func (s *catalogState) validate() error {
 	for _, want := range catalogProducts {

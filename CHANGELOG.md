@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+When voice is briefly paused for server maintenance, joining a call now says
+so and suggests trying again in a few minutes, instead of a generic error.
+
 Bug-report screenshots now have storage allowances and expire after 72 hours if
 the report is abandoned. Screenshots remain available when report delivery is
 uncertain or storage transfers need to retry. Shared-disk capacity guards apply
@@ -91,6 +94,7 @@ you verify your email.
 
 ### Fixed
 
+- **Redeeming two codes at the same time no longer fails** (internal development reference omitted) — two redemptions started by the same account at the same moment could deadlock in the database, and one of them returned an error. The server now takes the account's lock first, so the second redemption waits and then completes.
 - **Direct message history no longer skips messages that share a timestamp** (internal development reference omitted) — scrolling back through a conversation could drop a message stamped at the same instant as the last one on the page before it, as happens with imported or near-simultaneous messages. History now orders those messages the same way on every page, so each appears exactly once.
 - **Go certificate validation updated** — control-plane and operations-agent builds use Go 1.27.3, which includes the `crypto/x509` fix for [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809).
 

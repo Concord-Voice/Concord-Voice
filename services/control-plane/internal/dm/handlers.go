@@ -19,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/joinpause"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	messagehandlers "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -2588,6 +2589,16 @@ type voiceJoinState struct {
 	callerRole     string
 }
 
+// parseUnpausedDMVoiceIDs is parseDMVoiceIDs plus the conversion join pause,
+// for the handlers that admit a new DM voice join or ring.
+func (h *Handler) parseUnpausedDMVoiceIDs(c *gin.Context, convID, userID string) (uuid.UUID, uuid.UUID, bool) {
+	convUUID, userUUID, ok := parseDMVoiceIDs(c, convID, userID)
+	if !ok || joinpause.Refuse(c, h.redis, h.log, userID) {
+		return uuid.Nil, uuid.Nil, false
+	}
+	return convUUID, userUUID, true
+}
+
 func parseDMVoiceIDs(c *gin.Context, convID, userID string) (uuid.UUID, uuid.UUID, bool) {
 	convUUID, err := uuid.Parse(convID)
 	if err != nil {
@@ -2991,7 +3002,7 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	userID := c.GetString("user_id")
 	convID := c.Param("id")
 
-	convUUID, userUUID, validIDs := parseDMVoiceIDs(c, convID, userID)
+	convUUID, userUUID, validIDs := h.parseUnpausedDMVoiceIDs(c, convID, userID)
 	if !validIDs {
 		return
 	}
@@ -4589,7 +4600,7 @@ func (h *Handler) RingDMCall(c *gin.Context) {
 	callerIDStr := c.GetString("user_id")
 	convIDStr := c.Param("id")
 
-	convUUID, callerUUID, validIDs := parseDMVoiceIDs(c, convIDStr, callerIDStr)
+	convUUID, callerUUID, validIDs := h.parseUnpausedDMVoiceIDs(c, convIDStr, callerIDStr)
 	if !validIDs {
 		return
 	}
@@ -5114,7 +5125,7 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	userID := c.GetString("user_id")
 	convID := c.Param("id")
 
-	convUUID, userUUID, validIDs := parseDMVoiceIDs(c, convID, userID)
+	convUUID, userUUID, validIDs := h.parseUnpausedDMVoiceIDs(c, convID, userID)
 	if !validIDs {
 		return
 	}

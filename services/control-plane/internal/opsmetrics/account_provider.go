@@ -32,6 +32,13 @@ FROM users
 WHERE ops_last_active_at >= $4
 `
 
+// billingErasureOverdueSQL counts Stripe-customer erasure obligations that have
+// waited more than 24 hours ($1 is the collection instant), so any non-zero
+// value is the alert (#2033 spec section 10).
+const billingErasureOverdueSQL = `
+SELECT COUNT(*) FROM billing_erasure_outbox WHERE created_at < $1::timestamptz - INTERVAL '24 hours'
+`
+
 const recordActivityQualificationsSQL = `
 WITH qualified AS (
     SELECT *
@@ -64,6 +71,7 @@ type accountActiveCounts struct {
 type accountRepository interface {
 	CurrentCounts(context.Context, time.Time) (accountCurrentCounts, error)
 	ActiveCounts(context.Context, time.Time) (accountActiveCounts, error)
+	BillingErasureOverdue(context.Context, time.Time) (int64, error)
 	RecordQualifications(context.Context, []ActivityQualification) error
 }
 
@@ -89,7 +97,7 @@ func newAccountProvider(repository accountRepository, tracker *ActivityTracker) 
 // AccountMetrics returns only fixed aggregate keys. Query failures omit their
 // affected samples while preserving independently collectable values.
 func (provider *AccountProvider) AccountMetrics(ctx context.Context, at time.Time) (map[MetricKey]float64, error) {
-	metrics := make(map[MetricKey]float64, 7)
+	metrics := make(map[MetricKey]float64, 8)
 	if provider == nil || provider.repository == nil {
 		return metrics, errors.New("account metrics provider is unavailable")
 	}
@@ -121,6 +129,13 @@ func (provider *AccountProvider) AccountMetrics(ctx context.Context, at time.Tim
 			metrics[MetricActiveUsers15D] = float64(active.days15)
 			metrics[MetricActiveUsers30D] = float64(active.days30)
 		}
+	}
+
+	overdue, err := provider.repository.BillingErasureOverdue(ctx, at)
+	if err != nil {
+		collectedErrors = append(collectedErrors, fmt.Errorf("collect overdue billing erasures: %w", err))
+	} else {
+		metrics[MetricBillingErasureOutboxPending] = float64(overdue)
 	}
 
 	return metrics, errors.Join(collectedErrors...)
@@ -167,6 +182,12 @@ func (repository *postgresAccountRepository) ActiveCounts(ctx context.Context, a
 		at.Add(-30*24*time.Hour),
 	).Scan(&counts.hours24, &counts.days7, &counts.days15, &counts.days30)
 	return counts, err
+}
+
+func (repository *postgresAccountRepository) BillingErasureOverdue(ctx context.Context, at time.Time) (int64, error) {
+	var overdue int64
+	err := repository.db.QueryRowContext(ctx, billingErasureOverdueSQL, at.UTC()).Scan(&overdue)
+	return overdue, err
 }
 
 func (repository *postgresAccountRepository) RecordQualifications(ctx context.Context, qualifications []ActivityQualification) error {

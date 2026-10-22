@@ -242,7 +242,7 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	require.Equal(t, float64(1), values[MetricHTTPRequestsTotal])
 	require.Equal(t, float64(1), values[MetricChannelMessagesTotal])
 	require.Zero(t, values[MetricMediaUploadsTotal])
-	require.Len(t, values, 19)
+	require.Len(t, values, 20)
 	require.Eventually(t, func() bool {
 		return !collector.busy.Load()
 	}, time.Second, time.Millisecond)
@@ -260,7 +260,7 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	secondValues := samplesByKey(batches[1])
 	require.NotContains(t, secondValues, MetricHostCPUPercent)
 	require.NotContains(t, secondValues, MetricMediaRoomsCurrent)
-	require.Len(t, secondValues, 17)
+	require.Len(t, secondValues, 18)
 
 	cancel()
 	require.Eventually(t, func() bool {
@@ -283,6 +283,8 @@ func TestCollectorAddsDistinctUsersAndAccountMetrics(t *testing.T) {
 		MetricActiveUsers7D:               7,
 		MetricActiveUsers15D:              8,
 		MetricActiveUsers30D:              9,
+		// #2033 PR-2: admitted by isAccountProviderMetric, or the collector drops it.
+		MetricBillingErasureOutboxPending: 2,
 	}
 	collector := NewCollector(
 		newCollectorTestStore(),
@@ -300,7 +302,7 @@ func TestCollectorAddsDistinctUsersAndAccountMetrics(t *testing.T) {
 	for key, value := range accountMetrics {
 		require.Equal(t, value, values[key])
 	}
-	require.Len(t, values, 25)
+	require.Len(t, values, 27)
 }
 
 func TestCollectorSnapshotDoesNotReportMoreOnlineUsersThanConnectionsDuringClientChange(t *testing.T) {

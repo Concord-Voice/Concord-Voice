@@ -134,6 +134,8 @@ const (
 	MetricActiveUsers15D                                    MetricKey = "active_users_15d"
 	MetricActiveUsers30D                                    MetricKey = "active_users_30d"
 	MetricMediaUploadsTotal                                 MetricKey = "media_uploads_total"
+	MetricBillingErasureOutboxPending                       MetricKey = "billing_erasure_outbox_pending"
+	MetricBillingDriftCorrectionsTotal                      MetricKey = "billing_drift_corrections_total"
 
 	MetricMediaRoomsCurrent                   MetricKey = "media_rooms_current"
 	MetricMediaParticipantsAudioCurrent       MetricKey = "media_participants_audio_current"
@@ -246,6 +248,8 @@ var catalog = func() map[MetricKey]MetricDefinition {
 		metric(MetricActiveUsers15D, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricActiveUsers30D, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricMediaUploadsTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricBillingErasureOutboxPending, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricBillingDriftCorrectionsTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricMediaRoomsCurrent, SourceMedia, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricMediaParticipantsAudioCurrent, SourceMedia, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricMediaParticipantsWebcamCurrent, SourceMedia, UnitCount, KindGauge, RollupAverage, 0, maxCount),

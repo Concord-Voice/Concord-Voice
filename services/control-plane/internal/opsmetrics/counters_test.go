@@ -27,7 +27,7 @@ func TestCountersSnapshotIsClosedAndConcurrentSafe(t *testing.T) {
 	require.Equal(t, float64(800), snapshot[opsmetrics.MetricChannelMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricDMMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricMediaUploadsTotal])
-	require.Len(t, snapshot, 16)
+	require.Len(t, snapshot, 17)
 	for key := range snapshot {
 		definition, ok := opsmetrics.Definition(key)
 		require.True(t, ok)
@@ -90,6 +90,27 @@ func TestCountersTrackTerminalOutboxOutcomesAndIgnoreNil(t *testing.T) {
 	for _, key := range keys {
 		require.Equal(t, float64(1), snapshot[key], "terminal outbox counter %q", key)
 	}
+}
+
+func TestCountersSnapshotIncludesBillingDrift(t *testing.T) {
+	var nilCounters *opsmetrics.Counters
+	nilCounters.Increment(opsmetrics.MetricBillingDriftCorrectionsTotal) // nil-safe, as every Increment is
+
+	counters := opsmetrics.NewCounters()
+	require.Contains(t, counters.Snapshot(), opsmetrics.MetricBillingDriftCorrectionsTotal)
+	require.Zero(t, counters.Snapshot()[opsmetrics.MetricBillingDriftCorrectionsTotal])
+
+	counters.Increment(opsmetrics.MetricBillingDriftCorrectionsTotal)
+	counters.Increment(opsmetrics.MetricBillingDriftCorrectionsTotal)
+	counters.Increment(opsmetrics.MetricBillingDriftCorrectionsTotal)
+
+	snapshot := counters.Snapshot()
+	require.Equal(t, float64(3), snapshot[opsmetrics.MetricBillingDriftCorrectionsTotal])
+	require.Zero(t, snapshot[opsmetrics.MetricMediaUploadsTotal], "the new counter does not bleed into another field")
+	// The gauge is read from the database, never counted in process.
+	require.NotContains(t, snapshot, opsmetrics.MetricBillingErasureOutboxPending)
+	counters.Increment(opsmetrics.MetricBillingErasureOutboxPending)
+	require.NotContains(t, counters.Snapshot(), opsmetrics.MetricBillingErasureOutboxPending)
 }
 
 func TestCountersIgnoreKeysNotOwnedByControlPlane(t *testing.T) {

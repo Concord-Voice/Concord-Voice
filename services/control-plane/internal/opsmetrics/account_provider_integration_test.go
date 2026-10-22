@@ -58,6 +58,42 @@ func TestPostgresAccountRepositoryIntegrationCountsClosedAccountState(t *testing
 	assert.Equal(t, accountActiveCounts{hours24: 2, days7: 3, days15: 4, days30: 5}, active)
 }
 
+// #2033 PR-2 (refinement R-c): the gauge counts erasure obligations that have been
+// waiting more than 24 hours, so any non-zero value is the alert spec section 10 describes.
+func TestPostgresAccountRepositoryIntegrationCountsOverdueBillingErasures(t *testing.T) {
+	db := setupAccountProviderIntegrationDB(t)
+	repository := &postgresAccountRepository{db: db}
+	ctx := context.Background()
+
+	empty, err := repository.BillingErasureOverdue(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Zero(t, empty, "an empty outbox is zero, not an error")
+
+	for name, age := range map[string]string{
+		"cus_new":      "0 seconds",
+		"cus_23h":      "23 hours",
+		"cus_25h":      "25 hours",
+		"cus_48h":      "48 hours",
+		"cus_30d_late": "30 days",
+	} {
+		_, err := db.Exec(
+			`INSERT INTO billing_erasure_outbox (stripe_customer_id, created_at) VALUES ($1, NOW() - $2::interval)`,
+			name, age)
+		require.NoError(t, err)
+	}
+
+	overdue, err := repository.BillingErasureOverdue(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, overdue, "only rows created more than 24 hours ago are counted")
+
+	provider := newAccountProvider(repository, nil)
+	_, err = db.Exec(`INSERT INTO users (id) VALUES ($1)`, uuid.New())
+	require.NoError(t, err)
+	metrics, err := provider.AccountMetrics(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, float64(3), metrics[MetricBillingErasureOutboxPending])
+}
+
 func TestPostgresAccountRepositoryIntegrationExpiresActivityOutsideThirtyDays(t *testing.T) {
 	db := setupAccountProviderIntegrationDB(t)
 	repository := &postgresAccountRepository{db: db}
@@ -128,7 +164,12 @@ func setupAccountProviderIntegrationDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db := setupOpsMetricsIntegrationDB(t)
 	_, err := db.Exec(`
-		DROP TABLE IF EXISTS refresh_tokens, pending_registrations, users CASCADE;
+		DROP TABLE IF EXISTS billing_erasure_outbox, refresh_tokens, pending_registrations, users CASCADE;
+		CREATE TABLE billing_erasure_outbox (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			stripe_customer_id TEXT NOT NULL UNIQUE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
 		CREATE TABLE users (
 			id UUID PRIMARY KEY,
 			ops_last_active_at TIMESTAMPTZ
@@ -145,7 +186,7 @@ func setupAccountProviderIntegrationDB(t *testing.T) *sql.DB {
 	`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, cleanupErr := db.Exec(`DROP TABLE IF EXISTS refresh_tokens, pending_registrations, users CASCADE`)
+		_, cleanupErr := db.Exec(`DROP TABLE IF EXISTS billing_erasure_outbox, refresh_tokens, pending_registrations, users CASCADE`)
 		assert.NoError(t, cleanupErr)
 	})
 	return db

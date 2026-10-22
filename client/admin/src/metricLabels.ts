@@ -65,6 +65,8 @@ export const METRIC_LABELS: Record<MetricKey, string> = {
     "Server Voice terminal lock retentions",
   server_voice_terminal_outbox_queue_rescheduled_total:
     "Server Voice terminal queue reschedules",
+  billing_erasure_outbox_pending: "Billing erasures overdue (24 h+)",
+  billing_drift_corrections_total: "Billing drift corrections",
   media_camera_layering_gate_flips_total: "Camera layering gate flips",
   media_camera_pressure_demands_total: "Camera pressure demands",
   registered_users_current: "Registered users",

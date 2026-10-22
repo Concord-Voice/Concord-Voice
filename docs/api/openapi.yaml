@@ -13395,6 +13395,154 @@ paths:
                 $ref: '#/components/schemas/Error'
               example:
                 error: subscription status unavailable
+  /billing/stripe/webhook:
+    post:
+      tags:
+      - Platform
+      summary: Receive a Stripe webhook event
+      description: 'Stripe-to-Concord webhook (#2033). Registered only when Stripe
+        keys are configured on a non-self-hosted instance; otherwise the route does
+        not exist (404). Not called by clients.
+
+
+        Unauthenticated by design: the `Stripe-Signature` header (an HMAC over the
+        exact raw request body, with a 300-second timestamp tolerance) is the only
+        authentication. The body is read under a 256 KiB cap before anything else.
+        A verified event is only a trigger — the named subscription is re-fetched
+        from Stripe and reconciled into Concord''s entitlement rows.
+
+
+        Any non-2xx response is redelivered by Stripe: a failure a retry can fix
+        (Stripe or the database unavailable, saturation) is 5xx; an event no retry
+        can make actionable is recorded and answered 200.
+
+        '
+      operationId: handleStripeWebhook
+      security: []
+      parameters:
+      - name: Stripe-Signature
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Stripe's signature header (`t=<timestamp>,v1=<hmac>`)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: A Stripe Event object; verified against the signature before it is parsed
+      responses:
+        '200':
+          description: Event accepted (reconciled, ignored by type, or already processed)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+                    example: true
+        '400':
+          description: Unreadable body, missing or invalid signature, stale timestamp, or event mode that does not match the configured key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Body exceeds 256 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Retryable failure (a database or Stripe error, or Reconcile failed); no dedupe row is written, so Stripe retries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Saturated (more than 4 reconciles already running, `busy`); Stripe retries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/portal-session:
+    post:
+      tags:
+      - Platform
+      summary: Create a Stripe Customer Portal session
+      description: 'Returns a one-time Stripe Customer Portal URL for the authenticated
+        user''s billing account (#2033). Registered only when Stripe keys are configured
+        on a non-self-hosted instance; otherwise the route does not exist (404). Requires
+        a verified email. Not gated by purchase mode, so an existing subscriber can
+        always manage billing.
+
+
+        The optional `flow` deep-links into a single Portal task: `payment_method_update`
+        or `subscription_cancel` (which needs the caller''s live subscription). Omit
+        it for the Portal home. The user is resolved from the JWT, never from the request.
+
+
+        Rate limit: 10 requests per 10 minutes.
+
+        '
+      operationId: createBillingPortalSession
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                flow:
+                  type: string
+                  enum: [payment_method_update, subscription_cancel]
+                  description: Optional Portal deep-link flow
+      responses:
+        '201':
+          description: Portal session created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                    description: One-time Stripe-hosted Portal URL
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: '`no_billing_account`: the user has no mapped Stripe Customer, a `subscription_cancel` flow has no live Stripe subscription to cancel, or Stripe confirms the mapped Customer was deleted (the stale mapping is then removed)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Stripe or the billing configuration is unavailable, or Stripe reports the mapped Customer missing but cannot confirm it was deleted (`billing_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/audit-log:
     get:
       tags:
@@ -19861,6 +20009,7 @@ components:
       required:
       - tier
       - status
+      - billing
       properties:
         tier:
           type: string
@@ -19889,6 +20038,85 @@ components:
           format: date-time
           description: When the current subscription period ends (RFC 3339, UTC).
             Absent when the grant has no fixed period and for the free-default shape.
+        billing:
+          type: string
+          description: Whether billing exists on this instance. `self_hosted` for
+            a self-hosted instance, `not_configured` for a hosted instance with no
+            Stripe keys, `available` when keys are present (whether a plan can be
+            bought right now is the plans endpoint's answer).
+          enum:
+          - self_hosted
+          - not_configured
+          - available
+          example: not_configured
+        stripe:
+          $ref: '#/components/schemas/SubscriptionStripe'
+        code:
+          $ref: '#/components/schemas/SubscriptionCode'
+    SubscriptionStripe:
+      type: object
+      description: The user's first live Stripe-billed row. Present only when the
+        user holds one. The top-level tier, status, source and current_period_end
+        follow the row enforcement honors (premium first, then Stripe before
+        code), which may be a different row.
+      required:
+      - plan
+      - interval
+      - status
+      - current_period_end
+      - canceling
+      - founders_rate
+      properties:
+        plan:
+          type: string
+          nullable: true
+          description: The plan the row maps to. Null when the Stripe price is
+            not one Concord recognizes.
+          example: wing
+        interval:
+          type: string
+          nullable: true
+          description: The billing interval. Null when the Stripe price is not
+            one Concord recognizes.
+          example: month
+        status:
+          type: string
+          description: The live DB status of the row.
+          enum:
+          - active
+          - trialing
+          - past_due
+          example: active
+        current_period_end:
+          type: string
+          format: date-time
+          description: When the current billing period ends (RFC 3339, UTC).
+        canceling:
+          type: boolean
+          description: True when the subscription is set to end, either at the
+            period end or at a specific cancellation time.
+        ends_at:
+          type: string
+          format: date-time
+          description: When the subscription ends (RFC 3339, UTC). The
+            cancellation time when one is set, else the period end when canceling
+            at period end. Absent when the subscription is not canceling.
+        founders_rate:
+          type: boolean
+          description: True when the founders-rate coupon applies to the subscription.
+    SubscriptionCode:
+      type: object
+      description: The user's first live code-redeemed row. Present only when the
+        user holds one.
+      required:
+      - current_period_end
+      properties:
+        current_period_end:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the code grant lapses (RFC 3339, UTC). Null when it
+            never lapses.
     RegisterRequest:
       type: object
       required:

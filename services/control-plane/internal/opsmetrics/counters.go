@@ -25,6 +25,7 @@ type Counters struct {
 	serverVoiceTerminalOutboxChannelSuppressed   atomic.Uint64
 	serverVoiceTerminalOutboxLockRetained        atomic.Uint64
 	serverVoiceTerminalOutboxQueueRescheduled    atomic.Uint64
+	billingDriftCorrections                      atomic.Uint64
 
 	routesMu sync.RWMutex
 	routes   map[string]uint64
@@ -74,6 +75,8 @@ func (c *Counters) Increment(key MetricKey) {
 		c.serverVoiceTerminalOutboxLockRetained.Add(1)
 	case MetricServerVoiceTerminalOutboxQueueRescheduledTotal:
 		c.serverVoiceTerminalOutboxQueueRescheduled.Add(1)
+	case MetricBillingDriftCorrectionsTotal:
+		c.billingDriftCorrections.Add(1)
 	}
 }
 
@@ -99,6 +102,7 @@ func (c *Counters) Snapshot() map[MetricKey]float64 {
 		MetricServerVoiceTerminalOutboxChannelSuppressedTotal:   float64(c.serverVoiceTerminalOutboxChannelSuppressed.Load()),
 		MetricServerVoiceTerminalOutboxLockRetainedTotal:        float64(c.serverVoiceTerminalOutboxLockRetained.Load()),
 		MetricServerVoiceTerminalOutboxQueueRescheduledTotal:    float64(c.serverVoiceTerminalOutboxQueueRescheduled.Load()),
+		MetricBillingDriftCorrectionsTotal:                      float64(c.billingDriftCorrections.Load()),
 	}
 }
 
