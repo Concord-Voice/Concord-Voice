@@ -9237,6 +9237,7 @@ class VoiceService {
 
   private setupSocketListeners(): void {
     if (!this.socket) return;
+    const owningSocket = this.socket;
 
     this.socket.on('new-producer', (event) => this.handleNewProducer(event));
 
@@ -9496,9 +9497,29 @@ class VoiceService {
       }
     });
 
-    // Socket.IO exhausted all reconnection attempts
+    // The pinned colour may have been reaped. Re-authorize through the control
+    // plane before redialing so a drained blue URL cannot strand this call.
     this.socket.io.on('reconnect_failed', () => {
-      this.emergencyCleanup();
+      if (this.socket !== owningSocket) return;
+      const store = useVoiceStore.getState();
+      const channelId = store.activeChannelId;
+      if (store.connectionState !== 'reconnecting' || !channelId) {
+        this.emergencyCleanup();
+        return;
+      }
+      const failedSocket = this.socket;
+      void this.retryResumeAfterOwnershipRefusal(
+        channelId,
+        store.isDMCall ? 'dm' : 'channel'
+      ).catch((err) => {
+        if (
+          this.socket === failedSocket &&
+          useVoiceStore.getState().activeChannelId === channelId
+        ) {
+          console.warn('Voice placement recovery failed:', errorMessage(err));
+          this.emergencyCleanup();
+        }
+      });
     });
 
     this.socket.on('error', ({ message }) => {

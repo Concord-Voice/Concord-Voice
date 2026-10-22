@@ -1851,7 +1851,7 @@ media_bluegreen_preflight() {
 }
 
 media_bluegreen_cutover_locked() {
-  local active standby old_colour active_port standby_port tombstone old_generation status deadline running
+  local active standby old_colour active_port standby_port tombstone old_generation status deadline running drain_started result
   media_bluegreen_preflight >/dev/null || return 1
   if ! active="$(media_bluegreen_redis GET media:active_colour)"; then
     echo 'media-bluegreen: Redis promotion read failed; refusing cutover' >&2
@@ -1921,33 +1921,43 @@ media_bluegreen_cutover_locked() {
     echo "media-bluegreen: standby ${standby} failed its identity, worker, or readiness gate" >&2
     return 1
   fi
+  drain_started="$(date +%s)" || return 1
+  [[ "$drain_started" =~ ^[1-9][0-9]{9,14}$ ]] || {
+    echo 'media-bluegreen: cannot record the drain deadline; refusing promotion' >&2
+    return 1
+  }
 
   if ! media_bluegreen_redis SADD media:colours:registered "$standby" >/dev/null; then
     echo 'media-bluegreen: registry write failed before promotion; active color is unchanged' >&2
     return 1
   fi
-  if ! media_bluegreen_redis SET media:active_colour "$standby" >/dev/null; then
-    # An unacknowledged SET can have committed; resolve its outcome before any
-    # drain action, and refuse if Redis cannot prove the result.
-    active="$(media_bluegreen_redis GET media:active_colour)" || {
-      echo 'media-bluegreen: promotion outcome is unknown; refusing to arm a drain' >&2
+  if [[ -n "$active_port" ]]; then
+    # Promotion and its deadline are one Redis transaction, including on crash.
+    if ! result="$(media_bluegreen_redis EVAL '
+      if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+      redis.call("SET", KEYS[1], ARGV[2])
+      redis.call("SET", KEYS[2], ARGV[3])
       return 1
-    }
+    ' 2 media:active_colour "media:colour_draining:${old_colour}" "$old_colour" "$standby" "${drain_started}:${old_generation}")"; then
+      active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+      tombstone="$(media_bluegreen_redis GET "media:colour_draining:${old_colour}")" || return 1
+      [[ "$active" == "$standby" && "$tombstone" == "${drain_started}:${old_generation}" ]] || {
+        echo 'media-bluegreen: promotion and drain deadline were not confirmed' >&2
+        return 1
+      }
+    elif [[ "$result" != 1 ]]; then
+      echo 'media-bluegreen: active color changed before atomic promotion; refusing cutover' >&2
+      return 1
+    fi
+  elif ! media_bluegreen_redis SET media:active_colour "$standby" >/dev/null; then
+    # The first colour has no prior colour to drain; resolve an unacknowledged SET.
+    active="$(media_bluegreen_redis GET media:active_colour)" || return 1
     [[ "$active" == "$standby" ]] || {
-      echo 'media-bluegreen: promotion was not confirmed; old color remains undrained' >&2
+      echo 'media-bluegreen: first-colour promotion was not confirmed' >&2
       return 1
     }
   fi
-  # A successful SET reply confirms promotion. If its acknowledgement was
-  # lost, the branch above reads back and confirms the committed value.
   if [[ -n "$active_port" ]]; then
-    if ! media_bluegreen_redis SET "media:colour_draining:${old_colour}" "$old_generation" >/dev/null; then
-      tombstone="$(media_bluegreen_redis GET "media:colour_draining:${old_colour}")" || return 1
-      [[ "$tombstone" == "$old_generation" ]] || {
-        echo 'media-bluegreen: drain tombstone was not confirmed; old color remains running' >&2
-        return 1
-      }
-    fi
     deadline=$(( $(date +%s) + 90 ))
     while :; do
       status="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
@@ -2002,7 +2012,7 @@ media_bluegreen_sweep_markers() {
 }
 
 media_bluegreen_reap_one() {
-  local colour="$1" force="${2:-0}" active port body status rooms creates owner_key channel_id live_key result generation
+  local colour="$1" active port body status rooms creates result generation tombstone started_at now
   port="$(media_bluegreen_port "$colour")" || return 1
   active="$(media_bluegreen_redis GET media:active_colour)" || return 1
   [[ -n "$active" && "$active" =~ ^(blue|green)$ ]] || {
@@ -2044,6 +2054,11 @@ raise SystemExit(0 if stopped else 1)
       return 0
     fi
   fi
+  tombstone="$(media_bluegreen_redis GET "media:colour_draining:${colour}")" || return 1
+  started_at=''
+  if [[ "$tombstone" =~ ^([1-9][0-9]{9,14}):[^[:space:]]+$ ]]; then
+    started_at="${BASH_REMATCH[1]}"
+  fi
   body="$(mktemp)" || return 1
   status=0
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T "media-plane-${colour}" \
@@ -2080,24 +2095,39 @@ print(value["rooms"], value["creates_in_flight"], value["generation"])
   echo "media-bluegreen: ${colour} reported generation ${generation} (diagnostic only; restart generations are not compared)"
   if (( rooms != 0 || creates != 0 )); then
     echo "media-bluegreen: ${colour} reports ${rooms} live rooms and ${creates} in-flight creates"
-    if (( creates != 0 )); then
-      echo 'media-bluegreen: in-flight creates must reach zero; --force cannot bypass this check' >&2
-      return 2
-    fi
-    if (( force != 1 )); then
-      echo 'media-bluegreen: live rooms remain; reap skipped (manual --force is available after the 2-hour drain window)' >&2
-      return 2
-    fi
-    echo 'media-bluegreen: verify from deployment/operations records that this color has drained for at least 2 hours.' >&2
-    local confirmation
-    if ! read -r -p "Type REAP ${colour} WITH ${rooms} LIVE ROOMS to continue: " confirmation; then
-      echo 'media-bluegreen: force confirmation was not received; color remains running' >&2
-      return 2
-    fi
-    [[ "$confirmation" == "REAP ${colour} WITH ${rooms} LIVE ROOMS" ]] || {
-      echo 'media-bluegreen: force confirmation did not match; color remains running' >&2
-      return 2
+    [[ -n "$started_at" ]] || {
+      echo "media-bluegreen: ${colour} has no valid drain deadline; refusing automatic cutoff" >&2
+      return 1
     }
+    now="$(date +%s)" || return 1
+    [[ "$now" =~ ^[1-9][0-9]{9,14}$ ]] && (( now >= started_at )) || {
+      echo "media-bluegreen: ${colour} drain clock is invalid; refusing automatic cutoff" >&2
+      return 1
+    }
+    if (( now - started_at < 7200 )); then
+      echo 'media-bluegreen: drain grace period remains; reap skipped' >&2
+      return 2
+    fi
+    # A live room can renew its marker until stopped, so sweep only afterward.
+    if ! media_bluegreen_probe_ready "$active" true "$(media_bluegreen_port "$active")"; then
+      echo "media-bluegreen: active ${active} is not ready; refusing deadline cutoff" >&2
+      return 1
+    fi
+    result="$(media_bluegreen_redis SISMEMBER media:colours:registered "$active")" || return 1
+    [[ "$result" == 1 ]] || return 1
+    result="$(media_bluegreen_redis SREM media:colours:registered "$colour")" || return 1
+    [[ "$result" =~ ^[01]$ ]] || return 1
+    echo "media-bluegreen: ${colour} reached the 2-hour deadline; disconnecting remaining rooms"
+    if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 "media-plane-${colour}"); then
+      echo "media-bluegreen: deadline stop failed; ${colour} remains fenced for retry" >&2
+      return 1
+    fi
+    media_bluegreen_sweep_markers "$colour" "$active" || return 1
+    (cd "$DEPLOY_DIR" && $COMPOSE_CMD rm -f "media-plane-${colour}") || return 1
+    result="$(media_bluegreen_redis DEL "media:colour_draining:${colour}")" || return 1
+    [[ "$result" =~ ^[01]$ ]] || return 1
+    echo "media-bluegreen: reaped ${colour} after the deadline"
+    return 0
   fi
   # Validate the complete scan before the registry transition, then keep R4
   # adjacent to the owner-matched R5 sweep so placement cannot race it.
@@ -2133,23 +2163,9 @@ print(value["rooms"], value["creates_in_flight"])
 ' "$body")
   if (( rooms != 0 || creates != 0 )); then
     echo "media-bluegreen: ${colour} changed after marker sweep: ${rooms} live rooms, ${creates} in-flight creates" >&2
-    if (( creates != 0 || force != 1 )); then
-      rm -f "$body"
-      echo "media-bluegreen: ${colour} remains running" >&2
-      return 2
-    fi
-    echo 'media-bluegreen: re-confirm the 2-hour drain window from deployment/operations records.' >&2
-    local confirmation
-    if ! read -r -p "Type REAP ${colour} WITH ${rooms} LIVE ROOMS to continue: " confirmation; then
-      rm -f "$body"
-      echo "media-bluegreen: ${colour} remains running" >&2
-      return 2
-    fi
-    if [[ "$confirmation" != "REAP ${colour} WITH ${rooms} LIVE ROOMS" ]]; then
-      rm -f "$body"
-      echo "media-bluegreen: ${colour} remains running" >&2
-      return 2
-    fi
+    rm -f "$body"
+    echo "media-bluegreen: ${colour} remains running" >&2
+    return 2
   fi
   rm -f "$body"
   if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 "media-plane-${colour}"); then
@@ -2163,7 +2179,7 @@ print(value["rooms"], value["creates_in_flight"])
 }
 
 media_bluegreen_reap() {
-  local force="${1:-0}" keys key colour active rc=0 project colours
+  local keys key colour active rc=0 project colours
   if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" != media-bluegreen ]]; then
     project="$(media_bluegreen_render | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')" || return 1
     colours="$(docker ps --filter "label=com.docker.compose.project=${project}" \
@@ -2206,7 +2222,7 @@ media_bluegreen_reap() {
   done <<<"$keys"
   while IFS= read -r key; do
     colour="${key#media:colour_draining:}"
-    media_bluegreen_reap_one "$colour" "$force" || {
+    media_bluegreen_reap_one "$colour" || {
       _reap_rc=$?
       if [[ $_reap_rc -eq 2 ]]; then
         continue
@@ -2220,7 +2236,7 @@ media_bluegreen_reap() {
     mkdir -p "${CONFIG_ROOT}/logs" 2>/dev/null || true
     printf 'media reaper failed at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
       >"${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
-    echo 'media-bluegreen: reap aborted; color remains running for operator inspection' >&2
+    echo 'media-bluegreen: reap aborted; drain tombstone remains for retry and operator inspection' >&2
   fi
   return "$rc"
 }
@@ -3227,14 +3243,11 @@ else:
 
   media-reap)
     shift
-    _media_reap_force=0
-    if [[ $# -eq 1 && "$1" == --force ]]; then
-      _media_reap_force=1
-    elif [[ $# -ne 0 ]]; then
-      echo 'Usage: concord-ctl.sh media-reap [--force]' >&2
+    if [[ $# -ne 0 ]]; then
+      echo 'Usage: concord-ctl.sh media-reap' >&2
       exit 2
     fi
-    media_bluegreen_reap "$_media_reap_force"
+    media_bluegreen_reap
     ;;
 
   activity-history-routine-guard)
@@ -4423,8 +4436,8 @@ else:
     echo "                 Drain/disable, optionally downgrade, and start one pinned old CP image"
     echo "  voice-enforcement-rollout deploy"
     echo "                 Build CP, drain/rebuild MP, verify protocol 3, activate"
-    echo "  media-reap [--force]"
-    echo "                 Reap only a confirmed draining color; force requires operator confirmation"
+    echo "  media-reap"
+    echo "                 Reap a draining color when empty or at its automatic 2-hour cutoff"
     echo "  validate-config  §F: pre-rebuild guard via 'docker compose config --quiet'"
     echo "  media-shared-listeners-check  validate a lab Compose JSON render on stdin; does not admit deployment"
     echo "  selfhost-port-check  Self-host only: refuse live port bindings outside the posture allowlist (#3538)"

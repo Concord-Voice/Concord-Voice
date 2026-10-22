@@ -513,7 +513,8 @@ function makeRecvTransport(id = 'recv-1') {
 async function joinVoiceChannel(
   co?: Record<string, unknown>,
   top?: Record<string, unknown>,
-  roomJoined?: Record<string, unknown>
+  roomJoined?: Record<string, unknown>,
+  joinType: 'channel' | 'dm' = 'channel'
 ) {
   setupAuth();
   mockApiFetch.mockResolvedValueOnce({
@@ -541,7 +542,7 @@ async function joinVoiceChannel(
   const micProducer = createMockProducer('prod-mic', 'mic');
   sendTransport.produce.mockResolvedValue(micProducer);
 
-  await voiceService.joinChannel('channel-1');
+  await voiceService.joinChannel('channel-1', joinType);
   return { sendTransport, recvTransport, micProducer };
 }
 
@@ -2584,10 +2585,108 @@ describe('VoiceService Extended', () => {
   });
 
   describe('socket listener: reconnect_failed', () => {
-    it('triggers emergency cleanup', async () => {
+    it('re-authorizes and dials the newly active colour after the pinned URL fails', async () => {
       await joinVoiceChannel();
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          ...makeJoinResponse(),
+          media_server_url: 'https://media.example.test/?colour=green',
+        }),
+      });
+      triggerSocketEvent('disconnect', 'transport close');
       triggerIoEvent('reconnect_failed');
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+      });
+      const { io } = await import('socket.io-client');
+      expect(io).toHaveBeenCalledTimes(2);
+      expect(io).toHaveBeenNthCalledWith(
+        2,
+        'https://media.example.test/?colour=green',
+        expect.any(Object)
+      );
+      expect(mockSocket.emit.mock.calls.filter((call) => call[0] === 'join-room')).toHaveLength(2);
+    });
+
+    it('does not restore a call the user left before the old socket fails', async () => {
+      await joinVoiceChannel();
+      await voiceService.leaveChannel();
+      triggerIoEvent('reconnect_failed');
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      expect(useVoiceStore.getState().activeChannelId).toBeNull();
+    });
+
+    it('cleans up without re-authorizing when the call was not reconnecting', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.getState().setConnectionState('connected');
+      triggerIoEvent('reconnect_failed');
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
       expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+    });
+
+    it('cleans up when placement recovery itself fails', async () => {
+      await joinVoiceChannel();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(voiceService, 'leaveChannel').mockRejectedValueOnce(new Error('teardown failed'));
+      triggerSocketEvent('disconnect', 'transport close');
+      triggerIoEvent('reconnect_failed');
+      await vi.waitFor(() => {
+        expect(warn).toHaveBeenCalledWith('Voice placement recovery failed:', 'teardown failed');
+      });
+      expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+      warn.mockRestore();
+    });
+
+    it('re-authorizes a DM call through the DM join endpoint', async () => {
+      await joinVoiceChannel(undefined, undefined, undefined, 'dm');
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      triggerSocketEvent('disconnect', 'transport close');
+      triggerIoEvent('reconnect_failed');
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+      });
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        2,
+        '/api/v1/dm/conversations/channel-1/voice/join',
+        expect.anything()
+      );
+    });
+
+    it('ignores a reconnect_failed from a socket that is no longer current', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as unknown as { socket: unknown };
+      svc.socket = { ...mockSocket };
+      useVoiceStore.getState().setConnectionState('reconnecting');
+      const leave = vi.spyOn(voiceService, 'leaveChannel');
+      triggerIoEvent('reconnect_failed');
+      expect(leave).not.toHaveBeenCalled();
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
+      svc.socket = mockSocket;
+    });
+
+    it('does not clean up a successor call when recovery fails late', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as unknown as { socket: unknown };
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(voiceService, 'leaveChannel').mockImplementationOnce(async () => {
+        svc.socket = { ...mockSocket };
+        throw new Error('teardown failed');
+      });
+      triggerSocketEvent('disconnect', 'transport close');
+      triggerIoEvent('reconnect_failed');
+      await vi.waitFor(() => {
+        expect(voiceService.leaveChannel).toHaveBeenCalled();
+      });
+      await Promise.resolve();
+      expect(warn).not.toHaveBeenCalledWith('Voice placement recovery failed:', 'teardown failed');
+      expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
+      svc.socket = mockSocket;
+      warn.mockRestore();
     });
   });
 
