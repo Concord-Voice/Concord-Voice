@@ -171,15 +171,10 @@ expected_container_names() {
   # Same quote-stripping as above, but this one fails the OTHER way: a quoted
   # container_name: never enters `known`, so a genuine split goes unreported —
   # silent and total, where the name: case is merely loud.
-  # An array, not "${@:-a b}" — that expands the default as ONE word, so awk gets
-  # a single nonexistent filename, the caller sees an empty set and returns early.
-  local files=("$@")
-  [[ ${#files[@]} -gt 0 ]] || files=(
-    "$PROJECT_ROOT/docker-compose.yml"
-    "$PROJECT_ROOT/docker-compose.dev.yml"
-  )
+  # The caller passes the compose files as separate words. One "a b" string would
+  # hand awk a single nonexistent filename, so the caller would see an empty set.
   awk '/^[[:space:]]*container_name:[[:space:]]/ { v = $2; gsub(/["\047]/, "", v); print v }' \
-    "${files[@]}" 2>/dev/null | sort -u
+    "$@" 2>/dev/null | sort -u
 }
 
 # Advisory only: never fails a verb, and silent when there is no split.
@@ -194,7 +189,8 @@ warn_compose_project_split() {
     [[ "$VERBOSE" -eq 1 ]] && echo "  split check skipped: docker is not on PATH" >&2
     return 0
   fi
-  expected=$(expected_container_names) || return 0
+  expected=$(expected_container_names "$PROJECT_ROOT/docker-compose.yml" \
+    "$PROJECT_ROOT/docker-compose.dev.yml") || return 0
   [[ -n "$expected" ]] || return 0
 
   if ! rows=$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Status}}' 2>/dev/null); then
@@ -1532,10 +1528,16 @@ _up_clients() {
   # unreliable). This is a laptop-only test harness, so synthetic media is the
   # sane default; opt out to use the REAL camera/mic/screen with:
   #     CONCORD_DEV_FAKE_MEDIA=0 ./scripts/concord-dev.sh up ...
+  # Audio output is muted in fake-media mode (opt out: CONCORD_DEV_MUTE_AUDIO=0): the fake mic beeps, and two clients play each other's beeps aloud.
   local media_flags=()
   if [[ "${CONCORD_DEV_FAKE_MEDIA:-1}" == "1" ]]; then
     media_flags=(--use-fake-device-for-media-stream --use-fake-ui-for-media-stream)
-    [[ "$QUIET" -eq 0 ]] && echo -e "  ${BLUE}🎥 synthetic camera/mic ON (default — set CONCORD_DEV_FAKE_MEDIA=0 for real devices)${NC}"
+    local mute_note=""
+    if [[ "${CONCORD_DEV_MUTE_AUDIO:-1}" != "0" ]]; then
+      media_flags+=(--mute-audio)
+      mute_note="; audio output muted (set CONCORD_DEV_MUTE_AUDIO=0 to hear it)"
+    fi
+    [[ "$QUIET" -eq 0 ]] && echo -e "  ${BLUE}🎥 synthetic camera/mic ON (default — set CONCORD_DEV_FAKE_MEDIA=0 for real devices)${mute_note}${NC}"
   fi
 
   for i in $(seq 1 "$num_clients"); do

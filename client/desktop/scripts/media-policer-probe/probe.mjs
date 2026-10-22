@@ -65,6 +65,7 @@ function launch(opts) {
       '--allow-loopback-in-peer-connection', // dev media plane announces 127.0.0.1
       '--use-fake-device-for-media-stream',
       '--use-fake-ui-for-media-stream',
+      '--mute-audio', // fake mic beeps; nobody needs to hear an automated probe
     ];
     if (opts['ipv4-vite']) args.push('--host-resolver-rules=MAP localhost 127.0.0.1');
     const child = spawn(electronBin, args, {
