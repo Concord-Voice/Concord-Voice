@@ -3,6 +3,7 @@ import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { useInvitePreview } from '@/renderer/hooks/messaging/useInvitePreview';
 import { useIsServerMember } from '@/renderer/hooks/messaging/useIsServerMember';
 import { resolveMediaUrl } from '@/renderer/utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '@/renderer/components/common/AuthenticatedMediaImage';
 import './InviteEmbed.css';
 
 /**
@@ -81,7 +82,7 @@ export function InviteEmbed({ code }: Readonly<{ code: string }>) {
   return (
     <div className="invite-embed">
       {icon ? (
-        <img className="invite-embed__icon" src={icon} alt="" />
+        <AuthenticatedMediaImage className="invite-embed__icon" source={server_icon} alt="" />
       ) : (
         <div className="invite-embed__icon invite-embed__icon--placeholder" />
       )}

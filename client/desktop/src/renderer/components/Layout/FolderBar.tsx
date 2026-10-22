@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { createPortal } from 'react-dom';
 import ServerHoverTooltip from './ServerHoverTooltip';
 import { ChevronDown, FolderPlus, Pencil, Trash2 } from 'lucide-react';
@@ -524,8 +525,8 @@ const FolderBar: React.FC = () => {
                       >
                         <div className="folder-dropdown-item-icon">
                           {resolveMediaUrl(server.icon_url) ? (
-                            <img
-                              src={resolveMediaUrl(server.icon_url)}
+                            <AuthenticatedMediaImage
+                              source={server.icon_url}
                               alt={server.name}
                               draggable={false}
                             />

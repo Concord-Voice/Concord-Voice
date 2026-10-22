@@ -8,6 +8,7 @@ import React, {
   forwardRef,
 } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { AtSign, Users, Shield } from 'lucide-react';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { useDMStore } from '../../stores/chat/dmStore';
@@ -305,8 +306,8 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
                   );
                 if (resolveMediaUrl(option.avatarUrl))
                   return (
-                    <img
-                      src={resolveMediaUrl(option.avatarUrl)}
+                    <AuthenticatedMediaImage
+                      source={option.avatarUrl}
                       alt=""
                       className="mention-option-avatar"
                     />

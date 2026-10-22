@@ -109,7 +109,7 @@ describe('ParticipantTile', () => {
     );
     const img = screen.getByAltText('Test User');
     expect(img).toBeInTheDocument();
-    expect(img).toHaveAttribute('src', 'https://example.com/avatar.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('applies magnification scale when not 1', () => {

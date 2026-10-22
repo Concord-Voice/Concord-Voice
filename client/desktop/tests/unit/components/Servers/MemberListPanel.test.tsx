@@ -363,7 +363,7 @@ describe('MemberListPanel', () => {
     render(<MemberListPanel {...defaultProps} members={memberWithAvatar} />);
     const img = document.querySelector('img.member-avatar') as HTMLImageElement;
     expect(img).toBeInTheDocument();
-    expect(img.src).toBe('https://example.com/avatar.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('does not have expand/collapse toggle buttons', () => {

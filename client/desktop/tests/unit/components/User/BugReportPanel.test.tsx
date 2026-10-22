@@ -371,7 +371,10 @@ describe('BugReportPanel', () => {
 
     it('renders the "Attach screenshots" control', () => {
       render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
-      expect(screen.getByRole('button', { name: /attach screenshots/i })).toBeInTheDocument();
+      const button = screen.getByRole('button', { name: /attach screenshots/i });
+      expect(button).toBeInTheDocument();
+      expect(button).toHaveAccessibleDescription(/Screenshots are publicly readable.*Redact/i);
+      expect(screen.getByText(/Screenshots are publicly readable/)).toBeVisible();
     });
 
     it('selecting a file renders a thumbnail with a remove button, and removing it clears the thumbnail', async () => {

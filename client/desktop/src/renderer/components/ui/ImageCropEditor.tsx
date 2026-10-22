@@ -6,6 +6,7 @@ import DangerousActionStepUpDialog, {
 } from '../Auth/DangerousActionStepUpDialog';
 import type { StepUpPurpose } from '../Auth/stepUpPurpose';
 import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
+import { invalidateAuthenticatedMediaUrl } from '../../hooks/ui/useAuthenticatedMediaUrl';
 import {
   describeFailureWith,
   FIRST_SEND_SESSION_CHANGED,
@@ -532,8 +533,10 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
         return;
       }
       const outcome = await uploadBlob(blob, upload);
-      if (outcome.kind === 'uploaded') onConfirm(outcome.url);
-      else {
+      if (outcome.kind === 'uploaded') {
+        invalidateAuthenticatedMediaUrl(outcome.url);
+        onConfirm(outcome.url);
+      } else {
         const { refusal, target, context } = outcome;
         setStepUp({ blob, refusal, target, context });
       }
@@ -562,7 +565,10 @@ const ImageCropEditor: React.FC<ImageCropEditorProps> = ({
     const url = uploadedUrlRef.current;
     uploadedUrlRef.current = null;
     closeStepUp();
-    if (url !== null) onConfirm(url);
+    if (url !== null) {
+      invalidateAuthenticatedMediaUrl(url);
+      onConfirm(url);
+    }
   };
 
   const stepUpPurpose = upload?.stepUpPurpose;

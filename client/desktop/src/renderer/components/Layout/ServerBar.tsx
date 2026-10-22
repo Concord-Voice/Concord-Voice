@@ -1,5 +1,6 @@
 import React, { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { createPortal } from 'react-dom';
 import ServerHoverTooltip from './ServerHoverTooltip';
 import { useNavigate, useLocation } from 'react-router';
@@ -447,7 +448,7 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
             style={{ width: stickyIconSize, height: stickyIconSize }}
           >
             {resolveMediaUrl(activeServer.icon_url) ? (
-              <img src={resolveMediaUrl(activeServer.icon_url)} alt={activeServer.name} />
+              <AuthenticatedMediaImage source={activeServer.icon_url} alt={activeServer.name} />
             ) : (
               <span className="server-bar-icon-initial">
                 {activeServer.name.charAt(0).toUpperCase()}
@@ -590,8 +591,8 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
                     aria-label={`${server.name} server${isMuted ? ' (muted)' : ''}`}
                   >
                     {resolveMediaUrl(server.icon_url) ? (
-                      <img
-                        src={resolveMediaUrl(server.icon_url)}
+                      <AuthenticatedMediaImage
+                        source={server.icon_url}
                         alt={server.name}
                         draggable={false}
                       />

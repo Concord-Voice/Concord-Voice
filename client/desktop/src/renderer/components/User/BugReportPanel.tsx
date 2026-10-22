@@ -24,12 +24,12 @@ import './BugReportPanel.css';
  * obvious, not hide it behind a hover the keyboard / screen-reader user may
  * never discover.
  *
- * Screenshots (#1747): opt-in image attachments upload to the Tier-1 media
+ * Screenshots (#1747): opt-in image attachments upload to the media
  * endpoint, which re-encodes them (stripping EXIF/GPS metadata) and returns an
  * unguessable path. The control-plane embeds that path as a server-authored
  * image link in the filed (public-ish) feedback issue — so an attached
- * screenshot becomes as visible as the report itself. The picker hint states
- * the metadata-stripping and the per-file / type / count caps.
+ * screenshot becomes publicly readable. The picker warning is visible before
+ * selection and states this alongside the metadata-stripping and upload caps.
  */
 
 // Field caps per #159 spec (stricter than the control-plane's 200B / 8000B
@@ -157,6 +157,7 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
   const descriptionId = useId();
   const includeLogsId = useId();
   const disclosureId = useId();
+  const screenshotWarningId = useId();
 
   // Synchronous in-flight guard. The parent `isSubmitting` prop only flips
   // AFTER onSubmit runs the modal's setState — but when "Include diagnostic
@@ -357,6 +358,7 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
             type="button"
             ref={attachButtonRef}
             className="bug-report-attach-btn"
+            aria-describedby={screenshotWarningId}
             disabled={isSubmitting || atCapacity}
             onClick={() => {
               setAttachError(null);
@@ -366,9 +368,10 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
             <ImagePlus size={16} />
             {atCapacity ? `Maximum ${MAX_SCREENSHOTS} screenshots` : 'Attach screenshots'}
           </button>
-          <p className="bug-report-screenshot-hint">
-            PNG, JPEG, or WebP — up to {MAX_SCREENSHOTS}, 5&nbsp;MB each. Image metadata is stripped
-            on upload.
+          <p id={screenshotWarningId} className="bug-report-screenshot-hint">
+            Screenshots are publicly readable. Redact anything you do not want others to see before
+            attaching them. PNG, JPEG, or WebP — up to {MAX_SCREENSHOTS}, 5&nbsp;MB each. Image
+            metadata is stripped on upload.
           </p>
           {attachError && (
             <p className="bug-report-screenshot-error" role="alert">

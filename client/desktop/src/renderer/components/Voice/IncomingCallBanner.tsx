@@ -8,6 +8,7 @@
 
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { useDMStore } from '../../stores/chat/dmStore';
 import {
   acceptIncomingCall,
@@ -43,7 +44,7 @@ export function IncomingCallBanner() {
     <div className="incoming-call-banner" role="alert" aria-live="polite">
       <div className="incoming-call-banner__avatar">
         {resolveMediaUrl(caller.avatarUrl) ? (
-          <img src={resolveMediaUrl(caller.avatarUrl)} alt={displayName} />
+          <AuthenticatedMediaImage source={caller.avatarUrl} alt={displayName} />
         ) : (
           <span className="incoming-call-banner__initials" aria-hidden="true">
             {initials}

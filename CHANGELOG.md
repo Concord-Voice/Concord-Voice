@@ -98,6 +98,7 @@ you verify your email.
 
 ### Fixed
 
+- **Invite links keep previews in the signed-in app** (internal development reference omitted) — shared links show a generic friend or server greeting, then offer to open Concord Voice. After sign-in and key unlock, the app opens the selected invite. Profile pictures, banners, and server icons now load through the signed-in account instead of anonymous image requests. The feedback screenshot picker warns that attached images are publicly readable and should be redacted before upload.
 - Group DM icon uploads now require the uploader to retain the admin role through the object write. A removed or demoted admin cannot finish an upload admitted before the role change.
 - **Redeeming two codes at the same time no longer fails** (internal development reference omitted) — two redemptions started by the same account at the same moment could deadlock in the database, and one of them returned an error. The server now takes the account's lock first, so the second redemption waits and then completes.
 - **Direct message history no longer skips messages that share a timestamp** (internal development reference omitted) — scrolling back through a conversation could drop a message stamped at the same instant as the last one on the page before it, as happens with imported or near-simultaneous messages. History now orders those messages the same way on every page, so each appears exactly once.

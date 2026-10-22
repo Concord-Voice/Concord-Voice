@@ -1243,7 +1243,7 @@ describe('ConversationList', () => {
     expect(initial?.textContent).toBe('A');
   });
 
-  it('shows the other users avatar for 1:1 conversations', () => {
+  it('shows initials until a 1:1 avatar is fetched with an account session', () => {
     useDMStore.setState({
       conversations: [
         makeConversation({
@@ -1265,8 +1265,8 @@ describe('ConversationList', () => {
     );
 
     const image = container.querySelector('.conversation-avatar-img');
-    expect(image).toHaveAttribute('src', `${API_BASE}/api/v1/media/avatars/alice.png`);
-    expect(container.querySelector('.conversation-avatar-initial')).not.toBeInTheDocument();
+    expect(image).not.toBeInTheDocument();
+    expect(container.querySelector('.conversation-avatar-initial')).toBeInTheDocument();
   });
 
   it('falls back to initials when a 1:1 avatar image fails', async () => {
@@ -1279,7 +1279,7 @@ describe('ConversationList', () => {
               userId: 'user-2',
               username: 'alice',
               displayName: 'Alice',
-              avatarUrl: 'https://example.com/broken.png',
+              avatarUrl: 'data:image/png;base64,broken',
             },
           ],
         }),

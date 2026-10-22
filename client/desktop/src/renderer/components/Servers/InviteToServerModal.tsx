@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import Modal from '../ui/Modal';
 import CustomSelect from '../ui/CustomSelect';
 import LoadingSpinner from '../Auth/LoadingSpinner';
@@ -165,7 +166,7 @@ const InviteToServerModal: React.FC<InviteToServerModalProps> = ({ isOpen, serve
         <div className="invite-modal-server">
           <div className="invite-modal-server-icon">
             {resolveMediaUrl(server.icon_url) ? (
-              <img src={resolveMediaUrl(server.icon_url)} alt={server.name} />
+              <AuthenticatedMediaImage source={server.icon_url} alt={server.name} />
             ) : (
               <span>{server.name.charAt(0).toUpperCase()}</span>
             )}

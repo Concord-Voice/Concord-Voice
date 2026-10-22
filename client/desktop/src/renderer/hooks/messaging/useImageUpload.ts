@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback } from 'react';
-import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { useAuthenticatedMediaUrl } from '../ui/useAuthenticatedMediaUrl';
 
 const formatImageLimit = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))}MB`;
 
@@ -32,10 +32,10 @@ export function useImageUpload({
   onError,
   initialUrl,
 }: UseImageUploadOptions): UseImageUploadReturn {
-  // preview is display-only and MUST be absolutized (resolves against the SPA
-  // origin otherwise — #1586). imageUrl is the WIRE value sent back to the
-  // server and dirty-checked against the relative user.*_url; it MUST stay raw.
-  const [preview, setPreview] = useState<string | null>(() => resolveMediaUrl(initialUrl) ?? null);
+  // Keep the display source separate from the raw wire value. Managed media
+  // is fetched with the account session by useAuthenticatedMediaUrl.
+  const [previewSource, setPreviewSource] = useState<string | null>(initialUrl ?? null);
+  const preview = useAuthenticatedMediaUrl(previewSource) ?? null;
   const [imageUrl, setImageUrl] = useState<string | null>(initialUrl ?? null);
   const [removed, setRemoved] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
@@ -86,7 +86,7 @@ export function useImageUpload({
 
   const handleCropConfirm = useCallback(
     (url: string) => {
-      setPreview(resolveMediaUrl(url) ?? url);
+      setPreviewSource(url);
       setImageUrl(url);
       setRemoved(false);
       setPendingFile(null);
@@ -103,14 +103,14 @@ export function useImageUpload({
   }, [clearFileInput]);
 
   const handleRemove = useCallback(() => {
-    setPreview(null);
+    setPreviewSource(null);
     setImageUrl(null);
     setRemoved(true);
     clearFileInput();
   }, [clearFileInput]);
 
   const reset = useCallback((newInitialUrl: string | null = null) => {
-    setPreview(resolveMediaUrl(newInitialUrl) ?? null);
+    setPreviewSource(newInitialUrl);
     setImageUrl(newInitialUrl);
     setRemoved(false);
     setPendingFile(null);

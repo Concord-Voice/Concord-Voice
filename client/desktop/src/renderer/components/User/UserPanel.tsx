@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useId } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { Settings } from 'lucide-react';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
@@ -131,8 +132,8 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
   const avatarContent = user ? (
     <>
       {resolveMediaUrl(user.avatar_url) ? (
-        <img
-          src={resolveMediaUrl(user.avatar_url)}
+        <AuthenticatedMediaImage
+          source={user.avatar_url}
           alt={user.username}
           className="user-avatar-img"
         />

@@ -124,6 +124,7 @@ const CreateServerModal: React.FC<CreateServerModalProps> = ({ isOpen, onClose, 
       <form className="create-server-form" onSubmit={handleSubmit}>
         <IconUploadArea
           preview={icon.preview}
+          hasImage={Boolean(icon.imageUrl)}
           error={errors.icon}
           onClick={icon.handleClick}
           onKeyDown={icon.handleKeyDown}
@@ -134,6 +135,7 @@ const CreateServerModal: React.FC<CreateServerModalProps> = ({ isOpen, onClose, 
 
         <BannerUploadArea
           preview={banner.preview}
+          hasImage={Boolean(banner.imageUrl)}
           error={errors.banner}
           onClick={banner.handleClick}
           onKeyDown={banner.handleKeyDown}

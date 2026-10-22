@@ -101,7 +101,7 @@ describe('InviteToServerModal', () => {
     render(<InviteToServerModal isOpen={true} server={serverWithIcon} onClose={mockOnClose} />);
     const img = document.querySelector('.invite-modal-server-icon img');
     expect(img).toBeInTheDocument();
-    expect(img).toHaveAttribute('src', 'https://example.com/icon.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   // ── Section titles and descriptions ──

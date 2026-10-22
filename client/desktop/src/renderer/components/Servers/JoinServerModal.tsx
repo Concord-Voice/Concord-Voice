@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useInviteStore } from '../../stores/chat/inviteStore';
@@ -276,7 +277,7 @@ const JoinServerModal: React.FC<JoinServerModalProps> = ({
           <div className="join-server-preview">
             <div className="join-preview-icon">
               {resolveMediaUrl(preview.server_icon) ? (
-                <img src={resolveMediaUrl(preview.server_icon)} alt={preview.server_name} />
+                <AuthenticatedMediaImage source={preview.server_icon} alt={preview.server_name} />
               ) : (
                 <span className="join-preview-initial">
                   {preview.server_name.charAt(0).toUpperCase()}

@@ -37,6 +37,7 @@ import { savedGifsSyncService } from '../../services/system/savedGifsSync';
 import { friendOrgSyncService } from '../../services/system/friendOrgSync';
 import { presenceOverrideSyncService } from '../../services/system/presenceOverrideSync';
 import { apiFetch } from '../../services/system/apiClient';
+import { invalidateAuthenticatedMediaUrl } from '../ui/useAuthenticatedMediaUrl';
 import { useVoiceStore, channelVoiceMemberFromApi } from '../../stores/voice/voiceStore';
 import { useConnectionStore } from '../../stores/ui/connectionStore';
 import { useDMStore } from '../../stores/chat/dmStore';
@@ -1473,6 +1474,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     const unsubProfileUpdated = wsService.on('profile_updated', (msg) => {
       const data = msg.data;
       const userId = data.user_id;
+      invalidateAuthenticatedMediaUrl(data.avatar_url ?? '');
+      invalidateAuthenticatedMediaUrl(data.header_image_url ?? '');
 
       // Update all messages from this user across all channels
       updateUserInMessages(userId, {
@@ -1548,6 +1551,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // emit variants per schema comment).
     const unsubServerUpdated = wsService.on('server_updated', (msg) => {
       const data = msg.data;
+      invalidateAuthenticatedMediaUrl(data.icon_url ?? '');
+      invalidateAuthenticatedMediaUrl(data.banner_url ?? '');
 
       // Only include `allow_embedded_content` when the payload supplies a
       // boolean. One `server_updated` variant (services/control-plane/internal/

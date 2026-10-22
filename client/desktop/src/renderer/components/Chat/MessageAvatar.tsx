@@ -1,5 +1,6 @@
 import React from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { MessageWithStatus } from '../../types/chat';
 import { identityInitialStyle, type SchemeAccentColors } from '../../utils/ui/schemeColors';
 
@@ -57,9 +58,9 @@ const MessageAvatar: React.FC<MessageAvatarProps> = ({
       aria-label="View user profile"
     >
       {resolveMediaUrl(message.avatar_url) ? (
-        <img
+        <AuthenticatedMediaImage
           className="avatar-image"
-          src={resolveMediaUrl(message.avatar_url)}
+          source={message.avatar_url}
           alt={message.username}
         />
       ) : (

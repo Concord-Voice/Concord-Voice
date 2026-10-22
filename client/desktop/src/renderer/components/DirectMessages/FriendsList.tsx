@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useId, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import {
   ChevronDown,
   ChevronRight,
@@ -21,7 +22,7 @@ import {
 import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { useFriendOrgStore, type FriendCategory } from '../../stores/chat/friendOrgStore';
 import ContextMenu from '../ui/ContextMenu';
-import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
+import MemberProfileCard from '../Members/MemberProfileCard';
 import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import AddFriendModal from './AddFriendModal';
 import CategoryManagerPanel from './CategoryManagerPanel';
@@ -639,8 +640,8 @@ const FriendsList: React.FC<FriendsListProps> = ({
       >
         <div className="member-avatar">
           {resolveMediaUrl(friend.avatarUrl) ? (
-            <img
-              src={resolveMediaUrl(friend.avatarUrl)}
+            <AuthenticatedMediaImage
+              source={friend.avatarUrl}
               alt={friend.username}
               className="member-avatar-img"
             />
@@ -1032,15 +1033,13 @@ const FriendsList: React.FC<FriendsListProps> = ({
       {/* Profile Card */}
       {selectedFriend && selectedFriendData && (
         <MemberProfileCard
-          member={
-            {
-              user_id: selectedFriendData.userId,
-              username: selectedFriendData.username,
-              display_name: selectedFriendData.displayName,
-              avatar_url: selectedFriendData.avatarUrl,
-              color_scheme: selectedFriendData.colorScheme,
-            } satisfies ProfileCardMember
-          }
+          member={{
+            user_id: selectedFriendData.userId,
+            username: selectedFriendData.username,
+            display_name: selectedFriendData.displayName,
+            avatar_url: selectedFriendData.avatarUrl,
+            color_scheme: selectedFriendData.colorScheme,
+          }}
           status={selectedFriendData.status}
           position={selectedFriend.position}
           onClose={() => setSelectedFriend(null)}

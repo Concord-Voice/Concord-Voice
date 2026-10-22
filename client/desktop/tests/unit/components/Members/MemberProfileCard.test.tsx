@@ -127,7 +127,7 @@ describe('MemberProfileCard', () => {
     render(<MemberProfileCard {...defaultProps} member={memberWithAvatar} />);
     const img = screen.getByAltText('testuser');
     expect(img).toBeInTheDocument();
-    expect(img).toHaveAttribute('src', 'https://example.com/avatar.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('renders bio when provided', () => {

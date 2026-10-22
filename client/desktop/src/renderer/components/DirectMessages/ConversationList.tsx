@@ -29,7 +29,7 @@ import {
 } from '../../services/system/runtimeServerBase';
 import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { errorMessage } from '../../utils/runtime/redactError';
-import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { useAuthenticatedMediaUrl } from '../../hooks/ui/useAuthenticatedMediaUrl';
 import { describeMessagePreview, truncateSenderName } from '../../utils/messaging/messagePreview';
 import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import CreateGroupModal from './CreateGroupModal';
@@ -263,7 +263,8 @@ const ConversationAvatar: React.FC<ConversationAvatarProps> = ({
     groupIconMatches(groupImage.owner, conv, currentUserId)
       ? groupImage
       : null;
-  const avatarSrc = conv.isGroup ? displayedGroupImage?.url : resolveMediaUrl(other?.avatarUrl);
+  const peerAvatarUrl = useAuthenticatedMediaUrl(other?.avatarUrl);
+  const avatarSrc = conv.isGroup ? displayedGroupImage?.url : peerAvatarUrl;
   const showImage = Boolean(avatarSrc && (conv.isGroup || avatarSrc !== failedAvatarUrl));
   const handleImageError = () => {
     if (conv.isGroup) {

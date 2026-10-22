@@ -94,7 +94,7 @@ describe('SendToFriendModal', () => {
     // Modal content portals to document.body (#2087), so query document-scoped.
     const img = document.querySelector('img.send-to-friend-modal__avatar');
     expect(img).not.toBeNull();
-    expect(img?.getAttribute('src')).toContain('/api/v1/media/avatars/alice.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('filters the friend list by the search query', () => {

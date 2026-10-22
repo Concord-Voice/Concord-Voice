@@ -383,6 +383,8 @@ function App() {
   const emailVerified = useAuthStore((state) => state.emailVerified);
   const authGeneration = useAuthStore((state) => state.authGeneration);
   const pendingE2EEUnlockGeneration = useAuthStore((state) => state.pendingE2EEUnlockGeneration);
+  const needsSSOUnlock = useE2EEStore((state) => state.needsSSOUnlock);
+  const e2eeReady = useE2EEStore((state) => state.ready);
   // #2346: while a just-authenticated password login is still completing its
   // inline E2EE unlock (or awaiting consented key recovery), hold "/" at
   // AuthFlow rather than navigating into the app — otherwise Login unmounts
@@ -392,6 +394,10 @@ function App() {
   // gates a successor, since a successor login or a clear advances authGeneration
   // past it (a same-session refresh via rotateAuthCredentials preserves it).
   const e2eeUnlockPending = isE2EEUnlockPending(pendingE2EEUnlockGeneration, authGeneration);
+  const deepLinkSessionReady =
+    !!accessToken && emailVerified && e2eeReady && !e2eeUnlockPending && !needsSSOUnlock;
+  const deepLinkSessionReadyRef = useRef(deepLinkSessionReady);
+  deepLinkSessionReadyRef.current = deepLinkSessionReady;
   const navigate = useNavigate();
 
   // Route cert-pin / publisher-signature failures into useUpdateStatusStore
@@ -413,7 +419,7 @@ function App() {
     if (typeof subscribe !== 'function') return undefined;
     const unsubscribe = subscribe(({ code }) => {
       setDeepLinkInviteCode(code);
-      if (useAuthStore.getState().accessToken && useAuthStore.getState().emailVerified) {
+      if (deepLinkSessionReadyRef.current) {
         setIsDeepLinkInviteOpen(true);
       }
     });
@@ -463,11 +469,11 @@ function App() {
   }, [isPipWindow, accessToken]);
 
   useEffect(() => {
-    if (deepLinkInviteCode && accessToken && emailVerified) {
+    if (deepLinkInviteCode && deepLinkSessionReady) {
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: opens queued invite modal after auth state becomes eligible; not a render loop
       setIsDeepLinkInviteOpen(true);
     }
-  }, [deepLinkInviteCode, accessToken, emailVerified]);
+  }, [deepLinkInviteCode, deepLinkSessionReady]);
 
   // Friend-code deep links ride their own channel rather than a widened invite
   // payload (#945), so an older SPA that knows only 'invite:received' can never
@@ -481,7 +487,7 @@ function App() {
     if (typeof subscribe !== 'function') return undefined;
     const unsubscribe = subscribe(({ code }) => {
       setDeepLinkFriendCode(code);
-      if (useAuthStore.getState().accessToken && useAuthStore.getState().emailVerified) {
+      if (deepLinkSessionReadyRef.current) {
         setIsDeepLinkFriendOpen(true);
       }
     });
@@ -492,11 +498,11 @@ function App() {
   }, [isPipWindow]);
 
   useEffect(() => {
-    if (deepLinkFriendCode && accessToken && emailVerified) {
+    if (deepLinkFriendCode && deepLinkSessionReady) {
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: opens queued friend modal after auth state becomes eligible; not a render loop
       setIsDeepLinkFriendOpen(true);
     }
-  }, [deepLinkFriendCode, accessToken, emailVerified]);
+  }, [deepLinkFriendCode, deepLinkSessionReady]);
 
   // A held deep-link code must not outlive the session that was current when it
   // arrived (#945, M4). Nothing cleared these but the modals' own onClose, so a
@@ -518,17 +524,11 @@ function App() {
     const loggedOut = hadAccessTokenRef.current && !hasAccessToken;
     hadAccessTokenRef.current = hasAccessToken;
     if (!loggedOut) return;
-    /* eslint-disable @eslint-react/set-state-in-effect -- intentional: this is a
-       reaction to an external store transition (the auth store clearing its
-       token), not derived render state, and it runs only on the logout edge —
-       `loggedOut` is false on every other pass, so there is no render loop. The
-       four clears share one rationale; disabling per line would repeat it four
-       times. */
+    // Drop codes bound to the session that just ended before another account signs in.
     setDeepLinkInviteCode(null);
     setIsDeepLinkInviteOpen(false);
     setDeepLinkFriendCode(null);
     setIsDeepLinkFriendOpen(false);
-    /* eslint-enable @eslint-react/set-state-in-effect -- end of the logout-edge clear */
   }, [accessToken]);
 
   // Restore session on startup: ask main process to decrypt the
@@ -673,7 +673,7 @@ function App() {
           <AttestationFailedModalHost />
           <ChangelogModalHost />
           <JoinServerModal
-            isOpen={!!deepLinkInviteCode && isDeepLinkInviteOpen && !!accessToken && emailVerified}
+            isOpen={!!deepLinkInviteCode && isDeepLinkInviteOpen && deepLinkSessionReady}
             initialCode={deepLinkInviteCode}
             onClose={() => {
               setIsDeepLinkInviteOpen(false);
@@ -687,7 +687,7 @@ function App() {
             }}
           />
           <AddFriendModal
-            isOpen={!!deepLinkFriendCode && isDeepLinkFriendOpen && !!accessToken && emailVerified}
+            isOpen={!!deepLinkFriendCode && isDeepLinkFriendOpen && deepLinkSessionReady}
             initialCode={deepLinkFriendCode}
             onClose={() => {
               setIsDeepLinkFriendOpen(false);

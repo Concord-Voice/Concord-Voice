@@ -66,10 +66,10 @@ describe('MemberItem', () => {
   });
 
   it('shows avatar image when avatar_url is set', () => {
-    const member = makeMember({ avatar_url: 'https://example.com/avatar.png' });
+    const member = makeMember({ avatar_url: 'data:image/png;base64,AAAA' });
     render(<MemberItem {...defaultProps} member={member} />);
     const img = screen.getByRole('img');
-    expect(img).toHaveAttribute('src', 'https://example.com/avatar.png');
+    expect(img).toHaveAttribute('src', 'data:image/png;base64,AAAA');
     expect(img).toHaveAttribute('alt', 'testuser');
   });
 

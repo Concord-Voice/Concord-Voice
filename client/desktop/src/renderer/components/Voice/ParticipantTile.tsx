@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useMemo, useState, useId } from 'react';
 import { prefetchEligibility } from '../../services/system/friendEligibility';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import {
   HeadphoneOff,
   Lock,
@@ -153,8 +154,8 @@ function ParticipantAvatar({
   return (
     <div className="participant-tile__avatar">
       {resolveMediaUrl(avatarUrl) ? (
-        <img
-          src={resolveMediaUrl(avatarUrl)}
+        <AuthenticatedMediaImage
+          source={avatarUrl}
           alt={displayName}
           className="participant-tile__avatar-img"
         />

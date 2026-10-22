@@ -27,6 +27,12 @@ const mockInvalidateChannelKey = vi.fn();
 const mockProcessPendingKeyRequests = vi.fn().mockResolvedValue(undefined);
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
+const mockInvalidateAuthenticatedMediaUrl = vi.fn();
+
+vi.mock('@/renderer/hooks/ui/useAuthenticatedMediaUrl', () => ({
+  invalidateAuthenticatedMediaUrl: (...args: unknown[]) =>
+    mockInvalidateAuthenticatedMediaUrl(...args),
+}));
 
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
@@ -695,6 +701,38 @@ describe('useWebSocketMessages — extended handlers', () => {
   });
 
   describe('profile_updated handler', () => {
+    it('invalidates fixed identity media paths from remote profile and server updates', () => {
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const avatar = '/api/v1/media/avatars/00000000-0000-4000-8000-000000000001';
+      const banner = '/api/v1/media/banners/00000000-0000-4000-8000-000000000002';
+      const icon = '/api/v1/media/server-icons/00000000-0000-4000-8000-000000000003';
+      const serverBanner = '/api/v1/media/server-banners/00000000-0000-4000-8000-000000000004';
+
+      act(() => {
+        ws.handlers.get('profile_updated')!({
+          type: 'profile_updated',
+          data: {
+            user_id: 'user-2',
+            username: 'peer',
+            avatar_url: avatar,
+            header_image_url: banner,
+          },
+        });
+        ws.handlers.get('server_updated')!({
+          type: 'server_updated',
+          data: { server_id: 'server-1', icon_url: icon, banner_url: serverBanner },
+        });
+      });
+
+      expect(mockInvalidateAuthenticatedMediaUrl.mock.calls.map(([path]) => path)).toEqual([
+        avatar,
+        banner,
+        icon,
+        serverBanner,
+      ]);
+    });
+
     it('updates messages, member list, DM participants, and friend profiles', () => {
       const ws = createMockWsService();
       renderHook(() => useWebSocketMessages(ws as never));

@@ -1,6 +1,7 @@
 import { renderHook, act } from '@testing-library/react';
 import { useImageUpload } from '@/renderer/hooks/messaging/useImageUpload';
 import { API_BASE } from '@/renderer/config';
+import { resetAllStores } from '../../helpers/store-helpers';
 import { vi } from 'vitest';
 
 describe('useImageUpload', () => {
@@ -11,6 +12,7 @@ describe('useImageUpload', () => {
   };
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
   });
 
@@ -27,8 +29,8 @@ describe('useImageUpload', () => {
     const { result } = renderHook(() =>
       useImageUpload({ ...defaultOptions, initialUrl: '/api/v1/media/avatars/123' })
     );
-    // #1586: preview is absolutized for display; imageUrl stays the raw wire value.
-    expect(result.current.preview).toBe(`${API_BASE}/api/v1/media/avatars/123`);
+    // A managed image waits for an account-authenticated fetch. The wire value stays raw.
+    expect(result.current.preview).toBeNull();
     expect(result.current.imageUrl).toBe('/api/v1/media/avatars/123');
   });
 
@@ -104,7 +106,7 @@ describe('useImageUpload', () => {
 
       act(() => result.current.handleCropConfirm('/api/v1/media/avatars/456'));
 
-      expect(result.current.preview).toBe(`${API_BASE}/api/v1/media/avatars/456`);
+      expect(result.current.preview).toBeNull();
       expect(result.current.imageUrl).toBe('/api/v1/media/avatars/456');
       expect(result.current.removed).toBe(false);
       expect(result.current.pendingFile).toBeNull();

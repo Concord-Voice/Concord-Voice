@@ -1,6 +1,7 @@
 import React, { use, useEffect, useId, useRef, useState, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useUserStore } from '../../stores/auth/userStore';
@@ -185,8 +186,8 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
         }
       >
         {resolveMediaUrl(member.header_image_url) && (
-          <img
-            src={resolveMediaUrl(member.header_image_url)}
+          <AuthenticatedMediaImage
+            source={member.header_image_url}
             alt=""
             className="member-profile-banner-img"
           />
@@ -196,8 +197,8 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
       <div className="member-profile-header">
         <div className="member-profile-avatar">
           {resolveMediaUrl(member.avatar_url) ? (
-            <img
-              src={resolveMediaUrl(member.avatar_url)}
+            <AuthenticatedMediaImage
+              source={member.avatar_url}
               alt={member.username}
               className="member-profile-avatar-img"
             />

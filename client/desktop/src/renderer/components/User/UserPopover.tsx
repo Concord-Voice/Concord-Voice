@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useMemo } from 'react';
 import { SmilePlus } from 'lucide-react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { openProfilePage } from '../../utils/ui/openProfilePage';
 import { useNavigate } from 'react-router';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
@@ -136,8 +137,8 @@ const UserPopover: React.FC<UserPopoverProps> = ({
       <div className="user-popover-header">
         <div className="user-popover-avatar">
           {resolveMediaUrl(user.avatar_url) ? (
-            <img
-              src={resolveMediaUrl(user.avatar_url)}
+            <AuthenticatedMediaImage
+              source={user.avatar_url}
               alt={user.username}
               className="user-popover-avatar-img"
             />

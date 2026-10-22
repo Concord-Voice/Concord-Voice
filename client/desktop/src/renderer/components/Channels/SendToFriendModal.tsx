@@ -7,6 +7,7 @@ import {
   type SendInviteResult,
 } from '../../hooks/messaging/useSendInviteToFriend';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import './SendToFriendModal.css';
 
 interface SendToFriendModalProps {
@@ -118,7 +119,11 @@ export function SendToFriendModal({
                     aria-busy={sendingId === friend.userId}
                   >
                     {avatar ? (
-                      <img className="send-to-friend-modal__avatar" src={avatar} alt="" />
+                      <AuthenticatedMediaImage
+                        className="send-to-friend-modal__avatar"
+                        source={friend.avatarUrl}
+                        alt=""
+                      />
                     ) : (
                       <span
                         className="send-to-friend-modal__avatar send-to-friend-modal__avatar--placeholder"

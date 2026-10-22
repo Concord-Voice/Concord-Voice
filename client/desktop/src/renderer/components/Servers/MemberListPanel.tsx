@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { prefetchEligibility } from '../../services/system/friendEligibility';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { createPortal } from 'react-dom';
 import { MicOff, HeadphoneOff, Lock, Clock } from 'lucide-react';
 import type { ServerMember } from '../../stores/chat/memberStore';
@@ -295,7 +296,11 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
                   }}
                 />
                 {resolveMediaUrl(member.avatar_url) ? (
-                  <img src={resolveMediaUrl(member.avatar_url)} alt="" className="member-avatar" />
+                  <AuthenticatedMediaImage
+                    source={member.avatar_url}
+                    alt=""
+                    className="member-avatar"
+                  />
                 ) : (
                   <div
                     className="member-avatar member-avatar--initial"

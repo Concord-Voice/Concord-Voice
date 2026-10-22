@@ -2,6 +2,7 @@ import React from 'react';
 
 interface IconUploadAreaProps {
   preview: string | null;
+  hasImage: boolean;
   error?: string;
   onClick: () => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
@@ -13,6 +14,7 @@ interface IconUploadAreaProps {
 
 const IconUploadArea: React.FC<IconUploadAreaProps> = ({
   preview,
+  hasImage,
   error,
   onClick,
   onKeyDown,
@@ -49,7 +51,7 @@ const IconUploadArea: React.FC<IconUploadAreaProps> = ({
     </button>
     <div className="banner-upload-actions">
       {hint && <span className="banner-upload-hint">{hint}</span>}
-      {preview && (
+      {hasImage && (
         <button type="button" className="icon-remove-btn" onClick={onRemove}>
           Remove
         </button>

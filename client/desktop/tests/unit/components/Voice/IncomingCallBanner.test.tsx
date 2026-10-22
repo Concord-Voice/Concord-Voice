@@ -110,7 +110,7 @@ describe('IncomingCallBanner', () => {
       setIncomingRingingState({ avatarUrl: 'https://example.com/a.png' });
       render(<IncomingCallBanner />);
       const img = screen.getByRole('img');
-      expect(img).toHaveAttribute('src', 'https://example.com/a.png');
+      expect(img).not.toHaveAttribute('src');
     });
 
     it('renders initials when caller has no avatarUrl (uses displayName)', () => {

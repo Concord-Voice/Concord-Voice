@@ -160,7 +160,7 @@ describe('Message', () => {
       />
     );
     const img = screen.getByAltText('testuser');
-    expect(img).toHaveAttribute('src', 'https://example.com/avatar.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('applies own-message class for own messages', () => {

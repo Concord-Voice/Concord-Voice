@@ -428,6 +428,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
 
         <IconUploadArea
           preview={icon.preview}
+          hasImage={Boolean(icon.imageUrl)}
           error={errors.icon}
           onClick={icon.handleClick}
           onKeyDown={icon.handleKeyDown}
@@ -440,6 +441,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
         {/* Banner Upload */}
         <BannerUploadArea
           preview={banner.preview}
+          hasImage={Boolean(banner.imageUrl)}
           error={errors.banner}
           onClick={banner.handleClick}
           onKeyDown={banner.handleKeyDown}

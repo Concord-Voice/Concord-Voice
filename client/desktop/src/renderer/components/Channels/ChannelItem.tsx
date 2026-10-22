@@ -12,6 +12,7 @@ import {
   PenLine,
 } from 'lucide-react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import type { Channel } from '../../types/chat';
 
 export interface VoiceMemberInfo {
@@ -124,11 +125,6 @@ function VoiceStatusIcon({ p }: Readonly<{ p: VoiceMemberInfo }>) {
 /** #2360. Sibling of the name, never a child of it - an avatar inside the
  *  interactive <button> would join its accessible name (D1).
  *
- *  resolveMediaUrl is called twice, inline, on purpose: the #1586 ESLint guard
- *  matches `src={avatarUrl}` as a DIRECT child of the expression container, so
- *  hoisting the result into a variable would pass lint by renaming rather than
- *  by correctness, and this call site would stop being guarded. It is pure.
- *
  *  The fallback is untinted (D5): the per-user gradient comes from
  *  resolveUserAccentColors(color_scheme), and color_scheme is carried by neither
  *  the voice store nor the Go voice handler. Both donors already render untinted
@@ -137,8 +133,8 @@ function VoiceParticipantAvatar({ p }: Readonly<{ p: VoiceMemberInfo }>) {
   return (
     <span className="voice-channel-participant__avatar">
       {resolveMediaUrl(p.avatarUrl) ? (
-        <img
-          src={resolveMediaUrl(p.avatarUrl)}
+        <AuthenticatedMediaImage
+          source={p.avatarUrl}
           alt=""
           className="voice-channel-participant__avatar-img"
         />

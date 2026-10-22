@@ -1,6 +1,7 @@
 import React, { use, useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/system/apiClient';
 import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
@@ -159,8 +160,8 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
           }
         >
           {resolveMediaUrl(profile?.header_image_url) && (
-            <img
-              src={resolveMediaUrl(profile?.header_image_url)}
+            <AuthenticatedMediaImage
+              source={profile?.header_image_url}
               alt=""
               className="user-profile-modal-banner-img"
             />
@@ -183,8 +184,8 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
           <div className="user-profile-modal-header">
             <div className="user-profile-modal-avatar">
               {resolveMediaUrl(member.avatar_url) ? (
-                <img
-                  src={resolveMediaUrl(member.avatar_url)}
+                <AuthenticatedMediaImage
+                  source={member.avatar_url}
                   alt={member.username}
                   className="user-profile-modal-avatar-img"
                 />

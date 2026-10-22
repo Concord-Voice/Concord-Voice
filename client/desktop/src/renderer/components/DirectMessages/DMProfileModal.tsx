@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import type { DMParticipant, DMConversation } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
@@ -195,8 +196,8 @@ const DMProfileModal: React.FC<DMProfileModalProps> = ({
           }
         >
           {resolveMediaUrl(profile?.header_image_url) && (
-            <img
-              src={resolveMediaUrl(profile?.header_image_url)}
+            <AuthenticatedMediaImage
+              source={profile?.header_image_url}
               alt=""
               className="dm-profile-modal-banner-img"
             />
@@ -222,8 +223,8 @@ const DMProfileModal: React.FC<DMProfileModalProps> = ({
           <div className="dm-profile-modal-header">
             <div className="dm-profile-modal-avatar">
               {resolveMediaUrl(peer.avatarUrl) ? (
-                <img
-                  src={resolveMediaUrl(peer.avatarUrl)}
+                <AuthenticatedMediaImage
+                  source={peer.avatarUrl}
                   alt={peer.username}
                   className="dm-profile-modal-avatar-img"
                 />

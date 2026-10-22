@@ -225,27 +225,23 @@ describe('ServerSettingsPage', () => {
     expect(screen.queryByText('Members')).not.toBeInTheDocument();
   });
 
-  it('renders server icon preview as a plain <img> from server.icon_url without sending an Authorization header', () => {
+  it('does not expose a server icon path as an anonymous image source', () => {
     useServerStore.setState({
       servers: [{ ...mockServer, icon_url: '/api/v1/media/server-icons/server-1' }],
     });
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(''));
     render(<ServerSettingsPage serverId="server-1" />);
     const iconImg = document.querySelector('img.icon-preview') as HTMLImageElement | null;
-    expect(iconImg).not.toBeNull();
-    // #1586: preview is absolutized via resolveMediaUrl (mocked API_BASE).
-    expect(iconImg!.getAttribute('src')).toBe(
-      'http://localhost:8080/api/v1/media/server-icons/server-1'
+    expect(iconImg).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+    expect(screen.queryByRole('button', { name: 'Remove' })).not.toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/media/server-icons/'),
+      expect.anything(),
+      expect.anything()
     );
-    // Plain <img> src does not invoke our mocked fetch, so no Authorization header is set
-    const imageFetchCalls = fetchSpy.mock.calls.filter((c) =>
-      String(c[0]).includes('/api/v1/media/server-icons/')
-    );
-    expect(imageFetchCalls.length).toBe(0);
-    fetchSpy.mockRestore();
   });
 
-  it('renders server banner preview as a plain <img> from server.banner_url', () => {
+  it('does not expose a server banner path as an anonymous image source', () => {
     useServerStore.setState({
       servers: [
         {
@@ -256,11 +252,9 @@ describe('ServerSettingsPage', () => {
     });
     render(<ServerSettingsPage serverId="server-1" />);
     const bannerImg = document.querySelector('img.banner-preview') as HTMLImageElement | null;
-    expect(bannerImg).not.toBeNull();
-    // #1586: preview is absolutized via resolveMediaUrl (mocked API_BASE).
-    expect(bannerImg!.getAttribute('src')).toBe(
-      'http://localhost:8080/api/v1/media/server-banners/server-1'
-    );
+    expect(bannerImg).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove banner' }));
+    expect(screen.queryByRole('button', { name: 'Remove banner' })).not.toBeInTheDocument();
   });
 
   it('renders Server Info section with server name input', () => {

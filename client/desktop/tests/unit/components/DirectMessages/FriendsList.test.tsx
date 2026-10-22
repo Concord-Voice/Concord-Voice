@@ -231,12 +231,12 @@ describe('FriendsList', () => {
 
   it('renders avatar image when avatarUrl is provided', () => {
     useFriendStore.setState({
-      friends: [makeFriend({ avatarUrl: 'https://example.com/avatar.png' })],
+      friends: [makeFriend({ avatarUrl: 'data:image/png;base64,AAAA' })],
     });
     const { container } = render(<FriendsList onFriendClick={mockOnFriendClick} />);
     const img = container.querySelector('.member-avatar-img') as HTMLImageElement;
     expect(img).toBeInTheDocument();
-    expect(img.src).toBe('https://example.com/avatar.png');
+    expect(img.src).toBe('data:image/png;base64,AAAA');
   });
 
   it('renders status dot for friend', () => {

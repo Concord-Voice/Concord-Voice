@@ -401,7 +401,7 @@ const ProfileInfoForm: React.FC = () => {
             Click to upload an avatar (PNG, JPEG, GIF, WebP &mdash; max{' '}
             {formatFileSize(maxAvatarBytes)})
           </span>
-          {avatar.preview && (
+          {avatar.imageUrl && (
             <button
               type="button"
               className="profile-avatar-remove-btn"
@@ -468,7 +468,7 @@ const ProfileInfoForm: React.FC = () => {
             PNG, JPEG, GIF, WebP &mdash; max {formatFileSize(maxBannerBytes)}. Recommended:
             600&times;120 or wider.
           </span>
-          {header.preview && (
+          {header.imageUrl && (
             <button
               type="button"
               className="profile-avatar-remove-btn"

@@ -7,7 +7,6 @@ import ChannelList, {
   resolveTargetGroupId,
   buildOldGroupUpdates,
 } from '@/renderer/components/Channels/ChannelList';
-import { API_BASE } from '@/renderer/config';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
@@ -625,7 +624,7 @@ describe('ChannelList', () => {
     const { container } = renderChannelList();
     const img = container.querySelector('.voice-channel-participant__avatar-img');
     expect(img).toBeInTheDocument();
-    expect(img?.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/user-2.png`);
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('forwards avatarUrl from live participants (connected branch)', () => {
@@ -654,7 +653,7 @@ describe('ChannelList', () => {
     const { container } = renderChannelList();
     const img = container.querySelector('.voice-channel-participant__avatar-img');
     expect(img).toBeInTheDocument();
-    expect(img?.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/user-1.png`);
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('uses the existing cached roster for compact voice count and detail', () => {

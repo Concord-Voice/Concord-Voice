@@ -1,6 +1,5 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import MessageAvatar from '@/renderer/components/Chat/MessageAvatar';
-import { API_BASE } from '@/renderer/config';
 import { mockMessage } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { inlinePairWorst } from '../../helpers/inlinePairContrast';
@@ -15,7 +14,7 @@ describe('MessageAvatar', () => {
     resetAllStores();
   });
 
-  it('renders avatar image when avatar_url is present', () => {
+  it('does not load an external avatar URL outside the selected server', () => {
     const messageWithAvatar = { ...mockMessage, avatar_url: 'https://example.com/avatar.png' };
     render(
       <MessageAvatar
@@ -27,10 +26,10 @@ describe('MessageAvatar', () => {
     );
     const img = document.querySelector('.avatar-image') as HTMLImageElement;
     expect(img).toBeInTheDocument();
-    expect(img.src).toBe('https://example.com/avatar.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
-  it('absolutizes a relative /api/v1/media avatar_url against API_BASE (#1586)', () => {
+  it('does not put a managed avatar path in img.src before an authenticated fetch', () => {
     const messageRelative = { ...mockMessage, avatar_url: '/api/v1/media/avatars/abc' };
     render(
       <MessageAvatar
@@ -42,7 +41,7 @@ describe('MessageAvatar', () => {
     );
     const img = document.querySelector('.avatar-image') as HTMLImageElement;
     expect(img).toBeInTheDocument();
-    expect(img.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/abc`);
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('renders initials circle when no avatar_url', () => {

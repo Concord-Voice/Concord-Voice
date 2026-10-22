@@ -516,6 +516,7 @@ describe('App', () => {
   function authenticateUser() {
     useAuthStore.getState().setAccessToken('mock-token');
     useAuthStore.setState({ emailVerified: true });
+    useE2EEStore.getState().setReady(true);
     useUserStore.setState({
       user: {
         id: 'user-1',
@@ -676,6 +677,53 @@ describe('App', () => {
     expect((screen.getByPlaceholderText('AbCd1234') as HTMLInputElement).value).toBe('GHJKMNPQ');
   });
 
+  it('shows the queued invite only after password-login key unlock finishes', async () => {
+    let inviteHandler: ((payload: { code: string }) => void) | undefined;
+    Object.assign(globalThis.electron ?? {}, {
+      onInviteReceived: vi.fn((handler: (payload: { code: string }) => void) => {
+        inviteHandler = handler;
+        return vi.fn();
+      }),
+    });
+    useInviteStore.setState({ getInviteInfo: vi.fn().mockResolvedValue(null) });
+    render(<App />);
+
+    act(() => inviteHandler?.({ code: 'GHJKMNPQ' }));
+    act(() => {
+      authenticateUser();
+      useAuthStore.setState({
+        pendingE2EEUnlockGeneration: useAuthStore.getState().authGeneration,
+      });
+    });
+    expect(screen.getByTestId('auth-flow')).toBeInTheDocument();
+    expect(screen.queryByText('Join a Server')).not.toBeInTheDocument();
+
+    act(() => useAuthStore.setState({ pendingE2EEUnlockGeneration: null }));
+    await waitFor(() => expect(screen.getByText('Join a Server')).toBeInTheDocument());
+  });
+
+  it('holds a queued invite when registration has a session but E2EE is not ready', async () => {
+    let inviteHandler: ((payload: { code: string }) => void) | undefined;
+    Object.assign(globalThis.electron ?? {}, {
+      onInviteReceived: vi.fn((handler: (payload: { code: string }) => void) => {
+        inviteHandler = handler;
+        return vi.fn();
+      }),
+    });
+    const getInviteInfo = vi.fn().mockResolvedValue(null);
+    useInviteStore.setState({ getInviteInfo });
+    authenticateUser();
+    useE2EEStore.getState().setReady(false);
+    render(<App />);
+
+    act(() => inviteHandler?.({ code: 'GHJKMNPQ' }));
+    expect(screen.queryByText('Join a Server')).not.toBeInTheDocument();
+    expect(getInviteInfo).not.toHaveBeenCalled();
+
+    act(() => useE2EEStore.getState().setReady(true));
+    await waitFor(() => expect(screen.getByText('Join a Server')).toBeInTheDocument());
+  });
+
   it('replays a pre-auth friend code into AddFriendModal, not JoinServerModal', async () => {
     let friendHandler: ((payload: { code: string }) => void) | undefined;
     const mockFriendRendererReady = vi.fn();
@@ -724,11 +772,37 @@ describe('App', () => {
     expect(screen.queryByText('Join a Server')).not.toBeInTheDocument();
   });
 
+  it('holds a friend code through SSO key unlock', async () => {
+    let friendHandler: ((payload: { code: string }) => void) | undefined;
+    Object.assign(globalThis.electron ?? {}, {
+      onFriendCodeReceived: vi.fn((handler: (payload: { code: string }) => void) => {
+        friendHandler = handler;
+        return vi.fn();
+      }),
+    });
+    useFriendStore.setState({
+      fetchFriendCodes: vi.fn().mockResolvedValue(undefined),
+      previewFriendCode: vi.fn().mockResolvedValue(null),
+    });
+    render(<App />);
+
+    act(() => friendHandler?.({ code: 'AbCdEfGh' }));
+    act(() => {
+      authenticateUser();
+      useE2EEStore.getState().setNeedsSSOUnlock(true);
+    });
+    expect(screen.queryByText('Add Friend')).not.toBeInTheDocument();
+
+    act(() => useE2EEStore.getState().setNeedsSSOUnlock(false));
+    await waitFor(() => expect(screen.getByText('Add Friend')).toBeInTheDocument());
+  });
+
   // ── SSO eager-unlock gate (#270 Task 21b) ─────────────────────────────────
 
   it('mounts SSOEagerUnlock when an SSO user lacks unwrapped E2EE keys', () => {
     authenticateUser();
     // Simulate a fresh SSO callback: token + needsSSOUnlock=true, ready=false.
+    useE2EEStore.getState().setReady(false);
     useE2EEStore.getState().setNeedsSSOUnlock(true);
     render(<App />);
 

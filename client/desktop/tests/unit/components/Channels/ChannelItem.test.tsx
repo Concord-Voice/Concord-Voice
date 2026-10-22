@@ -1,7 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import ChannelItem, { type VoiceMemberInfo } from '@/renderer/components/Channels/ChannelItem';
 import type { Channel } from '@/renderer/types/chat';
-import { API_BASE } from '@/renderer/config';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 
@@ -645,12 +644,12 @@ describe('ChannelItem', () => {
 
   // -- #2360 voice-participant avatars --
 
-  it('renders the participant avatar through resolveMediaUrl', () => {
+  it('does not source a participant avatar before authentication', () => {
     const voiceMembers: VoiceMemberInfo[] = [
       {
         userId: 'u1',
         username: 'alice',
-        avatarUrl: '/api/v1/media/avatars/u1.png',
+        avatarUrl: '/api/v1/media/avatars/00000000-0000-4000-8000-000000000001',
         isMuted: false,
       },
     ];
@@ -659,14 +658,7 @@ describe('ChannelItem', () => {
     );
     const img = container.querySelector<HTMLImageElement>('.voice-channel-participant__avatar-img');
     expect(img).toBeInTheDocument();
-    // EXACT match against the API base, never toContain. mediaUrl returns
-    // `${API_BASE}${path}`, so the resolved value CONTAINS the raw one - a
-    // `toContain` here stayed green against `src={p.avatarUrl}`, i.e. against the
-    // very #1586 defect the double-call comment in the component exists to
-    // prevent. Verified by mutation: toContain survived it, toBe kills it.
-    // getAttribute, not img.src: jsdom absolutizes the property against the
-    // document base and would mask the difference either way.
-    expect(img?.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/u1.png`);
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('refuses a non-allowlisted scheme and falls back to the initial', () => {

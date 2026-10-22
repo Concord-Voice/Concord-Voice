@@ -1,5 +1,6 @@
 import React, { useEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import { useNavigate, useLocation } from 'react-router';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useServerStore } from '../../stores/chat/serverStore';
@@ -95,8 +96,8 @@ const ServerList: React.FC<ServerListProps> = ({ onOpenActionModal, onContextMen
               aria-label={`${server.name} server`}
             >
               {resolveMediaUrl(server.icon_url) ? (
-                <img
-                  src={resolveMediaUrl(server.icon_url)}
+                <AuthenticatedMediaImage
+                  source={server.icon_url}
                   alt={server.name}
                   className="server-icon-img"
                 />

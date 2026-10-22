@@ -471,7 +471,7 @@ describe('FolderBar', () => {
     fireEvent.click(screen.getByText('My Folder'));
     const img = document.querySelector('.folder-dropdown-item-icon img');
     expect(img).toBeInTheDocument();
-    expect(img).toHaveAttribute('src', 'https://example.com/icon.png');
+    expect(img).not.toHaveAttribute('src');
   });
 
   it('shows server initial when no icon_url', () => {

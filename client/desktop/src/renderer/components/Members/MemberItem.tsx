@@ -1,5 +1,6 @@
 import React from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { AuthenticatedMediaImage } from '../common/AuthenticatedMediaImage';
 import type { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { identityInitialStyle, resolveUserAccentColors } from '../../utils/ui/schemeColors';
@@ -51,8 +52,8 @@ const MemberItem: React.FC<MemberItemProps> = ({
     >
       <div className="member-avatar">
         {resolveMediaUrl(member.avatar_url) ? (
-          <img
-            src={resolveMediaUrl(member.avatar_url)}
+          <AuthenticatedMediaImage
+            source={member.avatar_url}
             alt={member.username}
             className="member-avatar-img"
           />
