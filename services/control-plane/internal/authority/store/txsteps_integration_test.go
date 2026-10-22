@@ -231,6 +231,26 @@ func TestRevokedCAKTakesEffectOnTheNextRequest(t *testing.T) {
 	e.errorAs(a.Suspend(t, ac.ActorUser).Bytes, 400, ac.ErrorBadAuthz) // D-207: uncached, no restart
 }
 
+// revoked_keys is keyed on key_digest alone and is insert-only, so a row
+// filed under the wrong kind can never be corrected. Both checks match the
+// digest alone: a kind filter would let a revoked key through.
+func TestAMisKindedRevocationStillRevokes(t *testing.T) {
+	t.Run("cak", func(t *testing.T) {
+		e := newEnv(t)
+		a, _ := e.enrolledWith()
+		mustExec(t, e.f.Owner, `INSERT INTO authority.revoked_keys (key_digest, kind) VALUES ($1, 'cp_tls')`,
+			ac.KeyDigest(authoritytest.Point(e.r.CAK)))
+		e.errorAs(a.Suspend(t, ac.ActorUser).Bytes, 400, ac.ErrorBadAuthz)
+	})
+	t.Run("operator", func(t *testing.T) {
+		e := newEnv(t)
+		a, _ := e.enrolledWith()
+		mustExec(t, e.f.Owner, `INSERT INTO authority.revoked_keys (key_digest, kind) VALUES ($1, 'cp_tls')`,
+			ac.KeyDigest(authoritytest.Point(e.r.Operator)))
+		e.errorAs(a.Suspend(t, ac.ActorOperator).Bytes, 400, ac.ErrorBadAuthz)
+	})
+}
+
 // Codex round 3: a database error while the store reads the installed trust is
 // 503 store, never 503 signer. signer is step 9's verdict that no installed
 // delegation is usable (DoR:1450, :1756); a read that failed reached no verdict,

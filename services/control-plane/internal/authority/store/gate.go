@@ -64,17 +64,20 @@ func (s *Store) replicationError() Outcome {
 	return errorOutcome(503, ac.ErrorReplication)
 }
 
+// inRecovery is step 1a's read on conn: Hooks.InRecovery, or
+// pg_is_in_recovery() (B1-D10). serve's role poll shares it (B2-D6).
+func (s *Store) inRecovery(ctx context.Context, conn *sql.Conn) (bool, error) {
+	if s.hooks.InRecovery != nil {
+		return s.hooks.InRecovery(ctx, conn)
+	}
+	var r bool
+	err := conn.QueryRowContext(ctx, `SELECT pg_is_in_recovery()`).Scan(&r)
+	return r, err
+}
+
 // leaderCheck is step 1a on the request's connection. Any error fails closed.
 func (s *Store) leaderCheck(ctx context.Context, conn *sql.Conn) (Outcome, bool) {
-	check := s.hooks.InRecovery
-	if check == nil {
-		check = func(ctx context.Context, c *sql.Conn) (bool, error) {
-			var r bool
-			err := c.QueryRowContext(ctx, `SELECT pg_is_in_recovery()`).Scan(&r)
-			return r, err
-		}
-	}
-	inRecovery, err := check(ctx, conn)
+	inRecovery, err := s.inRecovery(ctx, conn)
 	if err != nil {
 		s.nonClient503.Store(true)
 		return errorOutcome(503, ac.ErrorStore), false

@@ -139,11 +139,16 @@ func NewRealm(t testing.TB, opts ...RealmOption) *Realm {
 	r.Operator, _ = genKey(t)
 	r.TLSKey, _ = genKey(t)
 	r.CPTLS, _ = genKey(t)
+	// The pin is SHA-384 of the SPKI DER, not of the point (DoR:387, B2-D23).
+	cpPin, err := ac.TLSPin(Point(r.CPTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := r.Clock.Ms
 	d := ac.Delegation{RealmID: r.ID, Serial: 1, MinValidSerial: 1, ProductRootGen: 0,
 		RSKPublicKeys: [][]byte{r.RSK.PublicKey()}, CAKPublicKeys: [][]byte{Point(r.CAK)},
 		OperatorPublicKeys: [][]byte{Point(r.Operator)}, AuthorityTLSKeys: [][]byte{Point(r.TLSKey)},
-		CPTLSPins: [][]byte{ac.KeyDigest(Point(r.CPTLS))}, NotBeforeMs: now - 3_600_000,
+		CPTLSPins: [][]byte{cpPin}, NotBeforeMs: now - 3_600_000,
 		NotAfterMs: now - 3_600_000 + 180*86_400_000, Scope: allScope(), AcceptedVersions: []string{"1"},
 		TauMs: 600_000, DeltaMs: 900_000, GMs: 120_000}
 	for _, o := range opts {

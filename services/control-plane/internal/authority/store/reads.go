@@ -28,15 +28,28 @@ func canonicalID(s string) bool {
 // the hard disk floor, and returns the conn for the gate. The caller defers
 // release() and conn.Close(). Leadership comes first, as step 1a precedes 2b
 // on a submit: a standby answers every read with not_leader, which moves the
-// CP to its next URL, even below the floor (DoR §3.3, Codex round 2).
+// CP to its next URL, even below the floor (DoR §3.3, Codex round 2). The
+// slot and the connection are released by a deferred guard unless handed to
+// the caller, so a panic that serve's run() recovers holds neither
+// (CWE-772).
 func (s *Store) readSession(ctx context.Context) (*sql.Conn, func(), Outcome, bool) {
 	rel, ok := s.adm.acquireRead()
 	if !ok {
 		return nil, nil, errorOutcome(503, ac.ErrorBusy), false
 	}
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
+	var conn *sql.Conn
+	handed := false
+	defer func() {
+		if handed {
+			return
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
 		rel()
+	}()
+	var err error
+	if conn, err = s.db.Conn(ctx); err != nil {
 		return nil, nil, s.storeError(), false
 	}
 	out, ok := s.leaderCheck(ctx, conn)
@@ -44,10 +57,9 @@ func (s *Store) readSession(ctx context.Context) (*sql.Conn, func(), Outcome, bo
 		out, ok = s.hardFloorCheck() // D-232: every request, reads included (review round 2)
 	}
 	if !ok {
-		_ = conn.Close()
-		rel()
 		return nil, nil, out, false
 	}
+	handed = true
 	return conn, rel, Outcome{}, true
 }
 
@@ -102,22 +114,8 @@ func (s *Store) readTx(ctx context.Context, conn *sql.Conn, ready bool, accounts
 		if !ok {
 			return nil, out, false
 		}
-		tr, accepted, err := s.trustFor(ctx, rc.tx)
-		if err == nil {
-			rc.sig, err = s.signingDelegation(ctx, rc.tx, tr.CurrentGen(), rc.now, accepted)
-		}
-		if err == nil && !s.rskListed(rc.sig) { // T10, as step 9 checks it for writes
-			err = errSigner
-		}
-		if err != nil { // a database error reading the trust is 503 store
-			_ = rc.tx.Rollback()
-			return nil, s.signerOrStore(err), false
-		}
-		// T6 (DoR:347, :720): a status or device-status is valid only under a
-		// delegation whose scope holds `status` (review round 3).
-		if len(accounts) > 0 && !slices.Contains(rc.sig.D.Scope, ac.ScopeStatus) {
-			_ = rc.tx.Rollback()
-			return nil, s.signerError(), false
+		if out, ok := s.readSigner(ctx, rc, accounts); !ok {
+			return nil, out, false
 		}
 		if s.reserveAsOf(accounts, rc.now) {
 			return rc, Outcome{}, true
@@ -129,6 +127,30 @@ func (s *Store) readTx(ctx context.Context, conn *sql.Conn, ready bool, accounts
 		}
 		s.pause()
 	}
+}
+
+// readSigner loads rc's signing delegation and checks that it may sign this
+// read: it lists this node's RSK (T10, as step 9 checks it for writes) and,
+// when the read signs statuses, its scope holds `status` (T6, DoR:347, :720;
+// review round 3). A refusal rolls rc.tx back; a database error reading the
+// trust is 503 store.
+func (s *Store) readSigner(ctx context.Context, rc *readCtx, accounts []string) (Outcome, bool) {
+	tr, accepted, err := s.trustFor(ctx, rc.tx)
+	if err == nil {
+		rc.sig, err = s.signingDelegation(ctx, rc.tx, tr.CurrentGen(), rc.now, accepted)
+	}
+	if err == nil && !s.rskListed(rc.sig) {
+		err = errSigner
+	}
+	if err != nil {
+		_ = rc.tx.Rollback()
+		return s.signerOrStore(err), false
+	}
+	if len(accounts) > 0 && !slices.Contains(rc.sig.D.Scope, ac.ScopeStatus) {
+		_ = rc.tx.Rollback()
+		return s.signerError(), false
+	}
+	return Outcome{}, true
 }
 
 // loadHeadRO reads a head without locking it; a missing head is genesis

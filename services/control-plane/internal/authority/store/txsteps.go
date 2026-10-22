@@ -159,7 +159,7 @@ func (s *Store) drainAndRevocation(ctx context.Context, st *txState) (bool, erro
 	if !ac.DrainClause(supAt.Valid, msOfNull(supAt), uint64(grace), st.now) {
 		return false, nil
 	}
-	revoked, err := isRevoked(ctx, st.tx, ac.KeyDigest(c.Key), "cak")
+	revoked, err := isRevoked(ctx, st.tx, ac.KeyDigest(c.Key))
 	if err != nil || revoked {
 		return false, err
 	}
@@ -170,7 +170,7 @@ func (s *Store) drainAndRevocation(ctx context.Context, st *txState) (bool, erro
 	ref := ac.DelegationRef{Gen: st.sig.Gen, Serial: st.sig.Serial}
 	ok := st.trust.OperatorAuthority(st.rq.IntentDigest, st.rq.Sub.SigOperator, ref,
 		st.rq.AZ.AssertedAtMs, ref, func(k []byte) bool {
-			r, err := isRevoked(ctx, st.tx, ac.KeyDigest(k), "operator")
+			r, err := isRevoked(ctx, st.tx, ac.KeyDigest(k))
 			if err != nil {
 				qerr = err
 				return true // fail closed
@@ -204,10 +204,13 @@ func (s *Store) supersedingInstalledAt(ctx context.Context, q queryer, gen, seri
 	return sql.NullTime{}, rows.Err()
 }
 
-func isRevoked(ctx context.Context, tx *sql.Tx, digest []byte, kind string) (bool, error) {
+// isRevoked matches key_digest alone. It is revoked_keys' primary key and
+// the table is insert-only, so a row filed under the wrong kind can never be
+// corrected: a kind filter would let that key through.
+func isRevoked(ctx context.Context, tx *sql.Tx, digest []byte) (bool, error) {
 	var x bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM authority.revoked_keys WHERE key_digest = $1 AND kind = $2)`,
-		digest, kind).Scan(&x)
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM authority.revoked_keys WHERE key_digest = $1)`,
+		digest).Scan(&x)
 	return x, err
 }
 

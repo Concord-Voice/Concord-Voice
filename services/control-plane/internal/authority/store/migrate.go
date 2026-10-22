@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/migrationrunner"
 )
 
 // MigrationFiles embeds the authority's migrations (B1-D1). A test pins it to
-// the directory; B2's binary feeds it to the runner.
+// the directory; B2's binary feeds it to the runner through MigrateEmbedded.
 //
 //go:embed migrations/*.sql
 var MigrationFiles embed.FS
@@ -31,6 +33,16 @@ var (
 // refuses a dirty recorded version (D-209: no copy, no parity test).
 func Migrate(db *sql.DB, sourceURL string) error {
 	return migrationrunner.Run(db, sourceURL)
+}
+
+// MigrateEmbedded applies MigrationFiles through the shared runner: the
+// binary carries its own migrations (B1-D1, B2-D1).
+func MigrateEmbedded(db *sql.DB) error {
+	src, err := iofs.New(MigrationFiles, "migrations")
+	if err != nil {
+		return fmt.Errorf("authority store: embedded migrations: %w", err)
+	}
+	return migrationrunner.RunSource(db, src)
 }
 
 // CheckSchema refuses a dirty, missing or skewed schema in either direction

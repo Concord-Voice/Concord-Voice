@@ -63,8 +63,14 @@ The control plane is responsible for:
 ```
 control-plane/
 ├── cmd/
-│   └── server/           # Application entry point (main.go)
-├── internal/             # 56 packages — see the groups below
+│   ├── server/             # Control-plane entry point (main.go)
+│   ├── account-authority/  # Account-key authority: serve, migrate, keygen
+│   ├── migrate/            # Migration CLI (also reaches a dirty database)
+│   ├── issue-codes/        # Redemption-code issuer (operator CLI)
+│   ├── mfa-rekey/          # Re-encrypts TOTP seeds to the active key version
+│   ├── migrate-media/      # One-time move of image assets to object storage
+│   └── ops-agent/          # Aggregate host and container metrics
+├── internal/               # see the groups below
 ├── pkg/
 │   ├── config/           # Configuration management
 │   └── logger/           # Structured logging
@@ -80,13 +86,14 @@ control-plane/
 Run `ls internal/` for the current package set. The packages group as follows.
 
 - **HTTP surface** — `api` (router setup), `middleware` (auth, rate limiting, CORS), `models` (data models), `database` (connections and migrations), `clientconfig`, `servercapabilities` (pre-auth capability descriptor)
-- **Identity and access** — `auth` (Argon2id, JWT, sessions), `mfa` (TOTP, WebAuthn), `oauth` (SSO providers), `sessions` (device tracking), `stepup` (password/MFA step-up), `rbac`, `credepoch` (per-user credential-epoch fence), `age` (identity-blind age verification), `attestation` (client attestation)
+- **Identity and access** — `auth` (Argon2id, JWT, sessions), `mfa` (TOTP, WebAuthn), `oauth` (SSO providers), `sessions` (device tracking), `stepup` (password/MFA step-up), `rbac`, `credepoch` (per-user credential-epoch fence), `devicerecovery` (trusted-device recovery), `mfaenforce` (server MFA-enforcement gate), `permgen` (permission-cache generations), `age` (identity-blind age verification), `attestation` (client attestation)
 - **Servers and membership** — `servers`, `members`, `channels`, `invites`, `ownership`, `friends`
-- **Messaging** — `messages` (CRUD with E2EE enforcement), `dm`, `dmblock` (durable blocked-pair reconciliation), `websocket` (hub: messaging, presence, DMs), `purge` (message-purge engine), `keyrotation` (channel session key rotation), `klipy` (GIF integration)
+- **Messaging** — `messages` (CRUD with E2EE enforcement), `dm`, `dmblock` (durable blocked-pair reconciliation), `dmvisibility` (DM hidden ranges), `expiration` (message expiry), `websocket` (hub: messaging, presence, DMs), `purge` (message-purge engine), `keyrotation` (channel session key rotation), `klipy` (GIF integration)
 - **Presence** — `presence` (audience authority), `activepresence`, `graphpresence`, `presencecapture`, `presencehistory` (Activity History), `presencehook`, `voicepresence`
-- **Media and storage** — `media` (file handling), `storage` (object storage abstraction), `voice` (NATS coordination with the media-plane)
-- **Accounts and commerce** — `users`, `privacy` (GDPR erasure), `notifications` (mute preferences), `subscriptions`, `entitlements`, `redemption` (redemption codes), `feedback`
-- **Operations** — `admin` (Admin/Operations console identity), `opsmetrics` (aggregate metric boundary), `updates` (client update management), `email`, `cfkv` (Cloudflare Workers KV client for SSO), `ingressbudget` (unauthenticated ingress admission control), `testhelpers`
+- **Media and storage** — `media` (file handling), `storage` (object storage abstraction), `voice` (NATS coordination with the media-plane), `voicecommand` (voice-enforcement wire contract), `roomplacement` (media room ownership fence)
+- **Accounts and commerce** — `users`, `privacy` (GDPR erasure), `notifications` (mute preferences), `subscriptions`, `entitlements`, `redemption` (redemption codes), `feedback`, `feedbackscreenshots` (feedback screenshot lifecycle)
+- **Operations** — `admin` (Admin/Operations console identity), `opsmetrics` (aggregate metric boundary), `updates` (client update management), `email`, `cfkv` (Cloudflare Workers KV client for SSO), `ingressbudget` (unauthenticated ingress admission control), `health` (readiness), `securityevent` (security-event stream), `migrationrunner` (boot-time migrations), `testhelpers`
+- **Account-key authority** — `authority` (the authority's `server`, `store`, `tlspin`, `policy` and `signer`, and its test fixtures), `authoritycontract` (the frozen protocol v1 codec)
 
 ## Development
 

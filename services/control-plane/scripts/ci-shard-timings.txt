@@ -21,10 +21,14 @@
 # internal/migrationrunner, internal/authority/* and internal/testhelpers/authoritydb were refreshed 2026-10-15
 # from Required PR build run 38779965936, head 6aa893d55 (#3587 PR-B1): shard 1 job 116584857773,
 # shard 2 job 116584857642 (internal/authority/store).
+# cmd/account-authority, internal/authority/server, internal/authority/store and internal/authority/tlspin
+# were refreshed 2026-10-21 from Required PR build run 39691551449, head 94a9041cb (#3587 PR-B2):
+# shard 2 job 119539093788 (all four ran there; shard 1 job 119539093592).
 # internal/authoritycontract was added 2026-10-15 from nightly run 38526580881, head a19c54a3a,
 # shard 1 job 115728676196. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
 #
 # Packages without test files remain absent and use the default weight.
+cmd/account-authority             4.742
 cmd/issue-codes                   1.030
 cmd/mfa-rekey                     2.563
 cmd/migrate-media                 7.709
@@ -37,8 +41,10 @@ internal/attestation              25.129
 internal/auth                     186.080
 internal/authority/authoritytest  1.983
 internal/authority/policy         1.244
+internal/authority/server         28.873
 internal/authority/signer         1.249
-internal/authority/store          56.451
+internal/authority/store          81.134
+internal/authority/tlspin         2.596
 internal/authoritycontract        297.396
 internal/cfkv                     1.031
 internal/channels                 103.708

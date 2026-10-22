@@ -44,6 +44,12 @@ func NewWithWriter(w io.Writer) *Logger {
 	return &Logger{Logger: slog.New(handler)}
 }
 
+// NewJSON is New("production")'s handler writing to w instead of os.Stdout:
+// the account authority's journald lines, testable (#3587 PR-B2, B2-D28).
+func NewJSON(w io.Writer) *Logger {
+	return &Logger{Logger: slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))}
+}
+
 // Fatal logs a fatal error and exits
 func (l *Logger) Fatal(msg string, args ...any) {
 	l.Error(msg, args...)

@@ -1,6 +1,6 @@
 // Package migrationrunner applies golang-migrate migrations and refuses a dirty
 // recorded version (#3587 PR-0). The control plane's database.RunMigrations
-// calls it.
+// calls it; the account authority's binary calls RunSource (#3587 PR-B2).
 package migrationrunner
 
 import (
@@ -9,6 +9,7 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source"
 	_ "github.com/golang-migrate/migrate/v4/source/file" // Register the file:// migration source.
 )
 
@@ -27,17 +28,32 @@ import (
 // the runner then succeeds. The version table and the lock key come from the
 // connection's current schema, so each caller needs its own database or schema.
 func Run(db *sql.DB, sourceURL string) error {
+	src, err := source.Open(sourceURL)
+	if err != nil {
+		return fmt.Errorf("could not create migrate instance: %w", err)
+	}
+	return RunSource(db, src)
+}
+
+// RunSource is Run over a source that is already open, such as an embedded
+// directory through source/iofs (#3587 PR-B2). It shares Run's dirty refusal
+// and every caveat in Run's doc.
+//
+// RunSource takes ownership of src, whatever it returns. A failure before the
+// migrate instance exists closes src. Once the instance exists it owns src,
+// and like Run's instance it is never closed, since its Close would close db,
+// so src stays open for the life of the process, as the pinned connection
+// does. The caller must not close or reuse src.
+func RunSource(db *sql.DB, src source.Driver) error {
 	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	if err != nil {
+		_ = src.Close()
 		return fmt.Errorf("could not create migration driver: %w", err)
 	}
 
-	m, err := migrate.NewWithDatabaseInstance(
-		sourceURL,
-		"postgres",
-		driver,
-	)
+	m, err := migrate.NewWithInstance("source", src, "postgres", driver)
 	if err != nil {
+		_ = src.Close()
 		return fmt.Errorf("could not create migrate instance: %w", err)
 	}
 

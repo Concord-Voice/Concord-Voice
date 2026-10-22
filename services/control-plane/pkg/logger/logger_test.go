@@ -2,6 +2,7 @@ package logger
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
@@ -156,4 +157,44 @@ func TestSetDefaultEscapesMessages(t *testing.T) {
 	out := strings.TrimRight(buf.String(), "\n")
 	assert.Equal(t, 3, strings.Count(out, "\n")+1, "three calls must produce three physical records:\n%s", out)
 	assert.NotContains(t, out, "\n2026/09/24 12:00:00 ERROR FORGED")
+}
+
+// Two records make two '\n'-terminated lines, each one JSON object, so a
+// reader splitting on newlines sees every record whole.
+func TestNewJSONWritesOneJSONObjectPerLine(t *testing.T) {
+	var buf bytes.Buffer
+	log := NewJSON(&buf)
+	log.Info("authority.exit", "reason", "trust")
+	log.Info("authority.tick", "outcome", 3)
+	out := buf.String()
+	if !strings.HasSuffix(out, "\n") {
+		t.Fatalf("the last record is not newline-terminated: %q", out)
+	}
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("%d lines for two records: %q", len(lines), out)
+	}
+	want := []map[string]any{
+		{"msg": "authority.exit", "reason": "trust", "level": "INFO"},
+		{"msg": "authority.tick", "outcome": float64(3), "level": "INFO"},
+	}
+	for i, l := range lines {
+		var got map[string]any
+		if err := json.Unmarshal([]byte(l), &got); err != nil {
+			t.Fatalf("line %d is not one JSON object: %q: %v", i, l, err)
+		}
+		for k, v := range want[i] {
+			if got[k] != v {
+				t.Fatalf("line %d: %s = %v, want %v (%v)", i, k, got[k], v, got)
+			}
+		}
+	}
+}
+
+func TestNewJSONDropsDebug(t *testing.T) {
+	var buf bytes.Buffer
+	NewJSON(&buf).Debug("noise")
+	if buf.Len() != 0 {
+		t.Fatalf("debug line written: %q", buf.String())
+	}
 }

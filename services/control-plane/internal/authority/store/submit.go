@@ -47,14 +47,25 @@ func (s *Store) submit(ctx context.Context, body []byte) (Outcome, string, strin
 // slot is held does it decode without one, to learn whether the request may
 // take its class's reserve (D-271, D-179). That decode is bounded by the body
 // cap and checks no signature (step 4 does, under the slot); any other class
-// is 503 busy. A body that fails to decode gives its slot back.
+// is 503 busy. A body that fails to decode gives its slot back. So does a
+// decoder that panics: serve's run() recovers the panic, answers 503 and
+// keeps serving (B2-D7), so a slot released on the refusal path alone would
+// be held until restart, and MutatingSlots-1 such panics would answer every
+// ordinary submit 503 busy while the watchdog stays fed (CWE-772). The slot is released by the deferred guard unless it is handed
+// to the caller.
 func (s *Store) admitAndDecode(body []byte, decode func([]byte) (*request, Outcome, bool)) (*request, func(), Outcome, bool) {
 	if rel, ok := s.adm.acquireGeneral(); ok {
+		handed := false
+		defer func() {
+			if !handed {
+				rel()
+			}
+		}()
 		rq, out, ok := decode(body)
 		if !ok {
-			rel()
 			return nil, nil, out, false
 		}
+		handed = true
 		return rq, rel, Outcome{}, true
 	}
 	rq, out, ok := decode(body)
