@@ -9837,10 +9837,9 @@ paths:
       - Media
       summary: Delete an uploaded media file
       operationId: mediaDeleteFile
-      description: 'Soft-deletes a Tier 2 attachment and removes it from object storage. Uploader only
-        —
+      description: 'Soft-deletes a Tier 2 attachment and removes it from object storage. Only the uploader can delete it, and they must still belong to its channel server or DM.
 
-        files uploaded by other users return 404. Tier 1 assets (avatars, banners, icons) are
+        Files uploaded by other users return 404; former members receive 403. Tier 1 assets (avatars, banners, icons) are
 
         managed via profile/server update endpoints and cannot be deleted here.
 
@@ -9872,6 +9871,12 @@ paths:
                 - deleted
         '400':
           description: Invalid file ID (not a UUID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Uploader is no longer a member of the channel server or DM
           content:
             application/json:
               schema:

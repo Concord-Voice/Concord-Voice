@@ -1939,6 +1939,434 @@ func TestDeleteMediaOwnerOnly(t *testing.T) {
 	assert.False(t, ts.store.hasObject(storageKey), "object should be deleted")
 }
 
+func TestDeleteMediaRejectsFormerChannelMember(t *testing.T) {
+	ts := setupMediaTest(t)
+	serverOwner := ts.createTestUser(t, "deletechannelowner")
+	uploader := ts.createTestUser(t, "deletechannelleaver")
+	serverID := ts.createTestServer(t, serverOwner, "Delete Membership Server")
+	channelID := ts.createTestChannel(t, serverID, "delete-membership")
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, uploader)
+	require.NoError(t, err)
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err = ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, channelID)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, uploader)
+	require.NoError(t, err)
+
+	w := ts.doJSON(ts.handler.DeleteMedia, "DELETE", pathMediaPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.True(t, ts.store.hasObject(storageKey))
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid)
+}
+
+func TestDeleteMediaRejectsFormerDMParticipant(t *testing.T) {
+	ts := setupMediaTest(t)
+	uploader := ts.createTestUser(t, "deletedmleaver")
+	peer := ts.createTestUser(t, "deletedmpeer")
+	conversationID := ts.createTestDMConversation(t, uploader, peer)
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, conversationID)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, uploader)
+	require.NoError(t, err)
+
+	w := ts.doJSON(ts.handler.DeleteMedia, "DELETE", pathMediaPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.True(t, ts.store.hasObject(storageKey))
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid)
+}
+
+func TestDeleteMediaAllowsCurrentDMParticipant(t *testing.T) {
+	ts := setupMediaTest(t)
+	uploader := ts.createTestUser(t, "deletedmcurrent")
+	peer := ts.createTestUser(t, "deletedmcurrentpeer")
+	conversationID := ts.createTestDMConversation(t, uploader, peer)
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, conversationID)
+	require.NoError(t, err)
+
+	w := ts.doJSON(ts.handler.DeleteMedia, "DELETE", pathMediaPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.False(t, ts.store.hasObject(storageKey))
+}
+
+func TestDeleteMediaWaitsForConcurrentMembershipRevocation(t *testing.T) {
+	ts := setupMediaTest(t)
+	serverOwner := ts.createTestUser(t, "deleteraceowner")
+	uploader := ts.createTestUser(t, "deleteraceuploader")
+	serverID := ts.createTestServer(t, serverOwner, "Delete Race Server")
+	channelID := ts.createTestChannel(t, serverID, "delete-race")
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, uploader)
+	require.NoError(t, err)
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err = ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, channelID)
+	require.NoError(t, err)
+
+	revocation, err := ts.db.Begin()
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := revocation.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("roll back revocation: %v", rollbackErr)
+		}
+	}()
+	_, err = revocation.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, uploader)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodDelete, pathMediaPrefix+fileID, nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req.WithContext(ctx)
+	c.Set("user_id", uploader)
+	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
+	done := make(chan struct{})
+	go func() {
+		ts.handler.DeleteMedia(c)
+		close(done)
+	}()
+	// The deferred revocation rollback runs before this cleanup joins the handler.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("deletion did not stop after request cancellation")
+		}
+	})
+	waiting := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		require.NoError(t, ts.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR KEY SHARE OF sm%')`).Scan(&waiting))
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.NoError(t, revocation.Commit())
+	require.True(t, waiting, "deletion should wait for the membership row lock")
+	select {
+	case <-done:
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("deletion did not finish after revocation")
+	}
+	assert.True(t, ts.store.hasObject(storageKey))
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid)
+}
+
+func TestDeleteMediaWaitsForUploaderLockBeforeDeleting(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "deletelockowner")
+	uploader := ts.createTestUser(t, "deletelockuploader")
+	serverID := ts.createTestServer(t, owner, "Delete Lock Server")
+	channelID := ts.createTestChannel(t, serverID, "delete-lock")
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, uploader)
+	require.NoError(t, err)
+	fileID := uuid.NewString()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err = ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, channelID)
+	require.NoError(t, err)
+	probe, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, probe.Close()) })
+
+	lockTx, err := ts.db.Begin()
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := lockTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("roll back uploader lock: %v", rollbackErr)
+		}
+	}()
+	var lockedID string
+	require.NoError(t, lockTx.QueryRow(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, uploader).Scan(&lockedID))
+	var txID int64
+	require.NoError(t, lockTx.QueryRow(`SELECT txid_current()`).Scan(&txID))
+
+	req := httptest.NewRequest(http.MethodDelete, pathMediaPrefix+fileID, nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req.WithContext(ctx)
+	c.Set("user_id", uploader)
+	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
+	done := make(chan struct{})
+	go func() {
+		ts.handler.DeleteMedia(c)
+		close(done)
+	}()
+	defer func() {
+		if rollbackErr := lockTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("release uploader lock: %v", rollbackErr)
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("deletion did not stop after request cancellation")
+		}
+	}()
+
+	waiting := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline) && !waiting; {
+		waiting = rowLockWaiterExists(t, probe, txID)
+		time.Sleep(10 * time.Millisecond)
+	}
+	objectBeforeRelease := ts.store.hasObject(storageKey)
+	require.NoError(t, lockTx.Rollback())
+	select {
+	case <-done:
+		assert.Equal(t, http.StatusOK, w.Code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("deletion did not finish after uploader lock released")
+	}
+	assert.True(t, waiting, "deletion must acquire the uploader lock before the media row")
+	assert.True(t, objectBeforeRelease, "storage must not change while account erasure holds the uploader")
+	assert.False(t, ts.store.hasObject(storageKey))
+}
+
+func TestDeleteMediaWaitsForDMRetirementBeforeLockingMedia(t *testing.T) {
+	ts := setupMediaTest(t)
+	uploader := ts.createTestUser(t, "deletedmretirement")
+	peer := ts.createTestUser(t, "deletedmretirementpeer")
+	conversationID := ts.createTestDMConversation(t, uploader, peer)
+	_, err := ts.db.Exec(`UPDATE dm_conversations SET is_group=TRUE WHERE id=$1`, conversationID)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(`UPDATE dm_participants SET hidden_at=NOW() WHERE conversation_id=$1`, conversationID)
+	require.NoError(t, err)
+	fileID := uuid.NewString()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err = ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, conversationID)
+	require.NoError(t, err)
+	probe, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, probe.Close()) })
+
+	retirement, err := ts.db.Begin()
+	require.NoError(t, err)
+	var lockedID string
+	require.NoError(t, retirement.QueryRow(`SELECT id FROM dm_conversations WHERE id=$1 FOR UPDATE`, conversationID).Scan(&lockedID))
+	_, err = retirement.Exec(`UPDATE dm_participants SET hidden_at=hidden_at WHERE conversation_id=$1`, conversationID)
+	require.NoError(t, err)
+	var txID int64
+	require.NoError(t, retirement.QueryRow(`SELECT txid_current()`).Scan(&txID))
+
+	req := httptest.NewRequest(http.MethodDelete, pathMediaPrefix+fileID, nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req.WithContext(ctx)
+	c.Set("user_id", uploader)
+	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
+	done := make(chan struct{})
+	go func() {
+		ts.handler.DeleteMedia(c)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		if err := retirement.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("retirement rollback: %v", err)
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("deletion did not stop after request cancellation")
+		}
+	})
+	require.Eventually(t, func() bool { return rowLockWaiterExists(t, probe, txID) }, 5*time.Second, 10*time.Millisecond)
+	mediaProbe, err := probe.Begin()
+	require.NoError(t, err)
+	var available int
+	err = mediaProbe.QueryRow(`SELECT 1 FROM media_files WHERE id=$1 FOR UPDATE NOWAIT`, fileID).Scan(&available)
+	require.NoError(t, mediaProbe.Rollback())
+	require.NoError(t, err, "the deletion must wait for the conversation before taking the media row")
+
+	_, err = retirement.Exec(`DELETE FROM dm_conversations WHERE id=$1`, conversationID)
+	require.NoError(t, err)
+	require.NoError(t, retirement.Commit())
+	select {
+	case <-done:
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("deletion did not finish after DM retirement")
+	}
+}
+
+func TestDeleteMediaBeginFailureDoesNotTouchStorage(t *testing.T) {
+	ts := setupMediaTest(t)
+	user := ts.createTestUser(t, "deletebeginfailure")
+	closedDB, err := sql.Open("postgres", "")
+	require.NoError(t, err)
+	require.NoError(t, closedDB.Close())
+	ts.handler.db = closedDB
+
+	fileID := uuid.NewString()
+	w := ts.doJSON(ts.handler.DeleteMedia, http.MethodDelete, pathMediaPrefix+fileID, user, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Zero(t, ts.store.objectCount())
+}
+
+func TestDeleteMediaMissingUploaderDoesNotTouchStorage(t *testing.T) {
+	ts := setupMediaTest(t)
+	fileID := uuid.NewString()
+	w := ts.doJSON(ts.handler.DeleteMedia, http.MethodDelete, pathMediaPrefix+fileID,
+		uuid.NewString(), gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Zero(t, ts.store.objectCount())
+}
+
+func TestDeleteMediaDatabaseReadFailureDoesNotTouchStorage(t *testing.T) {
+	for _, tc := range []struct {
+		name, lockSQL, response string
+	}{
+		{"uploader", "LOCK TABLE users IN ACCESS EXCLUSIVE MODE", errMsgFailedDeleteFile},
+		{"file row", "LOCK TABLE media_files IN ACCESS EXCLUSIVE MODE", errMsgFailedDeleteFile},
+		{"conversation", "LOCK TABLE dm_conversations IN ACCESS EXCLUSIVE MODE", errMsgFailedDeleteFile},
+		{"membership", "LOCK TABLE dm_participants IN ACCESS EXCLUSIVE MODE", errMsgFailedVerifyAccess},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			uploader := ts.createTestUser(t, "deletereadfailure")
+			peer := ts.createTestUser(t, "deletereadpeer")
+			conversationID := ts.createTestDMConversation(t, uploader, peer)
+			fileID := uuid.NewString()
+			storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+			require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+			_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id)
+				VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, conversationID)
+			require.NoError(t, err)
+
+			lockTx, err := ts.db.Begin()
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, lockTx.Rollback()) }()
+			_, err = lockTx.Exec(tc.lockSQL)
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			req := httptest.NewRequest(http.MethodDelete, pathMediaPrefix+fileID, nil).WithContext(ctx)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = req
+			c.Set("user_id", uploader)
+			c.Params = gin.Params{{Key: "file_id", Value: fileID}}
+			ts.handler.DeleteMedia(c)
+			assert.Equal(t, http.StatusInternalServerError, w.Code)
+			assert.Contains(t, w.Body.String(), tc.response)
+			assert.True(t, ts.store.hasObject(storageKey))
+		})
+	}
+}
+
+func TestDeleteMediaSkippedUpdateKeepsRowAndObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	uploader := ts.createTestUser(t, "deleteskippedupdate")
+	serverID := ts.createTestServer(t, uploader, "Skipped Delete Update")
+	channelID := ts.createTestChannel(t, serverID, "skipped-delete-update")
+	fileID := uuid.NewString()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, channelID)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(`CREATE FUNCTION skip_media_soft_delete_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, dropTriggerErr := ts.db.Exec(`DROP TRIGGER IF EXISTS skip_media_soft_delete_test ON media_files`)
+		assert.NoError(t, dropTriggerErr)
+		_, dropFunctionErr := ts.db.Exec(`DROP FUNCTION IF EXISTS skip_media_soft_delete_test()`)
+		assert.NoError(t, dropFunctionErr)
+	})
+	_, err = ts.db.Exec(`CREATE TRIGGER skip_media_soft_delete_test BEFORE UPDATE OF deleted_at ON media_files FOR EACH ROW EXECUTE FUNCTION skip_media_soft_delete_test()`)
+	require.NoError(t, err)
+
+	w := ts.doJSON(ts.handler.DeleteMedia, http.MethodDelete, pathMediaPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.True(t, ts.store.hasObject(storageKey))
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid)
+}
+
+func TestDeleteMediaUpdateFailureKeepsRowAndObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	uploader := ts.createTestUser(t, "deleteupdatefailure")
+	serverID := ts.createTestServer(t, uploader, "Delete Update Failure")
+	channelID := ts.createTestChannel(t, serverID, "delete-update-failure")
+	fileID := uuid.NewString()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, channelID)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(`CREATE FUNCTION reject_media_soft_delete_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic media update refusal'; END $$`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, dropTriggerErr := ts.db.Exec(`DROP TRIGGER IF EXISTS reject_media_soft_delete_test ON media_files`)
+		assert.NoError(t, dropTriggerErr)
+		_, dropFunctionErr := ts.db.Exec(`DROP FUNCTION IF EXISTS reject_media_soft_delete_test()`)
+		assert.NoError(t, dropFunctionErr)
+	})
+	_, err = ts.db.Exec(`CREATE TRIGGER reject_media_soft_delete_test BEFORE UPDATE OF deleted_at ON media_files FOR EACH ROW EXECUTE FUNCTION reject_media_soft_delete_test()`)
+	require.NoError(t, err)
+
+	w := ts.doJSON(ts.handler.DeleteMedia, http.MethodDelete, pathMediaPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.True(t, ts.store.hasObject(storageKey))
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid)
+}
+
+type failedAttachmentDeleteStore struct{ *mockStore }
+
+func (s *failedAttachmentDeleteStore) DeleteObject(context.Context, string) error {
+	return errors.New("synthetic storage delete failure")
+}
+
+func TestDeleteMediaStorageFailureLeavesDurableSweepCandidate(t *testing.T) {
+	ts := setupMediaTest(t)
+	uploader := ts.createTestUser(t, "deletestoragetry")
+	serverID := ts.createTestServer(t, uploader, "Delete Storage Retry")
+	channelID := ts.createTestChannel(t, serverID, "delete-storage-retry")
+	fileID := uuid.NewString()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("data")), 4, mimeOctetStream))
+	_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`, fileID, uploader, storageKey, channelID)
+	require.NoError(t, err)
+	ts.handler.store = &failedAttachmentDeleteStore{mockStore: ts.store}
+
+	w := ts.doJSON(ts.handler.DeleteMedia, http.MethodDelete, pathMediaPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ts.store.hasObject(storageKey))
+	var deletedAt, reapedAt sql.NullTime
+	require.NoError(t, ts.db.QueryRow(`SELECT deleted_at, blob_reaped_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt, &reapedAt))
+	assert.True(t, deletedAt.Valid)
+	assert.False(t, reapedAt.Valid)
+}
+
 func TestDeleteMediaInvalidID(t *testing.T) {
 	ts := setupMediaTest(t)
 	user := ts.createTestUser(t, "delbadid")

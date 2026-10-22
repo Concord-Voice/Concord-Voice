@@ -47,10 +47,12 @@ const (
 	errMsgFailedVerifyAccess        = "Failed to verify access"
 	errMsgFailedVerifyPerms         = "Failed to verify permissions"
 	errMsgFailedStoreImage          = "Failed to store image"
+	errMsgFailedDeleteFile          = "Failed to delete file"
 	errMsgNotGroupDMParticipant     = "Not a group DM participant"
 	errMsgUserNotFound              = "User not found"
 	errMsgFailedRecordMediaMetadata = "Failed to record media metadata"
 	errMsgNotFound                  = "Not found"
+	errMsgFileNotFound              = "File not found"
 	errMsgInternalServer            = "Internal server error"
 	errMsgStorageUnavailable        = "Object storage unavailable"
 	// errMsgAttachmentStorageAtCapacity is returned with 507 Insufficient
@@ -538,7 +540,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	err := h.db.QueryRow(query, fileID).
 		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion, &storageBackend, &uploaderID)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
 		return
 	} else if err != nil {
 		h.log.Error("Failed to fetch file metadata", "error", err)
@@ -969,7 +971,8 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 
 // DeleteMedia soft-deletes a media file and removes it from object storage.
 // DELETE /api/v1/media/:file_id
-// Only the uploader can delete their own Tier 2 (attachment) files.
+// Only the uploader can delete their own Tier 2 (attachment) files while they
+// are still a member of the channel's server or the owning DM.
 // Tier 1 assets (avatars, banners, server icons) are managed via profile/server
 // update endpoints and cannot be deleted directly.
 func (h *Handler) DeleteMedia(c *gin.Context) {
@@ -981,20 +984,97 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		return
 	}
 
+	// Revocation either wins before this lock (deny) or waits for the commit.
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("Failed to start media deletion", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back media deletion", "error", rollbackErr)
+		}
+	}()
+
+	var uploader int
+	err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM users WHERE id = $1 FOR SHARE`, userID).Scan(&uploader)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to lock media uploader", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
+	}
+	// DM retirement locks the conversation before cascading to participants and
+	// media. Read its ID without taking the media row lock, then share that order.
+	var expectedConversationID sql.NullString
+	err = tx.QueryRowContext(c.Request.Context(), `SELECT conversation_id FROM media_files
+		WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL`, fileID, userID).Scan(&expectedConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to locate file for deletion", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
+	}
+	if expectedConversationID.Valid {
+		var lockedConversation int
+		err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM dm_conversations WHERE id = $1 FOR KEY SHARE`, expectedConversationID.String).Scan(&lockedConversation)
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to lock media conversation", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+			return
+		}
+	}
+
 	// Verify ownership, tier 2 only, and get the storage key AND its placement.
 	// The backend rides along on the row we are already reading (ADR-0038 /
 	// #2759 unit B2) — deleting from the wrong bucket would SUCCEED and erase
 	// nothing. NULLable permanently: NULL is the legacy backend.
 	var storageKey string
 	var storageBackend *string
-	query := `SELECT storage_key, storage_backend FROM media_files WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL`
-	err := h.db.QueryRow(query, fileID, userID).Scan(&storageKey, &storageBackend)
+	var channelID, conversationID sql.NullString
+	query := `SELECT storage_key, storage_backend, channel_id, conversation_id FROM media_files WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL FOR UPDATE`
+	err = tx.QueryRowContext(c.Request.Context(), query, fileID, userID).Scan(&storageKey, &storageBackend, &channelID, &conversationID)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
 		return
 	} else if err != nil {
 		h.log.Error("Failed to fetch file for deletion", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete file"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
+	}
+	if conversationID != expectedConversationID {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return
+	}
+	if channelID.Valid == conversationID.Valid {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return
+	}
+
+	var member int
+	if channelID.Valid {
+		err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM channels ch JOIN server_members sm ON sm.server_id = ch.server_id AND sm.user_id = $2 WHERE ch.id = $1 FOR KEY SHARE OF sm`, channelID.String, userID).Scan(&member)
+	} else {
+		err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR KEY SHARE`, conversationID.String, userID).Scan(&member)
+	}
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to lock media membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
 		return
 	}
 
@@ -1007,10 +1087,21 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 	}
 
 	// Soft-delete in DB
-	_, err = h.db.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
 	if err != nil {
 		h.log.Error("Failed to soft-delete file", "error", err, "file_id", fileID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete file"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		h.log.Error("Failed to verify media deletion", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit media deletion", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
 		return
 	}
 
