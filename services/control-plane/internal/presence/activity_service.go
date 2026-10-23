@@ -97,7 +97,30 @@ type ActivityService struct {
 	senderPresence           SenderPresenceResolver
 	settingsRecipients       activitySettingsRecipientResolver
 	hiddenSettingsRecipients activitySettingsRecipientResolver
+	// absentRecipients names the connected clients that could hold a sender's
+	// activity when no stored generation can name its audience. nil keeps the
+	// replica-wide disconnect (unit fixtures).
+	absentRecipients absentActivityRecipientResolver
+	// absentClears limits that clear to once per voice session. nil clears on
+	// every suppressed heartbeat.
+	absentClears absentClearMarker
+	// absentMarkerFailure reports, by a fixed failure class, a marker read or
+	// write that failed after the clear itself was settled. Such a failure
+	// costs one extra clear, never a skipped one, so it is reported rather than
+	// returned: every caller turns a returned error into a replica-wide
+	// disconnect. This package does not log, so the server wires it.
+	absentMarkerFailure func(failureClass string)
 }
+
+type absentClearMarker interface {
+	AbsentClearDelivered(context.Context, uuid.UUID, Category, uuid.UUID) (bool, error)
+	MarkAbsentClearDelivered(context.Context, uuid.UUID, Category, uuid.UUID) error
+	ForgetAbsentClear(context.Context, uuid.UUID, Category) error
+}
+
+type absentActivityRecipientResolver func(
+	ctx context.Context, senderID uuid.UUID, input PolicyInput,
+) (map[uuid.UUID]bool, error)
 
 // NewActivityService creates the authoritative Rich Presence lifecycle bridge.
 func NewActivityService(
@@ -148,6 +171,12 @@ func NewActivityService(
 			ctx, dependencies, delivery, userID, before, after, true,
 		)
 	}
+	service.absentRecipients = func(
+		ctx context.Context, userID uuid.UUID, input PolicyInput,
+	) (map[uuid.UUID]bool, error) {
+		return absentServerVoiceRecipients(ctx, dependencies, delivery, userID, input)
+	}
+	service.absentClears = store
 	return service
 }
 
@@ -430,7 +459,7 @@ func (s *ActivityService) suppressRefreshedActivity(
 		// (#2444).
 		return s.suppressMovedGeneration(
 			ctx, request.senderID, request.category,
-			previous.built.SourceToken, previous.built.SourceVersion, previous.audience,
+			*previous.built, previous.audience,
 			decision.SuppressedBySenderPresence,
 		)
 	}
@@ -447,7 +476,7 @@ func (s *ActivityService) suppressRefreshedActivity(
 		)
 	}
 	return s.suppressGeneration(
-		ctx, request.senderID, request.category, built.SourceToken, built.SourceVersion,
+		ctx, request.senderID, request.category, built, request.recheckViewers,
 	)
 }
 
@@ -512,6 +541,18 @@ func (s *ActivityService) persistAndDeliverRefreshedActivity(
 		SourceToken: built.SourceToken, SourceVersion: built.SourceVersion,
 		Minimized: decision.Minimized, Payload: decision.Payload,
 		UpdatedAt: request.scope.EventAt.Unix(),
+	}
+	// Forget the absent-clear marker before publishing: once published, this
+	// generation can vanish while viewers hold it, and its next absent state
+	// must clear them.
+	if s.absentClears != nil {
+		if err := s.absentClears.ForgetAbsentClear(ctx, request.senderID, request.category); err != nil {
+			failure := fmt.Errorf("forget %s rich-presence absent clear: %w", request.category, err)
+			return s.failClosedGeneration(
+				ctx, request.senderID, request.category,
+				built.SourceToken, built.SourceVersion, failure,
+			)
+		}
 	}
 	stored, err := s.store.CompareAndSetActive(ctx, request.senderID, request.category, state)
 	if err != nil {
@@ -619,10 +660,7 @@ func (s *ActivityService) clearAlreadyGated(
 				hiddenRecipients, hiddenRecipientsErr, true,
 			)
 		}
-		return s.suppressGeneration(
-			ctx, request.senderID, request.category,
-			prepared.built.SourceToken, prepared.built.SourceVersion,
-		)
+		return s.suppressGeneration(ctx, request.senderID, request.category, prepared.built, nil)
 	}
 	return s.deleteAndDeliverActivityClear(ctx, request, prepared)
 }
@@ -768,21 +806,26 @@ func (s *ActivityService) suppressGeneration(
 	ctx context.Context,
 	senderID uuid.UUID,
 	category Category,
-	sourceToken uuid.UUID,
-	sourceVersion int64,
+	built BuiltActivity,
+	recheckViewers map[uuid.UUID]bool,
 ) error {
 	deleteCtx, cancelDelete := boundedActivityCleanupContext(ctx)
 	deleted, deleteErr := s.store.CompareAndDelete(
-		deleteCtx, senderID, category, sourceToken, sourceVersion,
+		deleteCtx, senderID, category, built.SourceToken, built.SourceVersion,
 	)
 	cancelDelete()
 	var disconnectErr error
 	if deleteErr == nil && !deleted {
 		successor, inspectErr := s.hasGenerationSuccessor(
-			ctx, senderID, category, sourceVersion,
+			ctx, senderID, category, built.SourceVersion,
 		)
-		if inspectErr != nil || !successor {
+		switch {
+		case inspectErr != nil:
 			disconnectErr = s.disconnectAll(ctx)
+		case !successor:
+			disconnectErr = s.clearAbsentGeneration(
+				ctx, senderID, category, built, recheckViewers,
+			)
 		}
 		return errors.Join(inspectErr, disconnectErr)
 	}
@@ -791,6 +834,92 @@ func (s *ActivityService) suppressGeneration(
 		wrapActivityError("delete suppressed rich-presence activity", deleteErr),
 		disconnectErr,
 	)
+}
+
+// clearAbsentGeneration handles a suppression that finds nothing stored and no
+// successor. That is the steady state for a voice sender nobody may see (two
+// members who are not friends, under the default friends-only tier): every
+// heartbeat lands here. It is also what a published generation looks like after
+// its row expired or was evicted, and the desktop never expires a badge itself,
+// so the two cannot be told apart and a clear is still owed.
+//
+// Clear the possible audience once per voice channel instead of disconnecting
+// the whole replica on every heartbeat. A clear for a client that never held the
+// badge is a client-side no-op. Publication forgets the marker, so a generation
+// published and then lost is cleared again. An unnameable audience still fails
+// closed.
+func (s *ActivityService) clearAbsentGeneration(
+	ctx context.Context,
+	senderID uuid.UUID,
+	category Category,
+	built BuiltActivity,
+	recheckViewers map[uuid.UUID]bool,
+) error {
+	if s.absentRecipients == nil {
+		return s.disconnectAll(ctx)
+	}
+	// Captured pre-mutation viewers (an RBAC recheck) are owed a clear that the
+	// fresh audience below can no longer name: they lost visibility. The marker
+	// cannot vouch for them either, so it never skips this clear.
+	owed := includedActivityRecipients(recheckViewers)
+	var markerErr error
+	if s.absentClears != nil && len(owed) == 0 {
+		delivered, err := s.absentClears.AbsentClearDelivered(
+			ctx, senderID, category, built.SourceToken,
+		)
+		if err == nil && delivered {
+			return nil
+		}
+		// An unreadable marker is treated as absent: clear again, and keep the
+		// cause so a later failure on the same request still reports it.
+		if err != nil {
+			markerErr = fmt.Errorf("read %s rich-presence absent clear marker: %w", category, err)
+		}
+	}
+	recipients, err := s.absentRecipients(ctx, senderID, built.Input)
+	if err != nil {
+		return errors.Join(
+			markerErr,
+			wrapActivityError("resolve absent rich-presence activity recipients", err),
+			s.disconnectAll(ctx),
+		)
+	}
+	recipients = unionActivityRecipients(recipients, owed)
+	if err := s.deliverHiddenSenderClears(
+		ctx, senderID, activitySettingsRecipients{category: recipients},
+	); err != nil {
+		return errors.Join(markerErr, err)
+	}
+	if markerErr != nil {
+		s.warnAbsentMarker("read")
+	}
+	if s.absentClears != nil {
+		// The clear is delivered. Record it on a cleanup budget of its own, so a
+		// delivery that used up the request's budget does not also lose the
+		// marker and repeat the clear on every heartbeat.
+		markCtx, cancelMark := boundedActivityCleanupContext(ctx)
+		err := s.absentClears.MarkAbsentClearDelivered(
+			markCtx, senderID, category, built.SourceToken,
+		)
+		cancelMark()
+		if err != nil {
+			s.warnAbsentMarker("write")
+		}
+	}
+	return nil
+}
+
+// SetAbsentMarkerFailureReporter wires the report for an absent-clear marker
+// failure. The class is one of absent_marker_read or absent_marker_write and
+// carries no identifier.
+func (s *ActivityService) SetAbsentMarkerFailureReporter(report func(failureClass string)) {
+	s.absentMarkerFailure = report
+}
+
+func (s *ActivityService) warnAbsentMarker(operation string) {
+	if s.absentMarkerFailure != nil {
+		s.absentMarkerFailure("absent_marker_" + operation)
+	}
 }
 
 // suppressHiddenSenderGeneration removes an active generation for a sender whose
@@ -932,11 +1061,11 @@ func (s *ActivityService) suppressMovedGeneration(
 	ctx context.Context,
 	senderID uuid.UUID,
 	category Category,
-	priorSourceToken uuid.UUID,
-	priorSourceVersion int64,
+	prior BuiltActivity,
 	priorAudience map[uuid.UUID]bool,
 	hiddenSender bool,
 ) error {
+	priorSourceToken, priorSourceVersion := prior.SourceToken, prior.SourceVersion
 	deleteCtx, cancelDelete := boundedActivityCleanupContext(ctx)
 	deleted, deleteErr := s.store.CompareAndDelete(
 		deleteCtx,
@@ -962,9 +1091,21 @@ func (s *ActivityService) suppressMovedGeneration(
 			// conservative posture unchanged.
 			return nil
 		}
-		return s.disconnectAfterGenerationMiss(
-			ctx, senderID, category, priorSourceVersion, priorAudience,
+		// Same steady state as suppressGeneration's absent arm: an
+		// empty-audience sender never stored the prior generation, so every
+		// channel hop lands here. Clear the prior channel's possible viewers
+		// instead of disconnecting the replica.
+		successor, inspectErr := s.hasGenerationSuccessor(
+			ctx, senderID, category, priorSourceVersion,
 		)
+		switch {
+		case inspectErr != nil:
+			return errors.Join(inspectErr, s.disconnectAll(ctx))
+		case successor:
+			return s.disconnectKnown(ctx, priorAudience)
+		default:
+			return s.clearAbsentGeneration(ctx, senderID, category, prior, priorAudience)
+		}
 	}
 	if len(priorAudience) == 0 {
 		return nil

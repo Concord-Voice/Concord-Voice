@@ -104,6 +104,10 @@ const (
 	FailureAudienceRead      FailureClass = "audience_read"
 	FailureAuthorizationRead FailureClass = "authorization_read"
 	FailureMinimization      FailureClass = "minimization"
+	// FailureAbsentAudienceUnsupported marks an absent generation whose
+	// category has no nameable audience (Private Call). It fails closed by
+	// design, unlike an invalid input.
+	FailureAbsentAudienceUnsupported FailureClass = "absent_audience_unsupported"
 )
 
 // PolicyError classifies a policy failure without exposing its cause publicly.

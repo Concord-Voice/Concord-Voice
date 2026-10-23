@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 The desktop's chat connection no longer drops and reconnects every 14 minutes
 while you're signed in.
 
+Chat no longer drops for everyone every 30 seconds while someone sits in a voice
+channel that none of their friends can see, or when that person switches voice
+channels.
+
 When voice is briefly paused for server maintenance, joining a call now says
 so and suggests trying again in a few minutes, instead of a generic error.
 

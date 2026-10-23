@@ -938,3 +938,154 @@ func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testi
 		})
 	}
 }
+
+// The 30-second replica disconnect: a Server Voice sender with no friend in the
+// server publishes nothing under the default friends-only tier, so every
+// heartbeat suppresses with nothing stored. The session clears the connected
+// channel viewers once, never disconnects everyone, and a session whose
+// heartbeats stopped (a crash or an unclean drop) clears afresh on rejoin.
+func TestServerVoiceRefresh_EmptyAudienceClearsOncePerSessionWithoutDisconnect(t *testing.T) {
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(dbCleanup)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	senderID := testhelpers.CreateUser(t, db)
+	_, serverID, channelID := createServerVoiceBuilderFixtureForUser(
+		t, db, senderID, "Presence", "Strangers",
+	)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddServerMember(t, db, serverID, viewerID)
+	outsiderID := testhelpers.CreateUser(t, db)
+	lifecycleAt := time.Date(2026, 10, 22, 22, 59, 0, 0, time.UTC)
+	_, err := db.Exec(`
+		INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, channelID, senderID, lifecycleAt)
+	require.NoError(t, err)
+
+	store := presence.NewActivityStore(redisClient)
+	seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, presence.ActivityState{
+		SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+	})
+
+	delivery := &connectedSettingsActivityDelivery{
+		connectedUserIDs: []uuid.UUID{senderID, viewerID, outsiderID},
+	}
+	service := presence.NewActivityService(
+		presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+		presence.NewActivityBuilder(db, nil, store), store, db,
+		activitySnapshotVisibility{allow: true}, delivery, permitAllPresence{},
+	)
+	scope := presence.Scope{
+		Category: presence.CategoryServerVoice, RoomID: channelID,
+		LifecycleID: channelID, EventAt: lifecycleAt,
+	}
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, service.RefreshServerVoice(ctx, senderID, scope, nil))
+	}
+
+	assert.Zero(t, delivery.all, "an empty audience must not disconnect the replica")
+	assert.Empty(t, delivery.targeted)
+	require.Len(t, delivery.plans, 1, "one clear per voice session")
+	assert.Equal(t, presence.CategoryServerVoice, delivery.plans[0].Category)
+	assert.Equal(t, map[uuid.UUID]bool{viewerID: true}, delivery.plans[0].ClearRecipients,
+		"connected channel viewers only; never the sender or a non-member")
+	_, found, err := store.Get(ctx, senderID, presence.CategoryServerVoice)
+	require.NoError(t, err)
+	assert.False(t, found, "nothing is published for an empty audience")
+
+	markerKey := "presence:rich:" + senderID.String() + ":server_voice:absent-cleared"
+	ttl, err := redisClient.PTTL(ctx, markerKey).Result()
+	require.NoError(t, err)
+	assert.Positive(t, ttl, "the marker must expire on its own")
+	assert.LessOrEqual(t, ttl, presence.ActivityStateTTL)
+
+	// Heartbeats stopped long enough for the marker to lapse.
+	require.NoError(t, redisClient.Del(ctx, markerKey).Err())
+	require.NoError(t, service.RefreshServerVoice(ctx, senderID, scope, nil))
+	assert.Len(t, delivery.plans, 2, "a session after a lapsed marker clears again")
+	assert.Zero(t, delivery.all)
+}
+
+func TestActivityStore_AbsentClearMarkerRoundTrip(t *testing.T) {
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	store := presence.NewActivityStore(redisClient)
+	senderID, channelID, otherChannel := uuid.New(), uuid.New(), uuid.New()
+
+	delivered, err := store.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID)
+	require.NoError(t, err)
+	assert.False(t, delivered)
+
+	require.NoError(t, store.MarkAbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID))
+	delivered, err = store.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID)
+	require.NoError(t, err)
+	assert.True(t, delivered)
+	delivered, err = store.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, otherChannel)
+	require.NoError(t, err)
+	assert.False(t, delivered, "another channel never matches")
+	delivered, err = store.AbsentClearDelivered(ctx, senderID, presence.CategoryPrivateCall, channelID)
+	require.NoError(t, err)
+	assert.False(t, delivered, "another category never matches")
+
+	require.NoError(t, store.ForgetAbsentClear(ctx, senderID, presence.CategoryServerVoice))
+	delivered, err = store.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID)
+	require.NoError(t, err)
+	assert.False(t, delivered, "publication forgets the marker")
+
+	_, err = store.AbsentClearDelivered(ctx, uuid.Nil, presence.CategoryServerVoice, channelID)
+	require.ErrorIs(t, err, presence.ErrInvalidActivityState)
+}
+
+// A matching read renews the marker's TTL, so a long session clears once; a
+// read for another channel must not keep a stale marker alive.
+func TestActivityStore_AbsentClearMarkerRenewsOnlyOnMatch(t *testing.T) {
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	store := presence.NewActivityStore(redisClient)
+	senderID, channelID := uuid.New(), uuid.New()
+	markerKey := "presence:rich:" + senderID.String() + ":server_voice:absent-cleared"
+	shortTTL := 2 * time.Second
+
+	require.NoError(t, store.MarkAbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID))
+	require.NoError(t, redisClient.PExpire(ctx, markerKey, shortTTL).Err())
+	delivered, err := store.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID)
+	require.NoError(t, err)
+	require.True(t, delivered)
+	ttl, err := redisClient.PTTL(ctx, markerKey).Result()
+	require.NoError(t, err)
+	assert.Greater(t, ttl, shortTTL, "a matching read renews the marker")
+
+	require.NoError(t, redisClient.PExpire(ctx, markerKey, shortTTL).Err())
+	delivered, err = store.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, uuid.New())
+	require.NoError(t, err)
+	require.False(t, delivered)
+	ttl, err = redisClient.PTTL(ctx, markerKey).Result()
+	require.NoError(t, err)
+	assert.LessOrEqual(t, ttl, shortTTL, "a mismatched read does not renew it")
+}
+
+// Each replica clears only its own connected clients, so one replica's marker
+// must never vouch for another's, while a publication on either forgets both.
+func TestActivityStore_AbsentClearMarkerIsPerReplica(t *testing.T) {
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	replicaA, replicaB := presence.NewActivityStore(redisClient), presence.NewActivityStore(redisClient)
+	senderID, channelID := uuid.New(), uuid.New()
+
+	require.NoError(t, replicaA.MarkAbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID))
+	delivered, err := replicaB.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID)
+	require.NoError(t, err)
+	assert.False(t, delivered, "replica A's clear does not cover replica B's clients")
+
+	require.NoError(t, replicaB.MarkAbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID))
+	require.NoError(t, replicaB.ForgetAbsentClear(ctx, senderID, presence.CategoryServerVoice))
+	delivered, err = replicaA.AbsentClearDelivered(ctx, senderID, presence.CategoryServerVoice, channelID)
+	require.NoError(t, err)
+	assert.False(t, delivered, "a publication on any replica forgets every replica's marker")
+}

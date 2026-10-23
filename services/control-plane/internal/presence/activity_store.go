@@ -15,6 +15,10 @@ import (
 // ActivityStore manages exact-key ephemeral Rich Presence current state.
 type ActivityStore struct {
 	redis *redis.Client
+	// instance scopes the absent-clear marker to this process: each replica
+	// delivers only to its own connected clients, so one replica's delivered
+	// clear must never vouch for another's.
+	instance string
 }
 
 const activityLifecycleVerificationBatchSize = 64
@@ -31,7 +35,7 @@ type ActivityGeneration struct {
 
 // NewActivityStore creates an activity store backed by client.
 func NewActivityStore(client *redis.Client) *ActivityStore {
-	return &ActivityStore{redis: client}
+	return &ActivityStore{redis: client, instance: uuid.NewString()}
 }
 
 const decodeActivityStateLua = `
@@ -806,4 +810,115 @@ func hasExactActivityEnvelopeFields(envelope map[string]json.RawMessage) bool {
 		}
 	}
 	return true
+}
+
+// The absent-clear marker records that a sender's possible audience in one
+// voice channel was cleared and that nothing has been published since. A stale
+// badge needs a publication, and publication deletes the marker, so a present
+// marker proves no client can hold one. It holds the lifecycle token (the
+// channel) rather than the version, which every heartbeat advances; a channel
+// move therefore clears again. It expires with ActivityStateTTL and each
+// honoured heartbeat renews it, so a session that crashed or dropped without a
+// clean leave loses its marker once heartbeats stop, and the next join clears
+// afresh. Every failure mode (a Redis error, eviction, a crash between steps)
+// reads as "no marker", which costs one more clear, never a skipped one.
+//
+// The key is a hash with one field per store instance. Every replica receives
+// every voice event but clears only its own connected clients, so one replica's
+// delivered clear must never vouch for another's; a publication deletes the
+// whole key and so forgets every replica's field. A string-typed marker left by
+// an older binary makes HGET fail with WRONGTYPE, which reads as "no marker".
+
+var absentClearDeliveredScript = redis.NewScript(`
+if redis.call('HGET', KEYS[1], ARGV[3]) == ARGV[1] then
+	redis.call('PEXPIRE', KEYS[1], ARGV[2])
+	return 1
+end
+return 0
+`)
+
+var markAbsentClearScript = redis.NewScript(`
+redis.call('HSET', KEYS[1], ARGV[3], ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+`)
+
+func absentClearKey(userID uuid.UUID, category Category) (string, error) {
+	key, err := activityKey(userID, category)
+	if err != nil {
+		return "", err
+	}
+	return key + ":absent-cleared", nil
+}
+
+func absentClearValue(sourceToken uuid.UUID) string {
+	return sourceToken.String()
+}
+
+// AbsentClearDelivered reports whether the absent clear for this lifecycle
+// token was already delivered, renewing the marker when it was.
+func (s *ActivityStore) AbsentClearDelivered(
+	ctx context.Context,
+	userID uuid.UUID,
+	category Category,
+	sourceToken uuid.UUID,
+) (bool, error) {
+	key, err := absentClearKey(userID, category)
+	if err != nil {
+		return false, err
+	}
+	if s == nil || s.redis == nil {
+		return false, errors.New("rich-presence activity store unavailable")
+	}
+	matched, err := absentClearDeliveredScript.Run(
+		ctx, s.redis, []string{key},
+		absentClearValue(sourceToken), ActivityStateTTL.Milliseconds(), s.instance,
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("read rich-presence absent clear marker: %w", err)
+	}
+	return matched == 1, nil
+}
+
+// MarkAbsentClearDelivered records a delivered absent clear for one lifecycle token.
+func (s *ActivityStore) MarkAbsentClearDelivered(
+	ctx context.Context,
+	userID uuid.UUID,
+	category Category,
+	sourceToken uuid.UUID,
+) error {
+	key, err := absentClearKey(userID, category)
+	if err != nil {
+		return err
+	}
+	if s == nil || s.redis == nil {
+		return errors.New("rich-presence activity store unavailable")
+	}
+	if err := markAbsentClearScript.Run(
+		ctx, s.redis, []string{key},
+		absentClearValue(sourceToken), ActivityStateTTL.Milliseconds(), s.instance,
+	).Err(); err != nil {
+		return fmt.Errorf("write rich-presence absent clear marker: %w", err)
+	}
+	return nil
+}
+
+// ForgetAbsentClear removes the marker. Publication calls it first, because a
+// generation that has been published may later vanish while viewers hold it.
+func (s *ActivityStore) ForgetAbsentClear(
+	ctx context.Context,
+	userID uuid.UUID,
+	category Category,
+) error {
+	key, err := absentClearKey(userID, category)
+	if err != nil {
+		return err
+	}
+	if s == nil || s.redis == nil {
+		return errors.New("rich-presence activity store unavailable")
+	}
+	if err := s.redis.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("delete rich-presence absent clear marker: %w", err)
+	}
+	return nil
 }

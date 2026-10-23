@@ -1020,6 +1020,11 @@ func NewRouter(
 		hub,
 		senderPresence,
 	)
+	// A failed absent-clear marker costs one extra clear, never a skipped one,
+	// so the service reports it here instead of failing the heartbeat.
+	activityService.SetAbsentMarkerFailureReporter(func(failureClass string) {
+		log.Warn("Rich Presence absent-clear marker failed", "failure_class", failureClass)
+	})
 	activitySnapshotService := presence.NewActivitySnapshotService(
 		db,
 		activityBuilder,

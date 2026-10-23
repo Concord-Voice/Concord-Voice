@@ -890,6 +890,48 @@ func serverSettingsRecipientsFromRow(
 	)
 }
 
+var (
+	errAbsentAudienceUnsupportedCategory = errors.New("rich-presence absent-generation audience is server voice only")
+	errAbsentAudienceMissingServerVoice  = errors.New("rich-presence absent-generation build has no server voice context")
+)
+
+// absentServerVoiceRecipients names the connected clients that could hold an
+// absent Server Voice badge: the sender's server members who can view the voice
+// channel, under the widest tier, from the fresh build's server and channel.
+//
+// The set is bounded by channel visibility on purpose. A clear names its
+// sender, so sending one to a client outside that set would disclose that the
+// sender is in voice, while a channel viewer can already see who occupies the
+// channel. A viewer who has since lost membership or visibility is not here:
+// the revocation path captures the prior audience inside the revoking
+// transaction (#2445, #2447) and the recheck adds those captured viewers to this
+// clear. A Private Call has its own absent-state rules, so it stays fail-closed.
+func absentServerVoiceRecipients(
+	ctx context.Context,
+	dependencies activitySettingsRecipientDependencies,
+	delivery Delivery,
+	userID uuid.UUID,
+	input PolicyInput,
+) (map[uuid.UUID]bool, error) {
+	if input.Category != CategoryServerVoice {
+		return nil, &PolicyError{class: FailureAbsentAudienceUnsupported, cause: errAbsentAudienceUnsupportedCategory}
+	}
+	if input.ServerVoice == nil {
+		return nil, &PolicyError{class: FailureInvalidInput, cause: errAbsentAudienceMissingServerVoice}
+	}
+	if clients, ok := delivery.(connectedActivityClientProvider); ok {
+		dependencies.connected = clients.RichPresenceClientUserIDs()
+		if dependencies.connected == nil {
+			dependencies.connected = []uuid.UUID{}
+		}
+	}
+	voice := input.ServerVoice.Context
+	return visibleServerSettingsRecipients(
+		ctx, dependencies, userID, voice.ServerID, voice.ChannelID,
+		hiddenSenderWidestPriorSettings.ServerVoiceTier,
+	)
+}
+
 // privateSettingsRecipientsFromRow does the same for a Private Call, from the
 // sender's single DM call row. A sender with rows in two calls is ambiguous.
 func privateSettingsRecipientsFromRow(

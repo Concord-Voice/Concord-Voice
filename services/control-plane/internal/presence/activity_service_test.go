@@ -785,6 +785,32 @@ func TestActivityService_SuppressedSenderDoesNotStormDisconnects(t *testing.T) {
 	require.Empty(t, store.sets)
 }
 
+// The empty-audience storm: a voice sender nobody may see (default friends-only
+// tier, no friends in the server) suppresses on every heartbeat with nothing
+// stored. Each heartbeat must clear, never disconnect the replica.
+func TestActivityService_EmptyAudienceSenderDoesNotStormDisconnects(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+		return Decision{Audience: map[uuid.UUID]bool{}}, nil
+	}
+	service.absentRecipients = func(context.Context, uuid.UUID, PolicyInput) (map[uuid.UUID]bool, error) {
+		return map[uuid.UUID]bool{}, nil
+	}
+	store.deleteResult = false // nothing stored: the steady state
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, service.RefreshServerVoice(
+			context.Background(), activityServiceSender, serverActivityScope(), nil,
+		))
+	}
+
+	require.Zero(t, delivery.disconnectAllCalls,
+		"an empty-audience sender must never trigger a global disconnect")
+	require.Empty(t, delivery.plans, "nobody connected could have seen it")
+	require.Len(t, store.deletes, 10)
+	require.Empty(t, store.sets)
+}
+
 // Sibling of TestActivityService_SuppressionClassifiesMissingGeneration for the
 // hidden-sender reason (#2444). Only the absent-state row is reclassified.
 func TestActivityService_SuppressionClassifiesHiddenSender(t *testing.T) {
@@ -1010,13 +1036,50 @@ func TestActivityService_SuppressionClassifiesMissingGeneration(t *testing.T) {
 		assert.Zero(t, delivery.disconnectAllCalls)
 	})
 
-	t.Run("absent state disconnects stale clients", func(t *testing.T) {
+	t.Run("absent state without an audience resolver disconnects stale clients", func(t *testing.T) {
 		service, store, delivery := newSuppressedFixture()
 
 		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
 
 		require.NoError(t, err)
 		assert.Len(t, store.gets, 1)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+	})
+
+	t.Run("absent state clears every possible viewer without disconnecting", func(t *testing.T) {
+		service, store, delivery := newSuppressedFixture()
+		var resolved []PolicyInput
+		service.absentRecipients = func(_ context.Context, senderID uuid.UUID, input PolicyInput) (map[uuid.UUID]bool, error) {
+			assert.Equal(t, activityServiceSender, senderID)
+			resolved = append(resolved, input)
+			return map[uuid.UUID]bool{activityServiceViewer: true, activityServiceSender: true}, nil
+		}
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.NoError(t, err)
+		assert.Len(t, store.gets, 1)
+		require.Len(t, resolved, 1)
+		assert.Equal(t, CategoryServerVoice, resolved[0].Category)
+		assert.Zero(t, delivery.disconnectAllCalls,
+			"an absent generation must not disconnect the replica")
+		assert.Equal(t, []DeliveryPlan{{
+			SenderID: activityServiceSender, Category: CategoryServerVoice,
+			ClearRecipients: map[uuid.UUID]bool{activityServiceViewer: true},
+		}}, delivery.plans, "the sender is never its own clear recipient")
+	})
+
+	t.Run("absent state with an unnameable audience fails closed", func(t *testing.T) {
+		service, _, delivery := newSuppressedFixture()
+		resolveErr := errors.New("forced absent-audience resolution failure")
+		service.absentRecipients = func(context.Context, uuid.UUID, PolicyInput) (map[uuid.UUID]bool, error) {
+			return nil, resolveErr
+		}
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.ErrorIs(t, err, resolveErr)
+		assert.Empty(t, delivery.plans)
 		assert.Equal(t, 1, delivery.disconnectAllCalls)
 	})
 
